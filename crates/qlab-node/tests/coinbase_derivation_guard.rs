@@ -42,11 +42,23 @@ const V4_ONLY: [&str; 3] = ["coinbase_note(", "coinbase_note_leaf(", "coinbase_n
 /// 🔴 **This list only shrinks.** An entry whose file no longer calls one is a stale
 /// exemption and fails the test below, so a fix cannot land while quietly leaving a
 /// hole open behind it.
-const ALLOWED: [(&str, &str); 1] = [(
-    "qumbra-wallet/src/coinbase.rs",
-    "lab #566 — the wallet's coinbase scan needs the form from RPC net facts, which \
-     is a different change from #559's",
-)];
+///
+/// **It is empty, and empty is the end state, not a gap**: no production code outside
+/// `qlab-node` derives a coinbase note under a hard-coded form, and nothing is exempt
+/// from saying so. It got here by the rule working — the single entry was
+/// `qumbra-wallet/src/coinbase.rs` (lab #566, *"the wallet's coinbase scan needs the
+/// form from RPC net facts, which is a different change from #559's"*), and #566's fix
+/// is what removed the wallet's last v4 call, which made its own exemption stale and
+/// failed `every_allowed_exemption_is_still_being_used` until the entry was deleted
+/// here. That is the interlock: a guard that only fired on *new* violations would have
+/// left a dead entry standing, and the next holder-side mistake in that file would have
+/// been silently permitted.
+///
+/// While this is empty `every_allowed_exemption_is_still_being_used` is vacuous — by
+/// construction, not by accident. It goes live again the moment an entry is added, and
+/// `only_qlab_node_derives_a_coinbase_note_under_a_hard_coded_form` below is unaffected
+/// either way: it is the check that is always doing work.
+const ALLOWED: [(&str, &str); 0] = [];
 
 /// The crate that defines the derivations, and therefore the one place the v4 names
 /// are ordinary code.

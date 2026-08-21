@@ -26,14 +26,52 @@
 //! miner is asking, which is the same leak `/v1/nullifiers` refuses in its own
 //! shape. What a probe adds is the *question*.
 //!
-//! ## One derivation, not a second formula
+//! ## One derivation, not a second formula — and it must be the right one
 //!
-//! [`qlab_node::coinbase_note_parts`] is what `apply_state` runs when it appends
-//! the leaf, and this module calls it rather than restating it. That is the whole
-//! correctness argument, and it is sharper here than it was for the nullifier
-//! subtraction: a wrong value produces a wrong commitment, a wrong commitment is
-//! in no tree, and the note would be both a wrong balance **and** unspendable —
-//! failing at the witness lookup with nothing pointing at the arithmetic.
+//! [`qlab_node::coinbase_note_parts_for`] is the dispatcher `apply_state`'s own
+//! append path resolves through (`matured_coinbase_leaf_for` →
+//! `coinbase_note_leaf_for` → `coinbase_note_for` → this same function), and
+//! this module calls it rather than restating it. That is the whole correctness
+//! argument, and **it is checkable in one hop: both sides name the same
+//! function and pass the same [`qlab_devnet::forms::GenesisForm`].**
+//!
+//! It is sharper here than it was for the nullifier subtraction: a wrong value
+//! produces a wrong commitment, a wrong commitment is in no tree, and the note
+//! would be both a wrong balance **and** unspendable — failing at the witness
+//! lookup with nothing pointing at the arithmetic.
+//!
+//! ### 🔴 That paragraph was not hypothetical, and the fix is what makes it one
+//!
+//! Until lab #566 this module called the **v4** `coinbase_note_parts`, which
+//! takes no form. `apply_state` had been form-aware since #470 stage 4a, so on
+//! the v5 T2 chain every note this module reconstructed carried v4 ρ/rseed: the
+//! same value, a different commitment, no leaf in the tree, no witness, no
+//! spend. The sentence above described the failure exactly — wrong commitment,
+//! in no tree, wrong balance and unspendable, failing at the witness lookup —
+//! **while being offered as the reason it could not happen**, because its
+//! premise ("`coinbase_note_parts` is what `apply_state` runs") had expired at
+//! the T2 mint and prose has no compiler to notice.
+//!
+//! Confirmed at the transaction level 2026-08-21 on a wallet holding a T2
+//! mining rkm: `send --no-submit` reported *"131 matured coinbase note(s) this
+//! wallet mined are among the candidate inputs"* and then refused with *"a
+//! spendable note's commitment is not in the supplied tree — the tree and the
+//! scan disagree; refusing rather than proving against the wrong anchor"*. The
+//! refusal is **correct and is deliberately unchanged**: it cost nobody a coin,
+//! and it fired before the prover, so the diagnosis was cheap. What was wrong
+//! was the derivation, and the fix is [`MinedChain::form`] reaching
+//! `coinbase_note_parts_for`.
+//!
+//! ### Reproducing it, and the error that is NOT it
+//!
+//! 🔴 A wallet dir that lived through the T1→T2 cutover hits a **stale
+//! `tree-leaves.v1` cache** refusal first — *"tree sync refused: the endpoint
+//! serves 1192 leaves but the local cache already holds 13109. An append-only
+//! tree never rewinds"*. That is [`crate::sync`] correctly refusing a cache
+//! synced against a different net, **not this defect**, and a reproduction that
+//! stops there has confirmed nothing. Set the cache aside (rename, never
+//! delete — it is not key material but it is not disposable either) and run
+//! again to reach the derivation.
 //!
 //! In particular the amount is **not** the emission schedule's value at that
 //! height. It is the miner's frozen §3 share of what the block declared, plus
@@ -61,6 +99,7 @@
 //! refusal vocabulary below is unchanged and shared by both.
 
 use qlab_cbserver::codec::BlockCoinbase;
+use qlab_devnet::forms::GenesisForm;
 use qlab_node::{coinbase_leaf_appears_at, coinbase_maturity, CoinbaseMaturity};
 use qlab_note::note::Note;
 use qlab_wallet::Wallet;
@@ -192,6 +231,20 @@ pub struct MinedChain {
     pub covered: Option<(u64, u64)>,
     /// Every block in `covered`, ascending — one entry per height.
     pub blocks: Vec<BlockCoinbase>,
+    /// 🔴 **The genesis form of the chain these facts came from** (lab #566).
+    ///
+    /// It lives here, beside the blocks, rather than being a parameter of
+    /// [`match_mined`], because the form and the facts have to describe the same
+    /// net: a form passed separately can be paired with a page from a different
+    /// chain and still compile, which is the one mistake that makes every note
+    /// in the report unspendable. Named once, where the endpoint is named.
+    ///
+    /// [`Default`] is [`GenesisForm::V4`] — the live T1 net — and that is
+    /// unobservable rather than a silent choice: a default [`MinedChain`] has no
+    /// `blocks`, so no derivation runs on it. The only default chain in the tree
+    /// is the one `SelectDriver` substitutes when `/v1/coinbase` is unavailable,
+    /// and it exists to carry "nothing was read", not facts.
+    pub form: GenesisForm,
 }
 
 impl MinedChain {
@@ -230,12 +283,16 @@ impl MinedChain {
 /// `to` or when the endpoint serves nothing further. Contiguity is checked as it
 /// goes and is also the progress guard: a page that does not continue where the
 /// last one ended is a named refusal rather than another lap.
+/// `form` is the genesis form of the chain `source` serves, and it rides the
+/// returned [`MinedChain`] into every derivation made from it (lab #566) — see
+/// [`MinedChain::form`] for why it is not a separate argument downstream.
 pub fn fetch_coinbase(
     source: &impl CoinbaseSource,
     from: u64,
     to: u64,
+    form: GenesisForm,
 ) -> Result<MinedChain, CoinbaseRefusal> {
-    let mut catch = CoinbaseCatchUp::new(from, to);
+    let mut catch = CoinbaseCatchUp::new(from, to, form);
     while let Some((from, to)) = catch.want() {
         let page = source.fetch_range(from, to).map_err(|why| CoinbaseRefusal::Endpoint { why })?;
         catch.supply(page)?;
@@ -254,8 +311,15 @@ pub struct CoinbaseCatchUp {
 }
 
 impl CoinbaseCatchUp {
-    pub fn new(from: u64, to: u64) -> CoinbaseCatchUp {
-        CoinbaseCatchUp { chain: MinedChain::default(), cursor: from, to, done: false }
+    /// `form` is the genesis form of the chain being paged — it rides the
+    /// accumulated [`MinedChain`] (lab #566).
+    pub fn new(from: u64, to: u64, form: GenesisForm) -> CoinbaseCatchUp {
+        CoinbaseCatchUp {
+            chain: MinedChain { form, ..MinedChain::default() },
+            cursor: from,
+            to,
+            done: false,
+        }
     }
 
     /// The `(from, to)` range to ask the endpoint for next, or `None` once the
@@ -405,6 +469,13 @@ impl MinedReport {
 /// derived exactly as a spend derives it ([`crate::spent::note_nullifier`]), so
 /// there is no second formula here either.
 ///
+/// 🔴 **The note comes from [`qlab_node::coinbase_note_parts_for`] under
+/// [`MinedChain::form`]** — the same dispatcher `apply_state` resolves through
+/// when it appends the leaf, given the same form. That is the correctness
+/// argument, and it is one hop to check: if the two ever name different
+/// functions or different forms again, every note this returns is a commitment
+/// in no tree (lab #566).
+///
 /// 🔴 **The `[0; 4]` payee is never matched, whatever a wallet's key is.** A
 /// non-minting block carries it as a sentinel, and treating it as an identity
 /// would credit every wallet with genesis.
@@ -429,9 +500,11 @@ pub fn match_mined(
         let Some(&(div_index, _)) = mine.iter().find(|(_, rkm)| *rkm == blk.coinbase_rkm) else {
             continue; // somebody else's block
         };
-        // The applier's own derivation — see the module docs on why a second
-        // formula here would be worse than a wrong number.
-        let Some(note) = qlab_node::coinbase_note_parts(
+        // The applier's own derivation, under the form of the chain these facts
+        // came from — see the module docs on why a second formula here would be
+        // worse than a wrong number, and on what calling the v4 one cost (#566).
+        let Some(note) = qlab_node::coinbase_note_parts_for(
+            chain.form,
             blk.height,
             blk.coinbase_rkm,
             blk.coinbase,
@@ -509,7 +582,7 @@ mod tests {
     #[test]
     fn the_stream_is_paged_until_the_range_is_in_hand() {
         let src = Honest::mined_by(0..=9, [7; 4], 4);
-        let chain = fetch_coinbase(&src, 0, 9).expect("an honest stream pages");
+        let chain = fetch_coinbase(&src, 0, 9, GenesisForm::V4).expect("an honest stream pages");
         assert_eq!(chain.covered, Some((0, 9)));
         assert_eq!(chain.blocks.len(), 10, "every block's coinbase arrived");
         assert_eq!(
@@ -527,7 +600,7 @@ mod tests {
     #[test]
     fn a_stream_short_of_the_range_refuses_rather_than_under_counting() {
         let src = Honest::mined_by(0..=6, [7; 4], 100);
-        let chain = fetch_coinbase(&src, 0, 9).expect("the pages themselves are well-formed");
+        let chain = fetch_coinbase(&src, 0, 9, GenesisForm::V4).expect("the pages themselves are well-formed");
         assert_eq!(chain.covered, Some((0, 6)), "it covers what it served, honestly");
         let e = chain.covers(Some((0, 9))).unwrap_err();
         assert_eq!(e, CoinbaseRefusal::NotCovered { covered: Some((0, 6)), wanted: (0, 9) });
@@ -551,7 +624,7 @@ mod tests {
                 })
             }
         }
-        let e = fetch_coinbase(&Holed, 0, 3).unwrap_err();
+        let e = fetch_coinbase(&Holed, 0, 3, GenesisForm::V4).unwrap_err();
         assert_eq!(e, CoinbaseRefusal::Gap { expected: 1, got: 2 });
         assert!(e.to_string().contains("not somebody else's block"), "{e}");
 
@@ -568,7 +641,7 @@ mod tests {
             }
         }
         assert_eq!(
-            fetch_coinbase(&HoledAcrossPages, 0, 5).unwrap_err(),
+            fetch_coinbase(&HoledAcrossPages, 0, 5, GenesisForm::V4).unwrap_err(),
             CoinbaseRefusal::Gap { expected: 2, got: 3 }
         );
     }
@@ -584,7 +657,7 @@ mod tests {
             }
         }
         assert_eq!(
-            fetch_coinbase(&WrongEcho, 0, 9).unwrap_err(),
+            fetch_coinbase(&WrongEcho, 0, 9, GenesisForm::V4).unwrap_err(),
             CoinbaseRefusal::RangeMismatch { asked: (0, 9), got: (7, 9) }
         );
 
@@ -599,7 +672,7 @@ mod tests {
             }
         }
         assert_eq!(
-            fetch_coinbase(&Backwards, 0, 3).unwrap_err(),
+            fetch_coinbase(&Backwards, 0, 3, GenesisForm::V4).unwrap_err(),
             CoinbaseRefusal::NotAscending { previous: 1, height: 1 }
         );
     }
@@ -616,7 +689,7 @@ mod tests {
                 Err("non-200 response: HTTP 404".into())
             }
         }
-        let e = fetch_coinbase(&Down, 0, 9).unwrap_err();
+        let e = fetch_coinbase(&Down, 0, 9, GenesisForm::V4).unwrap_err();
         assert!(matches!(e, CoinbaseRefusal::Endpoint { .. }));
         assert!(e.to_string().contains("404"), "{e}");
         assert!(e.to_string().contains("TRANSACTIONS ONLY"), "and it says what is lost: {e}");
@@ -643,7 +716,7 @@ mod tests {
             let payee = if h == 1 || h == 2 || h == tip { mine } else { theirs };
             blocks.push(blk(h, payee, 5_000));
         }
-        let chain = MinedChain { covered: Some((0, tip)), blocks };
+        let chain = MinedChain { covered: Some((0, tip)), blocks, form: GenesisForm::V4 };
 
         let report = match_mined(&w, &[0], &chain, &SpentSet::default());
         assert_eq!(report.as_of, tip, "the split is stated as of the height it was read at");
@@ -685,6 +758,7 @@ mod tests {
     fn another_miners_blocks_and_the_no_payee_sentinel_are_never_matched() {
         let w = wallet();
         let chain = MinedChain {
+            form: GenesisForm::V4,
             covered: Some((0, 3)),
             blocks: vec![
                 blk(0, [0; 4], 0),
@@ -715,7 +789,7 @@ mod tests {
         for h in 1..=tip {
             blocks.push(blk(h, if h <= 2 { mine } else { [9; 4] }, 5_000));
         }
-        let chain = MinedChain { covered: Some((0, tip)), blocks };
+        let chain = MinedChain { covered: Some((0, tip)), blocks, form: GenesisForm::V4 };
 
         // Nothing spent yet: two spendable notes.
         let clean = match_mined(&w, &[0], &chain, &SpentSet::default());
@@ -813,7 +887,7 @@ mod tests {
                 Ok(CoinbaseChunk { from: page.from, to: page.to, blocks: page.blocks })
             }
         }
-        let chain = fetch_coinbase(&RouteSource(&rpc), 0, last).expect("the route answers");
+        let chain = fetch_coinbase(&RouteSource(&rpc), 0, last, GenesisForm::V4).expect("the route answers");
         assert!(chain.covers(Some((0, last))).is_ok());
 
         let report = match_mined(&w, &[0], &chain, &SpentSet::default());
@@ -904,7 +978,7 @@ mod tests {
             for h in 2..=tip {
                 blocks.push(blk(h, [9; 4], 5_000));
             }
-            let chain = MinedChain { covered: Some((0, tip)), blocks };
+            let chain = MinedChain { covered: Some((0, tip)), blocks, form: GenesisForm::V4 };
             match_mined(&w, &[0], &chain, &SpentSet::default())
         };
 
@@ -921,5 +995,138 @@ mod tests {
         assert_eq!(ready.spendable.len(), 1, "at maturity the leaf exists and the note counts");
         assert_eq!(ready.next_maturity(), None);
         assert_eq!(ready.spendable[0].maturity, CoinbaseMaturity::Matured { leaf_at: at });
+    }
+    /// 🔴 **The lab #566 property, on the net where it can fail: a mined note's
+    /// commitment must be the leaf the node appended.**
+    ///
+    /// Every other coinbase test in this module runs on `GenesisForm::V4` — the
+    /// same blind spot #564 found in the faucet, and the reason a defect this
+    /// total was invisible here for a day. `apply_state` appends
+    /// `matured_coinbase_leaf_for(self.form, …)`, and v5's ρ/rseed carry the
+    /// payee index under a `:v2` domain, so a holder deriving under v4 on a v5
+    /// chain computes a commitment the tree does not contain: the note is
+    /// reported spendable and can never be witnessed.
+    ///
+    /// Nothing here is a fixture. A real v5 `MemNode` mines real blocks paying
+    /// this wallet's `rkm`, the leaf is appended by `apply_state` on the frozen
+    /// §2 schedule, both routes are served by the **real** `NodeRpc::route` and
+    /// decoded by the wallet's own decoders.
+    ///
+    /// **Both directions are asserted, and the second is the one that would have
+    /// caught this**: under `V5` the commitment is a leaf, and under `V4` — the
+    /// only derivation this module could reach before #566 — it is not. A fix
+    /// that made the first assertion pass by weakening the derivation would fail
+    /// the second.
+    #[test]
+    fn a_v5_chains_mined_note_is_the_leaf_the_node_appended_and_v4s_is_not() {
+        use qlab_cbserver::codec::CoinbasePage;
+        use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
+        use qlab_devnet::header::BlockHeader;
+        use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
+        use qlab_node::{genesis_block_for, MemNode, NodeRpc, NodeState, TreeLeaves};
+        use qlab_wallet::seed::MasterSeed;
+
+        struct NoTx;
+        impl TxVerifier for NoTx {
+            fn verify_tx(&self, _: &TxEntry) -> bool {
+                unreachable!("this chain carries no transactions")
+            }
+        }
+
+        let w = Wallet::from_master_seed(&MasterSeed::from_entropy([0x66; 32]), 0);
+        let mine = w.rkm(w.diversifier_at_index(0));
+
+        // ---- A real V5 chain this wallet mined, past the maturity delay. ----
+        // v4's helpers cannot be reused: v5 has its own header layout, its own
+        // body commitment and the exact emission from height 0.
+        let genesis = genesis_block_for(GenesisForm::V5, GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory_for(GenesisForm::V5, genesis.clone());
+        let mut tip = genesis.header();
+        let last = coinbase_leaf_appears_at(1) + 2;
+        for height in 1..=last {
+            let body = BlockBody {
+                txs: Vec::new(),
+                coinbase: qlab_node::coinbase_for(GenesisForm::V5, height),
+                coinbase_rkm: mine,
+            };
+            let header = BlockHeader::child_of_for(
+                GenesisForm::V5,
+                &tip,
+                height * 75,
+                GENESIS_DIFFICULTY,
+                body.commitment_v5(),
+            );
+            let hash = node.apply_block(header, body, &NoTx).expect("block applies");
+            node.finalize(hash).expect("finalize, so every root is a valid anchor");
+            tip = header;
+        }
+        let rpc = NodeRpc::new(node);
+
+        struct RouteSource<'a>(&'a qlab_node::MemNodeRpc);
+        impl CoinbaseSource for RouteSource<'_> {
+            fn fetch_range(&self, from: u64, to: u64) -> Result<CoinbaseChunk, String> {
+                let bytes = self
+                    .0
+                    .route(&format!("/v1/coinbase?from={from}&to={to}"))
+                    .map_err(|(c, m)| format!("{c} {m}"))?;
+                let page = CoinbasePage::from_bytes(&bytes).map_err(|e| format!("{e:?}"))?;
+                Ok(CoinbaseChunk { from: page.from, to: page.to, blocks: page.blocks })
+            }
+        }
+
+        // The node's own tree, rebuilt from the served leaf stream.
+        let mut catch = crate::sync::TreeCatchUp::new(qlab_cbserver::tree::CommitmentTree::new());
+        while let Some(from) = catch.want_from() {
+            let bytes = rpc.route(&format!("/v1/tree/leaves?from={from}")).expect("served");
+            let page = TreeLeaves::from_bytes(&bytes).expect("the node's own wire");
+            catch
+                .supply(crate::sync::LeafChunk {
+                    from: page.from,
+                    total: page.total,
+                    leaves: page.leaves,
+                })
+                .expect("an honest stream");
+        }
+        let synced = catch.finish();
+        assert_eq!(
+            qlab_note::hash::digest_bytes(&synced.tree.root_at(synced.tree.len())),
+            rpc.node().commitment_root(),
+            "the rebuilt tree IS the v5 node's tree"
+        );
+
+        // `cm` of the oldest matured note, as this wallet derives it under `form`.
+        let cm_under = |form: GenesisForm| {
+            let chain = fetch_coinbase(&RouteSource(&rpc), 0, last, form)
+                .expect("the route answers");
+            assert_eq!(chain.form, form, "the form rides the fetched chain");
+            let report = match_mined(&w, &[0], &chain, &SpentSet::default());
+            assert_eq!(
+                report.blocks_mined() as u64, last,
+                "the payee match is form-independent — it compares rkm lanes, no derivation"
+            );
+            let mined = report.spendable.first().expect("the early ones have matured").clone();
+            assert_eq!(mined.minted_height, 1, "the oldest matured note is block 1's");
+            let d = w.diversifier_at_index(mined.div_index);
+            let inp = w.spend_input(mined.note.value, mined.note.rho, mined.note.rseed, d);
+            let (_nk, _nf, cm) = qlab_air::narrow::derive_input(&inp);
+            cm
+        };
+
+        // 🔴 The property: under the chain's OWN form the commitment is a leaf.
+        assert!(
+            synced.tree.position_of(&cm_under(GenesisForm::V5)).is_some(),
+            "a v5 chain's mined note must be locatable in the v5 tree — without this \
+             the note is reported spendable and refuses at the witness lookup"
+        );
+
+        // 🔴 …and under v4 it is NOT. This is lab #566 itself, pinned: the value
+        // is identical (same `coinbase_note_value_parts`), only ρ/rseed differ,
+        // so nothing short of the tree can tell the two apart. That is why the
+        // balance looked perfectly healthy while no note could move.
+        assert!(
+            synced.tree.position_of(&cm_under(GenesisForm::V4)).is_none(),
+            "the v4 derivation must NOT land in a v5 tree — if it does, the two forms \
+             have stopped being distinguishable and this test proves nothing"
+        );
     }
 }

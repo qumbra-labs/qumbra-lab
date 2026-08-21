@@ -96,6 +96,12 @@ pub struct SendRequest<'a> {
     /// registration steps and on renewals, `None` on every ordinary send. The
     /// declared fee grows by the op's burned name fee; the proof is untouched.
     pub name_op: Option<&'a qlab_devnet::names::NameOp>,
+    /// 🔴 The genesis form of the net being spent on (lab #566). The coinbase
+    /// phase derives this wallet's mined notes under it, and a wrong value makes
+    /// every mined input a commitment in no tree — which `select` then refuses
+    /// at the witness lookup rather than proving against the wrong anchor. It is
+    /// a request field and not a constant because one binary serves both nets.
+    pub form: qlab_devnet::forms::GenesisForm,
 }
 
 /// One thing that happened, as it happened.
@@ -298,6 +304,7 @@ fn select_with_rng(
         scanned,
         held,
         req.scan_to,
+        req.form,
     );
     let mut persisted = false;
     loop {
@@ -705,6 +712,7 @@ mod tests {
             scan_to: bundle.selected_at_tip(),
             no_submit: false,
             name_op: None,
+            form: qlab_devnet::forms::GenesisForm::V4,
         };
         let calls = Rc::new(RefCell::new(Vec::new()));
         let select_calls = Rc::clone(&calls);

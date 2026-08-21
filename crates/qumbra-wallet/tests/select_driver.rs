@@ -16,6 +16,7 @@ use qlab_note::kem::Dk;
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::body::{BlockBody, TxEntry, TxPublic, TxVerifier};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
 use qlab_node::{anchor_set, coinbase, genesis_block, ChainStore, Hash32, MemNode, NodeState};
@@ -202,6 +203,7 @@ fn new_driver(f: &Fixture) -> SelectDriver {
         f.outcomes(),
         CommitmentTree::new(),
         f.to,
+        GenesisForm::V4,
     )
 }
 
@@ -309,6 +311,7 @@ fn the_verdict_gate_is_not_skippable() {
         incomplete,
         CommitmentTree::new(),
         f.to,
+        GenesisForm::V4,
     );
     let mut rng = StdRng::from_seed([0x66; 32]);
     match driver.step(&mut rng) {
@@ -421,6 +424,7 @@ fn a_mining_only_wallet_selects_its_matured_coinbase_note() {
         f.outcomes_finding(0),
         CommitmentTree::new(),
         f.to,
+        GenesisForm::V4,
     );
     let (outcome, events, asked) = pump(&f, &mut driver, Coinbase::Served);
     let bundle = outcome.unwrap_or_else(|e| panic!("a matured coinbase must be spendable: {e}"));
@@ -471,6 +475,7 @@ fn a_maturing_mined_note_is_never_selectable_and_the_refusal_says_when() {
         early.outcomes_finding(0),
         CommitmentTree::new(),
         early.to,
+        GenesisForm::V4,
     );
     let (outcome, _, _) = pump(&early, &mut driver, Coinbase::Served);
     let why = outcome.err().expect("nothing has matured yet");
@@ -495,6 +500,7 @@ fn a_maturing_mined_note_is_never_selectable_and_the_refusal_says_when() {
         ready.outcomes_finding(0),
         CommitmentTree::new(),
         ready.to,
+        GenesisForm::V4,
     );
     let (outcome, _, _) = pump(&ready, &mut driver, Coinbase::Served);
     let bundle = outcome.unwrap_or_else(|e| panic!("at maturity the leaf exists: {e}"));
@@ -560,6 +566,7 @@ fn insufficient_funds_names_the_coinbase_gap_only_when_coinbase_was_invisible() 
         f.outcomes(),
         CommitmentTree::new(),
         f.to,
+        GenesisForm::V4,
     );
     let (seen, _, _) = pump(&f, &mut visible, Coinbase::Served);
     let seen = seen.err().expect("10 QMB cannot cover 1000");
@@ -572,6 +579,7 @@ fn insufficient_funds_names_the_coinbase_gap_only_when_coinbase_was_invisible() 
         f.outcomes(),
         CommitmentTree::new(),
         f.to,
+        GenesisForm::V4,
     );
     let (unseen, _, _) = pump(&f, &mut blind, Coinbase::NotFound);
     let unseen = unseen.err().expect("still cannot cover it");

@@ -61,7 +61,8 @@ pub mod telemetry;
 pub use coinbase::{
     coinbase_leaf_appears_at, coinbase_maturity, coinbase_note, coinbase_note_for,
     coinbase_note_leaf, coinbase_note_leaf_for,
-    coinbase_note_parts, coinbase_note_value, coinbase_note_value_parts, coinbase_rho,
+    coinbase_note_parts, coinbase_note_parts_for, coinbase_note_value, coinbase_note_value_parts,
+    coinbase_rho,
     coinbase_rseed, matured_coinbase_leaf,
     matures_coinbase_minted_at, CoinbaseMaturity, COINBASE_RHO_DOMAIN, COINBASE_RSEED_DOMAIN,
 };

@@ -208,6 +208,7 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
         scan_to: tip.height,
         no_submit: true,
         name_op: None,
+        form: qumbra_wallet::GenesisForm::V4,
     };
     let bundle = select(&req, &mut |_| {}).expect("phase 1 selects and serializes a witness");
 

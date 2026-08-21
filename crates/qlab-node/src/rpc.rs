@@ -1407,11 +1407,22 @@ pub fn nullifier_page(blocks: &[BlockDiscovery], from: u64, to: u64) -> Nullifie
 ///
 /// 🔴 **What is deliberately NOT here: the note's value.** The route serves the
 /// three numbers the value is a function of and lets the holder run
-/// [`crate::coinbase::coinbase_note_parts`], which is the same call
-/// `apply_state` makes when it appends the leaf. Deriving it here would put a
-/// consensus rule on the serving path and would leave the `qlab-cbserver`
-/// reference server — which cannot depend on this crate — stating a rule of its
-/// own invention.
+/// [`crate::coinbase::coinbase_note_parts_for`] — the dispatcher `apply_state`
+/// resolves through when it appends the leaf, given the same
+/// [`qlab_devnet::forms::GenesisForm`]. Deriving it here would put a consensus
+/// rule on the serving path and would leave the `qlab-cbserver` reference
+/// server — which cannot depend on this crate — stating a rule of its own
+/// invention.
+///
+/// 🔴 **And the form is not on this wire either.** This comment named the v4
+/// `coinbase_note_parts` and said it was "the same call `apply_state` makes",
+/// which stopped being true at the T2 mint: `apply_state` has been form-aware
+/// since #470 stage 4a. A holder reading the old sentence and calling the v4
+/// function derives commitments that are in no v5 tree — lab #566, which is
+/// exactly what `qumbra-wallet` did. The route's honesty property below still
+/// holds, with the form as its precondition: **the served facts reconstruct the
+/// leaf this node appended, provided the holder derives under the net's own
+/// form.** Where the holder gets that form is the open question on #566.
 pub fn coinbase_page(blocks: &[BlockDiscovery], from: u64, to: u64) -> CoinbasePage {
     CoinbasePage::page(
         blocks.iter().map(|b| BlockCoinbase {
@@ -1992,14 +2003,32 @@ mod tests {
     // that what it serves reconstructs the note the node itself appended.
 
     /// 🔴 **The property the route exists for: the served facts reconstruct the
-    /// leaf `apply_state` appended.**
+    /// leaf `apply_state` appended — under the chain's own genesis form.**
     ///
-    /// A wallet holding this page runs `coinbase_note_parts` — the same call
-    /// [`crate::coinbase::coinbase_note`] makes — and the commitment it derives
-    /// must be a leaf of the node's own tree. This is what makes the value
-    /// *checkable* rather than trusted: a server that lied about `coinbase` or
-    /// `fees` would produce a `cm` that is in no tree, and the spend would refuse
-    /// instead of proving something false.
+    /// A wallet holding this page runs
+    /// [`crate::coinbase::coinbase_note_parts_for`] — the dispatcher
+    /// [`crate::coinbase::coinbase_note_for`] resolves through, and the one
+    /// `apply_state`'s append path reaches via `matured_coinbase_leaf_for` — and
+    /// the commitment it derives must be a leaf of the node's own tree. This is
+    /// what makes the value *checkable* rather than trusted: a server that lied
+    /// about `coinbase` or `fees` would produce a `cm` that is in no tree, and the
+    /// spend would refuse instead of proving something false.
+    ///
+    /// 🔴 **The form is a precondition of that property, and this test used to
+    /// hide it.** It said "a wallet holding this page runs `coinbase_note_parts`
+    /// — the same call", naming the **v4** derivation, and ran on a v4 chain, so
+    /// it passed while the sentence stopped being true at the T2 mint. Lab #566:
+    /// `qumbra-wallet` called exactly that v4 function on a v5 chain and every
+    /// note it reconstructed was a commitment in no tree — 131 matured notes a
+    /// miner was told they had and could not move. **The route is not what was
+    /// wrong** (it serves the block's own bytes and derives nothing), but this
+    /// test was the check that should have caught the holder, and being V4-only
+    /// is why it did not. It now takes the form from the node under test, so a
+    /// form-blind derivation cannot pass here again; the v5 end of the property
+    /// is pinned in `coinbase.rs` by
+    /// `the_served_five_facts_reconstruct_the_appended_note_under_either_form`
+    /// and, at the holder, by `qumbra-wallet`'s
+    /// `a_v5_chains_mined_note_is_the_leaf_the_node_appended_and_v4s_is_not`.
     ///
     /// It is also the check that would have caught the task book's original
     /// premise — "amount = the emission schedule's value at that height" — which
@@ -2030,8 +2059,11 @@ mod tests {
         assert_eq!(blk.fees, body.total_fees());
         assert_eq!(blk.name_burn, body.total_name_burn());
 
-        // Reconstructed from the served facts alone — no body, as a wallet.
-        let note = crate::coinbase::coinbase_note_parts(
+        // Reconstructed from the served facts alone — no body, as a wallet, and
+        // under the form of the node that served them rather than a literal.
+        let form = rpc.node().form();
+        let note = crate::coinbase::coinbase_note_parts_for(
+            form,
             blk.height,
             blk.coinbase_rkm,
             blk.coinbase,
@@ -2041,8 +2073,8 @@ mod tests {
         .expect("a minting block mints a note");
         assert_eq!(
             Some(&note),
-            crate::coinbase::coinbase_note(1, &body).as_ref(),
-            "the wallet's note IS the applier's note"
+            crate::coinbase::coinbase_note_for(form, 1, &body).as_ref(),
+            "the wallet's note IS the applier's note — same dispatcher, same form"
         );
 
         // 🔴 …and the schedule alone would NOT have produced it: the value is
@@ -2057,7 +2089,11 @@ mod tests {
 
         // The leaf is the node's own, once maturity puts it in the tree.
         let leaf = digest_bytes(&note.commitment());
-        assert_eq!(leaf, crate::coinbase::coinbase_note_leaf(1, &body).expect("mints"));
+        assert_eq!(
+            leaf,
+            crate::coinbase::coinbase_note_leaf_for(form, 1, &body).expect("mints"),
+            "and the leaf the tree gets is the leaf of that same note"
+        );
     }
 
     /// Projection discipline, `route_serves_the_stored_blocks_nullifier_section_verbatim`'s
@@ -2087,7 +2123,15 @@ mod tests {
         assert!(!page.is_truncated(), "and the page reaches the `to` it echoes");
         // Nothing is derivable from a non-minting block, and the shared
         // derivation says so rather than minting a zero-value note.
-        assert!(crate::coinbase::coinbase_note_parts(2, [0; 4], 0, 0, 0).is_none());
+        assert!(crate::coinbase::coinbase_note_parts_for(
+            rpc.node().form(),
+            2,
+            [0; 4],
+            0,
+            0,
+            0
+        )
+        .is_none());
     }
 
     /// The route's refusals are `/v1/nullifiers`' refusals, and there is no

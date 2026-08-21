@@ -155,7 +155,12 @@ impl Rig {
     /// them — the wallet's own view, over real sockets, with the chain's
     /// nullifiers already subtracted.
     fn mined_report(&self) -> MinedReport {
-        let chain = fetch_coinbase(&HttpCoinbaseSource::new(&self.base), 0, self.tip.height)
+        let chain = fetch_coinbase(
+            &HttpCoinbaseSource::new(&self.base),
+            0,
+            self.tip.height,
+            qumbra_wallet::GenesisForm::V4,
+        )
             .expect("the node serves /v1/coinbase (lab #415)");
         let spent = fetch_spent(&HttpNullifierSource::new(&self.base), 0, self.tip.height)
             .expect("the node serves /v1/nullifiers");
@@ -244,6 +249,7 @@ fn select_a_spend(rig: &Rig) -> (WitnessBundle, Vec<SendStep>) {
         scan_to: rig.tip.height,
         no_submit: false,
         name_op: None,
+        form: qumbra_wallet::GenesisForm::V4,
     };
     let mut steps: Vec<SendStep> = Vec::new();
     let bundle = select(&req, &mut |s| steps.push(s))
@@ -359,6 +365,7 @@ fn a_mining_only_wallet_spends_a_matured_coinbase_note_and_a_stranger_detects_it
         scan_to: rig.tip.height,
         no_submit: false,
         name_op: None,
+        form: qumbra_wallet::GenesisForm::V4,
     };
     let current = preflight(&req).expect("fresh public chain facts are available");
     let art = prove(&bundle, &current, &mut |_| {})

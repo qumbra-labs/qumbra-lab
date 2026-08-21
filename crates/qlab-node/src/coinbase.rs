@@ -325,20 +325,74 @@ pub const V5_SINGLE_PAYEE_INDEX: u8 = 0;
 /// So the form-aware note is the primitive and the leaf is derived **from it**
 /// below, rather than the two being computed side by side. There is one
 /// derivation per form and the leaf cannot drift from the note again.
+///
+/// This is the `&BlockBody` face of [`coinbase_note_parts_for`], which is where
+/// the `match form` actually lives — a holder that has the block reads this one,
+/// a holder that has only the five served facts reads that one, and neither is a
+/// second dispatch to keep in step (lab #566).
 pub fn coinbase_note_for(
     form: qlab_devnet::forms::GenesisForm,
     height: u64,
     body: &BlockBody,
 ) -> Option<Note> {
+    coinbase_note_parts_for(
+        form,
+        height,
+        body.coinbase_rkm,
+        body.coinbase,
+        body.total_fees(),
+        body.total_name_burn(),
+    )
+}
+
+/// [`coinbase_note_parts`] under an explicit genesis form — **the derivation a
+/// holder who is not a node runs** (lab #566), and the ONE `match form` for the
+/// coinbase note in this tree.
+///
+/// ## Why this shape exists and the `&BlockBody` one was not enough
+///
+/// [`coinbase_note_for`] takes the block. A wallet does not have the block and
+/// never will: the compact wire carries no `coinbase_rkm`, so a wallet reads the
+/// five facts off `GET /v1/coinbase` ([`qlab_cbserver::codec::BlockCoinbase`])
+/// and holds nothing else about that height. With no parts-level dispatcher its
+/// only reachable derivation was the **v4** [`coinbase_note_parts`], which is
+/// exactly what `qumbra-wallet` called — on a v5 chain that is a commitment in
+/// no tree, and lab #566 is the transaction-level witness: 131 matured notes a
+/// wallet had mined, none of them in the tree, `send` refusing at the witness
+/// lookup rather than proving against the wrong anchor.
+///
+/// ## The payee index is not the caller's to pass
+///
+/// It is [`V5_SINGLE_PAYEE_INDEX`] — the birth cap is 1, so the payee index of
+/// `coinbase_rkm` is 0 wherever a v5 coinbase note is derived. Taking it as a
+/// parameter here would hand every holder a number to get wrong, and a literal
+/// `0` in two files is the shape lab #559 was. Raising the cap stays a rule
+/// change: it moves this function, not its call sites.
+///
+/// **No new arithmetic.** Both arms are the functions that already existed and
+/// are already tested against each other
+/// (`v4_and_v5_agree_on_the_value_and_disagree_on_the_commitment`); this only
+/// chooses between them. Writing a third formula here would be the
+/// defect lab #566 is about, reproduced in the place that was supposed to fix it.
+pub fn coinbase_note_parts_for(
+    form: qlab_devnet::forms::GenesisForm,
+    height: u64,
+    rkm: [u64; 4],
+    coinbase: u64,
+    total_fees: u64,
+    total_name_burn: u64,
+) -> Option<Note> {
     match form {
-        qlab_devnet::forms::GenesisForm::V4 => coinbase_note(height, body),
+        qlab_devnet::forms::GenesisForm::V4 => {
+            coinbase_note_parts(height, rkm, coinbase, total_fees, total_name_burn)
+        }
         qlab_devnet::forms::GenesisForm::V5 => coinbase_note_parts_v5(
             height,
             V5_SINGLE_PAYEE_INDEX,
-            body.coinbase_rkm,
-            body.coinbase,
-            body.total_fees(),
-            body.total_name_burn(),
+            rkm,
+            coinbase,
+            total_fees,
+            total_name_burn,
         ),
     }
 }
@@ -637,6 +691,60 @@ mod tests {
             v4.commitment(),
             v5.commitment(),
             "so a v4-derived note is not a leaf of a v5 chain's tree"
+        );
+    }
+
+    /// 🔴 **The holder's property, for BOTH forms: the five facts `/v1/coinbase`
+    /// serves reconstruct the note the applier appended, and its leaf.**
+    ///
+    /// This is the invariant lab #566 broke and the one that had no test.
+    /// `qlab-node`'s own coverage checked `coinbase_note_for` (the block face) and
+    /// v4-vs-v5 separation, and `rpc.rs` checked the served facts on a **v4**
+    /// chain only — so nothing anywhere asserted that the *parts* face and the
+    /// *body* face agree under a given form. That is exactly the seam a wallet
+    /// sits on: it has the five scalars and never the block.
+    ///
+    /// Both directions are asserted per form, which is what makes it a check and
+    /// not a restatement: within a form the two faces agree, and across forms the
+    /// same five facts give different commitments. A `coinbase_note_parts_for`
+    /// that ignored its `form` argument would pass the first and fail the second.
+    #[test]
+    fn the_served_five_facts_reconstruct_the_appended_note_under_either_form() {
+        use qlab_devnet::forms::GenesisForm;
+        let body = body_at(700, RKM_A, 2);
+        // The five facts, exactly as `coinbase_page` projects them off the block.
+        let (h, rkm, cb, fees, burn) = (
+            700u64,
+            body.coinbase_rkm,
+            body.coinbase,
+            body.total_fees(),
+            body.total_name_burn(),
+        );
+        for form in [GenesisForm::V4, GenesisForm::V5] {
+            let from_parts =
+                coinbase_note_parts_for(form, h, rkm, cb, fees, burn).expect("mints");
+            let from_body = coinbase_note_for(form, h, &body).expect("mints");
+            assert_eq!(
+                from_parts, from_body,
+                "{form:?}: a holder with the served facts must derive the applier's own note"
+            );
+            assert_eq!(
+                digest_bytes(&from_parts.commitment()),
+                coinbase_note_leaf_for(form, h, &body).expect("mints"),
+                "{form:?}: …and therefore the leaf the tree actually got"
+            );
+        }
+        // Across forms the same facts are different notes — so the dispatch is
+        // load-bearing and not decoration.
+        assert_ne!(
+            coinbase_note_parts_for(GenesisForm::V4, h, rkm, cb, fees, burn)
+                .expect("mints")
+                .commitment(),
+            coinbase_note_parts_for(GenesisForm::V5, h, rkm, cb, fees, burn)
+                .expect("mints")
+                .commitment(),
+            "a form-blind dispatcher would make these equal and every holder on the \
+             other net unspendable"
         );
     }
 

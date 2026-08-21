@@ -233,6 +233,7 @@ fn names_self_send(
         scan_to,
         no_submit,
         name_op: Some(op),
+        form: genesis_form_of(args)?,
     };
     execute(&req, &mut sink).map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
     Ok(())
@@ -294,7 +295,14 @@ fn usage() {
                 (what this wallet's rkm MINED — a node that does not serve it makes\n\
                 the balance transactions-only, and the report says so)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
-                (defaults to --url when omitted — one host usually serves both)\n\n\
+                (defaults to --url when omitted — one host usually serves both)\n\
+         --net  t1|t2 — WHICH NET these endpoints serve (default t1). A coinbase\n\
+                note\'s derivation is genesis-form dependent, so a wallet that\n\
+                MINED on T2 and omits `--net t2` reconstructs commitments that are\n\
+                in no tree: `scan` reports a mined balance and `send` then refuses\n\
+                at the witness lookup (lab #566). Accepted by scan/send/history\n\
+                and by `names register`/`renew`. No effect on a wallet that only\n\
+                receives — transaction outputs are not form-dependent\n\n\
          Both URLs accept http://host:PORT (port required, plaintext) and\n\
          https://host[:port] (TLS, port defaults to 443, roots are the compiled-in\n\
          Mozilla set). There is no fallback from https to http: a TLS failure is\n\
@@ -309,6 +317,51 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// `--net t1|t2` → the genesis form the chain's coinbase notes are keyed under
+/// (lab #566).
+///
+/// ## Why this flag exists, and what it is NOT
+///
+/// A coinbase note's ρ and rseed are form-dependent: v5 derives them under a
+/// `:v2` domain carrying the payee index, so **the same block yields a different
+/// commitment on T1 and T2.** A holder that derives under the wrong form gets a
+/// commitment that is in no tree — the note reads as spendable and then refuses
+/// at the witness lookup. That is lab #566, confirmed on a T2 mining wallet
+/// holding 131 matured notes it could not move.
+///
+/// `qumbra-node mine` resolves the same question through a [`NetProfile`] table
+/// (`--genesis-hash > --net > QUMBRA_GENESIS_HASH > BUILT_FOR_NET`, lab #527).
+/// **This is deliberately less than that**: the wallet is nodeless, loads no
+/// genesis file, and nothing it fetches — `/v1/coinbase`, `/v1/nullifiers`,
+/// `/v1/tree/leaves`, `/v1/anchors` — carries a format version, so there is
+/// nothing here for a profile to verify the flag against.
+///
+/// 🔴 **So this is an interim and its weakness is named rather than hidden: a T2
+/// wallet that omits the flag is silently wrong until it tries to spend.** The
+/// durable fix is for the served wire to carry the genesis format version, which
+/// is a wire change and a stop point this baton did not cross — it is asked on
+/// lab #566. What keeps the interim safe rather than merely small is that the
+/// wrong answer cannot produce a bad proof: the tree disagrees, and
+/// `sync`/`send` refuse and now name this flag when they do.
+///
+/// Default `t1`, so every existing command on the live net behaves exactly as
+/// before.
+///
+/// [`NetProfile`]: https://github.com/qumbra-labs/qumbra-lab/blob/main/crates/qumbra-node/src/mine.rs
+fn genesis_form_of(args: &[String]) -> Result<qlab_devnet::forms::GenesisForm, Box<dyn Error>> {
+    use qlab_devnet::forms::GenesisForm;
+    match flag(args, "--net") {
+        None | Some("t1") => Ok(GenesisForm::V4),
+        Some("t2") => Ok(GenesisForm::V5),
+        Some(other) => Err(format!(
+            "--net {other} is not a net this wallet knows (it knows: t1, t2). The net decides how \
+             a mined coinbase note is derived, so guessing it would produce notes with no leaf in \
+             any tree — refusing rather than picking one"
+        )
+        .into()),
+    }
 }
 
 
@@ -695,6 +748,7 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         scan_to,
         no_submit,
         name_op: None,
+        form: genesis_form_of(args)?,
     };
 
     // A proof that cost gigabytes should not be lost to a failed socket — so the
@@ -786,7 +840,7 @@ fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
-    let report = qumbra_wallet::ledger_run::report(&dir, &w, url, from, to);
+    let report = qumbra_wallet::ledger_run::report(&dir, &w, url, from, to, genesis_form_of(args)?);
     // stderr, so a piped ledger stays a ledger — but never dropped: each note
     // names a reason a `recipient:` line below reads `not recorded`.
     for note in &report.notes {
@@ -814,7 +868,7 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
-    let report = qumbra_wallet::scan::scan_report(&w, url, from, to);
+    let report = qumbra_wallet::scan::scan_report(&w, url, from, to, genesis_form_of(args)?);
     print!(
         "{}",
         view::render(

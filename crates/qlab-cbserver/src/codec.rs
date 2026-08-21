@@ -481,12 +481,22 @@ pub const MAX_COINBASE_BLOCKS: usize = 1024;
 /// One block's coinbase, as the block committed it — the five facts the coinbase
 /// note is a function of, and **nothing derived** (lab #415).
 ///
-/// `qlab_node::coinbase_note_parts(height, coinbase_rkm, coinbase, fees,
-/// name_burn)` turns these into the note `apply_state` appended. The derivation
-/// is deliberately NOT run on the serving side: this crate cannot reach it (the
-/// dependency runs `qlab-node → qlab-cbserver`, never back), and a served figure
-/// would be a consensus rule restated by whichever server answered rather than
-/// the block's own bytes.
+/// `qlab_node::coinbase_note_parts_for(form, height, coinbase_rkm, coinbase,
+/// fees, name_burn)` turns these into the note `apply_state` appended. The
+/// derivation is deliberately NOT run on the serving side: this crate cannot
+/// reach it (the dependency runs `qlab-node → qlab-cbserver`, never back), and a
+/// served figure would be a consensus rule restated by whichever server answered
+/// rather than the block's own bytes.
+///
+/// 🔴 **`form` is the dispatcher's first argument and it is NOT on this wire.**
+/// The named function used to be the v4 `coinbase_note_parts`, and a reader who
+/// followed this pointer landed on the derivation that is wrong on a v5 chain —
+/// which is what `qumbra-wallet` called until lab #566, reconstructing
+/// commitments that are in no T2 tree. A holder must therefore learn the genesis
+/// form somewhere other than here: the wallet takes it as `--net t1|t2`, the
+/// faucet reads `node.form()`. **That the form is absent from this payload is
+/// the open question on #566**, not an omission this comment is papering over —
+/// adding it is a wire change and has not been ruled on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockCoinbase {
     pub height: u64,

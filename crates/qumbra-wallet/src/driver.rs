@@ -21,10 +21,22 @@
 //! The fix is a fourth phase, `Spent → Coinbase → Tree → Anchors`: the same
 //! `GET /v1/coinbase` stream `scan` pages, through the same accumulator
 //! ([`CoinbaseCatchUp`]) and the same reconstruction ([`match_mined`] →
-//! `qlab_node::coinbase_note_parts`), so there is no second derivation of a
+//! `qlab_node::coinbase_note_parts_for`), so there is no second derivation of a
 //! mined note anywhere. **Only [`MinedReport::spendable`] enters selection** —
 //! a maturing note is real money this wallet owns and cannot spend, and it must
 //! never be selectable.
+//!
+//! 🔴 **"No second derivation anywhere" was true in letter and false in effect
+//! until lab #566, and the missing word was `_for`.** There was no second
+//! *formula* in the wallet — and the wallet was calling the wrong one of the two
+//! the node has, the v4 `coinbase_note_parts`, on a v5 chain. Every note this
+//! phase offered was a commitment in no tree, and a T2 miner's `send` refused at
+//! the witness lookup with 131 matured notes in hand. What makes the sentence
+//! true now is that the call names the **dispatcher** and passes
+//! [`MinedChain::form`], the same form `apply_state` appends under — so "no
+//! second derivation" is checkable rather than merely asserted. Corollary worth
+//! keeping: *"there is only one formula"* is not the same claim as *"the right
+//! one is being called"*, and only the second one is worth anything.
 //!
 //! 🔴 **What a send does when that route 404s — RULED (Larry, 2026-08-16, lab
 //! #424): proceed on transaction notes only, LOUDLY.** The grounds are the
@@ -150,6 +162,10 @@ pub struct SelectDriver {
     /// Notes this wallet owns whose nullifiers are already on the chain, both
     /// categories — kept for the refusal text.
     skipped_spent: usize,
+    /// The genesis form of the net this send is talking to — the coinbase phase
+    /// derives under it (lab #566). Held here rather than asked for at the
+    /// coinbase phase because the driver does no I/O and cannot learn it later.
+    form: qlab_devnet::forms::GenesisForm,
 }
 
 impl SelectDriver {
@@ -166,6 +182,7 @@ impl SelectDriver {
         outcomes: Vec<(u64, ScanOutcome)>,
         held: CommitmentTree,
         to: u64,
+        form: qlab_devnet::forms::GenesisForm,
     ) -> SelectDriver {
         // The `Resolved` narration stays with the CALLER (it precedes the scan,
         // which precedes this driver's birth) — the driver's events begin at
@@ -209,6 +226,7 @@ impl SelectDriver {
             mined: None,
             coinbase_gap: None,
             skipped_spent: 0,
+            form,
         }
     }
 
@@ -256,7 +274,7 @@ impl SelectDriver {
                         }
                         self.spent_covered = spent_set.covered;
                         self.spent = Some(spent_set);
-                        self.phase = Phase::Coinbase(CoinbaseCatchUp::new(0, self.to));
+                        self.phase = Phase::Coinbase(CoinbaseCatchUp::new(0, self.to, self.form));
                     }
                 },
                 Phase::Coinbase(catch) => {

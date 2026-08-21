@@ -885,8 +885,24 @@ pub unsafe extern "C" fn qmb_select_new(
 
     let outcomes = std::mem::take(&mut scan_state.outcomes);
     let to = scan_state.to;
-    let driver =
-        SelectDriver::new((*w).wallet.clone(), recipient, amount, None, outcomes, held, to);
+    // 🔴 **`GenesisForm::V4` (T1) is hardcoded here, and that is a KNOWN GAP, not
+    // a decision** (lab #566). The CLI takes `--net t1|t2`; this ABI has no
+    // parameter for it, so an extension or iOS shell driving a T2 wallet gets the
+    // v4 coinbase derivation and its mined notes are commitments in no tree —
+    // exactly the defect #566 fixed one layer in. Closing it means a new/extended
+    // C entry point, which is an ABI change (the header is pinned to source by a
+    // bidirectional test) and outside this baton's scope. Reported on #566.
+    // Sends of RECEIVED notes are unaffected: transaction outputs carry no form.
+    let driver = SelectDriver::new(
+        (*w).wallet.clone(),
+        recipient,
+        amount,
+        None,
+        outcomes,
+        held,
+        to,
+        qumbra_wallet::GenesisForm::V4,
+    );
     Box::into_raw(Box::new(SelectState {
         driver,
         rng: StdRng::from_seed(seed),
