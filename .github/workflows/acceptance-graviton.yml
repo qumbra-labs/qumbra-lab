@@ -312,6 +312,31 @@ jobs:
       # conservative direction, since the failure modes are asymmetric: a
       # skipped stop costs at most 2 h of watchdog-bounded idle, a wrong
       # stop kills a live suite mid-run.
+      #
+      # 🔴 THIS COUNTS ONLY THIS WORKFLOW'S RUNS, AND THAT IS LOAD-BEARING.
+      # It is correct precisely because acceptance-graviton is the lane's ONLY
+      # user. The day a second workflow is given `runs-on: [self-hosted,
+      # graviton-rig]`, this guard becomes wrong in the DANGEROUS direction:
+      # that build would be running on a rig this job believes nobody is using,
+      # and this job would park the iron out from under it. The `start` job's
+      # queue-depth count carries the same single-user assumption.
+      #
+      # So adding a second user of the rigs is NOT a one-line `runs-on` change.
+      # Occupancy has to become lane-wide first: count the non-completed runs of
+      # EVERY workflow targeting the rigs, from one list both jobs read.
+      #
+      # For whoever builds that — the direct question, "is any graviton runner
+      # busy?", is NOT reachable from a workflow. GET /repos/{repo}/actions/runners
+      # needs `administration: read`, which a workflow GITHUB_TOKEN cannot be
+      # granted at all; the only route is a stored PAT, which deploy #130 S7
+      # refuses. Run-counting is the reachable proxy. (A local operator CAN ask it;
+      # qumbra-deploy's terraform/ci-runner/apply.sh does.)
+      #
+      # Costed and DECLINED 2026-08-21: moving explorer-image/node-image here would
+      # have required it, and the saving was ~$1.7/month once paid-runner EXECUTIONS
+      # were counted rather than workflow RUNS — those workflows are
+      # workflow_dispatch-gated and reach the paid runner ~2 times in 40 runs. The
+      # ARM SKU's spend was ~91% suite-arm64, now retired.
       - name: Is any other run using the lane?
         id: lane
         env:
