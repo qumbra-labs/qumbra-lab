@@ -153,6 +153,11 @@ fields that matter:
 | `template_max_poll_failures` | consecutive failed polls before work is suspended (default 3) |
 | `template_max_age_ms` | wall-clock without a successful poll before work is suspended. Unset, this is `template_max_poll_failures × poll_ms` so the bound tracks the poll cadence rather than a second literal |
 | `payout_rkm` | the pool's own payout identity, from `qumbra-wallet miner-rkm` |
+| `max_connections` | concurrent stratum connections (default 64). Each one is a thread; past the cap the accept loop writes `connection-cap-reached` and does not spawn |
+| `max_connections_per_ip` | concurrent connections from one IP. Unset, this is `max(1, max_connections / 8)` so one peer cannot occupy the whole cap |
+| `max_line_bytes` | max bytes of one LF-terminated line (default 4096). Past it the connection is closed as `line-too-long` |
+| `request_timeout_ms` | wall-clock to finish one line after its first byte (default 10000). Distinct from the 100 ms per-read timeout that drains the job outbox; this is what catches a trickling client |
+| `connection_timeout_ms` | wall-clock from accept to the first complete line. Unset, this is `request_timeout_ms`. After a complete line, silence is a hashing miner and is not killed |
 | `[template]` | a **static fixture** for tests only — see the refusal below |
 
 ### Two refusals you should expect, and want

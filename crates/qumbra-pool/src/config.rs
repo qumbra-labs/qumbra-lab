@@ -7,6 +7,10 @@
 use qlab_devnet::forms::GenesisForm;
 use serde::Deserialize;
 
+use crate::guard::{
+    ListenLimits, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_REQUEST_TIMEOUT_MS,
+    PER_IP_DIVISOR,
+};
 use crate::hexutil;
 use crate::template::{header_from_parts, parse_form, HeldTemplateSource, Template, TemplateError};
 
@@ -52,6 +56,29 @@ pub struct PoolConfig {
     /// which wallet owns its coinbase must refuse before accepting miners.
     #[serde(default)]
     pub payout_rkm: Option<String>,
+    /// Concurrent stratum connections. Default
+    /// [`crate::guard::DEFAULT_MAX_CONNECTIONS`]. Each connection is a thread.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+    /// Concurrent connections from one IP. When unset, derived as
+    /// `max(1, max_connections / PER_IP_DIVISOR)` so one peer cannot occupy
+    /// the whole cap (`derived-not-duplicated.md` §4).
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u32>,
+    /// Max bytes of one LF-terminated line, including the newline.
+    /// Default [`crate::guard::DEFAULT_MAX_LINE_BYTES`].
+    #[serde(default)]
+    pub max_line_bytes: Option<u64>,
+    /// Wall-clock milliseconds to finish one line after its first byte.
+    /// Default [`crate::guard::DEFAULT_REQUEST_TIMEOUT_MS`]. Distinct from
+    /// the 100 ms per-read timeout used to drain the job outbox.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Wall-clock milliseconds from accept to the first complete line.
+    /// When unset, derived as `request_timeout_ms`. After a complete line,
+    /// silence is a hashing miner and is not killed.
+    #[serde(default)]
+    pub connection_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +109,7 @@ pub enum ConfigError {
     /// where an operator can still fix it before any miner connects.
     PlaceholderPayoutRkm,
     StaticTemplateSource,
+    ZeroListenGuard(&'static str),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -111,6 +139,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "static-template-source-refused: a serving pool requires node_rpc; static [template] jobs can never track the live chain"
             ),
+            ConfigError::ZeroListenGuard(field) => {
+                write!(f, "zero-listen-guard: {field} must be ≥ 1")
+            }
         }
     }
 }
@@ -150,6 +181,26 @@ impl PoolConfig {
             }
             let _ = self.template_source()?;
         }
+        self.check_listen_guards()?;
+        Ok(())
+    }
+
+    fn check_listen_guards(&self) -> Result<(), ConfigError> {
+        let zero = |field: &'static str, v: Option<u64>| -> Result<(), ConfigError> {
+            if matches!(v, Some(0)) {
+                Err(ConfigError::ZeroListenGuard(field))
+            } else {
+                Ok(())
+            }
+        };
+        zero("max_connections", self.max_connections.map(u64::from))?;
+        zero(
+            "max_connections_per_ip",
+            self.max_connections_per_ip.map(u64::from),
+        )?;
+        zero("max_line_bytes", self.max_line_bytes)?;
+        zero("request_timeout_ms", self.request_timeout_ms)?;
+        zero("connection_timeout_ms", self.connection_timeout_ms)?;
         Ok(())
     }
 
@@ -188,6 +239,50 @@ impl PoolConfig {
                     .saturating_mul(self.stall_poll_failures())
             })
             .max(1)
+    }
+
+    pub fn max_connections(&self) -> u32 {
+        self.max_connections
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+            .max(1)
+    }
+
+    /// Unset → `max(1, max_connections / PER_IP_DIVISOR)`.
+    pub fn max_connections_per_ip(&self) -> u32 {
+        self.max_connections_per_ip
+            .unwrap_or_else(|| (self.max_connections() / PER_IP_DIVISOR).max(1))
+            .max(1)
+    }
+
+    pub fn max_line_bytes(&self) -> usize {
+        self.max_line_bytes
+            .unwrap_or(DEFAULT_MAX_LINE_BYTES as u64)
+            .max(1) as usize
+    }
+
+    pub fn request_timeout_ms_resolved(&self) -> u64 {
+        self.request_timeout_ms
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS)
+            .max(1)
+    }
+
+    /// Unset → [`Self::request_timeout_ms_resolved`].
+    pub fn connection_timeout_ms_resolved(&self) -> u64 {
+        self.connection_timeout_ms
+            .unwrap_or_else(|| self.request_timeout_ms_resolved())
+            .max(1)
+    }
+
+    pub fn listen_limits(&self) -> ListenLimits {
+        ListenLimits::from_parts(
+            self.max_connections(),
+            Some(self.max_connections_per_ip()),
+            self.max_line_bytes(),
+            std::time::Duration::from_millis(self.request_timeout_ms_resolved()),
+            Some(std::time::Duration::from_millis(
+                self.connection_timeout_ms_resolved(),
+            )),
+        )
     }
 
     /// Decode the configured public payout identity into the coinbase lanes.
@@ -250,6 +345,9 @@ impl PoolConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guard::{
+        DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, PER_IP_DIVISOR,
+    };
 
     const SAMPLE: &str = r#"
 listen_addr = "127.0.0.1:3333"
@@ -372,5 +470,67 @@ payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
         let cfg = PoolConfig::from_toml(explicit).unwrap();
         assert_eq!(cfg.stall_poll_failures(), 5);
         assert_eq!(cfg.stall_age_ms(), 15000);
+    }
+
+    #[test]
+    fn listen_guard_defaults_derive_from_the_cap_and_request_timeout() {
+        let live = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let cfg = PoolConfig::from_toml(live).unwrap();
+        assert_eq!(cfg.max_connections(), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(
+            cfg.max_connections_per_ip(),
+            (DEFAULT_MAX_CONNECTIONS / PER_IP_DIVISOR).max(1)
+        );
+        assert_eq!(cfg.max_line_bytes(), DEFAULT_MAX_LINE_BYTES);
+        assert_eq!(
+            cfg.request_timeout_ms_resolved(),
+            DEFAULT_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            cfg.connection_timeout_ms_resolved(),
+            cfg.request_timeout_ms_resolved(),
+            "unset connection timeout tracks request timeout"
+        );
+
+        let explicit = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+max_connections = 32
+request_timeout_ms = 4000
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let cfg = PoolConfig::from_toml(explicit).unwrap();
+        assert_eq!(cfg.max_connections(), 32);
+        assert_eq!(
+            cfg.max_connections_per_ip(),
+            4,
+            "32/8 derived, not restated"
+        );
+        assert_eq!(cfg.request_timeout_ms_resolved(), 4000);
+        assert_eq!(cfg.connection_timeout_ms_resolved(), 4000);
+    }
+
+    #[test]
+    fn explicit_zero_listen_guard_is_refused_by_name() {
+        let live = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+max_connections = 0
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let err = PoolConfig::from_toml(live).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ZeroListenGuard("max_connections")
+        ));
+        assert!(err.to_string().contains("zero-listen-guard"));
+        assert!(err.to_string().contains("max_connections"));
     }
 }

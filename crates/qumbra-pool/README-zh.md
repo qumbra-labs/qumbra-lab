@@ -139,6 +139,11 @@ Qumbra 的出块奖励是**写进共识的收款人列表**(`CoinbasePayee`,T2 �
 | `template_max_poll_failures` | 连续失败多少次 poll 之后暂停发活(默认 3) |
 | `template_max_age_ms` | 多久没有一次成功的 poll 就暂停发活。不设时等于 `template_max_poll_failures × poll_ms`,跟着 poll 节奏走,而不是另写一个数字 |
 | `payout_rkm` | 矿池自己的收款身份,来自 `qumbra-wallet miner-rkm` |
+| `max_connections` | 同时在线的 stratum 连接数(默认 64)。每个连接是一条线程;超过上限时 accept 循环写 `connection-cap-reached`,不再 spawn |
+| `max_connections_per_ip` | 同一 IP 的同时连接数。不设时等于 `max(1, max_connections / 8)`,一个对端占不满整个上限 |
+| `max_line_bytes` | 一行(含换行)的最大字节(默认 4096)。超过就以 `line-too-long` 断开 |
+| `request_timeout_ms` | 从一行的第一个字节起,写完这一行的墙上时钟(默认 10000 ms)。和用来排空 job outbox 的 100 ms 每次 read 超时不是一回事;慢速逐字节的客户端是这条在关 |
+| `connection_timeout_ms` | 从 accept 到第一条完整行的墙上时钟。不设时等于 `request_timeout_ms`。出过完整行之后,沉默的是在算的矿工,不会被踢 |
 | `[template]` | **静态 fixture,仅供测试**——见下面的拒绝 |
 
 ### 两条你应该期待、也应该想要的拒绝
