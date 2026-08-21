@@ -15,23 +15,22 @@
 //! with §0 versioning carried by the outer [`crate::wire`] envelope.
 
 use qlab_cbserver::codec::{decode_compact_response, encode_compact_response, CodecError};
-use qlab_devnet::body::TxEntry;
+use qlab_devnet::body::{
+    coinbase_payee_cap_v5_above, CoinbasePayee, TxEntry,
+    COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+};
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{decode_header, encode_header, encode_tx, header_wire_len, tx_id, DecodeError, Reader};
-use qlab_devnet::body::COINBASE_PAYEE_CAP_V5;
 use qlab_devnet::forms::GenesisForm;
 
-/// The (rkm, amount) payee list the v5 announce wire carries for a body whose
-/// in-memory shape is (coinbase, coinbase_rkm) — the same derivation as
-/// `BlockBody::coinbase_payees`, restated here over the two announce fields so
-/// the wire and the preimage tail can never disagree about the empty case.
-fn coinbase_payees_of(coinbase: u64, rkm: [u64; 4]) -> Vec<([u64; 4], u64)> {
-    if coinbase == 0 && rkm == [0u64; 4] {
-        Vec::new()
-    } else {
-        vec![(rkm, coinbase)]
+/// Project a list into the byte-frozen v4 announce pair.
+fn single_payee_parts(payees: &[CoinbasePayee]) -> Option<(u64, [u64; 4])> {
+    match payees {
+        [] => Some((0, [0; 4])),
+        [payee] => Some((payee.amount, payee.rkm)),
+        _ => None,
     }
 }
 use crate::varint::write_varint;
@@ -88,20 +87,10 @@ pub struct PrefilledTx {
 pub struct BlockAnnounce {
     pub header: BlockHeader,
     pub nonce: u64,
-    /// The block body's coinbase emission counter (`BlockBody::coinbase`). Carried
-    /// so a receiver can reconstruct the exact body (the coinbase is not a tx slot)
-    /// and validate/fold it. §7 relay is `[devnet-placeholder]`, not a frozen wire.
-    pub coinbase: u64,
-    /// The block body's coinbase payout key (`BlockBody::coinbase_rkm`, issue
-    /// #101) — 32 bytes, four little-endian lanes, immediately after `coinbase`.
-    ///
-    /// Carried for the same reason `coinbase` is: it is part of the body, it is
-    /// not a tx slot, and without it the receiver reconstructs a *different* body
-    /// whose commitment does not match the header — so every announced block
-    /// would be rejected as a binding mismatch (#79) and, worse, its announcer
-    /// penalised for a fault that is ours. **This is a wire break**: a pre-#101
-    /// peer's announce is 32 bytes short and fails to decode.
-    pub coinbase_rkm: [u64; 4],
+    /// The block body's coinbase payee list. V4 projects this to its frozen
+    /// `(amount, rkm)` pair; V5 writes the already-shipped
+    /// `count ‖ [rkm ‖ amount]×N` bytes.
+    pub coinbase_payees: Vec<CoinbasePayee>,
     pub short_ids: Vec<[u8; SHORTID_LEN]>,
     pub prefilled: Vec<PrefilledTx>,
 }
@@ -124,14 +113,25 @@ pub struct BlockTxn {
 
 /// Encode a `BlockAnnounce`.
 pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
+    encode_announce_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, form, a)
+}
+
+/// [`encode_announce`] with the V5 payee-cap boundary injected for drills.
+pub fn encode_announce_above(
+    payee_boundary: Option<u64>,
+    form: GenesisForm,
+    a: &BlockAnnounce,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_header(form, &a.header));
     out.extend_from_slice(&a.nonce.to_le_bytes());
     match form {
         GenesisForm::V4 => {
             // The v4 wire, byte-frozen: coinbase total ‖ rkm lanes.
-            out.extend_from_slice(&a.coinbase.to_le_bytes());
-            for lane in &a.coinbase_rkm {
+            let (coinbase, coinbase_rkm) = single_payee_parts(&a.coinbase_payees)
+                .expect("v4 announce requires zero or one coinbase payee");
+            out.extend_from_slice(&coinbase.to_le_bytes());
+            for lane in &coinbase_rkm {
                 out.extend_from_slice(&lane.to_le_bytes());
             }
         }
@@ -139,13 +139,14 @@ pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
             // The v5 payee-list form (lab #470 stage 2): count ‖ [rkm ‖
             // amount]×N, mirroring the v5 body-preimage tail — the total is
             // Σ amounts and travels nowhere else on this wire either.
-            let payees = coinbase_payees_of(a.coinbase, a.coinbase_rkm);
-            out.push(payees.len() as u8);
-            for (rkm, amount) in payees {
-                for lane in &rkm {
+            let cap = coinbase_payee_cap_v5_above(payee_boundary, a.header.height);
+            assert!(a.coinbase_payees.len() <= cap);
+            out.push(a.coinbase_payees.len() as u8);
+            for payee in &a.coinbase_payees {
+                for lane in &payee.rkm {
                     out.extend_from_slice(&lane.to_le_bytes());
                 }
-                out.extend_from_slice(&amount.to_le_bytes());
+                out.extend_from_slice(&payee.amount.to_le_bytes());
             }
         }
     }
@@ -165,39 +166,50 @@ pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
 
 /// Decode a `BlockAnnounce`.
 pub fn decode_announce(form: GenesisForm, buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
+    decode_announce_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, form, buf)
+}
+
+/// [`decode_announce`] with the V5 payee-cap boundary injected for drills.
+pub fn decode_announce_above(
+    payee_boundary: Option<u64>,
+    form: GenesisForm,
+    buf: &[u8],
+) -> Result<BlockAnnounce, DecodeError> {
     let mut r = Reader::new(buf);
     let hdr_bytes = r.rest(header_wire_len(form), "announce.header")?;
     let header = decode_header(form, &hdr_bytes)?;
     let nonce = r.u64_le("announce.nonce")?;
-    let (coinbase, coinbase_rkm) = match form {
+    let coinbase_payees = match form {
         GenesisForm::V4 => {
             let coinbase = r.u64_le("announce.coinbase")?;
             let mut coinbase_rkm = [0u64; 4];
             for lane in coinbase_rkm.iter_mut() {
                 *lane = r.u64_le("announce.coinbase_rkm")?;
             }
-            (coinbase, coinbase_rkm)
+            match (coinbase, coinbase_rkm) {
+                (0, rkm) if rkm == [0; 4] => Vec::new(),
+                (amount, rkm) => vec![CoinbasePayee { rkm, amount }],
+            }
         }
         GenesisForm::V5 => {
             let count = r.u8("announce.payee_count")? as usize;
-            if count > COINBASE_PAYEE_CAP_V5 {
-                // The birth cap, refused BY NAME at decode: an in-memory body
-                // cannot even represent an over-cap list, so an announce
-                // naming one is not a block this build can validate.
+            let cap = coinbase_payee_cap_v5_above(payee_boundary, header.height);
+            if count > cap {
                 return Err(DecodeError::TooManyCoinbasePayees {
                     got: count,
-                    cap: COINBASE_PAYEE_CAP_V5,
+                    cap,
                 });
             }
-            let mut coinbase = 0u64;
-            let mut coinbase_rkm = [0u64; 4];
-            if count == 1 {
-                for lane in coinbase_rkm.iter_mut() {
+            let mut payees = Vec::with_capacity(count);
+            for _ in 0..count {
+                let mut rkm = [0u64; 4];
+                for lane in rkm.iter_mut() {
                     *lane = r.u64_le("announce.payee_rkm")?;
                 }
-                coinbase = r.u64_le("announce.payee_amount")?;
+                let amount = r.u64_le("announce.payee_amount")?;
+                payees.push(CoinbasePayee { rkm, amount });
             }
-            (coinbase, coinbase_rkm)
+            payees
         }
     };
     let n_short = r.varint()? as usize;
@@ -215,7 +227,7 @@ pub fn decode_announce(form: GenesisForm, buf: &[u8]) -> Result<BlockAnnounce, D
         prefilled.push(PrefilledTx { index, tx: crate::codec::decode_tx(&tx_bytes)? });
     }
     r.finish()?;
-    Ok(BlockAnnounce { header, nonce, coinbase, coinbase_rkm, short_ids, prefilled })
+    Ok(BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled })
 }
 
 // --- GetBlockTxn ---
@@ -378,8 +390,7 @@ mod tests {
         let a = BlockAnnounce {
             header: header(),
             nonce: 0xDEADBEEF,
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             short_ids: vec![short_id(0xDEADBEEF, &tx_id(&tx(2))), short_id(0xDEADBEEF, &tx_id(&tx(3)))],
             prefilled: vec![PrefilledTx { index: 0, tx: tx(1) }],
         };
@@ -413,8 +424,7 @@ mod tests {
         let a = BlockAnnounce {
             header: header(),
             nonce,
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             // slots 1,2 are short ids; slot 0 is prefilled coinbase.
             short_ids: vec![short_id(nonce, &tx_id(&t1)), short_id(nonce, &tx_id(&t2))],
             prefilled: vec![PrefilledTx { index: 0, tx: coinbase.clone() }],
@@ -438,8 +448,7 @@ mod tests {
         let a = BlockAnnounce {
             header: header(),
             nonce,
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             short_ids: vec![short_id(nonce, &tx_id(&t1)), short_id(nonce, &tx_id(&t2))],
             prefilled: vec![],
         };
@@ -455,8 +464,10 @@ mod tests {
         BlockAnnounce {
             header: header(),
             nonce: 0xDEADBEEF,
-            coinbase: 5_000_000_000,
-            coinbase_rkm: [11, 22, 33, 44],
+            coinbase_payees: vec![CoinbasePayee {
+                rkm: [11, 22, 33, 44],
+                amount: 5_000_000_000,
+            }],
             short_ids: vec![short_id(0xDEADBEEF, &tx_id(&tx(2)))],
             prefilled: vec![PrefilledTx { index: 0, tx: tx(1) }],
         }
@@ -467,20 +478,16 @@ mod tests {
         let mut a = sample_announce();
         let bytes = encode_announce(GenesisForm::V5, &a);
         let back = decode_announce(GenesisForm::V5, &bytes).unwrap();
-        assert_eq!(back.coinbase, a.coinbase);
-        assert_eq!(back.coinbase_rkm, a.coinbase_rkm);
+        assert_eq!(back.coinbase_payees, a.coinbase_payees);
         assert_eq!(back.header, a.header);
         // The mint-nothing shape carries a 0 count and round-trips too.
-        a.coinbase = 0;
-        a.coinbase_rkm = [0; 4];
+        a.coinbase_payees.clear();
         let bytes = encode_announce(GenesisForm::V5, &a);
         let back = decode_announce(GenesisForm::V5, &bytes).unwrap();
-        assert_eq!(back.coinbase, 0);
-        assert_eq!(back.coinbase_rkm, [0; 4]);
+        assert!(back.coinbase_payees.is_empty());
     }
 
-    /// N > cap on the wire is refused BY NAME at decode — an in-memory body
-    /// cannot even represent an over-cap list.
+    /// N > the height-keyed cap is refused BY NAME at decode.
     #[test]
     fn v5_announce_refuses_more_payees_than_the_cap_by_name() {
         let a = sample_announce();
@@ -499,6 +506,89 @@ mod tests {
         forged.extend_from_slice(&good[entry_start + entry_len..]);
         assert!(matches!(
             decode_announce(GenesisForm::V5, &forged),
+            Err(DecodeError::TooManyCoinbasePayees { got: 2, cap: 1 })
+        ));
+    }
+
+    #[test]
+    fn v5_announce_refuses_more_than_eight_above_the_boundary_by_name() {
+        let a = sample_announce();
+        let good = encode_announce_above(Some(0), GenesisForm::V5, &a);
+        let count_pos = 97 + 8;
+        let entry_start = count_pos + 1;
+        let entry_len = 32 + 8;
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&good[..count_pos]);
+        forged.push(9);
+        for _ in 0..9 {
+            forged.extend_from_slice(&good[entry_start..entry_start + entry_len]);
+        }
+        forged.extend_from_slice(&good[entry_start + entry_len..]);
+        assert!(matches!(
+            decode_announce_above(Some(0), GenesisForm::V5, &forged),
+            Err(DecodeError::TooManyCoinbasePayees { got: 9, cap: 8 })
+        ));
+    }
+
+    #[test]
+    fn v5_multi_payee_announce_round_trips_only_above_the_boundary() {
+        let boundary = 7;
+        let height = boundary + 1;
+        let txs = vec![tx(1), tx(2)];
+        let payees = vec![
+            CoinbasePayee {
+                rkm: [11, 22, 33, 44],
+                amount: 456,
+            },
+            CoinbasePayee {
+                rkm: [55, 66, 77, 88],
+                amount: 123,
+            },
+        ];
+        let body = qlab_devnet::body::BlockBody::new(txs.clone(), payees.clone());
+        let header = BlockHeader {
+            height,
+            ..BlockHeader::child_of_for(
+                GenesisForm::V5,
+                &BlockHeader::genesis_for(GenesisForm::V5, 1000, 0),
+                75,
+                1000,
+                body.commitment_v5_above(Some(boundary), height),
+            )
+        };
+        let a = BlockAnnounce {
+            header,
+            nonce: 0,
+            coinbase_payees: payees,
+            short_ids: Vec::new(),
+            prefilled: txs
+                .into_iter()
+                .enumerate()
+                .map(|(index, tx)| PrefilledTx {
+                    index: index as u32,
+                    tx,
+                })
+                .collect(),
+        };
+        let bytes = encode_announce_above(Some(boundary), GenesisForm::V5, &a);
+        let back = decode_announce_above(Some(boundary), GenesisForm::V5, &bytes)
+            .expect("N=2 is valid above the boundary");
+        assert_eq!(back.coinbase_payees, a.coinbase_payees);
+        let Reconstruct::Complete(txs) = reconstruct(&back, &[]) else {
+            panic!("all transactions were prefilled");
+        };
+        let rebuilt = qlab_devnet::body::BlockBody::new(txs, back.coinbase_payees);
+        assert_eq!(
+            rebuilt.commitment_v5_above(Some(boundary), height),
+            back.header.tx_body_commitment,
+            "decoded N-payee announce reconstructs exactly the announced body"
+        );
+
+        let mut pre_boundary = bytes;
+        // V5 height occupies bytes 33..39 as u48 LE.
+        pre_boundary[33..39].copy_from_slice(&boundary.to_le_bytes()[..6]);
+        assert!(matches!(
+            decode_announce_above(Some(boundary), GenesisForm::V5, &pre_boundary),
             Err(DecodeError::TooManyCoinbasePayees { got: 2, cap: 1 })
         ));
     }

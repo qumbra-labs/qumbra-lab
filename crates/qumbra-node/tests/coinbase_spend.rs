@@ -661,14 +661,16 @@ fn a_pre_101_block_announcement_does_not_decode() {
     let ann = BlockAnnounce {
         header: BlockHeader::genesis(GENESIS_DIFFICULTY, 0),
         nonce: 0xABCD,
-        coinbase: 5_000,
-        coinbase_rkm: [1, 2, 3, 4],
+        coinbase_payees: vec![qlab_devnet::body::CoinbasePayee {
+            rkm: [1, 2, 3, 4],
+            amount: 5_000,
+        }],
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
     let bytes = encode_announce(qlab_devnet::forms::GenesisForm::V4, &ann);
     let round = decode_announce(qlab_devnet::forms::GenesisForm::V4, &bytes).expect("current wire round-trips");
-    assert_eq!(round.coinbase_rkm, [1, 2, 3, 4]);
+    assert_eq!(round.coinbase_payees[0].rkm, [1, 2, 3, 4]);
 
     // The same frame as a pre-#101 peer would have sent it: everything except the
     // 32 payout-key bytes. `coinbase` sits immediately before them, so removing

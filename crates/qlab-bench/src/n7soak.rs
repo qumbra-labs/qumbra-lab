@@ -390,8 +390,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     let ann = BlockAnnounce {
         header: bad_block_header,
         nonce: 0,
-        coinbase: 0,
-        coinbase_rkm: [0; 4],
+        coinbase_payees: Vec::new(),
         short_ids: Vec::new(),
         prefilled: vec![PrefilledTx { index: 0, tx: bad_tx }],
     };
@@ -416,8 +415,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     let ann_empty = BlockAnnounce {
         header: honest_header,
         nonce: 0,
-        coinbase: 0,
-        coinbase_rkm: [0; 4],
+        coinbase_payees: Vec::new(),
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };

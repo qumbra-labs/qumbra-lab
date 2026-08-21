@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use qlab_devnet::body::{
-    check_scheduled_coinbase_payees, validate_body, BlockBody, BodyError, CoinbasePayee, TxEntry,
+    check_scheduled_coinbase_payees, coinbase_payee_cap_v5, validate_body, BlockBody,
+    BodyError, CoinbasePayee, TxEntry,
 };
 use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
@@ -1891,7 +1892,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// verbatim — a second assembly is a consensus-adjacent fork.
     pub fn assemble_block(&mut self) -> Option<AssembledCandidate> {
         let parent_hash = self.mining_parent_hash()?;
-        self.assemble_on_parent(parent_hash, self.miner_rkm)
+        self.assemble_on_parent(parent_hash, self.miner_rkm, None)
     }
 
     /// Form and height of the candidate [`Self::assemble_block`] would build,
@@ -1916,11 +1917,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         };
         let parent = self.chain.header(&parent_hash).ok_or_else(|| "assemble-parent-unknown".to_string())?;
         let height = parent.height + 1;
-        if payees.len() != 1 {
-            return Err(format!("coinbase-payee-count: got {}, want 1 at the current cap", payees.len()));
+        let cap = match self.rules.form {
+            GenesisForm::V4 => 1,
+            GenesisForm::V5 => coinbase_payee_cap_v5(height),
+        };
+        if payees.is_empty() || payees.len() > cap {
+            return Err(format!(
+                "coinbase-payee-count: got {}, want 1..={} at height {}",
+                payees.len(), cap, height
+            ));
         }
-        let payee = payees[0];
-        if payee.rkm == [0; 4] {
+        if payees.iter().any(|payee| payee.rkm == [0; 4]) {
             return Err("coinbase-payee-zero-rkm".into());
         }
         match self.rules.form {
@@ -1928,12 +1935,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 .map_err(|e| format!("coinbase-payees: {e:?}"))?,
             GenesisForm::V4 => {
                 let expected = qlab_node::emission::coinbase_for(GenesisForm::V4, height);
-                if payee.amount != expected {
-                    return Err(format!("coinbase-payee-amount: height {height} expected {expected}, got {}", payee.amount));
+                if payees[0].amount != expected {
+                    return Err(format!("coinbase-payee-amount: height {height} expected {expected}, got {}", payees[0].amount));
                 }
             }
         }
-        Ok(self.assemble_on_parent(parent_hash, payee.rkm))
+        Ok(self.assemble_on_parent(parent_hash, payees[0].rkm, Some(payees)))
     }
 
     /// Assemble + mine (but do NOT insert) the next block over the current tip.
@@ -2029,7 +2036,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// while fork choice is elsewhere, and the header's height is the only one
     /// consensus reads.
     fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
-        let assembled = self.assemble_on_parent(parent_hash, self.miner_rkm)?;
+        let assembled = self.assemble_on_parent(parent_hash, self.miner_rkm, None)?;
         let mined = mine_under(
             &self.pow,
             assembled.header,
@@ -2043,14 +2050,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
     /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
     /// path as a self-mined block. A fork here is a consensus-adjacent fork.
-    fn assemble_on_parent(&mut self, parent_hash: Hash32, coinbase_rkm: [u64; 4]) -> Option<AssembledCandidate> {
+    fn assemble_on_parent(
+        &mut self,
+        parent_hash: Hash32,
+        coinbase_rkm: [u64; 4],
+        requested_payees: Option<&[CoinbasePayee]>,
+    ) -> Option<AssembledCandidate> {
         let template = self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, coinbase_rkm);
-        let body = template.body;
+        let mut body = template.body;
+        if let Some(payees) = requested_payees {
+            body.coinbase_payees = payees.to_vec();
+        }
         let parent = *self.chain.header(&parent_hash)?;
         let candidate_height = parent.height + 1;
         let bc = match self.rules.form {
             GenesisForm::V4 => body.commitment_at(candidate_height),
-            GenesisForm::V5 => body.commitment_v5(),
+            GenesisForm::V5 => body.commitment_v5_at(candidate_height),
         };
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);

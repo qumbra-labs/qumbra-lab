@@ -17,7 +17,9 @@
 
 use std::sync::mpsc;
 
-use qlab_devnet::body::{BlockBody, CoinbasePayee, COINBASE_PAYEE_CAP_V5};
+use qlab_devnet::body::{
+    coinbase_payee_cap_v5, BlockBody, CoinbasePayee, COINBASE_PAYEE_CAP_V5,
+};
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::BlockHeader;
 use qlab_p2p::adapter::AssembledCandidate;
@@ -136,9 +138,16 @@ impl MineBlockWire {
         let form = parse_form(&self.form)?;
         let header_bytes = hex_decode(&self.header).ok_or_else(|| "header: bad hex".to_string())?;
         let header = decode_header(form, &header_bytes).map_err(|e| format!("header: {e:?}"))?;
-        let payees = payees_from_wire(&self.coinbase_payees)?;
-        if payees.len() != 1 {
-            return Err(format!("coinbase_payees: got {}, want 1 at the current cap", payees.len()));
+        let payees = payees_from_wire(&self.coinbase_payees, header.height)?;
+        let cap = match form {
+            GenesisForm::V4 => 1,
+            GenesisForm::V5 => coinbase_payee_cap_v5(header.height),
+        };
+        if payees.len() > cap {
+            return Err(format!(
+                "coinbase_payees: got {}, cap {} at height {}",
+                payees.len(), cap, header.height
+            ));
         }
         let mut txs = Vec::with_capacity(self.txs.len());
         for (i, t) in self.txs.iter().enumerate() {
@@ -154,9 +163,16 @@ pub fn payees_to_wire(payees: &[CoinbasePayee]) -> Vec<CoinbasePayeeWire> {
     payees.iter().map(|p| CoinbasePayeeWire { rkm: rkm_hex(&p.rkm), amount: p.amount }).collect()
 }
 
-pub fn payees_from_wire(payees: &[CoinbasePayeeWire]) -> Result<Vec<CoinbasePayee>, String> {
-    if payees.len() > COINBASE_PAYEE_CAP_V5 {
-        return Err(format!("coinbase_payees: got {}, cap {}", payees.len(), COINBASE_PAYEE_CAP_V5));
+pub fn payees_from_wire(
+    payees: &[CoinbasePayeeWire],
+    height: u64,
+) -> Result<Vec<CoinbasePayee>, String> {
+    let cap = coinbase_payee_cap_v5(height);
+    if payees.len() > cap {
+        return Err(format!(
+            "coinbase_payees: got {}, cap {} at height {}",
+            payees.len(), cap, height
+        ));
     }
     payees.iter().enumerate().map(|(i, p)| Ok(CoinbasePayee {
         rkm: rkm_from_hex(&p.rkm).map_err(|e| format!("coinbase_payees[{i}]: {e}"))?,
