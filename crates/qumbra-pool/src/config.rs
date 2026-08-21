@@ -77,6 +77,10 @@ pub enum ConfigError {
     EmptyListen,
     MissingPayoutRkm,
     InvalidPayoutRkm(hexutil::HexError),
+    /// `payout_rkm` is the node's unconfigured-miner placeholder (lab #547).
+    /// Refused by name here as well as at the payee gate: the config is
+    /// where an operator can still fix it before any miner connects.
+    PlaceholderPayoutRkm,
     StaticTemplateSource,
 }
 
@@ -97,6 +101,12 @@ impl std::fmt::Display for ConfigError {
                 "all-zero-payout-rkm: payout_rkm must name a real wallet; an all-zero coinbase payee is unspendable"
             ),
             ConfigError::InvalidPayoutRkm(e) => write!(f, "invalid-payout-rkm: {e}"),
+            ConfigError::PlaceholderPayoutRkm => write!(
+                f,
+                "placeholder-payout-rkm: payout_rkm is the node's UNCONFIGURED_MINER_RKM \
+                 placeholder, which NOBODY can spend — name the wallet that owns the pool's \
+                 coinbase, not the value a node prints when it was never told where to pay"
+            ),
             ConfigError::StaticTemplateSource => write!(
                 f,
                 "static-template-source-refused: a serving pool requires node_rpc; static [template] jobs can never track the live chain"
@@ -186,7 +196,11 @@ impl PoolConfig {
             .payout_rkm
             .as_deref()
             .ok_or(ConfigError::MissingPayoutRkm)?;
-        hexutil::rkm_lanes_from_hex(value).map_err(ConfigError::InvalidPayoutRkm)
+        let lanes = hexutil::rkm_lanes_from_hex(value).map_err(ConfigError::InvalidPayoutRkm)?;
+        if lanes == crate::payee::UNCONFIGURED_NODE_RKM {
+            return Err(ConfigError::PlaceholderPayoutRkm);
+        }
+        Ok(lanes)
     }
 
     pub fn form(&self) -> Result<GenesisForm, ConfigError> {
@@ -289,6 +303,31 @@ payout_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
             ConfigError::InvalidPayoutRkm(hexutil::HexError::ZeroRkm)
         ));
         assert!(err.to_string().contains("all-zero-payout-rkm"));
+    }
+
+    /// Lab #547. The all-zero shape was already refused; this one is the
+    /// shape that actually reached the chain, and an operator who copies a
+    /// payee off a block explorer to "match what the node pays" would
+    /// otherwise configure it and be refused nowhere.
+    #[test]
+    fn serving_refuses_the_node_placeholder_payout_by_name() {
+        let live = format!(
+            r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+payout_rkm = "{}"
+"#,
+            "0111011101110111".repeat(4)
+        );
+        let err = PoolConfig::from_toml(&live).unwrap_err();
+        assert!(matches!(&err, ConfigError::PlaceholderPayoutRkm));
+        let msg = err.to_string();
+        assert!(msg.contains("placeholder-payout-rkm"), "got: {msg}");
+        assert!(
+            msg.contains("NOBODY can spend"),
+            "the refusal must say what is wrong with it, got: {msg}"
+        );
     }
 
     #[test]

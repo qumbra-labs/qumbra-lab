@@ -29,6 +29,18 @@
 //! The birth cap means PPLNS cannot yet split the mint — the winner
 //! takes it; the assembler already truncates to `cap`.
 //!
+//! ## 🔴 The payee gate (lab #547)
+//!
+//! Three T2 blocks (607, 610, 611) paid the node's
+//! [`payee::UNCONFIGURED_NODE_RKM`] placeholder — structurally valid,
+//! spendable by nobody. `coinbase_rkm` is committed by the header the
+//! miner grinds, so a payee cannot be substituted after a share arrives;
+//! the pool's only structural defence is refusal. [`payee::check_payee`]
+//! defines the accepted set (the configured `payout_rkm`, or an rkm owned
+//! by a login this pool knows) and it is enforced twice: at template
+//! intake, before a miner spends a hash, and again immediately before the
+//! block POST as a backstop.
+//!
 //! Mapping authority: `docs/pool-stratum-mapping.md`. Tracker: lab #482.
 //! Multica: QUM-136.
 
@@ -53,7 +65,10 @@ pub use hasher::{FixedHasher, KeccakShareHasher, ShareHasher};
 pub use jobs::{IssuedJob, JobStore};
 pub use node_rpc::{NodeRpcClient, NodeRpcTemplateSource};
 pub use outbox::{JobOutbox, SessionPush};
-pub use payee::{assemble_coinbase, Accounts, AssembledCoinbase};
+pub use payee::{
+    assemble_coinbase, check_body_payee, check_payee, Accounts, AssembledCoinbase, PayeeRefusal,
+    UNCONFIGURED_NODE_RKM,
+};
 pub use pool::{
     BlockSubmitter, Outgoing, Pool, PoolCounters, PoolError, ERR_BAD_ALGO, ERR_BAD_HASH,
     ERR_DUPLICATE, ERR_INVALID, ERR_LOW_DIFF, ERR_UNAUTHORIZED, ERR_UNCLEAN_V4, ERR_UNKNOWN_JOB,

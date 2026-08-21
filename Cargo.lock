@@ -1870,6 +1870,7 @@ version = "0.0.0"
 dependencies = [
  "ctrlc",
  "qlab-devnet",
+ "qlab-p2p",
  "qlab-pow",
  "qlab-stratum",
  "serde",
