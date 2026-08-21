@@ -6,7 +6,7 @@
 ## Status board
 
 Rows flip ⬜ → ✅ only when the coordinator has accepted the thing, never when it is
-merely written. Last updated 2026-08-22 01:20 +08.
+merely written. Last updated 2026-08-22 07:25 +08.
 
 ### The software — COMPLETE
 
@@ -28,7 +28,7 @@ merely written. Last updated 2026-08-22 01:20 +08.
 | **svc1 has its own `qumbra-node`** — the faucet has no mine RPC on any revision | ✅ 2026-08-21 (deploy #215, lab #519) |
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
-| **🎉 A miner paid by this pool** | ✅ **2026-08-22 01:19 +08, height 1776** — 4.992690888 QMB to the miner's own key; lab #553 CLOSED |
+| **🎉 A miner paid by this pool** | ✅ **first at height 1776**, 2026-08-22 01:19 +08; **137 blocks over the following 3 h**, and **0** to the pool's own address — lab #553 CLOSED |
 | Public stratum on `pool.qumbra.org:3333` | ▶️ **restarted 2026-08-22 01:12 +08** — it can pay now; SG still `0.0.0.0/0`, deliberately, Larry's call |
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
@@ -66,7 +66,7 @@ stock XMRig against a public endpoint. **What is NOT proven: that this pool can 
 
 | item | state | blocked on |
 |---|---|---|
-| A block actually mined, and its payee read | ✅ **done twice — bad, then good** | 2026-08-21: three blocks, all paying the pool. 2026-08-22: height 1776 paid the miner. |
+| A block actually mined, and its payee read | ✅ **done at scale** | 08-21: three blocks, all paying the pool. 08-22: **137 of 324** paid the miner, **0** paid the pool. |
 | Connection cap, line bound, rate limit on public stratum | ✅ 2026-08-21 (PR #563, lab #544) |  |
 | Bounded staleness on the held template | ✅ 2026-08-21 (PR #549, lab #545) |  |
 | An unowned payee cannot reach the chain **from the pool** | ✅ 2026-08-21 (PR #554, the pool half of lab #547) |  |
@@ -141,6 +141,17 @@ you the round, not your balance.
 with a payout key **nothing else on the chain has ever mined to** was inside the PPLNS window
 the whole time. Three blocks landed in that window. **All three paid the pool's own address;
 the miner's key received zero.**
+
+**Measured again, at scale** (2026-08-22, `1772..2095`, **324 of 324 heights verified covered**, both keys matched at their full 32 bytes):
+
+| payee | blocks |
+|---|---|
+| `daf76f16…` — the miner's key, **published at tip 1771, 13 s before its rig connected** | **137** |
+| `5f13e0c7…` — a solo miner | 39 |
+| `d2c02c7c…` — a solo miner | 33 |
+| **`79c3291d…` — the pool's own fallback address** | **0** |
+
+**The zero is the sharper half.** The fallback is not losing the tally; it is never taken. And the run contains its own **negative control**, unplanned: during a 52-minute window in which the miner hashed zero, its key was paid **0 of 33** blocks and the pool produced none — so payment tracks work in both directions. The 137 figure spans that dead window, so it understates the rate while mining and **must not be read as a hashrate share**.
 
 That is the whole reason the payee-list coinbase exists, and it is why this crate is
 worth reading rather than just running: **anyone can operate one of these**, and the
