@@ -331,11 +331,17 @@ pub struct FaucetService {
     d: Diversifier,
     /// Coinbase-note commitments already funded, so a re-walk never funds twice.
     harvested: HashSet<[u8; 32]>,
-    /// The height the earliest outstanding immature note matures at, from the last
-    /// harvest pass. Carried because it is what the status page answers with.
-    next_maturity: Option<u64>,
-    /// Immature coinbase notes outstanding, from the last harvest pass.
-    maturing: usize,
+    /// What the last harvest pass found about coinbase that has not landed yet —
+    /// `None` until one has run.
+    ///
+    /// 🔴 **One `Option`, not a pair of defaults** (lab #543). This was
+    /// `next_maturity: Option<u64>` + `maturing: usize`, initialised to `None` + `0`
+    /// — indistinguishable from a pass that found nothing maturing, so a status
+    /// render before the first tick answered `Empty` ("none coming") for a faucet
+    /// whose whole stock was inside the §2 gate, on a listener that was already
+    /// serving. Now the caller cannot render the inventory question without holding
+    /// a pass's answer to it.
+    harvest: Option<crate::harvest::HarvestFacts>,
     /// Rendered status, shared with the HTTP thread. Same snapshot discipline as the
     /// node's `/metrics`: the loop renders on its own cadence, a request clones.
     status: Arc<Mutex<ServiceStatus>>,
@@ -367,15 +373,15 @@ impl FaucetService {
             confirmed: 0,
             refused: 0,
             notes_held: faucet.inventory().len(),
-            notes_maturing: 0,
+            // No pass has run, and the page says that rather than `0` (lab #543).
+            notes_maturing: None,
         };
         FaucetService {
             gate: Arc::new(Mutex::new(FaucetGate::new(faucet))),
             wallet,
             d,
             harvested: HashSet::new(),
-            next_maturity: None,
-            maturing: 0,
+            harvest: None,
             status: Arc::new(Mutex::new(status)),
         }
     }
@@ -468,8 +474,7 @@ impl FaucetService {
             report.harvest =
                 harvest_matured(&mut gate.faucet, state, &self.wallet, self.d, &mut self.harvested);
         }
-        self.next_maturity = report.harvest.next_maturity;
-        self.maturing = report.harvest.maturing;
+        self.harvest = Some(report.harvest.facts());
 
         // (2) Serve at most one request.
         //
@@ -649,7 +654,7 @@ impl FaucetService {
     pub fn refresh_status<N: FaucetNode>(&self, node: &N) {
         let gate = self.lock_gate();
         let view = NodeView(node.chain_state());
-        let availability = classify(gate.faucet(), &view, self.next_maturity, self.maturing);
+        let availability = classify(gate.faucet(), &view, self.harvest);
         let stats = gate.faucet().stats();
         let next = ServiceStatus {
             // `chain.state_tip` is the same `MemNode::tip_height()` this `view`
@@ -670,7 +675,7 @@ impl FaucetService {
             confirmed: stats.confirmed,
             refused: stats.refused,
             notes_held: gate.faucet().inventory().len(),
-            notes_maturing: self.maturing,
+            notes_maturing: self.harvest.map(|h| h.maturing),
         };
         drop(gate);
         if let Ok(mut slot) = self.status.lock() {

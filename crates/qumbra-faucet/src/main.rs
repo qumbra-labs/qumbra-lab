@@ -358,9 +358,23 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         let bound = node.start_telemetry_endpoint(addr)?;
         qlab_devnet::jprintln!("  node telemetry: http://{bound}/v1/telemetry");
     }
-    // First real sample: from here the snapshot is node-derived and `chain` stops
-    // being `None`.
-    service.refresh_status(&node);
+    // 🔴 **The first real sample is a whole tick, not a bare render** (lab #543).
+    // `refresh_status` alone publishes what the service currently holds, and before
+    // any harvest pass that is `next_maturity: None` / `maturing: 0` — the values a
+    // pass reports for a faucet with *no* immature coinbase. So a faucet whose entire
+    // stock was inside the frozen §2 gate answered `Empty` — "out of funds … the only
+    // refill is a coinbase note", i.e. **none coming** — and refused requests it would
+    // have queued one iteration later, to a listener that has been serving since it
+    // bound. A tick harvests and then renders, so the first thing this page publishes
+    // is measured rather than defaulted.
+    //
+    // The Ctrl-C handler is installed **before** it, because a restart's first pass
+    // re-walks the whole main chain and that is not a moment to be unkillable.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let sig = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
+    let mut rng = rand::rng();
+    log_serve_report(&service.tick(&mut node, &mut rng));
 
     qlab_devnet::jprintln!("qumbra-faucet running");
     qlab_devnet::jprintln!("  faucet:         http://{}/", server.addr());
@@ -402,50 +416,10 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     );
     qlab_devnet::jprintln!("(Ctrl-C to shut down — the node's snapshot is flushed on exit)");
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sig = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
-
     // The faucet runs on the node's own loop, not a thread of its own — see
     // `RunningNode::run_until_with` for what that buys and what it costs.
-    let mut rng = rand::rng();
     node.run_until_with(&shutdown, |n| {
-        let report = service.tick(n, &mut rng);
-        if report.harvest.funded > 0 {
-            qlab_devnet::jprintln!(
-                "FAUCET funded {} matured coinbase note(s)",
-                report.harvest.funded
-            );
-        }
-        if report.harvest.skipped_spent > 0 {
-            // Lab #310: spent notes the restart walk would otherwise re-fund.
-            qlab_devnet::jprintln!(
-                "FAUCET harvest-skipped-spent {}",
-                report.harvest.skipped_spent
-            );
-        }
-        if let Some(receipt) = report.granted {
-            // The receipt, never the recipient: a grant line in a log rotation must
-            // not be a record of who asked (PR #103's redaction, same rule).
-            qlab_devnet::jprintln!("FAUCET granted receipt={receipt}");
-        }
-        // Lab #310 / #241: one named reason per refused attempt, before any
-        // gave-up line so the operator sees the fault that burned the budget.
-        if let Some(reason) = &report.refusal_reason {
-            qlab_devnet::jprintln!("FAUCET refuse reason={reason}");
-        }
-        if report.dropped_spent > 0 {
-            qlab_devnet::jprintln!(
-                "FAUCET dropped-spent {} (stale inventory; attempt not burned)",
-                report.dropped_spent
-            );
-        }
-        if let Some(receipt) = report.gave_up {
-            match &report.refusal_reason {
-                Some(reason) => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt} reason={reason}"),
-                None => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt}"),
-            }
-        }
+        log_serve_report(&service.tick(n, &mut rng));
     });
 
     server.shutdown();
@@ -454,4 +428,48 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     }
     qlab_devnet::jprintln!("shutdown complete");
     Ok(())
+}
+
+/// Every operator-visible line a served tick produces, in one place.
+///
+/// One statement rather than two (lab #543): the first sample is a tick now, and a
+/// restart's first pass is exactly the one that funds hundreds of notes at once — so
+/// a second copy of this block would have been the copy that drifted, and the pass
+/// whose numbers matter most would have been the one nobody printed.
+fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
+    if report.harvest.funded > 0 {
+        qlab_devnet::jprintln!(
+            "FAUCET funded {} matured coinbase note(s)",
+            report.harvest.funded
+        );
+    }
+    if report.harvest.skipped_spent > 0 {
+        // Lab #310: spent notes the restart walk would otherwise re-fund.
+        qlab_devnet::jprintln!(
+            "FAUCET harvest-skipped-spent {}",
+            report.harvest.skipped_spent
+        );
+    }
+    if let Some(receipt) = report.granted {
+        // The receipt, never the recipient: a grant line in a log rotation must
+        // not be a record of who asked (PR #103's redaction, same rule).
+        qlab_devnet::jprintln!("FAUCET granted receipt={receipt}");
+    }
+    // Lab #310 / #241: one named reason per refused attempt, before any
+    // gave-up line so the operator sees the fault that burned the budget.
+    if let Some(reason) = &report.refusal_reason {
+        qlab_devnet::jprintln!("FAUCET refuse reason={reason}");
+    }
+    if report.dropped_spent > 0 {
+        qlab_devnet::jprintln!(
+            "FAUCET dropped-spent {} (stale inventory; attempt not burned)",
+            report.dropped_spent
+        );
+    }
+    if let Some(receipt) = report.gave_up {
+        match &report.refusal_reason {
+            Some(reason) => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt} reason={reason}"),
+            None => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt}"),
+        }
+    }
 }
