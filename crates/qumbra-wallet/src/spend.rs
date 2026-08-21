@@ -712,6 +712,7 @@ mod tests {
             scan_to: bundle.selected_at_tip(),
             no_submit: false,
             name_op: None,
+            form: qlab_devnet::forms::GenesisForm::V4,
         };
         let calls = Rc::new(RefCell::new(Vec::new()));
         let select_calls = Rc::clone(&calls);

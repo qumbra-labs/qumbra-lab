@@ -157,7 +157,7 @@ mod tests {
         rand::rng().fill_bytes(&mut entropy);
         let w = WalletDir::create(&dir, MasterSeed::from_entropy(entropy)).expect("create wallet");
 
-        let out = super::report(&dir, &w, "http://127.0.0.1:1", 0, 8);
+        let out = super::report(&dir, &w, "http://127.0.0.1:1", 0, 8, qlab_devnet::forms::GenesisForm::V4);
 
         assert!(
             out.notes.iter().any(|n| n.contains(crate::sends::SENDS_FILE)),

@@ -694,6 +694,60 @@ mod tests {
         );
     }
 
+    /// 🔴 **The holder's property, for BOTH forms: the five facts `/v1/coinbase`
+    /// serves reconstruct the note the applier appended, and its leaf.**
+    ///
+    /// This is the invariant lab #566 broke and the one that had no test.
+    /// `qlab-node`'s own coverage checked `coinbase_note_for` (the block face) and
+    /// v4-vs-v5 separation, and `rpc.rs` checked the served facts on a **v4**
+    /// chain only — so nothing anywhere asserted that the *parts* face and the
+    /// *body* face agree under a given form. That is exactly the seam a wallet
+    /// sits on: it has the five scalars and never the block.
+    ///
+    /// Both directions are asserted per form, which is what makes it a check and
+    /// not a restatement: within a form the two faces agree, and across forms the
+    /// same five facts give different commitments. A `coinbase_note_parts_for`
+    /// that ignored its `form` argument would pass the first and fail the second.
+    #[test]
+    fn the_served_five_facts_reconstruct_the_appended_note_under_either_form() {
+        use qlab_devnet::forms::GenesisForm;
+        let body = body_at(700, RKM_A, 2);
+        // The five facts, exactly as `coinbase_page` projects them off the block.
+        let (h, rkm, cb, fees, burn) = (
+            700u64,
+            body.coinbase_rkm,
+            body.coinbase,
+            body.total_fees(),
+            body.total_name_burn(),
+        );
+        for form in [GenesisForm::V4, GenesisForm::V5] {
+            let from_parts =
+                coinbase_note_parts_for(form, h, rkm, cb, fees, burn).expect("mints");
+            let from_body = coinbase_note_for(form, h, &body).expect("mints");
+            assert_eq!(
+                from_parts, from_body,
+                "{form:?}: a holder with the served facts must derive the applier's own note"
+            );
+            assert_eq!(
+                digest_bytes(&from_parts.commitment()),
+                coinbase_note_leaf_for(form, h, &body).expect("mints"),
+                "{form:?}: …and therefore the leaf the tree actually got"
+            );
+        }
+        // Across forms the same facts are different notes — so the dispatch is
+        // load-bearing and not decoration.
+        assert_ne!(
+            coinbase_note_parts_for(GenesisForm::V4, h, rkm, cb, fees, burn)
+                .expect("mints")
+                .commitment(),
+            coinbase_note_parts_for(GenesisForm::V5, h, rkm, cb, fees, burn)
+                .expect("mints")
+                .commitment(),
+            "a form-blind dispatcher would make these equal and every holder on the \
+             other net unspendable"
+        );
+    }
+
     /// A block that mints nothing mints no note — this is what exempts genesis,
     /// which carries `coinbase == 0`. And a payee-less body cannot produce a leaf
     /// even if this function is reached off the validation path.
