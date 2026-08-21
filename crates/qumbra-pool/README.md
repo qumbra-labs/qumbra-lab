@@ -67,20 +67,28 @@ stock XMRig against a public endpoint. **What is NOT proven: that this pool can 
 | item | state | blocked on |
 |---|---|---|
 | A block actually mined, and its payee read | ✅ **done, and the answer was bad** | three blocks, all paying the pool, miner's key zero — **lab #553** |
-| Connection cap, line bound, rate limit on public stratum | ⬜ | **lab #544** |
-| Bounded staleness on the held template | ⬜ | **lab #545** |
-| Public announcement of the endpoint | ⬜ | the two rows above — **not** the first share |
+| Connection cap, line bound, rate limit on public stratum | ✅ 2026-08-21 (PR #563, lab #544) |  |
+| Bounded staleness on the held template | ✅ 2026-08-21 (PR #549, lab #545) |  |
+| An unowned payee cannot reach the chain **from the pool** | ✅ 2026-08-21 (PR #554, the pool half of lab #547) |  |
+| **The pool can pay a miner at all** | 🔴 | **lab #553** — the design is unimplemented, not untested |
+| The node refuses to mine without a `miner_rkm` | ⬜ | **lab #552** — why the unspendable placeholder was expressible |
+| Admissions are attributable to a source | ⬜ | **lab #584** — the counters count, they do not attribute |
+| Public announcement of the endpoint | ⬜ | **lab #553 first.** Announcing a pool that cannot pay is the one thing we must not do |
 
-🔴 **The endpoint is reachable but deliberately unadvertised, and those two issues are why.**
-Public stratum has no connection cap, no line-length bound and a per-syscall rather than
-per-connection timeout (#544). #545 is two defects, not one: the poll thread discarded the jobs
-`replace_template` already built, so a miner got work at login and never again (every later share
-came back `stale job`, connection up, no message); and a held template with no staleness bound
-would keep that last job live while the node is unreachable. The node's refusal to assemble on a
-contested tip is correct and is not in scope. Neither defect is a risk to the chain or to any key;
-both are ways a miner burns electricity for nothing. **The window in which this endpoint is
-exposed and unprotected is one nobody has been told about, which makes it the cheapest time we
-will ever have to fix them.** The board stays ⬜ until the coordinator accepts the software.
+**Both of the issues that once held this row are fixed** (#544 caps connections, line length and
+per-connection deadlines, PR #563; #545 was two defects — the poll thread discarded jobs
+`replace_template` had already built, so a miner got work at login and never again, and a held
+template had no staleness bound — PR #549). Neither was ever a risk to the chain or to any key;
+both were ways a miner burns electricity for nothing.
+
+🔴 **What replaced them is worse, and it is not a hardening gap: the pool cannot pay anyone
+(#553).** The endpoint was stopped 2026-08-21 21:39 +08 and stays stopped until that lands.
+
+⚠️ **And retire the reasoning this paragraph used to carry.** It said the exposure was acceptable
+because the endpoint was *unadvertised*. **Obscurity is not a control** — the exposure was bounded
+by the security group, which is still open to `0.0.0.0/0`, and stopping the container is what
+actually closed the port. Restarting means **narrowing the SG first, then starting the profile**,
+in that order.
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
