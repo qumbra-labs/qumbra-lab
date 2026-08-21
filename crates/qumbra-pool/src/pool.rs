@@ -873,6 +873,7 @@ fn issue_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbox::SessionPush;
     use crate::template::HeldTemplateSource;
     use qlab_devnet::forms::GenesisForm;
     use qlab_devnet::header::{AggregateProofSlot, BlockHeader, EpochSupplyAttestation};
@@ -908,6 +909,90 @@ mod tests {
             Box::new(HeldTemplateSource::new(template(GenesisForm::V5, 100))),
         )
         .unwrap()
+    }
+
+    fn rkm(n: u64) -> [u64; 4] {
+        [n, 0, 0, 0]
+    }
+
+    /// `Pool::new`'s test `pool_rkm`. Named so the payee tests below read
+    /// as "the pool's own key" rather than a magic 9.
+    const TEST_POOL_RKM: [u64; 4] = [9, 0, 0, 0];
+
+    fn body(coinbase_rkm: [u64; 4]) -> TemplateBody {
+        TemplateBody {
+            coinbase: 5_000,
+            coinbase_rkm,
+            txs: Vec::new(),
+        }
+    }
+
+    fn template_with_body(height: u64, coinbase_rkm: [u64; 4]) -> Template {
+        Template {
+            body: Some(body(coinbase_rkm)),
+            ..template(GenesisForm::V5, height)
+        }
+    }
+
+    /// A source that can start sound and turn bad *without* going through
+    /// [`Pool::replace_template`] — the only way to reach the submit-time
+    /// backstop, and a faithful model of what it exists for.
+    struct SwitchingSource {
+        good: Template,
+        bad: Template,
+        serve_bad: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TemplateSource for SwitchingSource {
+        fn current(&self) -> Template {
+            if self.serve_bad.load(std::sync::atomic::Ordering::SeqCst) {
+                self.bad.clone()
+            } else {
+                self.good.clone()
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSubmitter {
+        payees: Mutex<Vec<[u64; 4]>>,
+    }
+
+    impl RecordingSubmitter {
+        fn payees(&self) -> Vec<[u64; 4]> {
+            self.payees.lock().expect("recorder").clone()
+        }
+    }
+
+    impl BlockSubmitter for RecordingSubmitter {
+        fn submit_block(
+            &self,
+            _form: GenesisForm,
+            _header_preimage: &[u8],
+            body: &TemplateBody,
+        ) -> Result<String, String> {
+            self.payees
+                .lock()
+                .expect("recorder")
+                .push(body.coinbase_rkm);
+            Ok("accepted".into())
+        }
+    }
+
+    /// Login, then land a block-class share. `passing_result` is the
+    /// all-zero hash, whose v5 work value is 0, so it is `<=` any
+    /// difficulty — every accepted share here is also a block candidate.
+    fn land_a_block(pool: &Pool) {
+        let (sid, login) = login_ok(pool);
+        let sid = sid.unwrap();
+        let mut s = Some(sid.clone());
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(&sid, &login.job.job_id, "d0030040", &passing_result(), Some("rx/0")),
+            )
+            .unwrap();
+        assert_eq!(reply_status(&out).1.as_deref(), Some("OK"), "the share itself is valid");
     }
 
     fn login_line(algo: Option<Vec<String>>) -> String {
@@ -1314,5 +1399,201 @@ mod tests {
         assert_eq!(err.code, ERR_UNKNOWN_JOB);
         assert!(err.message.contains("stale job"));
         assert!(err.message.contains("template-unavailable:"));
+    }
+
+    // ── lab #547: an unowned coinbase payee cannot reach the chain ──────
+
+    /// 🔴 The headline. A template carrying the node's placeholder payee
+    /// reaches a job, a real block-class share lands on it, and **nothing
+    /// is POSTed**. Before this gate, `on_submit` forwarded `job.body`
+    /// verbatim and `0111011101110111…` would have gone to the node.
+    #[test]
+    fn a_template_payee_the_pool_does_not_own_is_never_submitted() {
+        let serve_bad = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source = SwitchingSource {
+            good: template(GenesisForm::V5, 100),
+            bad: template_with_body(100, crate::payee::UNCONFIGURED_NODE_RKM),
+            serve_bad: Arc::clone(&serve_bad),
+        };
+        let pool = Pool::new(1024, Box::new(source)).unwrap();
+        let recorder = Arc::new(RecordingSubmitter::default());
+        pool.set_submitter(Arc::clone(&recorder) as Arc<dyn BlockSubmitter>);
+
+        serve_bad.store(true, std::sync::atomic::Ordering::SeqCst);
+        land_a_block(&pool);
+
+        assert!(
+            recorder.payees().is_empty(),
+            "the placeholder payee must not reach the node"
+        );
+        assert!(pool.is_unavailable(), "and the pool stops issuing work on it");
+        let reason = pool.counters().work_unavailable.expect("named reason");
+        assert!(
+            reason.contains("node-placeholder-coinbase-payee"),
+            "refused by name, got: {reason}"
+        );
+    }
+
+    /// Same shape, an unowned-but-structurally-fine key: this is the
+    /// general case, and it is what makes the guard a whitelist rather
+    /// than a blacklist of two known-bad constants.
+    #[test]
+    fn an_unowned_stranger_payee_is_never_submitted_either() {
+        let serve_bad = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stranger = [0xd2c0_2c7cu64, 2, 3, 4];
+        let source = SwitchingSource {
+            good: template(GenesisForm::V5, 100),
+            bad: template_with_body(100, stranger),
+            serve_bad: Arc::clone(&serve_bad),
+        };
+        let pool = Pool::new(1024, Box::new(source)).unwrap();
+        let recorder = Arc::new(RecordingSubmitter::default());
+        pool.set_submitter(Arc::clone(&recorder) as Arc<dyn BlockSubmitter>);
+
+        serve_bad.store(true, std::sync::atomic::Ordering::SeqCst);
+        land_a_block(&pool);
+
+        assert!(recorder.payees().is_empty());
+        let reason = pool.counters().work_unavailable.expect("named reason");
+        assert!(reason.contains("unowned-coinbase-payee"), "got: {reason}");
+    }
+
+    /// The mutation check the two tests above need: the gate is not simply
+    /// refusing everything. A template paying the configured `payout_rkm`
+    /// IS submitted, and the payee that arrives at the node is that key.
+    #[test]
+    fn a_template_paying_the_configured_payout_rkm_is_submitted() {
+        let pool = Pool::new(
+            1024,
+            Box::new(HeldTemplateSource::new(template_with_body(100, TEST_POOL_RKM))),
+        )
+        .unwrap();
+        let recorder = Arc::new(RecordingSubmitter::default());
+        pool.set_submitter(Arc::clone(&recorder) as Arc<dyn BlockSubmitter>);
+
+        land_a_block(&pool);
+
+        assert_eq!(
+            recorder.payees(),
+            vec![TEST_POOL_RKM],
+            "the pool's own key is exactly what should reach the node"
+        );
+        assert!(!pool.is_unavailable());
+    }
+
+    /// A registered miner's rkm is accepted — the branch that is dead on
+    /// today's node RPC (the template's payee is always the node's own
+    /// `miner_rkm`) and becomes live the moment the node accepts a
+    /// requested payee. Kept, and kept tested, because that is the whole
+    /// point of the custody-free path.
+    #[test]
+    fn a_registered_miners_payee_is_submitted() {
+        let pool = Pool::new(
+            1024,
+            Box::new(HeldTemplateSource::new(template_with_body(100, TEST_POOL_RKM))),
+        )
+        .unwrap();
+        pool.register_account("alice", rkm(42));
+        let recorder = Arc::new(RecordingSubmitter::default());
+        pool.set_submitter(Arc::clone(&recorder) as Arc<dyn BlockSubmitter>);
+        pool.replace_template(Box::new(HeldTemplateSource::new(template_with_body(
+            101,
+            rkm(42),
+        ))))
+        .unwrap();
+        assert!(!pool.is_unavailable(), "alice's key is owned, so work continues");
+
+        land_a_block(&pool);
+        assert_eq!(recorder.payees(), vec![rkm(42)]);
+    }
+
+    /// The intake gate: refuse the *template*, before any miner spends a
+    /// hash on it. No job is issued, the live session is told, and the
+    /// reason names the shape.
+    #[test]
+    fn replace_template_with_an_unowned_payee_suspends_work_and_issues_no_job() {
+        let pool = pool_v5();
+        let outbox = Arc::new(JobOutbox::new());
+        pool.set_outbox(Arc::clone(&outbox));
+        let (sid, _) = login_ok(&pool);
+        let sid = sid.unwrap();
+
+        outbox.register(sid.clone());
+
+        let jobs = pool
+            .replace_template(Box::new(HeldTemplateSource::new(template_with_body(
+                101,
+                crate::payee::UNCONFIGURED_NODE_RKM,
+            ))))
+            .unwrap();
+        assert!(jobs.is_empty(), "no job may be issued on a poisoned template");
+        assert!(pool.is_unavailable());
+        let reason = pool.counters().work_unavailable.expect("named reason");
+        assert!(reason.contains("node-placeholder-coinbase-payee"), "got: {reason}");
+
+        // The live session is told why rather than left hashing.
+        match outbox.take(&sid) {
+            Some(SessionPush::Unavailable(r)) => {
+                assert!(r.contains("node-placeholder-coinbase-payee"), "got: {r}");
+            }
+            other => panic!("expected a named Unavailable push, got {other:?}"),
+        }
+    }
+
+    /// Sound template after a refused one: the poller recovers on its own,
+    /// which is why intake refuses with named-unavailable rather than an
+    /// error the caller logs and forgets.
+    #[test]
+    fn a_sound_template_clears_the_payee_refusal() {
+        let pool = pool_v5();
+        let _ = login_ok(&pool);
+        pool.replace_template(Box::new(HeldTemplateSource::new(template_with_body(
+            101,
+            crate::payee::UNCONFIGURED_NODE_RKM,
+        ))))
+        .unwrap();
+        assert!(pool.is_unavailable());
+
+        let jobs = pool
+            .replace_template(Box::new(HeldTemplateSource::new(template_with_body(
+                102,
+                TEST_POOL_RKM,
+            ))))
+            .unwrap();
+        assert!(!pool.is_unavailable());
+        assert_eq!(jobs.len(), 1, "the live session gets fresh work again");
+    }
+
+    /// Startup refusal. A pool whose node pays somewhere the pool does not
+    /// own can never submit a block it owns, and says so before binding a
+    /// listener rather than on a block find hours later.
+    #[test]
+    fn construction_refuses_a_template_payee_the_pool_does_not_own() {
+        let Err(err) = Pool::new(
+            1024,
+            Box::new(HeldTemplateSource::new(template_with_body(
+                100,
+                crate::payee::UNCONFIGURED_NODE_RKM,
+            ))),
+        ) else {
+            panic!("startup must refuse a payee the pool does not own");
+        };
+        assert!(matches!(
+            err,
+            PoolError::Payee(crate::payee::PayeeRefusal::NodePlaceholder)
+        ));
+        assert!(err.to_string().contains("node-placeholder-coinbase-payee"));
+    }
+
+    /// A static `[template]` file carries no body, so a block-class share
+    /// is logged and never POSTed — nothing can reach the chain and there
+    /// is nothing to refuse. This is what keeps every pre-#547 fixture
+    /// (and `pool_v5()` itself) working.
+    #[test]
+    fn a_bodyless_template_is_not_gated() {
+        let pool = pool_v5();
+        assert!(!pool.is_unavailable());
+        land_a_block(&pool);
+        assert!(!pool.is_unavailable());
     }
 }

@@ -305,6 +305,31 @@ payout_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
         assert!(err.to_string().contains("all-zero-payout-rkm"));
     }
 
+    /// Lab #547. The all-zero shape was already refused; this one is the
+    /// shape that actually reached the chain, and an operator who copies a
+    /// payee off a block explorer to "match what the node pays" would
+    /// otherwise configure it and be refused nowhere.
+    #[test]
+    fn serving_refuses_the_node_placeholder_payout_by_name() {
+        let live = format!(
+            r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+payout_rkm = "{}"
+"#,
+            "0111011101110111".repeat(4)
+        );
+        let err = PoolConfig::from_toml(&live).unwrap_err();
+        assert!(matches!(&err, ConfigError::PlaceholderPayoutRkm));
+        let msg = err.to_string();
+        assert!(msg.contains("placeholder-payout-rkm"), "got: {msg}");
+        assert!(
+            msg.contains("NOBODY can spend"),
+            "the refusal must say what is wrong with it, got: {msg}"
+        );
+    }
+
     #[test]
     fn live_service_uses_the_configured_payout_lanes() {
         let live = r#"

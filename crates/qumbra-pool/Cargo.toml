@@ -40,3 +40,13 @@ ctrlc = { workspace = true }
 
 [dev-dependencies]
 # Targeted debug tests only. No RandomX, no in-process node.
+#
+# Exception, and the reason it is worth the graph (lab #547): the pool must
+# refuse the node's `UNCONFIGURED_MINER_RKM` placeholder by name, and that
+# constant lives in `qlab-p2p`, which this crate must NOT depend on at
+# build time (the arrow points one way, and Cargo has no per-target deps).
+# So `payee::UNCONFIGURED_NODE_RKM` mirrors it and `tests/cross_assert.rs`
+# pins the two together. A dev-dep constructs no node; it buys a compile
+# failure instead of a silent divergence on a value that already burned
+# three blocks' issuance.
+qlab-p2p = { path = "../qlab-p2p" }

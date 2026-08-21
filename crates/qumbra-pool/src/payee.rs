@@ -417,6 +417,147 @@ mod tests {
         }
     }
 
+    /// The v4 half of the documented fallback. The v5 case above was the
+    /// only one asserted before lab #547, and the fallback's own doc line
+    /// covers both forms.
+    #[test]
+    fn v4_empty_window_pays_the_configured_pool_rkm() {
+        let assembled = assemble_coinbase(
+            GenesisForm::V4,
+            5,
+            &PplnsWindow::default(),
+            &Accounts::default(),
+            rkm(9),
+        )
+        .unwrap();
+        assert_eq!(
+            assembled,
+            AssembledCoinbase::V4 {
+                rkm: rkm(9),
+                amount: coinbase_exact(5),
+            }
+        );
+    }
+
+    /// 🔴 The value on three T2 blocks. This is the test that ties the
+    /// constant in this file to the evidence on the chain: if the hex here
+    /// stops matching what the explorer served, one of the two is wrong.
+    #[test]
+    fn the_node_placeholder_encodes_to_the_hex_seen_on_chain() {
+        let hex = rkm_hex(&UNCONFIGURED_NODE_RKM);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, "0111011101110111".repeat(4));
+        assert!(
+            hex.starts_with("0111011101110111"),
+            "the prefix recorded on lab #547 for heights 607 / 610 / 611"
+        );
+    }
+
+    #[test]
+    fn check_payee_accepts_the_pool_rkm_and_a_registered_miner() {
+        let mut accounts = Accounts::default();
+        accounts.register("alice", rkm(1));
+        assert!(check_payee(rkm(9), rkm(9), &accounts, std::iter::empty()).is_ok());
+        assert!(check_payee(rkm(1), rkm(9), &accounts, std::iter::empty()).is_ok());
+    }
+
+    /// A 64-hex login *is* an rkm ([`Accounts::rkm_of`]), so a miner that
+    /// never called `register` is still an owner — but only when we are
+    /// given its login to test against, which is what `known_logins` is for.
+    #[test]
+    fn check_payee_accepts_a_hex_login_only_when_that_login_is_known() {
+        let accounts = Accounts::default();
+        let hex = rkm_hex(&rkm(7));
+        let mine = rkm(7);
+        assert!(check_payee(mine, rkm(9), &accounts, [hex.as_str()]).is_ok());
+        assert_eq!(
+            check_payee(mine, rkm(9), &accounts, std::iter::empty()),
+            Err(PayeeRefusal::Unowned { rkm: mine }),
+            "without the login there is nothing to reverse the rkm against"
+        );
+    }
+
+    /// Item 3 of lab #547: both shapes refused, and refused *by name* —
+    /// the tokens are the operator-visible contract, not the prose.
+    #[test]
+    fn the_zero_and_placeholder_shapes_are_refused_by_name() {
+        let accounts = Accounts::default();
+        let zero = check_payee([0; 4], rkm(9), &accounts, std::iter::empty()).unwrap_err();
+        assert_eq!(zero, PayeeRefusal::ZeroPayee);
+        assert_eq!(zero.token(), "all-zero-coinbase-payee");
+
+        let ph =
+            check_payee(UNCONFIGURED_NODE_RKM, rkm(9), &accounts, std::iter::empty()).unwrap_err();
+        assert_eq!(ph, PayeeRefusal::NodePlaceholder);
+        assert_eq!(ph.token(), "node-placeholder-coinbase-payee");
+        assert!(
+            ph.to_string().contains("miner_rkm"),
+            "the refusal must name the operator fix, which is on the node"
+        );
+    }
+
+    /// The ordering claim: a `payout_rkm` that was itself set to a refused
+    /// shape must not launder that shape into acceptance by matching.
+    #[test]
+    fn a_refused_shape_configured_as_the_pool_rkm_is_still_refused() {
+        let accounts = Accounts::default();
+        assert_eq!(
+            check_payee(
+                UNCONFIGURED_NODE_RKM,
+                UNCONFIGURED_NODE_RKM,
+                &accounts,
+                std::iter::empty()
+            ),
+            Err(PayeeRefusal::NodePlaceholder)
+        );
+        assert_eq!(
+            check_payee([0; 4], [0; 4], &accounts, std::iter::empty()),
+            Err(PayeeRefusal::ZeroPayee)
+        );
+    }
+
+    #[test]
+    fn an_unowned_payee_is_refused_and_named_in_hex() {
+        let stranger = [0xDEAD_BEEFu64, 2, 3, 4];
+        let err = check_payee(stranger, rkm(9), &Accounts::default(), std::iter::empty())
+            .expect_err("nobody here owns it");
+        assert_eq!(err, PayeeRefusal::Unowned { rkm: stranger });
+        assert_eq!(err.token(), "unowned-coinbase-payee");
+        assert!(
+            err.to_string().contains(&rkm_hex(&stranger)),
+            "the refusal must carry the key, in the encoding a config file uses"
+        );
+    }
+
+    #[test]
+    fn a_body_that_mints_nothing_and_names_nobody_passes() {
+        let body = crate::template::TemplateBody {
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+            txs: Vec::new(),
+        };
+        assert!(check_body_payee(&body, rkm(9), &Accounts::default(), std::iter::empty()).is_ok());
+
+        // But minting to nobody is not the same thing.
+        let minting = crate::template::TemplateBody {
+            coinbase: 1,
+            coinbase_rkm: [0; 4],
+            txs: Vec::new(),
+        };
+        assert_eq!(
+            check_body_payee(&minting, rkm(9), &Accounts::default(), std::iter::empty()),
+            Err(PayeeRefusal::ZeroPayee)
+        );
+    }
+
+    #[test]
+    fn owns_rkm_is_the_reverse_of_rkm_of() {
+        let mut accounts = Accounts::default();
+        accounts.register("alice", rkm(1));
+        assert!(accounts.owns_rkm(rkm(1)));
+        assert!(!accounts.owns_rkm(rkm(2)));
+    }
+
     #[test]
     fn zero_pool_rkm_is_refused() {
         assert!(matches!(

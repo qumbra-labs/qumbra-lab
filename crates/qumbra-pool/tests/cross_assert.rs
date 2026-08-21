@@ -10,6 +10,11 @@
 //! on `qlab-devnet`. It cannot live in `qlab-devnet`: the consensus
 //! crate must not depend on the pool protocol lib. `qumbra-pool` is the
 //! first crate that honestly sits on both sides of the seam.
+//!
+//! Lab #547 adds a second seam of the same shape: the node's
+//! `UNCONFIGURED_MINER_RKM` placeholder is a `qlab-p2p` constant that the
+//! pool must refuse **by value**, and `qlab-p2p` is a build-time dep this
+//! crate does not take. The mirror lives in `payee`; the pin lives here.
 
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::{
@@ -86,4 +91,43 @@ fn preimage_for_v5_is_byte_identical_to_stratum_blob_helpers() {
     set_extranonce(&mut blob, &extra).unwrap();
     apply_miner_nonce(&mut blob, &miner).unwrap();
     assert_eq!(blob, preimage, "helpers must reproduce preimage_for(V5)");
+}
+
+/// 🔴 Lab #547. `payee::UNCONFIGURED_NODE_RKM` is a mirror, and a mirror
+/// that drifts is worse than no mirror at all: the pool would go on
+/// refusing a value the node no longer emits while passing the one it
+/// does. Three T2 blocks (607, 610, 611) paid this key, and the whole
+/// point of naming it is that it is *this* key.
+#[test]
+fn the_pools_placeholder_mirror_equals_the_nodes_own_constant() {
+    assert_eq!(
+        qumbra_pool::UNCONFIGURED_NODE_RKM,
+        qlab_p2p::adapter::UNCONFIGURED_MINER_RKM,
+        "the pool's placeholder mirror drifted from qlab-p2p's constant"
+    );
+}
+
+/// And the encoding, because the refusal is only useful if it matches what
+/// an operator reads off the explorer. Lane-major LE, 64 hex chars — the
+/// same encoding `miner_rkm` and `payout_rkm` use in a config file.
+#[test]
+fn the_nodes_placeholder_is_the_hex_recorded_on_chain() {
+    let hex = qumbra_pool::payee::rkm_hex(&qlab_p2p::adapter::UNCONFIGURED_MINER_RKM);
+    assert_eq!(hex, "0111011101110111".repeat(4));
+}
+
+/// The pool must refuse it, and must refuse it as the placeholder rather
+/// than as a generic stranger — the operator fix is on the node, and only
+/// the named variant says so.
+#[test]
+fn the_pool_refuses_the_nodes_placeholder_by_name() {
+    let err = qumbra_pool::check_payee(
+        qlab_p2p::adapter::UNCONFIGURED_MINER_RKM,
+        [9, 0, 0, 0],
+        &qumbra_pool::Accounts::default(),
+        std::iter::empty(),
+    )
+    .expect_err("the pool must never accept the node's placeholder");
+    assert_eq!(err, qumbra_pool::PayeeRefusal::NodePlaceholder);
+    assert_eq!(err.token(), "node-placeholder-coinbase-payee");
 }
