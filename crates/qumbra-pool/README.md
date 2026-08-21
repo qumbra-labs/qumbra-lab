@@ -6,7 +6,7 @@
 ## Status board
 
 Rows flip ⬜ → ✅ only when the coordinator has accepted the thing, never when it is
-merely written. Last updated 2026-08-21 21:55 +08.
+merely written. Last updated 2026-08-22 01:20 +08.
 
 ### The software — COMPLETE
 
@@ -28,8 +28,8 @@ merely written. Last updated 2026-08-21 21:55 +08.
 | **svc1 has its own `qumbra-node`** — the faucet has no mine RPC on any revision | ✅ 2026-08-21 (deploy #215, lab #519) |
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
-| **A miner paid by this pool** | 🔴 **NOT POSSIBLE YET** — lab #553; every block pays the pool's own address |
-| Public stratum on `pool.qumbra.org:3333` | ⏹ **stopped 2026-08-21 21:39 +08** — it cannot pay anyone; restarting means narrowing the SG first |
+| **🎉 A miner paid by this pool** | ✅ **2026-08-22 01:19 +08, height 1776** — 4.992690888 QMB to the miner's own key; lab #553 CLOSED |
+| Public stratum on `pool.qumbra.org:3333` | ▶️ **restarted 2026-08-22 01:12 +08** — it can pay now; SG still `0.0.0.0/0`, deliberately, Larry's call |
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
 64-hex rkm as the login — so this is the **miner-payee** branch, not the pool's fallback:
@@ -66,11 +66,11 @@ stock XMRig against a public endpoint. **What is NOT proven: that this pool can 
 
 | item | state | blocked on |
 |---|---|---|
-| A block actually mined, and its payee read | ✅ **done, and the answer was bad** | three blocks, all paying the pool, miner's key zero — **lab #553** |
+| A block actually mined, and its payee read | ✅ **done twice — bad, then good** | 2026-08-21: three blocks, all paying the pool. 2026-08-22: height 1776 paid the miner. |
 | Connection cap, line bound, rate limit on public stratum | ✅ 2026-08-21 (PR #563, lab #544) |  |
 | Bounded staleness on the held template | ✅ 2026-08-21 (PR #549, lab #545) |  |
 | An unowned payee cannot reach the chain **from the pool** | ✅ 2026-08-21 (PR #554, the pool half of lab #547) |  |
-| **The pool can pay a miner at all** | 🔴 | **lab #553** — the design is unimplemented, not untested |
+| **The pool can pay a miner at all** | ✅ 2026-08-22 (lab PR #588, observed at height 1776) |  |
 | The node refuses to mine without a `miner_rkm` | ⬜ | **lab #552** — why the unspendable placeholder was expressible |
 | Admissions are attributable to a source | ⬜ | **lab #584** — the counters count, they do not attribute |
 | Public announcement of the endpoint | ⬜ | **lab #553 first.** Announcing a pool that cannot pay is the one thing we must not do |
@@ -123,17 +123,21 @@ is accepted. **The pool never holds miner funds** — it decides the split and a
 the block, but the chain does the paying. A pool operator who disappears mid-round costs
 you the round, not your balance.
 
-🔴 **THAT IS THE DESIGN. IT IS NOT WHAT THIS POOL DOES TODAY.** `GET /v1/mine/template`
-**reports** a payee, it does not **accept** one — and the payee is bound into the header the
-miner grinds against, so it cannot be substituted once a share comes back. **Every block this
-pool can submit pays the poolnode's `miner_rkm`, whatever the PPLNS window says.**
-`payee::assemble_coinbase` — the winner selection, the empty-window fallback, the cap — is
-correct and is **not on the submit path**; its only consumers are a read-only accessor and two
-unit tests. **So the pool is custodial right now: it earns the coinbase to its own address and
-has no mechanism to pay anyone.** Tracked as [lab #553](https://github.com/qumbra-labs/qumbra-lab/issues/553),
-which is the gate on this endpoint being announced to anybody.
+✅ **THAT IS THE DESIGN, AND AS OF 2026-08-22 01:19 +08 IT IS ALSO WHAT THIS POOL DOES.** Height 1776 paid `daf76f16…` — a miner's own key, posted publicly at tip 1771 thirteen seconds before the rig connected, and proven absent from all 1,772 prior heights. 4.992690888 QMB, paid by the chain, never held by the pool.
 
-**Measured, not inferred** (2026-08-21, first live session): a rig mining 29 accepted shares
+**The retired 🔴 block is kept below, because a doc that deletes the state it was in teaches nobody what was wrong:**
+
+> 🔴 **THAT IS THE DESIGN. IT IS NOT WHAT THIS POOL DOES TODAY.** `GET /v1/mine/template`
+> **reports** a payee, it does not **accept** one — and the payee is bound into the header the
+> miner grinds against, so it cannot be substituted once a share comes back. **Every block this
+> pool can submit pays the poolnode's `miner_rkm`, whatever the PPLNS window says.**
+> `payee::assemble_coinbase` — the winner selection, the empty-window fallback, the cap — is
+> correct and is **not on the submit path**; its only consumers are a read-only accessor and two
+> unit tests. **So the pool is custodial right now: it earns the coinbase to its own address and
+> has no mechanism to pay anyone.** Tracked as [lab #553](https://github.com/qumbra-labs/qumbra-lab/issues/553),
+> which is the gate on this endpoint being announced to anybody.
+> 
+> **Measured, not inferred** (2026-08-21, first live session): a rig mining 29 accepted shares
 with a payout key **nothing else on the chain has ever mined to** was inside the PPLNS window
 the whole time. Three blocks landed in that window. **All three paid the pool's own address;
 the miner's key received zero.**
