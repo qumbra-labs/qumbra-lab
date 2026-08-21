@@ -26,14 +26,52 @@
 //! miner is asking, which is the same leak `/v1/nullifiers` refuses in its own
 //! shape. What a probe adds is the *question*.
 //!
-//! ## One derivation, not a second formula
+//! ## One derivation, not a second formula — and it must be the right one
 //!
-//! [`qlab_node::coinbase_note_parts`] is what `apply_state` runs when it appends
-//! the leaf, and this module calls it rather than restating it. That is the whole
-//! correctness argument, and it is sharper here than it was for the nullifier
-//! subtraction: a wrong value produces a wrong commitment, a wrong commitment is
-//! in no tree, and the note would be both a wrong balance **and** unspendable —
-//! failing at the witness lookup with nothing pointing at the arithmetic.
+//! [`qlab_node::coinbase_note_parts_for`] is the dispatcher `apply_state`'s own
+//! append path resolves through (`matured_coinbase_leaf_for` →
+//! `coinbase_note_leaf_for` → `coinbase_note_for` → this same function), and
+//! this module calls it rather than restating it. That is the whole correctness
+//! argument, and **it is checkable in one hop: both sides name the same
+//! function and pass the same [`qlab_devnet::forms::GenesisForm`].**
+//!
+//! It is sharper here than it was for the nullifier subtraction: a wrong value
+//! produces a wrong commitment, a wrong commitment is in no tree, and the note
+//! would be both a wrong balance **and** unspendable — failing at the witness
+//! lookup with nothing pointing at the arithmetic.
+//!
+//! ### 🔴 That paragraph was not hypothetical, and the fix is what makes it one
+//!
+//! Until lab #566 this module called the **v4** `coinbase_note_parts`, which
+//! takes no form. `apply_state` had been form-aware since #470 stage 4a, so on
+//! the v5 T2 chain every note this module reconstructed carried v4 ρ/rseed: the
+//! same value, a different commitment, no leaf in the tree, no witness, no
+//! spend. The sentence above described the failure exactly — wrong commitment,
+//! in no tree, wrong balance and unspendable, failing at the witness lookup —
+//! **while being offered as the reason it could not happen**, because its
+//! premise ("`coinbase_note_parts` is what `apply_state` runs") had expired at
+//! the T2 mint and prose has no compiler to notice.
+//!
+//! Confirmed at the transaction level 2026-08-21 on a wallet holding a T2
+//! mining rkm: `send --no-submit` reported *"131 matured coinbase note(s) this
+//! wallet mined are among the candidate inputs"* and then refused with *"a
+//! spendable note's commitment is not in the supplied tree — the tree and the
+//! scan disagree; refusing rather than proving against the wrong anchor"*. The
+//! refusal is **correct and is deliberately unchanged**: it cost nobody a coin,
+//! and it fired before the prover, so the diagnosis was cheap. What was wrong
+//! was the derivation, and the fix is [`MinedChain::form`] reaching
+//! `coinbase_note_parts_for`.
+//!
+//! ### Reproducing it, and the error that is NOT it
+//!
+//! 🔴 A wallet dir that lived through the T1→T2 cutover hits a **stale
+//! `tree-leaves.v1` cache** refusal first — *"tree sync refused: the endpoint
+//! serves 1192 leaves but the local cache already holds 13109. An append-only
+//! tree never rewinds"*. That is [`crate::sync`] correctly refusing a cache
+//! synced against a different net, **not this defect**, and a reproduction that
+//! stops there has confirmed nothing. Set the cache aside (rename, never
+//! delete — it is not key material but it is not disposable either) and run
+//! again to reach the derivation.
 //!
 //! In particular the amount is **not** the emission schedule's value at that
 //! height. It is the miner's frozen §3 share of what the block declared, plus
@@ -61,6 +99,7 @@
 //! refusal vocabulary below is unchanged and shared by both.
 
 use qlab_cbserver::codec::BlockCoinbase;
+use qlab_devnet::forms::GenesisForm;
 use qlab_node::{coinbase_leaf_appears_at, coinbase_maturity, CoinbaseMaturity};
 use qlab_note::note::Note;
 use qlab_wallet::Wallet;
@@ -192,6 +231,20 @@ pub struct MinedChain {
     pub covered: Option<(u64, u64)>,
     /// Every block in `covered`, ascending — one entry per height.
     pub blocks: Vec<BlockCoinbase>,
+    /// 🔴 **The genesis form of the chain these facts came from** (lab #566).
+    ///
+    /// It lives here, beside the blocks, rather than being a parameter of
+    /// [`match_mined`], because the form and the facts have to describe the same
+    /// net: a form passed separately can be paired with a page from a different
+    /// chain and still compile, which is the one mistake that makes every note
+    /// in the report unspendable. Named once, where the endpoint is named.
+    ///
+    /// [`Default`] is [`GenesisForm::V4`] — the live T1 net — and that is
+    /// unobservable rather than a silent choice: a default [`MinedChain`] has no
+    /// `blocks`, so no derivation runs on it. The only default chain in the tree
+    /// is the one `SelectDriver` substitutes when `/v1/coinbase` is unavailable,
+    /// and it exists to carry "nothing was read", not facts.
+    pub form: GenesisForm,
 }
 
 impl MinedChain {
@@ -230,12 +283,16 @@ impl MinedChain {
 /// `to` or when the endpoint serves nothing further. Contiguity is checked as it
 /// goes and is also the progress guard: a page that does not continue where the
 /// last one ended is a named refusal rather than another lap.
+/// `form` is the genesis form of the chain `source` serves, and it rides the
+/// returned [`MinedChain`] into every derivation made from it (lab #566) — see
+/// [`MinedChain::form`] for why it is not a separate argument downstream.
 pub fn fetch_coinbase(
     source: &impl CoinbaseSource,
     from: u64,
     to: u64,
+    form: GenesisForm,
 ) -> Result<MinedChain, CoinbaseRefusal> {
-    let mut catch = CoinbaseCatchUp::new(from, to);
+    let mut catch = CoinbaseCatchUp::new(from, to, form);
     while let Some((from, to)) = catch.want() {
         let page = source.fetch_range(from, to).map_err(|why| CoinbaseRefusal::Endpoint { why })?;
         catch.supply(page)?;
@@ -254,8 +311,15 @@ pub struct CoinbaseCatchUp {
 }
 
 impl CoinbaseCatchUp {
-    pub fn new(from: u64, to: u64) -> CoinbaseCatchUp {
-        CoinbaseCatchUp { chain: MinedChain::default(), cursor: from, to, done: false }
+    /// `form` is the genesis form of the chain being paged — it rides the
+    /// accumulated [`MinedChain`] (lab #566).
+    pub fn new(from: u64, to: u64, form: GenesisForm) -> CoinbaseCatchUp {
+        CoinbaseCatchUp {
+            chain: MinedChain { form, ..MinedChain::default() },
+            cursor: from,
+            to,
+            done: false,
+        }
     }
 
     /// The `(from, to)` range to ask the endpoint for next, or `None` once the
@@ -405,6 +469,13 @@ impl MinedReport {
 /// derived exactly as a spend derives it ([`crate::spent::note_nullifier`]), so
 /// there is no second formula here either.
 ///
+/// 🔴 **The note comes from [`qlab_node::coinbase_note_parts_for`] under
+/// [`MinedChain::form`]** — the same dispatcher `apply_state` resolves through
+/// when it appends the leaf, given the same form. That is the correctness
+/// argument, and it is one hop to check: if the two ever name different
+/// functions or different forms again, every note this returns is a commitment
+/// in no tree (lab #566).
+///
 /// 🔴 **The `[0; 4]` payee is never matched, whatever a wallet's key is.** A
 /// non-minting block carries it as a sentinel, and treating it as an identity
 /// would credit every wallet with genesis.
@@ -429,9 +500,11 @@ pub fn match_mined(
         let Some(&(div_index, _)) = mine.iter().find(|(_, rkm)| *rkm == blk.coinbase_rkm) else {
             continue; // somebody else's block
         };
-        // The applier's own derivation — see the module docs on why a second
-        // formula here would be worse than a wrong number.
-        let Some(note) = qlab_node::coinbase_note_parts(
+        // The applier's own derivation, under the form of the chain these facts
+        // came from — see the module docs on why a second formula here would be
+        // worse than a wrong number, and on what calling the v4 one cost (#566).
+        let Some(note) = qlab_node::coinbase_note_parts_for(
+            chain.form,
             blk.height,
             blk.coinbase_rkm,
             blk.coinbase,

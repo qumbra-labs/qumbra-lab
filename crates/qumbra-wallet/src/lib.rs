@@ -51,9 +51,13 @@
 //! construction, and since lab #415 the wallet fetches the other half rather
 //! than only naming it.** [`coinbase`] pages `GET /v1/coinbase`, matches the
 //! served payees against this wallet's own `rkm` lanes locally, reconstructs
-//! each mined note through the applier's own derivation
-//! (`qlab_node::coinbase_note_parts`) and splits it spendable vs maturing per
-//! the frozen §2 delay. **The verdict language below un-narrows only for a scan
+//! each mined note through the applier's own derivation — the form dispatcher
+//! `qlab_node::coinbase_note_parts_for`, under the genesis form of the net the
+//! page came from — and splits it spendable vs maturing per the frozen §2 delay.
+//! (Until lab #566 this named the **v4** `coinbase_note_parts`, which takes no
+//! form: on the v5 T2 chain every note it reconstructed was a commitment in no
+//! tree. `--net t1|t2` is where the form comes from; see `main`'s
+//! `genesis_form_of`.) **The verdict language below un-narrows only for a scan
 //! that actually fetched that route to the same height** — against a node that
 //! does not serve it (every host older than #415) the refusal is named and the
 //! narrowed claim stands. What follows is why the claim had to be narrowed in
@@ -139,6 +143,11 @@ pub mod view;
 // Moved to qlab-ledger (#407); re-exported so this crate keeps one set of
 // paths and there is still exactly one implementation.
 pub use qlab_ledger::{history, sends, spent};
+
+/// The genesis form a holder derives its coinbase notes under, re-exported so a
+/// shell over this crate (the extension, iOS, `qumbra-ffi`) can name one without
+/// taking a `qlab-devnet` dependency of its own (lab #566).
+pub use qlab_devnet::forms::GenesisForm;
 pub mod ledger_run;
 pub mod sends_build;
 pub mod words;

@@ -77,7 +77,16 @@ pub struct Gathered {
 /// coverage than the outputs need, never less. Fetching it first would turn an
 /// ordinary block arrival into a spurious `UNAVAILABLE`.
 #[cfg(feature = "net")]
-pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
+/// `form` is the genesis form of the net `url` serves — it rides the fetched
+/// [`MinedChain`] into the coinbase derivation and is what makes the mined
+/// figure a note the chain actually committed to (lab #566).
+pub fn gather(
+    w: &WalletDir,
+    url: &str,
+    from: u64,
+    to: u64,
+    form: qlab_devnet::forms::GenesisForm,
+) -> Gathered {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
     let wallet = w.wallet();
@@ -116,7 +125,7 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
     // be inside the nullifier coverage exactly as an output's are — which is why
     // the range below folds coinbase in rather than judging it separately.
     let (coinbase_coverage, mined) =
-        match fetch_coinbase(&HttpCoinbaseSource::new(url), from, to) {
+        match fetch_coinbase(&HttpCoinbaseSource::new(url), from, to, form) {
             Err(e) => (CoinbaseCoverage::Unavailable { why: e.to_string() }, None),
             Ok(chain) => (CoinbaseCoverage::Covered { range: chain.covered }, Some(chain)),
         };
@@ -149,10 +158,16 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
 /// three figures and one cannot-know — not an aborted command, and certainly not
 /// a zero.
 #[cfg(feature = "net")]
-pub fn scan_report(w: &WalletDir, url: &str, from: u64, to: u64) -> ScanReport {
+pub fn scan_report(
+    w: &WalletDir,
+    url: &str,
+    from: u64,
+    to: u64,
+    form: qlab_devnet::forms::GenesisForm,
+) -> ScanReport {
     let wallet = w.wallet();
     let Gathered { outcomes, coverage, set, coinbase_coverage, mined } =
-        gather(w, url, from, to);
+        gather(w, url, from, to, form);
 
     // The mined half. A figure exists only where BOTH streams do, exactly as for
     // transaction outputs: a coinbase note can be spent, so one that could not be
@@ -242,7 +257,8 @@ mod tests {
         rand::rng().fill_bytes(&mut entropy);
         let w = WalletDir::create(&dir, MasterSeed::from_entropy(entropy)).expect("create wallet");
 
-        let report = scan_report(&w, "http://127.0.0.1:1", 0, 8);
+        let report =
+            scan_report(&w, "http://127.0.0.1:1", 0, 8, qlab_devnet::forms::GenesisForm::V4);
         let (scans, coverage) = (report.scans, report.spent);
         assert!(
             matches!(report.coinbase_coverage, CoinbaseCoverage::Unavailable { .. }),

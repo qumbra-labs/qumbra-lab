@@ -112,7 +112,11 @@ impl std::fmt::Display for BuildRefusal {
             BuildRefusal::NotInTree => write!(
                 f,
                 "a spendable note's commitment is not in the supplied tree — the tree and the \
-             scan disagree; refusing rather than proving against the wrong anchor"
+             scan disagree; refusing rather than proving against the wrong anchor. If the notes \
+             in question were MINED rather than received, the likeliest cause is the net: a \
+             coinbase note's derivation is genesis-form dependent, so a wallet on T2 must pass \
+             `--net t2` and one on T1 must not (lab #566). A stale `tree-leaves.v1` cache from a \
+             different net is the other cause, and it refuses earlier with its own message"
             ),
             BuildRefusal::OutsideAnchor { pos, anchor_count } => write!(
                 f,

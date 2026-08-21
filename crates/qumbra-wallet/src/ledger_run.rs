@@ -63,8 +63,9 @@ pub fn report(
     url: &str,
     from: u64,
     to: u64,
+    form: qlab_devnet::forms::GenesisForm,
 ) -> HistoryReport {
-    let data = report_data(dir, w, url, from, to);
+    let data = report_data(dir, w, url, from, to, form);
     HistoryReport { text: render(&data.ledger, url), notes: data.notes }
 }
 
@@ -76,6 +77,7 @@ pub fn report_data(
     url: &str,
     from: u64,
     to: u64,
+    form: qlab_devnet::forms::GenesisForm,
 ) -> HistoryData {
     use crate::sends::{SendLog, SENDS_FILE};
 
@@ -109,8 +111,11 @@ pub fn report_data(
     // mining-only wallet's `history` is empty while its `scan` now reads
     // non-zero**, which is reported as a known gap on the PR rather than
     // discovered by a miner.
+    // `form` is threaded rather than hardcoded even though the coinbase half is
+    // dropped two lines up: it is fetched here, and a literal form in a flow
+    // that later starts *using* `mined` is precisely how lab #566 happened.
     let crate::scan::Gathered { outcomes, coverage, set, .. } =
-        crate::scan::gather(w, url, from, to);
+        crate::scan::gather(w, url, from, to, form);
     let scans: Vec<AddressScan> = outcomes
         .into_iter()
         .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
