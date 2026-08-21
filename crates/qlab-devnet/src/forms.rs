@@ -86,6 +86,28 @@ impl GenesisForm {
             GenesisForm::V5 => None,
         }
     }
+
+    /// The `boundary` the **mempool** passes to
+    /// [`crate::names::names_admit_op_above`] — the admission twin of the body
+    /// rule in [`crate::body::validate_body_form`], and it must match it exactly:
+    ///
+    /// - **V4**: [`crate::names::NAME_RULE_BOUNDARY_HEIGHT`], as `validate_body`'s
+    ///   v4 arm uses.
+    /// - **V5**: `Some(0)`, NOT `None`. The v5 body rule is `header.height > 0`
+    ///   (`body.rs`, C4: names native from height ≥ 1), which is exactly
+    ///   [`crate::names::riders_active_above`]`(Some(0), h)`. `None` would mean
+    ///   "riders never active" and refuse every T2 name op with
+    ///   `RiderBeforeBoundary` — the bug this method exists to prevent.
+    ///
+    /// **This differs deliberately from [`Self::name_boundary`]**, which answers
+    /// the *observer/display* question ("what boundary height to show", `None`
+    /// on a native net → `null`). Admission needs the *rule*, not the label.
+    pub fn rider_admit_boundary(self) -> Option<u64> {
+        match self {
+            GenesisForm::V4 => crate::names::NAME_RULE_BOUNDARY_HEIGHT,
+            GenesisForm::V5 => Some(0),
+        }
+    }
 }
 
 /// The complete rule/form context a running node enforces — **the carrier of
@@ -152,6 +174,19 @@ mod tests {
         for v in [0u32, 1, 2, 3, 6, 7, u32::MAX] {
             assert_eq!(GenesisForm::from_genesis_format_version(v), None, "v{v} must not map");
         }
+    }
+
+    #[test]
+    fn rider_admit_boundary_mirrors_the_body_rule_v5_is_some_zero_not_none() {
+        // The mempool admission boundary must equal what validate_body_form
+        // enforces: V4 → the shipped boundary; V5 → Some(0) (≡ height > 0), so
+        // riders_active_above agrees with the v5 body's `header.height > 0`.
+        assert_eq!(GenesisForm::V4.rider_admit_boundary(), crate::names::NAME_RULE_BOUNDARY_HEIGHT);
+        assert_eq!(GenesisForm::V5.rider_admit_boundary(), Some(0));
+        // The exact rule equivalence, and the bug it prevents: Some(0) admits a
+        // rider above genesis; None (the display boundary) would refuse it.
+        assert!(crate::names::riders_active_above(GenesisForm::V5.rider_admit_boundary(), 1));
+        assert!(!crate::names::riders_active_above(GenesisForm::V5.name_boundary(), 1));
     }
 
     #[test]

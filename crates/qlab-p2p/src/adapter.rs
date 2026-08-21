@@ -2693,7 +2693,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             return Err(TxSubmitRefusal::StateLagging);
         }
         let wid = wire_tx_id(&tx);
-        match self.mempool.admit(tx, &self.state, &self.verifier, self.state.names()) {
+        // Admission is keyed by the installed form, the same way body validation
+        // is (see the `validate_body` / `validate_body_v5` funnel below): a name
+        // rider on a v5 net is native from height ≥ 1, so the mempool must use
+        // the form's admit boundary (V5 → Some(0)), NOT `Mempool::admit`'s
+        // hardcoded v4 `NAME_RULE_BOUNDARY_HEIGHT` — which refused every T2 name
+        // op as `RiderBeforeBoundary` while v5 block-validation accepted it.
+        let admit_boundary = self.rules.form.rider_admit_boundary();
+        match self.mempool.admit_above(
+            admit_boundary,
+            tx,
+            &self.state,
+            &self.verifier,
+            self.state.names(),
+        ) {
             Ok(id) => {
                 self.wire_ids.insert(wid, id);
                 Ok(id)
