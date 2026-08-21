@@ -47,6 +47,14 @@ qumbra-wallet = { path = "../qumbra-wallet", default-features = false }
 # AnchorSet::from_bytes — the /v1/anchors codec, one copy (tip height for the
 # browser scan's `to`). Lean: no randomx in the wasm/iOS graphs.
 qlab-node = { path = "../qlab-node", default-features = false }
+# The paired-prover channel (docs/mobile-paired-prover.md in the macos repo).
+# Neither is a NEW external dependency — both are already in this workspace's
+# lock (chacha20poly1305 via qlab-note's note encryption, sha3 transitively), and
+# both are pure Rust, so the iOS cross-build stays free of any C++/cmake chain.
+# They are here because Apple's CryptoKit has no SHA-3, so the KDF and the
+# artifact digest CANNOT be discharged shell-side; see src/pairing.rs.
+sha3 = "0.11.0"
+chacha20poly1305 = "=0.11.0"
 
 # wasm32 (the browser-extension shell): getrandom needs the JS backend wired
 # explicitly (crypto.getRandomValues). Build with
