@@ -207,7 +207,8 @@ fn the_slag_slope_is_strictly_below_the_block_rate_under_continuing_load() {
     for _ in 0..8 {
         let (h, body) = server.node_mut().mine_block().expect("mine");
         assert_eq!(server.node_mut().ingest_block(h, body.clone()), IngestOutcome::Accepted);
-        server.announce_block(h, body.txs, body.coinbase, body.coinbase_rkm, 0);
+        let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+        server.announce_block(h, body.txs, coinbase, rkm, 0);
         now = run(&mut [&mut server, &mut behind], 4, now);
         samples.push(slag(&behind));
     }
@@ -348,11 +349,12 @@ fn a_served_body_that_does_not_match_the_header_commitment_is_charged_to_the_ser
     // counter is a body field, so changing it breaks the binding without touching a
     // single transaction.
     let (header, body) = blocks[1].clone();
+    let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
     let forged = BlockAnnounce {
         header,
         nonce: 0,
-        coinbase: body.coinbase.wrapping_add(1),
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase: coinbase.wrapping_add(1),
+        coinbase_rkm: rkm,
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
@@ -537,13 +539,14 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
                 fee: 1_000_000,
             }))
         .collect();
-    let body = BlockBody { txs: txs.clone(), coinbase: 42, coinbase_rkm: [7; 4] };
+    let body = BlockBody::from_single_payee(txs.clone(), 42, [7; 4]);
     let header = BlockHeader::child_of(&BlockHeader::genesis(1000, 0), 75, 1000, body.commitment());
+    let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
     let ann = BlockAnnounce {
         header,
         nonce: 0,
-        coinbase: body.coinbase,
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase,
+        coinbase_rkm: rkm,
         short_ids: Vec::new(),
         prefilled: txs
             .iter()
@@ -562,7 +565,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
                 assert_eq!(tx_id(a), tx_id(b), "in order, byte-identical");
             }
             let rebuilt =
-                BlockBody { txs: got, coinbase: back.coinbase, coinbase_rkm: back.coinbase_rkm };
+                BlockBody::from_single_payee(got, back.coinbase, back.coinbase_rkm);
             assert_eq!(
                 rebuilt.commitment(),
                 header.tx_body_commitment,
@@ -578,8 +581,8 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
     let live = BlockAnnounce {
         header,
         nonce: 0xABCD,
-        coinbase: body.coinbase,
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase,
+        coinbase_rkm: rkm,
         short_ids: txs[1..].iter().map(|tx| short_id(0xABCD, &tx_id(tx))).collect(),
         prefilled: vec![PrefilledTx { index: 0, tx: txs[0].clone() }],
     };
@@ -720,11 +723,12 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
     // 17 down to 3, none of which can apply — all of them buffer.
     let mut now = 20;
     for (h, body) in blocks[2..17].iter().rev() {
+        let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
         let ann = BlockAnnounce {
             header: *h,
             nonce: 0,
-            coinbase: body.coinbase,
-            coinbase_rkm: body.coinbase_rkm,
+            coinbase,
+            coinbase_rkm: rkm,
             short_ids: Vec::new(),
             prefilled: Vec::new(),
         };
@@ -752,11 +756,12 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
 
     // The frontier arrives: the whole buffered span drains in one pass.
     let (h2, b2) = &blocks[1];
+    let (coinbase, rkm) = b2.single_payee_parts().expect("current-cap body");
     let ann = BlockAnnounce {
         header: *h2,
         nonce: 0,
-        coinbase: b2.coinbase,
-        coinbase_rkm: b2.coinbase_rkm,
+        coinbase,
+        coinbase_rkm: rkm,
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };

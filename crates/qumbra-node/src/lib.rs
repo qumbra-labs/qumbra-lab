@@ -34,7 +34,7 @@
 //!   because Windows kills the process the moment that handler returns (lab #478).
 //! - [`audit_emission`] — read-only `audit-emission` subcommand: walk a data dir's
 //!   main chain via [`qlab_node::MemNode::open`] and report every height whose
-//!   `body.coinbase` differs from [`qlab_node::emission::coinbase`] (lab #299 /
+//!   the body payee total differs from [`qlab_node::emission::coinbase`] (lab #299 /
 //!   QUM-82). Observes only; no consensus change.
 //! - [`verifier`] — the injected transaction verifier. The **default is the real
 //!   M3 verifier** ([`verifier::ConsensusVerifier`] → `qlab_consensus::verify_proof`,

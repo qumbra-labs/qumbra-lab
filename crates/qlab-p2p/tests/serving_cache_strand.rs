@@ -176,7 +176,8 @@ fn strand() -> Stranded {
     //       any block at the tip.
     let (lh1, lb1) = v.node_mut().mine_block().expect("V mines L1");
     let l1 = lh1.header_hash();
-    v.announce_block(lh1, lb1.txs.clone(), lb1.coinbase, lb1.coinbase_rkm, 7);
+    let (coinbase, rkm) = lb1.single_payee_parts().expect("current-cap body");
+    v.announce_block(lh1, lb1.txs.clone(), coinbase, rkm, 7);
     assert!(v.node().has_stored_body(&l1), "V applied L1");
     assert_eq!(v.served_bodies().0, 1, "…and cached its body for serving (#135)");
 
@@ -319,7 +320,8 @@ fn the_same_strand_via_the_peer_accept_insert_site() {
     pump(&mut v, &mut s, &mut now, 20);
     let (lh1, lb1) = mine_on(s.node_mut());
     let l1 = lh1.header_hash();
-    s.announce_block(lh1, lb1.txs.clone(), lb1.coinbase, lb1.coinbase_rkm, 11);
+    let (coinbase, rkm) = lb1.single_payee_parts().expect("current-cap body");
+    s.announce_block(lh1, lb1.txs.clone(), coinbase, rkm, 11);
     pump(&mut v, &mut s, &mut now, 10);
     assert!(v.node().has_stored_body(&l1), "V accepted L1 live from a peer");
     assert_eq!(v.served_bodies().0, 1, "…and `complete_block` cached it — the other site");
@@ -418,7 +420,8 @@ fn the_serving_cache_still_serves() {
     // A mines and announces; the body enters A's cache at the own-block insert site.
     let (h, body) = a.node_mut().mine_block().expect("mine");
     let bh = h.header_hash();
-    a.announce_block(h, body.txs.clone(), body.coinbase, body.coinbase_rkm, 3);
+    let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+    a.announce_block(h, body.txs.clone(), coinbase, rkm, 3);
     assert!(a.served_bodies().0 >= 1, "the announced body is cached for serving");
     pump(&mut a, &mut b, &mut now, 20);
 

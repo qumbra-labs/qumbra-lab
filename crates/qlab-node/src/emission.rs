@@ -188,7 +188,7 @@ pub fn s_atomic(h: u64) -> u64 {
 }
 
 /// **The canonical block subsidy at height `h`, in bessel** — what a block at that
-/// height must commit as `body.coinbase` (#299), and what assembly must pay.
+/// height must commit as `body.coinbase_total()` (#299), and what assembly must pay.
 ///
 /// `h ≤ RULE_BOUNDARY_HEIGHT` ⇒ the historical `f64` difference (the last block
 /// under the old schedule is the boundary itself). `h > RULE_BOUNDARY_HEIGHT` ⇒

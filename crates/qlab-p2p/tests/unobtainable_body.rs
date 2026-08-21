@@ -215,7 +215,8 @@ fn i200_no_possessor_the_net_resumes_by_mining_on_the_state_tip() {
                 "round {round}: mined on the unobtainable header — the exemption \
                  must never extend a tip this node cannot verify"
             );
-            net[miner].announce_block(h, b.txs, b.coinbase, b.coinbase_rkm, 0);
+            let (coinbase, rkm) = b.single_payee_parts().expect("current-cap body");
+            net[miner].announce_block(h, b.txs, coinbase, rkm, 0);
             produced += 1;
             first_producer.get_or_insert(miner);
         }

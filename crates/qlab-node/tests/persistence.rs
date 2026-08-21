@@ -52,7 +52,7 @@ fn apply_one_tx_block(
     parent: &BlockHeader,
     tx: TxEntry,
 ) -> Result<(BlockHeader, Hash32), NodeError> {
-    let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+    let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
     let header = BlockHeader::child_of(parent, parent.height + 1, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &MockVerifier)?;
     Ok((header, hash))
@@ -451,11 +451,7 @@ fn apply_marked(
     anchor: Hash32,
     marker: u8,
 ) -> (BlockHeader, Hash32) {
-    let body = BlockBody {
-        txs: vec![tx(anchor, vec![[marker; 32]], vec![[marker.wrapping_add(0x40); 32]])],
-        coinbase: 0,
-        coinbase_rkm: [marker as u64; 4],
-    };
+    let body = BlockBody::from_single_payee(vec![tx(anchor, vec![[marker; 32]], vec![[marker.wrapping_add(0x40); 32]])], 0, [marker as u64; 4]);
     let header =
         BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &MockVerifier).expect("marked block applies");
@@ -1181,11 +1177,7 @@ fn measure_the_cost_of_a_rewind() {
             nf[..8].copy_from_slice(&i.to_le_bytes());
             let mut cm = [0xffu8; 32];
             cm[..8].copy_from_slice(&i.to_le_bytes());
-            let body = BlockBody {
-                txs: vec![tx(root, vec![nf], vec![cm])],
-                coinbase: 0,
-                coinbase_rkm: [i; 4],
-            };
+            let body = BlockBody::from_single_payee(vec![tx(root, vec![nf], vec![cm])], 0, [i; 4]);
             let header = BlockHeader::child_of(
                 &parent,
                 parent.timestamp + 75,

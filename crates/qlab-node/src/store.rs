@@ -179,11 +179,13 @@ pub struct StoredBlock {
 impl StoredBlock {
     /// Build the persisted form from a live devnet header + body.
     pub fn from_parts(header: &BlockHeader, body: &BlockBody) -> Self {
+        let (coinbase, coinbase_rkm) =
+            body.single_payee_parts().expect("accepted body is at the current cap");
         Self {
             header: header.into(),
             txs: body.txs.iter().map(StoredTx::from).collect(),
-            coinbase: body.coinbase,
-            coinbase_rkm: body.coinbase_rkm,
+            coinbase,
+            coinbase_rkm,
         }
     }
 
@@ -194,11 +196,7 @@ impl StoredBlock {
 
     /// The live devnet body this block round-trips to.
     pub fn body(&self) -> BlockBody {
-        BlockBody {
-            txs: self.txs.iter().map(TxEntry::from).collect(),
-            coinbase: self.coinbase,
-            coinbase_rkm: self.coinbase_rkm,
-        }
+        BlockBody::from_single_payee(self.txs.iter().map(TxEntry::from).collect(), self.coinbase, self.coinbase_rkm)
     }
 }
 
@@ -558,7 +556,7 @@ mod tests {
     use super::*;
 
     fn block(parent: &BlockHeader, marker: u64) -> StoredBlock {
-        let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [marker; 4] };
+        let body = BlockBody::from_single_payee(vec![], 0, [marker; 4]);
         let header = BlockHeader::child_of(
             parent,
             parent.timestamp + 75,
@@ -721,7 +719,7 @@ mod tests {
         use qlab_devnet::forms::GenesisForm;
 
         fn block_v5(parent: &BlockHeader, marker: u64) -> StoredBlock {
-            let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [marker; 4] };
+            let body = BlockBody::from_single_payee(vec![], 0, [marker; 4]);
             let header = BlockHeader::child_of_for(
                 GenesisForm::V5,
                 parent,

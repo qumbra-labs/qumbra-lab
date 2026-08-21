@@ -1,12 +1,12 @@
 //! Public supply attestation, grouped by committee epoch (issue #121).
 //!
 //! The value being attested is the block body's scheduled-emission counter:
-//! `Σ body.coinbase`. Fees are reported beside it but are not subtracted, because
+//! `Σ body.coinbase_total()`. Fees are reported beside it but are not subtracted, because
 //! they are transfers paid to the miner. *(Corrected, lab #367: fees WERE never
 //! burned; the name-service fee split now burns the name-fee half of a
 //! registering tx's declared fee — reported as its own `burned` column below,
 //! still never entering the issuance comparison.)* In the current
-//! body format `body.coinbase` already excludes fees; subtracting them would make
+//! body payee totals already exclude fees; subtracting them would make
 //! an honest fee-paying block look inflationary/deflationary.
 //!
 //! The expected side is integer throughout. [`crate::emission::coinbase`] is
@@ -147,7 +147,7 @@ pub struct SupplyEpoch {
     pub start_height: u64,
     /// Last canonical height covered, inclusive.
     pub end_height: u64,
-    /// `Σ body.coinbase` over the covered interval, in bessel.
+    /// `Σ body.coinbase_total()` over the covered interval, in bessel.
     pub measured_coinbase: u64,
     /// Closed-form scheduled issuance over the same interval, in bessel.
     pub expected_coinbase: u64,
@@ -288,7 +288,7 @@ pub struct SupplyLedger {
     /// test-locked with synthetic literals before activation supplies real ones.
     /// Consulted only on [`GenesisForm::V4`].
     pins: &'static [EpochPin],
-    /// `Σ body.coinbase` over the straddling epoch's pre-boundary prefix. Exactly
+    /// `Σ body.coinbase_total()` over the straddling epoch's pre-boundary prefix. Exactly
     /// one epoch can straddle [`RULE_BOUNDARY_HEIGHT`] (see the module docs), so one
     /// accumulator covers it. Consulted only on [`GenesisForm::V4`].
     straddle_prefix: u64,
@@ -501,7 +501,7 @@ fn pinned_expected(pins: &[EpochPin], row: &SupplyEpoch) -> Option<u64> {
 /// the wrong case, and **form-keyed** so the auditor agrees with consensus by
 /// construction (lab #520).
 ///
-/// `straddle_prefix` is `Σ body.coinbase` over the row's pre-boundary prefix and is
+/// `straddle_prefix` is `Σ body.coinbase_total()` over the row's pre-boundary prefix and is
 /// read **only** in the v4 straddling case.
 fn expected_for_row(
     form: GenesisForm,

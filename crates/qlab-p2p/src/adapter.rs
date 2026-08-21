@@ -3250,7 +3250,7 @@ mod tests {
         // #130 (a) state where a stale tree would answer the anchor rule wrongly.
         // The typed path refuses by name; the wire path Ignores (not a fault),
         // and both are the same gate.
-        let b = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] };
+        let b = BlockBody::from_single_payee(vec![], 0, [0; 4]);
         let h = mine_body_over_tip(&mut a, &b);
         assert_eq!(a.ingest_header(h), IngestOutcome::Accepted);
         assert!(a.state_lag().is_lagging());
@@ -3364,7 +3364,7 @@ mod tests {
         // (issue #77), so the bad body gets a header that honestly commits to it.
         // Before #77 this case paired a mined header with an unrelated body and
         // asserted "bad body" — a pairing no honest producer can emit.
-        let bad_body = BlockBody { txs: vec![tx_with(anchor, 9, b"bad")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let bad_body = BlockBody::from_single_payee(vec![tx_with(anchor, 9, b"bad")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let h2 = BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_body.commitment());
         assert_eq!(a.ingest_block(h2, bad_body), IngestOutcome::Rejected("bad body"));
@@ -3428,7 +3428,8 @@ mod tests {
         assert_eq!(joiner.chain().finalized_height(), Some(3));
 
         let mut wrong_body = blocks[0].1.clone();
-        wrong_body.coinbase = wrong_body.coinbase.saturating_add(1);
+        wrong_body.coinbase_payees[0].amount =
+            wrong_body.coinbase_payees[0].amount.saturating_add(1);
         assert_eq!(
             joiner.ingest_block(blocks[0].0, wrong_body),
             IngestOutcome::Rejected("body does not match header commitment"),
@@ -3695,7 +3696,11 @@ mod tests {
         assert!(loser.stored_body(&lh1.header_hash()).is_none(), "not APPLIED");
         assert!(loser.held_body(&lh1.header_hash()).is_some(), "but still HELD, and served (#198)");
         assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is applied");
-        assert_eq!(lb1.coinbase_rkm, [0xB2; 4], "the orphan really was the loser's own block");
+        assert_eq!(
+            lb1.coinbase_payees[0].rkm,
+            [0xB2; 4],
+            "the orphan really was the loser's own block"
+        );
 
         // (3) Converged, and it stays converged as the winner keeps extending.
         for _ in 0..6 {
@@ -3773,10 +3778,10 @@ mod tests {
         // ── moves: a two-block span whose second block re-spends the first's
         //    nullifier. Height 2 spends it; height 3 spends it again.
         let spend = tx_with(anchor, 1, b"ok");
-        let b2 = BlockBody { txs: vec![spend.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let b2 = BlockBody::from_single_payee(vec![spend.clone()], 0, [0; 4]);
         let h2 = mine_body_over_tip(&mut a, &b2);
         assert_eq!(a.ingest_header(h2), IngestOutcome::Accepted, "header-first sync");
-        let b3 = BlockBody { txs: vec![spend], coinbase: 0, coinbase_rkm: [0; 4] };
+        let b3 = BlockBody::from_single_payee(vec![spend], 0, [0; 4]);
         let h3 = mine_body_over_tip(&mut a, &b3);
         assert_eq!(h3.height, 3);
 
@@ -4419,11 +4424,7 @@ mod tests {
         );
 
         // (1) Intrinsic: the proof does not verify. Same verdict on every node.
-        let bad_proof = BlockBody {
-            txs: vec![tx_with(anchor, 9, b"bad")],
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
-        };
+        let bad_proof = BlockBody::from_single_payee(vec![tx_with(anchor, 9, b"bad")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let h1 =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_proof.commitment());
@@ -4433,11 +4434,7 @@ mod tests {
 
         // (2) Positional, judged from the position that owns the verdict: an anchor
         // that is simply not a finalized root of this chain.
-        let never_final = BlockBody {
-            txs: vec![tx_with([0xEE; 32], 10, b"ok")],
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
-        };
+        let never_final = BlockBody::from_single_payee(vec![tx_with([0xEE; 32], 10, b"ok")], 0, [0; 4]);
         let h2 = BlockHeader::child_of(
             &tip,
             tip.timestamp + 75,
@@ -4777,7 +4774,7 @@ mod tests {
 
         // The byte budget bites first when bodies carry proofs.
         let (mut b, anchor) = adapter_with_finalized_genesis();
-        let mut fat = BlockBody { txs: vec![tx_with(anchor, 1, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let mut fat = BlockBody::from_single_payee(vec![tx_with(anchor, 1, b"ok")], 0, [0; 4]);
         fat.txs[0].proof = vec![0u8; 2 * 1024 * 1024];
         for height in 1..24u64 {
             b.buffer_body(header_at(height), fat.clone());
@@ -5449,12 +5446,12 @@ mod tests {
     fn ingest_block_rejects_a_body_that_is_not_the_headers_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
         // An honest header over the tip, committing to a real one-tx body.
-        let honest_body = BlockBody { txs: vec![tx_with(anchor, 3, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest_body = BlockBody::from_single_payee(vec![tx_with(anchor, 3, b"ok")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let header =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
         // …handed a different, also-internally-valid body.
-        let swapped = BlockBody { txs: vec![tx_with(anchor, 4, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let swapped = BlockBody::from_single_payee(vec![tx_with(anchor, 4, b"ok")], 0, [0; 4]);
         assert_eq!(
             a.ingest_block(header, swapped),
             IngestOutcome::Rejected("body does not match header commitment")
@@ -5469,7 +5466,7 @@ mod tests {
     #[test]
     fn ingest_block_rejects_an_honest_header_with_an_empty_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
-        let honest_body = BlockBody { txs: vec![tx_with(anchor, 5, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest_body = BlockBody::from_single_payee(vec![tx_with(anchor, 5, b"ok")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let header =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
@@ -6713,7 +6710,7 @@ mod tests {
         use qlab_node::{ChainStore as _, MemChainStore, StoredBlock};
 
         let child = |parent: &BlockHeader, marker: u64| {
-            let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [marker; 4] };
+            let body = BlockBody::from_single_payee(vec![], 0, [marker; 4]);
             let header =
                 BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment());
             StoredBlock::from_parts(&header, &body)
@@ -6950,7 +6947,7 @@ mod tests {
 
         let (header, body) = miner.mine_block().expect("v5 mining succeeds");
         assert_eq!(
-            body.coinbase,
+            body.coinbase_total(),
             qlab_devnet::emission_exact::coinbase_exact(1),
             "a v5 template mints the exact schedule natively"
         );
@@ -6987,15 +6984,14 @@ mod tests {
         let mut requested_node = mk();
         let native = native_node.assemble_block().expect("native candidate");
         let requested = requested_node
-            .assemble_block_for_payees(&native.body.coinbase_payees())
+            .assemble_block_for_payees(&native.body.coinbase_payees)
             .expect("valid requested payee list")
             .expect("requested candidate");
         assert_eq!(requested.form, native.form);
         assert_eq!(requested.header, native.header);
         assert_eq!(requested.seed_hash, native.seed_hash);
         assert_eq!(requested.next_seed_hash, native.next_seed_hash);
-        assert_eq!(requested.body.coinbase, native.body.coinbase);
-        assert_eq!(requested.body.coinbase_rkm, native.body.coinbase_rkm);
+        assert_eq!(requested.body.coinbase_payees, native.body.coinbase_payees);
         assert_eq!(requested.body.txs.len(), native.body.txs.len());
         assert_eq!(requested.body.commitment_v5(), native.body.commitment_v5());
     }

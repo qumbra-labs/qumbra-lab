@@ -113,7 +113,7 @@ fn apply_and_finalize(node: &mut MemNode, txs: Vec<TxEntry>) -> u64 {
     let tip = node.tip_hash();
     let parent = node.chain().block(&tip).expect("tip stored").header();
     let height = parent.height + 1;
-    let body = BlockBody { txs, coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
+    let body = BlockBody::from_single_payee(txs, height, [height, 2, 3, 4]);
     let header = BlockHeader::child_of(&parent, height * 75, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &AcceptAll).expect("block applies");
     assert!(node.finalize(hash).expect("finalize").is_recorded(), "height {height} finalizes");
@@ -321,7 +321,8 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
         fee: posted_fee(ArityBucket::TwoByTwo),
     };
     let tx = TxEntry::new(b"proof-placeholder".to_vec(), public, &recipients, &payloads);
-    let body = BlockBody { txs: vec![tx.clone()], coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+    let body = BlockBody::from_single_payee(vec![tx.clone()], 1, [1, 2, 3, 4]);
+    let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
 
     let view = DiscoveryView {
         blocks: vec![qlab_node::BlockDiscovery {
@@ -330,8 +331,8 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             groups: vec![tx.discovery.clone()],
             nullifiers: vec![],
             riders: vec![tx.rider.clone()],
-            coinbase_rkm: body.coinbase_rkm,
-            coinbase: body.coinbase,
+            coinbase_rkm: rkm,
+            coinbase,
             fees: body.total_fees(),
             name_burn: body.total_name_burn(),
         }],
@@ -367,7 +368,9 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
     let last = tampered_tx.discovery.len() - 1;
     tampered_tx.discovery[last] ^= 0x01;
     let tampered_body =
-        BlockBody { txs: vec![tampered_tx.clone()], coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+        BlockBody::from_single_payee(vec![tampered_tx.clone()], 1, [1, 2, 3, 4]);
+    let (tampered_coinbase, tampered_rkm) =
+        tampered_body.single_payee_parts().expect("current-cap body");
     let tampered_view = DiscoveryView {
         blocks: vec![qlab_node::BlockDiscovery {
             height: 1,
@@ -375,8 +378,8 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             groups: vec![tampered_tx.discovery.clone()],
             nullifiers: vec![],
             riders: vec![tampered_tx.rider.clone()],
-            coinbase_rkm: tampered_body.coinbase_rkm,
-            coinbase: tampered_body.coinbase,
+            coinbase_rkm: tampered_rkm,
+            coinbase: tampered_coinbase,
             fees: tampered_body.total_fees(),
             name_burn: tampered_body.total_name_burn(),
         }],
@@ -426,7 +429,7 @@ fn a_payment_that_attaches_no_discovery_cannot_reach_the_serving_path() {
 
     let tip = node.tip_hash();
     let parent = node.chain().block(&tip).expect("tip stored").header();
-    let body = BlockBody { txs: vec![stripped], coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+    let body = BlockBody::from_single_payee(vec![stripped], 1, [1, 2, 3, 4]);
     let header = BlockHeader::child_of(&parent, 75, GENESIS_DIFFICULTY, body.commitment());
     let err = node.apply_block(header, body, &AcceptAll).expect_err("consensus must refuse it");
     let rendered = format!("{err:?}");

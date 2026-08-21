@@ -885,7 +885,7 @@ mod tests {
         // the tip advances.
         let mut n = node();
         let g = genesis();
-        let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![], 0, [0; 4]);
         let h1 = BlockHeader::child_of(&g, 75, 1000, body.commitment());
         assert_eq!(n.ingest_block(h1, body), IngestOutcome::Accepted);
         assert_eq!(n.tip_height(), 1);
@@ -897,10 +897,10 @@ mod tests {
     #[test]
     fn stubnode_ingest_block_rejects_a_body_the_header_did_not_commit_to() {
         let mut n = node();
-        let honest = BlockBody { txs: vec![], coinbase: 7, coinbase_rkm: [7; 4] };
+        let honest = BlockBody::from_single_payee(vec![], 7, [7; 4]);
         let h1 = BlockHeader::child_of(&genesis(), 75, 1000, honest.commitment());
         assert_eq!(
-            n.ingest_block(h1, BlockBody { txs: vec![], coinbase: 9, coinbase_rkm: [9; 4] }),
+            n.ingest_block(h1, BlockBody::from_single_payee(vec![], 9, [9; 4])),
             IngestOutcome::Rejected("body does not match header commitment")
         );
         assert_eq!(n.tip_height(), 0, "the header was not ingested either");

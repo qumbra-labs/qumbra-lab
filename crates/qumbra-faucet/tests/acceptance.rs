@@ -184,7 +184,7 @@ impl TestNode {
     /// Mine one block carrying `txs` and paying `rkm`, and finalize it.
     fn mine<V: TxVerifier>(&mut self, txs: Vec<TxEntry>, rkm: [u64; 4], verifier: &V) -> u64 {
         let height = self.tip.height + 1;
-        let body = BlockBody { txs, coinbase: coinbase(height), coinbase_rkm: rkm };
+        let body = BlockBody::from_single_payee(txs, coinbase(height), rkm);
         let header =
             BlockHeader::child_of(&self.tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
         let node = self.rpc.node_mut();

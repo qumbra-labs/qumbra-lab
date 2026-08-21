@@ -110,7 +110,7 @@ enum BodyPreimageForm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoinbasePayee {
     /// The payee's raw re-randomized key material (same meaning as
-    /// [`BlockBody::coinbase_rkm`]).
+    /// the pre-list body's flat payout-key field).
     pub rkm: [u64; 4],
     /// The amount this payee is paid, in bessel.
     pub amount: u64,
@@ -268,14 +268,53 @@ impl TxEntry {
 #[derive(Clone, Default)]
 pub struct BlockBody {
     pub txs: Vec<TxEntry>,
-    pub coinbase: u64,
-    /// The miner's raw `rkm` for this block's coinbase note (issue #101).
-    /// `[0; 4]` means "no payee" and is rejected for any block that mints
-    /// (`coinbase > 0`) — see [`BodyError::MissingCoinbasePayee`].
-    pub coinbase_rkm: [u64; 4],
+    /// The block's coinbase payouts. The current consensus cap remains one;
+    /// representing more than one payee is deliberately separate from making
+    /// such a body valid (lab #593 / QUM-161).
+    pub coinbase_payees: Vec<CoinbasePayee>,
 }
 
 impl BlockBody {
+    /// Construct a body from its list-shaped coinbase source of truth.
+    pub fn new(txs: Vec<TxEntry>, coinbase_payees: Vec<CoinbasePayee>) -> Self {
+        Self { txs, coinbase_payees }
+    }
+
+    /// Preserve the old flat pair's exact states while callers migrate to the
+    /// list representation: `(0, [0; 4])` is empty; every other pair is one
+    /// payee, including the invalid non-zero-amount/zero-key shape used to
+    /// exercise [`BodyError::MissingCoinbasePayee`].
+    pub fn from_single_payee(txs: Vec<TxEntry>, amount: u64, rkm: [u64; 4]) -> Self {
+        let coinbase_payees = if amount == 0 && rkm == [0; 4] {
+            Vec::new()
+        } else {
+            vec![CoinbasePayee { rkm, amount }]
+        };
+        Self::new(txs, coinbase_payees)
+    }
+
+    /// The total issuance declared by the payee list, saturated only for an
+    /// invalid list whose sum exceeds the old `u64` representation. Consensus
+    /// performs the authoritative sum in `u128` before accepting a body.
+    pub fn coinbase_total(&self) -> u64 {
+        self.coinbase_payees
+            .iter()
+            .map(|p| p.amount as u128)
+            .sum::<u128>()
+            .min(u64::MAX as u128) as u64
+    }
+
+    /// Project the current-cap list into the byte-identical legacy pair used
+    /// by the v2/v3 body preimage and unchanged single-payee wire surfaces.
+    /// `None` is the deliberately undefined N>1 form owned by the cap raise.
+    pub fn single_payee_parts(&self) -> Option<(u64, [u64; 4])> {
+        match self.coinbase_payees.as_slice() {
+            [] => Some((0, [0; 4])),
+            [payee] => Some((payee.amount, payee.rkm)),
+            _ => None,
+        }
+    }
+
     /// A deterministic Keccak-256 commitment to the body, for binding into the
     /// header's `tx_body_commitment`. Encodes each tx's public surface and proof
     /// bytes in order, then the coinbase counter, then the coinbase payout key.
@@ -397,8 +436,11 @@ impl BlockBody {
         }
         match form {
             BodyPreimageForm::V2 | BodyPreimageForm::V3 => {
-                buf.extend_from_slice(&self.coinbase.to_le_bytes());
-                for lane in &self.coinbase_rkm {
+                let (amount, rkm) = self
+                    .single_payee_parts()
+                    .expect("N>1 v2/v3 coinbase commitment belongs to the cap raise");
+                buf.extend_from_slice(&amount.to_le_bytes());
+                for lane in &rkm {
                     buf.extend_from_slice(&lane.to_le_bytes());
                 }
             }
@@ -406,13 +448,12 @@ impl BlockBody {
                 // The payee-list tail: count ‖ [rkm ‖ amount]×N. The total is
                 // Σ amounts and travels nowhere else — a redundant total that
                 // could disagree with its own list is unrepresentable.
-                let payees = self.coinbase_payees();
                 // A real check, not a debug_assert (#253 house rule): the bar
                 // is --release, and an encoder emitting an over-cap count
                 // would be committing a body no validator accepts.
-                assert!(payees.len() <= COINBASE_PAYEE_CAP_V5);
-                buf.push(payees.len() as u8);
-                for p in &payees {
+                assert!(self.coinbase_payees.len() <= COINBASE_PAYEE_CAP_V5);
+                buf.push(self.coinbase_payees.len() as u8);
+                for p in &self.coinbase_payees {
                     for lane in &p.rkm {
                         buf.extend_from_slice(&lane.to_le_bytes());
                     }
@@ -457,29 +498,12 @@ impl BlockBody {
         crate::names::burn_of_riders(self.txs.iter().map(|t| t.rider.as_slice()))
     }
 
-    /// Whether this body mints issuance without naming a payee — a block that
-    /// pays `coinbase > 0` to `rkm = [0; 4]`. See
-    /// [`BodyError::MissingCoinbasePayee`].
+    /// Whether this body names an unusable payee. The old flat `(0, [0; 4])`
+    /// state canonicalizes to an empty list, so a stored zero-key entry is
+    /// always non-canonical — rejecting it also prevents empty and one-zero
+    /// lists from being two accepted bodies with the same v2/v3 preimage.
     pub fn mints_without_payee(&self) -> bool {
-        self.coinbase > 0 && self.coinbase_rkm == [0u64; 4]
-    }
-
-    /// This body's coinbase as a **v5 payee list** (lab #470 stage 2). The
-    /// in-memory body stays single-payee (the birth cap is 1, and every v4
-    /// consumer keeps reading `coinbase`/`coinbase_rkm` unchanged — the
-    /// provable-equivalence requirement); this derivation is the one place the
-    /// list shape comes from, so the two representations cannot drift.
-    ///
-    /// Empty exactly when the body mints nothing and names nobody (genesis);
-    /// otherwise one entry paying the whole mint. A minting body with a zero
-    /// payee stays representable (and refused) via
-    /// [`BodyError::MissingCoinbasePayee`], same as v2/v3.
-    pub fn coinbase_payees(&self) -> Vec<CoinbasePayee> {
-        if self.coinbase == 0 && self.coinbase_rkm == [0u64; 4] {
-            Vec::new()
-        } else {
-            vec![CoinbasePayee { rkm: self.coinbase_rkm, amount: self.coinbase }]
-        }
+        self.coinbase_payees.iter().any(|p| p.rkm == [0u64; 4])
     }
 }
 
@@ -625,7 +649,7 @@ pub enum BodyError {
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
 ///
-/// `body.coinbase == coinbase_exact(height)` for every block above
+/// `body.coinbase_total() == coinbase_exact(height)` for every block above
 /// [`RULE_BOUNDARY_HEIGHT`]; at and below it, history is grandfathered as recorded
 /// and this returns `Ok` without evaluating the schedule at all.
 ///
@@ -908,6 +932,14 @@ where
     F: Fn(&Hash32) -> bool,
     N: names::NameView,
 {
+    // Representation is no longer the cap. The rule still is: this migration
+    // makes N>1 storable but does not make it valid or define v2/v3 bytes for it.
+    if body.coinbase_payees.len() > COINBASE_PAYEE_CAP_V5 {
+        return Err(BodyError::TooManyCoinbasePayees {
+            got: body.coinbase_payees.len(),
+            cap: COINBASE_PAYEE_CAP_V5,
+        });
+    }
     match &form {
         BodyRuleForm::V4 { name_boundary } => {
             check_body_binding_above(*name_boundary, header, body)?
@@ -924,10 +956,8 @@ where
     // get paid", this asks "is that the amount the schedule owes". The v5 arm is
     // the Σ form of the SAME comparison (lab #470 stage 2) — native, unboundaried.
     match &form {
-        BodyRuleForm::V4 { .. } => check_scheduled_coinbase(header.height, body.coinbase)?,
-        BodyRuleForm::V5 => {
-            check_scheduled_coinbase_payees(header.height, &body.coinbase_payees())?
-        }
+        BodyRuleForm::V4 { .. } => check_scheduled_coinbase(header.height, body.coinbase_total())?,
+        BodyRuleForm::V5 => check_scheduled_coinbase_payees(header.height, &body.coinbase_payees)?,
     }
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
     // Names revealed earlier in this block — the same-block tie rule: earliest
@@ -1166,13 +1196,13 @@ mod tests {
 
     #[test]
     fn valid_body_passes_and_commitment_is_deterministic() {
-        let body = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42, coinbase_rkm: MINER_RKM };
+        let body = BlockBody::from_single_payee(vec![good_tx(1), good_tx(2)], 42, MINER_RKM);
         let header = header_for(&body);
         assert_eq!(validate_body(&header, &body, &MockVerifier, is_final), Ok(()));
         assert_eq!(body.commitment(), body.commitment());
         assert_eq!(body.total_fees(), 2 * posted_fee(ArityBucket::TwoByTwo));
         // A different body ⇒ different commitment.
-        let other = BlockBody { txs: vec![good_tx(1)], coinbase: 42, coinbase_rkm: MINER_RKM };
+        let other = BlockBody::from_single_payee(vec![good_tx(1)], 42, MINER_RKM);
         assert_ne!(body.commitment(), other.commitment());
     }
 
@@ -1180,7 +1210,7 @@ mod tests {
     fn non_finalized_anchor_is_rejected() {
         let mut tx = good_tx(1);
         tx.public.anchor = [0xEE; 32]; // not the finalized root
-        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::AnchorNotFinal { index: 0 })
@@ -1191,7 +1221,7 @@ mod tests {
     fn wrong_fee_is_rejected() {
         let mut tx = good_tx(1);
         tx.public.fee += 1;
-        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::WrongFee {
@@ -1208,7 +1238,7 @@ mod tests {
         let a = good_tx(7);
         let mut b = good_tx(9);
         b.public.nullifiers = a.public.nullifiers.clone();
-        let body = BlockBody { txs: vec![a, b], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![a, b], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DoubleSpendInBlock { index: 1 })
@@ -1219,7 +1249,7 @@ mod tests {
     fn invalid_proof_is_rejected() {
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec();
-        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::ProofInvalid { index: 0 })
@@ -1232,9 +1262,9 @@ mod tests {
     /// invariant itself, at the validation seam.
     #[test]
     fn body_not_matching_the_header_commitment_is_rejected() {
-        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42, coinbase_rkm: MINER_RKM };
+        let honest = BlockBody::from_single_payee(vec![good_tx(1), good_tx(2)], 42, MINER_RKM);
         let header = header_for(&honest); // commits to `honest`…
-        let swapped = BlockBody { txs: vec![good_tx(3)], coinbase: 42, coinbase_rkm: MINER_RKM }; // …but we hand it this
+        let swapped = BlockBody::from_single_payee(vec![good_tx(3)], 42, MINER_RKM); // …but we hand it this
         assert_eq!(
             validate_body(&header, &swapped, &MockVerifier, is_final),
             Err(BodyError::CommitmentMismatch {
@@ -1250,7 +1280,7 @@ mod tests {
     /// so the binding check is the *only* thing that rejects it.
     #[test]
     fn empty_body_under_an_honest_header_is_rejected() {
-        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42, coinbase_rkm: MINER_RKM };
+        let honest = BlockBody::from_single_payee(vec![good_tx(1), good_tx(2)], 42, MINER_RKM);
         let header = header_for(&honest);
         let empty = BlockBody::default();
         // Everything except the binding is happy with the empty body:
@@ -1273,7 +1303,7 @@ mod tests {
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec(); // would be ProofInvalid…
         tx.public.anchor = [0xEE; 32]; // …and AnchorNotFinal
-        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
         let foreign = header_for(&BlockBody::default());
         assert_eq!(
             validate_body(&foreign, &body, &MockVerifier, is_final),
@@ -1292,17 +1322,17 @@ mod tests {
     /// burns the block's whole issuance with nothing to detect it.
     #[test]
     fn a_minting_block_with_no_payee_is_rejected() {
-        let body = BlockBody { txs: vec![good_tx(1)], coinbase: 5_000, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![good_tx(1)], 5_000, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::MissingCoinbasePayee)
         );
         // Naming a payee is the only difference, and it passes.
-        let paid = BlockBody { coinbase_rkm: MINER_RKM, ..body.clone() };
+        let paid = BlockBody::from_single_payee(body.txs.clone(), body.coinbase_total(), MINER_RKM);
         assert_eq!(validate_body(&header_for(&paid), &paid, &MockVerifier, is_final), Ok(()));
         // A non-minting block needs no payee — this is what exempts genesis,
         // which carries `coinbase == 0`.
-        let no_mint = BlockBody { coinbase: 0, ..body };
+        let no_mint = BlockBody::from_single_payee(body.txs, 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&no_mint), &no_mint, &MockVerifier, is_final),
             Ok(())
@@ -1320,11 +1350,7 @@ mod tests {
         let b = RULE_BOUNDARY_HEIGHT;
         for delta in [1i64, -1, 1_000_000] {
             let value = (coinbase_exact(b + 1) as i64 + delta) as u64;
-            let body = BlockBody {
-                txs: vec![good_tx(1)],
-                coinbase: value,
-                coinbase_rkm: MINER_RKM,
-            };
+            let body = BlockBody::from_single_payee(vec![good_tx(1)], value, MINER_RKM);
             // Above: refused, by name, with both numbers in the error.
             assert_eq!(
                 validate_body(&header_at(b + 1, &body), &body, &MockVerifier, is_final),
@@ -1352,11 +1378,7 @@ mod tests {
     fn an_honest_post_boundary_block_passes_the_schedule_rule() {
         let b = RULE_BOUNDARY_HEIGHT;
         for height in [b + 1, b + 2, b + 1_000, b + 500_000] {
-            let body = BlockBody {
-                txs: vec![good_tx(1)],
-                coinbase: coinbase_exact(height),
-                coinbase_rkm: MINER_RKM,
-            };
+            let body = BlockBody::from_single_payee(vec![good_tx(1)], coinbase_exact(height), MINER_RKM);
             assert_eq!(
                 validate_body(&header_at(height, &body), &body, &MockVerifier, is_final),
                 Ok(()),
@@ -1377,11 +1399,7 @@ mod tests {
         let height = b + 1;
         let wrong = coinbase_exact(height + 1); // what block 1377 did, one height up
         assert_ne!(wrong, coinbase_exact(height), "the schedule must actually decay");
-        let body = BlockBody {
-            txs: Vec::new(),
-            coinbase: wrong,
-            coinbase_rkm: MINER_RKM,
-        };
+        let body = BlockBody::from_single_payee(Vec::new(), wrong, MINER_RKM);
         assert_eq!(
             validate_body(&header_at(height, &body), &body, &MockVerifier, is_final),
             Err(BodyError::WrongScheduledCoinbase {
@@ -1406,7 +1424,7 @@ mod tests {
     /// a re-stamp of the constant.
     #[test]
     fn the_rule_never_evaluates_the_schedule_against_genesis() {
-        let genesis_body = BlockBody { txs: Vec::new(), coinbase: 0, coinbase_rkm: [0; 4] };
+        let genesis_body = BlockBody::from_single_payee(Vec::new(), 0, [0; 4]);
         assert_ne!(coinbase_exact(0), 0, "coinbase(0) is 5e9; genesis commits 0");
         assert_eq!(
             validate_body(&header_at(0, &genesis_body), &genesis_body, &MockVerifier, is_final),
@@ -1426,36 +1444,34 @@ mod tests {
     #[test]
     fn the_binding_still_wins_over_the_schedule_rule() {
         let b = RULE_BOUNDARY_HEIGHT;
-        let honest = BlockBody {
-            txs: vec![good_tx(1)],
-            coinbase: coinbase_exact(b + 1),
-            coinbase_rkm: MINER_RKM,
-        };
+        let honest = BlockBody::from_single_payee(vec![good_tx(1)], coinbase_exact(b + 1), MINER_RKM);
         let header = header_at(b + 1, &honest);
         // A foreign body with BOTH defects: wrong commitment and wrong schedule.
-        let foreign = BlockBody { coinbase: 1, ..honest.clone() };
+        let foreign = BlockBody::from_single_payee(honest.txs.clone(), 1, MINER_RKM);
         assert!(matches!(
             validate_body(&header, &foreign, &MockVerifier, is_final),
             Err(BodyError::CommitmentMismatch { .. }),
         ));
         // And a minting body with no payee is still MissingCoinbasePayee, not a
         // schedule error, even above the boundary.
-        let unpaid = BlockBody { coinbase_rkm: [0; 4], ..honest.clone() };
+        let unpaid =
+            BlockBody::from_single_payee(honest.txs.clone(), honest.coinbase_total(), [0; 4]);
         assert_eq!(
             validate_body(&header_at(b + 1, &unpaid), &unpaid, &MockVerifier, is_final),
             Err(BodyError::MissingCoinbasePayee)
         );
     }
 
-    /// The payout key is *inside* the header binding: swapping only `coinbase_rkm`
+    /// The payout key is *inside* the header binding: swapping only the payee's `rkm`
     /// under an otherwise honest header is caught. Without this the field would be
     /// unauthenticated and any relay could redirect a block's issuance.
     #[test]
     fn redirecting_the_payout_key_breaks_the_header_binding() {
         let honest =
-            BlockBody { txs: vec![good_tx(1)], coinbase: 5_000, coinbase_rkm: MINER_RKM };
+            BlockBody::from_single_payee(vec![good_tx(1)], 5_000, MINER_RKM);
         let header = header_for(&honest);
-        let stolen = BlockBody { coinbase_rkm: [0xBAD; 4], ..honest.clone() };
+        let stolen =
+            BlockBody::from_single_payee(honest.txs.clone(), honest.coinbase_total(), [0xBAD; 4]);
         assert_ne!(honest.commitment(), stolen.commitment(), "rkm must enter the preimage");
         assert_eq!(
             validate_body(&header, &stolen, &MockVerifier, is_final),
@@ -1468,8 +1484,8 @@ mod tests {
 
     /// A fixed body with every field pinned — the input to the golden vector.
     fn golden_body() -> BlockBody {
-        BlockBody {
-            txs: vec![TxEntry {
+        BlockBody::from_single_payee(
+            vec![TxEntry {
                 proof: vec![0xAB, 0xCD, 0xEF],
                 public: TxPublic {
                     anchor: [0x11; 32],
@@ -1481,14 +1497,14 @@ mod tests {
                 discovery: two_recipient_discovery(&[[0x44; 32], [0x55; 32]]),
                 rider: TxEntry::absent_rider(),
             }],
-            coinbase: 0x1234_5678_9ABC_DEF0,
-            coinbase_rkm: [
+            0x1234_5678_9ABC_DEF0,
+            [
                 0x0011_2233_4455_6677,
                 0x8899_AABB_CCDD_EEFF,
                 0x0F0E_0D0C_0B0A_0908,
                 0x0706_0504_0302_0100,
             ],
-        }
+        )
     }
 
     /// 🔴 **The golden vector for `BlockBody::commitment()`** — the thing that did
@@ -1541,6 +1557,27 @@ mod tests {
         assert_eq!(
             hex, "8ef00f318e7a4517107dfd538ed80b7d7ecf7caa71573085e8d5bdcfb5ad6cdc",
             "block-body commitment preimage changed — see this test's doc comment"
+        );
+    }
+
+    /// QUM-161's live-chain lock: replacing the flat pair with a one-element
+    /// payee list must leave the existing golden commitment byte-identical.
+    #[test]
+    fn payee_list_migration_keeps_golden_body_commitment_bytes_byte_identical() {
+        let legacy_shape = golden_body();
+        let (amount, rkm) = legacy_shape.single_payee_parts().expect("golden is current-cap");
+        let listed = BlockBody::new(
+            legacy_shape.txs.clone(),
+            vec![CoinbasePayee { rkm, amount }],
+        );
+        assert_eq!(
+            listed.commitment(),
+            legacy_shape.commitment(),
+            "direct list storage must reproduce the old flat pair's commitment",
+        );
+        assert_eq!(
+            hex_of(&listed.commitment()),
+            "8ef00f318e7a4517107dfd538ed80b7d7ecf7caa71573085e8d5bdcfb5ad6cdc",
         );
     }
 
@@ -1659,7 +1696,7 @@ mod tests {
         // exact scheduled amount to a named payee — the fixture pays both
         // rules, which is precisely what a real above-boundary block does.
         let body_of =
-            |txs: Vec<TxEntry>| BlockBody { txs, coinbase: coinbase_exact(h), coinbase_rkm: MINER_RKM };
+            |txs: Vec<TxEntry>| BlockBody::from_single_payee(txs, coinbase_exact(h), MINER_RKM);
         let at = |height: u64, body: &BlockBody| BlockHeader {
             height,
             ..BlockHeader::child_of(
@@ -1697,11 +1734,7 @@ mod tests {
             commits: [(names::commit_hash(&record, &salt), ha - 100)].into(),
             names: HashMap::new(),
         };
-        let armed_body = BlockBody {
-            txs: vec![tx.clone()],
-            coinbase: coinbase_exact(ha),
-            coinbase_rkm: MINER_RKM,
-        };
+        let armed_body = BlockBody::from_single_payee(vec![tx.clone()], coinbase_exact(ha), MINER_RKM);
         let armed_header = BlockHeader {
             height: ha,
             ..BlockHeader::child_of(
@@ -1819,11 +1852,7 @@ mod tests {
                 posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
             tx
         };
-        let body_of = |txs: Vec<TxEntry>| BlockBody {
-            txs,
-            coinbase: coinbase_exact(h),
-            coinbase_rkm: MINER_RKM,
-        };
+        let body_of = |txs: Vec<TxEntry>| BlockBody::from_single_payee(txs, coinbase_exact(h), MINER_RKM);
         let at = |body: &BlockBody| BlockHeader {
             height: h,
             ..BlockHeader::child_of(
@@ -1932,7 +1961,7 @@ mod tests {
         let mut tx = good_tx(1);
         tx.public.commitments = cms.clone();
         tx.discovery = honest.clone();
-        let body = BlockBody { txs: vec![tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx.clone()], 0, [0; 4]);
         let header = header_for(&body);
         assert_eq!(validate_body(&header, &body, &MockVerifier, is_final), Ok(()));
 
@@ -1957,7 +1986,7 @@ mod tests {
         // (b) And the header binding DOES, because the payloads are in the
         //     preimage now. Same header, moved body.
         let bad_body =
-            BlockBody { txs: vec![bad_tx], coinbase: 0, coinbase_rkm: [0; 4] };
+            BlockBody::from_single_payee(vec![bad_tx], 0, [0; 4]);
         assert_ne!(
             bad_body.commitment(),
             body.commitment(),
@@ -2042,11 +2071,11 @@ mod tests {
         assert_eq!(contents_commitments(&back), cms, "D4 order, recipient-major");
 
         // 2. deterministic, and sensitive to the discovery region alone.
-        let body = BlockBody { txs: vec![tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx.clone()], 0, [0; 4]);
         assert_eq!(body.commitment(), body.commitment());
         let mut swapped = tx.clone();
         swapped.discovery = two_recipient_discovery(&[cms[1], cms[0]]);
-        let reordered = BlockBody { txs: vec![swapped], coinbase: 0, coinbase_rkm: [0; 4] };
+        let reordered = BlockBody::from_single_payee(vec![swapped], 0, [0; 4]);
         assert_ne!(
             body.commitment(),
             reordered.commitment(),
@@ -2061,8 +2090,9 @@ mod tests {
         assert_eq!(empty.commitment(), BlockBody::default().commitment());
         let v1_empty = {
             let mut buf = Vec::new();
-            buf.extend_from_slice(&empty.coinbase.to_le_bytes());
-            for lane in &empty.coinbase_rkm {
+            let (amount, rkm) = empty.single_payee_parts().expect("empty is current-cap");
+            buf.extend_from_slice(&amount.to_le_bytes());
+            for lane in &rkm {
                 buf.extend_from_slice(&lane.to_le_bytes());
             }
             keccak256(&buf)
@@ -2099,7 +2129,7 @@ mod tests {
         let mut tx = good_tx(1);
         tx.public.commitments = cms.clone();
         tx.discovery = honest.clone();
-        let body = BlockBody { txs: vec![tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx.clone()], 0, [0; 4]);
         assert_eq!(validate_body(&header_for(&body), &body, &MockVerifier, is_final), Ok(()));
 
         // (a) A padded varint spliced at the region's first byte. `0x82 0x00` is
@@ -2190,7 +2220,7 @@ mod tests {
         // Wrong commitment, right shape — parses, does not bind.
         let mut wrong = tx.clone();
         wrong.discovery = two_recipient_discovery(&[cms[0], [0xEE; 32]]);
-        let body = BlockBody { txs: vec![wrong], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![wrong], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DiscoveryDoesNotBind {
@@ -2204,7 +2234,7 @@ mod tests {
         // Right commitments, wrong ORDER — D4 fixes the order for exactly this.
         let mut reordered = tx.clone();
         reordered.discovery = two_recipient_discovery(&[cms[1], cms[0]]);
-        let body = BlockBody { txs: vec![reordered], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![reordered], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DiscoveryDoesNotBind {
@@ -2219,7 +2249,7 @@ mod tests {
         // invalid, and it is the n = 0 case of the same rule, not a branch.
         let mut omitted = tx.clone();
         omitted.discovery = TxEntry::empty_discovery();
-        let body = BlockBody { txs: vec![omitted], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![omitted], 0, [0; 4]);
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DiscoveryDoesNotBind {
@@ -2233,7 +2263,7 @@ mod tests {
         // …and *cannot parse* is a different answer, not the same one.
         let mut garbage = tx.clone();
         garbage.discovery = vec![0x01, 0xFF, 0xFF];
-        let body = BlockBody { txs: vec![garbage], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![garbage], 0, [0; 4]);
         assert!(matches!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DiscoveryMalformed { index: 0, err: CodecError::Truncated { .. } })
@@ -2243,7 +2273,7 @@ mod tests {
         // must not be mistaken for the honest n = 0 encoding.
         let mut nothing = tx.clone();
         nothing.discovery = Vec::new();
-        let body = BlockBody { txs: vec![nothing], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![nothing], 0, [0; 4]);
         assert!(matches!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DiscoveryMalformed { index: 0, .. })
@@ -2255,7 +2285,7 @@ mod tests {
     /// the coinbase note.
     #[test]
     fn the_coinbase_needs_no_discovery() {
-        let body = BlockBody { txs: vec![], coinbase: 5_000, coinbase_rkm: MINER_RKM };
+        let body = BlockBody::from_single_payee(vec![], 5_000, MINER_RKM);
         assert_eq!(validate_body(&header_for(&body), &body, &MockVerifier, is_final), Ok(()));
     }
 
@@ -2266,7 +2296,7 @@ mod tests {
     #[test]
     fn consensus_does_not_judge_the_ciphertext() {
         let tx = good_tx(1); // placeholder_discovery: ct = [0; 1088], tag = [0; 8]
-        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
         assert_eq!(validate_body(&header_for(&body), &body, &MockVerifier, is_final), Ok(()));
     }
 
@@ -2336,7 +2366,7 @@ mod tests {
     #[test]
     fn a_genesis_header_with_a_foreign_body_is_rejected() {
         let g = BlockHeader::genesis(1_000, 0);
-        let foreign = BlockBody { txs: Vec::new(), coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+        let foreign = BlockBody::from_single_payee(Vec::new(), 1, [1, 2, 3, 4]);
         assert!(matches!(
             check_body_binding(&g, &foreign),
             Err(BodyError::CommitmentMismatch { .. })
@@ -2366,8 +2396,8 @@ mod tests {
         b.public.nullifiers = vec![[0x71; 32], [0x72; 32]];
         b.public.commitments = vec![[0x73; 32]];
 
-        let body_a = BlockBody { txs: vec![a], coinbase: 0, coinbase_rkm: [0; 4] };
-        let body_b = BlockBody { txs: vec![b], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body_a = BlockBody::from_single_payee(vec![a], 0, [0; 4]);
+        let body_b = BlockBody::from_single_payee(vec![b], 0, [0; 4]);
         assert_eq!(
             body_a.commitment(),
             body_b.commitment(),
@@ -2405,10 +2435,11 @@ mod tests {
         expect.extend_from_slice(&(tx.rider.len() as u64).to_le_bytes());
         expect.extend_from_slice(&tx.rider);
         expect.push(1); // one payee
-        for lane in &body.coinbase_rkm {
+        let (amount, rkm) = body.single_payee_parts().expect("golden is current-cap");
+        for lane in &rkm {
             expect.extend_from_slice(&lane.to_le_bytes());
         }
-        expect.extend_from_slice(&body.coinbase.to_le_bytes());
+        expect.extend_from_slice(&amount.to_le_bytes());
         assert_eq!(body.commitment_v5(), keccak256(&expect));
     }
 
@@ -2433,11 +2464,11 @@ mod tests {
     #[test]
     fn v5_funnel_enforces_exact_emission_where_v4_grandfathers() {
         let h = 100u64;
-        let body = BlockBody {
-            txs: vec![],
-            coinbase: coinbase_exact(h) - 4_114, // the 1377-scar shape, replayed on v5
-            coinbase_rkm: MINER_RKM,
-        };
+        let body = BlockBody::from_single_payee(
+            vec![],
+            coinbase_exact(h) - 4_114, // the 1377-scar shape, replayed on v5
+            MINER_RKM,
+        );
         let hdr_v4 = BlockHeader {
             height: h,
             ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, body.commitment_at(h))
@@ -2467,11 +2498,7 @@ mod tests {
         let commit = NameOp::Commit { commit: [0x5A; 32] };
         let mut tx = good_tx(0x60).with_name_op(&commit);
         tx.public.fee = posted_fee(ArityBucket::TwoByTwo) + names::name_fee_for(&commit);
-        let body = BlockBody {
-            txs: vec![tx],
-            coinbase: coinbase_exact(h),
-            coinbase_rkm: MINER_RKM,
-        };
+        let body = BlockBody::from_single_payee(vec![tx], coinbase_exact(h), MINER_RKM);
         let at = |c: Hash32| BlockHeader {
             height: h,
             ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, c)
@@ -2505,7 +2532,7 @@ mod tests {
     fn v5_funnel_refuses_a_v2_bound_header() {
         let h = 5u64;
         let body =
-            BlockBody { txs: vec![], coinbase: coinbase_exact(h), coinbase_rkm: MINER_RKM };
+            BlockBody::from_single_payee(vec![], coinbase_exact(h), MINER_RKM);
         let hdr_v2_bound = BlockHeader {
             height: h,
             ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, body.commitment())
@@ -2516,5 +2543,35 @@ mod tests {
         ));
     }
 
+    /// QUM-161 changes representation only: an N=2 body can now exist in
+    /// memory, but the unchanged current cap refuses it before any undefined
+    /// v2/v3 commitment form is consulted.
+    #[test]
+    fn list_representation_does_not_raise_the_current_coinbase_payee_cap() {
+        let body = BlockBody::new(
+            vec![],
+            vec![
+                CoinbasePayee { rkm: [1; 4], amount: 1 },
+                CoinbasePayee { rkm: [2; 4], amount: 2 },
+            ],
+        );
+        assert_eq!(
+            body.coinbase_payees.len(),
+            2,
+            "representation holds both payees"
+        );
+        assert_eq!(
+            validate_body_v5(
+                &BlockHeader::genesis(1, 0),
+                &body,
+                &MockVerifier,
+                is_final,
+                &names::EmptyNameView,
+            ),
+            Err(BodyError::TooManyCoinbasePayees {
+                got: 2,
+                cap: COINBASE_PAYEE_CAP_V5,
+            }),
+        );
+    }
 }
-

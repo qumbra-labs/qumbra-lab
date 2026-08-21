@@ -2004,11 +2004,7 @@ mod tests {
         let mut parent = g_header;
         for height in 1..=24u64 {
             let body = if height % 6 == 1 {
-                BlockBody {
-                    txs: vec![tx(node.commitment_root(), height as u8)],
-                    coinbase: 0,
-                    coinbase_rkm: [0; 4],
-                }
+                BlockBody::from_single_payee(vec![tx(node.commitment_root(), height as u8)], 0, [0; 4])
             } else {
                 BlockBody::default()
             };
@@ -2056,9 +2052,9 @@ mod tests {
     #[test]
     fn apply_block_rejects_a_body_the_header_did_not_commit_to() {
         let (mut node, g, root) = node_with_finalized_genesis();
-        let honest = BlockBody { txs: vec![tx(root, 1)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest = BlockBody::from_single_payee(vec![tx(root, 1)], 0, [0; 4]);
         let header = child_committing_to(&g, &honest);
-        let swapped = BlockBody { txs: vec![tx(root, 2)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let swapped = BlockBody::from_single_payee(vec![tx(root, 2)], 0, [0; 4]);
         let err = node.apply_block(header, swapped.clone(), &MockVerifier).unwrap_err();
         assert!(
             matches!(
@@ -2076,7 +2072,7 @@ mod tests {
     #[test]
     fn apply_block_rejects_an_honest_header_with_an_empty_body() {
         let (mut node, g, root) = node_with_finalized_genesis();
-        let honest = BlockBody { txs: vec![tx(root, 3)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest = BlockBody::from_single_payee(vec![tx(root, 3)], 0, [0; 4]);
         let header = child_committing_to(&g, &honest);
         let err = node.apply_block(header, BlockBody::default(), &MockVerifier).unwrap_err();
         assert!(
@@ -2097,7 +2093,7 @@ mod tests {
         let g_header = genesis.header();
 
         // A block whose header honestly commits to `honest`…
-        let honest = BlockBody { txs: vec![tx([9u8; 32], 4)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest = BlockBody::from_single_payee(vec![tx([9u8; 32], 4)], 0, [0; 4]);
         let header = child_committing_to(&g_header, &honest);
         // …but whose persisted body is not that body.
         let tampered = StoredBlock {
@@ -2157,7 +2153,7 @@ mod tests {
         let root = node.commitment_root();
 
         // One honest block, then a snapshot covering it.
-        let body = BlockBody { txs: vec![tx(root, 5)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx(root, 5)], 0, [0; 4]);
         let header = child_committing_to(&g_header, &body);
         node.apply_block(header, body, &MockVerifier).unwrap();
         node.save_snapshot().unwrap();
@@ -2166,7 +2162,7 @@ mod tests {
 
         // Append a tampered record at the same height: `open` restores the
         // snapshot (applied_height = 1) and takes the fast path for it.
-        let honest2 = BlockBody { txs: vec![tx(root, 6)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest2 = BlockBody::from_single_payee(vec![tx(root, 6)], 0, [0; 4]);
         let h2 = child_committing_to(&g_header, &honest2);
         let tampered =
             StoredBlock {
@@ -2203,7 +2199,7 @@ mod tests {
         node.finalize(g_header.header_hash()).unwrap();
         let root = node.commitment_root();
 
-        let body = BlockBody { txs: vec![tx(root, 7)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx(root, 7)], 0, [0; 4]);
         let h1 = child_committing_to(&g_header, &body);
         node.apply_block(h1, body, &MockVerifier).unwrap();
         node.save_snapshot().unwrap();
@@ -2212,7 +2208,7 @@ mod tests {
 
         // A record at height 2 — strictly above the snapshot, so the beyond loop
         // takes it — whose stored body is not the body its header commits to.
-        let honest2 = BlockBody { txs: vec![tx(root, 8)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest2 = BlockBody::from_single_payee(vec![tx(root, 8)], 0, [0; 4]);
         let h2 = child_committing_to(&h1, &honest2);
         let tampered = StoredBlock {
             header: StoredHeader::from(&h2),
@@ -2297,9 +2293,9 @@ mod tests {
         /// refuse it.
         fn empty_body_at(height: u64) -> BlockBody {
             if height > RULE_BOUNDARY_HEIGHT {
-                BlockBody { txs: vec![], coinbase: coinbase_exact(height), coinbase_rkm: DRILL_RKM }
+                BlockBody::from_single_payee(vec![], coinbase_exact(height), DRILL_RKM)
             } else {
-                BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] }
+                BlockBody::from_single_payee(vec![], 0, [0; 4])
             }
         }
         /// The header an ARMED producer emits: committed at its own height.
@@ -2431,7 +2427,7 @@ mod tests {
         // Three records: P and Q are siblings at height 1 (so Q's arrival is a
         // rewind to genesis that drops P), then R at height 2 claims P as parent.
         let mk = |parent: &BlockHeader, nf: u8| {
-            let body = BlockBody { txs: vec![tx([9u8; 32], nf)], coinbase: 0, coinbase_rkm: [0; 4] };
+            let body = BlockBody::from_single_payee(vec![tx([9u8; 32], nf)], 0, [0; 4]);
             let header = child_committing_to(parent, &body);
             let stored = StoredBlock {
                 header: StoredHeader::from(&header),
@@ -2598,7 +2594,7 @@ mod tests {
         node.finalize(g_header.header_hash()).unwrap();
         let root = node.commitment_root();
 
-        let body = BlockBody { txs: vec![tx(root, 21)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(vec![tx(root, 21)], 0, [0; 4]);
         let header = child_committing_to(&g_header, &body);
         node.apply_block(header, body, &MockVerifier).expect("child applies over genesis");
         assert_eq!(node.tip_height(), 1);
@@ -2619,7 +2615,7 @@ mod tests {
 
         // The variant #130 was filed against — produced for real, by handing
         // `apply_block` a block whose parent is not the tip.
-        let body = BlockBody { txs: Vec::new(), coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(Vec::new(), 0, [0; 4]);
         let orphan = BlockHeader {
             prev: [0x9c; 32],
             ..BlockHeader::child_of(&g, g.timestamp + 150, GENESIS_DIFFICULTY, body.commitment())
@@ -2629,9 +2625,9 @@ mod tests {
         assert_eq!(err.refusal_reason(), "not_extending_tip");
 
         // A body failure, likewise produced rather than constructed.
-        let honest = BlockBody { txs: vec![tx(root, 1)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest = BlockBody::from_single_payee(vec![tx(root, 1)], 0, [0; 4]);
         let header = child_committing_to(&g, &honest);
-        let swapped = BlockBody { txs: vec![tx(root, 2)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let swapped = BlockBody::from_single_payee(vec![tx(root, 2)], 0, [0; 4]);
         let err = node.apply_block(header, swapped, &MockVerifier).unwrap_err();
         assert_eq!(err.refusal_reason(), "bad_body");
 
@@ -2688,11 +2684,7 @@ mod tests {
             // (this test's first draft paid coinbase=100 and was refused with
             // WrongScheduledCoinbase{expected: 4_999_995_882} — the stage-3
             // contrast rule biting on the very first v5 block, as designed).
-            let body = BlockBody {
-                txs: vec![],
-                coinbase: qlab_devnet::emission_exact::coinbase_exact(1),
-                coinbase_rkm: [1, 2, 3, 4],
-            };
+            let body = BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(1), [1, 2, 3, 4]);
             let header = BlockHeader::child_of_for(
                 GenesisForm::V5,
                 &parent,
@@ -2719,11 +2711,7 @@ mod tests {
         let genesis5 = genesis_block_for(GenesisForm::V5, 8, 0);
         {
             let mut node = MemNode::open_for(GenesisForm::V5, &dir, genesis5.clone()).unwrap();
-            let body = BlockBody {
-                txs: vec![],
-                coinbase: qlab_devnet::emission_exact::coinbase_exact(1),
-                coinbase_rkm: [1, 2, 3, 4],
-            };
+            let body = BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(1), [1, 2, 3, 4]);
             let header = BlockHeader::child_of_for(
                 GenesisForm::V5,
                 &genesis5.header(),
@@ -2747,7 +2735,7 @@ mod tests {
     #[should_panic(expected = "only legal on a fresh node")]
     fn rekey_genesis_refuses_a_node_with_applied_state() {
         let mut node = MemNode::in_memory(genesis_block(8, 0));
-        let body = BlockBody { txs: vec![], coinbase: 100, coinbase_rkm: [1, 2, 3, 4] };
+        let body = BlockBody::from_single_payee(vec![], 100, [1, 2, 3, 4]);
         let header =
             BlockHeader::child_of(&genesis_block(8, 0).header(), 75, 8, body.commitment_at(1));
         node.apply_block(header, body, &MockVerifier).unwrap();
@@ -2774,11 +2762,7 @@ mod tests {
         let genesis = genesis_block_for(GenesisForm::V5, 8, 0);
 
         let v5_block = |parent: &BlockHeader, height: u64, ts: u64, marker: u64| {
-            let body = BlockBody {
-                txs: vec![],
-                coinbase: qlab_devnet::emission_exact::coinbase_exact(height),
-                coinbase_rkm: [marker; 4],
-            };
+            let body = BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(height), [marker; 4]);
             let header =
                 BlockHeader::child_of_for(GenesisForm::V5, parent, ts, 8, body.commitment_v5());
             (header, body)
