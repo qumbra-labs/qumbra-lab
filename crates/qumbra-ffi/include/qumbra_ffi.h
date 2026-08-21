@@ -277,6 +277,20 @@ char *qmb_uri_parse(const char *uri, uint64_t *out_amount_bessel,
 char *qmb_uri_build(const char *address, uint64_t amount_bessel,
                     uint8_t has_amount, char **err_out);
 
+/* That same payment URI as a QR (SVG) — ONE call, so the text a Receive
+ * screen shows and the code a payer scans cannot disagree about the amount.
+ * Composes qmb_uri_build, so there is still exactly one URI builder; a qs1...
+ * fingerprint is refused with the builder's own sentence.
+ *
+ * Deliberately NOT a general "QR of any text" export — that is a wider
+ * surface than a Receive screen needs.
+ *
+ * The caller still shows the qs1... fingerprint beside it: a QR that merely
+ * scans is not a verified address (#342 D3). Caller frees with
+ * qmb_string_free. NULL + *err_out on refusal, by name. */
+char *qmb_uri_qr_svg(const char *address, uint64_t amount_bessel,
+                     uint8_t has_amount, char **err_out);
+
 /* Parse a whole-coin decimal QMB string ("1.5") to bessel, EXACTLY — the one
  * decimal-money parser, so no shell has to write one. Returns 0 and sets
  * *out_bessel on success; -1 and *err_out on refusal, naming the rule broken.
