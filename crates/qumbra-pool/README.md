@@ -28,6 +28,7 @@ merely written. Last updated 2026-08-20 16:5x +08.
 | **svc1 has its own `qumbra-node`** — the faucet has no mine RPC on any revision | ✅ 2026-08-21 (deploy #215, lab #519) |
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
+| **A miner paid by this pool** | 🔴 **NOT POSSIBLE YET** — lab #553; every block pays the pool's own address |
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
 64-hex rkm as the login — so this is the **miner-payee** branch, not the pool's fallback:
@@ -64,7 +65,7 @@ stock XMRig against a public endpoint. **What is NOT proven: that this pool can 
 
 | item | state | blocked on |
 |---|---|---|
-| A block actually mined, and its payee read | ⬜ | hashrate and luck; the pool is running now |
+| A block actually mined, and its payee read | ✅ **done, and the answer was bad** | three blocks, all paying the pool, miner's key zero — **lab #553** |
 | Connection cap, line bound, rate limit on public stratum | ⬜ | **lab #544** |
 | Bounded staleness on the held template | ⬜ | **lab #545** |
 | Public announcement of the endpoint | ⬜ | the two rows above — **not** the first share |
