@@ -47,7 +47,7 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Provenance
         run: |
@@ -66,7 +66,7 @@ jobs:
           shasum -a 256 crates/qlab-vask/fixtures/golden-*.bin 2>/dev/null \
             || sha256sum crates/qlab-vask/fixtures/golden-*.bin
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: qvask-golden-fixture-v1
           path: crates/qlab-vask/fixtures/golden-*.bin

@@ -193,7 +193,7 @@ jobs:
       genesis_hash: ${{ steps.pins.outputs.genesis_hash }}
       dial_peers: ${{ steps.pins.outputs.dial_peers }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Lab #516: the smoke verifies the PUBLISHED genesis, so a T2 release can
       # only be cut AFTER cutover has repointed seed.qumbra.org. This step is
@@ -363,7 +363,7 @@ jobs:
       DIAL_PEERS: ${{ needs.preflight.outputs.dial_peers }}
       NET: ${{ needs.preflight.outputs.net }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: C++ toolchain for randomx-rs
         run: |
@@ -421,7 +421,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           LAB_REV: ${{ needs.preflight.outputs.rev }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: qumbra-${{ needs.preflight.outputs.tag }}-${{ matrix.platform }}
           path: |
@@ -458,7 +458,7 @@ jobs:
       DIAL_PEERS: ${{ needs.preflight.outputs.dial_peers }}
       NET: ${{ needs.preflight.outputs.net }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Toolchain — pinned to the same rustc the other legs use
         run: |
@@ -517,7 +517,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           LAB_REV: ${{ needs.preflight.outputs.rev }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: qumbra-${{ needs.preflight.outputs.tag }}-windows-x86_64
           path: |
@@ -545,7 +545,7 @@ jobs:
       DIAL_PEERS: ${{ needs.preflight.outputs.dial_peers }}
       NET: ${{ needs.preflight.outputs.net }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Toolchain — pinned to the same rustc the Linux legs and the fleet use
         run: |
@@ -609,7 +609,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           LAB_REV: ${{ needs.preflight.outputs.rev }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: qumbra-${{ needs.preflight.outputs.tag }}-macos-arm64
           path: |
@@ -624,9 +624,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: incoming
           merge-multiple: true

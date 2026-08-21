@@ -87,7 +87,7 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # merge-base and rev-list need history
 
@@ -213,7 +213,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: C++ toolchain for randomx-rs
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake g++
@@ -225,7 +225,7 @@ jobs:
           uname -m; nproc; free -g | head -2
           docker --version; docker buildx version
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
