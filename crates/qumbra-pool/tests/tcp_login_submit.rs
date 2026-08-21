@@ -1,12 +1,12 @@
 //! Real TCP: login → job → submit against a loopback listener.
 //! Targeted debug; no RandomX, no node.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::{AggregateProofSlot, BlockHeader, EpochSupplyAttestation};
@@ -15,7 +15,10 @@ use qlab_stratum::codec::{decode_line, DecodedLine};
 use qlab_stratum::types::{LoginParams, LoginResult, StratumRequest, SubmitParams};
 use qumbra_pool::endpoint::serve;
 use qumbra_pool::template::{HeldTemplateSource, Template};
-use qumbra_pool::{JobOutbox, Pool};
+use qumbra_pool::{
+    ConnGuard, JobOutbox, ListenLimits, Pool, REASON_CONNECTION_CAP, REASON_LINE_TOO_LONG,
+    REASON_PER_IP, REASON_REQUEST_TIMEOUT,
+};
 
 fn sample_template() -> Template {
     sample_template_at(100)
@@ -57,7 +60,8 @@ fn tcp_login_job_submit_round_trips() {
     let stop_t = Arc::clone(&stop);
     let pool_t = Arc::clone(&pool);
     let outbox = Arc::new(JobOutbox::new());
-    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox));
+    let guard_t = Arc::new(ConnGuard::new(ListenLimits::default()));
+    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox, guard_t));
 
     // Retry connect — the accept loop sleeps 20 ms on WouldBlock.
     let mut stream = None;
@@ -155,7 +159,8 @@ fn tcp_tip_change_pushes_job_notify_on_the_wire() {
     let stop_t = Arc::clone(&stop);
     let pool_t = Arc::clone(&pool);
     let outbox = Arc::new(JobOutbox::new());
-    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox));
+    let guard_t = Arc::new(ConnGuard::new(ListenLimits::default()));
+    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox, guard_t));
 
     let mut stream = None;
     for _ in 0..50 {
@@ -244,7 +249,8 @@ fn tcp_template_unavailable_is_named_then_disconnects() {
     let stop_t = Arc::clone(&stop);
     let pool_t = Arc::clone(&pool);
     let outbox = Arc::new(JobOutbox::new());
-    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox));
+    let guard_t = Arc::new(ConnGuard::new(ListenLimits::default()));
+    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox, guard_t));
 
     let mut stream = None;
     for _ in 0..50 {
@@ -311,6 +317,223 @@ fn tcp_template_unavailable_is_named_then_disconnects() {
     resp_line.clear();
     let eof = reader.read_line(&mut resp_line).unwrap();
     assert_eq!(eof, 0, "connection must drop after naming the stall");
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(stream);
+    let _ = server.join();
+}
+
+fn spawn_guarded(
+    limits: ListenLimits,
+) -> (
+    SocketAddr,
+    Arc<AtomicBool>,
+    Arc<ConnGuard>,
+    thread::JoinHandle<std::io::Result<()>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let pool =
+        Arc::new(Pool::new(1024, Box::new(HeldTemplateSource::new(sample_template()))).unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = Arc::clone(&stop);
+    let outbox = Arc::new(JobOutbox::new());
+    let guard = Arc::new(ConnGuard::new(limits));
+    let guard_t = Arc::clone(&guard);
+    let server = thread::spawn(move || serve(listener, pool, stop_t, outbox, guard_t));
+    (addr, stop, guard, server)
+}
+
+fn connect(addr: SocketAddr) -> TcpStream {
+    for _ in 0..50 {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            Ok(s) => {
+                s.set_nodelay(true).unwrap();
+                return s;
+            }
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    panic!("connect to pool at {addr}");
+}
+
+fn wait_live(guard: &ConnGuard, n: u32) {
+    for _ in 0..100 {
+        if guard.snapshot().live == n {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("live != {n}: {:?}", guard.snapshot());
+}
+
+fn named_error_message(stream: &TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .expect("named refusal must arrive on the wire");
+    assert!(n > 0, "connection closed without naming the refusal");
+    let DecodedLine::Response(resp) = decode_line(&line).unwrap() else {
+        panic!("expected error response, got {line}");
+    };
+    resp.error.expect("named refusal").message
+}
+
+/// The first of the three attacks: past the cap, refuse by name, count it,
+/// and do not spawn a handler thread for the overflow (live stays at the cap).
+#[test]
+fn tcp_connection_flood_past_the_cap_is_named_and_counted() {
+    let limits = ListenLimits::from_parts(
+        2,
+        Some(2),
+        4096,
+        Duration::from_secs(30),
+        Some(Duration::from_secs(30)),
+    );
+    let (addr, stop, guard, server) = spawn_guarded(limits);
+    let _a = connect(addr);
+    let _b = connect(addr);
+    wait_live(&guard, 2);
+
+    let overflow = connect(addr);
+    let msg = named_error_message(&overflow);
+    assert!(msg.starts_with(REASON_CONNECTION_CAP), "got {msg}");
+    let snap = guard.snapshot();
+    assert_eq!(snap.live, 2, "overflow must not occupy a slot: {snap:?}");
+    assert!(
+        snap.refused_connection_cap >= 1,
+        "flood must be counted: {snap:?}"
+    );
+    assert_eq!(snap.refused_per_ip, 0, "{snap:?}");
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(overflow);
+    let _ = server.join();
+}
+
+/// Same source IP, per-IP cap of 1: the second connection is its own
+/// named refusal, not the global cap.
+#[test]
+fn tcp_per_ip_cap_is_its_own_named_refusal() {
+    let limits = ListenLimits::from_parts(
+        8,
+        Some(1),
+        4096,
+        Duration::from_secs(30),
+        Some(Duration::from_secs(30)),
+    );
+    let (addr, stop, guard, server) = spawn_guarded(limits);
+    let _held = connect(addr);
+    wait_live(&guard, 1);
+
+    let overflow = connect(addr);
+    let msg = named_error_message(&overflow);
+    assert!(msg.starts_with(REASON_PER_IP), "got {msg}");
+    let snap = guard.snapshot();
+    assert_eq!(snap.live, 1, "{snap:?}");
+    assert!(snap.refused_per_ip >= 1, "{snap:?}");
+    assert_eq!(snap.refused_connection_cap, 0, "{snap:?}");
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(overflow);
+    let _ = server.join();
+}
+
+/// The second of the three attacks: a client that never sends `\n` and
+/// fills past the line bound is refused by name, not buffered forever.
+#[test]
+fn tcp_unterminated_line_is_named_and_counted() {
+    let limits = ListenLimits::from_parts(
+        8,
+        Some(8),
+        32,
+        Duration::from_secs(30),
+        Some(Duration::from_secs(30)),
+    );
+    let (addr, stop, guard, server) = spawn_guarded(limits);
+    let mut stream = connect(addr);
+    stream.write_all(&[b'x'; 64]).unwrap();
+    stream.flush().unwrap();
+    let msg = named_error_message(&stream);
+    assert!(msg.starts_with(REASON_LINE_TOO_LONG), "got {msg}");
+    let snap = guard.snapshot();
+    assert!(
+        snap.refused_line_too_long >= 1,
+        "unterminated line must be counted: {snap:?}"
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(stream);
+    let _ = server.join();
+}
+
+/// The third of the three attacks: one byte every 150 ms, slower than the
+/// 100 ms per-read timeout, no newline. The read timeout must not close
+/// the socket; the request deadline must.
+#[test]
+fn tcp_trickling_client_is_request_timeout_not_read_timeout() {
+    let limits = ListenLimits::from_parts(
+        8,
+        Some(8),
+        4096,
+        Duration::from_millis(400),
+        Some(Duration::from_secs(5)),
+    );
+    let (addr, stop, guard, server) = spawn_guarded(limits);
+    let mut stream = connect(addr);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(80)))
+        .unwrap();
+    stream.write_all(b"{").unwrap();
+    stream.flush().unwrap();
+    let t0 = Instant::now();
+    let mut got = String::new();
+    loop {
+        thread::sleep(Duration::from_millis(150));
+        let _ = stream.write_all(b"x");
+        let _ = stream.flush();
+        let mut buf = [0u8; 512];
+        match stream.read(&mut buf) {
+            Ok(0) => panic!("eof without a named request-timeout, so far: {got:?}"),
+            Ok(n) => {
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if got.contains(REASON_REQUEST_TIMEOUT) {
+                    break;
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if t0.elapsed() > Duration::from_secs(2) {
+                    panic!("trickle was not refused; elapsed {:?}", t0.elapsed());
+                }
+            }
+            Err(e) => panic!("trickle read: {e}"),
+        }
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "request-timeout fired too fast to be distinct from the 100 ms read timeout: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "request-timeout took too long: {elapsed:?}"
+    );
+    let snap = guard.snapshot();
+    assert!(
+        snap.refused_request_timeout >= 1,
+        "trickle must be counted as request-timeout: {snap:?}"
+    );
+    assert_eq!(
+        snap.refused_connection_timeout, 0,
+        "first byte arrived; this is a request timeout, not a connect-and-hold: {snap:?}"
+    );
 
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(stream);

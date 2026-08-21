@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use qumbra_pool::config::PoolConfig;
 use qumbra_pool::endpoint::serve;
-use qumbra_pool::{JobOutbox, Pool, TemplateWatch};
+use qumbra_pool::{ConnGuard, JobOutbox, Pool, TemplateWatch};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,6 +72,14 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
             cfg.stall_poll_failures(),
             cfg.stall_age_ms()
         );
+        println!(
+            "  listen guards:     {} conn / {} per-ip / {} B line / {}ms request / {}ms first-line",
+            cfg.max_connections(),
+            cfg.max_connections_per_ip(),
+            cfg.max_line_bytes(),
+            cfg.request_timeout_ms_resolved(),
+            cfg.connection_timeout_ms_resolved()
+        );
         println!("  template:          live (GET /v1/mine/template)");
     } else {
         let form = cfg.form()?;
@@ -114,6 +122,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     })?;
 
     let outbox = Arc::new(JobOutbox::new());
+    let guard = Arc::new(ConnGuard::new(cfg.listen_limits()));
     #[cfg(feature = "randomx")]
     let pool = if let Some(url) = cfg.node_rpc.clone() {
         let live = qumbra_pool::NodeRpcTemplateSource::connect(&url)?;
@@ -136,6 +145,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let stop_poll = Arc::clone(&stop);
         let watch_poll = Arc::clone(&watch);
         let outbox_poll = Arc::clone(&outbox);
+        let guard_poll = Arc::clone(&guard);
         std::thread::spawn(move || {
             while !stop_poll.load(Ordering::SeqCst) {
                 std::thread::sleep(poll);
@@ -156,12 +166,13 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                                         "tip changed"
                                     };
                                     qlab_devnet::jprintln!(
-                                        "pool template: {why}; pushed {} job(s); poll_failures={} consecutive={} last_good_s={} jobs_pushed={}",
+                                        "pool template: {why}; pushed {} job(s); poll_failures={} consecutive={} last_good_s={} jobs_pushed={} {}",
                                         jobs.len(),
                                         snap.template_poll_failures,
                                         snap.consecutive_failures,
                                         snap.seconds_since_last_good_template,
-                                        outbox_poll.jobs_pushed()
+                                        outbox_poll.jobs_pushed(),
+                                        guard_poll.snapshot().journal_fields()
                                     );
                                 }
                                 Err(e) => {
@@ -176,21 +187,23 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                             let snap = watch_poll.snapshot();
                             qlab_devnet::jeprintln!(
                                 WARN,
-                                "pool template poll: {e}; {reason}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={}",
+                                "pool template poll: {e}; {reason}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={} {}",
                                 snap.template_poll_failures,
                                 snap.consecutive_failures,
                                 snap.seconds_since_last_good_template,
-                                outbox_poll.jobs_pushed()
+                                outbox_poll.jobs_pushed(),
+                                guard_poll.snapshot().journal_fields()
                             );
                         } else {
                             let snap = watch_poll.snapshot();
                             qlab_devnet::jeprintln!(
                                 WARN,
-                                "pool template poll: {e}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={}",
+                                "pool template poll: {e}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={} {}",
                                 snap.template_poll_failures,
                                 snap.consecutive_failures,
                                 snap.seconds_since_last_good_template,
-                                outbox_poll.jobs_pushed()
+                                outbox_poll.jobs_pushed(),
+                                guard_poll.snapshot().journal_fields()
                             );
                         }
                     }
@@ -230,8 +243,16 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "  pplns window: {} shares [devnet-placeholder]",
         qumbra_pool::PPLNS_WINDOW_SHARES
     );
+    qlab_devnet::jprintln!(
+        "  listen guards: {} conn / {} per-ip / {} B line / {}ms request / {}ms first-line",
+        cfg.max_connections(),
+        cfg.max_connections_per_ip(),
+        cfg.max_line_bytes(),
+        cfg.request_timeout_ms_resolved(),
+        cfg.connection_timeout_ms_resolved()
+    );
 
-    serve(listener, pool, stop, outbox)?;
+    serve(listener, pool, stop, outbox, guard)?;
     qlab_devnet::jprintln!("qumbra-pool stopped");
     Ok(())
 }
