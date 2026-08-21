@@ -5,12 +5,29 @@
 //!    `POST /v1/mine/block` through the real run loop advances the tip.
 //! 2. The stage-3 harness over a **real** node (not `DevnetTemplateSource`):
 //!    login → job from the node → block-class share → POST → tip advances.
+//!
+//! ## 🔴 Every wait in this file is bounded and fails by name (lab #547)
+//!
+//! `RunningNode::run_until` returns only when the shutdown flag is set, and
+//! in every test here the flag is set by the client thread once it is done.
+//! A client that *panics* instead therefore never sets it: the node loop
+//! spins, and because cargo's harness buffers a test's output until the test
+//! finishes, the panic message is captured and never printed. Lab #547's
+//! first CI run is what that costs — `suite` cancelled at
+//! `timeout-minutes: 120`, two hours of paid runner, no verdict, and the
+//! only trace anywhere in the log was `Terminate orphan process: pid (8165)
+//! (mine_rpc_live-…)` in the cleanup step.
+//!
+//! So no test drives the node loop directly. [`spawn_leg`] catches the
+//! client's panic and sets the flag on both paths, and [`drive`] stops the
+//! loop on a [`LEG_BUDGET`] deadline it owns itself. A failure in this file
+//! is a named assertion, never a hang.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::pow::{satisfies_target_for, KeccakPow, PowEngine};
@@ -27,7 +44,35 @@ use qumbra_node::run::{DevnetRehearsalVerifier, RunningNode};
 use qumbra_pool::hasher::KeccakShareHasher;
 use qumbra_pool::pool::Outgoing;
 use qumbra_pool::template::HeldTemplateSource;
-use qumbra_pool::{NodeRpcClient, Pool};
+use qumbra_pool::{NodeRpcClient, PayeeRefusal, Pool, PoolError};
+
+/// The one wallet this harness owns — the node's `miner_rkm` **and** the
+/// pool's `payout_rkm`.
+///
+/// `GET /v1/mine/template` has no payee parameter, so the body the pool
+/// receives always names the **node's** own `miner_rkm`. A pool configured
+/// to pay anywhere else cannot submit a block it owns, and since lab #547 it
+/// refuses to try — so one value for both fields is the only configuration
+/// in which this harness was ever meaningful.
+///
+/// Before this it was two: the node paid `[1,2,3,4]` and the pool's
+/// `payout_rkm` was the hardcoded `[9,0,0,0]` that #523 removed from
+/// production. That is a node paying one identity while the pool owns
+/// another, which is precisely the arrangement lab #547 exists to make
+/// impossible, and the payee gate refused it — correctly, at
+/// `Pool::new_with_hasher`.
+const RIG_RKM: [u64; 4] = [1, 2, 3, 4];
+
+/// A structurally fine key nobody here owns. Used only as the *wrong*
+/// `payout_rkm`, in
+/// [`a_payout_rkm_the_live_template_does_not_pay_refuses_at_startup`].
+const STRANGER_RKM: [u64; 4] = [0xd2c0_2c7c, 2, 3, 4];
+
+/// Alice's PPLNS identity, and deliberately **not** [`RIG_RKM`]: on today's
+/// RPC the coinbase payee is the node's key whoever mined the share, so a
+/// miner's registered rkm is a share-accounting identity here and not a
+/// payee. Keeping the two distinct is what keeps that visible.
+const ALICE_RKM: [u64; 4] = [1, 0, 0, 0];
 
 fn rig_t2(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
     let base = std::env::temp_dir().join(format!("qmb_mine_rpc_{tag}_{}", std::process::id()));
@@ -49,7 +94,7 @@ fn rig_t2(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
         metrics_addr: None,
         telemetry_addr: None,
         discovery_addr: None,
-        miner_rkm: Some("0100000000000000020000000000000003000000000000000400000000000000".into()),
+        miner_rkm: Some(rkm_hex(&RIG_RKM)),
         template_serving: false,
     };
     (config, genesis, base)
@@ -126,6 +171,111 @@ fn hex32(s: &str) -> [u8; 32] {
     out
 }
 
+/// How long a client leg gets before [`drive`] stops the node loop and fails.
+///
+/// Basis: the longest leg here is a 500 000-nonce Keccak grind at the T2
+/// genesis difficulty plus one node-loop iteration per HTTP round trip —
+/// sub-second in `--release` (the acceptance lane) and tens of seconds in an
+/// unoptimised debug build, so 180 s is that with a wide margin. What the
+/// number really has to be is *far under the CI job's 120-minute cap*, which
+/// is the wall this file hit once already: any failure now costs three
+/// minutes of runner and names itself.
+const LEG_BUDGET: Duration = Duration::from_secs(180);
+
+/// Grace after the node loop exits for a leg that has already set the
+/// shutdown flag to actually return. The flag is stored in [`spawn_leg`]
+/// immediately before the thread ends, so this is microseconds in practice;
+/// the bound exists so a healthy leg is never called stuck.
+const LEG_JOIN_GRACE: Duration = Duration::from_secs(5);
+
+/// A client leg that reports its own verdict, so a failure can never present
+/// as a hang. See this file's header for what that cost once.
+struct Leg {
+    handle: std::thread::JoinHandle<Result<(), String>>,
+}
+
+/// Spawn `body` as this test's client leg.
+///
+/// The shutdown flag is set on **both** exits — success and panic — which is
+/// the whole point: `run_until` only stops on that flag, so a leg that dies
+/// without setting it hangs the test rather than failing it. The panic is
+/// carried out as a `String` so [`drive`] can put the real reason (a payee
+/// refusal, a grind that found nothing) in the failing assertion's message.
+fn spawn_leg<F>(shutdown: &Arc<AtomicBool>, body: F) -> Leg
+where
+    F: FnOnce() + Send + 'static,
+{
+    let done = Arc::clone(shutdown);
+    Leg {
+        handle: std::thread::spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+                .map_err(describe_panic);
+            done.store(true, Ordering::SeqCst);
+            out
+        }),
+    }
+}
+
+fn describe_panic(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panicked with a payload that is neither &str nor String".to_string()
+    }
+}
+
+/// Run the node loop until `leg` finishes or [`LEG_BUDGET`] elapses, then
+/// turn the leg's outcome into this test's verdict.
+///
+/// The deadline is enforced from the loop's own per-iteration hook
+/// (`run_until_with`), because the hook cannot make the loop exit — only the
+/// flag can — so the harness sets the flag itself. That keeps the bound on
+/// *this* side of the client: it holds even for a leg that is genuinely
+/// blocked rather than panicking, which is the case a `catch_unwind` alone
+/// would still hang on.
+fn drive(
+    node: &mut RunningNode<KeccakPow, DevnetRehearsalVerifier>,
+    shutdown: &Arc<AtomicBool>,
+    leg: Leg,
+    what: &str,
+) {
+    let deadline = Instant::now() + LEG_BUDGET;
+    let expired = Arc::new(AtomicBool::new(false));
+    {
+        let expired = Arc::clone(&expired);
+        let flag = Arc::clone(shutdown);
+        node.run_until_with(shutdown, move |_| {
+            if Instant::now() >= deadline && !flag.load(Ordering::SeqCst) {
+                expired.store(true, Ordering::SeqCst);
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    let grace = Instant::now() + LEG_JOIN_GRACE;
+    while !leg.handle.is_finished() && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        leg.handle.is_finished(),
+        "leg-still-running: `{what}` was still executing {}s after login-to-verdict; the \
+         harness deadline stopped the node loop, the leg did not. Nothing in this file \
+         waits without a bound (lab #547).",
+        LEG_BUDGET.as_secs()
+    );
+    match leg.handle.join() {
+        Ok(Ok(())) => assert!(
+            !expired.load(Ordering::SeqCst),
+            "leg-over-budget: `{what}` succeeded, but only after the harness deadline of \
+             {}s had already stopped the node loop",
+            LEG_BUDGET.as_secs()
+        ),
+        Ok(Err(msg)) => panic!("leg-failed: `{what}` — {msg}"),
+        Err(_) => panic!("leg-failed: `{what}` — the leg's panic payload could not be recovered"),
+    }
+}
+
 /// Gate off → named UNAVAILABLE, not a 404 that invites retrying elsewhere.
 #[test]
 fn template_serving_off_is_unavailable_by_name() {
@@ -134,8 +284,7 @@ fn template_serving_off_is_unavailable_by_name() {
         RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
     let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&shutdown);
-    let client = std::thread::spawn(move || {
+    let leg = spawn_leg(&shutdown, move || {
         let (status, body) = http_get(addr, "/v1/mine/template");
         assert!(status.contains("503"), "{status}");
         let text = String::from_utf8_lossy(&body);
@@ -144,10 +293,8 @@ fn template_serving_off_is_unavailable_by_name() {
             "UNAVAILABLE token, got {text}"
         );
         assert_eq!(text.trim(), TEMPLATE_SERVING_DISABLED);
-        done.store(true, Ordering::SeqCst);
     });
-    node.run_until(&shutdown);
-    client.join().unwrap();
+    drive(&mut node, &shutdown, leg, "gated template GET");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -162,14 +309,18 @@ fn live_template_then_submit_advances_tip() {
     node.set_mine_interval(Duration::from_secs(3600));
     let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&shutdown);
-    let client = std::thread::spawn(move || {
+    let leg = spawn_leg(&shutdown, move || {
         let (status, body) = http_get(addr, "/v1/mine/template");
         assert!(status.contains("200"), "{status} {}", String::from_utf8_lossy(&body));
         let wire: MineTemplateWire = serde_json::from_slice(&body).unwrap();
         assert_eq!(wire.form, "v5");
         assert_eq!(wire.height, 1);
         assert_eq!(wire.nonce, 0);
+        assert_eq!(
+            wire.coinbase_rkm,
+            rkm_hex(&RIG_RKM),
+            "the served template pays the node's configured miner_rkm, not a placeholder"
+        );
         let (header, _) = grind_v5(&wire);
         let post = MineBlockWire {
             form: "v5".into(),
@@ -181,10 +332,8 @@ fn live_template_then_submit_advances_tip() {
         let (status, text) = http_post(addr, "/v1/mine/block", &serde_json::to_vec(&post).unwrap());
         assert!(status.contains("202"), "{status} {text}");
         assert!(text.starts_with("accepted "), "{text}");
-        done.store(true, Ordering::SeqCst);
     });
-    node.run_until(&shutdown);
-    client.join().unwrap();
+    drive(&mut node, &shutdown, leg, "template → grind → POST");
     assert_eq!(node.tip_height(), 1, "POST must take the own-mined ingest path");
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -200,22 +349,26 @@ fn e2e_live_node_login_job_submit_advances_tip() {
     let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
     let url = format!("http://{addr}");
     let shutdown = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&shutdown);
-    let client = std::thread::spawn(move || {
+    let leg = spawn_leg(&shutdown, move || {
         let rpc = NodeRpcClient::parse(&url).unwrap();
         let template = rpc.fetch_template().expect("live template");
         assert_eq!(template.form, GenesisForm::V5);
         assert_eq!(template.header.height, 1);
-        assert!(template.body.is_some(), "live template carries the body");
+        let body = template.body.as_ref().expect("live template carries the body");
+        assert_eq!(
+            body.coinbase_rkm, RIG_RKM,
+            "the payee the pool is about to accept is the node's own miner_rkm — the fixture \
+             is only meaningful when that is also the pool's payout_rkm (lab #547)"
+        );
         let pool = Pool::new_with_hasher(
             1,
             Box::new(HeldTemplateSource::new(template.clone())),
             Box::new(KeccakShareHasher),
-            [9, 0, 0, 0],
+            RIG_RKM,
         )
-        .unwrap();
+        .expect("payout_rkm is the payee the node pays, so the payee gate passes");
         pool.set_submitter(Arc::new(rpc));
-        pool.register_account("alice", [1, 0, 0, 0]);
+        pool.register_account("alice", ALICE_RKM);
         let mut sid = None;
         let login_line = encode_request(
             &StratumRequest::login(
@@ -274,11 +427,57 @@ fn e2e_live_node_login_job_submit_advances_tip() {
             panic!("submit reply");
         };
         assert!(resp.error.is_none(), "submit {:?}", resp.error);
-        done.store(true, Ordering::SeqCst);
+        assert!(
+            !pool.is_unavailable(),
+            "the payee gate must not have suspended work: {:?}",
+            pool.counters().work_unavailable
+        );
     });
-    node.run_until(&shutdown);
-    client.join().unwrap();
+    drive(&mut node, &shutdown, leg, "pool login → block-class share → POST");
     assert_eq!(node.tip_height(), 1, "pool POST must advance the real node tip");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 🔴 The mismatch this file itself carried, now asserted instead of hung
+/// (lab #547 review). A pool whose `payout_rkm` is not the payee the live
+/// node puts in the template refuses **at startup, by name** — before a
+/// listener is bound and before any miner spends a hash.
+///
+/// It lives here rather than in `qumbra-pool`'s unit tests because only a
+/// real node's template can show *which* key the gate is checking against:
+/// the node's own configured `miner_rkm`, not a value a fixture chose.
+#[test]
+fn a_payout_rkm_the_live_template_does_not_pay_refuses_at_startup() {
+    let (mut config, genesis, base) = rig_t2("payout-mismatch");
+    config.template_serving = true;
+    let mut node =
+        RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+    node.set_mine_interval(Duration::from_secs(3600));
+    let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
+    let url = format!("http://{addr}");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let leg = spawn_leg(&shutdown, move || {
+        let rpc = NodeRpcClient::parse(&url).unwrap();
+        let template = rpc.fetch_template().expect("live template");
+        let Err(err) = Pool::new_with_hasher(
+            1,
+            Box::new(HeldTemplateSource::new(template)),
+            Box::new(KeccakShareHasher),
+            STRANGER_RKM,
+        ) else {
+            panic!("a payout_rkm the node does not pay must refuse before any miner logs in");
+        };
+        assert!(
+            matches!(&err, PoolError::Payee(PayeeRefusal::Unowned { rkm }) if *rkm == RIG_RKM),
+            "the refusal must name the payee the node actually served, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("unowned-coinbase-payee"),
+            "refused by token, got: {err}"
+        );
+    });
+    drive(&mut node, &shutdown, leg, "payout_rkm mismatch startup refusal");
+    assert_eq!(node.tip_height(), 0, "nothing was submitted");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -296,7 +495,7 @@ fn template_header_decodes_under_v5() {
         seed_hash: "33".repeat(32),
         next_seed_hash: None,
         coinbase: 1,
-        coinbase_rkm: rkm_hex(&[1, 2, 3, 4]),
+        coinbase_rkm: rkm_hex(&RIG_RKM),
         txs: vec![],
     };
     let header = qlab_devnet::header::BlockHeader {
