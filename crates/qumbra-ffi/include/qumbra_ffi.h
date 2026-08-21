@@ -322,7 +322,13 @@ void qmb_spent_free(qmb_spent_t *s);
  *                        || counter:u64le
  *    direction  client->Mac "MOBI"    Mac->client "DESK"
  *
- * Drive it as a pump, exactly like qmb_scan_*:
+ * Drive it as a pump, exactly like qmb_scan_new / qmb_scan_step /
+ * qmb_scan_supply. Named rather than wildcarded ON PURPOSE: the header-vs-source
+ * test scans every line of this file, comments included, for a function-shaped
+ * token, so a trailing-asterisk wildcard reads to it as an undeclared function.
+ * It caught exactly that on this PR's first verify run — and then caught the
+ * explanation of the fix, which had spelled the bare prefix out loud. Write the
+ * names.
  *
  *    s = qmb_pair_new(uri, id, op, bundle, len, scan_url, node_url, &err);
  *    connect to qmb_pair_endpoint(s);
