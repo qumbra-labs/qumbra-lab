@@ -1435,12 +1435,23 @@ mod tests {
         );
         // The `net:` dispatch input's default, read out of the workflow's own
         // choice block rather than remembered here.
-        let net_input = WORKFLOW
-            .split("      net:\n")
-            .nth(1)
+        //
+        // 🔴 Line-ending agnostic, DELIBERATELY. This used to split on the
+        // literal `"      net:\n"`, which embeds a LF. `include_str!` embeds the
+        // file *as checked out*, and this repo has no `.gitattributes`, so a
+        // Windows checkout under git's default `autocrlf` gives `      net:\r\n`
+        // — the split found nothing and this test panicked on the Windows leg of
+        // every PR while passing everywhere else. A hardcoded line terminator is
+        // a literal standing in for something the environment decides
+        // (`qumbra-design/derived-not-duplicated.md`); `str::lines()` already
+        // knows the answer, so ask it. The same applies to the other two
+        // `include_str!` sites in this file — neither hardcodes a terminator,
+        // and neither should start.
+        let mut after_net = WORKFLOW.lines().skip_while(|l| l.trim() != "net:");
+        after_net
+            .next()
             .expect("release-binaries.yml declares a `net:` dispatch input");
-        let default_line = net_input
-            .lines()
+        let default_line = after_net
             .find(|l| l.trim_start().starts_with("default:"))
             .expect("the `net:` input declares a default");
         assert!(
