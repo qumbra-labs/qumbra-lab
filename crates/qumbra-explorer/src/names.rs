@@ -28,14 +28,18 @@
 //!
 //! # The dark ship, and why it backfills
 //!
-//! Every document carries `boundary_height`
-//! ([`qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT`]); below it the feed over any
-//! covered range is empty **and that is a fact, not an error** — the page renders
-//! the honest empty state ("the name service arms at height 19,008"). Because the
-//! feed is chain-derived rather than accumulated in a ring, it **backfills**: an
-//! explorer rolled after the boundary still serves every event from the boundary's
-//! first block on its next walk, so "data accrues from block one" holds by
-//! construction (stage-0 §4, the finding that killed the boundary-timing pressure).
+//! Every document carries `boundary_height` — **the served net's** boundary
+//! (`GenesisForm::name_boundary`, seeded from the loaded genesis form), not a
+//! hardcoded constant. On a halt-keyed v4 (T1) net it is the height at which the
+//! name service arms; below it the feed over any covered range is empty **and
+//! that is a fact, not an error** — the page renders the honest empty state. On
+//! a native-names v5 (T2) net names are in force from height 0, there is no
+//! boundary, and the field is JSON `null` — never T1's 19,008 carried onto a
+//! chain that has no such height. Because the feed is chain-derived rather than
+//! accumulated in a ring, it **backfills**: an explorer rolled after a boundary
+//! still serves every event from the boundary's first block on its next walk, so
+//! "data accrues from block one" holds by construction (stage-0 §4, the finding
+//! that killed the boundary-timing pressure).
 //!
 //! # The contract it inherits
 //!
@@ -49,7 +53,7 @@
 use std::sync::{Arc, Mutex};
 
 use qlab_devnet::names::{
-    decode_rider, name_fee_bessel, NameOp, NAME_RULE_BOUNDARY_HEIGHT, NAME_TERM_BLOCKS,
+    decode_rider, name_fee_bessel, NameOp, NAME_TERM_BLOCKS,
     RECORD_KIND_L1_ADDRESS, RECORD_KIND_RESERVED_ANNULET,
 };
 use qlab_node::{ChainStore, Hash32};
@@ -149,6 +153,13 @@ pub struct NameEventsView {
     pub tip_height: u64,
     /// The tip hash this view was projected at; `None` = never projected.
     pub tip_hash: Option<Hash32>,
+    /// The served net's name-service boundary — `GenesisForm::name_boundary`,
+    /// seeded once from the loaded genesis form and carried through every
+    /// re-projection (the field is a net fact, not a walk product, so
+    /// [`Self::refresh`] preserves it). `Some(h)` on a halt-keyed v4 net,
+    /// `None` on a native-names v5 net. Defaults to `None` (an unprojected
+    /// view knows no net); the binary seeds it before it binds.
+    pub name_boundary: Option<u64>,
 }
 
 impl NameEventsView {
@@ -250,6 +261,9 @@ pub struct NamesPage {
     pub tip_height: u64,
     pub covered_to: Option<u64>,
     pub events: Vec<NameEvent>,
+    /// The served net's name boundary, copied from the projection so the
+    /// document renders it per-net (v4 → the height, v5 → `null`).
+    pub name_boundary: Option<u64>,
 }
 
 /// Build the page for `[from, to]` over a projection — the txlist arithmetic
@@ -257,7 +271,14 @@ pub struct NamesPage {
 pub fn page(view: &NameEventsView, from: u64, to: u64) -> NamesPage {
     let ceiling = to.min(view.tip_height);
     if from > ceiling {
-        return NamesPage { from, to, tip_height: view.tip_height, covered_to: None, events: Vec::new() };
+        return NamesPage {
+            from,
+            to,
+            tip_height: view.tip_height,
+            covered_to: None,
+            events: Vec::new(),
+            name_boundary: view.name_boundary,
+        };
     }
     let scan_to = ceiling.min(from.saturating_add(MAX_NAMES_HEIGHTS - 1));
     let mut events: Vec<NameEvent> = Vec::new();
@@ -279,7 +300,14 @@ pub fn page(view: &NameEventsView, from: u64, to: u64) -> NamesPage {
         }
         events.push(e.clone());
     }
-    NamesPage { from, to, tip_height: view.tip_height, covered_to: Some(covered_to), events }
+    NamesPage {
+        from,
+        to,
+        tip_height: view.tip_height,
+        covered_to: Some(covered_to),
+        events,
+        name_boundary: view.name_boundary,
+    }
 }
 
 /// The paging rule — delegated whole to the shared implementation.
@@ -296,8 +324,10 @@ pub fn next_after(p: &NamesPage, requested_to: u64) -> Next {
 ///
 /// `boundary_height` rides in **every** document (the dark ship's honesty
 /// field): below it an empty covered range is the expected state and the page
-/// says why; the constant arriving as `None` on some future net renders `null`,
-/// never a fabricated height.
+/// says why. The value is the **served net's** boundary (`p.name_boundary`,
+/// seeded from the genesis form), not a hardcoded constant — a native-names v5
+/// net (T2) is the "future net" this field was always documented to render as
+/// `null`, never T1's 19,008 carried onto a chain that has no boundary.
 pub fn document(p: &NamesPage) -> String {
     let events: Vec<String> = p
         .events
@@ -331,7 +361,7 @@ pub fn document(p: &NamesPage) -> String {
          \"tip_height\":{tip},\
          \"range\":{{\"from\":{from},\"to\":{to},\"covered_to\":{covered}}},\
          \"events\":[{events}]}}",
-        boundary = num(NAME_RULE_BOUNDARY_HEIGHT),
+        boundary = num(p.name_boundary),
         tip = p.tip_height,
         from = p.from,
         to = p.to,
@@ -343,7 +373,7 @@ pub fn document(p: &NamesPage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qlab_devnet::names::{encode_rider, NameRecord, RIDER_ABSENT};
+    use qlab_devnet::names::{encode_rider, NameRecord, NAME_RULE_BOUNDARY_HEIGHT, RIDER_ABSENT};
     use qlab_node::{StoredBlock, StoredHeader, StoredTx};
 
     fn h32(first: u8) -> Hash32 {
@@ -413,7 +443,13 @@ mod tests {
                 }
             }
         }
-        NameEventsView { events, tip_height: tip, tip_hash: Some(h32(0xfe)) }
+        // These tests project a v4-lineage (T1) net: the halt-keyed boundary.
+        NameEventsView {
+            events,
+            tip_height: tip,
+            tip_hash: Some(h32(0xfe)),
+            name_boundary: NAME_RULE_BOUNDARY_HEIGHT,
+        }
     }
 
     fn parse(s: &str) -> serde_json::Value {
@@ -508,6 +544,28 @@ mod tests {
         );
         assert_eq!(v["events"].as_array().unwrap().len(), 0);
         assert_eq!(next_after(&p, 15_761), Next::Done);
+    }
+
+    /// 🔴 The native-names net (T2/v5): names are in force from height 0, so
+    /// there is no boundary and `boundary_height` must serialize as JSON `null`
+    /// — never T1's 19,008 carried onto a chain that has no such height. This is
+    /// exactly the "future net renders null" the field was documented for.
+    #[test]
+    fn a_native_names_net_serves_a_null_boundary_not_the_t1_height() {
+        let view = NameEventsView {
+            events: Vec::new(),
+            tip_height: 210,
+            tip_hash: Some(h32(0xfe)),
+            name_boundary: None, // GenesisForm::V5.name_boundary()
+        };
+        let p = page(&view, 0, 210);
+        let raw = document(&p);
+        // Textually null (the num() helper's None arm), and serde agrees it is
+        // JSON null, not the number 19008 nor the string "null".
+        assert!(raw.contains("\"boundary_height\":null"), "must be literal null: {raw}");
+        let v = parse(&raw);
+        assert!(v["boundary_height"].is_null(), "native-names boundary is null: {v}");
+        assert_ne!(v["boundary_height"], serde_json::json!(19_008));
     }
 
     /// No-coverage stays distinct from empty-covered here too.
@@ -654,6 +712,7 @@ mod tests {
             tip_height: 19_100,
             covered_to: Some(19_100),
             events: vec![evil],
+            name_boundary: NAME_RULE_BOUNDARY_HEIGHT,
         };
         let v = parse(&document(&p)); // would panic on malformed JSON
         assert_eq!(v["events"][0]["name"], "a\"b\\c\nd", "round-trips verbatim");
