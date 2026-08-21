@@ -15,6 +15,10 @@ share_difficulty = 1024
 # The node must have template_serving = true.
 node_rpc = "http://node:9420"
 poll_ms = 1000
+# Stall bounds. Unset, the age bound is stall-polls × poll_ms (derived,
+# not a second literal). Uncomment only to override the defaults.
+# template_max_poll_failures = 5
+# template_max_age_ms = 15000
 
 # Deliberately unusable placeholder: replace it with the public `rkm` from the
 # pool's dedicated wallet. Leaving it zero makes `check` and `run` refuse by name.
