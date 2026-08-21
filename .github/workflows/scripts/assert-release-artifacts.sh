@@ -124,6 +124,16 @@ echo "===== qumbra-wallet --help (header) ====="
 # The wallet prints its stamp on the first line of --help; --help exits 0.
 "$WALLET_BIN" --help 2>&1 | sed -n '1,3p' | tee wallet-help.txt
 echo "========================================"
+WALLET_NET=$(sed -n 's/^built for net: //p' wallet-help.txt | sed -n 1p)
+# lab #581. The node has been asked which net it was baked for since #527; the
+# wallet shipped in the same tarball was asked NOTHING, so `--net` defaulted to
+# t1 and a T2 miner's own release derived their coinbase under the retired net —
+# the note reads as spendable and refuses at the witness lookup. Ask it here for
+# the same reason the node is asked: a stamp nothing reads back is a stamp that
+# can silently fail to apply, and this gate is the only place that would notice.
+[ "$WALLET_NET" = "$NET" ] \
+  || fail "qumbra-wallet reports 'built for net: ${WALLET_NET:-<no line>}', expected '$NET'. Either QUMBRA_NET did not reach the wallet's build step, or the two binaries in this tarball disagree about which net they are for. Refusing to ship a wallet that would derive mined coinbase notes under the wrong genesis form (lab #566, #581)."
+
 WALLET_REV=$(sed -n 's/^build rev: //p' wallet-help.txt | sed -n 1p)
 [ "$WALLET_REV" = "$EXPECTED_BUILD_REV" ] \
   || fail "qumbra-wallet build stamp is '$WALLET_REV', expected $EXPECTED_BUILD_REV. The two binaries in one tarball must be from one revision — a wallet from a different build is precisely the confusion the stamp exists to prevent."
