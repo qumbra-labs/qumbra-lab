@@ -139,10 +139,20 @@ WALLET_REV=$(sed -n 's/^build rev: //p' wallet-help.txt | sed -n 1p)
   || fail "qumbra-wallet build stamp is '$WALLET_REV', expected $EXPECTED_BUILD_REV. The two binaries in one tarball must be from one revision — a wallet from a different build is precisely the confusion the stamp exists to prevent."
 
 echo "===== qumbra-pool --help ====="
-# Pool usage is on stderr; --help exits 0. The check is identity, not a stamp:
-# this crate does not read QUMBRA_BUILD_REV (lab #516 is workflow-only).
+# Pool usage is on stderr; --help exits 0.
+#
+# lab #605: this used to say "the check is identity, not a stamp: this crate does
+# not read QUMBRA_BUILD_REV". The lane was passing the variable all along and the
+# crate dropped it on the floor — so of the three binaries in this tarball the pool
+# was the only one that could not say which commit it was, and it is the one whose
+# `assemble_coinbase` decides who gets paid. The node's stamp beside it says
+# nothing about the process that chose the payee.
 [ -f "$POOL_BIN" ] || fail "POOL_BIN '$POOL_BIN' is missing — the pool binary was supposed to ship beside the node (lab #516)."
 "$POOL_BIN" --help 2>&1 | sed -n '1,8p' | tee pool-help.txt
+POOL_REV=$(sed -n 's/^build rev: //p' pool-help.txt | sed -n 1p)
+[ -n "$POOL_REV" ] || fail "qumbra-pool printed no 'build rev:' line — the field or its format moved, and a stamp nothing reads back is a stamp that can silently fail to apply."
+[ "$POOL_REV" = "$EXPECTED_BUILD_REV" ] \
+  || fail "qumbra-pool build stamp is '$POOL_REV', expected $EXPECTED_BUILD_REV. All three binaries in one tarball must be from one revision — and the pool is the one that chooses the coinbase payee, so its provenance is the one that answers 'which build paid this miner'."
 echo "================================"
 grep -qF "qumbra-pool" pool-help.txt \
   || fail "qumbra-pool --help did not identify itself as qumbra-pool. Wrong binary in the slot, or the CLI usage line moved."
