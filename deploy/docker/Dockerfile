@@ -37,6 +37,25 @@ COPY . .
 # Two images from one Dockerfile, the main binary being the right variant, so a
 # fleet roll is the usual image-digest swap. The drill binaries below are unaffected.
 ARG NODE_FEATURES=""
+# lab #590: the SAME revision the runtime stages put in the OCI label, but reaching
+# the compiler, so `halt-status` can answer "which commit am I" from the process.
+#
+# 🔴 Until this existed the answer lived entirely OUTSIDE the process: the compose
+# file names a digest, the registry says that digest carries label X, therefore the
+# running binary is X. Every link is external, so a hand-built image, the right
+# digest on the wrong host, and a container that was never actually replaced all
+# produce a byte-identical `halt-status`. The frozen digest and the revision string
+# answer "are these the consensus constants" and must NOT be repurposed for this —
+# they are deliberately stable across non-consensus commits.
+#
+# `release.rs` reads it via `option_env!("QUMBRA_BUILD_REV")`, so an unpassed value
+# stays the honest "unstamped — not built by the release lane" rather than a blank.
+#
+# Cost, named because it is real: this ENV changes on every commit, so the layer
+# below cannot be reused across revisions. Only the crates that read the variable
+# recompile under cargo, but the RUN layer itself always re-executes.
+ARG GIT_REVISION=unknown
+ENV QUMBRA_BUILD_REV=$GIT_REVISION
 RUN cargo build --release --locked -p qumbra-node ${NODE_FEATURES:+--features "$NODE_FEATURES"} \
     && cp target/release/qumbra-node /usr/local/bin/qumbra-node
 
