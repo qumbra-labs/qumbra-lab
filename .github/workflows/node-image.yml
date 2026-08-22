@@ -308,6 +308,15 @@ jobs:
           BUILDREV=$(sed -n 's/^  build rev:    //p' halt.txt | head -1)
           [ -n "$BUILDREV" ] || { echo "::error::halt-status printed no build-rev line at all — the field or its format moved"; exit 1; }
           [ "$BUILDREV" = "$EXP_REV" ] || { echo "::error::build-rev mismatch — halt-status reports '$BUILDREV', this build is $EXP_REV. Either QUMBRA_BUILD_REV did not reach the builder stage, or this binary is not from the revision the label will claim."; exit 1; }
+          # lab #605: the pool binary rides in this same image and is the process
+          # that CHOOSES THE PAYEE. The node's stamp above says nothing about it,
+          # so ask it separately. The Dockerfile's `ENV QUMBRA_BUILD_REV` sits
+          # above every cargo build in the builder stage, so one env reaches all
+          # three binaries — but "should" is not "does", and this is the readback.
+          docker run --rm --entrypoint /usr/local/bin/qumbra-pool "$T" --help 2>&1 | sed -n '1,12p' | tee pool-help.txt
+          POOLREV=$(sed -n 's/^build rev: //p' pool-help.txt | head -1)
+          [ -n "$POOLREV" ] || { echo "::error::qumbra-pool printed no 'build rev:' line — the field or its format moved"; exit 1; }
+          [ "$POOLREV" = "$EXP_REV" ] || { echo "::error::pool build-rev mismatch — qumbra-pool reports '$POOLREV', this build is $EXP_REV. The image would ship a node and a pool from different revisions, and the pool is the one that decides who gets paid."; exit 1; }
           # The faucet binary rides in this same image and has its own copy of
           # the release constant (#397). The revision identifier is compiled in
           # iff the resume feature reached `-p qumbra-faucet`, so its presence /

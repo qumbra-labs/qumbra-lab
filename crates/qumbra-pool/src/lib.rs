@@ -86,3 +86,39 @@ pub use watch::{TemplateWatch, WatchSnapshot};
 
 #[cfg(feature = "randomx")]
 pub use hasher::RandomXShareHasher;
+
+/// The commit this binary was built from, stamped by the release lane and by
+/// `deploy/docker/Dockerfile`'s builder stage via `QUMBRA_BUILD_REV`.
+///
+/// 🔴 **This crate is the one that decides who gets paid.** `payee::assemble_coinbase`
+/// picks the PPLNS winner and the resulting list is what reaches the chain, so
+/// "which build chose this payee" is a question about *this* process — the node's
+/// stamp beside it says nothing about it. Until lab #605 the pool was the only one
+/// of the three binaries in the release tarball that could not answer, and the
+/// release gate said so in its own comment while asserting the other two.
+///
+/// Deliberately the same env var and the same wording as `qumbra_node::release::BUILD_REV`
+/// and `qumbra_wallet::BUILD_REV` — a stranger comparing three binaries from one
+/// archive should see one string, not three vocabularies. `None` is the honest
+/// answer for every build that is not a release or image build.
+pub const BUILD_REV: Option<&str> = option_env!("QUMBRA_BUILD_REV");
+
+/// The `--help` header's build-provenance line. Never empty; see [`BUILD_REV`].
+pub fn build_rev_line() -> String {
+    match BUILD_REV {
+        Some(rev) => rev.to_string(),
+        None => "unstamped — not built by the release lane".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod build_rev_tests {
+    #[test]
+    fn the_build_rev_line_is_never_blank() {
+        // A blank field reads as a tooling gap; an unstamped binary is a real and
+        // expected state and must say so in words. Same position as
+        // `qumbra_node::release::build_rev_line`.
+        let line = super::build_rev_line();
+        assert!(!line.trim().is_empty());
+    }
+}

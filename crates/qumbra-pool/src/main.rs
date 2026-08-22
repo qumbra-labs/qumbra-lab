@@ -48,6 +48,10 @@ fn usage() {
          v4-compat: a v4 template refuses stock-xmrig login by name\n  \
          (#356 UNCLEAN). Share-PoW: qlab_pow::RandomXHasher. PPLNS + N=1 payee list.\n"
     );
+    // lab #605: the process that chooses the payee says which build it is. On the
+    // same line shape the node and the wallet use, so one archive reads as one
+    // vocabulary.
+    eprintln!("build rev: {}", qumbra_pool::build_rev_line());
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
