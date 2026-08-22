@@ -482,6 +482,15 @@ impl Mempool {
     /// Admit a candidate transaction, or say why it was refused. Checks run
     /// cheapest-first; the proof verify is last.
     ///
+    /// ⚠️ This convenience hardcodes the **v4** name boundary
+    /// ([`qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT`]). A **production caller
+    /// on a form-aware node must use [`Self::admit_above`] with
+    /// [`qlab_devnet::forms::GenesisForm::rider_admit_boundary`]** instead — on a
+    /// v5 net this path would refuse every name rider as `RiderBeforeBoundary`
+    /// (see `NodeAdapter::submit_tx_typed`). Kept for v4/test callers whose txs
+    /// carry no rider (rider-free txs are boundary-agnostic — `names_admit_op`
+    /// returns early before the boundary check).
+    ///
     /// There is no maturity check and no `spends_coinbase` argument (issue #102):
     /// an immature coinbase has no leaf in any valid anchor, so an immature spend
     /// has no witness and cannot be proved. Enforcement is
@@ -994,6 +1003,44 @@ mod tests {
                 qlab_devnet::body::BodyError::RiderBeforeBoundary { .. }
             ))
         ));
+    }
+
+    /// Lab #470 C4 / the T2 first-registration blocker: on a v5 net the name
+    /// rule is native from height ≥ 1, so the mempool must ADMIT a rider the v4
+    /// boundary refuses. `GenesisForm::V5.rider_admit_boundary()` is `Some(0)`;
+    /// the same commit that production `admit` (v4 `NAME_RULE_BOUNDARY_HEIGHT`)
+    /// refuses as `RiderBeforeBoundary` at a low height is admitted under the v5
+    /// boundary. This is the exact asymmetry that made `submit_tx_typed` refuse
+    /// on T2 what `validate_body_v5` accepts. Mutation check: set the v5 arm of
+    /// `rider_admit_boundary` to `None` and the admit below refuses (rider never
+    /// active); leave it `NAME_RULE_BOUNDARY_HEIGHT` and it stays refused.
+    #[test]
+    fn a_v5_net_admits_a_name_rider_the_v4_boundary_refuses() {
+        use qlab_devnet::forms::GenesisForm;
+        use qlab_devnet::names::{EmptyNameView, NameOp};
+        let st = state_with_anchor();
+        let commit = good_tx(1).with_name_op(&NameOp::Commit { commit: [0x5A; 32] });
+
+        // Production `admit` (v4 boundary) refuses it at this low height.
+        let mut v4 = Mempool::default();
+        assert!(matches!(
+            v4.admit(commit.clone(), &st, &MockVerifier, &EmptyNameView),
+            Err(MempoolError::RiderInvalid(
+                qlab_devnet::body::BodyError::RiderBeforeBoundary { .. }
+            ))
+        ));
+
+        // The v5 admit boundary (Some(0)) admits the identical rider.
+        let mut v5 = Mempool::default();
+        v5.admit_above(
+            GenesisForm::V5.rider_admit_boundary(),
+            commit,
+            &st,
+            &MockVerifier,
+            &EmptyNameView,
+        )
+        .expect("a v5 net admits a name rider above genesis");
+        assert_eq!(v5.len(), 1, "the rider tx pooled");
     }
 
     // ── the armed pool: assembly + eviction (lab #387) ───────────────────────
