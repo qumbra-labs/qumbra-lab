@@ -1646,7 +1646,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                     // has already folded this body's own riders in, which is what
                     // makes the name-eviction leg see the block that outraced a
                     // pooled reveal (lab #387).
-                    self.mempool.on_block_connected(&body, &self.state, self.state.names());
+                    //
+                    // Admission and eviction ask the same rider question and must
+                    // ask it under the same installed form (lab #612). Calling the
+                    // v4 convenience here silently evicted every native v5 rider
+                    // on the block after it was admitted.
+                    self.mempool.on_block_connected_above(
+                        self.rules.form.rider_admit_boundary(),
+                        &body,
+                        &self.state,
+                        self.state.names(),
+                    );
                 }
                 // A body that fails at the funnel has mutated nothing (`apply_state`
                 // validates before it writes), and no peer is charged for it — the
@@ -7041,6 +7051,35 @@ mod tests {
         assert!(
             peer.mempool().contains(&id),
             "an unrelated v5 block must not evict a still-valid v5 name rider"
+        );
+
+        // The opposite mutation: a rider that somehow exists in a v4 pool below
+        // height 19,008 MUST be evicted. Seed it through the explicit boundary
+        // seam because ordinary v4 admission correctly refuses it. If the
+        // production call above is hardcoded to v5's Some(0), this half fails.
+        let (mut v4, v4_anchor) =
+            adapter_for_form_with_finalized_genesis(GenesisForm::V4);
+        let (mut v4_producer, _) =
+            adapter_for_form_with_finalized_genesis(GenesisForm::V4);
+        let v4_commit = tx_with(v4_anchor, 0x52, b"ok")
+            .with_name_op(&NameOp::Commit { commit: [0xA7; 32] });
+        let v4_id = v4
+            .mempool
+            .admit_above(
+                GenesisForm::V5.rider_admit_boundary(),
+                v4_commit,
+                &v4.state,
+                &v4.verifier,
+                v4.state.names(),
+            )
+            .expect("explicit v5 boundary seeds the v4 mutation fixture");
+        let (v4_header, v4_body) =
+            v4_producer.mine_block().expect("mine an unrelated v4 block");
+        assert!(v4_body.txs.is_empty());
+        assert_eq!(v4.ingest_block(v4_header, v4_body), IngestOutcome::Accepted);
+        assert!(
+            !v4.mempool().contains(&v4_id),
+            "v4 eviction must still enforce the v4 boundary"
         );
     }
 

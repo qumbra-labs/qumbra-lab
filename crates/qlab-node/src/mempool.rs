@@ -658,6 +658,15 @@ impl Mempool {
     /// `names` is the view **after** the block was applied — this runs on
     /// `apply_block`'s success arm, so the caller's registry already carries
     /// the block's own registrations.
+    ///
+    /// ⚠️ This convenience hardcodes the **v4** name boundary
+    /// ([`qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT`]). A **production caller
+    /// on a form-aware node must use [`Self::on_block_connected_above`] with
+    /// [`qlab_devnet::forms::GenesisForm::rider_admit_boundary`]** instead — on a
+    /// v5 net this path would evict every still-valid name rider as
+    /// `RiderBeforeBoundary` (see `NodeAdapter::drain_pending_bodies`). Kept for
+    /// v4/test callers whose pools carry no rider; the `name_op.is_some()` filter
+    /// below keeps that rider-free path out of name validation entirely.
     pub fn on_block_connected<S: NodeState, N: qlab_devnet::names::NameView>(
         &mut self,
         body: &BlockBody,
@@ -672,9 +681,9 @@ impl Mempool {
         )
     }
 
-    /// [`Mempool::on_block_connected`] with the name boundary as an argument —
-    /// the **drill** seam, and nothing else (see [`Mempool::admit_above`]).
-    /// Production calls [`Mempool::on_block_connected`].
+    /// [`Mempool::on_block_connected`] with the name boundary as an argument.
+    /// Form-aware production callers use this with the installed form's rider
+    /// boundary; drills also use it to exercise boundary crossings explicitly.
     pub fn on_block_connected_above<S: NodeState, N: qlab_devnet::names::NameView>(
         &mut self,
         boundary: Option<u64>,
