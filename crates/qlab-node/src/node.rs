@@ -591,11 +591,12 @@ fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
 
 /// [`check_stored_binding`] under an explicit genesis form (lab #470 4a): the
 /// v4 arm is the height-keyed v2/v3 rule exactly as before; the v5 arm binds
-/// under `commitment_v5`.
+/// under the height-keyed cap assertion in `commitment_v5_at` (the bytes stay
+/// the same across that boundary).
 fn check_stored_binding_for(form: GenesisForm, block: &StoredBlock) -> Result<(), NodeError> {
     let got = match form {
         GenesisForm::V4 => block.body().commitment_at(block.header.height),
-        GenesisForm::V5 => block.body().commitment_v5(),
+        GenesisForm::V5 => block.body().commitment_v5_at(block.header.height),
     };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {

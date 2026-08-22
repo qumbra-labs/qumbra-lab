@@ -2205,12 +2205,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         use qlab_p2p::n1::ChainView;
         let form = self.p2p.node().genesis_form();
         self.nonce = self.nonce.wrapping_add(1);
-        let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
-        let outcome = self.p2p.announce_block_named(
+        let outcome = self.p2p.announce_block_named_for_payees(
             header,
             body.txs,
-            coinbase,
-            rkm,
+            body.coinbase_payees,
             self.nonce,
         );
         // Refresh the template cache: a new tip (or a refusal that left the

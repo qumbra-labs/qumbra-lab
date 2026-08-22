@@ -24,10 +24,10 @@
 //!
 //! [`pplns::PplnsWindow`] is last-N accepted shares ([devnet-placeholder]
 //! `PPLNS_WINDOW_SHARES = 1024`). [`payee::assemble_coinbase`] emits a
-//! v5 [`qlab_devnet::body::CoinbasePayee`] list capped at
-//! `COINBASE_PAYEE_CAP_V5` (1 at birth) or a v4 N=1 `(rkm, amount)`.
-//! The birth cap means PPLNS cannot yet split the mint — the winner
-//! takes it; the assembler already truncates to `cap`.
+//! v5 [`qlab_devnet::body::CoinbasePayee`] list capped at one before the
+//! height boundary and `COINBASE_PAYEE_CAP_V5` (8) after it, or a v4 N=1
+//! `(rkm, amount)`. The pool selects `min(cap, window winners)` and preserves
+//! the exact scheduled sum through the final winner's remainder.
 //!
 //! ## 🔴 The payee gate (lab #547)
 //!

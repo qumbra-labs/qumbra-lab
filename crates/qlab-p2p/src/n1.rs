@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use qlab_devnet::body::{check_body_binding, BlockBody, TxEntry};
+use qlab_devnet::body::{check_body_binding, BlockBody, CoinbasePayee, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, Vote};
 use qlab_devnet::ebbflow::{
@@ -44,6 +44,19 @@ pub(crate) fn txs_weight(txs: &[TxEntry]) -> usize {
                 + 16
         })
         .sum()
+}
+
+/// The coinbase portion of the body-surface meter shared by the pending-body
+/// and serving-cache bounds.
+///
+/// This meter charges declared body data, not wire framing or allocator
+/// metadata: [`txs_weight`] likewise excludes `Vec` headers and allocation
+/// rounding, whose fixed per-entry cost is bounded by the separate entry caps.
+/// The pre-list body stored `amount: u64` and `rkm: [u64; 4]` (40 B), exactly
+/// one [`CoinbasePayee`]. Preserve that 40 B floor for zero/one payee and add
+/// 40 B for each additional payee retained above the activation boundary.
+pub(crate) fn coinbase_payees_weight(payees: &[CoinbasePayee]) -> usize {
+    std::mem::size_of::<CoinbasePayee>() * payees.len().max(1)
 }
 
 /// What happened when an object was handed to the node.

@@ -95,7 +95,7 @@ in that order.
 | item | state | note |
 |---|---|---|
 | Operator fee policy | ⬜ no ruling exists | nobody has decided what a pool charges |
-| More than one payee per block | ⬜ `COINBASE_PAYEE_CAP_V5 = 1` | raising the cap is a **rule change**, not config |
+| More than one payee per block | 🧊 max 8 built; boundary unset, so active cap remains 1 | height-keyed **rule change**, not config; activation is a later rollout stamp |
 | Third-party pool operator guide (public) | ⬜ | written after we have run one ourselves, not before |
 | Audit | ⬜ | the pool is in the audit RFP's scope, unstarted |
 

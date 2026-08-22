@@ -5,7 +5,8 @@
 # they cannot track the live chain and would mislead miners.
 # Share-PoW: qlab_pow::RandomXHasher (feature randomx, default ON).
 # PPLNS window = 1024 accepted shares [devnet-placeholder].
-# V5 payee list is N=1 at birth (COINBASE_PAYEE_CAP_V5).
+# V5 payee list stays N=1 while the activation boundary is unset; the built
+# maximum is COINBASE_PAYEE_CAP_V5 = 8.
 
 listen_addr = "127.0.0.1:3333"
 share_difficulty = 1024

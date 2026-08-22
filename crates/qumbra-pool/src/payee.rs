@@ -1,16 +1,16 @@
 //! Payee-list assembly, form-keyed.
 //!
-//! - **V5**: native [`CoinbasePayee`] list, capped at
-//!   [`COINBASE_PAYEE_CAP_V5`] (1 at birth). Validated through
-//!   [`check_scheduled_coinbase_payees`] — we do not re-derive Σ.
+//! - **V5**: native [`CoinbasePayee`] list, capped at one before the payee-cap
+//!   boundary and [`qlab_devnet::body::COINBASE_PAYEE_CAP_V5`] (8) after it.
+//!   Validated through [`check_scheduled_coinbase_payees_above`] — we do not
+//!   re-derive Σ.
 //! - **V4**: N=1 single-payee (`coinbase` + `coinbase_rkm`). Accounting
 //!   testability on today's net; **not** stock-xmrig (#356 UNCLEAN).
 //!
-//! With the birth cap at 1, PPLNS cannot yet split the mint. The
-//! highest-weight miner in the window (or the pool rkm if the window
-//! is empty / the winner has no registered rkm) takes the whole
-//! `coinbase_exact(height)`. Raising the cap is a rule change; this
-//! assembler already truncates to `cap` so the same function grows.
+//! Before activation, PPLNS cannot split the mint: the highest-weight miner in
+//! the window (or the pool rkm if the window is empty / the winner has no
+//! registered rkm) takes the whole `coinbase_exact(height)`. Above the boundary
+//! the same assembler selects up to eight winners and splits proportionally.
 //!
 //! ## 🔴 The payout and refusal path (lab #547 + #553)
 //!
@@ -27,7 +27,10 @@
 //! [`UNCONFIGURED_NODE_RKM`] placeholder, which is what three T2 blocks
 //! (607, 610, 611) were paid to and which nobody can spend.
 
-use qlab_devnet::body::{check_scheduled_coinbase_payees, CoinbasePayee, COINBASE_PAYEE_CAP_V5};
+use qlab_devnet::body::{
+    check_scheduled_coinbase_payees_above, coinbase_payee_cap_v5_above, CoinbasePayee,
+    COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+};
 use qlab_devnet::emission_exact::coinbase_exact;
 use qlab_devnet::forms::GenesisForm;
 
@@ -251,15 +254,43 @@ impl Accounts {
     }
 }
 
-pub fn payee_cap(form: GenesisForm) -> usize {
+pub fn payee_cap(form: GenesisForm, height: u64) -> usize {
+    payee_cap_above(form, COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, height)
+}
+
+/// [`payee_cap`] with the V5 boundary injected for drills.
+pub fn payee_cap_above(
+    form: GenesisForm,
+    payee_boundary: Option<u64>,
+    height: u64,
+) -> usize {
     match form {
-        GenesisForm::V5 => COINBASE_PAYEE_CAP_V5,
+        GenesisForm::V5 => coinbase_payee_cap_v5_above(payee_boundary, height),
         GenesisForm::V4 => 1,
     }
 }
 
 /// Assemble the coinbase for `height` under `form`.
 pub fn assemble_coinbase(
+    form: GenesisForm,
+    height: u64,
+    window: &PplnsWindow,
+    accounts: &Accounts,
+    pool_rkm: [u64; 4],
+) -> Result<AssembledCoinbase, AssembleError> {
+    assemble_coinbase_above(
+        COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+        form,
+        height,
+        window,
+        accounts,
+        pool_rkm,
+    )
+}
+
+/// [`assemble_coinbase`] with the V5 payee-cap boundary injected for drills.
+pub fn assemble_coinbase_above(
+    payee_boundary: Option<u64>,
     form: GenesisForm,
     height: u64,
     window: &PplnsWindow,
@@ -274,11 +305,11 @@ pub fn assemble_coinbase(
     } else {
         coinbase_exact(height)
     };
-    let cap = payee_cap(form);
+    let cap = payee_cap_above(form, payee_boundary, height);
     let winner = pick_payees(window, accounts, pool_rkm, cap, amount);
     match form {
         GenesisForm::V5 => {
-            check_scheduled_coinbase_payees(height, &winner)
+            check_scheduled_coinbase_payees_above(payee_boundary, height, &winner)
                 .map_err(|e| AssembleError::Schedule(format!("{e:?}")))?;
             Ok(AssembledCoinbase::V5 { payees: winner })
         }
@@ -331,7 +362,7 @@ fn pick_payees(
             amount,
         }];
     }
-    // Cap > 1 (future rule change): proportional split, last gets remainder.
+    // Cap > 1: proportional split, last gets the exact remainder.
     let total_w: u128 = scored.iter().map(|(_, w)| *w).sum();
     let mut left = amount;
     let last = scored.len() - 1;
@@ -400,12 +431,59 @@ mod tests {
         let assembled = assemble_coinbase(GenesisForm::V5, 2, &w, &accounts, rkm(9)).unwrap();
         match assembled {
             AssembledCoinbase::V5 { payees } => {
-                assert_eq!(payees.len(), COINBASE_PAYEE_CAP_V5);
+                assert_eq!(payees.len(), 1);
                 assert_eq!(payees[0].rkm, rkm(2), "bob has more weight");
                 assert_eq!(payees[0].amount, coinbase_exact(2));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn v5_above_the_boundary_pays_up_to_eight_winners_and_preserves_the_sum() {
+        let boundary = 7;
+        let height = boundary + 1;
+        let mut accounts = Accounts::default();
+        let mut pairs = Vec::new();
+        for i in 1..=10u64 {
+            let login = format!("miner-{i}");
+            accounts.register(login.clone(), rkm(i));
+            pairs.push((login, i));
+        }
+        let borrowed: Vec<(&str, u64)> =
+            pairs.iter().map(|(login, weight)| (login.as_str(), *weight)).collect();
+        let w = window(&borrowed);
+        let assembled = assemble_coinbase_above(
+            Some(boundary),
+            GenesisForm::V5,
+            height,
+            &w,
+            &accounts,
+            rkm(99),
+        )
+        .unwrap();
+        let AssembledCoinbase::V5 { payees } = assembled else {
+            panic!("expected V5 payees");
+        };
+        assert_eq!(payees.len(), qlab_devnet::body::COINBASE_PAYEE_CAP_V5);
+        assert_eq!(
+            payees.iter().map(|p| p.amount as u128).sum::<u128>(),
+            coinbase_exact(height) as u128,
+            "the last winner receives the integer remainder"
+        );
+        assert_eq!(payees[0].rkm, rkm(10), "highest weight comes first");
+        assert_eq!(payees.last().unwrap().rkm, rkm(3), "only the top eight win");
+
+        let below = assemble_coinbase_above(
+            Some(boundary),
+            GenesisForm::V5,
+            boundary,
+            &w,
+            &accounts,
+            rkm(99),
+        )
+        .unwrap();
+        assert_eq!(below.payees().len(), 1, "the boundary height still uses N=1");
     }
 
     #[test]
