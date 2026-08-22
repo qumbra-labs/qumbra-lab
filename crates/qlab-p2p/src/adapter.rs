@@ -3145,6 +3145,22 @@ mod tests {
         (a, anchor)
     }
 
+    /// The form-aware sibling of [`adapter_with_finalized_genesis`]. The form
+    /// must be installed before genesis is finalized: `set_chain_rules` re-keys
+    /// an untouched adapter, and the finalized anchor must belong to that
+    /// re-keyed chain rather than to the default v4 one.
+    fn adapter_for_form_with_finalized_genesis(
+        form: GenesisForm,
+    ) -> (NodeAdapter<KeccakPow, MockVerifier>, Hash32) {
+        let (cstate, _v) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        a.set_chain_rules(ChainRules { form, halt: RuleSchedule::V1_0 });
+        let g = a.chain().genesis_block_hash();
+        a.state_mut().finalize(g).expect("finalize the installed form's genesis");
+        let anchor = a.state().commitment_root();
+        (a, anchor)
+    }
+
     fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
         TxEntry::with_placeholder_discovery(proof.to_vec(), qlab_devnet::body::TxPublic {
             anchor,
@@ -6992,6 +7008,40 @@ mod tests {
         assert_eq!(peer.chain().tip_hash(), id, "the peer adopted the v5 identity");
         assert_eq!(peer.chain().tip_hash(), miner.chain().tip_hash());
         assert_eq!(peer.chain().tip_height(), 1);
+    }
+
+    /// Lab #612: admission and eviction must ask the rider question under the
+    /// same installed form. A v5 name COMMIT is valid natively from height 1;
+    /// connecting an unrelated empty v5 block must not make the pool re-ask it
+    /// under v4's height-19,008 boundary and silently delete it.
+    ///
+    /// This is the production path in both halves: `submit_tx_typed` admits the
+    /// transaction, then `ingest_block` applies the unrelated block and reaches
+    /// the adapter's post-connect mempool reconciliation. On `96f04fe` the last
+    /// assertion fails because that reconciliation calls the v4-hardcoded
+    /// `Mempool::on_block_connected`.
+    #[test]
+    fn a_v5_name_rider_survives_an_unrelated_connected_block() {
+        use qlab_devnet::names::NameOp;
+
+        let (mut peer, anchor) =
+            adapter_for_form_with_finalized_genesis(GenesisForm::V5);
+        let (mut producer, _) =
+            adapter_for_form_with_finalized_genesis(GenesisForm::V5);
+
+        let commit = tx_with(anchor, 0x51, b"ok")
+            .with_name_op(&NameOp::Commit { commit: [0xA6; 32] });
+        let id = peer.submit_tx_typed(commit).expect("v5 admits its native name rider");
+        assert!(peer.mempool().contains(&id));
+
+        let (header, body) = producer.mine_block().expect("mine an unrelated v5 block");
+        assert!(body.txs.is_empty(), "the connected block does not mine the pooled commit");
+        assert_eq!(peer.ingest_block(header, body), IngestOutcome::Accepted);
+
+        assert!(
+            peer.mempool().contains(&id),
+            "an unrelated v5 block must not evict a still-valid v5 name rider"
+        );
     }
 
     /// Lab #553 acceptance: parameterising the RPC assembly path must not move
