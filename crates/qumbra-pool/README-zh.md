@@ -174,6 +174,7 @@ Qumbra 的出块奖励是**写进共识的收款人列表**(`CoinbasePayee`,T2 �
 | `poll_ms` | 多久向节点重新要一次模板(默认 1000 ms)。tip 变化时矿池替换持有的模板、把未完成的 job 标陈旧,并向每个在线会话 **推送一条 `job` 通知** |
 | `template_max_poll_failures` | 连续失败多少次 poll 之后暂停发活(默认 3) |
 | `template_max_age_ms` | 多久没有一次成功的 poll 就暂停发活。不设时等于 `template_max_poll_failures × poll_ms`,跟着 poll 节奏走,而不是另写一个数字 |
+| `template_disconnect_after_ms` | 持续多久拿不到好模板后才结束已暂停的会话,让矿工切换备用矿池(默认 300000 ms / 5 分钟)。必须大于暂停阈值 |
 | `payout_rkm` | 矿池自己的收款身份,来自 `qumbra-wallet miner-rkm` |
 | `max_connections` | 同时在线的 stratum 连接数(默认 64)。每个连接是一条线程;超过上限时 accept 循环写 `connection-cap-reached`,不再 spawn |
 | `max_connections_per_ip` | 同一 IP 的同时连接数。不设时等于 `max(1, max_connections / 8)`,一个对端占不满整个上限 |

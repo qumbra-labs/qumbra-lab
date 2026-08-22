@@ -20,6 +20,9 @@ poll_ms = 1000
 # not a second literal). Uncomment only to override the defaults.
 # template_max_poll_failures = 5
 # template_max_age_ms = 15000
+# Suspended sessions stay registered for recovery. A sustained outage ends
+# them for miner failover after five minutes by default.
+# template_disconnect_after_ms = 300000
 
 # Public-stratum guards (lab #544). Unset, per-IP is max(1, max_connections / 8)
 # so one peer cannot occupy the whole cap; connection timeout tracks request

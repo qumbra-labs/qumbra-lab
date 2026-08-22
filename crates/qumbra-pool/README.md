@@ -192,6 +192,7 @@ fields that matter:
 | `poll_ms` | how often to re-ask the node for a template (default 1000). On a tip change the pool replaces the held template, marks outstanding jobs stale, and **pushes a `job` notification** to each live session |
 | `template_max_poll_failures` | consecutive failed polls before work is suspended (default 3) |
 | `template_max_age_ms` | wall-clock without a successful poll before work is suspended. Unset, this is `template_max_poll_failures × poll_ms` so the bound tracks the poll cadence rather than a second literal |
+| `template_disconnect_after_ms` | sustained wall-clock outage before suspended sessions end so miners can fail over (default 300000 ms / 5 min). Must be greater than the suspension age |
 | `payout_rkm` | the pool's own payout identity, from `qumbra-wallet miner-rkm` |
 | `max_connections` | concurrent stratum connections (default 64). Each one is a thread; past the cap the accept loop writes `connection-cap-reached` and does not spawn |
 | `max_connections_per_ip` | concurrent connections from one IP. Unset, this is `max(1, max_connections / 8)` so one peer cannot occupy the whole cap |
