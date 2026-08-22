@@ -1,36 +1,36 @@
 //! Payee-list assembly, form-keyed.
 //!
-//! - **V5**: native [`CoinbasePayee`] list, capped at
-//!   [`COINBASE_PAYEE_CAP_V5`] (1 at birth). Validated through
-//!   [`check_scheduled_coinbase_payees`] — we do not re-derive Σ.
+//! - **V5**: native [`CoinbasePayee`] list, capped at one before the payee-cap
+//!   boundary and [`qlab_devnet::body::COINBASE_PAYEE_CAP_V5`] (8) after it.
+//!   Validated through [`check_scheduled_coinbase_payees_above`] — we do not
+//!   re-derive Σ.
 //! - **V4**: N=1 single-payee (`coinbase` + `coinbase_rkm`). Accounting
 //!   testability on today's net; **not** stock-xmrig (#356 UNCLEAN).
 //!
-//! With the birth cap at 1, PPLNS cannot yet split the mint. The
-//! highest-weight miner in the window (or the pool rkm if the window
-//! is empty / the winner has no registered rkm) takes the whole
-//! `coinbase_exact(height)`. Raising the cap is a rule change; this
-//! assembler already truncates to `cap` so the same function grows.
+//! Before activation, PPLNS cannot split the mint: the highest-weight miner in
+//! the window (or the pool rkm if the window is empty / the winner has no
+//! registered rkm) takes the whole `coinbase_exact(height)`. Above the boundary
+//! the same assembler selects up to eight winners and splits proportionally.
 //!
-//! ## 🔴 What [`assemble_coinbase`] is, and what it is not (lab #547)
+//! ## 🔴 The payout and refusal path (lab #547 + #553)
 //!
-//! **It is not on the submit path, and on today's node RPC it cannot be.**
-//! `coinbase_rkm` lives inside the body preimage that the header commits
-//! to through `tx_body_commitment` (`qlab_devnet::body`), so the payee is
-//! fixed *before* the miner grinds and cannot be substituted afterwards
-//! without invalidating the share. `GET /v1/mine/template` has no payee
-//! parameter, so the body the pool receives already names the **node's**
-//! own `miner_rkm`. `assemble_coinbase` therefore describes the payout
-//! this pool *would* choose, and its result reaches no block.
+//! `coinbase_rkm` lives inside the body preimage that the header commits to,
+//! so the payee is fixed *before* the miner grinds. Lab #553 puts this assembler
+//! on that path: every live-node poll calls it, sends its list to
+//! `GET /v1/mine/template`, and stores the returned committed body in the job
+//! that is later submitted.
 //!
-//! What this module can enforce is the negative: [`check_payee`] is the
+//! [`check_payee`] remains the negative backstop. It defines the
 //! set of payees the pool is willing to let reach the chain at all — the
 //! configured `payout_rkm`, or an rkm owned by a login we know. Everything
 //! else is refused **by name**, including the node's
 //! [`UNCONFIGURED_NODE_RKM`] placeholder, which is what three T2 blocks
 //! (607, 610, 611) were paid to and which nobody can spend.
 
-use qlab_devnet::body::{check_scheduled_coinbase_payees, CoinbasePayee, COINBASE_PAYEE_CAP_V5};
+use qlab_devnet::body::{
+    check_scheduled_coinbase_payees_above, coinbase_payee_cap_v5_above, CoinbasePayee,
+    COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+};
 use qlab_devnet::emission_exact::coinbase_exact;
 use qlab_devnet::forms::GenesisForm;
 
@@ -174,9 +174,8 @@ where
 
 /// [`check_payee`] over a template body.
 ///
-/// A body that mints nothing and names nobody (`coinbase == 0 &&
-/// rkm == [0; 4]` — genesis's shape, and the only shape for which
-/// `BlockBody::coinbase_payees` is empty) has nothing at stake and passes.
+/// An empty list is the non-minting genesis shape. Every requested payee must
+/// be owned; checking only the first would become an escape when the cap rises.
 pub fn check_body_payee<'a, I>(
     body: &crate::template::TemplateBody,
     pool_rkm: [u64; 4],
@@ -186,16 +185,26 @@ pub fn check_body_payee<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
-    if body.coinbase == 0 && body.coinbase_rkm == [0u64; 4] {
-        return Ok(());
+    let known: Vec<&str> = known_logins.into_iter().collect();
+    for payee in &body.coinbase_payees {
+        check_payee(payee.rkm, pool_rkm, accounts, known.iter().copied())?;
     }
-    check_payee(body.coinbase_rkm, pool_rkm, accounts, known_logins)
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssembledCoinbase {
     V5 { payees: Vec<CoinbasePayee> },
     V4 { rkm: [u64; 4], amount: u64 },
+}
+
+impl AssembledCoinbase {
+    pub fn payees(&self) -> Vec<CoinbasePayee> {
+        match self {
+            Self::V5 { payees } => payees.clone(),
+            Self::V4 { rkm, amount } => vec![CoinbasePayee { rkm: *rkm, amount: *amount }],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,15 +254,43 @@ impl Accounts {
     }
 }
 
-pub fn payee_cap(form: GenesisForm) -> usize {
+pub fn payee_cap(form: GenesisForm, height: u64) -> usize {
+    payee_cap_above(form, COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, height)
+}
+
+/// [`payee_cap`] with the V5 boundary injected for drills.
+pub fn payee_cap_above(
+    form: GenesisForm,
+    payee_boundary: Option<u64>,
+    height: u64,
+) -> usize {
     match form {
-        GenesisForm::V5 => COINBASE_PAYEE_CAP_V5,
+        GenesisForm::V5 => coinbase_payee_cap_v5_above(payee_boundary, height),
         GenesisForm::V4 => 1,
     }
 }
 
 /// Assemble the coinbase for `height` under `form`.
 pub fn assemble_coinbase(
+    form: GenesisForm,
+    height: u64,
+    window: &PplnsWindow,
+    accounts: &Accounts,
+    pool_rkm: [u64; 4],
+) -> Result<AssembledCoinbase, AssembleError> {
+    assemble_coinbase_above(
+        COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+        form,
+        height,
+        window,
+        accounts,
+        pool_rkm,
+    )
+}
+
+/// [`assemble_coinbase`] with the V5 payee-cap boundary injected for drills.
+pub fn assemble_coinbase_above(
+    payee_boundary: Option<u64>,
     form: GenesisForm,
     height: u64,
     window: &PplnsWindow,
@@ -268,11 +305,11 @@ pub fn assemble_coinbase(
     } else {
         coinbase_exact(height)
     };
-    let cap = payee_cap(form);
+    let cap = payee_cap_above(form, payee_boundary, height);
     let winner = pick_payees(window, accounts, pool_rkm, cap, amount);
     match form {
         GenesisForm::V5 => {
-            check_scheduled_coinbase_payees(height, &winner)
+            check_scheduled_coinbase_payees_above(payee_boundary, height, &winner)
                 .map_err(|e| AssembleError::Schedule(format!("{e:?}")))?;
             Ok(AssembledCoinbase::V5 { payees: winner })
         }
@@ -325,7 +362,7 @@ fn pick_payees(
             amount,
         }];
     }
-    // Cap > 1 (future rule change): proportional split, last gets remainder.
+    // Cap > 1: proportional split, last gets the exact remainder.
     let total_w: u128 = scored.iter().map(|(_, w)| *w).sum();
     let mut left = amount;
     let last = scored.len() - 1;
@@ -394,12 +431,59 @@ mod tests {
         let assembled = assemble_coinbase(GenesisForm::V5, 2, &w, &accounts, rkm(9)).unwrap();
         match assembled {
             AssembledCoinbase::V5 { payees } => {
-                assert_eq!(payees.len(), COINBASE_PAYEE_CAP_V5);
+                assert_eq!(payees.len(), 1);
                 assert_eq!(payees[0].rkm, rkm(2), "bob has more weight");
                 assert_eq!(payees[0].amount, coinbase_exact(2));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn v5_above_the_boundary_pays_up_to_eight_winners_and_preserves_the_sum() {
+        let boundary = 7;
+        let height = boundary + 1;
+        let mut accounts = Accounts::default();
+        let mut pairs = Vec::new();
+        for i in 1..=10u64 {
+            let login = format!("miner-{i}");
+            accounts.register(login.clone(), rkm(i));
+            pairs.push((login, i));
+        }
+        let borrowed: Vec<(&str, u64)> =
+            pairs.iter().map(|(login, weight)| (login.as_str(), *weight)).collect();
+        let w = window(&borrowed);
+        let assembled = assemble_coinbase_above(
+            Some(boundary),
+            GenesisForm::V5,
+            height,
+            &w,
+            &accounts,
+            rkm(99),
+        )
+        .unwrap();
+        let AssembledCoinbase::V5 { payees } = assembled else {
+            panic!("expected V5 payees");
+        };
+        assert_eq!(payees.len(), qlab_devnet::body::COINBASE_PAYEE_CAP_V5);
+        assert_eq!(
+            payees.iter().map(|p| p.amount as u128).sum::<u128>(),
+            coinbase_exact(height) as u128,
+            "the last winner receives the integer remainder"
+        );
+        assert_eq!(payees[0].rkm, rkm(10), "highest weight comes first");
+        assert_eq!(payees.last().unwrap().rkm, rkm(3), "only the top eight win");
+
+        let below = assemble_coinbase_above(
+            Some(boundary),
+            GenesisForm::V5,
+            boundary,
+            &w,
+            &accounts,
+            rkm(99),
+        )
+        .unwrap();
+        assert_eq!(below.payees().len(), 1, "the boundary height still uses N=1");
     }
 
     #[test]
@@ -532,16 +616,14 @@ mod tests {
     #[test]
     fn a_body_that_mints_nothing_and_names_nobody_passes() {
         let body = crate::template::TemplateBody {
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             txs: Vec::new(),
         };
         assert!(check_body_payee(&body, rkm(9), &Accounts::default(), std::iter::empty()).is_ok());
 
         // But minting to nobody is not the same thing.
         let minting = crate::template::TemplateBody {
-            coinbase: 1,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: vec![CoinbasePayee { rkm: [0; 4], amount: 1 }],
             txs: Vec::new(),
         };
         assert_eq!(

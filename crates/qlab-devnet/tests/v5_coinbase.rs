@@ -5,24 +5,24 @@
 
 use qlab_devnet::body::{
     check_scheduled_coinbase_above, check_scheduled_coinbase_payees, BlockBody, BodyError,
-    CoinbasePayee, COINBASE_PAYEE_CAP_V5,
+    CoinbasePayee, COINBASE_PAYEE_CAP_V5_AT_BIRTH,
 };
 use qlab_devnet::emission_exact::coinbase_exact;
 
 fn minting_body(coinbase: u64) -> BlockBody {
-    BlockBody { txs: Vec::new(), coinbase, coinbase_rkm: [7, 8, 9, 10] }
+    BlockBody::from_single_payee(Vec::new(), coinbase, [7, 8, 9, 10])
 }
 
-// ── the payee-list derivation and the preimage tail ─────────────────────────
+// ── the payee-list representation and the preimage tail ────────────────────
 
 #[test]
 fn payee_list_is_one_entry_paying_the_whole_mint_or_empty() {
     let body = minting_body(5_000);
     assert_eq!(
-        body.coinbase_payees(),
+        body.coinbase_payees,
         vec![CoinbasePayee { rkm: [7, 8, 9, 10], amount: 5_000 }]
     );
-    assert_eq!(BlockBody::default().coinbase_payees(), Vec::new(), "genesis shape is empty");
+    assert_eq!(BlockBody::default().coinbase_payees, Vec::new(), "genesis shape is empty");
 }
 
 /// The v5 preimage tail is `count(1) ‖ [rkm(4×8 LE) ‖ amount(8 LE)]×N`, and the
@@ -35,10 +35,10 @@ fn v5_preimage_tail_is_the_payee_list() {
     // Rebuild what the tail must be and check the commitment moves with every
     // tail byte (rkm lane and amount each flip the hash).
     let mut other = body.clone();
-    other.coinbase_rkm = [7, 8, 9, 11];
+    other.coinbase_payees[0].rkm = [7, 8, 9, 11];
     assert_ne!(c5, other.commitment_v5(), "rkm is committed");
     let mut other = body.clone();
-    other.coinbase = 1;
+    other.coinbase_payees[0].amount = 1;
     assert_ne!(c5, other.commitment_v5(), "the amount is committed");
 
     // Empty: count byte 0x00 — distinct from any minting body.
@@ -98,8 +98,13 @@ fn more_payees_than_the_birth_cap_is_refused_by_name() {
     ];
     assert_eq!(
         check_scheduled_coinbase_payees(h, &payees),
-        Err(BodyError::TooManyCoinbasePayees { got: 2, cap: COINBASE_PAYEE_CAP_V5 })
+        Err(BodyError::TooManyCoinbasePayees {
+            got: 2,
+            cap: COINBASE_PAYEE_CAP_V5_AT_BIRTH,
+        })
     );
+    let body = BlockBody::new(Vec::new(), payees.to_vec());
+    assert_eq!(body.coinbase_payees, payees);
 }
 
 #[test]
@@ -119,6 +124,9 @@ fn a_zero_payee_list_on_a_minting_height_is_refused() {
 #[test]
 fn genesis_is_structurally_exempt_and_still_cannot_mint() {
     assert_eq!(check_scheduled_coinbase_payees(0, &[]), Ok(()));
+    let noncanonical_zero =
+        BlockBody::new(Vec::new(), vec![CoinbasePayee { rkm: [0; 4], amount: 0 }]);
+    assert!(noncanonical_zero.mints_without_payee());
     // A genesis-height list that DOES mint is refused — the exemption is
     // "genesis mints nothing", not "height 0 may do anything".
     let payees = [CoinbasePayee { rkm: [1, 2, 3, 4], amount: 5 }];
@@ -136,6 +144,6 @@ fn genesis_is_structurally_exempt_and_still_cannot_mint() {
 fn todays_single_rkm_body_is_a_valid_v5_producer() {
     let h = 100u64;
     let body = minting_body(coinbase_exact(h));
-    assert_eq!(check_scheduled_coinbase_payees(h, &body.coinbase_payees()), Ok(()));
+    assert_eq!(check_scheduled_coinbase_payees(h, &body.coinbase_payees), Ok(()));
     assert!(!body.mints_without_payee());
 }

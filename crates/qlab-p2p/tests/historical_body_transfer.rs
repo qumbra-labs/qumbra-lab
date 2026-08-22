@@ -207,7 +207,8 @@ fn the_slag_slope_is_strictly_below_the_block_rate_under_continuing_load() {
     for _ in 0..8 {
         let (h, body) = server.node_mut().mine_block().expect("mine");
         assert_eq!(server.node_mut().ingest_block(h, body.clone()), IngestOutcome::Accepted);
-        server.announce_block(h, body.txs, body.coinbase, body.coinbase_rkm, 0);
+        let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+        server.announce_block(h, body.txs, coinbase, rkm, 0);
         now = run(&mut [&mut server, &mut behind], 4, now);
         samples.push(slag(&behind));
     }
@@ -348,11 +349,12 @@ fn a_served_body_that_does_not_match_the_header_commitment_is_charged_to_the_ser
     // counter is a body field, so changing it breaks the binding without touching a
     // single transaction.
     let (header, body) = blocks[1].clone();
+    let mut forged_payees = body.coinbase_payees.clone();
+    forged_payees[0].amount = forged_payees[0].amount.wrapping_add(1);
     let forged = BlockAnnounce {
         header,
         nonce: 0,
-        coinbase: body.coinbase.wrapping_add(1),
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase_payees: forged_payees,
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
@@ -537,13 +539,12 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
                 fee: 1_000_000,
             }))
         .collect();
-    let body = BlockBody { txs: txs.clone(), coinbase: 42, coinbase_rkm: [7; 4] };
+    let body = BlockBody::from_single_payee(txs.clone(), 42, [7; 4]);
     let header = BlockHeader::child_of(&BlockHeader::genesis(1000, 0), 75, 1000, body.commitment());
     let ann = BlockAnnounce {
         header,
         nonce: 0,
-        coinbase: body.coinbase,
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase_payees: body.coinbase_payees.clone(),
         short_ids: Vec::new(),
         prefilled: txs
             .iter()
@@ -561,8 +562,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
             for (a, b) in got.iter().zip(&txs) {
                 assert_eq!(tx_id(a), tx_id(b), "in order, byte-identical");
             }
-            let rebuilt =
-                BlockBody { txs: got, coinbase: back.coinbase, coinbase_rkm: back.coinbase_rkm };
+            let rebuilt = BlockBody::new(got, back.coinbase_payees);
             assert_eq!(
                 rebuilt.commitment(),
                 header.tx_body_commitment,
@@ -578,8 +578,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
     let live = BlockAnnounce {
         header,
         nonce: 0xABCD,
-        coinbase: body.coinbase,
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase_payees: body.coinbase_payees.clone(),
         short_ids: txs[1..].iter().map(|tx| short_id(0xABCD, &tx_id(tx))).collect(),
         prefilled: vec![PrefilledTx { index: 0, tx: txs[0].clone() }],
     };
@@ -596,8 +595,10 @@ fn a_served_block_uses_the_existing_announce_codec_and_no_new_msg_type() {
     let ann = BlockAnnounce {
         header: BlockHeader::genesis(1000, 0),
         nonce: 0,
-        coinbase: 5,
-        coinbase_rkm: [9; 4],
+        coinbase_payees: vec![qlab_devnet::body::CoinbasePayee {
+            rkm: [9; 4],
+            amount: 5,
+        }],
         short_ids: Vec::new(),
         prefilled: vec![PrefilledTx {
             index: 0,
@@ -723,8 +724,7 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
         let ann = BlockAnnounce {
             header: *h,
             nonce: 0,
-            coinbase: body.coinbase,
-            coinbase_rkm: body.coinbase_rkm,
+            coinbase_payees: body.coinbase_payees.clone(),
             short_ids: Vec::new(),
             prefilled: Vec::new(),
         };
@@ -755,8 +755,7 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
     let ann = BlockAnnounce {
         header: *h2,
         nonce: 0,
-        coinbase: b2.coinbase,
-        coinbase_rkm: b2.coinbase_rkm,
+        coinbase_payees: b2.coinbase_payees.clone(),
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };

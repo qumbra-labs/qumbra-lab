@@ -137,10 +137,12 @@ pub const BURNED_SINCE_VERSION: u8 = 0x06;
 /// direction. `0x04` (issue #275's route bump — the telemetry *payload* is
 /// byte-identical at `0x04` and `0x05`) leaves under the same rule.
 /// `0x05` joined the list at the `0x06` bump (lab #367 arming prep): the whole
-/// fleet serves `0x05` today, so a reader without it would be blind to every
-/// host until the roll completes. It leaves under the standing rule — all
-/// hosts serving `0x06` or later.
-pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, 0x04, 0x05, RPC_VERSION];
+/// fleet served `0x05` then, so a reader without it would have been blind to
+/// every host until the roll completed. It leaves under the standing rule —
+/// all hosts serving `0x06` or later.
+/// `0x06` joins at the `0x07` mine-payee bump (lab #553); the telemetry bytes
+/// after the lead version remain unchanged.
+pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, 0x04, 0x05, 0x06, RPC_VERSION];
 
 /// **An identity in the block-hash space**: the first [`CHECKPOINT_ID_BYTES`] of a
 /// block hash, big-endian, rendered at `fid`'s width through `fid`'s helper.
@@ -1350,7 +1352,7 @@ mod tests {
     /// absent, present, and the `split` case where a node's own keys are committed
     /// to two variants at one slot.
     #[test]
-    fn telemetry_roundtrips_checkpoint_identity_at_0x06() {
+    fn telemetry_roundtrips_checkpoint_identity_at_0x07() {
         let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
@@ -1362,7 +1364,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x06, "the lab #367 arming bump (burned tail appended after #212's durable tail)");
+        assert_eq!(RPC_VERSION, 0x07, "the lab #553 mine-payee surface bump");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -1401,7 +1403,7 @@ mod tests {
     /// committee aggregates round-trip at the current version, while an older wire
     /// is rejected on its version byte by the STRICT decoder.**
     #[test]
-    fn committee_aggregates_roundtrip_at_0x06_and_older_is_rejected() {
+    fn committee_aggregates_roundtrip_at_0x07_and_older_is_rejected() {
         let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
             .with_committee(21, 19, 15)
             .with_supply(vec![SupplyEpoch {
@@ -1414,7 +1416,7 @@ mod tests {
                 burned: 0,
             }]);
         let bytes = t.to_bytes();
-        assert_eq!(bytes[0], 0x06);
+        assert_eq!(bytes[0], 0x07);
         assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
         assert_eq!(
             (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
@@ -1427,7 +1429,7 @@ mod tests {
         // The strict decoder refuses EVERY older version, including the `0x03` and
         // `0x04` the compat decoder now knowingly reads. Those are different paths
         // on purpose and this is the line that keeps them from converging (#212).
-        for old_version in [0x01u8, 0x02, 0x03, 0x04] {
+        for old_version in [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06] {
             let mut old = bytes.clone();
             old[0] = old_version;
             assert!(
@@ -1462,7 +1464,7 @@ mod tests {
 
         let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
         assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
-        assert_eq!(decoded.to_bytes()[0], 0x06, "coverage uses fields already on the wire");
+        assert_eq!(decoded.to_bytes()[0], 0x07, "coverage uses fields already on the wire");
     }
 
     /// **Acceptance (#130 (a)): `SupplyCoverage` and the state-lag figures are one
@@ -1926,7 +1928,7 @@ mod tests {
 
         // The rolled host: full fidelity, and the version says so.
         let (v, rolled) = Telemetry::from_bytes_compat(&live.to_bytes()).unwrap();
-        assert_eq!(v, 0x06);
+        assert_eq!(v, 0x07);
         assert_eq!(rolled, live);
         assert!(rolled.durable.is_available());
 
@@ -1959,9 +1961,9 @@ mod tests {
         ));
 
         // The readable set is bounded and named, and it is not a `>=` comparison:
-        // `0x02` and an unknown future `0x07` are both refused by BOTH paths.
-        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04, 0x05, 0x06]);
-        for refused in [0x00u8, 0x01, 0x02, 0x07, 0xff] {
+        // `0x02` and an unknown future `0x08` are both refused by BOTH paths.
+        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04, 0x05, 0x06, 0x07]);
+        for refused in [0x00u8, 0x01, 0x02, 0x08, 0xff] {
             let mut bytes = live.to_bytes();
             bytes[0] = refused;
             assert!(
@@ -2005,9 +2007,11 @@ mod tests {
                 burned: 77,
             }]);
         let new = t.to_bytes();
-        assert_eq!(new[0], 0x06);
-        // Round-trip at 0x06 carries the real value.
+        assert_eq!(new[0], 0x07);
         assert_eq!(Telemetry::from_bytes(&new).unwrap().supply[0].burned, 77);
+        let mut v6 = new.clone();
+        v6[0] = 0x06;
+        assert_eq!(Telemetry::from_bytes_compat(&v6).unwrap().1.supply[0].burned, 77);
 
         // The append discipline, stated as bytes: strip the tail, restamp 0x05,
         // and the compat reader decodes the whole snapshot — burned reads 0 and

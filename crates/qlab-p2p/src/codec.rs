@@ -71,10 +71,9 @@ pub enum DecodeError {
     WrongHeaderLen { got: usize, want: usize },
     /// A v5 block header's format-version byte (offset 32) was not 0x05.
     BadHeaderVersion { got: u8 },
-    /// A v5 announce names more coinbase payees than the birth cap (lab #470
-    /// stage 2, `COINBASE_PAYEE_CAP_V5`) — refused by name at decode: the
-    /// in-memory body cannot represent an over-cap list, so this is a block
-    /// this build cannot validate (the same grounds as `BadBucket`).
+    /// A v5 announce names more coinbase payees than the height-keyed cap —
+    /// refused by name before constructing a body this build cannot validate
+    /// (the same grounds as `BadBucket`).
     TooManyCoinbasePayees { got: usize, cap: usize },
 }
 
@@ -957,15 +956,15 @@ mod tests {
         let back = decode_tx(&encode_tx(&tx)).unwrap();
         assert_eq!(back.discovery, tx.discovery, "discovery bytes are carried verbatim");
 
-        let here = BlockBody { txs: vec![tx.clone()], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
-        let there = BlockBody { txs: vec![back], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        let here = BlockBody::from_single_payee(vec![tx.clone()], 7, [1, 2, 3, 4]);
+        let there = BlockBody::from_single_payee(vec![back], 7, [1, 2, 3, 4]);
         assert_eq!(here.commitment(), there.commitment());
 
         // And a peer that strips the group produces a different body — the
         // mutation this test exists to catch.
         let mut stripped = decode_tx(&encode_tx(&tx)).unwrap();
         stripped.discovery = TxEntry::empty_discovery();
-        let mutated = BlockBody { txs: vec![stripped], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        let mutated = BlockBody::from_single_payee(vec![stripped], 7, [1, 2, 3, 4]);
         assert_ne!(here.commitment(), mutated.commitment());
     }
 

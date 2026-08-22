@@ -6,7 +6,7 @@
 ## Status board
 
 Rows flip ⬜ → ✅ only when the coordinator has accepted the thing, never when it is
-merely written. Last updated 2026-08-21 21:55 +08.
+merely written. Last updated 2026-08-22 07:25 +08.
 
 ### The software — COMPLETE
 
@@ -28,8 +28,8 @@ merely written. Last updated 2026-08-21 21:55 +08.
 | **svc1 has its own `qumbra-node`** — the faucet has no mine RPC on any revision | ✅ 2026-08-21 (deploy #215, lab #519) |
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
-| **A miner paid by this pool** | 🔴 **NOT POSSIBLE YET** — lab #553; every block pays the pool's own address |
-| Public stratum on `pool.qumbra.org:3333` | ⏹ **stopped 2026-08-21 21:39 +08** — it cannot pay anyone; restarting means narrowing the SG first |
+| **🎉 A miner paid by this pool** | ✅ **first at height 1776**, 2026-08-22 01:19 +08; **137 blocks over the following 3 h**, and **0** to the pool's own address — lab #553 CLOSED |
+| Public stratum on `pool.qumbra.org:3333` | ▶️ **restarted 2026-08-22 01:12 +08** — it can pay now; SG still `0.0.0.0/0`, deliberately, Larry's call |
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
 64-hex rkm as the login — so this is the **miner-payee** branch, not the pool's fallback:
@@ -66,28 +66,36 @@ stock XMRig against a public endpoint. **What is NOT proven: that this pool can 
 
 | item | state | blocked on |
 |---|---|---|
-| A block actually mined, and its payee read | ✅ **done, and the answer was bad** | three blocks, all paying the pool, miner's key zero — **lab #553** |
-| Connection cap, line bound, rate limit on public stratum | ⬜ | **lab #544** |
-| Bounded staleness on the held template | ⬜ | **lab #545** |
-| Public announcement of the endpoint | ⬜ | the two rows above — **not** the first share |
+| A block actually mined, and its payee read | ✅ **done at scale** | 08-21: three blocks, all paying the pool. 08-22: **137 of 324** paid the miner, **0** paid the pool. |
+| Connection cap, line bound, rate limit on public stratum | ✅ 2026-08-21 (PR #563, lab #544) |  |
+| Bounded staleness on the held template | ✅ 2026-08-21 (PR #549, lab #545) |  |
+| An unowned payee cannot reach the chain **from the pool** | ✅ 2026-08-21 (PR #554, the pool half of lab #547) |  |
+| **The pool can pay a miner at all** | ✅ 2026-08-22 (lab PR #588, observed at height 1776) |  |
+| The node refuses to mine without a `miner_rkm` | ⬜ | **lab #552** — why the unspendable placeholder was expressible |
+| Admissions are attributable to a source | ⬜ | **lab #584** — the counters count, they do not attribute |
+| Public announcement of the endpoint | ⬜ | **lab #553 first.** Announcing a pool that cannot pay is the one thing we must not do |
 
-🔴 **The endpoint is reachable but deliberately unadvertised, and those two issues are why.**
-Public stratum has no connection cap, no line-length bound and a per-syscall rather than
-per-connection timeout (#544). #545 is two defects, not one: the poll thread discarded the jobs
-`replace_template` already built, so a miner got work at login and never again (every later share
-came back `stale job`, connection up, no message); and a held template with no staleness bound
-would keep that last job live while the node is unreachable. The node's refusal to assemble on a
-contested tip is correct and is not in scope. Neither defect is a risk to the chain or to any key;
-both are ways a miner burns electricity for nothing. **The window in which this endpoint is
-exposed and unprotected is one nobody has been told about, which makes it the cheapest time we
-will ever have to fix them.** The board stays ⬜ until the coordinator accepts the software.
+**Both of the issues that once held this row are fixed** (#544 caps connections, line length and
+per-connection deadlines, PR #563; #545 was two defects — the poll thread discarded jobs
+`replace_template` had already built, so a miner got work at login and never again, and a held
+template had no staleness bound — PR #549). Neither was ever a risk to the chain or to any key;
+both were ways a miner burns electricity for nothing.
+
+🔴 **What replaced them is worse, and it is not a hardening gap: the pool cannot pay anyone
+(#553).** The endpoint was stopped 2026-08-21 21:39 +08 and stays stopped until that lands.
+
+⚠️ **And retire the reasoning this paragraph used to carry.** It said the exposure was acceptable
+because the endpoint was *unadvertised*. **Obscurity is not a control** — the exposure was bounded
+by the security group, which is still open to `0.0.0.0/0`, and stopping the container is what
+actually closed the port. Restarting means **narrowing the SG first, then starting the profile**,
+in that order.
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
 | item | state | note |
 |---|---|---|
 | Operator fee policy | ⬜ no ruling exists | nobody has decided what a pool charges |
-| More than one payee per block | ⬜ `COINBASE_PAYEE_CAP_V5 = 1` | raising the cap is a **rule change**, not config |
+| More than one payee per block | 🧊 max 8 built; boundary unset, so active cap remains 1 | height-keyed **rule change**, not config; activation is a later rollout stamp |
 | Third-party pool operator guide (public) | ⬜ | written after we have run one ourselves, not before |
 | Audit | ⬜ | the pool is in the audit RFP's scope, unstarted |
 
@@ -115,20 +123,35 @@ is accepted. **The pool never holds miner funds** — it decides the split and a
 the block, but the chain does the paying. A pool operator who disappears mid-round costs
 you the round, not your balance.
 
-🔴 **THAT IS THE DESIGN. IT IS NOT WHAT THIS POOL DOES TODAY.** `GET /v1/mine/template`
-**reports** a payee, it does not **accept** one — and the payee is bound into the header the
-miner grinds against, so it cannot be substituted once a share comes back. **Every block this
-pool can submit pays the poolnode's `miner_rkm`, whatever the PPLNS window says.**
-`payee::assemble_coinbase` — the winner selection, the empty-window fallback, the cap — is
-correct and is **not on the submit path**; its only consumers are a read-only accessor and two
-unit tests. **So the pool is custodial right now: it earns the coinbase to its own address and
-has no mechanism to pay anyone.** Tracked as [lab #553](https://github.com/qumbra-labs/qumbra-lab/issues/553),
-which is the gate on this endpoint being announced to anybody.
+✅ **THAT IS THE DESIGN, AND AS OF 2026-08-22 01:19 +08 IT IS ALSO WHAT THIS POOL DOES.** Height 1776 paid `daf76f16…` — a miner's own key, posted publicly at tip 1771 thirteen seconds before the rig connected, and proven absent from all 1,772 prior heights. 4.992690888 QMB, paid by the chain, never held by the pool.
 
-**Measured, not inferred** (2026-08-21, first live session): a rig mining 29 accepted shares
+**The retired 🔴 block is kept below, because a doc that deletes the state it was in teaches nobody what was wrong:**
+
+> 🔴 **THAT IS THE DESIGN. IT IS NOT WHAT THIS POOL DOES TODAY.** `GET /v1/mine/template`
+> **reports** a payee, it does not **accept** one — and the payee is bound into the header the
+> miner grinds against, so it cannot be substituted once a share comes back. **Every block this
+> pool can submit pays the poolnode's `miner_rkm`, whatever the PPLNS window says.**
+> `payee::assemble_coinbase` — the winner selection, the empty-window fallback, the cap — is
+> correct and is **not on the submit path**; its only consumers are a read-only accessor and two
+> unit tests. **So the pool is custodial right now: it earns the coinbase to its own address and
+> has no mechanism to pay anyone.** Tracked as [lab #553](https://github.com/qumbra-labs/qumbra-lab/issues/553),
+> which is the gate on this endpoint being announced to anybody.
+> 
+> **Measured, not inferred** (2026-08-21, first live session): a rig mining 29 accepted shares
 with a payout key **nothing else on the chain has ever mined to** was inside the PPLNS window
 the whole time. Three blocks landed in that window. **All three paid the pool's own address;
 the miner's key received zero.**
+
+**Measured again, at scale** (2026-08-22, `1772..2095`, **324 of 324 heights verified covered**, both keys matched at their full 32 bytes):
+
+| payee | blocks |
+|---|---|
+| `daf76f16…` — the miner's key, **published at tip 1771, 13 s before its rig connected** | **137** |
+| `5f13e0c7…` — a solo miner | 39 |
+| `d2c02c7c…` — a solo miner | 33 |
+| **`79c3291d…` — the pool's own fallback address** | **0** |
+
+**The zero is the sharper half.** The fallback is not losing the tally; it is never taken. And the run contains its own **negative control**, unplanned: during a 52-minute window in which the miner hashed zero, its key was paid **0 of 33** blocks and the pool produced none — so payment tracks work in both directions. The 137 figure spans that dead window, so it understates the rate while mining and **must not be read as a hashrate share**.
 
 That is the whole reason the payee-list coinbase exists, and it is why this crate is
 worth reading rather than just running: **anyone can operate one of these**, and the
@@ -169,6 +192,7 @@ fields that matter:
 | `poll_ms` | how often to re-ask the node for a template (default 1000). On a tip change the pool replaces the held template, marks outstanding jobs stale, and **pushes a `job` notification** to each live session |
 | `template_max_poll_failures` | consecutive failed polls before work is suspended (default 3) |
 | `template_max_age_ms` | wall-clock without a successful poll before work is suspended. Unset, this is `template_max_poll_failures × poll_ms` so the bound tracks the poll cadence rather than a second literal |
+| `template_disconnect_after_ms` | sustained wall-clock outage before suspended sessions end so miners can fail over (default 300000 ms / 5 min). Must be greater than the suspension age |
 | `payout_rkm` | the pool's own payout identity, from `qumbra-wallet miner-rkm` |
 | `max_connections` | concurrent stratum connections (default 64). Each one is a thread; past the cap the accept loop writes `connection-cap-reached` and does not spawn |
 | `max_connections_per_ip` | concurrent connections from one IP. Unset, this is `max(1, max_connections / 8)` so one peer cannot occupy the whole cap |

@@ -394,7 +394,7 @@ impl BlockTemplate {
             quadratic_penalty(coinbase_total, total_weight, effective_median, &params.weight);
         let miner_take = reward_split.miner.saturating_sub(weight_penalty) + total_fees;
         let body =
-            BlockBody { txs: chosen.clone(), coinbase: coinbase_total, coinbase_rkm };
+            BlockBody::from_single_payee(chosen.clone(), coinbase_total, coinbase_rkm);
         let coinbase_note = crate::coinbase::coinbase_note_leaf_for(form, height, &body);
         Ok(Self {
             height,
@@ -1207,11 +1207,7 @@ mod tests {
 
         // Someone else's reveal of the SAME name is mined at 201, and the
         // registry the node now holds carries their registration.
-        let body = BlockBody {
-            txs: vec![their_reveal.clone()],
-            coinbase: coinbase(201),
-            coinbase_rkm: TEST_RKM,
-        };
+        let body = BlockBody::from_single_payee(vec![their_reveal.clone()], coinbase(201), TEST_RKM);
         let mut reg_after = reg.clone();
         reg_after
             .apply_block_riders(201, &[crate::store::StoredTx::from(&their_reveal)])
@@ -1304,7 +1300,7 @@ mod tests {
         let minted_at = 100;
         let cb = crate::coinbase::coinbase_note_leaf(
             minted_at,
-            &BlockBody { txs: vec![], coinbase: coinbase(minted_at), coinbase_rkm: TEST_RKM },
+            &BlockBody::from_single_payee(vec![], coinbase(minted_at), TEST_RKM),
         )
         .expect("a minting body has a coinbase leaf");
         assert_eq!(crate::coinbase::coinbase_leaf_appears_at(minted_at), 244);
@@ -1479,11 +1475,11 @@ mod tests {
         assert_eq!(t.total_fees, 2 * posted_fee(ArityBucket::TwoByTwo));
         // Miner take = 65 % of coinbase (no penalty) + fees.
         assert_eq!(t.miner_take, t.reward_split.miner + t.total_fees);
-        assert_eq!(t.body.coinbase, t.coinbase_total);
+        assert_eq!(t.body.coinbase_total(), t.coinbase_total);
         // The template carries the payee and the real leaf the applier will
         // append — derived from the same function, so the two cannot disagree.
         assert_eq!(t.coinbase_rkm, TEST_RKM);
-        assert_eq!(t.body.coinbase_rkm, TEST_RKM);
+        assert_eq!(t.body.coinbase_payees[0].rkm, TEST_RKM);
         assert_eq!(t.coinbase_note, crate::coinbase::coinbase_note_leaf(201, &t.body));
         assert!(t.coinbase_note.is_some(), "a minting template mints a note");
     }
@@ -1536,7 +1532,7 @@ mod tests {
         // A block at height 201 mines tx `a` (spends nullifier [1;32]).
         let mined = mp.txs.get(&a).unwrap().entry.clone();
         let body =
-            BlockBody { txs: vec![mined], coinbase: coinbase(201), coinbase_rkm: TEST_RKM };
+            BlockBody::from_single_payee(vec![mined], coinbase(201), TEST_RKM);
         mp.on_block_connected(&body, &st, &qlab_devnet::names::EmptyNameView);
 
         // `a` is gone; `b` remains.

@@ -504,7 +504,8 @@ fn i198_the_net_resumes_when_the_sole_holder_of_a_rewound_body_serves_it() {
         }
         let miner = round as usize % NET;
         if let Some((h, b)) = refs[miner].node_mut().mine_block() {
-            refs[miner].announce_block(h, b.txs, b.coinbase, b.coinbase_rkm, 0);
+            let (coinbase, rkm) = b.single_payee_parts().expect("current-cap body");
+            refs[miner].announce_block(h, b.txs, coinbase, rkm, 0);
             produced += 1;
             first_producer.get_or_insert(miner);
         }

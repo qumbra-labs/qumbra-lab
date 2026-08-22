@@ -118,7 +118,7 @@ impl Rig {
         let tip = node.tip_hash();
         let parent = node.chain().block(&tip).expect("tip stored").header();
         let height = parent.height + 1;
-        let body = BlockBody { txs, coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(txs, 0, [0; 4]);
         let header = BlockHeader::child_of(&parent, height, 1_000, body.commitment());
         node.apply_block(header, body, verifier).expect("block applies");
         height
@@ -817,11 +817,7 @@ fn a_coinbase_funded_grant_discloses_no_coinbase_origin() {
     let cb_at = |h: u64| {
         qlab_node::coinbase_note_leaf(
             h,
-            &qlab_devnet::body::BlockBody {
-                txs: Vec::new(),
-                coinbase: qlab_node::coinbase(h),
-                coinbase_rkm: miner_rkm,
-            },
+            &qlab_devnet::body::BlockBody::from_single_payee(Vec::new(), qlab_node::coinbase(h), miner_rkm),
         )
         .expect("a minting body has a coinbase leaf")
     };

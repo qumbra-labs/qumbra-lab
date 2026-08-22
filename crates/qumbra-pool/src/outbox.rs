@@ -1,6 +1,6 @@
 //! Latest-value per-session outbox.
 //!
-//! The poll thread deposits a fresh [`Job`] (or a named stop) under a
+//! The poll thread deposits a fresh [`Job`] (or a named work-state change) under a
 //! session id; the connection thread drains it. A queue of superseded
 //! tips would only make XMRig hash work the pool has already marked
 //! stale, so a later push overwrites an unread one.
@@ -15,7 +15,10 @@ use qlab_stratum::types::Job;
 pub enum SessionPush {
     Job(Job),
     /// Named reason the pool has no current work. The connection writes
-    /// it on the wire and then disconnects so the miner stops hashing.
+    /// it on the wire but remains registered for the recovery job.
+    Suspended(String),
+    /// Named reason the pool has no current work. The connection writes
+    /// it on the wire and then disconnects so the miner can fail over.
     Unavailable(String),
 }
 
@@ -67,7 +70,17 @@ impl JobOutbox {
         n
     }
 
-    /// Tell every live session there is no current work.
+    /// Tell every live session there is temporarily no current work.
+    pub fn suspend_all(&self, reason: String) {
+        let mut g = self.inner.lock().expect("outbox mutex");
+        let live: Vec<String> = g.live.iter().cloned().collect();
+        for sid in live {
+            g.pending
+                .insert(sid, SessionPush::Suspended(reason.clone()));
+        }
+    }
+
+    /// Tell every live session there is no current work and it must fail over.
     pub fn unavailable_all(&self, reason: String) {
         let mut g = self.inner.lock().expect("outbox mutex");
         let live: Vec<String> = g.live.iter().cloned().collect();
@@ -104,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_job_wins_and_unavailable_covers_live_sessions() {
+    fn latest_value_wins_and_work_state_changes_cover_live_sessions() {
         let box_ = JobOutbox::new();
         box_.register("s1".into());
         box_.push_job("s1".into(), job("j1", 1));
@@ -119,7 +132,14 @@ mod tests {
         assert!(box_.take("s1").is_none());
         assert_eq!(box_.jobs_pushed(), 2);
 
-        box_.unavailable_all("template-unavailable: test".into());
+        box_.suspend_all("template-unavailable: test".into());
+        match box_.take("s1") {
+            Some(SessionPush::Suspended(r)) => {
+                assert!(r.starts_with("template-unavailable:"));
+            }
+            other => panic!("{other:?}"),
+        }
+        box_.unavailable_all("template-unavailable: sustained".into());
         match box_.take("s1") {
             Some(SessionPush::Unavailable(r)) => {
                 assert!(r.starts_with("template-unavailable:"));

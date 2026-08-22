@@ -53,11 +53,7 @@ fn extend(node: &mut MemNode, committed_coinbase: u64) {
         .expect("tip")
         .header();
     let height = parent.height + 1;
-    let body = BlockBody {
-        txs: vec![],
-        coinbase: committed_coinbase,
-        coinbase_rkm: RKM,
-    };
+    let body = BlockBody::from_single_payee(vec![], committed_coinbase, RKM);
     let header = BlockHeader::child_of(&parent, height, T0_GENESIS_DIFFICULTY, body.commitment());
     node.apply_block(header, body, &AcceptAll).unwrap();
 }

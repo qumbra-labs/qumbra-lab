@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use qumbra_pool::config::PoolConfig;
 use qumbra_pool::endpoint::serve;
-use qumbra_pool::{ConnGuard, JobOutbox, Pool, TemplateWatch};
+use qumbra_pool::{assemble_coinbase, Accounts, ConnGuard, JobOutbox, NodeRpcClient,
+    PplnsWindow, Pool, TemplateWatch, WatchAction};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +48,10 @@ fn usage() {
          v4-compat: a v4 template refuses stock-xmrig login by name\n  \
          (#356 UNCLEAN). Share-PoW: qlab_pow::RandomXHasher. PPLNS + N=1 payee list.\n"
     );
+    // lab #605: the process that chooses the payee says which build it is. On the
+    // same line shape the node and the wallet use, so one archive reads as one
+    // vocabulary.
+    eprintln!("build rev: {}", qumbra_pool::build_rev_line());
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -71,6 +76,10 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
             "  stall:             {} failed polls / {}ms without a good template",
             cfg.stall_poll_failures(),
             cfg.stall_age_ms()
+        );
+        println!(
+            "  disconnect:        {}ms without a good template",
+            cfg.disconnect_after_ms()
         );
         println!(
             "  listen guards:     {} conn / {} per-ip / {} B line / {}ms request / {}ms first-line",
@@ -125,7 +134,17 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let guard = Arc::new(ConnGuard::new(cfg.listen_limits()));
     #[cfg(feature = "randomx")]
     let pool = if let Some(url) = cfg.node_rpc.clone() {
-        let live = qumbra_pool::NodeRpcTemplateSource::connect(&url)?;
+        // Learn only form/height, then make the first template request with an
+        // explicit pool-owned payee list. No payee-free template shim exists.
+        let context = NodeRpcClient::parse(&url)?.fetch_context()?;
+        let initial_payees = assemble_coinbase(
+            context.form,
+            context.height,
+            &PplnsWindow::default(),
+            &Accounts::default(),
+            payout_rkm,
+        )?.payees();
+        let live = qumbra_pool::NodeRpcTemplateSource::connect(&url, &initial_payees)?;
         let client = live.client();
         let initial = live.snapshot();
         let form = initial.form;
@@ -140,7 +159,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let poll = Duration::from_millis(cfg.poll_interval_ms());
         let stall_failures = cfg.stall_poll_failures();
         let stall_age = Duration::from_millis(cfg.stall_age_ms());
-        let watch = Arc::new(TemplateWatch::new(stall_failures, stall_age));
+        let disconnect_after = Duration::from_millis(cfg.disconnect_after_ms());
+        let watch = Arc::new(TemplateWatch::new(
+            stall_failures,
+            stall_age,
+            disconnect_after,
+        ));
         let pool_poll = Arc::clone(&pool);
         let stop_poll = Arc::clone(&stop);
         let watch_poll = Arc::clone(&watch);
@@ -149,7 +173,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::thread::spawn(move || {
             while !stop_poll.load(Ordering::SeqCst) {
                 std::thread::sleep(poll);
-                match live.poll() {
+                let polled = live.client().fetch_context()
+                    .and_then(|context| pool_poll
+                        .assemble_for(context.form, context.height)
+                        .map_err(|e| e.to_string()))
+                    .and_then(|coinbase| live.poll(&coinbase.payees()));
+                match polled {
                     Ok(changed) => {
                         let recovering = pool_poll.is_unavailable();
                         watch_poll.record_ok();
@@ -182,12 +211,17 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Err(e) => {
-                        if let Some(reason) = watch_poll.record_err() {
-                            pool_poll.suspend_work(&reason);
+                        if let Some(action) = watch_poll.record_err() {
+                            let action_name = match &action {
+                                WatchAction::Suspend(_) => "suspend",
+                                WatchAction::Disconnect(_) => "disconnect",
+                            };
+                            let reason = action.reason().to_owned();
+                            pool_poll.apply_watch_action(action);
                             let snap = watch_poll.snapshot();
                             qlab_devnet::jeprintln!(
                                 WARN,
-                                "pool template poll: {e}; {reason}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={} {}",
+                                "pool template poll: {e}; action={action_name}; {reason}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={} {}",
                                 snap.template_poll_failures,
                                 snap.consecutive_failures,
                                 snap.seconds_since_last_good_template,
@@ -211,10 +245,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         });
         qlab_devnet::jprintln!(
-            "  node_rpc: {url}  poll_ms={} stall={}/{}ms",
+            "  node_rpc: {url}  poll_ms={} stall={}/{}ms disconnect={}ms",
             cfg.poll_interval_ms(),
             cfg.stall_poll_failures(),
-            cfg.stall_age_ms()
+            cfg.stall_age_ms(),
+            cfg.disconnect_after_ms()
         );
         qlab_devnet::jprintln!("  form: {form:?} (from live node)");
         pool

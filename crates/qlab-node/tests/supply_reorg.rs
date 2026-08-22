@@ -44,7 +44,7 @@ fn apply_empty_block(
     parent: &BlockHeader,
     coinbase: u64,
 ) -> (BlockHeader, Hash32) {
-    let body = BlockBody { txs: Vec::new(), coinbase, coinbase_rkm: MINER_RKM };
+    let body = BlockBody::from_single_payee(Vec::new(), coinbase, MINER_RKM);
     let header =
         BlockHeader::child_of(parent, parent.height + 1, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &MockVerifier).expect("empty block applies");

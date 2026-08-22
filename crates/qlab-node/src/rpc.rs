@@ -97,8 +97,8 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 ///   an old reader failing loudly against a new node is the reject-unknown
 ///   feature working, not a regression.
 ///
-/// So a client now speaks `0x05` to the node's own wires and `0x01` to the
-/// compact-block wires it shares with the `qlab-cbserver` reference server.
+/// At that release a client spoke `0x05` to the node's own wires and `0x01` to
+/// the compact-block wires it shares with the `qlab-cbserver` reference server.
 ///
 /// **`0x05` since issue #275, and this bump is a ROUTE bump, not a payload one.**
 /// The wallet-send server half adds `/v1/tree/leaves` (a new versioned wire, see
@@ -118,6 +118,12 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// > route addition does not.** `/v1/nullifiers` (#314) is the first route added
 /// > under the ruled form; `0x05` stays as history, not as precedent.
 ///
+/// **`0x07` since lab #553.** The existing `/v1/mine/template` response and
+/// `/v1/mine/block` request moved from one flat `(miner_rkm, coinbase_amount)`
+/// pair to an ordered payee list. Those JSON routes do not carry this lead byte,
+/// but the house rule keeps one node-RPC release boundary; `qumbra-pool` moves in
+/// the same source tree.
+///
 /// # The reader side of a bump is not free, and #212 is where that was paid
 ///
 /// [`Reader::version`] is an equality check, so **a reader built at `0x05` reads
@@ -132,7 +138,7 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// reads every host of the current fleet. **This constant, and every strict
 /// `from_bytes`, are unchanged in their strictness** — the node still serves exactly
 /// one version and still refuses every other on its own decode paths.
-pub const RPC_VERSION: u8 = 0x06;
+pub const RPC_VERSION: u8 = 0x07;
 
 // ---------------------------------------------------------------------------
 // Transaction identity + note-discovery artifacts
@@ -270,7 +276,7 @@ pub struct BlockDiscovery {
     /// (lab #367). Same no-encoder-between-block-and-served-bytes guarantee
     /// as `groups`.
     pub riders: Vec<Vec<u8>>,
-    /// This block's coinbase payee — `body.coinbase_rkm`, verbatim (lab #415).
+    /// This block's sole coinbase payee, projected from `body.coinbase_payees` (lab #415).
     ///
     /// ## Why it rides here too
     ///
@@ -285,7 +291,7 @@ pub struct BlockDiscovery {
     /// records is that a chain of coinbase-only blocks projected to nothing a
     /// wallet could read.
     pub coinbase_rkm: [u64; 4],
-    /// `body.coinbase` — the issuance this block declared, verbatim. **Not the
+    /// `body.coinbase_total()` — the issuance this block declared. **Not the
     /// coinbase note's value**; see [`crate::coinbase::coinbase_note_value_parts`].
     pub coinbase: u64,
     /// `body.total_fees()` — the declared fees, which are the miner's.
@@ -1687,7 +1693,7 @@ mod tests {
         let tip_hash = node.tip_hash();
         let parent = node.chain().block(&tip_hash).expect("tip block stored").header();
         let height = parent.height + 1;
-        let body = BlockBody { txs: vec![], coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
+        let body = BlockBody::from_single_payee(vec![], height, [height, 2, 3, 4]);
         let header = BlockHeader::child_of(&parent, timestamp, 1_000, body.commitment());
         let hash = header.header_hash();
         node.apply_block(header, body, &OkVerifier).expect("block applies");
@@ -1900,7 +1906,7 @@ mod tests {
 
         // version(1) + from(8) + total(8) + n(1, varint) + 3 × leaf(32) = 114.
         assert_eq!(bytes.len(), 114, "golden total length");
-        assert_eq!(bytes[0], 0x06, "golden version — RPC_VERSION at the #367 arming bump");
+        assert_eq!(bytes[0], 0x07, "golden version — RPC_VERSION at the #553 mine-payee bump");
         assert_eq!(&bytes[1..9], &2u64.to_le_bytes(), "golden from (LE)");
         assert_eq!(&bytes[9..17], &5u64.to_le_bytes(), "golden total (LE)");
         assert_eq!(bytes[17], 0x03, "golden n (varint)");
@@ -1911,9 +1917,9 @@ mod tests {
         let digest = keccak256(&bytes);
         assert_eq!(
             hex32(&digest),
-            "dfa1d3dcd5f6e51cf5dea217de8eb15eab224ebe67965c6501320459c352d8cd",
+            "3b0b2aa648e527d99d1c1e7eb68a731f6cf539a5b40a83d5be53c89f268085ec",
             "GOLDEN digest — update ONLY with an intentional, documented framing change \
-             (lab #367: RPC_VERSION 0x05 -> 0x06, the leaf stream's version byte moved)"
+             (lab #553: RPC_VERSION 0x06 -> 0x07, the leaf stream's version byte moved)"
         );
 
         assert_eq!(TreeLeaves::from_bytes(&bytes).unwrap(), page, "and it round-trips");
@@ -2054,8 +2060,9 @@ mod tests {
             chain.block(&hash).expect("the tip is stored").clone()
         };
         let body = stored.body();
-        assert_eq!(blk.coinbase_rkm, body.coinbase_rkm);
-        assert_eq!(blk.coinbase, body.coinbase);
+        let (body_coinbase, body_rkm) = body.single_payee_parts().expect("current-cap body");
+        assert_eq!(blk.coinbase_rkm, body_rkm);
+        assert_eq!(blk.coinbase, body_coinbase);
         assert_eq!(blk.fees, body.total_fees());
         assert_eq!(blk.name_burn, body.total_name_burn());
 
@@ -2079,11 +2086,11 @@ mod tests {
 
         // 🔴 …and the schedule alone would NOT have produced it: the value is
         // the miner's share plus this block's fees.
-        assert_eq!(note.value, crate::RewardSplit::of(body.coinbase).miner + fee);
-        assert_ne!(note.value, body.coinbase, "the whole emission is not the miner's");
+        assert_eq!(note.value, crate::RewardSplit::of(body.coinbase_total()).miner + fee);
+        assert_ne!(note.value, body.coinbase_total(), "the whole emission is not the miner's");
         assert_ne!(
             note.value,
-            crate::RewardSplit::of(body.coinbase).miner,
+            crate::RewardSplit::of(body.coinbase_total()).miner,
             "and the fees are part of it — the task book's rule would have been short by {fee}"
         );
 
@@ -2171,8 +2178,9 @@ mod tests {
         let body = stored.body();
         let projected = BlockDiscovery::of(rpc.node().tip_hash(), &stored);
 
-        assert_eq!(projected.coinbase, body.coinbase);
-        assert_eq!(projected.coinbase_rkm, body.coinbase_rkm);
+        let (body_coinbase, body_rkm) = body.single_payee_parts().expect("current-cap body");
+        assert_eq!(projected.coinbase, body_coinbase);
+        assert_eq!(projected.coinbase_rkm, body_rkm);
         assert_eq!(projected.fees, body.total_fees(), "two transactions' worth of fee");
         assert_eq!(projected.fees, 2 * fee);
         assert_eq!(projected.name_burn, body.total_name_burn());
@@ -2317,13 +2325,13 @@ mod tests {
     /// roll problem is that route's alone, and widening the compat window to routes
     /// nothing needs it on would be leniency bought for free.
     #[test]
-    fn status_and_anchors_moved_to_0x06_with_telemetry_and_reject_older_versions() {
+    fn status_and_anchors_moved_to_0x07_with_telemetry_and_reject_older_versions() {
         let (rpc, _) = rpc_with_finalized_genesis();
-        assert_eq!(RPC_VERSION, 0x06);
+        assert_eq!(RPC_VERSION, 0x07);
 
         for mut payload in [rpc.status().to_bytes(), rpc.anchors().to_bytes(), rpc.telemetry().to_bytes()] {
-            assert_eq!(payload[0], 0x06, "the node's own surfaces move as one");
-            for old in [0x01, 0x02, 0x03, 0x04, 0x05] {
+            assert_eq!(payload[0], 0x07, "the node's own surfaces move as one");
+            for old in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06] {
                 payload[0] = old;
                 let as_status = NodeStatus::from_bytes(&payload);
                 let as_anchors = AnchorSet::from_bytes(&payload);
@@ -2348,7 +2356,7 @@ mod tests {
         let height = parent.height + 1;
         let (coinbase, coinbase_rkm) =
             if minting { (height, [height, 2, 3, 4]) } else { (0, [0; 4]) };
-        let body = BlockBody { txs, coinbase, coinbase_rkm };
+        let body = BlockBody::from_single_payee(txs, coinbase, coinbase_rkm);
         // child_of's 2nd arg is the timestamp; height is derived from the parent.
         let header = BlockHeader::child_of(&parent, height, 1_000, body.commitment());
         node.apply_block(header, body, &OkVerifier).expect("block applies");

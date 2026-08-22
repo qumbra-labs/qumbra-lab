@@ -22,6 +22,10 @@ pub const DEFAULT_POLL_MS: u64 = 1000;
 /// poll intervals) before work is suspended. Public-endpoint default:
 /// three seconds at the default poll cadence.
 pub const DEFAULT_TEMPLATE_STALL_POLLS: u64 = 3;
+/// Sustained template outage before sessions end so miners can fail over.
+/// Five minutes is four target block intervals and 14× the longest measured
+/// 22-second contested-tip episode from lab #598.
+pub const DEFAULT_TEMPLATE_DISCONNECT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
@@ -49,6 +53,10 @@ pub struct PoolConfig {
     /// work is suspended. When unset, derived as stall-polls × poll_ms.
     #[serde(default)]
     pub template_max_age_ms: Option<u64>,
+    /// Wall-clock milliseconds without a successful template poll before
+    /// suspended sessions are ended for miner failover. Default five minutes.
+    #[serde(default)]
+    pub template_disconnect_after_ms: Option<u64>,
     /// Public coinbase-payee identity for pool fallback payouts, encoded as
     /// 64 hex characters (32 bytes, lane-major little-endian).
     ///
@@ -109,6 +117,10 @@ pub enum ConfigError {
     /// where an operator can still fix it before any miner connects.
     PlaceholderPayoutRkm,
     StaticTemplateSource,
+    TemplateDisconnectNotAfterSuspend {
+        disconnect_ms: u64,
+        suspend_ms: u64,
+    },
     ZeroListenGuard(&'static str),
 }
 
@@ -138,6 +150,13 @@ impl std::fmt::Display for ConfigError {
             ConfigError::StaticTemplateSource => write!(
                 f,
                 "static-template-source-refused: a serving pool requires node_rpc; static [template] jobs can never track the live chain"
+            ),
+            ConfigError::TemplateDisconnectNotAfterSuspend {
+                disconnect_ms,
+                suspend_ms,
+            } => write!(
+                f,
+                "template_disconnect_after_ms ({disconnect_ms}) must be greater than the template suspension age ({suspend_ms}ms)"
             ),
             ConfigError::ZeroListenGuard(field) => {
                 write!(f, "zero-listen-guard: {field} must be ≥ 1")
@@ -180,6 +199,12 @@ impl PoolConfig {
                 ));
             }
             let _ = self.template_source()?;
+        }
+        if self.disconnect_after_ms() <= self.stall_age_ms() {
+            return Err(ConfigError::TemplateDisconnectNotAfterSuspend {
+                disconnect_ms: self.disconnect_after_ms(),
+                suspend_ms: self.stall_age_ms(),
+            });
         }
         self.check_listen_guards()?;
         Ok(())
@@ -238,6 +263,12 @@ impl PoolConfig {
                 self.poll_interval_ms()
                     .saturating_mul(self.stall_poll_failures())
             })
+            .max(1)
+    }
+
+    pub fn disconnect_after_ms(&self) -> u64 {
+        self.template_disconnect_after_ms
+            .unwrap_or(DEFAULT_TEMPLATE_DISCONNECT_MS)
             .max(1)
     }
 
@@ -453,6 +484,7 @@ payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
         let cfg = PoolConfig::from_toml(live).unwrap();
         assert_eq!(cfg.poll_interval_ms(), 2000);
         assert_eq!(cfg.stall_poll_failures(), DEFAULT_TEMPLATE_STALL_POLLS);
+        assert_eq!(cfg.disconnect_after_ms(), DEFAULT_TEMPLATE_DISCONNECT_MS);
         assert_eq!(
             cfg.stall_age_ms(),
             cfg.poll_interval_ms() * cfg.stall_poll_failures()
@@ -465,11 +497,31 @@ node_rpc = "http://node:9420"
 poll_ms = 2000
 template_max_poll_failures = 5
 template_max_age_ms = 15000
+template_disconnect_after_ms = 600000
 payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
 "#;
         let cfg = PoolConfig::from_toml(explicit).unwrap();
         assert_eq!(cfg.stall_poll_failures(), 5);
         assert_eq!(cfg.stall_age_ms(), 15000);
+        assert_eq!(cfg.disconnect_after_ms(), 600000);
+    }
+
+    #[test]
+    fn disconnect_bound_must_leave_a_real_suspension_window() {
+        let live = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+template_max_age_ms = 15000
+template_disconnect_after_ms = 15000
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let err = PoolConfig::from_toml(live).expect_err("equal bounds erase suspension");
+        assert!(
+            err.to_string()
+                .contains("must be greater than the template suspension age"),
+            "got: {err}"
+        );
     }
 
     #[test]

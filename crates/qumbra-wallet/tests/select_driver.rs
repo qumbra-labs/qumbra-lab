@@ -55,7 +55,7 @@ fn mine_paying(
     rkm: [u64; 4],
 ) -> u64 {
     let height = tip.height + 1;
-    let body = BlockBody { txs, coinbase: coinbase(height), coinbase_rkm: rkm };
+    let body = BlockBody::from_single_payee(txs, coinbase(height), rkm);
     let header = BlockHeader::child_of(tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &AnyTx).expect("block applies");
     node.finalize(hash).expect("finalize");
@@ -398,7 +398,7 @@ fn matures_at() -> u64 {
 /// derived through the spend path's derivation over the applier's own note.
 fn mined_nullifier(f: &Fixture, height: u64) -> [u8; 32] {
     let rkm = f.wallet.rkm(f.wallet.diversifier_at_index(0));
-    let body = BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm: rkm };
+    let body = BlockBody::from_single_payee(Vec::new(), coinbase(height), rkm);
     let note = qlab_node::coinbase_note(height, &body).expect("that block minted");
     qumbra_wallet::spent::note_nullifier(&f.wallet, 0, &note)
 }

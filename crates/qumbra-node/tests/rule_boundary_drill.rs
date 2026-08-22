@@ -66,7 +66,7 @@ impl TxVerifier for NoTx {
 
 /// A coinbase-only body paying `coinbase`, with the header that commits to it.
 fn block_at(height: u64, coinbase: u64) -> (BlockHeader, BlockBody) {
-    let body = BlockBody { txs: Vec::new(), coinbase, coinbase_rkm: MINER_RKM };
+    let body = BlockBody::from_single_payee(Vec::new(), coinbase, MINER_RKM);
     let genesis = BlockHeader::genesis(GENESIS_DIFFICULTY, 0);
     let header = BlockHeader { height, ..BlockHeader::child_of(&genesis, 75, GENESIS_DIFFICULTY, body.commitment()) };
     (header, body)

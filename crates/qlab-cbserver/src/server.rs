@@ -270,11 +270,13 @@ mod tests {
             let height = 1 + i as u64;
             assert_eq!(blk.height, height, "ascending and contiguous");
             let stored = d.block(height).expect("held");
+            let (coinbase, rkm) =
+                stored.body.single_payee_parts().expect("accepted body is current-cap");
             assert_eq!(
-                blk.coinbase_rkm, stored.body.coinbase_rkm,
+                blk.coinbase_rkm, rkm,
                 "the served payee IS the block's own coinbase_rkm"
             );
-            assert_eq!(blk.coinbase, stored.body.coinbase);
+            assert_eq!(blk.coinbase, coinbase);
             assert_eq!(blk.fees, stored.body.total_fees());
             assert_eq!(blk.name_burn, stored.body.total_name_burn());
         }

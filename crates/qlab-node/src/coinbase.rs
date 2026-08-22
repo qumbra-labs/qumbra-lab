@@ -18,8 +18,8 @@
 //! ## The derivation (consensus rules, ratified on issue #101)
 //!
 //! ```text
-//!   value = RewardSplit::of(body.coinbase).miner + body.total_fees()
-//!   rkm   = body.coinbase_rkm                                (raw, from the block)
+//!   value = RewardSplit::of(body.coinbase_total()).miner + body.total_fees()
+//!   rkm   = body.coinbase_payees[0].rkm                      (raw, from the block)
 //!   ρ     = H(b"qumbra:coinbase-note-rho:v1"   ‖ height_le ‖ rkm_le)
 //!   rseed = H(b"qumbra:coinbase-note-rseed:v1" ‖ height_le ‖ rkm_le)
 //!   cm    = note_commitment(value, rkm, ρ, rseed)            ← the tree leaf
@@ -182,7 +182,7 @@ pub fn coinbase_rseed_v5(height: u64, payee_index: u8, rkm: &[u64; 4]) -> [u64; 
 /// and `value_is_the_miner_share_plus_fees` still passes untouched, which is
 /// the compat lock this seam wants.
 pub fn coinbase_note_value(body: &BlockBody) -> u64 {
-    coinbase_note_value_parts(body.coinbase, body.total_fees(), body.total_name_burn())
+    coinbase_note_value_parts(body.coinbase_total(), body.total_fees(), body.total_name_burn())
 }
 
 /// [`coinbase_note_value`]'s arithmetic over the three body facts it is a
@@ -229,10 +229,11 @@ pub fn coinbase_note_value_parts(coinbase: u64, total_fees: u64, total_name_burn
 /// #559 is what that costs: the T2 faucet funded its entire inventory this way
 /// and could not pay a single grant.
 pub fn coinbase_note(height: u64, body: &BlockBody) -> Option<Note> {
+    let (amount, rkm) = body.single_payee_parts()?;
     coinbase_note_parts(
         height,
-        body.coinbase_rkm,
-        body.coinbase,
+        rkm,
+        amount,
         body.total_fees(),
         body.total_name_burn(),
     )
@@ -304,7 +305,7 @@ pub fn coinbase_note_leaf(height: u64, body: &BlockBody) -> Option<Hash32> {
 }
 
 /// The single payee a v5 body pays: the birth cap is 1, so the payee index of
-/// `body.coinbase_rkm` is 0 wherever a v5 coinbase note is derived (lab #470).
+/// the selected payee's `rkm` is 0 wherever a v5 coinbase note is derived (lab #470).
 ///
 /// Named because it is the one number that has to be the same in the node's
 /// append path and in every holder's reconstruction — a literal `0` in two files
@@ -335,11 +336,12 @@ pub fn coinbase_note_for(
     height: u64,
     body: &BlockBody,
 ) -> Option<Note> {
+    let (amount, rkm) = body.single_payee_parts()?;
     coinbase_note_parts_for(
         form,
         height,
-        body.coinbase_rkm,
-        body.coinbase,
+        rkm,
+        amount,
         body.total_fees(),
         body.total_name_burn(),
     )
@@ -556,11 +558,7 @@ mod tests {
     }
 
     fn body_at(height: u64, rkm: [u64; 4], n_txs: u8) -> BlockBody {
-        BlockBody {
-            txs: (0..n_txs).map(fee_tx).collect(),
-            coinbase: coinbase(height),
-            coinbase_rkm: rkm,
-        }
+        BlockBody::from_single_payee((0..n_txs).map(fee_tx).collect(), coinbase(height), rkm)
     }
 
     /// The whole point of the module: what it mints is a **real note**, openable
@@ -713,13 +711,8 @@ mod tests {
         use qlab_devnet::forms::GenesisForm;
         let body = body_at(700, RKM_A, 2);
         // The five facts, exactly as `coinbase_page` projects them off the block.
-        let (h, rkm, cb, fees, burn) = (
-            700u64,
-            body.coinbase_rkm,
-            body.coinbase,
-            body.total_fees(),
-            body.total_name_burn(),
-        );
+        let (cb, rkm) = body.single_payee_parts().expect("current-cap fixture");
+        let (h, fees, burn) = (700u64, body.total_fees(), body.total_name_burn());
         for form in [GenesisForm::V4, GenesisForm::V5] {
             let from_parts =
                 coinbase_note_parts_for(form, h, rkm, cb, fees, burn).expect("mints");
@@ -756,7 +749,7 @@ mod tests {
         let genesis = BlockBody::default();
         assert_eq!(coinbase_note(0, &genesis), None);
         assert_eq!(coinbase_note_leaf(0, &genesis), None);
-        let payeeless = BlockBody { coinbase: 5_000, ..BlockBody::default() };
+        let payeeless = BlockBody::from_single_payee(Vec::new(), 5_000, [0; 4]);
         assert_eq!(coinbase_note(1, &payeeless), None);
     }
 

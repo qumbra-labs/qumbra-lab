@@ -215,7 +215,7 @@ impl Devnet {
             let coinbase_rkm = params
                 .miner_rkm
                 .unwrap_or([height, height ^ 0xA5, height ^ 0x5A, height ^ 0xFF]);
-            let body = BlockBody { txs: body_txs, coinbase: height, coinbase_rkm };
+            let body = BlockBody::from_single_payee(body_txs, height, coinbase_rkm);
             let header = BlockHeader::child_of(&parent, height, params.difficulty, body.commitment());
             chain
                 .insert_header(header)
@@ -351,12 +351,16 @@ impl Devnet {
         self.blocks
             .iter()
             .filter(|blk| blk.height >= from && blk.height <= to)
-            .map(|blk| BlockCoinbase {
-                height: blk.height,
-                coinbase_rkm: blk.body.coinbase_rkm,
-                coinbase: blk.body.coinbase,
-                fees: blk.body.total_fees(),
-                name_burn: blk.body.total_name_burn(),
+            .map(|blk| {
+                let (coinbase, rkm) =
+                    blk.body.single_payee_parts().expect("accepted body is at the current cap");
+                BlockCoinbase {
+                    height: blk.height,
+                    coinbase_rkm: rkm,
+                    coinbase,
+                    fees: blk.body.total_fees(),
+                    name_burn: blk.body.total_name_burn(),
+                }
             })
             .collect()
     }

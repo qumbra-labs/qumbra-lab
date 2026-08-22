@@ -145,7 +145,7 @@ fn known_scar_seen(readings: &[NodeReading]) -> Option<&'static qlab_node::suppl
 
 /// Render the scheduled-issuance attestation carried by each reachable node.
 ///
-/// Fees are a separate column because they are transfers and `body.coinbase`
+/// Fees are a separate column because they are transfers and the body payee total
 /// already excludes them. Pass/fail is the exact integer `DIV_BSL == 0`; the
 /// relative column is context for humans, never a floating-point tolerance.
 pub fn supply(readings: &[NodeReading]) -> String {

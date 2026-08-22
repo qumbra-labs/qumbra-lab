@@ -17,7 +17,7 @@ use qumbra_pool::endpoint::serve;
 use qumbra_pool::template::{HeldTemplateSource, Template};
 use qumbra_pool::{
     ConnGuard, JobOutbox, ListenLimits, Pool, REASON_CONNECTION_CAP, REASON_LINE_TOO_LONG,
-    REASON_PER_IP, REASON_REQUEST_TIMEOUT,
+    REASON_PER_IP, REASON_REQUEST_TIMEOUT, TemplateWatch, WatchAction,
 };
 
 fn sample_template() -> Template {
@@ -237,10 +237,10 @@ fn tcp_tip_change_pushes_job_notify_on_the_wire() {
     let _ = server.join();
 }
 
-/// A stall must name itself on the wire and drop the connection rather
-/// than leave the miner hashing a job the pool will reject.
+/// The lab #598 property: the honest refusal still reaches the miner, but
+/// the same registered socket receives the recovery job without a reconnect.
 #[test]
-fn tcp_template_unavailable_is_named_then_disconnects() {
+fn tcp_template_gap_holds_session_and_recovers_without_reconnect() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let pool =
@@ -309,14 +309,105 @@ fn tcp_template_unavailable_is_named_then_disconnects() {
     };
     let err = resp.error.expect("named stall");
     assert!(
-        err.message.starts_with("template-unavailable:"),
+        err.message.contains("3 consecutive poll failures"),
+        "got {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("3000ms since last good template"),
         "got {}",
         err.message
     );
 
+    let jobs = pool
+        .replace_template(Box::new(HeldTemplateSource::new(sample_template_at(101))))
+        .unwrap();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the same session must remain registered during suspension"
+    );
+
     resp_line.clear();
-    let eof = reader.read_line(&mut resp_line).unwrap();
-    assert_eq!(eof, 0, "connection must drop after naming the stall");
+    let n = reader
+        .read_line(&mut resp_line)
+        .expect("recovery job must arrive on the held socket");
+    assert!(n > 0, "held socket closed before recovery");
+    let DecodedLine::Request(req) = decode_line(&resp_line).unwrap() else {
+        panic!("expected recovery job notification, got {resp_line}");
+    };
+    assert_eq!(req.method, "job");
+    assert_eq!(req.params.get("height").and_then(|v| v.as_u64()), Some(101));
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(stream);
+    let _ = server.join();
+}
+
+/// The hold is bounded: the real watch verdict crosses the pool/outbox/socket
+/// seam and ends the session after a sustained outage so the miner can fail over.
+#[test]
+fn tcp_sustained_template_gap_eventually_disconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let pool =
+        Arc::new(Pool::new(1024, Box::new(HeldTemplateSource::new(sample_template()))).unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = Arc::clone(&stop);
+    let pool_t = Arc::clone(&pool);
+    let outbox = Arc::new(JobOutbox::new());
+    let guard_t = Arc::new(ConnGuard::new(ListenLimits::default()));
+    let server = thread::spawn(move || serve(listener, pool_t, stop_t, outbox, guard_t));
+
+    let mut stream = connect(addr);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let login = StratumRequest::login(
+        1,
+        &LoginParams {
+            login: "alice".into(),
+            pass: "x".into(),
+            agent: Some("XMRig/6.21.0".into()),
+            algo: Some(vec!["rx/0".into()]),
+            rigid: None,
+        },
+    )
+    .unwrap();
+    stream
+        .write_all(
+            qlab_stratum::codec::encode_request(&login)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let DecodedLine::Response(_) = decode_line(&line).unwrap() else {
+        panic!("expected login response, got {line}");
+    };
+
+    let watch = TemplateWatch::new(1, Duration::from_millis(1), Duration::from_millis(100));
+    let first = watch.record_err().expect("failure threshold suspends");
+    assert!(matches!(first, WatchAction::Suspend(_)));
+    pool.apply_watch_action(first);
+    line.clear();
+    reader.read_line(&mut line).expect("named suspension");
+    assert!(line.contains("1 consecutive poll failures"), "got: {line}");
+
+    thread::sleep(Duration::from_millis(150));
+    let terminal = watch.record_err().expect("sustained bound disconnects");
+    assert!(matches!(terminal, WatchAction::Disconnect(_)));
+    pool.apply_watch_action(terminal);
+    line.clear();
+    let n = reader.read_line(&mut line).expect("named terminal refusal");
+    assert!(n > 0, "disconnect must name the sustained outage first");
+    assert!(line.contains("2 consecutive poll failures"), "got: {line}");
+    line.clear();
+    assert_eq!(reader.read_line(&mut line).unwrap(), 0, "session must end");
 
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(stream);

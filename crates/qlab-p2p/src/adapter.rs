@@ -28,7 +28,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
+use qlab_devnet::body::{
+    check_scheduled_coinbase_payees, coinbase_payee_cap_v5, validate_body, BlockBody,
+    BodyError, CoinbasePayee, TxEntry,
+};
 use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
@@ -554,13 +557,12 @@ enum BodyFault {
     Positional(&'static str),
 }
 
-/// The memory a held body actually costs: the proof bytes (which dominate — one 2×2
-/// proof is ~145 kB against a ~100-byte public surface) plus its declared surface.
-/// The memory a held body actually costs — [`crate::n1::txs_weight`] (the meter
-/// shared with the #135 serving cache, so the two byte budgets are comparable)
-/// plus the fixed part: coinbase counter + payout key + map overhead.
+/// The retained body-surface weight shared with the #135 serving cache, so the
+/// two byte budgets stay comparable. Fixed container/map overhead is bounded by
+/// the separate entry caps; the peer-controlled proof and payee data is metered.
 fn body_weight(body: &BlockBody) -> usize {
-    crate::n1::txs_weight(&body.txs) + 40
+    crate::n1::txs_weight(&body.txs)
+        + crate::n1::coinbase_payees_weight(&body.coinbase_payees)
 }
 
 /// The payout key a node mines to when no wallet has been configured (issue #101).
@@ -1889,7 +1891,55 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// verbatim — a second assembly is a consensus-adjacent fork.
     pub fn assemble_block(&mut self) -> Option<AssembledCandidate> {
         let parent_hash = self.mining_parent_hash()?;
-        self.assemble_on_parent(parent_hash)
+        self.assemble_on_parent(parent_hash, self.miner_rkm, None)
+    }
+
+    /// Form and height of the candidate [`Self::assemble_block`] would build,
+    /// without assembling a body or advancing the mining clock. The pool uses
+    /// this once at startup so its first template request carries a real payee
+    /// list; there is no payee-free compatibility request.
+    pub fn mine_template_context(&mut self) -> Option<(GenesisForm, u64)> {
+        let parent_hash = self.mining_parent_hash()?;
+        let parent = self.chain.header(&parent_hash)?;
+        Some((self.rules.form, parent.height + 1))
+    }
+
+    /// Assemble the same candidate as [`Self::assemble_block`], but pay the
+    /// caller-provided coinbase list (lab #553). The list is chosen before the
+    /// header is issued because the body commitment is in the hashing blob.
+    pub fn assemble_block_for_payees(
+        &mut self,
+        payees: &[CoinbasePayee],
+    ) -> Result<Option<AssembledCandidate>, String> {
+        let Some(parent_hash) = self.mining_parent_hash() else {
+            return Ok(None);
+        };
+        let parent = self.chain.header(&parent_hash).ok_or_else(|| "assemble-parent-unknown".to_string())?;
+        let height = parent.height + 1;
+        let cap = match self.rules.form {
+            GenesisForm::V4 => 1,
+            GenesisForm::V5 => coinbase_payee_cap_v5(height),
+        };
+        if payees.is_empty() || payees.len() > cap {
+            return Err(format!(
+                "coinbase-payee-count: got {}, want 1..={} at height {}",
+                payees.len(), cap, height
+            ));
+        }
+        if payees.iter().any(|payee| payee.rkm == [0; 4]) {
+            return Err("coinbase-payee-zero-rkm".into());
+        }
+        match self.rules.form {
+            GenesisForm::V5 => check_scheduled_coinbase_payees(height, payees)
+                .map_err(|e| format!("coinbase-payees: {e:?}"))?,
+            GenesisForm::V4 => {
+                let expected = qlab_node::emission::coinbase_for(GenesisForm::V4, height);
+                if payees[0].amount != expected {
+                    return Err(format!("coinbase-payee-amount: height {height} expected {expected}, got {}", payees[0].amount));
+                }
+            }
+        }
+        Ok(self.assemble_on_parent(parent_hash, payees[0].rkm, Some(payees)))
     }
 
     /// Assemble + mine (but do NOT insert) the next block over the current tip.
@@ -1985,7 +2035,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// while fork choice is elsewhere, and the header's height is the only one
     /// consensus reads.
     fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
-        let assembled = self.assemble_on_parent(parent_hash)?;
+        let assembled = self.assemble_on_parent(parent_hash, self.miner_rkm, None)?;
         let mined = mine_under(
             &self.pow,
             assembled.header,
@@ -1999,15 +2049,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
     /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
     /// path as a self-mined block. A fork here is a consensus-adjacent fork.
-    fn assemble_on_parent(&mut self, parent_hash: Hash32) -> Option<AssembledCandidate> {
-        let template =
-            self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
-        let body = template.body;
+    fn assemble_on_parent(
+        &mut self,
+        parent_hash: Hash32,
+        coinbase_rkm: [u64; 4],
+        requested_payees: Option<&[CoinbasePayee]>,
+    ) -> Option<AssembledCandidate> {
+        let template = self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, coinbase_rkm);
+        let mut body = template.body;
+        if let Some(payees) = requested_payees {
+            body.coinbase_payees = payees.to_vec();
+        }
         let parent = *self.chain.header(&parent_hash)?;
         let candidate_height = parent.height + 1;
         let bc = match self.rules.form {
             GenesisForm::V4 => body.commitment_at(candidate_height),
-            GenesisForm::V5 => body.commitment_v5(),
+            GenesisForm::V5 => body.commitment_v5_at(candidate_height),
         };
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
@@ -3220,7 +3277,7 @@ mod tests {
         // #130 (a) state where a stale tree would answer the anchor rule wrongly.
         // The typed path refuses by name; the wire path Ignores (not a fault),
         // and both are the same gate.
-        let b = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] };
+        let b = BlockBody::from_single_payee(vec![], 0, [0; 4]);
         let h = mine_body_over_tip(&mut a, &b);
         assert_eq!(a.ingest_header(h), IngestOutcome::Accepted);
         assert!(a.state_lag().is_lagging());
@@ -3334,7 +3391,7 @@ mod tests {
         // (issue #77), so the bad body gets a header that honestly commits to it.
         // Before #77 this case paired a mined header with an unrelated body and
         // asserted "bad body" — a pairing no honest producer can emit.
-        let bad_body = BlockBody { txs: vec![tx_with(anchor, 9, b"bad")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let bad_body = BlockBody::from_single_payee(vec![tx_with(anchor, 9, b"bad")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let h2 = BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_body.commitment());
         assert_eq!(a.ingest_block(h2, bad_body), IngestOutcome::Rejected("bad body"));
@@ -3398,7 +3455,8 @@ mod tests {
         assert_eq!(joiner.chain().finalized_height(), Some(3));
 
         let mut wrong_body = blocks[0].1.clone();
-        wrong_body.coinbase = wrong_body.coinbase.saturating_add(1);
+        wrong_body.coinbase_payees[0].amount =
+            wrong_body.coinbase_payees[0].amount.saturating_add(1);
         assert_eq!(
             joiner.ingest_block(blocks[0].0, wrong_body),
             IngestOutcome::Rejected("body does not match header commitment"),
@@ -3665,7 +3723,11 @@ mod tests {
         assert!(loser.stored_body(&lh1.header_hash()).is_none(), "not APPLIED");
         assert!(loser.held_body(&lh1.header_hash()).is_some(), "but still HELD, and served (#198)");
         assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is applied");
-        assert_eq!(lb1.coinbase_rkm, [0xB2; 4], "the orphan really was the loser's own block");
+        assert_eq!(
+            lb1.coinbase_payees[0].rkm,
+            [0xB2; 4],
+            "the orphan really was the loser's own block"
+        );
 
         // (3) Converged, and it stays converged as the winner keeps extending.
         for _ in 0..6 {
@@ -3743,10 +3805,10 @@ mod tests {
         // ── moves: a two-block span whose second block re-spends the first's
         //    nullifier. Height 2 spends it; height 3 spends it again.
         let spend = tx_with(anchor, 1, b"ok");
-        let b2 = BlockBody { txs: vec![spend.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let b2 = BlockBody::from_single_payee(vec![spend.clone()], 0, [0; 4]);
         let h2 = mine_body_over_tip(&mut a, &b2);
         assert_eq!(a.ingest_header(h2), IngestOutcome::Accepted, "header-first sync");
-        let b3 = BlockBody { txs: vec![spend], coinbase: 0, coinbase_rkm: [0; 4] };
+        let b3 = BlockBody::from_single_payee(vec![spend], 0, [0; 4]);
         let h3 = mine_body_over_tip(&mut a, &b3);
         assert_eq!(h3.height, 3);
 
@@ -4389,11 +4451,7 @@ mod tests {
         );
 
         // (1) Intrinsic: the proof does not verify. Same verdict on every node.
-        let bad_proof = BlockBody {
-            txs: vec![tx_with(anchor, 9, b"bad")],
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
-        };
+        let bad_proof = BlockBody::from_single_payee(vec![tx_with(anchor, 9, b"bad")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let h1 =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_proof.commitment());
@@ -4403,11 +4461,7 @@ mod tests {
 
         // (2) Positional, judged from the position that owns the verdict: an anchor
         // that is simply not a finalized root of this chain.
-        let never_final = BlockBody {
-            txs: vec![tx_with([0xEE; 32], 10, b"ok")],
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
-        };
+        let never_final = BlockBody::from_single_payee(vec![tx_with([0xEE; 32], 10, b"ok")], 0, [0; 4]);
         let h2 = BlockHeader::child_of(
             &tip,
             tip.timestamp + 75,
@@ -4747,7 +4801,7 @@ mod tests {
 
         // The byte budget bites first when bodies carry proofs.
         let (mut b, anchor) = adapter_with_finalized_genesis();
-        let mut fat = BlockBody { txs: vec![tx_with(anchor, 1, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let mut fat = BlockBody::from_single_payee(vec![tx_with(anchor, 1, b"ok")], 0, [0; 4]);
         fat.txs[0].proof = vec![0u8; 2 * 1024 * 1024];
         for height in 1..24u64 {
             b.buffer_body(header_at(height), fat.clone());
@@ -5419,12 +5473,12 @@ mod tests {
     fn ingest_block_rejects_a_body_that_is_not_the_headers_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
         // An honest header over the tip, committing to a real one-tx body.
-        let honest_body = BlockBody { txs: vec![tx_with(anchor, 3, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest_body = BlockBody::from_single_payee(vec![tx_with(anchor, 3, b"ok")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let header =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
         // …handed a different, also-internally-valid body.
-        let swapped = BlockBody { txs: vec![tx_with(anchor, 4, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let swapped = BlockBody::from_single_payee(vec![tx_with(anchor, 4, b"ok")], 0, [0; 4]);
         assert_eq!(
             a.ingest_block(header, swapped),
             IngestOutcome::Rejected("body does not match header commitment")
@@ -5439,7 +5493,7 @@ mod tests {
     #[test]
     fn ingest_block_rejects_an_honest_header_with_an_empty_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
-        let honest_body = BlockBody { txs: vec![tx_with(anchor, 5, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        let honest_body = BlockBody::from_single_payee(vec![tx_with(anchor, 5, b"ok")], 0, [0; 4]);
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let header =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
@@ -6683,7 +6737,7 @@ mod tests {
         use qlab_node::{ChainStore as _, MemChainStore, StoredBlock};
 
         let child = |parent: &BlockHeader, marker: u64| {
-            let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [marker; 4] };
+            let body = BlockBody::from_single_payee(vec![], 0, [marker; 4]);
             let header =
                 BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment());
             StoredBlock::from_parts(&header, &body)
@@ -6920,7 +6974,7 @@ mod tests {
 
         let (header, body) = miner.mine_block().expect("v5 mining succeeds");
         assert_eq!(
-            body.coinbase,
+            body.coinbase_total(),
             qlab_devnet::emission_exact::coinbase_exact(1),
             "a v5 template mints the exact schedule natively"
         );
@@ -6938,6 +6992,35 @@ mod tests {
         assert_eq!(peer.chain().tip_hash(), id, "the peer adopted the v5 identity");
         assert_eq!(peer.chain().tip_hash(), miner.chain().tip_hash());
         assert_eq!(peer.chain().tip_height(), 1);
+    }
+
+    /// Lab #553 acceptance: parameterising the RPC assembly path must not move
+    /// one byte of the node's own mining candidate.
+    #[test]
+    fn own_mining_candidate_is_byte_identical_to_its_parameterised_sibling() {
+        use qlab_devnet::forms::{ChainRules, GenesisForm};
+        let payout = [0xA1, 0xA2, 0xA3, 0xA4];
+        let mk = || {
+            let (cstate, _v) = committee7();
+            let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+            a.set_chain_rules(ChainRules { form: GenesisForm::V5, halt: RuleSchedule::V1_0 });
+            a.set_miner_rkm(payout);
+            a
+        };
+        let mut native_node = mk();
+        let mut requested_node = mk();
+        let native = native_node.assemble_block().expect("native candidate");
+        let requested = requested_node
+            .assemble_block_for_payees(&native.body.coinbase_payees)
+            .expect("valid requested payee list")
+            .expect("requested candidate");
+        assert_eq!(requested.form, native.form);
+        assert_eq!(requested.header, native.header);
+        assert_eq!(requested.seed_hash, native.seed_hash);
+        assert_eq!(requested.next_seed_hash, native.next_seed_hash);
+        assert_eq!(requested.body.coinbase_payees, native.body.coinbase_payees);
+        assert_eq!(requested.body.txs.len(), native.body.txs.len());
+        assert_eq!(requested.body.commitment_v5(), native.body.commitment_v5());
     }
 
     /// The extended install-before-run invariant: re-keying an adapter whose

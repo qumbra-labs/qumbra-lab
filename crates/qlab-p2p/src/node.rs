@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use qlab_devnet::committee::{Checkpoint, Vote};
-use qlab_devnet::body::{BlockBody, TxEntry};
+use qlab_devnet::body::{BlockBody, CoinbasePayee, TxEntry};
 use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
@@ -563,20 +563,19 @@ enum CheckpointHeaderOutcome {
 /// dead rounds is a feed that is not converging.
 const MAX_CHECKPOINT_SYNC_STALLED_BATCHES: u32 = 8;
 
-/// One cached body: the ordered txs, the coinbase counter and the payout key —
-/// all three are needed to rebuild the *exact* body (issue #101) — plus the
+/// One cached body: the ordered txs and coinbase payee list — both are needed
+/// to rebuild the *exact* body — plus the
 /// height it entered under and its metered weight, so eviction needs no rescan.
 struct ServedBody {
     height: u64,
     txs: Vec<TxEntry>,
-    // Read since issue #130 (c): serving a whole block needs the coinbase counter
-    // and payout key as well as the txs, because they are body fields and not tx
-    // slots. #135 kept them against exactly this — "a cache entry that cannot
+    // Serving a whole block needs every payee as well as the txs, because they
+    // are body fields and not tx slots. #135 kept the old flat fields against
+    // exactly this — "a cache entry that cannot
     // rebuild the *exact* body would be a trap for the next serving path" — and
     // the `#[allow(dead_code)]` they carried until now is gone because they are no
     // longer dead.
-    coinbase: u64,
-    coinbase_rkm: [u64; 4],
+    coinbase_payees: Vec<CoinbasePayee>,
     weight: usize,
 }
 
@@ -632,9 +631,18 @@ impl ServedBodies {
     /// height held while the cache is full, it IS the least useful entry by the
     /// rule, and it goes (its announce was still relayed; a peer that misses the
     /// re-request window recovers via re-announce or, once applied, the store).
-    fn insert(&mut self, height: u64, hash: Hash32, txs: Vec<TxEntry>, coinbase: u64, coinbase_rkm: [u64; 4]) {
-        let weight = crate::n1::txs_weight(&txs) + 40;
-        let entry = ServedBody { height, txs, coinbase, coinbase_rkm, weight };
+    fn insert(
+        &mut self,
+        height: u64,
+        hash: Hash32,
+        txs: Vec<TxEntry>,
+        coinbase_payees: Vec<CoinbasePayee>,
+    ) {
+        // This is the retained body-surface meter, not the V5 wire length. The
+        // count byte is an encoding byte; `ServedBody` does not retain it.
+        let weight = crate::n1::txs_weight(&txs)
+            + crate::n1::coinbase_payees_weight(&coinbase_payees);
+        let entry = ServedBody { height, txs, coinbase_payees, weight };
         if let Some(old) = self.by_hash.insert(hash, entry) {
             // Same hash re-completed (e.g. re-announce after restart): replace,
             // do not double-count.
@@ -1396,7 +1404,20 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         coinbase_rkm: [u64; 4],
         nonce: u64,
     ) {
-        let _ = self.announce_block_named(header, txs, coinbase, coinbase_rkm, nonce);
+        let payees = BlockBody::from_single_payee(Vec::new(), coinbase, coinbase_rkm)
+            .coinbase_payees;
+        self.announce_block_for_payees(header, txs, payees, nonce);
+    }
+
+    /// [`Self::announce_block`] with the complete V5 payee list.
+    pub fn announce_block_for_payees(
+        &mut self,
+        header: BlockHeader,
+        txs: Vec<TxEntry>,
+        coinbase_payees: Vec<CoinbasePayee>,
+        nonce: u64,
+    ) {
+        let _ = self.announce_block_named_for_payees(header, txs, coinbase_payees, nonce);
     }
 
     /// The own-mined ingest path with a named outcome (lab #511).
@@ -1413,6 +1434,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         coinbase_rkm: [u64; 4],
         nonce: u64,
     ) -> IngestOutcome {
+        let payees = BlockBody::from_single_payee(Vec::new(), coinbase, coinbase_rkm)
+            .coinbase_payees;
+        self.announce_block_named_for_payees(header, txs, payees, nonce)
+    }
+
+    /// [`Self::announce_block_named`] with the complete V5 payee list.
+    pub fn announce_block_named_for_payees(
+        &mut self,
+        header: BlockHeader,
+        txs: Vec<TxEntry>,
+        coinbase_payees: Vec<CoinbasePayee>,
+        nonce: u64,
+    ) -> IngestOutcome {
         let bh = header.header_hash_for(self.node.genesis_form());
         // Ingest first, and do not put on the wire what our own node rejects
         // (issue #77, the own-announce seam): a locally-produced header/body pair
@@ -1420,7 +1454,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // node the origin of the very object every peer must penalise.
         let outcome = self
             .node
-            .ingest_block(header, BlockBody { txs: txs.clone(), coinbase, coinbase_rkm });
+            .ingest_block(header, BlockBody::new(txs.clone(), coinbase_payees.clone()));
         // Issue #134 widens this from `Rejected` to `Rejected | Ignored`. `Ignored` now
         // also covers a body whose anchors this node **could not evaluate**, and
         // announcing one would make this node the origin of an object it never
@@ -1433,12 +1467,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
             return outcome;
         }
-        self.blocks.insert(header.height, bh, txs.clone(), coinbase, coinbase_rkm);
+        self.blocks.insert(header.height, bh, txs.clone(), coinbase_payees.clone());
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
-        let ann =
-            BlockAnnounce { header, nonce, coinbase, coinbase_rkm, short_ids, prefilled };
+        let ann = BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled };
         let payload = encode_announce(self.node.genesis_form(), &ann);
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -1984,11 +2017,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// refuse them: see that method for the loop this closed on the live net.
     fn body_for_serving(&self, hash: &Hash32) -> Option<BlockBody> {
         if let Some(entry) = self.blocks.get(hash) {
-            return Some(BlockBody {
-                txs: entry.txs.clone(),
-                coinbase: entry.coinbase,
-                coinbase_rkm: entry.coinbase_rkm,
-            });
+            return Some(BlockBody::new(
+                entry.txs.clone(),
+                entry.coinbase_payees.clone(),
+            ));
         }
         self.node.held_body(hash)
     }
@@ -3164,14 +3196,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     ) {
         let outcome = self
             .node
-            .ingest_block(
-                ann.header,
-                BlockBody {
-                    txs: txs.clone(),
-                    coinbase: ann.coinbase,
-                    coinbase_rkm: ann.coinbase_rkm,
-                },
-            );
+            .ingest_block(ann.header, BlockBody::new(txs.clone(), ann.coinbase_payees.clone()));
         // Orphan-triggered sync kick (M10-T0-1, issue #62 item 6 — the N7 finding):
         // an announced block whose parent is unknown was previously dropped, and
         // gap recovery relied solely on the taller-peer handshake. Instead, kick
@@ -3208,7 +3233,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
-        self.blocks.insert(ann.header.height, bh, txs, ann.coinbase, ann.coinbase_rkm);
+        self.blocks.insert(ann.header.height, bh, txs, ann.coinbase_payees.clone());
         self.seen.insert(bh);
         let payload = encode_announce(self.node.genesis_form(), &ann);
         for pid in self.peers.ready_peers() {
@@ -3253,8 +3278,8 @@ where
 /// **A whole block, in the announce codec** (issue #130 (c)): every transaction
 /// prefilled, no short ids.
 ///
-/// A `BlockAnnounce` already carries the two body fields that are not transaction
-/// slots — `coinbase` and `coinbase_rkm` (issue #101) — which is exactly why it,
+/// A `BlockAnnounce` already carries the body field that is not a transaction
+/// slot — the coinbase payee list — which is exactly why it,
 /// and not `BlockTxn`, is the answer to a historical body request: `BlockTxn`
 /// carries transactions only, so a receiver could never rebuild a body whose
 /// commitment matches the header, and every served block would be rejected as a
@@ -3265,6 +3290,7 @@ where
 /// a pure function of the block, so two nodes serving the same block serve the
 /// same bytes.
 fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
+    let coinbase_payees = body.coinbase_payees;
     let prefilled = body
         .txs
         .into_iter()
@@ -3274,8 +3300,7 @@ fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
     BlockAnnounce {
         header,
         nonce: 0,
-        coinbase: body.coinbase,
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase_payees,
         short_ids: Vec::new(),
         prefilled,
     }
@@ -3739,7 +3764,7 @@ mod tests {
     /// commits to exactly that body, which since issue #77 is what makes the
     /// announce ingestable at all.
     fn header_over(parent: &BlockHeader, ts: u64, txs: &[TxEntry], coinbase: u64) -> BlockHeader {
-        let body = BlockBody { txs: txs.to_vec(), coinbase, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(txs.to_vec(), coinbase, [0; 4]);
         BlockHeader::child_of(parent, ts, 1000, body.commitment())
     }
 
@@ -4504,8 +4529,7 @@ mod tests {
         let ann = BlockAnnounce {
             header,
             nonce: 0xBEEF,
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             short_ids,
             prefilled,
         };
@@ -4554,7 +4578,7 @@ mod tests {
             bucket: ArityBucket::TwoByTwo,
             fee: 0,
             });
-        c.insert(height, hash, vec![entry], 0, [0; 4]);
+        c.insert(height, hash, vec![entry], Vec::new());
         hash
     }
 
@@ -4642,6 +4666,34 @@ mod tests {
         for bh in &hashes[10..] {
             assert!(node.blocks.contains(bh), "the newest {MAX_SERVED_BODIES} still serve");
         }
+    }
+
+    #[test]
+    fn serving_cache_meter_keeps_the_legacy_floor_and_charges_each_payee() {
+        let mut c = ServedBodies::new();
+        c.insert(1, [1; 32], Vec::new(), Vec::new());
+        assert_eq!(c.bytes, 40, "an empty body keeps the shared legacy floor");
+
+        c.insert(
+            2,
+            [2; 32],
+            Vec::new(),
+            vec![CoinbasePayee { rkm: [2; 4], amount: 2 }],
+        );
+        assert_eq!(c.bytes, 80, "zero and one payee both meter 40 B");
+
+        c.insert(
+            3,
+            [3; 32],
+            Vec::new(),
+            (0..8)
+                .map(|i| CoinbasePayee {
+                    rkm: [i + 1; 4],
+                    amount: i + 1,
+                })
+                .collect(),
+        );
+        assert_eq!(c.bytes, 400, "the eight retained payees add 8 x 40 B");
     }
 
     /// A [`StubNode`] with an applied-body store bolted on — the smallest
@@ -4810,8 +4862,7 @@ mod tests {
         let ann = BlockAnnounce {
             header,
             nonce: 0xC0DE,
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             short_ids,
             prefilled,
         };
@@ -6056,11 +6107,12 @@ mod tests {
             );
             let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
             assert_eq!(body.txs.len(), 1, "the served block carries a transaction");
+            let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
             nodes[0].announce_block(
                 header,
                 body.txs.clone(),
-                body.coinbase,
-                body.coinbase_rkm,
+                coinbase,
+                rkm,
                 round,
             );
             drive(nodes, (round + 1) * 10_000);
@@ -6175,7 +6227,8 @@ mod tests {
             );
             let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
             assert_eq!(body.txs.len(), 1);
-            nodes[0].announce_block(header, body.txs.clone(), body.coinbase, body.coinbase_rkm, 1);
+            let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+            nodes[0].announce_block(header, body.txs.clone(), coinbase, rkm, 1);
             drive(&mut nodes, 50_000);
 
             assert_eq!(

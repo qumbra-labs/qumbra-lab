@@ -162,7 +162,7 @@ fn reveal_tx(nf: u8, salt: [u8; 32]) -> TxEntry {
 
 fn body_of(txs: Vec<TxEntry>) -> BlockBody {
     // coinbase 0: no mint, so no payee/schedule interaction — see B's note.
-    BlockBody { txs, coinbase: 0, coinbase_rkm: [0; 4] }
+    BlockBody::from_single_payee(txs, 0, [0; 4])
 }
 
 /// A header at `height` committing to `body` under the boundary's rule.
@@ -338,9 +338,9 @@ const DRILL_RKM: [u64; 4] = [0xA1, 0xA2, 0xA3, 0xA4];
 /// emission boundary and the exact schedule above it.
 fn empty_body_at(height: u64) -> BlockBody {
     if height > RULE_BOUNDARY_HEIGHT {
-        BlockBody { txs: vec![], coinbase: coinbase_exact(height), coinbase_rkm: DRILL_RKM }
+        BlockBody::from_single_payee(vec![], coinbase_exact(height), DRILL_RKM)
     } else {
-        BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] }
+        BlockBody::from_single_payee(vec![], 0, [0; 4])
     }
 }
 

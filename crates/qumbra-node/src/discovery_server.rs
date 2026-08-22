@@ -579,6 +579,20 @@ impl DiscoveryServer {
                 // The one write route, method-gated first (the faucet's 405+Allow
                 // shape) and handed off before its body is read — see the method
                 // docs for why the GET worker must never block on a submitter.
+                if path == crate::mine_rpc::MINE_CONTEXT_PATH {
+                    if *request.method() != tiny_http::Method::Get {
+                        let allow = tiny_http::Header::from_bytes(&b"Allow"[..], &b"GET"[..])
+                            .expect("static header parses");
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("method not allowed: GET the mining context")
+                                .with_status_code(405)
+                                .with_header(allow),
+                        );
+                        continue;
+                    }
+                    spawn_mine_context_handler(request, mine.clone());
+                    continue;
+                }
                 if path == crate::mine_rpc::MINE_TEMPLATE_PATH {
                     if *request.method() != tiny_http::Method::Get {
                         let allow = tiny_http::Header::from_bytes(&b"Allow"[..], &b"GET"[..])
@@ -590,7 +604,7 @@ impl DiscoveryServer {
                         );
                         continue;
                     }
-                    spawn_mine_template_handler(request, mine.clone());
+                    spawn_mine_template_handler(request, mine.clone(), query.to_string());
                     continue;
                 }
                 if path == crate::mine_rpc::MINE_BLOCK_PATH {
@@ -914,12 +928,53 @@ fn spawn_submit_handler(
     });
 }
 
-fn spawn_mine_template_handler(
+fn spawn_mine_context_handler(
     request: tiny_http::Request,
     mine: Option<crate::mine_rpc::MineServing>,
 ) {
     std::thread::spawn(move || {
-        let (code, body, json) = mine_template_verdict(mine);
+        let (code, body, json) = mine_context_verdict(mine);
+        let response = tiny_http::Response::from_string(body).with_status_code(code);
+        let response = if json {
+            response.with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .expect("static header parses"),
+            )
+        } else {
+            response
+        };
+        let _ = request.respond(response);
+    });
+}
+
+fn mine_context_verdict(mine: Option<crate::mine_rpc::MineServing>) -> (u16, String, bool) {
+    let Some(mine) = mine else {
+        return (404, "not found: mining context is not wired on this listener".into(), false);
+    };
+    if !mine.enabled {
+        return (503, crate::mine_rpc::TEMPLATE_SERVING_DISABLED.into(), false);
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    if mine.contexts.try_send(crate::mine_rpc::TemplateContextRequest { reply: tx }).is_err() {
+        return (503, "unavailable: context-queue-full — retry".into(), false);
+    }
+    match rx.recv_timeout(crate::mine_rpc::MINE_VERDICT_TIMEOUT) {
+        Ok(Ok(wire)) => match serde_json::to_string(&wire) {
+            Ok(s) => (200, s, true),
+            Err(e) => (500, format!("internal: encode {e}"), false),
+        },
+        Ok(Err(name)) => (503, format!("unavailable: {name}"), false),
+        Err(_) => (503, "unavailable: no-verdict-in-time — retry".into(), false),
+    }
+}
+
+fn spawn_mine_template_handler(
+    request: tiny_http::Request,
+    mine: Option<crate::mine_rpc::MineServing>,
+    query: String,
+) {
+    std::thread::spawn(move || {
+        let (code, body, json) = mine_template_verdict(mine, &query);
         if json {
             let header = tiny_http::Header::from_bytes(
                 &b"Content-Type"[..],
@@ -941,6 +996,7 @@ fn spawn_mine_template_handler(
 
 fn mine_template_verdict(
     mine: Option<crate::mine_rpc::MineServing>,
+    query: &str,
 ) -> (u16, String, bool) {
     let Some(mine) = mine else {
         return (
@@ -952,10 +1008,14 @@ fn mine_template_verdict(
     if !mine.enabled {
         return (503, crate::mine_rpc::TEMPLATE_SERVING_DISABLED.into(), false);
     }
+    let payees = match crate::mine_rpc::payees_from_query(query) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("refused: {e}"), false),
+    };
     let (tx, rx) = mpsc::sync_channel(1);
     if mine
         .templates
-        .try_send(crate::mine_rpc::TemplateRequest { reply: tx })
+        .try_send(crate::mine_rpc::TemplateRequest { payees, reply: tx })
         .is_err()
     {
         return (
@@ -969,6 +1029,9 @@ fn mine_template_verdict(
             Ok(s) => (200, s, true),
             Err(e) => (500, format!("internal: encode {e}"), false),
         },
+        Ok(Err(name)) if name.starts_with("coinbase-") => {
+            (400, format!("refused: {name}"), false)
+        }
         Ok(Err(name)) => (503, format!("unavailable: {name}"), false),
         Err(_) => (
             503,

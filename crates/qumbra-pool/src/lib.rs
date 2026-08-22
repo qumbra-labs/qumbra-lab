@@ -24,22 +24,21 @@
 //!
 //! [`pplns::PplnsWindow`] is last-N accepted shares ([devnet-placeholder]
 //! `PPLNS_WINDOW_SHARES = 1024`). [`payee::assemble_coinbase`] emits a
-//! v5 [`qlab_devnet::body::CoinbasePayee`] list capped at
-//! `COINBASE_PAYEE_CAP_V5` (1 at birth) or a v4 N=1 `(rkm, amount)`.
-//! The birth cap means PPLNS cannot yet split the mint — the winner
-//! takes it; the assembler already truncates to `cap`.
+//! v5 [`qlab_devnet::body::CoinbasePayee`] list capped at one before the
+//! height boundary and `COINBASE_PAYEE_CAP_V5` (8) after it, or a v4 N=1
+//! `(rkm, amount)`. The pool selects `min(cap, window winners)` and preserves
+//! the exact scheduled sum through the final winner's remainder.
 //!
 //! ## 🔴 The payee gate (lab #547)
 //!
 //! Three T2 blocks (607, 610, 611) paid the node's
 //! [`payee::UNCONFIGURED_NODE_RKM`] placeholder — structurally valid,
 //! spendable by nobody. `coinbase_rkm` is committed by the header the
-//! miner grinds, so a payee cannot be substituted after a share arrives;
-//! the pool's only structural defence is refusal. [`payee::check_payee`]
-//! defines the accepted set (the configured `payout_rkm`, or an rkm owned
-//! by a login this pool knows) and it is enforced twice: at template
-//! intake, before a miner spends a hash, and again immediately before the
-//! block POST as a backstop.
+//! miner grinds, so lab #553 sends [`payee::assemble_coinbase`]'s list in
+//! the template request before issuing work. [`payee::check_payee`] defines
+//! the accepted set (the configured `payout_rkm`, or an rkm owned by a login
+//! this pool knows) and remains enforced at template intake and immediately
+//! before the block POST.
 //!
 //! Mapping authority: `docs/pool-stratum-mapping.md`. Tracker: lab #482.
 //! Multica: QUM-136.
@@ -83,7 +82,43 @@ pub use pplns::{PplnsWindow, PPLNS_WINDOW_SHARES};
 pub use template::{
     DevnetTemplateSource, HeldTemplateSource, Template, TemplateBody, TemplateError, TemplateSource,
 };
-pub use watch::{TemplateWatch, WatchSnapshot};
+pub use watch::{TemplateWatch, WatchAction, WatchSnapshot};
 
 #[cfg(feature = "randomx")]
 pub use hasher::RandomXShareHasher;
+
+/// The commit this binary was built from, stamped by the release lane and by
+/// `deploy/docker/Dockerfile`'s builder stage via `QUMBRA_BUILD_REV`.
+///
+/// 🔴 **This crate is the one that decides who gets paid.** `payee::assemble_coinbase`
+/// picks the PPLNS winner and the resulting list is what reaches the chain, so
+/// "which build chose this payee" is a question about *this* process — the node's
+/// stamp beside it says nothing about it. Until lab #605 the pool was the only one
+/// of the three binaries in the release tarball that could not answer, and the
+/// release gate said so in its own comment while asserting the other two.
+///
+/// Deliberately the same env var and the same wording as `qumbra_node::release::BUILD_REV`
+/// and `qumbra_wallet::BUILD_REV` — a stranger comparing three binaries from one
+/// archive should see one string, not three vocabularies. `None` is the honest
+/// answer for every build that is not a release or image build.
+pub const BUILD_REV: Option<&str> = option_env!("QUMBRA_BUILD_REV");
+
+/// The `--help` header's build-provenance line. Never empty; see [`BUILD_REV`].
+pub fn build_rev_line() -> String {
+    match BUILD_REV {
+        Some(rev) => rev.to_string(),
+        None => "unstamped — not built by the release lane".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod build_rev_tests {
+    #[test]
+    fn the_build_rev_line_is_never_blank() {
+        // A blank field reads as a tooling gap; an unstamped binary is a real and
+        // expected state and must say so in words. Same position as
+        // `qumbra_node::release::build_rev_line`.
+        let line = super::build_rev_line();
+        assert!(!line.trim().is_empty());
+    }
+}
