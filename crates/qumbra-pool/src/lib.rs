@@ -82,7 +82,7 @@ pub use pplns::{PplnsWindow, PPLNS_WINDOW_SHARES};
 pub use template::{
     DevnetTemplateSource, HeldTemplateSource, Template, TemplateBody, TemplateError, TemplateSource,
 };
-pub use watch::{TemplateWatch, WatchSnapshot};
+pub use watch::{TemplateWatch, WatchAction, WatchSnapshot};
 
 #[cfg(feature = "randomx")]
 pub use hasher::RandomXShareHasher;
