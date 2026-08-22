@@ -30,6 +30,7 @@ use crate::share::{is_block_candidate, share_meets_target};
 use crate::template::{
     next_seed_in_preload_window, Template, TemplateBody, TemplateError, TemplateSource,
 };
+use crate::watch::WatchAction;
 
 /// Where a block-class share is submitted (lab #511). Production injects
 /// [`crate::node_rpc::NodeRpcClient`]; tests leave this unset and only
@@ -201,9 +202,28 @@ impl Pool {
         self.inner.lock().expect("pool mutex").sessions.remove(sid);
     }
 
-    /// Stop issuing work and mark every outstanding job stale. Live
-    /// sessions are told via the outbox (named reason, then disconnect).
+    /// Stop issuing work and mark every outstanding job stale. Live sessions
+    /// are told via the outbox and remain registered for a recovery job.
     pub fn suspend_work(&self, reason: impl Into<String>) {
+        self.set_work_unavailable(reason, false);
+    }
+
+    /// End live sessions after a terminal refusal or sustained outage so the
+    /// miner can fail over. A later sound template can still clear pool state.
+    pub fn end_sessions(&self, reason: impl Into<String>) {
+        self.set_work_unavailable(reason, true);
+    }
+
+    /// Apply the template watch's consequence at the pool/outbox boundary.
+    /// Shared by the poll loop and the real-socket integration tests.
+    pub fn apply_watch_action(&self, action: WatchAction) {
+        match action {
+            WatchAction::Suspend(reason) => self.suspend_work(reason),
+            WatchAction::Disconnect(reason) => self.end_sessions(reason),
+        }
+    }
+
+    fn set_work_unavailable(&self, reason: impl Into<String>, terminal: bool) {
         let mut g = self.inner.lock().expect("pool mutex");
         let reason = reason.into();
         g.unavailable = Some(reason.clone());
@@ -211,7 +231,11 @@ impl Pool {
         let outbox = g.outbox.clone();
         drop(g);
         if let Some(outbox) = outbox {
-            outbox.unavailable_all(reason);
+            if terminal {
+                outbox.unavailable_all(reason);
+            } else {
+                outbox.suspend_all(reason);
+            }
         }
     }
 
@@ -655,7 +679,7 @@ impl Pool {
             // than repeat the refusal on every find against this template.
             let reason = format!("work-unavailable: {refusal}");
             eprintln!("pool block NOT submitted, payee refused: {refusal}");
-            self.suspend_work(reason);
+            self.end_sessions(reason);
             return Ok(vec![Outgoing::Reply(StratumResponse::ok_status(rid, "OK"))]);
         }
         if let Some((form, preimage, body, submitter)) = pending_submit {

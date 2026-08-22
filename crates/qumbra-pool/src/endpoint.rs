@@ -246,8 +246,8 @@ fn sync_registration(
     }
 }
 
-/// Drain this session's outbox slot. `Ok(false)` means the pool asked
-/// us to disconnect after writing a named stop.
+/// Drain this session's outbox slot. A suspended session stays registered;
+/// `Ok(false)` is reserved for a terminal refusal or sustained outage.
 fn drain_outbox(
     writer: &mut TcpStream,
     outbox: &JobOutbox,
@@ -260,6 +260,13 @@ fn drain_outbox(
         Some(SessionPush::Job(job)) => {
             let req = job_notification(&job).map_err(std::io::Error::other)?;
             write_out(writer, Outgoing::Notify(req))?;
+            Ok(true)
+        }
+        Some(SessionPush::Suspended(reason)) => {
+            write_out(
+                writer,
+                Outgoing::Reply(StratumResponse::err(0, ERR_INVALID, reason)),
+            )?;
             Ok(true)
         }
         Some(SessionPush::Unavailable(reason)) => {
