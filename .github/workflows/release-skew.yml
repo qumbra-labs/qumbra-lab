@@ -1,0 +1,99 @@
+# Lab #614 — is the node we tell people to download still able to talk to the net?
+#
+# WHAT THIS IS NOT: an attempt to automate the release lane. `release-binaries.yml`
+# is `workflow_dispatch`-only, gated on typing `confirm=release`, and its header
+# explains why in cost terms — a 10x-billed `macos-14` leg against a $20/month cap
+# with `Stop usage: Yes`, so an expensive cut can take `suite-arm64.yml`, the
+# acceptance bar, down with it. **That decision is correct and this file does not
+# touch it.** Spending the budget stays Larry's call, every time (R3). This file
+# only ever reports.
+#
+# WHAT IT IS: the missing instrument. On 2026-08-22 the published binaries sat at
+# `RPC_VERSION = 0x06` while the live fleet had moved to `0x07`, so following the
+# mining panel's own install instructions handed a person a node their freshly
+# built app could not read. Nothing anywhere answered "can the published node
+# still talk to the running net?", and the gap was found by hand, two days late,
+# by someone chasing an unrelated bug.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE KNOWN WEAKNESS OF THIS FILE, STATED RATHER THAN DISCOVERED LATER
+#
+# A workflow that is red on a schedule is a channel this project has already
+# learned to ignore: `node-image.yml` stood red on eight consecutive merges while
+# being correct every time, because "the published image is behind the code" was
+# being expressed in the channel a BROKEN BUILD uses. This file is at risk of
+# exactly that, and one mitigation is built in:
+#
+#   **The job summary carries the three version numbers on every run, green or
+#   red.** A channel that only ever says something when it is alarming teaches
+#   people that its silence is the normal state and its noise is the error. This
+#   one is readable when nothing is wrong, which is the only way its red stays
+#   worth reading.
+#
+# The stronger mitigation is not a CI change and is deliberately not attempted
+# here: the measurement should also be taken at the moment the decision is made —
+# when the fleet is rolled. That belongs in the roll protocol (`qumbra-deploy`),
+# not in a cron job on this side, and is left as its own decision.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: release skew
+
+on:
+  schedule:
+    # 02:00 UTC daily. ubuntu-latest is the 1x lane; ~1 minute a day is ~$0.25 a
+    # month against the cap, which is why this may be scheduled where the release
+    # lane may not.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    # The moment someone bumps the constant is the moment this is worth saying:
+    # the run will report `PENDING ROLL`, i.e. "your bump implies a fleet roll and
+    # a release cut". It does not fail the PR — that would be refusing a bump we
+    # want people to make.
+    paths:
+      - "crates/qlab-node/src/rpc.rs"
+      - ".github/workflows/release-skew.yml"
+      - ".github/workflows/scripts/release-skew.py"
+
+# Reading a public repo's releases and a public HTTP endpoint. Nothing is written.
+permissions:
+  contents: read
+
+jobs:
+  skew:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # `git show <rev>:…` against the PUBLISHED release's source revision,
+          # which is months of history behind the tip on a bad day. A shallow
+          # checkout turns that into an unreadable-object error — which the script
+          # reports as BADPROBE rather than as "no skew", but the run is wasted.
+          fetch-depth: 0
+
+      - name: Compare published, live and main
+        id: skew
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          # Tee: the summary must carry the numbers whether this passes or fails,
+          # so `set -e` must not swallow the body before it is written.
+          rc=0
+          python3 .github/workflows/scripts/release-skew.py > skew.txt 2>&1 || rc=$?
+          cat skew.txt
+          {
+            echo "## RPC version skew"
+            echo
+            echo '```'
+            cat skew.txt
+            echo '```'
+            echo
+            case "$rc" in
+              0) echo "**No skew.** The published node and the live net speak the same RPC version." ;;
+              1) echo "**Skew.** See above. This does not cut a release — it asks for a decision." ;;
+              2) echo "**Could not measure.** This is NOT a statement that there is no skew; a reading failed and is named above." ;;
+              *) echo "**Unexpected exit $rc.**" ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
