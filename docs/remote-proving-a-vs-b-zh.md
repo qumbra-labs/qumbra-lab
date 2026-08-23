@@ -26,7 +26,8 @@ Grok 在 2026-08-23 的选型:
   会把一台 viewing oracle 交给官方服务:selected inputs、金额、收款/找零，以及
   `nk`（full-viewing-class）。
 - **单靠 B 不是盗币模型。** 它的「不能盗」绑在 SEV-SNP/TDX、firmware、cloud、
-  attestation 与 side-channel 上。一次破裂同时给出盗币和完整 witness。
+  attestation 与 side-channel 上。一次足够强、能读取或改写 confidential worker
+  的破裂，可以把花费完整性与 witness 保密性两道保证一起打穿。
 - 现稿 Hash-OTS **不是** A。保留 `rkm` root-binding 接缝。Authorization spike
   默认用标准化 stateless leaf（先 ML-DSA），直到父记录 §6 的 P0 关闭。
 

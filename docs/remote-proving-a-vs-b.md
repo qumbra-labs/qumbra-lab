@@ -30,8 +30,10 @@ Grok's pick, 2026-08-23:
   viewing oracle: selected inputs, amounts, recipient/change, and `nk`
   (full-viewing-class).
 - **B-alone is not the theft model.** Its "cannot steal" rests on
-  SEV-SNP/TDX, firmware, cloud, attestation, and side-channels. One break
-  gives both theft and full witness.
+  SEV-SNP/TDX, firmware, cloud, attestation, and side-channels. A
+  sufficiently strong breach that permits reading or modifying the
+  confidential worker can collapse the spend-integrity and
+  witness-confidentiality guarantees together.
 - Hash-OTS as written is **not** A. Keep the `rkm` root-binding seam.
   Default the authorization spike to a standardized stateless leaf (ML-DSA
   first) until the parent record's §6 P0s close.
