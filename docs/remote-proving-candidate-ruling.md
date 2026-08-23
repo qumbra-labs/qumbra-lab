@@ -1,141 +1,217 @@
-# Remote proving — candidate ruling: A is the launch security basis, B is a later layer
+# Remote proving — security-basis ruling
 
-**Status: RULED 2026-08-23. Larry accepted the reviewer-f5 recommendation
-below in the same session that produced it. This ruling selects the *launch
-security basis* of [`remote-proving-decision.md`](remote-proving-decision.md)
-§9.3. It does not approve implementation, does not select a signature
-primitive, and does not amend the binding design specification — those remain
-gated exactly as that record says.**
+**Status: DECIDED 2026-08-23, NOT IMPLEMENTATION APPROVAL. Candidate A is
+mandatory for real-value remote proving. Candidate B is optional
+defense-in-depth and is not a funds-safety trust root. This ruling does not
+select an authorization primitive or amend the binding design specification.**
 Paired with
 [`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md).
 
+This document resolves the route-selection question in
+[`remote-proving-decision.md`](remote-proving-decision.md). That record remains
+the detailed launch gate; this one records the choice and its consequences.
+
 ---
 
-## 1. The ruling
+## 1. The decision
 
-**Candidate A — consensus-bound phone-held authorization — is the security
-basis on which a real-value shared prover launches. Candidate B — an attested
-confidential worker — is a deployment-layer privacy hardening to be added on
-top of A later, and is not a launch prerequisite.**
+**Candidate A — consensus-bound, phone-held spend authorization — is the
+mandatory security basis for every shared prover that carries real value.** A
+node must reject any transaction that changes the complete phone-approved
+intent, even when the prover, service operator, cloud, and submission path are
+malicious.
 
-The two are not alternatives at the same layer, and the decision record's
-"A or B or both" framing should be read as resolved to **A first, B later**.
+**Candidate B — a wallet-verified attested confidential worker — is an
+optional deployment layer on top of A.** The official service should measure
+it in parallel and may use it to reduce witness visibility, but B is not a
+substitute for A and is not a launch prerequisite for funds safety. A B-only
+deployment may be used for a valueless experiment; it may not carry real
+value.
 
-## 2. Why — in the order that decided it
+The preferred production composition is therefore **A, plus B where its
+measured fit and operational trust are acceptable**. Community or alternative
+provers need A but do not need to reproduce Qumbra's confidential-compute
+deployment.
 
-### 2.1 The two candidates compose in only one direction
+## 2. Why A is mandatory and B is optional
 
-A changes the **protocol**: the node rejects any transaction that lacks the
-phone's authorization over the complete intent. Its guarantee is a
-mathematical property anyone can verify from the chain.
+### 2.1 Integrity belongs in the protocol
 
-B changes the **deployment**: the worker runs inside a SEV-SNP/TDX-class
-confidential VM. Its guarantee is a chain of assumptions — CPU vendor
-firmware, the cloud operator, the attestation service, a measured image, and
-the absence of an exploitable side channel.
+A makes the authorization decision independently verifiable by every node.
+The prover can see the witness and can refuse service, but it cannot redirect
+the selected funds. That property survives a malicious operator, compromised
+cloud account, broken worker isolation, and direct submission by the prover.
 
-B can be added to a chain that already has A without touching consensus. A
-cannot be added to a deployment that launched on B without a re-mint or a
-hard fork. A first is the only order that does not foreclose the other.
+B protects a deployment boundary. Its guarantee depends on CPU and firmware,
+cloud isolation, attestation and revocation services, the measured image,
+wallet verification, and side-channel assumptions. Those are valuable
+barriers, but they should not decide who is allowed to spend a user's money.
 
-### 2.2 The re-mint window is open for A and irrelevant to B
+### 2.2 The candidates compose in only one safe direction
 
-T2 is minted and not launched. Today A's consensus change is one PR and one
-re-mint through the existing ceremony. After launch it is a hard fork with
-live value on both sides. B never needs that window. The window closes on its
-own; only A is hurt by waiting.
+B can be added to an A-protected service without changing consensus. Adding A
+after launching on B requires the protocol, circuit, wire, wallet, verifier,
+and activation boundary to move together. T2 is minted but not launched, so
+the re-mint window for A is open now; B does not depend on that window.
 
-### 2.3 B alone contradicts the chain's own trust thesis
+### 2.3 A permits more than one prover operator
 
-Qumbra's design wager is conservative hash plus STARK everywhere in consensus,
-declining even lattice signatures on engineering-conservatism grounds. Making
-the one question that matters most to a user — *who can spend my money* —
-depend on TEE attestation would put the weakest trust assumption in the whole
-system at its most sensitive point. The published record of SGX and SEV
-breaks is long enough that "attestation holds" is not a sentence a privacy
-chain's security statement can rest on. B is a good **additional** barrier
-and a bad **only** barrier.
+Once the node enforces the phone's authorization, Qumbra's service becomes one
+provider rather than the permanent trust root. Community nodes, pools, or a
+future proving market can serve the same protocol. B-only proving instead
+requires wallets to keep trusting an approved attestation policy and its
+operator ecosystem.
 
-### 2.4 A also dissolves the availability and censorship dependency
+### 2.4 B still has real privacy value
 
-Under A a prover cannot steal, so a prover does not need to be Qumbra.
-Community nodes, pools, or a paid market can prove for phones; the central
-service becomes one provider among several. Under B a prover must forever be
-"an attested Qumbra-approved image", which keeps
-[`backend-assisted-proving-security.md`](backend-assisted-proving-security.md)
-§7's single-operator availability and censorship problem permanent.
+A does not hide the witness from an ordinary worker. The service may still
+link selected notes, amount, recipient material, nullifiers, device identity,
+IP, and timing, and it receives privacy-sensitive `nk` material. B can reduce
+payload visibility for the official service if encryption terminates only
+inside a verified worker. Ingress metadata and on-chain timing remain visible,
+so B is privacy hardening rather than anonymity.
 
-### 2.5 Why this can be ruled before the measurements
+Current target-class attestation is also not an end-to-end post-quantum trust
+chain. AMD specifies ECDSA P-384 signatures for SEV-SNP attestation reports,
+and Intel's TDX quote/certification path uses ECDSA. This does not make the
+platforms unusable; it is another reason not to make attestation the exclusive
+authorization root.
 
-`remote-proving-decision.md` §9.3 says "do not select from estimated rows".
-This ruling does not: none of §2.1–2.4 is a number. They are layering,
-sequencing, and trust-model facts that no measurement changes. What the
-measurements still decide is listed in §4 — and all of it gates
-*implementation*, not the choice of basis.
+## 3. Decision matrix
 
-## 3. What A does not give, stated plainly
+| deployment | funds cannot be redirected when the operator is malicious | witness confidentiality | protocol consequence | ruling |
+|---|---|---|---|---|
+| A: ordinary worker + phone authorization | yes, enforced by every node | no | T2 re-mint-class change | **mandatory baseline** |
+| B only: confidential worker | only while the complete TEE/attestation chain holds | reduced; ingress metadata remains | no consensus change in principle | **not allowed for real value** |
+| A + B: phone authorization inside a confidential deployment | yes, still enforced by A if B fails | reduced under B's stated assumptions | A's protocol change plus B's deployment work | **preferred official-service composition where measured fit passes** |
 
-- **A does not pass the "cannot see/link" bar.** An ordinary worker still
-  observes the selected notes, amounts, recipient plaintexts, nullifiers,
-  device identity, IP, and timing, and receives full-viewing-class `nk`. That
-  is a privacy gap, not a funds-safety gap, and it is exactly what B (or
-  multi-operator proving) is for later.
-- **A requires a dated correction to the binding design spec** — the "one
-  monolithic STARK, no per-spend signatures" decision. That correction is
-  Larry's to make in the design repo and must land before the lab circuit or
-  wire moves (`remote-proving-decision.md` §9.4).
-- **A is a T2 re-mint-class change.** Note/`rkm` binding, AIR and public
-  values, transaction wire, node verification, transaction identity, genesis.
+If B degrades or its attestation policy is withdrawn in an A+B deployment,
+privacy or availability may degrade, but the failure must not become authority
+to redirect funds.
 
-## 4. How A proceeds — recommendations, not rulings
+## 4. Selected architecture
 
-These are the reviewer's recommendations for the §9.1 authorization spike.
-They are offered so the spike starts from a position, and each is overridable
-by its measurement.
+The phone retains the authorization secret and normally submits the returned
+artifact. The prover receives the authorized proving envelope, obtains fresh
+anchors and nullifiers from operator-pinned read-only node endpoints, and
+returns a proof and transaction. A client request never chooses the worker's
+node URL.
 
-1. **Default the leaf to ML-DSA-44, not WOTS+.** It is stateless, so the
-   rollback/key-reuse P0 in `remote-proving-decision.md` §6 disappears rather
-   than being managed; it is a NIST standard with published vectors, so the
-   incomplete-instantiation P0 disappears too. The price is about +3.1 KB per
-   transaction over the WOTS+ row (≈166 KB est., still under b4's ~236 KB).
-   WOTS+ and random-index WOTS+ stay in the comparison as future size
-   optimizations, not as the launch path.
-2. **Write the dummy-slot rule first.** The #219 latch makes slot 1 a
-   prover-side dummy with no note and no key tree. Its authorization rule
-   (ephemeral phone-held key, latch path binding that key rather than a tree
-   path, real-input count still hidden) is the first deliverable of the spike,
-   because every other part of the spec depends on the two slots having one
-   public shape.
-3. **Keep the structural seam from
-   [`hash-ots-spend-authorization.md`](hash-ots-spend-authorization.md):**
-   per-address root in `rkm`'s spare Keccak rate, 32-byte leaf, membership
-   proved in-circuit, signature verified natively at the node before STARK
-   verification. The primitive changes; the seam does not.
-4. **Run B's confidential-VM fit lane in parallel, not on the critical path.**
-   It is cheap, and its result decides *when* B is layered on, not *whether*
-   A proceeds.
+```mermaid
+flowchart LR
+    subgraph DEVICE["iOS / Android device"]
+        WALLET["Wallet kernel<br/>scan • select • build • review"]
+        SECRET["Phone-only authorization secret<br/>never uploaded"]
+        ENVELOPE["Authorized proving envelope<br/>witness • canonical intent • authorization"]
+        SECRET --> WALLET --> ENVELOPE
+    end
 
-Effort, in Claude session hours (wall time depends on how sessions are
-spaced): spec + vectors + dummy rule ≈ 5 h; circuit change with the
-domain-separation review ≈ 15–20 h; wire, node verification, wallet key
-hierarchy ≈ 15 h; the re-mint itself follows the existing ceremony.
-**≈ 40–50 session hours**, plus 2^19 prover measurements on the rig (machine
-time, not session time). The design-spec correction and the T2 launch
-sequencing are Larry's steps and are outside this estimate.
+    subgraph SERVICE["Shared prover service"]
+        INGRESS["Ingress<br/>TLS • auth • rate limit • byte ceilings"]
+        ADMISSION["Admission<br/>bounded job + worker lease"]
+        MODE{"Worker deployment"}
+        ORDINARY["Ordinary ephemeral b16 worker<br/>Candidate A baseline"]
+        CONFIDENTIAL["Attested confidential worker<br/>optional Candidate A + B"]
+        INGRESS --> ADMISSION --> MODE
+        MODE -->|"community / baseline"| ORDINARY
+        MODE -.->|"optional official privacy layer"| CONFIDENTIAL
+    end
 
-## 5. What this ruling changes in the other records
+    subgraph NETWORK["Qumbra network"]
+        READ["Operator-pinned read endpoints<br/>anchors • nullifiers"]
+        TX["Transaction endpoint"]
+        VERIFY_AUTH["Verify phone authorization<br/>over canonical complete intent"]
+        VERIFY_STARK["Verify STARK<br/>including note/authorization binding"]
+        ACCEPT["Accept transaction"]
+        TX --> VERIFY_AUTH --> VERIFY_STARK --> ACCEPT
+    end
 
-- `remote-proving-decision.md` §9.3 is resolved: the launch security basis is
-  A. §9.1 (spike), §9.2 (B lane, now parallel), §9.4 (spec correction) and
-  §9.5 stand unchanged and still gate implementation.
-- §8's launch gates are unchanged; A must pass every applicable one.
-- Nothing in `backend-assisted-proving-security.md`,
-  `hash-ots-spend-authorization.md`, or `phone-self-proving-reopened.md` is
-  amended by this ruling.
+    WALLET -->|"1. scan public state"| READ
+    ENVELOPE -->|"2. prove request"| INGRESS
+    ORDINARY -->|"3. fresh read-only preflight"| READ
+    CONFIDENTIAL -->|"3. fresh read-only preflight"| READ
+    ORDINARY -->|"4. artifact"| INGRESS
+    CONFIDENTIAL -->|"4. encrypted artifact"| INGRESS
+    INGRESS -->|"5. return"| WALLET
+    WALLET -->|"6. compare and submit"| TX
+```
 
-## 6. Scope at this handoff
+Phone-side comparison and submission remain defense-in-depth. They are not
+the anti-theft boundary: a malicious prover can submit directly, so the node's
+Candidate A verification is authoritative.
 
-- No code, circuit, wire, genesis, cloud resource, or deployment changed.
-- `CONSENSUS_CFG` remains untouched.
-- The binding design specification remains unamended until its own
-  correction process runs.
+## 5. Consequences and invariants
+
+1. **A is a T2 re-mint-class protocol change.** Note or recipient-key binding,
+   AIR/public values, transaction wire and identity, node verification,
+   genesis parameters, activation, and migration must be one design.
+2. **The binding design specification must be corrected first.** Its current
+   "one monolithic STARK; no per-spend signatures" decision cannot be silently
+   bypassed by lab implementation.
+3. **B-only is not a real-value shortcut.** It is permitted only for an
+   explicitly isolated, valueless service-mechanics or capacity experiment.
+4. **An A-only service must state its privacy boundary honestly.** It must not
+   claim witness confidentiality, and it needs explicit retention, logging,
+   access, incident-response, and metadata-linkability rules.
+5. **An A+B service keeps A authoritative.** Attestation failure may refuse a
+   job; it must never authorize a transaction or bypass node verification.
+6. **The prover's node access is read-only and operator-pinned.** The wallet
+   normally submits through its own pinned transaction endpoint.
+7. **User-operated persistent proving remains out of scope.** A enables other
+   operators; it does not require users to operate one.
+
+## 6. What remains undecided
+
+Selecting A does **not** accept the hash-OTS draft or any signature primitive.
+The authorization spike must compare at least:
+
+- a standardized stateless leaf, with ML-DSA as the initial frontrunner;
+- standardized WOTS+ with its complete instantiation and rollback-safe state
+  story; and
+- random-index WOTS+ as a measured comparator, without treating it as SLH-DSA.
+
+The spike must close the dummy-slot rule, canonical complete intent, exact
+codecs and vectors, mobile key lifecycle and restore, multi-device behavior,
+wire bytes, prover RSS/time, node verification time, and privacy impact. The
+P0 blockers in [`remote-proving-decision.md`](remote-proving-decision.md) §6
+remain open.
+
+No confidential-compute vendor, cloud, instance family, attestation policy,
+API, queue, retention design, or capacity plan is selected here.
+
+## 7. Execution order
+
+1. Run the authorization spike as research, starting from the standardized
+   stateless-leaf shape and keeping WOTS+ variants as comparators.
+2. Once the protocol shape is reviewable, write the dated design-spec
+   correction that permits consensus-bound phone-held authorization. It must
+   land before circuit or wire implementation.
+3. Specify the T2 re-mint change across the circuit, public values, wire, node
+   verifier, wallet, activation, and migration; then implement only after the
+   protocol review passes.
+4. In parallel, run a valueless B pilot on the exact confidential instance to
+   measure b16 memory, latency, queue behavior, teardown, attestation negatives,
+   and mobile verification.
+5. Launch no real-value shared prover until A passes all applicable gates in
+   [`remote-proving-decision.md`](remote-proving-decision.md) §8. If the
+   official service claims confidential processing, B's applicable gates must
+   pass too.
+
+## 8. Evidence and scope
+
+- The detailed shared-service topology, threat model, and operational controls
+  remain in
+  [`backend-assisted-proving-security.md`](backend-assisted-proving-security.md).
+- The authorization research and unresolved WOTS+ blockers remain in
+  [`hash-ots-spend-authorization.md`](hash-ots-spend-authorization.md).
+- [NIST FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) specifies ML-DSA.
+- [AMD SEV-SNP specification](https://www.amd.com/content/dam/amd/en/documents/epyc-technical-docs/specifications/56860.pdf)
+  defines the attestation report and its ECDSA P-384 signature.
+- [Intel TDX module base specification](https://cdrdv2-public.intel.com/865787/intel-tdx-module-base-spec-348549007.pdf)
+  defines the TDX quote and ECDSA certification path.
+- [Azure confidential VM overview](https://learn.microsoft.com/en-us/azure/confidential-computing/confidential-vm-overview)
+  is evidence that SEV-SNP/TDX-class deployment is an engineering option, not
+  evidence that it should be the protocol's authorization root.
+
+No code, circuit, wire, genesis, cloud resource, or deployment changes under
+this ruling. `CONSENSUS_CFG` remains untouched.
