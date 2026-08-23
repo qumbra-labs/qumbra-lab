@@ -373,9 +373,10 @@ explicitly isolated service-mechanics experiment.
   blockers are closed.
 - [`m2-iphone-plan.md`](m2-iphone-plan.md) is the underlying phone
   memory/proof-size evidence and build path.
-- [`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) is the pre-ruling
-  research note. It is superseded by the candidate ruling; do not read it as
-  the current pick.
+- [`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) is **Grok's**
+  2026-08-23 A-versus-B judgment (Grok 4.6, xAI), not Larry's ruling. It is
+  superseded as the pick by the candidate ruling; do not cite it as lab
+  consensus.
 
 If an earlier document's next-step wording conflicts with this record, this
 record is the current lab decision. The binding protocol still lives in the
