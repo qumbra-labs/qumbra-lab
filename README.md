@@ -16,6 +16,7 @@ crates/         # 26 crates
   qlab-pow/           # RandomX (light) + Zawy LWMA-1, exact integer form
   qlab-stratum/       # Monero-convention stratum codec (pool protocol lib; no I/O)
   qlab-remote-auth/   # research-only Candidate A authorization spike (not production-reachable)
+  qlab-remote-auth-mobile-bench/ # isolated D12..D16 iOS/Android measurement ABI
   qumbra-pool/        # the T2 pool binary: TCP stratum + accounting + form-keyed template source (lab #482 stage 1)
   qlab-p2p/           # wire envelope, peer table, gossip, sync, discovery, transports
   qlab-node/          # node state, mempool, emission, finality recovery, RPC

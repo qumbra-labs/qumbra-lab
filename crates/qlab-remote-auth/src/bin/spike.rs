@@ -288,14 +288,6 @@ fn timing(label: &str, elapsed: std::time::Duration, iterations: usize) {
     );
 }
 
-fn derive_mldsa_seed(master: &Hash32, index: u32) -> Hash32 {
-    keccak256(&[
-        b"qumbra:remote-auth:mldsa44-seed:spike-v1",
-        master,
-        &index.to_le_bytes(),
-    ])
-}
-
 fn measure_address(candidate: &str, depth: u8) -> Result<(), String> {
     if depth > 24 {
         return Err("address measurement depth must be in 0..=24".into());
@@ -312,7 +304,8 @@ fn measure_address(candidate: &str, depth: u8) -> Result<(), String> {
     let leaves: Vec<Hash32> = match candidate {
         "mldsa" => (0..count)
             .map(|index| {
-                let key = MlDsaKey::from_seed(derive_mldsa_seed(&address_master, index as u32));
+                let key =
+                    MlDsaKey::from_seed(mldsa::derive_leaf_seed(&address_master, index as u32));
                 key.descriptor(index as u32).leaf()
             })
             .collect(),

@@ -33,6 +33,74 @@ pub fn root(mut leaves: Vec<Hash32>) -> Result<Hash32, String> {
     Ok(leaves[0])
 }
 
+/// Streaming root builder for one complete depth-fixed authorization tree.
+///
+/// A phone can generate each public leaf, hand it to a service-side cache, and
+/// retain only this `O(depth)` frontier while independently computing the root
+/// it commits into its address. The cache never receives the address master or
+/// any leaf signing seed. Leaves must arrive once in ascending public-index
+/// order; incomplete trees and extra leaves are refused.
+pub struct RootAccumulator {
+    depth: u8,
+    leaves: u64,
+    frontier: Vec<Option<Hash32>>,
+}
+
+impl RootAccumulator {
+    pub fn new(depth: u8) -> Result<Self, String> {
+        if depth > 31 {
+            return Err("authorization-tree depth must be at most 31".into());
+        }
+        Ok(Self {
+            depth,
+            leaves: 0,
+            frontier: vec![None; depth as usize + 1],
+        })
+    }
+
+    pub const fn expected_leaves(&self) -> u64 {
+        1u64 << self.depth
+    }
+
+    pub const fn leaves_pushed(&self) -> u64 {
+        self.leaves
+    }
+
+    pub fn push(&mut self, leaf: Hash32) -> Result<(), String> {
+        if self.leaves >= self.expected_leaves() {
+            return Err("authorization tree already has every leaf".into());
+        }
+
+        let mut node = leaf;
+        let mut position = self.leaves;
+        let mut level = 0usize;
+        while position & 1 == 1 {
+            let left = self.frontier[level]
+                .take()
+                .ok_or("authorization-tree frontier is inconsistent")?;
+            node = parent(level as u32, &left, &node);
+            position >>= 1;
+            level += 1;
+        }
+        self.frontier[level] = Some(node);
+        self.leaves += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Hash32, String> {
+        if self.leaves != self.expected_leaves() {
+            return Err(format!(
+                "authorization tree is incomplete: got {} of {} leaves",
+                self.leaves,
+                self.expected_leaves()
+            ));
+        }
+        self.frontier[self.depth as usize]
+            .take()
+            .ok_or("authorization-tree root is missing".into())
+    }
+}
+
 pub fn fold_path(leaf: Hash32, mut index: u32, path: &[Hash32]) -> Hash32 {
     let mut node = leaf;
     for (level, sibling) in path.iter().enumerate() {
@@ -69,5 +137,24 @@ mod tests {
             parent(1, &leaves[0], &leaves[1]),
             parent(0, &leaves[0], &leaves[1])
         );
+    }
+
+    #[test]
+    fn streaming_root_matches_the_batch_tree_and_refuses_wrong_cardinality() {
+        let leaves = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let mut streaming = RootAccumulator::new(2).unwrap();
+        for leaf in leaves {
+            streaming.push(leaf).unwrap();
+        }
+        assert_eq!(streaming.finish().unwrap(), root(leaves.to_vec()).unwrap());
+
+        let mut incomplete = RootAccumulator::new(2).unwrap();
+        incomplete.push(leaves[0]).unwrap();
+        assert!(incomplete.finish().is_err());
+
+        let mut full = RootAccumulator::new(0).unwrap();
+        full.push(leaves[0]).unwrap();
+        assert!(full.push(leaves[1]).is_err());
+        assert_eq!(full.finish().unwrap(), leaves[0]);
     }
 }

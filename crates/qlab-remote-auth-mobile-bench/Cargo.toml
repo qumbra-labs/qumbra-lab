@@ -1,0 +1,14 @@
+[package]
+name = "qlab-remote-auth-mobile-bench"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Research-only mobile measurement ABI. No shipping crate depends on this
+# package; the two standalone benchmark apps link its static library directly.
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+qlab-remote-auth = { path = "../qlab-remote-auth" }

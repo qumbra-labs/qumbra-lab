@@ -380,3 +380,8 @@ then may the result be translated into a dated EN/ZH binding-design correction.
 AIR, transaction wire/identity, node verification, activation, genesis/re-mint,
 wallet integration, and the prover service remain later, separately authorized
 phases.
+
+The isolated measurement ABI, iOS/Android shell boundary, evidence schema, and
+physical-device procedure are specified in
+[`remote-proving-mobile-benchmark.md`](remote-proving-mobile-benchmark.md).
+That harness does not itself satisfy the mobile-measurement gate.
