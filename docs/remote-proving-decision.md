@@ -220,8 +220,22 @@ is acceptable only if it preserves all of these invariants:
 5. Both fixed input slots keep the same public shape. The single-real-input
    dummy path must have an explicit authorization rule and must not reveal the
    real-input count.
-6. Transaction ID, body/P2P codecs, mempool identity, replay handling, and the
-   activation boundary bind the new fields canonically.
+6. The binding specification explicitly chooses whether transaction ID commits
+   to the authorization section, then makes body/P2P codecs, mempool identity,
+   wallet history joins, replay handling, and activation agree with that choice.
+7. The authorization Merkle path and root remain STARK-private witness values,
+   never transaction or public-value fields. This hides the per-address cluster
+   from chain observers, not from an ordinary prover that receives the path.
+8. For an ML-DSA rotation tree, depth is a network constant, the dummy index is
+   uniform over the same range, and the wallet uses crash-safe
+   reserve-before-export state. A new digest never reuses an exported leaf;
+   restore, multi-device allocation, and exhaustion are binding wallet rules.
+9. The production envelope excludes authorization secrets and `TxInput.sk`.
+   Any retained `nk` is explicitly classified as wallet-global disclosure to
+   the prover, not described as private proving.
+10. The phone reconstructs and approves the complete intent before upload,
+    then reconstructs it from the returned artifact and requires exact equality
+    before submission.
 
 This is a T2 re-mint-class change: note or recipient-key binding, AIR/public
 values, transaction wire, node verification, genesis parameters, and migration
@@ -309,7 +323,9 @@ pass its applicable gates too:
 1. **Cannot steal:** an adversarial prover/operator cannot authorize outputs or
    semantic fields the phone did not approve.
 2. **Privacy is explicit:** the design states who can observe/link the witness,
-   device, IP, timing, and transaction, with retention and logging rules.
+   authorization root, `nk`, device, IP, timing, and transaction, with retention
+   and logging rules. ML-DSA rotation is described as public/on-chain
+   unlinkability, never as unlinkability from an ordinary Candidate A prover.
 3. **Capacity and availability are measured:** peak memory, time distribution,
    queue policy, cancellation, retry, regional failure, and cost are evidence,
    not estimates.
@@ -323,6 +339,13 @@ pass its applicable gates too:
 6. **Adversarial end-to-end tests pass:** field rewriting, stale/wrong
    attestation, duplicate/replay, dummy shape, disconnect, malicious sizes, and
    worker escape are covered at their real verification seams.
+7. **Wallet lifecycle is fail-closed:** exported ML-DSA leaves cannot be reused
+   after crash, ambiguous restore, concurrent-device use, retry, or exhaustion;
+   an on-chain scan alone is not treated as recovery for exported-but-unmined
+   authorizations.
+8. **The client boundary is tested:** pre-upload secret exclusion and complete
+   intent checks, plus post-proof artifact-to-intent equality, run in the shared
+   wallet kernel used by iOS and Android.
 
 Before those gates, a trusted worker may be used only for a valueless,
 explicitly isolated service-mechanics experiment.

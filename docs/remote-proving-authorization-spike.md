@@ -37,10 +37,17 @@ The rotation tree adds two Merkle-path permutations per depth, makes address
 construction `O(2^D)`, and moves every practical depth to 2^19 rows. The spike
 implements a private deterministic shuffle without replacement so public leaf
 indices are neither sequential ordinals nor independent draws that collide.
+This is a **public/on-chain unlinkability** improvement only. An ordinary
+Candidate A prover sees each private authorization path, can recover the stable
+per-address `auth_root`, and can additionally join the wallet if the future
+envelope retains `nk`.
+
 Production persistence, restore, and multi-device allocation remain gates. The
 final fixed depth is not guessed here: D12 through D16 require mobile
-measurement before the binding-design correction. Depth 0 remains only a
-valueless mechanics comparator. This spike makes no shape consensus.
+measurement before the binding-design correction, and the selected `D` must be
+one network-wide protocol constant rather than a per-wallet choice. Depth 0
+remains only a valueless mechanics comparator. This spike makes no shape
+consensus.
 
 ## 2. What was implemented
 
@@ -125,6 +132,11 @@ byte.
 The exact delta is 3,112 bytes. These are spike-section bytes, not a production
 transaction-wire decision.
 
+The binding wire specification must also decide whether transaction identity
+commits to the authorization section and then define body/P2P encoding, mempool
+deduplication, wallet history joins, and replay behavior consistently. This
+spike deliberately does not make that transaction-ID decision.
+
 A future node's required order is: strict decode; reconstruct the complete
 intent from the actual transaction; require descriptor equality; verify both
 phone authorizations; only then spend work on STARK verification. The crate
@@ -154,6 +166,13 @@ native verification recovers the RFC L-tree leaf using its descriptor's public
 seed. A future AIR need only fold the public leaf through the authorization
 path and bind its root through the same hidden note material. It need not
 verify either signature inside the STARK.
+
+The authorization path and `auth_root` are STARK-private witness values: they
+must never enter the authorization section, transaction body, or STARK public
+values. The ordinary worker nevertheless sees them while proving and can use
+the stable `auth_root` to cluster jobs for one address. Publishing the path
+would let every chain observer compute the same cluster and would completely
+undo the public unlinkability gained by removing `tree_context`.
 
 Starting from 84 current permutation slots, dropping the two `ROLE_ANK` slots
 and adding two depth-`D` paths gives `82 + 2D` slots:
@@ -191,8 +210,11 @@ uploads the proving envelope. The worker may not create or replace dummy
 authorization material: both descriptors are part of the digest, and material
 created after phone signing was never approved. The random dummy path need not
 build a full address tree because its sibling nodes can be generated directly;
-its public descriptor remains identically shaped. Removing slot 0's
-always-real invariant would still invalidate this rule.
+its public descriptor remains identically shaped. Its `leaf_index` must also be
+sampled uniformly from the same network-fixed `[0, 2^D)` range as a real leaf;
+shape without the same distribution would remain a public one-real-input
+distinguisher. Removing slot 0's always-real invariant would still invalidate
+this rule.
 
 ## 6. WOTS+ exactness and the state failure
 
@@ -262,10 +284,27 @@ bytes, prover RSS/time, and node verification time remain open gates.
 For ML-DSA, a phone-only wallet master derives a unique private master for each
 receiving address, which in turn derives the tree's leaf keys. The candidate
 selector deterministically shuffles all indices from a private address seed
-and consumes them without replacement. Production must reserve before
-exporting a signature and define restore and multi-device allocation; rollback
-or reuse is a privacy failure, not the WOTS+ forgery failure. Building or
-caching `2^D` public leaves remains an unmeasured address-creation cost.
+and consumes them without replacement. Once measurement selects `D`, every
+wallet on that network uses the same value.
+
+Production state must be crash-safe and reserve an index against one intent
+digest before any authorization bytes leave the phone. A retry of that same
+job reuses the exact signed envelope; a new digest never reuses a reserved or
+exported leaf. Before export, abandoned local preparation may release its
+reservation. After export, the leaf is permanently consumed even if the prover
+fails, withholds the result, or the transaction never lands. Exhaustion refuses
+the spend rather than wrapping. Service failures must not silently advance to
+a new leaf or expose a distinct "leaves remaining" oracle.
+
+Restore and multi-device allocation are not solved by the shuffle. An on-chain
+scan can recover landed descriptors but cannot discover an authorization that
+left the phone and never landed. Production therefore needs rollback-resistant,
+backed-up reservation state or a specified safe tree migration; if the wallet
+cannot prove that state current after restore, it must refuse remote spending
+from the ambiguous tree. Concurrent devices need coordinated leases or
+cryptographically disjoint allocations. Reuse is a privacy failure, not the
+WOTS+ forgery failure. Building or caching `2^D` public leaves remains an
+unmeasured address-creation cost.
 
 Stateful WOTS+ requires rollback-proof, multi-device-coordinated state that the
 current wallet product does not provide. Random-index WOTS+ removes the journal
@@ -277,12 +316,16 @@ crate does not serialize a proving envelope, so it cannot yet prove which live
 least:
 
 - authorization signing seeds: forbidden from the envelope;
-- current `TxInput.sk`: must be removed, but this spike does not implement that
+- current `TxInput.sk`: forbidden from a production envelope and must be
+  removed before Phase 2 can serialize one; this spike does not implement that
   removal;
 - `nk`: if present, it is account-global spend-viewing material, so one job is
   a wallet-level disclosure to that operator and later jobs can link different
   diversified addresses;
-- `rho`, `rseed`, `d`, Merkle paths, recipient/discovery/rider bytes, amount,
+- authorization Merkle paths and `auth_root`: private STARK witness only, never
+  transaction or public-value fields, but necessarily visible to an ordinary
+  Candidate A prover and stable enough to cluster one address;
+- `rho`, `rseed`, `d`, note Merkle paths, recipient/discovery/rider bytes, amount,
   change, and internal dummy state: inherited from today's bundle until each is
   explicitly removed or narrowed; intent hashes prevent rewriting, not
   observation; and
@@ -295,6 +338,14 @@ option. A rotation tree removes that repeated public address tag when leaves
 are not reused, but it does not remove service metadata or A-only witness
 visibility. Candidate B may reduce worker payload visibility; it does not
 alter the authorization ruling.
+
+The phone boundary is mandatory in both directions. Before upload, the wallet
+must reconstruct the complete intent, verify both locally created slots, and
+assert that authorization secrets, `TxInput.sk`, wallet seeds, `div_seed`, and
+incoming-viewing/decryption keys are absent. After proving, it must decode the
+returned artifact, reconstruct its intent, and require exact equality with the
+approved intent before submission. Direct worker submission is not the default:
+it adds a race and gives the node a worker-origin correlation signal.
 
 ## 10. Verification and remaining gates
 
@@ -313,12 +364,19 @@ policy forbids agent sessions from running local `cargo test`, so the written
 unit/integration tests await CI. No mobile or pinned-rig performance number is
 claimed by this document.
 
-The independent reviews resolve the shape decision: ML-DSA rotation advances;
-depth 0 and both WOTS+ rows do not. Phase 2 remains blocked on D12..D16 mobile
-measurements, a production allocation/restore rule, and accepted re-review of
-this corrected immutable PR by Claude Code for protocol/cryptographic seams
-and Grok for the proving-envelope/privacy boundary. Only then may the result be
-translated into a dated EN/ZH binding-design correction. AIR, transaction
-wire/identity, node verification, activation, genesis/re-mint, wallet
-integration, and the prover service remain later, separately authorized
+Independent post-remediation reviews at `5e679ad` by
+[Claude Code](https://github.com/qumbra-labs/qumbra-lab/pull/632#issuecomment-5386685515)
+for protocol/cryptographic seams and
+[Grok](https://github.com/qumbra-labs/qumbra-lab/pull/632#issuecomment-5386698823)
+for the proving-envelope/privacy boundary both returned **APPROVE WITH
+NON-BLOCKING FOLLOW-UPS** and no blocker. This revision incorporates their
+shared privacy/lifecycle clarifications; the new head requires delta
+confirmation.
+
+The shape decision is resolved: ML-DSA rotation advances; depth 0 and both
+WOTS+ rows do not. Phase 2 remains blocked on D12..D16 mobile measurements, a
+binding production allocation/restore rule, and accepted delta review. Only
+then may the result be translated into a dated EN/ZH binding-design correction.
+AIR, transaction wire/identity, node verification, activation, genesis/re-mint,
+wallet integration, and the prover service remain later, separately authorized
 phases.

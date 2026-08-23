@@ -32,9 +32,14 @@ fingerprint。由于 slot 0 永远是真实输入，而 dummy slot-1 key 是 eph
 Rotation tree 每层增加两个 Merkle-path permutation，建地址成本为 `O(2^D)`，并让
 任何实用 depth 都进入 2^19 rows。Spike 实现了私有、deterministic、without-
 replacement 的 shuffle，因此公开 leaf index 既不是顺序 ordinal，也不是会碰撞的
-独立随机抽样。生产环境的持久化、恢复和多设备分配仍是 gate。这里不会猜最终固定
-depth：D12 到 D16 必须先完成手机实测，再写 binding-design correction。Depth 0
-只保留为无资产 mechanics comparator。本 spike 不会把任何形状变成共识规则。
+独立随机抽样。这只是一项**公开／链上不可关联性**改进。普通 Candidate A prover 会
+看到每条私有授权路径，可以恢复稳定的 per-address `auth_root`；若未来 envelope 保留
+`nk`，它还可以把整个 wallet 的 job 关联起来。
+
+生产环境的持久化、恢复和多设备分配仍是 gate。这里不会猜最终固定 depth：D12 到
+D16 必须先完成手机实测，再写 binding-design correction；选定的 `D` 必须是全网统一
+的 protocol constant，不能由各 wallet 自选。Depth 0 只保留为无资产 mechanics
+comparator。本 spike 不会把任何形状变成共识规则。
 
 ## 2. 已实现内容
 
@@ -112,6 +117,10 @@ Spike authorization section 以固定 magic `QRA1`、version、scheme、slot cou
 
 精确差值是 3,112 字节。这些是 spike section bytes，不是生产交易 wire 的决定。
 
+Binding wire 规格还必须决定 transaction identity 是否承诺 authorization section，
+并据此统一规定 body/P2P encoding、mempool deduplication、wallet history join 与 replay
+行为。本 spike 有意不做这项 transaction-ID 决定。
+
 未来 node 的强制顺序应是：严格 decode；从真实交易重建 complete intent；要求
 descriptor 完全相等；验证两份手机授权；最后才投入 STARK verification 成本。
 Crate 模拟了这个顺序，但有意没有接入当前 node。
@@ -137,6 +146,11 @@ domain、level、left child 和 right child，但不包含公开地址标签。�
 出现的 wire value。对 WOTS+，native verification 使用 descriptor 中的 public seed
 恢复 RFC L-tree leaf。未来 AIR 只需把 public leaf 沿授权路径折叠，并通过同一份
 hidden note material 绑定 root；不需要在 STARK 内验证任一签名。
+
+Authorization path 和 `auth_root` 都是 STARK-private witness：绝不能进入 authorization
+section、transaction body 或 STARK public values。但普通 worker 在 proving 时仍会看到
+它们，并可用稳定的 `auth_root` 关联同一地址的 job。若把 path 发布出去，任何链上观察者
+都能计算同一个 cluster，移除 `tree_context` 所取得的公开不可关联性将被完全抵消。
 
 从当前 84 个 permutation slot 出发，删掉两个 `ROLE_ANK`，再加入两个 depth-`D`
 路径，得到 `82 + 2D` slots：
@@ -170,8 +184,9 @@ hidden root，再构造并签名 common intent。手机用两个 slot key 签署
 intent，之后才上传 proving envelope。Worker 不得生成或替换 dummy authorization
 material：两个 descriptor 都在 digest 内，手机签名之后才创建的材料从未获得批准。
 Dummy 的随机 path 可以直接生成 sibling node，不需要构造完整地址树；其 public
-descriptor 仍保持完全相同的形状。如果删掉“slot 0 永远真实”这个 invariant，本规则
-仍会失效。
+descriptor 仍保持完全相同的形状。它的 `leaf_index` 也必须从与真实 leaf 相同、全网
+固定的 `[0, 2^D)` 范围均匀抽样；只有形状相同而分布不同，仍会成为公开的单真实输入
+distinguisher。如果删掉“slot 0 永远真实”这个 invariant，本规则仍会失效。
 
 ## 6. WOTS+ 的精确性和状态失败
 
@@ -233,9 +248,22 @@ RSS/time 和 node verification time 都仍是 open gate。
 
 对 ML-DSA，手机持有的 wallet master 为每个收款地址派生唯一的私有 master，再由
 后者派生整棵树的 leaf key。候选 selector 用私有 address seed 对所有 index 做
-deterministic shuffle，并以不放回方式消耗。生产实现必须在导出签名前 reserve，且
-定义恢复和多设备分配；rollback 或复用是隐私失败，但不是 WOTS+ 那种伪造失败。
-创建或缓存 `2^D` public leaves 的地址构建成本仍未实测。
+deterministic shuffle，并以不放回方式消耗。一旦实测选定 `D`，该网络上的每个 wallet
+都必须使用同一个值。
+
+生产状态必须 crash-safe，并在任何 authorization bytes 离开手机前，把 index 绑定到
+一个 intent digest 后持久化 reserve。同一 job 重试时复用完全相同的 signed envelope；
+新的 digest 绝不能复用已 reserve 或已导出的 leaf。本地准备若在导出前放弃，可以释放
+reservation；一旦导出，即使 prover 失败、扣留结果或交易从未上链，该 leaf 也永久视为
+已消耗。耗尽时必须拒绝 spend，绝不能 wrap。Service failure 不得悄悄跳到下一个 leaf，
+也不得通过不同错误暴露“剩余 leaf 数量”oracle。
+
+Shuffle 本身没有解决恢复和多设备分配。扫链能找回已上链 descriptor，却无法发现已经
+离开手机但从未上链的 authorization。因此生产环境需要 rollback-resistant、已备份的
+reservation state，或明确规定的安全 tree migration；wallet 恢复后若无法证明状态是
+最新的，就必须拒绝从这棵状态不明的 tree 做远程 spend。并发设备必须使用协调 lease
+或密码学上不重叠的 allocation。复用是隐私失败，但不是 WOTS+ 那种伪造失败。创建或
+缓存 `2^D` public leaves 的地址构建成本仍未实测。
 
 Stateful WOTS+ 要求当前 wallet 产品并不具备的 rollback-proof、跨设备协调状态。
 Random-index WOTS+ 不需要 journal，却换成了有明确数值的灾难性碰撞风险。两者都
@@ -246,10 +274,14 @@ envelope，因此目前无法证明 live `WitnessBundle` 中哪些字段已经�
 必须明确：
 
 - authorization signing seed：禁止进入 envelope；
-- 当前的 `TxInput.sk`：必须移除，但本 spike 尚未实现该移除；
+- 当前的 `TxInput.sk`：禁止进入生产 envelope，Phase 2 能序列化 envelope 前必须移除；
+  本 spike 尚未实现该移除；
 - `nk`：如果存在，它是 account-global spend-viewing material，因此一次 job 就是对
   该 operator 的 wallet-level disclosure，后续 job 还能关联不同 diversified address；
-- `rho`、`rseed`、`d`、Merkle path、recipient/discovery/rider bytes、amount、change
+- authorization Merkle path 与 `auth_root`：只能是 private STARK witness，绝不能成为
+  transaction 或 public-value field；但普通 Candidate A prover 必然可见，并足以稳定
+  关联同一地址；
+- `rho`、`rseed`、`d`、note Merkle path、recipient/discovery/rider bytes、amount、change
   和内部 dummy state：在逐项明确移除或缩窄之前，视为继承自当前 bundle；intent hash
   能防止改写，不能阻止观察；
 - IP、device identity、timing、queue metadata 和对应链上事件：在 confidential
@@ -259,6 +291,12 @@ Depth 0 还会公开稳定 verifying-key cluster，以及 §1 所述的延迟 du
 distinguisher，因此不能进入生产。Rotation tree 在不复用 leaf 时可以移除这种重复的
 公开地址标签，但不会消除 service metadata 或 A-only witness 可见性。Candidate B
 可以减少 worker 对 payload 的可见性，但不会改变授权裁决。
+
+手机边界的两个方向都属于强制要求。上传前，wallet 必须重建 complete intent，验证两个
+本地生成的 slot，并断言 authorization secret、`TxInput.sk`、wallet seed、`div_seed`
+以及 incoming-viewing/decryption key 均不在 envelope 内。证明完成后，手机必须 decode
+返回 artifact，从该 artifact 重建 intent，并在提交前要求它与已批准 intent 完全相等。
+默认不允许 worker 直接提交；这既增加 race，也会给 node 暴露 worker-origin 关联信号。
 
 ## 10. 验证与剩余 gate
 
@@ -276,9 +314,15 @@ leaf 的比较也逐字节一致。Repo policy 禁止 agent session 在本地运
 所以已经写好的 unit/integration tests 等待 CI。本文不声称任何手机或 pinned-rig
 性能数字。
 
-独立 review 已解决形状选择：推进 ML-DSA rotation；不推进 depth 0 和两种 WOTS+。
-Phase 2 仍被 D12..D16 手机实测、生产 allocation/restore 规则，以及修正版 immutable
-PR 的独立复审所阻塞：Claude Code 复审协议／密码学 seam，Grok 复审 proving-envelope／
-隐私边界。只有全部接受后，结果才能写入带日期的中英文 binding-design correction。
+[Claude Code](https://github.com/qumbra-labs/qumbra-lab/pull/632#issuecomment-5386685515)
+对协议／密码学 seam、
+[Grok](https://github.com/qumbra-labs/qumbra-lab/pull/632#issuecomment-5386698823)
+对 proving-envelope／隐私边界在 `5e679ad` 完成了独立 post-remediation review；两者均
+给出 **APPROVE WITH NON-BLOCKING FOLLOW-UPS**，没有 blocker。本次修订吸收了双方共同
+的隐私／生命周期澄清；新 head 仍需 delta confirmation。
+
+形状选择已经解决：推进 ML-DSA rotation；不推进 depth 0 和两种 WOTS+。Phase 2 仍被
+D12..D16 手机实测、具有约束力的生产 allocation/restore 规则和已接受的 delta review
+所阻塞。只有全部完成后，结果才能写入带日期的中英文 binding-design correction。
 AIR、交易 wire/identity、node verification、activation、genesis/re-mint、wallet
 integration 和 prover service 仍属于后续分别授权的 phase。
