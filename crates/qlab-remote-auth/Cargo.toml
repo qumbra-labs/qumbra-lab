@@ -1,0 +1,20 @@
+[package]
+name = "qlab-remote-auth"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "qlab-remote-auth-spike"
+path = "src/bin/spike.rs"
+
+[dependencies]
+# The stateless-leaf frontrunner. This is the same FIPS 204-final RustCrypto
+# implementation and exact pin already used by the committee code.
+ml-dsa = "=0.1.1"
+# RFC 8391's mandatory WOTSP-SHA2_256 instantiation uses SHA-256 for F/H/PRF.
+sha2 = "=0.11.0"
+# Qumbra's existing conservative consensus hash. Used for the spike-only
+# canonical intent and outer authorization tree, never as a WOTS+ substitute.
+tiny-keccak = { version = "2", features = ["keccak"] }
