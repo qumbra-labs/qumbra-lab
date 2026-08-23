@@ -1,0 +1,73 @@
+//! The candidate outer authorization tree.
+//!
+//! WOTS+ leaf compression remains RFC 8391 SHA-256. This outer tree is a
+//! separate Qumbra Keccak tree because a future AIR must prove the path with
+//! the same conservative primitive already used by the note tree.
+
+use crate::{keccak256, Hash32};
+
+const MLDSA_LEAF_DOMAIN: &[u8] = b"qumbra:remote-auth:mldsa44-leaf:v1";
+const NODE_DOMAIN: &[u8] = b"qumbra:remote-auth:tree-node:v1";
+
+pub fn mldsa_leaf(index: u32, verifying_key: &[u8]) -> Hash32 {
+    keccak256(&[MLDSA_LEAF_DOMAIN, &index.to_le_bytes(), verifying_key])
+}
+
+pub fn parent(level: u32, left: &Hash32, right: &Hash32) -> Hash32 {
+    keccak256(&[NODE_DOMAIN, &level.to_le_bytes(), left, right])
+}
+
+pub fn root(mut leaves: Vec<Hash32>) -> Result<Hash32, String> {
+    if leaves.is_empty() || !leaves.len().is_power_of_two() {
+        return Err("authorization leaves must be a non-empty power of two".into());
+    }
+    let mut level = 0;
+    while leaves.len() > 1 {
+        let mut next = Vec::with_capacity(leaves.len() / 2);
+        for pair in leaves.chunks_exact(2) {
+            next.push(parent(level, &pair[0], &pair[1]));
+        }
+        leaves = next;
+        level += 1;
+    }
+    Ok(leaves[0])
+}
+
+pub fn fold_path(leaf: Hash32, mut index: u32, path: &[Hash32]) -> Hash32 {
+    let mut node = leaf;
+    for (level, sibling) in path.iter().enumerate() {
+        node = if index & 1 == 0 {
+            parent(level as u32, &node, sibling)
+        } else {
+            parent(level as u32, sibling, &node)
+        };
+        index >>= 1;
+    }
+    node
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_direction_and_level_are_bound() {
+        let leaves = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let expected = root(leaves.to_vec()).unwrap();
+        let sibling_at_1 = leaves[0];
+        let sibling_parent = parent(0, &leaves[2], &leaves[3]);
+        assert_eq!(
+            fold_path(leaves[1], 1, &[sibling_at_1, sibling_parent]),
+            expected
+        );
+
+        assert_ne!(
+            fold_path(leaves[1], 0, &[sibling_at_1, sibling_parent]),
+            expected
+        );
+        assert_ne!(
+            parent(1, &leaves[0], &leaves[1]),
+            parent(0, &leaves[0], &leaves[1])
+        );
+    }
+}

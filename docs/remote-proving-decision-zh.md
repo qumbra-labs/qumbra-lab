@@ -197,8 +197,19 @@ invariants 才可以接受:
 4. Node 重算 intent,并在花 STARK verification 成本之前验证手机授权。
 5. 两个固定 input slots 保持同一 public shape。Single-real-input dummy path 必须有明确
    authorization 规则,且不能泄露真实 input 数。
-6. Transaction ID、body/P2P codecs、mempool identity、replay handling 与 activation
-   boundary 都规范绑定新字段。
+6. Binding specification 必须明确选择 transaction ID 是否承诺 authorization section，
+   再让 body/P2P codecs、mempool identity、wallet history join、replay handling 与
+   activation boundary 全部遵守同一个选择。
+7. Authorization Merkle path 与 root 只能是 STARK-private witness，绝不能成为
+   transaction 或 public-value field。这能向链上观察者隐藏 per-address cluster，但不能
+   向收到 path 的普通 prover 隐藏。
+8. 对 ML-DSA rotation tree，depth 必须是全网常量，dummy index 必须在同一范围均匀
+   分布，wallet 必须使用 crash-safe 的 reserve-before-export state。新的 digest 绝不能
+   复用已导出的 leaf；restore、多设备 allocation 与耗尽都必须成为 binding wallet rule。
+9. 生产 envelope 必须排除 authorization secret 和 `TxInput.sk`。若保留 `nk`，必须明确
+   把它归类为向 prover 泄露 wallet-global 信息，不能称为 private proving。
+10. 手机上传前重建并批准 complete intent；收到 artifact 后从 artifact 再次重建 intent，
+    只有完全相等才可提交。
 
 这是一项 T2 re-mint 级变更:note 或 recipient-key binding、AIR/public values、transaction
 wire、node verification、genesis parameters 与 migration 必须一起移动。
@@ -268,8 +279,9 @@ Attestation 自己不能消除 linkability。Ingress 仍可关联 device identit
 service 还声称 Candidate B confidentiality,B 也必须通过自己的 applicable gates:
 
 1. **不能盗币:**对抗性 prover/operator 无法授权手机没批准的 outputs 或 semantic fields。
-2. **隐私写清楚:**设计明说谁能观察/关联 witness、device、IP、timing 与 transaction,
-   并写清 retention/logging rules。
+2. **隐私写清楚:**设计明说谁能观察/关联 witness、authorization root、`nk`、device、IP、
+   timing 与 transaction，并写清 retention/logging rules。ML-DSA rotation 只能称为
+   public/on-chain unlinkability，绝不能称为对普通 Candidate A prover 不可关联。
 3. **容量与可用性已经实测:**peak memory、time distribution、queue policy、cancellation、
    retry、regional failure 与成本必须是证据,不能是估算。
 4. **Internet boundary 已加固:**大内存分配前先认证;实测 request/response ceilings;无 client
@@ -279,6 +291,11 @@ service 还声称 Candidate B confidentiality,B 也必须通过自己的 applica
    transaction identity、genesis/re-mint 与 legacy behavior 只有一份 activation plan。
 6. **对抗性端到端测试通过:**field rewrite、stale/wrong attestation、duplicate/replay、dummy
    shape、disconnect、恶意 sizes 与 worker escape 都在真实 verification seams 上覆盖。
+7. **Wallet lifecycle fail-closed:**crash、状态不明的 restore、并发设备、retry 或耗尽后，
+   已导出的 ML-DSA leaf 都不能复用；仅扫链不能被当作对“已导出但未上链”authorization
+   的完整恢复方案。
+8. **Client boundary 已测试:**上传前排除 secret 并核对 complete intent，证明后核对
+   artifact-to-intent 完全相等；这些检查必须在 iOS 与 Android 共用的 wallet kernel 执行。
 
 通过这些门槛之前,trusted worker 只可用于无真实价值、明确隔离的 service-mechanics
 experiment。
