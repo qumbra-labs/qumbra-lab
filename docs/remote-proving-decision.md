@@ -334,6 +334,10 @@ explicitly isolated service-mechanics experiment.
    confidential instance and complete the mobile attestation negatives.
 3. **Select one launch security basis:** protocol authorization, attested
    confidential work, or both. Do not select from estimated rows.
+   *Resolved 2026-08-23 on structural grounds, not estimates:* **A is the
+   launch basis; B is a later deployment layer** —
+   [`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md).
+   Steps 1, 2, 4, 5 still gate implementation; step 2 now runs in parallel.
 4. **If authorization wins, correct the binding design spec** before changing
    the lab circuit or wire.
 5. **Only then implement and pilot** the public service boundary.
