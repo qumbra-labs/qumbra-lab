@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use qlab_devnet::body::{
-    check_scheduled_coinbase_payees, coinbase_payee_cap_v5, validate_body, BlockBody,
+    check_scheduled_coinbase_payees, coinbase_payee_cap_v5, validate_body_with_names, BlockBody,
     BodyError, CoinbasePayee, TxEntry,
 };
 use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError};
@@ -2614,18 +2614,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         //    side of it it is standing on.
         let anchor_ok = |root: &Hash32| self.state.is_valid_anchor(root);
         // The rule funnel keyed by the installed form (lab #470 stage 3): the
-        // v4 arm is byte-for-byte the old call; the v5 arm is the same loop
-        // under the v5 forms. EmptyNameView on both — this adapter is the
-        // relay-grade validator; the registry-armed funnel is the qlab-node
-        // state path (stage 4a threads its form).
+        // v4 arm is the v2/v3 body rule; the v5 arm is the same loop under the
+        // v5 forms. Both thread this node's applied registry — the armed-node
+        // path lab #381 specified (`validate_body_with_names` /
+        // `validate_body_v5` with a real NameView). EmptyNameView was the
+        // inert-era / pre-boundary shortcut: `commit_included_in` is
+        // unconditionally false, so a current node that assembled a reveal
+        // from its own registry then refused the block it just built
+        // (lab #624). The view is the same `NodeState` `is_valid_anchor`
+        // reads, so a lagging node's registry verdict and its anchor verdict
+        // go stale together and stay Positional / uncharged.
         let validate_result = match self.rules.form {
-            GenesisForm::V4 => validate_body(&header, &body, &self.verifier, anchor_ok),
+            GenesisForm::V4 => validate_body_with_names(
+                &header,
+                &body,
+                &self.verifier,
+                anchor_ok,
+                self.state.names(),
+            ),
             GenesisForm::V5 => qlab_devnet::body::validate_body_v5(
                 &header,
                 &body,
                 &self.verifier,
                 anchor_ok,
-                &qlab_devnet::names::EmptyNameView,
+                self.state.names(),
             ),
         };
         match validate_result {
@@ -7020,49 +7032,65 @@ mod tests {
         assert_eq!(peer.chain().tip_height(), 1);
     }
 
-    /// Lab #624 offline reproduction: the live T2 fleet admitted a name REVEAL
-    /// through `POST /v1/tx` but produced only empty blocks while holding it.
-    ///
-    /// This drives the same production seams on a v5-form chain: a COMMIT is
-    /// mined, aged to the inclusive `COMMIT_MIN_AGE` edge, the REVEAL enters via
-    /// [`NodeAdapter::submit_tx_typed`], and [`NodeAdapter::mine_block`] performs
-    /// the node's own assembly and PoW path. The assertions record the observed
-    /// result on this tree rather than presupposing the live result: assembly
-    /// INCLUDES the reveal, then the adapter's relay-grade self-ingest gate
-    /// refuses it as `RiderRule(CommitNotFound)` because that gate validates v5
-    /// bodies against `EmptyNameView` instead of the node's populated registry.
-    #[test]
-    fn a_v5_burn_bearing_name_reveal_is_admitted_assembled_and_refused() {
-        use qlab_devnet::names::{
-            commit_hash, name_fee_bessel, NameOp, NameRecord, COMMIT_MIN_AGE,
-            L1_ADDRESS_LEN, RECORD_KIND_L1_ADDRESS,
-        };
+    /// Lab #624 / #629 fixture: a v5 node has applied a COMMIT and the aging
+    /// blocks, admitted a burn-bearing REVEAL, and mined a candidate that
+    /// includes it. The candidate has not been ingested.
+    struct PooledRevealCandidate {
+        node: NodeAdapter<KeccakPow, MockVerifier>,
+        history: Vec<(BlockHeader, BlockBody)>,
+        reveal_header: BlockHeader,
+        reveal_body: BlockBody,
+        reveal_id: TxId,
+        reveal_wire_id: Hash32,
+        name: Vec<u8>,
+        name_fee: u64,
+    }
 
-        let (mut node, anchor) =
-            adapter_for_form_with_finalized_genesis(GenesisForm::V5);
-        node.set_miner_rkm([0x624, 2, 3, 4]);
+    fn t2rollcheck_ops(anchor: Hash32) -> (TxEntry, TxEntry, Vec<u8>, u64) {
+        use qlab_devnet::names::{
+            commit_hash, name_fee_bessel, NameOp, NameRecord, L1_ADDRESS_LEN,
+            RECORD_KIND_L1_ADDRESS,
+        };
 
         // Eleven bytes matches the live `t2rollcheck` fee tier: 1 QMB burned,
         // or 100_000_000 bessel, on top of the 0.01 QMB relay fee.
-        let name = b"t2rollcheck";
+        let name = b"t2rollcheck".to_vec();
         let salt = [0x62; 32];
         let record = NameRecord {
             kind: RECORD_KIND_L1_ADDRESS,
-            name: name.to_vec(),
+            name: name.clone(),
             address: vec![0xA5; L1_ADDRESS_LEN],
         };
         let name_fee = name_fee_bessel(name.len());
         assert_eq!(name_fee, 100_000_000, "the fixture is the live reveal's burn tier");
-
         let commit = tx_with(anchor, 0x61, b"ok")
             .with_name_op(&NameOp::Commit { commit: commit_hash(&record, &salt) });
+        let mut reveal = tx_with(anchor, 0x63, b"ok")
+            .with_name_op(&NameOp::Reveal { record, salt });
+        reveal.public.fee = posted_fee(ArityBucket::TwoByTwo) + name_fee;
+        (commit, reveal, name, name_fee)
+    }
+
+    fn v5_pooled_burn_bearing_reveal() -> PooledRevealCandidate {
+        use qlab_devnet::names::COMMIT_MIN_AGE;
+
+        let (mut node, anchor) =
+            adapter_for_form_with_finalized_genesis(GenesisForm::V5);
+        node.set_miner_rkm([0x624, 2, 3, 4]);
+        let (commit, reveal, name, name_fee) = t2rollcheck_ops(anchor);
+        let reveal_wire_id = wire_tx_id(&reveal);
+
         node.submit_tx_typed(commit).expect("the v5 production path admits the commit");
         let (commit_header, commit_body) = node.mine_block().expect("mine the commit block");
         assert_eq!(commit_header.height, 1);
         assert_eq!(commit_body.txs.len(), 1, "the commit is on chain, not seeded by hand");
         assert_eq!(commit_body.total_name_burn(), 0, "a commit pays relay only");
-        assert_eq!(node.ingest_block(commit_header, commit_body), IngestOutcome::Accepted);
+        assert_eq!(
+            node.ingest_block(commit_header, commit_body.clone()),
+            IngestOutcome::Accepted
+        );
         assert_eq!(node.state().tip_height(), 1, "the commit block applied");
+        let mut history = vec![(commit_header, commit_body)];
 
         // Commit at height 1, reveal candidate at height 1 + COMMIT_MIN_AGE.
         // The seven intervening blocks are mined and applied through the same
@@ -7071,38 +7099,287 @@ mod tests {
             let (header, body) = node.mine_block().expect("mine the commit-aging block");
             assert_eq!(header.height, height);
             assert!(body.txs.is_empty());
-            assert_eq!(node.ingest_block(header, body), IngestOutcome::Accepted);
+            assert_eq!(node.ingest_block(header, body.clone()), IngestOutcome::Accepted);
             assert_eq!(node.state().tip_height(), height);
+            history.push((header, body));
         }
-
-        let mut reveal = tx_with(anchor, 0x63, b"ok")
-            .with_name_op(&NameOp::Reveal { record: record.clone(), salt });
-        reveal.public.fee = posted_fee(ArityBucket::TwoByTwo) + name_fee;
-        let reveal_wire_id = wire_tx_id(&reveal);
 
         let reveal_id = node
             .submit_tx_typed(reveal)
             .expect("production admit_above(form.rider_admit_boundary(), ...) admits the reveal");
         assert!(node.mempool().contains(&reveal_id), "the reveal is pooled before mining");
 
-        let reveal_height = 1 + COMMIT_MIN_AGE;
-        let (header, body) = node.mine_block().expect("the node's own mining path assembles");
-        assert_eq!(header.height, reveal_height);
-        assert_eq!(body.txs.len(), 1, "OBSERVED: the reveal is included, not silently omitted");
-        assert_eq!(wire_tx_id(&body.txs[0]), reveal_wire_id, "the included tx is the reveal");
-        assert_eq!(body.total_name_burn(), name_fee, "the included block carries the real burn");
+        let (reveal_header, reveal_body) =
+            node.mine_block().expect("the node's own mining path assembles");
+        assert_eq!(reveal_header.height, 1 + COMMIT_MIN_AGE);
         assert_eq!(
-            body.total_fees(),
+            reveal_body.txs.len(),
+            1,
+            "the reveal is included, not silently omitted"
+        );
+        assert_eq!(
+            wire_tx_id(&reveal_body.txs[0]),
+            reveal_wire_id,
+            "the included tx is the reveal"
+        );
+        assert_eq!(
+            reveal_body.total_name_burn(),
+            name_fee,
+            "the included block carries the real burn"
+        );
+        assert_eq!(
+            reveal_body.total_fees(),
             posted_fee(ArityBucket::TwoByTwo) + name_fee,
             "relay plus burn is the declared fee"
         );
 
-        // Pin the exact predicate before `ingest_block` flattens it to "bad body".
-        // The adapter's relay-grade v5 gate uses EmptyNameView, which cannot see
-        // the on-chain commit the state registry above just applied. The stateful
-        // funnel accepts the identical header/body pair, isolating the disagreement
-        // to the view passed into validation rather than any rider rule or proof.
+        PooledRevealCandidate {
+            node,
+            history,
+            reveal_header,
+            reveal_body,
+            reveal_id,
+            reveal_wire_id,
+            name,
+            name_fee,
+        }
+    }
+
+    fn v5_follower_with_headers_only(
+        blocks: &[(BlockHeader, BlockBody)],
+    ) -> NodeAdapter<KeccakPow, MockVerifier> {
+        let (cstate, _v) = committee7();
+        let mut f = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        f.set_chain_rules(ChainRules { form: GenesisForm::V5, halt: RuleSchedule::V1_0 });
+        for (h, _) in blocks {
+            assert_eq!(f.ingest_header(*h), IngestOutcome::Accepted);
+        }
+        assert_eq!(f.chain().tip_height(), blocks.len() as u64);
+        assert_eq!(f.state().tip_height(), 0, "no body has been applied");
+        f
+    }
+
+    /// Lab #624: a v5 node holding a valid pending reveal assembles it and
+    /// **ingests its own candidate**. On `main` at `3b778c5` this fails with
+    /// `Rejected("bad body")` because ingest validated under `EmptyNameView`.
+    ///
+    /// Mutation: revert the v5 arm of `ingest_block` to `EmptyNameView` → the
+    /// `Accepted` assertion fails with that same `Rejected("bad body")`.
+    #[test]
+    fn a_v5_burn_bearing_name_reveal_is_admitted_assembled_and_ingested() {
+        use qlab_devnet::names::COMMIT_MIN_AGE;
+
+        let mut fx = v5_pooled_burn_bearing_reveal();
+        let header = fx.reveal_header;
+        let body = fx.reveal_body.clone();
+
+        // Pin the exact predicate EmptyNameView still produces, so a future
+        // reader cannot mistake "ingest now succeeds" for "the empty view grew
+        // a registry". The disagreement is the view, not the rider rule.
         let empty_view_refusal = qlab_devnet::body::validate_body_v5(
+            &header,
+            &body,
+            &fx.node.verifier,
+            |root| fx.node.state.is_valid_anchor(root),
+            &qlab_devnet::names::EmptyNameView,
+        );
+        assert_eq!(
+            empty_view_refusal,
+            Err(qlab_devnet::body::BodyError::RiderRule {
+                index: 0,
+                err: qlab_devnet::names::NameRuleError::CommitNotFound,
+            }),
+            "EmptyNameView still cannot see the mined commit"
+        );
+        assert_eq!(
+            qlab_devnet::body::validate_body_v5(
+                &header,
+                &body,
+                &fx.node.verifier,
+                |root| fx.node.state.is_valid_anchor(root),
+                fx.node.state.names(),
+            ),
+            Ok(()),
+            "the node's real registry makes the identical block valid"
+        );
+
+        // Burn remains a correlate, not the trigger: forcing the burn input
+        // to zero raises the derived miner note by exactly the name fee.
+        let burned_value = qlab_node::coinbase_note_value_parts(
+            body.coinbase_total(),
+            body.total_fees(),
+            body.total_name_burn(),
+        );
+        let forced_zero_value =
+            qlab_node::coinbase_note_value_parts(body.coinbase_total(), body.total_fees(), 0);
+        assert_eq!(forced_zero_value - burned_value, fx.name_fee);
+
+        // Second attempt before ingest: assemble is deterministic and a
+        // refused (or uningested) candidate evicts nothing, so the next mine
+        // reselects the same reveal — "no blocks, not empty blocks".
+        let (retry_header, retry_body) = fx.node.mine_block().expect("second mine at the same height");
+        assert_eq!(retry_header.height, header.height);
+        assert_eq!(
+            retry_body.txs.len(),
+            1,
+            "without ingest, assemble reselects the same reveal"
+        );
+        assert_eq!(wire_tx_id(&retry_body.txs[0]), fx.reveal_wire_id);
+
+        assert_eq!(
+            fx.node.ingest_block(header, body),
+            IngestOutcome::Accepted,
+            "self-ingest of the assembled reveal must succeed"
+        );
+        assert_eq!(fx.node.state().tip_height(), COMMIT_MIN_AGE + 1);
+        assert!(
+            fx.node.state().names().entry(&fx.name).is_some(),
+            "the reveal applied; the name is registered"
+        );
+        assert!(
+            !fx.node.mempool().contains(&fx.reveal_id),
+            "a connected reveal is dropped from the pool"
+        );
+
+        let (next_header, next_body) = fx.node.mine_block().expect("the node keeps mining");
+        assert_eq!(next_header.height, COMMIT_MIN_AGE + 2);
+        assert!(
+            next_body.txs.is_empty(),
+            "the reveal was consumed; the next block is not a stuck retry of it"
+        );
+        assert_eq!(
+            fx.node.ingest_block(next_header, next_body),
+            IngestOutcome::Accepted
+        );
+    }
+
+    /// Lab #624: a node whose applied state is behind still produces
+    /// `Positional` for `CommitNotFound` and does not charge the sender —
+    /// neither on the unjudged-anchor path nor on the settled-history amnesty.
+    ///
+    /// Mutation: classify `CommitNotFound` as intrinsic, or charge every
+    /// positional rider verdict — both arms below fail `is_peer_fault`.
+    /// Reverting ingest to `EmptyNameView` does **not** fail this test: the
+    /// empty view also yields `CommitNotFound`. That is the amnesty invariant,
+    /// not the inclusion fix.
+    #[test]
+    fn a_lagging_node_does_not_charge_commit_not_found() {
+        type A = NodeAdapter<KeccakPow, MockVerifier>;
+        assert!(
+            matches!(
+                A::body_fault_class(&BodyError::RiderRule {
+                    index: 0,
+                    err: qlab_devnet::names::NameRuleError::CommitNotFound,
+                }),
+                BodyFault::Positional("bad body")
+            ),
+            "CommitNotFound stays positional so a lagging registry is not a peer fault"
+        );
+
+        let fx = v5_pooled_burn_bearing_reveal();
+        let mut announced = fx.history.clone();
+        announced.push((fx.reveal_header, fx.reveal_body.clone()));
+
+        // (1) Joiner: headers only, nothing finalized past genesis on this
+        // node (it never finalized genesis). Unjudged positional path.
+        let mut joiner = v5_follower_with_headers_only(&announced);
+        assert_eq!(joiner.state().finalized_height(), None);
+        assert!(!joiner.anchor_verdict_is_authoritative(&fx.reveal_header));
+        assert!(!joiner.block_is_settled_history(&fx.reveal_header));
+        let joiner_out = joiner.ingest_block(fx.reveal_header, fx.reveal_body.clone());
+        assert_eq!(joiner_out, IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON));
+        assert!(
+            !joiner_out.is_peer_fault(),
+            "a lagging joiner must not charge the sender of a reveal it cannot yet see"
+        );
+        assert_eq!(joiner.state().tip_height(), 0, "unjudged is not accepting");
+
+        // (2) Settled-history amnesty: the same headers, but the reveal height
+        // is committee-finalized on the joiner's fork-choice chain. The
+        // positional `{}` arm must still not charge.
+        let mut settled = v5_follower_with_headers_only(&announced);
+        let (_cstate, validators) = committee7();
+        let tip = settled.chain().tip_hash();
+        let cp = Checkpoint::new(fx.reveal_header.height, tip, tip);
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(settled.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        assert!(
+            settled.block_is_settled_history(&fx.reveal_header),
+            "the reveal header is settled history on this node"
+        );
+        let settled_out = settled.ingest_block(fx.reveal_header, fx.reveal_body);
+        assert!(
+            !settled_out.is_peer_fault(),
+            "settled-history amnesty must still excuse CommitNotFound"
+        );
+        assert_ne!(settled_out, IngestOutcome::Rejected("bad body"));
+        assert_eq!(
+            settled.state().tip_height(),
+            0,
+            "amnesty is not applying a body whose parent is unapplied"
+        );
+    }
+
+    /// Lab #624 v4 arm: T1 crossed `NAME_RULE_BOUNDARY_HEIGHT = 19_008` on
+    /// 2026-08-21. The identical EmptyNameView exclusion is latent there.
+    /// Cheap enough for the suite because `genesis_difficulty: 1` makes each
+    /// mine a single hash (same ceiling as the producer-across-boundary test).
+    ///
+    /// Mutation: revert the v4 arm of `ingest_block` to `validate_body`
+    /// (`EmptyNameView`) → `Accepted` fails with `Rejected("bad body")`.
+    #[test]
+    fn a_v4_burn_bearing_name_reveal_is_ingested_above_the_stamped_boundary() {
+        use qlab_devnet::names::{COMMIT_MIN_AGE, NAME_RULE_BOUNDARY_HEIGHT};
+
+        let b = NAME_RULE_BOUNDARY_HEIGHT
+            .expect("the boundary is stamped; with None this test proves nothing");
+        assert!(b <= 200_000, "stamped boundary {b} is past this test's in-suite ceiling");
+
+        let (cstate, validators) = committee7();
+        let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
+        let mut node = NodeAdapter::new(cstate, KeccakPow, MockVerifier, cfg);
+        node.set_miner_rkm([0x624, 0x04, 0, 0]);
+        let g = node.chain().genesis_block_hash();
+        node.state_mut().finalize(g).expect("finalize genesis");
+
+        for h in 1..=b {
+            let (header, body) = node.mine_block().unwrap_or_else(|| panic!("mine at {h}"));
+            assert_eq!(node.ingest_block(header, body), IngestOutcome::Accepted, "block {h}");
+        }
+        let cp = Checkpoint::new(b, node.chain().tip_hash(), node.chain().tip_hash());
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(node.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        assert_eq!(node.state().finalized_height(), Some(b));
+
+        // Genesis is long outside MAX_ANCHOR_AGE_BLOCKS. Anchor the name txs
+        // at the just-finalized boundary root.
+        let anchor = node.state().commitment_root();
+        let (commit, reveal, name, name_fee) = t2rollcheck_ops(anchor);
+        let reveal_wire_id = wire_tx_id(&reveal);
+
+        node.submit_tx_typed(commit).expect("v4 admits a commit above the boundary");
+        let (commit_header, commit_body) = node.mine_block().expect("mine the v4 commit");
+        assert_eq!(commit_header.height, b + 1);
+        assert_eq!(commit_body.txs.len(), 1);
+        assert_eq!(
+            node.ingest_block(commit_header, commit_body),
+            IngestOutcome::Accepted
+        );
+
+        for height in (b + 2)..=(b + COMMIT_MIN_AGE) {
+            let (header, body) = node.mine_block().unwrap_or_else(|| panic!("mine at {height}"));
+            assert!(body.txs.is_empty());
+            assert_eq!(node.ingest_block(header, body), IngestOutcome::Accepted);
+        }
+
+        let reveal_id = node.submit_tx_typed(reveal).expect("v4 admits the reveal");
+        let (header, body) = node.mine_block().expect("v4 assembles the reveal");
+        assert_eq!(header.height, b + 1 + COMMIT_MIN_AGE);
+        assert_eq!(body.txs.len(), 1, "the v4 assembler includes the reveal");
+        assert_eq!(wire_tx_id(&body.txs[0]), reveal_wire_id);
+        assert_eq!(body.total_name_burn(), name_fee);
+
+        let empty_view_refusal = qlab_devnet::body::validate_body_with_names(
             &header,
             &body,
             &node.verifier,
@@ -7115,51 +7392,34 @@ mod tests {
                 index: 0,
                 err: qlab_devnet::names::NameRuleError::CommitNotFound,
             }),
-            "EXACT REFUSAL: relay-grade validation cannot see the mined commit"
+            "v4 EmptyNameView still cannot see the mined commit"
         );
         assert_eq!(
-            qlab_devnet::body::validate_body_v5(
+            qlab_devnet::body::validate_body_with_names(
                 &header,
                 &body,
                 &node.verifier,
                 |root| node.state.is_valid_anchor(root),
                 node.state.names(),
             ),
-            Ok(()),
-            "the node's real registry makes the identical block valid"
+            Ok(())
         );
 
-        // The requested forced-zero contrast at the one arithmetic boundary the
-        // burn reaches. `total_name_burn` is derived from the reveal rider, so
-        // there is no production switch that can set it to zero while leaving the
-        // transaction identical. Forcing only this input raises the derived
-        // coinbase-note value by exactly the burn. The refusal above happens
-        // earlier, in `check_op`, and does not read this arithmetic input at all:
-        // burn is a correlate here, not the trigger.
-        let burned_value = qlab_node::coinbase_note_value_parts(
-            body.coinbase_total(),
-            body.total_fees(),
-            body.total_name_burn(),
-        );
-        let forced_zero_value =
-            qlab_node::coinbase_note_value_parts(body.coinbase_total(), body.total_fees(), 0);
-        assert_eq!(forced_zero_value - burned_value, name_fee);
+        let (retry_header, retry_body) = node.mine_block().expect("second v4 mine at the same height");
+        assert_eq!(retry_header.height, header.height);
+        assert_eq!(retry_body.txs.len(), 1, "without ingest, v4 reselects the same reveal");
 
         assert_eq!(
             node.ingest_block(header, body),
-            IngestOutcome::Rejected("bad body"),
-            "OBSERVED: self-ingest flattens RiderRule(CommitNotFound) to bad body"
+            IngestOutcome::Accepted,
+            "v4 self-ingest of the assembled reveal must succeed"
         );
-        assert_eq!(
-            node.state().tip_height(),
-            COMMIT_MIN_AGE,
-            "the refused reveal block did not apply"
-        );
-        assert!(node.state().names().entry(name).is_none(), "the name was not registered");
-        assert!(
-            node.mempool().contains(&reveal_id),
-            "the refused reveal remains pooled to be selected and refused again"
-        );
+        assert!(node.state().names().entry(&name).is_some());
+        assert!(!node.mempool().contains(&reveal_id));
+
+        let (next_header, next_body) = node.mine_block().expect("v4 keeps mining");
+        assert!(next_body.txs.is_empty());
+        assert_eq!(node.ingest_block(next_header, next_body), IngestOutcome::Accepted);
     }
 
     /// Lab #612: admission and eviction must ask the rider question under the
