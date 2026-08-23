@@ -2621,9 +2621,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         // inert-era / pre-boundary shortcut: `commit_included_in` is
         // unconditionally false, so a current node that assembled a reveal
         // from its own registry then refused the block it just built
-        // (lab #624). The view is the same `NodeState` `is_valid_anchor`
-        // reads, so a lagging node's registry verdict and its anchor verdict
-        // go stale together and stay Positional / uncharged.
+        // (lab #624).
+        //
+        // A positional `CommitNotFound` is charged only when
+        // `anchor_verdict_is_authoritative`, whose first clause is
+        // `header.prev == state.tip_hash()`. The registry is applied state
+        // (`apply_state` → `names.apply_block_riders`), so a registry that is
+        // stale for this block means the applied tip is not the parent and
+        // the node is never charged. That is the position clause alone.
+        // `is_valid_anchor` also reads the finalized head (checkpoint path,
+        // not `apply_state`), so the two do not go stale together; a lagging
+        // finality only makes the authority predicate more conservative.
         let validate_result = match self.rules.form {
             GenesisForm::V4 => validate_body_with_names(
                 &header,
