@@ -1,15 +1,19 @@
 # 远程证明 —— 当前决策记录
 
-**状态:当前决策,不是 implementation approval。下面的产品与安全约束已经决定;
-authorization primitive 与 confidential-compute 路线尚未选定。任何候选在通过 §8 的
-上线门槛之前,公网 prover 都不得承载真实价值。**
+**状态:当前决策,不是 implementation approval。Candidate A 已选为真实价值场景的
+强制安全基础;它的 authorization primitive 仍未选定。Candidate B 是可选
+defense-in-depth,不是资金安全 trust root。在 A 通过 §8 applicable launch gates 之前,
+公网 prover 不得承载真实价值。**
 英文权威版:[`remote-proving-decision.md`](remote-proving-decision.md)。
 
 写于 2026-08-23,接续 PR #618、PR #619 与后续安全复核。本文是 `qumbra-lab` 里
 remote proving 的权威入口。早期文档继续保留为证据与设计记录;§10 说明该怎么读。
 
-本文不会悄悄修改 Qumbra 的 binding design spec。如果最终选择 protocol-level
-authorization,实现前必须给当前"每笔交易一个 monolithic STARK;没有 per-spend
+带日期的路线选择另行记录在
+[`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md)。
+
+本文不会悄悄修改 Qumbra 的 binding design spec。实现已经选定的 protocol-level
+authorization 前,必须给当前"每笔交易一个 monolithic STARK;没有 per-spend
 signature"决策做一份带日期的 design-repo 修正。
 
 ---
@@ -18,7 +22,7 @@ signature"决策做一份带日期的 design-repo 修正。
 
 Qumbra 可以为所有支持手机研究一个共享逻辑 prover service,但现行 trusted
 `WitnessBundle` 交接不得承载真实价值:上线前必须有共识绑定、任何 prover 都无法伪造的
-手机持有授权,或者由钱包验证、普通运营方无法读取的 attested confidential worker。
+手机持有授权;由钱包验证的 attested confidential worker 可以另外降低 witness 可见性。
 用户运营常驻 prover 不在范围内。
 
 ## 2. 已经决定的部分
@@ -37,7 +41,8 @@ Qumbra 可以为所有支持手机研究一个共享逻辑 prover service,但现
 6. **Prover 需要只读 node access。** 分配证明工作前,它从运营方固定 endpoints 获取
    fresh anchors/nullifiers。客户端请求不得提供任意 node URL。
 
-以上内容没有选定 backend implementation,也没有改共识。
+安全基础已经选定。本文没有选择 authorization primitive、backend implementation 或
+confidential-compute target,也没有实现任何共识变更。
 
 ## 3. 诚实的路线比较
 
@@ -45,14 +50,15 @@ Qumbra 可以为所有支持手机研究一个共享逻辑 prover service,但现
 |---|---|---|---|---|---|
 | 用户运营常驻 prover | 只有用户运营时才行 | 取决于 operator | 诚实时留在本地 | 无 | **按产品裁决排除** |
 | b4 本地证明,无远程 fallback | 不行;低内存手机被排除 | 本地可以 | 本地可以 | re-mint 或永久双 verifier | 无法完整覆盖产品目标 |
-| b4 本地证明 + 远程 fallback | 原则上可以 | fallback 仍需 authorization/attestation | fallback 除非 confidential,否则仍能看见/关联 | b4 re-mint + remote-prover 成本 | 相比 shared service 没有安全捷径 |
+| b4 本地证明 + 远程 fallback | 原则上可以 | fallback 仍需 Candidate A authorization | fallback 除非 confidential,否则仍能看见/关联 | b4 re-mint + remote-prover 成本 | 相比 shared service 没有安全捷径 |
 | Trusted shared b16 prover | 可以 | **失败** | **失败** | 无 | **真实价值场景排除**;只可做无价值 mechanics experiment |
-| 共享 b16 prover + 手机持有 authorization | 可以 | 只有共识绑定手机批准的完整 intent 才通过 | 普通 worker 下**失败** | re-mint 级协议变更 | **候选 A**;primitive 未选 |
-| Attested confidential b16 worker | 原则上可以 | 只有接受 attested image/hardware/isolation 假设才通过 | 可减少 payload 可见性;ingress metadata 仍在 | 原则上不需 protocol re-mint | **候选 B**;fit/attestation 未测 |
+| 共享 b16 prover + 手机持有 authorization | 可以 | 只有共识绑定手机批准的完整 intent 才通过 | 普通 worker 下**失败** | re-mint 级协议变更 | **已选定的强制基础**;primitive 未选 |
+| 没有 A 的 attested confidential b16 worker | 原则上可以 | 只有完整 attestation/hardware/isolation chain 成立时才通过 | 可减少 payload 可见性;ingress metadata 仍在 | 原则上不需 protocol re-mint | **真实价值场景不能单独采用**;可选叠加在 A 上 |
 | MPC 或密码学隐藏的 outsourced proving | 未知 | 目标是通过 | 可能减少 payload 可见性 | 很可能大改 | 延后研究 |
 
-因此,产品比较不是"b4 对相信 Qumbra",而是带安全 fallback 的 b4,对带
-authorization 或 attestation 的 b16 remote proving。
+因此,产品比较不是"b4 对相信 Qumbra"。选定的远程路线是带 Candidate A authorization
+的 b16 proving;Candidate B 通过自己的 fit/trust gates 后,可以把它部署在 confidential
+compute 里。
 
 ### 候选架构图
 
@@ -60,7 +66,7 @@ Baseline topology 的 service 主干不变:wallet 从固定 read endpoints 扫�
 service 给 ephemeral workers 发 lease,worker 用固定的只读 node access 做 preflight,
 通常仍由 wallet 提交返回的交易。两个候选的区别在 security boundary。
 
-#### 候选 A —— 共识绑定的手机授权
+#### 候选 A —— 已选定的共识绑定手机授权
 
 普通 service 仍可能观察并关联 witness。它的安全声明更窄:手机保留 authorization
 secret;worker 一旦改动已授权 intent 或 note binding,node 就会拒绝交易。
@@ -109,7 +115,7 @@ flowchart LR
 这条路线会改共识。Node 先验 authorization,再做昂贵的 STARK verification;STARK 随后
 必须证明 authorization public values 属于同一批 hidden inputs。
 
-#### 候选 B —— attested confidential worker
+#### 候选 B —— 已被排除单独使用的历史 B-only 候选
 
 原则上这条路线保留今天的 consensus transaction。Wallet 先验证 fresh worker
 attestation,并把 ephemeral encryption key 绑定到获准 image/configuration。只有该 worker
@@ -158,6 +164,9 @@ flowchart LR
 这条路线改 transport/trust boundary,而不是 transaction format。Attestation、encryption、
 hardware、firmware、image measurement 与 side-channel assumptions 都属于它的安全声明。
 Ingress metadata linkability 仍然存在。
+
+本图继续保留为 B-only trust boundary 记录。选定的 A+B 组合见
+[`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md) §4。
 
 ## 4. 当前 trusted 交接不得上线
 
@@ -230,16 +239,17 @@ public-key bytes、proof size、node time、mobile time、privacy 与精确标�
 其他标准化 stateless 候选也可以进入比较。任何 custom signature construction 都必须先
 经过独立 cryptographic review 与 published test vectors,才能继续。
 
-## 7. 候选 B —— attested confidential worker
+## 7. 候选 B —— 可选 attested confidential worker
 
-Attested confidential VM 是当前唯一能保留今天 consensus transaction、同时不让普通
-Qumbra/cloud operator 读取 witness 的路线。它不是普通的 TLS-to-VM。
+Attested confidential VM 是当前一条原则上能保留今天 consensus transaction、同时在
+明示假设下不让普通 Qumbra/cloud operator 读取 witness 的路线。它不是普通的
+TLS-to-VM,也不足以在没有 A 时独自成为真实价值 security basis。
 
 钱包必须验证 ephemeral encryption key 属于获准的 worker image/configuration,再把
 bundle 直接加密给它。Ingress/queue 不得解密。Measurement 必须 pin prover、consensus
 config、protocol version、node allowlist、debug-disabled 状态与 result-encryption 行为。
 
-选型之前,精确 SEV-SNP/TDX 级目标必须证明:
+部署或提出 confidentiality claim 之前,精确 SEV-SNP/TDX 级目标必须证明:
 
 1. 当前 12–15 GB 级 b16 job 的 peak private memory、cold/warm proof time、proof bytes、
    failure behavior 与成本;
@@ -254,7 +264,8 @@ Attestation 自己不能消除 linkability。Ingress 仍可关联 device identit
 
 ## 8. 真实价值上线门槛
 
-公共 real-value prover 被阻塞,直到一个候选通过所有适用门槛:
+公共 real-value prover 被阻塞,直到 Candidate A 通过所有 applicable gates。如果官方
+service 还声称 Candidate B confidentiality,B 也必须通过自己的 applicable gates:
 
 1. **不能盗币:**对抗性 prover/operator 无法授权手机没批准的 outputs 或 semantic fields。
 2. **隐私写清楚:**设计明说谁能观察/关联 witness、device、IP、timing 与 transaction,
@@ -287,16 +298,19 @@ experiment。
    [FIPS 205](https://csrc.nist.gov/pubs/fips/205/final) 的安全论证。
 2. **Confidential-worker lane:**在精确目标 confidential instance 上跑今天的 b16 电路,
    并完成 mobile attestation negatives。
-3. **选择一份 launch security basis:**protocol authorization、attested confidential work,
-   或两者。不得按 estimated rows 选型。
-   *2026-08-23 已按结构性理由(非估算)解决:***A 为上线基础,B 为之后叠加的部署层** ——
+3. **Security-basis selection —— 2026-08-23 已解决:**Candidate A 强制;Candidate B 是
+   可选 defense-in-depth,不能替代 A ——
    [`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md)。
-   第 1、2、4、5 步仍是实现门槛;第 2 步改为并行。
-4. **如果 authorization 胜出,先修正 binding design spec**,再改 lab circuit/wire。
-5. **完成以上步骤后才实现并 pilot** 公共 service boundary。
+   这项裁定基于 protocol layering 与 trust boundaries,不是 estimated performance rows。
+   第 1、2、4、5 步仍是各自工作的门槛;第 2 步并行运行。
+4. **为 authorization 修正 binding design spec**,再改 lab circuit/wire。
+5. **完成以上步骤后才实现并 pilot A。** B 可以在无价值 parallel lane 推进,并在通过
+   自己的 gates 后叠加到官方 service。
 
 ## 10. 早期记录该怎么读
 
+- [`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md)
+  选定 A 为强制基础、B 为可选 defense-in-depth。本文更早的 A-or-B wording 以它为准。
 - [`phone-self-proving-reopened-zh.md`](phone-self-proving-reopened-zh.md) 是历史上的
   phone-memory/UX 交接,解释 b4 为什么不能自己覆盖所有设备。
 - [`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md) 是
@@ -311,8 +325,8 @@ experiment。
 
 ## 11. 本次交接的范围
 
-- 本文没有构建 backend service、cloud resource、account system、authorization primitive、
-  attestation path、circuit、wire、genesis 或 deployment。
+- 安全基础已经选定,但本文没有构建 backend service、cloud resource、account system、
+  authorization primitive、attestation path、circuit、wire、genesis 或 deployment。
 - `CONSENSUS_CFG` 未改变。
 - 用户运营常驻 prover 继续排除。
 - 当前 paired-prover 继续只是 trusted-LAN 上的一次请求工具,不得作为真实价值公网服务
