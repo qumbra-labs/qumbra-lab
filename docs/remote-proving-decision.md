@@ -319,10 +319,17 @@ explicitly isolated service-mechanics experiment.
 0. **Independent hardening:** replace both 128 MiB paired-prover protocol
    ceilings with measured bundle/artifact ceilings, derive chunk counts from
    byte limits, and add boundary tests. This does not select an architecture.
-1. **Authorization spike:** specify and compare standardized WOTS+ and stateless
-   leaf authorization end to end, including dummy semantics, canonical intent,
-   exact codecs, rollback/multi-device behavior, wire bytes, prover RSS/time,
-   node time, address creation, restore, and privacy.
+1. **Authorization spike:** specify and compare standardized WOTS+, a
+   standardized stateless signature leaf, and a random-index WOTS+ leaf end to
+   end, including dummy semantics, canonical intent, exact codecs,
+   rollback/multi-device behavior, wire bytes, prover RSS/time, node time,
+   address creation, restore, and privacy. For the random-index row, treat a
+   repeated leaf as catastrophic for acceptance and quantify the ideal-uniform
+   birthday bound `q(q−1)/2^(D+1)` per depth-`D` tree, plus multi-wallet and
+   multi-target risk, at every depth that fits 2^19. A single random-leaf tree
+   is not SLH-DSA and cannot inherit the security argument of
+   [FIPS 205](https://csrc.nist.gov/pubs/fips/205/final) without its FORS and
+   hypertree construction.
 2. **Confidential-worker lane:** run today's b16 circuit on the exact target
    confidential instance and complete the mobile attestation negatives.
 3. **Select one launch security basis:** protocol authorization, attested

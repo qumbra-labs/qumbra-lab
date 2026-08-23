@@ -277,9 +277,14 @@ experiment。
 0. **独立加固:**把 paired-prover 两边的 128 MiB protocol ceilings 换成实测
    bundle/artifact ceilings,从 byte limits 推导 chunk count,并加 boundary tests。它不选
    架构。
-1. **Authorization spike:**端到端规定并比较标准 WOTS+ 与 stateless leaf authorization,
-   覆盖 dummy semantics、canonical intent、exact codecs、rollback/multi-device、wire
-   bytes、prover RSS/time、node time、address creation、restore 与 privacy。
+1. **Authorization spike:**端到端规定并比较标准 WOTS+、标准 stateless signature leaf
+   与 random-index WOTS+ leaf,覆盖 dummy semantics、canonical intent、exact codecs、
+   rollback/multi-device、wire bytes、prover RSS/time、node time、address creation、
+   restore 与 privacy。Random-index 那一行必须把重复 leaf 当作 acceptance 上的灾难性
+   事件,对每个能放进 2^19 的 depth-`D` tree 计算 ideal-uniform birthday bound
+   `q(q−1)/2^(D+1)`,再叠加 multi-wallet/multi-target 风险。单棵 random-leaf tree 不是
+   SLH-DSA;没有 FORS 与 hypertree construction,就不能继承
+   [FIPS 205](https://csrc.nist.gov/pubs/fips/205/final) 的安全论证。
 2. **Confidential-worker lane:**在精确目标 confidential instance 上跑今天的 b16 电路,
    并完成 mobile attestation negatives。
 3. **选择一份 launch security basis:**protocol authorization、attested confidential work,
