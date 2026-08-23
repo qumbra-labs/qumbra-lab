@@ -1,6 +1,8 @@
 # Phone self-proving, re-opened — handoff
 
-**Status: NOT DECIDED. Two measurements are owed before anyone changes a parameter.**
+**Status: HISTORICAL HANDOFF. The current remote-proving decision is
+[`remote-proving-decision.md`](remote-proving-decision.md). The phone parameter
+choice remains unselected.**
 Paired with [`phone-self-proving-reopened-zh.md`](phone-self-proving-reopened-zh.md).
 
 Written 2026-08-23 as a session handoff. Nothing in this document has been built;

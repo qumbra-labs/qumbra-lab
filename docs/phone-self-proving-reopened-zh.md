@@ -1,6 +1,8 @@
 # 手机自证明,重新打开 —— 交接
 
-**状态:未决。动任何参数之前,欠两个测量。**
+**状态:历史交接。当前 remote-proving 决策见
+[`remote-proving-decision-zh.md`](remote-proving-decision-zh.md)。Phone parameter
+仍未选定。**
 配对文档:[`phone-self-proving-reopened.md`](phone-self-proving-reopened.md)
 
 写于 2026-08-23,作为会话交接。本文所述**一件都没有动工**;产生它的那次会话

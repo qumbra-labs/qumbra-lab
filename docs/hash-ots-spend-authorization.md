@@ -1,8 +1,11 @@
-# Hash-based one-time spend authorization — design for an untrusted prover
+# Hash-based one-time spend authorization — research candidate
 
-**Status: DESIGN, NOT BUILT. Requires a consensus change (new circuit, new
-`rkm` packing, new transaction wire) and therefore a T2 re-mint. Nothing here
-is implemented; every number marked "est." is unmeasured.**
+**Status: RESEARCH CANDIDATE, NOT ACCEPTED OR BUILT. Follow-up review found
+unresolved P0 state-rollback/key-reuse, incomplete WOTS+ instantiation, and
+dummy-slot rules. See
+[`remote-proving-decision.md`](remote-proving-decision.md) §6. Any accepted
+version would require a consensus change and T2 re-mint; every number marked
+"est." remains unmeasured.**
 Paired with
 [`hash-ots-spend-authorization-zh.md`](hash-ots-spend-authorization-zh.md).
 
@@ -12,16 +15,15 @@ Written 2026-08-23 as the follow-up owed by
 document established that a shared Qumbra prover is feasible only as a
 *trusted* service, because `WitnessBundle` hands the worker the input `sk` and
 nothing in the protocol stops the worker from proving and submitting a
-different spend of the same notes. This document designs the protocol change
-that removes that trust: after it, **no prover — Qumbra's, a community
-node's, or a paid market's — can spend, redirect, or alter a transaction it
-was asked to prove.**
+different spend of the same notes. This document explores a protocol shape
+intended to remove that trust. The property is **not established** until the
+P0 blockers in the current decision record are closed.
 
 ---
 
 ## 1. Answer in one sentence
 
-Commit a per-address Merkle root of hash-based one-time public keys
+Candidate: commit a per-address Merkle root of hash-based one-time public keys
 (WOTS+) into the note's recipient key material; spend by signing a canonical
 *intent digest* with one of those one-time keys on the phone; let the circuit
 prove only that the revealed one-time public key belongs to the spent note's
@@ -262,25 +264,27 @@ both — none of which this document decides.
 
 ## 10. Consequences for the open decision
 
-| choice | every phone sends | any prover is safe | tx size | T2 | enduring dependency |
+| choice | every phone sends | prover cannot redirect | tx size | T2 | enduring dependency |
 |---|---|---|---:|---|---|
 | b4 local prove + fallback | fallback on low-memory devices | n/a (no prover) | ~236 KB | re-mint | fallback prover |
 | trusted Qumbra backend (PR #618) | yes | **no** | 148 KB | none | trusted, single operator |
 | split STARK | yes | yes | ~230 KB (est.) | re-mint | a service |
-| **hash-OTS authorization (this doc)** | yes | **yes** | ~163 KB (est.) | re-mint | *any* prover, decentralizable |
+| **hash-OTS authorization (this doc)** | yes | **intended yes; not established** | ~163 KB (est.) | re-mint | *any* prover, decentralizable |
 
-Both b4 and this design pay one T2 re-mint. b4 buys phone independence at
-the cost of the largest transactions and a fallback that is still a trusted
-prover. This design buys "no prover can steal", smaller transactions than
-b4, zero phone memory pressure, and — because the worker is no longer
-trusted — the option to let community nodes, pools, or a market prove for
-phones. That last property converts PR #618 §7's central availability and
-censorship dependency from a launch blocker into an operations choice.
+Both b4 and an accepted version of this shape would pay one T2 re-mint. b4
+buys phone independence at the cost of the largest transactions and a fallback
+that is still a trusted prover. If the P0 blockers are solved, this shape is
+intended to buy resistance to prover redirection, smaller transactions than b4,
+zero phone memory pressure, and the option to let community nodes, pools, or a
+market prove for phones. The current construction does not yet establish those
+properties.
 
 ## 11. Decisions owed
 
-1. Accept or reject the direction: protocol-level authorization versus a
-   disclosed trusted service.
+1. Do not accept this construction until the P0 blockers in
+   [`remote-proving-decision.md`](remote-proving-decision.md) §6 are closed;
+   compare it with a stateless ML-DSA-leaf construction before selecting a
+   primitive.
 2. `DEPTH` (12 vs 16) and WOTS+ `w` (16 vs 256: 256 halves signature size to
    ~1.1 KB but costs ~17× verification hashes).
 3. Whether `pk_ots` enters `intent` as specified or is bound by the circuit
@@ -302,9 +306,10 @@ censorship dependency from a launch blocker into an operations choice.
 
 ## 13. Scope at this handoff
 
+- Current ruling: this construction is not accepted; the paired current
+  decision record is authoritative.
 - Nothing is implemented. `CONSENSUS_CFG`, the circuit, the wire, and the
   wallet are untouched.
-- This document supersedes the "decide the trust bar" step in
-  [`phone-self-proving-reopened.md`](phone-self-proving-reopened.md) §7 only
-  if Larry accepts the direction in §11.1; until then PR #618's trusted-model
-  gates stand as written.
+- This document does not supersede the phone handoff or authorize a protocol
+  direction. Its findings feed
+  [`remote-proving-decision.md`](remote-proving-decision.md) §6.

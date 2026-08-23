@@ -3,6 +3,9 @@
 **状态:调研记录,不是 build plan。共享证明在算力拓扑上可行,但当前 trusted 形态
 不能用于真实价值。不得把当前 paired-prover binary 直接暴露到公网。**
 英文权威版:[`backend-assisted-proving-security.md`](backend-assisted-proving-security.md)。
+当前决策入口:
+[`remote-proving-decision-zh.md`](remote-proving-decision-zh.md)。本文保留为详细的
+可行性与 threat-model 证据。
 
 写于 2026-08-23,接续手机自证明重新讨论。本文记录一条产品裁决和一条技术结论:
 
@@ -227,7 +230,13 @@ witness 在 spend integrity 上安全地暴露,同时服务仍然看得见整笔
 
 ### 8.1 候选 A —— 手机持有 transaction-intent authorization
 
-这是目前从代码里看得到的最小设计,不是已经批准的协议。手机在证明前已经构造完整
+**已被后续结论取代的构造说明:**下文第 1–2 步草拟了按 note 的
+`ask_i`/`apk_i`。后续复查发现这个具体形状不可行:sender 无法绑定由 recipient secret
+派生的 public key;若在电路内派生,又会把 linking secret 暴露给 worker。本节只保留作
+推导出处。当前 primitive 对比见
+[`remote-proving-decision-zh.md`](remote-proving-decision-zh.md) §6。
+
+这是写作当时从代码里看得到的最小设计,从来不是已批准协议。手机在证明前已经构造完整
 intent:`WitnessBundle` 固定 anchor、真实 nullifiers、两个 output plaintext/commitment、
 fee、已承诺 discovery bytes 与 rider。缺的是一把能授权这些字节、却永不进入 bundle
 的 secret。
@@ -359,8 +368,9 @@ Backend-assisted proving 是手机决策里原先缺失的分支:
 
 选 build plan 之前:
 
-1. 把 §8.1 展开成 protocol spike,在当前电路上直接与 b4 比较 re-mint、wire、隐私与
-   prover 成本。
+1. 执行 [`remote-proving-decision-zh.md`](remote-proving-decision-zh.md) §9 的
+   authorization spike,在当前电路上直接与 b4 比较 re-mint、wire、隐私与 prover
+   成本,并纳入 primitive 的 state model。
 2. 跑 §8.2 的当前 b16 confidential-VM fit/attestation lane,让"不改协议"选项有证据,
    不只是一行标签。
 3. 决定上线范围:T2-only 实验、mainnet 可选路径,还是手机默认/唯一 send 路径。

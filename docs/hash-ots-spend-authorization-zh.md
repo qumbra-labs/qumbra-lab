@@ -1,21 +1,22 @@
-# 基于哈希的一次性花费授权 —— 面向不可信 prover 的设计
+# 基于哈希的一次性花费授权 —— 研究候选
 
-**状态:设计稿,未构建。需要改共识(新电路、新 `rkm` 打包、新交易 wire),因此需要一次
-T2 re-mint。本文没有任何东西已实现;所有标"估"的数字都没测过。**
+**状态:研究候选,未接受、未构建。后续复查发现尚未解决的 P0 state rollback/key reuse、
+不完整的 WOTS+ 实例化与 dummy-slot 规则。见
+[`remote-proving-decision-zh.md`](remote-proving-decision-zh.md) §6。任何获接受的版本都会
+改共识并需要 T2 re-mint;所有标"估"的数字仍未测量。**
 英文权威版:[`hash-ots-spend-authorization.md`](hash-ots-spend-authorization.md)。
 
 写于 2026-08-23,是 [`backend-assisted-proving-security.md`](backend-assisted-proving-security.md)
 (PR #618)§8 第三行"手机持有交易意图授权"欠下的后续。那份文档证明了:共享 Qumbra prover
 只能作为**受信任**服务存在,因为 `WitnessBundle` 把 input 的 `sk` 交给了 worker,而协议里
-没有任何东西阻止 worker 用同一批 note 证明并提交另一笔花费。本文设计的就是拆掉这份信任的
-协议改动:改完之后,**任何 prover —— Qumbra 的、社区节点的、付费市场的 —— 都无法花掉、
-改道或篡改它被托付去证明的交易。**
+没有任何东西阻止 worker 用同一批 note 证明并提交另一笔花费。本文探索的是一条意图拆掉
+这份信任的协议形状。在当前决策记录里的 P0 blockers 关闭前,这个属性**尚未成立**。
 
 ---
 
 ## 1. 一句话答案
 
-把每个地址的一棵 WOTS+ 一次性公钥 Merkle 树的树根写进 note 的 recipient key material;
+候选方案:把每个地址的一棵 WOTS+ 一次性公钥 Merkle 树的树根写进 note 的 recipient key material;
 花费时在手机上用其中一把一次性私钥对规范化的**意图摘要**签名;电路只证明"亮出来的一次性
 公钥属于被花 note 的地址";节点在 STARK 之外验签。于是 prover 只需要**证明材料**(`nk`、
 note 开口、Merkle 路径),永远拿不到**授权材料**(`sk_auth`、一次性私钥)。
@@ -213,21 +214,23 @@ marker 就会被打开。挪 `ROLE_ARKM` 的 pad 和新增两个 role,必须以�
 
 ## 10. 对悬而未决那个决定的影响
 
-| 选择 | 每台手机能发 | 任何 prover 都安全 | 交易大小 | T2 | 长期依赖 |
+| 选择 | 每台手机能发 | prover 不能改道 | 交易大小 | T2 | 长期依赖 |
 |---|---|---|---:|---|---|
 | b4 本地证明 + fallback | 低内存设备靠 fallback | 不适用(没有 prover) | ~236 KB | re-mint | fallback prover |
 | 受信任 Qumbra 后端(PR #618) | 能 | **否** | 148 KB | 无 | 受信任、单一运营方 |
 | 拆分 STARK | 能 | 是 | ~230 KB(估) | re-mint | 一个服务 |
-| **hash-OTS 授权(本文)** | 能 | **是** | ~163 KB(估) | re-mint | *任何* prover,可去中心化 |
+| **hash-OTS 授权(本文)** | 能 | **目标是;尚未成立** | ~163 KB(估) | re-mint | *任何* prover,可去中心化 |
 
-b4 和本设计都付一次 T2 re-mint。b4 买到手机自立,代价是最大的交易和一个仍然受信任的
-fallback prover。本设计买到"没有 prover 能偷"、比 b4 小的交易、手机零内存压力,以及 ——
-因为 worker 不再需要被信任 —— 让社区节点、矿池或市场替手机证明的选项。最后这条把
-PR #618 §7 的中心化可用性与审查依赖从发布阻塞项降为运营选择。
+b4 与获接受的这个方案都会付一次 T2 re-mint。b4 买到手机自立,代价是最大的交易和一个
+仍然受信任的 fallback prover。如果 P0 blockers 被解决,这个方案的目标是买到防止 prover
+改道、比 b4 小的交易、手机零内存压力,以及让社区节点、矿池或市场替手机证明的选项。
+当前构造还没有证明这些属性成立。
 
 ## 11. 欠的决定
 
-1. 接受或拒绝方向:协议级授权,还是披露后的受信任服务。
+1. 在 [`remote-proving-decision-zh.md`](remote-proving-decision-zh.md) §6 的 P0
+   blockers 关闭前,不要接受这份构造;选择 primitive 前必须与 stateless ML-DSA-leaf
+   构造对比。
 2. `DEPTH`(12 还是 16)与 WOTS+ `w`(16 还是 256:256 把签名砍到约 1.1 KB,验证哈希数
    约 17 倍)。
 3. `pk_ots` 是按本文规定进入 `intent`,还是只靠电路绑定(本文写的是两者都要;对叶子替换
@@ -248,7 +251,7 @@ PR #618 §7 的中心化可用性与审查依赖从发布阻塞项降为运营�
 
 ## 13. 交接时的范围
 
+- 当前裁决:不接受这份构造;配对的当前决策记录具有权威性。
 - 什么都没实现。`CONSENSUS_CFG`、电路、wire、钱包均未触碰。
-- 只有 Larry 在 §11.1 接受方向,本文才取代
-  [`phone-self-proving-reopened-zh.md`](phone-self-proving-reopened-zh.md) §7 的"决定信任
-  门槛"那一步;在那之前,PR #618 的受信任模型门槛按原文成立。
+- 本文不取代 phone handoff,也不批准协议方向。它的 findings 汇入
+  [`remote-proving-decision-zh.md`](remote-proving-decision-zh.md) §6。

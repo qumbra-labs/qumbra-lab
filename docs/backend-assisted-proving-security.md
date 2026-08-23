@@ -5,6 +5,9 @@ feasible, but its current trusted form is not shippable for real-value use. Do
 not expose the current paired-prover binary to the Internet.**
 Paired with
 [`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md).
+Current decision entry point:
+[`remote-proving-decision.md`](remote-proving-decision.md). This document remains
+the detailed feasibility and threat-model evidence.
 
 Written 2026-08-23 after reopening phone self-proving. This document records one
 product ruling and one technical finding:
@@ -267,8 +270,16 @@ unbounded spinner is not.
 
 ### 8.1 Candidate A — phone-held transaction-intent authorization
 
-This is the smallest design currently visible in the code, not a ratified
-protocol. The phone already constructs the complete intent before proving:
+**Superseded construction note:** Steps 1–2 below sketch a per-note
+`ask_i`/`apk_i`. Follow-up found that exact shape is not viable: the sender
+cannot bind a recipient secret-derived public key, while deriving it in the
+circuit exposes the linking secret to the worker. Keep this section as
+provenance only. The current primitive comparison is in
+[`remote-proving-decision.md`](remote-proving-decision.md) §6.
+
+At the time of writing, this appeared to be the smallest design visible in the
+code; it was never a ratified protocol. The phone already constructs the
+complete intent before proving:
 `WitnessBundle` fixes the anchor, real nullifiers, both output plaintexts and
 commitments, fee, committed discovery bytes, and rider. The missing property is
 a secret that authorizes those bytes and never enters the bundle.
@@ -426,8 +437,10 @@ kept as a separate future product goal.
 
 Before selecting a build plan:
 
-1. Expand §8.1 into a protocol spike and measure its re-mint, wire, privacy, and
-   prover costs directly against b4 on the current circuit.
+1. Run the authorization spike in
+   [`remote-proving-decision.md`](remote-proving-decision.md) §9 and measure its
+   re-mint, wire, privacy, and prover costs directly against b4 on the current
+   circuit, including the primitive's state model.
 2. Run §8.2's current-b16 confidential-VM fit/attestation lane so the
    no-protocol-change alternative has evidence rather than a label.
 3. Decide the launch scope: T2-only experiment, optional mainnet path, or the
