@@ -6,8 +6,14 @@
 //!
 //! Hand-rolled HTTP/1.1 over `std::net::TcpStream` — this crate does not
 //! take `ureq`/`hyper`. The pool talks to its own node on the same host.
+//!
+//! **Response framing lives in [`crate::http`]** (lab #626). Read that
+//! module before changing anything below `request`: the version of this
+//! file that treated "everything after `\r\n\r\n`" as the body took the
+//! T2 pool offline for 2 h 32 min the first time a transaction sat in the
+//! node's mempool.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -116,6 +122,11 @@ impl NodeRpcClient {
         s.set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| e.to_string())?;
         let host_hdr = format!("{}:{}", self.host, self.port);
+        // One request per connection: `Connection: close` still asks the
+        // server to tear it down rather than leaving a socket this client
+        // will never reuse. Since #626 the body read no longer DEPENDS on
+        // the server honouring it — `crate::http` stops at the end of the
+        // body whenever the response is self-delimiting.
         match body {
             None => write!(
                 s,
@@ -132,16 +143,19 @@ impl NodeRpcClient {
                 s.write_all(b).map_err(|e| e.to_string())?;
             }
         }
-        let mut raw = Vec::new();
-        s.read_to_end(&mut raw).map_err(|e| e.to_string())?;
-        let sep = raw
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or("HTTP response missing header terminator")?;
-        let head = String::from_utf8_lossy(&raw[..sep]);
-        let status = head.lines().next().unwrap_or_default().to_string();
-        let body = String::from_utf8_lossy(&raw[sep + 4..]).to_string();
-        Ok((status, body))
+        // Lab #626: the framing is READ, not assumed. This used to be a
+        // `read_to_end` plus "everything after `\r\n\r\n` is the body", which
+        // handed `serde_json` the chunk header `2000\r\n…` the moment a
+        // transaction pushed the template past `tiny_http`'s chunking
+        // threshold — one pending transaction, pool offline for 2 h 32 min.
+        //
+        // It also means the read now stops at the end of the BODY. The old
+        // one stopped at EOF, i.e. only because the server closed; against a
+        // keep-alive peer every template poll would have hung to the 30 s
+        // read timeout instead of returning.
+        let resp = crate::http::read_response(&mut s).map_err(|e| e.to_string())?;
+        let body = resp.body_string();
+        Ok((resp.status, body))
     }
 }
 

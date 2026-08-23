@@ -49,6 +49,7 @@ pub mod endpoint;
 pub mod guard;
 pub mod hasher;
 pub mod hexutil;
+pub mod http;
 pub mod jobs;
 pub mod node_rpc;
 pub mod outbox;
@@ -67,6 +68,7 @@ pub use guard::{
     REASON_LINE_TOO_LONG, REASON_PER_IP, REASON_REQUEST_TIMEOUT,
 };
 pub use hasher::{FixedHasher, KeccakShareHasher, ShareHasher};
+pub use http::{read_response, FramingError, Response};
 pub use jobs::{IssuedJob, JobStore};
 pub use node_rpc::{NodeRpcClient, NodeRpcTemplateSource};
 pub use outbox::{JobOutbox, SessionPush};

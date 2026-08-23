@@ -50,3 +50,14 @@ ctrlc = { workspace = true }
 # failure instead of a silent divergence on a value that already burned
 # three blocks' issuance.
 qlab-p2p = { path = "../qlab-p2p" }
+# Lab #626: the pool's HTTP client must be tested against the server that
+# actually broke it. `tests/node_rpc_framing.rs` drives a real `tiny_http`
+# on a loopback port, because a hand-written byte fixture only encodes the
+# author's belief about what the server sends — and in #626 that belief
+# WAS the bug (the fix was written against "chunked above 8192 bytes"; the
+# real default threshold is 32768, and only a live server says so).
+#
+# Dev-dep only: the shipped binary's dependency surface is unchanged, and
+# `tiny_http` is already in this workspace's lock at the same `=0.12.0`
+# pin the five crates that serve HTTP use.
+tiny_http = "=0.12.0"
