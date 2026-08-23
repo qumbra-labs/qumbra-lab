@@ -29,12 +29,11 @@ impl Key {
         self.signing.verifying_key().encode().to_vec()
     }
 
-    pub fn descriptor(&self, tree_context: Hash32, leaf_index: u32) -> AuthDescriptor {
+    pub fn descriptor(&self, leaf_index: u32) -> AuthDescriptor {
         let verifying_key = self.verifying_key_bytes();
-        AuthDescriptor {
-            tree_context,
+        AuthDescriptor::MlDsa44 {
             leaf_index,
-            leaf: mldsa_leaf(&tree_context, leaf_index, &verifying_key),
+            leaf: mldsa_leaf(leaf_index, &verifying_key),
         }
     }
 
@@ -60,12 +59,10 @@ pub fn verify(
     if verifying_key.len() != VERIFYING_KEY_BYTES || signature.len() != SIGNATURE_BYTES {
         return false;
     }
-    if mldsa_leaf(
-        &descriptor.tree_context,
-        descriptor.leaf_index,
-        verifying_key,
-    ) != descriptor.leaf
-    {
+    let AuthDescriptor::MlDsa44 { leaf_index, leaf } = descriptor else {
+        return false;
+    };
+    if mldsa_leaf(*leaf_index, verifying_key) != *leaf {
         return false;
     }
 
@@ -87,9 +84,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stateless_leaf_signs_and_binds_key_context_and_index() {
+    fn stateless_leaf_signs_and_binds_key_and_index_without_a_public_address_tag() {
         let key = Key::from_seed([7u8; 32]);
-        let descriptor = key.descriptor([8u8; 32], 9);
+        let descriptor = key.descriptor(9);
         let digest = [10u8; 32];
         let public = key.verifying_key_bytes();
         let signature = key.sign(&digest);
@@ -101,7 +98,10 @@ mod tests {
         changed[0] ^= 1;
         assert!(!verify(&descriptor, &public, &signature, &changed));
         let mut changed_descriptor = descriptor;
-        changed_descriptor.leaf_index ^= 1;
+        let AuthDescriptor::MlDsa44 { leaf_index, .. } = &mut changed_descriptor else {
+            unreachable!()
+        };
+        *leaf_index ^= 1;
         assert!(!verify(&changed_descriptor, &public, &signature, &digest));
     }
 }

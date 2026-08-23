@@ -31,5 +31,7 @@ The cross-check covers the RFC address encoding, HRS16 private-element
 expansion, WOTS+ chains, checksum, and L-tree compression. This evidence does
 not make the research implementation production cryptography.
 
-The final outer-tree context/root pair separately locks the spike's candidate
-domain-, context- and level-separated Keccak tree; it is not an RFC 8391 value.
+The final outer-tree root separately locks the spike's candidate domain-,
+level- and direction-separated Keccak tree with no public per-address context;
+it is not an RFC 8391 value. The depth-4 ML-DSA rotation order locks the private
+deterministic shuffle-without-replacement helper.

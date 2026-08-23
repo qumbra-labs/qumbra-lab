@@ -22,37 +22,43 @@ rows under the same fixed two-input shape:
 
 | row | state property | exact two-slot auth section | result |
 |---|---|---:|---|
-| FIPS 204 ML-DSA-44 | signature keys are safely reusable; no monotonic counter | 7,608 B | **only row recommended to advance** |
+| FIPS 204 ML-DSA-44 | signature keys are safely reusable; rotation non-reuse is a privacy rule, not a forgery rule | 7,544 B | **only primitive recommended to advance, in a rotation tree** |
 | RFC 8391 `WOTSP-SHA2_256`, stateful index | an OTS index must never be reused | 4,432 B | **blocked:** a valid old backup and two devices can reuse an index |
 | RFC 8391 `WOTSP-SHA2_256`, random index | no journal, but an index collision is catastrophic | 4,432 B | **comparator only:** practical collision bounds are unacceptable |
 
-The recommended next design question is therefore not “ML-DSA or WOTS+.” It
-is which ML-DSA commitment shape Qumbra accepts:
+The primitive and commitment-shape decision is now explicit: advance a
+**rotation tree of ML-DSA leaves** and do not advance depth 0. A depth-0
+verifying key is a public, stable sender-address fingerprint. Because slot 0 is
+always real while a dummy slot-1 key is ephemeral, history also turns reusable
+real keys into a delayed distinguisher between one-real and two-real spends.
+That is a privacy failure even though ML-DSA unforgeability survives key reuse.
 
-- **depth 0 / one reusable leaf per receiving address** is the smallest
-  security baseline. `auth_root == H(pk)`, there is no authorization path, and
-  the candidate AIR remains at 2^18 rows. Reuse does not enable forgery, but it
-  links spends made with the same authorization key;
-- **a rotation tree of ML-DSA leaves** reduces that linkage, but adds two
-  Merkle-path permutations per depth, makes address construction `O(2^D)`, and
-  moves every practical depth to 2^19 rows.
-
-Larry must choose that privacy/complexity tradeoff after mobile measurements
-and independent review. The spike makes neither shape consensus.
+The rotation tree adds two Merkle-path permutations per depth, makes address
+construction `O(2^D)`, and moves every practical depth to 2^19 rows. The spike
+implements a private deterministic shuffle without replacement so public leaf
+indices are neither sequential ordinals nor independent draws that collide.
+Production persistence, restore, and multi-device allocation remain gates. The
+final fixed depth is not guessed here: D12 through D16 require mobile
+measurement before the binding-design correction. Depth 0 remains only a
+valueless mechanics comparator. This spike makes no shape consensus.
 
 ## 2. What was implemented
 
 The research-only [`qlab-remote-auth`](../crates/qlab-remote-auth/) crate
 contains:
 
-- a 436-byte, versioned, fixed-width complete-intent preimage;
+- scheme-fixed 372-byte ML-DSA and 436-byte WOTS+ versioned complete-intent
+  preimages;
 - deterministic FIPS 204 ML-DSA-44 vectors using the workspace's pinned
   `ml-dsa = 0.1.1` implementation;
 - RFC 8391 `WOTSP-SHA2_256` F/H/PRF, addresses, base-w checksum, chains and
   L-tree compression, including the RFC authors' HRS16 key expansion;
 - a strict, no-length-field two-slot authorization-section codec;
-- a domain-, context-, level- and direction-bound outer Keccak tree;
-- an executable hidden-dummy acceptance model;
+- a domain-, level- and direction-bound outer Keccak tree with no public
+  per-address ML-DSA tag;
+- a private ML-DSA leaf permutation without replacement;
+- an executable hidden-dummy acceptance model that requires both slots to
+  exist before phone approval;
 - a checksummed reserve-before-export WOTS+ journal plus executable old-backup
   and two-device failure models;
 - exact birthday-bound and candidate AIR geometry reports; and
@@ -89,12 +95,19 @@ The spike signs `Keccak256(intent_preimage)`, where the fixed-width preimage is:
 || auth_descriptor[0] || auth_descriptor[1]
 ```
 
-Each 68-byte descriptor is `tree_context[32] || leaf_index_le32 || leaf[32]`.
-The scheme tag separates stateless ML-DSA, stateful WOTS+, and random-index
-WOTS+ safety contracts even though the two WOTS+ rows share a primitive.
-Changing any semantic field changes the digest. Adding a future semantic field
-requires a new version; it cannot be appended where an old signer would ignore
-it.
+The descriptor is scheme-fixed:
+
+- ML-DSA uses 36 bytes: `leaf_index_le32 || leaf[32]`. It deliberately carries
+  no public per-address context.
+- WOTS+ uses 68 bytes: `public_seed[32] || leaf_index_le32 || leaf[32]`; the RFC
+  8391 public seed is required for native verification.
+
+The complete preimage is therefore 372 bytes for ML-DSA and 436 bytes for
+WOTS+. The scheme tag separates stateless ML-DSA, stateful WOTS+, and
+random-index WOTS+ safety contracts even though the two WOTS+ rows share a
+primitive. Changing any semantic field changes the digest. Adding a future
+semantic field requires a new version; it cannot be appended where an old
+signer would ignore it.
 
 The spike authorization section begins with fixed magic `QRA1`, version,
 scheme, and slot count. The scheme fixes every later width; decode rejects an
@@ -104,13 +117,13 @@ byte.
 | component | ML-DSA-44 | WOTS+ |
 |---|---:|---:|
 | header | 8 | 8 |
-| descriptor, two slots | 136 | 136 |
+| descriptor, two slots | 72 | 136 |
 | verifying key per slot | 1,312 | 0; recovered 32-byte leaf is in the descriptor |
 | signature per slot | 2,420 | 2,144 |
-| **two-slot total** | **7,608** | **4,432** |
+| **two-slot total** | **7,544** | **4,432** |
 
-The exact delta is 3,176 bytes, not the earlier 3,112-byte paper estimate.
-These are spike-section bytes, not a production transaction-wire decision.
+The exact delta is 3,112 bytes. These are spike-section bytes, not a production
+transaction-wire decision.
 
 A future node's required order is: strict decode; reconstruct the complete
 intent from the actual transaction; require descriptor equality; verify both
@@ -122,21 +135,25 @@ models that order but is deliberately not connected to the current node.
 One candidate note binding extends the existing `ROLE_ARKM` absorb:
 
 ```text
-rkm = Keccak256(nk || D_R || d || auth_root || tree_context || pad10*1)
+rkm = Keccak256(nk || D_R || d || auth_root || pad10*1)
 ```
 
 In the current lane spelling this occupies `nk` lanes 0..3, domain lane 4,
-diversifier lanes 5..6, authorization root lanes 7..10, context lanes 11..14,
-pad start lane 15, and the final rate bit in lane 16. It therefore fits one
-17-lane Keccak rate block. This is spike arithmetic; the binding design spec
-must still fix the exact production field/byte encoding and domain review.
+diversifier lanes 5..6, authorization root lanes 7..10, pad start lane 11, and
+the final rate bit in lane 16. It therefore fits one 17-lane Keccak rate block
+and leaves the former context lanes unused. This is spike arithmetic; the
+binding design spec must still fix the exact production field/byte encoding
+and domain review.
 
-The node derives an ML-DSA leaf as a domain-separated hash of tree context,
-leaf index, and the complete 1,312-byte public key. For WOTS+, native
-verification recovers the RFC L-tree leaf. A future AIR need only fold the
-public leaf through the authorization path and bind its root/context through
-the same hidden note material. It need not verify either signature inside the
-STARK.
+The node derives an ML-DSA leaf as
+`Keccak256(leaf_domain || leaf_index_le32 || verifying_key)`. Outer parents bind
+the node domain, level, left child, and right child, but no public address tag.
+Address separation comes from a unique private per-address derivation master
+and the resulting hidden `auth_root`, not a repeated wire value. For WOTS+,
+native verification recovers the RFC L-tree leaf using its descriptor's public
+seed. A future AIR need only fold the public leaf through the authorization
+path and bind its root through the same hidden note material. It need not
+verify either signature inside the STARK.
 
 Starting from 84 current permutation slots, dropping the two `ROLE_ANK` slots
 and adding two depth-`D` paths gives `82 + 2D` slots:
@@ -167,11 +184,15 @@ note or a zero-value off-tree dummy. The candidate rule preserves that shape:
    dummy condition; and
 5. no public dummy flag is introduced.
 
-The worker may create the dummy slot's ephemeral authorization material. That
-does not grant redirection authority because the non-dummy slot 0 phone key is
-note-bound and signs the complete common intent, including both outputs and
-both authorization descriptors. Removing slot 0's always-real invariant would
-invalidate this rule.
+The phone must create the dummy slot's ephemeral key, descriptor, random path
+material, and hidden root before it constructs and signs the common intent. It
+then signs the same complete intent with both slot keys and only afterwards
+uploads the proving envelope. The worker may not create or replace dummy
+authorization material: both descriptors are part of the digest, and material
+created after phone signing was never approved. The random dummy path need not
+build a full address tree because its sibling nodes can be generated directly;
+its public descriptor remains identically shaped. Removing slot 0's
+always-real invariant would still invalidate this rule.
 
 ## 6. WOTS+ exactness and the state failure
 
@@ -226,37 +247,54 @@ bounds before any new public values or proof growth:
 
 | row | current proof | auth section | proof + auth only |
 |---|---:|---:|---:|
-| ML-DSA-44 | 148,625 | 7,608 | 156,233 B |
+| ML-DSA-44 | 148,625 | 7,544 | 156,169 B |
 | WOTS+ | 148,625 | 4,432 | 153,057 B |
 
 These sums are not predictions of the future proof or full transaction. They
 show that an all-in transport interpretation of the ≤150 KB target is already
 exceeded. The existing regression target is proof-only, and the future proof
-must be remeasured: depth 0 may retain 2^18 height but changes the AIR/public
-surface; practical trees move to 2^19. Proof bytes, full transaction bytes,
-prover RSS/time, and node verification time remain open gates.
+must be remeasured. Depth 0 may retain 2^18 height but fails the selected
+privacy shape; practical trees move to 2^19. Proof bytes, full transaction
+bytes, prover RSS/time, and node verification time remain open gates.
 
 ## 9. Mobile lifecycle and privacy
 
-For ML-DSA, a phone-only master authorization seed can deterministically
-derive address/leaf keys. Depth 0 restores from the seed with no monotonic
-journal. Multiple legitimate devices holding the same seed do not create the
-WOTS+ forgery failure, although duplicate signing, key compromise, and spend
-linkability still require product handling. A rotation tree also restores from
-the seed, but building or caching `2^D` public leaves is an unmeasured address
-creation cost.
+For ML-DSA, a phone-only wallet master derives a unique private master for each
+receiving address, which in turn derives the tree's leaf keys. The candidate
+selector deterministically shuffles all indices from a private address seed
+and consumes them without replacement. Production must reserve before
+exporting a signature and define restore and multi-device allocation; rollback
+or reuse is a privacy failure, not the WOTS+ forgery failure. Building or
+caching `2^D` public leaves remains an unmeasured address-creation cost.
 
 Stateful WOTS+ requires rollback-proof, multi-device-coordinated state that the
 current wallet product does not provide. Random-index WOTS+ removes the journal
 but replaces it with quantified catastrophic collision risk. Neither advances.
 
-Candidate A does not hide the witness from an ordinary remote prover. The
-service can still observe selected notes, values, recipient/discovery material,
-privacy-sensitive `nk`, IP, device identity, timing, and the resulting chain
-event. ML-DSA depth 0 additionally exposes a reusable public key/leaf that can
-link spends. A rotation tree reduces that particular link but not service
-metadata. Candidate B may reduce worker payload visibility; it does not alter
-the authorization ruling.
+Candidate A does not hide the witness from an ordinary remote prover. This
+crate does not serialize a proving envelope, so it cannot yet prove which live
+`WitnessBundle` fields have been removed. The next specification must name at
+least:
+
+- authorization signing seeds: forbidden from the envelope;
+- current `TxInput.sk`: must be removed, but this spike does not implement that
+  removal;
+- `nk`: if present, it is account-global spend-viewing material, so one job is
+  a wallet-level disclosure to that operator and later jobs can link different
+  diversified addresses;
+- `rho`, `rseed`, `d`, Merkle paths, recipient/discovery/rider bytes, amount,
+  change, and internal dummy state: inherited from today's bundle until each is
+  explicitly removed or narrowed; intent hashes prevent rewriting, not
+  observation; and
+- IP, device identity, timing, queue metadata, and the resulting chain event:
+  still visible outside a confidential worker.
+
+Depth 0 would additionally publish a stable verifying-key cluster and the
+delayed dummy-arity distinguisher described in §1, so it is not a production
+option. A rotation tree removes that repeated public address tag when leaves
+are not reused, but it does not remove service metadata or A-only witness
+visibility. Candidate B may reduce worker payload visibility; it does not
+alter the authorization ruling.
 
 ## 10. Verification and remaining gates
 
@@ -265,17 +303,22 @@ Completed locally:
 ```console
 cargo fmt -p qlab-remote-auth
 cargo check -p qlab-remote-auth --all-targets --locked
+cargo clippy -p qlab-remote-auth --all-targets --locked -- -D warnings
+cargo run -q -p qlab-remote-auth --bin qlab-remote-auth-spike -- vector
 ```
 
-The RFC reference signature and leaf comparison was byte-identical. Repository
+The regenerated vector stdout is byte-identical to the committed fixture. The
+RFC reference signature and leaf comparison was byte-identical. Repository
 policy forbids agent sessions from running local `cargo test`, so the written
 unit/integration tests await CI. No mobile or pinned-rig performance number is
 claimed by this document.
 
-Before Phase 2, Larry must decide the ML-DSA depth/linkability shape from this
-spike plus mobile evidence, and Claude Code must independently review the
-immutable PR. Grok's review must cover the A-only witness/metadata boundary and
-the depth-0 linkage tradeoff. Only an accepted result may be translated into a
-dated EN/ZH binding-design correction. AIR, transaction wire/identity, node
-verification, activation, genesis/re-mint, wallet integration, and the prover
-service remain later, separately authorized phases.
+The independent reviews resolve the shape decision: ML-DSA rotation advances;
+depth 0 and both WOTS+ rows do not. Phase 2 remains blocked on D12..D16 mobile
+measurements, a production allocation/restore rule, and accepted re-review of
+this corrected immutable PR by Claude Code for protocol/cryptographic seams
+and Grok for the proving-envelope/privacy boundary. Only then may the result be
+translated into a dated EN/ZH binding-design correction. AIR, transaction
+wire/identity, node verification, activation, genesis/re-mint, wallet
+integration, and the prover service remain later, separately authorized
+phases.

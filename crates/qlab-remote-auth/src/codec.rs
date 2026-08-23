@@ -49,6 +49,11 @@ impl AuthSection {
 
     fn validate_shape(&self) -> Result<(), String> {
         for (index, slot) in self.slots.iter().enumerate() {
+            if !slot.descriptor().matches_scheme(self.scheme) {
+                return Err(format!(
+                    "authorization descriptor {index} does not match the section scheme"
+                ));
+            }
             match (self.scheme, slot) {
                 (
                     Scheme::MlDsa44,
@@ -100,7 +105,7 @@ impl AuthSection {
             Scheme::MlDsa44 => mldsa::VERIFYING_KEY_BYTES + mldsa::SIGNATURE_BYTES,
             Scheme::WotsSha2Stateful | Scheme::WotsSha2RandomIndex => wots::SIGNATURE_BYTES,
         };
-        HEADER_BYTES + INPUT_SLOTS * (AuthDescriptor::ENCODED_BYTES + payload)
+        HEADER_BYTES + INPUT_SLOTS * (AuthDescriptor::encoded_len_for(scheme) + payload)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, String> {
@@ -111,7 +116,7 @@ impl AuthSection {
         out.push(self.scheme as u8);
         out.push(INPUT_SLOTS as u8);
         for slot in &self.slots {
-            encode_descriptor(&mut out, slot.descriptor());
+            encode_descriptor(&mut out, self.scheme, slot.descriptor());
             match slot {
                 Slot::MlDsa44 {
                     verifying_key,
@@ -159,7 +164,7 @@ impl AuthSection {
 
         let mut decoded = Vec::with_capacity(INPUT_SLOTS);
         for _ in 0..INPUT_SLOTS {
-            let descriptor = decode_descriptor(&mut r)?;
+            let descriptor = decode_descriptor(&mut r, scheme)?;
             let slot = match scheme {
                 Scheme::MlDsa44 => Slot::MlDsa44 {
                     descriptor,
@@ -187,6 +192,7 @@ impl AuthSection {
     /// verification.
     pub fn verify_intent(&self, intent: &Intent) -> Result<(), String> {
         self.validate_shape()?;
+        intent.validate_shape()?;
         if self.scheme != intent.scheme {
             return Err("authorization section and intent use different schemes".into());
         }
@@ -218,18 +224,40 @@ impl AuthSection {
     }
 }
 
-fn encode_descriptor(out: &mut Vec<u8>, descriptor: AuthDescriptor) {
-    out.extend_from_slice(&descriptor.tree_context);
-    out.extend_from_slice(&descriptor.leaf_index.to_le_bytes());
-    out.extend_from_slice(&descriptor.leaf);
+fn encode_descriptor(out: &mut Vec<u8>, scheme: Scheme, descriptor: AuthDescriptor) {
+    match (scheme, descriptor) {
+        (Scheme::MlDsa44, AuthDescriptor::MlDsa44 { leaf_index, leaf }) => {
+            out.extend_from_slice(&leaf_index.to_le_bytes());
+            out.extend_from_slice(&leaf);
+        }
+        (
+            Scheme::WotsSha2Stateful | Scheme::WotsSha2RandomIndex,
+            AuthDescriptor::WotsSha2 {
+                public_seed,
+                leaf_index,
+                leaf,
+            },
+        ) => {
+            out.extend_from_slice(&public_seed);
+            out.extend_from_slice(&leaf_index.to_le_bytes());
+            out.extend_from_slice(&leaf);
+        }
+        _ => unreachable!("section shape was validated before encoding"),
+    }
 }
 
-fn decode_descriptor(r: &mut Reader<'_>) -> Result<AuthDescriptor, String> {
-    Ok(AuthDescriptor {
-        tree_context: r.array("tree context")?,
-        leaf_index: u32::from_le_bytes(r.array("leaf index")?),
-        leaf: r.array("authorization leaf")?,
-    })
+fn decode_descriptor(r: &mut Reader<'_>, scheme: Scheme) -> Result<AuthDescriptor, String> {
+    match scheme {
+        Scheme::MlDsa44 => Ok(AuthDescriptor::MlDsa44 {
+            leaf_index: u32::from_le_bytes(r.array("leaf index")?),
+            leaf: r.array("authorization leaf")?,
+        }),
+        Scheme::WotsSha2Stateful | Scheme::WotsSha2RandomIndex => Ok(AuthDescriptor::WotsSha2 {
+            public_seed: r.array("WOTS+ public seed")?,
+            leaf_index: u32::from_le_bytes(r.array("leaf index")?),
+            leaf: r.array("authorization leaf")?,
+        }),
+    }
 }
 
 struct Reader<'a> {
@@ -285,10 +313,7 @@ mod tests {
 
     fn mldsa_fixture() -> (Intent, AuthSection) {
         let keys = [Key::from_seed([1u8; 32]), Key::from_seed([2u8; 32])];
-        let descriptors = [
-            keys[0].descriptor([3u8; 32], 4),
-            keys[1].descriptor([5u8; 32], 6),
-        ];
+        let descriptors = [keys[0].descriptor(4), keys[1].descriptor(6)];
         let intent = fixture_intent(Scheme::MlDsa44, descriptors);
         let digest = intent.digest();
         let slots = std::array::from_fn(|i| Slot::MlDsa44 {
@@ -316,7 +341,7 @@ mod tests {
 
     #[test]
     fn exact_lengths_and_round_trip_are_canonical() {
-        assert_eq!(AuthSection::encoded_len_for(Scheme::MlDsa44), 7_608);
+        assert_eq!(AuthSection::encoded_len_for(Scheme::MlDsa44), 7_544);
         assert_eq!(
             AuthSection::encoded_len_for(Scheme::WotsSha2Stateful),
             4_432
@@ -327,6 +352,7 @@ mod tests {
         );
         let (_, section) = mldsa_fixture();
         let bytes = section.encode().unwrap();
+        assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
         let decoded = AuthSection::decode(&bytes).unwrap();
         assert_eq!(decoded.encode().unwrap(), bytes);
 
@@ -354,7 +380,10 @@ mod tests {
             .contains("invalid"));
 
         let mut changed = intent;
-        changed.auth[0].leaf[0] ^= 1;
+        let AuthDescriptor::MlDsa44 { leaf, .. } = &mut changed.auth[0] else {
+            unreachable!()
+        };
+        leaf[0] ^= 1;
         assert!(section
             .verify_intent(&changed)
             .unwrap_err()

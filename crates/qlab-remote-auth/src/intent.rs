@@ -34,22 +34,83 @@ impl Scheme {
 }
 
 /// Public authorization values that a future AIR would bind to the hidden
-/// note. `tree_context` is the RFC 8391 public seed for WOTS+ and an
-/// address-tree domain salt for ML-DSA. `leaf_index` fixes Merkle directions.
+/// note. ML-DSA deliberately has no public per-address tree context: publishing
+/// one would turn every spend from an address into a linkable cluster. WOTS+
+/// retains its RFC 8391 public seed because native verification requires it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthDescriptor {
-    pub tree_context: Hash32,
-    pub leaf_index: u32,
-    pub leaf: Hash32,
+pub enum AuthDescriptor {
+    MlDsa44 {
+        leaf_index: u32,
+        leaf: Hash32,
+    },
+    WotsSha2 {
+        public_seed: Hash32,
+        leaf_index: u32,
+        leaf: Hash32,
+    },
 }
 
 impl AuthDescriptor {
-    pub const ENCODED_BYTES: usize = 32 + 4 + 32;
+    pub const MLDSA_ENCODED_BYTES: usize = 4 + 32;
+    pub const WOTS_ENCODED_BYTES: usize = 32 + 4 + 32;
 
-    fn encode_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.tree_context);
-        out.extend_from_slice(&self.leaf_index.to_le_bytes());
-        out.extend_from_slice(&self.leaf);
+    pub const fn encoded_len_for(scheme: Scheme) -> usize {
+        match scheme {
+            Scheme::MlDsa44 => Self::MLDSA_ENCODED_BYTES,
+            Scheme::WotsSha2Stateful | Scheme::WotsSha2RandomIndex => Self::WOTS_ENCODED_BYTES,
+        }
+    }
+
+    pub const fn matches_scheme(self, scheme: Scheme) -> bool {
+        matches!(
+            (scheme, self),
+            (Scheme::MlDsa44, Self::MlDsa44 { .. })
+                | (
+                    Scheme::WotsSha2Stateful | Scheme::WotsSha2RandomIndex,
+                    Self::WotsSha2 { .. }
+                )
+        )
+    }
+
+    pub const fn leaf_index(self) -> u32 {
+        match self {
+            Self::MlDsa44 { leaf_index, .. } | Self::WotsSha2 { leaf_index, .. } => leaf_index,
+        }
+    }
+
+    pub const fn leaf(self) -> Hash32 {
+        match self {
+            Self::MlDsa44 { leaf, .. } | Self::WotsSha2 { leaf, .. } => leaf,
+        }
+    }
+
+    pub const fn public_seed(self) -> Option<Hash32> {
+        match self {
+            Self::MlDsa44 { .. } => None,
+            Self::WotsSha2 { public_seed, .. } => Some(public_seed),
+        }
+    }
+
+    fn encode_into(&self, scheme: Scheme, out: &mut Vec<u8>) {
+        match (scheme, self) {
+            (Scheme::MlDsa44, Self::MlDsa44 { leaf_index, leaf }) => {
+                out.extend_from_slice(&leaf_index.to_le_bytes());
+                out.extend_from_slice(leaf);
+            }
+            (
+                Scheme::WotsSha2Stateful | Scheme::WotsSha2RandomIndex,
+                Self::WotsSha2 {
+                    public_seed,
+                    leaf_index,
+                    leaf,
+                },
+            ) => {
+                out.extend_from_slice(public_seed);
+                out.extend_from_slice(&leaf_index.to_le_bytes());
+                out.extend_from_slice(leaf);
+            }
+            _ => panic!("authorization descriptor does not match intent scheme"),
+        }
     }
 }
 
@@ -71,22 +132,29 @@ pub struct Intent {
 }
 
 impl Intent {
-    pub const ENCODED_BYTES: usize = INTENT_DOMAIN.len()
-        + 2
-        + 4
-        + 32
-        + 32
-        + (32 * INPUT_SLOTS)
-        + (32 * 2)
-        + 1
-        + 8
-        + 32
-        + 32
-        + 1
-        + (AuthDescriptor::ENCODED_BYTES * INPUT_SLOTS);
+    const BASE_ENCODED_BYTES: usize =
+        INTENT_DOMAIN.len() + 2 + 4 + 32 + 32 + (32 * INPUT_SLOTS) + (32 * 2) + 1 + 8 + 32 + 32 + 1;
+
+    pub const fn encoded_len_for(scheme: Scheme) -> usize {
+        Self::BASE_ENCODED_BYTES + (AuthDescriptor::encoded_len_for(scheme) * INPUT_SLOTS)
+    }
+
+    pub fn validate_shape(&self) -> Result<(), String> {
+        for (index, descriptor) in self.auth.iter().enumerate() {
+            if !descriptor.matches_scheme(self.scheme) {
+                return Err(format!(
+                    "authorization descriptor {index} does not match the intent scheme"
+                ));
+            }
+        }
+        Ok(())
+    }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::ENCODED_BYTES);
+        self.validate_shape()
+            .expect("fixture intent descriptors match their scheme");
+        let encoded_len = Self::encoded_len_for(self.scheme);
+        let mut out = Vec::with_capacity(encoded_len);
         out.extend_from_slice(INTENT_DOMAIN);
         out.extend_from_slice(&INTENT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.genesis_format.to_le_bytes());
@@ -104,9 +172,9 @@ impl Intent {
         out.extend_from_slice(&self.rider_hash);
         out.push(self.scheme as u8);
         for descriptor in &self.auth {
-            descriptor.encode_into(&mut out);
+            descriptor.encode_into(self.scheme, &mut out);
         }
-        assert_eq!(out.len(), Self::ENCODED_BYTES);
+        assert_eq!(out.len(), encoded_len);
         out
     }
 
@@ -136,9 +204,16 @@ pub fn fixture_intent(scheme: Scheme, auth: [AuthDescriptor; 2]) -> Intent {
 mod tests {
     use super::*;
 
-    fn descriptor(byte: u8, index: u32) -> AuthDescriptor {
-        AuthDescriptor {
-            tree_context: [byte; 32],
+    fn mldsa_descriptor(byte: u8, index: u32) -> AuthDescriptor {
+        AuthDescriptor::MlDsa44 {
+            leaf_index: index,
+            leaf: [byte; 32],
+        }
+    }
+
+    fn wots_descriptor(byte: u8, index: u32) -> AuthDescriptor {
+        AuthDescriptor::WotsSha2 {
+            public_seed: [byte; 32],
             leaf_index: index,
             leaf: [byte + 1; 32],
         }
@@ -148,19 +223,33 @@ mod tests {
     fn intent_is_fixed_width_and_stable() {
         let intent = fixture_intent(
             Scheme::MlDsa44,
-            [descriptor(0x71, 0x1122_3344), descriptor(0x81, 0x5566_7788)],
+            [
+                mldsa_descriptor(0x72, 0x1122_3344),
+                mldsa_descriptor(0x82, 0x5566_7788),
+            ],
         );
-        assert_eq!(intent.encode().len(), Intent::ENCODED_BYTES);
-        assert_eq!(Intent::ENCODED_BYTES, 436);
+        assert_eq!(intent.encode().len(), 372);
+        assert_eq!(Intent::encoded_len_for(Scheme::MlDsa44), 372);
+        assert_eq!(Intent::encoded_len_for(Scheme::WotsSha2Stateful), 436);
+        assert_eq!(intent.auth[0].public_seed(), None);
         assert_eq!(
             crate::hex(&intent.digest()),
-            "0ae629a6f6f13bd24a44806ec9607a3e1ae849c7ae5c862449c674780a58d30c"
+            "6faad91acc3904617f82f1c6ae219d8221914eaaf64c8da6be57907fec49f186"
         );
+
+        let invalid = fixture_intent(
+            Scheme::MlDsa44,
+            [wots_descriptor(0x71, 7), wots_descriptor(0x81, 9)],
+        );
+        assert!(invalid.validate_shape().is_err());
     }
 
     #[test]
     fn every_semantic_field_changes_the_digest() {
-        let base = fixture_intent(Scheme::MlDsa44, [descriptor(0x71, 7), descriptor(0x81, 9)]);
+        let base = fixture_intent(
+            Scheme::MlDsa44,
+            [mldsa_descriptor(0x72, 7), mldsa_descriptor(0x82, 9)],
+        );
         let expected = base.digest();
         let mut variants = Vec::new();
 
@@ -199,24 +288,31 @@ mod tests {
         variants.push(v);
         let mut v = base.clone();
         v.scheme = Scheme::WotsSha2Stateful;
+        v.auth = [wots_descriptor(0x71, 7), wots_descriptor(0x81, 9)];
         variants.push(v);
         let mut v = base.clone();
-        v.auth[0].tree_context[0] ^= 1;
+        let AuthDescriptor::MlDsa44 { leaf_index, .. } = &mut v.auth[0] else {
+            unreachable!()
+        };
+        *leaf_index ^= 1;
         variants.push(v);
         let mut v = base.clone();
-        v.auth[0].leaf_index ^= 1;
+        let AuthDescriptor::MlDsa44 { leaf, .. } = &mut v.auth[0] else {
+            unreachable!()
+        };
+        leaf[0] ^= 1;
         variants.push(v);
         let mut v = base.clone();
-        v.auth[0].leaf[0] ^= 1;
+        let AuthDescriptor::MlDsa44 { leaf_index, .. } = &mut v.auth[1] else {
+            unreachable!()
+        };
+        *leaf_index ^= 1;
         variants.push(v);
         let mut v = base.clone();
-        v.auth[1].tree_context[0] ^= 1;
-        variants.push(v);
-        let mut v = base.clone();
-        v.auth[1].leaf_index ^= 1;
-        variants.push(v);
-        let mut v = base.clone();
-        v.auth[1].leaf[0] ^= 1;
+        let AuthDescriptor::MlDsa44 { leaf, .. } = &mut v.auth[1] else {
+            unreachable!()
+        };
+        leaf[0] ^= 1;
         variants.push(v);
 
         for (i, variant) in variants.iter().enumerate() {

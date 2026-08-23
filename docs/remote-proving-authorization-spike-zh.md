@@ -19,35 +19,37 @@ Spike 在相同的固定双输入形状和同一 complete intent 下实现、比
 
 | 方案 | 状态属性 | 精确的双 slot auth section | 结果 |
 |---|---|---:|---|
-| FIPS 204 ML-DSA-44 | 签名 key 可安全复用；不需要单调 counter | 7,608 B | **唯一建议继续推进的方案** |
+| FIPS 204 ML-DSA-44 | 签名 key 可安全复用；rotation 不复用是隐私规则，不是防伪造规则 | 7,544 B | **唯一建议推进的 primitive，且必须放入 rotation tree** |
 | RFC 8391 `WOTSP-SHA2_256`，stateful index | OTS index 绝不能复用 | 4,432 B | **阻塞：**有效旧备份和两台设备都会复用 index |
 | RFC 8391 `WOTSP-SHA2_256`，random index | 不需要 journal，但 index 碰撞是灾难性的 | 4,432 B | **只保留作 comparator：**实际碰撞界不可接受 |
 
-所以下一个应该裁决的问题不再是“ML-DSA 还是 WOTS+”，而是 Qumbra 接受哪种
-ML-DSA commitment 形状：
+Primitive 和 commitment 形状的决定现在已经明确：推进 **ML-DSA leaf rotation
+tree**，不推进 depth 0。Depth-0 verifying key 是公开、稳定的 sender-address
+fingerprint。由于 slot 0 永远是真实输入，而 dummy slot-1 key 是 ephemeral，历史记录
+还会把可复用真实 key 变成一种延迟出现的 distinguisher，用于区分单真实输入与双真实
+输入 spend。即使 ML-DSA key 复用不会破坏 unforgeability，这仍然是隐私失败。
 
-- **depth 0／每个收款地址一个可复用 leaf** 是最小的安全基线。此时
-  `auth_root == H(pk)`，没有授权路径，候选 AIR 保持在 2^18 rows。复用不会让
-  attacker 伪造签名，但会关联使用同一 authorization key 的多次 spend；
-- **ML-DSA leaf rotation tree** 可以减少这种关联，但每一层要增加两个 Merkle
-  path permutation，建地址成本为 `O(2^D)`，任何实用 depth 都会把 trace 提升到
-  2^19 rows。
-
-Larry 需要在手机实测和独立 review 后裁决这个隐私／复杂度 tradeoff。Spike
-没有把任一形状变成共识规则。
+Rotation tree 每层增加两个 Merkle-path permutation，建地址成本为 `O(2^D)`，并让
+任何实用 depth 都进入 2^19 rows。Spike 实现了私有、deterministic、without-
+replacement 的 shuffle，因此公开 leaf index 既不是顺序 ordinal，也不是会碰撞的
+独立随机抽样。生产环境的持久化、恢复和多设备分配仍是 gate。这里不会猜最终固定
+depth：D12 到 D16 必须先完成手机实测，再写 binding-design correction。Depth 0
+只保留为无资产 mechanics comparator。本 spike 不会把任何形状变成共识规则。
 
 ## 2. 已实现内容
 
 仅用于研究的 [`qlab-remote-auth`](../crates/qlab-remote-auth/) crate 包含：
 
-- 436 字节、带版本、固定宽度的 complete-intent preimage；
+- scheme 固定宽度的 complete-intent preimage：ML-DSA 为 372 字节、WOTS+ 为
+  436 字节；
 - 使用 workspace 已 pin 的 `ml-dsa = 0.1.1` 生成的 deterministic FIPS 204
   ML-DSA-44 vectors；
 - RFC 8391 `WOTSP-SHA2_256` 的 F/H/PRF、address、base-w checksum、chain、
   L-tree compression，以及 RFC 作者采用的 HRS16 key expansion；
 - 无 length field、严格固定双 slot 的 authorization-section codec；
-- 绑定 domain、context、level 和左右方向的外层 Keccak tree；
-- 可执行的 hidden-dummy 接受模型；
+- 绑定 domain、level 和左右方向、但没有公开 ML-DSA 地址标签的外层 Keccak tree；
+- 不放回抽样的私有 ML-DSA leaf permutation；
+- 要求两个 slot 都在手机批准前已存在的可执行 hidden-dummy 接受模型；
 - 带 checksum、先持久化再导出 index 的 WOTS+ journal，以及可执行的旧备份／
   双设备失败模型；
 - 精确的 birthday bound 和候选 AIR geometry 报告；
@@ -84,11 +86,17 @@ Spike 签名的是 `Keccak256(intent_preimage)`；固定宽度 preimage 为：
 || auth_descriptor[0] || auth_descriptor[1]
 ```
 
-每个 68 字节 descriptor 是
-`tree_context[32] || leaf_index_le32 || leaf[32]`。Scheme tag 将 stateless
-ML-DSA、stateful WOTS+ 和 random-index WOTS+ 的安全契约隔离开，即使两种
-WOTS+ 使用同一个 primitive。任何语义字段变化都会改变 digest。未来新增语义
-字段必须升级版本，不能追加到旧 signer 会忽略的位置。
+Descriptor 的宽度由 scheme 固定：
+
+- ML-DSA 为 36 字节：`leaf_index_le32 || leaf[32]`；它有意不携带公开的
+  per-address context。
+- WOTS+ 为 68 字节：`public_seed[32] || leaf_index_le32 || leaf[32]`；native
+  verification 需要 RFC 8391 public seed。
+
+因此 complete preimage 对 ML-DSA 是 372 字节，对 WOTS+ 是 436 字节。Scheme tag
+将 stateless ML-DSA、stateful WOTS+ 和 random-index WOTS+ 的安全契约隔离开，
+即使两种 WOTS+ 使用同一个 primitive。任何语义字段变化都会改变 digest。未来新增
+语义字段必须升级版本，不能追加到旧 signer 会忽略的位置。
 
 Spike authorization section 以固定 magic `QRA1`、version、scheme、slot count
 开头。Scheme 决定其后所有字段宽度；decoder 会拒绝未知 scheme、错误 slot 数、
@@ -97,13 +105,12 @@ Spike authorization section 以固定 magic `QRA1`、version、scheme、slot cou
 | 组件 | ML-DSA-44 | WOTS+ |
 |---|---:|---:|
 | header | 8 | 8 |
-| 两个 slot 的 descriptor | 136 | 136 |
+| 两个 slot 的 descriptor | 72 | 136 |
 | 每 slot verifying key | 1,312 | 0；恢复出的 32-byte leaf 已在 descriptor 中 |
 | 每 slot signature | 2,420 | 2,144 |
-| **双 slot 总计** | **7,608** | **4,432** |
+| **双 slot 总计** | **7,544** | **4,432** |
 
-精确差值是 3,176 字节，而不是早期 3,112 字节的纸面估算。这些是 spike
-section bytes，不是生产交易 wire 的决定。
+精确差值是 3,112 字节。这些是 spike section bytes，不是生产交易 wire 的决定。
 
 未来 node 的强制顺序应是：严格 decode；从真实交易重建 complete intent；要求
 descriptor 完全相等；验证两份手机授权；最后才投入 STARK verification 成本。
@@ -114,19 +121,22 @@ Crate 模拟了这个顺序，但有意没有接入当前 node。
 一种候选 note binding 是扩展现有 `ROLE_ARKM` absorb：
 
 ```text
-rkm = Keccak256(nk || D_R || d || auth_root || tree_context || pad10*1)
+rkm = Keccak256(nk || D_R || d || auth_root || pad10*1)
 ```
 
 按当前 lane 写法，`nk` 占 lanes 0..3，domain 占 lane 4，diversifier 占
-lanes 5..6，authorization root 占 lanes 7..10，context 占 lanes 11..14，
-pad start 在 lane 15，rate 最终 bit 在 lane 16。因此它可以放进一个 17-lane
-Keccak rate block。这只是 spike 算术；binding design spec 仍须确定生产使用的
+lanes 5..6，authorization root 占 lanes 7..10，pad start 在 lane 11，rate 最终
+bit 在 lane 16。因此它可以放进一个 17-lane Keccak rate block，并让原 context
+lanes 保持空闲。这只是 spike 算术；binding design spec 仍须确定生产使用的
 field/byte encoding，并完成 domain review。
 
-Node 对 ML-DSA leaf 的计算是完整 1,312-byte public key、tree context 和 leaf
-index 的 domain-separated hash。对 WOTS+，native verification 会恢复 RFC L-tree
-leaf。未来 AIR 只需把 public leaf 沿授权路径折叠，并通过同一份 hidden note
-material 绑定 root/context；不需要在 STARK 内验证任一签名。
+Node 对 ML-DSA leaf 的计算是
+`Keccak256(leaf_domain || leaf_index_le32 || verifying_key)`。外层 parent 绑定 node
+domain、level、left child 和 right child，但不包含公开地址标签。地址隔离来自每个
+收款地址唯一的私有 derivation master 和由此生成、隐藏的 `auth_root`，而不是重复
+出现的 wire value。对 WOTS+，native verification 使用 descriptor 中的 public seed
+恢复 RFC L-tree leaf。未来 AIR 只需把 public leaf 沿授权路径折叠，并通过同一份
+hidden note material 绑定 root；不需要在 STARK 内验证任一签名。
 
 从当前 84 个 permutation slot 出发，删掉两个 `ROLE_ANK`，再加入两个 depth-`D`
 路径，得到 `82 + 2D` slots：
@@ -155,10 +165,13 @@ public-value bank、quotient degree、proof size、RSS 或 proving time 的变�
 4. 单真实输入时，slot 1 改为证明现有 hidden zero-value dummy 条件；
 5. 不新增 public dummy flag。
 
-Worker 可以生成 dummy slot 的 ephemeral authorization material。这不会给予它
-重定向权，因为非 dummy 的 slot 0 手机 key 与真实 note 绑定，而且签名完整的
-common intent，其中包括两个 output 和两个 authorization descriptor。如果删掉
-“slot 0 永远真实”这个 invariant，本规则就不再成立。
+手机必须先生成 dummy slot 的 ephemeral key、descriptor、随机 path material 和
+hidden root，再构造并签名 common intent。手机用两个 slot key 签署同一个完整
+intent，之后才上传 proving envelope。Worker 不得生成或替换 dummy authorization
+material：两个 descriptor 都在 digest 内，手机签名之后才创建的材料从未获得批准。
+Dummy 的随机 path 可以直接生成 sibling node，不需要构造完整地址树；其 public
+descriptor 仍保持完全相同的形状。如果删掉“slot 0 永远真实”这个 invariant，本规则
+仍会失效。
 
 ## 6. WOTS+ 的精确性和状态失败
 
@@ -207,31 +220,44 @@ authorization section，尚未计入新 public value 和 proof 增长时，下�
 
 | 方案 | 当前 proof | auth section | 仅 proof + auth |
 |---|---:|---:|---:|
-| ML-DSA-44 | 148,625 | 7,608 | 156,233 B |
+| ML-DSA-44 | 148,625 | 7,544 | 156,169 B |
 | WOTS+ | 148,625 | 4,432 | 153,057 B |
 
 这些和数既不是未来 proof，也不是完整交易的预测；它们说明如果把 ≤150 KB
 解释为全量 transport artifact，目标已经超出。现有 regression target 只针对
-proof，未来 proof 仍必须重新测量：depth 0 可能保持 2^18 height，但仍会改变
-AIR/public surface；实用 tree 会升到 2^19。Proof bytes、完整 transaction bytes、
-prover RSS/time 和 node verification time 都仍是 open gate。
+proof，未来 proof 仍必须重新测量。Depth 0 可能保持 2^18 height，但不满足已经选择
+的隐私形状；实用 tree 会升到 2^19。Proof bytes、完整 transaction bytes、prover
+RSS/time 和 node verification time 都仍是 open gate。
 
 ## 9. 手机生命周期与隐私
 
-对 ML-DSA，手机持有的 master authorization seed 可以 deterministic 地派生
-address/leaf key。Depth 0 可只靠 seed 恢复，不需要 monotonic journal。多台合法
-设备持有同一 seed 不会制造 WOTS+ 的伪造失败，但 duplicate signing、key compromise
-和 spend linkability 仍需要产品规则。Rotation tree 同样可从 seed 恢复，但创建
-或缓存 `2^D` public leaves 的地址构建成本尚未实测。
+对 ML-DSA，手机持有的 wallet master 为每个收款地址派生唯一的私有 master，再由
+后者派生整棵树的 leaf key。候选 selector 用私有 address seed 对所有 index 做
+deterministic shuffle，并以不放回方式消耗。生产实现必须在导出签名前 reserve，且
+定义恢复和多设备分配；rollback 或复用是隐私失败，但不是 WOTS+ 那种伪造失败。
+创建或缓存 `2^D` public leaves 的地址构建成本仍未实测。
 
 Stateful WOTS+ 要求当前 wallet 产品并不具备的 rollback-proof、跨设备协调状态。
 Random-index WOTS+ 不需要 journal，却换成了有明确数值的灾难性碰撞风险。两者都
 不推进。
 
-Candidate A 不会向普通 remote prover 隐藏 witness。Service 仍可观察 selected
-notes、value、recipient/discovery material、隐私敏感的 `nk`、IP、device identity、
-timing 和对应的链上事件。ML-DSA depth 0 还会公开可复用 public key/leaf，从而关联
-spend。Rotation tree 只减少这一种关联，不会消除 service metadata。Candidate B
+Candidate A 不会向普通 remote prover 隐藏 witness。本 crate 不会序列化 proving
+envelope，因此目前无法证明 live `WitnessBundle` 中哪些字段已经移除。下一份规格至少
+必须明确：
+
+- authorization signing seed：禁止进入 envelope；
+- 当前的 `TxInput.sk`：必须移除，但本 spike 尚未实现该移除；
+- `nk`：如果存在，它是 account-global spend-viewing material，因此一次 job 就是对
+  该 operator 的 wallet-level disclosure，后续 job 还能关联不同 diversified address；
+- `rho`、`rseed`、`d`、Merkle path、recipient/discovery/rider bytes、amount、change
+  和内部 dummy state：在逐项明确移除或缩窄之前，视为继承自当前 bundle；intent hash
+  能防止改写，不能阻止观察；
+- IP、device identity、timing、queue metadata 和对应链上事件：在 confidential
+  worker 外仍然可见。
+
+Depth 0 还会公开稳定 verifying-key cluster，以及 §1 所述的延迟 dummy-arity
+distinguisher，因此不能进入生产。Rotation tree 在不复用 leaf 时可以移除这种重复的
+公开地址标签，但不会消除 service metadata 或 A-only witness 可见性。Candidate B
 可以减少 worker 对 payload 的可见性，但不会改变授权裁决。
 
 ## 10. 验证与剩余 gate
@@ -241,15 +267,18 @@ spend。Rotation tree 只减少这一种关联，不会消除 service metadata�
 ```console
 cargo fmt -p qlab-remote-auth
 cargo check -p qlab-remote-auth --all-targets --locked
+cargo clippy -p qlab-remote-auth --all-targets --locked -- -D warnings
+cargo run -q -p qlab-remote-auth --bin qlab-remote-auth-spike -- vector
 ```
 
-RFC reference signature 和 leaf 的比较逐字节一致。Repo policy 禁止 agent session
-在本地运行 `cargo test`，所以已经写好的 unit/integration tests 等待 CI。本文不声称
-任何手机或 pinned-rig 性能数字。
+重新生成的 vector stdout 与已提交 fixture 逐字节一致。RFC reference signature 和
+leaf 的比较也逐字节一致。Repo policy 禁止 agent session 在本地运行 `cargo test`，
+所以已经写好的 unit/integration tests 等待 CI。本文不声称任何手机或 pinned-rig
+性能数字。
 
-进入 Phase 2 前，Larry 必须结合本 spike、手机 evidence 裁决 ML-DSA depth／
-linkability 形状；Claude Code 必须独立 review immutable PR。Grok 的 review 必须
-覆盖 A-only witness/metadata 边界和 depth-0 linkability tradeoff。只有接受后的结果
-才能写入带日期的中英文 binding-design correction。AIR、交易 wire/identity、node
-verification、activation、genesis/re-mint、wallet integration 和 prover service
-仍属于后续分别授权的 phase。
+独立 review 已解决形状选择：推进 ML-DSA rotation；不推进 depth 0 和两种 WOTS+。
+Phase 2 仍被 D12..D16 手机实测、生产 allocation/restore 规则，以及修正版 immutable
+PR 的独立复审所阻塞：Claude Code 复审协议／密码学 seam，Grok 复审 proving-envelope／
+隐私边界。只有全部接受后，结果才能写入带日期的中英文 binding-design correction。
+AIR、交易 wire/identity、node verification、activation、genesis/re-mint、wallet
+integration 和 prover service 仍属于后续分别授权的 phase。

@@ -6,6 +6,7 @@ use qlab_remote_auth::{
     intent::{fixture_intent, AuthDescriptor, Intent, Scheme},
     keccak256,
     mldsa::{self, Key as MlDsaKey},
+    rotation,
     state::{birthday_bound, multi_target_birthday_bound, MAX_TREE_DEPTH},
     tree, wots, Hash32,
 };
@@ -53,17 +54,19 @@ fn parse_number(args: &[String], flag: &str, default: usize) -> Result<usize, St
 
 fn report() -> Result<(), String> {
     println!("remote proving authorization spike — research only (lab #630)");
-    println!("intent_preimage_bytes={}", Intent::ENCODED_BYTES);
+    println!(
+        "intent_preimage_bytes mldsa44={} wotsp_sha2_256={}",
+        Intent::encoded_len_for(Scheme::MlDsa44),
+        Intent::encoded_len_for(Scheme::WotsSha2Stateful)
+    );
     let stable_intent = fixture_intent(
         Scheme::MlDsa44,
         [
-            AuthDescriptor {
-                tree_context: [0x71; 32],
+            AuthDescriptor::MlDsa44 {
                 leaf_index: 0x1122_3344,
                 leaf: [0x72; 32],
             },
-            AuthDescriptor {
-                tree_context: [0x81; 32],
+            AuthDescriptor::MlDsa44 {
                 leaf_index: 0x5566_7788,
                 leaf: [0x82; 32],
             },
@@ -115,9 +118,11 @@ fn report() -> Result<(), String> {
     }
     println!("stateful_wots_verdict=blocked_by_old-backup_and-multi-device-index-reuse");
     println!("random_wots_verdict=collision-is-catastrophic; comparator-only; not-SLH-DSA");
+    println!("mldsa44_verdict=advance-rotation-tree-only; depth0-fails-public-unlinkability");
     println!(
-        "mldsa44_verdict=stateless-reuse-preserves-unforgeability; reuse leaks-linkability-only"
+        "mldsa44_rotation_selector=private-keccak-shuffle-without-replacement; persistence-and-multi-device-are-open-gates"
     );
+    println!("mldsa44_rotation_depth=unselected; measure-12-through-16-before-binding");
     Ok(())
 }
 
@@ -126,10 +131,7 @@ fn mldsa_fixture() -> (Intent, AuthSection) {
         MlDsaKey::from_seed([1u8; 32]),
         MlDsaKey::from_seed([2u8; 32]),
     ];
-    let descriptors = [
-        keys[0].descriptor([0xa1; 32], 7),
-        keys[1].descriptor([0xa2; 32], 11),
-    ];
+    let descriptors = [keys[0].descriptor(7), keys[1].descriptor(11)];
     let intent = fixture_intent(Scheme::MlDsa44, descriptors);
     let digest = intent.digest();
     let slots = std::array::from_fn(|i| Slot::MlDsa44 {
@@ -179,9 +181,9 @@ fn vector() -> Result<(), String> {
         &reference_public,
         reference_index,
     );
-    let outer_context = [0xd1; 32];
     let outer_leaves = [[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]];
-    let outer_root = tree::root(outer_leaves.to_vec(), &outer_context)?;
+    let outer_root = tree::root(outer_leaves.to_vec())?;
+    let rotation_order = rotation::selection_order(&[0xd1; 32], 4)?;
 
     println!("format=qlab-remote-auth-vector-v1");
     println!("material=synthetic-public-test-vector-never-use-as-secret");
@@ -198,13 +200,20 @@ fn vector() -> Result<(), String> {
     println!("reference_wots_public_seed={}", hex(&reference_public));
     println!("reference_wots_message={}", hex(&reference_message));
     println!("reference_wots_index={reference_index}");
-    println!("reference_wots_leaf={}", hex(&reference_descriptor.leaf));
+    println!("reference_wots_leaf={}", hex(&reference_descriptor.leaf()));
     println!(
         "reference_wots_signature={}",
         hex(&reference_signature.encode())
     );
-    println!("reference_outer_tree_context={}", hex(&outer_context));
     println!("reference_outer_tree_root={}", hex(&outer_root));
+    println!(
+        "reference_mldsa_rotation_order_depth4={}",
+        rotation_order
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     Ok(())
 }
 
@@ -220,7 +229,7 @@ fn measure(iterations: usize) -> Result<(), String> {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
         let key = MlDsaKey::from_seed(seed);
-        let descriptor = key.descriptor([0x44; 32], i as u32);
+        let descriptor = key.descriptor(i as u32);
         black_box(&descriptor);
         mldsa_material.push((key, descriptor));
     }
@@ -295,24 +304,26 @@ fn measure_address(candidate: &str, depth: u8) -> Result<(), String> {
         return Err("WOTS+ needs a non-empty one-time-key tree".into());
     }
     let count = 1usize << depth;
-    let context = [0x42u8; 32];
-    let master = [0x24u8; 32];
+    let public_seed = [0x42u8; 32];
+    // Synthetic stand-in for a unique private per-address master. Production
+    // derivation must not reuse one master across receiving addresses.
+    let address_master = [0x24u8; 32];
     let start = Instant::now();
     let leaves: Vec<Hash32> = match candidate {
         "mldsa" => (0..count)
             .map(|index| {
-                let key = MlDsaKey::from_seed(derive_mldsa_seed(&master, index as u32));
-                key.descriptor(context, index as u32).leaf
+                let key = MlDsaKey::from_seed(derive_mldsa_seed(&address_master, index as u32));
+                key.descriptor(index as u32).leaf()
             })
             .collect(),
         "wots" => (0..count)
-            .map(|index| wots::leaf(&master, &context, index as u32))
+            .map(|index| wots::leaf(&address_master, &public_seed, index as u32))
             .collect(),
         _ => return Err("address candidate must be mldsa or wots".into()),
     };
     let leaves_elapsed = start.elapsed();
     let start = Instant::now();
-    let root = tree::root(leaves, &context)?;
+    let root = tree::root(leaves)?;
     let tree_elapsed = start.elapsed();
     println!("candidate={candidate} depth={depth} leaves={count}");
     println!("leaf_generation_secs={:.6}", leaves_elapsed.as_secs_f64());

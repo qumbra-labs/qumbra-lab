@@ -13,6 +13,7 @@
 pub mod codec;
 pub mod intent;
 pub mod mldsa;
+pub mod rotation;
 pub mod shape;
 pub mod state;
 pub mod tree;

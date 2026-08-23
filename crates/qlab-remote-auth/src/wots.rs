@@ -296,8 +296,8 @@ pub fn leaf(secret_seed: &Hash32, public_seed: &Hash32, leaf_index: u32) -> Hash
 }
 
 pub fn descriptor(secret_seed: &Hash32, public_seed: Hash32, leaf_index: u32) -> AuthDescriptor {
-    AuthDescriptor {
-        tree_context: public_seed,
+    AuthDescriptor::WotsSha2 {
+        public_seed,
         leaf_index,
         leaf: leaf(secret_seed, &public_seed, leaf_index),
     }
@@ -335,15 +335,18 @@ pub fn leaf_from_signature(
 }
 
 pub fn verify(descriptor: &AuthDescriptor, signature: &[u8], message: &Hash32) -> bool {
+    let AuthDescriptor::WotsSha2 {
+        public_seed,
+        leaf_index,
+        leaf,
+    } = descriptor
+    else {
+        return false;
+    };
     let Some(signature) = Signature::decode(signature) else {
         return false;
     };
-    leaf_from_signature(
-        message,
-        &signature,
-        &descriptor.tree_context,
-        descriptor.leaf_index,
-    ) == descriptor.leaf
+    leaf_from_signature(message, &signature, public_seed, *leaf_index) == *leaf
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,7 +412,10 @@ mod tests {
         changed[0] ^= 1;
         assert!(!verify(&descriptor, &signature, &changed));
         let mut changed_descriptor = descriptor;
-        changed_descriptor.leaf_index ^= 1;
+        let AuthDescriptor::WotsSha2 { leaf_index, .. } = &mut changed_descriptor else {
+            unreachable!()
+        };
+        *leaf_index ^= 1;
         assert!(!verify(&changed_descriptor, &signature, &message));
     }
 }
