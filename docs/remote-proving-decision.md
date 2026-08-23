@@ -1,13 +1,10 @@
 # Remote proving — current decision record
 
-**Status: CURRENT DECISION, NOT IMPLEMENTATION APPROVAL. The product and
-security constraints below are decided; the authorization primitive and
-confidential-compute route are not. No public prover may carry real value until
-one candidate clears the launch gates in §8.** A recorded A-versus-B
-recommendation lives in
-[`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md). It is not
-ratification; the "route not selected" below stands until this record is
-amended.
+**Status: CURRENT DECISION, NOT IMPLEMENTATION APPROVAL. Candidate A is the
+mandatory real-value security basis; its authorization primitive remains
+unselected. Candidate B is optional defense-in-depth, not a funds-safety trust
+root. No public prover may carry real value until A clears the applicable
+launch gates in §8.**
 Paired with
 [`remote-proving-decision-zh.md`](remote-proving-decision-zh.md).
 
@@ -16,20 +13,23 @@ This is the authoritative entry point for remote proving in `qumbra-lab`.
 Earlier documents remain the evidence and design record; §10 says how to read
 them.
 
+The dated route selection is recorded separately in
+[`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md).
+
 This decision does not silently amend Qumbra's binding design specification.
-Selecting protocol-level authorization would require a dated design-repo
-correction to the current "one monolithic STARK; no per-spend signatures"
-decision before implementation.
+Implementing the selected protocol-level authorization requires a dated
+design-repo correction to the current "one monolithic STARK; no per-spend
+signatures" decision before implementation.
 
 ---
 
 ## 1. Decision in one sentence
 
 Qumbra may pursue one shared logical prover service for all supported phones,
-but it must not ship the current trusted `WitnessBundle` handoff for real value:
-launch requires either consensus-bound phone-held authorization that no prover
-can forge, or a wallet-verified attested confidential worker that the ordinary
-operator cannot read. User-operated persistent proving is out of scope.
+but it must not ship the current trusted `WitnessBundle` handoff for real
+value: launch requires consensus-bound phone-held authorization that no prover
+can forge; a wallet-verified attested confidential worker may additionally
+reduce witness visibility. User-operated persistent proving is out of scope.
 
 ## 2. What is settled
 
@@ -50,7 +50,9 @@ operator cannot read. User-operated persistent proving is out of scope.
    nullifiers from operator-pinned endpoints before allocating proof work. A
    client request never supplies an arbitrary node URL.
 
-Nothing above selects a backend implementation or changes consensus.
+The security basis is selected. No authorization primitive, backend
+implementation, confidential-compute target, or consensus change is
+implemented by this record.
 
 ## 3. Honest option matrix
 
@@ -58,22 +60,15 @@ Nothing above selects a backend implementation or changes consensus.
 |---|---|---|---|---|---|
 | User-operated persistent prover | only if the user operates it | depends on operator | local if honest | none | **rejected by product ruling** |
 | b4 local proving, no remote fallback | no; low-memory phones are excluded | yes, locally | yes, locally | re-mint or permanent dual verifier | incomplete for the product target |
-| b4 local proving plus remote fallback | yes in principle | fallback still needs authorization or attestation | fallback still sees/links unless confidential | b4 re-mint plus remote-prover cost | no security shortcut over the shared service |
+| b4 local proving plus remote fallback | yes in principle | fallback still needs Candidate A authorization | fallback still sees/links unless confidential | b4 re-mint plus remote-prover cost | no security shortcut over the shared service |
 | Trusted shared b16 prover | yes | **fails** | **fails** | none | **rejected for real value**; valueless mechanics experiment only |
-| Shared b16 prover plus phone-held authorization | yes | passes only if consensus binds the complete phone-approved intent | **fails** at an ordinary worker | re-mint-class protocol change | **candidate A**; primitive not selected |
-| Attested confidential b16 worker | yes in principle | passes only under the attested image/hardware/isolation assumptions | reduces payload visibility; ingress metadata remains | no protocol re-mint in principle | **candidate B**; fit and attestation unmeasured |
+| Shared b16 prover plus phone-held authorization | yes | passes only if consensus binds the complete phone-approved intent | **fails** at an ordinary worker | re-mint-class protocol change | **selected mandatory basis**; primitive not selected |
+| Attested confidential b16 worker without A | yes in principle | passes only while the complete attestation/hardware/isolation chain holds | reduces payload visibility; ingress metadata remains | no protocol re-mint in principle | **rejected alone for real value**; optional on top of A |
 | MPC or cryptographically hidden outsourced proving | unknown | intended to pass | may reduce payload visibility | likely extensive | deferred research |
 
-The product comparison is therefore not "b4 versus trust Qumbra." It is b4
-plus a protected fallback versus b16 remote proving plus authorization or
-attestation.
-
-A recorded recommendation —
-[`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) — picks **A as the
-load-bearing protocol destination** and **B as a required privacy overlay**
-for the Qumbra-operated default send path. That file does not change the
-rulings in the table above. The primitive, TEE fit, and launch gates remain
-unmeasured.
+The product comparison is therefore not "b4 versus trust Qumbra." The selected
+remote path is b16 proving with Candidate A authorization, optionally deployed
+inside Candidate B confidential compute after its own fit and trust gates pass.
 
 ### Candidate architecture diagrams
 
@@ -82,7 +77,7 @@ read endpoints, one public logical service leases ephemeral workers, workers
 use pinned read-only node access for preflight, and the wallet normally submits
 the returned transaction. The security boundary differs by candidate.
 
-#### Candidate A — consensus-bound phone authorization
+#### Candidate A — selected consensus-bound phone authorization
 
 The ordinary service may still observe and link the witness. Its security claim
 is narrower: the phone keeps the authorization secret, and the node rejects any
@@ -133,7 +128,7 @@ This route changes consensus. Authorization verification happens before the
 expensive STARK verification; the STARK must then prove that the authorization
 public values belong to the same hidden inputs.
 
-#### Candidate B — attested confidential worker
+#### Candidate B — historical B-only candidate, now rejected alone
 
 This route preserves today's consensus transaction in principle. The wallet
 first verifies a fresh worker attestation and binds an ephemeral encryption key
@@ -184,6 +179,10 @@ This route changes the transport and trust boundary rather than the transaction
 format. The attestation, encryption, hardware, firmware, image-measurement, and
 side-channel assumptions are part of its security claim. Ingress metadata
 linkability remains.
+
+The diagram remains as the B-only trust-boundary record. The selected A+B
+composition is in
+[`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md) §4.
 
 ## 4. The current trusted handoff must not ship
 
@@ -272,11 +271,12 @@ Other standardized stateless candidates may enter the comparison. No custom
 signature construction advances without an independent cryptographic review
 and published test vectors.
 
-## 7. Candidate B — attested confidential worker
+## 7. Candidate B — optional attested confidential worker
 
-An attested confidential VM is the only current route that can preserve today's
+An attested confidential VM is a current route that can preserve today's
 consensus transaction while preventing the ordinary Qumbra/cloud operator from
-reading the witness. It is not ordinary TLS to a VM.
+reading the witness under its stated assumptions. It is not ordinary TLS to a
+VM, and it is not sufficient as the real-value security basis without A.
 
 The wallet must verify that an ephemeral encryption key belongs to the approved
 worker image and configuration, then encrypt the bundle directly to that key.
@@ -284,7 +284,8 @@ The ingress and queue cannot decrypt it. The measurement must pin the prover,
 consensus config, protocol version, node allowlist, debug-disabled state, and
 result-encryption behavior.
 
-Before selection, the exact SEV-SNP/TDX-class target must demonstrate:
+Before deployment or any confidentiality claim, the exact SEV-SNP/TDX-class
+target must demonstrate:
 
 1. current b16 peak private memory, cold/warm proof time, proof bytes, failure
    behavior, and cost for the 12–15 GB-class job;
@@ -301,8 +302,9 @@ associate device identity, IP, timing, and the resulting on-chain transaction.
 
 ## 8. Real-value launch gates
 
-A public real-value prover is blocked until one candidate passes every
-applicable gate:
+A public real-value prover is blocked until Candidate A passes every applicable
+gate. If the official service also claims Candidate B confidentiality, B must
+pass its applicable gates too:
 
 1. **Cannot steal:** an adversarial prover/operator cannot authorize outputs or
    semantic fields the phone did not approve.
@@ -343,14 +345,22 @@ explicitly isolated service-mechanics experiment.
    hypertree construction.
 2. **Confidential-worker lane:** run today's b16 circuit on the exact target
    confidential instance and complete the mobile attestation negatives.
-3. **Select one launch security basis:** protocol authorization, attested
-   confidential work, or both. Do not select from estimated rows.
-4. **If authorization wins, correct the binding design spec** before changing
-   the lab circuit or wire.
-5. **Only then implement and pilot** the public service boundary.
+3. **Security-basis selection — resolved 2026-08-23:** Candidate A is mandatory;
+   Candidate B is optional defense-in-depth, not a substitute —
+   [`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md).
+   This ruling rests on protocol layering and trust boundaries, not estimated
+   performance rows. Steps 1, 2, 4, and 5 still gate their applicable work;
+   step 2 runs in parallel.
+4. **Correct the binding design spec for authorization** before changing the
+   lab circuit or wire.
+5. **Only then implement and pilot A.** B may advance in the valueless parallel
+   lane and may be layered onto the official service after its own gates pass.
 
 ## 10. How to read the earlier records
 
+- [`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md)
+  selects A as mandatory and B as optional defense-in-depth. It resolves any
+  older A-or-B wording in this record.
 - [`phone-self-proving-reopened.md`](phone-self-proving-reopened.md) is the
   historical phone-memory/UX handoff and explains why b4 does not cover every
   device by itself.
@@ -363,8 +373,9 @@ explicitly isolated service-mechanics experiment.
   blockers are closed.
 - [`m2-iphone-plan.md`](m2-iphone-plan.md) is the underlying phone
   memory/proof-size evidence and build path.
-- [`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) is the recorded
-  A-versus-B recommendation. It does not ratify a route or skip §9.
+- [`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) is the pre-ruling
+  research note. It is superseded by the candidate ruling; do not read it as
+  the current pick.
 
 If an earlier document's next-step wording conflicts with this record, this
 record is the current lab decision. The binding protocol still lives in the
@@ -372,8 +383,9 @@ design repo and changes only through its own correction process.
 
 ## 11. Scope at this handoff
 
-- No backend service, cloud resource, account system, authorization primitive,
-  attestation path, circuit, wire, genesis, or deployment was built here.
+- The security basis is selected, but no backend service, cloud resource,
+  account system, authorization primitive, attestation path, circuit, wire,
+  genesis, or deployment was built here.
 - `CONSENSUS_CFG` remains untouched.
 - User-operated persistent proving remains out of scope.
 - The current paired-prover remains a trusted-LAN, one-request tool and must not
