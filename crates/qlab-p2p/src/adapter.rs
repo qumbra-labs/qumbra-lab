@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use qlab_devnet::body::{
-    check_scheduled_coinbase_payees, coinbase_payee_cap_v5, validate_body, BlockBody,
+    check_scheduled_coinbase_payees, coinbase_payee_cap_v5, validate_body_with_names, BlockBody,
     BodyError, CoinbasePayee, TxEntry,
 };
 use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError};
@@ -2614,18 +2614,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         //    side of it it is standing on.
         let anchor_ok = |root: &Hash32| self.state.is_valid_anchor(root);
         // The rule funnel keyed by the installed form (lab #470 stage 3): the
-        // v4 arm is byte-for-byte the old call; the v5 arm is the same loop
-        // under the v5 forms. EmptyNameView on both — this adapter is the
-        // relay-grade validator; the registry-armed funnel is the qlab-node
-        // state path (stage 4a threads its form).
+        // v4 arm is the v2/v3 body rule; the v5 arm is the same loop under the
+        // v5 forms. Both thread this node's applied registry — the armed-node
+        // path lab #381 specified (`validate_body_with_names` /
+        // `validate_body_v5` with a real NameView). EmptyNameView was the
+        // inert-era / pre-boundary shortcut: `commit_included_in` is
+        // unconditionally false, so a current node that assembled a reveal
+        // from its own registry then refused the block it just built
+        // (lab #624). The view is the same `NodeState` `is_valid_anchor`
+        // reads, so a lagging node's registry verdict and its anchor verdict
+        // go stale together and stay Positional / uncharged.
         let validate_result = match self.rules.form {
-            GenesisForm::V4 => validate_body(&header, &body, &self.verifier, anchor_ok),
+            GenesisForm::V4 => validate_body_with_names(
+                &header,
+                &body,
+                &self.verifier,
+                anchor_ok,
+                self.state.names(),
+            ),
             GenesisForm::V5 => qlab_devnet::body::validate_body_v5(
                 &header,
                 &body,
                 &self.verifier,
                 anchor_ok,
-                &qlab_devnet::names::EmptyNameView,
+                self.state.names(),
             ),
         };
         match validate_result {
