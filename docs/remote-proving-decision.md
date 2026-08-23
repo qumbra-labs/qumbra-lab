@@ -361,6 +361,9 @@ explicitly isolated service-mechanics experiment.
 - [`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md)
   selects A as mandatory and B as optional defense-in-depth. It resolves any
   older A-or-B wording in this record.
+- [`remote-proving-implementation-plan.md`](remote-proving-implementation-plan.md)
+  records the dated implementation owner, independent review roles, phase
+  gates, and handoff contract. It assigns work but does not approve a phase.
 - [`phone-self-proving-reopened.md`](phone-self-proving-reopened.md) is the
   historical phone-memory/UX handoff and explains why b4 does not cover every
   device by itself.
