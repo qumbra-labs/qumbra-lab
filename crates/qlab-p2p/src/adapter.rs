@@ -7020,6 +7020,107 @@ mod tests {
         assert_eq!(peer.chain().tip_height(), 1);
     }
 
+    /// Lab #624 offline reproduction: the live T2 fleet admitted a name REVEAL
+    /// through `POST /v1/tx` but produced only empty blocks while holding it.
+    ///
+    /// This drives the same production seams on a v5-form chain: a COMMIT is
+    /// mined, aged to the inclusive `COMMIT_MIN_AGE` edge, the REVEAL enters via
+    /// [`NodeAdapter::submit_tx_typed`], and [`NodeAdapter::mine_block`] performs
+    /// the node's own assembly and PoW path. The assertions record the observed
+    /// result on this tree rather than presupposing the live result: the reveal
+    /// is INCLUDED, its full name fee is burned, and the miner's own state funnel
+    /// accepts and applies the block.
+    #[test]
+    fn a_v5_burn_bearing_name_reveal_is_admitted_and_mined() {
+        use qlab_devnet::names::{
+            commit_hash, name_fee_bessel, NameOp, NameRecord, COMMIT_MIN_AGE,
+            L1_ADDRESS_LEN, RECORD_KIND_L1_ADDRESS,
+        };
+
+        let (mut node, anchor) =
+            adapter_for_form_with_finalized_genesis(GenesisForm::V5);
+        node.set_miner_rkm([0x624, 2, 3, 4]);
+
+        // Eleven bytes matches the live `t2rollcheck` fee tier: 1 QMB burned,
+        // or 100_000_000 bessel, on top of the 0.01 QMB relay fee.
+        let name = b"t2rollcheck";
+        let salt = [0x62; 32];
+        let record = NameRecord {
+            kind: RECORD_KIND_L1_ADDRESS,
+            name: name.to_vec(),
+            address: vec![0xA5; L1_ADDRESS_LEN],
+        };
+        let name_fee = name_fee_bessel(name.len());
+        assert_eq!(name_fee, 100_000_000, "the fixture is the live reveal's burn tier");
+
+        let commit = tx_with(anchor, 0x61, b"ok")
+            .with_name_op(&NameOp::Commit { commit: commit_hash(&record, &salt) });
+        node.submit_tx_typed(commit).expect("the v5 production path admits the commit");
+        let (commit_header, commit_body) = node.mine_block().expect("mine the commit block");
+        assert_eq!(commit_header.height, 1);
+        assert_eq!(commit_body.txs.len(), 1, "the commit is on chain, not seeded by hand");
+        assert_eq!(commit_body.total_name_burn(), 0, "a commit pays relay only");
+        assert_eq!(node.ingest_block(commit_header, commit_body), IngestOutcome::Accepted);
+        assert_eq!(node.state().tip_height(), 1, "the commit block applied");
+
+        // Commit at height 1, reveal candidate at height 1 + COMMIT_MIN_AGE.
+        // The seven intervening blocks are mined and applied through the same
+        // path, so the registry and tip view admission reads are production state.
+        for height in 2..=COMMIT_MIN_AGE {
+            let (header, body) = node.mine_block().expect("mine the commit-aging block");
+            assert_eq!(header.height, height);
+            assert!(body.txs.is_empty());
+            assert_eq!(node.ingest_block(header, body), IngestOutcome::Accepted);
+            assert_eq!(node.state().tip_height(), height);
+        }
+
+        let mut reveal = tx_with(anchor, 0x63, b"ok")
+            .with_name_op(&NameOp::Reveal { record: record.clone(), salt });
+        reveal.public.fee = posted_fee(ArityBucket::TwoByTwo) + name_fee;
+        let reveal_wire_id = wire_tx_id(&reveal);
+
+        let reveal_id = node
+            .submit_tx_typed(reveal)
+            .expect("production admit_above(form.rider_admit_boundary(), ...) admits the reveal");
+        assert!(node.mempool().contains(&reveal_id), "the reveal is pooled before mining");
+
+        let reveal_height = 1 + COMMIT_MIN_AGE;
+        let (header, body) = node.mine_block().expect("the node's own mining path assembles");
+        assert_eq!(header.height, reveal_height);
+        assert_eq!(body.txs.len(), 1, "OBSERVED: the reveal is included, not silently omitted");
+        assert_eq!(wire_tx_id(&body.txs[0]), reveal_wire_id, "the included tx is the reveal");
+        assert_eq!(body.total_name_burn(), name_fee, "the included block carries the real burn");
+        assert_eq!(
+            body.total_fees(),
+            posted_fee(ArityBucket::TwoByTwo) + name_fee,
+            "relay plus burn is the declared fee"
+        );
+
+        // The requested forced-zero contrast at the one arithmetic boundary the
+        // burn reaches. `total_name_burn` is derived from the reveal rider, so
+        // there is no production switch that can set it to zero while leaving the
+        // transaction identical. Forcing only this input raises the derived
+        // coinbase-note value by exactly the burn; the burn-bearing production
+        // candidate above is already selected and assembled.
+        let burned_value = qlab_node::coinbase_note_value_parts(
+            body.coinbase_total(),
+            body.total_fees(),
+            body.total_name_burn(),
+        );
+        let forced_zero_value =
+            qlab_node::coinbase_note_value_parts(body.coinbase_total(), body.total_fees(), 0);
+        assert_eq!(forced_zero_value - burned_value, name_fee);
+
+        assert_eq!(
+            node.ingest_block(header, body),
+            IngestOutcome::Accepted,
+            "OBSERVED: the miner does not refuse the burn-bearing reveal block"
+        );
+        assert_eq!(node.state().tip_height(), reveal_height, "the reveal block applied");
+        assert!(node.state().names().entry(name).is_some(), "the reveal changed registry state");
+        assert!(node.mempool().is_empty(), "the mined reveal left the pool");
+    }
+
     /// Lab #612: admission and eviction must ask the rider question under the
     /// same installed form. A v5 name COMMIT is valid natively from height 1;
     /// connecting an unrelated empty v5 block must not make the pool re-ask it
