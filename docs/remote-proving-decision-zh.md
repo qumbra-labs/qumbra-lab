@@ -311,6 +311,9 @@ experiment。
 
 - [`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md)
   选定 A 为强制基础、B 为可选 defense-in-depth。本文更早的 A-or-B wording 以它为准。
+- [`remote-proving-implementation-plan-zh.md`](remote-proving-implementation-plan-zh.md)
+  记录带日期的 implementation owner、独立 review roles、phase gates 与 handoff contract。
+  它分配工作，但不批准任何 phase。
 - [`phone-self-proving-reopened-zh.md`](phone-self-proving-reopened-zh.md) 是历史上的
   phone-memory/UX 交接,解释 b4 为什么不能自己覆盖所有设备。
 - [`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md) 是
