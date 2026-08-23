@@ -63,7 +63,8 @@ Two step-0 conclusions, both design-grade:
    decision among: (a) relax the tx target for self-proved transactions
    (~240 KB — Abelian demonstrates ~100 KB-class txs clear markets, and
    the performance doc's PQ-tax section already prices 20–30×); (b)
-   delegated/assisted proving (privacy implications — its own doc); (c)
+   delegated/assisted proving
+   ([architecture/security handoff](backend-assisted-proving-security.md)); (c)
    WHIR-class PCS (the §4 escape hatch — smaller proofs at low blowup,
    external maturity gate); (d) network accepts multiple configs (weakens
    uniformity, anonymity-set fragmentation risk). Device measurements

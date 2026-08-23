@@ -6,6 +6,12 @@
 写于 2026-08-23,作为会话交接。本文所述**一件都没有动工**;产生它的那次会话
 里每个 PR 都已合并,每棵工作树都干净。
 
+**2026-08-23 后续:**Qumbra 运营的共享 prover 在算力上可行,能服务所有手机;但协议
+不变的 trusted 形态能盗取 selected inputs,不是 real-value 产品路线。Larry 已裁决,
+要求用户自己运营常驻 self-hosted prover 太麻烦,**不在考虑范围内**。可上线的
+authorization/attestation 候选与公网安全边界记录在
+[`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md)。
+
 ---
 
 ## 1. 这件事怎么起来的
@@ -144,22 +150,36 @@ pub fn verify_proof(inst: &BucketInstance, pvs: &[Val], proof: &Proof<Config>) -
 
 ## 7. 新会话该按什么顺序做
 
-1. **拿 §4 跟 Larry 重新确认那个选择。** 他选 b4 时以为它能去掉 Mac。它不能。
-   更正后的取舍是:236 KB 交易 + 一次重新 mint(或永久双验证器)+ **仍然要留着**
-   配对路径,换来的是新手机不需要 Mac。
-2. **测量二**(设备余量)—— 便宜,而且哪种结局都用得上。
-3. **测量一**(当前电路上的 b4/b8)—— 在 rig 或 `verify-graviton` lane 上,
-   绝不在 Larry 本机。
-4. 到这一步之后,才谈动 `CONSENSUS_CFG`。
+1. **要对着诚实产品路线做选择,不能再用原来的二选一标签。**
+   - b4:旧 mint 前数据约 236 KB + 重新 mint/双验证器 + 低内存设备仍要 fallback,
+     换来新手机本地独立证明。
+   - 共享 b16 backend + 手机持有 authorization:每台手机都能 send,prover 不能把
+     selected inputs 改付给自己;但 note/public/wire/verifier 改动同样属于 re-mint 级,
+     byte 与 prover 成本欠测。
+   - attested confidential b16 backend:原则上不需 protocol re-mint,但 confidential-VM
+     memory fit、performance、attestation、operator isolation 与 ingress linkability
+     都未测。
+   - 协议不变的 trusted b16 backend:今天 148,625 字节且不需 re-mint,但服务能盗取
+     selected inputs。这只是可行性基线,不是 real-value 产品路线。
+   - 用户每笔操作 Mac:当前行为,产品 UX 已拒绝。
+2. **给两条可上线 backend 候选计价:**展开手机持有 authorization 设计,把它的
+   re-mint/wire/prover 成本直接与 b4 比;另跑当前 b16 proof 的 attested
+   confidential-VM lane。
+3. **只有 b4 仍是候选时:**才做测量二(设备余量)与测量一(当前电路 b4/b8),并在
+   各自规定的硬件上跑。Confidential backend 不依赖这两个测量;authorization 比较
+   需要当前 b4 数字。
+4. 完成选择与任何仍需测量后,才碰 `CONSENSUS_CFG`。
 
-另外有一件事**不需要任何决策**,今天就能改善:**Mac 那个 prover 是一次性的,
-而且每次运行都重新编译。** 把它改成常驻、每笔之后用全新 secret 和全新二维码
-重新待命,既保住安全性质(每会话一个 256-bit 全新 secret),又省掉"走过去跑命令"
-那一步。纯工具改动,不碰协议。
+**已被取代的路线:**把用户 Mac prover 做成长驻在技术上仍可行,但 Larry 已裁决
+用户运营常驻证明太麻烦。现有 one-shot 路径可留作开发工具;除非明确重开这条裁决,
+不得围绕 self-hosting 构建产品。
 
 ## 8. 交接时的状态
 
-- `qumbra-lab` `4f54b42`、`qumbra-wallet-ios` `8fa64d6`、`qumbra-design` `5983048`
-- **没有未合并的 PR**;这次会话的每个 PR 都已合并
+- 原始交接:`qumbra-lab` `4f54b42`、`qumbra-wallet-ios` `8fa64d6`、
+  `qumbra-design` `5983048`
+- 共享 backend 后续查阅:`qumbra-lab` `1c5a27b`、`qumbra-wallet-macos`
+  `4bdde1d`、`qumbra-wallet-ios` `e3a9e2d`
+- Backend 架构/安全交接:`backend-assisted-proving-security.md` 与 `-zh`
 - iOS `ROADMAP.md` / `-zh`:**24 ✅ / 11 ⬜**
 - 本文所述一件都没动工。`CONSENSUS_CFG` 未被触碰。
