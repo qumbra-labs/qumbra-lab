@@ -319,6 +319,9 @@ experiment。
   候选与成本假设。它的 root-binding insight 仍有用;在 §6 blockers 关闭前,它的 WOTS+
   safety claim 不被接受。
 - [`m2-iphone-plan.md`](m2-iphone-plan.md) 是底层 phone memory/proof-size 证据与 build path。
+- [`remote-proving-a-vs-b-zh.md`](remote-proving-a-vs-b-zh.md) 是 **Grok** 在
+  2026-08-23 的 A-versus-B 判断（Grok 4.6，xAI），不是 Larry 的裁定。作为选型已被
+  candidate ruling 取代，不要把它当 lab 共识。
 
 如果早期文档的 next-step wording 与本文冲突,本文是当前 lab decision。Binding protocol
 仍在 design repo,只能通过它自己的 correction process 改变。
