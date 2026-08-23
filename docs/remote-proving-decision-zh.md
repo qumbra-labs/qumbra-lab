@@ -2,7 +2,9 @@
 
 **状态:当前决策,不是 implementation approval。下面的产品与安全约束已经决定;
 authorization primitive 与 confidential-compute 路线尚未选定。任何候选在通过 §8 的
-上线门槛之前,公网 prover 都不得承载真实价值。**
+上线门槛之前,公网 prover 都不得承载真实价值。** A-versus-B 的已记录推荐见
+[`remote-proving-a-vs-b-zh.md`](remote-proving-a-vs-b-zh.md)。那不是批准;在本记录
+被修正之前,下面的"路线未选"仍然成立。
 英文权威版:[`remote-proving-decision.md`](remote-proving-decision.md)。
 
 写于 2026-08-23,接续 PR #618、PR #619 与后续安全复核。本文是 `qumbra-lab` 里
@@ -53,6 +55,11 @@ Qumbra 可以为所有支持手机研究一个共享逻辑 prover service,但现
 
 因此,产品比较不是"b4 对相信 Qumbra",而是带安全 fallback 的 b4,对带
 authorization 或 attestation 的 b16 remote proving。
+
+一份已记录的推荐 ——
+[`remote-proving-a-vs-b-zh.md`](remote-proving-a-vs-b-zh.md) —— 把 **A 选为承重的
+协议目的地**,把 **B 选为 Qumbra 运营默认 send 路径上必须有的隐私层**。那份文件
+不改上表的裁决。Primitive、TEE fit 与上线门槛仍未实测。
 
 ### 候选架构图
 
@@ -302,6 +309,8 @@ experiment。
   候选与成本假设。它的 root-binding insight 仍有用;在 §6 blockers 关闭前,它的 WOTS+
   safety claim 不被接受。
 - [`m2-iphone-plan.md`](m2-iphone-plan.md) 是底层 phone memory/proof-size 证据与 build path。
+- [`remote-proving-a-vs-b-zh.md`](remote-proving-a-vs-b-zh.md) 是已记录的 A-versus-B
+  推荐。它不批准路线,也不跳过 §9。
 
 如果早期文档的 next-step wording 与本文冲突,本文是当前 lab decision。Binding protocol
 仍在 design repo,只能通过它自己的 correction process 改变。

@@ -3,7 +3,11 @@
 **Status: CURRENT DECISION, NOT IMPLEMENTATION APPROVAL. The product and
 security constraints below are decided; the authorization primitive and
 confidential-compute route are not. No public prover may carry real value until
-one candidate clears the launch gates in §8.**
+one candidate clears the launch gates in §8.** A recorded A-versus-B
+recommendation lives in
+[`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md). It is not
+ratification; the "route not selected" below stands until this record is
+amended.
 Paired with
 [`remote-proving-decision-zh.md`](remote-proving-decision-zh.md).
 
@@ -63,6 +67,13 @@ Nothing above selects a backend implementation or changes consensus.
 The product comparison is therefore not "b4 versus trust Qumbra." It is b4
 plus a protected fallback versus b16 remote proving plus authorization or
 attestation.
+
+A recorded recommendation —
+[`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) — picks **A as the
+load-bearing protocol destination** and **B as a required privacy overlay**
+for the Qumbra-operated default send path. That file does not change the
+rulings in the table above. The primitive, TEE fit, and launch gates remain
+unmeasured.
 
 ### Candidate architecture diagrams
 
@@ -352,6 +363,8 @@ explicitly isolated service-mechanics experiment.
   blockers are closed.
 - [`m2-iphone-plan.md`](m2-iphone-plan.md) is the underlying phone
   memory/proof-size evidence and build path.
+- [`remote-proving-a-vs-b.md`](remote-proving-a-vs-b.md) is the recorded
+  A-versus-B recommendation. It does not ratify a route or skip §9.
 
 If an earlier document's next-step wording conflicts with this record, this
 record is the current lab decision. The binding protocol still lives in the
