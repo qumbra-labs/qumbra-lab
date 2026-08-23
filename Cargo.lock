@@ -1723,6 +1723,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-remote-auth-mobile-bench"
+version = "0.0.0"
+dependencies = [
+ "qlab-remote-auth",
+]
+
+[[package]]
 name = "qlab-stratum"
 version = "0.0.0"
 dependencies = [

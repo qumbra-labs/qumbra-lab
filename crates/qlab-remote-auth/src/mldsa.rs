@@ -5,11 +5,22 @@ use ml_dsa::{
     B32,
 };
 
-use crate::{intent::AuthDescriptor, tree::mldsa_leaf, Hash32};
+use crate::{intent::AuthDescriptor, keccak256, tree::mldsa_leaf, Hash32};
 
 pub const VERIFYING_KEY_BYTES: usize = 1_312;
 pub const SIGNATURE_BYTES: usize = 2_420;
 pub const SIGNING_CONTEXT: &[u8] = b"qumbra:remote-auth:mldsa44:v1";
+const LEAF_SEED_DOMAIN: &[u8] = b"qumbra:remote-auth:mldsa44-seed:spike-v1";
+
+/// Derive one research leaf seed from a private per-address master.
+///
+/// The master is synthetic in every current caller. A future production key
+/// hierarchy remains a binding-design decision; exposing this helper only
+/// keeps the desktop and mobile measurement instruments on the same exact
+/// spike construction.
+pub fn derive_leaf_seed(address_master: &Hash32, leaf_index: u32) -> Hash32 {
+    keccak256(&[LEAF_SEED_DOMAIN, address_master, &leaf_index.to_le_bytes()])
+}
 
 /// A deterministic key wrapper for vectors and measurements. Production key
 /// lifecycle is explicitly out of scope for this spike.
@@ -103,5 +114,17 @@ mod tests {
         };
         *leaf_index ^= 1;
         assert!(!verify(&changed_descriptor, &public, &signature, &digest));
+    }
+
+    #[test]
+    fn leaf_seed_derivation_binds_the_address_master_and_index() {
+        assert_ne!(
+            derive_leaf_seed(&[1u8; 32], 7),
+            derive_leaf_seed(&[2u8; 32], 7)
+        );
+        assert_ne!(
+            derive_leaf_seed(&[1u8; 32], 7),
+            derive_leaf_seed(&[1u8; 32], 8)
+        );
     }
 }

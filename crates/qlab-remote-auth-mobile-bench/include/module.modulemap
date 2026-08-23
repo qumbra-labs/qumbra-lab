@@ -1,0 +1,4 @@
+module QumbraRemoteAuthBench {
+    header "qlab_remote_auth_mobile_bench.h"
+    export *
+}

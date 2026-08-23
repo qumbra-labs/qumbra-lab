@@ -326,3 +326,7 @@ D12..D16 手机实测、具有约束力的生产 allocation/restore 规则和已
 所阻塞。只有全部完成后，结果才能写入带日期的中英文 binding-design correction。
 AIR、交易 wire/identity、node verification、activation、genesis/re-mint、wallet
 integration 和 prover service 仍属于后续分别授权的 phase。
+
+独立 measurement ABI、iOS/Android shell 边界、evidence schema 与真机流程见
+[`remote-proving-mobile-benchmark-zh.md`](remote-proving-mobile-benchmark-zh.md)。
+只有工具而没有真机 evidence，并不满足 mobile-measurement gate。
