@@ -6,6 +6,11 @@
 写于 2026-08-23,作为会话交接。本文所述**一件都没有动工**;产生它的那次会话
 里每个 PR 都已合并,每棵工作树都干净。
 
+**2026-08-23 后续:**Qumbra 运营的共享 prover 是可行的第三条路线;它保留 b16,
+同时服务所有手机。Larry 已裁决,要求用户自己运营常驻 self-hosted prover 太麻烦,
+**不在考虑范围内**。共享服务的信任与公网安全边界记录在
+[`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md)。
+
 ---
 
 ## 1. 这件事怎么起来的
@@ -144,22 +149,28 @@ pub fn verify_proof(inst: &BucketInstance, pvs: &[Val], proof: &Proof<Config>) -
 
 ## 7. 新会话该按什么顺序做
 
-1. **拿 §4 跟 Larry 重新确认那个选择。** 他选 b4 时以为它能去掉 Mac。它不能。
-   更正后的取舍是:236 KB 交易 + 一次重新 mint(或永久双验证器)+ **仍然要留着**
-   配对路径,换来的是新手机不需要 Mac。
-2. **测量二**(设备余量)—— 便宜,而且哪种结局都用得上。
-3. **测量一**(当前电路上的 b4/b8)—— 在 rig 或 `verify-graviton` lane 上,
-   绝不在 Larry 本机。
-4. 到这一步之后,才谈动 `CONSENSUS_CFG`。
+1. **要对着三条真实路线做选择,不能再用原来的二选一标签。**
+   - b4:旧 mint 前数据约 236 KB + 重新 mint/双验证器 + 低内存设备仍要 fallback,
+     换来新手机本地独立证明。
+   - 共享 b16 backend:今天 148,625 字节交易 + T2 共识不变 + 每台手机都能 send,
+     换来一个受信任、隐私敏感、可用性关键的 Qumbra 服务。
+   - 用户每笔操作 Mac:当前行为,产品 UX 已拒绝。
+2. **按链接的安全交接决定 backend 信任门槛:**披露后的 trusted service、带
+   attestation 的 confidential worker,或协议级的手机持有交易授权。
+3. **只有 b4 仍是候选时:**才做测量二(设备余量)与测量一(当前电路 b4/b8),并在
+   各自规定的硬件上跑。共享 backend 不依赖这两个测量。
+4. 完成选择与任何仍需测量后,才碰 `CONSENSUS_CFG`。
 
-另外有一件事**不需要任何决策**,今天就能改善:**Mac 那个 prover 是一次性的,
-而且每次运行都重新编译。** 把它改成常驻、每笔之后用全新 secret 和全新二维码
-重新待命,既保住安全性质(每会话一个 256-bit 全新 secret),又省掉"走过去跑命令"
-那一步。纯工具改动,不碰协议。
+**已被取代的路线:**把用户 Mac prover 做成长驻在技术上仍可行,但 Larry 已裁决
+用户运营常驻证明太麻烦。现有 one-shot 路径可留作开发工具;除非明确重开这条裁决,
+不得围绕 self-hosting 构建产品。
 
 ## 8. 交接时的状态
 
-- `qumbra-lab` `4f54b42`、`qumbra-wallet-ios` `8fa64d6`、`qumbra-design` `5983048`
-- **没有未合并的 PR**;这次会话的每个 PR 都已合并
+- 原始交接:`qumbra-lab` `4f54b42`、`qumbra-wallet-ios` `8fa64d6`、
+  `qumbra-design` `5983048`
+- 共享 backend 后续查阅:`qumbra-lab` `1c5a27b`、`qumbra-wallet-macos`
+  `4bdde1d`、`qumbra-wallet-ios` `e3a9e2d`
+- Backend 架构/安全交接:`backend-assisted-proving-security.md` 与 `-zh`
 - iOS `ROADMAP.md` / `-zh`:**24 ✅ / 11 ⬜**
 - 本文所述一件都没动工。`CONSENSUS_CFG` 未被触碰。

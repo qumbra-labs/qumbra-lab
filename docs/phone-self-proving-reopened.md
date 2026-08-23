@@ -6,6 +6,13 @@ Paired with [`phone-self-proving-reopened-zh.md`](phone-self-proving-reopened-zh
 Written 2026-08-23 as a session handoff. Nothing in this document has been built;
 every PR from the session that produced it is merged and every worktree is clean.
 
+**2026-08-23 follow-up:** a Qumbra-operated shared prover is a feasible third
+branch that keeps b16 and serves every phone. Larry ruled that requiring users
+to operate a persistent self-hosted prover is too much friction and is **out of
+scope**. The shared service's trust and Internet-security boundary is recorded
+in
+[`backend-assisted-proving-security.md`](backend-assisted-proving-security.md).
+
 ---
 
 ## 1. How this came up
@@ -157,24 +164,35 @@ discovering it by being killed.
 
 In order:
 
-1. **Re-confirm the choice with Larry against §4.** He picked b4 believing it
-   removed the Mac. It does not. The corrected trade is: 236 KB txs + a re-mint
-   (or a permanent dual verifier) + *keeping* the pairing path anyway, in
-   exchange for modern phones not needing a Mac.
-2. **Measurement 2** (device headroom) — cheap, useful under every outcome.
-3. **Measurement 1** (b4/b8 on the current circuit) — on the rig or the
-   `verify-graviton` lane, never on Larry's machine.
-4. Only then: touch `CONSENSUS_CFG`.
+1. **Choose against all three real branches, not the old two-way label.**
+   - b4: about 236 KB on stale pre-mint data + re-mint/dual verifier + a
+     fallback for low-memory devices, in exchange for local independence on
+     modern phones.
+   - shared b16 backend: 148,625-byte transactions today + no T2 consensus
+     change + every phone can send, in exchange for a trusted, privacy-sensitive
+     and availability-critical Qumbra service.
+   - per-send user Mac: current behavior, rejected as product UX.
+2. **Decide the backend trust bar** from the linked security handoff: disclosed
+   trusted service, attested confidential worker, or a protocol-level
+   phone-held transaction authorization.
+3. **Only if b4 remains a contender:** run Measurement 2 (device headroom) and
+   Measurement 1 (current-circuit b4/b8) on their prescribed hardware. The
+   shared backend does not depend on either measurement.
+4. Only after those choices and any required measurements: touch
+   `CONSENSUS_CFG`.
 
-And independent of all of it, one thing needs no decision and would help today:
-**the Mac prover is one-shot and rebuilds itself on every run.** Making it
-long-lived, re-arming with a fresh secret and a fresh QR after each spend, keeps
-the security property (a per-session 256-bit secret) and removes the
-"walk over and run a command" step. That is pure tooling, no protocol change.
+**Superseded route:** making the user's Mac prover long-lived remains
+technically possible, but Larry ruled user-operated persistent proving too
+burdensome. Keep the existing one-shot path as a development tool; do not build
+the product around self-hosting unless that ruling is explicitly reopened.
 
 ## 8. State at handoff
 
-- `qumbra-lab` `4f54b42`, `qumbra-wallet-ios` `8fa64d6`, `qumbra-design` `5983048`
-- **No open PRs**; every PR from this session is merged
+- Original handoff: `qumbra-lab` `4f54b42`, `qumbra-wallet-ios` `8fa64d6`,
+  `qumbra-design` `5983048`
+- Shared-backend follow-up inspected `qumbra-lab` `1c5a27b`,
+  `qumbra-wallet-macos` `4bdde1d`, and `qumbra-wallet-ios` `e3a9e2d`
+- Backend architecture/security handoff: `backend-assisted-proving-security.md`
+  and `-zh`
 - iOS `ROADMAP.md` / `-zh`: **24 ✅ / 11 ⬜**
 - Nothing in this document has been built. `CONSENSUS_CFG` is untouched.
