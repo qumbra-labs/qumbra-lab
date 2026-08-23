@@ -289,6 +289,9 @@ experiment。
    并完成 mobile attestation negatives。
 3. **选择一份 launch security basis:**protocol authorization、attested confidential work,
    或两者。不得按 estimated rows 选型。
+   *2026-08-23 已按结构性理由(非估算)解决:***A 为上线基础,B 为之后叠加的部署层** ——
+   [`remote-proving-candidate-ruling-zh.md`](remote-proving-candidate-ruling-zh.md)。
+   第 1、2、4、5 步仍是实现门槛;第 2 步改为并行。
 4. **如果 authorization 胜出,先修正 binding design spec**,再改 lab circuit/wire。
 5. **完成以上步骤后才实现并 pilot** 公共 service boundary。
 
