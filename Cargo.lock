@@ -1875,6 +1875,7 @@ dependencies = [
  "qlab-stratum",
  "serde",
  "serde_json",
+ "tiny_http",
  "toml",
 ]
 
