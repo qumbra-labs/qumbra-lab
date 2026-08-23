@@ -6,9 +6,10 @@
 写于 2026-08-23,作为会话交接。本文所述**一件都没有动工**;产生它的那次会话
 里每个 PR 都已合并,每棵工作树都干净。
 
-**2026-08-23 后续:**Qumbra 运营的共享 prover 是可行的第三条路线;它保留 b16,
-同时服务所有手机。Larry 已裁决,要求用户自己运营常驻 self-hosted prover 太麻烦,
-**不在考虑范围内**。共享服务的信任与公网安全边界记录在
+**2026-08-23 后续:**Qumbra 运营的共享 prover 在算力上可行,能服务所有手机;但协议
+不变的 trusted 形态能盗取 selected inputs,不是 real-value 产品路线。Larry 已裁决,
+要求用户自己运营常驻 self-hosted prover 太麻烦,**不在考虑范围内**。可上线的
+authorization/attestation 候选与公网安全边界记录在
 [`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md)。
 
 ---
@@ -149,16 +150,24 @@ pub fn verify_proof(inst: &BucketInstance, pvs: &[Val], proof: &Proof<Config>) -
 
 ## 7. 新会话该按什么顺序做
 
-1. **要对着三条真实路线做选择,不能再用原来的二选一标签。**
+1. **要对着诚实产品路线做选择,不能再用原来的二选一标签。**
    - b4:旧 mint 前数据约 236 KB + 重新 mint/双验证器 + 低内存设备仍要 fallback,
      换来新手机本地独立证明。
-   - 共享 b16 backend:今天 148,625 字节交易 + T2 共识不变 + 每台手机都能 send,
-     换来一个受信任、隐私敏感、可用性关键的 Qumbra 服务。
+   - 共享 b16 backend + 手机持有 authorization:每台手机都能 send,prover 不能把
+     selected inputs 改付给自己;但 note/public/wire/verifier 改动同样属于 re-mint 级,
+     byte 与 prover 成本欠测。
+   - attested confidential b16 backend:原则上不需 protocol re-mint,但 confidential-VM
+     memory fit、performance、attestation、operator isolation 与 ingress linkability
+     都未测。
+   - 协议不变的 trusted b16 backend:今天 148,625 字节且不需 re-mint,但服务能盗取
+     selected inputs。这只是可行性基线,不是 real-value 产品路线。
    - 用户每笔操作 Mac:当前行为,产品 UX 已拒绝。
-2. **按链接的安全交接决定 backend 信任门槛:**披露后的 trusted service、带
-   attestation 的 confidential worker,或协议级的手机持有交易授权。
+2. **给两条可上线 backend 候选计价:**展开手机持有 authorization 设计,把它的
+   re-mint/wire/prover 成本直接与 b4 比;另跑当前 b16 proof 的 attested
+   confidential-VM lane。
 3. **只有 b4 仍是候选时:**才做测量二(设备余量)与测量一(当前电路 b4/b8),并在
-   各自规定的硬件上跑。共享 backend 不依赖这两个测量。
+   各自规定的硬件上跑。Confidential backend 不依赖这两个测量;authorization 比较
+   需要当前 b4 数字。
 4. 完成选择与任何仍需测量后,才碰 `CONSENSUS_CFG`。
 
 **已被取代的路线:**把用户 Mac prover 做成长驻在技术上仍可行,但 Larry 已裁决

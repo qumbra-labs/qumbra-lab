@@ -1,7 +1,8 @@
 # Backend-assisted proving — feasibility and security handoff
 
-**Status: FEASIBLE, NOT BUILT. The trust model and production security gates are
-not decided. Do not expose the current paired-prover binary to the Internet.**
+**Status: RESEARCH RECORD, NOT A BUILD PLAN. Shared proving is computationally
+feasible, but its current trusted form is not shippable for real-value use. Do
+not expose the current paired-prover binary to the Internet.**
 Paired with
 [`backend-assisted-proving-security-zh.md`](backend-assisted-proving-security-zh.md).
 
@@ -12,8 +13,9 @@ product ruling and one technical finding:
   prover is too much friction and is out of scope. Do not build the product
   around a user's Mac, home server, or rented VM.
 - **VERIFIED:** Qumbra can operate one public logical prover service for all
-  wallets without changing `CONSENSUS_CFG`. It must be described honestly as
-  **trusted assisted proving** under the current transaction protocol.
+  wallets without changing `CONSENSUS_CFG`, but the unchanged protocol gives
+  that service power to steal the selected inputs. That is a useful feasibility
+  baseline, not an acceptable product architecture.
 
 "One service" does not mean one process or one machine. The product surface can
 be one endpoint while an admission queue dispatches jobs to multiple isolated
@@ -23,14 +25,18 @@ workers as demand grows.
 
 ## 1. Answer in one sentence
 
-Yes: keep b16, let the phone select and approve a spend, send its
-`WitnessBundle` over an authenticated encrypted channel to a Qumbra-operated
-worker, return the proved transaction to the phone, and let the phone submit it.
+The compute topology works: keep b16, let the phone select and approve a spend,
+send its `WitnessBundle` to a Qumbra-operated worker, return the proof, and let
+the phone submit it. **That exact trusted topology must not ship with real
+value.** A public product additionally needs either phone-held authorization
+that the worker cannot forge or an attested confidential worker the operator
+cannot read.
 
-This gives every supported phone a send path, keeps today's 148,625-byte
-consensus wire size, and avoids a T2 re-mint or permanent dual verifier. The
-price is not on the consensus wire: it is the service trust, privacy,
-availability, and operating bill described below.
+The unchanged trusted baseline gives every supported phone a send path, keeps
+today's 148,625-byte consensus wire size, and avoids a T2 re-mint. It does so by
+paying with selected-input spend authority, which is disqualifying rather than
+a property to disclose away. The authorization design in §8 removes that power
+but is itself a T2 re-mint-class protocol change whose wire/prover cost is owed.
 
 ## 2. What already exists
 
@@ -91,9 +97,15 @@ The blast radius is bounded but material:
 Therefore a Qumbra-operated service is technically a temporary holder of enough
 material to authorize the selected-note spend. Whether that has a legal label is
 outside this document; technically it must not be marketed as trustless or
-non-custodial under the current protocol.
+non-custodial under the current protocol, and this document does not recommend
+shipping it for real-value use.
 
-## 4. Proposed public-service boundary
+## 4. Baseline service topology and node connectivity
+
+This diagram answers how the apps, prover tier, and Qumbra nodes connect. It is
+not by itself a shippable security design: §8 must replace the highlighted
+trusted-worker boundary with phone-held authorization or an attested
+confidential worker.
 
 ```mermaid
 flowchart LR
@@ -111,7 +123,7 @@ flowchart LR
         INGRESS["API ingress<br/>TLS 1.3 • device auth • rate limit"]
         ADMISSION["Admission + quota<br/>reserve a worker lease"]
         WORKERS["Ephemeral prover workers<br/>one job per process or VM"]
-        RISK["Current trust boundary<br/>worker sees selected-input spend material"]
+        RISK["Unshippable trusted boundary<br/>worker sees selected-input spend material"]
         INGRESS --> ADMISSION --> WORKERS
         WORKERS --- RISK
     end
@@ -151,16 +163,20 @@ Each worker serves one job in a separate unprivileged process or VM and exits.
 A long-lived coordinator may schedule work; the process that held a witness
 must not be reused across users.
 
-The phone remains the submitter. This does not remove the fundamental trust
-fact in §3, but it reduces accidental submission authority, makes the approved
-intent checkable, and keeps incomplete/duplicate recovery in the wallet's
-existing typed flow.
+### Phone submission is engineering hygiene, not a trust argument
+
+The phone remains the submitter so the service holds no submission credential
+and incomplete/duplicate recovery stays in the wallet's existing typed flow.
+This is worthwhile engineering hygiene. It is not a selected-input theft
+control: a malicious worker can connect to the same public node and submit its
+conflicting proof itself. The architecture diagram shows the honest data flow,
+not a security boundary that prevents §3.
 
 ## 5. P0 gates before any Internet pilot
 
 | risk | fact in the current seam | required gate |
 |---|---|---|
-| Selected-input theft | the worker receives the input `sk` and witness | Explicitly accept and disclose the trusted-assisted model, or require §8's stronger authorization before launch |
+| Selected-input theft | the worker receives the input `sk` and witness | Do not ship this form for real value. Require §8's phone-held authorization or an attested worker whose measurement/key the wallet verifies before upload |
 | SSRF / internal-network reachability | the client supplies `scan_url` and `node_url`; `required_url` checks only an `http://` or `https://` prefix (`qumbra-paired-prover.rs:286-289,411-415`) | Remove URLs from the public request. Accept a network identifier and map it to operator-pinned endpoints. Deny worker access to loopback, private ranges, cloud metadata, and all other egress |
 | Compute exhaustion | one b16 proof is roughly a 12–15 GB-class job; the real deployment target is unmeasured | Authenticate before admission; bound queue depth, jobs per device, global concurrency, proof wall time, and retries. Add cooperative cancellation or kill the worker on lease expiry |
 | Pre-auth memory exhaustion | the server accepts an attacker-declared encrypted frame up to 128 MiB and allocates it before AEAD authentication (`qumbra-paired-prover.rs:180-213`) | Set a measured bundle ceiling near the real format size; authenticate a small fixed first message before allocating the payload |
@@ -190,6 +206,23 @@ not a legal identity. The design still owes a Sybil/cost decision: app
 attestation, invite/quota tokens, anonymous rate-limit credentials, payment, or
 some combination. No choice here is free, and the privacy property must be
 written before implementation.
+
+### Two independent launch bars
+
+Theft and linkability are different failures. Fixing one does not imply the
+other is fixed:
+
+| bar | question | trusted worker | phone-held authorization | attested confidential worker |
+|---|---|---|---|---|
+| **Cannot steal** | Can the service authorize outputs the phone did not approve? | **fails** | passes if consensus binds the phone-only signature to the complete intent | passes only under the attested image/hardware assumptions |
+| **Cannot see/link** | Can the service join input, output, amount, recipient, nullifier, device, and IP? | **fails** | **still fails** — authorization prevents theft, not observation | reduces host/operator access only if the bundle is encrypted directly to the attested worker; ingress/device/IP metadata still needs a separate privacy design |
+
+A shippable design must state which adversary each bar covers. Anonymous quota
+credentials, log minimization, separation between ingress identity and worker
+payload, and possibly a relay can reduce linkability. None makes the witness
+opaque to an ordinary non-confidential worker. Conversely, an authorization
+signature can make the witness safe to expose for spend integrity while leaving
+the entire transaction relationship visible to the service.
 
 Minimum protocol properties regardless of that choice:
 
@@ -223,23 +256,145 @@ more than one failure domain before it is the only send path, and an answer for
 what wallets do during a regional or total outage. "Try later" is honest; an
 unbounded spinner is not.
 
-## 8. Paths to a stronger trust model
+## 8. Shippable remote-proving design space
 
-| path | consensus change | what it buys | residual cost/risk |
-|---|---|---|---|
-| Trusted Qumbra service | none | Fastest route; keeps b16 and today's wire size | Qumbra/worker can steal selected inputs; privacy, censorship, and breach risk remain |
-| Attested confidential VM | none in principle | Reduces ordinary operator/cloud access to plaintext witnesses | Trust moves to hardware, firmware, attestation, measured image, and side-channel posture; prover memory fit and performance are unmeasured |
-| Phone-held transaction-intent authorization | yes | A worker can know the proving witness but cannot authorize different outputs | Requires a distinct secret that never enters the bundle, a note/commitment and verifier binding to it, canonical intent bytes, PQ authorization choice, migration rules, and new size/performance measurements |
-| MPC / encrypted outsourced proving | likely extensive | Tries to hide the witness cryptographically from every single worker | Research project, large performance/complexity risk; not a launch path on present evidence |
+| path | consensus change | selected-input theft | linkability | status |
+|---|---|---|---|---|
+| Trusted Qumbra worker | none | **worker can steal** | worker and ingress can link | feasibility baseline only; do not ship for real value |
+| Phone-held transaction-intent authorization | yes | worker cannot forge a different intent if the binding is correct | service still sees the witness and relationship | candidate protocol design below |
+| Attested confidential worker | none in principle | host/operator cannot steal if attestation and isolation hold | host payload access can be reduced; ingress metadata remains | concrete measurement lane below |
+| MPC / encrypted outsourced proving | likely extensive | aims to remove any single stealing worker | may reduce witness visibility | research project, not a current launch path |
 
-The authorization path must bind at least network/genesis, selected-note
-identity or nullifiers, anchor/freshness rule, both output commitments,
-discovery bytes, rider, fee, and an expiry/replay domain. An API-layer signature
-alone is insufficient: the node or the proved statement must reject a
-conflicting transaction that lacks the phone-only authorization.
+### 8.1 Candidate A — phone-held transaction-intent authorization
 
-No such authorization key exists in today's note format. Adding one is a
-protocol project, not a backend refactor.
+This is the smallest design currently visible in the code, not a ratified
+protocol. The phone already constructs the complete intent before proving:
+`WitnessBundle` fixes the anchor, real nullifiers, both output plaintexts and
+commitments, fee, committed discovery bytes, and rider. The missing property is
+a secret that authorizes those bytes and never enters the bundle.
+
+Current constraints that shape the design:
+
+- one `sk` derives `nk`, the nullifier, and `rkm`; the remote prover receives
+  that `sk` (`qlab-air/src/narrow.rs:1183-1198,1289-1324`);
+- a note currently commits only `(value, rkm, rho, rseed)`
+  (`qlab-note/src/note.rs:22-50`);
+- the STARK public values are only anchor, two nullifiers, two output
+  commitments, and fee (`qlab-air/src/narrow.rs:261-290`);
+- `TxPublic` has the same surface, while discovery and rider sit beside it in
+  `TxEntry` (`qlab-devnet/src/body.rs:166-214`).
+
+A candidate fixed-shape construction is:
+
+1. Derive a distinct per-note authorization secret `ask_i` on the phone and a
+   corresponding post-quantum public key `apk_i`. `ask_i` never enters
+   `WitnessBundle`; the proving component of the spend secret still does.
+2. Bind `apk_i` into the note commitment path — for example by extending the
+   note plaintext/commitment or the `rkm` derivation. The STARK must prove that
+   each exposed `apk_i` belongs to the same input note whose membership and
+   nullifier it proves. Merely placing a key beside the proof is not a binding.
+3. Define one canonical intent digest over at least:
+
+   ```text
+   domain || protocol_version || network_id || genesis_hash ||
+   anchor || nf_0 || nf_1 || cm_out_0 || cm_out_1 || fee ||
+   H(discovery_bytes) || H(rider_bytes) || expiry/replay_domain
+   ```
+
+   Discovery and rider must be covered even though they are outside today's
+   STARK public-value vector; otherwise the worker can rewrite recipient
+   delivery material or the name operation without invalidating authorization.
+4. The phone signs that digest with each fixed input slot's authorization key
+   and sends only the signatures/public keys with the bundle. Keep two
+   authorization slots even when one spend input is the dummy, so the change
+   does not reveal the real-input count that the frozen 2×2 shape currently
+   hides. The dummy slot can use an ephemeral phone-held authorization key.
+5. The proof exposes and binds both `apk_i` values to its input-note relations.
+   The node verifies the signatures against the same canonical digest before it
+   accepts the transaction. Native verification outside the STARK is the
+   smallest current hypothesis; proving the signature verification inside the
+   STARK is an alternative that must be priced separately.
+
+Under this construction, the worker may randomize/rebuild the proof or submit
+the already-authorized transaction, but cannot change an intent field without
+forging a phone-held signature. Replays carry the same nullifiers and reduce to
+the existing duplicate rule. The service can still censor and link the spend;
+this design clears the **cannot steal** bar, not the **cannot see/link** bar.
+
+#### Protocol and T2 cost
+
+This is a T2 re-mint-class change, not an API addition:
+
+- note plaintext/commitment or `rkm` derivation changes so existing notes do
+  not contain an authorization key;
+- input witness/AIR relations and the public-value layout change;
+- `TxPublic`, `TxEntry`, P2P/body codecs, transaction ID/preimage rules, and the
+  node verifier gain authorization fields and checks;
+- frozen genesis parameters and the consensus wire-size pin move.
+
+A clean T2 re-mint gives every live note the new shape. A height-gated legacy
+path avoids a re-mint only by permanently retaining old-note verification and a
+trusted way to remotely spend those old notes — the same historical burden the
+phone b4 handoff identified for dual FRI verification.
+
+The magnitude is unmeasured. It depends on the post-quantum authorization
+primitive, whether public keys can be committed compactly and derived per note,
+whether signatures are verified natively or inside the STARK, and the extra
+public-value/AIR openings. A classical signature cannot be assumed silently in
+a post-quantum spend-authority design. Measure at minimum:
+
+- bytes for two fixed authorization public-key/signature slots plus codec
+  framing;
+- new circuit width/permutation count, peak prover memory, prove time, proof
+  bytes, and verifier time at b16;
+- note plaintext/discovery growth and scanning cost;
+- privacy effects of exposing one-time authorization public keys;
+- migration/replay behavior across the activation boundary.
+
+This cost must be compared directly with b4's re-mint-class cost. The backend
+row cannot claim "T2 consequence: none" while quietly assuming the disqualified
+trusted model.
+
+### 8.2 Candidate B — attested confidential worker
+
+An attested confidential VM is the only visible route that can keep today's
+consensus protocol while withholding witness plaintext from the ordinary
+Qumbra/cloud operator. It is not "TLS to a VM." The wallet must verify a remote
+attestation that binds an ephemeral encryption key to the approved worker image
+and security configuration, then encrypt the bundle directly to that key. The
+ingress/queue must be unable to decrypt it.
+
+The measured image must pin the prover binary, consensus config, protocol
+version, node allowlist, debug-disabled state, and result-encryption behavior.
+The worker still needs tightly restricted read-only access to pinned nodes. Its
+result is encrypted back to the wallet, and the VM is destroyed after the job.
+
+The go/no-go question is concrete: can the current 12–15 GB-class b16 job fit
+and perform acceptably inside the chosen SEV-SNP/TDX-class confidential-VM
+offering? Before treating this as a product option, run a dedicated lane that:
+
+1. proves the current circuit on the exact confidential instance type and
+   records peak private memory, cold/warm time, failure behavior, and cost;
+2. verifies the full attestation and image/config measurement from both iOS and
+   Android, including stale, debug, wrong-image, and revoked-key negatives;
+3. proves the bundle remains encrypted across ingress, queue, host, snapshots,
+   swap, crash collection, and operator observability;
+4. tests host/guest rollback, job replay, cancellation, and teardown;
+5. states the accepted hardware, firmware, cloud, side-channel, and availability
+   trust explicitly.
+
+Attestation does not automatically solve linkability. An ingress that
+authenticates a device and sees its IP can still associate a job with timing and
+the resulting on-chain transaction even if it cannot decrypt the witness. That
+requires the separate privacy controls in §6.
+
+### 8.3 Deferred route — MPC or encrypted outsourced proving
+
+Computing the STARK without any single worker learning the witness would address
+both operator theft and some payload visibility without a hardware root of
+trust. Nothing in the current code provides that seam, and its performance and
+complexity are unpriced. It remains research, not a reason to delay costing the
+two concrete candidates above.
 
 ## 9. Relationship to the b4 decision
 
@@ -247,14 +402,21 @@ Backend-assisted proving is the missing branch in the reopened phone decision:
 
 | choice | all supported phones can send | consensus wire | T2 consequence | enduring dependency |
 |---|---|---:|---|---|
-| b4 local prove + fallback | only through a fallback on low-memory devices | about 236 KB on stale pre-mint data; current value owed | re-mint or permanent dual verifier | fallback prover still exists |
-| Qumbra backend at b16 | yes | 148,625 bytes today | none | trusted, available prover service |
+| b4 local prove, no remote fallback | no — low-memory phones are excluded | about 236 KB on stale pre-mint data; current value owed | re-mint or permanent dual verifier | honest local proving on capable phones only |
+| Trusted Qumbra backend at b16 | yes | 148,625 bytes today | none | **unshippable:** service can steal selected inputs and link spends |
+| Shared b16 backend + phone-held authorization | yes | 148,625 bytes + unmeasured proof/auth/wire delta | re-mint or permanent legacy verifier/note path | service cannot steal if binding is correct; it still sees and can censor |
+| Attested confidential b16 backend | yes in principle | 148,625 bytes today | no protocol re-mint in principle | hardware/cloud/attestation trust; fit and performance unmeasured; ingress linkability remains |
 | current per-send Mac pairing | only when the user operates a Mac each time | 148,625 bytes today | none | rejected product UX |
 
-The shared backend therefore removes the reason to change `CONSENSUS_CFG` merely
-to make every phone capable of sending. It does not answer whether Larry accepts
-the trusted-assisted model for mainnet, or whether §8's stronger authorization
-must land first.
+The honest product comparison is therefore **b4 local proving** versus
+**b16 backend plus authorization/attestation**, not b4 versus "trust Qumbra."
+Phone-held authorization and b4 are both T2 re-mint-class changes; their actual
+wire, prover, and migration costs must be measured on the current circuit.
+
+If every supported phone must send, b4 alone is incomplete. Its low-memory
+fallback needs the same authorization or confidential-worker protection as the
+shared backend, so b4 may pay both the larger-proof cost and the remote-prover
+security cost.
 
 If the backend direction is selected, b4/b8 phone measurements are no longer a
 prerequisite for that service. They remain useful only if local self-proving is
@@ -262,16 +424,19 @@ kept as a separate future product goal.
 
 ## 10. Decisions and evidence still owed
 
-Before implementation:
+Before selecting a build plan:
 
-1. Decide the launch scope: T2-only experiment, optional mainnet path, or the
-   default/only phone send path.
-2. Decide the minimum trust bar: disclosed trusted service, attested worker, or
-   phone-held protocol authorization.
-3. Decide the device credential and abuse-control model without silently
+1. Expand §8.1 into a protocol spike and measure its re-mint, wire, privacy, and
+   prover costs directly against b4 on the current circuit.
+2. Run §8.2's current-b16 confidential-VM fit/attestation lane so the
+   no-protocol-change alternative has evidence rather than a label.
+3. Decide the launch scope: T2-only experiment, optional mainnet path, or the
+   default/only phone send path. A trusted worker is eligible only for a
+   valueless service-mechanics experiment, not real-value launch.
+4. Decide the device credential and abuse-control model without silently
    creating a wallet identity system.
-4. Set retention, logging, incident-response, queue/SLO, and outage policies.
-5. Threat-model the final protocol and deployment separately before exposing a
+5. Set retention, logging, incident-response, queue/SLO, and outage policies.
+6. Threat-model the final protocol and deployment separately before exposing a
    listener.
 
 Evidence to collect before capacity or cost claims:
@@ -284,6 +449,15 @@ Evidence to collect before capacity or cost claims:
    dump, log leakage, and worker escape.
 4. An end-to-end drill proving that the phone refuses every artifact whose
    public transaction surface differs from the approved bundle.
+
+### Independent no-decision fix
+
+Replacing both 128 MiB protocol ceilings does not depend on the product route.
+Measure the largest valid current `WitnessBundle` and transaction artifact, set
+small explicit multiples as request/response ceilings, derive chunk count from
+the byte ceiling, and add boundary tests in a standalone PR. That hardens the
+existing trusted-LAN tool and every future transport without committing to a
+backend architecture.
 
 ## 11. Scope at this handoff
 

@@ -6,11 +6,12 @@ Paired with [`phone-self-proving-reopened-zh.md`](phone-self-proving-reopened-zh
 Written 2026-08-23 as a session handoff. Nothing in this document has been built;
 every PR from the session that produced it is merged and every worktree is clean.
 
-**2026-08-23 follow-up:** a Qumbra-operated shared prover is a feasible third
-branch that keeps b16 and serves every phone. Larry ruled that requiring users
-to operate a persistent self-hosted prover is too much friction and is **out of
-scope**. The shared service's trust and Internet-security boundary is recorded
-in
+**2026-08-23 follow-up:** a Qumbra-operated shared prover is computationally
+feasible and can serve every phone, but the unchanged trusted form can steal
+selected inputs and is not a real-value product branch. Larry ruled that
+requiring users to operate a persistent self-hosted prover is too much friction
+and is **out of scope**. The shippable authorization/attestation candidates and
+Internet-security boundary are recorded in
 [`backend-assisted-proving-security.md`](backend-assisted-proving-security.md).
 
 ---
@@ -164,20 +165,28 @@ discovering it by being killed.
 
 In order:
 
-1. **Choose against all three real branches, not the old two-way label.**
+1. **Choose against the honest product branches, not the old two-way label.**
    - b4: about 236 KB on stale pre-mint data + re-mint/dual verifier + a
      fallback for low-memory devices, in exchange for local independence on
      modern phones.
-   - shared b16 backend: 148,625-byte transactions today + no T2 consensus
-     change + every phone can send, in exchange for a trusted, privacy-sensitive
-     and availability-critical Qumbra service.
+   - shared b16 backend + phone-held authorization: every phone can send and the
+     prover cannot redirect the selected inputs, but note/public/wire/verifier
+     changes make this a re-mint-class change too; its byte and prover cost are
+     owed.
+   - attested confidential b16 backend: no protocol re-mint in principle, but
+     confidential-VM memory fit, performance, attestation, operator isolation,
+     and ingress linkability are all unmeasured.
+   - unchanged trusted b16 backend: 148,625-byte transactions and no re-mint,
+     but the service can steal selected inputs. This is a feasibility baseline,
+     not a real-value product branch.
    - per-send user Mac: current behavior, rejected as product UX.
-2. **Decide the backend trust bar** from the linked security handoff: disclosed
-   trusted service, attested confidential worker, or a protocol-level
-   phone-held transaction authorization.
+2. **Cost the two shippable backend candidates:** expand the phone-held
+   authorization design and compare its re-mint/wire/prover cost directly with
+   b4; separately run the current b16 proof in an attested confidential-VM lane.
 3. **Only if b4 remains a contender:** run Measurement 2 (device headroom) and
    Measurement 1 (current-circuit b4/b8) on their prescribed hardware. The
-   shared backend does not depend on either measurement.
+   confidential backend does not depend on either measurement; the
+   authorization comparison does need current b4 numbers.
 4. Only after those choices and any required measurements: touch
    `CONSENSUS_CFG`.
 
