@@ -54,6 +54,111 @@ Qumbra 可以为所有支持手机研究一个共享逻辑 prover service,但现
 因此,产品比较不是"b4 对相信 Qumbra",而是带安全 fallback 的 b4,对带
 authorization 或 attestation 的 b16 remote proving。
 
+### 候选架构图
+
+Baseline topology 的 service 主干不变:wallet 从固定 read endpoints 扫描,一个公共逻辑
+service 给 ephemeral workers 发 lease,worker 用固定的只读 node access 做 preflight,
+通常仍由 wallet 提交返回的交易。两个候选的区别在 security boundary。
+
+#### 候选 A —— 共识绑定的手机授权
+
+普通 service 仍可能观察并关联 witness。它的安全声明更窄:手机保留 authorization
+secret;worker 一旦改动已授权 intent 或 note binding,node 就会拒绝交易。
+
+```mermaid
+flowchart LR
+    subgraph DEVICE["用户设备"]
+        APPS["iOS / Android app"]
+        KERNEL["Wallet kernel<br/>scan • select • build • review"]
+        AUTH["手机专属 authorization secret<br/>永不上传"]
+        INTENT["Canonical intent<br/>手机授权"]
+        ENVELOPE["已授权 proving envelope<br/>proving material • intent • authorization"]
+        APPS --> KERNEL
+        KERNEL --> INTENT
+        AUTH --> INTENT
+        KERNEL --> ENVELOPE
+        INTENT --> ENVELOPE
+    end
+
+    subgraph SERVICE["Qumbra prover service"]
+        INGRESS["API ingress<br/>TLS • auth • rate limit"]
+        ADMISSION["Admission + 有界 worker lease"]
+        WORKER["Ephemeral b16 worker<br/>没有 authorization secret"]
+        VISIBLE["Service 可能看见/关联 witness<br/>不能伪造另一份 intent"]
+        INGRESS --> ADMISSION --> WORKER
+        WORKER --- VISIBLE
+    end
+
+    subgraph NETWORK["Qumbra network"]
+        READ["运营方固定的 read endpoints<br/>anchors • nullifiers"]
+        TX["Transaction endpoint"]
+        VERIFY_AUTH["验证 canonical 手机授权"]
+        VERIFY_STARK["验证 STARK<br/>包括 authorization-note binding"]
+        ACCEPT["接受交易"]
+        TX --> VERIFY_AUTH --> VERIFY_STARK --> ACCEPT
+    end
+
+    KERNEL -->|"1. 扫描公开状态"| READ
+    ENVELOPE -->|"2. 上传"| INGRESS
+    WORKER -->|"3. fresh 只读 preflight"| READ
+    WORKER -->|"4. proof + 已授权交易"| INGRESS
+    INGRESS -->|"5. artifact"| KERNEL
+    KERNEL -->|"6. 核对并提交"| TX
+```
+
+这条路线会改共识。Node 先验 authorization,再做昂贵的 STARK verification;STARK 随后
+必须证明 authorization public values 属于同一批 hidden inputs。
+
+#### 候选 B —— attested confidential worker
+
+原则上这条路线保留今天的 consensus transaction。Wallet 先验证 fresh worker
+attestation,并把 ephemeral encryption key 绑定到获准 image/configuration。只有该 worker
+boundary 能解密 bundle;ingress、admission、durable infrastructure 与普通 operator 都只能
+看见 ciphertext。
+
+```mermaid
+flowchart LR
+    subgraph DEVICE["用户设备"]
+        APPS["iOS / Android app"]
+        KERNEL["Wallet kernel<br/>scan • select • build • review"]
+        ATTEST["Attestation verifier<br/>measurement • freshness • revocation"]
+        APPS --> KERNEL
+        ATTEST -->|"获准的 ephemeral key"| KERNEL
+    end
+
+    subgraph SERVICE["Qumbra prover service"]
+        INGRESS["API ingress<br/>auth • rate limit • ciphertext relay"]
+        ADMISSION["Admission + 有界 worker lease"]
+        CVM["Attested confidential b16 worker<br/>one job • debug disabled"]
+        BLIND["Ingress / queue / 普通 operator<br/>无法解密 payload"]
+        INGRESS --> ADMISSION --> CVM
+        INGRESS --- BLIND
+    end
+
+    subgraph NETWORK["Qumbra network"]
+        READ["运营方固定的 read endpoints<br/>anchors • nullifiers"]
+        TX["Transaction endpoint"]
+        VERIFY_STARK["现行 STARK verification"]
+        ACCEPT["接受交易"]
+        TX --> VERIFY_STARK --> ACCEPT
+    end
+
+    KERNEL -->|"1. 扫描公开状态"| READ
+    KERNEL -->|"2. 请求 worker lease"| INGRESS
+    CVM -->|"3. fresh attestation + ephemeral key"| INGRESS
+    INGRESS -->|"4. attestation"| ATTEST
+    KERNEL -->|"5. bundle 加密给 worker key"| INGRESS
+    INGRESS -->|"只转发 ciphertext"| CVM
+    CVM -->|"6. fresh 只读 preflight"| READ
+    CVM -->|"7. encrypted artifact"| INGRESS
+    INGRESS -->|"ciphertext relay"| KERNEL
+    KERNEL -->|"8. 解密、核对、提交"| TX
+```
+
+这条路线改 transport/trust boundary,而不是 transaction format。Attestation、encryption、
+hardware、firmware、image measurement 与 side-channel assumptions 都属于它的安全声明。
+Ingress metadata linkability 仍然存在。
+
 ## 4. 当前 trusted 交接不得上线
 
 `WitnessBundle` 带有每个 selected input 的 spend secret 与 note opening。今天的交易里

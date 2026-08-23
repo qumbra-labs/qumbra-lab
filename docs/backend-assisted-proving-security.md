@@ -109,6 +109,8 @@ This diagram answers how the apps, prover tier, and Qumbra nodes connect. It is
 not by itself a shippable security design: §8 must replace the highlighted
 trusted-worker boundary with phone-held authorization or an attested
 confidential worker.
+The route-specific successor diagrams are in
+[`remote-proving-decision.md`](remote-proving-decision.md#candidate-architecture-diagrams).
 
 ```mermaid
 flowchart LR

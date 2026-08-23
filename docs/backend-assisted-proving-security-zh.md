@@ -89,6 +89,8 @@ non-custodial,而且本文不建议把它用于真实价值。
 这张图只回答 apps、prover tier 与 Qumbra nodes 怎么连接,本身不是可上线安全设计。§8
 必须用手机持有 authorization 或 attested confidential worker 替换图中标出的 trusted
 worker 边界。
+两条路线各自的后续架构图见
+[`remote-proving-decision-zh.md`](remote-proving-decision-zh.md#候选架构图)。
 
 ```mermaid
 flowchart LR

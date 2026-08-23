@@ -64,6 +64,116 @@ The product comparison is therefore not "b4 versus trust Qumbra." It is b4
 plus a protected fallback versus b16 remote proving plus authorization or
 attestation.
 
+### Candidate architecture diagrams
+
+The service spine from the baseline topology remains: wallets scan pinned
+read endpoints, one public logical service leases ephemeral workers, workers
+use pinned read-only node access for preflight, and the wallet normally submits
+the returned transaction. The security boundary differs by candidate.
+
+#### Candidate A — consensus-bound phone authorization
+
+The ordinary service may still observe and link the witness. Its security claim
+is narrower: the phone keeps the authorization secret, and the node rejects any
+transaction whose authorized intent or note binding was changed by the worker.
+
+```mermaid
+flowchart LR
+    subgraph DEVICE["User device"]
+        APPS["iOS / Android app"]
+        KERNEL["Wallet kernel<br/>scan • select • build • review"]
+        AUTH["Phone-only authorization secret<br/>never uploaded"]
+        INTENT["Canonical intent<br/>phone authorization"]
+        ENVELOPE["Authorized proving envelope<br/>proving material • intent • authorization"]
+        APPS --> KERNEL
+        KERNEL --> INTENT
+        AUTH --> INTENT
+        KERNEL --> ENVELOPE
+        INTENT --> ENVELOPE
+    end
+
+    subgraph SERVICE["Qumbra prover service"]
+        INGRESS["API ingress<br/>TLS • auth • rate limit"]
+        ADMISSION["Admission + bounded worker lease"]
+        WORKER["Ephemeral b16 worker<br/>no authorization secret"]
+        VISIBLE["Service may see/link witness<br/>cannot forge a different intent"]
+        INGRESS --> ADMISSION --> WORKER
+        WORKER --- VISIBLE
+    end
+
+    subgraph NETWORK["Qumbra network"]
+        READ["Operator-pinned read endpoints<br/>anchors • nullifiers"]
+        TX["Transaction endpoint"]
+        VERIFY_AUTH["Verify canonical phone authorization"]
+        VERIFY_STARK["Verify STARK<br/>including authorization-note binding"]
+        ACCEPT["Accept transaction"]
+        TX --> VERIFY_AUTH --> VERIFY_STARK --> ACCEPT
+    end
+
+    KERNEL -->|"1. scan public state"| READ
+    ENVELOPE -->|"2. upload"| INGRESS
+    WORKER -->|"3. fresh read-only preflight"| READ
+    WORKER -->|"4. proof + authorized transaction"| INGRESS
+    INGRESS -->|"5. artifact"| KERNEL
+    KERNEL -->|"6. compare and submit"| TX
+```
+
+This route changes consensus. Authorization verification happens before the
+expensive STARK verification; the STARK must then prove that the authorization
+public values belong to the same hidden inputs.
+
+#### Candidate B — attested confidential worker
+
+This route preserves today's consensus transaction in principle. The wallet
+first verifies a fresh worker attestation and binds an ephemeral encryption key
+to the approved image/configuration. Only that worker boundary may decrypt the
+bundle; ingress, admission, durable infrastructure, and the ordinary operator
+must see ciphertext only.
+
+```mermaid
+flowchart LR
+    subgraph DEVICE["User device"]
+        APPS["iOS / Android app"]
+        KERNEL["Wallet kernel<br/>scan • select • build • review"]
+        ATTEST["Attestation verifier<br/>measurement • freshness • revocation"]
+        APPS --> KERNEL
+        ATTEST -->|"approved ephemeral key"| KERNEL
+    end
+
+    subgraph SERVICE["Qumbra prover service"]
+        INGRESS["API ingress<br/>auth • rate limit • ciphertext relay"]
+        ADMISSION["Admission + bounded worker lease"]
+        CVM["Attested confidential b16 worker<br/>one job • debug disabled"]
+        BLIND["Ingress / queue / ordinary operator<br/>cannot decrypt payload"]
+        INGRESS --> ADMISSION --> CVM
+        INGRESS --- BLIND
+    end
+
+    subgraph NETWORK["Qumbra network"]
+        READ["Operator-pinned read endpoints<br/>anchors • nullifiers"]
+        TX["Transaction endpoint"]
+        VERIFY_STARK["Existing STARK verification"]
+        ACCEPT["Accept transaction"]
+        TX --> VERIFY_STARK --> ACCEPT
+    end
+
+    KERNEL -->|"1. scan public state"| READ
+    KERNEL -->|"2. request worker lease"| INGRESS
+    CVM -->|"3. fresh attestation + ephemeral key"| INGRESS
+    INGRESS -->|"4. attestation"| ATTEST
+    KERNEL -->|"5. bundle encrypted to worker key"| INGRESS
+    INGRESS -->|"ciphertext only"| CVM
+    CVM -->|"6. fresh read-only preflight"| READ
+    CVM -->|"7. encrypted artifact"| INGRESS
+    INGRESS -->|"ciphertext relay"| KERNEL
+    KERNEL -->|"8. decrypt, compare, submit"| TX
+```
+
+This route changes the transport and trust boundary rather than the transaction
+format. The attestation, encryption, hardware, firmware, image-measurement, and
+side-channel assumptions are part of its security claim. Ingress metadata
+linkability remains.
+
 ## 4. The current trusted handoff must not ship
 
 `WitnessBundle` carries each selected input's spend secret and note opening.
