@@ -639,7 +639,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// Admit a transaction for a wallet. Cheap public checks against live node
     /// state run first (anchor validity, posted fee, nullifier gates, discovery
     /// binding); the injected proof verify runs last. On success the tx is pended
-    /// and its discovery artifacts recorded for serving.
+    /// and its discovery artifacts recorded for serving. The installed node form
+    /// selects the rider boundary, so this in-process API cannot reintroduce the
+    /// v4-hardcoded admission bug if a form-aware composition wires it later.
     pub fn submit_tx<V: TxVerifier>(
         &mut self,
         tx: TxEntry,
@@ -693,7 +695,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         // frozen §2 rule unreachable from the wallet RPC. It is now enforced by the
         // commitment tree's append schedule, so there is nothing to pass and no way
         // for this path to skip it.
-        match self.mempool.admit(tx, &self.node, verifier, self.node.names()) {
+        let rider_boundary = self.node.genesis_form().rider_admit_boundary();
+        match self.mempool.admit_above(
+            rider_boundary,
+            tx,
+            &self.node,
+            verifier,
+            self.node.names(),
+        ) {
             Ok(_body_id) => {
                 self.discovery.insert(txid, discovery);
                 SubmitOutcome::Accepted(txid)
@@ -1597,10 +1606,11 @@ where
 mod tests {
     use super::*;
     use qlab_devnet::fees::posted_fee;
-    use crate::node::{genesis_block, MemNode};
+    use crate::node::{genesis_block, genesis_block_for, MemNode};
     use qlab_cbserver::codec::decode_compact_response;
     use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
     use qlab_devnet::fees::ArityBucket;
+    use qlab_devnet::forms::GenesisForm;
     use qlab_devnet::header::BlockHeader;
     use qlab_note::wire::{ClueSlot, CompactEntry};
 
@@ -1676,6 +1686,16 @@ mod tests {
         (NodeRpc::new(node), anchor)
     }
 
+    fn rpc_for_form_with_finalized_genesis(form: GenesisForm) -> (MemNodeRpc, Hash32) {
+        let genesis = genesis_block_for(form, 1_000, 0);
+        let mut node = MemNode::in_memory_for(form, genesis);
+        let ghash = node.chain().genesis_block_hash();
+        assert!(node.finalize(ghash).unwrap().is_recorded());
+        let anchor = node.commitment_root();
+        assert!(node.is_valid_anchor(&anchor));
+        (NodeRpc::new(node), anchor)
+    }
+
     /// S8: with nothing finalized, the finalized-age telemetry field is 0, NOT the
     /// tip−genesis fallback (which read as a huge absolute value in Phase B-lite).
     #[test]
@@ -1742,6 +1762,43 @@ mod tests {
         // Duplicate submit is a no-op.
         let disc2 = disc_for(&[10, 11]);
         assert_eq!(rpc.submit_tx(tx, disc2, &OkVerifier), SubmitOutcome::Duplicate);
+    }
+
+    /// Lab #612's loaded-gun check: `NodeRpc` has no production submit caller,
+    /// but it owns a real form-keyed `Node`. Derive admission from that form so
+    /// a future composition cannot accept v5 blocks while refusing their native
+    /// name riders through this API. The v4 half is the opposite mutation lock.
+    #[test]
+    fn submit_tx_uses_the_wrapped_nodes_rider_boundary() {
+        use qlab_devnet::names::NameOp;
+
+        let (mut v5, v5_anchor) =
+            rpc_for_form_with_finalized_genesis(GenesisForm::V5);
+        let v5_commit = tx_with(
+            v5_anchor,
+            &[0x61],
+            &[0x71],
+            posted_fee(ArityBucket::TwoByTwo),
+        )
+        .with_name_op(&NameOp::Commit { commit: [0xB5; 32] });
+        assert!(matches!(
+            v5.submit_tx(v5_commit, disc_for(&[0x71]), &OkVerifier),
+            SubmitOutcome::Accepted(_)
+        ));
+
+        let (mut v4, v4_anchor) =
+            rpc_for_form_with_finalized_genesis(GenesisForm::V4);
+        let v4_commit = tx_with(
+            v4_anchor,
+            &[0x62],
+            &[0x72],
+            posted_fee(ArityBucket::TwoByTwo),
+        )
+        .with_name_op(&NameOp::Commit { commit: [0xB6; 32] });
+        assert_eq!(
+            v4.submit_tx(v4_commit, disc_for(&[0x72]), &OkVerifier),
+            SubmitOutcome::Rejected(RejectReason::RiderInvalid)
+        );
     }
 
     #[test]
