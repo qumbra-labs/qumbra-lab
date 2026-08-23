@@ -7027,11 +7027,12 @@ mod tests {
     /// mined, aged to the inclusive `COMMIT_MIN_AGE` edge, the REVEAL enters via
     /// [`NodeAdapter::submit_tx_typed`], and [`NodeAdapter::mine_block`] performs
     /// the node's own assembly and PoW path. The assertions record the observed
-    /// result on this tree rather than presupposing the live result: the reveal
-    /// is INCLUDED, its full name fee is burned, and the miner's own state funnel
-    /// accepts and applies the block.
+    /// result on this tree rather than presupposing the live result: assembly
+    /// INCLUDES the reveal, then the adapter's relay-grade self-ingest gate
+    /// refuses it as `RiderRule(CommitNotFound)` because that gate validates v5
+    /// bodies against `EmptyNameView` instead of the node's populated registry.
     #[test]
-    fn a_v5_burn_bearing_name_reveal_is_admitted_and_mined() {
+    fn a_v5_burn_bearing_name_reveal_is_admitted_assembled_and_refused() {
         use qlab_devnet::names::{
             commit_hash, name_fee_bessel, NameOp, NameRecord, COMMIT_MIN_AGE,
             L1_ADDRESS_LEN, RECORD_KIND_L1_ADDRESS,
@@ -7096,12 +7097,45 @@ mod tests {
             "relay plus burn is the declared fee"
         );
 
+        // Pin the exact predicate before `ingest_block` flattens it to "bad body".
+        // The adapter's relay-grade v5 gate uses EmptyNameView, which cannot see
+        // the on-chain commit the state registry above just applied. The stateful
+        // funnel accepts the identical header/body pair, isolating the disagreement
+        // to the view passed into validation rather than any rider rule or proof.
+        let empty_view_refusal = qlab_devnet::body::validate_body_v5(
+            &header,
+            &body,
+            &node.verifier,
+            |root| node.state.is_valid_anchor(root),
+            &qlab_devnet::names::EmptyNameView,
+        );
+        assert_eq!(
+            empty_view_refusal,
+            Err(qlab_devnet::body::BodyError::RiderRule {
+                index: 0,
+                err: qlab_devnet::names::NameRuleError::CommitNotFound,
+            }),
+            "EXACT REFUSAL: relay-grade validation cannot see the mined commit"
+        );
+        assert_eq!(
+            qlab_devnet::body::validate_body_v5(
+                &header,
+                &body,
+                &node.verifier,
+                |root| node.state.is_valid_anchor(root),
+                node.state.names(),
+            ),
+            Ok(()),
+            "the node's real registry makes the identical block valid"
+        );
+
         // The requested forced-zero contrast at the one arithmetic boundary the
         // burn reaches. `total_name_burn` is derived from the reveal rider, so
         // there is no production switch that can set it to zero while leaving the
         // transaction identical. Forcing only this input raises the derived
-        // coinbase-note value by exactly the burn; the burn-bearing production
-        // candidate above is already selected and assembled.
+        // coinbase-note value by exactly the burn. The refusal above happens
+        // earlier, in `check_op`, and does not read this arithmetic input at all:
+        // burn is a correlate here, not the trigger.
         let burned_value = qlab_node::coinbase_note_value_parts(
             body.coinbase_total(),
             body.total_fees(),
@@ -7113,12 +7147,19 @@ mod tests {
 
         assert_eq!(
             node.ingest_block(header, body),
-            IngestOutcome::Accepted,
-            "OBSERVED: the miner does not refuse the burn-bearing reveal block"
+            IngestOutcome::Rejected("bad body"),
+            "OBSERVED: self-ingest flattens RiderRule(CommitNotFound) to bad body"
         );
-        assert_eq!(node.state().tip_height(), reveal_height, "the reveal block applied");
-        assert!(node.state().names().entry(name).is_some(), "the reveal changed registry state");
-        assert!(node.mempool().is_empty(), "the mined reveal left the pool");
+        assert_eq!(
+            node.state().tip_height(),
+            COMMIT_MIN_AGE,
+            "the refused reveal block did not apply"
+        );
+        assert!(node.state().names().entry(name).is_none(), "the name was not registered");
+        assert!(
+            node.mempool().contains(&reveal_id),
+            "the refused reveal remains pooled to be selected and refused again"
+        );
     }
 
     /// Lab #612: admission and eviction must ask the rider question under the
