@@ -2939,10 +2939,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // parked grind — gating the resume here would grind one ~25 ms slice
         // per 75 s, a ~99.97 % hashrate loss worse than the blocking defect
         // this replaced. Each call blocks for at most one slice.
-        if self.mining {
-            if self.try_mine() {
-                self.try_checkpoint();
-            }
+        if self.mining && self.try_mine() {
+            self.try_checkpoint();
         }
         phases.mine = lap(&mut t);
         // #360: the call above is the loop's ONLY route to try_checkpoint,
@@ -3353,6 +3351,80 @@ mod tests {
             template_serving: false,
         };
         (config, genesis, base)
+    }
+
+    // ---- lab #651: the mine phase is sliced and the interval gates only starts
+
+    /// A PoW engine that never satisfies any target (all-0xFF ⇒ maximal work
+    /// value): a grind under it can never finish, which is lab #651's blocked
+    /// phase made deterministic.
+    #[derive(Clone)]
+    struct NeverPow;
+    impl PowEngine for NeverPow {
+        fn name(&self) -> &'static str {
+            "never"
+        }
+        fn pow_hash(
+            &self,
+            _form: GenesisForm,
+            _header: &qlab_devnet::header::BlockHeader,
+            _seed: &[u8],
+        ) -> qlab_devnet::header::Hash32 {
+            [0xFF; 32]
+        }
+    }
+
+    /// 🔴 Item (4) of the lab #651 design, loop half: with the real 75 s
+    /// `mine_interval` in force, two consecutive loop iterations must BOTH
+    /// make grind progress — the interval gates STARTING a template, never
+    /// RESUMING one. If a resume were interval-gated the node would grind one
+    /// ~25 ms slice per 75 s: a ~99.97 % hashrate loss that no test asserting
+    /// only "it yields" would ever see.
+    ///
+    /// This also carries the loop half of the yield regression: on `main` the
+    /// first `try_mine` at an unminable difficulty would hash the whole 2^26
+    /// budget inside one call and park nothing.
+    #[test]
+    fn a_resume_is_not_gated_on_mine_interval() {
+        let (config, genesis, _base) = rig("i651_resume", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, NeverPow, DevnetRehearsalVerifier).unwrap();
+
+        // Start the grind: with a zero interval the phase may start a template.
+        node.set_mine_interval(Duration::ZERO);
+        assert!(!node.try_mine(), "NeverPow can never produce a block");
+        let (parent, n0) = node.p2p.node().grind_progress().expect("a grind is parked");
+        assert!(n0 > 0, "the first slice made progress");
+
+        // Restore the real 75 s interval. `last_mine` is recent (node start),
+        // so STARTING a template would now be refused — but the parked grind
+        // must keep progressing on every iteration regardless.
+        node.set_mine_interval(Duration::from_secs(75));
+        node.one_iteration(&mut |_| {});
+        let (_, n1) = node.p2p.node().grind_progress().expect("still parked");
+        assert!(n1 > n0, "first interval-gated iteration still ground a slice ({n1} > {n0})");
+        node.one_iteration(&mut |_| {});
+        let (parent2, n2) = node.p2p.node().grind_progress().expect("still parked");
+        assert!(n2 > n1, "second consecutive iteration also ground ({n2} > {n1})");
+        assert_eq!(parent2, parent, "same template throughout — a resume, not restarts");
+    }
+
+    /// The other half of the interval's meaning survives: with no grind in
+    /// flight and the 75 s interval unelapsed (the node just started), the
+    /// mine phase starts nothing — `mine_interval` still paces template
+    /// creation exactly as it paced whole-grind attempts before lab #651.
+    #[test]
+    fn mine_interval_still_gates_starting_a_template() {
+        let (config, genesis, _base) = rig("i651_start_gate", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, NeverPow, DevnetRehearsalVerifier).unwrap();
+        // The default interval is the frozen 75 s and `last_mine` is the node's
+        // start instant: the phase must refuse to start a template.
+        assert!(!node.try_mine());
+        assert!(
+            node.p2p.node().grind_progress().is_none(),
+            "no template starts before the interval permits"
+        );
     }
 
     #[test]

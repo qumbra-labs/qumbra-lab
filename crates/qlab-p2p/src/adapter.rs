@@ -3559,6 +3559,152 @@ mod tests {
         );
     }
 
+    // ---- lab #651: the resumable mine phase --------------------------------
+
+    use std::sync::atomic::AtomicBool;
+
+    /// A PoW engine whose hashes can be made to never satisfy any real
+    /// difficulty (all-0xFF ⇒ maximal work value on both forms), switchable at
+    /// runtime so a test can let a real block validate mid-flight. It also
+    /// counts hashes, so a slice's bound is asserted, not inferred.
+    #[derive(Clone)]
+    struct SwitchablePow {
+        impossible: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PowEngine for SwitchablePow {
+        fn name(&self) -> &'static str {
+            "switchable-keccak"
+        }
+
+        fn pow_hash(&self, form: GenesisForm, header: &BlockHeader, seed: &[u8]) -> Hash32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.impossible.load(Ordering::Relaxed) {
+                [0xFF; 32]
+            } else {
+                KeccakPow.pow_hash(form, header, seed)
+            }
+        }
+    }
+
+    fn slice(max_hashes: u64) -> SliceBudget {
+        SliceBudget { max_hashes, deadline: None }
+    }
+
+    fn grinding_adapter() -> (
+        NodeAdapter<SwitchablePow, MockVerifier>,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+    ) {
+        let (cstate, _v) = committee7();
+        let impossible = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pow = SwitchablePow { impossible: impossible.clone(), calls: calls.clone() };
+        (NodeAdapter::new(cstate, pow, MockVerifier, sim()), impossible, calls)
+    }
+
+    /// 🔴 Lab #651's regression test: a grind that cannot finish yields at its
+    /// slice budget instead of blocking. On `main` the mine phase had no yield
+    /// point — one call hashed the entire 2^26 nonce budget (measured at 566 s
+    /// on the reporting Windows node), deaf to the network throughout. The
+    /// phase must return after EXACTLY one slice of hashes, with the resume
+    /// point parked — and the next phase must RESUME, not restart.
+    #[test]
+    fn a_grind_that_cannot_finish_yields_instead_of_blocking() {
+        let (mut a, _impossible, calls) = grinding_adapter();
+        let tip = a.chain().tip_hash();
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            512,
+            "exactly one slice of hashes, not the nonce budget"
+        );
+        assert_eq!(a.grind_progress(), Some((tip, 512)), "the resume point is parked");
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert_eq!(calls.load(Ordering::Relaxed), 1024);
+        assert_eq!(a.grind_progress(), Some((tip, 1024)), "progress accumulates across phases");
+    }
+
+    /// 🔴 Item (4) of the lab #651 design, adapter half: `may_start` gates
+    /// STARTING a template, never RESUMING one. If a resume were gated, the
+    /// node would grind one slice per `mine_interval` (75 s) — a ~99.97 %
+    /// hashrate loss, worse than the blocking defect this replaced.
+    #[test]
+    fn starting_needs_permission_but_resuming_does_not() {
+        let (mut a, _impossible, _calls) = grinding_adapter();
+        // No grind in flight + no permission ⇒ nothing starts.
+        assert!(matches!(a.mine_step(false, slice(512)), MineStep::Idle));
+        assert!(a.grind_progress().is_none(), "no template starts before the interval permits");
+        // Permission ⇒ a template is assembled and ground for one slice.
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        // 🔴 The resume proceeds WITHOUT start permission.
+        assert!(matches!(a.mine_step(false, slice(512)), MineStep::Yielded));
+        assert_eq!(
+            a.grind_progress().map(|(_, nonce)| nonce),
+            Some(1024),
+            "the ungated resume made real progress"
+        );
+    }
+
+    /// A moved tip abandons the parked grind. The abandonment trigger is the
+    /// MINING PARENT CHANGING — the event that makes the work worthless (its
+    /// block could only be an orphan) — not a clock, which cannot see it.
+    #[test]
+    fn a_moved_tip_abandons_the_parked_grind() {
+        let (mut a, impossible, _calls) = grinding_adapter();
+        let genesis_tip = a.chain().tip_hash();
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert_eq!(a.grind_progress(), Some((genesis_tip, 512)));
+
+        // A block mined elsewhere arrives. The local engine must validate it
+        // honestly, so the switchable engine drops its impossible mode for
+        // exactly the ingest.
+        let (cstate, _v) = committee7();
+        let mut other = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        let (header, body) = other.mine_block().expect("KeccakPow mines at sim difficulty");
+        impossible.store(false, Ordering::Relaxed);
+        assert_eq!(a.ingest_block(header, body), IngestOutcome::Accepted);
+        impossible.store(true, Ordering::Relaxed);
+        let new_tip = a.chain().tip_hash();
+        assert_ne!(new_tip, genesis_tip, "the mining parent moved");
+
+        // The next phase assembles FRESH on the new parent: cursor restarted
+        // at one slice from zero, never resumed onto the stale parent.
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert_eq!(
+            a.grind_progress(),
+            Some((new_tip, 512)),
+            "fresh template on the new parent, cursor restarted"
+        );
+    }
+
+    /// `nonce_budget` is a per-TEMPLATE bound since lab #651: exhausting it
+    /// drops the grind, and the next permitted phase assembles a fresh
+    /// template (fresh timestamp + mempool snapshot) starting at nonce 0 —
+    /// the pre-#651 retry-after-None behaviour, one slice at a time.
+    #[test]
+    fn an_exhausted_template_is_dropped_and_a_fresh_one_starts() {
+        let (cstate, _v) = committee7();
+        let impossible = Arc::new(AtomicBool::new(true));
+        let pow = SwitchablePow { impossible, calls: Arc::new(AtomicUsize::new(0)) };
+        let mut a = NodeAdapter::new(
+            cstate,
+            pow,
+            MockVerifier,
+            SimConfig { mine_nonce_budget: 1024, ..SimConfig::default() },
+        );
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Exhausted));
+        assert!(a.grind_progress().is_none(), "an exhausted template is dropped");
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert_eq!(
+            a.grind_progress().map(|(_, nonce)| nonce),
+            Some(512),
+            "a fresh template started from nonce 0"
+        );
+    }
+
     #[test]
     fn ingest_block_applies_a_produced_block_and_rejects_a_bad_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
