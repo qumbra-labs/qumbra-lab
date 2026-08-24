@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use qumbra_prover_service::{
     Api, ApiError, Config, SecretBytes, SubmitRequest, Worker, WorkerConfig, WorkerOutcome,
-    MAX_ARTIFACT_BYTES, MAX_BUNDLE_BYTES, MAX_REQUEST_BYTES,
+    MAX_ARTIFACT_BYTES, MAX_BUNDLE_BYTES, MAX_MAX_UPSTREAM_BYTES, MAX_REQUEST_BYTES,
+    MIN_MAX_UPSTREAM_BYTES,
 };
 use serde::Serialize;
 
@@ -364,6 +365,10 @@ impl Worker for ProcessWorker {
             .env("QUMBRA_PROVER_WORKER_PROTOCOL", WORKER_PROTOCOL)
             .env("QUMBRA_PROVER_SCAN_URL", &self.config.scan_url)
             .env("QUMBRA_PROVER_NODE_URL", &self.config.node_url)
+            .env(
+                "QUMBRA_PROVER_MAX_UPSTREAM_BYTES",
+                self.config.max_upstream_bytes.to_string(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -375,6 +380,7 @@ impl Worker for ProcessWorker {
             terminate(&mut child);
             return WorkerOutcome::Refused("worker-input-failed");
         }
+        drop(bundle);
         let Some(stdout) = child.stdout.take() else {
             terminate(&mut child);
             return WorkerOutcome::Refused("worker-output-missing");
@@ -496,6 +502,13 @@ fn worker_once() -> Result<Vec<u8>, &'static str> {
         std::env::var("QUMBRA_PROVER_SCAN_URL").map_err(|_| "worker-protocol-refused")?;
     let node_url =
         std::env::var("QUMBRA_PROVER_NODE_URL").map_err(|_| "worker-protocol-refused")?;
+    let max_upstream_bytes = std::env::var("QUMBRA_PROVER_MAX_UPSTREAM_BYTES")
+        .map_err(|_| "worker-protocol-refused")?
+        .parse::<usize>()
+        .map_err(|_| "worker-protocol-refused")?;
+    if !(MIN_MAX_UPSTREAM_BYTES..=MAX_MAX_UPSTREAM_BYTES).contains(&max_upstream_bytes) {
+        return Err("worker-protocol-refused");
+    }
     let mut length = [0u8; 4];
     std::io::stdin()
         .read_exact(&mut length)
@@ -516,8 +529,9 @@ fn worker_once() -> Result<Vec<u8>, &'static str> {
     // These are the only network calls reachable from the worker: GET valid
     // anchors and bulk nullifiers from operator-pinned bases. There is no call
     // to qumbra_wallet::spend::submit anywhere in this binary.
-    let current = qumbra_wallet::spend::preflight_urls(&scan_url, &node_url)
-        .map_err(|_| "node-preflight-refused")?;
+    let current =
+        qumbra_wallet::spend::preflight_urls_limited(&scan_url, &node_url, max_upstream_bytes)
+            .map_err(|_| "node-preflight-refused")?;
     let artifact =
         qumbra_wallet::spend::prove(&bundle, &current, &mut |_| {}).map_err(|_| "proof-refused")?;
     if artifact.wire_bytes.len() > MAX_ARTIFACT_BYTES {

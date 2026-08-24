@@ -56,6 +56,9 @@
 //! exchange at the Cloudflare edge is outside the wallet's control, and this is
 //! testnet-tunable, revisited at T2.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use qlab_cbserver::codec::{CoinbasePage, NullifierPage};
 use qlab_node::{AnchorSet, TreeLeaves};
 
@@ -72,6 +75,52 @@ use crate::sync::{AnchorSource, Anchors, LeafChunk, LeafSource};
 /// server's own ceiling with slack. Reads are safe to retry: a landed-but-
 /// unanswered submission comes back `duplicate`.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// A fail-closed byte budget shared by a bounded sequence of upstream GETs.
+///
+/// Each request is first limited to the bytes still available. Its decoded body
+/// is then charged against the shared budget before it can escape the transport
+/// layer. The prover service shares one instance across anchor and nullifier
+/// preflight so pagination cannot turn a per-response cap into unbounded retained
+/// state.
+#[derive(Clone)]
+pub struct HttpResponseBudget {
+    remaining: Arc<AtomicUsize>,
+}
+
+impl HttpResponseBudget {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(max_bytes)),
+        }
+    }
+
+    fn get(&self, base_url: &str, path: &str) -> std::io::Result<Vec<u8>> {
+        let remaining = self.remaining.load(Ordering::Acquire);
+        if remaining == 0 {
+            return Err(upstream_budget_exhausted());
+        }
+        let body = http_get_limited(base_url, path, Some(remaining))?;
+        self.charge(body.len())?;
+        Ok(body)
+    }
+
+    fn charge(&self, bytes: usize) -> std::io::Result<()> {
+        self.remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(bytes)
+            })
+            .map_err(|_| upstream_budget_exhausted())?;
+        Ok(())
+    }
+}
+
+fn upstream_budget_exhausted() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "upstream response budget exhausted",
+    )
+}
 
 /// The leaf stream as a [`LeafSource`] — one `GET /v1/tree/leaves?from=N` per
 /// call, decoded by `qlab_node`'s own `TreeLeaves::from_bytes`.
@@ -107,18 +156,38 @@ impl LeafSource for HttpLeafSource {
 /// decoded by `qlab_node`'s own `AnchorSet::from_bytes`.
 pub struct HttpAnchorSource {
     base_url: String,
+    response_budget: Option<HttpResponseBudget>,
 }
 
 impl HttpAnchorSource {
     pub fn new(base_url: impl Into<String>) -> HttpAnchorSource {
-        HttpAnchorSource { base_url: base_url.into() }
+        HttpAnchorSource {
+            base_url: base_url.into(),
+            response_budget: None,
+        }
+    }
+
+    /// Construct a source that charges this response against a shared budget
+    /// before decoding it. Service callers use this fail-closed form; ordinary
+    /// wallet callers retain their existing route-specific paging semantics.
+    pub fn new_limited(
+        base_url: impl Into<String>,
+        response_budget: HttpResponseBudget,
+    ) -> HttpAnchorSource {
+        HttpAnchorSource {
+            base_url: base_url.into(),
+            response_budget: Some(response_budget),
+        }
     }
 }
 
 impl AnchorSource for HttpAnchorSource {
     fn anchors(&self) -> Result<Anchors, String> {
-        let bytes = http_get(&self.base_url, "/v1/anchors")
-            .map_err(|e| format!("GET /v1/anchors: {e}"))?;
+        let bytes = match &self.response_budget {
+            Some(budget) => budget.get(&self.base_url, "/v1/anchors"),
+            None => http_get(&self.base_url, "/v1/anchors"),
+        }
+        .map_err(|e| format!("GET /v1/anchors: {e}"))?;
         let set = AnchorSet::from_bytes(&bytes)
             .map_err(|e| format!("GET /v1/anchors did not decode: {e:?}"))?;
         Ok(Anchors {
@@ -145,18 +214,37 @@ impl AnchorSource for HttpAnchorSource {
 /// against the same node whose outputs it is holding.
 pub struct HttpNullifierSource {
     base_url: String,
+    response_budget: Option<HttpResponseBudget>,
 }
 
 impl HttpNullifierSource {
     pub fn new(base_url: impl Into<String>) -> HttpNullifierSource {
-        HttpNullifierSource { base_url: base_url.into() }
+        HttpNullifierSource {
+            base_url: base_url.into(),
+            response_budget: None,
+        }
+    }
+
+    /// Construct a source whose paged responses all consume a shared budget.
+    pub fn new_limited(
+        base_url: impl Into<String>,
+        response_budget: HttpResponseBudget,
+    ) -> HttpNullifierSource {
+        HttpNullifierSource {
+            base_url: base_url.into(),
+            response_budget: Some(response_budget),
+        }
     }
 }
 
 impl NullifierSource for HttpNullifierSource {
     fn fetch_range(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
         let path = format!("/v1/nullifiers?from={from}&to={to}");
-        let bytes = http_get(&self.base_url, &path).map_err(|e| format!("GET {path}: {e}"))?;
+        let bytes = match &self.response_budget {
+            Some(budget) => budget.get(&self.base_url, &path),
+            None => http_get(&self.base_url, &path),
+        }
+        .map_err(|e| format!("GET {path}: {e}"))?;
         let page = NullifierPage::from_bytes(&bytes)
             .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
         Ok(NullifierChunk {
@@ -630,6 +718,21 @@ mod tests {
         let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
         raw.extend(std::iter::repeat(b'g').take(body_len));
         std::io::Cursor::new(raw)
+    }
+
+    #[test]
+    fn response_budget_is_shared_and_never_underflows() {
+        let budget = HttpResponseBudget::new(10);
+        budget.charge(4).expect("first response fits");
+        let sibling = budget.clone();
+        sibling
+            .charge(6)
+            .expect("second response consumes the rest");
+        let err = budget
+            .charge(1)
+            .expect_err("a later page cannot exceed the shared budget");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(budget.remaining.load(Ordering::Acquire), 0);
     }
 
     /// Lab #475 review finding 1. Before this, `read_response` was

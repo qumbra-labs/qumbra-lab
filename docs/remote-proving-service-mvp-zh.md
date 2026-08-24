@@ -15,18 +15,22 @@ real-value prover，不是 Candidate A integration，也不是 deployment approv
 的协议安全属性：
 
 - upload body 读取前完成 bearer authentication；
+- bearer token 通过已审计的 `subtle` constant-time primitive 比较；
 - protocol、mode、genesis 与 consensus label 精确 pin；
 - decoded bundle 64 KiB、JSON request 96 KiB 的上限；
 - mandatory idempotency key 与不可猜测的 256-bit job capability；
 - 单 dispatcher、有界 memory queue、取消与 proof timeout；
 - 每个 proof 一个新 child process，且不继承 parent environment；
-- 只使用 operator-pinned endpoint 做 anchor/nullifier read-only preflight；
+- 只使用 operator-pinned endpoint 做 anchor/nullifier read-only preflight，anchor 与全部
+  nullifier response 共享一个 fail-closed byte budget；
 - artifact 上限 256 KiB，与 node transaction admission cap 一致；
-- 结果只短期保留在内存，response 一律 `Cache-Control: no-store`；以及
+- 结果只短期保留在内存，response 一律 `Cache-Control: no-store`；
+- worker scope 结束时同时 zeroize raw 与 decoded witness material；以及
 - artifact 只返回 caller，没有 transaction submission route。
 
-Worker 调用现有的 `WitnessBundle::from_bytes`、`spend::preflight_urls` 与
-`spend::prove`，从不调用 `spend::submit`。可能泄露 anchor、nullifier、internal endpoint
+Worker 调用现有的 `WitnessBundle::from_bytes`、有界的
+`spend::preflight_urls_limited` wrapper 与 `spend::prove`，从不调用 `spend::submit`。可能泄露
+anchor、nullifier、internal endpoint
 或 bundle fact 的错误详情全部收敛为固定 code allowlist。
 
 ## 2. 架构与信任边界
@@ -71,7 +75,8 @@ operator-pinned genesis/config 以及 unpadded base64url `WitnessBundle`。新 j
 - `GET /v1/jobs/<job_id>`：`queued`、`running`、`succeeded`、`refused` 或 `cancelled`；
 - success 返回 canonical transaction bytes、byte length 与 Keccak-256 digest；
 - `DELETE /v1/jobs/<job_id>` 取消 queued job 或杀掉 running child；
-- `GET /healthz` 无需 auth，只暴露 mode、build revision 与 aggregate queue counts。
+- `GET /healthz` 无需 auth，是纯 liveness probe，完整 JSON body 为
+  `{"alive":true}`；它不声称 worker ready，也不暴露 mode、build、queue、job 或 witness fact。
 
 本版本刻意没有 submit endpoint、client-selected URL、可创建第二 proof lease 的 retry、access
 log、account database 或 durable queue。
@@ -83,7 +88,10 @@ log、account database 或 durable queue。
 - `QUMBRA_PROVER_VALUELESS_EXPERIMENT=I_UNDERSTAND_THIS_CANNOT_CARRY_REAL_VALUE`；
 - 32–256 字节 API token，优先从 `QUMBRA_PROVER_API_TOKEN_FILE` 读取；
 - operator-pinned `QUMBRA_PROVER_SCAN_URL` 与 `QUMBRA_PROVER_NODE_URL`；
-- exact genesis format、64 lowercase hex genesis hash 与 restricted consensus label。
+- exact genesis format、64 lowercase hex genesis hash 与 restricted consensus label；
+- `QUMBRA_PROVER_MAX_UPSTREAM_BYTES` 是 pinned anchor/nullifier preflight 共享的 decoded-body
+  总预算；每次 request 在 decode 前还会用当时的剩余预算限制 whole response。默认
+  8 MiB，范围 64 KiB–64 MiB。
 
 Queue capacity 默认 1、范围 1..=8；result TTL 默认 600 s、范围 60..=3600；prove timeout
 默认 300 s、范围 30..=1800。Insecure node HTTP 与 non-loopback listener 各自需要独立的长
@@ -111,10 +119,12 @@ prover child；worker 接收 witness 前清空 inherited environment；取消/�
 这些性质**不会**让当前 bundle 适合真实价值。仍缺 binding design correction、Candidate A key
 lifecycle、AIR/public-value binding、transaction wire/identity、node pre-STARK authorization、
 activation/re-mint、wallet complete-intent comparison、per-install asymmetric authentication、
-production ingress privacy、upstream response ceiling、capacity evidence、worker
-filesystem/credential isolation 与 egress enforcement、multi-region availability 以及独立
+production ingress privacy、capacity evidence、worker filesystem/credential isolation 与 egress
+enforcement、multi-region availability 以及独立
 Internet-boundary review。尤其是，`env_clear` 只能阻止意外继承环境变量，并不是 sandbox；在
-隔离补齐前，同 UID 的 compromised worker 仍可能尝试读取 mounted API-token file。
+隔离补齐前，同 UID 的 compromised worker 仍可能尝试读取 mounted API-token file。Typed
+value zeroization 只是 defense in depth，不能证明 compiler、allocator、kernel swap 或 core dump
+从未保留其他副本；swap 与 core dump 仍必须在隔离后的 worker boundary 关闭。
 
 真正的 authorized proving envelope 替换当前 bundle 时必须升级 API version；不得原地扩展 v1，
 让旧 client 看起来像已经得到 Candidate A 保护。

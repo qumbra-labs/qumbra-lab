@@ -19,6 +19,7 @@ use qlab_air::narrow::{derive_input, derive_output_rho, MerkleWitness, TxInput, 
 use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_note::compact::decode_committed_discovery;
 use qlab_note::hash::digest_bytes;
+use zeroize::Zeroize;
 
 /// Fixed discriminator. A version byte follows it.
 pub const WITNESS_BUNDLE_MAGIC: &[u8; 8] = b"QMBWITN\0";
@@ -54,6 +55,57 @@ pub struct WitnessBundle {
     pub(crate) allowed_scan_verdicts_only: bool,
     pub(crate) output_range: Option<(u64, u64)>,
     pub(crate) spent_covered: Option<(u64, u64)>,
+}
+
+impl Zeroize for WitnessBundle {
+    fn zeroize(&mut self) {
+        // Keep this list in lockstep with every field on `WitnessBundle`.
+        // `witness_bundle_zeroize_clears_typed_spend_authority` is the
+        // regression guard for additions to this manual implementation.
+        for input in &mut self.inputs {
+            input.sk.zeroize();
+            input.value.zeroize();
+            input.rho.zeroize();
+            input.rseed.zeroize();
+            input.d.zeroize();
+        }
+        for witness in &mut self.witnesses {
+            witness.siblings.zeroize();
+            witness.path_bits.fill(false);
+        }
+        for output in &mut self.outputs {
+            output.value.zeroize();
+            output.rkm.zeroize();
+            output.rho.zeroize();
+            output.rseed.zeroize();
+        }
+        self.anchor.zeroize();
+        self.discovery.zeroize();
+        self.rider.zeroize();
+        self.real_inputs.zeroize();
+        self.amount.zeroize();
+        self.fee.zeroize();
+        self.change_value.zeroize();
+        self.anchor_tip_height.zeroize();
+        self.recipient_short.zeroize();
+        self.allowed_scan_verdicts_only = false;
+        if let Some((from, to)) = self.output_range.as_mut() {
+            from.zeroize();
+            to.zeroize();
+        }
+        self.output_range = None;
+        if let Some((from, to)) = self.spent_covered.as_mut() {
+            from.zeroize();
+            to.zeroize();
+        }
+        self.spent_covered = None;
+    }
+}
+
+impl Drop for WitnessBundle {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 impl WitnessBundle {
@@ -591,6 +643,42 @@ mod tests {
                 .expect("future version refuses"),
             BundleError::UnknownVersion(0x7f),
         );
+    }
+
+    #[test]
+    fn witness_bundle_zeroize_clears_typed_spend_authority() {
+        let mut bundle = bundle();
+        bundle.zeroize();
+
+        assert!(bundle.inputs.iter().all(|input| {
+            input.sk == [0; 4]
+                && input.value == 0
+                && input.rho == [0; 4]
+                && input.rseed == [0; 4]
+                && input.d == [0; 2]
+        }));
+        assert!(bundle.witnesses.iter().all(|witness| {
+            witness.siblings == [[0; 4]; qlab_air::narrow::MERKLE_DEPTH]
+                && witness.path_bits == [false; qlab_air::narrow::MERKLE_DEPTH]
+        }));
+        assert!(bundle.outputs.iter().all(|output| {
+            output.value == 0
+                && output.rkm == [0; 4]
+                && output.rho == [0; 4]
+                && output.rseed == [0; 4]
+        }));
+        assert_eq!(bundle.anchor, [0; 4]);
+        assert!(bundle.discovery.is_empty());
+        assert!(bundle.rider.is_empty());
+        assert!(bundle.recipient_short.is_empty());
+        assert_eq!(bundle.real_inputs, 0);
+        assert_eq!(bundle.amount, 0);
+        assert_eq!(bundle.fee, 0);
+        assert_eq!(bundle.change_value, 0);
+        assert_eq!(bundle.anchor_tip_height, 0);
+        assert!(!bundle.allowed_scan_verdicts_only);
+        assert_eq!(bundle.output_range, None);
+        assert_eq!(bundle.spent_covered, None);
     }
 
     #[test]
