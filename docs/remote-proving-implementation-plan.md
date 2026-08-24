@@ -101,7 +101,8 @@ approve the containing phase, a real-value service, deployment, or launch.
 | Phase 0 start authorization and ownership task book | ✅ | Larry explicitly started the research and later the valueless service-mechanics milestone; scope and roles are recorded here |
 | Phase 1 primitive comparator, exact intent/codecs/vectors, dummy rule and shape ruling | ✅ | [`remote-proving-authorization-spike.md`](remote-proving-authorization-spike.md) and `qlab-remote-auth`; ML-DSA rotation advances, depth 0 and both WOTS+ rows do not |
 | Phase 1 isolated D12..D16 mobile benchmark harness | ✅ | [`remote-proving-mobile-benchmark.md`](remote-proving-mobile-benchmark.md) and `qlab-remote-auth-mobile-bench`; synthetic controls and cancellation/progress seams are committed |
-| Phase 1 physical-device D12..D16 evidence and final network-wide depth | ⬜ | Two retained runs per supported physical device and Larry's depth decision are still owed |
+| Phase 1 first physical-device D12..D16 evidence set | ✅ | [`remote-proving-mobile-evidence-2026-08-24.md`](remote-proving-mobile-evidence-2026-08-24.md); two retained runs per depth on iPhone 15 Pro Max and Solana Mobile Seeker, with cross-platform deterministic outputs |
+| Phase 1 supported-device floor and final network-wide depth | ⬜ | Floor hardware/OS, the same two-run protocol at that floor, UX threshold and Larry's depth decision are still owed |
 | Phase 5A precursor: valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) and lab PR #639; real current prover, bounded ephemeral workers, fixed refusals, read-only preflight, no submit path |
 | Phase 5A precursor: standalone deployment skeleton | ✅ | deploy PR #246; loopback-only review skeleton, not a deployment or public edge |
 | Phases 2–4 and Candidate A-bound real-value Phase 5A | ⬜ | Design correction, AIR/public values, wire/node verification, activation and wallet/mobile authorization remain unstarted |
@@ -193,8 +194,9 @@ provider does not inherit approval merely by taking the same role name.
 ## 9. Current next action and scope
 
 **Progress update, 2026-08-24:** The completed components and open gates are
-tracked in §4.1. Phase 1 produced the ML-DSA authorization spike and isolated
-D12..D16 mobile harness, but physical-device evidence and the final depth remain
+tracked in §4.1. Phase 1 produced the ML-DSA authorization spike, isolated
+D12..D16 mobile harness, and first physical-device evidence set. D16 completed
+on both measured devices, but the supported-device floor and final depth remain
 open. Larry then explicitly started a valueless shared-service mechanics
 milestone. The resulting
 [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) is a Phase 5A

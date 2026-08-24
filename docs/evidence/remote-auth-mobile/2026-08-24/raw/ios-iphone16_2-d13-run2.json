@@ -1,0 +1,43 @@
+{
+  "abi_version" : 1,
+  "auth_section_bytes" : 7544,
+  "captured_at" : "2026-08-24T02:53:05Z",
+  "depth" : 13,
+  "format" : "qlab-remote-auth-mobile-bench-v1",
+  "hardware" : "iPhone16,2",
+  "intent_digest" : "31f6e581f9926d2f523f9180a2e5c36e2de1725ce3ac3a0424e908a5794aefd5",
+  "lab_revision" : "ac7681832916c9b9b344052c1fac1f2010c94f34",
+  "leaf_count" : 8192,
+  "low_power_mode" : false,
+  "memory" : {
+    "baseline_bytes" : 25199536,
+    "kind" : "physical_footprint",
+    "peak_bytes" : 25428912,
+    "peak_delta_bytes" : 229376
+  },
+  "os" : "iOS 26.6",
+  "physical_memory_bytes" : 8025686016,
+  "platform" : "ios",
+  "research_only" : true,
+  "result_struct_size" : 152,
+  "root" : "433d579ac76e113dcf54501d17b1e3ab1700f3a62421bf2cea8bfd9c62200e20",
+  "rotation_schedule_bytes" : 32768,
+  "selected_indices" : [
+    703,
+    2752
+  ],
+  "shell_revision" : "b19e1eb0794a8813950d7fe0482b89f60ca96c76",
+  "signature_bytes_per_slot" : 2420,
+  "source_trees_clean" : true,
+  "thermal_state_end" : "nominal",
+  "thermal_state_start" : "nominal",
+  "timing" : {
+    "address_leaf_generation_ns" : 619807490,
+    "address_tree_hashing_ns" : 1807350,
+    "rotation_schedule_ns" : 1475583,
+    "spend_signing_ns" : 420583,
+    "spend_verification_ns" : 105542,
+    "total_ns" : 625502584
+  },
+  "verifying_key_bytes_per_slot" : 1312
+}
