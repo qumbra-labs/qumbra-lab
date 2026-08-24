@@ -265,7 +265,16 @@ fn fetch(base_url: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, Strin
     // this view to its read timeout — turning "one node is sick" into "the
     // operator's view is hung", which is the failure this tool is supposed
     // to report rather than reproduce.
-    let resp = qlab_http_framing::read_response(&mut stream).map_err(|e| e.to_string())?;
+    //
+    // `fetch` names the step (`connect` / `write` / `read`). A silent peer
+    // surfaces as `FramingError::Io` (Linux `SO_RCVTIMEO` often as
+    // `WouldBlock`); keep the `read:` token so the reason still names the
+    // step (`a_silent_node_times_out_and_reads_as_unreachable`). Named
+    // refusals stay `http-framing: …`.
+    let resp = qlab_http_framing::read_response(&mut stream).map_err(|e| match e {
+        qlab_http_framing::FramingError::Io(detail) => format!("read: {detail}"),
+        other => other.to_string(),
+    })?;
     if !resp.status.contains(" 200") {
         return Err(format!("non-200 response: {}", resp.status.trim()));
     }
