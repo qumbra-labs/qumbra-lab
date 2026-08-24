@@ -5358,11 +5358,14 @@ mod tests {
 
     // ===== lab #552(a): the payout gate — warn became refuse, on the binary only =====
 
-    /// A `NodeConfig` that parses, whose genesis is real, and whose two mining
-    /// fields are the caller's — the smallest thing [`check_miner_payout`] can be
-    /// asked about. `rig` is deliberately NOT reused: this gate is a pure config
-    /// predicate and must be provable without a data dir, a genesis write or a
-    /// bind, which is the reason `qumbra-node check` can apply it at all.
+    /// The smallest config [`check_miner_payout`] can be asked about: the two
+    /// mining fields are the caller's and nothing else exists — no data dir, no
+    /// genesis on disk, no bind.
+    ///
+    /// `rig` is deliberately NOT reused, and the absence is the point: this gate
+    /// is a pure config predicate, which is *why* `qumbra-node check` can apply
+    /// it at all. A version of it that needed a started node could not have been
+    /// put in `preflight`, and `check` would still be printing a warning.
     fn payout_cfg(mining: bool, miner_rkm: Option<&str>) -> NodeConfig {
         let base = std::env::temp_dir().join("qmb_i552_payout_cfg");
         NodeConfig {

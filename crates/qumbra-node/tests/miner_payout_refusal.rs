@@ -26,8 +26,10 @@
 //! it cannot prove that the binary *applies* it, which is the entire defect. A
 //! gate nothing calls is exactly the shape of the warning it replaces.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_qumbra-node")
@@ -106,33 +108,95 @@ fn assert_names_the_missing_thing(text: &str) {
     assert!(text.contains("`mining = false`"), "must name the other exit: {text}");
 }
 
+/// How long `run` gets to refuse before this test gives up and kills it.
+///
+/// 🔴 **Why this is not `Command::output()`.** `qumbra-node run` does not return —
+/// it mines until it is signalled. So if the gate ever stops firing, an
+/// `output()` here would not fail, it would **hang the suite** while a real
+/// RandomX miner burns a CI core. The timeout converts that regression into a
+/// named failure, and the kill is what stops the node. Generous on purpose: the
+/// refusal is a config predicate applied before the ~256 MiB RandomX cache, so a
+/// healthy run exits in well under a second and only a broken one comes near
+/// this bound.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Spawn `qumbra-node run`, wait for it to refuse, and kill it if it does not.
+///
+/// Returns the exit status and both streams. Output is read only after the child
+/// is done, which is safe here for the same reason the deadline is generous: a
+/// refusing node writes two lines, nowhere near a pipe buffer. A node that
+/// wrongly STARTED could fill a pipe and stall — and stalling is precisely what
+/// the deadline below turns into a test failure rather than a hung suite.
+fn run_until_it_refuses(cfg: &Path) -> (bool, String) {
+    let mut child = Command::new(bin())
+        .args(["run", "--config"])
+        .arg(cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn qumbra-node run");
+
+    let deadline = Instant::now() + REFUSAL_DEADLINE;
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let mut text = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut text);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut text);
+    }
+    match status {
+        Some(s) => (s.success(), text),
+        None => panic!(
+            "`qumbra-node run` did not exit within {REFUSAL_DEADLINE:?} — it STARTED on a config \
+             with `mining = true` and no `miner_rkm`, which is the whole defect this test is \
+             about (killed it). Output so far: {text}"
+        ),
+    }
+}
+
 /// **ACCEPTANCE — `run` REFUSES, and it refuses before it reads the genesis.**
 ///
-/// The ordering assertion is not decoration. `run_node` applies this gate as its
-/// first act after the config loads, ahead of the genesis read and ahead of the
-/// RandomX cache, so a node with nobody to pay is told so at the cheapest
-/// possible moment. The absence of lab #300's `STARTUP loading genesis file` line
-/// is what proves that placement from outside the process — and if the gate is
-/// ever moved down into `prepare`, this line appears and this test fails.
+/// This is the defect: T2 blocks 607, 610 and 611 were mined by a node in exactly
+/// this configuration, which warned and mined anyway.
+///
+/// The ordering half is not decoration. `run_node` applies this gate as its first
+/// act after the config loads, ahead of the genesis read and ahead of the
+/// ~256 MiB RandomX cache, so a node with nobody to pay is told so at the
+/// cheapest possible moment. The **absence** of lab #300's
+/// `STARTUP loading genesis file` line is what proves that placement from outside
+/// the process — if the gate is ever moved down into `prepare`, that line appears
+/// and this assertion fails by name.
 #[test]
 fn run_refuses_mining_with_no_miner_rkm_before_it_reads_the_genesis() {
     let base = staged("run_refuse");
     let cfg = config(&base, "mining = true\n");
 
-    let out = invoke("run", &cfg);
-    let text = both_streams(&out);
+    let (started, text) = run_until_it_refuses(&cfg);
     let _ = std::fs::remove_dir_all(&base);
 
-    assert!(!out.status.success(), "the node must not start: {text}");
+    assert!(!started, "the node must not start: {text}");
     assert_names_the_missing_thing(&text);
     assert!(
         !text.contains("STARTUP loading genesis file"),
         "the payout gate must refuse BEFORE the genesis read: {text}"
     );
     // Lab #300's entry line still comes first — the refusal is after the
-    // announce, not instead of it.
+    // announce, not instead of it, so a refusing node is still distinguishable
+    // from one that died before it could say anything.
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("STARTUP"),
+        text.contains("qumbra-node starting"),
         "the entry line still precedes everything: {text}"
     );
 }
