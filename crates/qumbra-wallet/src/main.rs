@@ -645,7 +645,7 @@ fn keygen(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  address [0]:");
     println!("    {}", addr.encode());
     println!("    short: {}", addr.short().encode());
-    if let Some(note) = qumbra_wallet::store::secret_file_protection_note() {
+    if let Some(note) = qumbra_wallet::store::secret_file_protection_note(&dir) {
         println!("{note}");
     }
     Ok(())
@@ -664,7 +664,7 @@ fn restore(args: &[String]) -> Result<(), Box<dyn Error>> {
          `address --new` — funds are index-derived and unaffected."
     );
     // Same seed file, same gap — a restore writes it too (lab #478).
-    if let Some(note) = qumbra_wallet::store::secret_file_protection_note() {
+    if let Some(note) = qumbra_wallet::store::secret_file_protection_note(&dir) {
         println!("{note}");
     }
     Ok(())

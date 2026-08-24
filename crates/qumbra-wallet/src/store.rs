@@ -336,28 +336,39 @@ pub const fn secret_file_protection() -> &'static str {
 /// The long form of [`secret_file_protection`]'s gap, printed once at the moment
 /// the seed is created. `None` where the platform really does have owner-only
 /// modes, so unix output is byte-identical to what it always was.
-pub const fn secret_file_protection_note() -> Option<&'static str> {
+///
+/// 🔴 **Takes the directory the caller actually passed, and is NOT `const`.**
+/// Lab #637: this returned a fixed string whose check and fix commands both
+/// hard-coded `%USERPROFILE%\.qumbra-wallet`. A reader who put their wallet
+/// anywhere else — which this project's own docs suggest — ran the fix against a
+/// directory they were not using, got `Successfully processed 1 files`, and left
+/// the real seed exactly as exposed. **A confident success on the wrong target is
+/// worse than the warning it replaced**, so the path is now the one the user gave.
+pub fn secret_file_protection_note(dir: &Path) -> Option<String> {
+    let _ = dir;
     #[cfg(unix)]
     {
         None
     }
     #[cfg(not(unix))]
     {
-        Some(
+        let d = dir.display();
+        Some(format!(
             "⚠️  Windows has no chmod, and this build does not set a DACL on the seed file.\n\
              \x20   Its protection is whatever it inherits from the folder you chose, and this\n\
-             \x20   message CANNOT TELL YOU WHAT THAT IS. Under your own profile\n\
-             \x20   (%USERPROFILE%\\.qumbra-wallet) it is usually you + SYSTEM + Administrators —\n\
-             \x20   already NOT owner-only, and NOT what the unix builds get. A folder outside\n\
-             \x20   your profile commonly inherits far more: a freshly-installed Windows 11 was\n\
-             \x20   MEASURED granting `Authenticated Users: Modify` on a seed file — every\n\
-             \x20   account that can log in could read AND alter it (lab #637).\n\
-             \x20   CHECK yours first — read-only, one command:\n\
-             \x20     icacls \"<the --dir you passed>\"\n\
-             \x20   Then, to make it owner-only, run this once in the same shell:\n\
-             \x20     icacls \"%USERPROFILE%\\.qumbra-wallet\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"\n\
-             \x20   Anyone who can read the seed file owns every coin this wallet holds.",
-        )
+             \x20   message CANNOT TELL YOU WHAT THAT IS. Under your own profile it is usually\n\
+             \x20   you + SYSTEM + Administrators — already NOT owner-only, and NOT what the\n\
+             \x20   unix builds get. A folder outside your profile commonly inherits more: a\n\
+             \x20   freshly-installed Windows 11 was MEASURED granting\n\
+             \x20   `NT AUTHORITY\\Authenticated Users:(I)(M)` on a seed file — (M) is modify,\n\
+             \x20   so every account that can log in could overwrite it as well as read it.\n\
+             \x20   CHECK yours first. This only reads; it prints names, not a verdict:\n\
+             \x20     icacls \"{d}\"\n\
+             \x20   More than one name where you expected only yourself is the problem.\n\
+             \x20   To make it owner-only, run this once in the same shell:\n\
+             \x20     icacls \"{d}\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"\n\
+             \x20   Anyone who can read the seed file owns every coin this wallet holds."
+        ))
     }
 }
 
@@ -544,7 +555,10 @@ mod tests {
     #[test]
     fn the_stated_protection_matches_what_this_platform_actually_does() {
         let claim = secret_file_protection();
-        let note = secret_file_protection_note();
+        // lab #637: the note now carries the caller's OWN directory, because a fix
+        // command aimed at a path the user is not using succeeds and repairs nothing.
+        let d = tmp("protnote");
+        let note = secret_file_protection_note(&d);
         #[cfg(unix)]
         {
             assert!(claim.contains("0600"), "unix must state the mode it sets: {claim:?}");
@@ -578,7 +592,17 @@ mod tests {
                 "the note must not let 'usually' stand in for the reader's own ACL: {note:?}"
             );
             assert!(
-                note.contains("Authenticated Users: Modify"),
+                note.contains(&d.display().to_string()),
+                "both commands must name the directory the caller passed — a fix aimed at a \
+                 path the user is not using succeeds and repairs nothing (lab #637): {note:?}"
+            );
+            assert!(
+                note.contains("(M) is modify"),
+                "the note must decode (M) — a reader who cannot read the check's output has \
+                 been sent to a dead end with extra confidence: {note:?}"
+            );
+            assert!(
+                note.contains("Authenticated Users:(I)(M)"),
                 "the note must carry the MEASURED grant, not only the typical one — a \
                  consequence without a magnitude is what left this unacted on: {note:?}"
             );
