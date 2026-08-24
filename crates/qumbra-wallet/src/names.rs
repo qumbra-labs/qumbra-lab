@@ -134,6 +134,22 @@ impl WalletRegistry {
         self.names.is_empty()
     }
 
+    /// Height at which this exact in-flight record was revealed, when the
+    /// synced chain view contains it inside this commit's reveal window.
+    /// Matching the dedicated address as well as the name prevents an old or
+    /// competing binding from being mistaken for confirmation of our reveal.
+    pub fn observed_reveal_height(&self, state: &RegisterState) -> Option<u64> {
+        use qlab_devnet::names::{COMMIT_MAX_AGE, COMMIT_MIN_AGE};
+        let committed = state.committed_at?;
+        let entry = self.names.get(&state.name)?;
+        let opens = committed.checked_add(COMMIT_MIN_AGE)?;
+        let closes = committed.checked_add(COMMIT_MAX_AGE)?;
+        (entry.kind == state.record.kind
+            && entry.address == state.record.address
+            && (opens..=closes).contains(&entry.registered))
+        .then_some(entry.registered)
+    }
+
     // ---- the cache file (rebuildable; contacts.v1 discipline) --------------
 
     pub fn save(&self, dir: &Path) -> io::Result<()> {
@@ -341,7 +357,8 @@ impl Pins {
 
 pub const REG_FILE: &str = "names-reg.v1";
 pub const REG_HEADER_V1: &str = "qumbra-wallet names-reg v1";
-pub const REG_HEADER: &str = "qumbra-wallet names-reg v2";
+pub const REG_HEADER_V2: &str = "qumbra-wallet names-reg v2";
+pub const REG_HEADER: &str = "qumbra-wallet names-reg v3";
 
 /// One in-flight registration. **Persisted BEFORE the commit tx posts** (the
 /// #324 lesson: write the local record before the network can answer) — the
@@ -360,6 +377,13 @@ pub struct RegisterState {
     /// true, discarding this state could lose the only salt for an on-chain
     /// commitment, so presentation layers must not offer an ordinary cancel.
     pub commit_attempted: bool,
+    /// Exact canonical reveal transaction bytes, persisted after proving and
+    /// BEFORE the first POST. A proof is randomized, so only these bytes can
+    /// make a retry byte-identical rather than merely rider-identical.
+    pub reveal_tx: Option<Vec<u8>>,
+    /// Height at which the exact record was observed in the synced chain view.
+    /// Persisted before clearing so a failed clear cannot cause a re-post.
+    pub revealed_at: Option<u64>,
 }
 
 /// Where a registration stands at chain height `tip`.
@@ -372,6 +396,9 @@ pub enum RegisterStep {
     WaitForWindow { at: u64 },
     /// Inside `[opens, closes]`: post the reveal now.
     RevealNow { closes: u64 },
+    /// The reveal was observed on chain. The presentation layer may now clear
+    /// the salt and the retained retry transaction.
+    RevealConfirmed { at: u64 },
     /// 🔴 The window closed unrevealed. The commit is dead and the salt MUST
     /// NOT be reused (brief §1) — start over with a fresh salt.
     WindowClosed,
@@ -385,6 +412,8 @@ impl RegisterState {
             salt,
             committed_at: None,
             commit_attempted: false,
+            reveal_tx: None,
+            revealed_at: None,
         }
     }
 
@@ -401,6 +430,9 @@ impl RegisterState {
     /// Where this registration stands at `tip`.
     pub fn step(&self, tip: u64) -> RegisterStep {
         use qlab_devnet::names::{COMMIT_MAX_AGE, COMMIT_MIN_AGE};
+        if let Some(at) = self.revealed_at {
+            return RegisterStep::RevealConfirmed { at };
+        }
         match self.committed_at {
             None => RegisterStep::NeedsCommit,
             Some(h) => {
@@ -422,13 +454,15 @@ impl RegisterState {
         out.push_str(REG_HEADER);
         out.push('\n');
         out.push_str(&format!(
-            "{} {} {} {} {} {}\n",
+            "{} {} {} {} {} {} {} {}\n",
             self.name,
             self.record.kind,
             hex(&self.salt),
             self.committed_at.map_or("none".to_string(), |h| h.to_string()),
             if self.commit_attempted { "attempted" } else { "prepared" },
+            self.revealed_at.map_or("none".to_string(), |h| h.to_string()),
             hex(&self.record.address),
+            self.reveal_tx.as_deref().map_or("none".to_string(), hex),
         ));
         write_owner_only(&dir.join(REG_FILE), out.as_bytes())
     }
@@ -442,7 +476,7 @@ impl RegisterState {
         let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{REG_FILE}: {why}"));
         let mut lines = text.lines();
         let header = lines.next();
-        if !matches!(header, Some(REG_HEADER | REG_HEADER_V1)) {
+        if !matches!(header, Some(REG_HEADER | REG_HEADER_V2 | REG_HEADER_V1)) {
             return Err(bad("unknown header — an in-flight registration must never be guessed at"));
         }
         let Some(line) = lines.next() else { return Ok(None) };
@@ -452,20 +486,64 @@ impl RegisterState {
         else {
             return Err(bad("malformed record"));
         };
-        let (commit_attempted, addr) = if header == Some(REG_HEADER) {
-            let attempted = match f.next() {
-                Some("attempted") => true,
-                Some("prepared") => false,
-                _ => return Err(bad("bad commit-attempt state")),
-            };
-            (attempted, f.next().ok_or_else(|| bad("missing address"))?)
+        let parse_attempted = |value| match value {
+            Some("attempted") => Ok(true),
+            Some("prepared") => Ok(false),
+            _ => Err(bad("bad commit-attempt state")),
+        };
+        let (commit_attempted, revealed, addr, reveal_tx) = if header == Some(REG_HEADER) {
+            let attempted = parse_attempted(f.next())?;
+            (
+                attempted,
+                Some(f.next().ok_or_else(|| bad("missing reveal height"))?),
+                f.next().ok_or_else(|| bad("missing address"))?,
+                Some(f.next().ok_or_else(|| bad("missing reveal transaction"))?),
+            )
+        } else if header == Some(REG_HEADER_V2) {
+            let attempted = parse_attempted(f.next())?;
+            (attempted, None, f.next().ok_or_else(|| bad("missing address"))?, None)
         } else {
             // A v1 record has no evidence that its commit was never posted.
             // Fail closed: preserve its salt and require explicit recovery.
-            (true, f.next().ok_or_else(|| bad("missing address"))?)
+            (true, None, f.next().ok_or_else(|| bad("missing address"))?, None)
         };
         if f.next().is_some() {
             return Err(bad("unexpected trailing fields"));
+        }
+        let committed_at = match committed {
+            "none" => None,
+            v => Some(v.parse::<u64>().map_err(|_| bad("bad commit height"))?),
+        };
+        let revealed_at = match revealed {
+            None | Some("none") => None,
+            Some(v) => Some(v.parse::<u64>().map_err(|_| bad("bad reveal height"))?),
+        };
+        let reveal_tx = match reveal_tx {
+            None | Some("none") => None,
+            Some(v) => Some(
+                unhex(v)
+                    .filter(|bytes| !bytes.is_empty())
+                    .ok_or_else(|| bad("bad reveal transaction"))?,
+            ),
+        };
+        if revealed_at.is_some() && committed_at.is_none() {
+            return Err(bad("a confirmed reveal is missing its commit height"));
+        }
+        if reveal_tx.is_some() && (committed_at.is_none() || !commit_attempted) {
+            return Err(bad("a retained reveal transaction is missing its attempted commit"));
+        }
+        if revealed_at.is_some() && reveal_tx.is_none() {
+            return Err(bad("a confirmed reveal is missing its retained transaction"));
+        }
+        if let (Some(committed), Some(revealed)) = (committed_at, revealed_at) {
+            use qlab_devnet::names::{COMMIT_MAX_AGE, COMMIT_MIN_AGE};
+            let opens = committed.checked_add(COMMIT_MIN_AGE)
+                .ok_or_else(|| bad("commit height overflows its reveal window"))?;
+            let closes = committed.checked_add(COMMIT_MAX_AGE)
+                .ok_or_else(|| bad("commit height overflows its reveal window"))?;
+            if !(opens..=closes).contains(&revealed) {
+                return Err(bad("reveal height is outside its commit window"));
+            }
         }
         let salt_v = unhex(salt).filter(|v| v.len() == 32).ok_or_else(|| bad("bad salt"))?;
         let mut salt = [0u8; 32];
@@ -478,11 +556,10 @@ impl RegisterState {
                 address: unhex(addr).ok_or_else(|| bad("bad address"))?,
             },
             salt,
-            committed_at: match committed {
-                "none" => None,
-                v => Some(v.parse::<u64>().map_err(|_| bad("bad commit height"))?),
-            },
+            committed_at,
             commit_attempted,
+            reveal_tx,
+            revealed_at,
         }))
     }
 
@@ -732,8 +809,26 @@ mod tests {
         assert_eq!(commit, qlab_devnet::names::commit_hash(&st.record, &st.salt));
         assert!(matches!(st.reveal_op(), NameOp::Reveal { .. }));
 
-        // Round-trip with a commit height, then clear.
-        assert_eq!(RegisterState::load(&dir).unwrap(), Some(st));
+        // The v3 additions round-trip: exact retry bytes first, then the chain
+        // observation that makes clearing safe even if the window has passed.
+        st.reveal_tx = Some(vec![0x51, 0x36, 0x32]);
+        st.save(&dir).unwrap();
+        assert_eq!(RegisterState::load(&dir).unwrap(), Some(st.clone()));
+        let revealed_at = 9_000 + COMMIT_MIN_AGE;
+        let mut registry = WalletRegistry::default();
+        registry.apply_page(&page(
+            vec![BlockNames { height: revealed_at, riders: vec![reveal(b"alice")] }],
+            revealed_at,
+            revealed_at,
+        ));
+        assert_eq!(registry.observed_reveal_height(&st), Some(revealed_at));
+        st.revealed_at = Some(revealed_at);
+        st.save(&dir).unwrap();
+        assert_eq!(RegisterState::load(&dir).unwrap(), Some(st.clone()));
+        assert_eq!(
+            st.step(9_000 + COMMIT_MAX_AGE + 1),
+            RegisterStep::RevealConfirmed { at: revealed_at },
+        );
         RegisterState::clear(&dir).unwrap();
         assert_eq!(RegisterState::load(&dir).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -755,6 +850,19 @@ mod tests {
         assert!(prepare_registration(&mut wallet, "UPPER").is_err());
         assert!(prepare_registration(&mut wallet, "bob").is_err());
 
+        let v2 = format!(
+            "{REG_HEADER_V2}\nalice {} {} 9000 attempted {}\n",
+            RECORD_KIND_L1_ADDRESS,
+            hex(&first.salt),
+            hex(&first.record.address),
+        );
+        std::fs::write(dir.join(REG_FILE), v2).unwrap();
+        let recovered = RegisterState::load(&dir).unwrap().unwrap();
+        assert!(recovered.commit_attempted);
+        assert_eq!(recovered.committed_at, Some(9_000));
+        assert_eq!(recovered.reveal_tx, None);
+        assert_eq!(recovered.revealed_at, None);
+
         let legacy = format!(
             "{REG_HEADER_V1}\nalice {} {} none {}\n",
             RECORD_KIND_L1_ADDRESS,
@@ -767,6 +875,9 @@ mod tests {
             recovered.commit_attempted,
             "v1 cannot prove its commit was never posted, so cancel must fail closed"
         );
+        std::fs::write(dir.join(REG_FILE), "qumbra-wallet names-reg v99\n").unwrap();
+        let err = RegisterState::load(&dir).unwrap_err().to_string();
+        assert!(err.contains("unknown header"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

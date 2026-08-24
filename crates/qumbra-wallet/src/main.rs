@@ -135,12 +135,33 @@ fn names(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// Drive one step of the resumable registration.
 fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
-    names_register_with(args, names_self_send_wire)
+    names_register_with(
+        args,
+        names_observe_reveal,
+        names_self_send_preserving,
+        names_repost_wire,
+    )
 }
 
-fn names_register_with<F>(args: &[String], mut send: F) -> Result<(), Box<dyn Error>>
+fn names_register_with<Observe, Send, Repost>(
+    args: &[String],
+    mut observe: Observe,
+    mut send: Send,
+    mut repost: Repost,
+) -> Result<(), Box<dyn Error>>
 where
-    F: FnMut(&[String], &qlab_devnet::names::NameOp, &str) -> Result<Vec<u8>, Box<dyn Error>>,
+    Observe: FnMut(
+        &[String],
+        &qumbra_wallet::names::RegisterState,
+        u64,
+    ) -> Result<Option<u64>, Box<dyn Error>>,
+    Send: FnMut(
+        &[String],
+        &qlab_devnet::names::NameOp,
+        &str,
+        &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), Box<dyn Error>>,
+    Repost: FnMut(&[String], &[u8], &str) -> Result<(), Box<dyn Error>>,
 {
     use qumbra_wallet::names::*;
     let name = args.first().ok_or(
@@ -162,7 +183,7 @@ where
         return Ok(());
     }
 
-    let st = match RegisterState::load(&dir)? {
+    let mut st = match RegisterState::load(&dir)? {
         Some(st) if st.name == bare => st,
         Some(st) => return Err(format!("a registration for {} is already in flight", st.name).into()),
         None => {
@@ -174,13 +195,23 @@ where
     let scan_to: u64 = flag(&args[1..], "--scan-to")
         .ok_or("names register requires --scan-to HEIGHT")?
         .parse()?;
+    if st.reveal_tx.is_some() && st.revealed_at.is_none() {
+        if let Some(at) = observe(&args[1..], &st, scan_to)? {
+            st.revealed_at = Some(at);
+            st.save(&dir)?;
+        }
+    }
     match st.step(scan_to) {
         RegisterStep::NeedsCommit => {
-            let mut st = st;
             st.commit_attempted = true;
             st.save(&dir)?;
             let op = st.commit_op();
-            send(&args[1..], &op, &format!("commit for {bare} (relay fee only)"))?;
+            send(
+                &args[1..],
+                &op,
+                &format!("commit for {bare} (relay fee only)"),
+                &mut |_| Ok(()),
+            )?;
             println!(
                 "commit posted. Once mined at height H: `names register {bare} --committed-at H --dir …`"
             );
@@ -192,10 +223,47 @@ where
         RegisterStep::RevealNow { closes } => {
             let op = st.reveal_op();
             let fee = qlab_devnet::names::name_fee_for(&op);
-            eprintln!("revealing {bare} (window closes at {closes}); name fee {fee} bessel, BURNED");
-            send(&args[1..], &op, &format!("reveal for {bare}"))?;
+            if let Some(wire) = st.reveal_tx.as_deref() {
+                eprintln!(
+                    "re-posting the saved reveal for {bare} byte-identically (window closes at \
+                     {closes}); name fee {fee} bessel, BURNED"
+                );
+                repost(&args[1..], wire, &format!("reveal for {bare}"))?;
+            } else {
+                eprintln!(
+                    "revealing {bare} (window closes at {closes}); name fee {fee} bessel, BURNED"
+                );
+                let mut preserve = |wire: &[u8]| {
+                    st.reveal_tx = Some(wire.to_vec());
+                    st.save(&dir).map_err(|e| e.to_string())
+                };
+                send(
+                    &args[1..],
+                    &op,
+                    &format!("reveal for {bare}"),
+                    &mut preserve,
+                )?;
+            }
+            if has_flag(&args[1..], "--no-submit") {
+                println!(
+                    "reveal prepared but NOT submitted — exact retry bytes and salt retained. \
+                     Re-run without --no-submit before height {closes}."
+                );
+            } else {
+                println!(
+                    "reveal posted, not yet confirmed — retry bytes and salt retained until chain \
+                     inclusion or height {closes}. Re-run `names register {bare} …` to check and \
+                     re-post the exact transaction."
+                );
+            }
+            Ok(())
+        }
+        RegisterStep::RevealConfirmed { at } => {
             RegisterState::clear(&dir)?;
-            println!("reveal posted — once mined, {bare}.qmb is yours for 365 epochs. Pin your own fingerprint for your records.");
+            println!(
+                "reveal confirmed at height {at} — {bare}.qmb is yours for 365 epochs; \
+                 registration retry state cleared. Pin your own fingerprint for your records."
+            );
             Ok(())
         }
         RegisterStep::WindowClosed => {
@@ -205,6 +273,25 @@ where
                 .into())
         }
     }
+}
+
+/// Sync the chain's committed name riders and identify this exact record only
+/// when it landed inside this commit's reveal window.
+fn names_observe_reveal(
+    args: &[String],
+    state: &qumbra_wallet::names::RegisterState,
+    scan_to: u64,
+) -> Result<Option<u64>, Box<dyn Error>> {
+    use qumbra_wallet::names::{sync_names, WalletRegistry};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("names register requires --url")?;
+    let mut registry = WalletRegistry::load(&dir)?.unwrap_or_default();
+    sync_names(&mut registry, scan_to, |path| {
+        qumbra_wallet::net::http_get(url, path).map_err(|e| e.to_string())
+    })
+    .map_err(|e| -> Box<dyn Error> { e.into() })?;
+    registry.save(&dir)?;
+    Ok(registry.observed_reveal_height(state))
 }
 
 /// A minimal self-send carrying `op` — the vehicle both registration steps and
@@ -217,12 +304,30 @@ fn names_self_send(
     names_self_send_wire(args, op, label).map(|_| ())
 }
 
+fn names_self_send_preserving(
+    args: &[String],
+    op: &qlab_devnet::names::NameOp,
+    label: &str,
+    before_submit: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), Box<dyn Error>> {
+    names_self_send_wire_before(args, op, label, before_submit).map(|_| ())
+}
+
 fn names_self_send_wire(
     args: &[String],
     op: &qlab_devnet::names::NameOp,
     label: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    use qumbra_wallet::spend::{execute, SendRequest, SendStep};
+    names_self_send_wire_before(args, op, label, &mut |_| Ok(()))
+}
+
+fn names_self_send_wire_before(
+    args: &[String],
+    op: &qlab_devnet::names::NameOp,
+    label: &str,
+    before_submit: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    use qumbra_wallet::spend::{execute_with_pre_submit, SendRequest, SendStep};
     let dir = dir_of(args)?;
     let url = flag(args, "--url").ok_or("requires --url")?;
     let node_url = flag(args, "--node").unwrap_or(url);
@@ -250,9 +355,32 @@ fn names_self_send_wire(
         name_op: Some(op),
         form: genesis_form_of(args)?,
     };
-    let outcome = execute(&req, &mut sink)
+    let outcome = execute_with_pre_submit(&req, &mut sink, before_submit)
         .map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
     Ok(outcome.wire_bytes)
+}
+
+/// Retry the exact canonical bytes retained before the first reveal POST. No
+/// proving or wallet reconstruction is reachable on this path.
+fn names_repost_wire(
+    args: &[String],
+    wire: &[u8],
+    _label: &str,
+) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::net::SubmitClass;
+    use qumbra_wallet::spend::submit;
+    if has_flag(args, "--no-submit") {
+        eprintln!("not submitted (--no-submit); the saved reveal transaction remains retryable");
+        return Ok(());
+    }
+    let url = flag(args, "--url").ok_or("requires --url")?;
+    let node_url = flag(args, "--node").unwrap_or(url);
+    let answer = submit(node_url, wire, &mut |_| {})
+        .map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
+    match answer.class() {
+        SubmitClass::Accepted | SubmitClass::Duplicate => Ok(()),
+        _ => Err(answer.body.into()),
+    }
 }
 
 fn usage() {
@@ -293,7 +421,9 @@ fn usage() {
          qumbra-wallet names pin NAME FINGERPRINT --dir DIR         pin an out-of-band-confirmed qs1…\n  \
          qumbra-wallet names register NAME --dir DIR --url URL --node URL --scan-to N\n\
                             resumable commit → reveal (re-run to advance; salt persisted first;\n\
-                            record the mined commit with --committed-at H). Name fee is BURNED\n  \
+                            record the mined commit with --committed-at H; an unconfirmed reveal\n\
+                            re-posts its saved exact bytes and clears only when chain-observed).\n\
+                            Name fee is BURNED\n  \
          qumbra-wallet names renew NAME --dir DIR --url URL --node URL --scan-to N  anyone may renew\n  \
          qumbra-wallet history --dir DIR --url URL --to N [--from N]  this wallet's own ledger:\n\
                             every note received, every note spent, and the sends reconstructed\n\
@@ -1033,9 +1163,11 @@ mod tests {
     use qlab_devnet::fees::ArityBucket;
     use qlab_devnet::forms::GenesisForm;
     use qlab_devnet::names::{
-        encode_rider, NameRecord, COMMIT_MIN_AGE, L1_ADDRESS_LEN, RECORD_KIND_L1_ADDRESS,
+        encode_rider, NameRecord, COMMIT_MAX_AGE, COMMIT_MIN_AGE, L1_ADDRESS_LEN,
+        RECORD_KIND_L1_ADDRESS,
     };
     use qumbra_wallet::names::RegisterState;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn unconfirmed_reveal_is_retained_and_reposted_byte_identically() {
@@ -1063,13 +1195,21 @@ mod tests {
             "--scan-to".to_string(),
             (9_000 + COMMIT_MIN_AGE).to_string(),
         ];
-        let mut submitted = Vec::new();
-        let mut build_and_submit = |_: &[String], op: &qlab_devnet::names::NameOp, _: &str| {
+        let submitted = RefCell::new(Vec::new());
+        let builds = Cell::new(0u8);
+        let mut observe = |_: &[String], _: &RegisterState, _: u64| Ok(None);
+        let mut build_and_submit = |
+            _: &[String],
+            op: &qlab_devnet::names::NameOp,
+            _: &str,
+            preserve: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+        | {
             // Model the real builder's randomized proof: rebuilding the same
             // reveal deliberately changes the canonical wire. The retry path
             // must retain and resubmit the FIRST bytes, not merely reconstruct
             // the same rider from the saved salt and record.
-            let build = submitted.len() as u8;
+            let build = builds.get();
+            builds.set(build + 1);
             let tx = TxEntry {
                 proof: vec![build],
                 public: TxPublic {
@@ -1083,23 +1223,108 @@ mod tests {
                 rider: encode_rider(Some(op)),
             };
             let wire = qlab_p2p::codec::encode_tx(&tx);
-            submitted.push(wire.clone());
-            Ok(wire)
+            preserve(&wire)?;
+            submitted.borrow_mut().push(wire);
+            Ok(())
+        };
+        let mut repost = |_: &[String], wire: &[u8], _: &str| {
+            submitted.borrow_mut().push(wire.to_vec());
+            Ok(())
         };
 
-        names_register_with(&args, &mut build_and_submit).unwrap();
-        assert_eq!(
-            RegisterState::load(&dir).unwrap(),
-            Some(state.clone()),
-            "an accepted POST is not chain confirmation; the salt and retry state must remain"
+        names_register_with(&args, &mut observe, &mut build_and_submit, &mut repost).unwrap();
+        let retained = RegisterState::load(&dir).unwrap().expect(
+            "an accepted POST is not chain confirmation; the salt and retry state must remain",
         );
+        assert_eq!(retained.salt, state.salt);
+        assert_eq!(retained.record, state.record);
+        assert!(retained.reveal_tx.is_some(), "the exact first wire is durable");
 
-        names_register_with(&args, &mut build_and_submit).unwrap();
+        names_register_with(&args, &mut observe, &mut build_and_submit, &mut repost).unwrap();
+        let submitted = submitted.borrow();
         assert_eq!(submitted.len(), 2, "the unconfirmed reveal is posted again");
+        assert_eq!(builds.get(), 1, "retry must not rebuild a randomized proof");
         assert_eq!(
             submitted[0], submitted[1],
             "retry must submit the exact first transaction, not rebuild randomized bytes"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_observed_reveal_clears_without_reposting() {
+        let dir = std::env::temp_dir().join(format!("qw-i625-confirm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = RegisterState::new(
+            "alice",
+            NameRecord {
+                kind: RECORD_KIND_L1_ADDRESS,
+                name: b"alice".to_vec(),
+                address: vec![0xA6; L1_ADDRESS_LEN],
+            },
+            [0x63; 32],
+        );
+        state.commit_attempted = true;
+        state.committed_at = Some(10_000);
+        state.reveal_tx = Some(vec![0x51, 0x36, 0x32]);
+        state.save(&dir).unwrap();
+        let confirmed = 10_000 + COMMIT_MIN_AGE;
+        let args = vec![
+            "alice".to_string(),
+            "--dir".to_string(),
+            dir.display().to_string(),
+            "--scan-to".to_string(),
+            confirmed.to_string(),
+        ];
+
+        names_register_with(
+            &args,
+            |_, _, _| Ok(Some(confirmed)),
+            |_, _, _, _| panic!("a confirmed reveal must not build"),
+            |_, _, _| panic!("a confirmed reveal must not re-post"),
+        )
+        .unwrap();
+        assert_eq!(RegisterState::load(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_closing_still_clears_and_refuses_salt_reuse() {
+        let dir = std::env::temp_dir().join(format!("qw-i625-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = RegisterState::new(
+            "alice",
+            NameRecord {
+                kind: RECORD_KIND_L1_ADDRESS,
+                name: b"alice".to_vec(),
+                address: vec![0xA7; L1_ADDRESS_LEN],
+            },
+            [0x64; 32],
+        );
+        state.commit_attempted = true;
+        state.committed_at = Some(11_000);
+        state.reveal_tx = Some(vec![0x51, 0x36, 0x33]);
+        state.save(&dir).unwrap();
+        let args = vec![
+            "alice".to_string(),
+            "--dir".to_string(),
+            dir.display().to_string(),
+            "--scan-to".to_string(),
+            (11_000 + COMMIT_MAX_AGE + 1).to_string(),
+        ];
+
+        let err = names_register_with(
+            &args,
+            |_, _, _| Ok(None),
+            |_, _, _, _| panic!("a closed window must not build"),
+            |_, _, _| panic!("a closed window must not re-post"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("salt will not be reused"), "{err}");
+        assert_eq!(RegisterState::load(&dir).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
