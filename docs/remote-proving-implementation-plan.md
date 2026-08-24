@@ -175,14 +175,19 @@ provider does not inherit approval merely by taking the same role name.
 
 ## 9. Current next action and scope
 
-The next eligible implementation action, after an explicit Larry start, is
-**Phase 1: the authorization spike**. It starts with the standardized stateless
-leaf/ML-DSA shape and keeps WOTS+ variants as comparators. It does not start by
-changing the AIR or transaction wire.
+**Progress update, 2026-08-24:** Phase 1 produced the ML-DSA authorization
+spike and isolated D12..D16 mobile harness. Larry then explicitly started a
+valueless shared-service mechanics milestone. The resulting
+[`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) is a Phase 5A
+precursor: it exercises bounded admission, read-only preflight and ephemeral
+workers around today's real prover, but it refuses startup without a valueless
+acknowledgement and has no submit path.
 
-This plan itself changes no code, circuit, wire, `CONSENSUS_CFG`, genesis,
-cloud resource, or deployment. It selects no signature primitive and grants no
-real-value launch approval.
+This does not skip Phases 2–4. The next protocol-bearing action remains the
+binding design correction, followed by the separately reviewed Candidate A
+circuit/wire/node and wallet work. The mechanics service may proceed to CI,
+independent Internet-boundary review and valueless capacity measurement; it
+may not be interpreted as real-value implementation or launch approval.
 
 ## 10. Related records
 

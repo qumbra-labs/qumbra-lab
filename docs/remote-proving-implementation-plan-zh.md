@@ -161,12 +161,16 @@ model session 的记忆。新 model version/provider 不会因为继承同一个
 
 ## 9. 当前下一步与范围
 
-Larry 明确决定开始后，下一个 eligible implementation action 是 **Phase 1：authorization
-spike**。它从标准化 stateless leaf/ML-DSA 形状起步，并把 WOTS+ variants 留作
-comparators；不是先修改 AIR 或 transaction wire。
+**进度更新，2026-08-24：**Phase 1 已产出 ML-DSA authorization spike 与隔离的
+D12..D16 mobile harness。Larry 随后明确启动无价值 shared-service mechanics milestone。
+[`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 是 Phase 5A 的
+precursor：它围绕当前真实 prover 实现 bounded admission、read-only preflight 与
+ephemeral worker，但没有精确 valueless acknowledgement 就拒绝启动，也没有 submit path。
 
-本计划没有修改 code、circuit、wire、`CONSENSUS_CFG`、genesis、cloud resource 或
-deployment；没有选择 signature primitive，也没有授予真实价值 launch approval。
+这不跳过 Phase 2–4。下一个 protocol-bearing action 仍是 binding design correction，之后才是
+另行评审的 Candidate A circuit/wire/node 与 wallet 工作。Mechanics service 可以进入 CI、
+独立 Internet-boundary review 与无价值 capacity measurement；不得把它解释为真实价值
+implementation 或 launch approval。
 
 ## 10. 相关记录
 

@@ -188,6 +188,47 @@ COPY --from=build-explorer /usr/local/bin/qumbra-explorer /usr/local/bin/qumbra-
 # `command: ["run", "--config", "/opt/qumbra/explorer.toml"]`, which says what it does.
 ENTRYPOINT ["/usr/local/bin/qumbra-explorer"]
 
+# ---- mechanics-only shared prover image -----------------------------------
+#
+# This is a separate build graph and runtime image. Adding the prover to the
+# fleet builder would move the signing-node image digest for a service that is
+# not part of consensus. Keep this stage before the final `runtime` stage so a
+# bare docker build still produces the fleet image, exactly as before.
+#
+# Build explicitly:
+#   docker build -f deploy/docker/Dockerfile --target runtime-prover-service \
+#     --build-arg GIT_REVISION=$(git rev-parse HEAD) \
+#     -t qumbra-prover-service:<revision> .
+#
+# This target is VALUELESS-EXPERIMENT ONLY until Candidate A is bound through
+# the design spec, AIR, transaction wire, and node verifier. The binary itself
+# also refuses startup without the exact valueless acknowledgement.
+FROM rust:1.95-bookworm AS build-prover-service
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang libclang-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+ARG GIT_REVISION=unknown
+ENV QUMBRA_BUILD_REV=$GIT_REVISION
+RUN cargo build --release --locked -p qumbra-prover-service \
+    && cp target/release/qumbra-prover-service /usr/local/bin/qumbra-prover-service
+
+FROM debian:bookworm-slim AS runtime-prover-service
+ARG GIT_REVISION=unknown
+LABEL org.opencontainers.image.revision=$GIT_REVISION
+LABEL org.opencontainers.image.source=https://github.com/qumbra-labs/qumbra-lab
+LABEL org.opencontainers.image.title=qumbra-prover-service
+LABEL org.opencontainers.image.description="Valueless-only remote proving mechanics experiment; never submits transactions."
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libgcc-s1 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --no-create-home --home-dir /nonexistent prover
+COPY --from=build-prover-service /usr/local/bin/qumbra-prover-service /usr/local/bin/qumbra-prover-service
+USER 10001:10001
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/qumbra-prover-service"]
+
 FROM debian:bookworm-slim AS runtime
 # Provenance (#224 / QUM-72). The key is the one qumbra-deploy's operator check
 # already reads (`org.opencontainers.image.revision`). Default is the string
