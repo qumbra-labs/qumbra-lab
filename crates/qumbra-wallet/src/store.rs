@@ -354,8 +354,11 @@ pub const fn secret_file_protection_note() -> Option<&'static str> {
              \x20   account that can log in could read AND alter it (lab #637).\n\
              \x20   CHECK yours first — read-only, one command:\n\
              \x20     icacls \"<the --dir you passed>\"\n\
-             \x20   Then, to make it owner-only, run this once in the same shell:\n\
-             \x20     icacls \"%USERPROFILE%\\.qumbra-wallet\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"\n\
+             \x20   Every name it lists can reach the seed. `(M)` means Modify: that account\n\
+             \x20   can overwrite your seed, not only read it.\n\
+             \x20   Then, to make it owner-only, run this once in the same shell — on THAT\n\
+             \x20   SAME directory, not on a path copied from this message:\n\
+             \x20     icacls \"<the --dir you passed>\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"\n\
              \x20   Anyone who can read the seed file owns every coin this wallet holds.",
         )
     }
@@ -590,6 +593,39 @@ mod tests {
             assert!(
                 note.contains("owns every coin this wallet holds"),
                 "the consequence line is the reason any of this is read at all: {note:?}"
+            );
+
+            // Measured on Windows 11 (Ryzen 7, fresh install) against a wallet in
+            // `C:\qumbra`, i.e. OUTSIDE the profile — which is what the operator
+            // guides tell people to do:
+            //
+            //   before: Administrators / SYSTEM / Users(RX) / Authenticated Users(M)
+            //   after:  <the account>:(I)(F)   — a single entry
+            //
+            // Both commands were run verbatim and both work. The failure the earlier
+            // wording had was subtler than being wrong: the FIX hard-coded
+            // `%USERPROFILE%\.qumbra-wallet` while the CHECK was already generic, so a
+            // reader whose wallet lives anywhere else repairs a directory they are not
+            // using — and `icacls` prints "Successfully processed 1 files" while doing
+            // it. A confident success on the wrong target is worse than no advice,
+            // because it retires the reader's sense that anything is outstanding.
+            assert!(
+                !note.contains("icacls \"%USERPROFILE%"),
+                "the FIX must not hard-code a path: it succeeds loudly against a directory \
+                 the reader may not be using, leaving the real seed exactly as exposed: {note:?}"
+            );
+            assert!(
+                note.matches("<the --dir you passed>").count() >= 2,
+                "both the check AND the fix must target the directory the user actually \
+                 passed — keygen knows it at the moment it prints this: {note:?}"
+            );
+            // `(M)` is the one token in `icacls` output a non-administrator cannot
+            // decode, and it is the token that carries the worst half: not merely
+            // readable by others, but writable by them.
+            assert!(
+                note.contains("`(M)` means Modify"),
+                "the note sends the reader to icacls output, so it must decode the one \
+                 field they cannot: {note:?}"
             );
         }
     }
