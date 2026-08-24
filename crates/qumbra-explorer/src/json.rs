@@ -527,7 +527,7 @@ mod tests {
 
         // Nothing finalized: `age_field` refuses, and the refusal reaches the reader
         // in the vocabulary every other Qumbra surface uses for it.
-        let refused = Telemetry::assemble(0, None, Some(0), 0, 0, 0, MAX_LAG);
+        let refused = Telemetry::assemble(0, None, None, 0, 0, 0, MAX_LAG);
         let v = parse(&health(&refused, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(
             v["finality"]["head1"]["age_s"], "-",
@@ -824,7 +824,7 @@ mod tests {
     /// unreachable — which is exactly why it is worth a test rather than a comment.
     #[test]
     fn a_hostile_genesis_hash_cannot_break_the_document() {
-        let t = Telemetry::assemble(1, None, Some(0), 0, 0, 0, MAX_LAG);
+        let t = Telemetry::assemble(1, None, None, 0, 0, 0, MAX_LAG);
         let s = health(&t, "a\"b\\c\nd", 30, "qumbra-devnet-t0");
         let v = parse(&s); // would panic on malformed JSON
         assert_eq!(

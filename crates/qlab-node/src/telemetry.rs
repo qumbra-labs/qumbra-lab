@@ -808,6 +808,22 @@ impl Telemetry {
             Some(fh) => tip_height.saturating_sub(fh),
             None => tip_height,
         };
+        // 🔴 **An age at a head that does not exist is not representable** (lab
+        // #633). `finalized_height` and the age are one fact, not two, and this is
+        // the one place a snapshot is assembled — so the contradiction is closed
+        // here rather than left for each reader to guard, which is precisely the
+        // mistake #73's fix made and this baton is undoing. Same rule as
+        // [`finalized_age_secs`]'s first arm, applied to whatever a caller passed.
+        //
+        // It is also what makes the wire round-trip **total**: `decode_body`
+        // rebuilds the refusal from `finalized_height` in exactly these two cases,
+        // so if `Some(x)` were constructible beside them, encode → decode would
+        // silently drop the `x`. Compare [`Self::with_durable_head`], where a
+        // half-present pair is unrepresentable for the same reason.
+        let last_finalized_age_secs = match finalized_height {
+            None | Some(0) => None,
+            Some(_) => last_finalized_age_secs,
+        };
         Self {
             finality_status,
             tip_height,
@@ -1314,8 +1330,11 @@ mod tests {
         assert_eq!(d.stall_depth, 92);
         assert_eq!(Telemetry::from_bytes(&d.to_bytes()).unwrap(), d);
 
-        // Nothing finalized ⇒ Degraded, depth = tip, no finalized height.
-        let n = Telemetry::assemble(5, None, Some(200), 0, 1, 0, MAX_LAG);
+        // Nothing finalized ⇒ Degraded, depth = tip, no finalized height — and no
+        // age either. This fixture said `200` before lab #633, meaning "the wire
+        // carries 200 and every reader ignores it"; that ambiguity is the thing
+        // the `Option` removed, so the intent is now spelled at the call site.
+        let n = Telemetry::assemble(5, None, None, 0, 1, 0, MAX_LAG);
         assert_eq!(n.finality_status, FinalityStatus::Degraded);
         assert_eq!(n.stall_depth, 5);
         assert_eq!(n.finalized_height, None);
@@ -1327,15 +1346,19 @@ mod tests {
     /// (S8) and finalized-at-genesis — while a real finalized height renders the
     /// number. The wire encoding is untouched: the same fields round-trip, only
     /// the value carried while the head is genesis changes.
+    ///
+    /// 🔴 **Unchanged by lab #633 except for the age argument's type** — this is
+    /// the guard #633 must not regress, so its three assertions are byte-for-byte
+    /// what they were.
     #[test]
     fn age_field_is_dash_until_a_real_checkpoint_finalizes() {
         // Nothing finalized (S8): `-`.
-        let none = Telemetry::assemble(5, None, Some(0), 0, 1, 0, MAX_LAG);
+        let none = Telemetry::assemble(5, None, None, 0, 1, 0, MAX_LAG);
         assert_eq!(none.age_field(), "-");
 
         // Finalized head still genesis (#73): `-`, never a number — this is the
         // state every fresh net boots into (`final=0` until slot 8 finalizes).
-        let genesis = Telemetry::assemble(1, Some(0), Some(0), 0, 1, 0, MAX_LAG);
+        let genesis = Telemetry::assemble(1, Some(0), None, 0, 1, 0, MAX_LAG);
         assert_eq!(genesis.age_field(), "-");
         assert_eq!(Telemetry::from_bytes(&genesis.to_bytes()).unwrap(), genesis);
 
@@ -1396,6 +1419,28 @@ mod tests {
         // A measurable zero is not a refusal, and this is the pair that says so.
         let zero = Telemetry::assemble(3792, Some(3792), Some(0), 0, 3, 0, MAX_LAG);
         assert_eq!(zero.age_field(), "0");
+    }
+
+    /// Lab #633: the constructor closes the one contradiction the `Option` would
+    /// otherwise admit — an age beside a head that cannot have one.
+    ///
+    /// Without this the wire round-trip would be **lossy in a second place**:
+    /// `decode_body` rebuilds `None` from `finalized_height` for exactly these two
+    /// cases, so a constructible `Some(x)` beside them would encode and come back
+    /// as `None` with the `x` silently gone.
+    #[test]
+    fn an_age_beside_a_head_that_cannot_have_one_is_not_representable() {
+        for (tip, fin) in [(5u64, None), (1, Some(0u64))] {
+            let t = Telemetry::assemble(tip, fin, Some(200), 0, 1, 0, MAX_LAG);
+            assert_eq!(t.last_finalized_age_secs, None, "the constructor refuses it");
+            assert_eq!(t.age_field(), "-");
+            assert_eq!(Telemetry::from_bytes(&t.to_bytes()).unwrap(), t, "…so this is total");
+        }
+        // And it does NOT reach past those two: a real head keeps whatever it was
+        // handed, zero included.
+        let real = Telemetry::assemble(10, Some(8), Some(0), 0, 1, 0, MAX_LAG);
+        assert_eq!(real.last_finalized_age_secs, Some(0));
+        assert_eq!(real.age_field(), "0");
     }
 
     /// 🔴 **Lab #633's disclosed gap, locked so a wire bump has to change it.**
