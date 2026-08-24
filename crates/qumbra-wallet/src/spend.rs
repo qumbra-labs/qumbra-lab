@@ -358,16 +358,43 @@ pub fn preflight(req: &SendRequest<'_>) -> Result<ProveContext, SendError> {
 /// endpoints remain outside that artifact.
 #[cfg(feature = "net")]
 pub fn preflight_urls(scan_url: &str, node_url: &str) -> Result<ProveContext, SendError> {
-    let anchors = HttpAnchorSource::new(node_url)
-        .anchors()
-        .map_err(|e| SendError::Refused(format!("anchor-preflight-unavailable: {e}")))?;
-    let spent = fetch_spent(&HttpNullifierSource::new(scan_url), 0, anchors.tip_height).map_err(
-        |e| {
-            SendError::Refused(format!(
-                "nullifier-preflight-unavailable: {e} — refusing to prove inputs the chain may already have consumed"
-            ))
-        },
-    )?;
+    preflight_urls_with_limit(scan_url, node_url, None)
+}
+
+/// Service form of [`preflight_urls`]: anchor and all nullifier responses share
+/// one byte budget, and each whole response is bounded by what remains before
+/// decoding.
+#[cfg(feature = "net")]
+pub fn preflight_urls_limited(
+    scan_url: &str,
+    node_url: &str,
+    max_upstream_bytes: usize,
+) -> Result<ProveContext, SendError> {
+    preflight_urls_with_limit(scan_url, node_url, Some(max_upstream_bytes))
+}
+
+#[cfg(feature = "net")]
+fn preflight_urls_with_limit(
+    scan_url: &str,
+    node_url: &str,
+    max_upstream_bytes: Option<usize>,
+) -> Result<ProveContext, SendError> {
+    let response_budget = max_upstream_bytes.map(crate::net::HttpResponseBudget::new);
+    let anchors = match &response_budget {
+        Some(budget) => HttpAnchorSource::new_limited(node_url, budget.clone()),
+        None => HttpAnchorSource::new(node_url),
+    }
+    .anchors()
+    .map_err(|e| SendError::Refused(format!("anchor-preflight-unavailable: {e}")))?;
+    let nullifiers = match response_budget {
+        Some(budget) => HttpNullifierSource::new_limited(scan_url, budget),
+        None => HttpNullifierSource::new(scan_url),
+    };
+    let spent = fetch_spent(&nullifiers, 0, anchors.tip_height).map_err(|e| {
+        SendError::Refused(format!(
+            "nullifier-preflight-unavailable: {e} — refusing to prove inputs the chain may already have consumed"
+        ))
+    })?;
     Ok(ProveContext { anchors, spent })
 }
 

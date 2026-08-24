@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use qlab_wallet::uri::{b64url_decode, b64url_encode};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tiny_keccak::{Hasher, Keccak};
 use zeroize::Zeroize;
 
@@ -40,6 +41,9 @@ pub const MAX_REQUEST_BYTES: usize = 96 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 pub const MAX_RETAINED_JOBS: usize = 64;
 pub const MAX_QUEUE_CAPACITY: usize = 8;
+pub const DEFAULT_MAX_UPSTREAM_BYTES: usize = 8 * 1024 * 1024;
+pub const MIN_MAX_UPSTREAM_BYTES: usize = 64 * 1024;
+pub const MAX_MAX_UPSTREAM_BYTES: usize = 64 * 1024 * 1024;
 
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_BYTES: usize = 256;
@@ -82,14 +86,7 @@ struct ApiToken(Vec<u8>);
 
 impl ApiToken {
     fn matches(&self, candidate: &[u8]) -> bool {
-        if candidate.len() != self.0.len() {
-            return false;
-        }
-        let mut difference = 0u8;
-        for (expected, got) in self.0.iter().zip(candidate) {
-            difference |= expected ^ got;
-        }
-        difference == 0
+        bool::from(self.0.as_slice().ct_eq(candidate))
     }
 }
 
@@ -110,6 +107,7 @@ pub struct Config {
     pub queue_capacity: usize,
     pub result_ttl: Duration,
     pub prove_timeout: Duration,
+    pub max_upstream_bytes: usize,
     api_token: ApiToken,
 }
 
@@ -187,6 +185,15 @@ impl Config {
         if !(30..=1800).contains(&prove_timeout_secs) {
             return Err("QUMBRA_PROVER_TIMEOUT_SECS must be between 30 and 1800".into());
         }
+        let max_upstream_bytes = parse_env_or(
+            "QUMBRA_PROVER_MAX_UPSTREAM_BYTES",
+            DEFAULT_MAX_UPSTREAM_BYTES,
+        )?;
+        if !(MIN_MAX_UPSTREAM_BYTES..=MAX_MAX_UPSTREAM_BYTES).contains(&max_upstream_bytes) {
+            return Err(format!(
+                "QUMBRA_PROVER_MAX_UPSTREAM_BYTES must be between {MIN_MAX_UPSTREAM_BYTES} and {MAX_MAX_UPSTREAM_BYTES}"
+            ));
+        }
 
         let api_token = read_api_token()?;
         Ok(Self {
@@ -199,6 +206,7 @@ impl Config {
             queue_capacity,
             result_ttl: Duration::from_secs(ttl_secs),
             prove_timeout: Duration::from_secs(prove_timeout_secs),
+            max_upstream_bytes,
             api_token: ApiToken(api_token),
         })
     }
@@ -214,6 +222,7 @@ impl Config {
             scan_url: self.scan_url.clone(),
             node_url: self.node_url.clone(),
             prove_timeout: self.prove_timeout,
+            max_upstream_bytes: self.max_upstream_bytes,
         }
     }
 }
@@ -222,6 +231,7 @@ pub struct WorkerConfig {
     pub scan_url: String,
     pub node_url: String,
     pub prove_timeout: Duration,
+    pub max_upstream_bytes: usize,
 }
 
 fn read_api_token() -> Result<Vec<u8>, String> {
@@ -328,15 +338,7 @@ pub struct JobView {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HealthView {
-    pub service: &'static str,
-    pub protocol_version: u32,
-    pub mode: &'static str,
-    pub build_revision: &'static str,
-    pub queued: usize,
-    pub running: usize,
-    pub retained: usize,
-    pub queue_capacity: usize,
-    pub ready: bool,
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,29 +549,7 @@ impl Api {
     }
 
     pub fn health(&self) -> HealthView {
-        let mut state = lock(&self.inner.state);
-        cleanup(&mut state, self.inner.config.result_ttl);
-        let queued = state
-            .jobs
-            .values()
-            .filter(|job| matches!(job.state, JobState::Queued))
-            .count();
-        let running = state
-            .jobs
-            .values()
-            .filter(|job| matches!(job.state, JobState::Running))
-            .count();
-        HealthView {
-            service: "qumbra-prover-service",
-            protocol_version: PROTOCOL_VERSION,
-            mode: SERVICE_MODE,
-            build_revision: build_revision(),
-            queued,
-            running,
-            retained: state.jobs.len(),
-            queue_capacity: self.inner.config.queue_capacity,
-            ready: true,
-        }
+        HealthView { alive: true }
     }
 
     fn validate_request(&self, request: &SubmitRequest) -> Result<(), ApiError> {
@@ -769,6 +749,7 @@ mod tests {
             queue_capacity: 1,
             result_ttl: Duration::from_secs(60),
             prove_timeout: Duration::from_secs(30),
+            max_upstream_bytes: DEFAULT_MAX_UPSTREAM_BYTES,
             api_token: ApiToken(vec![b'x'; 32]),
         })
     }
@@ -850,5 +831,11 @@ mod tests {
         assert!(bundle < artifact);
         assert_eq!(artifact, 256 * 1024);
         assert!(request >= bundle * 4 / 3);
+    }
+
+    #[test]
+    fn public_health_is_liveness_only() {
+        let encoded = serde_json::to_string(&HealthView { alive: true }).unwrap();
+        assert_eq!(encoded, r#"{"alive":true}"#);
     }
 }

@@ -19,21 +19,25 @@ acknowledges that it is a valueless experiment.
 b16 prover without claiming the missing protocol property:
 
 - authenticated HTTP admission before an upload body is read;
+- bearer-token comparison through the audited `subtle` constant-time primitive;
 - exact protocol, mode, genesis and consensus-label pins;
 - a 64 KiB decoded-bundle ceiling and 96 KiB request ceiling;
 - required idempotency keys and unguessable 256-bit job capabilities;
 - one dispatcher, a bounded in-memory queue, cancellation and proof timeout;
 - one fresh child process per proof, with an empty inherited environment;
-- operator-pinned read-only anchor/nullifier preflight;
+- operator-pinned read-only anchor/nullifier preflight, with one fail-closed
+  byte budget shared across anchor and all nullifier responses;
 - a 256 KiB artifact ceiling matching the node's transaction admission cap;
 - short-lived in-memory results, removed by an independent TTL sweeper, with
-  `Cache-Control: no-store`; and
+  `Cache-Control: no-store`;
+- zeroization of both raw and decoded witness material when its worker scope
+  ends; and
 - proof artifact return to the caller, with no transaction-submission route.
 
-The worker invokes the existing `WitnessBundle::from_bytes`,
-`spend::preflight_urls`, and `spend::prove` seams. It never calls
-`spend::submit`. Refusal details that could expose an anchor, nullifier, endpoint
-or bundle fact are collapsed to a fixed error-code allowlist.
+The worker invokes the existing `WitnessBundle::from_bytes`, the bounded
+`spend::preflight_urls_limited` wrapper, and `spend::prove` seams. It never
+calls `spend::submit`. Refusal details that could expose an anchor, nullifier,
+endpoint or bundle fact are collapsed to a fixed error-code allowlist.
 
 ## 2. Architecture and trust boundary
 
@@ -98,8 +102,9 @@ a changed request answers `409 idempotency-key-reused`.
 - A successful result includes canonical transaction bytes as unpadded
   base64url, their byte length and Keccak-256 digest.
 - `DELETE /v1/jobs/<job_id>` cancels queued work or kills the running child.
-- `GET /healthz` is unauthenticated and exposes only mode, build revision and
-  aggregate queue counts. It carries no job identifier or witness fact.
+- `GET /healthz` is an unauthenticated liveness probe whose complete JSON body
+  is `{"alive":true}`. It does not claim worker readiness and exposes no mode,
+  build, queue, job or witness fact.
 
 There is deliberately no submit endpoint, arbitrary URL field, retry that
 creates a second proof lease, access log, account database or durable queue.
@@ -117,6 +122,7 @@ The binary requires:
 | `QUMBRA_PROVER_GENESIS_FORMAT` | exact request pin |
 | `QUMBRA_PROVER_GENESIS_HASH` | exactly 64 lowercase hex characters |
 | `QUMBRA_PROVER_CONSENSUS_LABEL` | 1–64 restricted ASCII characters |
+| `QUMBRA_PROVER_MAX_UPSTREAM_BYTES` | total decoded-body budget shared across pinned anchor/nullifier preflight; the remaining budget also caps each whole response before decoding; default 8 MiB, range 64 KiB–64 MiB |
 
 Optional bounds are queue capacity `1..=8` (default 1), result TTL 60–3600 s
 (default 600), and proof timeout 30–1800 s (default 300). Insecure HTTP and a
@@ -163,12 +169,14 @@ work still includes the binding design correction, Candidate A key lifecycle,
 AIR/public-value binding, transaction wire/identity, node pre-STARK
 authorization verification, activation/re-mint, wallet complete-intent checks,
 per-install asymmetric authentication, production ingress privacy,
-upstream-response ceilings, capacity evidence, worker filesystem/credential
-isolation and egress enforcement, multi-region availability and an independent
+capacity evidence, worker filesystem/credential isolation and egress
+enforcement, multi-region availability and an independent
 Internet-boundary review. In particular, `env_clear` prevents accidental
 environment inheritance but is not a sandbox: until that isolation exists, a
 compromised worker running under the same UID could attempt to read the mounted
-API-token file.
+API-token file. Typed-value zeroization is defense in depth, not proof that the
+compiler, allocator, kernel swap or a core dump never retained another copy;
+swap and core dumps must still be disabled at the isolated worker boundary.
 
 The API version must change when an actual authorized proving envelope replaces
 the current bundle. It must not be extended in place in a way that makes a v1

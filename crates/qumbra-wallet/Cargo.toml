@@ -64,6 +64,7 @@ bincode = "1"
 # Only for the send test's declared-surface comparison (PrimeField32 → u32),
 # same pin as qlab-consensus.
 p3-field = "=0.6.1"
+zeroize = "1.9"
 
 # TLS for the wallet↔edge hop (issue #297, coordinator ruling 2026-08-08):
 # rustls as a STREAM LAYER under this crate's existing hand-rolled HTTP/1.1 —
@@ -126,4 +127,3 @@ randomx = ["qlab-devnet/randomx", "qlab-node/randomx"]
 # the native-messaging prover host (lab #400 rung): prove + submit behind a
 # framed stdio pipe. In default so `cargo test` builds and exercises the bin.
 host = ["net", "prove", "dep:serde_json"]
-
