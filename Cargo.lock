@@ -1559,6 +1559,7 @@ version = "0.0.0"
 dependencies = [
  "qlab-air",
  "qlab-devnet",
+ "qlab-http-framing",
  "qlab-note",
  "qlab-wallet",
  "rand 0.10.2",
@@ -1654,6 +1655,14 @@ dependencies = [
  "qlab-wallet",
  "qumbra-node",
  "rand 0.10.2",
+]
+
+[[package]]
+name = "qlab-http-framing"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "tiny_http",
 ]
 
 [[package]]
@@ -1876,6 +1885,7 @@ dependencies = [
 name = "qumbra-opview"
 version = "0.0.0"
 dependencies = [
+ "qlab-http-framing",
  "qlab-node",
  "tiny_http",
 ]
@@ -1886,6 +1896,7 @@ version = "0.0.0"
 dependencies = [
  "ctrlc",
  "qlab-devnet",
+ "qlab-http-framing",
  "qlab-p2p",
  "qlab-pow",
  "qlab-stratum",
@@ -1907,6 +1918,7 @@ dependencies = [
  "qlab-consensus",
  "qlab-devnet",
  "qlab-faucet",
+ "qlab-http-framing",
  "qlab-ledger",
  "qlab-node",
  "qlab-note",
@@ -1918,6 +1930,7 @@ dependencies = [
  "rand 0.10.2",
  "rustls",
  "serde_json",
+ "tiny_http",
  "webpki-roots",
 ]
 

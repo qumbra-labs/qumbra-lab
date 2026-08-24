@@ -33,6 +33,10 @@ qlab-ledger = { path = "../qlab-ledger" }
 # The whole light-client scan flow and its honesty vocabulary (ScanOutcome,
 # Completeness) — reused, never reimplemented.
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+# Lab #631: the shared HTTP/1.1 response decoder, gated with `net` so the
+# wasm/ffi core (no sockets) does not take it. Leaf crate, zero runtime deps
+# — this is not a new external crate on the wallet's surface.
+qlab-http-framing = { path = "../qlab-http-framing", optional = true }
 # ML-KEM Keypair/Dk types the scan takes.
 qlab-note = { path = "../qlab-note" }
 # OS CSPRNG for seed entropy and the scan's decoy rng.
@@ -97,6 +101,10 @@ serde_json = { version = "1", optional = true }
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
 qumbra-node = { path = "../qumbra-node" }
+# Lab #631: `tests/http_framing.rs` drives the wallet's public GET against a
+# real `tiny_http` on a loopback port. Same `=` pin as every other HTTP
+# surface in the tree. Dev-only — the shipped binary's graph is unchanged.
+tiny_http = "=0.12.0"
 
 # wasm32 (the browser-extension shell, lab #400): getrandom needs the JS backend
 # wired explicitly (crypto.getRandomValues) — same block as qumbra-ffi's.
@@ -110,7 +118,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [features]
 default = ["net", "prove", "randomx", "host"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
-net = ["dep:rustls", "dep:webpki-roots"]
+net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.
 prove = ["dep:qlab-consensus", "dep:qlab-p2p"]
 # the RandomX C++ chain, via the qlab-devnet/qlab-node passthroughs.

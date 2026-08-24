@@ -25,11 +25,16 @@ name = "qumbra-opview"
 path = "src/main.rs"
 
 [dependencies]
-# The versioned `/v1/telemetry` wire and its decoder. This is the ONLY dependency,
-# and it is here so the view parses the node's own encoding rather than carrying a
-# second implementation of it — a second encoding is exactly how "the identities
-# match" starts meaning two different things.
+# The versioned `/v1/telemetry` wire and its decoder. This is here so the view
+# parses the node's own encoding rather than carrying a second implementation
+# of it — a second encoding is exactly how "the identities match" starts
+# meaning two different things.
 qlab-node = { path = "../qlab-node" }
+# Lab #631: the shared HTTP/1.1 response decoder. Leaf crate, zero runtime
+# deps. The previous "only dependency" claim was load-bearing for this crate's
+# graph; a framing module inside qlab-cbserver or the pool would have broken
+# it. This does not.
+qlab-http-framing = { path = "../qlab-http-framing" }
 
 [dev-dependencies]
 # A real HTTP/1.1 server to poll in the tests, so the reachable/unreachable

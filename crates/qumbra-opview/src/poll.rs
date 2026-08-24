@@ -52,7 +52,7 @@
 //! feel. If this tool never runs, the net is unchanged
 //! (`observability-and-evidence.md` §5.2).
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
@@ -237,7 +237,8 @@ pub fn poll_one(endpoint: &Endpoint, opts: PollOptions) -> NodeReading {
 /// OS default (~75 s on Linux/macOS) — turning "one node is sick" into "the
 /// operator's view is hung", which is the failure this tool is supposed to report
 /// rather than reproduce. Reaching into that crate to add deadlines for an operator
-/// tool would couple two unrelated surfaces; ~60 lines of HTTP here does not.
+/// tool would couple two unrelated surfaces. Response framing is shared
+/// ([`qlab_http_framing`], lab #631); the deadline and the GET still live here.
 fn fetch(base_url: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     let authority = base_url
         .strip_prefix("http://")
@@ -259,53 +260,16 @@ fn fetch(base_url: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, Strin
     stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
     stream.flush().map_err(|e| format!("flush: {e}"))?;
 
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| format!("read: {e}"))?;
-
-    let sep = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "no HTTP header terminator".to_string())?;
-    let header = &raw[..sep];
-    let body = &raw[sep + 4..];
-
-    let status_line =
-        String::from_utf8_lossy(header.split(|&b| b == b'\n').next().unwrap_or(b"")).to_string();
-    if !status_line.contains(" 200") {
-        return Err(format!("non-200 response: {}", status_line.trim()));
+    // Lab #631: honour the framing the server sent. The pre-#631 reader
+    // de-chunked but ignored `Content-Length`, so a keep-alive peer hung
+    // this view to its read timeout — turning "one node is sick" into "the
+    // operator's view is hung", which is the failure this tool is supposed
+    // to report rather than reproduce.
+    let resp = qlab_http_framing::read_response(&mut stream).map_err(|e| e.to_string())?;
+    if !resp.status.contains(" 200") {
+        return Err(format!("non-200 response: {}", resp.status.trim()));
     }
-
-    // tiny_http answers with `Content-Length` for a known-size body and
-    // `Transfer-Encoding: chunked` otherwise; handle both rather than assuming
-    // which, since the wire is what matters and not how it was framed.
-    let header_lc = header.to_ascii_lowercase();
-    let chunked = header_lc
-        .windows(b"transfer-encoding: chunked".len())
-        .any(|w| w == b"transfer-encoding: chunked");
-    if chunked {
-        dechunk(body)
-    } else {
-        Ok(body.to_vec())
-    }
-}
-
-/// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body: repeated
-/// `<hex-size>\r\n<size bytes>\r\n`, terminated by a `0\r\n` chunk.
-fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
-    let bad = || "malformed chunked body".to_string();
-    let mut out = Vec::new();
-    loop {
-        let line_end = b.windows(2).position(|w| w == b"\r\n").ok_or_else(bad)?;
-        let size_str = String::from_utf8_lossy(&b[..line_end]).to_string();
-        let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or(""), 16)
-            .map_err(|_| bad())?;
-        b = b.get(line_end + 2..).ok_or_else(bad)?;
-        if size == 0 {
-            return Ok(out);
-        }
-        out.extend_from_slice(b.get(..size).ok_or_else(bad)?);
-        b = b.get(size + 2..).ok_or_else(bad)?;
-    }
+    Ok(resp.body)
 }
 
 #[cfg(test)]
@@ -350,5 +314,157 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(r.elapsed < Duration::from_secs(2), "a closed port fails fast, {:?}", r.elapsed);
+    }
+
+    // Lab #631: this client honours the framing the server sent.
+
+    struct TinyServer {
+        server: std::sync::Arc<tiny_http::Server>,
+        addr: String,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TinyServer {
+        fn serving(body: String) -> Self {
+            let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind"));
+            let addr = server.server_addr().to_ip().expect("ip").to_string();
+            let s = std::sync::Arc::clone(&server);
+            let join = std::thread::spawn(move || {
+                while let Ok(request) = s.recv() {
+                    let _ = request.respond(tiny_http::Response::from_string(body.clone()));
+                }
+            });
+            Self { server, addr, join: Some(join) }
+        }
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for TinyServer {
+        fn drop(&mut self) {
+            self.server.unblock();
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    struct RawServer {
+        addr: String,
+        hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RawServer {
+        fn new(script: Vec<u8>, hold_open: bool) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr").to_string();
+            let hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(hold_open));
+            let h = std::sync::Arc::clone(&hold);
+            let join = std::thread::spawn(move || {
+                let Ok((mut sock, _)) = listener.accept() else { return };
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    match sock.read(&mut byte) {
+                        Ok(1) => req.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let _ = sock.write_all(&script);
+                let _ = sock.flush();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while h.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            Self { addr, hold, join: Some(join) }
+        }
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+        fn release(&self) {
+            self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for RawServer {
+        fn drop(&mut self) {
+            self.release();
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    #[test]
+    fn a_chunked_tiny_http_body_reassembles() {
+        let body = "x".repeat(40_000);
+        assert!(body.len() > 32_768);
+        let server = TinyServer::serving(body.clone());
+        let got = fetch(&server.url(), "/", Duration::from_secs(10)).expect("chunked");
+        assert_eq!(got, body.as_bytes());
+    }
+
+    #[test]
+    fn a_content_length_tiny_http_body_is_exact() {
+        let body = "hello-opview";
+        let server = TinyServer::serving(body.to_string());
+        let got = fetch(&server.url(), "/", Duration::from_secs(5)).expect("content-length");
+        assert_eq!(got, body.as_bytes());
+    }
+
+    #[test]
+    fn a_content_length_body_ends_without_the_server_closing() {
+        let body = b"keep-alive-body";
+        let mut script = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        script.extend_from_slice(body);
+        let server = RawServer::new(script, true);
+        let started = Instant::now();
+        let got = fetch(&server.url(), "/", Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        server.release();
+        assert_eq!(got.expect("must parse"), body);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must stop at the end of the body, not at EOF; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_close_delimited_body_still_reads_to_eof() {
+        let body = b"close-delimited";
+        let mut script = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n".to_vec();
+        script.extend_from_slice(body);
+        let server = RawServer::new(script, false);
+        let got = fetch(&server.url(), "/", Duration::from_secs(5)).expect("close-delimited");
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn transfer_encoding_without_space_after_the_colon_is_still_chunked() {
+        let script = b"HTTP/1.1 200 OK\r\nTransfer-Encoding:chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+            .to_vec();
+        let server = RawServer::new(script, false);
+        let got = fetch(&server.url(), "/", Duration::from_secs(5)).expect("no-space chunked");
+        assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn an_unknown_transfer_encoding_is_refused_by_name() {
+        let script = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n\x1f\x8b\x08".to_vec();
+        let server = RawServer::new(script, false);
+        let e = fetch(&server.url(), "/", Duration::from_secs(5)).expect_err("gzip");
+        assert!(
+            e.contains("http-framing: unsupported-transfer-encoding: `gzip`"),
+            "got `{e}`"
+        );
     }
 }

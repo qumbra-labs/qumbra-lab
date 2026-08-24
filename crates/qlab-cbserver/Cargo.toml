@@ -9,6 +9,10 @@ publish.workspace = true
 # §2 over the ratified note-discovery §2 wire. See docs/cbserver-plan.md.
 
 [dependencies]
+# Lab #631: the shared HTTP/1.1 response decoder. Leaf crate, zero runtime
+# deps — this does not change the compact-server graph beyond one internal
+# arrow. Replaces the local de-chunker that ignored Content-Length.
+qlab-http-framing = { path = "../qlab-http-framing" }
 # The ratified note wire (KEM/AEAD/cm/tag/scan) — this crate serves & scans it.
 qlab-note = { path = "../qlab-note" }
 # The consensus Merkle node hash for the commitment tree/frontier, and cm packing.

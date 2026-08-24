@@ -15,8 +15,9 @@
 //!    `/full` fetches (discarded) — the §2 fetch-after-match side-channel
 //!    mitigation, behind [`DecoyPolicy`].
 //!
-//! The HTTP client is a dependency-free std `TcpStream` GET (we own both ends,
-//! localhost, fixed response shapes) — recorded in the plan doc.
+//! The HTTP client is a std `TcpStream` GET (we own both ends, localhost,
+//! fixed response shapes) whose response framing lives in
+//! `qlab_http_framing` (lab #631) — recorded in the plan doc.
 //!
 //! ## 🔴 Step 2 and step 3 no longer answer to the same authority (issue #188)
 //!
@@ -83,7 +84,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 
 use qlab_note::kem::Dk;
@@ -987,9 +988,12 @@ where
     }
 }
 
-/// Minimal dependency-free HTTP/1.1 GET over `TcpStream`. `base_url` is
-/// `http://host:port`; returns the response body bytes. Uses `Connection: close`
-/// and reads to EOF (fixed, small localhost responses).
+/// Minimal HTTP/1.1 GET over `TcpStream`. `base_url` is `http://host:port`;
+/// returns the response body bytes. Uses `Connection: close` on the request
+/// (one connection per call) and stops at the end of the body whenever the
+/// response is self-delimiting — [`qlab_http_framing::read_response`], lab
+/// #631. The pre-#631 reader de-chunked but ignored `Content-Length`, so a
+/// keep-alive peer hung this helper to its read timeout.
 ///
 /// **Plaintext-only, and deliberately so (issue #297).** Every caller here is a
 /// test or a tool talking to a `serve()` handle on loopback; the one caller that
@@ -1009,69 +1013,15 @@ pub fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>
     );
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-
-    // Split headers/body at the first CRLFCRLF.
-    let sep = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP header terminator"))?;
-    let header = &raw[..sep];
-    let raw_body = &raw[sep + 4..];
-
-    // Status line: "HTTP/1.1 200 OK".
-    let status_ok = header
-        .split(|&b| b == b'\n')
-        .next()
-        .map(|line| line.windows(3).any(|w| w == b"200"))
-        .unwrap_or(false);
+    let resp = qlab_http_framing::read_response(&mut stream)?;
+    let status_ok = resp.status.as_bytes().windows(3).any(|w| w == b"200");
     if !status_ok {
-        let status = String::from_utf8_lossy(header.split(|&b| b == b'\n').next().unwrap_or(b""));
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("non-200 response: {status}"),
+            format!("non-200 response: {}", resp.status),
         ));
     }
-
-    // tiny_http replies with `Transfer-Encoding: chunked` — de-chunk if present.
-    let header_lc = header.to_ascii_lowercase();
-    let chunked = header_lc
-        .windows(b"transfer-encoding: chunked".len())
-        .any(|w| w == b"transfer-encoding: chunked");
-    if chunked {
-        dechunk(raw_body)
-    } else {
-        Ok(raw_body.to_vec())
-    }
-}
-
-/// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body:
-/// repeated `<hex-size>\r\n<size bytes>\r\n`, terminated by a `0\r\n` chunk.
-fn dechunk(mut b: &[u8]) -> std::io::Result<Vec<u8>> {
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed chunked body");
-    let mut out = Vec::new();
-    loop {
-        let line_end = b.windows(2).position(|w| w == b"\r\n").ok_or_else(bad)?;
-        // Chunk-size may carry `;ext` — take the hex prefix only.
-        let size_tok = &b[..line_end];
-        let hex_end = size_tok
-            .iter()
-            .position(|&c| c == b';')
-            .unwrap_or(size_tok.len());
-        let size_str = std::str::from_utf8(&size_tok[..hex_end]).map_err(|_| bad())?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| bad())?;
-        b = &b[line_end + 2..];
-        if size == 0 {
-            break;
-        }
-        if b.len() < size + 2 {
-            return Err(bad());
-        }
-        out.extend_from_slice(&b[..size]);
-        b = &b[size + 2..]; // skip the trailing CRLF
-    }
-    Ok(out)
+    Ok(resp.body)
 }
 
 #[cfg(all(test, feature = "devnet"))]
