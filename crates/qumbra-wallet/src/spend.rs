@@ -191,7 +191,9 @@ pub struct SendOutcome {
 /// safe. Presenting this as "failed" is how a user is invited to double-send.
 #[derive(Debug)]
 pub enum SendError {
-    /// Refused before anything was proved — cheap, and named.
+    /// Refused with no ambiguous network submission. Normally cheap and
+    /// pre-proof; the pre-submit preservation hook can also refuse after proof
+    /// when it cannot make exact retry bytes durable.
     Refused(String),
     /// The proof was made and the POST did not complete.
     Incomplete { why: String, wire_bytes: Vec<u8> },
@@ -455,7 +457,20 @@ pub fn execute(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
 ) -> Result<SendOutcome, SendError> {
-    execute_with_phases(req, on, select, preflight, prove, submit)
+    execute_with_phases(req, on, select, preflight, prove, submit, |_| Ok(()))
+}
+
+/// Execute after handing the canonical transaction bytes to `before_submit`.
+/// The hook runs after proving but before both the local send record and the
+/// network socket, including under `no_submit`. Name registration uses this to
+/// make the exact randomized reveal retryable before its first POST can answer.
+#[cfg(all(feature = "net", feature = "prove"))]
+pub fn execute_with_pre_submit(
+    req: &SendRequest<'_>,
+    on: &mut dyn FnMut(SendStep),
+    before_submit: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<SendOutcome, SendError> {
+    execute_with_phases(req, on, select, preflight, prove, submit, before_submit)
 }
 
 /// Execute a send using a wallet already opened by a platform seed provider.
@@ -473,17 +488,19 @@ pub fn execute_opened(
         preflight,
         prove,
         submit,
+        |_| Ok(()),
     )
 }
 
 #[cfg(all(feature = "net", feature = "prove"))]
-fn execute_with_phases<Select, Preflight, Prove, Submit>(
+fn execute_with_phases<Select, Preflight, Prove, Submit, BeforeSubmit>(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
     select_phase: Select,
     preflight_phase: Preflight,
     prove_phase: Prove,
     submit_phase: Submit,
+    mut before_submit: BeforeSubmit,
 ) -> Result<SendOutcome, SendError>
 where
     Select: FnOnce(&SendRequest<'_>, &mut dyn FnMut(SendStep)) -> Result<WitnessBundle, SendError>,
@@ -494,10 +511,16 @@ where
         &mut dyn FnMut(SendStep),
     ) -> Result<SendArtifact, SendError>,
     Submit: FnOnce(&str, &[u8], &mut dyn FnMut(SendStep)) -> Result<SubmitAnswer, SendError>,
+    BeforeSubmit: FnMut(&[u8]) -> Result<(), String>,
 {
     let bundle = select_phase(req, on)?;
     let current = preflight_phase(req)?;
     let art = prove_phase(&bundle, &current, on)?;
+    before_submit(&art.wire_bytes).map_err(|why| {
+        SendError::Refused(format!(
+            "transaction was built but NOT submitted because its exact retry bytes could not be saved: {why}"
+        ))
+    })?;
 
     let outcome = |answer| SendOutcome {
         wire_bytes: art.wire_bytes.clone(),
@@ -719,6 +742,7 @@ mod tests {
         let preflight_calls = Rc::clone(&calls);
         let prove_calls = Rc::clone(&calls);
         let submit_calls = Rc::clone(&calls);
+        let preserve_calls = Rc::clone(&calls);
         let selected = bundle.clone();
         let proved_wire = vec![0x51, 0x35, 0x31];
         let expected_wire = proved_wire.clone();
@@ -769,12 +793,17 @@ mod tests {
                     body: "duplicate".into(),
                 })
             },
+            move |wire| {
+                preserve_calls.borrow_mut().push("preserve");
+                assert_eq!(wire, [0x51, 0x35, 0x31]);
+                Ok(())
+            },
         )
         .expect("duplicate is the safe retry outcome");
 
         assert_eq!(
             calls.borrow().as_slice(),
-            ["select", "preflight", "prove", "submit"]
+            ["select", "preflight", "prove", "preserve", "submit"]
         );
         assert_eq!(outcome.wire_bytes, [0x51, 0x35, 0x31]);
         assert_eq!(outcome.answer.unwrap().class(), SubmitClass::Duplicate);

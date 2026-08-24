@@ -1907,6 +1907,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qumbra-prover-service"
+version = "0.0.0"
+dependencies = [
+ "ctrlc",
+ "qlab-wallet",
+ "qumbra-wallet",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "tiny-keccak",
+ "tiny_http",
+ "zeroize",
+]
+
+[[package]]
 name = "qumbra-wallet"
 version = "0.0.0"
 dependencies = [

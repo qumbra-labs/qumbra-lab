@@ -73,24 +73,45 @@ make_node_stub() {
   echo "$out"
 }
 
-make_wallet_stub() { # $1 = build rev line value
+make_wallet_stub() { # $1 = build rev line value, $2 = the net it was baked for
   local out="$TMP/qumbra-wallet-stub"
   {
     echo '#!/usr/bin/env bash'
+    # usage() order, from crates/qumbra-wallet/src/main.rs: stamp, then net, then
+    # the usage body. lab #581 added the `built for net:` line and the gate's
+    # assertion for it, and did NOT add it here — so every case in this file was
+    # failing on the wallet before it reached anything else (found in lab #636).
     echo "echo \"build rev: $1\""
+    echo "echo \"built for net: $2\""
     echo 'echo "qumbra-wallet — the end-user wallet CLI (issue #243)"'
   } > "$out"
   chmod +x "$out"
   echo "$out"
 }
 
-make_pool_stub() {
+make_pool_stub() { # $1 = build rev line value
   local out="$TMP/qumbra-pool-stub"
   {
     echo '#!/usr/bin/env bash'
-    echo 'echo "qumbra-pool — the T2 pool listener (lab #482 stage 1)"'
-    echo 'echo "USAGE:"'
-    echo 'echo "  qumbra-pool check --config FILE"'
+    # 🔴 THE SHAPE IS THE TEST (lab #636). qumbra-pool's usage() prints a NINE-line
+    # block and then a SECOND eprintln! with the stamp, so `build rev:` is on line
+    # 10 — and the gate read `sed -n '1,8p'`. The window and the stamp shipped in
+    # one commit (1c995e4), so the assertion never passed once; a draft release cut
+    # from 8b347ce6 died on it. This stub printed three lines and no stamp at all,
+    # which is why this file could not have caught it. Keep the line count exact:
+    # if usage() grows a line, this stub must grow the same line.
+    # All of it on STDERR, as usage() does; the gate reads it with 2>&1.
+    echo 'exec >&2'
+    echo 'echo "qumbra-pool — the T2 pool listener (lab #482 stage 1)"'   #  1
+    echo 'echo ""'                                                        #  2
+    echo 'echo "USAGE:"'                                                  #  3
+    echo 'echo "  qumbra-pool check --config FILE   validate config; bind nothing"'  # 4
+    echo 'echo "  qumbra-pool run --config FILE     listen for stratum TCP"'         # 5
+    echo 'echo ""'                                                        #  6
+    echo 'echo "v4-compat: a v4 template refuses stock-xmrig login by name"'          # 7
+    echo 'echo "  (#356 UNCLEAN). Share-PoW: qlab_pow::RandomXHasher. PPLNS + N=1 payee list."'  # 8
+    echo 'echo ""'                                                        #  9
+    echo "echo \"build rev: $1\""                                        # 10
   } > "$out"
   chmod +x "$out"
   echo "$out"
@@ -104,17 +125,20 @@ T1_HASH=138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
 T2_HASH=d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3
 
 # expect <want:pass|fail> <name> <node-fixture> <node-rev> <wallet-rev>
-#        [baked-net] [baked-hash]
-# The last two default to a binary correctly baked for the net being cut; pass
-# them to describe a binary that is not, and pass an EMPTY baked-net for a
-# pre-lab-#527 binary that cannot answer the question at all.
+#        [baked-net] [baked-hash] [pool-rev] [wallet-net]
+# Everything after <wallet-rev> defaults to a correct binary, so a case only
+# states the ONE field it is about. [baked-net]/[baked-hash] describe what `mine`
+# baked (an EMPTY baked-net is a pre-lab-#527 binary that cannot answer at all);
+# [pool-rev] is the pool's stamp (lab #605/#636); [wallet-net] is the wallet's
+# `built for net:` (lab #581).
 expect() {
   local want=$1 name=$2 fixture=$3 nrev=$4 wrev=$5
   local bnet=${6-$CUT_NET} bhash=${7-$T2_HASH}
+  local prev=${8-$BUILD_REV} wnet=${9-$CUT_NET}
   local node wallet pool out rc
   node=$(make_node_stub "$FIX/$fixture" "$nrev" "$bnet" "$bhash")
-  wallet=$(make_wallet_stub "$wrev")
-  pool=$(make_pool_stub)
+  wallet=$(make_wallet_stub "$wrev" "$wnet")
+  pool=$(make_pool_stub "$prev")
   out=$(cd "$TMP" && NODE_BIN="$node" WALLET_BIN="$wallet" POOL_BIN="$pool" \
         EXPECTED_BUILD_REV="$BUILD_REV" \
         NET="$CUT_NET" GENESIS_HASH="$T2_HASH" \
@@ -158,6 +182,31 @@ expect fail "recomputed frozen digest drifted" halt-status-recomputed-drift.txt 
 expect fail "the node ignored QUMBRA_BUILD_REV" halt-status-unstamped.txt "$BUILD_REV" "$BUILD_REV"
 expect fail "the node carries a different revision" halt-status-resume.txt someotherrev "$BUILD_REV"
 expect fail "the wallet is from a different build" halt-status-resume.txt "$BUILD_REV" someotherrev
+
+# 🔴 Lab #636, the regression this file was blind to. The pool's stamp is on line
+# 10 of --help and the gate read the first EIGHT lines, so a correctly stamped
+# pool was refused with "the field or its format moved". The positive case above
+# now covers the pass side (the stub's stamp is on line 10 and must be read), and
+# these two cover the refusals — the point being that widening the reader must not
+# turn this into a check that passes on anything.
+#
+# `unstamped — not built by the release lane` MATCHES `^build rev: ` and satisfies
+# the gate's `[ -n "$POOL_REV" ]` guard. What refuses it is the equality check
+# against EXPECTED_BUILD_REV that follows. This case is the proof that the guard
+# is a message, not the assertion — the question lab #636 asked us to answer.
+expect fail "the pool ignored QUMBRA_BUILD_REV" halt-status-resume.txt \
+       "$BUILD_REV" "$BUILD_REV" "$CUT_NET" "$T2_HASH" "unstamped — not built by the release lane"
+# The pool is the binary whose assemble_coinbase decides who gets paid, so "which
+# build paid this miner" must be answerable from the tarball it shipped in.
+expect fail "the pool is from a different build" halt-status-resume.txt \
+       "$BUILD_REV" "$BUILD_REV" "$CUT_NET" "$T2_HASH" someotherrev
+
+# Lab #581's own assertion had no coverage here either — the stub could not
+# produce a wrong net because it produced no net line at all. A wallet baked for
+# the retired net derives a T2 miner's coinbase under T1's genesis form: the note
+# reads as spendable and refuses at the witness lookup.
+expect fail "the wallet is baked for the retired net" halt-status-resume.txt \
+       "$BUILD_REV" "$BUILD_REV" "$CUT_NET" "$T2_HASH" "$BUILD_REV" t1
 
 # 🔴 Lab #527, reproduced at the gate. The T2 release shipped a binary whose
 # `mine` baked T1's genesis hash: it downloaded the correct T2 genesis and

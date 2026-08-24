@@ -472,7 +472,7 @@ mod tests {
         signed: Option<(u64, Option<u64>)>,
     ) -> Telemetry {
         durable(
-            Telemetry::assemble(tip, fin, 75, 0, 3, 0, 16)
+            Telemetry::assemble(tip, fin, Some(75), 0, 3, 0, 16)
                 .with_committee(21, 19, 15)
                 .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
                 .with_tip_difficulty(Some(1_048_576)),
@@ -576,6 +576,39 @@ mod tests {
         assert_eq!(age_of("node1"), "75", "a real finalized checkpoint reports its age:\n{text}");
     }
 
+    /// Lab #633: handed a snapshot whose age is unmeasurable at a **real**
+    /// finalized height, this renderer refuses too. It shares `age_field`, so it
+    /// cannot disagree with the node's own line about what `-` means.
+    ///
+    /// 🔴 **This does not prove the thing that matters most for this tool.**
+    /// `/v1/telemetry` has no encoding for that refusal at `RPC_VERSION 0x07`, so a
+    /// snapshot decoded off the wire arrives as `Some(0)` and this tool renders `0`
+    /// against a live node in that state — see
+    /// `qlab_node::telemetry`'s `the_wire_cannot_carry_a_refusal_at_a_real_finalized_height`.
+    /// Closing that is a version bump lab #633 deliberately did not take, and until
+    /// it lands **`age_s=0` beside a large `STALL` on this table is that state**,
+    /// not a freshly-finalized head.
+    #[test]
+    fn age_renders_as_dash_when_the_snapshot_cannot_measure_one() {
+        let unmeasurable = durable(
+            Telemetry::assemble(3803, Some(3792), None, 0, 3, 0, 16)
+                .with_committee(21, 19, 15)
+                .with_checkpoint(Some(0xaaaa_aaaa_aaaa), None)
+                .with_tip_difficulty(Some(1_048_576)),
+            Some((3792, 0xdd)),
+        );
+        let text = table(&[ok("node0", unmeasurable)]);
+        let age = text
+            .lines()
+            .find(|l| l.starts_with("node0"))
+            .unwrap()
+            .split_whitespace()
+            .nth(6)
+            .unwrap()
+            .to_string();
+        assert_eq!(age, "-", "a real head with no measurable age still refuses:\n{text}");
+    }
+
     /// Same readings ⇒ same bytes, whatever order they arrived in. The view is
     /// diffed between runs, so a spurious diff is a false alarm of its own.
     #[test]
@@ -667,7 +700,7 @@ mod tests {
         let rolled = durable(t_at(2871, Some(H), Some(0xaaaa_aaaa_aaaa), None), Some((H, 0x63)));
         // `Unavailable` by construction — no `with_durable_head` call at all, which is
         // exactly what a `0x03` body decodes to.
-        let unrolled = Telemetry::assemble(2871, Some(H), 75, 0, 3, 0, 16)
+        let unrolled = Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 0, 16)
             .with_committee(21, 19, 15)
             .with_checkpoint(Some(0xaaaa_aaaa_aaaa), None)
             .with_tip_difficulty(Some(1_048_576));

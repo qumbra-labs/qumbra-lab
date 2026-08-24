@@ -348,8 +348,10 @@ experiment。
 
 ## 11. 本次交接的范围
 
-- 安全基础已经选定,但本文没有构建 backend service、cloud resource、account system、
-  authorization primitive、attestation path、circuit、wire、genesis 或 deployment。
+- 安全基础已经选定。后来经明确授权，现已有仅限无价值的 service-mechanics MVP：
+  [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md)。它不是 public
+  deployment、account system、Candidate A integration、attestation path、circuit/wire/genesis
+  change 或真实价值 authorization。
 - `CONSENSUS_CFG` 未改变。
 - 用户运营常驻 prover 继续排除。
 - 当前 paired-prover 继续只是 trusted-LAN 上的一次请求工具,不得作为真实价值公网服务

@@ -35,6 +35,7 @@ crates/         # 27 crates
   qumbra-faucet/      # the T1 faucet listener: HTTP over qlab-faucet's core, in-process with a KEYLESS node
   qumbra-explorer/    # the public chain-health JSON projection over its own keyless observer node (deliberately not an Etherscan; the page is qumbra-explorer-web, #281)
   qumbra-wallet/      # the end-user wallet CLI: keygen/restore/address/backup/scan/send (#276 wired send: tree sync + POST /v1/tx)
+  qumbra-prover-service/ # valueless-only shared proving mechanics: bounded jobs, ephemeral workers, no submit
   qumbra-ffi/         # the wallet kernel over a hand C ABI, cross-compiled for iOS (rung A, #246)
   qumbra-credit-ref/  # the exchange crediting-flow reference: POST /v1/credit over qlab-vask + the light-client scan (lab #483)
 docs/           # lab notes; polished results go to the design repo, not here

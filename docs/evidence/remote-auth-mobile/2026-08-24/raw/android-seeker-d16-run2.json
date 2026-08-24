@@ -1,0 +1,43 @@
+{
+  "lab_revision": "ac7681832916c9b9b344052c1fac1f2010c94f34",
+  "shell_revision": "cefc17a2130dc3abc74823609a9ab3437eede711",
+  "abi_version": 1,
+  "result_struct_size": 152,
+  "depth": 16,
+  "leaf_count": 65536,
+  "timing": {
+    "address_leaf_generation_ns": 12856128263,
+    "address_tree_hashing_ns": 32266689,
+    "rotation_schedule_ns": 26082461,
+    "spend_signing_ns": 1804000,
+    "spend_verification_ns": 238692,
+    "total_ns": 12981015693
+  },
+  "auth_section_bytes": 7544,
+  "verifying_key_bytes_per_slot": 1312,
+  "signature_bytes_per_slot": 2420,
+  "rotation_schedule_bytes": 262144,
+  "selected_indices": [
+    16444,
+    34337
+  ],
+  "root": "7101e620949339cd038703310337971d3162685cc269e335fe177f49edea5307",
+  "intent_digest": "8c72283c6ecca5a815cfc67df474f9f4a7e9af4fcf1856daab33e611186648e1",
+  "format": "qlab-remote-auth-mobile-bench-v1",
+  "research_only": true,
+  "source_trees_clean": true,
+  "captured_at": "2026-08-24T05:02:32.185007Z",
+  "platform": "android",
+  "hardware": "Solana Mobile Inc. Seeker (seeker; arm64-v8a)",
+  "os": "Android 16 (API 36)",
+  "physical_memory_bytes": 7841386496,
+  "low_power_mode": false,
+  "thermal_state_start": "none",
+  "thermal_state_end": "none",
+  "memory": {
+    "kind": "pss",
+    "baseline_bytes": 166087680,
+    "peak_bytes": 167726080,
+    "peak_delta_bytes": 1638400
+  }
+}
