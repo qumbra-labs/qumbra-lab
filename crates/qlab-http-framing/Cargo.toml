@@ -1,0 +1,29 @@
+[package]
+name = "qlab-http-framing"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Lab #631: HTTP/1.1 response framing for the four hand-rolled clients.
+#
+# Own crate rather than a module in any of the four, for the same one-way-arrow
+# reason qumbra-faucet / qumbra-opview argued: putting this in qlab-cbserver
+# would drag qlab-note / qlab-air / tiny_http into the pool and into opview
+# (opview's only dependency today is qlab-node). Putting it in the pool would
+# invert the arrow into the wallet. Putting it in qlab-node would pull the
+# node graph into the pool and into qlab-cbserver.
+#
+# Zero runtime dependencies. A shared internal module is not a new external
+# crate; that is the whole argument for doing all four at once.
+
+[dependencies]
+
+[dev-dependencies]
+# Lab #626: a hand-written fixture encodes the author's belief about what
+# the server sends, and in #626 that belief WAS the bug (the fix was written
+# against "chunked above 8192 bytes"; the real default threshold is 32768).
+# `tests/live_framing.rs` drives a real `tiny_http` on a loopback port.
+# Same `=` pin the five crates that serve HTTP already lock.
+tiny_http = "=0.12.0"
+serde_json = "1"

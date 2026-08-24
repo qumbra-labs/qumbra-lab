@@ -31,6 +31,7 @@ randomx = ["qlab-pow/randomx"]
 qlab-stratum = { path = "../qlab-stratum" }
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
 qlab-pow = { path = "../qlab-pow", default-features = false }
+qlab-http-framing = { path = "../qlab-http-framing" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

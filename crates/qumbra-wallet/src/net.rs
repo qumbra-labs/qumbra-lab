@@ -434,10 +434,12 @@ fn connect(base_url: &str) -> std::io::Result<(Box<dyn ReadWrite>, String)> {
     }
 }
 
-/// Read a whole `Connection: close` response: `(status, body bytes)`.
+/// Read one HTTP/1.1 response: `(status, body bytes)`.
 ///
-/// Shared by both verbs so the chunked/`Content-Length`-less handling cannot
-/// drift between them.
+/// Shared by both verbs so the framing cannot drift between them. Lab #631:
+/// the decoder is [`qlab_http_framing::read_response`]. The pre-#631 reader
+/// de-chunked but ignored `Content-Length`, so a keep-alive peer hung every
+/// wallet request to [`REQUEST_TIMEOUT`].
 fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> {
     read_response_limited(stream, None)
 }
@@ -456,71 +458,83 @@ fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> 
 /// stream until the miner's process died, before any verification ran. A
 /// caller that knows the artifact's size states it here.
 ///
-/// The read is `take(n + 1)`, so "exactly at the limit" and "truncated at the
-/// limit" are distinguishable and the refusal is unambiguous rather than a
-/// silently-clipped body.
+/// The read is wrapped in `take(n + 1)`, so "exactly at the limit" and
+/// "truncated at the limit" are distinguishable and the refusal is unambiguous
+/// rather than a silently-clipped body. Framing is decoded as bytes arrive;
+/// hitting the ceiling is still refused by name before the body is returned.
 fn read_response_limited(
     stream: &mut dyn ReadWrite,
     limit: Option<usize>,
 ) -> std::io::Result<(u16, Vec<u8>)> {
     use std::io::Read;
 
-    let mut raw = Vec::new();
-    // `take(n + 1)`: reading one byte past the ceiling is what makes an
-    // over-limit response detectable instead of merely short.
-    let read = match limit {
-        None => stream.read_to_end(&mut raw),
-        Some(n) => stream.take(n as u64 + 1).read_to_end(&mut raw),
+    fn status_of(resp: &qlab_http_framing::Response) -> std::io::Result<u16> {
+        resp.status
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unparseable status line: {}", resp.status),
+                )
+            })
+    }
+
+    // A TLS peer that closes without a `close_notify` — and plenty do —
+    // surfaces as `UnexpectedEof` *after* the response is already in hand.
+    // Failing a complete close-delimited response over the peer's shutdown
+    // manners would be a worse answer than the answer. An `UnexpectedEof`
+    // with nothing read is still an error: that is a truncated exchange.
+    let reader = TlsEof::new(stream);
+    let resp = match limit {
+        None => qlab_http_framing::read_response(reader)?,
+        Some(n) => {
+            let mut limited = reader.take(n as u64 + 1);
+            let result = qlab_http_framing::read_response(&mut limited);
+            if limited.limit() == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "response exceeds this route's {n}-byte ceiling and was refused before it \
+                         was parsed (read stopped at {} bytes)",
+                        n + 1
+                    ),
+                ));
+            }
+            result?
+        }
     };
-    if let Some(n) = limit {
-        if raw.len() > n {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "response exceeds this route's {n}-byte ceiling and was refused before it \
-                     was parsed (read stopped at {} bytes)",
-                    raw.len()
-                ),
-            ));
+    Ok((status_of(&resp)?, resp.body))
+}
+
+/// Treat a TLS `UnexpectedEof` after some bytes as a clean EOF. Close-delimited
+/// responses (no `Content-Length`, no chunked) still end at EOF; a keep-alive
+/// peer is handled by the framing decoder and never reaches this.
+struct TlsEof<R> {
+    inner: R,
+    saw_bytes: bool,
+}
+
+impl<R: std::io::Read> TlsEof<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, saw_bytes: false }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for TlsEof<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.inner.read(buf) {
+            Ok(n) => {
+                if n > 0 {
+                    self.saw_bytes = true;
+                }
+                Ok(n)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && self.saw_bytes => Ok(0),
+            Err(e) => Err(e),
         }
     }
-    if let Err(e) = read {
-        // A TLS peer that closes the connection without a `close_notify` — and
-        // plenty do — surfaces as `UnexpectedEof` *after* the response is
-        // already in hand. Failing a complete response over the peer's
-        // shutdown manners would be a worse answer than the answer. An
-        // `UnexpectedEof` with nothing read is still an error: that is a
-        // truncated exchange and there is nothing to parse.
-        if !(e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty()) {
-            return Err(e);
-        }
-    }
-
-    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP header terminator")
-    })?;
-    let header = &raw[..sep];
-    let raw_body = &raw[sep + 4..];
-
-    // "HTTP/1.1 202 Accepted" → 202.
-    let status_line = String::from_utf8_lossy(header.split(|&b| b == b'\n').next().unwrap_or(b""));
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unparseable status line: {status_line}"),
-            )
-        })?;
-
-    let header_lc = header.to_ascii_lowercase();
-    let chunked = header_lc
-        .windows(b"transfer-encoding: chunked".len())
-        .any(|w| w == b"transfer-encoding: chunked");
-    let bytes = if chunked { dechunk(raw_body)? } else { raw_body.to_vec() };
-    Ok((status, bytes))
 }
 
 /// `GET` returning the body bytes, over the connect seam. A non-200 is an
@@ -599,30 +613,6 @@ fn http_post(base_url: &str, path: &str, body: &[u8]) -> std::io::Result<(u16, S
 
     let (status, bytes) = read_response(stream.as_mut())?;
     Ok((status, String::from_utf8_lossy(&bytes).trim().to_string()))
-}
-
-/// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body — tiny_http replies
-/// chunked, so this is not optional.
-fn dechunk(mut b: &[u8]) -> std::io::Result<Vec<u8>> {
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed chunked body");
-    let mut out = Vec::new();
-    loop {
-        let line_end = b.windows(2).position(|w| w == b"\r\n").ok_or_else(bad)?;
-        let size_tok = &b[..line_end];
-        let hex_end = size_tok.iter().position(|&c| c == b';').unwrap_or(size_tok.len());
-        let size_str = std::str::from_utf8(&size_tok[..hex_end]).map_err(|_| bad())?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| bad())?;
-        b = &b[line_end + 2..];
-        if size == 0 {
-            break;
-        }
-        if b.len() < size + 2 {
-            return Err(bad());
-        }
-        out.extend_from_slice(&b[..size]);
-        b = &b[size + 2..];
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -865,10 +855,24 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&a, &b), "one config, built once");
     }
 
+    /// Lab #631: a chunked body is decoded, not handed through as `5\r\nhello`.
     #[test]
-    fn dechunk_reassembles_a_chunked_body() {
-        assert_eq!(dechunk(b"5\r\nhello\r\n0\r\n\r\n").unwrap(), b"hello");
-        assert_eq!(dechunk(b"0\r\n\r\n").unwrap(), b"");
-        assert!(dechunk(b"5\r\nhi\r\n0\r\n\r\n").is_err(), "a short chunk is malformed");
+    fn a_chunked_body_is_decoded_through_the_shared_reader() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (status, body) =
+            read_response_limited(&mut std::io::Cursor::new(raw.to_vec()), None).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        assert!(
+            read_response_limited(
+                &mut std::io::Cursor::new(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhi\r\n0\r\n\r\n"
+                        .to_vec()
+                ),
+                None
+            )
+            .is_err(),
+            "a short chunk is a named framing error"
+        );
     }
 }
