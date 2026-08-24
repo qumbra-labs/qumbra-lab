@@ -160,13 +160,36 @@ if scored.len() == 1 || cap == 1 {
 
 **This is a known and deliberate state, not a defect** — `payee.rs`'s module doc says *"Before
 activation, PPLNS cannot split the mint"* and the test is called
-`v5_birth_cap_is_one_so_the_winner_takes_the_mint`. It has never been exercised because **the pool
-has only ever had one miner.**
+`v5_birth_cap_is_one_so_the_winner_takes_the_mint`.
 
-**What it means for a stranger.** Two miners of similar size roughly even out over time. **A small
-miner against a large one wins only when it happens to lead the rolling window** — burning
-electricity for long stretches at zero. That is not what anyone means by a PPLNS pool, and it is
-not something to discover after being invited.
+### 🔴 It is not hypothetical — it has been running since 2026-08-22 12:19, and it is worse than "a small miner loses"
+
+**Two of our own miners have been on this pool concurrently for over 23 hours** — two stock XMRig
+processes on `hel1`, two distinct payout logins, **identical hardware, identical binaries, one
+thread each, ~27 H/s apiece**. Lifetime accepted shares within **2 %** of one another (2,730 vs
+2,783). Both keys were published on lab #553 **before either rig connected**, each with a
+full-chain absence proof, so the identity claims below do not rest on anyone's say-so.
+
+**What they earned:**
+
+| window | | |
+|---|---|---|
+| 2026-08-22 ~17:47, 60 blocks | `m2` = **28** | `m1` = **3** |
+| 2026-08-22 ~22:19, 60 blocks | `m2` = **0** | `m1` = **32** |
+| 2026-08-24, last 120 blocks | `m2` = **55** | `m1` = **1** |
+
+**Two miners of exactly equal size, taking turns shutting each other out for hours at a time.** The
+payout flips when the trailing-1,024-share PPLNS window tips, and until it tips the leader takes
+**everything**. At one point `m2` had performed *more* total work than `m1` and had earned nothing
+since mid-afternoon.
+
+**So "a smaller miner earns less" understates it, and understates it in a misleading direction.**
+It invites the reading that proportionality merely degrades at the margins. **What actually happens
+is winner-take-all between equals**, in multi-hour regimes, with the loser's electricity spent for
+nothing until the window flips. **That is what a stranger would be joining.**
+
+**No stranger has ever mined this pool** — both logins are ours, and that is the only reason this
+has cost nobody anything so far.
 
 ### 🔴 The boundary is a whole-fleet consensus roll, and inviting the second miner is what triggers it
 
