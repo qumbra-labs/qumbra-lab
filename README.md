@@ -9,12 +9,13 @@ Prototype lab for **Qumbra** — the post-quantum privacy-chain design exercise.
 ## Layout
 
 ```
-crates/         # 26 crates
+crates/         # 27 crates
   qlab-air/           # the fixed-shape AIR: Merkle path, PRF, commitment, balance
   qlab-bench/         # bench harness: hash matrix × hardware, criterion-based
   qlab-consensus/     # the frozen CONSENSUS_CFG + prove/verify wrappers (single source)
   qlab-pow/           # RandomX (light) + Zawy LWMA-1, exact integer form
   qlab-stratum/       # Monero-convention stratum codec (pool protocol lib; no I/O)
+  qlab-http-framing/  # HTTP/1.1 response framing for the four hand-rolled clients (lab #631)
   qlab-remote-auth/   # research-only Candidate A authorization spike (not production-reachable)
   qlab-remote-auth-mobile-bench/ # isolated D12..D16 iOS/Android measurement ABI
   qumbra-pool/        # the T2 pool binary: TCP stratum + accounting + form-keyed template source (lab #482 stage 1)
