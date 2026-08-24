@@ -345,10 +345,16 @@ pub const fn secret_file_protection_note() -> Option<&'static str> {
     {
         Some(
             "⚠️  Windows has no chmod, and this build does not set a DACL on the seed file.\n\
-             \x20   Its protection is whatever it inherits from the folder you chose. Under your\n\
-             \x20   own profile (%USERPROFILE%\\.qumbra-wallet) that is normally you + SYSTEM +\n\
-             \x20   Administrators — NOT owner-only, and NOT what the unix builds get.\n\
-             \x20   To make it owner-only, run this once, in the same shell:\n\
+             \x20   Its protection is whatever it inherits from the folder you chose, and this\n\
+             \x20   message CANNOT TELL YOU WHAT THAT IS. Under your own profile\n\
+             \x20   (%USERPROFILE%\\.qumbra-wallet) it is usually you + SYSTEM + Administrators —\n\
+             \x20   already NOT owner-only, and NOT what the unix builds get. A folder outside\n\
+             \x20   your profile commonly inherits far more: a freshly-installed Windows 11 was\n\
+             \x20   MEASURED granting `Authenticated Users: Modify` on a seed file — every\n\
+             \x20   account that can log in could read AND alter it (lab #637).\n\
+             \x20   CHECK yours first — read-only, one command:\n\
+             \x20     icacls \"<the --dir you passed>\"\n\
+             \x20   Then, to make it owner-only, run this once in the same shell:\n\
              \x20     icacls \"%USERPROFILE%\\.qumbra-wallet\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"\n\
              \x20   Anyone who can read the seed file owns every coin this wallet holds.",
         )
@@ -556,6 +562,35 @@ mod tests {
             );
             let note = note.expect("a platform with no owner-only mode must narrate the gap");
             assert!(note.contains("icacls"), "the note must name the fix: {note:?}");
+
+            // lab #637. The note already named the fix and the consequence; what it
+            // could not do was tell the reader what THEIR folder grants. It said what
+            // is "usually" true under %USERPROFILE% — and a freshly-installed Windows
+            // 11 was measured granting `Authenticated Users: Modify` on a seed file,
+            // which is broader than the example and is what a folder outside the
+            // profile commonly inherits. The person who hit it read the note and did
+            // not act; they acted on `icacls` output.
+            //
+            // So three properties, each of which a future tidy-up would otherwise be
+            // free to drop:
+            assert!(
+                note.contains("CANNOT TELL YOU WHAT THAT IS"),
+                "the note must not let 'usually' stand in for the reader's own ACL: {note:?}"
+            );
+            assert!(
+                note.contains("Authenticated Users: Modify"),
+                "the note must carry the MEASURED grant, not only the typical one — a \
+                 consequence without a magnitude is what left this unacted on: {note:?}"
+            );
+            assert!(
+                note.matches("icacls").count() >= 2,
+                "the note must give a read-only CHECK as well as the fix — a remedy with no \
+                 way to observe the condition assumes the reader already believes it: {note:?}"
+            );
+            assert!(
+                note.contains("owns every coin this wallet holds"),
+                "the consequence line is the reason any of this is read at all: {note:?}"
+            );
         }
     }
 
