@@ -10,20 +10,28 @@ host、pilot、真实价值或 transaction submission。** 英文权威版：
 里的 independent-review 要求变成 commit-addressed checklist。某个 sub-invariant 打勾，
 只说明该小项有证据；不等于整个 review gate 已关闭。
 
-## 1. 不可变 review target
+## 1. 不可变 review targets
 
-Reviewer 必须检查以下精确 merged artifacts，不能只看口头总结或之后变化的 `main`：
+首轮 findings 来自以下不可变 baseline artifacts：
 
 | Repository | Immutable target | Artifact |
 |---|---|---|
 | `qumbra-labs/qumbra-lab` | [`7d689df2e303697e34c3e1de2f6650d501141417`](https://github.com/qumbra-labs/qumbra-lab/commit/7d689df2e303697e34c3e1de2f6650d501141417) | PR [#639](https://github.com/qumbra-labs/qumbra-lab/pull/639)：service、worker boundary、Docker target 与服务文档 |
 | `qumbra-labs/qumbra-deploy` | [`9987b5545c2c411b7209186292975106b9455cd6`](https://github.com/qumbra-labs/qumbra-deploy/commit/9987b5545c2c411b7209186292975106b9455cd6) | PR [#246](https://github.com/qumbra-labs/qumbra-deploy/pull/246)：standalone loopback-only Compose skeleton 与部署记录 |
 
-Lab target 有意停留在 Candidate A 之前。它的 `WitnessBundle` 仍是 spend authority，所以
-所有 experiment 都必须无价值。Deployment target 是静态 review skeleton，不是已部署
-ingress。
+最终 delta review 必须检查以下精确成对 remediation tree，不能检查更早 PR head、口头摘要
+或之后变化的 `main`：
 
-## 2. 当前已有 findings
+| Repository | Immutable remediation target | Artifact |
+|---|---|---|
+| `qumbra-labs/qumbra-lab` | [`702456d4c7315df1ec2838ae729bdcab8edb1342`](https://github.com/qumbra-labs/qumbra-lab/commit/702456d4c7315df1ec2838ae729bdcab8edb1342) | PR [#652](https://github.com/qumbra-labs/qumbra-lab/pull/652)：liveness-only health、bounded upstream read、token compare 与 witness zeroize；parent `dae9f10ec5d57dad5773260a0ad15630e816c12e` |
+| `qumbra-labs/qumbra-deploy` | [`33afc24826381778841e3b123401ef56545a7f0f`](https://github.com/qumbra-labs/qumbra-deploy/commit/33afc24826381778841e3b123401ef56545a7f0f) | PR [#249](https://github.com/qumbra-labs/qumbra-deploy/pull/249)：拆分 ingress/prover/egress trust domains、route allowlist 与 runtime hardening；parent `228d57e3d86eb63c32e16f7a319fb453e73a35b0` |
+
+两个 lab target 都有意停留在 Candidate A 之前。`WitnessBundle` 仍是 spend authority，所以
+所有 experiment 都必须无价值。Deployment target 仍是 standalone、host-loopback-only；
+本文不记录实际 deployment，也不授权 public ingress。
+
+## 2. 当前 findings 与 remediation
 
 首轮 read-only security 检查保存在
 [#639 comment 5391225338](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391225338)。
@@ -35,21 +43,41 @@ Grok 的完整 privacy report 保存在
 Claude 的完整 Internet-boundary report 保存在
 [#639 comment 5391401951](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391401951)。
 两份 verdict 都只批准 frozen loopback、valueless、仅 Compose render 的 target；都不批准
-Internet-facing pilot。报告 severity 不一致时，下表采用更高等级：
+Internet-facing pilot。报告 severity 不一致时，下表采用更高等级。标为
+`REMEDIATED / RE-REVIEW OPEN` 只表示已有 implementation evidence；只有独立 final delta
+review 才能关闭：
 
-| Effective severity | 状态 | 来源 | Finding／所需处理 |
-|---|---|---|---|
-| P1 | ACCEPTED / UNRESOLVED | Claude + Grok | `tiny_http::Server::http` 没有 accepted-socket read deadline 或 connection cap。`MAX_HTTP_HANDLERS` 在完整 request 已被接收后才计数，因此 unauthenticated slow/incomplete headers 可以在 admission accounting 之前消耗 listener resources。 |
-| P1 | ACCEPTED / UNRESOLVED | Claude P2；Grok P1 | 未认证 `/healthz` 暴露 `queued`、`running`、`retained`、`queue_capacity` 与 `build_revision`，可以观察 load/timing 并做精确 version fingerprinting。Public liveness 不需要这些逐服务 activity counters。 |
-| P1 | ACCEPTED / UNRESOLVED | Grok | 被攻破的 same-UID worker 可以读取 mounted shared API token；一个泄露 credential 就代表整个 experiment identity，并能读取任何另行泄露 job capability 对应的结果。 |
-| P1 | ACCEPTED / UNRESOLVED | Claude P2；Grok P1 | Default bridge 没有 egress allowlist，因此持有当前 spend-authority bundle 的 compromised worker 可以向任意目的地 exfiltrate。 |
-| P2 | OPEN | Grok | Client-chosen idempotency key 可能成为跨 attempt 的稳定 identifier；retention 期间 reuse-conflict response 还是 existence oracle。 |
-| P2 | OPEN | Grok | Shared bearer 加泄露 job identifier 可以读取其他 caller 的完整 artifact；没有 per-install 或 per-job holder binding。 |
-| P2 | ACCEPTED / UNRESOLVED | Claude + Grok | Nullifier preflight 覆盖 `0..=tip`，可达 HTTP read 没有 response-byte ceiling；pinned/compromised upstream 可以在 witness 仍驻留时放大内存。 |
-| P2 | ACCEPTED / UNRESOLVED | Claude + Grok | Host swap 或 crash collection 可以活得比 in-process retention window 更久；`WitnessBundle` 本身没有 zeroize，只禁用 core 不能关闭 host/cloud persistence。 |
-| Advisory | ACCEPTED / UNRESOLVED | Claude + Grok | `ApiToken::matches` 使用手写 compare，没有 optimizer-resistant constant-time primitive。直接替换，不保留自制 security primitive。 |
-| Advisory | OPEN | Grok | `health()` 永远返回 `ready: true`；不能把它当成 prover readiness 或 idleness。 |
-| Advisory | OPEN | Claude | 一个 shared-token holder 可以在 TTL 内占满 64 个 retained-job slots；authentication 被多个 client 共享后，这会成为 cross-client admission denial。 |
+| Effective severity | 当前状态 | 来源 | Finding | Remediation／剩余边界 |
+|---|---|---|---|---|
+| P1 | PUBLISHED COMPOSE PATH 已修复／复审开放 | Claude + Grok | `tiny_http::Server::http` 在 application admission 前没有 accepted-socket deadline 或 connection cap。 | PR #249 把未发布的 `tiny_http` 放在具有 header/body/idle deadline 与 96 KiB edge body cap 的 ingress 后面。Binary 单独仍不能作为 listener；live slow-client check 仍是 pre-start gate。 |
+| P1 | 已修复／复审开放 | Claude P2；Grok P1 | 未认证 `/healthz` 暴露 load counters 与 build revision。 | PR #652 把 public response 缩减为 `{"alive":true}` 并用 regression test 锁定。它是 liveness，不是 readiness/idleness。 |
+| P1 | CLIENT-CREDENTIAL BOUNDARY 已修复／复审开放 | Grok | Same-UID worker 可以读取 mounted client API token。 | PR #249 把 client bearer 留在 ingress domain，prover 只获得独立 internal-hop token。Compromised worker 仍可读取并针对自己的 API 滥用 hop token；该 residual 已明确，且它不是 client identity。 |
+| P1 | 静态修复／live verification 与复审开放 | Claude P2；Grok P1 | Worker 持有 spend-authority bundle 时具有 unrestricted bridge egress。 | PR #249 让 prover 只连接两个 `internal: true` network，出站只能经过 GET-only、authority-pinned egress proxy。任何启动前仍必须做 live DNS/SYN/IPv4/IPv6 negative checks。 |
+| P2 | 开放／MULTI-CLIENT PILOT 前处理 | Grok | Client-chosen idempotency key 可能成为稳定 identifier，reuse-conflict 是 retention-window existence oracle。 | 未改变。它不阻塞 single-operator loopback capacity measurement；仍属于 per-install auth 与 public API contract 范围。 |
+| P2 | 开放／MULTI-CLIENT PILOT 前处理 | Grok | Shared bearer 加泄露 job id 可以读取其他 caller artifact；没有 per-install/per-job holder binding。 | Client 与 hop credential 已拆分，但 caller binding 未变。未授权 public/multi-client pilot。 |
+| P2 | WORKER 内已修复／EGRESS AVAILABILITY 复审开放 | Claude + Grok | Nullifier preflight 没有 response-byte ceiling，可在 witness 驻留时放大 worker memory。 | PR #652 为 anchor/nullifier read 共用 fail-closed byte budget。Egress 不独立限制 response body，因此 hostile-origin egress-container availability 与已记录的配置 coupling 仍需复审。 |
+| P2 | 部分修复／HOST GATE 开放 | Claude + Grok | Swap、crash collection 与普通 allocation 可活过 in-process retention；`WitnessBundle` 未 zeroize。 | PR #652 加入 typed best-effort zeroize，并在 handoff 后 drop parent bundle。PR #249 禁止 container swap growth 与 core dump。Host swap/crash collection、allocator copies 与 STARK working set 不声称已擦除，仍是 pre-start checks。 |
+| Advisory | 已修复／复审开放 | Claude + Grok | `ApiToken::matches` 使用手写 compare。 | PR #652 使用 `subtle::ConstantTimeEq`；token length 仍单独验证。 |
+| Advisory | 已修复／复审开放 | Grok | `health()` 永远返回 `ready: true`。 | PR #652 完全移除 readiness，只暴露 liveness。 |
+| Advisory | 开放 | Claude | 一个 shared-token holder 可在 TTL 内占满 retained-job slots。 | 无价值 mechanics lane 有意保持 single-operator auth；shared-client admission 前必须重新处理。 |
+
+Remediation PR 首次 cross-review 检查的是 lab head `3c0670b` 与 deploy head `f042080`，并非
+§1 最终 commits。Grok 与 Claude 独立发现同一个 crossed mapping：prover 的 node/anchor 和
+scan/nullifier URL 都会收到 `403`。Claude 还要求 lab branch rebase 到 shared HTTP-framing
+extraction 之后。合并前这些 findings 已修复：
+
+- 最终 lab CI 运行 merge ref `7a26369f9c621282ba4fa450e983e53b9be3d06a`；wallet network
+  path 使用 `qlab_http_framing::read_response`，没有私有 `dechunk` implementation；
+- 最终 deploy mapping 是 `NODE_URL` → `:8081` → `/v1/anchors` → `NODE_AUTHORITY`，以及
+  `SCAN_URL` → `:8082` → `/v1/nullifiers` → `SCAN_AUTHORITY`；static checker 锁定该 mapping，
+  negative mutation 会失败；
+- exact pinned Caddy image 已验证两个 allowed routes 与两个 crossed `403` routes；以及
+- exact-image startup 暴露 Caddy file capability 与 `cap_drop: ALL` 的 interaction，所以
+  每个 Caddy 只获得 `NET_BIND_SERVICE`，prover 不获得 capability；checker 锁定该 shape。
+
+这些是 implementation-owner observations，不是独立 closure。两位 reviewer 尚未检查 §1
+两个最终 commits。本文不包含 real proof、live network isolation、capacity run、host 或
+public listener。
 
 同一轮检查认为 immutable lab target 在 request 进入 application handling 后的以下性质成立：
 handler accounting 先于 authorization 与 body parsing；同时执行 declared 与 actual body
@@ -67,7 +95,7 @@ external ingress 并未出现在 deployment skeleton 中。
 
 ## 3. 必须完成的独立覆盖
 
-Claude Code 的独立 service-security assignment 对 immutable target 已**完成**，记录在 comment
+Claude Code 的独立 service-security assignment 对 baseline target 已**完成**，记录在 comment
 5391401951。它覆盖了要求的 areas，包括 call-graph-level no-submission verification，并披露
 未运行 live listener、fuzzing 与 capacity。它对 egress 的较低 severity，以及未把 same-UID
 filesystem token access 升级，不能推翻 Grok 较高的 public-boundary finding；implementation
@@ -88,33 +116,46 @@ owner 采用更严格分级。
 - 检查 deploy skeleton 的 filesystem、privilege、PID/memory/CPU/core-dump、secret、network
   与 image-digest boundaries。
 
-Grok 的 A-only privacy 与 metadata assignment 对 immutable target 已**完成**，记录在 comment
+Grok 的 A-only privacy 与 metadata assignment 对 baseline target 已**完成**，记录在 comment
 5391355844。它给出了要求的 observer/data-flow matrix，覆盖全部八个 dispatch areas，区分了
 privacy/availability 与当前 spend-authority exposure，并如实披露未运行的 live-host、ingress、
 Candidate A 与 Candidate B scope。它列出的 public-pilot blockers 仍保持开放。
 
-精确派发指令保存在：
+Baseline 精确派发指令保存在：
 
 - [`prompts/remote-prover-claude-boundary-review.md`](prompts/remote-prover-claude-boundary-review.md)
 - [`prompts/remote-prover-grok-privacy-review.md`](prompts/remote-prover-grok-privacy-review.md)
 
-每位 reviewer 都必须把 finding 分成 P0/P1/P2 或 advisory，引用 file/line 或 reproducible
-invariant，列出被攻击但成立的性质，如实说明未检查或未运行项，并在 lab PR #639 发布
-commit-addressed report。两位 reviewer 都不修改 implementation branch。
+两位 reviewer 对 non-final remediation heads 的 preliminary cross-review 保存在 lab
+[comment 5392271552](https://github.com/qumbra-labs/qumbra-lab/pull/652#issuecomment-5392271552)、
+lab [comment 5392245794](https://github.com/qumbra-labs/qumbra-lab/pull/652#issuecomment-5392245794)、
+deploy [comment 5392278098](https://github.com/qumbra-labs/qumbra-deploy/pull/249#issuecomment-5392278098)
+与 deploy [comment 5392246045](https://github.com/qumbra-labs/qumbra-deploy/pull/249#issuecomment-5392246045)。
+由于两条 head 随后都改变，这些不是 final approval。
+
+Final delta-review 精确指令是：
+
+- [`prompts/remote-prover-claude-remediation-review.md`](prompts/remote-prover-claude-remediation-review.md)
+- [`prompts/remote-prover-grok-remediation-review.md`](prompts/remote-prover-grok-remediation-review.md)
+
+每位 reviewer 必须同时针对 §1 两个 final commits，逐条交代 §2，区分 static evidence 与
+未运行 live gates，并在 PR #648 发布 commit-addressed report。两者都不修改 implementation
+branch，也不批准 deployment、capacity、real value 或 launch。
 
 ## 4. Gate 关闭规则与下一步
 
-只有以下项目全部留档，review gate 才能关闭：
+Review gate 仍保持开放。当前 checklist：
 
-1. Claude 的完整 Internet-boundary report 与 Grok 的独立 privacy report 都针对 §1 的
-   两个 commits；两者均已完成；
-2. Codex 对每条 finding 留下 fix 或 reasoned rejection；
-3. 每个被接受的 P0/P1 都在 scoped PR 中修复并带 regression coverage；
-4. 两位 reviewer 都检查 immutable remediation commit，并逐条交代原 findings 与所需覆盖
-   项；以及
-5. 在计划中的 pilot boundary，没有 unresolved finding 能暴露 spend authority、plaintext
-   witness、reusable credential、arbitrary network access 或 unauthenticated resource
-   exhaustion。
+1. [x] Claude 完整 Internet-boundary report 与 Grok 独立 privacy report 针对 §1 两个
+   baseline commits。
+2. [x] Codex 对每条 finding 记录 fix、明确 residual 或 reasoned deferral。
+3. [x] 已接受 P1 remediation 在 scoped PR #652/#249 中合并，具有 regression/static
+   coverage 与绿色 CI。
+4. [ ] 两位 reviewer 都检查 §1 两个 immutable remediation commits，并逐条交代原 finding
+   与 cross-review finding。
+5. [ ] 独立 reports 一致认为，在计划的 isolated capacity boundary 上，没有 unresolved
+   finding 可暴露 spend authority、plaintext witness、client credential、arbitrary network
+   access 或 unauthenticated resource exhaustion。
 
 满足后才可以准备 isolated-host capacity task book。Capacity 仍需单独批准，并必须记录
 cold/warm latency、peak RSS 与 committed memory、one-worker cancel 与 memory release、

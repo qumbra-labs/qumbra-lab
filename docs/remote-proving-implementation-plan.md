@@ -106,7 +106,7 @@ approve the containing phase, a real-value service, deployment, or launch.
 | Phase 5A precursor: valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) and lab PR #639; real current prover, bounded ephemeral workers, fixed refusals, read-only preflight, no submit path |
 | Phase 5A precursor: standalone deployment skeleton | ✅ | deploy PR #246; loopback-only review skeleton, not a deployment or public edge |
 | Phases 2–4 and Candidate A-bound real-value Phase 5A | ⬜ | Design correction, AIR/public values, wire/node verification, activation and wallet/mobile authorization remain unstarted |
-| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md) freezes lab `7d689df2` + deploy `9987b554`; both independent reports are complete with no P0 and a reconciled four P1, four P2 and three advisories, while remediation/re-review, isolated-host measurements and a separate Larry gate remain required |
+| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md) records the baseline reports and final remediation targets lab `702456d` + deploy `33afc248`; scoped remediation PRs #652/#249 are merged and green, while final two-reviewer delta review, isolated-host measurements and a separate Larry gate remain required |
 
 ## 5. Primary-owner contract
 
@@ -210,11 +210,12 @@ circuit/wire/node and wallet work. The mechanics service may proceed to CI,
 independent Internet-boundary review and valueless capacity measurement; it
 may not be interpreted as real-value implementation or launch approval.
 
-The immediate service-lane action is the commit-addressed review in
-[`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md).
-Both independent reports are complete and no P0 was found. The immediate action
-is finding-by-finding remediation, followed by commit-addressed delta review.
-Capacity work begins only after the accepted P1 remediation and re-review.
+The service-lane remediation is merged as lab `702456d` and deploy `33afc248`.
+The immediate action is the commit-addressed final delta review in
+[`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md),
+using the two retained remediation-review prompts. Capacity work begins only
+after both reviewers account for every baseline and cross-review finding on
+those immutable commits. No host, listener or proof run is authorized yet.
 
 ## 10. Related records
 
