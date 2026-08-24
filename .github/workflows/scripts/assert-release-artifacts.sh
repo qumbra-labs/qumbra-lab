@@ -32,8 +32,11 @@
 # Lab #516 added `qumbra-pool` as the third binary. The pool does not compose
 # qumbra-node and does not carry a halt plan, so its check is "the binary we
 # just built is the one we are about to pack, and it answers --help as
-# qumbra-pool". It does not read QUMBRA_BUILD_REV today (workflow-only baton);
-# do not pretend it has a stamp. Adding qumbra-explorer or qumbra-faucet still
+# qumbra-pool" — plus, since lab #605, its build stamp: the process that chooses
+# the coinbase payee now says which build it is, so it is asserted like the other
+# two. (This paragraph said "it does not read QUMBRA_BUILD_REV today; do not
+# pretend it has a stamp" until lab #636 — stale since #605.) Adding
+# qumbra-explorer or qumbra-faucet still
 # needs its own assertion: those DO compose qumbra-node and inherit ARMED
 # (#397).
 #
@@ -120,9 +123,15 @@ NODE_REV=$(sed -n 's/^  build rev:[[:space:]]*//p' halt.txt | sed -n 1p)
 [ "$NODE_REV" = "$EXPECTED_BUILD_REV" ] \
   || fail "qumbra-node build stamp is '$NODE_REV', expected $EXPECTED_BUILD_REV. Either QUMBRA_BUILD_REV did not reach the build, or this is not the binary that was just built."
 
-echo "===== qumbra-wallet --help (header) ====="
+echo "===== qumbra-wallet --help ====="
 # The wallet prints its stamp on the first line of --help; --help exits 0.
-"$WALLET_BIN" --help 2>&1 | sed -n '1,3p' | tee wallet-help.txt
+#
+# Read the WHOLE output, not a window. This used to be `sed -n '1,3p'`, which
+# happened to contain both lines it greps — correct by luck rather than by rule,
+# and the same construct one binary down excluded its own target for two months
+# (lab #636). `--help` is bounded and small; there is nothing here to truncate,
+# and each grep below already takes `sed -n 1p` of its own matches.
+"$WALLET_BIN" --help 2>&1 | tee wallet-help.txt
 echo "========================================"
 WALLET_NET=$(sed -n 's/^built for net: //p' wallet-help.txt | sed -n 1p)
 # lab #581. The node has been asked which net it was baked for since #527; the
@@ -147,10 +156,17 @@ echo "===== qumbra-pool --help ====="
 # was the only one that could not say which commit it was, and it is the one whose
 # `assemble_coinbase` decides who gets paid. The node's stamp beside it says
 # nothing about the process that chose the payee.
+#
+# lab #636: this read was `sed -n '1,8p'` and the pool prints `build rev:` on line
+# 10 — usage() is a nine-line block and the stamp is a SECOND eprintln! after it.
+# The window and the stamp shipped in the same commit (1c995e4), so this assertion
+# had never once passed, and nothing noticed because no release was cut in between.
+# It surfaced as a draft cut from 8b347ce6 failing with "the field or its format
+# moved" against a binary whose field had not moved. Do not reintroduce a window.
 [ -f "$POOL_BIN" ] || fail "POOL_BIN '$POOL_BIN' is missing — the pool binary was supposed to ship beside the node (lab #516)."
-"$POOL_BIN" --help 2>&1 | sed -n '1,8p' | tee pool-help.txt
+"$POOL_BIN" --help 2>&1 | tee pool-help.txt
 POOL_REV=$(sed -n 's/^build rev: //p' pool-help.txt | sed -n 1p)
-[ -n "$POOL_REV" ] || fail "qumbra-pool printed no 'build rev:' line — the field or its format moved, and a stamp nothing reads back is a stamp that can silently fail to apply."
+[ -n "$POOL_REV" ] || fail "no 'build rev:' line in the qumbra-pool --help output read. A stamp nothing reads back is a stamp that can silently fail to apply — but a truncating reader and an absent field are byte-identical from here, so check this script's read before concluding the binary is at fault (lab #636)."
 [ "$POOL_REV" = "$EXPECTED_BUILD_REV" ] \
   || fail "qumbra-pool build stamp is '$POOL_REV', expected $EXPECTED_BUILD_REV. All three binaries in one tarball must be from one revision — and the pool is the one that chooses the coinbase payee, so its provenance is the one that answers 'which build paid this miner'."
 echo "================================"

@@ -91,3 +91,47 @@ jobs:
       - name: cargo clippy (advisory)
         continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked
+
+  # ── The shell suites under .github/workflows/tests/ ─────────────────────────
+  #
+  # WHY THIS DOES NOT CONTRADICT THIS FILE'S HEADER. The header says this
+  # workflow "deliberately does NOT run tests", and that position stands: it is
+  # about the CARGO suite, and about this workflow never being mistakable for the
+  # acceptance bar. Running a filtered subset of the cargo tests and reporting it
+  # as a pass is lab PR #166's mistake and is still forbidden here. These suites
+  # are a different animal — they exercise the RELEASE-LANE SHELL SCRIPTS against
+  # captured fixtures, need no toolchain, no network, no docker and no credential,
+  # and finish in about two seconds. They are a separate job so that `check`'s
+  # identity above is untouched, and this job claims nothing about the crates.
+  #
+  # 🔴 WHY IT IS WIRED AT ALL (lab #636). All three of these suites ran NOWHERE.
+  # release-assertions/run.sh said so in its own header — "NOT WIRED INTO ANY
+  # WORKFLOW. It costs nothing until a human runs it" — and the cost of that was
+  # exactly what #636 is: it had gone red, its ONLY positive case was the one
+  # failing, and nobody knew, so the file asserted nothing about a publishable
+  # artifact for two months across two separate stub regressions (#581, #605).
+  # A gate whose own test nothing runs is the bug this issue is about, one level
+  # up. The suites under test guard the release lane, which by construction
+  # cannot be rehearsed: it runs on paid arm64 and 10x-billed macOS runners and
+  # publishes to a PUBLIC repository, so a fixture run on a free runner is the
+  # only place its refusals are ever exercised at all.
+  shell-suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Each suite is listed BY NAME rather than globbed. A glob would silently
+      # cover a new suite, which sounds like a feature until the new suite is red
+      # on arrival and this job is what everyone learns to ignore (lab #105's
+      # alarm-at-99.9% argument, the same one that keeps clippy advisory above).
+      # Adding a suite here should be a deliberate line in a diff.
+      - name: release-assertions (the release lane's artifact gate)
+        run: .github/workflows/tests/release-assertions/run.sh
+
+      - name: release-net (the t1|t2 net selection)
+        run: .github/workflows/tests/release-net/run.sh
+
+      - name: explorer-provenance (the explorer image's readback)
+        run: .github/workflows/tests/explorer-provenance/run.sh
