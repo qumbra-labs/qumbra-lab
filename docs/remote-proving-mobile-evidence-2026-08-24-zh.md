@@ -76,6 +76,9 @@ product supported-device floor 的表现。全网 depth gate 继续开放，直�
 3. 明确决定可接受的 cold address-initialization latency，以及 background/cancellation UX；
 4. Larry 基于合并证据作出 depth 决策。
 
+Larry 于 2026-08-24 暂缓 floor measurement。未来的真实设备云 execution 与 security plan
+见 [`remote-proving-mobile-device-cloud-plan-zh.md`](remote-proving-mobile-device-cloud-plan-zh.md)。
+
 若 floor 设备失败，正确动作是选择更低 depth 或修改构造，不是把 private authorization
 master 上传给 prover。
 

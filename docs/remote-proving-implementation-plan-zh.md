@@ -97,7 +97,7 @@ service、deployment 或 launch。`⬜` 表示 gate 仍未关闭。
 | Phase 1 primitive comparator、exact intent/codecs/vectors、dummy rule 与 shape ruling | ✅ | [`remote-proving-authorization-spike-zh.md`](remote-proving-authorization-spike-zh.md) 与 `qlab-remote-auth`；推进 ML-DSA rotation，不推进 depth 0 与两种 WOTS+ |
 | Phase 1 隔离 D12..D16 mobile benchmark harness | ✅ | [`remote-proving-mobile-benchmark-zh.md`](remote-proving-mobile-benchmark-zh.md) 与 `qlab-remote-auth-mobile-bench`；synthetic controls 和 cancel/progress seams 已提交 |
 | Phase 1 首轮真机 D12..D16 evidence set | ✅ | [`remote-proving-mobile-evidence-2026-08-24-zh.md`](remote-proving-mobile-evidence-2026-08-24-zh.md)；iPhone 15 Pro Max 与 Solana Mobile Seeker 每档保留两次，跨平台 deterministic output 一致 |
-| Phase 1 supported-device floor 与最终全网 depth | ⬜ | 仍需明确 floor hardware/OS、在 floor 上执行同一 two-run protocol、决定 UX threshold，并由 Larry 决定 depth |
+| Phase 1 supported-device floor 与最终全网 depth | ⬜ | 2026-08-24 暂缓；[`remote-proving-mobile-device-cloud-plan-zh.md`](remote-proving-mobile-device-cloud-plan-zh.md) 记录真实设备云恢复路径；仍需 floor hardware/OS、同一 two-run protocol、预先声明的 UX threshold 与 Larry depth decision |
 | Phase 5A precursor：valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 与 lab PR #639；真实当前 prover、有界 ephemeral worker、固定 refusal、read-only preflight、无 submit path |
 | Phase 5A precursor：standalone deployment skeleton | ✅ | deploy PR #246；loopback-only review skeleton，不是 deployment 或 public edge |
 | Phase 2–4 与 Candidate A-bound 真实价值 Phase 5A | ⬜ | Design correction、AIR/public values、wire/node verification、activation 与 wallet/mobile authorization 尚未启动 |

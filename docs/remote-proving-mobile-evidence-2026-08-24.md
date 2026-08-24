@@ -85,6 +85,10 @@ until:
    UX are explicitly decided; and
 4. Larry makes the depth decision from the combined evidence.
 
+Larry deferred the floor measurement on 2026-08-24. The future physical-cloud
+execution and security plan is
+[`remote-proving-mobile-device-cloud-plan.md`](remote-proving-mobile-device-cloud-plan.md).
+
 Failure at the floor means choosing a lower depth or revising the construction.
 It is not permission to upload the private authorization master to the prover.
 

@@ -11,6 +11,9 @@ The first physical-device D12..D16 evidence set is recorded in
 [`remote-proving-mobile-evidence-2026-08-24.md`](remote-proving-mobile-evidence-2026-08-24.md).
 It establishes results for the two measured devices but deliberately leaves
 the supported-device-floor and network-wide-depth gates open.
+Larry deferred that floor measurement on 2026-08-24; the safe real-device-cloud
+resumption path is recorded in
+[`remote-proving-mobile-device-cloud-plan.md`](remote-proving-mobile-device-cloud-plan.md).
 
 The governing decision remains
 [`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md):
