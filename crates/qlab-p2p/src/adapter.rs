@@ -5670,12 +5670,21 @@ mod tests {
 
     /// Assemble a telemetry snapshot from a live adapter + an injected peer count
     /// (age is chain-time from block timestamps — deterministic).
+    ///
+    /// Lab #633: the age comes from `qlab_node::telemetry::finalized_age_secs`, the
+    /// one arithmetic every producer shares. This helper used to carry a **third**
+    /// copy of the subtraction, and it indexed `main_chain()` by the finalized
+    /// height — which panics outright on the very state #633 is about (a tracker
+    /// head above this node's tip), so the harness could not have expressed the
+    /// defect even deliberately.
     fn telemetry_of(a: &NodeAdapter<KeccakPow, MockVerifier>, peer_count: u64) -> Telemetry {
         let tip = a.chain().tip_height();
         let finalized = a.finalized_height();
-        let main = a.chain().main_chain();
-        let ts_at = |h: u64| a.chain().header(&main[h as usize]).map(|hd| hd.timestamp).unwrap_or(0);
-        let age = ts_at(tip).saturating_sub(ts_at(finalized.unwrap_or(0)));
+        let age = qlab_node::telemetry::finalized_age_secs(
+            finalized,
+            a.chain().header(&a.chain().tip_hash()).map(|hd| hd.timestamp),
+            a.chain().finalized_hash().and_then(|h| a.chain().header(&h)).map(|hd| hd.timestamp),
+        );
         Telemetry::assemble(
             tip,
             finalized,
@@ -5731,7 +5740,10 @@ mod tests {
         let t_stall = telemetry_of(&a, PEERS);
         assert_eq!(t_stall.finality_status, FinalityStatus::Degraded);
         assert_eq!(t_stall.stall_depth, stalled_tip - CADENCE, "stall depth = tip − finalized");
-        assert!(t_stall.last_finalized_age_secs > 0, "chain-time age of the stall is visible");
+        assert!(
+            t_stall.last_finalized_age_secs.is_some_and(|age| age > 0),
+            "chain-time age of the stall is visible — and it is measured, not a fallback"
+        );
         // The stalled span earns the committee nothing (finalized-only accrual):
         // income is unchanged from before the stall despite ~17 new blocks.
         assert_eq!(

@@ -364,7 +364,7 @@ mod tests {
     /// head #3's block hash with them. Before #281 the page rendered head #1 only.
     #[test]
     fn both_heads_reach_the_surface_with_the_durable_block_hash() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
             .with_checkpoint(Some(0xb682_3616), None)
             .with_durable_head(Some((1040, hash32(0x3f))));
         let v = parse(&health(&t, "138e1524aabb", 30, "qumbra-devnet-t0"));
@@ -395,7 +395,7 @@ mod tests {
     /// hardcodes nothing.
     #[test]
     fn the_network_label_is_on_the_surface_and_v_stays_1() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(v["network"], "qumbra-devnet-t0", "the genesis label, verbatim");
         assert_eq!(v["v"], 1, "a pure addition does not bump the document version");
@@ -410,7 +410,7 @@ mod tests {
     /// one grep still covers opview, the wallet CLI and this surface.
     #[test]
     fn a_tracker_ahead_of_the_durable_head_carries_the_lag_token_and_both_heights() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1040, hash32(0x3f))));
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         let a = &v["finality"]["agreement"];
@@ -428,7 +428,7 @@ mod tests {
     /// a finalized height and head #3 holds nothing, so a restart returns to genesis.
     #[test]
     fn a_finalized_tracker_over_no_durable_head_carries_the_absent_token() {
-        let t = Telemetry::assemble(2900, Some(2864), 42, 0, 7, 0, MAX_LAG).with_durable_head(None);
+        let t = Telemetry::assemble(2900, Some(2864), Some(42), 0, 7, 0, MAX_LAG).with_durable_head(None);
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
         assert_eq!(
@@ -443,7 +443,7 @@ mod tests {
     /// operators learn to ignore the one that means something.
     #[test]
     fn agreement_carries_no_token_at_all() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1048, hash32(0x3f))));
         let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn an_unreadable_durable_head_is_a_named_state_and_never_an_alarm() {
         // `with_durable_head` never called: this composition does not read head #3.
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
 
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn the_chain_block_carries_the_five_facts_and_the_regime_as_a_machine_name() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 3, 7, 0, MAX_LAG)
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 3, 7, 0, MAX_LAG)
             .with_tip_difficulty(Some(1_048_576));
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_missing_tip_difficulty_is_null_and_never_a_zero() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         assert!(v["chain"]["tip_difficulty"].is_null(), "absent, not 0");
     }
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn the_committee_block_carries_the_three_aggregates_and_the_epoch() {
         let t =
-            Telemetry::assemble(1052, Some(1048), 42, 0, 7, 4, MAX_LAG).with_committee(21, 20, 15);
+            Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 4, MAX_LAG).with_committee(21, 20, 15);
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
         assert_eq!(v["committee"]["epoch"], 4);
@@ -518,7 +518,7 @@ mod tests {
     /// number-or-null a consumer's `|| 0` prints a zero, which is a different claim.
     #[test]
     fn age_s_is_a_string_and_the_refusal_survives_as_such() {
-        let stated = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let stated = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let v = parse(&health(&stated, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(
             v["finality"]["head1"]["age_s"], "42",
@@ -527,7 +527,7 @@ mod tests {
 
         // Nothing finalized: `age_field` refuses, and the refusal reaches the reader
         // in the vocabulary every other Qumbra surface uses for it.
-        let refused = Telemetry::assemble(0, None, 0, 0, 0, 0, MAX_LAG);
+        let refused = Telemetry::assemble(0, None, Some(0), 0, 0, 0, MAX_LAG);
         let v = parse(&health(&refused, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(
             v["finality"]["head1"]["age_s"], "-",
@@ -538,14 +538,14 @@ mod tests {
 
     #[test]
     fn stall_depth_is_carried() {
-        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(v["finality"]["head1"]["stall_depth"], 4);
     }
 
     #[test]
     fn complete_coverage_carries_the_epoch_rows_and_the_shared_token_spelling() {
-        let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
+        let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(14, 700, 700)]);
         assert!(matches!(t.supply_coverage(), SupplyCoverage::Complete));
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
@@ -573,7 +573,7 @@ mod tests {
     /// teeth: one bessel either side of the recorded total is `DIVERGENT` again.
     #[test]
     fn the_grandfathered_scar_is_named_and_a_neighbouring_total_is_not() {
-        let t = Telemetry::assemble(2_303, Some(2_303), 75, 0, 3, 1, MAX_LAG)
+        let t = Telemetry::assemble(2_303, Some(2_303), Some(75), 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_one_scar_row(-4_114)]);
         let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let row = &parse(&s)["supply"]["epochs"][0];
@@ -588,7 +588,7 @@ mod tests {
         assert!(!KNOWN_SCAR.contains(DIVERGENT) && !DIVERGENT.contains(KNOWN_SCAR));
 
         for other in [-4_113i128, -4_115] {
-            let t = Telemetry::assemble(2_303, Some(2_303), 75, 0, 3, 1, MAX_LAG)
+            let t = Telemetry::assemble(2_303, Some(2_303), Some(75), 0, 3, 1, MAX_LAG)
                 .with_supply(vec![epoch_one_scar_row(other)]);
             let s = health(&t, "aa", 30, "qumbra-devnet-t0");
             assert_eq!(parse(&s)["supply"]["epochs"][0]["verdict"], DIVERGENT, "{other}");
@@ -601,7 +601,7 @@ mod tests {
     /// vocabulary, so the token survives the split beside the exact signed delta.
     #[test]
     fn a_divergent_supply_row_carries_the_stable_token_and_the_exact_delta() {
-        let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
+        let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(14, 700, 705)]);
         let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn an_agreed_supply_row_carries_no_divergence_token() {
-        let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
+        let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(14, 700, 700)]);
         let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         assert_eq!(parse(&s)["supply"]["epochs"][0]["verdict"], "agreed");
@@ -627,7 +627,7 @@ mod tests {
     /// value makes its absence checkable as absence.
     #[test]
     fn partial_coverage_omits_the_epochs_key_entirely_and_leaks_no_figure() {
-        let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
+        let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(4, 123_456_789, 123_456_789)]);
         assert!(matches!(
             t.supply_coverage(),
@@ -661,9 +661,9 @@ mod tests {
     /// a reader, and no test could say so because the rule lived in CLI glue.
     #[test]
     fn the_fingerprint_moves_when_the_durable_head_does() {
-        let base = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+        let base = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1048, hash32(0x3f))));
-        let advanced = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+        let advanced = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1052, hash32(0x3f))));
         assert_ne!(
             fingerprint(&base),
@@ -672,7 +672,7 @@ mod tests {
         );
 
         // Same height, different block: the divergence head #3 exists to expose.
-        let forked = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+        let forked = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1048, hash32(0xaa))));
         assert_ne!(
             fingerprint(&base),
@@ -681,9 +681,9 @@ mod tests {
         );
 
         // And the availability distinction is not flattened away.
-        let unreadable = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let unreadable = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let nothing =
-            Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG).with_durable_head(None);
+            Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG).with_durable_head(None);
         assert_ne!(
             fingerprint(&unreadable),
             fingerprint(&nothing),
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn an_unchanged_snapshot_has_an_unchanged_fingerprint() {
         let t = || {
-            Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
+            Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG)
                 .with_durable_head(Some((1048, hash32(0x3f))))
         };
         assert_eq!(
@@ -710,25 +710,25 @@ mod tests {
     /// **same bytes** it asserts against. One artifact, two directions: a field
     /// renamed on either side of the repo boundary turns one of the two red.
     fn golden_cases() -> Vec<(&'static str, String)> {
-        let agreed = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 3, MAX_LAG)
+        let agreed = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 3, MAX_LAG)
             .with_checkpoint(Some(0xb682_3616), None)
             .with_tip_difficulty(Some(1_048_576))
             .with_committee(21, 21, 15)
             .with_supply(vec![epoch_row(1052, 500, 500)])
             .with_durable_head(Some((1048, hash32(0x3f))));
-        let lag = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 3, MAX_LAG)
+        let lag = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 3, MAX_LAG)
             .with_checkpoint(Some(0xb682_3616), None)
             .with_tip_difficulty(Some(1_048_576))
             .with_committee(21, 21, 15)
             .with_supply(vec![epoch_row(1052, 500, 500)])
             .with_durable_head(Some((1040, hash32(0x3f))));
-        let absent = Telemetry::assemble(2900, Some(2864), 77, 1, 4, 2, MAX_LAG)
+        let absent = Telemetry::assemble(2900, Some(2864), Some(77), 1, 4, 2, MAX_LAG)
             .with_checkpoint(Some(0x17dd_2cbd), None)
             .with_tip_difficulty(Some(2_097_152))
             .with_committee(21, 20, 15)
             .with_supply(vec![epoch_row(2900, 900, 900)])
             .with_durable_head(None);
-        let uncovered = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
+        let uncovered = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(4, 123_456_789, 123_456_789)])
             .with_durable_head(Some((8, hash32(0x11))));
         vec![
@@ -814,7 +814,7 @@ mod tests {
     /// unreachable — which is exactly why it is worth a test rather than a comment.
     #[test]
     fn a_hostile_genesis_hash_cannot_break_the_document() {
-        let t = Telemetry::assemble(1, None, 0, 0, 0, 0, MAX_LAG);
+        let t = Telemetry::assemble(1, None, Some(0), 0, 0, 0, MAX_LAG);
         let s = health(&t, "a\"b\\c\nd", 30, "qumbra-devnet-t0");
         let v = parse(&s); // would panic on malformed JSON
         assert_eq!(

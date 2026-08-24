@@ -1203,21 +1203,32 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             }
             ledger.rows().to_vec()
         };
-        // Age is chain-time from the finalized block; 0 when there is no finalized
-        // CHECKPOINT to measure from — nothing finalized (S8: no finalized head ⇒
-        // no finalized-age, not a genesis-fallback absolute) or the finalized head
-        // still genesis (#73: the bootstrap finalization is not a checkpoint round,
-        // and its ts=0 placeholder differenced against a WallClock tip printed the
-        // wall clock itself on every fresh net).
-        let age = match node.finalized_height() {
-            None | Some(0) => 0,
-            Some(_) => {
-                let tip_ts = chain.header(&chain.tip_hash()).map(|h| h.timestamp).unwrap_or(0);
-                let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_block_hash());
-                let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
-                tip_ts.saturating_sub(base_ts)
-            }
-        };
+        // Age is chain-time from the finalized block, and `None` — rendered `-` —
+        // whenever this node cannot state one. The rule is
+        // `qlab_node::telemetry::finalized_age_secs` and it is not restated here;
+        // this call site's only job is to hand it the three facts, each as the
+        // `Option` the store actually returns.
+        //
+        // 🔴 **Lab #633 lived in the two fallbacks this no longer has.** The guard
+        // below used to be `match node.finalized_height() { None | Some(0) => 0, …
+        // }` over a body that fell back to `genesis_block_hash()` for the base and
+        // `unwrap_or(0)` for both timestamps. `node.finalized_height()` is the
+        // COMMITTEE TRACKER's head (head #1) and `chain.finalized_hash()` is the
+        // FORK-CHOICE head's pointer (head #2) — two different heads, and #85
+        // already established they diverge routinely: a node that verifies a
+        // quorum ahead of its own headers advances #1 while `set_finalized` refuses
+        // #2 as `Unknown`, and nothing ever retries #2. So the guard saw a real
+        // `Some(3792)`, the base fell through to genesis, genesis's timestamp is
+        // the `0` placeholder, and `age_s` published the tip's absolute chain
+        // timestamp — `1787483455` and `1787506224`, on two nodes on two operating
+        // systems. It healed only when the NEXT checkpoint gave head #2 a pointer
+        // of its own, which is exactly what never happens on a node whose finality
+        // is genuinely stalled — the one situation this field exists to detect.
+        let age = qlab_node::telemetry::finalized_age_secs(
+            node.finalized_height(),
+            chain.header(&chain.tip_hash()).map(|h| h.timestamp),
+            chain.finalized_hash().and_then(|h| chain.header(&h)).map(|h| h.timestamp),
+        );
         let committee = node.slot_context(node.tip_height());
         Telemetry::assemble_with_halt(
             node.tip_height(),
@@ -4220,8 +4231,8 @@ mod tests {
         assert!(line.contains("age_s=-"), "no finalized checkpoint ⇒ no age: {line}");
         assert_eq!(
             node.telemetry().last_finalized_age_secs,
-            0,
-            "the wire carries 0, never tip_ts − genesis placeholder"
+            None,
+            "no age exists to state, and never tip_ts − genesis placeholder"
         );
 
         // Cross the boundary: reach slot 8 plus the #269 sign-hysteresis (the slot
@@ -4237,10 +4248,13 @@ mod tests {
         );
         assert!(node.try_mine());
         let t = node.telemetry();
-        assert!(t.last_finalized_age_secs > 0, "a real chain-time age, both timestamps real");
+        assert!(
+            t.last_finalized_age_secs.is_some_and(|age| age > 0),
+            "a real chain-time age, both timestamps real"
+        );
         let line = node.telemetry_sample();
         assert!(
-            line.contains(&format!("age_s={} ", t.last_finalized_age_secs)),
+            line.contains(&format!("age_s={} ", t.age_field())),
             "the line speaks once a checkpoint exists to measure from: {line}"
         );
         let _ = std::fs::remove_dir_all(&base);

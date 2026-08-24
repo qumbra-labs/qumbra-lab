@@ -472,7 +472,7 @@ mod tests {
         signed: Option<(u64, Option<u64>)>,
     ) -> Telemetry {
         durable(
-            Telemetry::assemble(tip, fin, 75, 0, 3, 0, 16)
+            Telemetry::assemble(tip, fin, Some(75), 0, 3, 0, 16)
                 .with_committee(21, 19, 15)
                 .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
                 .with_tip_difficulty(Some(1_048_576)),
@@ -667,7 +667,7 @@ mod tests {
         let rolled = durable(t_at(2871, Some(H), Some(0xaaaa_aaaa_aaaa), None), Some((H, 0x63)));
         // `Unavailable` by construction — no `with_durable_head` call at all, which is
         // exactly what a `0x03` body decodes to.
-        let unrolled = Telemetry::assemble(2871, Some(H), 75, 0, 3, 0, 16)
+        let unrolled = Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 0, 16)
             .with_committee(21, 19, 15)
             .with_checkpoint(Some(0xaaaa_aaaa_aaaa), None)
             .with_tip_difficulty(Some(1_048_576));
