@@ -27,18 +27,30 @@ committee_key_paths = [
 ]
 
 # Produce blocks (real RandomX PoW) when true.
-mining = true
+#
+# 🔴 `mining = true` REQUIRES `miner_rkm` below — since lab #552(a) the binary
+# refuses to start on the pair `mining = true` + no payout key, rather than
+# warning and mining to a placeholder nobody can spend. This example therefore
+# ships non-mining, so that a copy of it starts: turn BOTH on together.
+mining = false
 
 # OPTIONAL safety pin: refuse to start unless the loaded genesis hashes to this
 # (the value `qumbra-node genesis init` prints). Uncomment to enforce.
 # expected_genesis_hash = "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
 
-# OPTIONAL — where mined coinbase notes are paid (issue #101): your wallet's rkm,
-# 64 hex characters (32 bytes, lane-major little-endian).
+# REQUIRED WHEN `mining = true` — where mined coinbase notes are paid (issue
+# #101): your wallet's rkm, 64 hex characters (32 bytes, lane-major
+# little-endian). Print it with `qumbra-wallet miner-rkm --dir DIR`.
 #
-# LEAVING THIS UNSET BURNS EVERYTHING YOU MINE. The node still produces valid
-# blocks, but their coinbase notes are paid to a fixed placeholder key that nobody
-# holds a spend key for. The node says so loudly at startup when mining = true.
+# 🔴 LEAVING THIS UNSET WITH `mining = true` NO LONGER STARTS (lab #552(a)). It
+# used to warn and mine anyway, paying every coinbase to a fixed placeholder key
+# nobody holds a spend key for — the blocks are valid and the issuance is
+# unrecoverable. T2 blocks 607, 610 and 611 burned ~15 QMB that way on a node
+# that had been warned, because the warning was at startup and the burn was at
+# every block. A node that genuinely should not be paid is `mining = false`.
+#
+# The example value below is left commented AND all-zero on purpose: an all-zero
+# key is refused by name, so pasting it unchanged cannot quietly become a payee.
 # miner_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
 
 # ── note-discovery serving (issue #188) ──────────────────────────────────────

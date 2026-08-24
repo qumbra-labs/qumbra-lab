@@ -116,6 +116,28 @@ KEY_SPLIT=(6 5 5 5)
 # The argument is the container's NAME, not a node index, because the faucet (#128) is
 # a fifth container with a cgroup like any other and its run record needs the same
 # line. `soak.sh cpu-show` greps `^CPU_BUDGET` and reads field 2 as the name.
+# The DECLARED coinbase payee for a rehearsal container (lab #552(a)).
+#
+# `qumbra-node` refuses to start with `mining = true` and no `miner_rkm` now, so
+# the soak has to say where it pays itself. There is no wallet in these
+# containers and nothing spends these coins, so this is a fixed constant and
+# therefore unspendable in practice — the same honest position
+# `UNCONFIGURED_MINER_RKM` held. What changed is that it is STATED in the config
+# a reader can `docker compose logs node0 | grep miner_rkm` for, instead of being
+# the consequence of an absent field. That distinction is the entire finding of
+# lab #552: the old default travelled because it was reached by omission.
+#
+# Per-container, so the four nodes are distinguishable to
+# `qumbra-node audit-emission --payee` — the soak could not previously tell which
+# container mined a block from the payee alone, because all four paid the same one.
+# 64 hex characters, lane-major LE, non-zero (a zero key is rejected outright by
+# `validate_body` as BodyError::MissingCoinbasePayee).
+rehearsal_rkm() {   # rehearsal_rkm <node index 0-9>
+  # 62 hex characters of motif + "0" + the index = 64. Hex-only by construction:
+  # "d0cced" uses no letter above f, which a mnemonic like "d0cker" would.
+  printf 'd0ccedd0ccedd0ccedd0ccedd0ccedd0ccedd0ccedd0ccedd0ccedd0ccedd00%01d\n' "$1"
+}
+
 cpu_budget_line() {   # cpu_budget_line <name>
   local who="$1" quota="unknown" cpuset="unknown" q p nproc_n
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then                       # cgroup v2
@@ -237,6 +259,15 @@ dial_peers = [$peers]
 genesis_file = "$GENESIS_FILE"
 committee_key_paths = [$keys]
 mining = true
+# Lab #552(a): `mining = true` with no `miner_rkm` is a startup REFUSAL now, so
+# this rehearsal has to name its payee. It is a DECLARED rehearsal payee, not a
+# wallet: a fixed constant, so unspendable in practice exactly like the
+# UNCONFIGURED_MINER_RKM default it replaces. The difference — and the whole
+# point of #552 — is that the burn is now stated in the config a reader can see
+# rather than arrived at by leaving a field out. The last two hex digits carry
+# the node index, so `audit-emission --payee` can attribute soak blocks to a
+# container instead of seeing four nodes pay one indistinguishable address.
+miner_rkm = "$(rehearsal_rkm "$idx")"
 expected_genesis_hash = "$ghash"
 telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
 $pool_rpc_lines

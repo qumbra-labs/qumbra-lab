@@ -127,6 +127,13 @@ committee_key_paths = [
 {keys}
 ]
 mining = true
+# Lab #552(a): `mining = true` with no `miner_rkm` is now a startup REFUSAL, not
+# a warning, so this fixture has to name a payee or the child exits before it
+# mines the block this test needs to get ahead of the snapshot. The value is a
+# TEST payee — a fixed constant, so unspendable in practice exactly like the
+# default it replaces — but it is now DECLARED rather than arrived at by
+# omission, which is the whole point of the refusal.
+miner_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
 # Issue #411: discovery_addr defaults to the FIXED loopback port 9420, so any
 # other qumbra-node alive on this machine — a leaked child of an aborted run, a
 # dev node — makes this child exit at startup with EADDRINUSE on stderr, which
