@@ -115,6 +115,7 @@ test — it is what made "137 to the miner, 0 to the pool" evidence rather than 
 | Bounded staleness on the held template | ✅ 2026-08-21 (PR #549, lab #545) |  |
 | An unowned payee cannot reach the chain **from the pool** | ✅ 2026-08-21 (PR #554, the pool half of lab #547) |  |
 | **The pool can pay a miner at all** | ✅ 2026-08-22 (lab PR #588, observed at height 1776) |  |
+| 🔴 **The pool can pay MORE THAN ONE miner** | ⬜ | **the `11_520` payee-cap boundary** — see below. This is the gate a second miner runs into, and it was missing from this table until 2026-08-24. |
 | The node refuses to mine without a `miner_rkm` | ▶️ **in flight** 2026-08-24 (Multica QUM-173) | **lab #552(a)** — why the unspendable placeholder was expressible |
 | Admissions are attributable to a source | ⬜ | **lab #584** — the counters count, they do not attribute |
 | Public announcement of the endpoint | ⬜ | **Larry's call, and it is now the only thing on this row.** #553 is closed — the pool pays. |
@@ -133,6 +134,72 @@ both were ways a miner burns electricity for nothing.
 acceptable because the endpoint was *unadvertised*. **Obscurity is not a control** — the exposure
 was bounded by the security group, and stopping the container is what actually closed the port.
 Bringing it up means **narrowing the SG first, then starting the profile**, in that order.
+
+### 🔴 Why a second miner cannot be invited yet — the payee cap
+
+**Today a block can pay exactly one address, and the pool gives that address the whole reward.**
+
+```rust
+// crates/qlab-devnet/src/body.rs
+pub const COINBASE_PAYEE_CAP_V5: usize          = 8;
+pub const COINBASE_PAYEE_CAP_V5_AT_BIRTH: usize = 1;
+pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = Some(11_520);
+```
+
+T2 measured **tip 4,802** on 2026-08-24 15:49 +08 (`explorer.qumbra.org/v1/health.json`), so the
+active cap is **1**. `payee::pick_payees` then sorts the PPLNS window by weight, truncates to the
+cap, and hands the **entire** mint to whoever is first:
+
+```rust
+scored.sort_by(|a, b| b.1.cmp(&a.1));
+scored.truncate(cap);
+if scored.len() == 1 || cap == 1 {
+    return vec![CoinbasePayee { rkm: scored[0].0, amount }];   // the whole thing
+}
+```
+
+**This is a known and deliberate state, not a defect** — `payee.rs`'s module doc says *"Before
+activation, PPLNS cannot split the mint"* and the test is called
+`v5_birth_cap_is_one_so_the_winner_takes_the_mint`. It has never been exercised because **the pool
+has only ever had one miner.**
+
+**What it means for a stranger.** Two miners of similar size roughly even out over time. **A small
+miner against a large one wins only when it happens to lead the rolling window** — burning
+electricity for long stretches at zero. That is not what anyone means by a PPLNS pool, and it is
+not something to discover after being invited.
+
+### 🔴 The boundary is a whole-fleet consensus roll, and inviting the second miner is what triggers it
+
+From the constant's own doc comment:
+
+> **This is a consensus rule change and the roll is the whole fleet, not one host.** Above the
+> boundary a block may carry more than one coinbase payee; a node still on an older binary rejects
+> such a block and forks off. Unlike the 8,640 emission boundary this is a **no-halt** crossing, so
+> there is no halt to catch a straggler — every validating host must carry this constant *before*
+> `11_521`.
+
+**The practical risk window is narrower than the rule, and that is exactly the trap:** nothing forks
+until a block actually names two or more payees, **which happens only when the PPLNS window has two
+or more winners.** So *"a second miner joins"* and *"the fork becomes possible"* are the same event.
+The order cannot be reversed.
+
+**Runway**: 11,520 − 4,802 = **6,718 blocks**, ≈ **5.8 days** at the 75 s target — boundary around
+**2026-08-30**. Deliberately generous, and it is measured from a tip that moves.
+
+**Owed before then, and it is an on-host read, not a repo read: confirm every one of the six hosts
+is running a binary that carries `Some(11_520)`.** A host whose *file* has it and whose *process*
+does not is the failure this project has already paid for once.
+
+### The sequence, in order
+
+1. **Roll the fleet** to a binary carrying the `11_520` constant — all six hosts, verified against
+   the running process.
+2. **Cross the boundary** (~2026-08-30). Until then the cap is 1 whatever the pool does.
+3. **Fix [#584](https://github.com/qumbra-labs/qumbra-lab/issues/584)** — admissions must be
+   attributable. With only our own miners this cost four sessions four hours; with strangers on the
+   port you cannot tell a miner from an abuser, or answer a single complaint.
+4. **Decide the fee policy.** Nobody has. A stranger must be told what they are paying.
+5. **Then, and only then, the announcement is a live question** — and it is Larry's.
 
 ### Reachability — what this document can and cannot tell you
 
