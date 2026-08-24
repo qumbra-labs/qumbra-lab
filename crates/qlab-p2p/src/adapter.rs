@@ -2124,7 +2124,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// the same call, so no phase is wasted. When no parent can be read at all
     /// (halt / lag refusal), the grind is kept parked, not dropped: whether it
     /// is still worth resuming is exactly the parent comparison's question,
-    /// answered when a parent can be read again. The lag gate itself
+    /// answered when a parent can be read again. A refused call returns
+    /// [`MineStep::Idle`] having ground nothing — the caller must treat that
+    /// as an idle phase (the node loop sleeps on it; suppressing its idle
+    /// backoff whenever a grind merely EXISTS busy-spins this state, PR #653
+    /// review). The lag gate itself
     /// (`refuse_for_lag("mine")` inside [`Self::mining_parent_hash`]) is
     /// untouched — it is what pulls a deaf-and-behind node back into the
     /// chain, and slicing does not make it redundant (it still stops a
@@ -2186,9 +2190,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
-    /// The parked grind, if any: `(mining parent, next nonce)`. Read by the
-    /// node loop (idle-sleep suppression while grinding) and by tests; writes
-    /// nothing.
+    /// The parked grind, if any: `(mining parent, next nonce)`. Read by tests
+    /// and telemetry; writes nothing. The node loop's idle-sleep suppression
+    /// deliberately does NOT read this: a grind can be parked yet unable to
+    /// advance (lag/halt refusal), and suppressing the sleep on bare existence
+    /// busy-spins that state — the loop reads whether ITS mine phase actually
+    /// ground a slice this iteration instead (PR #653 review).
     pub fn grind_progress(&self) -> Option<(Hash32, u64)> {
         self.grind.as_ref().map(|g| (g.parent_hash, g.next_nonce))
     }
@@ -3702,6 +3709,44 @@ mod tests {
             a.grind_progress().map(|(_, nonce)| nonce),
             Some(512),
             "a fresh template started from nonce 0"
+        );
+    }
+
+    /// A grind parked behind `refuse_for_lag("mine")` is KEPT parked — whether
+    /// it is stale is the parent comparison's question, answered when a parent
+    /// can next be read — and the refused phase reports [`MineStep::Idle`]
+    /// having ground NOTHING (PR #653 review). The zero-hashes half is what the
+    /// node loop's idle sleep now keys on: a phase that ground nothing is an
+    /// idle phase, however much parked work it is holding.
+    #[test]
+    fn a_lag_refused_phase_keeps_the_grind_parked_and_grinds_nothing() {
+        let (mut a, impossible, calls) = grinding_adapter();
+        let genesis_tip = a.chain().tip_hash();
+        assert!(matches!(a.mine_step(true, slice(512)), MineStep::Yielded));
+        assert_eq!(a.grind_progress(), Some((genesis_tip, 512)));
+
+        // A header whose body never arrives: fork choice advances, the state
+        // machine cannot — the #130 (a) lag, which refuses the mine duty. The
+        // switchable engine validates the foreign header honestly, exactly as
+        // in `a_moved_tip_abandons_the_parked_grind`.
+        let (cstate, _v) = committee7();
+        let mut other = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        let (header, _body) = other.mine_block().expect("KeccakPow mines at sim difficulty");
+        impossible.store(false, Ordering::Relaxed);
+        assert_eq!(a.ingest_header(header), IngestOutcome::Accepted);
+        impossible.store(true, Ordering::Relaxed);
+        assert!(a.state_lag().is_lagging(), "header without body ⇒ the state machine lags");
+
+        let before = calls.load(Ordering::Relaxed);
+        assert!(
+            matches!(a.mine_step(true, slice(512)), MineStep::Idle),
+            "the lag refusal reports an idle phase, not a slice"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), before, "a refused phase hashes nothing");
+        assert_eq!(
+            a.grind_progress(),
+            Some((genesis_tip, 512)),
+            "the grind stays parked through the refusal, cursor untouched"
         );
     }
 

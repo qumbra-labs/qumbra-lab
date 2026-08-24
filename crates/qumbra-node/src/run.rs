@@ -540,6 +540,17 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     ///   not exist). Latching bounds that to *before this node's first block*, where
     ///   refusing is the safe direction anyway.
     mine_gate_latched: bool,
+    /// Whether the LAST [`Self::try_mine`] call actually ground hashes (started,
+    /// resumed, finished or exhausted a slice) — as opposed to returning without
+    /// touching the grind (gate refused, interval unelapsed, or the parent
+    /// unreadable under the lag/halt refusal with a grind still parked).
+    ///
+    /// This is what the loop's idle-sleep suppression reads (lab #651, PR #653
+    /// review): suppressing on `grind_progress().is_some()` alone busy-spins the
+    /// state where a grind is parked but `refuse_for_lag("mine")` keeps it from
+    /// advancing — the loop would neither sleep nor hash until the lag resolved.
+    /// A parked grind suppresses the sleep only while it is actually advancing.
+    grind_advanced: bool,
     /// **Issue #229: the `BODYWAIT` journal's rate limiter.** Holds what was last
     /// reported and when, so a stranding that changes nothing does not become a
     /// stream. See [`qlab_p2p::bodywait::BodyWaitJournal`] for the three rules.
@@ -970,6 +981,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             durable_snapshot: qlab_node::snapshot_on_disk(&config.data_dir)
                 .unwrap_or(qlab_node::SnapshotOnDisk::Unreadable),
             mine_gate_latched: false,
+            grind_advanced: false,
             body_wait: BodyWaitJournal::new(),
             started: Instant::now(),
             release,
@@ -2505,6 +2517,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// caller cannot reintroduce mine-before-sync by forgetting it. It is checked
     /// on resumes too: a node that stops being sync-ready parks its grind.
     pub fn try_mine(&mut self) -> bool {
+        self.grind_advanced = false;
         let gate = self.mine_gate();
         if !gate.permits() {
             return false;
@@ -2532,7 +2545,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             max_hashes: MINE_SLICE_MAX_HASHES,
             deadline: Some(Instant::now() + MINE_SLICE_DEADLINE),
         };
-        match self.p2p.node_mut().mine_step(may_start, slice) {
+        let step = self.p2p.node_mut().mine_step(may_start, slice);
+        // Idle is the one verdict that ground nothing: no grind and no start
+        // permission, or a parked grind whose parent is unreadable (lag/halt
+        // refusal). Everything else spent real hashes this call, and that is
+        // what earns the loop's idle-sleep suppression.
+        self.grind_advanced = !matches!(step, MineStep::Idle);
+        match step {
             MineStep::Mined(header, body) => {
                 self.nonce = self.nonce.wrapping_add(1);
                 let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
@@ -3001,11 +3020,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         on_tick(self);
         phases.hook = lap(&mut t);
         // The 20 ms idle backoff is for a loop with nothing to do. A parked
-        // grind IS something to do (lab #651): sleeping beside it would put
-        // ~20 ms of sleep against every ~25 ms slice and halve the hashrate
-        // on a quiet net. The mine slice's own deadline is the pacing — the
-        // loop still turns (and pumps the network) every few tens of ms.
-        if n == 0 && self.p2p.node().grind_progress().is_none() {
+        // grind that is ADVANCING is something to do (lab #651): sleeping
+        // beside it would put ~20 ms of sleep against every ~25 ms slice and
+        // halve the hashrate on a quiet net. The mine slice's own deadline is
+        // the pacing — the loop still turns (and pumps the network) every few
+        // tens of ms. But the suppression reads this iteration's mine phase,
+        // not the mere existence of a parked grind (PR #653 review): a grind
+        // parked behind `refuse_for_lag("mine")` cannot advance, and a quiet
+        // node in that state must sleep like any other idle loop — the
+        // alternative is a busy-spin that neither sleeps nor hashes until the
+        // lag resolves.
+        if n == 0 && !self.grind_advanced {
             std::thread::sleep(Duration::from_millis(20));
             phases.sleep = lap(&mut t);
         }
@@ -3425,6 +3450,91 @@ mod tests {
             node.p2p.node().grind_progress().is_none(),
             "no template starts before the interval permits"
         );
+    }
+
+    /// 🔴 PR #653 review — the busy-spin. The reachable state: `mining = true`,
+    /// a grind parked, `refuse_for_lag("mine")` refusing, `n == 0`. Suppressing
+    /// the idle sleep on the parked grind's EXISTENCE makes that loop neither
+    /// sleep nor hash until the lag resolves; the suppression must read whether
+    /// THIS iteration's mine phase actually ground a slice. Both halves are
+    /// asserted: an advancing grind still suppresses the sleep (lab #651's
+    /// hashrate half), and a refused one does not (the spin half). The parked
+    /// cursor survives the refusal untouched — kept, not dropped: whether it is
+    /// stale is the parent comparison's question, answered when a parent can
+    /// next be read.
+    #[test]
+    fn a_lag_refused_parked_grind_sleeps_instead_of_spinning() {
+        use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+
+        /// KeccakPow behind an "impossible" switch (all-0xFF ⇒ maximal work
+        /// value): impossible while the node grinds, honest while it validates
+        /// the header that induces the lag — the same shape as the adapter
+        /// tests' `SwitchablePow`.
+        #[derive(Clone)]
+        struct TogglePow(Arc<AtomicBool>);
+        impl PowEngine for TogglePow {
+            fn name(&self) -> &'static str {
+                "toggle-keccak"
+            }
+            fn pow_hash(
+                &self,
+                form: GenesisForm,
+                header: &qlab_devnet::header::BlockHeader,
+                seed: &[u8],
+            ) -> qlab_devnet::header::Hash32 {
+                if self.0.load(Ordering::Relaxed) {
+                    [0xFF; 32]
+                } else {
+                    KeccakPow.pow_hash(form, header, seed)
+                }
+            }
+        }
+
+        let (config, genesis, _base) = rig("i651_lag_sleep", true);
+        let impossible = Arc::new(AtomicBool::new(false));
+        let mut node = RunningNode::start(
+            &config,
+            &genesis,
+            TogglePow(impossible.clone()),
+            DevnetRehearsalVerifier,
+        )
+        .unwrap();
+
+        // A valid child of the tip, produced but NOT applied — the lag lever,
+        // held for later.
+        let (header, _body) =
+            node.p2p.node_mut().mine_block().expect("KeccakPow mines at genesis difficulty");
+
+        // Park a grind that cannot finish.
+        impossible.store(true, Ordering::Relaxed);
+        node.set_mine_interval(Duration::ZERO);
+        assert!(!node.try_mine(), "an impossible grind produces no block");
+        let (parent, n0) = node.p2p.node().grind_progress().expect("a grind is parked");
+
+        // Healthy parked grind on a quiet net: the iteration must NOT sleep —
+        // sleeping ~20 ms beside every ~25 ms slice would halve the hashrate.
+        node.set_mine_interval(Duration::from_secs(75));
+        let (phases, _) = node.one_iteration(&mut |_| {});
+        assert_eq!(phases.sleep, Duration::ZERO, "an advancing grind suppresses the idle sleep");
+        let (_, n1) = node.p2p.node().grind_progress().expect("still parked");
+        assert!(n1 > n0, "the iteration ground a slice ({n1} > {n0})");
+
+        // The held-back header arrives (body withheld): fork choice advances,
+        // the state machine lags, and the mine duty is refused.
+        impossible.store(false, Ordering::Relaxed);
+        assert_eq!(node.p2p.node_mut().ingest_header(header), IngestOutcome::Accepted);
+        impossible.store(true, Ordering::Relaxed);
+        assert!(node.p2p.node().state_lag().is_lagging(), "header without body ⇒ lag");
+
+        // 🔴 The spin state. The iteration must back off like any idle loop:
+        // before this fix it neither slept nor hashed.
+        let (phases, _) = node.one_iteration(&mut |_| {});
+        assert!(
+            phases.sleep > Duration::ZERO,
+            "a refused mine phase is an idle phase — the loop must sleep, not spin"
+        );
+        let progress = node.p2p.node().grind_progress().expect("kept parked through the refusal");
+        assert_eq!(progress, (parent, n1), "the parked cursor is untouched: not advanced, not dropped");
     }
 
     #[test]
