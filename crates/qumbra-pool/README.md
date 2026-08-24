@@ -1,12 +1,21 @@
 # `qumbra-pool` — a custody-free mining pool
 
 > [中文版](README-zh.md) · English is authoritative on technical detail.
-> **`pool.qumbra.org:3333` resolves but does not pay yet — see the status board below.**
+> **`pool.qumbra.org:3333` has paid miners — 137 blocks on 2026-08-22. It is not announced,
+> and this document cannot tell you whether it is serving right now (see §*Reachability*).**
 
 ## Status board
 
 Rows flip ⬜ → ✅ only when the coordinator has accepted the thing, never when it is
-merely written. Last updated 2026-08-22 07:25 +08.
+merely written. Last updated **2026-08-24 15:32 +08**.
+
+> 🔴 **Correction, 2026-08-24 — this document contradicted itself for two days.** Its headline
+> said *"does not pay yet"* and its own table said the pool paid 137 blocks. The 🔴 paragraphs
+> under *Bring-up* were written 2026-08-21 and were **superseded on 2026-08-22**, but nobody
+> came back to mark them, so a reader met the old verdict first and the new evidence second.
+> The superseded text is kept below **under a dated banner rather than deleted** — the 08-21
+> reading was correct when it was written and the reasoning in it is still worth having. What
+> is fixed here is that it no longer reads as current.
 
 ### The software — COMPLETE
 
@@ -19,7 +28,7 @@ merely written. Last updated 2026-08-22 07:25 +08.
 | Stock-XMRig-compatible work value (trailing-8-LE) | ✅ 2026-08-19 (lab PR #492, issue #490) |
 | Node mine RPC (`/v1/mine/template`, `/v1/mine/block`) + pool binary in the image | ✅ 2026-08-20 (lab PR #513, issue #511) |
 
-### Bring-up — the software ran in production, and then stopped working. 2026-08-21
+### Bring-up — ran, broke, was repaired, and has paid. 2026-08-21 → 08-23
 
 | item | state |
 |---|---|
@@ -29,7 +38,23 @@ merely written. Last updated 2026-08-22 07:25 +08.
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
 | **🎉 A miner paid by this pool** | ✅ **first at height 1776**, 2026-08-22 01:19 +08; **137 blocks over the following 3 h**, and **0** to the pool's own address — lab #553 CLOSED |
-| Public stratum on `pool.qumbra.org:3333` | ▶️ **restarted 2026-08-22 01:12 +08** — it can pay now; SG still `0.0.0.0/0`, deliberately, Larry's call |
+| Public stratum on `pool.qumbra.org:3333` | ▶️ **restarted 2026-08-22 01:12 +08** — it can pay now |
+| 🔴 **Outage: the pool could not read its node's template at all** | fixed 2026-08-23 (lab PR #628, issue #626) |
+
+**The 08-23 outage, recorded because the failure mode is reusable.** `tiny_http` switches to
+chunked transfer above `chunked_threshold().unwrap_or(32768)` (`response.rs:246`), and
+`chunked_transfer::Encoder` emits 8,192-byte chunks — hex `2000`. The pool's node-RPC client took
+everything after `\r\n\r\n` verbatim and handed it to serde, which read the **chunk-size line** as
+the document:
+
+```
+invalid type: integer 2000, expected struct MineTemplateWire at line 1 column 4
+```
+
+So the pool served nothing the moment a template crossed 32 KB. **PR #628 lifted framing into
+`qlab-http-framing` and fixed all four hand-rolled clients**, not just this one — the same
+take-the-bytes-after-the-header shape existed in three other places. Verified live after the roll:
+serving, zero parse failures.
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
 64-hex rkm as the login — so this is the **miner-payee** branch, not the pool's fallback:
@@ -41,6 +66,17 @@ The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` rele
 ```
 
 Eighteen seconds from `READY` to an accepted share, against the public endpoint, with nothing patched.
+
+---
+
+> ### ⏳ SUPERSEDED — the reading as of 2026-08-21 21:39 +08
+>
+> **Everything between this banner and the next horizontal rule was true when written and is not
+> true now.** It was overtaken on 2026-08-22 01:19 by the pool paying a miner at height 1776, and
+> then 137 blocks in three hours. It is kept because two of its arguments outlived their verdict:
+> that a payee tally cannot separate pool-paid from solo-mined when the same rkm does both, and
+> that obscurity was never the control on the open port. **Do not quote the ALL-CAPS verdicts
+> below as the state of the pool.**
 
 🔴 **AND THEN IT STOPPED, AND THE POOL IS STOPPED NOW.** That miner had **2 shares accepted and 38
 rejected**. After the second share the pool never issued another job — it builds them correctly on
@@ -62,7 +98,15 @@ stopped the moment this was seen and stays stopped.
 **What IS proven: the stratum leg.** Login, job, share accepted, ~264 ms round trip, unmodified
 stock XMRig against a public endpoint. **What is NOT proven: that this pool can pay a miner.**
 
-### Between here and a pool anyone should be told about — NOT DONE
+---
+
+**End of the superseded 08-21 reading.** What actually settled it: on 2026-08-22 the mine-RPC
+gained a payee parameter (lab PR #588, issue **#553 CLOSED**), the pool paid a miner at
+**height 1776, 01:19 +08**, and over the next three hours **137 of 324 blocks paid the miner and
+0 paid the pool's own address**. The 08-21 warning about payee ambiguity was **honoured** in that
+test — it is what made "137 to the miner, 0 to the pool" evidence rather than a coincidence.
+
+### Between here and a pool anyone should be told about
 
 | item | state | blocked on |
 |---|---|---|
@@ -71,9 +115,9 @@ stock XMRig against a public endpoint. **What is NOT proven: that this pool can 
 | Bounded staleness on the held template | ✅ 2026-08-21 (PR #549, lab #545) |  |
 | An unowned payee cannot reach the chain **from the pool** | ✅ 2026-08-21 (PR #554, the pool half of lab #547) |  |
 | **The pool can pay a miner at all** | ✅ 2026-08-22 (lab PR #588, observed at height 1776) |  |
-| The node refuses to mine without a `miner_rkm` | ⬜ | **lab #552** — why the unspendable placeholder was expressible |
+| The node refuses to mine without a `miner_rkm` | ▶️ **in flight** 2026-08-24 (Multica QUM-173) | **lab #552(a)** — why the unspendable placeholder was expressible |
 | Admissions are attributable to a source | ⬜ | **lab #584** — the counters count, they do not attribute |
-| Public announcement of the endpoint | ⬜ | **lab #553 first.** Announcing a pool that cannot pay is the one thing we must not do |
+| Public announcement of the endpoint | ⬜ | **Larry's call, and it is now the only thing on this row.** #553 is closed — the pool pays. |
 
 **Both of the issues that once held this row are fixed** (#544 caps connections, line length and
 per-connection deadlines, PR #563; #545 was two defects — the poll thread discarded jobs
@@ -81,14 +125,34 @@ per-connection deadlines, PR #563; #545 was two defects — the poll thread disc
 template had no staleness bound — PR #549). Neither was ever a risk to the chain or to any key;
 both were ways a miner burns electricity for nothing.
 
-🔴 **What replaced them is worse, and it is not a hardening gap: the pool cannot pay anyone
-(#553).** The endpoint was stopped 2026-08-21 21:39 +08 and stays stopped until that lands.
+~~🔴 **What replaced them is worse, and it is not a hardening gap: the pool cannot pay anyone
+(#553).**~~ **Struck 2026-08-24: #553 is closed and the pool has paid.** That sentence was written
+2026-08-21 and stood for a day.
 
-⚠️ **And retire the reasoning this paragraph used to carry.** It said the exposure was acceptable
-because the endpoint was *unadvertised*. **Obscurity is not a control** — the exposure was bounded
-by the security group, which is still open to `0.0.0.0/0`, and stopping the container is what
-actually closed the port. Restarting means **narrowing the SG first, then starting the profile**,
-in that order.
+⚠️ **The reasoning this paragraph retired is still retired.** It once said the exposure was
+acceptable because the endpoint was *unadvertised*. **Obscurity is not a control** — the exposure
+was bounded by the security group, and stopping the container is what actually closed the port.
+Bringing it up means **narrowing the SG first, then starting the profile**, in that order.
+
+### Reachability — what this document can and cannot tell you
+
+**It cannot tell you whether the pool is serving right now, and neither can an off-host probe.**
+Measured 2026-08-24 from the coordinator's laptop:
+
+| | |
+|---|---|
+| `pool.qumbra.org` → | `54.243.254.140`, **AMAZON** — DNS-only, straight to the host |
+| `seed.qumbra.org` → | `172.67.…` / `104.21.…` — **Cloudflare-proxied**, for contrast |
+| TCP `54.243.254.140:3333` | **times out** — no `RST` |
+
+**A timeout is not a closed port.** A stopped container behind an open security group answers
+immediately with `RST`; **silence is the signature of a security-group DROP.** So the SG is
+narrowed — which is the documented order above, working as intended — and the consequence is that
+**an outside probe cannot distinguish "SG closed, pool running" from "SG closed, pool stopped".**
+Whether the process is up is an on-host read, and this file will not guess it.
+
+Do not read a failed `nc`/`telnet` against 3333 as an outage report. It is a measurement of the
+security group.
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
