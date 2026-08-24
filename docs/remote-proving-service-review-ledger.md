@@ -28,16 +28,29 @@ static review skeleton, not a deployed ingress.
 
 ## 2. Findings currently on the record
 
-The first read-only pass is preserved in
+The first read-only security pass is preserved in
 [#639 comment 5391225338](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391225338).
 It explicitly declared itself partial. These entries therefore remain open
 until fixed or rejected with a recorded rationale and independently re-reviewed:
 
-| severity | status | finding / required disposition |
-|---|---|---|
-| P1 | OPEN | `tiny_http::Server::http` has no accepted-socket read deadline or connection cap. `MAX_HTTP_HANDLERS` begins after a request has been received, so unauthenticated slow/incomplete headers can consume listener resources before admission accounting. |
-| P2 | OPEN | Unauthenticated `/healthz` exposes `queued`, `running`, `retained`, `queue_capacity` and `build_revision`, enabling load/timing observation and exact version fingerprinting. Public liveness needs no per-service activity counters. |
-| Advisory | OPEN | `ApiToken::matches` uses a hand-written compare without an optimizer-resistant constant-time primitive. Decide whether to replace it or retain it with a documented rationale. |
+Grok's complete privacy report is preserved in
+[#639 comment 5391355844](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391355844).
+Its verdict approves only the frozen loopback, valueless, Compose-render-only
+target. It explicitly does **not** approve an Internet-facing pilot. The table
+uses the higher reported severity where the two passes differ:
+
+| effective severity | status | source | finding / required disposition |
+|---|---|---|---|
+| P1 | OPEN | both | `tiny_http::Server::http` has no accepted-socket read deadline or connection cap. `MAX_HTTP_HANDLERS` begins after a request has been received, so unauthenticated slow/incomplete headers can consume listener resources before admission accounting. |
+| P1 | OPEN | security pass P2; Grok P1 | Unauthenticated `/healthz` exposes `queued`, `running`, `retained`, `queue_capacity` and `build_revision`, enabling load/timing observation and exact version fingerprinting. Public liveness needs no per-service activity counters. |
+| P1 | OPEN | Grok | A compromised same-UID worker can read the mounted shared API token; one stolen credential is the entire experiment identity and can retrieve any separately leaked job capability. |
+| P1 | OPEN | Grok | The default bridge provides no egress allowlist, so a compromised worker that holds the current spend-authority bundle can exfiltrate it to arbitrary destinations. |
+| P2 | OPEN | Grok | A client-chosen idempotency key may be a stable cross-attempt identifier and its reuse-conflict response is an existence oracle during retention. |
+| P2 | OPEN | Grok | A shared bearer plus a leaked job identifier can retrieve another caller's full artifact; there is no per-install or per-job holder binding. |
+| P2 | OPEN | Grok | Nullifier preflight spans `0..=tip` and the reachable HTTP read has no response-byte ceiling, permitting a pinned or compromised upstream to amplify memory while the witness remains resident. |
+| P2 | OPEN | Grok | Host swap or crash collection can outlive the claimed in-process retention window; core disablement alone does not close host/cloud persistence. |
+| Advisory | OPEN | both | `ApiToken::matches` uses a hand-written compare without an optimizer-resistant constant-time primitive. Decide whether to replace it or retain it with a documented rationale. |
+| Advisory | OPEN | Grok | `health()` always returns `ready: true`; it must not be treated as prover readiness or idleness. |
 
 The same pass found the following properties holding in the immutable lab
 target once a request reaches application handling: handler accounting
@@ -46,6 +59,15 @@ both enforced; cancellation/timeout kills and reaps the child; `SecretBytes`
 and the API token zeroize on drop; TTL cleanup also bounds the idempotency map;
 and duplicate authorization headers are refused. These are retained
 observations, not a verdict.
+
+Grok independently confirmed that the current service crate has no
+`spend::submit` call, requests cannot select upstream URLs, inherited worker
+environment is cleared, worker errors are allowlisted, job identifiers are
+unguessable, results are TTL-bounded in process memory, and the Compose
+skeleton is loopback-only with the documented privilege/mount limits. It also
+confirmed that `env_clear` is not worker isolation and that the architecture's
+external ingress is absent from the skeleton. Claude still owes the broader
+security/call-graph review specified below.
 
 ## 3. Required independent coverage
 
@@ -69,12 +91,11 @@ complete every service-security invariant. At minimum its report must cover:
 - the deploy skeleton's filesystem, privilege, PID/memory/CPU/core-dump,
   secret, network and image-digest boundaries.
 
-Grok must issue a separate A-only privacy and metadata report. At minimum it
-must map what the client, ingress, API, worker, read endpoints, operator,
-container host, logging/crash tooling and an attacker can observe; test
-IP/device/timing/job/polling/upstream/on-chain correlation; inspect plaintext
-copies and retention; challenge `/healthz` and refusal/timing oracles; and
-state accurately which risks Candidate A does and does not solve.
+Grok's A-only privacy and metadata assignment is **COMPLETE for the immutable
+target** in comment 5391355844. It supplied the required observer/data-flow
+matrix, covered all eight dispatch areas, separated privacy/availability from
+current spend-authority exposure, and disclosed its unrun live-host, ingress,
+Candidate A and Candidate B scope. Its public-pilot blockers remain open.
 
 The exact dispatch instructions are retained in:
 
@@ -91,7 +112,8 @@ anything not reviewed or run, and post a commit-addressed report on lab PR
 The review gate remains open until all of the following are recorded:
 
 1. Claude's complete Internet-boundary report and Grok's independent privacy
-   report both target the two commits in §1;
+   report both target the two commits in §1; Grok is complete and Claude is
+   still owed;
 2. Codex records a fix or reasoned rejection for every finding;
 3. every accepted P0/P1 is fixed in a scoped PR with regression coverage;
 4. both reviewers inspect the immutable remediation commit and explicitly
