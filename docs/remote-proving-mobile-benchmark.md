@@ -7,6 +7,11 @@ committed.** Tracks [lab issue #630](https://github.com/qumbra-labs/qumbra-lab/i
 and is paired with
 [`remote-proving-mobile-benchmark-zh.md`](remote-proving-mobile-benchmark-zh.md).
 
+The first physical-device D12..D16 evidence set is recorded in
+[`remote-proving-mobile-evidence-2026-08-24.md`](remote-proving-mobile-evidence-2026-08-24.md).
+It establishes results for the two measured devices but deliberately leaves
+the supported-device-floor and network-wide-depth gates open.
+
 The governing decision remains
 [`remote-proving-candidate-ruling.md`](remote-proving-candidate-ruling.md):
 Candidate A is the mandatory real-value security basis and Candidate B is an

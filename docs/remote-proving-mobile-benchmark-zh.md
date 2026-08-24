@@ -5,6 +5,10 @@
 跟踪 [lab issue #630](https://github.com/qumbra-labs/qumbra-lab/issues/630)，与
 [`remote-proving-mobile-benchmark.md`](remote-proving-mobile-benchmark.md) 配对。
 
+首轮真机 D12..D16 evidence 记录在
+[`remote-proving-mobile-evidence-2026-08-24-zh.md`](remote-proving-mobile-evidence-2026-08-24-zh.md)。
+它只确认两台实测设备的结果，supported-device-floor 与全网 depth gate 仍明确开放。
+
 当前裁决不变：Candidate A 是真钱 shared prover 的强制安全基础；Candidate B 只是可选隐私层。
 Phase 1 已决定只推进 ML-DSA rotation tree，排除 depth 0 和两种 WOTS+；在选择全网统一深度前，
 必须真机测 D12 到 D16。
