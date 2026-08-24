@@ -101,7 +101,7 @@ service、deployment 或 launch。`⬜` 表示 gate 仍未关闭。
 | Phase 5A precursor：valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 与 lab PR #639；真实当前 prover、有界 ephemeral worker、固定 refusal、read-only preflight、无 submit path |
 | Phase 5A precursor：standalone deployment skeleton | ✅ | deploy PR #246；loopback-only review skeleton，不是 deployment 或 public edge |
 | Phase 2–4 与 Candidate A-bound 真实价值 Phase 5A | ⬜ | Design correction、AIR/public values、wire/node verification、activation 与 wallet/mobile authorization 尚未启动 |
-| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | 仍需 Claude/Grok review、隔离 host 实测和 Larry 单独 gate |
+| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 固定 lab `7d689df2` + deploy `9987b554`；partial first pass 已记录开放的 P1 slow-client bound、P2 `/healthz` disclosure 与一条 advisory，仍需完整 Claude/Grok reports、remediation/re-review、隔离 host 实测和 Larry 单独 gate |
 
 ## 5. Primary owner contract
 
@@ -190,6 +190,12 @@ ephemeral worker，但没有精确 valueless acknowledgement 就拒绝启动，�
 另行评审的 Candidate A circuit/wire/node 与 wallet 工作。Mechanics service 可以进入 CI、
 独立 Internet-boundary review 与无价值 capacity measurement；不得把它解释为真实价值
 implementation 或 launch approval。
+
+Service lane 的立即下一步是
+[`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md)
+定义的 commit-addressed review。首轮检查明确只是 partial，不能关闭 gate。只有两份独立
+report、被接受 P0/P1 的 remediation 与 commit-addressed re-review 完成后，才开始 capacity
+工作。
 
 ## 10. 相关记录
 

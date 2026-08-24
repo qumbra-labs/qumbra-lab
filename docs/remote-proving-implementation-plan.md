@@ -106,7 +106,7 @@ approve the containing phase, a real-value service, deployment, or launch.
 | Phase 5A precursor: valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) and lab PR #639; real current prover, bounded ephemeral workers, fixed refusals, read-only preflight, no submit path |
 | Phase 5A precursor: standalone deployment skeleton | ✅ | deploy PR #246; loopback-only review skeleton, not a deployment or public edge |
 | Phases 2–4 and Candidate A-bound real-value Phase 5A | ⬜ | Design correction, AIR/public values, wire/node verification, activation and wallet/mobile authorization remain unstarted |
-| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | Claude/Grok review, isolated-host measurements and a separate Larry gate remain required |
+| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md) freezes lab `7d689df2` + deploy `9987b554`; the partial first pass records an open P1 slow-client bound, P2 `/healthz` disclosure and one advisory, while complete Claude/Grok reports, remediation/re-review, isolated-host measurements and a separate Larry gate remain required |
 
 ## 5. Primary-owner contract
 
@@ -209,6 +209,12 @@ binding design correction, followed by the separately reviewed Candidate A
 circuit/wire/node and wallet work. The mechanics service may proceed to CI,
 independent Internet-boundary review and valueless capacity measurement; it
 may not be interpreted as real-value implementation or launch approval.
+
+The immediate service-lane action is the commit-addressed review in
+[`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md).
+The first pass is explicitly partial and does not clear the gate. Capacity work
+begins only after both independent reports, accepted P0/P1 remediation and
+commit-addressed re-review.
 
 ## 10. Related records
 
