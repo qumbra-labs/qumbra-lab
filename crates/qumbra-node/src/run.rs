@@ -6601,6 +6601,104 @@ mod tests {
         }
     }
 
+    /// 🔴 **Lab #633 — the reproduction. This assertion fails on `main`.**
+    ///
+    /// `age_s` printed an absolute chain timestamp — `1787483455` on an Ubuntu node
+    /// and `1787506224` on a Windows 11 one, both measured on nodes standing up
+    /// from nothing — beside a perfectly legitimate `final=`. The state it needs is
+    /// the one directly above: **issue #85's learn-ahead**, where the committee
+    /// tracker has verified a quorum whose block this node's own header chain does
+    /// not hold. Every node in the fleet was immune by construction, because every
+    /// one of them had been applying blocks forward since before the state could
+    /// arise.
+    ///
+    /// **The two heads are the whole mechanism, and neither `unwrap_or(0)` in the
+    /// old code was on the live path.** `final=` is head #1, the tracker. The age's
+    /// base came from head #2, fork choice's own finalized pointer, which
+    /// `ChainState::set_finalized` had refused as `Unknown` — and the old
+    /// arithmetic then fell back to `genesis_block_hash()`, whose `timestamp = 0`
+    /// placeholder is issue #73's zero base reached through a door #73's guard
+    /// cannot see. #73 validates the *height*; the corruption was in the
+    /// *timestamp*.
+    ///
+    /// Why it is not merely a startup blemish: head #2 gets no retry, so this state
+    /// persists until the NEXT checkpoint finalizes locally — which is exactly what
+    /// never happens on a node whose finality is genuinely stalled, the one
+    /// situation `age_s` exists to detect.
+    ///
+    /// On `main` the two `age_s=-` assertions below fail with a ten-digit number.
+    #[test]
+    fn telemetry_age_is_dash_when_the_quorum_is_ahead_of_this_nodes_headers() {
+        use qlab_devnet::committee::Checkpoint;
+        use qlab_p2p::n1::{CheckpointIngest, VotesOutcome};
+
+        let (config, genesis, base) = rig("age_i633", true);
+        let validators = genesis
+            .load_validators(&config.committee_key_paths)
+            .expect("the rig's 21 committee keys load");
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        // Wall-clock header timestamps, deliberately: on the deterministic clock the
+        // tip's timestamp is small and the defect's output would be a small wrong
+        // number rather than the ten-digit one the fleet printed. The magnitude is
+        // asserted below so this line cannot rot into decoration.
+        node.set_mining_clock(MiningClock::WallClock);
+        for _ in 0..4 {
+            assert!(node.try_mine());
+        }
+
+        // The learn-ahead quorum, over a block this node does not hold — and
+        // deliberately at a slot ABOVE its tip, which is the live shape
+        // (`tip=2000 final=3792`, `tip=4000 final=4104`).
+        let slot = CHECKPOINT_CADENCE_BLOCKS;
+        let cp = Checkpoint::new(slot, [0x63; 32], [0x36; 32]);
+        let votes: Vec<_> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        let need = node.p2p().node().slot_context(slot).need;
+        assert!(matches!(
+            node.p2p_mut().node_mut().ingest_checkpoint_votes(&cp, &votes[..need]),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+
+        // The two heads, asserted rather than assumed — this is the row of the
+        // task-book that had to be checked, and it is the whole precondition.
+        assert_eq!(node.finalized_height(), Some(slot), "head #1 learned the quorum");
+        assert_ne!(node.finalized_height(), Some(0), "…and it is NOT #73's genesis case");
+        assert_eq!(
+            node.p2p().node().chain().finalized_height(),
+            None,
+            "head #2 declined it — `set_finalized` refuses a block it does not hold"
+        );
+        let tip_ts = {
+            let chain = node.p2p().node().chain();
+            chain.header(&chain.tip_hash()).expect("a tip is a header this node holds").timestamp
+        };
+        assert!(
+            tip_ts > 1_700_000_000,
+            "the tip must carry a wall-clock-magnitude timestamp or this test cannot \
+             show the defect it exists for: {tip_ts}"
+        );
+
+        // 🔴 The refusal. On `main` this is `Some(tip_ts)` / `age_s=1787…`.
+        let t = node.telemetry();
+        assert_eq!(
+            t.last_finalized_age_secs, None,
+            "no pointer to measure from ⇒ no age, not a genesis-fallback absolute"
+        );
+        assert_eq!(t.age_field(), "-");
+        let line = node.telemetry_sample();
+        assert_eq!(field(&line, "age_s"), "-", "{line}");
+        assert!(
+            !line.contains(&format!("age_s={tip_ts}")),
+            "the tip's absolute chain timestamp must never be published as an age: {line}"
+        );
+        // The neighbouring fields stay exactly as #85 left them: this changes what
+        // `age_s` says, and nothing else on the line.
+        assert_eq!(field(&line, "final"), slot.to_string(), "{line}");
+        assert_eq!(field(&line, "fback"), "heard", "{line}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Mine to the first cadence slot and finalize it, returning the sample line.
     /// `wall` selects the header-timestamp clock: two nodes on different clocks
     /// mine *different blocks* at the same height, which is how a real net's nodes

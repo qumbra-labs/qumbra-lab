@@ -1344,6 +1344,95 @@ mod tests {
         assert_eq!(real.age_field(), "150");
     }
 
+    /// **Lab #633: the one arithmetic, every route through it.**
+    ///
+    /// Exhaustive over the three inputs' meaningful combinations, because the
+    /// defect was a *combination* nobody had enumerated: a real finalized height
+    /// (so #73's guard passes) with no base timestamp (so the subtraction has
+    /// nothing to stand on). Before #633 that combination did not exist as a case —
+    /// the base fell back to genesis and the arithmetic always produced a number.
+    #[test]
+    fn finalized_age_secs_refuses_every_route_it_cannot_measure() {
+        const TIP: Option<u64> = Some(1_787_483_455);
+        const BASE: Option<u64> = Some(1_787_483_205);
+
+        // Nothing finalized (S8) and finalized-at-genesis (#73): no checkpoint to
+        // measure from, whatever the timestamps say.
+        assert_eq!(finalized_age_secs(None, TIP, BASE), None);
+        assert_eq!(finalized_age_secs(Some(0), TIP, BASE), None);
+
+        // 🔴 #633: a REAL finalized height whose base this node cannot read. On
+        // `main` this route returned `Some(1787483455)` — the tip's absolute chain
+        // timestamp, because the base fell back to genesis's `0` placeholder.
+        assert_eq!(finalized_age_secs(Some(3792), TIP, None), None);
+        // …and the same refusal when the tip is the unreadable half.
+        assert_eq!(finalized_age_secs(Some(3792), None, BASE), None);
+        assert_eq!(finalized_age_secs(Some(3792), None, None), None);
+
+        // The healthy node still speaks, in chain-time seconds.
+        assert_eq!(finalized_age_secs(Some(3792), TIP, BASE), Some(250));
+        // A fully-finalized tip is a measurable ZERO and must stay distinguishable
+        // from the refusals above — `json.rs`'s rule that a zero is a different
+        // claim from a `-` cuts both ways.
+        assert_eq!(finalized_age_secs(Some(8), Some(99), Some(99)), Some(0));
+        // Non-monotonic pair inside the drift window: 0, never a wrapped ~2^64.
+        assert_eq!(finalized_age_secs(Some(8), Some(10), Some(40)), Some(0));
+    }
+
+    /// Lab #633: `age_field` refuses at a real finalized height when there is no
+    /// age — the third `-` route, beside S8 and #73.
+    ///
+    /// This is the rendering half of the defect. `finalized_height` is `Some(3792)`
+    /// and non-zero, so **both** existing guards pass it through; only the value's
+    /// own absence can refuse, which is why it had to become an `Option`.
+    #[test]
+    fn age_field_refuses_an_unmeasurable_age_at_a_real_finalized_height() {
+        let unmeasurable = Telemetry::assemble(3803, Some(3792), None, 0, 3, 0, MAX_LAG);
+        assert_eq!(unmeasurable.age_field(), "-");
+        // The pre-#633 output, for the record: the tip's chain timestamp, rendered
+        // with total confidence beside a legitimate `final=3792`.
+        let measured = Telemetry::assemble(3803, Some(3792), Some(1_787_483_455), 0, 3, 0, MAX_LAG);
+        assert_eq!(measured.age_field(), "1787483455");
+        // A measurable zero is not a refusal, and this is the pair that says so.
+        let zero = Telemetry::assemble(3792, Some(3792), Some(0), 0, 3, 0, MAX_LAG);
+        assert_eq!(zero.age_field(), "0");
+    }
+
+    /// 🔴 **Lab #633's disclosed gap, locked so a wire bump has to change it.**
+    ///
+    /// `None` at a real finalized height has no encoding in the eight bytes
+    /// `age_secs` occupies, so it goes out as `0` and comes back as `Some(0)`: the
+    /// node renders `-` on its own surfaces and `0` through this decoder, which is
+    /// what `qumbra-opview` reads. Closing it needs a presence byte at the tail and
+    /// an `RPC_VERSION` bump — a wire payload change, deliberately not folded into
+    /// this baton.
+    ///
+    /// The refusals the payload CAN carry — S8 and #73, where `finalized_height`
+    /// itself is the reason — round-trip exactly, and that is asserted here too so
+    /// the gap is bounded to the one cell rather than described loosely.
+    #[test]
+    fn the_wire_cannot_carry_a_refusal_at_a_real_finalized_height() {
+        let unmeasurable = Telemetry::assemble(3803, Some(3792), None, 0, 3, 0, MAX_LAG);
+        let back = Telemetry::from_bytes(&unmeasurable.to_bytes()).unwrap();
+        assert_eq!(
+            back.last_finalized_age_secs,
+            Some(0),
+            "the one lossy cell on this wire: a refusal decodes as a measured zero"
+        );
+        assert_eq!(back.age_field(), "0", "…so a remote reader states a number");
+        assert_eq!(unmeasurable.age_field(), "-", "…where the node itself refuses");
+
+        // Bounded: both derivable refusals survive the round trip untouched.
+        for t in [
+            Telemetry::assemble(5, None, None, 0, 1, 0, MAX_LAG),
+            Telemetry::assemble(1, Some(0), None, 0, 1, 0, MAX_LAG),
+        ] {
+            let back = Telemetry::from_bytes(&t.to_bytes()).unwrap();
+            assert_eq!(back, t, "the payload carries the reason, so the decoder rebuilds it");
+            assert_eq!(back.age_field(), "-");
+        }
+    }
+
     /// Issue #74: the halt regimes ride the SAME status field (extended, not
     /// forked), round-trip on the wire, and are derived from the halt rule rather
     /// than re-defined here.

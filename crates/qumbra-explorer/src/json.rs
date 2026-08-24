@@ -534,6 +534,16 @@ mod tests {
             "the #73 refusal, verbatim"
         );
         assert_eq!(v["finality"]["head1"]["age_s"], refused.age_field());
+
+        // Lab #633's route, and this page gets it right for free: the explorer runs
+        // its OWN in-process observer node, so it renders the snapshot rather than
+        // decoding it off a wire that cannot carry the refusal. `final=3792` is a
+        // real, non-genesis finalized height — both older guards pass it through —
+        // and the age is still `-`.
+        let unmeasurable = Telemetry::assemble(3803, Some(3792), None, 0, 7, 0, MAX_LAG);
+        let v = parse(&health(&unmeasurable, "aa", 30, "qumbra-devnet-t0"));
+        assert_eq!(v["finality"]["head1"]["age_s"], "-", "lab #633's refusal, verbatim");
+        assert_eq!(v["finality"]["head1"]["height"], 3792, "…beside a legitimate head");
     }
 
     #[test]
