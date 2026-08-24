@@ -1,8 +1,9 @@
 # Remote proving service — Internet-boundary review ledger
 
-**Status: OPEN REVIEW GATE, 2026-08-24. VALUELESS MECHANICS ONLY. THIS RECORD
-DOES NOT AUTHORIZE A LISTENER, HOST, PILOT, REAL VALUE, OR TRANSACTION
-SUBMISSION.** Paired with
+**Status: FINAL REMEDIATION REVIEW COMPLETE, 2026-08-24. CAPACITY TASK-BOOK
+PREPARATION MAY BEGIN; CAPACITY EXECUTION IS NOT AUTHORIZED. VALUELESS
+MECHANICS ONLY. THIS RECORD DOES NOT AUTHORIZE A LISTENER, HOST, PILOT, REAL
+VALUE, OR TRANSACTION SUBMISSION.** Paired with
 [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md).
 
 The governing service record is
@@ -10,7 +11,8 @@ The governing service record is
 turns the independent-review requirement in
 [`remote-proving-implementation-plan.md`](remote-proving-implementation-plan.md)
 into a commit-addressed checklist. A checked sub-invariant is evidence about
-that sub-invariant only; it does not clear the review gate.
+that sub-invariant only; §4 states the exact gate that has closed and the gates
+that remain open.
 
 ## 1. Immutable review targets
 
@@ -47,22 +49,22 @@ Claude's complete Internet-boundary report is preserved in
 [#639 comment 5391401951](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391401951).
 Both verdicts approve only the frozen loopback, valueless,
 Compose-render-only target. Neither approves an Internet-facing pilot. The
-table uses the higher reported severity where the reports differ. A
-`REMEDIATED / RE-REVIEW OPEN` entry records implementation evidence; only the
-independent final delta review may close it.
+table uses the higher reported severity where the reports differ. Claude and
+Grok independently re-reviewed the final remediation pair; the status column
+now separates confirmed remediation from residual live and multi-client gates.
 
 | effective severity | current status | source | finding | remediation / remaining boundary |
 |---|---|---|---|---|
-| P1 | REMEDIATED ON THE PUBLISHED COMPOSE PATH / RE-REVIEW OPEN | Claude + Grok | `tiny_http::Server::http` has no accepted-socket deadline or connection cap before application admission. | PR #249 places unpublished `tiny_http` behind ingress header/body/idle deadlines and a 96 KiB edge body cap. The binary alone remains unsuitable as a listener; a live slow-client check remains a pre-start gate. |
-| P1 | REMEDIATED / RE-REVIEW OPEN | Claude P2; Grok P1 | Unauthenticated `/healthz` exposed load counters and build revision. | PR #652 reduces the public response to `{"alive":true}` and regression-locks that shape. It is liveness, not readiness or idleness. |
-| P1 | REMEDIATED AT THE CLIENT-CREDENTIAL BOUNDARY / RE-REVIEW OPEN | Grok | A same-UID worker could read the mounted client API token. | PR #249 keeps the client bearer in the ingress domain and gives the prover a separate internal-hop token. A compromised worker can still read and misuse that hop token against its own API; that residual is explicit and is not client identity. |
-| P1 | STATICALLY REMEDIATED / LIVE VERIFICATION AND RE-REVIEW OPEN | Claude P2; Grok P1 | The worker had unrestricted bridge egress while holding the spend-authority bundle. | PR #249 puts the prover only on two `internal: true` networks and permits outbound traffic through a GET-only, authority-pinned egress proxy. Live DNS/SYN/IPv4/IPv6 negative checks remain mandatory before any start. |
+| P1 | CONFIRMED REMEDIATED ON THE COMPOSE PATH / LIVE GATE OPEN | Claude + Grok | `tiny_http::Server::http` has no accepted-socket deadline or connection cap before application admission. | PR #249 places unpublished `tiny_http` behind ingress header/body/idle deadlines and a 96 KiB edge body cap. The binary alone remains unsuitable as a listener; a live slow-client check remains a pre-start gate. |
+| P1 | CONFIRMED REMEDIATED | Claude P2; Grok P1 | Unauthenticated `/healthz` exposed load counters and build revision. | PR #652 reduces the public response to `{"alive":true}` and regression-locks that shape. It is liveness, not readiness or idleness; invariant-probe timing remains an accepted loopback advisory. |
+| P1 | CONFIRMED REMEDIATED AT THE CLIENT-CREDENTIAL BOUNDARY / HOP-TOKEN RESIDUAL | Grok | A same-UID worker could read the mounted client API token. | PR #249 keeps the client bearer in the ingress domain and gives the prover a separate internal-hop token. A compromised worker can still read and misuse that hop token against its own API; both reviewers accept that explicit residual for this single-operator lane. |
+| P1 | STATIC REMEDIATION CONFIRMED / LIVE GATE OPEN | Claude P2; Grok P1 | The worker had unrestricted bridge egress while holding the spend-authority bundle. | PR #249 puts the prover only on two `internal: true` networks and permits outbound traffic through a GET-only, authority-pinned egress proxy. Live DNS/SYN/IPv4/IPv6 negative checks remain mandatory before any start. |
 | P2 | OPEN / DEFERRED BEFORE A MULTI-CLIENT PILOT | Grok | A client-chosen idempotency key may become a stable identifier and its reuse-conflict response is a retention-window existence oracle. | Not changed. It does not block single-operator loopback capacity measurement; it remains in scope for per-install authentication and a public API contract. |
 | P2 | OPEN / DEFERRED BEFORE A MULTI-CLIENT PILOT | Grok | A shared bearer plus a leaked job identifier can retrieve another caller's artifact; there is no per-install or per-job holder binding. | Client and hop credentials are now separated, but caller binding is unchanged. No public or multi-client pilot is authorized. |
-| P2 | REMEDIATED IN THE WORKER / EGRESS AVAILABILITY RE-REVIEW OPEN | Claude + Grok | Nullifier preflight had no response-byte ceiling and could amplify worker memory while the witness remained resident. | PR #652 shares one fail-closed byte budget across anchor and nullifier reads. Egress does not independently cap response bodies, so hostile-origin egress-container availability and the documented configuration coupling remain for review. |
+| P2 | CONFIRMED REMEDIATED IN THE WORKER / EGRESS RESIDUAL OPEN | Claude + Grok | Nullifier preflight had no response-byte ceiling and could amplify worker memory while the witness remained resident. | PR #652 shares one fail-closed byte budget across anchor and nullifier reads. Egress does not independently cap response bodies, so hostile-origin egress-container availability and the documented configuration coupling remain capacity stop conditions. |
 | P2 | PARTIALLY REMEDIATED / HOST GATE OPEN | Claude + Grok | Swap, crash collection and ordinary allocations can outlive in-process retention; `WitnessBundle` was not zeroized. | PR #652 adds typed best-effort zeroization and drops the parent bundle after handoff. PR #249 disables container swap growth and core dumps. Host swap/crash collection, allocator copies and the STARK working set are not claimed erased and remain pre-start checks. |
-| Advisory | REMEDIATED / RE-REVIEW OPEN | Claude + Grok | `ApiToken::matches` used a hand-written compare. | PR #652 uses `subtle::ConstantTimeEq`; token length remains validated separately. |
-| Advisory | REMEDIATED / RE-REVIEW OPEN | Grok | `health()` always returned `ready: true`. | PR #652 removes readiness entirely and exposes liveness only. |
+| Advisory | CONFIRMED REMEDIATED | Claude + Grok | `ApiToken::matches` used a hand-written compare. | PR #652 uses `subtle::ConstantTimeEq`; token length remains validated separately. |
+| Advisory | CONFIRMED REMEDIATED | Grok | `health()` always returned `ready: true`. | PR #652 removes readiness entirely and exposes liveness only. |
 | Advisory | OPEN | Claude | One shared-token holder can occupy retained-job slots for the TTL. | Authentication remains intentionally single-operator for the valueless mechanics lane. This must be revisited before shared-client admission. |
 
 The first cross-review of the remediation PRs inspected lab head `3c0670b` and
@@ -84,9 +86,9 @@ the shared HTTP-framing extraction. Those findings were fixed before merge:
   `cap_drop: ALL`, so each Caddy now receives only `NET_BIND_SERVICE`; the prover
   receives no capability. The checker locks that shape.
 
-These are implementation-owner observations, not independent closure. Neither
-reviewer has yet inspected both final §1 commits. No real proof, live network
-isolation test, capacity run, host or public listener is part of this record.
+Both final reports independently confirmed these implementation observations on
+the exact §1 commits. No real proof, live network isolation test, capacity run,
+host or public listener is part of this record.
 
 The same pass found the following properties holding in the immutable lab
 target once a request reaches application handling: handler accounting
@@ -159,14 +161,37 @@ The exact final delta-review instructions are:
 - [`prompts/remote-prover-claude-remediation-review.md`](prompts/remote-prover-claude-remediation-review.md)
 - [`prompts/remote-prover-grok-remediation-review.md`](prompts/remote-prover-grok-remediation-review.md)
 
-Each reviewer must target both final commits in §1, account for every row in
-§2, distinguish static evidence from unrun live gates, and post a
-commit-addressed report on PR #648. Neither reviewer edits an implementation
-branch or approves deployment, capacity, real value or launch.
+Both final reports were returned against the exact §1 pair with no drift:
 
-## 4. Gate-closing rule and next action
+- Claude Code
+  [comment 5393523859](https://github.com/qumbra-labs/qumbra-lab/pull/648#issuecomment-5393523859):
+  **approve with non-blocking findings** for capacity task-book preparation;
+- Grok 4.6
+  [comment 5393591701](https://github.com/qumbra-labs/qumbra-lab/pull/648#issuecomment-5393591701):
+  **approve with non-blocking findings** for the same boundary.
 
-The review gate remains open. Current checklist:
+Both reports account for every §2 row and both preliminary blockers. Neither
+found a new P0/P1 blocker. Their clarified non-blocking residuals are binding
+inputs to the task book:
+
+- token files must be checked before start for 32–256 bytes, exact ownership
+  and **no CR/LF**; relying on application trimming would fail closed with a
+  silent `401` and is not the provisioning gate;
+- the unauthenticated invariant health response can still carry a timing signal
+  under load, accepted only for loopback single-operator measurement;
+- the 8 MiB worker budget remains the only upstream response-body ceiling;
+  egress OOM/stream stall is a stop condition and raising that budget requires
+  re-review; and
+- the same-UID worker can read and use the internal-hop token against its own
+  parent API. This is an admitted residual, not client-credential exposure.
+
+Neither reviewer edited an implementation branch or approved capacity
+execution, deployment, a host, public ingress, real value or launch.
+
+## 4. Review outcome and next action
+
+The final remediation-review gate is complete for **preparing** an isolated,
+single-operator, loopback-only capacity task book. Current checklist:
 
 1. [x] Claude's complete Internet-boundary report and Grok's independent
    privacy report target the two baseline commits in §1.
@@ -174,15 +199,25 @@ The review gate remains open. Current checklist:
    finding.
 3. [x] Accepted P1 remediation is merged in scoped PRs #652 and #249 with
    regression/static coverage and green CI.
-4. [ ] Both reviewers inspect both immutable remediation commits in §1 and
+4. [x] Both reviewers inspect both immutable remediation commits in §1 and
    explicitly account for every original and cross-review finding.
-5. [ ] The independent reports agree that no unresolved finding can expose
-   spend authority, plaintext witnesses, the client credential, arbitrary
-   network access or unauthenticated resource exhaustion at the intended
-   isolated capacity boundary.
+5. [x] Both reports agree that the intended capacity boundary has no unresolved
+   remediation regression exposing the **client** credential, arbitrary network
+   access, unauthenticated health state or unbounded worker-side upstream body
+   retention. The admitted pre-Candidate-A worker still sees plaintext spend
+   authority, so the experiment remains strictly valueless.
 
-Only then may an isolated-host capacity task book be prepared. Capacity work
-must still be separately approved and must record cold/warm latency, peak RSS
-and committed memory, one-worker cancellation and memory release, artifact
-sizes, safe concurrency and cost. A green review plus good capacity numbers
-still do not approve a valueless pilot: that remains a separate Larry gate.
+The next permitted action is a docs-only isolated-host capacity task book. It
+must schedule the two reviewers' live gates before any witness is accepted:
+exact-image/digest read-back; token byte/ownership/CRLF checks without printing
+values; both allowed and crossed egress routes on the pinned image; slow-client
+deadlines at ingress; DNS/SYN/default-route negatives from the prover namespace
+for IPv4 and IPv6; host swap/crash/log-shipper checks; target-engine swap-limit
+behavior; and the stop conditions for egress OOM/stall and unexpected hop-token
+behavior. It must then specify cold/warm latency, peak RSS and committed memory,
+one-worker cancellation and memory release, artifact sizes, safe concurrency
+and cost evidence.
+
+Preparing that task book does **not** authorize capacity execution, a host,
+image pull, token provisioning, listener, proof, public pilot, real value or
+launch. Each remains a separate Larry gate.

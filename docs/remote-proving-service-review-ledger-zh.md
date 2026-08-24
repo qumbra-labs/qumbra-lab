@@ -1,14 +1,15 @@
 # 远程证明服务 —— Internet-boundary review 账本
 
-**状态：2026-08-24 的开放 review gate。仅限无价值 mechanics。本文不授权 listener、
-host、pilot、真实价值或 transaction submission。** 英文权威版：
+**状态：2026-08-24 final remediation review 已完成；可以准备 capacity task book，但不授权
+capacity execution。仅限无价值 mechanics。本文不授权 listener、host、pilot、真实价值或
+transaction submission。** 英文权威版：
 [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md)。
 
 服务约束以
 [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 为准。本文把
 [`remote-proving-implementation-plan-zh.md`](remote-proving-implementation-plan-zh.md)
 里的 independent-review 要求变成 commit-addressed checklist。某个 sub-invariant 打勾，
-只说明该小项有证据；不等于整个 review gate 已关闭。
+只说明该小项有证据；§4 说明精确关闭了哪个 gate，以及哪些 gate 仍保持开放。
 
 ## 1. 不可变 review targets
 
@@ -43,22 +44,22 @@ Grok 的完整 privacy report 保存在
 Claude 的完整 Internet-boundary report 保存在
 [#639 comment 5391401951](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391401951)。
 两份 verdict 都只批准 frozen loopback、valueless、仅 Compose render 的 target；都不批准
-Internet-facing pilot。报告 severity 不一致时，下表采用更高等级。标为
-`REMEDIATED / RE-REVIEW OPEN` 只表示已有 implementation evidence；只有独立 final delta
-review 才能关闭：
+Internet-facing pilot。报告 severity 不一致时，下表采用更高等级。Claude 与 Grok 已分别
+复审最终 remediation pair；状态栏现在区分已确认 remediation 与仍开放的 live/multi-client
+gates：
 
 | Effective severity | 当前状态 | 来源 | Finding | Remediation／剩余边界 |
 |---|---|---|---|---|
-| P1 | PUBLISHED COMPOSE PATH 已修复／复审开放 | Claude + Grok | `tiny_http::Server::http` 在 application admission 前没有 accepted-socket deadline 或 connection cap。 | PR #249 把未发布的 `tiny_http` 放在具有 header/body/idle deadline 与 96 KiB edge body cap 的 ingress 后面。Binary 单独仍不能作为 listener；live slow-client check 仍是 pre-start gate。 |
-| P1 | 已修复／复审开放 | Claude P2；Grok P1 | 未认证 `/healthz` 暴露 load counters 与 build revision。 | PR #652 把 public response 缩减为 `{"alive":true}` 并用 regression test 锁定。它是 liveness，不是 readiness/idleness。 |
-| P1 | CLIENT-CREDENTIAL BOUNDARY 已修复／复审开放 | Grok | Same-UID worker 可以读取 mounted client API token。 | PR #249 把 client bearer 留在 ingress domain，prover 只获得独立 internal-hop token。Compromised worker 仍可读取并针对自己的 API 滥用 hop token；该 residual 已明确，且它不是 client identity。 |
-| P1 | 静态修复／live verification 与复审开放 | Claude P2；Grok P1 | Worker 持有 spend-authority bundle 时具有 unrestricted bridge egress。 | PR #249 让 prover 只连接两个 `internal: true` network，出站只能经过 GET-only、authority-pinned egress proxy。任何启动前仍必须做 live DNS/SYN/IPv4/IPv6 negative checks。 |
+| P1 | COMPOSE PATH 已确认修复／LIVE GATE 开放 | Claude + Grok | `tiny_http::Server::http` 在 application admission 前没有 accepted-socket deadline 或 connection cap。 | PR #249 把未发布的 `tiny_http` 放在具有 header/body/idle deadline 与 96 KiB edge body cap 的 ingress 后面。Binary 单独仍不能作为 listener；live slow-client check 仍是 pre-start gate。 |
+| P1 | 已确认修复 | Claude P2；Grok P1 | 未认证 `/healthz` 暴露 load counters 与 build revision。 | PR #652 把 public response 缩减为 `{"alive":true}` 并用 regression test 锁定。它是 liveness，不是 readiness/idleness；invariant probe timing 是仅在 loopback 接受的 advisory。 |
+| P1 | CLIENT-CREDENTIAL BOUNDARY 已确认修复／HOP-TOKEN RESIDUAL | Grok | Same-UID worker 可以读取 mounted client API token。 | PR #249 把 client bearer 留在 ingress domain，prover 只获得独立 internal-hop token。Compromised worker 仍可读取并针对自己的 API 滥用 hop token；两位 reviewer 接受该 single-operator lane residual。 |
+| P1 | 静态修复已确认／LIVE GATE 开放 | Claude P2；Grok P1 | Worker 持有 spend-authority bundle 时具有 unrestricted bridge egress。 | PR #249 让 prover 只连接两个 `internal: true` network，出站只能经过 GET-only、authority-pinned egress proxy。任何启动前仍必须做 live DNS/SYN/IPv4/IPv6 negative checks。 |
 | P2 | 开放／MULTI-CLIENT PILOT 前处理 | Grok | Client-chosen idempotency key 可能成为稳定 identifier，reuse-conflict 是 retention-window existence oracle。 | 未改变。它不阻塞 single-operator loopback capacity measurement；仍属于 per-install auth 与 public API contract 范围。 |
 | P2 | 开放／MULTI-CLIENT PILOT 前处理 | Grok | Shared bearer 加泄露 job id 可以读取其他 caller artifact；没有 per-install/per-job holder binding。 | Client 与 hop credential 已拆分，但 caller binding 未变。未授权 public/multi-client pilot。 |
-| P2 | WORKER 内已修复／EGRESS AVAILABILITY 复审开放 | Claude + Grok | Nullifier preflight 没有 response-byte ceiling，可在 witness 驻留时放大 worker memory。 | PR #652 为 anchor/nullifier read 共用 fail-closed byte budget。Egress 不独立限制 response body，因此 hostile-origin egress-container availability 与已记录的配置 coupling 仍需复审。 |
+| P2 | WORKER 内已确认修复／EGRESS RESIDUAL 开放 | Claude + Grok | Nullifier preflight 没有 response-byte ceiling，可在 witness 驻留时放大 worker memory。 | PR #652 为 anchor/nullifier read 共用 fail-closed byte budget。Egress 不独立限制 response body，因此 hostile-origin egress-container availability 与已记录的配置 coupling 仍是 capacity stop conditions。 |
 | P2 | 部分修复／HOST GATE 开放 | Claude + Grok | Swap、crash collection 与普通 allocation 可活过 in-process retention；`WitnessBundle` 未 zeroize。 | PR #652 加入 typed best-effort zeroize，并在 handoff 后 drop parent bundle。PR #249 禁止 container swap growth 与 core dump。Host swap/crash collection、allocator copies 与 STARK working set 不声称已擦除，仍是 pre-start checks。 |
-| Advisory | 已修复／复审开放 | Claude + Grok | `ApiToken::matches` 使用手写 compare。 | PR #652 使用 `subtle::ConstantTimeEq`；token length 仍单独验证。 |
-| Advisory | 已修复／复审开放 | Grok | `health()` 永远返回 `ready: true`。 | PR #652 完全移除 readiness，只暴露 liveness。 |
+| Advisory | 已确认修复 | Claude + Grok | `ApiToken::matches` 使用手写 compare。 | PR #652 使用 `subtle::ConstantTimeEq`；token length 仍单独验证。 |
+| Advisory | 已确认修复 | Grok | `health()` 永远返回 `ready: true`。 | PR #652 完全移除 readiness，只暴露 liveness。 |
 | Advisory | 开放 | Claude | 一个 shared-token holder 可在 TTL 内占满 retained-job slots。 | 无价值 mechanics lane 有意保持 single-operator auth；shared-client admission 前必须重新处理。 |
 
 Remediation PR 首次 cross-review 检查的是 lab head `3c0670b` 与 deploy head `f042080`，并非
@@ -75,9 +76,8 @@ extraction 之后。合并前这些 findings 已修复：
 - exact-image startup 暴露 Caddy file capability 与 `cap_drop: ALL` 的 interaction，所以
   每个 Caddy 只获得 `NET_BIND_SERVICE`，prover 不获得 capability；checker 锁定该 shape。
 
-这些是 implementation-owner observations，不是独立 closure。两位 reviewer 尚未检查 §1
-两个最终 commits。本文不包含 real proof、live network isolation、capacity run、host 或
-public listener。
+两份 final reports 已分别在精确 §1 commits 上确认这些 implementation observations。本文
+不包含 real proof、live network isolation、capacity run、host 或 public listener。
 
 同一轮检查认为 immutable lab target 在 request 进入 application handling 后的以下性质成立：
 handler accounting 先于 authorization 与 body parsing；同时执行 declared 与 actual body
@@ -138,26 +138,54 @@ Final delta-review 精确指令是：
 - [`prompts/remote-prover-claude-remediation-review.md`](prompts/remote-prover-claude-remediation-review.md)
 - [`prompts/remote-prover-grok-remediation-review.md`](prompts/remote-prover-grok-remediation-review.md)
 
-每位 reviewer 必须同时针对 §1 两个 final commits，逐条交代 §2，区分 static evidence 与
-未运行 live gates，并在 PR #648 发布 commit-addressed report。两者都不修改 implementation
-branch，也不批准 deployment、capacity、real value 或 launch。
+两份 final report 都针对 §1 精确 pair 返回，无 drift：
 
-## 4. Gate 关闭规则与下一步
+- Claude Code
+  [comment 5393523859](https://github.com/qumbra-labs/qumbra-lab/pull/648#issuecomment-5393523859)：
+  对 capacity task-book preparation 给出 **approve with non-blocking findings**；
+- Grok 4.6
+  [comment 5393591701](https://github.com/qumbra-labs/qumbra-lab/pull/648#issuecomment-5393591701)：
+  对同一 boundary 给出 **approve with non-blocking findings**。
 
-Review gate 仍保持开放。当前 checklist：
+两份 report 都逐条交代 §2 与两个 preliminary blockers，没有发现新的 P0/P1 blocker。其澄清的
+non-blocking residual 是 task book 的 binding inputs：
+
+- 启动前必须检查 token file 为 32–256 bytes、精确 ownership 且**没有 CR/LF**；依赖
+  application trim 会 fail closed 为静默 `401`，不能作为 provisioning gate；
+- 未认证 invariant health response 在 load 下仍可能携带 timing signal，只在 loopback
+  single-operator measurement 接受；
+- 8 MiB worker budget 仍是唯一 upstream response-body ceiling；egress OOM/stream stall 是
+  stop condition，提升 budget 需要重新 review；以及
+- same-UID worker 可以读取 internal-hop token 并针对 parent API 使用。这是已承认 residual，
+  不是 client-credential exposure。
+
+两位 reviewer 都没有修改 implementation branch，也没有批准 capacity execution、deployment、
+host、public ingress、real value 或 launch。
+
+## 4. Review 结果与下一步
+
+Final remediation-review gate 已完成，可**准备** isolated、single-operator、loopback-only
+capacity task book。当前 checklist：
 
 1. [x] Claude 完整 Internet-boundary report 与 Grok 独立 privacy report 针对 §1 两个
    baseline commits。
 2. [x] Codex 对每条 finding 记录 fix、明确 residual 或 reasoned deferral。
 3. [x] 已接受 P1 remediation 在 scoped PR #652/#249 中合并，具有 regression/static
    coverage 与绿色 CI。
-4. [ ] 两位 reviewer 都检查 §1 两个 immutable remediation commits，并逐条交代原 finding
+4. [x] 两位 reviewer 都检查 §1 两个 immutable remediation commits，并逐条交代原 finding
    与 cross-review finding。
-5. [ ] 独立 reports 一致认为，在计划的 isolated capacity boundary 上，没有 unresolved
-   finding 可暴露 spend authority、plaintext witness、client credential、arbitrary network
-   access 或 unauthenticated resource exhaustion。
+5. [x] 两份 report 一致认为，计划中的 capacity boundary 没有 unresolved remediation
+   regression 会暴露 **client** credential、arbitrary network access、unauthenticated health
+   state 或 unbounded worker-side upstream body retention。被承认的 pre-Candidate-A worker
+   仍可看到 plaintext spend authority，因此 experiment 必须严格无价值。
 
-满足后才可以准备 isolated-host capacity task book。Capacity 仍需单独批准，并必须记录
-cold/warm latency、peak RSS 与 committed memory、one-worker cancel 与 memory release、
-artifact sizes、safe concurrency 与 cost。Review 绿色和 capacity 数字良好仍不批准 valueless
-pilot；后者继续由 Larry 单独 gate。
+下一项允许的 action 是 docs-only isolated-host capacity task book。它必须在接受任何 witness
+之前安排两位 reviewer 的 live gates：exact image/digest read-back；不打印 value 的 token
+byte/ownership/CRLF checks；pinned image 上两条 allowed 与 crossed egress routes；ingress
+slow-client deadlines；从 prover namespace 做 IPv4/IPv6 DNS/SYN/default-route negatives；host
+swap/crash/log-shipper checks；target engine swap-limit behavior；以及 egress OOM/stall 与异常
+hop-token behavior stop conditions。随后必须定义 cold/warm latency、peak RSS/committed memory、
+one-worker cancel/memory release、artifact sizes、safe concurrency 与 cost evidence。
+
+准备 task book **不授权** capacity execution、host、image pull、token provisioning、listener、
+proof、public pilot、real value 或 launch。每项仍需 Larry 单独 gate。

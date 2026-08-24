@@ -101,7 +101,7 @@ service、deployment 或 launch。`⬜` 表示 gate 仍未关闭。
 | Phase 5A precursor：valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 与 lab PR #639；真实当前 prover、有界 ephemeral worker、固定 refusal、read-only preflight、无 submit path |
 | Phase 5A precursor：standalone deployment skeleton | ✅ | deploy PR #246；loopback-only review skeleton，不是 deployment 或 public edge |
 | Phase 2–4 与 Candidate A-bound 真实价值 Phase 5A | ⬜ | Design correction、AIR/public values、wire/node verification、activation 与 wallet/mobile authorization 尚未启动 |
-| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 记录 baseline reports 与最终 remediation targets lab `702456d` + deploy `33afc248`；scoped remediation PR #652/#249 已合并且 CI 绿色；仍需两位 reviewer 的 final delta review、隔离 host 实测和 Larry 单独 gate |
+| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 记录 lab `702456d` + deploy `33afc248`；Claude/Grok 都以 non-blocking residuals 批准 capacity task-book preparation。Capacity execution/evidence、任何 host/listener 与 Larry 单独 pilot gate 仍开放 |
 
 ## 5. Primary owner contract
 
@@ -191,11 +191,12 @@ ephemeral worker，但没有精确 valueless acknowledgement 就拒绝启动，�
 独立 Internet-boundary review 与无价值 capacity measurement；不得把它解释为真实价值
 implementation 或 launch approval。
 
-Service lane remediation 已作为 lab `702456d` 与 deploy `33afc248` 合并。立即行动是
-[`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md)
-定义的 commit-addressed final delta review，使用两份保留的 remediation-review prompts。
-只有两位 reviewer 都针对这些 immutable commits 逐条交代 baseline 与 cross-review findings，
-才开始 capacity 工作。目前不授权 host、listener 或 proof run。
+Service lane remediation 已作为 lab `702456d` 与 deploy `33afc248` 合并。Claude 与 Grok 已
+完成 [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md)
+定义的 commit-addressed final delta review，并都批准准备 isolated、single-operator、
+loopback-only capacity task book，同时保留已记录的 live pre-start gates。立即行动是该
+docs-only task book。目前不授权 capacity execution、host、image pull、token provisioning、
+listener 或 proof run。
 
 ## 10. 相关记录
 
