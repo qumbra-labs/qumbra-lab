@@ -6679,7 +6679,47 @@ mod tests {
              show the defect it exists for: {tip_ts}"
         );
 
-        // 🔴 The refusal. On `main` this is `Some(tip_ts)` / `age_s=1787…`.
+        // 🔴 **The defect, reproduced in the same run as the fix** — the pattern
+        // `metrics.rs`'s pre-#187 expression check already uses. `main`'s exact
+        // arithmetic is inlined verbatim below, so the bogus value is pinned to a
+        // number in CI rather than quoted from a red run somebody has to trust.
+        let pre_i633 = {
+            let node = node.p2p().node();
+            let chain = node.chain();
+            match node.finalized_height() {
+                None | Some(0) => 0,
+                Some(_) => {
+                    let tip_ts = chain.header(&chain.tip_hash()).map(|h| h.timestamp).unwrap_or(0);
+                    let base_hash =
+                        chain.finalized_hash().unwrap_or_else(|| chain.genesis_block_hash());
+                    let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
+                    tip_ts.saturating_sub(base_ts)
+                }
+            }
+        };
+        assert_eq!(
+            pre_i633, tip_ts,
+            "the defect, reproduced: the old arithmetic's 'age' IS the tip's absolute \
+             chain timestamp, because the base fell back to genesis's 0 placeholder"
+        );
+        assert!(
+            pre_i633 > 1_700_000_000,
+            "…and it is a ten-digit number, exactly as the fleet printed: {pre_i633}"
+        );
+        // Neither `unwrap_or(0)` above was ever reached: `ChainState` only ever sets
+        // its finalized pointer to a hash in its header map and never removes one,
+        // and a tip is a header it holds. The fallback that fired is the GENESIS
+        // one — which is why removing only the `unwrap_or`s would have fixed nothing.
+        {
+            let chain = node.p2p().node().chain();
+            assert!(chain.header(&chain.tip_hash()).is_some(), "the tip header is held");
+            assert!(
+                chain.header(&chain.genesis_block_hash()).is_some(),
+                "so is genesis — which is precisely why the fallback produced a NUMBER"
+            );
+        }
+
+        // 🔴 The refusal. On `main` this is `Some(pre_i633)` / `age_s=1787…`.
         let t = node.telemetry();
         assert_eq!(
             t.last_finalized_age_secs, None,
