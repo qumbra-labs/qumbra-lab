@@ -135,6 +135,13 @@ fn names(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// Drive one step of the resumable registration.
 fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
+    names_register_with(args, names_self_send_wire)
+}
+
+fn names_register_with<F>(args: &[String], mut send: F) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(&[String], &qlab_devnet::names::NameOp, &str) -> Result<Vec<u8>, Box<dyn Error>>,
+{
     use qumbra_wallet::names::*;
     let name = args.first().ok_or(
         "names register NAME --dir … --url … --node … --scan-to H [--committed-at H]",
@@ -173,7 +180,7 @@ fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
             st.commit_attempted = true;
             st.save(&dir)?;
             let op = st.commit_op();
-            names_self_send(&args[1..], &op, &format!("commit for {bare} (relay fee only)"))?;
+            send(&args[1..], &op, &format!("commit for {bare} (relay fee only)"))?;
             println!(
                 "commit posted. Once mined at height H: `names register {bare} --committed-at H --dir …`"
             );
@@ -186,7 +193,7 @@ fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
             let op = st.reveal_op();
             let fee = qlab_devnet::names::name_fee_for(&op);
             eprintln!("revealing {bare} (window closes at {closes}); name fee {fee} bessel, BURNED");
-            names_self_send(&args[1..], &op, &format!("reveal for {bare}"))?;
+            send(&args[1..], &op, &format!("reveal for {bare}"))?;
             RegisterState::clear(&dir)?;
             println!("reveal posted — once mined, {bare}.qmb is yours for 365 epochs. Pin your own fingerprint for your records.");
             Ok(())
@@ -207,6 +214,14 @@ fn names_self_send(
     op: &qlab_devnet::names::NameOp,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
+    names_self_send_wire(args, op, label).map(|_| ())
+}
+
+fn names_self_send_wire(
+    args: &[String],
+    op: &qlab_devnet::names::NameOp,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     use qumbra_wallet::spend::{execute, SendRequest, SendStep};
     let dir = dir_of(args)?;
     let url = flag(args, "--url").ok_or("requires --url")?;
@@ -235,8 +250,9 @@ fn names_self_send(
         name_op: Some(op),
         form: genesis_form_of(args)?,
     };
-    execute(&req, &mut sink).map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
-    Ok(())
+    let outcome = execute(&req, &mut sink)
+        .map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
+    Ok(outcome.wire_bytes)
 }
 
 fn usage() {
@@ -1012,8 +1028,80 @@ fn resolve_send_amount(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_net, resolve_send_amount, NetSource};
+    use super::{names_register_with, resolve_net, resolve_send_amount, NetSource};
+    use qlab_devnet::body::{TxEntry, TxPublic};
+    use qlab_devnet::fees::ArityBucket;
     use qlab_devnet::forms::GenesisForm;
+    use qlab_devnet::names::{
+        encode_rider, NameRecord, COMMIT_MIN_AGE, L1_ADDRESS_LEN, RECORD_KIND_L1_ADDRESS,
+    };
+    use qumbra_wallet::names::RegisterState;
+
+    #[test]
+    fn unconfirmed_reveal_is_retained_and_reposted_byte_identically() {
+        let dir = std::env::temp_dir().join(format!("qw-i625-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = RegisterState::new(
+            "alice",
+            NameRecord {
+                kind: RECORD_KIND_L1_ADDRESS,
+                name: b"alice".to_vec(),
+                address: vec![0xA5; L1_ADDRESS_LEN],
+            },
+            [0x62; 32],
+        );
+        state.commit_attempted = true;
+        state.committed_at = Some(9_000);
+        state.save(&dir).unwrap();
+
+        let args = vec![
+            "alice".to_string(),
+            "--dir".to_string(),
+            dir.display().to_string(),
+            "--scan-to".to_string(),
+            (9_000 + COMMIT_MIN_AGE).to_string(),
+        ];
+        let mut submitted = Vec::new();
+        let mut build_and_submit = |_: &[String], op: &qlab_devnet::names::NameOp, _: &str| {
+            // Model the real builder's randomized proof: rebuilding the same
+            // reveal deliberately changes the canonical wire. The retry path
+            // must retain and resubmit the FIRST bytes, not merely reconstruct
+            // the same rider from the saved salt and record.
+            let build = submitted.len() as u8;
+            let tx = TxEntry {
+                proof: vec![build],
+                public: TxPublic {
+                    anchor: [0x11; 32],
+                    nullifiers: vec![[0x21; 32], [0x22; 32]],
+                    commitments: vec![[0x31; 32], [0x32; 32]],
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: qlab_devnet::names::name_fee_for(op),
+                },
+                discovery: vec![0x41],
+                rider: encode_rider(Some(op)),
+            };
+            let wire = qlab_p2p::codec::encode_tx(&tx);
+            submitted.push(wire.clone());
+            Ok(wire)
+        };
+
+        names_register_with(&args, &mut build_and_submit).unwrap();
+        assert_eq!(
+            RegisterState::load(&dir).unwrap(),
+            Some(state.clone()),
+            "an accepted POST is not chain confirmation; the salt and retry state must remain"
+        );
+
+        names_register_with(&args, &mut build_and_submit).unwrap();
+        assert_eq!(submitted.len(), 2, "the unconfirmed reveal is posted again");
+        assert_eq!(
+            submitted[0], submitted[1],
+            "retry must submit the exact first transaction, not rebuild randomized bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn net_resolution_precedence() {
