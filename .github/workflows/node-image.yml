@@ -69,6 +69,18 @@ permissions:
 jobs:
   drift:
     name: is a published fleet image current with the node's code?
+    # AFTER `image`, never beside it (#616): without this ordering, a dispatch
+    # that actually built ran drift in parallel — an 8 s registry read against
+    # a 2m20s build+push — so the verdict was taken BEFORE the push existed and
+    # every successful manual build ended red. `image` is skipped on push and
+    # schedule, and a skipped need skips its dependents unless the dependent
+    # carries a status-check function in `if` — hence the pair below. NOT
+    # `always()`: that runs even when the run is cancelled, i.e. a drift
+    # verdict against a half-pushed cancelled build — the same wrong-moment
+    # reading this `needs:` exists to end. `!cancelled()` is GitHub's own
+    # recommended form and still runs drift when `image` is skipped or failed.
+    needs: [image]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
