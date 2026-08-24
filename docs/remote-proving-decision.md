@@ -410,9 +410,11 @@ design repo and changes only through its own correction process.
 
 ## 11. Scope at this handoff
 
-- The security basis is selected, but no backend service, cloud resource,
-  account system, authorization primitive, attestation path, circuit, wire,
-  genesis, or deployment was built here.
+- The security basis is selected. A later explicitly authorized, valueless-only
+  service-mechanics MVP now exists at
+  [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md). It is not a
+  public deployment, account system, Candidate A integration, attestation path,
+  circuit/wire/genesis change, or real-value authorization.
 - `CONSENSUS_CFG` remains untouched.
 - User-operated persistent proving remains out of scope.
 - The current paired-prover remains a trusted-LAN, one-request tool and must not

@@ -1,6 +1,6 @@
 # Remote proving — implementation ownership and review plan
 
-**Status: CURRENT EXECUTION ASSIGNMENT, DATED 2026-08-23. NOT IMPLEMENTATION
+**Status: CURRENT EXECUTION ASSIGNMENT, UPDATED 2026-08-24. NOT IMPLEMENTATION
 APPROVAL. This document assigns responsibilities and review gates; it does not
 authorize a circuit, wire, wallet, genesis, cloud, or deployment change. Each
 implementation phase still requires an explicit Larry start decision.**
@@ -90,6 +90,23 @@ Phase numbers are workflow ordering, not consensus version numbers. Phase 1 is
 research and may precede the design correction; Phase 3 circuit/wire work may
 not.
 
+### 4.1 Progress ledger
+
+`✅` means that exact scoped artifact is implemented and recorded; it does not
+approve the containing phase, a real-value service, deployment, or launch.
+`⬜` remains an open gate.
+
+| scoped artifact | status | evidence / remaining boundary |
+|---|---|---|
+| Phase 0 start authorization and ownership task book | ✅ | Larry explicitly started the research and later the valueless service-mechanics milestone; scope and roles are recorded here |
+| Phase 1 primitive comparator, exact intent/codecs/vectors, dummy rule and shape ruling | ✅ | [`remote-proving-authorization-spike.md`](remote-proving-authorization-spike.md) and `qlab-remote-auth`; ML-DSA rotation advances, depth 0 and both WOTS+ rows do not |
+| Phase 1 isolated D12..D16 mobile benchmark harness | ✅ | [`remote-proving-mobile-benchmark.md`](remote-proving-mobile-benchmark.md) and `qlab-remote-auth-mobile-bench`; synthetic controls and cancellation/progress seams are committed |
+| Phase 1 physical-device D12..D16 evidence and final network-wide depth | ⬜ | Two retained runs per supported physical device and Larry's depth decision are still owed |
+| Phase 5A precursor: valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) and lab PR #639; real current prover, bounded ephemeral workers, fixed refusals, read-only preflight, no submit path |
+| Phase 5A precursor: standalone deployment skeleton | ✅ | deploy PR #246; loopback-only review skeleton, not a deployment or public edge |
+| Phases 2–4 and Candidate A-bound real-value Phase 5A | ⬜ | Design correction, AIR/public values, wire/node verification, activation and wallet/mobile authorization remain unstarted |
+| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | Claude/Grok review, isolated-host measurements and a separate Larry gate remain required |
+
 ## 5. Primary-owner contract
 
 For each authorized phase, Codex must:
@@ -175,14 +192,21 @@ provider does not inherit approval merely by taking the same role name.
 
 ## 9. Current next action and scope
 
-The next eligible implementation action, after an explicit Larry start, is
-**Phase 1: the authorization spike**. It starts with the standardized stateless
-leaf/ML-DSA shape and keeps WOTS+ variants as comparators. It does not start by
-changing the AIR or transaction wire.
+**Progress update, 2026-08-24:** The completed components and open gates are
+tracked in §4.1. Phase 1 produced the ML-DSA authorization spike and isolated
+D12..D16 mobile harness, but physical-device evidence and the final depth remain
+open. Larry then explicitly started a valueless shared-service mechanics
+milestone. The resulting
+[`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) is a Phase 5A
+precursor: it exercises bounded admission, read-only preflight and ephemeral
+workers around today's real prover, but it refuses startup without a valueless
+acknowledgement and has no submit path.
 
-This plan itself changes no code, circuit, wire, `CONSENSUS_CFG`, genesis,
-cloud resource, or deployment. It selects no signature primitive and grants no
-real-value launch approval.
+This does not skip Phases 2–4. The next protocol-bearing action remains the
+binding design correction, followed by the separately reviewed Candidate A
+circuit/wire/node and wallet work. The mechanics service may proceed to CI,
+independent Internet-boundary review and valueless capacity measurement; it
+may not be interpreted as real-value implementation or launch approval.
 
 ## 10. Related records
 

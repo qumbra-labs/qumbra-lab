@@ -1,0 +1,17 @@
+[package]
+name = "qumbra-prover-service"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ctrlc = { workspace = true }
+qlab-wallet = { path = "../qlab-wallet" }
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["net", "prove"] }
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "=0.12.0"
+tiny-keccak = { version = "2", features = ["keccak"] }
+zeroize = "1.9"
