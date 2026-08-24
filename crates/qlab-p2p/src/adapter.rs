@@ -43,7 +43,7 @@ use qlab_devnet::finality::{FinalityTracker, FinalizeError};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::tally::VoteTally;
 use qlab_pow::keyblock::KeyBlockSchedule;
-use qlab_devnet::mining::mine_under;
+use qlab_devnet::mining::{grind_slice, mine_under, GrindOutcome, SliceBudget};
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
     DEGRADED_MODE_LAG_BLOCKS, DOWNTIME_JAIL_THRESHOLD_PCT, DOWNTIME_JAIL_WINDOW,
@@ -118,6 +118,44 @@ pub struct AssembledCandidate {
     pub next_seed_hash: Option<Hash32>,
 }
 
+/// A self-mining grind parked between loop iterations (lab #651): the
+/// snapshotted template plus the nonce cursor.
+///
+/// It lives on the adapter — not the node loop — because the adapter owns the
+/// tip: the abandonment trigger is [`NodeAdapter::mining_parent_hash`]
+/// answering differently than it did when the template was assembled, and
+/// only here is that question answered atomically with the resume itself (the
+/// loop would have to read the tip through an API and race its own phase).
+struct GrindState {
+    /// The parent this template extends — the staleness check's key. The tip
+    /// moving off this hash is what makes the parked work worthless (its
+    /// block would be an orphan); a clock cannot see that event.
+    parent_hash: Hash32,
+    /// The template exactly as assembled — header (nonce 0), body, seed. A
+    /// resumed grind hashes this snapshot, so the header it finds is
+    /// byte-identical to what an unsliced grind would have found.
+    candidate: AssembledCandidate,
+    /// First nonce the next slice tries; `[0, next_nonce)` are spent.
+    next_nonce: u64,
+}
+
+/// One [`NodeAdapter::mine_step`] verdict (lab #651).
+pub enum MineStep {
+    /// A block was found — the caller announces it, exactly as it would a
+    /// [`NodeAdapter::mine_block`] result.
+    Mined(BlockHeader, BlockBody),
+    /// The slice is done with no hit; the grind is parked for the next phase.
+    Yielded,
+    /// The template's nonce budget is spent — the grind is dropped. The next
+    /// permitted phase assembles a fresh template (fresh timestamp, fresh
+    /// mempool snapshot) and starts at nonce 0.
+    Exhausted,
+    /// Nothing was ground: no grind in flight and starting was not permitted
+    /// (`may_start` false), or the mining parent is unavailable (halt / lag
+    /// refusal / unknown), or assembly failed.
+    Idle,
+}
+
 /// Real wall-clock time in whole seconds since the Unix epoch (the
 /// [`MiningClock::WallClock`] source). A clock reading before the epoch (never on a
 /// sane host) reads as 0 — the parent-clamp in [`NodeAdapter::next_timestamp`] then
@@ -173,8 +211,14 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     schedule: KeyBlockSchedule,
     /// Target block time (drives LWMA + timestamps).
     block_time: u64,
-    /// Mining nonce budget per block.
+    /// Mining nonce budget per block — since lab #651 this bounds one
+    /// TEMPLATE's nonce space (exhaustion ⇒ re-assemble fresh), not one
+    /// blocking call; see [`Self::mine_step`].
     nonce_budget: u64,
+    /// The parked self-mining grind, if one is in flight (lab #651). Only
+    /// [`Self::mine_step`] reads or writes it; [`Self::mine_block`] (the
+    /// simulator/test path) grinds to completion and never parks.
+    grind: Option<GrindState>,
     /// Monotone mining clock (sim seconds) — used only by [`MiningClock::Deterministic`].
     clock: u64,
     /// How a mined block's header timestamp is chosen (item 0). Defaults to
@@ -772,6 +816,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             schedule: KeyBlockSchedule::new(sim.key_epoch_blocks, sim.key_epoch_lag),
             block_time: sim.block_time_secs,
             nonce_budget: sim.mine_nonce_budget,
+            grind: None,
             clock: 0,
             mining_clock: MiningClock::default(),
             rules: ChainRules { form, halt: qlab_devnet::halt::RuleSchedule::V1_0 },
@@ -2054,6 +2099,98 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             &self.rules,
         )?;
         Some((mined, assembled.body))
+    }
+
+    /// Resumable self-mining, one bounded slice per call (lab #651). The node
+    /// loop's mine phase calls this every iteration; each call blocks for at
+    /// most `slice` (deadline + one hash) instead of [`Self::mine_block`]'s
+    /// whole nonce budget — the defect measured at 9.4 minutes on the Windows
+    /// node, with a 67,108,864-hash worst case.
+    ///
+    /// # `may_start` gates STARTING a template, never RESUMING one
+    ///
+    /// The caller passes its `mine_interval` verdict as `may_start`, and it is
+    /// consulted only when there is no grind in flight. Gating the resume on
+    /// it would grind one slice per interval — with a 75 s interval and a
+    /// ~25 ms slice that is a ~99.97 % hashrate loss, worse than the blocking
+    /// defect this replaces.
+    ///
+    /// # Abandonment is the tip moving, not a clock
+    ///
+    /// A parked grind is resumed only while [`Self::mining_parent_hash`] still
+    /// answers the parent it was assembled on. A new mining parent (a block
+    /// arrived, a rewind, the #200 exemption switching tips) drops the parked
+    /// work — it could only produce an orphan — and assembly starts fresh in
+    /// the same call, so no phase is wasted. When no parent can be read at all
+    /// (halt / lag refusal), the grind is kept parked, not dropped: whether it
+    /// is still worth resuming is exactly the parent comparison's question,
+    /// answered when a parent can be read again. The lag gate itself
+    /// (`refuse_for_lag("mine")` inside [`Self::mining_parent_hash`]) is
+    /// untouched — it is what pulls a deaf-and-behind node back into the
+    /// chain, and slicing does not make it redundant (it still stops a
+    /// lagging node from mining a doomed template at full speed).
+    ///
+    /// `Exhausted` means the template's whole `nonce_budget` was spent: the
+    /// grind is dropped and the next permitted call re-assembles — picking up
+    /// a fresh timestamp and mempool snapshot, which is what the budget now
+    /// bounds (template staleness), not blocking time.
+    pub fn mine_step(&mut self, may_start: bool, slice: SliceBudget) -> MineStep {
+        if self.grind.is_none() && !may_start {
+            return MineStep::Idle;
+        }
+        let Some(parent_hash) = self.mining_parent_hash() else {
+            return MineStep::Idle;
+        };
+        if self.grind.as_ref().is_some_and(|g| g.parent_hash != parent_hash) {
+            self.grind = None;
+        }
+        if self.grind.is_none() {
+            if !may_start {
+                return MineStep::Idle;
+            }
+            let Some(candidate) = self.assemble_on_parent(parent_hash, self.miner_rkm, None)
+            else {
+                return MineStep::Idle;
+            };
+            self.grind = Some(GrindState { parent_hash, candidate, next_nonce: 0 });
+        }
+        let g = self.grind.as_mut().expect("grind state was just ensured");
+        match grind_slice(
+            &self.pow,
+            &g.candidate.header,
+            &g.candidate.seed_hash,
+            &self.rules,
+            g.next_nonce,
+            self.nonce_budget,
+            slice,
+        ) {
+            GrindOutcome::Found(header) => {
+                let state = self.grind.take().expect("grind state present on Found");
+                // #200 metric parity with `mine_block`: a block produced under
+                // the state-tip exemption is observed at production time.
+                if self.state_tip_mine_ready
+                    && (self.state_lag().is_lagging() || self.applied_tip().is_off_main_chain())
+                {
+                    self.metrics.observe_state_tip_mine();
+                }
+                MineStep::Mined(header, state.candidate.body)
+            }
+            GrindOutcome::Exhausted => {
+                self.grind = None;
+                MineStep::Exhausted
+            }
+            GrindOutcome::Yielded { next_nonce } => {
+                g.next_nonce = next_nonce;
+                MineStep::Yielded
+            }
+        }
+    }
+
+    /// The parked grind, if any: `(mining parent, next nonce)`. Read by the
+    /// node loop (idle-sleep suppression while grinding) and by tests; writes
+    /// nothing.
+    pub fn grind_progress(&self) -> Option<(Hash32, u64)> {
+        self.grind.as_ref().map(|g| (g.parent_hash, g.next_nonce))
     }
 
     /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
