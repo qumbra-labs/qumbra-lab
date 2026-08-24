@@ -106,7 +106,7 @@ approve the containing phase, a real-value service, deployment, or launch.
 | Phase 5A precursor: valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp.md`](remote-proving-service-mvp.md) and lab PR #639; real current prover, bounded ephemeral workers, fixed refusals, read-only preflight, no submit path |
 | Phase 5A precursor: standalone deployment skeleton | ✅ | deploy PR #246; loopback-only review skeleton, not a deployment or public edge |
 | Phases 2–4 and Candidate A-bound real-value Phase 5A | ⬜ | Design correction, AIR/public values, wire/node verification, activation and wallet/mobile authorization remain unstarted |
-| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md) freezes lab `7d689df2` + deploy `9987b554`; Grok's complete privacy report records four P1, four P2 and two advisories for the public-pilot boundary, while Claude's complete report, remediation/re-review, isolated-host measurements and a separate Larry gate remain required |
+| Independent Internet-boundary review, capacity evidence and valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md) freezes lab `7d689df2` + deploy `9987b554`; both independent reports are complete with no P0 and a reconciled four P1, four P2 and three advisories, while remediation/re-review, isolated-host measurements and a separate Larry gate remain required |
 
 ## 5. Primary-owner contract
 
@@ -212,10 +212,9 @@ may not be interpreted as real-value implementation or launch approval.
 
 The immediate service-lane action is the commit-addressed review in
 [`remote-proving-service-review-ledger.md`](remote-proving-service-review-ledger.md).
-Grok's privacy report is complete; the first security pass remains explicitly
-partial and Claude's complete report is still owed. Capacity work begins only
-after both independent reports, accepted P0/P1 remediation and commit-addressed
-re-review.
+Both independent reports are complete and no P0 was found. The immediate action
+is finding-by-finding remediation, followed by commit-addressed delta review.
+Capacity work begins only after the accepted P1 remediation and re-review.
 
 ## 10. Related records
 

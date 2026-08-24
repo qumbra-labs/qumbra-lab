@@ -35,22 +35,25 @@ until fixed or rejected with a recorded rationale and independently re-reviewed:
 
 Grok's complete privacy report is preserved in
 [#639 comment 5391355844](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391355844).
-Its verdict approves only the frozen loopback, valueless, Compose-render-only
-target. It explicitly does **not** approve an Internet-facing pilot. The table
-uses the higher reported severity where the two passes differ:
+Claude's complete Internet-boundary report is preserved in
+[#639 comment 5391401951](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391401951).
+Both verdicts approve only the frozen loopback, valueless,
+Compose-render-only target. Neither approves an Internet-facing pilot. The
+table uses the higher reported severity where the reports differ:
 
 | effective severity | status | source | finding / required disposition |
 |---|---|---|---|
-| P1 | OPEN | both | `tiny_http::Server::http` has no accepted-socket read deadline or connection cap. `MAX_HTTP_HANDLERS` begins after a request has been received, so unauthenticated slow/incomplete headers can consume listener resources before admission accounting. |
-| P1 | OPEN | security pass P2; Grok P1 | Unauthenticated `/healthz` exposes `queued`, `running`, `retained`, `queue_capacity` and `build_revision`, enabling load/timing observation and exact version fingerprinting. Public liveness needs no per-service activity counters. |
-| P1 | OPEN | Grok | A compromised same-UID worker can read the mounted shared API token; one stolen credential is the entire experiment identity and can retrieve any separately leaked job capability. |
-| P1 | OPEN | Grok | The default bridge provides no egress allowlist, so a compromised worker that holds the current spend-authority bundle can exfiltrate it to arbitrary destinations. |
+| P1 | ACCEPTED / UNRESOLVED | Claude + Grok | `tiny_http::Server::http` has no accepted-socket read deadline or connection cap. `MAX_HTTP_HANDLERS` begins after a request has been received, so unauthenticated slow/incomplete headers can consume listener resources before admission accounting. |
+| P1 | ACCEPTED / UNRESOLVED | Claude P2; Grok P1 | Unauthenticated `/healthz` exposes `queued`, `running`, `retained`, `queue_capacity` and `build_revision`, enabling load/timing observation and exact version fingerprinting. Public liveness needs no per-service activity counters. |
+| P1 | ACCEPTED / UNRESOLVED | Grok | A compromised same-UID worker can read the mounted shared API token; one stolen credential is the entire experiment identity and can retrieve any separately leaked job capability. |
+| P1 | ACCEPTED / UNRESOLVED | Claude P2; Grok P1 | The default bridge provides no egress allowlist, so a compromised worker that holds the current spend-authority bundle can exfiltrate it to arbitrary destinations. |
 | P2 | OPEN | Grok | A client-chosen idempotency key may be a stable cross-attempt identifier and its reuse-conflict response is an existence oracle during retention. |
 | P2 | OPEN | Grok | A shared bearer plus a leaked job identifier can retrieve another caller's full artifact; there is no per-install or per-job holder binding. |
-| P2 | OPEN | Grok | Nullifier preflight spans `0..=tip` and the reachable HTTP read has no response-byte ceiling, permitting a pinned or compromised upstream to amplify memory while the witness remains resident. |
-| P2 | OPEN | Grok | Host swap or crash collection can outlive the claimed in-process retention window; core disablement alone does not close host/cloud persistence. |
-| Advisory | OPEN | both | `ApiToken::matches` uses a hand-written compare without an optimizer-resistant constant-time primitive. Decide whether to replace it or retain it with a documented rationale. |
+| P2 | ACCEPTED / UNRESOLVED | Claude + Grok | Nullifier preflight spans `0..=tip` and the reachable HTTP read has no response-byte ceiling, permitting a pinned or compromised upstream to amplify memory while the witness remains resident. |
+| P2 | ACCEPTED / UNRESOLVED | Claude + Grok | Host swap or crash collection can outlive the claimed in-process retention window; `WitnessBundle` itself is not zeroized, and core disablement alone does not close host/cloud persistence. |
+| Advisory | ACCEPTED / UNRESOLVED | Claude + Grok | `ApiToken::matches` uses a hand-written compare without an optimizer-resistant constant-time primitive. Replace it rather than retain a bespoke security primitive. |
 | Advisory | OPEN | Grok | `health()` always returns `ready: true`; it must not be treated as prover readiness or idleness. |
+| Advisory | OPEN | Claude | One shared-token holder can occupy the 64 retained-job slots for the TTL; this becomes cross-client admission denial if authentication is shared. |
 
 The same pass found the following properties holding in the immutable lab
 target once a request reaches application handling: handler accounting
@@ -60,19 +63,28 @@ and the API token zeroize on drop; TTL cleanup also bounds the idempotency map;
 and duplicate authorization headers are refused. These are retained
 observations, not a verdict.
 
-Grok independently confirmed that the current service crate has no
-`spend::submit` call, requests cannot select upstream URLs, inherited worker
-environment is cleared, worker errors are allowlisted, job identifiers are
-unguessable, results are TTL-bounded in process memory, and the Compose
-skeleton is loopback-only with the documented privilege/mount limits. It also
-confirmed that `env_clear` is not worker isolation and that the architecture's
-external ingress is absent from the skeleton. Claude still owes the broader
-security/call-graph review specified below.
+The two reports independently confirmed that requests cannot select upstream
+URLs, inherited worker environment is cleared, worker errors are allowlisted,
+job identifiers are unguessable, results are TTL-bounded in process memory,
+and the Compose skeleton is loopback-only with the documented privilege/mount
+limits. Claude additionally verified in-app SSRF and redirect resistance, TLS
+roots and timeouts, worker framing/cancellation, every fixed-error branch and
+the no-submission property through the reachable call graph. Grok correctly
+retains the filesystem distinction: clearing the child's environment does not
+stop that same-UID child reading the mounted token file. The external ingress
+shown in the architecture is absent from the deployment skeleton.
 
 ## 3. Required independent coverage
 
-Claude Code must independently reproduce or reject the recorded findings and
-complete every service-security invariant. At minimum its report must cover:
+Claude Code's independent service-security assignment is **COMPLETE for the
+immutable target** in comment 5391401951. It covered the required areas,
+including call-graph-level no-submission verification, and disclosed its unrun
+live listener, fuzzing and capacity scope. Its lower severity for egress and
+its failure to elevate same-UID filesystem token access do not override Grok's
+higher public-boundary finding; the implementation owner accepts the stricter
+classification.
+
+The completed Claude report covered:
 
 - every request field and dependency call path for request-selected endpoints,
   redirects, DNS rebinding, upstream identity, response byte/time ceilings and
@@ -112,8 +124,7 @@ anything not reviewed or run, and post a commit-addressed report on lab PR
 The review gate remains open until all of the following are recorded:
 
 1. Claude's complete Internet-boundary report and Grok's independent privacy
-   report both target the two commits in §1; Grok is complete and Claude is
-   still owed;
+   report both target the two commits in §1; both are complete;
 2. Codex records a fix or reasoned rejection for every finding;
 3. every accepted P0/P1 is fixed in a scoped PR with regression coverage;
 4. both reviewers inspect the immutable remediation commit and explicitly

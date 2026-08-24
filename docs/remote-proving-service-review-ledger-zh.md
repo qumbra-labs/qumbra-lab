@@ -32,21 +32,24 @@ ingress。
 
 Grok 的完整 privacy report 保存在
 [#639 comment 5391355844](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391355844)。
-它只批准 frozen loopback、valueless、仅 Compose render 的 target，并明确**不批准**
-Internet-facing pilot。两轮 severity 不一致时，下表采用更高等级：
+Claude 的完整 Internet-boundary report 保存在
+[#639 comment 5391401951](https://github.com/qumbra-labs/qumbra-lab/pull/639#issuecomment-5391401951)。
+两份 verdict 都只批准 frozen loopback、valueless、仅 Compose render 的 target；都不批准
+Internet-facing pilot。报告 severity 不一致时，下表采用更高等级：
 
 | Effective severity | 状态 | 来源 | Finding／所需处理 |
 |---|---|---|---|
-| P1 | OPEN | 两者 | `tiny_http::Server::http` 没有 accepted-socket read deadline 或 connection cap。`MAX_HTTP_HANDLERS` 在完整 request 已被接收后才计数，因此 unauthenticated slow/incomplete headers 可以在 admission accounting 之前消耗 listener resources。 |
-| P1 | OPEN | security pass P2；Grok P1 | 未认证 `/healthz` 暴露 `queued`、`running`、`retained`、`queue_capacity` 与 `build_revision`，可以观察 load/timing 并做精确 version fingerprinting。Public liveness 不需要这些逐服务 activity counters。 |
-| P1 | OPEN | Grok | 被攻破的 same-UID worker 可以读取 mounted shared API token；一个泄露 credential 就代表整个 experiment identity，并能读取任何另行泄露 job capability 对应的结果。 |
-| P1 | OPEN | Grok | Default bridge 没有 egress allowlist，因此持有当前 spend-authority bundle 的 compromised worker 可以向任意目的地 exfiltrate。 |
+| P1 | ACCEPTED / UNRESOLVED | Claude + Grok | `tiny_http::Server::http` 没有 accepted-socket read deadline 或 connection cap。`MAX_HTTP_HANDLERS` 在完整 request 已被接收后才计数，因此 unauthenticated slow/incomplete headers 可以在 admission accounting 之前消耗 listener resources。 |
+| P1 | ACCEPTED / UNRESOLVED | Claude P2；Grok P1 | 未认证 `/healthz` 暴露 `queued`、`running`、`retained`、`queue_capacity` 与 `build_revision`，可以观察 load/timing 并做精确 version fingerprinting。Public liveness 不需要这些逐服务 activity counters。 |
+| P1 | ACCEPTED / UNRESOLVED | Grok | 被攻破的 same-UID worker 可以读取 mounted shared API token；一个泄露 credential 就代表整个 experiment identity，并能读取任何另行泄露 job capability 对应的结果。 |
+| P1 | ACCEPTED / UNRESOLVED | Claude P2；Grok P1 | Default bridge 没有 egress allowlist，因此持有当前 spend-authority bundle 的 compromised worker 可以向任意目的地 exfiltrate。 |
 | P2 | OPEN | Grok | Client-chosen idempotency key 可能成为跨 attempt 的稳定 identifier；retention 期间 reuse-conflict response 还是 existence oracle。 |
 | P2 | OPEN | Grok | Shared bearer 加泄露 job identifier 可以读取其他 caller 的完整 artifact；没有 per-install 或 per-job holder binding。 |
-| P2 | OPEN | Grok | Nullifier preflight 覆盖 `0..=tip`，可达 HTTP read 没有 response-byte ceiling；pinned/compromised upstream 可以在 witness 仍驻留时放大内存。 |
-| P2 | OPEN | Grok | Host swap 或 crash collection 可以活得比 in-process retention window 更久；只禁用 core 不能关闭 host/cloud persistence。 |
-| Advisory | OPEN | 两者 | `ApiToken::matches` 使用手写 compare，没有 optimizer-resistant constant-time primitive。需要决定替换，或保留并记录理由。 |
+| P2 | ACCEPTED / UNRESOLVED | Claude + Grok | Nullifier preflight 覆盖 `0..=tip`，可达 HTTP read 没有 response-byte ceiling；pinned/compromised upstream 可以在 witness 仍驻留时放大内存。 |
+| P2 | ACCEPTED / UNRESOLVED | Claude + Grok | Host swap 或 crash collection 可以活得比 in-process retention window 更久；`WitnessBundle` 本身没有 zeroize，只禁用 core 不能关闭 host/cloud persistence。 |
+| Advisory | ACCEPTED / UNRESOLVED | Claude + Grok | `ApiToken::matches` 使用手写 compare，没有 optimizer-resistant constant-time primitive。直接替换，不保留自制 security primitive。 |
 | Advisory | OPEN | Grok | `health()` 永远返回 `ready: true`；不能把它当成 prover readiness 或 idleness。 |
+| Advisory | OPEN | Claude | 一个 shared-token holder 可以在 TTL 内占满 64 个 retained-job slots；authentication 被多个 client 共享后，这会成为 cross-client admission denial。 |
 
 同一轮检查认为 immutable lab target 在 request 进入 application handling 后的以下性质成立：
 handler accounting 先于 authorization 与 body parsing；同时执行 declared 与 actual body
@@ -54,16 +57,23 @@ ceilings；cancel/timeout 会 kill 并 reap child；`SecretBytes` 与 API token 
 zeroize；TTL cleanup 同时约束 idempotency map；重复 authorization headers 会被拒绝。
 这些只是保留的 observations，不是 verdict。
 
-Grok 独立确认：当前 service crate 没有 `spend::submit` call，request 不能选择 upstream URL，
-worker inherited environment 已清空，worker error 有 allowlist，job identifiers 不可猜，result
-在 process memory 中受 TTL 约束，Compose skeleton 保持 loopback-only 并具备已记录的
-privilege/mount limits。它也确认 `env_clear` 不是 worker isolation，架构图里的 external
-ingress 并未出现在 skeleton 中。Claude 仍需完成下述更广的 security/call-graph review。
+两份报告独立确认：request 不能选择 upstream URL，worker inherited environment 已清空，
+worker error 有 allowlist，job identifiers 不可猜，result 在 process memory 中受 TTL 约束，
+Compose skeleton 保持 loopback-only 并具备已记录的 privilege/mount limits。Claude 还验证了
+in-app SSRF/redirect resistance、TLS roots/timeouts、worker framing/cancellation、全部 fixed-error
+branches，以及 reachable call graph 上的 no-submission property。Grok 正确保留了 filesystem
+区别：清空 child environment 不能阻止 same-UID child 读取 mounted token file。架构图里的
+external ingress 并未出现在 deployment skeleton 中。
 
 ## 3. 必须完成的独立覆盖
 
-Claude Code 必须独立复现或否定已记录 finding，并完成所有 service-security invariants。
-最低覆盖范围：
+Claude Code 的独立 service-security assignment 对 immutable target 已**完成**，记录在 comment
+5391401951。它覆盖了要求的 areas，包括 call-graph-level no-submission verification，并披露
+未运行 live listener、fuzzing 与 capacity。它对 egress 的较低 severity，以及未把 same-UID
+filesystem token access 升级，不能推翻 Grok 较高的 public-boundary finding；implementation
+owner 采用更严格分级。
+
+已完成的 Claude report 覆盖：
 
 - 沿所有 request fields 与 dependency call paths 检查 request-selected endpoint、redirect、
   DNS rebinding、upstream identity、response byte/time ceilings 与 SSRF；
@@ -97,7 +107,7 @@ commit-addressed report。两位 reviewer 都不修改 implementation branch。
 只有以下项目全部留档，review gate 才能关闭：
 
 1. Claude 的完整 Internet-boundary report 与 Grok 的独立 privacy report 都针对 §1 的
-   两个 commits；Grok 已完成，Claude 仍未完成；
+   两个 commits；两者均已完成；
 2. Codex 对每条 finding 留下 fix 或 reasoned rejection；
 3. 每个被接受的 P0/P1 都在 scoped PR 中修复并带 regression coverage；
 4. 两位 reviewer 都检查 immutable remediation commit，并逐条交代原 findings 与所需覆盖

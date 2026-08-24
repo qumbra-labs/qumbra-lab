@@ -101,7 +101,7 @@ service、deployment 或 launch。`⬜` 表示 gate 仍未关闭。
 | Phase 5A precursor：valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 与 lab PR #639；真实当前 prover、有界 ephemeral worker、固定 refusal、read-only preflight、无 submit path |
 | Phase 5A precursor：standalone deployment skeleton | ✅ | deploy PR #246；loopback-only review skeleton，不是 deployment 或 public edge |
 | Phase 2–4 与 Candidate A-bound 真实价值 Phase 5A | ⬜ | Design correction、AIR/public values、wire/node verification、activation 与 wallet/mobile authorization 尚未启动 |
-| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 固定 lab `7d689df2` + deploy `9987b554`；Grok 的完整 privacy report 为 public-pilot boundary 记录了四条 P1、四条 P2 与两条 advisory，仍需 Claude 完整 report、remediation/re-review、隔离 host 实测和 Larry 单独 gate |
+| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 固定 lab `7d689df2` + deploy `9987b554`；两份 independent reports 均已完成，没有 P0，合并后为四条 P1、四条 P2 与三条 advisory；仍需 remediation/re-review、隔离 host 实测和 Larry 单独 gate |
 
 ## 5. Primary owner contract
 
@@ -193,9 +193,9 @@ implementation 或 launch approval。
 
 Service lane 的立即下一步是
 [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md)
-定义的 commit-addressed review。Grok privacy report 已完成；首轮 security 检查仍明确只是
-partial，Claude 的完整 report 仍未完成。只有两份独立 report、被接受 P0/P1 的 remediation
-与 commit-addressed re-review 完成后，才开始 capacity 工作。
+定义的 commit-addressed review。两份 independent reports 均已完成，没有发现 P0。立即行动
+转为逐项 remediation，随后做 commit-addressed delta review。只有被接受 P1 的 remediation
+与 re-review 完成后，才开始 capacity 工作。
 
 ## 10. 相关记录
 
