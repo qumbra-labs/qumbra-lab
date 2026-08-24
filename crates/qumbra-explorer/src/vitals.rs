@@ -221,7 +221,7 @@ mod tests {
         // Assembled the way the node does it: tip 16_051 over finalized 16_048
         // derives stall_depth 3 — the sample carries the derived field, not a
         // re-derivation of its own.
-        let tele = Telemetry::assemble(16_051, Some(16_048), 42, 2, 7, 0, 64);
+        let tele = Telemetry::assemble(16_051, Some(16_048), Some(42), 2, 7, 0, 64);
         let got = sample_of(1_787_000_060, &tele);
         assert_eq!(
             got,

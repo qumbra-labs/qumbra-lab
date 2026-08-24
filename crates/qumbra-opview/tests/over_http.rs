@@ -33,7 +33,7 @@ fn telem_durable(
     signed: Option<(u64, Option<u64>)>,
     durable: Option<(u64, u8)>,
 ) -> Telemetry {
-    let base = Telemetry::assemble(fin + 24, Some(fin), 75, 0, 3, 1, MAX_LAG)
+    let base = Telemetry::assemble(fin + 24, Some(fin), Some(75), 0, 3, 1, MAX_LAG)
         .with_checkpoint(Some(fid), signed.map(|(slot, id)| LocalCommitment { slot, id }))
         .with_tip_difficulty(Some(1_048_576));
     base.with_durable_head(durable.map(|(height, first)| {

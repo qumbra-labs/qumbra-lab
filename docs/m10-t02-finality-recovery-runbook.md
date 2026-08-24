@@ -69,7 +69,8 @@ from block timestamps (chain-time), so it is deterministic, not wall-clock.
 > covers the state every fresh net actually boots into: genesis is finalized as a
 > **bootstrap act**, not by a checkpoint round, so from start until the first
 > non-genesis checkpoint (slot 8, ≈10 min at 75 s) every node shows `final=0` and
-> `age_s=-` (`last_finalized_age_secs` = 0 on the wire). Before this fix the field
+> `age_s=-` (`last_finalized_age_secs` = `None`; `0` on the wire, which is why the
+> reader derives the refusal from `finalized_height` — lab #633). Before this fix the field
 > differenced the WallClock tip against genesis's `timestamp = 0` placeholder and
 > printed the wall clock itself (`age_s=1785352360` on all four nodes of the #119
 > run) — garbage precisely when a new net is watched hardest. **During this window
@@ -78,6 +79,25 @@ from block timestamps (chain-time), so it is deterministic, not wall-clock.
 > `stall_depth` 16 (2× cadence), `finality_status` flips to Degraded on its own,
 > with no age input needed.** `age_s` joins at the first non-genesis checkpoint,
 > which is also how you confirm the window ended.
+>
+> 🔴 **Learn-ahead window (added 2026-08-24, lab #633) — the one that does not
+> always end.** `final=` is the committee tracker's head; the age's base is **fork
+> choice's** finalized pointer, and those are two different heads (issue #85's
+> `fback=`). A node that verified a quorum before it held the block has the first
+> and not the second, and `age_s` used to fall back to the genesis hash there and
+> publish **the tip's absolute chain timestamp** — measured `age_s=1787483455` on a
+> fresh Ubuntu node and `1787506224` on a fresh Windows 11 one, both beside a
+> perfectly legitimate `final=`. It now reads `-`. **Read `fback=heard` as "the age
+> half of the alarm is unavailable on this node", and run on `stall` alone**, exactly
+> as in the two windows above. Unlike them, this one has no guaranteed end: fork
+> choice's pointer is never retried, so it clears only when the next checkpoint
+> finalizes locally — which is precisely what a genuinely stalled node never does.
+>
+> **One instrument still shows `0` here rather than `-`: `qumbra-opview`.** It reads
+> the binary `/v1/telemetry` payload, and the refusal has no encoding in the eight
+> bytes reserved for the age at `RPC_VERSION 0x07`. The node's own stdout line and
+> `qumbra-explorer` are correct. **On an opview row, `age_s=0` beside a large
+> `stall` is this state, not a freshly-finalized head.**
 
 ## 3. Triage — is it the committee or the network?
 

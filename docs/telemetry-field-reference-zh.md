@@ -695,11 +695,25 @@ WAN 节奏下实测：1,707 个区间的平均 86 s、中位 60 s、p99 320 s（
 运维习惯的单位（「卡了多久」而不是「落后多少块」）。**是链上时间，不是墙上时间：** 它由
 区块时间戳推导，在链确定的前提下是确定性的。
 
-**`age_s=-` 不是错误，也不是零。** 它覆盖两种给不出诚实数字的状态
-（`Telemetry::age_field`，`telemetry.rs:527`）：完全没有终结过，以及已终结头仍是创世块。
-创世块的 `timestamp = 0` 是为了让创世哈希可复现而钉死的，拿一个墙上时钟的链尖去减它，
-打印出来的是整个 Unix 纪元 —— 在 `issue #73` 修掉之前，每个新网的每个节点都读
-`age_s=1785352360`。
+**`age_s=-` 不是错误，也不是零。** 它覆盖 **三** 种给不出诚实数字的状态
+（`Telemetry::age_field` 是唯一的渲染规则，其背后唯一的算术是
+`qlab_node::telemetry::finalized_age_secs`）：
+
+1. 完全没有终结过；
+2. 已终结头仍是创世块。创世块的 `timestamp = 0` 是为了让创世哈希可复现而钉死的，拿一个
+   墙上时钟的链尖去减它，打印出来的是整个 Unix 纪元 —— 在 `issue #73` 修掉之前，每个新网
+   的每个节点都读 `age_s=1785352360`；
+3. **（2026-08-24 新增，lab #633）** 一个真实的、非创世的 `final=`，但本节点无法测量它的
+   年龄。`final=` 读的是委员会跟踪器的头；而年龄的基准来自 **分叉选择** 的已终结指针 ——
+   一个在自己的区块头之前就验证了法定票数的节点（`fback=heard`）有前者而没有后者。旧代码
+   在那里回落到创世哈希，于是把链尖的绝对链上时间戳当作年龄发布出去 —— 一台 Ubuntu 节点
+   读 `age_s=1787483455`，一台 Windows 11 节点读 `1787506224`，两台都是刚启动的，两台的
+   `final=` 都完全合法。**这就是为什么第 2 条的护栏抓不到它：那道护栏校验的是高度，而被
+   污染的是时间戳。**
+
+⚠️ **第 3 条并不总会自愈，这正是要点。** 分叉选择的指针不会重试，所以这个状态会一直持续
+到下一个检查点在本地终结为止 —— 而在一个终结确实卡死的节点上，那永远不会发生。健康网络上
+它几分钟内消失；在这个字段本就是为之而存在的那一种情形里，它根本没有消失。
 
 **正常值。** 小，量级约为「周期 × 出块时间」≈ 8 × 75 s = 600 s；或在没有终结到创世块以上
 的网上是 `-`。
@@ -712,9 +726,21 @@ WAN 节奏下实测：1,707 个区间的平均 86 s、中位 60 s、p99 320 s（
 **何时升级：** 配合 `regime=Degraded` 和上升的 `stall`，按 runbook 的描述。不要单独用它，
 更不要对 `-` 用。
 
-**由这些测试锁定：** `telemetry_age_is_dash_when_nothing_finalized`（`run.rs:2318`）、
-`telemetry_age_is_dash_at_genesis_then_real_after_first_checkpoint`（`run.rs:2340`）、
-`age_field_is_dash_until_a_real_checkpoint_finalizes`（`telemetry.rs:740`）。
+**由这些测试锁定：** `telemetry_age_is_dash_when_nothing_finalized` 与
+`telemetry_age_is_dash_at_genesis_then_real_after_first_checkpoint`（均在
+`qumbra-node/src/run.rs`）、`age_field_is_dash_until_a_real_checkpoint_finalizes`
+（`qlab-node/src/telemetry.rs`），以及 lab #633 新增的
+`telemetry_age_is_dash_when_the_quorum_is_ahead_of_this_nodes_headers`
+（`qumbra-node/src/run.rs`）、`finalized_age_secs_refuses_every_route_it_cannot_measure`
+与 `age_field_refuses_an_unmeasurable_age_at_a_real_finalized_height`（均在
+`qlab-node/src/telemetry.rs`）。行号已删除而非重新钉死：原先那三个都已漂移。
+
+🔴 **有一个读者还看不到第 3 条的 `-`。** 这个拒绝在 `/v1/telemetry` 为年龄预留的八个字节
+里没有编码，所以它以 `0` 的形式过线。节点自己的 `TELEMETRY` 行和 `qumbra-explorer`（在
+进程内组装快照）都正确渲染 `-`；**而解码线格式的 `qumbra-opview` 渲染 `age_s=0`。** 要
+关掉这个缺口需要在载荷尾部加一个存在字节并抬升 `RPC_VERSION`，而 lab #633 有意没有动它。
+`the_wire_cannot_carry_a_refusal_at_a_real_finalized_height` 锁定了当前行为，好让那次抬升
+必须去改一个测试，而不是安静地继承它。
 
 ---
 

@@ -830,12 +830,30 @@ same stall as `stall=` but in the unit an operator reasons in ("how long stuck"
 rather than "how many blocks behind"). **Chain time, not wall time:** it is
 derived from block timestamps and is deterministic given the chain.
 
-**`age_s=-` is not an error and not a zero.** It covers two states in which no
-number would be honest (`Telemetry::age_field`, `telemetry.rs:527`): nothing
-finalized at all, and the finalized head still being genesis. Genesis is stamped
-`timestamp = 0` so that the genesis hash is reproducible, and differencing a
-wall-clock tip against it printed the whole Unix epoch — `age_s=1785352360` on
-every node of a fresh net, before `issue #73` fixed it.
+**`age_s=-` is not an error and not a zero.** It covers **three** states in which
+no number would be honest (`Telemetry::age_field` is the one rendering rule, and
+`qlab_node::telemetry::finalized_age_secs` the one arithmetic behind it):
+
+1. nothing finalized at all;
+2. the finalized head still being genesis. Genesis is stamped `timestamp = 0` so
+   that the genesis hash is reproducible, and differencing a wall-clock tip against
+   it printed the whole Unix epoch — `age_s=1785352360` on every node of a fresh
+   net, before `issue #73` fixed it;
+3. **(added 2026-08-24, lab #633)** a real, non-genesis `final=` whose age this
+   node cannot measure. `final=` is the committee tracker's head; the age's base is
+   **fork choice's** finalized pointer, and a node that verified a quorum ahead of
+   its own headers (`fback=heard`) has the first and not the second. The old code
+   fell back to the genesis hash there and republished the tip's absolute chain
+   timestamp as an age — `age_s=1787483455` on an Ubuntu node and `1787506224` on
+   a Windows 11 one, both freshly started, `final=` perfectly legitimate on both.
+   **This is why route 2's guard could not catch it: that guard validates the
+   height, and the corruption was in the timestamp.**
+
+⚠️ **Route 3 does not always self-heal, and that is the point.** Fork choice's
+pointer is not retried, so the state persists until the next checkpoint finalizes
+locally — which never happens on a node whose finality is genuinely stalled. On a
+healthy net it clears in minutes; in the one situation this field exists to detect,
+it did not clear at all.
 
 **Normal value.** Small, on the order of the cadence × block time ≈ 8 × 75 s = 600
 s, or `-` on a net that has not finalized above genesis.
@@ -849,10 +867,25 @@ start** — a recorded caveat from PR #72; see
 **Escalate when:** together with `regime=Degraded` and a climbing `stall`, as the
 runbook describes. Not on its own, and never on `-`.
 
-**Locked by:** `telemetry_age_is_dash_when_nothing_finalized` (`run.rs:2318`),
-`telemetry_age_is_dash_at_genesis_then_real_after_first_checkpoint`
-(`run.rs:2340`), `age_field_is_dash_until_a_real_checkpoint_finalizes`
-(`telemetry.rs:740`).
+**Locked by:** `telemetry_age_is_dash_when_nothing_finalized` and
+`telemetry_age_is_dash_at_genesis_then_real_after_first_checkpoint` (both
+`qumbra-node/src/run.rs`), `age_field_is_dash_until_a_real_checkpoint_finalizes`
+(`qlab-node/src/telemetry.rs`), and — lab #633 —
+`telemetry_age_is_dash_when_the_quorum_is_ahead_of_this_nodes_headers`
+(`qumbra-node/src/run.rs`),
+`finalized_age_secs_refuses_every_route_it_cannot_measure` and
+`age_field_refuses_an_unmeasurable_age_at_a_real_finalized_height` (both
+`qlab-node/src/telemetry.rs`). Line numbers dropped rather than re-pinned: the
+three that were here had all drifted.
+
+🔴 **One reader does NOT see route 3's `-` yet.** The refusal has no encoding in
+the eight bytes `/v1/telemetry` reserves for the age, so it crosses the wire as
+`0`. The node's own `TELEMETRY` line and `qumbra-explorer` (which assembles the
+snapshot in-process) render `-` correctly; **`qumbra-opview`, which decodes the
+wire, renders `age_s=0`.** Closing that needs a presence byte at the payload tail
+and an `RPC_VERSION` bump, which lab #633 deliberately did not take.
+`the_wire_cannot_carry_a_refusal_at_a_real_finalized_height` locks the current
+behaviour so the bump has to change a test rather than inherit it quietly.
 
 ---
 

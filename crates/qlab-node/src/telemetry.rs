@@ -641,17 +641,24 @@ pub struct Telemetry {
     /// Stall depth = `tip − finalized` (or `tip` if nothing is finalized).
     pub stall_depth: u64,
     /// Chain-time seconds since the last finalized checkpoint (tip block timestamp
-    /// − finalized block timestamp). Derived from block timestamps, so it is
-    /// deterministic — no wall clock.
+    /// − finalized block timestamp), or **`None` — *"this node cannot measure
+    /// one"***. Derived from block timestamps, so it is deterministic — no wall
+    /// clock.
     ///
-    /// **0, and rendered `-`, while there is no finalized checkpoint to measure
-    /// from** — nothing finalized (S8) *or* the finalized head still genesis
-    /// (issue #73). Genesis is finalized as a bootstrap act, not by a checkpoint
-    /// round (`is_checkpoint_height`: genesis is never a slot), and its timestamp
-    /// is the `0` placeholder — differencing a `WallClock` tip against it printed
-    /// the whole Unix epoch (`age_s=1785352360` on every node of a fresh net).
-    /// See [`Self::age_field`], the one rendering rule for this field.
-    pub last_finalized_age_secs: u64,
+    /// 🔴 **`None` is a value, not a missing number** (lab #633). Every route to
+    /// *"there is no age to state"* goes through it, and [`finalized_age_secs`] is
+    /// the single place that decides which routes those are: nothing finalized
+    /// (S8), the finalized head still genesis (issue #73), or the fork-choice
+    /// head's finalized pointer absent (lab #633). This was a bare `u64` whose
+    /// `0` had to be read together with `finalized_height` to mean anything, and
+    /// #633's route produced neither a `0` nor a guardable height — it produced
+    /// the tip's absolute chain timestamp.
+    ///
+    /// See [`Self::age_field`], the one rendering rule for this field, and
+    /// [`finalized_age_secs`], the one arithmetic behind it.
+    ///
+    /// 🔴 **The wire does not carry every `None`** — see [`Self::to_bytes`].
+    pub last_finalized_age_secs: Option<u64>,
     /// Connected peer count (injected from the P2P layer).
     pub peer_count: u64,
     /// Pending mempool size.
@@ -713,6 +720,46 @@ pub struct Telemetry {
     pub durable: DurableView,
 }
 
+/// **The one arithmetic behind `age_s`** — the chain-time gap between the tip and
+/// the finalized checkpoint, or `None` when this node cannot measure one.
+///
+/// Every producer of [`Telemetry::last_finalized_age_secs`] calls this, for the
+/// reason [`Telemetry::age_field`] is the one *rendering* rule (the #117
+/// discipline). Three copies of this subtraction existed before lab #633 —
+/// `qumbra_node::run::RunningNode::telemetry`, [`crate::rpc::NodeRpc`], and a
+/// `qlab_p2p` test helper — and they did not agree on what a missing input meant.
+///
+/// 🔴 **There is no fallback on any input**, and that is the whole change:
+///
+/// * `finalized_height` is the **committee tracker's** head (head #1). `None` and
+///   `Some(0)` are both *"no finalized checkpoint"* — nothing finalized (S8,
+///   PR #72), and the bootstrap finalization of genesis, which is not a checkpoint
+///   round and whose `timestamp = 0` placeholder is not a time (issue #73).
+/// * `finalized_ts` is the timestamp of the block the **fork-choice head** (head
+///   #2) has its finalized pointer on, and `None` when that pointer is absent.
+///   That is the ordinary state of a node that verified a quorum ahead of its own
+///   headers (issue #85's `fback=heard`), and it is **lab #633**: this arithmetic
+///   used to fall back to the GENESIS hash and difference against its `0`, so the
+///   field published the tip's absolute chain timestamp as an age — `1787483455`
+///   and `1787506224`, measured on two nodes on two operating systems.
+/// * `tip_ts` is `None` when the tip header is not in this store. No store in the
+///   tree can be in that state — a tip is a header it holds — and it is an
+///   `Option` anyway, because the alternative is an `unwrap_or(0)` that is *also*
+///   unreachable today and would fabricate a number the day it stopped being.
+///
+/// `saturating_sub` keeps a tip timestamp below the finalized one — which the
+/// header rules permit inside the drift window — at `0` rather than wrapping.
+pub fn finalized_age_secs(
+    finalized_height: Option<u64>,
+    tip_ts: Option<u64>,
+    finalized_ts: Option<u64>,
+) -> Option<u64> {
+    match finalized_height {
+        None | Some(0) => None,
+        Some(_) => Some(tip_ts?.saturating_sub(finalized_ts?)),
+    }
+}
+
 impl Telemetry {
     /// Assemble a snapshot from the node-owned facts + the injected network facts.
     /// `max_lag` is the degraded-mode threshold
@@ -723,7 +770,7 @@ impl Telemetry {
     pub fn assemble(
         tip_height: u64,
         finalized_height: Option<u64>,
-        last_finalized_age_secs: u64,
+        last_finalized_age_secs: Option<u64>,
         mempool_size: u64,
         peer_count: u64,
         epoch: u64,
@@ -749,7 +796,7 @@ impl Telemetry {
     pub fn assemble_with_halt(
         tip_height: u64,
         finalized_height: Option<u64>,
-        last_finalized_age_secs: u64,
+        last_finalized_age_secs: Option<u64>,
         mempool_size: u64,
         peer_count: u64,
         epoch: u64,
@@ -760,6 +807,22 @@ impl Telemetry {
         let stall_depth = match finalized_height {
             Some(fh) => tip_height.saturating_sub(fh),
             None => tip_height,
+        };
+        // 🔴 **An age at a head that does not exist is not representable** (lab
+        // #633). `finalized_height` and the age are one fact, not two, and this is
+        // the one place a snapshot is assembled — so the contradiction is closed
+        // here rather than left for each reader to guard, which is precisely the
+        // mistake #73's fix made and this baton is undoing. Same rule as
+        // [`finalized_age_secs`]'s first arm, applied to whatever a caller passed.
+        //
+        // It is also what makes the wire round-trip **total**: `decode_body`
+        // rebuilds the refusal from `finalized_height` in exactly these two cases,
+        // so if `Some(x)` were constructible beside them, encode → decode would
+        // silently drop the `x`. Compare [`Self::with_durable_head`], where a
+        // half-present pair is unrepresentable for the same reason.
+        let last_finalized_age_secs = match finalized_height {
+            None | Some(0) => None,
+            Some(_) => last_finalized_age_secs,
         };
         Self {
             finality_status,
@@ -915,21 +978,33 @@ impl Telemetry {
         self.tip_difficulty.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
     }
 
-    /// The `age_s=` field: `-` while there is no finalized **checkpoint** to
-    /// measure an age from, else [`Self::last_finalized_age_secs`].
+    /// The `age_s=` field: `-` while there is no age this node can state, else
+    /// [`Self::last_finalized_age_secs`].
     ///
-    /// `-` covers two states an operator must not read a number in: nothing
-    /// finalized at all (S8, PR #72), and the finalized head still genesis
-    /// (issue #73) — the bootstrap finalization every fresh net starts from, which
-    /// is not a checkpoint round and whose `timestamp = 0` placeholder is not a
-    /// time. The rule keys on `finalized_height == Some(0)` rather than on the
-    /// timestamp because height 0 IS genesis on every net, and height is what this
-    /// wire carries — so the log line, `qumbra-opview` and any other reader derive
-    /// the same `-` from the same snapshot (the #117 discipline).
+    /// `-` covers **three** states an operator must not read a number in, and the
+    /// third is why the value is an `Option`:
+    ///
+    /// 1. nothing finalized at all (S8, PR #72);
+    /// 2. the finalized head still genesis (issue #73) — the bootstrap
+    ///    finalization every fresh net starts from, which is not a checkpoint
+    ///    round and whose `timestamp = 0` placeholder is not a time. This keys on
+    ///    `finalized_height == Some(0)` rather than on the timestamp because
+    ///    height 0 IS genesis on every net, and height is what the wire carries;
+    /// 3. 🔴 **lab #633** — a real finalized height whose age this node cannot
+    ///    measure ([`finalized_age_secs`] returned `None`). Rules 1 and 2 could
+    ///    not catch it: **they validate the height, and the corruption was in the
+    ///    timestamp.** The old code differenced a `WallClock` tip against a
+    ///    fabricated zero base and printed 1.79 billion beside a perfectly
+    ///    legitimate `final=3792`.
+    ///
+    /// All three render through this one method, so the log line,
+    /// `qumbra-opview`, `qumbra-explorer` and any other reader derive the same `-`
+    /// from the same snapshot (the #117 discipline).
     pub fn age_field(&self) -> String {
-        match self.finalized_height {
-            None | Some(0) => "-".to_string(),
-            Some(_) => self.last_finalized_age_secs.to_string(),
+        match (self.finalized_height, self.last_finalized_age_secs) {
+            (None | Some(0), _) => "-".to_string(),
+            (Some(_), None) => "-".to_string(),
+            (Some(_), Some(age)) => age.to_string(),
         }
     }
 
@@ -997,7 +1072,13 @@ impl Telemetry {
             None => out.push(0),
         }
         out.extend_from_slice(&self.stall_depth.to_le_bytes());
-        out.extend_from_slice(&self.last_finalized_age_secs.to_le_bytes());
+        // 🔴 Lab #633: `None` — *"this node cannot measure an age"* — has no
+        // encoding of its own in these eight bytes, so it goes out as `0` and
+        // `decode_body` reconstructs it only where the payload already carries the
+        // reason. See [`Self::from_bytes`] for the gap that leaves, and
+        // `the_wire_cannot_carry_a_refusal_at_a_real_finalized_height` for the
+        // test that locks it.
+        out.extend_from_slice(&self.last_finalized_age_secs.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.peer_count.to_le_bytes());
         out.extend_from_slice(&self.mempool_size.to_le_bytes());
         out.extend_from_slice(&self.epoch.to_le_bytes());
@@ -1077,6 +1158,19 @@ impl Telemetry {
     /// reader against a stale node fails loudly rather than returning a snapshot
     /// whose tail is silently absent. [`Telemetry::from_bytes_compat`] is the one
     /// caller-opt-in exception and it exists for a named, bounded reason.
+    ///
+    /// 🔴 **One cell on this wire is lossy, and it is the only one** (lab #633).
+    /// `last_finalized_age_secs: None` at a **real** finalized height — *"the age
+    /// cannot be measured"* — has no encoding in the eight bytes reserved for it,
+    /// so it is written as `0` and comes back as `Some(0)`. A node in that state
+    /// therefore renders `age_s=-` on **its own** surfaces (the `TELEMETRY` line,
+    /// and `qumbra-explorer`, which assembles the snapshot in-process) and
+    /// `age_s=0` through **this** decoder, which is what `qumbra-opview` reads.
+    /// Closing it needs a presence byte appended at the tail and an `RPC_VERSION`
+    /// bump — a wire payload change, deliberately not folded into #633's baton.
+    /// `the_wire_cannot_carry_a_refusal_at_a_real_finalized_height` locks the
+    /// current behaviour so that bump has to change a test rather than inherit
+    /// this quietly.
     pub fn from_bytes(b: &[u8]) -> Result<Telemetry, CodecError> {
         let mut r = Reader::new(b);
         r.version()?;
@@ -1119,7 +1213,18 @@ impl Telemetry {
         let tip_height = r.u64()?;
         let finalized_height = if r.u8()? == 1 { Some(r.u64()?) } else { None };
         let stall_depth = r.u64()?;
-        let last_finalized_age_secs = r.u64()?;
+        // Lab #633: reconstruct the refusal from the fact the payload DOES carry.
+        // `None | Some(0)` for the finalized height is definitionally "no
+        // finalized checkpoint to measure from" (S8 / #73), so a snapshot in that
+        // state decodes as `None` and round-trips exactly. A refusal at a REAL
+        // finalized height — #633's own state — is not representable at this
+        // version and decodes as `Some(0)`; that is the one lossy cell on this
+        // wire and it is named on `from_bytes`.
+        let age_secs = r.u64()?;
+        let last_finalized_age_secs = match finalized_height {
+            None | Some(0) => None,
+            Some(_) => Some(age_secs),
+        };
         let peer_count = r.u64()?;
         let mempool_size = r.u64()?;
         let epoch = r.u64()?;
@@ -1214,19 +1319,22 @@ mod tests {
     #[test]
     fn telemetry_roundtrips_both_regimes() {
         // Within lag ⇒ Final.
-        let t = Telemetry::assemble(20, Some(16), 300, 3, 7, 1, MAX_LAG);
+        let t = Telemetry::assemble(20, Some(16), Some(300), 3, 7, 1, MAX_LAG);
         assert_eq!(t.finality_status, FinalityStatus::Final);
         assert_eq!(t.stall_depth, 4);
         assert_eq!(Telemetry::from_bytes(&t.to_bytes()).unwrap(), t);
 
         // Lag beyond threshold ⇒ Degraded (the stall the runbook fires on).
-        let d = Telemetry::assemble(100, Some(8), 6900, 2, 5, 1, MAX_LAG);
+        let d = Telemetry::assemble(100, Some(8), Some(6900), 2, 5, 1, MAX_LAG);
         assert_eq!(d.finality_status, FinalityStatus::Degraded);
         assert_eq!(d.stall_depth, 92);
         assert_eq!(Telemetry::from_bytes(&d.to_bytes()).unwrap(), d);
 
-        // Nothing finalized ⇒ Degraded, depth = tip, no finalized height.
-        let n = Telemetry::assemble(5, None, 200, 0, 1, 0, MAX_LAG);
+        // Nothing finalized ⇒ Degraded, depth = tip, no finalized height — and no
+        // age either. This fixture said `200` before lab #633, meaning "the wire
+        // carries 200 and every reader ignores it"; that ambiguity is the thing
+        // the `Option` removed, so the intent is now spelled at the call site.
+        let n = Telemetry::assemble(5, None, None, 0, 1, 0, MAX_LAG);
         assert_eq!(n.finality_status, FinalityStatus::Degraded);
         assert_eq!(n.stall_depth, 5);
         assert_eq!(n.finalized_height, None);
@@ -1238,21 +1346,136 @@ mod tests {
     /// (S8) and finalized-at-genesis — while a real finalized height renders the
     /// number. The wire encoding is untouched: the same fields round-trip, only
     /// the value carried while the head is genesis changes.
+    ///
+    /// 🔴 **Unchanged by lab #633 except for the age argument's type** — this is
+    /// the guard #633 must not regress, so its three assertions are byte-for-byte
+    /// what they were.
     #[test]
     fn age_field_is_dash_until_a_real_checkpoint_finalizes() {
         // Nothing finalized (S8): `-`.
-        let none = Telemetry::assemble(5, None, 0, 0, 1, 0, MAX_LAG);
+        let none = Telemetry::assemble(5, None, None, 0, 1, 0, MAX_LAG);
         assert_eq!(none.age_field(), "-");
 
         // Finalized head still genesis (#73): `-`, never a number — this is the
         // state every fresh net boots into (`final=0` until slot 8 finalizes).
-        let genesis = Telemetry::assemble(1, Some(0), 0, 0, 1, 0, MAX_LAG);
+        let genesis = Telemetry::assemble(1, Some(0), None, 0, 1, 0, MAX_LAG);
         assert_eq!(genesis.age_field(), "-");
         assert_eq!(Telemetry::from_bytes(&genesis.to_bytes()).unwrap(), genesis);
 
         // First non-genesis checkpoint: the field speaks, in chain-time seconds.
-        let real = Telemetry::assemble(10, Some(8), 150, 0, 1, 0, MAX_LAG);
+        let real = Telemetry::assemble(10, Some(8), Some(150), 0, 1, 0, MAX_LAG);
         assert_eq!(real.age_field(), "150");
+    }
+
+    /// **Lab #633: the one arithmetic, every route through it.**
+    ///
+    /// Exhaustive over the three inputs' meaningful combinations, because the
+    /// defect was a *combination* nobody had enumerated: a real finalized height
+    /// (so #73's guard passes) with no base timestamp (so the subtraction has
+    /// nothing to stand on). Before #633 that combination did not exist as a case —
+    /// the base fell back to genesis and the arithmetic always produced a number.
+    #[test]
+    fn finalized_age_secs_refuses_every_route_it_cannot_measure() {
+        const TIP: Option<u64> = Some(1_787_483_455);
+        const BASE: Option<u64> = Some(1_787_483_205);
+
+        // Nothing finalized (S8) and finalized-at-genesis (#73): no checkpoint to
+        // measure from, whatever the timestamps say.
+        assert_eq!(finalized_age_secs(None, TIP, BASE), None);
+        assert_eq!(finalized_age_secs(Some(0), TIP, BASE), None);
+
+        // 🔴 #633: a REAL finalized height whose base this node cannot read. On
+        // `main` this route returned `Some(1787483455)` — the tip's absolute chain
+        // timestamp, because the base fell back to genesis's `0` placeholder.
+        assert_eq!(finalized_age_secs(Some(3792), TIP, None), None);
+        // …and the same refusal when the tip is the unreadable half.
+        assert_eq!(finalized_age_secs(Some(3792), None, BASE), None);
+        assert_eq!(finalized_age_secs(Some(3792), None, None), None);
+
+        // The healthy node still speaks, in chain-time seconds.
+        assert_eq!(finalized_age_secs(Some(3792), TIP, BASE), Some(250));
+        // A fully-finalized tip is a measurable ZERO and must stay distinguishable
+        // from the refusals above — `json.rs`'s rule that a zero is a different
+        // claim from a `-` cuts both ways.
+        assert_eq!(finalized_age_secs(Some(8), Some(99), Some(99)), Some(0));
+        // Non-monotonic pair inside the drift window: 0, never a wrapped ~2^64.
+        assert_eq!(finalized_age_secs(Some(8), Some(10), Some(40)), Some(0));
+    }
+
+    /// Lab #633: `age_field` refuses at a real finalized height when there is no
+    /// age — the third `-` route, beside S8 and #73.
+    ///
+    /// This is the rendering half of the defect. `finalized_height` is `Some(3792)`
+    /// and non-zero, so **both** existing guards pass it through; only the value's
+    /// own absence can refuse, which is why it had to become an `Option`.
+    #[test]
+    fn age_field_refuses_an_unmeasurable_age_at_a_real_finalized_height() {
+        let unmeasurable = Telemetry::assemble(3803, Some(3792), None, 0, 3, 0, MAX_LAG);
+        assert_eq!(unmeasurable.age_field(), "-");
+        // The pre-#633 output, for the record: the tip's chain timestamp, rendered
+        // with total confidence beside a legitimate `final=3792`.
+        let measured = Telemetry::assemble(3803, Some(3792), Some(1_787_483_455), 0, 3, 0, MAX_LAG);
+        assert_eq!(measured.age_field(), "1787483455");
+        // A measurable zero is not a refusal, and this is the pair that says so.
+        let zero = Telemetry::assemble(3792, Some(3792), Some(0), 0, 3, 0, MAX_LAG);
+        assert_eq!(zero.age_field(), "0");
+    }
+
+    /// Lab #633: the constructor closes the one contradiction the `Option` would
+    /// otherwise admit — an age beside a head that cannot have one.
+    ///
+    /// Without this the wire round-trip would be **lossy in a second place**:
+    /// `decode_body` rebuilds `None` from `finalized_height` for exactly these two
+    /// cases, so a constructible `Some(x)` beside them would encode and come back
+    /// as `None` with the `x` silently gone.
+    #[test]
+    fn an_age_beside_a_head_that_cannot_have_one_is_not_representable() {
+        for (tip, fin) in [(5u64, None), (1, Some(0u64))] {
+            let t = Telemetry::assemble(tip, fin, Some(200), 0, 1, 0, MAX_LAG);
+            assert_eq!(t.last_finalized_age_secs, None, "the constructor refuses it");
+            assert_eq!(t.age_field(), "-");
+            assert_eq!(Telemetry::from_bytes(&t.to_bytes()).unwrap(), t, "…so this is total");
+        }
+        // And it does NOT reach past those two: a real head keeps whatever it was
+        // handed, zero included.
+        let real = Telemetry::assemble(10, Some(8), Some(0), 0, 1, 0, MAX_LAG);
+        assert_eq!(real.last_finalized_age_secs, Some(0));
+        assert_eq!(real.age_field(), "0");
+    }
+
+    /// 🔴 **Lab #633's disclosed gap, locked so a wire bump has to change it.**
+    ///
+    /// `None` at a real finalized height has no encoding in the eight bytes
+    /// `age_secs` occupies, so it goes out as `0` and comes back as `Some(0)`: the
+    /// node renders `-` on its own surfaces and `0` through this decoder, which is
+    /// what `qumbra-opview` reads. Closing it needs a presence byte at the tail and
+    /// an `RPC_VERSION` bump — a wire payload change, deliberately not folded into
+    /// this baton.
+    ///
+    /// The refusals the payload CAN carry — S8 and #73, where `finalized_height`
+    /// itself is the reason — round-trip exactly, and that is asserted here too so
+    /// the gap is bounded to the one cell rather than described loosely.
+    #[test]
+    fn the_wire_cannot_carry_a_refusal_at_a_real_finalized_height() {
+        let unmeasurable = Telemetry::assemble(3803, Some(3792), None, 0, 3, 0, MAX_LAG);
+        let back = Telemetry::from_bytes(&unmeasurable.to_bytes()).unwrap();
+        assert_eq!(
+            back.last_finalized_age_secs,
+            Some(0),
+            "the one lossy cell on this wire: a refusal decodes as a measured zero"
+        );
+        assert_eq!(back.age_field(), "0", "…so a remote reader states a number");
+        assert_eq!(unmeasurable.age_field(), "-", "…where the node itself refuses");
+
+        // Bounded: both derivable refusals survive the round trip untouched.
+        for t in [
+            Telemetry::assemble(5, None, None, 0, 1, 0, MAX_LAG),
+            Telemetry::assemble(1, Some(0), None, 0, 1, 0, MAX_LAG),
+        ] {
+            let back = Telemetry::from_bytes(&t.to_bytes()).unwrap();
+            assert_eq!(back, t, "the payload carries the reason, so the decoder rebuilds it");
+            assert_eq!(back.age_field(), "-");
+        }
     }
 
     /// Issue #74: the halt regimes ride the SAME status field (extended, not
@@ -1262,32 +1485,32 @@ mod tests {
     fn telemetry_roundtrips_halting_and_halted() {
         const H: u64 = 16;
         // Tip at H, H not finalized yet ⇒ Halting.
-        let halting = Telemetry::assemble_with_halt(H, Some(8), 600, 0, 3, 0, MAX_LAG, Some(H));
+        let halting = Telemetry::assemble_with_halt(H, Some(8), Some(600), 0, 3, 0, MAX_LAG, Some(H));
         assert_eq!(halting.finality_status, FinalityStatus::Halting);
         assert_eq!(Telemetry::from_bytes(&halting.to_bytes()).unwrap(), halting);
         assert_eq!(halting.to_bytes()[1], STATUS_HALTING);
 
         // H finalized ⇒ Halted, stall depth 0 (the boundary IS the tip).
-        let halted = Telemetry::assemble_with_halt(H, Some(H), 0, 0, 3, 0, MAX_LAG, Some(H));
+        let halted = Telemetry::assemble_with_halt(H, Some(H), Some(0), 0, 3, 0, MAX_LAG, Some(H));
         assert_eq!(halted.finality_status, FinalityStatus::Halted);
         assert_eq!(halted.stall_depth, 0);
         assert_eq!(Telemetry::from_bytes(&halted.to_bytes()).unwrap(), halted);
         assert_eq!(halted.to_bytes()[1], STATUS_HALTED);
 
         // Below H the halt does not govern — ordinary Ebb-and-Flow.
-        let pre = Telemetry::assemble_with_halt(10, Some(8), 150, 0, 3, 0, MAX_LAG, Some(H));
+        let pre = Telemetry::assemble_with_halt(10, Some(8), Some(150), 0, 3, 0, MAX_LAG, Some(H));
         assert_eq!(pre.finality_status, FinalityStatus::Final);
 
         // A node with no halt scheduled is byte-identical to the pre-#74 surface.
-        let a = Telemetry::assemble(20, Some(16), 300, 3, 7, 1, MAX_LAG);
-        let b = Telemetry::assemble_with_halt(20, Some(16), 300, 3, 7, 1, MAX_LAG, None);
+        let a = Telemetry::assemble(20, Some(16), Some(300), 3, 7, 1, MAX_LAG);
+        let b = Telemetry::assemble_with_halt(20, Some(16), Some(300), 3, 7, 1, MAX_LAG, None);
         assert_eq!(a, b);
         assert_eq!(a.to_bytes(), b.to_bytes());
     }
 
     #[test]
     fn telemetry_rejects_bad_version_and_trailing_and_bad_status() {
-        let t = Telemetry::assemble(20, Some(16), 300, 3, 7, 1, MAX_LAG);
+        let t = Telemetry::assemble(20, Some(16), Some(300), 3, 7, 1, MAX_LAG);
         let good = t.to_bytes();
 
         // Unknown version byte.
@@ -1341,7 +1564,7 @@ mod tests {
             None => out.push(0),
         }
         out.extend_from_slice(&t.stall_depth.to_le_bytes());
-        out.extend_from_slice(&t.last_finalized_age_secs.to_le_bytes());
+        out.extend_from_slice(&t.last_finalized_age_secs.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&t.peer_count.to_le_bytes());
         out.extend_from_slice(&t.mempool_size.to_le_bytes());
         out.extend_from_slice(&t.epoch.to_le_bytes());
@@ -1353,7 +1576,7 @@ mod tests {
     /// to two variants at one slot.
     #[test]
     fn telemetry_roundtrips_checkpoint_identity_at_0x07() {
-        let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
+        let base = Telemetry::assemble(3776, Some(3776), Some(75), 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
         // as absent, exactly like the `TELEMETRY` log line's `-`.
@@ -1404,7 +1627,7 @@ mod tests {
     /// is rejected on its version byte by the STRICT decoder.**
     #[test]
     fn committee_aggregates_roundtrip_at_0x07_and_older_is_rejected() {
-        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
+        let t = Telemetry::assemble(3776, Some(3776), Some(75), 0, 3, 3, MAX_LAG)
             .with_committee(21, 19, 15)
             .with_supply(vec![SupplyEpoch {
                 epoch: 3,
@@ -1444,7 +1667,7 @@ mod tests {
 
     #[test]
     fn supply_coverage_refuses_a_state_tip_behind_fork_choice_without_a_wire_change() {
-        let partial = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG)
+        let partial = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 0, MAX_LAG)
             .with_supply(vec![SupplyEpoch {
                 epoch: 0,
                 start_height: 0,
@@ -1477,7 +1700,7 @@ mod tests {
     /// expressed in terms of it — this test fails if either grows its own copy.
     #[test]
     fn supply_coverage_and_state_lag_are_the_same_comparison() {
-        let partial = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG).with_supply(vec![
+        let partial = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 0, MAX_LAG).with_supply(vec![
             SupplyEpoch {
                 epoch: 0,
                 start_height: 0,
@@ -1499,7 +1722,7 @@ mod tests {
         );
 
         // Agreement is a zero lag, and vice versa — one predicate, both readings.
-        let complete = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG).with_supply(vec![
+        let complete = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 0, MAX_LAG).with_supply(vec![
             SupplyEpoch {
                 epoch: 0,
                 start_height: 0,
@@ -1516,7 +1739,7 @@ mod tests {
 
         // No ledger rows ⇒ no lag can be computed, and coverage is Unavailable for
         // that reason rather than for a disagreement. The two are different facts.
-        let no_rows = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG);
+        let no_rows = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 0, MAX_LAG);
         assert_eq!(no_rows.supply_lag(), None);
         assert_eq!(
             no_rows.supply_coverage(),
@@ -1636,7 +1859,7 @@ mod tests {
     /// rendering of an unknown.
     #[test]
     fn a_v1_telemetry_payload_is_rejected_not_best_effort_parsed() {
-        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
+        let t = Telemetry::assemble(3776, Some(3776), Some(75), 0, 3, 2, MAX_LAG);
         let old = v1_payload(&t);
 
         // The old encoding is genuinely the prefix of the new one — i.e. the failure
@@ -1691,7 +1914,7 @@ mod tests {
             None => out.push(0),
         }
         out.extend_from_slice(&t.stall_depth.to_le_bytes());
-        out.extend_from_slice(&t.last_finalized_age_secs.to_le_bytes());
+        out.extend_from_slice(&t.last_finalized_age_secs.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&t.peer_count.to_le_bytes());
         out.extend_from_slice(&t.mempool_size.to_le_bytes());
         out.extend_from_slice(&t.epoch.to_le_bytes());
@@ -1751,7 +1974,7 @@ mod tests {
     /// `no keys` vs `my keys disagree` assertion applied to head #3.
     #[test]
     fn the_three_durable_states_are_distinct_on_the_wire_and_round_trip() {
-        let base = Telemetry::assemble(2871, Some(2864), 75, 0, 3, 2, MAX_LAG);
+        let base = Telemetry::assemble(2871, Some(2864), Some(75), 0, 3, 2, MAX_LAG);
 
         // Not injected at all: this composition does not read head #3.
         assert_eq!(base.durable, DurableView::Unavailable);
@@ -1843,7 +2066,7 @@ mod tests {
     #[test]
     fn the_tracker_and_the_durable_head_are_compared_in_one_place() {
         let t = |fin: Option<u64>, durable: Option<Option<(u64, u8)>>| {
-            let base = Telemetry::assemble(1100, fin, 75, 0, 3, 0, MAX_LAG);
+            let base = Telemetry::assemble(1100, fin, Some(75), 0, 3, 0, MAX_LAG);
             match durable {
                 None => base,
                 Some(d) => with_durable(base, d),
@@ -1920,7 +2143,7 @@ mod tests {
     #[test]
     fn a_current_reader_still_reads_a_0x03_or_0x04_node_and_knows_that_it_did() {
         let live = with_durable(
-            Telemetry::assemble(2871, Some(2864), 75, 0, 3, 2, MAX_LAG)
+            Telemetry::assemble(2871, Some(2864), Some(75), 0, 3, 2, MAX_LAG)
                 .with_committee(21, 21, 15)
                 .with_checkpoint(Some(0x63e4_2f7e_13a7), None),
             Some((2864, 0x63)),
@@ -1995,7 +2218,7 @@ mod tests {
     /// field anywhere but the end, this fails before any consumer notices.
     #[test]
     fn the_0x06_wire_appends_the_burned_tail_and_a_0x05_reader_stays_whole() {
-        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG)
+        let t = Telemetry::assemble(3776, Some(3776), Some(75), 0, 3, 2, MAX_LAG)
             .with_committee(21, 21, 15)
             .with_supply(vec![SupplyEpoch {
                 epoch: 3,
@@ -2033,7 +2256,7 @@ mod tests {
     #[test]
     fn the_0x04_wire_appends_and_does_not_reshuffle() {
         let t = with_durable(
-            Telemetry::assemble(2871, Some(2864), 75, 4, 3, 2, MAX_LAG)
+            Telemetry::assemble(2871, Some(2864), Some(75), 4, 3, 2, MAX_LAG)
                 .with_committee(21, 21, 15)
                 .with_checkpoint(Some(0x63e4_2f7e_13a7), Some(LocalCommitment { slot: 2864, id: Some(0x63e4_2f7e_13a7) }))
                 .with_tip_difficulty(Some(1_048_576))

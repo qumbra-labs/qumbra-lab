@@ -814,29 +814,30 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         )
     }
 
-    /// Chain-time seconds between the tip block and the finalized block. Reports
-    /// **0 when nothing is finalized** (M10-T0-5 / S8): the T0-2 runbook keys its
-    /// stall alarm on this field, and a genesis fallback made "no finality yet" read
-    /// as a huge absolute age (Phase B-lite logged `age_s=1784917791`). Reports **0
-    /// while the finalized head is still genesis too** (issue #73) — the same door:
-    /// genesis is finalized as a bootstrap act, not by a checkpoint round, and its
-    /// `timestamp = 0` placeholder differenced against a `WallClock` tip is the wall
-    /// clock itself. Uses only the public chain store.
-    fn last_finalized_age_secs(&self) -> u64 {
-        match self.node.finalized_height() {
-            // Nothing finalized, or only the genesis bootstrap ⇒ no finalized
-            // CHECKPOINT exists, so there is no finalized-age to report.
-            None | Some(0) => return 0,
-            Some(_) => {}
-        }
+    /// Chain-time seconds between the tip block and the finalized block, or
+    /// `None` — *"this composition cannot measure one"*. The rule is
+    /// [`crate::telemetry::finalized_age_secs`] and it is not restated here; this
+    /// method's whole job is to read the three facts out of the public chain store
+    /// and hand them over as the `Option`s the store returns.
+    ///
+    /// The T0-2 runbook keys its stall alarm on this field, so every route to
+    /// "no age" has to arrive as `None` and not as a number: nothing finalized
+    /// (M10-T0-5 / S8, which a genesis fallback once printed as `age_s=1784917791`),
+    /// the finalized head still genesis (issue #73, the same door), and — lab #633
+    /// — a finalized head this store has no pointer to.
+    ///
+    /// 🔴 **The genesis fallback is gone, not guarded.** It used to supply
+    /// `genesis_block_hash()` as the base whenever `finalized_hash()` was absent,
+    /// and genesis's `timestamp = 0` placeholder made that a zero base — which is
+    /// how lab #633 published a tip's absolute chain timestamp as an age from the
+    /// sibling copy of this arithmetic in `qumbra_node::run`.
+    fn last_finalized_age_secs(&self) -> Option<u64> {
         let chain = self.node.chain();
-        let tip_ts = chain
-            .block(&chain.tip_hash())
-            .map(|b| b.header.timestamp)
-            .unwrap_or(0);
-        let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_block_hash());
-        let base_ts = chain.block(&base_hash).map(|b| b.header.timestamp).unwrap_or(0);
-        tip_ts.saturating_sub(base_ts)
+        crate::telemetry::finalized_age_secs(
+            self.node.finalized_height(),
+            chain.block(&chain.tip_hash()).map(|b| b.header.timestamp),
+            chain.finalized_hash().and_then(|h| chain.block(&h)).map(|b| b.header.timestamp),
+        )
     }
 
     // ---- main-chain helpers (public API only) ------------------------------
@@ -1696,15 +1697,21 @@ mod tests {
         (NodeRpc::new(node), anchor)
     }
 
-    /// S8: with nothing finalized, the finalized-age telemetry field is 0, NOT the
-    /// tip−genesis fallback (which read as a huge absolute value in Phase B-lite).
+    /// S8: with nothing finalized there is no finalized-age at all — `None`, NOT
+    /// the tip−genesis fallback (which read as a huge absolute value in Phase
+    /// B-lite). Renamed from `…_is_zero_…` at lab #633: the value stopped being a
+    /// `0` that had to be read together with `finalized_height` to mean anything.
     #[test]
-    fn telemetry_age_is_zero_when_nothing_finalized() {
+    fn telemetry_age_is_unmeasurable_when_nothing_finalized() {
         let node = MemNode::in_memory(genesis_block(1_000, 0));
         let rpc = NodeRpc::new(node);
         let t = rpc.telemetry();
         assert_eq!(t.finalized_height, None, "fresh node has no finalized head");
-        assert_eq!(t.last_finalized_age_secs, 0, "age is 0 when nothing is finalized");
+        assert_eq!(
+            t.last_finalized_age_secs, None,
+            "nothing finalized ⇒ no age exists to state"
+        );
+        assert_eq!(t.age_field(), "-");
     }
 
     // Apply one coinbase-only block with an explicit timestamp; returns its hash.
@@ -1724,11 +1731,12 @@ mod tests {
     /// finalization every fresh net starts from), the age must not difference the
     /// tip against genesis's `timestamp = 0` placeholder — on a WallClock net that
     /// read as the wall clock itself (`age_s=1785352360` on all four nodes of the
-    /// #119 run, for the ~7 minutes before slot 8 finalized). The value is 0 and
-    /// the rendering `-`; the field starts speaking at the first non-genesis
-    /// finalization. S8 closed the `None` case; this closes `Some(0)`.
+    /// #119 run, for the ~7 minutes before slot 8 finalized). The value is `None`
+    /// and the rendering `-`; the field starts speaking at the first non-genesis
+    /// finalization. S8 closed the no-finalized-head case; this closes `Some(0)`.
+    /// Renamed from `…_is_zero_…` at lab #633 for the same reason as above.
     #[test]
-    fn telemetry_age_is_zero_while_the_finalized_head_is_genesis() {
+    fn telemetry_age_is_unmeasurable_while_the_finalized_head_is_genesis() {
         let (mut rpc, _anchor) = rpc_with_finalized_genesis();
         // A wall-clock-magnitude tip timestamp over the ts=0 genesis — the exact
         // shape of the live defect.
@@ -1736,7 +1744,7 @@ mod tests {
         let t = rpc.telemetry();
         assert_eq!(t.finalized_height, Some(0), "the finalized head is genesis");
         assert_eq!(
-            t.last_finalized_age_secs, 0,
+            t.last_finalized_age_secs, None,
             "age must never be tip_ts − genesis placeholder"
         );
         assert_eq!(t.age_field(), "-", "rendered as refusal, not as a confident number");
@@ -1747,7 +1755,7 @@ mod tests {
         assert!(rpc.node_mut().finalize(h1).unwrap().is_recorded(), "height 1 finalizes");
         let t = rpc.telemetry();
         assert_eq!(t.finalized_height, Some(1));
-        assert_eq!(t.last_finalized_age_secs, 75, "tip_ts − finalized_ts, both real");
+        assert_eq!(t.last_finalized_age_secs, Some(75), "tip_ts − finalized_ts, both real");
         assert_eq!(t.age_field(), "75");
     }
 

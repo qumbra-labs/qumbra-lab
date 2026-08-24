@@ -290,7 +290,7 @@ mod tests {
     }
 
     fn sample() -> Telemetry {
-        Telemetry::assemble_with_halt(3800, Some(3776), 1800, 0, 3, 2, MAX_LAG, None)
+        Telemetry::assemble_with_halt(3800, Some(3776), Some(1800), 0, 3, 2, MAX_LAG, None)
             .with_checkpoint(
                 Some(0x3f1a_9c2b_0d41),
                 Some(LocalCommitment { slot: 3776, id: Some(0x3f1a_9c2b_0d41) }),

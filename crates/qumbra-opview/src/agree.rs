@@ -420,7 +420,7 @@ mod tests {
     /// lagging, or split say so explicitly.)*
     fn telem(tip: u64, fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
         with_durable(
-            Telemetry::assemble(tip, fin, 75, 0, 3, 0, MAX_LAG)
+            Telemetry::assemble(tip, fin, Some(75), 0, 3, 0, MAX_LAG)
                 .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id })),
             fin.map(|h| (h, 0xdd)),
         )
@@ -637,7 +637,7 @@ mod tests {
         let healthy = telem(1060, Some(H), Some(FID), None);
         // Identical on every pre-#212 field, and its durable head is 8 behind.
         let node1 = with_durable(
-            Telemetry::assemble(1060, Some(H), 75, 0, 3, 0, MAX_LAG).with_checkpoint(Some(FID), None),
+            Telemetry::assemble(1060, Some(H), Some(75), 0, 3, 0, MAX_LAG).with_checkpoint(Some(FID), None),
             Some((1048, 0xdd)),
         );
 
@@ -683,7 +683,7 @@ mod tests {
     fn two_nodes_durably_holding_different_blocks_at_one_height_is_a_stop() {
         const H: u64 = 2864;
         const FID: u64 = 0x63e4_2f7e_13a7;
-        let base = Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG)
+        let base = Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG)
             .with_checkpoint(Some(FID), None);
         let a_node = with_durable(base.clone(), Some((H, 0xa1)));
         let b_node = with_durable(base, Some((H, 0xb2)));
@@ -720,12 +720,12 @@ mod tests {
         const H: u64 = 2864;
         const FID: u64 = 0x63e4_2f7e_13a7;
         let rolled = with_durable(
-            Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG).with_checkpoint(Some(FID), None),
+            Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG).with_checkpoint(Some(FID), None),
             Some((H, 0x63)),
         );
         // A 0x03 host decodes with no durable head at all — see
         // `Telemetry::from_bytes_compat`. The version is what attributes it.
-        let unrolled = Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG)
+        let unrolled = Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG)
             .with_checkpoint(Some(FID), None);
 
         let a = Agreement::of(&[
@@ -762,14 +762,14 @@ mod tests {
         // 🔴 …and a known split still outranks the unknown: 🔴 over INDETERMINATE.
         let split_mid_roll = Agreement::of(&[
             node("node0", with_durable(
-                Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG).with_checkpoint(Some(FID), None),
+                Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG).with_checkpoint(Some(FID), None),
                 Some((H, 0xa1)),
             )),
             node("node1", with_durable(
-                Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG).with_checkpoint(Some(FID), None),
+                Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG).with_checkpoint(Some(FID), None),
                 Some((H, 0xb2)),
             )),
-            node_at("node2", Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG), 0x03),
+            node_at("node2", Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG), 0x03),
         ]);
         assert_eq!(split_mid_roll.durable_verdict, DurableVerdict::Diverged);
         assert_eq!(split_mid_roll.exit_code(), 2);
@@ -786,7 +786,7 @@ mod tests {
     fn nothing_durable_is_a_per_node_finding_and_a_fresh_net_is_not_an_alarm() {
         const H: u64 = 2864;
         let stranded = with_durable(
-            Telemetry::assemble(2871, Some(H), 75, 0, 3, 2, MAX_LAG).with_checkpoint(Some(1), None),
+            Telemetry::assemble(2871, Some(H), Some(75), 0, 3, 2, MAX_LAG).with_checkpoint(Some(1), None),
             None,
         );
         let a = Agreement::of(&[node("node0", telem(2871, Some(H), Some(1), None)), node("node1", stranded)]);
