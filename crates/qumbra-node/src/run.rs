@@ -4971,7 +4971,15 @@ mod tests {
             RunningNode::start(&config, &genesis, RandomXPow::new(), DevnetRehearsalVerifier)
                 .unwrap();
         node.set_mine_interval(Duration::ZERO);
-        assert!(node.try_mine(), "RandomX mines at the genesis difficulty");
+        // Lab #651: the mine phase is sliced, and real RandomX is slow enough
+        // that one ~25 ms slice covers only a handful of hashes — so drive the
+        // phase repeatedly, exactly as the node loop does. Each phase makes
+        // ≥ 1 nonce of progress, so the cap alone covers a winning nonce out
+        // to 10,000 (expected ~256 at this difficulty; P(>10k) ≈ e^-39), and
+        // real slices carry several hashes each, so in practice this ends in
+        // a few dozen phases.
+        let mined = (0..10_000).any(|_| node.try_mine());
+        assert!(mined, "RandomX mines at the genesis difficulty");
         assert_eq!(node.tip_height(), 1, "RandomX-mined block accepted");
         let _ = std::fs::remove_dir_all(&base);
     }
