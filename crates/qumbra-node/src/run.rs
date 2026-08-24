@@ -4817,7 +4817,16 @@ mod tests {
     fn preflight_validates_a_staged_node_without_binding() {
         // The deploy dry-run's per-node assertion: a laid-down config + genesis +
         // key subset validate through the real startup checks, no socket bound.
-        let (config, genesis, base) = rig("preflight", true);
+        //
+        // Lab #552(a): this rig gained a `miner_rkm`, because a MINING node with
+        // no payout key is no longer a config a pre-flight passes — that is the
+        // change, and `preflight_refuses_a_miner_rkm_the_node_could_not_start_with`
+        // below is where it is asserted. Nothing else about this test moved: what
+        // it is about is the genesis hash, the committee shape and the key count,
+        // and a staged mining host on the real fleet carries a payout key anyway.
+        let (mut config, genesis, base) = rig("preflight", true);
+        config.miner_rkm =
+            Some("0100000000000000020000000000000003000000000000000400000000000000".to_string());
         let pf = preflight(&config, &genesis).expect("preflight ok");
         assert_eq!(pf.genesis_hash, genesis.hash_hex());
         assert_eq!(pf.committee_size, 21);
@@ -4839,14 +4848,34 @@ mod tests {
     /// malformed `miner_rkm` passed `check` cleanly and was discovered one host
     /// at a time as each node refused to start — and `deploy/deploy.sh` can now
     /// push one per host, so the blast radius of a truncated paste is the fleet.
+    ///
+    /// 🔴 **Lab #552(a) INVERTED this test's first assertion, deliberately.** It
+    /// used to read *"Unset is not an error — it is the loud-burn-warning case,
+    /// and the pre-flight reports it rather than refusing a legal config"*, and
+    /// that sentence was the defect written down as a contract: T2 blocks 607,
+    /// 610 and 611 are what "reports it" bought. A mining node with no payout key
+    /// is now refused by `check`, exactly as `run` refuses it. The unset case is
+    /// still legal for a node that does not mine, which is the other half below
+    /// and the regression that mattered most.
     #[test]
     fn preflight_refuses_a_miner_rkm_the_node_could_not_start_with() {
         let (mut config, genesis, base) = rig("preflight_rkm", true);
 
-        // Unset is not an error — it is the loud-burn-warning case, and the
-        // pre-flight reports it rather than refusing a legal config.
+        // Unset + mining: REFUSED now, where it used to preflight clean.
         config.miner_rkm = None;
-        assert_eq!(preflight(&config, &genesis).expect("unset is legal").miner_rkm, None);
+        assert!(
+            matches!(preflight(&config, &genesis), Err(RunError::MiningWithoutPayout)),
+            "a mining node with no payout key must not pass a pre-flight that `run` will reject"
+        );
+
+        // Unset + NOT mining: still legal, still reported as absent. `check` has
+        // to keep passing every keyless observer and every non-mining T0 host.
+        let mut idle = config.clone();
+        idle.mining = false;
+        assert_eq!(
+            preflight(&idle, &genesis).expect("unset is legal on a node that does not mine").miner_rkm,
+            None
+        );
 
         let good = "0100000000000000020000000000000003000000000000000400000000000000";
         config.miner_rkm = Some(good.to_string());
