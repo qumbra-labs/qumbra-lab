@@ -250,6 +250,18 @@ void qmb_select_supply_err(qmb_select_t *s, const char *reason);
 uint8_t *qmb_select_take_bundle(qmb_select_t *s, size_t *out_len);
 void qmb_select_free(qmb_select_t *s);
 
+/* qmb_select_new with the two parameters the original ABI lacked (lab #659):
+ * form_v5 selects the net's coinbase derivation (0 = v4/T1, nonzero = v5/T2 -
+ * closes the gap lab #566 reported against this ABI), and rider_hex carries a
+ * name-service rider from qmb_name_commit_rider / qmb_name_reveal_rider /
+ * qmb_name_renewal_rider (NULL for an ordinary send). The rider travels inside
+ * the witness bundle; its burned name fee folds into the declared fee. */
+qmb_select_t *qmb_select_new_v2(const qmb_wallet_t *w, qmb_scan_t *scan,
+                                const char *recipient, uint64_t amount,
+                                const uint8_t *held_leaves, size_t held_len,
+                                const uint8_t *rng_seed32, const char *rider_hex,
+                                int32_t form_v5, char **err_out);
+
 char *qmb_bundle_review(const uint8_t *bytes, size_t len, char **err_out);
 
 /* --- payment URIs + the history join (roadmap #3/#4) ---------------------- */
@@ -500,6 +512,82 @@ int32_t qmb_pair_step(qmb_pair_t *p, uint8_t **out, size_t *out_len, char **err_
 char *qmb_pair_take_notes(qmb_pair_t *p);
 uint8_t *qmb_pair_take_artifact(qmb_pair_t *p, size_t *out_len);
 void qmb_pair_free(qmb_pair_t *p);
+
+/* --- Name Service (lab #659): the generic name-service surface ------------
+ *
+ * The commit->reveal registration state machine, promoted from the macOS
+ * bridge as a CAPABILITY: this crate is sans-IO and storage-free, so the
+ * state crosses as a versioned record STRING the platform persists (Keychain
+ * on iOS - it holds the only reveal salt; losing it after a commit loses the
+ * registration). Every mutation is state in -> state out; every returned
+ * char* is freed with qmb_string_free.
+ *
+ * A commit or reveal is an ordinary spend carrying a rider: feed the
+ * rider helpers' output below to qmb_select_new_v2 and drive the normal
+ * select -> pair -> prove -> submit flow. Retain the reveal's exact wire
+ * bytes with qmb_name_record_reveal BEFORE the first POST can answer, and
+ * re-post those bytes verbatim on retry (qmb_name_reveal_wire) - the prover
+ * is randomized, so the same salt does NOT rebuild the same transaction.
+ * Nothing completes a registration except chain observation
+ * (qmb_name_observe_reveal_over_fetch) or the user's discard once the view's
+ * discard_safe says so - a node's ACCEPT is mempool-level (wallet-macos#27 /
+ * lab #625). */
+
+/* Begin a registration. address_index is the caller-allocated dedicated
+ * address index; salt32 is 32 platform-sourced entropy bytes. Persist the
+ * returned state BEFORE any network request. */
+char *qmb_name_prepare(const qmb_wallet_t *w, const char *name,
+                       uint64_t address_index, const uint8_t *salt32,
+                       char **err_out);
+
+/* The registration rendered as JSON: name, address, fingerprint, step,
+ * detail, committed_at, commit_attempted, next_height, reveal_closes,
+ * reveal_fee_qmb, reveal_fee_bessel, discard_safe, has_retained_reveal.
+ * The step vocabulary is the macOS bridge's, including reveal_submitted. */
+char *qmb_name_view(const char *state, uint64_t tip, char **err_out);
+
+/* State transitions, each a new state string (persist it). */
+char *qmb_name_mark_commit_attempted(const char *state, char **err_out);
+char *qmb_name_record_commit(const char *state, uint64_t height, char **err_out);
+char *qmb_name_confirm_commit_absent(const char *state, char **err_out);
+char *qmb_name_record_reveal(const char *state, const char *wire_hex, char **err_out);
+
+/* The retained reveal transaction (hex) for verbatim re-posting; NULL with
+ * err_out untouched when none is retained. */
+char *qmb_name_reveal_wire(const char *state, char **err_out);
+
+/* Riders for qmb_select_new_v2, hex-encoded. */
+char *qmb_name_commit_rider(const char *state, char **err_out);
+char *qmb_name_reveal_rider(const char *state, char **err_out);
+char *qmb_name_renewal_rider(const char *name, char **err_out);
+
+/* The renewal fee as JSON {"qmb": "...", "bessel": "..."} - integer-exact. */
+char *qmb_name_renewal_fee(const char *name, char **err_out);
+
+/* Search (floor, tip] for the mined commit and record its height; floor is
+ * the name-rule activation floor (the boundary on a v4 net, 0 on v5/T2).
+ * Returns the state - updated when found, unchanged when not. */
+char *qmb_name_find_commit_over_fetch(const char *state, uint64_t floor,
+                                      uint64_t tip, qmb_fetch_fn fetch,
+                                      void *fetch_ctx, char **err_out);
+
+/* One GET before proving the reveal: does the chain carry exactly this
+ * commit at its recorded height? 1 present, 0 absent, -1 error (err_out). */
+int32_t qmb_name_commit_present_over_fetch(const char *state, qmb_fetch_fn fetch,
+                                           void *fetch_ctx, char **err_out);
+
+/* Sync the chain's name riders and record the reveal's mined height when
+ * this exact registration is observed inside its commit window - the ONLY
+ * path that completes a registration. registry is the caller-persisted
+ * registry cache string (NULL to start fresh). Returns JSON
+ * {"state": "...", "registry": "..."} - persist both. */
+char *qmb_name_observe_reveal_over_fetch(const char *state, const char *registry,
+                                         uint64_t tip, qmb_fetch_fn fetch,
+                                         void *fetch_ctx, char **err_out);
+
+/* Is Name Service active at tip? native nonzero for a v5 net (active from
+ * height 0); zero for a v4 net, where the rule boundary gates it. */
+int32_t qmb_name_active(int32_t native, uint64_t tip);
 
 #ifdef __cplusplus
 }

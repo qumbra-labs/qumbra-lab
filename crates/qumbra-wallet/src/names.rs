@@ -152,7 +152,9 @@ impl WalletRegistry {
 
     // ---- the cache file (rebuildable; contacts.v1 discipline) --------------
 
-    pub fn save(&self, dir: &Path) -> io::Result<()> {
+    /// The cache, as a string — the format [`Self::save`] writes. Platform
+    /// shells that own their storage carry it as this string (lab #659).
+    pub fn to_record_string(&self) -> String {
         let mut out = String::new();
         out.push_str(REGISTRY_HEADER);
         out.push('\n');
@@ -166,7 +168,11 @@ impl WalletRegistry {
                 hex(&e.address)
             ));
         }
-        write_owner_only(&dir.join(REGISTRY_FILE), out.as_bytes())
+        out
+    }
+
+    pub fn save(&self, dir: &Path) -> io::Result<()> {
+        write_owner_only(&dir.join(REGISTRY_FILE), self.to_record_string().as_bytes())
     }
 
     pub fn load(dir: &Path) -> io::Result<Option<WalletRegistry>> {
@@ -175,6 +181,12 @@ impl WalletRegistry {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path)?;
+        Self::from_record_str(&text).map(Some)
+    }
+
+    /// Decode [`Self::to_record_string`]'s format; [`Self::load`] delegates
+    /// here. Unknown headers are refused, never guessed at.
+    pub fn from_record_str(text: &str) -> io::Result<WalletRegistry> {
         let mut lines = text.lines();
         let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("{REGISTRY_FILE}: {why}"));
         if lines.next() != Some(REGISTRY_HEADER) {
@@ -204,7 +216,7 @@ impl WalletRegistry {
                 },
             );
         }
-        Ok(Some(WalletRegistry { names, synced_to }))
+        Ok(WalletRegistry { names, synced_to })
     }
 }
 
@@ -449,7 +461,11 @@ impl RegisterState {
         }
     }
 
-    pub fn save(&self, dir: &Path) -> io::Result<()> {
+    /// The persisted record, as a string — the same versioned format
+    /// [`Self::save`] writes. Platform shells that own their storage (iOS
+    /// Keychain, per mobile-name-service-brief §3.2) carry the state as this
+    /// string instead of a file; one codec, every shell (lab #659).
+    pub fn to_record_string(&self) -> String {
         let mut out = String::new();
         out.push_str(REG_HEADER);
         out.push('\n');
@@ -464,7 +480,11 @@ impl RegisterState {
             hex(&self.record.address),
             self.reveal_tx.as_deref().map_or("none".to_string(), hex),
         ));
-        write_owner_only(&dir.join(REG_FILE), out.as_bytes())
+        out
+    }
+
+    pub fn save(&self, dir: &Path) -> io::Result<()> {
+        write_owner_only(&dir.join(REG_FILE), self.to_record_string().as_bytes())
     }
 
     pub fn load(dir: &Path) -> io::Result<Option<RegisterState>> {
@@ -473,6 +493,13 @@ impl RegisterState {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path)?;
+        Self::from_record_str(&text)
+    }
+
+    /// Decode [`Self::to_record_string`]'s format, all three header vintages,
+    /// with the same fail-closed rules as [`Self::load`] (which delegates
+    /// here). `Ok(None)` is a header with no record line.
+    pub fn from_record_str(text: &str) -> io::Result<Option<RegisterState>> {
         let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{REG_FILE}: {why}"));
         let mut lines = text.lines();
         let header = lines.next();
@@ -578,11 +605,6 @@ impl RegisterState {
 /// generation, and the pre-network durable write all remain wallet rules.
 pub fn prepare_registration(wallet: &mut WalletDir, name: &str) -> Result<RegisterState, String> {
     let bare = name.strip_suffix(".qmb").unwrap_or(name);
-    if !qlab_devnet::names::valid_name(bare.as_bytes()) {
-        return Err(format!(
-            "{bare:?} fails the v1 name grammar (a-z 0-9, interior hyphens, 1-63 bytes)"
-        ));
-    }
     match RegisterState::load(&wallet.dir).map_err(|error| error.to_string())? {
         Some(state) if state.name == bare => return Ok(state),
         Some(state) => {
@@ -598,14 +620,131 @@ pub fn prepare_registration(wallet: &mut WalletDir, name: &str) -> Result<Regist
     let mut salt = [0u8; 32];
     use rand::Rng as _;
     crate::send::os_rng().fill_bytes(&mut salt);
+    let state = prepare_registration_parts(name, address, salt)?;
+    state.save(&wallet.dir).map_err(|error| error.to_string())?;
+    Ok(state)
+}
+
+/// The storage-free half of [`prepare_registration`]: grammar check + record
+/// construction from parts the caller supplies. Platform shells own address
+/// allocation (an index cursor) and salt entropy (the platform CSPRNG, the
+/// house ABI rule), and persist the returned state themselves (lab #659).
+/// The one-in-flight check is the caller's, because it lives with the storage.
+pub fn prepare_registration_parts(
+    name: &str,
+    address: Vec<u8>,
+    salt: [u8; 32],
+) -> Result<RegisterState, String> {
+    let bare = name.strip_suffix(".qmb").unwrap_or(name);
+    if !qlab_devnet::names::valid_name(bare.as_bytes()) {
+        return Err(format!(
+            "{bare:?} fails the v1 name grammar (a-z 0-9, interior hyphens, 1-63 bytes)"
+        ));
+    }
     let record = qlab_devnet::names::NameRecord {
         kind: qlab_devnet::names::RECORD_KIND_L1_ADDRESS,
         name: bare.as_bytes().to_vec(),
         address,
     };
-    let state = RegisterState::new(bare, record, salt);
-    state.save(&wallet.dir).map_err(|error| error.to_string())?;
-    Ok(state)
+    Ok(RegisterState::new(bare, record, salt))
+}
+
+/// Does the chain carry exactly this commit in block `height`? One GET before
+/// proving a reveal settles what a `CommitNotFound` refusal would otherwise
+/// cost a full STARK to learn (the macOS bridge paid 7.16 s and 8.32 s for
+/// that lesson, twice, on the live net). Hoisted from the bridge (lab #659) so
+/// every shell shares one implementation; `fetch` is the #297 injection
+/// pattern — `GET path → body bytes`, transport stays in the caller.
+pub fn commit_at_height(
+    expected: [u8; 32],
+    height: u64,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+) -> Result<bool, String> {
+    let path = format!("/v1/names?from={height}&to={height}");
+    let bytes = fetch(&path)?;
+    let page = qlab_cbserver::codec::NamesPage::from_bytes(&bytes)
+        .map_err(|error| format!("{path} did not decode: {error:?}"))?;
+    if page.from != height || page.to != height {
+        return Err(format!(
+            "{path} echoed [{}, {}] instead of [{height}, {height}]",
+            page.from, page.to
+        ));
+    }
+    Ok(page.blocks.iter().any(|block| {
+        block.height == height
+            && block.riders.iter().any(|rider| {
+                matches!(
+                    qlab_devnet::names::decode_rider(rider),
+                    Ok(Some(qlab_devnet::names::NameOp::Commit { commit })) if commit == expected
+                )
+            })
+    }))
+}
+
+/// Search `(floor, tip]` for the block that carries exactly this commit,
+/// newest match winning, paged with the #312 progress guard. `floor` is the
+/// name-rule activation floor: the boundary on a v4 net, 0 on a native-names
+/// v5 net. Hoisted from the macOS bridge (lab #659).
+pub fn find_name_commit_height<F>(
+    expected: [u8; 32],
+    floor: u64,
+    tip: u64,
+    mut fetch: F,
+) -> Result<Option<u64>, String>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    use qlab_devnet::names::{decode_rider, NameOp, COMMIT_MAX_AGE};
+
+    let first_active = floor
+        .checked_add(1)
+        .ok_or_else(|| "Name Service activation height cannot advance".to_string())?;
+    let mut from = first_active.max(tip.saturating_sub(COMMIT_MAX_AGE));
+    if from > tip {
+        return Ok(None);
+    }
+    let mut latest = None;
+    while from <= tip {
+        let path = format!("/v1/names?from={from}&to={tip}");
+        let bytes = fetch(&path)?;
+        let page = qlab_cbserver::codec::NamesPage::from_bytes(&bytes)
+            .map_err(|error| format!("{path} did not decode: {error:?}"))?;
+        if page.from != from || page.to != tip {
+            return Err(format!(
+                "{path} echoed [{}, {}] instead of [{from}, {tip}]",
+                page.from, page.to
+            ));
+        }
+        let mut previous = None;
+        for block in &page.blocks {
+            if block.height < from
+                || block.height > tip
+                || previous.is_some_and(|h| block.height <= h)
+            {
+                return Err(format!(
+                    "{path} returned non-ascending or out-of-range blocks"
+                ));
+            }
+            previous = Some(block.height);
+            for rider in &block.riders {
+                let operation = decode_rider(rider)
+                    .map_err(|error| format!("{path} contains an invalid rider: {error:?}"))?;
+                if matches!(operation, Some(NameOp::Commit { commit }) if commit == expected) {
+                    latest = Some(block.height);
+                }
+            }
+        }
+        let Some(last) = page.last_height() else {
+            break;
+        };
+        if last == tip {
+            break;
+        }
+        from = last
+            .checked_add(1)
+            .ok_or_else(|| format!("{path} cannot advance past height {last}"))?;
+    }
+    Ok(latest)
 }
 
 /// Construct a renewal operation after applying the consensus name grammar.
