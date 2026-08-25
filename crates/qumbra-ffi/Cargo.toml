@@ -44,6 +44,12 @@ rand = "0.10"
 # no RandomX chain (the wasm/iOS graphs must stay clean; features are additive,
 # so native workspace builds still unify to the full wallet).
 qumbra-wallet = { path = "../qumbra-wallet", default-features = false }
+# The name-service types (NameOp, rider codec, fee table, grammar) the generic
+# qmb_name_* surface exposes (lab #659). default-features off for the same
+# reason as qlab-cbserver above: the randomx C++ chain must not enter the
+# iOS/wasm graphs — and it already sits in this crate's lean graph via
+# qumbra-wallet, so this adds no new edge, only a name for it.
+qlab-devnet = { path = "../qlab-devnet", default-features = false }
 # AnchorSet::from_bytes — the /v1/anchors codec, one copy (tip height for the
 # browser scan's `to`). Lean: no randomx in the wasm/iOS graphs.
 qlab-node = { path = "../qlab-node", default-features = false }

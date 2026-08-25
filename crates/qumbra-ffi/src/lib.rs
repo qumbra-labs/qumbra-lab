@@ -21,6 +21,7 @@
 
 pub mod events;
 pub mod ledger_blob;
+pub mod names;
 pub mod pairing;
 pub mod report;
 
@@ -935,6 +936,100 @@ pub unsafe extern "C" fn qmb_select_new(
     rng_seed32: *const u8,
     err_out: *mut *mut c_char,
 ) -> *mut SelectState {
+    // Kept byte-compatible for existing shells; the V4 hardcode below is why
+    // `qmb_select_new_v2` exists — new callers should use it.
+    select_new_inner(
+        w,
+        scan,
+        recipient,
+        amount,
+        held_leaves,
+        held_len,
+        rng_seed32,
+        None,
+        qumbra_wallet::GenesisForm::V4,
+        err_out,
+    )
+}
+
+/// [`qmb_select_new`] with the two parameters the original ABI lacked:
+///
+/// - `form_v5`: 0 = a v4 net (T1), nonzero = a v5 net (T2). This closes the
+///   gap lab #566 reported against this ABI — the coinbase derivation was
+///   hardcoded V4, so a shell driving a T2 wallet saw its mined notes as
+///   commitments in no tree. Sends of received notes never depended on it.
+/// - `rider_hex`: an encoded name-service rider (from `qmb_name_commit_rider`
+///   / `qmb_name_reveal_rider` / `qmb_name_renewal_rider`), or NULL for an
+///   ordinary send. The rider travels inside the witness bundle and its
+///   burned name fee folds into the declared fee (lab #659) — the paired
+///   prover proves the same bundle either way.
+///
+/// # Safety
+/// As [`qmb_select_new`]; `rider_hex` NULL or NUL-terminated UTF-8 hex.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_new_v2(
+    w: *const WalletState,
+    scan: *mut ScanState,
+    recipient: *const c_char,
+    amount: u64,
+    held_leaves: *const u8,
+    held_len: usize,
+    rng_seed32: *const u8,
+    rider_hex: *const c_char,
+    form_v5: i32,
+    err_out: *mut *mut c_char,
+) -> *mut SelectState {
+    let name_op = if rider_hex.is_null() {
+        None
+    } else {
+        let Ok(text) = CStr::from_ptr(rider_hex).to_str() else {
+            set_err(err_out, "rider_hex is not UTF-8".into());
+            return ptr::null_mut();
+        };
+        let Some(bytes) = names::unhex(text) else {
+            set_err(err_out, "rider_hex did not decode as hex".into());
+            return ptr::null_mut();
+        };
+        match qlab_devnet::names::decode_rider(&bytes) {
+            Ok(op) => op,
+            Err(e) => {
+                set_err(err_out, format!("the rider did not decode: {e:?}"));
+                return ptr::null_mut();
+            }
+        }
+    };
+    let form = if form_v5 != 0 {
+        qumbra_wallet::GenesisForm::V5
+    } else {
+        qumbra_wallet::GenesisForm::V4
+    };
+    select_new_inner(
+        w,
+        scan,
+        recipient,
+        amount,
+        held_leaves,
+        held_len,
+        rng_seed32,
+        name_op,
+        form,
+        err_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn select_new_inner(
+    w: *const WalletState,
+    scan: *mut ScanState,
+    recipient: *const c_char,
+    amount: u64,
+    held_leaves: *const u8,
+    held_len: usize,
+    rng_seed32: *const u8,
+    name_op: Option<qlab_devnet::names::NameOp>,
+    form: qumbra_wallet::GenesisForm,
+    err_out: *mut *mut c_char,
+) -> *mut SelectState {
     if w.is_null() || scan.is_null() || recipient.is_null() || rng_seed32.is_null() {
         set_err(err_out, "NULL argument".into());
         return ptr::null_mut();
@@ -990,23 +1085,18 @@ pub unsafe extern "C" fn qmb_select_new(
 
     let outcomes = std::mem::take(&mut scan_state.outcomes);
     let to = scan_state.to;
-    // 🔴 **`GenesisForm::V4` (T1) is hardcoded here, and that is a KNOWN GAP, not
-    // a decision** (lab #566). The CLI takes `--net t1|t2`; this ABI has no
-    // parameter for it, so an extension or iOS shell driving a T2 wallet gets the
-    // v4 coinbase derivation and its mined notes are commitments in no tree —
-    // exactly the defect #566 fixed one layer in. Closing it means a new/extended
-    // C entry point, which is an ABI change (the header is pinned to source by a
-    // bidirectional test) and outside this baton's scope. Reported on #566.
-    // Sends of RECEIVED notes are unaffected: transaction outputs carry no form.
+    // The #566 gap (GenesisForm hardcoded V4 with no ABI parameter) is closed
+    // by `qmb_select_new_v2`; the legacy `qmb_select_new` keeps V4 so existing
+    // shells' byte behavior does not move under them.
     let driver = SelectDriver::new(
         (*w).wallet.clone(),
         recipient,
         amount,
-        None,
+        name_op,
         outcomes,
         held,
         to,
-        qumbra_wallet::GenesisForm::V4,
+        form,
     );
     Box::into_raw(Box::new(SelectState {
         driver,
@@ -2720,11 +2810,14 @@ mod tests {
         );
     }
 
-    /// The hand-maintained header and this file must declare the same ABI.
+    /// The hand-maintained header and the crate's ABI sources must declare the
+    /// same function list. Two source files hold entry points since lab #659
+    /// (the Cargo.toml's own "revisit past ~15 functions" line came due): this
+    /// file, and `names.rs` for the `qmb_name_*` surface.
     #[test]
     fn the_header_names_every_exported_function_and_nothing_else() {
         let header = include_str!("../include/qumbra_ffi.h");
-        let src = include_str!("lib.rs");
+        let src = concat!(include_str!("lib.rs"), include_str!("names.rs"));
         let exported: Vec<&str> = src
             .lines()
             .filter_map(|l| {
@@ -2734,7 +2827,10 @@ mod tests {
                     .and_then(|r| r.split('(').next())
             })
             .collect();
-        assert!(!exported.is_empty());
+        // A floor on what the prefix-scan matched, so a formatting change that
+        // makes BOTH sides match nothing cannot pass as agreement (the
+        // explorer wiring-guard lesson).
+        assert!(exported.len() >= 60, "expected the full ABI, matched {}", exported.len());
         for f in &exported {
             assert!(header.contains(f), "header is missing `{f}`");
         }
