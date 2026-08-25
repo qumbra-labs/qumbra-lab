@@ -39,7 +39,7 @@ use qlab_devnet::node::SimConfig;
 use qlab_devnet::pow::KeccakPow;
 use qlab_p2p::adapter::NodeAdapter;
 use qlab_p2p::codec::{encode_inv, InvItem, InvKind};
-use qlab_p2p::bodywait::{AskSetObservation, BodyAnswer, BodyWaitJournal, RejoinGate};
+use qlab_p2p::bodywait::{AskSetObservation, BodyAnswer, BodyWaitJournal, MineDuty, RejoinGate};
 use qlab_p2p::n1::{BlockIngest, IngestOutcome};
 use qlab_p2p::node::{BODY_REQUEST_TIMEOUT_MS, MAX_BODIES_IN_FLIGHT};
 use qlab_p2p::peer::PeerId;
@@ -542,4 +542,173 @@ fn a_not_found_answer_is_recorded_as_dont_have_and_still_scores_nothing() {
         0,
         "and recording the answer changed no scoring: an ask we originated is exempt"
     );
+}
+
+// ---------------------------------------------------------------------------
+// lab #661 — the wanted set, not the in-flight count
+// ---------------------------------------------------------------------------
+
+/// **The 2026-08-24 explorer row, built rather than described.**
+///
+/// The live node: applied tip on the main chain at `stip=4882`, header chain
+/// ahead of it, `bask=1@4882` — one body wanted — and `breq=0`, because
+/// `request_missing_bodies` returned at `ready_peers().is_empty()` and the ask
+/// was never inserted. Frozen there for 100 minutes.
+///
+/// Reduced here to the same six numbers at sim scale: `off_main = false`,
+/// `fork_point == state_tip`, `ask_set = 1`, `in_flight = 0`, and a stall clock
+/// the caller drives past the threshold. The node has **no peers**, which is what
+/// produces `breq=0` for the same reason the live node did — not a mock, the
+/// requester's own early return.
+///
+/// Returns the frozen node and the block the chain moved to that it wants.
+fn on_main_wanting_one_body(hub: &Arc<InProcHub>) -> (Node, BlockHeader) {
+    // The chain, mined off-net on a factory adapter so nothing can reach the
+    // frozen node by accident — it must want this body and never be served it.
+    let mut fac = adapter(0x51);
+    let chain: Vec<(BlockHeader, BlockBody)> = (0..4).map(|_| mine_on(&mut fac)).collect();
+
+    let mut frozen = node(9, 0x99, hub);
+    for (h, _) in &chain {
+        frozen.node_mut().ingest_header(*h);
+    }
+    // Three bodies applied: the applied tip is a main-chain block, so `off_main`
+    // is false and `state_fork_point` is the applied tip itself.
+    for (h, b) in &chain[..3] {
+        frozen.node_mut().ingest_block(*h, b.clone());
+    }
+    assert_eq!(frozen.node().applied_tip().height, 3, "three bodies applied");
+    assert!(
+        !frozen.node().applied_tip().is_off_main_chain(),
+        "and on the main chain — this is NOT a strand, which is the whole point"
+    );
+    assert_eq!(frozen.body_requests(), 0, "no peers, so nothing was ever asked");
+    (frozen, chain[3].0)
+}
+
+/// 🔴 **The fixture the incident is: a node that WANTS a body, has no request
+/// outstanding for it, is on the main chain, and has been frozen for five times
+/// the threshold. It must report.**
+///
+/// This is the row `BODYWAIT` was built for and produced zero occurrences on. The
+/// predicate measured *asked* (`breq_observed`, the in-flight count) where the
+/// doc comment above it says *"something to ask for"* — the wanted set. The
+/// difference is not a corner: a node that wants a body and never managed to
+/// issue the request is the worst reading of layer (a), and it was the only one
+/// the latch could not see.
+///
+/// **It is also the mutation check, asserted rather than run.** The two
+/// pre-existing disjuncts are pinned false *in this test* — `off_main == false`
+/// and `in_flight == 0` — so `armed` here can only come from `ask_set > 0`.
+/// Remove that disjunct and this test fails on the very next assertion; it cannot
+/// pass against `main`.
+#[test]
+fn an_on_main_node_frozen_past_threshold_with_ask_set_1_and_breq_0_is_reportable() {
+    let hub = InProcHub::new();
+    let (mut frozen, _wanted) = on_main_wanting_one_body(&hub);
+    let t = threshold_ms(&frozen);
+
+    frozen.tick(0); // the first observation starts the stall clock
+    // Five times the clock — the live node's ratio: ~6,000,000 ms against a
+    // 1,200,000 ms threshold at the 75 s block target.
+    let now = 5 * t;
+    frozen.tick(now);
+
+    let obs = observe(&frozen);
+
+    // The three clauses of the predicate, each pinned before the verdict.
+    assert!(obs.stuck_ms >= t, "the clock is past the threshold: {obs:?}");
+    assert_eq!(obs.stuck_ms, 5 * t, "five times it, as on the live node: {obs:?}");
+    assert!(!obs.off_main, "🔴 disjunct 1 is FALSE — the node is on the main chain");
+    assert_eq!(obs.in_flight, 0, "🔴 disjunct 2 is FALSE — nothing is in flight");
+    assert_eq!(obs.ask_set, 1, "🔴 disjunct 3: exactly one body is WANTED: {obs:?}");
+    assert_eq!(
+        obs.fork_point,
+        Some(obs.state_tip),
+        "the fork point IS the applied tip — this is why `off_main` is false: {obs:?}"
+    );
+    assert_eq!(obs.gate, RejoinGate::OnMain, "nothing to rejoin: {obs:?}");
+    assert_eq!(obs.mine, MineDuty::RefusedLag, "and it is refusing to mine while silent");
+
+    assert!(
+        obs.armed,
+        "🔴 a node frozen past the threshold with a body it wants and no request \
+         outstanding is reportable — this is the reading that produced 100 minutes \
+         of silence: {obs:?}"
+    );
+
+    // Arming is not the observable an operator gets. The line is.
+    let mut j = BodyWaitJournal::new();
+    let lines = journal(&frozen, &mut j, now);
+    assert!(!lines.is_empty(), "and it produces a report, not merely a flag");
+    let line = &lines[0];
+    assert!(line.starts_with("BODYWAIT "), "{line}");
+    assert!(line.contains(" schain=main "), "on-main, and it says so: {line}");
+    assert!(line.contains(" ask=1 breq=0 "), "wanted 1, asked 0: {line}");
+    println!("PR-SAMPLE (#661) {line}");
+}
+
+/// **The halted-net exemption still holds, and it is the property most likely to
+/// be broken by a wider fix.**
+///
+/// *"A caught-up node on a halted net — `stip` frozen, on-main, nothing to ask —
+/// trips neither clause and stays quiet, which is right: it is not stranded, the
+/// chain is."* Same row as the fixture above with the fourth body applied, so
+/// `ask_set = 0`: the third disjunct is false along with the other two, at five
+/// times the threshold and beyond.
+#[test]
+fn a_halted_net_with_nothing_to_ask_stays_quiet_past_the_threshold() {
+    let hub = InProcHub::new();
+    let mut fac = adapter(0x52);
+    let chain: Vec<(BlockHeader, BlockBody)> = (0..4).map(|_| mine_on(&mut fac)).collect();
+    let mut halted = node(8, 0x88, &hub);
+    for (h, b) in &chain {
+        halted.node_mut().ingest_header(*h);
+        halted.node_mut().ingest_block(*h, b.clone());
+    }
+    let t = threshold_ms(&halted);
+
+    halted.tick(0);
+    let mut j = BodyWaitJournal::new();
+    // Well past the threshold, and then past it again: the chain is not producing
+    // blocks, so `stip` never moves and the clock only grows.
+    for k in 1..=5u64 {
+        let now = k * t;
+        halted.tick(now);
+        let obs = observe(&halted);
+        assert_eq!(obs.ask_set, 0, "caught up: there is nothing it wants: {obs:?}");
+        assert!(!obs.off_main, "and it is on the main chain: {obs:?}");
+        assert_eq!(obs.in_flight, 0, "with nothing in flight: {obs:?}");
+        assert!(obs.stuck_ms >= t, "the clock is past the threshold: {obs:?}");
+        assert!(
+            !obs.armed,
+            "🔴 a halted net is not a stranded node and must stay quiet: {obs:?}"
+        );
+        assert!(journal(&halted, &mut j, now).is_empty(), "silent at {}× the clock", k);
+    }
+}
+
+/// **Below the clock, the fixture row is still quiet.**
+///
+/// The change is to *what counts as wanting*, not to *how long a freeze must
+/// last*: `unobtainable_threshold_ms()` is #201's and is untouched. A node that
+/// wants a body and has been frozen for one millisecond less than the threshold
+/// says nothing — which is what keeps every ordinary catch-up off the surface.
+#[test]
+fn the_fixture_row_below_the_clock_is_not_armed() {
+    let hub = InProcHub::new();
+    let (mut frozen, _wanted) = on_main_wanting_one_body(&hub);
+    let t = threshold_ms(&frozen);
+
+    frozen.tick(0);
+    let now = t - 1;
+    frozen.tick(now);
+
+    let obs = observe(&frozen);
+    assert_eq!(obs.ask_set, 1, "it wants the same one body: {obs:?}");
+    assert_eq!(obs.stuck_ms, t - 1, "one millisecond short of the clock: {obs:?}");
+    assert!(!obs.armed, "🔴 the clock is unchanged by #661: {obs:?}");
+
+    let mut j = BodyWaitJournal::new();
+    assert!(journal(&frozen, &mut j, now).is_empty(), "and it says nothing");
 }
