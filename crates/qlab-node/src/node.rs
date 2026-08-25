@@ -1712,7 +1712,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // fails to decode HERE means the block was never validated (or the
         // log is corrupt): named, not ignored.
         self.names
-            .apply_block_riders(block.header.height, &block.txs)
+            .apply_block_riders(block.header.height, block.txs.iter().map(|t| t.rider.as_slice()))
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
         let root = self.commitments.root_bytes();
         self.roots_by_height.insert(block.header.height, root);

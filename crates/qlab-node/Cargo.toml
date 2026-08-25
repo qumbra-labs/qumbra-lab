@@ -16,7 +16,9 @@ publish.workspace = true
 [dependencies]
 # Chain state / fork choice / finality, block header + body types, and the
 # body-validation rule (anchor-final + posted-fee + in-block double-spend).
-qlab-devnet = { path = "../qlab-devnet", default-features = false }
+# `serde` is the #660 sidecar seam: the registry types moved to qlab-devnet
+# and this crate — the sole sidecar writer — is their only serde consumer.
+qlab-devnet = { path = "../qlab-devnet", default-features = false, features = ["serde"] }
 
 # The depth-32 incremental commitment tree (the exact consensus tree the M3
 # bucket proves membership against).

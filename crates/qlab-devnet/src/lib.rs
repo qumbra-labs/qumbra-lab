@@ -42,6 +42,7 @@ pub mod header;
 pub mod journal;
 pub mod load;
 pub mod mining;
+pub mod name_registry;
 pub mod names;
 pub mod net;
 pub mod node;

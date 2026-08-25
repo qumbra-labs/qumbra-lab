@@ -21,8 +21,16 @@ qlab-air = { path = "../qlab-air" }
 # (`discovery-on-the-consensus-wire.md` D2). This crate used to depend on
 # qlab-note "only for the shared Keccak primitive"; body-bound discovery ends
 # that, because D2 requires ONE encoder for these bytes and qlab-cbserver (their
-# previous home) depends on this crate. Still no prover, no IO, no serde here.
+# previous home) depends on this crate. Still no prover and no IO here; serde
+# is reachable ONLY behind the off-by-default `serde` feature below (lab #660).
 qlab-note = { path = "../qlab-note" }
+
+# Lab #660: derives for `name_registry`'s types, so qlab-node's `names.bin`
+# sidecar can keep serializing them after the registry replay moved here.
+# OPTIONAL and off by default — this amends the long-standing "no serde here"
+# contract as narrowly as possible: the default build, the wallet graph, and
+# the wasm graph carry no serde edge; only qlab-node turns the feature on.
+serde = { version = "1", features = ["derive"], optional = true }
 
 # The real CPU-friendly PoW primitive (RandomX) + the LWMA-120 retarget and the
 # key-block rotation schedule (M9-N3). The `PowEngine` adapter (`pow::RandomXPow`)
@@ -49,3 +57,6 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 [features]
 default = ["randomx"]
 randomx = ["qlab-pow/randomx"]
+# Serde derives on the name-registry types (lab #660) — for the node's sidecar
+# only; see the dependency's note above.
+serde = ["dep:serde"]
