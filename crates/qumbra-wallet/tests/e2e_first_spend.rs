@@ -463,7 +463,7 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     }];
     let coverage = SpentCoverage::Covered { range: spent_set.covered };
     let ledger =
-        history::build(&sender, &ledger_scans, Some(&spent_set), &coverage, None, (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
+        history::build(&sender, &ledger_scans, Some(&spent_set), &coverage, None, (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()), Some(&std::collections::BTreeMap::new()));
     assert!(ledger.gaps.is_empty(), "a fully accounted ledger: {:?}", ledger.gaps);
     assert_eq!(ledger.events.len(), 2, "the grant receipt and the send — the change is folded in");
     match &ledger.events[0] {
@@ -520,7 +520,7 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
         Some(&spent_set),
         &coverage,
         Some(&log),
-        (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
+        (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()), Some(&std::collections::BTreeMap::new()));
     assert_eq!(labeled.totals, ledger.totals, "local memory labels; it moves no chain figure");
     assert_eq!(labeled.unmatched_records, 0);
     let labeled_text = history::render(&labeled, &node_url);

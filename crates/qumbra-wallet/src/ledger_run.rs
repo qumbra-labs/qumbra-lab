@@ -114,8 +114,24 @@ pub fn report_data(
     // `form` is threaded rather than hardcoded even though the coinbase half is
     // dropped two lines up: it is fetched here, and a literal form in a flow
     // that later starts *using* `mined` is precisely how lab #566 happened.
-    let crate::scan::Gathered { outcomes, coverage, set, .. } =
+    let crate::scan::Gathered { outcomes, coverage, set, mined, .. } =
         crate::scan::gather(w, url, from, to, form);
+    // 🔴 **`mined` is no longer dropped whole** (lab #658). Its *notes* still are,
+    // for the reason stated above — a coinbase receipt is a different event
+    // shape. What is kept is one fact off the same already-fetched pages:
+    // `BlockCoinbase::name_burn`, i.e. which heights burned a name fee. A send
+    // event at such a height cannot quote `inputs − change − posted_fee` as the
+    // amount sent, because the burn is value that left and entered no note, so
+    // that subtraction hands it to the recipient. `None` here means the route
+    // was not read and the answer is unknown — which is NOT the same as no burn,
+    // and is the distinction this argument exists to preserve.
+    let name_burns: Option<std::collections::BTreeMap<u64, u64>> = mined.as_ref().map(|m| {
+        m.blocks
+            .iter()
+            .filter(|b| b.name_burn > 0)
+            .map(|b| (b.height, b.name_burn))
+            .collect()
+    });
     let scans: Vec<AddressScan> = outcomes
         .into_iter()
         .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
@@ -129,6 +145,7 @@ pub fn report_data(
         (from, to),
         // This platform HAS the posted-fee table, so send events get exact fees.
         Some(posted_fee_2x2()),
+        name_burns.as_ref(),
     );
     HistoryData { ledger, notes }
 }
