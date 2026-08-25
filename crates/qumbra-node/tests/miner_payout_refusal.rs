@@ -229,7 +229,8 @@ fn check_refuses_mining_with_no_miner_rkm_instead_of_reporting_it_ok() {
 /// **REGRESSION GUARD — `mining = false` with no `miner_rkm` still passes.**
 ///
 /// This is the ordinary node: every explorer observer, `tests/sigterm_shutdown.rs`,
-/// and three of the four hosts in `deploy/hosts.example`. It is the regression this
+/// and every host of a fleet `deploy/deploy.sh --no-mining` generates (which is what
+/// `deploy/hosts.example` is as shipped, since lab #552's deploy follow-up). It is the regression this
 /// change was most likely to introduce, so it is asserted through the binary and
 /// not only through the predicate — a gate wired in at the wrong place would refuse
 /// here too.
