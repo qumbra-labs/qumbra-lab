@@ -5689,9 +5689,11 @@ mod tests {
 
     /// **REGRESSION GUARD — the one this change was most likely to break.**
     ///
-    /// A non-mining node with no `miner_rkm` is the ordinary case: three of the four
-    /// hosts in `deploy/hosts.example` carry no payout key, every explorer observer
-    /// is keyless and non-mining, and `tests/sigterm_shutdown.rs` runs one. If this
+    /// A non-mining node with no `miner_rkm` is the ordinary case: a
+    /// `deploy/deploy.sh --no-mining` fleet carries none (`deploy/hosts.example` as
+    /// shipped is one — the generator refuses a keyless MINING host since lab #552's deploy follow-up),
+    /// every explorer observer is keyless and non-mining, and
+    /// `tests/sigterm_shutdown.rs` runs one. If this
     /// assertion ever fails, the gate has stopped reading `config.mining` and has
     /// become a requirement that every node hold a wallet.
     #[test]

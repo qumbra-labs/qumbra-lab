@@ -6,9 +6,20 @@
 #                 every other node's dial-peer list.
 # - ssh_target  : user@host for rsync/ssh deploy, or "-" for LOCAL mode
 #                 (dry-run — the payload is copied into <local-base>/<node_name>).
-# - miner_rkm   : OPTIONAL, per host (lab #475). The 64-hex coinbase payee that
-#                 node mines to — `qumbra-wallet miner-rkm --dir DIR` prints it.
-#                 Omit it, or write "-", for a host that carries none.
+# - miner_rkm   : per host (lab #475). The 64-hex coinbase payee that node mines
+#                 to — `qumbra-wallet miner-rkm --dir DIR` prints it.
+#
+#                 🔴 REQUIRED ON EVERY HOST OF A MINING FLEET, which is what
+#                 `deploy.sh` generates by default. Since lab #552 (PR #655)
+#                 `qumbra-node` REFUSES TO START with `mining = true` and no
+#                 `miner_rkm` — every coin such a node mined was paid to a key
+#                 nobody holds — so `deploy.sh` refuses to GENERATE that, naming
+#                 every keyless host before it builds anything. Omit the column,
+#                 or write "-", ONLY for a fleet deployed with `--no-mining` (a
+#                 verify-only rehearsal): that flag is the one honest way to say
+#                 "this fleet does not mine". The tool will not flip a keyless
+#                 host to mining = false on its own — which hosts mine, and to
+#                 what, is decided here, by you, per row.
 #
 #                 🔴 THIS FILE IS THE SOURCE OF TRUTH FOR THAT FIELD. Before the
 #                 column existed, `deploy.sh` emitted no `miner_rkm` at all, so
@@ -21,10 +32,16 @@
 # keys split 6/5/5/5 across these 4 nodes in listed order.
 #
 # ---- real 4-VPS deploy (fill in for Phase B) --------------------------------
-# The miner_rkm column below is illustrative: node1 mines to a wallet, the rest
-# carry none. Replace it with your own `qumbra-wallet miner-rkm` output — a node
-# whose miner_rkm is unset mines valid blocks whose coinbase is UNSPENDABLE.
+# AS SHIPPED THIS FILE IS A --no-mining TEMPLATE: no row carries a key, so
+# `deploy.sh --hosts` REFUSES it until you either pass --no-mining or fill the
+# 4th column on all four rows with your own `qumbra-wallet miner-rkm` output.
+# No illustrative key is shipped, on purpose: a placeholder that reached a host
+# is structurally valid, mines, and pays a key nobody holds — the same class of
+# value as the payee on T2 blocks 607/610/611 (lab #552), and no refusal
+# anywhere would catch it. A mining row looks like:
+#
+#   node1   203.0.113.11:9444    root@203.0.113.11   <the 64 hex characters `qumbra-wallet miner-rkm --dir DIR` printed>
 node0   203.0.113.10:9444    root@203.0.113.10   -
-node1   203.0.113.11:9444    root@203.0.113.11   0100000000000000020000000000000003000000000000000400000000000000
+node1   203.0.113.11:9444    root@203.0.113.11   -
 node2   203.0.113.12:9444    root@203.0.113.12   -
 node3   203.0.113.13:9444    root@203.0.113.13   -

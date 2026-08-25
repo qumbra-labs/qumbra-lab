@@ -9,8 +9,13 @@ subset + a generated config) onto each host.
 - **`dry-run.sh`** — Phase-A: run the whole deploy against 4 **local directories**
   standing in for the hosts, then assert the layout is correct and startable.
 - **`hosts.example`** — the 4-node host spec (fill in real IPs for Phase B). Since
-  lab #475 it carries an **optional 4th column, `miner_rkm`** — the per-host
-  coinbase payee — and it is the **source of truth** for that field.
+  lab #475 it carries a **4th column, `miner_rkm`** — the per-host coinbase payee
+  — and it is the **source of truth** for that field. Since lab #552 that column
+  is **required on every host of a mining fleet** (the default): `qumbra-node`
+  refuses to start with `mining = true` and no `miner_rkm`, so `deploy.sh`
+  refuses to *generate* one, naming every keyless host before it builds. `-` (or
+  an omitted column) is legal only under `--no-mining`, and the file as shipped
+  is such a template — no placeholder keys, deliberately.
 - **`qumbra-node.service.example`** — optional systemd unit for the VPS.
 
 ## The T0 topology (inline stamps, per the task-book)
@@ -31,12 +36,23 @@ deploy/dry-run.sh            # builds if needed, lays down 4 node dirs, asserts,
 deploy/dry-run.sh --keep     # keep the tree to inspect it
 ```
 
-It writes a local hosts spec (`127.0.0.1:9401..9404`, ssh target `-`), invokes
-`deploy.sh` in local mode, and checks: every payload present; the 21 keys split
-6/5/5/5 disjoint + complete; the genesis file byte-identical on all 4 nodes;
-`qumbra-node check` passing on every node with a single shared pinned genesis
-hash; and the **committee key modes — 0700 on `keys/`, 0600 on each key file**.
-Exits non-zero on the first failed assertion.
+It writes a local hosts spec (`127.0.0.1:9401..9404`, ssh target `-`, a distinct
+`miner_rkm` on every host), invokes `deploy.sh` in local mode, and checks: every
+payload present; the 21 keys split 6/5/5/5 disjoint + complete; the genesis file
+byte-identical on all 4 nodes; `qumbra-node check` passing on every node with a
+single shared pinned genesis hash, reporting `mining = true` and that host's own
+payout key; the **committee key modes — 0700 on `keys/`, 0600 on each key file**;
+and each host's `miner_rkm` reaching **that host's config, verbatim and alone**,
+and surviving a re-deploy. Two further passes pin the **payout contract** (lab
+#552): a mining fleet with keyless hosts is **refused at generation** — before
+the genesis is minted or a payload exists, naming every keyless host and the
+`--no-mining` exit — and the same mixed fleet under `--no-mining` generates
+cleanly, every node preflighting with `mining = false`. Exits non-zero on the
+first failed assertion.
+
+🔴 **`dry-run.sh` is not in CI.** The suite runs `cargo test` only and nothing in
+`crates/` shells out to `deploy.sh`; a green tick says nothing about this
+directory. After touching anything here, run `deploy/dry-run.sh` and paste it.
 
 The mode check runs three times over and is worth understanding before editing it.
 On 2026-07-31 the T0 net was found with `drwxr-xr-x /opt/qumbra/keys` while every
@@ -108,9 +124,13 @@ and a re-run after T0-5 — budget roughly a week of uptime on four small instan
 ## Phase B — the real 4-VPS deploy ✅ executed 2026-07-26 (see `qumbra-deploy`)
 
 1. Edit `hosts.example` → `hosts` with the 4 VPS public addresses + ssh targets,
-   and — for any host that should be paid what it mines — its `miner_rkm` in the
-   optional 4th column (`qumbra-wallet miner-rkm --dir DIR` prints the value; `-`
-   or an omitted column means that host carries none).
+   and **every host's `miner_rkm`** in the 4th column (`qumbra-wallet miner-rkm
+   --dir DIR` prints the value). Since lab #552 a mining host without one is a
+   config `qumbra-node` refuses to start — every coin it mined went to a key
+   nobody holds — so `deploy.sh` refuses to generate it and names the hosts. `-`
+   or an omitted column is legal only with `--no-mining` (a verify-only
+   rehearsal in which no host mines); the tool never flips a host to
+   `mining = false` for you.
 
    🔴 **Put it in the hosts file, never on the host.** Before lab #475 the
    generator emitted no `miner_rkm` at all, so every re-run dropped the field
