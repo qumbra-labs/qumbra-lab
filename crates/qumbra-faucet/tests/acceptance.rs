@@ -122,6 +122,30 @@ fn post_request(addr: SocketAddr, address: &str, ticket: Option<&str>) -> (u16, 
     post_request_with_headers(addr, address, ticket, "")
 }
 
+/// [`post_request`] against a **path of the caller's choosing** — the form's own
+/// target `/` and the original `/request` are one route, and a test that only ever
+/// exercises one of them cannot see the other break.
+fn post_request_to(
+    addr: SocketAddr,
+    path: &str,
+    address: &str,
+    ticket: Option<&str>,
+) -> (u16, String, String) {
+    let mut body = format!("address={address}");
+    if let Some(t) = ticket {
+        body.push_str(&format!("&ticket={t}"));
+    }
+    http(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
 /// Like [`post_request`], with extra raw header lines (each ending in `\r\n`).
 fn post_request_with_headers(
     addr: SocketAddr,
@@ -504,6 +528,43 @@ fn every_refusal_is_a_refusal_over_the_wire_never_a_500() {
         journal.iter().all(|l| !l.contains(" 500 ")),
         "a refusal was reported as a server error: {journal:?}"
     );
+    server.shutdown();
+}
+
+/// 🔴 **The form posts to the page's own path, and both paths are one route** — the
+/// URL a visitor is looking at does not change when they ask for a grant.
+///
+/// It used to post to `/request`, so the address bar moved to `…/request` on the
+/// first request and stayed there: the URL no longer named the page in front of
+/// you, and reloading it re-submitted instead of refreshing. `/request` still
+/// serves POST, because scripts and `OPERATOR.md`'s own `FAUCET POST /request`
+/// check are written against it — so this asserts **both** paths, over a real
+/// socket, and that the served page's form targets `/`.
+#[test]
+fn the_form_posts_to_the_pages_own_path_and_request_still_serves() {
+    let wallet = faucet_wallet();
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Disabled);
+    let mut rng = rand::rngs::StdRng::from_seed([0x2F; 32]);
+    svc.tick(&mut node, &mut rng);
+    let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
+
+    // The page a visitor is served points its form at the path they are on.
+    let (status, _, body) = http(
+        server.addr(),
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("action=\"/\""), "the form posts to `/`: {body}");
+    assert!(!body.contains("action=\"/request\""), "and not to a path that moves the URL");
+
+    // Both paths answer the same route: neither is a 404 or a 405.
+    let (_, addr) = requester(0xC0DE_0055);
+    for path in ["/", "/request"] {
+        let (status, _, body) = post_request_to(server.addr(), path, &addr.encode(), None);
+        assert_ne!(status, 404, "POST {path} must be routed: {body}");
+        assert_ne!(status, 405, "POST {path} must be allowed: {body}");
+    }
     server.shutdown();
 }
 

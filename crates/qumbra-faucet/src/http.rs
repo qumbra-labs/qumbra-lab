@@ -2,7 +2,10 @@
 //!
 //! ```text
 //!   GET  /                a form, the faucet's state, and why it is in that state
-//!   POST /request         address + ticket → 202 with a receipt, or a NAMED refusal
+//!   POST /                the form's own target — address + ticket → 202 with a receipt,
+//!                         or a NAMED refusal. Same route as below, labelled `/request`.
+//!   POST /request         the same handler under its original path, kept for anything
+//!                         scripted against it (and for `FAUCET POST /request` in logs)
 //!   GET  /r/<receipt>     what happened to one request
 //!   GET  /healthz         "ok" — for a supervisor, no state
 //!   GET  /favicon-{32,16}.png   the brand mark, compiled in (assets/brand/README.md)
@@ -593,7 +596,21 @@ impl FaucetServer {
                             ),
                         }
                     }
-                    (tiny_http::Method::Post, "/request") => {
+                    // 🔴 **Two paths, one route, and the form posts to `/`.** It used to
+                    // post to `/request`, which is a different path, so a browser's address
+                    // bar changed to `…/request` the moment anyone asked for a grant and
+                    // stayed there — the visitor's URL was no longer the page they were
+                    // looking at, and reloading it re-submitted rather than refreshing.
+                    // Posting to the page's own path leaves the URL untouched.
+                    //
+                    // `/request` keeps working, and the **route label stays `/request`**
+                    // for both. That is deliberate: the journal and the metrics record the
+                    // matched route rather than the raw path, `OPERATOR.md`'s own
+                    // proven-grant check greps `FAUCET POST /request`, and a label that
+                    // moved would make that check answer "absent" for a faucet serving
+                    // normally — this repo's most-repeated defect, in the log this time.
+                    // The method separates `POST /` from `GET /` for anyone reading.
+                    (tiny_http::Method::Post, "/" | "/request") => {
                         let mut body = String::new();
                         // `Read::take` explicitly: `as_reader` hands back a
                         // `&mut dyn Read`, and method syntax would try to call
@@ -639,7 +656,10 @@ impl FaucetServer {
                             "method not allowed",
                             "<p><code>/request</code> takes <code>POST</code>. It is a POST so \
                              that the address you submit never lands in a URL, and therefore \
-                             never in an access log.</p>",
+                             never in an access log.</p>\
+                             <p>The form lives at <a href=\"/\">the faucet's front page</a>, \
+                             and posts to that same path — so asking for a grant no longer \
+                             leaves you on this URL.</p>",
                         )),
                         Some(("Allow".to_string(), "POST".to_string())),
                     ),
@@ -1000,7 +1020,7 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
 
     body.push_str(&format!(
         "<h2>Ask for {} QMB</h2>\n\
-         <form method=\"post\" action=\"/request\">\n\
+         <form method=\"post\" action=\"/\">\n\
          <p><label for=\"address\">Your Qumbra address</label><br>\n\
          <textarea id=\"address\" name=\"address\" rows=\"4\" required \
          placeholder=\"{}\"></textarea></p>\n\
@@ -1464,7 +1484,9 @@ mod tests {
         for icon in ["href=\"/favicon-32.png\"", "href=\"/favicon-16.png\""] {
             assert!(html.contains(icon), "the page must declare {icon}: {html}");
         }
-        assert!(html.contains("form method=\"post\" action=\"/request\""));
+        // Lab: the form posts to the page's own path, so the address bar does not
+        // change when someone asks for a grant. `/request` still accepts POST.
+        assert!(html.contains("form method=\"post\" action=\"/\""));
         assert!(html.contains("10.00000000"), "the grant value is rendered in QMB: {html}");
         assert!(html.contains("Receipt") || html.contains("receipt"));
     }
