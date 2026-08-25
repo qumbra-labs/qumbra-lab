@@ -89,11 +89,27 @@ pub struct SendArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildRefusal {
     /// The spendable set does not cover `amount + fee` in at most two notes.
-    CannotCover { need: u64, amount: u64, fee: u64, have: u64 },
+    CannotCover {
+        need: u64,
+        amount: u64,
+        fee: u64,
+        have: u64,
+    },
     /// A selected note's commitment is in no leaf of the supplied tree.
     NotInTree,
     /// The note is a leaf, but past the anchor — its block is not finalized yet.
     OutsideAnchor { pos: u64, anchor_count: u64 },
+    /// The FINALIZED notes alone cannot cover the amount, but the full spendable
+    /// set (including notes whose block is not finalized yet) would. Distinct
+    /// from [`CannotCover`] because the money IS here — it just cannot be spent
+    /// YET, and becomes spendable with no action once finality advances. This is
+    /// the common shape right after a send: the change note is not finalized for
+    /// ~15 blocks, so a second send that would re-use it must wait, not despair.
+    NotYetFinalized {
+        need: u64,
+        finalized_have: u64,
+        total_have: u64,
+    },
     /// Anything else, verbatim (arithmetic overflow, a recipient with no
     /// encapsulation key).
     Other(String),
@@ -102,7 +118,12 @@ pub enum BuildRefusal {
 impl std::fmt::Display for BuildRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuildRefusal::CannotCover { need, amount, fee, have } => write!(
+            BuildRefusal::CannotCover {
+                need,
+                amount,
+                fee,
+                have,
+            } => write!(
                 f,
                 "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
              notes summing {have}. The frozen 2×2 bucket moves at most TWO notes per \
@@ -125,6 +146,19 @@ impl std::fmt::Display for BuildRefusal {
                  built against a finalized anchor, so this spend is not possible YET; it becomes \
                  possible with no action once finality advances past that block. Refusing here \
                  rather than proving a statement the chain would reject."
+            ),
+            BuildRefusal::NotYetFinalized {
+                need,
+                finalized_have,
+                total_have,
+            } => write!(
+                f,
+                "this spend needs {need} bessel and your wallet holds {total_have}, but only \
+                 {finalized_have} is in notes whose block the chain has finalized. The rest is \
+                 not spendable YET — a witness can only be built against a finalized anchor. No \
+                 action is needed: it becomes spendable once finality advances past those blocks \
+                 (~15 blocks after they were mined). This is the ordinary state right after a \
+                 send, whose change note is not finalized for a short while."
             ),
             BuildRefusal::Other(why) => write!(f, "{why}"),
         }
@@ -166,45 +200,105 @@ pub(crate) fn build_bundle(
         .checked_add(fee)
         .ok_or_else(|| BuildRefusal::Other("amount overflows".into()))?;
 
-    // Coin selection: fewest notes that cover amount+fee, largest first. The
-    // frozen bucket moves AT MOST two real notes; more means consolidating
-    // first, and this refusal says so instead of silently spending wrong.
-    let mut sorted: Vec<&Spendable> = notes.iter().collect();
-    sorted.sort_by(|a, b| b.value.cmp(&a.value));
-    let (chosen, used_dummy): (Vec<&Spendable>, bool) =
-        if sorted.first().is_some_and(|n| n.value >= need) {
-            (vec![sorted[0]], true)
-        } else if sorted.len() >= 2
-            && sorted[0]
+    // Every candidate's tree position, computed UP FRONT so selection can
+    // prefer notes whose block is finalized (`pos < anchor_count`). A note past
+    // the anchor is spendable soon with no action; skipping it here lets a send
+    // that CAN be built from finalized notes succeed, instead of the old
+    // behaviour that could pick a larger not-yet-finalized note and then refuse
+    // (issue qumbra-wallet#58). `derive_input`'s cm is what positions the note;
+    // getting it wrong is invisible to a test that builds its tree the same
+    // wrong way (see the module test history).
+    struct Candidate {
+        div_index: u64,
+        value: u64,
+        rho: [u64; 4],
+        rseed: [u64; 4],
+        pos: u64,
+        finalized: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(notes.len());
+    for n in notes {
+        let d = wallet.diversifier_at_index(n.div_index);
+        let inp = wallet.spend_input(n.value, n.rho, n.rseed, d);
+        let (_nk, _nf, cm) = derive_input(&inp);
+        let pos = tree.position_of(&cm).ok_or(BuildRefusal::NotInTree)?;
+        candidates.push(Candidate {
+            div_index: n.div_index,
+            value: n.value,
+            rho: n.rho,
+            rseed: n.rseed,
+            pos,
+            finalized: pos < anchor_count,
+        });
+    }
+
+    // Coin selection: fewest FINALIZED notes that cover amount+fee, largest
+    // first. The frozen bucket moves AT MOST two real notes.
+    fn covers_in_two(sorted: &[&Candidate], need: u64) -> bool {
+        sorted.first().is_some_and(|c| c.value >= need)
+            || (sorted.len() >= 2
+                && sorted[0]
+                    .value
+                    .checked_add(sorted[1].value)
+                    .is_some_and(|s| s >= need))
+    }
+
+    let mut finalized: Vec<&Candidate> = candidates.iter().filter(|c| c.finalized).collect();
+    finalized.sort_by(|a, b| b.value.cmp(&a.value));
+
+    let (chosen, used_dummy): (Vec<&Candidate>, bool) =
+        if finalized.first().is_some_and(|c| c.value >= need) {
+            (vec![finalized[0]], true)
+        } else if finalized.len() >= 2
+            && finalized[0]
                 .value
-                .checked_add(sorted[1].value)
+                .checked_add(finalized[1].value)
                 .is_some_and(|s| s >= need)
         {
-            (vec![sorted[0], sorted[1]], false)
+            (vec![finalized[0], finalized[1]], false)
         } else {
-            let have: u64 = sorted.iter().map(|n| n.value).sum();
-            return Err(BuildRefusal::CannotCover { need, amount, fee, have });
+            // Finalized notes cannot cover. Would the FULL set (including the
+            // not-yet-finalized notes) have covered? If so the money is here,
+            // just not spendable yet — a different, temporary situation than a
+            // real shortfall, and it says so.
+            let total_have: u64 = candidates.iter().map(|c| c.value).sum();
+            let finalized_have: u64 = finalized.iter().map(|c| c.value).sum();
+            let mut all: Vec<&Candidate> = candidates.iter().collect();
+            all.sort_by(|a, b| b.value.cmp(&a.value));
+            if covers_in_two(&all, need) {
+                return Err(BuildRefusal::NotYetFinalized {
+                    need,
+                    finalized_have,
+                    total_have,
+                });
+            }
+            return Err(BuildRefusal::CannotCover {
+                need,
+                amount,
+                fee,
+                have: total_have,
+            });
         };
 
-    // Real inputs + their tree witnesses.
+    // Real inputs + their tree witnesses. Every chosen note is finalized by
+    // construction, so `auth_path` cuts against a leaf inside the anchor.
+    let chosen: Vec<Spendable> = chosen
+        .iter()
+        .map(|c| Spendable {
+            div_index: c.div_index,
+            value: c.value,
+            rho: c.rho,
+            rseed: c.rseed,
+        })
+        .collect();
     let mut inputs: Vec<TxInput> = Vec::with_capacity(2);
     let mut witnesses: Vec<MerkleWitness> = Vec::with_capacity(2);
     for n in &chosen {
         let d = wallet.diversifier_at_index(n.div_index);
         let inp = wallet.spend_input(n.value, n.rho, n.rseed, d);
-        // `derive_input` returns (nk, nf, cm) — position matters, and getting it
-        // wrong here is invisible to a test that builds its tree the same wrong
-        // way (see the module test's history in the PR).
         let (_nk, _nf, cm) = derive_input(&inp);
         let pos = tree.position_of(&cm).ok_or(BuildRefusal::NotInTree)?;
-        // The note is in the tree, but is it inside the ANCHOR? `auth_path`
-        // would happily cut a path for a leaf past `anchor_count`, and the
-        // result folds to something that is not the anchor root — a perfectly
-        // well-formed proof of a false statement, which costs ~3 s and ~12 GB
-        // to produce and comes back `refused: proof-invalid` with no hint that
-        // the real problem was finality. A wallet whose note landed in a block
-        // the chain has not finalized yet is in an ordinary, temporary state
-        // and deserves to be told so (issue #276).
+        // Defensive invariant: selection only chose finalized notes.
         if pos >= anchor_count {
             return Err(BuildRefusal::OutsideAnchor { pos, anchor_count });
         }
@@ -268,11 +362,9 @@ pub(crate) fn build_bundle(
 
     // Encrypt each output to its owner — the #188 (a) discovery payloads,
     // recipient-major, same order as `commitments`.
-    let recipient_ek = recipient
-        .encapsulation_key()
-        .ok_or_else(|| {
-            BuildRefusal::Other("recipient address carries no ML-KEM encapsulation key".into())
-        })?;
+    let recipient_ek = recipient.encapsulation_key().ok_or_else(|| {
+        BuildRefusal::Other("recipient address carries no ML-KEM encapsulation key".into())
+    })?;
     let to_recipient = encrypt_to_recipient(&recipient_ek, &[recipient_note], rng);
     let self_ek = wallet.diversified_keypair(&change_d).ek;
     let to_self = encrypt_to_recipient(&self_ek, &[change_note], rng);
@@ -297,7 +389,9 @@ pub(crate) fn build_bundle(
         output_range,
         spent_covered,
     };
-    bundle.validate().map_err(|e| BuildRefusal::Other(e.to_string()))?;
+    bundle
+        .validate()
+        .map_err(|e| BuildRefusal::Other(e.to_string()))?;
     Ok(bundle)
 }
 
@@ -477,17 +571,79 @@ mod tests {
         tree.append(cm);
         assert_eq!(tree.position_of(&cm), Some(2));
 
+        // The wallet's ONLY note is not finalized, and it would cover the send.
+        // Selection now reports this as NotYetFinalized ("your money is here,
+        // just not finalized yet — wait") rather than picking it and refusing at
+        // the witness step. Still no prove happens.
         let err = match build_send(&wallet, &[note], &recipient, 4_000_000, &tree, 2, &mut rng) {
             Err(e) => e,
-            Ok(_) => panic!("a note outside the anchor must refuse, not prove"),
+            Ok(_) => panic!("a note not finalized yet must refuse, not prove"),
         };
-        assert!(err.contains("position 2"), "{err}");
-        assert!(err.contains("outside the anchor at 2 leaves"), "{err}");
-        assert!(err.contains("not finalized yet"), "{err}");
+        assert!(err.contains("not spendable YET"), "{err}");
+        assert!(err.contains("finalized"), "{err}");
         assert!(
-            err.contains("not possible YET"),
+            err.contains("No action is needed") && err.contains("finality advances"),
             "the state is temporary and says so: {err}"
         );
+    }
+
+    /// A larger note that is not finalized yet must NOT block a send that a
+    /// smaller finalized note can cover: selection prefers the finalized note
+    /// (issue qumbra-wallet#58).
+    #[test]
+    fn a_finalized_note_is_preferred_over_a_larger_unfinalized_one() {
+        let mut rng = StdRng::seed_from_u64(0x5E1E);
+        let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([41u8; 32]), 0);
+        let recipient =
+            Wallet::from_master_seed(&MasterSeed::from_entropy([42u8; 32]), 0).address_at_index(0);
+
+        // A small finalized note (enough to cover) and a big not-yet-finalized
+        // note. The big one sorts first by value but is past the anchor.
+        let small = Spendable {
+            div_index: 0,
+            value: 6_000_000,
+            rho: [3, 3, 3, 3],
+            rseed: [5, 5, 5, 5],
+        };
+        let big = Spendable {
+            div_index: 1,
+            value: 90_000_000,
+            rho: [7, 7, 7, 7],
+            rseed: [9, 9, 9, 9],
+        };
+        let cm = |n: &Spendable| {
+            let d = wallet.diversifier_at_index(n.div_index);
+            derive_input(&wallet.spend_input(n.value, n.rho, n.rseed, d)).2
+        };
+
+        // Tree: small at leaf 0 (finalized), a filler at 1, big at 2 (outside
+        // the anchor). anchor_count = 2 → leaves 0,1 finalized; 2 is not.
+        let mut tree = CommitmentTree::new();
+        tree.append(cm(&small));
+        tree.append([2, 2, 2, 2]);
+        tree.append(cm(&big));
+        assert_eq!(tree.position_of(&cm(&small)), Some(0));
+        assert_eq!(tree.position_of(&cm(&big)), Some(2));
+
+        // Build (no prove): if selection wrongly preferred the larger
+        // unfinalized note, build_bundle would refuse. It succeeds → the small
+        // finalized note was chosen. No ~12 GB proof, so this is not
+        // release-gated.
+        build_bundle(
+            &wallet,
+            &[big, small],
+            &recipient,
+            4_000_000,
+            &tree,
+            2,
+            0,
+            recipient.short().encode(),
+            Some((0, 0)),
+            Some((0, 0)),
+            None,
+            &mut rng,
+        )
+        .expect("the finalized note covers this send and must be chosen, not refused");
     }
 
     /// One real spend, end to end, through the merged post-mint circuit: build a
