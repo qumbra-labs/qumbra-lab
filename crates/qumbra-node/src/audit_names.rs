@@ -198,7 +198,7 @@ pub fn audit_blocks(
         }
         // Fold the block into the registry AFTER rule-checking it (the rules
         // read the state as of the block's parent, same as validation).
-        if let Err((i, e)) = registry.apply_block_riders(h, &block.txs) {
+        if let Err((i, e)) = registry.apply_block_riders(h, block.txs.iter().map(|t| t.rider.as_slice())) {
             if audited {
                 violations.push(NameViolation {
                     height: h,

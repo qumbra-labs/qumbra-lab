@@ -1103,9 +1103,8 @@ mod tests {
     /// view would let these tests agree with a registry that does not exist.
     fn registry_with(height: u64, txs: &[TxEntry]) -> crate::name_registry::NameRegistry {
         let mut reg = crate::name_registry::NameRegistry::default();
-        let stored: Vec<crate::store::StoredTx> =
-            txs.iter().map(crate::store::StoredTx::from).collect();
-        reg.apply_block_riders(height, &stored).expect("fixture riders decode");
+        reg.apply_block_riders(height, txs.iter().map(|t| t.rider.as_slice()))
+            .expect("fixture riders decode");
         reg
     }
 
@@ -1219,7 +1218,7 @@ mod tests {
         let body = BlockBody::from_single_payee(vec![their_reveal.clone()], coinbase(201), TEST_RKM);
         let mut reg_after = reg.clone();
         reg_after
-            .apply_block_riders(201, &[crate::store::StoredTx::from(&their_reveal)])
+            .apply_block_riders(201, [their_reveal.rider.as_slice()])
             .expect("the mined rider applies");
         let st_after = TestState { tip: 201, ..state_with_anchor() };
 

@@ -412,9 +412,10 @@ pub fn reopens_at(expiry: u64) -> u64 {
 }
 
 /// What rider rule-checking needs to know about chain state — injected into
-/// `validate_body` exactly like `is_anchor_final`, implemented by the node's
-/// registry (stage 3). Kept minimal on purpose: two questions, both answerable
-/// from a replay of committed riders.
+/// `validate_body` exactly like `is_anchor_final`, implemented by
+/// [`crate::name_registry::NameRegistry`] (stage 3; the shared replay since
+/// lab #660). Kept minimal on purpose: two questions, both answerable from a
+/// replay of committed riders.
 pub trait NameView {
     /// Was a COMMIT rider carrying exactly `commit` included on the main chain
     /// at some height in `[min_h, max_h]` (inclusive)?
