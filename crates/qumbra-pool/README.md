@@ -1,8 +1,10 @@
 # `qumbra-pool` — a custody-free mining pool
 
 > [中文版](README-zh.md) · English is authoritative on technical detail.
-> **`pool.qumbra.org:3333` has paid miners — 137 blocks on 2026-08-22. It is not announced,
-> and this document cannot tell you whether it is serving right now (see §*Reachability*).**
+> 🔴 **`pool.qumbra.org:3333` is OPEN to the internet and serving.** Measured 2026-08-25: a
+> stratum login from an ordinary outside laptop was answered with a real job. It has paid miners
+> (137 blocks on 2026-08-22) and it is **unannounced but not unreachable** — see §*Reachability*,
+> which corrects the opposite claim this line carried on 2026-08-24.
 
 ## Status board
 
@@ -224,25 +226,45 @@ does not is the failure this project has already paid for once.
 4. **Decide the fee policy.** Nobody has. A stranger must be told what they are paying.
 5. **Then, and only then, the announcement is a live question** — and it is Larry's.
 
-### Reachability — what this document can and cannot tell you
+### 🔴 Reachability — the endpoint is OPEN to the internet and serving
 
-**It cannot tell you whether the pool is serving right now, and neither can an off-host probe.**
-Measured 2026-08-24 from the coordinator's laptop:
+**Measured 2026-08-25 11:25 +08 from an ordinary laptop outside the fleet.** A stratum `login`
+with an arbitrary name was answered with a **real job for a real height**:
 
-| | |
-|---|---|
-| `pool.qumbra.org` → | `54.243.254.140`, **AMAZON** — DNS-only, straight to the host |
-| `seed.qumbra.org` → | `172.67.…` / `104.21.…` — **Cloudflare-proxied**, for contrast |
-| TCP `54.243.254.140:3333` | **times out** — no `RST` |
+```
+nc -vz 54.243.254.140 3333   ->  succeeded
 
-**A timeout is not a closed port.** A stopped container behind an open security group answers
-immediately with `RST`; **silence is the signature of a security-group DROP.** So the SG is
-narrowed — which is the documented order above, working as intended — and the consequence is that
-**an outside probe cannot distinguish "SG closed, pool running" from "SG closed, pool stopped".**
-Whether the process is up is an on-host read, and this file will not guess it.
+{"id":1,"jsonrpc":"2.0","result":{"id":"s00000012","job":{
+  "algo":"rx/0","height":5737,"job_id":"j00000fae",
+  "blob":"1591123cb6e4…","seed_hash":"d1e28adcce8f…"}}}
+```
 
-Do not read a failed `nc`/`telnet` against 3333 as an outage report. It is a measurement of the
-security group.
+**Anyone who knows the hostname can connect and be given work today.** `pool.qumbra.org` resolves
+to `54.243.254.140` (AMAZON, DNS-only — no Cloudflare in front, unlike `seed.qumbra.org`), and
+nothing between the internet and the stratum port refuses a stranger.
+
+> ⏳ **CORRECTION, 2026-08-25.** The version of this section merged on 2026-08-24 stated the
+> opposite — that TCP 3333 *"times out"*, that *"silence is the signature of a security-group
+> DROP"*, and that an outside probe therefore could not tell a running pool from a stopped one.
+> **All of that was false.** It rested on one probe,
+> `bash -c 'exec 3<>/dev/tcp/pool.qumbra.org/3333' 2>/dev/null`, which **hangs** against this
+> endpoint and was killed by its own `timeout` — with stderr discarded, so the silence was read
+> as a fact about the service. A control run the next day settles it: the same construct against
+> `seed.qumbra.org:443` returns instantly, so `/dev/tcp` works here and the failure was specific
+> to that probe. **`nc` and a stratum login both succeed.**
+>
+> The lesson is the one this repo keeps paying for: **a probe that fails silently and a service
+> that is down are the same reading.** Suppressing stderr on a probe that can hang converts "my
+> instrument did not work" into "the thing is not there."
+
+**So "unannounced" is the only thing standing between a stranger and this pool — and this document
+already says obscurity is not a control.** That was written about the exposure window before the
+endpoint was stopped; it applies unchanged now, with the port open again.
+
+**What that means today, given the payee cap above:** a stranger who connects gets hours of the
+entire mint and hours of nothing, uncorrelated with what they contributed in that period. **The
+gate on announcing is not the only thing protecting them — the security group would be, and it is
+not narrowed.** Narrowing it is an on-host decision and Larry's.
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
