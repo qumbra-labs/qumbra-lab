@@ -1296,6 +1296,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     ///   exists to catch. `off_main` covers it. Conversely a caught-up node on a
     ///   halted net — `stip` frozen, on-main, nothing to ask — trips neither clause
     ///   and stays quiet, which is right: it is not stranded, the chain is.
+    /// - 🔴 **`ask_set > 0` is the third disjunct, and it is what "something to
+    ///   ask for" always meant** (#661). The clause above says the design
+    ///   distinguishes *nothing to ask* from *something to ask*, and then the code
+    ///   measured the second with `breq_observed` — the **in-flight request
+    ///   count**, which is a different quantity from the **wanted set**. `breq > 0`
+    ///   is "I have a request outstanding"; `ask_set > 0` is "there is a body I
+    ///   want". A node that wants a body and never managed to issue the request has
+    ///   `ask_set=1, breq=0`, and it is the worst case, not a corner: the explorer
+    ///   node on 2026-08-24 sat on-main at `stip=4882` with `bask=1@4882 breq=0`
+    ///   for 100 minutes — five times this clock — and this latch, built to
+    ///   announce exactly that, produced zero occurrences. The firing path was
+    ///   correct throughout; the predicate could not see the node.
+    ///   **The halted-net exemption is preserved exactly**: there `ask_set = 0`, so
+    ///   the third disjunct is false along with the other two and the node stays
+    ///   quiet. The clock is unchanged — this widens *what counts as wanting*, not
+    ///   *how long a freeze must last*.
     pub fn ask_set_observation(&self, in_flight: usize, mining: bool) -> AskSetObservation {
         let applied = self.applied_tip();
         let lag = self.state_lag();
@@ -1303,9 +1319,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let stuck_ms = self
             .stip_moved_ms
             .map_or(0, |t| self.stall_now_ms.saturating_sub(t));
+        // The window the requester would actually use this tick (QUM-115), not
+        // a fixed 16: reporting the steady width while a catch-up asks 128
+        // would make `ask_set` say the pipeline was full when it was not.
+        //
+        // Computed once, here, and read by BOTH the predicate below and the
+        // `ask_set` field — the doc comment's "everything else is read here so
+        // the two views of the ask set cannot disagree" is the reason the
+        // predicate must not grow a second source for this number (#661).
+        let ask_set = self.missing_body_hashes(body_window_for(lag.blocks())).len();
         let armed = self.stip_moved_ms.is_some()
             && stuck_ms >= self.unobtainable_threshold_ms()
-            && (off_main || self.breq_observed > 0);
+            && (off_main || self.breq_observed > 0 || ask_set > 0);
         let mine = if !mining {
             MineDuty::Off
         } else if !lag.is_lagging() {
@@ -1323,10 +1348,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             lag: lag.blocks(),
             off_main,
             fork_point: self.state_fork_point().map(|(h, _)| h),
-            // The window the requester would actually use this tick (QUM-115), not
-            // a fixed 16: reporting the steady width while a catch-up asks 128
-            // would make `ask_set` say the pipeline was full when it was not.
-            ask_set: self.missing_body_hashes(body_window_for(lag.blocks())).len(),
+            ask_set,
             in_flight,
             pending: self.pending_bodies.len(),
             gate: self.rejoin_gate_observed(),
