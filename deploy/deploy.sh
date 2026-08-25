@@ -22,13 +22,17 @@
 #                         <node_name> <public_addr host:port> <ssh_target | -> [miner_rkm]
 #                       ssh_target "-" means LOCAL mode for that node (dry-run):
 #                       the payload is copied into <local-base>/<node_name>.
-#                       miner_rkm is OPTIONAL and per host: the 64-hex coinbase
-#                       payee that node mines to (`qumbra-wallet miner-rkm`).
-#                       Omit it (or write "-") and the generated config carries
-#                       no miner_rkm, exactly as before. This column exists so
-#                       the hosts file is the SOURCE OF TRUTH for the field:
-#                       before it, a re-run silently dropped miner_rkm from
-#                       every host that had it (OPERATOR §9.5.1).
+#                       miner_rkm is per host: the 64-hex coinbase payee that
+#                       node mines to (`qumbra-wallet miner-rkm`). REQUIRED on
+#                       every host of a mining fleet, which is the default:
+#                       `qumbra-node` REFUSES TO START with `mining = true` and
+#                       no `miner_rkm` (lab #552, PR #655), so this tool refuses
+#                       to GENERATE that — naming every keyless host, before it
+#                       builds anything. Omit it (or write "-") ONLY under
+#                       --no-mining. This column exists so the hosts file is
+#                       the SOURCE OF TRUTH for the field: before it, a re-run
+#                       silently dropped miner_rkm from every host that had it
+#                       (OPERATOR §9.5.1).
 #   --local-base DIR    Root for LOCAL-mode nodes (default: ./t0-deploy). Each
 #                       local node lands in DIR/<node_name>/ (an absolute path is
 #                       baked into that node's config).
@@ -39,6 +43,8 @@
 #   --binary PATH       Use a pre-built binary instead of building.
 #   --no-build          Do not build; expect the binary at the default path.
 #   --no-mining         Generate configs with mining = false (verify-only rehearsal).
+#                       The ONLY fleet in which a host without a miner_rkm is
+#                       generated; see --hosts.
 #   --metrics-port N    Serve the /metrics scrape endpoint on 0.0.0.0:N (issue #87).
 #                       OMITTED BY DEFAULT: no flag, no listener. Passing it also
 #                       requires an inbound security-group rule SOURCE-RESTRICTED to
@@ -84,7 +90,7 @@ while [[ $# -gt 0 ]]; do
     --no-mining)   MINING="false"; shift ;;
     --metrics-port) METRICS_PORT="${2:?}"; shift 2 ;;
     --keep-stage)  KEEP_STAGE=1; shift ;;
-    -h|--help)     sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "unknown option: $1 (see --help)" ;;
   esac
 done
@@ -124,6 +130,45 @@ NODE_COUNT=${#NAMES[@]}
 # validate the key split
 sum=0; for k in "${KEY_SPLIT[@]}"; do sum=$((sum + k)); done
 [[ "$sum" -eq "$N_KEYS" ]] || die "KEY_SPLIT sums to $sum, not $N_KEYS"
+
+# ---- the fleet's payout contract (lab #552, PR #655) -------------------------
+#
+# `qumbra-node` REFUSES TO START with `mining = true` and no `miner_rkm`: every
+# coin such a node mined was paid to a fixed key nobody holds (T2 blocks 607/610/
+# 611). Until lab #552 this tool generated exactly that for any host whose row
+# had no key, and the binary then rejected it — one host at a time, on the host,
+# after the rsync. Refuse HERE instead: before the build, before the genesis is
+# minted, before any payload exists, naming every keyless host in one message
+# (lab #475's thesis: catch it once, not one host at a time).
+#
+# Refuse rather than write `mining = false` for the keyless hosts. A generator
+# that quietly decides which hosts mine is the same class of unexamined default
+# that produced #552 — the flip would be at generation and the surprise at the
+# first payout, and hosts.example's 1-keyed/3-keyless fleet would silently have
+# become a one-miner net. The operator says which it is: a key on every row, or
+# --no-mining for a rehearsal in which no host mines. Both are theirs to choose;
+# neither is this script's.
+#
+# This IS a second copy of one of the node's rules, which the shape check above
+# deliberately declines to be. The difference: that rule needs the node's parser
+# and can drift from it; this one is "mining and no key", has nothing to drift,
+# and is a property of the WHOLE fleet — which the per-host `check` cannot see,
+# and which in remote mode nobody runs before the payload is on the host.
+if [[ "$MINING" == "true" ]]; then
+  keyless=()
+  for i in "${!NAMES[@]}"; do
+    [[ -z "${RKMS[$i]}" ]] && keyless+=("${NAMES[$i]}")
+  done
+  if [[ ${#keyless[@]} -gt 0 ]]; then
+    die "mining fleet, but ${#keyless[@]} of $NODE_COUNT hosts carry no miner_rkm: ${keyless[*]}
+  qumbra-node REFUSES TO START with mining = true and no miner_rkm (lab #552, PR #655):
+  every coin such a host mined would be paid to a key nobody can spend. Nothing was
+  built, minted or deployed. Choose one — in the hosts file, or on this command line:
+    - give EVERY host a miner_rkm (\`qumbra-wallet miner-rkm --dir DIR\` prints it), or
+    - pass --no-mining for a verify-only rehearsal in which no host mines.
+  This tool will not flip a keyless host to mining = false on its own."
+  fi
+fi
 
 echo "== Qumbra T0 deploy =="
 echo "  nodes:       $NODE_COUNT  (${NAMES[*]})"
@@ -231,10 +276,11 @@ mining = $MINING
 expected_genesis_hash = "$GENESIS_HASH"
 EOF
 
-  # Per-host coinbase payee (OPERATOR §9.5.1, lab #475). Emitted ONLY when the
-  # hosts file carries one, so a fleet that does not mine to a wallet generates
-  # exactly the config it generated before. The point of the column is that this
-  # is now REGENERABLE: `deploy.sh` used to drop the field on every re-run, so
+  # Per-host coinbase payee (OPERATOR §9.5.1, lab #475). Emitted from the hosts
+  # file, never invented here. Absent ONLY for a keyless host under --no-mining:
+  # the payout-contract refusal above guarantees a MINING fleet reaches this
+  # point with a key on every host (lab #552). The point of the column is that
+  # this is REGENERABLE: `deploy.sh` used to drop the field on every re-run, so
   # the live hosts' configs and the config the tool produced had permanently
   # diverged, and the fix was a hand edit after every deploy.
   if [[ -n "${RKMS[$i]}" ]]; then
