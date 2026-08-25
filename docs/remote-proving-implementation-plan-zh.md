@@ -101,7 +101,9 @@ service、deployment 或 launch。`⬜` 表示 gate 仍未关闭。
 | Phase 5A precursor：valueless service mechanics implementation | ✅ | [`remote-proving-service-mvp-zh.md`](remote-proving-service-mvp-zh.md) 与 lab PR #639；真实当前 prover、有界 ephemeral worker、固定 refusal、read-only preflight、无 submit path |
 | Phase 5A precursor：standalone deployment skeleton | ✅ | deploy PR #246；loopback-only review skeleton，不是 deployment 或 public edge |
 | Phase 2–4 与 Candidate A-bound 真实价值 Phase 5A | ⬜ | Design correction、AIR/public values、wire/node verification、activation 与 wallet/mobile authorization 尚未启动 |
-| 独立 Internet-boundary review、capacity evidence 与 valueless pilot approval | ⬜ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 记录 lab `702456d` + deploy `33afc248`；Claude/Grok 都以 non-blocking residuals 批准 capacity task-book preparation。Capacity execution/evidence、任何 host/listener 与 Larry 单独 pilot gate 仍开放 |
+| capacity task-book preparation 的独立 Internet-boundary review | ✅ | [`remote-proving-service-review-ledger-zh.md`](remote-proving-service-review-ledger-zh.md) 记录 lab `702456d` + deploy `33afc248`；Claude/Grok 都以 non-blocking residuals 批准 |
+| 无价值 capacity execution 与 evidence | ✅ | 2026-08-25 在隔离单一用途 host 上执行(运行中经评审的两行 caddy-exec 修复把 deploy topology pin 从 `33afc248`→`bb511a4`,deploy PR #258)。H1–H7 全闸当天授权、执行并拆除;全新上下文的独立 §11 评审裁定**并发一在观测包络内**(七笔单 worker 证明,prover 峰值 ~11.28 GiB < 16 GiB 上限,取消/队列容量 1 干净,无 stop condition)。原始证据、authority ledger 与两份裁定按 §5 存于 **off-git** `qumbra-ops/prover-capacity-20260825T012900Z/`。两个运维发现单独归档:deploy #259(faucet `trusted_proxy_cidrs`)、deploy #261(ingress `read_body`)。记录待办残留:满爬 child 的 running-cancel 未直测、服务端逐请求计时、子进程直接计数 |
+| 无价值 pilot approval | ⬜ | 独立的 Larry gate;上面的 capacity 裁定不授权任何东西、也不开启它。公开/多客户端 pilot 另需 Candidate A(Phase 2–5A)并解决所携拓扑残留(deploy #261) |
 
 ## 5. Primary owner contract
 
