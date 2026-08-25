@@ -65,7 +65,8 @@ use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
 
 use qlab_p2p::addrman::{valid_addr, AddrManager, DIAL_RETRY_INTERVAL_MS};
-use qlab_p2p::adapter::{MiningClock, NodeAdapter};
+use qlab_devnet::mining::SliceBudget;
+use qlab_p2p::adapter::{MineStep, MiningClock, NodeAdapter};
 use qlab_p2p::bodywait::BodyWaitJournal;
 use qlab_p2p::node::BODY_REQUEST_TIMEOUT_MS;
 use qlab_p2p::n1::{ChainView, CommitteeControl};
@@ -132,6 +133,29 @@ const MAINTAIN_INTERVAL: Duration = Duration::from_millis(DIAL_RETRY_INTERVAL_MS
 
 /// The persisted address book, under the node's data dir (issue #83 scope 7).
 const ADDRBOOK_FILE: &str = "peers.dat";
+
+/// One mine-phase grind slice's wall-clock bound (lab #651). This is what
+/// actually bounds the loop blackout on a machine whose per-hash cost is
+/// unknown — the defect this replaces blocked one phase for a measured
+/// 566 s (nonce-bounded at 67,108,864 hashes, i.e. hours at worst).
+///
+/// 25 ms is chosen against per-iteration blocking, not against work lost on
+/// a tip move (which is negligible either way: one slice is ≤ 0.04 % of the
+/// expected per-block work at the 75 s block time). A healthy loop iteration
+/// today is ~20 ms (the idle sleep), so a 25 ms mine slice keeps the loop
+/// period in the tens of milliseconds — an arriving block or telemetry read
+/// waits one slice, not one grind — while keeping the slicing overhead (one
+/// template staleness check + one `Instant` read per hash) far below the
+/// cost of a real RandomX hash.
+const MINE_SLICE_DEADLINE: Duration = Duration::from_millis(25);
+
+/// One mine-phase grind slice's hash-count bound (lab #651): the determinism
+/// backstop, `2^18`. On the one measured real miner (~118 kH/s, the lab #651
+/// Windows node) the 25 ms deadline binds first at ~3 k hashes; the count
+/// exists so a pathologically cheap hash (a test engine, a misconfigured
+/// PoW) still cannot turn one slice into an unbounded spin, and so tests can
+/// assert slice arithmetic exactly.
+const MINE_SLICE_MAX_HASHES: u64 = 1 << 18;
 
 /// **How often the run loop writes a snapshot** (issue #359 S2) — the cadence that
 /// makes `snapshot.bin` an invariant instead of an accident.
@@ -359,8 +383,12 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     data_dir: std::path::PathBuf,
     /// Whether to produce blocks.
     mining: bool,
-    /// Wall-clock spacing between mining attempts (the frozen 75 s in the binary;
-    /// tests set it to zero and drive [`Self::try_mine`] directly).
+    /// Wall-clock spacing between STARTING mining templates (the frozen 75 s
+    /// in the binary; tests set it to zero and drive [`Self::try_mine`]
+    /// directly). Lab #651: this gates assembling a NEW template only — a
+    /// grind already in flight resumes on every loop iteration regardless,
+    /// because gating the resume here would grind one ~25 ms slice per 75 s
+    /// and lose ~99.97 % of the hashrate.
     mine_interval: Duration,
     last_mine: Instant,
     /// #362: last boundary vote re-push, bounded to [`Self::repush_interval`].
@@ -512,6 +540,17 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     ///   not exist). Latching bounds that to *before this node's first block*, where
     ///   refusing is the safe direction anyway.
     mine_gate_latched: bool,
+    /// Whether the LAST [`Self::try_mine`] call actually ground hashes (started,
+    /// resumed, finished or exhausted a slice) — as opposed to returning without
+    /// touching the grind (gate refused, interval unelapsed, or the parent
+    /// unreadable under the lag/halt refusal with a grind still parked).
+    ///
+    /// This is what the loop's idle-sleep suppression reads (lab #651, PR #653
+    /// review): suppressing on `grind_progress().is_some()` alone busy-spins the
+    /// state where a grind is parked but `refuse_for_lag("mine")` keeps it from
+    /// advancing — the loop would neither sleep nor hash until the lag resolved.
+    /// A parked grind suppresses the sleep only while it is actually advancing.
+    grind_advanced: bool,
     /// **Issue #229: the `BODYWAIT` journal's rate limiter.** Holds what was last
     /// reported and when, so a stranding that changes nothing does not become a
     /// stream. See [`qlab_p2p::bodywait::BodyWaitJournal`] for the three rules.
@@ -942,6 +981,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             durable_snapshot: qlab_node::snapshot_on_disk(&config.data_dir)
                 .unwrap_or(qlab_node::SnapshotOnDisk::Unreadable),
             mine_gate_latched: false,
+            grind_advanced: false,
             body_wait: BodyWaitJournal::new(),
             started: Instant::now(),
             release,
@@ -2458,13 +2498,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         }
     }
 
-    /// Attempt to mine + announce the next block over the tip. Returns whether a
-    /// block was produced (real RandomX PoW under the key-block seed).
+    /// One mine-phase step: resume the parked grind for one bounded slice, or
+    /// start a new template if the interval permits, announcing the block on a
+    /// hit. Returns whether a block was produced (real RandomX PoW under the
+    /// key-block seed).
+    ///
+    /// Lab #651: this no longer grinds a whole nonce budget in one call — the
+    /// measured 9.4-minute loop blackout. Each call blocks for at most one
+    /// slice ([`MINE_SLICE_DEADLINE`] / [`MINE_SLICE_MAX_HASHES`], whichever
+    /// first, plus one hash); the loop calls it every iteration, and
+    /// `mine_interval` gates only STARTING a new template (`last_mine` moves
+    /// only on a produced block, exactly as before). The grind itself — its
+    /// cursor and its abandonment when the tip moves — lives on the adapter
+    /// ([`NodeAdapter::mine_step`]), which owns the tip.
     ///
     /// Issue #106: the readiness gate is here rather than at the call site, so it
     /// covers every caller — the event loop and the tests alike — and so a future
-    /// caller cannot reintroduce mine-before-sync by forgetting it.
+    /// caller cannot reintroduce mine-before-sync by forgetting it. It is checked
+    /// on resumes too: a node that stops being sync-ready parks its grind.
     pub fn try_mine(&mut self) -> bool {
+        self.grind_advanced = false;
         let gate = self.mine_gate();
         if !gate.permits() {
             return false;
@@ -2487,15 +2540,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     .unwrap_or_else(|| "-".to_string()),
             );
         }
-        match self.p2p.node_mut().mine_block() {
-            Some((header, body)) => {
+        let may_start = self.last_mine.elapsed() >= self.mine_interval;
+        let slice = SliceBudget {
+            max_hashes: MINE_SLICE_MAX_HASHES,
+            deadline: Some(Instant::now() + MINE_SLICE_DEADLINE),
+        };
+        let step = self.p2p.node_mut().mine_step(may_start, slice);
+        // Idle is the one verdict that ground nothing: no grind and no start
+        // permission, or a parked grind whose parent is unreadable (lag/halt
+        // refusal). Everything else spent real hashes this call, and that is
+        // what earns the loop's idle-sleep suppression.
+        self.grind_advanced = !matches!(step, MineStep::Idle);
+        match step {
+            MineStep::Mined(header, body) => {
                 self.nonce = self.nonce.wrapping_add(1);
                 let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
                 self.p2p.announce_block(header, body.txs, coinbase, rkm, self.nonce);
                 self.last_mine = Instant::now();
                 true
             }
-            None => false,
+            MineStep::Yielded | MineStep::Exhausted | MineStep::Idle => false,
         }
     }
 
@@ -2889,10 +2953,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // separate decisions.
         self.emit_body_waits();
         phases.journal = lap(&mut t);
-        if self.mining && self.last_mine.elapsed() >= self.mine_interval {
-            if self.try_mine() {
-                self.try_checkpoint();
-            }
+        // Lab #651: every iteration, not on the 75 s cadence. The interval
+        // gates STARTING a template (inside `try_mine`), never RESUMING the
+        // parked grind — gating the resume here would grind one ~25 ms slice
+        // per 75 s, a ~99.97 % hashrate loss worse than the blocking defect
+        // this replaced. Each call blocks for at most one slice.
+        if self.mining && self.try_mine() {
+            self.try_checkpoint();
         }
         phases.mine = lap(&mut t);
         // #360: the call above is the loop's ONLY route to try_checkpoint,
@@ -2952,7 +3019,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // state rather than the previous one's.
         on_tick(self);
         phases.hook = lap(&mut t);
-        if n == 0 {
+        // The 20 ms idle backoff is for a loop with nothing to do. A parked
+        // grind that is ADVANCING is something to do (lab #651): sleeping
+        // beside it would put ~20 ms of sleep against every ~25 ms slice and
+        // halve the hashrate on a quiet net. The mine slice's own deadline is
+        // the pacing — the loop still turns (and pumps the network) every few
+        // tens of ms. But the suppression reads this iteration's mine phase,
+        // not the mere existence of a parked grind (PR #653 review): a grind
+        // parked behind `refuse_for_lag("mine")` cannot advance, and a quiet
+        // node in that state must sleep like any other idle loop — the
+        // alternative is a busy-spin that neither sleeps nor hashes until the
+        // lag resolves.
+        if n == 0 && !self.grind_advanced {
             std::thread::sleep(Duration::from_millis(20));
             phases.sleep = lap(&mut t);
         }
@@ -3298,6 +3376,165 @@ mod tests {
             template_serving: false,
         };
         (config, genesis, base)
+    }
+
+    // ---- lab #651: the mine phase is sliced and the interval gates only starts
+
+    /// A PoW engine that never satisfies any target (all-0xFF ⇒ maximal work
+    /// value): a grind under it can never finish, which is lab #651's blocked
+    /// phase made deterministic.
+    #[derive(Clone)]
+    struct NeverPow;
+    impl PowEngine for NeverPow {
+        fn name(&self) -> &'static str {
+            "never"
+        }
+        fn pow_hash(
+            &self,
+            _form: GenesisForm,
+            _header: &qlab_devnet::header::BlockHeader,
+            _seed: &[u8],
+        ) -> qlab_devnet::header::Hash32 {
+            [0xFF; 32]
+        }
+    }
+
+    /// 🔴 Item (4) of the lab #651 design, loop half: with the real 75 s
+    /// `mine_interval` in force, two consecutive loop iterations must BOTH
+    /// make grind progress — the interval gates STARTING a template, never
+    /// RESUMING one. If a resume were interval-gated the node would grind one
+    /// ~25 ms slice per 75 s: a ~99.97 % hashrate loss that no test asserting
+    /// only "it yields" would ever see.
+    ///
+    /// This also carries the loop half of the yield regression: on `main` the
+    /// first `try_mine` at an unminable difficulty would hash the whole 2^26
+    /// budget inside one call and park nothing.
+    #[test]
+    fn a_resume_is_not_gated_on_mine_interval() {
+        let (config, genesis, _base) = rig("i651_resume", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, NeverPow, DevnetRehearsalVerifier).unwrap();
+
+        // Start the grind: with a zero interval the phase may start a template.
+        node.set_mine_interval(Duration::ZERO);
+        assert!(!node.try_mine(), "NeverPow can never produce a block");
+        let (parent, n0) = node.p2p.node().grind_progress().expect("a grind is parked");
+        assert!(n0 > 0, "the first slice made progress");
+
+        // Restore the real 75 s interval. `last_mine` is recent (node start),
+        // so STARTING a template would now be refused — but the parked grind
+        // must keep progressing on every iteration regardless.
+        node.set_mine_interval(Duration::from_secs(75));
+        node.one_iteration(&mut |_| {});
+        let (_, n1) = node.p2p.node().grind_progress().expect("still parked");
+        assert!(n1 > n0, "first interval-gated iteration still ground a slice ({n1} > {n0})");
+        node.one_iteration(&mut |_| {});
+        let (parent2, n2) = node.p2p.node().grind_progress().expect("still parked");
+        assert!(n2 > n1, "second consecutive iteration also ground ({n2} > {n1})");
+        assert_eq!(parent2, parent, "same template throughout — a resume, not restarts");
+    }
+
+    /// The other half of the interval's meaning survives: with no grind in
+    /// flight and the 75 s interval unelapsed (the node just started), the
+    /// mine phase starts nothing — `mine_interval` still paces template
+    /// creation exactly as it paced whole-grind attempts before lab #651.
+    #[test]
+    fn mine_interval_still_gates_starting_a_template() {
+        let (config, genesis, _base) = rig("i651_start_gate", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, NeverPow, DevnetRehearsalVerifier).unwrap();
+        // The default interval is the frozen 75 s and `last_mine` is the node's
+        // start instant: the phase must refuse to start a template.
+        assert!(!node.try_mine());
+        assert!(
+            node.p2p.node().grind_progress().is_none(),
+            "no template starts before the interval permits"
+        );
+    }
+
+    /// 🔴 PR #653 review — the busy-spin. The reachable state: `mining = true`,
+    /// a grind parked, `refuse_for_lag("mine")` refusing, `n == 0`. Suppressing
+    /// the idle sleep on the parked grind's EXISTENCE makes that loop neither
+    /// sleep nor hash until the lag resolves; the suppression must read whether
+    /// THIS iteration's mine phase actually ground a slice. Both halves are
+    /// asserted: an advancing grind still suppresses the sleep (lab #651's
+    /// hashrate half), and a refused one does not (the spin half). The parked
+    /// cursor survives the refusal untouched — kept, not dropped: whether it is
+    /// stale is the parent comparison's question, answered when a parent can
+    /// next be read.
+    #[test]
+    fn a_lag_refused_parked_grind_sleeps_instead_of_spinning() {
+        use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+
+        /// KeccakPow behind an "impossible" switch (all-0xFF ⇒ maximal work
+        /// value): impossible while the node grinds, honest while it validates
+        /// the header that induces the lag — the same shape as the adapter
+        /// tests' `SwitchablePow`.
+        #[derive(Clone)]
+        struct TogglePow(Arc<AtomicBool>);
+        impl PowEngine for TogglePow {
+            fn name(&self) -> &'static str {
+                "toggle-keccak"
+            }
+            fn pow_hash(
+                &self,
+                form: GenesisForm,
+                header: &qlab_devnet::header::BlockHeader,
+                seed: &[u8],
+            ) -> qlab_devnet::header::Hash32 {
+                if self.0.load(Ordering::Relaxed) {
+                    [0xFF; 32]
+                } else {
+                    KeccakPow.pow_hash(form, header, seed)
+                }
+            }
+        }
+
+        let (config, genesis, _base) = rig("i651_lag_sleep", true);
+        let impossible = Arc::new(AtomicBool::new(false));
+        let mut node = RunningNode::start(
+            &config,
+            &genesis,
+            TogglePow(impossible.clone()),
+            DevnetRehearsalVerifier,
+        )
+        .unwrap();
+
+        // A valid child of the tip, produced but NOT applied — the lag lever,
+        // held for later.
+        let (header, _body) =
+            node.p2p.node_mut().mine_block().expect("KeccakPow mines at genesis difficulty");
+
+        // Park a grind that cannot finish.
+        impossible.store(true, Ordering::Relaxed);
+        node.set_mine_interval(Duration::ZERO);
+        assert!(!node.try_mine(), "an impossible grind produces no block");
+        let (parent, n0) = node.p2p.node().grind_progress().expect("a grind is parked");
+
+        // Healthy parked grind on a quiet net: the iteration must NOT sleep —
+        // sleeping ~20 ms beside every ~25 ms slice would halve the hashrate.
+        node.set_mine_interval(Duration::from_secs(75));
+        let (phases, _) = node.one_iteration(&mut |_| {});
+        assert_eq!(phases.sleep, Duration::ZERO, "an advancing grind suppresses the idle sleep");
+        let (_, n1) = node.p2p.node().grind_progress().expect("still parked");
+        assert!(n1 > n0, "the iteration ground a slice ({n1} > {n0})");
+
+        // The held-back header arrives (body withheld): fork choice advances,
+        // the state machine lags, and the mine duty is refused.
+        impossible.store(false, Ordering::Relaxed);
+        assert_eq!(node.p2p.node_mut().ingest_header(header), IngestOutcome::Accepted);
+        impossible.store(true, Ordering::Relaxed);
+        assert!(node.p2p.node().state_lag().is_lagging(), "header without body ⇒ lag");
+
+        // 🔴 The spin state. The iteration must back off like any idle loop:
+        // before this fix it neither slept nor hashed.
+        let (phases, _) = node.one_iteration(&mut |_| {});
+        assert!(
+            phases.sleep > Duration::ZERO,
+            "a refused mine phase is an idle phase — the loop must sleep, not spin"
+        );
+        let progress = node.p2p.node().grind_progress().expect("kept parked through the refusal");
+        assert_eq!(progress, (parent, n1), "the parked cursor is untouched: not advanced, not dropped");
     }
 
     #[test]
@@ -4844,7 +5081,15 @@ mod tests {
             RunningNode::start(&config, &genesis, RandomXPow::new(), DevnetRehearsalVerifier)
                 .unwrap();
         node.set_mine_interval(Duration::ZERO);
-        assert!(node.try_mine(), "RandomX mines at the genesis difficulty");
+        // Lab #651: the mine phase is sliced, and real RandomX is slow enough
+        // that one ~25 ms slice covers only a handful of hashes — so drive the
+        // phase repeatedly, exactly as the node loop does. Each phase makes
+        // ≥ 1 nonce of progress, so the cap alone covers a winning nonce out
+        // to 10,000 (expected ~256 at this difficulty; P(>10k) ≈ e^-39), and
+        // real slices carry several hashes each, so in practice this ends in
+        // a few dozen phases.
+        let mined = (0..10_000).any(|_| node.try_mine());
+        assert!(mined, "RandomX mines at the genesis difficulty");
         assert_eq!(node.tip_height(), 1, "RandomX-mined block accepted");
         let _ = std::fs::remove_dir_all(&base);
     }
