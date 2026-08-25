@@ -519,6 +519,30 @@ pub fn execute_opened(
     )
 }
 
+/// [`execute_opened`] with [`execute_with_pre_submit`]'s hook: the canonical
+/// bytes reach `before_submit` after proving and before both the local send
+/// record and the socket. Platform shells whose seed lives behind an opened
+/// wallet need this for the same reason the CLI does — persisting the exact
+/// randomized reveal before its first POST can answer (the #625 class;
+/// consumed by wallet-macos #27).
+#[cfg(all(feature = "net", feature = "prove"))]
+pub fn execute_opened_with_pre_submit(
+    req: &SendRequest<'_>,
+    wallet: &WalletDir,
+    on: &mut dyn FnMut(SendStep),
+    before_submit: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<SendOutcome, SendError> {
+    execute_with_phases(
+        req,
+        on,
+        |req, on| select_opened(req, on, wallet),
+        preflight,
+        prove,
+        submit,
+        before_submit,
+    )
+}
+
 #[cfg(all(feature = "net", feature = "prove"))]
 fn execute_with_phases<Select, Preflight, Prove, Submit, BeforeSubmit>(
     req: &SendRequest<'_>,
