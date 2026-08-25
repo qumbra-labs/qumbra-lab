@@ -264,7 +264,25 @@ endpoint was stopped; it applies unchanged now, with the port open again.
 **What that means today, given the payee cap above:** a stranger who connects gets hours of the
 entire mint and hours of nothing, uncorrelated with what they contributed in that period. **The
 gate on announcing is not the only thing protecting them — the security group would be, and it is
-not narrowed.** Narrowing it is an on-host decision and Larry's.
+not narrowed.**
+
+> **DECIDED 2026-08-25 14:10 +08 — Larry: leave it open and unannounced.** The coordinator
+> recommended narrowing the security group until the payee-cap boundary passes; that recommendation
+> was declined and this is the deliberate position, not an oversight.
+>
+> **What it accepts:** the port stays reachable from the internet, the only protection is that the
+> hostname is not published — *and obscurity is not a control, as this document says two paragraphs
+> up* — and a stranger who does connect meets the cap-1 payout with nothing telling them it is
+> expected, in a pool that [cannot record who they were](https://github.com/qumbra-labs/qumbra-lab/issues/584).
+>
+> **What bounds it:** the payee cap ends by rule at height **11,520**, which was **5,638 blocks —
+> about 4.9 days** — away when this was decided (T2 tip 5882). Above it `pick_payees` splits
+> proportionally across up to eight winners.
+>
+> **What it does not decide:** announcing. That remains gated on the boundary, on #584, and on a
+> fee policy. **This decision is about the door, not the invitation** — a distinction that only
+> became visible today, when a broken probe of the coordinator's was corrected and the endpoint
+> turned out to have been open all along.
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
