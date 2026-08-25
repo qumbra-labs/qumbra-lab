@@ -511,8 +511,14 @@ pub struct BlockCoinbase {
     /// `body.total_fees()` — the block's declared fees, which are the miner's.
     pub fees: u64,
     /// `body.total_name_burn()` — the burned name-fee half of those fees, which
-    /// are not (lab #367). Zero on every rider-free block, i.e. everywhere on
-    /// this chain today.
+    /// are not (lab #367).
+    ///
+    /// **"Zero everywhere on this chain today" is what this said, and T2 retired
+    /// it**: the name rule is native from height 0 on a v5 net, so a burn is an
+    /// ordinary thing to meet here. It is also the only published statement of
+    /// how much value left a block without entering a note, which is why
+    /// `qlab-ledger` reconciles send events against it (lab #658) — a holder
+    /// that assumes zero reports the burn as money someone was paid.
     pub name_burn: u64,
 }
 

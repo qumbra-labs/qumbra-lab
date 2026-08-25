@@ -24,6 +24,15 @@
 //!   read from the posted table, supplied by the caller (see `build`), never
 //!   stored.
 //!
+//!   🔴 **That identity holds only where nothing burned a name fee** (lab #658).
+//!   A name-bearing transaction declares `posted_fee + name_fee` and the name
+//!   half enters no note at all — value that left, which this subtraction has no
+//!   term for, so it would be reported as money sent to the recipient: 1 / 32 /
+//!   128 / 512 / 2048 QMB depending on tier, silently. The burn is published per
+//!   **block**, not per transaction, so at a height that burned anything this
+//!   module cannot say which transaction paid it, and refuses the figure rather
+//!   than attributing it.
+//!
 //! What the chain can **never** yield is the recipient — a transaction's
 //! outputs are addressed to keys the sender does not hold, which is the privacy
 //! property working. Chain-only send events render `recipient: not recorded`.
@@ -45,7 +54,9 @@
 //!    this wallet's own money coming back; counting it as income would inflate
 //!    `total in` and break the ledger's arithmetic. Folded in, the summary
 //!    closes exactly: `total in − total out − fees = current spendable` for a
-//!    wallet whose whole life is in range.
+//!    wallet whose whole life is in range — with the same name-burn exemption
+//!    as above: a height that burned a name fee yields no `Exact` figure to
+//!    close the identity with, by design (lab #658).
 //!
 //! # UNAVAILABLE discipline, identical to `scan`'s
 //!
@@ -189,6 +200,13 @@ pub struct Ledger {
 /// when `coverage` is [`SpentCoverage::Unavailable`], and in that case **no
 /// send event can be derived at all** — a wallet that cannot read the nullifier
 /// stream does not know which of its notes are gone.
+// Eight rather than seven since lab #658. The tidier shape is a `FeeFacts { posted_fee_2x2,
+// name_burns }` — the two are one question, "what could the caller read about the public
+// figures a send is reconciled against", and pairing them in the type would make it
+// impossible to supply a fee without saying whether burns were looked at. That is a wider
+// change to this crate's API than a cross-lane fix should take on its own authority, so the
+// lint is silenced with the alternative named rather than the shape being chosen here.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     wallet: &Wallet,
     scans: &[AddressScan],
@@ -202,6 +220,17 @@ pub fn build(
     // its figure instead of guessing one. One number rather than a table
     // because the circuit is a fixed 2x2 shape, so there is exactly one arity.
     posted_fee_2x2: Option<u64>,
+    // 🔴 **Which heights burned a name fee, from the per-block coinbase facts**
+    // (`BlockCoinbase::name_burn`, lab #367) — `Some` with only the non-zero
+    // entries, and `None` when that route was not read at all.
+    //
+    // Both states are load-bearing and neither may be spelled as "no burn"
+    // (lab #658, and the shape lab #543 paid for on the faucet's page): a height
+    // whose burn is *unknown* cannot be reconciled either, because the figure
+    // this module would print is exactly the one the burn invalidates. The
+    // caller already fetches these facts for the coinbase half of the same scan,
+    // so `Some` costs no extra request.
+    name_burns: Option<&std::collections::BTreeMap<u64, u64>>,
 ) -> Ledger {
     let mut received: Vec<Received> = Vec::new();
     let mut spent: Vec<(u64, SpentInput, [u8; 32])> = Vec::new(); // (spent_height, input, nf)
@@ -330,6 +359,25 @@ pub fn build(
                 why: format!(
                     "a shadowed output sits at height {h}; the chain cannot say whether it was \
                      this send's change or a payment in, so the amount that left is not derivable"
+                ),
+            }
+        } else if name_burns.is_none() {
+            Outgoing::Unavailable {
+                why: format!(
+                    "whether height {h} burned a name fee was not read, and a burn is value \
+                     that left without entering any note — so `inputs − change − posted_fee` \
+                     cannot be quoted as the amount sent (lab #658)"
+                ),
+            }
+        } else if name_burns.is_some_and(|b| b.get(&h).is_some_and(|burn| *burn > 0)) {
+            let burn = name_burns.and_then(|b| b.get(&h).copied()).unwrap_or_default();
+            Outgoing::Unavailable {
+                why: format!(
+                    "height {h} burned {burn} bessel of name fee, which is value that left and \
+                     entered no note. The burn is published per block, not per transaction, so \
+                     it cannot be told whether this wallet's send paid it — and subtracting only \
+                     the posted fee would report the burn as money sent to the recipient \
+                     (lab #658)"
                 ),
             }
         } else if inputs.len() > 2 || change.len() > 1 {
@@ -737,6 +785,12 @@ mod tests {
         }
     }
 
+    /// "The coinbase route was read and no height in range burned a name fee" —
+    /// the state every test here but the two #658 ones is written against.
+    fn no_burns() -> std::collections::BTreeMap<u64, u64> {
+        std::collections::BTreeMap::new()
+    }
+
     fn covered(range: (u64, u64)) -> SpentCoverage {
         SpentCoverage::Covered { range: Some(range) }
     }
@@ -760,7 +814,7 @@ mod tests {
             outcome(vec![located(&grant, 4), located(&change, 9)], (0, 12)),
         )];
         let set = SpentSet::from_parts(Some((0, 12)), [(9, nf)]);
-        let l = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12), Some(FEE), Some(&no_burns()));
 
         assert!(l.gaps.is_empty(), "{:?}", l.gaps);
         assert_eq!(l.events.len(), 2, "the change is folded into its send, not a third event");
@@ -832,8 +886,8 @@ mod tests {
             }],
         };
 
-        let chain_only = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12), Some(FEE));
-        let with_log = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&log), (0, 12), Some(FEE));
+        let chain_only = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12), Some(FEE), Some(&no_burns()));
+        let with_log = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&log), (0, 12), Some(FEE), Some(&no_burns()));
         assert_eq!(chain_only.totals, with_log.totals, "local memory moves no chain figure");
         assert_eq!(chain_only.current_spendable, with_log.current_spendable);
         assert_eq!(with_log.unmatched_records, 0);
@@ -855,7 +909,7 @@ mod tests {
                 nullifiers: vec![[0x77; 32]],
             }],
         };
-        let l = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&orphan), (0, 12), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&orphan), (0, 12), Some(FEE), Some(&no_burns()));
         assert_eq!(l.unmatched_records, 1);
         assert!(render(&l, "http://e").contains("joined no event in this range"));
     }
@@ -869,7 +923,7 @@ mod tests {
         let nf = crate::spent::note_nullifier(&w, 0, &n);
         let scans = vec![scan_of(&w, 0, outcome(vec![located(&n, 2)], (0, 9)))];
         let set = SpentSet::from_parts(Some((0, 9)), [(6, nf)]);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
 
         let send = match &l.events[1] {
             Event::Send(s) => s,
@@ -901,7 +955,7 @@ mod tests {
         let coverage = SpentCoverage::Unavailable {
             why: "the nullifier stream could not be read (404)".into(),
         };
-        let l = build(&w, &scans, None, &coverage, None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, None, &coverage, None, (0, 9), Some(FEE), Some(&no_burns()));
 
         assert_eq!(l.events.len(), 1, "the receipt is still a chain fact");
         assert!(matches!(l.events[0], Event::Received(_)));
@@ -938,7 +992,7 @@ mod tests {
         o.stats.detected_outputs = 2;
         let scans = vec![scan_of(&w, 0, o)];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
 
         assert_eq!(l.events.len(), 1);
         assert!(l.totals.is_none());
@@ -959,13 +1013,112 @@ mod tests {
             outcome: Err("connection refused".into()),
         }];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
         assert!(l.events.is_empty());
         assert!(l.totals.is_none());
         let text = render(&l, "http://down");
         assert!(text.contains("the scan never started: connection refused"), "{text}");
         assert!(text.contains("no events"), "{text}");
         assert!(text.contains("this ledger is NOT complete"), "{text}");
+    }
+
+    /// 🔴 **Lab #658: a height that burned a name fee refuses its figure, because
+    /// the subtraction would hand the burn to the recipient.**
+    ///
+    /// A name-bearing transaction declares `posted_fee + name_fee` and the name
+    /// half enters no note. `inputs − change − posted_fee` therefore counts the
+    /// burn as money sent. The third assertion is the defect itself: the figure
+    /// this arm refuses is arithmetically the amount **plus** the burn.
+    #[test]
+    fn a_burned_name_fee_is_not_reported_as_money_sent() {
+        let w = wallet();
+        let spent_note = note(&w, 0, 5_000_000_000, 600);
+        let change = note(&w, 0, 1_000_000_000, 700);
+        let set =
+            SpentSet::from_parts(Some((0, 9)), [(7, crate::spent::note_nullifier(&w, 0, &spent_note))]);
+        let scans = vec![scan_of(
+            &w,
+            0,
+            outcome(vec![located(&spent_note, 1), located(&change, 7)], (0, 9)),
+        )];
+        // The cheapest ratified tier: 1 QMB, burned at the height of the send.
+        let burn: u64 = 100_000_000;
+        let burns = std::collections::BTreeMap::from([(7u64, burn)]);
+
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&burns));
+        let send = l
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::Send(s) => Some(s),
+                _ => None,
+            })
+            .expect("the spend is still an event");
+        match &send.outgoing {
+            Outgoing::Unavailable { why } => {
+                assert!(why.contains(&burn.to_string()), "it names the burn: {why}");
+                assert!(why.contains("entered no note"), "{why}");
+            }
+            other => panic!("a burn height must not quote a figure, got {other:?}"),
+        }
+
+        // The defect, pinned: with the burn unknown the same state answers
+        // `Exact`, and that figure is the amount PLUS the 1 QMB that was burned.
+        let blind =
+            build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
+        let blind_send = blind
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::Send(s) => Some(s),
+                _ => None,
+            })
+            .expect("send");
+        match &blind_send.outgoing {
+            Outgoing::Exact { amount, fee } => {
+                assert_eq!(*fee, FEE, "it believes the posted fee was the whole fee");
+                assert_eq!(
+                    *amount,
+                    u128::from(5_000_000_000u64 - 1_000_000_000 - FEE),
+                    "and the burn is inside this number — that is the bug"
+                );
+            }
+            other => panic!("expected the pre-#658 arithmetic, got {other:?}"),
+        }
+    }
+
+    /// 🔴 **Lab #658: "we did not look" is not "nothing burned".** The same shape
+    /// lab #543 paid for on the faucet's page — an unmeasured value spelled as a
+    /// measured zero. With the coinbase route unread, every send figure is
+    /// unquotable, because the burn is exactly what would invalidate it.
+    #[test]
+    fn an_unread_burn_route_refuses_rather_than_assuming_no_burn() {
+        let w = wallet();
+        let spent_note = note(&w, 0, 5_000_000_000, 600);
+        let change = note(&w, 0, 1_000_000_000, 700);
+        let set =
+            SpentSet::from_parts(Some((0, 9)), [(7, crate::spent::note_nullifier(&w, 0, &spent_note))]);
+        let scans = vec![scan_of(
+            &w,
+            0,
+            outcome(vec![located(&spent_note, 1), located(&change, 7)], (0, 9)),
+        )];
+
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), None);
+        let send = l
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::Send(s) => Some(s),
+                _ => None,
+            })
+            .expect("send");
+        match &send.outgoing {
+            Outgoing::Unavailable { why } => {
+                assert!(why.contains("was not read"), "{why}");
+            }
+            other => panic!("an unknown burn must not be read as zero, got {other:?}"),
+        }
     }
 
     /// Two of this wallet's sends in ONE block cannot be separated by the
@@ -994,7 +1147,7 @@ mod tests {
                 (0, 9),
             ),
         )];
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
 
         let send = l
             .events
@@ -1036,7 +1189,7 @@ mod tests {
         o.stats.shadowed_outputs = 1;
         let scans = vec![scan_of(&w, 0, o)];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
 
         assert_eq!(l.shadowed_total, 40);
         assert_eq!(l.events.len(), 2);
@@ -1059,7 +1212,7 @@ mod tests {
             scan_of(&w, 0, outcome(vec![located(&early, 2)], (0, 9))),
         ];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE), Some(&no_burns()));
         let heights: Vec<u64> = l.events.iter().map(|e| e.height()).collect();
         assert_eq!(heights, vec![2, 9]);
     }

@@ -449,6 +449,12 @@ unsafe fn build_ledger_over_fetch(
         None,
         (from, to),
         None,
+        // Same reason as the `None` above it: this shell does not read the
+        // per-block coinbase facts, so whether a height burned a name fee is
+        // unknown here (lab #658). Send events refuse their figures on this
+        // platform either way — the posted-fee table does not cross-compile —
+        // so this changes nothing it renders, and says the true thing.
+        None,
     );
     Some((ledger, label))
 }
