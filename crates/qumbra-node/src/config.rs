@@ -177,8 +177,15 @@ pub struct NodeConfig {
     /// holds a spend key for; the blocks are valid and the issuance is
     /// unrecoverable. That is the honest behaviour for a node that was never told
     /// where to pay itself — a zero key would be rejected outright and a
-    /// self-invented one would be a lie — and [`crate::run`] says so loudly at
-    /// startup whenever `mining = true` and this is unset.
+    /// self-invented one would be a lie.
+    ///
+    /// 🔴 **But the binary no longer accepts it.** Since lab #552(a),
+    /// `qumbra-node run` and `qumbra-node check` both REFUSE `mining = true` with
+    /// this unset ([`crate::run::check_miner_payout`]), because the warning they
+    /// used to print was at startup while the burn is at every block. The loud
+    /// warning survives only on the in-process `RunningNode::start` seam the
+    /// rehearsals use, which is where `UNCONFIGURED_MINER_RKM`'s justification
+    /// actually lives.
     ///
     /// Deployment ordering caveat, same as `metrics_addr`: `deny_unknown_fields`
     /// is deliberate, so a config carrying this key is REFUSED by a binary built
@@ -458,8 +465,11 @@ pub fn rkm_lanes_from_hex(hex: &str) -> Result<[u64; 4], ConfigError> {
     if lanes == [0u64; 4] {
         return Err(ConfigError::Parse(
             "miner_rkm is all zero, which no wallet can derive and which every node \
-             rejects (BodyError::MissingCoinbasePayee). Omit the key to mine to the \
-             unconfigured burn address, or set a real one."
+             rejects (BodyError::MissingCoinbasePayee). Set a real one — the value \
+             `qumbra-wallet miner-rkm --dir DIR` prints — or set `mining = false`. \
+             Omitting the key is NOT an exit: since lab #552(a) `qumbra-node` refuses \
+             to start with `mining = true` and no `miner_rkm` rather than mining to \
+             an unspendable placeholder."
                 .to_string(),
         ));
     }

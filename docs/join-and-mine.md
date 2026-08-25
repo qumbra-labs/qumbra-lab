@@ -375,13 +375,22 @@ On startup, prove the config took effect by finding this exact line:
 miner payout: coinbase notes paid to the configured miner_rkm
 ```
 
-If you instead see the following warning, stop mining and fix the config: valid blocks
-are being paid to an unspendable placeholder and the payout is unrecoverable
-([`run.rs:838-840`](../crates/qumbra-node/src/run.rs#L838-L840)).
+**Since lab #552(a) the two fields above are a pair, and the binary enforces it.** A
+config with `mining = true` and no `miner_rkm` no longer starts: `qumbra-node run`
+refuses before it reads the genesis file, and `qumbra-node check --config node.toml`
+refuses the same combination so you find out before you start a host, not after.
 
 ```text
-⚠️  NO miner_rkm CONFIGURED: ... Every coin this node mines is BURNED.
+qumbra-node error: `mining = true` but no `miner_rkm`: ... Every coin this node
+mines is BURNED. This REFUSES TO START rather than warning (lab #552) ...
 ```
+
+That used to be a warning the node printed and then mined anyway. It was accurate
+and it was ignored — T2 blocks 607, 610 and 611 paid about 15 QMB to a placeholder
+key nobody owns, on a node that had been warned. The warning was at startup and the
+burn was at every block. If you want a node that does not pay itself, that node is
+`mining = false`; there is no configuration in which mining to nobody is what you
+meant.
 
 ### 2.4 Reward, maturity, pacing, and odds
 

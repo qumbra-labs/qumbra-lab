@@ -337,6 +337,16 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // that silence structurally impossible (ordering locked in `startup`'s
     // tests + tests/startup_entry.rs).
     let config = qumbra_node::startup::announce_then_load(&mut std::io::stdout(), cfg_path)?;
+    // Lab #552(a) — THE FIRST REFUSAL, and it is first on purpose: it is a pure
+    // config fact, so it costs nothing, and a node that is going to be told it
+    // has nobody to pay should be told before it reads a genesis file or builds a
+    // ~256 MiB RandomX cache. This used to be a WARNING at the point the payout
+    // key was installed (`run.rs`, still there for the in-process rehearsal seam)
+    // — but the warning is at startup and the burn is at every block, and nobody
+    // rereads startup logs: T2 blocks 607/610/611 paid ~15 QMB to a placeholder
+    // nobody owns. `qumbra-node check` refuses the same combination via
+    // `preflight`, so the two operator surfaces agree.
+    qumbra_node::run::check_miner_payout(&config)?;
     qlab_devnet::jprintln!("STARTUP loading genesis file {}", config.genesis_file.display());
     let genesis = GenesisFile::load(&config.genesis_file)?;
     qlab_devnet::jprintln!("STARTUP genesis file loaded");
@@ -640,14 +650,17 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  listen:       {}", pf.listen_addr);
     println!("  dial peers:   {}", pf.dial_peers);
     println!("  mining:       {}", pf.mining);
-    // Lab #475: shown because `run`'s loud burn warning arrives too late to act
-    // on — by then the node is up and the operator has stopped reading.
-    match (&pf.miner_rkm, pf.mining) {
-        (Some(rkm), _) => println!("  miner_rkm:    {rkm}"),
-        (None, true) => println!(
-            "  miner_rkm:    ⚠️  UNSET with mining = true — every coin this node mines is BURNED"
-        ),
-        (None, false) => println!("  miner_rkm:    not set (this node does not mine)"),
+    // Lab #475: shown because `run`'s loud burn warning arrived too late to act
+    // on — by then the node was up and the operator had stopped reading.
+    //
+    // Lab #552(a) removed the third arm this match used to have. `mining = true`
+    // with no `miner_rkm` cannot reach here: `preflight` above returns
+    // `RunError::MiningWithoutPayout` for it, so `check` REFUSES where it used to
+    // print `⚠️ UNSET with mining = true`. An unset key that gets this far
+    // therefore belongs to a non-mining node, and saying so is not a guess.
+    match &pf.miner_rkm {
+        Some(rkm) => println!("  miner_rkm:    {rkm}"),
+        None => println!("  miner_rkm:    not set (this node does not mine)"),
     }
     println!("  halt plan:    {}", RELEASE.plan.describe());
     Ok(())

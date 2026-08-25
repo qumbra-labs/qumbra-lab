@@ -337,12 +337,20 @@ miner_rkm = "[qumbra-wallet miner-rkm 打印的 64 个十六进制字符]"
 miner payout: coinbase notes paid to the configured miner_rkm
 ```
 
-若你看到的是下面这条警告，停止挖矿并修配置：有效区块正被付给一个不可花费的占位符，
-付款不可恢复（[`run.rs:838-840`](../crates/qumbra-node/src/run.rs#L838-L840)）。
+**自 lab #552(a) 起，上面这两个字段是一对，且由二进制强制。** `mining = true` 而没有
+`miner_rkm` 的配置不再能启动：`qumbra-node run` 在读取 genesis 文件之前就拒绝，
+`qumbra-node check --config node.toml` 也拒绝同一组合——所以你会在启动主机之前发现，
+而不是之后。
 
 ```text
-⚠️  NO miner_rkm CONFIGURED: ... Every coin this node mines is BURNED.
+qumbra-node error: `mining = true` but no `miner_rkm`: ... Every coin this node
+mines is BURNED. This REFUSES TO START rather than warning (lab #552) ...
 ```
+
+这以前只是一条警告：节点打印它，然后照样挖矿。警告本身是准确的，但被忽略了——T2 的
+607、610、611 三个区块把大约 15 QMB 付给了一个没人拥有的占位符密钥，而那个节点是被
+警告过的。**警告在启动时只出现一次，而烧币发生在每一个区块。** 如果你要的是一个不给
+自己付款的节点，那个节点就是 `mining = false`；不存在“挖矿但付给没有人”是本意的配置。
 
 ### 2.4 奖励、成熟期、节奏与胜率
 

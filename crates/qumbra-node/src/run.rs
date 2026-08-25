@@ -271,6 +271,10 @@ pub enum RunError {
     /// Persisted canonical bodies could not be reduced to a contiguous supply
     /// ledger. Starting without an audit basis would make the public view lie.
     Supply(qlab_node::SupplyError),
+    /// `mining = true` with no resolvable `miner_rkm` (lab #552(a), sibling of
+    /// #547). See [`check_miner_payout`] for why this is a refusal and not the
+    /// warning it used to be.
+    MiningWithoutPayout,
 }
 
 impl std::fmt::Display for RunError {
@@ -282,6 +286,7 @@ impl std::fmt::Display for RunError {
             RunError::Io(e) => write!(f, "io: {e}"),
             RunError::Release(e) => write!(f, "release: {e}"),
             RunError::Supply(e) => write!(f, "supply attestation: {e:?}"),
+            RunError::MiningWithoutPayout => write!(f, "{MINING_WITHOUT_PAYOUT}"),
         }
     }
 }
@@ -327,10 +332,61 @@ pub struct Preflight {
     pub dial_peers: usize,
     /// Whether this node would produce blocks.
     pub mining: bool,
-    /// The configured coinbase payee, if any. `None` means mined coins burn —
-    /// which `run` warns about loudly and which a pre-flight should therefore
-    /// be able to show *before* the node is started.
+    /// The configured coinbase payee, if any.
+    ///
+    /// Since lab #552(a) a `None` here can only belong to a **non-mining** node:
+    /// [`check_miner_payout`] refuses the `mining = true` + unset combination
+    /// before this struct is built, so `check` no longer has a burn to report.
     pub miner_rkm: Option<String>,
+}
+
+/// The refusal text for `mining = true` with no `miner_rkm` (lab #552(a)).
+///
+/// **The spine of the old startup WARNING is kept verbatim** — "coinbase notes
+/// are paid to a fixed placeholder key that NOBODY can spend. Every coin this
+/// node mines is BURNED." — because that wording was worth having and an operator
+/// who has read a T2 post-mortem will be searching for it. What changed is the
+/// severity and both exits are now named.
+pub const MINING_WITHOUT_PAYOUT: &str = "\
+    `mining = true` but no `miner_rkm`: this node would mine valid blocks whose \
+    coinbase notes are paid to a fixed placeholder key that NOBODY can spend. Every \
+    coin this node mines is BURNED. This REFUSES TO START rather than warning \
+    (lab #552): the warning was at startup and the burn is at every block, and \
+    nobody rereads startup logs. Set `miner_rkm` (64 hex characters, lane-major LE \
+    — the value `qumbra-wallet miner-rkm --dir DIR` prints) to keep what you mine, \
+    or set `mining = false` to run a non-mining node.";
+
+/// Refuse a config that asks to mine and names nobody to pay (lab #552(a),
+/// sibling of #547). Parses `miner_rkm` on the way, so this subsumes the
+/// lab #475 pre-flight parse for every caller.
+///
+/// 🔴 **This is a BINARY-ONLY gate, and the boundary is deliberate.** Its two
+/// callers are [`preflight`] (i.e. `qumbra-node check`) and `main.rs`'s
+/// `run_node` — both operator surfaces, where a real operator with a real wallet
+/// is. It is **not** in [`RunningNode::prepare`]/[`RunningNode::start`], which
+/// keep the WARNING they have always had, because that library seam is what the
+/// in-process rehearsals use: `run.rs`'s own `rig` mines with `miner_rkm: None`
+/// at 61 call sites, as do `tests/recipient_scan.rs` and
+/// `qumbra-credit-ref/tests/credit_e2e.rs`. `qlab_p2p::adapter::UNCONFIGURED_MINER_RKM`
+/// exists so those rehearsals produce *valid* blocks and it is untouched; making
+/// `miner_rkm` an `Option` the type system forces a consumer to resolve — issue
+/// #552's change (b) — is the structural version of this and is deliberately NOT
+/// done here (it touches the `qlab-p2p` API and every rehearsal path).
+///
+/// **What this does not do**, and #552 says it out loud: it reduces the chance the
+/// *next* operator burns a block. It does nothing about T2 blocks 607/610/611,
+/// and nothing constrains a stranger running an older binary — consensus cannot
+/// tell that a coinbase payee is unspendable, which is a permanent property of
+/// the design rather than a gap.
+pub fn check_miner_payout(config: &NodeConfig) -> Result<(), RunError> {
+    // Parsed even when `mining = false`, which is the lab #475 behaviour this
+    // replaces: a truncated or all-zero paste on a non-mining host is still a
+    // typo worth catching in one `check` rather than one host at a time.
+    let lanes = config.miner_rkm_lanes().map_err(RunError::Config)?;
+    match lanes {
+        None if config.mining => Err(RunError::MiningWithoutPayout),
+        _ => Ok(()),
+    }
 }
 
 /// Validate a node's `config` against its `genesis` exactly as startup would — the
@@ -347,7 +403,11 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
     // a time when each node refused to start. `deploy/deploy.sh` can now push a
     // per-host `miner_rkm`, which makes this the difference between one caught
     // typo and four hosts down.
-    config.miner_rkm_lanes().map_err(RunError::Config)?;
+    //
+    // Lab #552(a) widened it from "parses" to "is present when this node mines":
+    // `check` must refuse whatever `run` is about to refuse, or it tells an
+    // operator a swap is safe when startup is about to reject it.
+    check_miner_payout(config)?;
     Ok(Preflight {
         genesis_hash: genesis.hash_hex(),
         committee_size: genesis.frozen.committee_size,
@@ -901,6 +961,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // loud, not legal and quiet: the node still mines valid blocks, but to a
         // key nobody holds, so the issuance is burned. Silence here would let a
         // node mine for days before anyone noticed the coins were gone.
+        //
+        // 🔴 **This WARN arm is now the LIBRARY fallback only** (lab #552(a)).
+        // The binary cannot reach it: `main.rs`'s `run_node` and `preflight` both
+        // call `check_miner_payout` first, which REFUSES `mining = true` with no
+        // `miner_rkm`. What still reaches it is the in-process rehearsal seam —
+        // `RunningNode::start` called directly by `rig`, `tests/recipient_scan.rs`
+        // and `qumbra-credit-ref`, which mine to
+        // `qlab_p2p::adapter::UNCONFIGURED_MINER_RKM` on purpose. The wording is
+        // unchanged deliberately: #552 judged it worth having, and an operator
+        // reading an old post-mortem will be searching for these exact words.
         match config.miner_rkm_lanes().map_err(RunError::Config)? {
             Some(rkm) => {
                 p2p.node_mut().set_miner_rkm(rkm);
@@ -4984,7 +5054,16 @@ mod tests {
     fn preflight_validates_a_staged_node_without_binding() {
         // The deploy dry-run's per-node assertion: a laid-down config + genesis +
         // key subset validate through the real startup checks, no socket bound.
-        let (config, genesis, base) = rig("preflight", true);
+        //
+        // Lab #552(a): this rig gained a `miner_rkm`, because a MINING node with
+        // no payout key is no longer a config a pre-flight passes — that is the
+        // change, and `preflight_refuses_a_miner_rkm_the_node_could_not_start_with`
+        // below is where it is asserted. Nothing else about this test moved: what
+        // it is about is the genesis hash, the committee shape and the key count,
+        // and a staged mining host on the real fleet carries a payout key anyway.
+        let (mut config, genesis, base) = rig("preflight", true);
+        config.miner_rkm =
+            Some("0100000000000000020000000000000003000000000000000400000000000000".to_string());
         let pf = preflight(&config, &genesis).expect("preflight ok");
         assert_eq!(pf.genesis_hash, genesis.hash_hex());
         assert_eq!(pf.committee_size, 21);
@@ -5006,14 +5085,34 @@ mod tests {
     /// malformed `miner_rkm` passed `check` cleanly and was discovered one host
     /// at a time as each node refused to start — and `deploy/deploy.sh` can now
     /// push one per host, so the blast radius of a truncated paste is the fleet.
+    ///
+    /// 🔴 **Lab #552(a) INVERTED this test's first assertion, deliberately.** It
+    /// used to read *"Unset is not an error — it is the loud-burn-warning case,
+    /// and the pre-flight reports it rather than refusing a legal config"*, and
+    /// that sentence was the defect written down as a contract: T2 blocks 607,
+    /// 610 and 611 are what "reports it" bought. A mining node with no payout key
+    /// is now refused by `check`, exactly as `run` refuses it. The unset case is
+    /// still legal for a node that does not mine, which is the other half below
+    /// and the regression that mattered most.
     #[test]
     fn preflight_refuses_a_miner_rkm_the_node_could_not_start_with() {
         let (mut config, genesis, base) = rig("preflight_rkm", true);
 
-        // Unset is not an error — it is the loud-burn-warning case, and the
-        // pre-flight reports it rather than refusing a legal config.
+        // Unset + mining: REFUSED now, where it used to preflight clean.
         config.miner_rkm = None;
-        assert_eq!(preflight(&config, &genesis).expect("unset is legal").miner_rkm, None);
+        assert!(
+            matches!(preflight(&config, &genesis), Err(RunError::MiningWithoutPayout)),
+            "a mining node with no payout key must not pass a pre-flight that `run` will reject"
+        );
+
+        // Unset + NOT mining: still legal, still reported as absent. `check` has
+        // to keep passing every keyless observer and every non-mining T0 host.
+        let mut idle = config.clone();
+        idle.mining = false;
+        assert_eq!(
+            preflight(&idle, &genesis).expect("unset is legal on a node that does not mine").miner_rkm,
+            None
+        );
 
         let good = "0100000000000000020000000000000003000000000000000400000000000000";
         config.miner_rkm = Some(good.to_string());
@@ -5528,6 +5627,179 @@ mod tests {
         let node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier)
             .expect("an unreadable book is not fatal");
         assert_eq!(node.p2p().addrs().known_count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ===== lab #552(a): the payout gate — warn became refuse, on the binary only =====
+
+    /// The smallest config [`check_miner_payout`] can be asked about: the two
+    /// mining fields are the caller's and nothing else exists — no data dir, no
+    /// genesis on disk, no bind.
+    ///
+    /// `rig` is deliberately NOT reused, and the absence is the point: this gate
+    /// is a pure config predicate, which is *why* `qumbra-node check` can apply
+    /// it at all. A version of it that needed a started node could not have been
+    /// put in `preflight`, and `check` would still be printing a warning.
+    fn payout_cfg(mining: bool, miner_rkm: Option<&str>) -> NodeConfig {
+        let base = std::env::temp_dir().join("qmb_i552_payout_cfg");
+        NodeConfig {
+            data_dir: base.join("data"),
+            listen_addr: "127.0.0.1:0".to_string(),
+            dial_peers: vec![],
+            advertise_addr: None,
+            genesis_file: base.join("genesis.qmb"),
+            committee_key_paths: vec![],
+            mining,
+            expected_genesis_hash: None,
+            metrics_addr: None,
+            telemetry_addr: None,
+            discovery_addr: None,
+            miner_rkm: miner_rkm.map(str::to_string),
+            template_serving: false,
+        }
+    }
+
+    /// **ACCEPTANCE — the defect. `mining = true` with no payout key REFUSES.**
+    ///
+    /// This is T2 blocks 607, 610 and 611: ~15 QMB minted to
+    /// `qlab_p2p::adapter::UNCONFIGURED_MINER_RKM`, whose lane-major LE encoding is
+    /// `0111011101110111…`, by a node that was warned at startup and mined anyway.
+    /// #552's finding is not that the value was undocumented — its own doc comment
+    /// is honest about it — but that **the warning was at startup and the burn was
+    /// at every block**, and nobody rereads startup logs.
+    ///
+    /// The refusal must NAME the missing field, because the operator reading it has
+    /// a config file open and needs to know which line to add.
+    #[test]
+    fn mining_with_no_miner_rkm_is_refused_and_the_refusal_names_miner_rkm() {
+        let err = check_miner_payout(&payout_cfg(true, None)).expect_err("must refuse");
+        assert!(matches!(err, RunError::MiningWithoutPayout), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("miner_rkm"), "the refusal must name the field: {text}");
+        assert!(text.contains("mining = true"), "and the setting that triggered it: {text}");
+        // The old warning's spine, kept verbatim on purpose (#552 judged the
+        // wording worth having, and it is what an operator greps a post-mortem for).
+        assert!(text.contains("NOBODY can spend"), "{text}");
+        assert!(text.contains("BURNED"), "{text}");
+        // Both exits named, not just the one. A drill node that genuinely does not
+        // want a payout key is `mining = false` — #552's position, and mine: a node
+        // that wants to mine and pay nobody is not a deployment, it is a mistake.
+        assert!(text.contains("`mining = false`"), "the other exit must be named too: {text}");
+    }
+
+    /// **REGRESSION GUARD — the one this change was most likely to break.**
+    ///
+    /// A non-mining node with no `miner_rkm` is the ordinary case: three of the four
+    /// hosts in `deploy/hosts.example` carry no payout key, every explorer observer
+    /// is keyless and non-mining, and `tests/sigterm_shutdown.rs` runs one. If this
+    /// assertion ever fails, the gate has stopped reading `config.mining` and has
+    /// become a requirement that every node hold a wallet.
+    #[test]
+    fn a_non_mining_node_with_no_miner_rkm_is_still_accepted() {
+        check_miner_payout(&payout_cfg(false, None)).expect("mining = false is normal and stays so");
+    }
+
+    /// A configured payout key is accepted on both mining settings — and the parse
+    /// still happens on the non-mining one, which is lab #475's behaviour and the
+    /// reason this gate subsumes `preflight`'s old bare `miner_rkm_lanes()` call
+    /// rather than sitting beside it. A truncated paste on a host that does not mine
+    /// yet is still a typo worth catching in one `check`.
+    #[test]
+    fn a_configured_payout_key_is_accepted_and_a_malformed_one_is_refused_either_way() {
+        let good = "0100000000000000020000000000000003000000000000000400000000000000";
+        check_miner_payout(&payout_cfg(true, Some(good))).expect("a real key mines");
+        check_miner_payout(&payout_cfg(false, Some(good))).expect("and is legal unused");
+        for mining in [true, false] {
+            // Too short, and all-zero — `rkm_lanes_from_hex`'s two refusals.
+            for bad in ["dead", &"0".repeat(64)] {
+                let err = check_miner_payout(&payout_cfg(mining, Some(bad)))
+                    .expect_err("a malformed key is refused whether or not this node mines");
+                assert!(
+                    matches!(err, RunError::Config(_)),
+                    "a bad PARSE is a config error, not the payout refusal: {err}"
+                );
+            }
+        }
+    }
+
+    /// **ACCEPTANCE — `mining = true` with a real key still starts AND still mines,
+    /// to that key.**
+    ///
+    /// The gate would be worthless if it were satisfied by a node that starts and
+    /// then pays somebody else, so this asserts the payee in the block body rather
+    /// than the field in the config: the height-1 coinbase's rkm must be the
+    /// configured lanes. `rig_paying` sets `miner_rkm` to `0x2a` × 32.
+    #[test]
+    fn a_mining_node_with_a_real_miner_rkm_starts_and_pays_its_coinbase_to_it() {
+        let (config, genesis, base) = rig_paying("i552_pays", 0x2a);
+        check_miner_payout(&config).expect("a configured miner mines");
+
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert!(node.try_mine(), "KeccakPow mines at the genesis difficulty");
+        assert_eq!(node.tip_height(), 1, "the gate did not stop a configured miner");
+
+        let want = config.miner_rkm_lanes().expect("valid").expect("configured");
+        let hash = node.p2p().node().chain().main_chain()[1];
+        let body = node.state().chain().block(&hash).expect("body").clone().body();
+        let (coinbase, rkm) = body.single_payee_parts().expect("a T0 coinbase-only body");
+        assert!(coinbase > 0, "the block this asserts about actually mints");
+        assert_eq!(rkm, want, "the coinbase is paid to the CONFIGURED key");
+        assert_ne!(
+            rkm,
+            qlab_p2p::adapter::UNCONFIGURED_MINER_RKM,
+            "and not to the placeholder T2 607/610/611 were paid to"
+        );
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 🔴 **THE SCOPE OF THE GATE, ASSERTED — this is the boundary, not an
+    /// oversight.**
+    ///
+    /// `RunningNode::start` keeps mining with no `miner_rkm`, warning as it always
+    /// has. That seam is what the in-process rehearsals use — `rig(_, true)` at 61
+    /// call sites in this file, `tests/recipient_scan.rs`,
+    /// `qumbra-credit-ref/tests/credit_e2e.rs` — and
+    /// `qlab_p2p::adapter::UNCONFIGURED_MINER_RKM` exists so that they produce
+    /// *valid* blocks, which is its whole and good justification. The refusal lives
+    /// on the binary's two operator surfaces ([`preflight`], i.e. `qumbra-node
+    /// check`, and `main.rs`'s `run_node`), where a real operator with a real wallet
+    /// is; `tests/miner_payout_refusal.rs` is its acceptance, through the real
+    /// binary.
+    ///
+    /// If someone later hoists the gate into `prepare`, this test fails and says
+    /// why. Turning `miner_rkm` into an `Option` the type system forces a consumer
+    /// to resolve — issue #552's change (b) — is where the value should end up, and
+    /// it is deliberately not done here: it touches the `qlab-p2p` API and every
+    /// rehearsal path, and wants its own baton and its own suite run.
+    #[test]
+    fn the_library_seam_still_mines_without_a_payout_key_and_only_warns() {
+        let (config, genesis, base) = rig("i552_lib_seam", true);
+        assert!(config.mining && config.miner_rkm.is_none(), "the rehearsal shape");
+        // The gate WOULD refuse this — the binary is what applies it.
+        assert!(check_miner_payout(&config).is_err(), "the binary surfaces refuse this");
+
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier)
+                .expect("the LIBRARY seam still starts — 61 rehearsal call sites depend on it");
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert!(node.try_mine(), "and still mines a VALID block");
+
+        let hash = node.p2p().node().chain().main_chain()[1];
+        let body = node.state().chain().block(&hash).expect("body").clone().body();
+        let (_, rkm) = body.single_payee_parts().expect("a T0 coinbase-only body");
+        assert_eq!(
+            rkm,
+            qlab_p2p::adapter::UNCONFIGURED_MINER_RKM,
+            "paid to the placeholder, which is the honest state for a node never told where to pay"
+        );
+
+        drop(node);
         let _ = std::fs::remove_dir_all(&base);
     }
 
