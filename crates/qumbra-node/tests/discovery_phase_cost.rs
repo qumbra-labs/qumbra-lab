@@ -28,6 +28,23 @@
 //! the anchor *answer* is capped at the age window, so above it a projection
 //! whose cost tracks its answer is flat while one that walks the whole chain to
 //! produce it doubles.
+//!
+//! ## 🔴 What it found, and it was neither candidate
+//!
+//! The issue named two suspects from source: `refresh_leaves`'s
+//! `commitments_ordered().to_vec()`, and `refresh_discovery` cloning the whole
+//! view before deciding whether it needed to. Measured, the phase belongs to
+//! **`refresh_anchors`**, which neither the issue nor the task book suspected:
+//! `anchor_set` walked the entire main chain — cloning every `StoredBlock`,
+//! STARK proofs included, then recomputing `CommitmentTree::root_at` once per
+//! height — to produce an answer that `MAX_ANCHOR_AGE_BLOCKS` already caps.
+//! `root_at` is the deliberate O(n) prefix walk, so that is `O(heights ×
+//! leaves)` Merkle node hashes **per applied block, on the main loop**.
+//!
+//! The other two are real and much smaller: the leaf copy is one memcpy of
+//! 32 B per commitment (pinned below), and the discovery clone was being built
+//! and discarded fourteen times in fifteen (5 s cadence, 75 s blocks) and is
+//! now gated by the check that used to follow it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -36,7 +53,12 @@ use qlab_devnet::body::{BlockBody, TxEntry};
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::params_devnet::{GENESIS_DIFFICULTY, MAX_ANCHOR_AGE_BLOCKS};
 use qlab_node::{anchor_set, genesis_block, ChainStore, MemNode, NodeState};
+use qlab_devnet::pow::KeccakPow;
+use qumbra_node::config::NodeConfig;
 use qumbra_node::discovery_server::{DiscoveryView, LeavesView};
+use qumbra_node::genesis::GenesisFile;
+use qumbra_node::run::RunningNode;
+use qumbra_node::verifier::DevnetRehearsalVerifier;
 
 // ── the instrument ──────────────────────────────────────────────────────────
 
@@ -152,20 +174,25 @@ const LONG: u64 = SHORT * 2;
 
 // ── the measurement ─────────────────────────────────────────────────────────
 
-/// 🔴 **The #673 answer, and it is not either of the two candidates the issue
-/// named.**
+/// 🔴 **The fix, stated as the thing the loop no longer does.**
 ///
-/// The issue's reading of the source put `refresh_leaves`'s
-/// `commitments_ordered().to_vec()` first and `refresh_discovery`'s
-/// clone-before-checking second. Measured, `refresh_anchors` is the one whose
-/// cost tracks the chain — and it tracks it *above the age window*, where the
-/// answer it produces has stopped growing.
+/// Above `MAX_ANCHOR_AGE_BLOCKS` the anchor answer has stopped growing, so a
+/// derivation that costs what its answer costs must be **flat across a chain
+/// that doubles**. Before the fix this ratio was the chain's — `anchor_set`
+/// cloned every `StoredBlock` and recomputed a root per height — and that is
+/// what made `refresh_anchors` the 13 s.
+///
+/// Revert `Node::valid_anchor_roots` to the full-chain walk and this test
+/// fails on the growth assertion, which is the mutation check. It fails on the
+/// *domination* assertion too, in the opposite direction: pre-fix,
+/// `refresh_anchors` allocated more than an order of magnitude beyond the two
+/// refreshes the issue suspected.
 ///
 /// The three numbers are printed as well as asserted: a ratio that moves is
 /// news either way, and the next reader should not have to re-instrument to see
 /// what it moved to.
 #[test]
-fn the_anchor_refresh_is_the_one_whose_cost_tracks_the_chain() {
+fn the_anchor_refresh_no_longer_costs_what_the_chain_costs() {
     let short = chain(SHORT);
     let long = chain(LONG);
 
@@ -214,20 +241,38 @@ fn the_anchor_refresh_is_the_one_whose_cost_tracks_the_chain() {
          the chain must not change the answer's size"
     );
 
-    // 🔴 The finding: the answer is flat and the work is not.
+    // 🔴 The fix: the answer is flat, and now so is the work. The bound is
+    // 1.2 rather than 1.0 because the derivation still touches an age window's
+    // worth of index entries and a `Vec` doubles as it fills — what must not
+    // survive is a term that tracks the CHAIN, and 1.2 is far below the ~2.0 a
+    // chain-proportional derivation gives across a doubling.
     assert!(
-        growth(a_short.allocs, a_long.allocs) > 1.8,
-        "refresh_anchors allocates proportionally to the chain even though its \
-         answer is capped: {} -> {} allocations across a 2x chain",
+        growth(a_short.allocs, a_long.allocs) < 1.2,
+        "refresh_anchors must not allocate proportionally to the chain — its \
+         answer is capped by MAX_ANCHOR_AGE_BLOCKS: {} -> {} allocations across a 2x chain",
         a_short.allocs,
         a_long.allocs
     );
-
-    // And it dominates the two the issue suspected — by so much that no
-    // plausible measurement error reorders them.
     assert!(
-        a_short.bytes > 10 * (l_short.bytes + d_short.bytes),
-        "refresh_anchors is the phase's cost: anchors {} B vs leaves {} B + view {} B",
+        growth(a_short.bytes, a_long.bytes) < 1.2,
+        "and the same in bytes: {} -> {} B across a 2x chain",
+        a_short.bytes,
+        a_long.bytes
+    );
+
+    // The other two are unchanged by this PR and are pinned so the comparison
+    // that named `refresh_anchors` stays checkable: both track the chain, and
+    // both are now larger than the projection that used to dwarf them.
+    assert!(
+        growth(l_short.bytes, l_long.bytes) > 1.8,
+        "the leaf copy still tracks the chain — 32 B per commitment, once per \
+         block: {} -> {} B",
+        l_short.bytes,
+        l_long.bytes
+    );
+    assert!(
+        a_short.bytes < l_short.bytes + d_short.bytes,
+        "refresh_anchors is no longer the phase's cost: anchors {} B vs leaves {} B + view {} B",
         a_short.bytes,
         l_short.bytes,
         d_short.bytes
@@ -247,4 +292,74 @@ fn the_leaf_copy_is_one_allocation_of_32_bytes_per_commitment() {
     assert_eq!(view.leaves.len() as u64, n);
     assert_eq!(cost.allocs, 1, "one Vec, one allocation — a memcpy, not a walk");
     assert_eq!(cost.bytes, n * 32, "32 B per commitment and nothing else");
+}
+
+/// 🔴 **The clone-then-check fix, locked at the call site.**
+///
+/// `DISCOVERY_REFRESH` is 5 s against a FROZEN 75 s block time, so at steady
+/// state fourteen of every fifteen refresh passes find the tip where they left
+/// it. `RunningNode::refresh_discovery` used to clone the entire
+/// `DiscoveryView` — one `BlockDiscovery` per main-chain block, each owning its
+/// block's groups, riders and nullifiers — and only then ask whether anything
+/// had changed, discarding the copy when it had not. It now asks first.
+///
+/// Measured on the real method rather than on the predicate, because the
+/// predicate was never the bug: `DiscoveryView::refresh` has always checked
+/// before doing anything. What was wrong was the order at the call site, and
+/// only a measurement of the call site can hold it there. Restore the clone
+/// and this test fails immediately — an unchanged tip goes from zero
+/// allocations to one per block on the chain.
+#[test]
+fn a_discovery_refresh_on_an_unchanged_tip_copies_nothing() {
+    let base = std::env::temp_dir().join("qmb_i673_refresh_noclone");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let genesis = GenesisFile::new_devnet_t0();
+    let gpath = base.join("genesis.qmb");
+    genesis.write(&gpath).unwrap();
+    let keys = genesis.write_committee_key_files(base.join("keys")).unwrap();
+    let config = NodeConfig {
+        data_dir: base.join("data"),
+        listen_addr: "127.0.0.1:0".to_string(),
+        dial_peers: vec![],
+        advertise_addr: None,
+        genesis_file: gpath,
+        committee_key_paths: keys,
+        mining: true,
+        expected_genesis_hash: Some(genesis.hash_hex()),
+        metrics_addr: None,
+        telemetry_addr: None,
+        discovery_addr: None,
+        miner_rkm: None,
+        template_serving: false,
+    };
+    let mut node =
+        RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+    node.set_mine_interval(std::time::Duration::ZERO);
+    for _ in 0..24 {
+        assert!(node.try_mine());
+    }
+
+    // The first pass builds the projection from nothing: it copies, and it must.
+    let (built, first) = measure(|| node.refresh_discovery());
+    assert!(built, "a projection that has never been built is not current");
+    assert!(first.allocs > 24, "building it really does allocate: {first:?}");
+
+    // The second, with the tip exactly where the first left it. This is the
+    // fourteen-in-fifteen case, and it is now free.
+    let (again, second) = measure(|| node.refresh_discovery());
+    assert!(!again, "an unchanged tip publishes nothing");
+    assert_eq!(
+        second.allocs, 0,
+        "an unchanged tip must not copy the view to discover that it is unchanged: {second:?}"
+    );
+
+    // And the check is not a stale cache: one more block and it copies again,
+    // so "free" is about an unchanged tip and not about having stopped working.
+    assert!(node.try_mine());
+    let (moved, third) = measure(|| node.refresh_discovery());
+    assert!(moved, "a moved tip republishes");
+    assert!(third.allocs > 0, "and pays for the blocks it added: {third:?}");
+
+    let _ = std::fs::remove_dir_all(&base);
 }

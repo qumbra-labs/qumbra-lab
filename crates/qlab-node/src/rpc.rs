@@ -1258,23 +1258,30 @@ pub fn main_chain_roots_of<C: ChainStore, N: NullifierStore, T: CommitmentStore>
 /// counts it may legally build at — it matches its own reconstructed roots
 /// against this set, so the server still learns nothing positional (the B2
 /// rejection holds).
+///
+/// ## Lab #673: read the index, do not rebuild the chain
+///
+/// This used to walk the whole main chain to produce its answer —
+/// [`main_chain_roots_of`], which is [`main_chain_of`] (a clone of every
+/// `StoredBlock`, STARK proofs included) plus one `CommitmentTree::root_at`
+/// **per height**, itself the deliberate O(n) prefix walk. `run.rs` calls this
+/// from the node's main loop once per applied block, so that walk was
+/// quadratic in the chain, ON the loop that also serves the network: lab #673
+/// measured 13.1 s per block at tip 6,117 across four hosts.
+///
+/// The answer is bounded by `MAX_ANCHOR_AGE_BLOCKS` and every root it needs is
+/// already in `apply_state`'s own index, so none of that walk was buying
+/// anything. [`Node::valid_anchor_roots`] carries the derivation and the
+/// argument that it is the same answer;
+/// `anchor_set_matches_the_full_chain_recomputation` is the lock.
 pub fn anchor_set<C: ChainStore, N: NullifierStore, T: CommitmentStore>(
     node: &Node<C, N, T>,
 ) -> AnchorSet {
-    let mut roots = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    // Walk main chain tip→genesis, accumulating leaf counts, and test each
-    // height's root for anchor validity.
-    for (_, root) in main_chain_roots_of(node).into_iter().rev() {
-        if node.is_valid_anchor(&root) && seen.insert(root) {
-            roots.push(root);
-        }
-    }
     AnchorSet {
         tip_height: node.tip_height(),
         finalized_height: node.finalized_height(),
         max_age_blocks: MAX_ANCHOR_AGE_BLOCKS,
-        roots,
+        roots: node.valid_anchor_roots(),
     }
 }
 
@@ -2431,6 +2438,183 @@ mod tests {
     // serveable).
     fn apply_block_with(node: &mut MemNode, txs: Vec<TxEntry>) {
         apply_block_with_shape(node, txs, true);
+    }
+
+    // ── lab #673: the anchor projection stopped rebuilding the chain ─────────
+
+    /// **The derivation `anchor_set` replaced, kept as the ground truth.**
+    ///
+    /// Byte-for-byte the pre-#673 body: walk every main-chain height
+    /// tip → genesis off the live tree, emit each root the first time it is
+    /// seen if [`NodeState::is_valid_anchor`] accepts it. Quadratic in the
+    /// chain, which is why it is no longer what the node runs — and exactly
+    /// why it is worth keeping here, at test scale, as the thing the fast path
+    /// must agree with.
+    ///
+    /// QUM-111's rule, one level up: a derived acceleration structure owes an
+    /// identical answer to the scan it accelerates.
+    fn anchor_set_by_full_chain_recomputation(node: &MemNode) -> AnchorSet {
+        let mut roots = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, root) in main_chain_roots_of(node).into_iter().rev() {
+            if node.is_valid_anchor(&root) && seen.insert(root) {
+                roots.push(root);
+            }
+        }
+        AnchorSet {
+            tip_height: node.tip_height(),
+            finalized_height: node.finalized_height(),
+            max_age_blocks: MAX_ANCHOR_AGE_BLOCKS,
+            roots,
+        }
+    }
+
+    /// Assert both derivations agree, **as structure and as served bytes**.
+    /// `/v1/anchors` serves `to_bytes()`, so byte-equality is the claim the
+    /// wire actually rests on; the structural comparison is what makes a
+    /// failure readable.
+    fn assert_anchor_derivations_agree(node: &MemNode, at: &str) {
+        let fast = anchor_set(node);
+        let ground = anchor_set_by_full_chain_recomputation(node);
+        assert_eq!(fast, ground, "anchor set diverged from the recomputation at {at}");
+        assert_eq!(
+            fast.to_bytes(),
+            ground.to_bytes(),
+            "the SERVED bytes diverged at {at} — this is the /v1/anchors wire"
+        );
+    }
+
+    /// 🔴 **Lab #673's mutation lock: the fast anchor projection is the same
+    /// answer as the full-chain recomputation it replaced.**
+    ///
+    /// Not one chain but a chain walked through every shape that can make the
+    /// two disagree, asserting at **every height**, because the failure this
+    /// guards against is a wire change and a wire change is silent:
+    ///
+    /// - **empty blocks**, which append no leaf and so REPEAT their parent's
+    ///   root. Repeated roots are the whole reason the ordering key is the
+    ///   highest occurrence rather than the height being visited, and a chain
+    ///   of all-distinct roots cannot tell a correct implementation from one
+    ///   that keys on the first occurrence.
+    /// - **a root whose only in-window occurrence is below a later
+    ///   out-of-window one** — the case where "is this root valid" and "is this
+    ///   height valid" give different answers.
+    /// - **minting and multi-commitment transaction blocks**, so the tree grows
+    ///   on both of `apply_state`'s two schedules.
+    /// - **finality lagging the tip**, which is the only state in which the set
+    ///   is not simply every root.
+    /// - **a reorg**, after which `roots_by_height` has been rebuilt from
+    ///   genesis and the abandoned branch's roots must be gone from BOTH.
+    #[test]
+    fn anchor_set_matches_the_full_chain_recomputation() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        assert_anchor_derivations_agree(rpc.node(), "genesis");
+
+        // Nothing finalized past genesis yet, and a mix of shapes: empty
+        // (root repeats), minting (one leaf on maturity's schedule), and
+        // transactions carrying one and two commitments.
+        let mut cm = 10u8;
+        for step in 0..24u64 {
+            match step % 4 {
+                0 => apply_block_with_shape(rpc.node_mut(), vec![], false), // repeats the root
+                1 => apply_block_with_shape(rpc.node_mut(), vec![], true),
+                2 => {
+                    let tx = tx_with(anchor, &[cm, cm + 1], &[cm, cm + 1], fee);
+                    cm += 2;
+                    apply_block_with_shape(rpc.node_mut(), vec![tx], false)
+                }
+                _ => {
+                    let a = tx_with(anchor, &[cm, cm + 1], &[cm], fee);
+                    let b = tx_with(anchor, &[cm + 2, cm + 3], &[cm + 1], fee);
+                    cm += 4;
+                    apply_block_with_shape(rpc.node_mut(), vec![a, b], true)
+                }
+            }
+            assert_anchor_derivations_agree(rpc.node(), &format!("height {}", step + 1));
+        }
+
+        // Finality walking up the chain, one height at a time: the set changes
+        // on every step and the two derivations must change together. This is
+        // where a floor/ceiling off-by-one shows itself.
+        let heights: Vec<u64> = (0..=rpc.node().tip_height()).collect();
+        for h in heights {
+            let hash = main_chain_of(rpc.node())
+                .into_iter()
+                .find(|b| b.header.height == h)
+                .expect("main chain holds every height")
+                .header()
+                .header_hash();
+            assert!(rpc.node_mut().finalize(hash).unwrap().is_recorded());
+            assert_anchor_derivations_agree(rpc.node(), &format!("finalized {h}"));
+        }
+        // …and the set is not vacuously empty at the end of all that, or every
+        // assertion above compared two empty vectors.
+        let served = anchor_set(rpc.node());
+        assert!(!served.roots.is_empty(), "the chain really does offer anchors");
+        assert!(
+            served.roots.len() < served.tip_height as usize + 1,
+            "and repeated roots really were collapsed: {} roots over {} heights",
+            served.roots.len(),
+            served.tip_height + 1
+        );
+
+        // A reorg: rewind two blocks and build a different suffix. Both
+        // derivations are rebuilt from genesis by `rewind_to`, so a root that
+        // existed only on the abandoned branch must be in neither.
+        let target = main_chain_of(rpc.node())
+            .into_iter()
+            .find(|b| b.header.height == rpc.node().tip_height() - 2)
+            .expect("two below the tip")
+            .header()
+            .header_hash();
+        let abandoned: Vec<Hash32> = anchor_set(rpc.node()).roots;
+        rpc.node_mut().rewind_to(target).expect("rewind to an ancestor");
+        assert_anchor_derivations_agree(rpc.node(), "immediately after the rewind");
+        for step in 0..4u64 {
+            let tx = tx_with(anchor, &[cm, cm + 1], &[cm, cm + 1], fee);
+            cm += 2;
+            apply_block_with_shape(rpc.node_mut(), vec![tx], step % 2 == 0);
+            assert_anchor_derivations_agree(rpc.node(), &format!("reorg block {step}"));
+        }
+        let after: Vec<Hash32> = anchor_set(rpc.node()).roots;
+        assert_ne!(abandoned, after, "the reorg really did change the anchor set");
+    }
+
+    /// The bound that makes the new derivation cheap is a claim about the
+    /// ANSWER, and it is asserted rather than assumed: no root older than
+    /// `MAX_ANCHOR_AGE_BLOCKS` from the tip is served, so the set a node
+    /// publishes is capped by the window and not by its height.
+    ///
+    /// It also pins the two degenerate states the range read has to survive:
+    /// nothing finalized at all, and a finalized head that has fallen behind
+    /// the whole age window.
+    #[test]
+    fn the_anchor_answer_is_bounded_by_the_age_window_and_the_finalized_head() {
+        // Nothing finalized ⇒ no anchors, and the recomputation agrees.
+        let mut node = MemNode::in_memory(genesis_block(1_000, 0));
+        apply_block_with_shape(&mut node, vec![], true);
+        assert_eq!(node.finalized_height(), None);
+        assert!(anchor_set(&node).roots.is_empty(), "nothing finalized ⇒ nothing to anchor at");
+        assert_anchor_derivations_agree(&node, "nothing finalized");
+
+        // A finalized head, then a tip that runs an entire age window past it:
+        // the window floor is now ABOVE the finalized head, so the answer is
+        // empty for a reason that is about the chain rather than about the
+        // absence of finality.
+        let (mut rpc, _anchor) = rpc_with_finalized_genesis();
+        assert!(!anchor_set(rpc.node()).roots.is_empty(), "genesis root anchors a fresh net");
+        for _ in 0..MAX_ANCHOR_AGE_BLOCKS + 1 {
+            apply_block_with_shape(rpc.node_mut(), vec![], true);
+        }
+        let served = anchor_set(rpc.node());
+        assert_eq!(served.finalized_height, Some(0), "finality never moved");
+        assert!(
+            served.roots.is_empty(),
+            "the finalized head is more than one age window below the tip: {} roots",
+            served.roots.len()
+        );
+        assert_anchor_derivations_agree(rpc.node(), "finality a full window behind");
     }
 
     #[test]

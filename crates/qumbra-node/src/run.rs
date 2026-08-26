@@ -2110,12 +2110,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// encoder between the block and the served bytes, which is what makes a served
     /// group that differs from the committed one unconstructible rather than
     /// unlikely. Incremental: an unchanged tip returns without touching the view.
+    ///
+    /// ## Lab #673: the check comes before the clone
+    ///
+    /// This used to clone the entire `DiscoveryView` — one `BlockDiscovery` per
+    /// main-chain block, each carrying its block's committed groups, riders and
+    /// nullifiers as owned `Vec`s — and only then ask
+    /// [`DiscoveryView::refresh`] whether anything had changed, discarding the
+    /// copy when it had not. `DISCOVERY_REFRESH` is 5 s against a FROZEN 75 s
+    /// block time, so at steady state **fourteen of every fifteen of those
+    /// deep copies were built and thrown away**.
+    ///
+    /// The check does not need the copy: `refresh`'s own first act is to
+    /// compare the projection's tip hash against the chain's, and that reads
+    /// nothing it would mutate. [`DiscoveryView::tip_hash`] is that predicate,
+    /// extracted so both callers ask the identical question rather than two
+    /// questions that agree today.
+    ///
+    /// The Arc-swap discipline is unchanged and is why the early return is
+    /// safe: the snapshot is still built whole and published by replacing the
+    /// `Arc` under the lock, so a reader sees the old projection or the new one
+    /// and never a half-built one. What is held across the check is an `Arc`
+    /// clone — the same refcount bump a serving thread takes — not the lock.
     pub fn refresh_discovery(&mut self) -> bool {
-        let mut next = (**self
-            .discovery_view
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()))
-        .clone();
+        let tip = self.p2p.node().state().chain().tip_hash();
+        let current =
+            Arc::clone(&self.discovery_view.lock().unwrap_or_else(|p| p.into_inner()));
+        if current.tip_hash() == Some(tip) {
+            return false;
+        }
+        let mut next = (*current).clone();
         if !next.refresh(self.p2p.node().state().chain()) {
             return false;
         }
@@ -4700,6 +4724,18 @@ mod tests {
         let (config, genesis, base) = rig("i673_split", true);
         let mut node =
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+
+        // A pass with the gate SHUT: the block does not run, and the split says
+        // so rather than reporting whatever was left in it. Taken FIRST, while
+        // the process is milliseconds old — `last_discovery_refresh` is set at
+        // startup and the cadence is 5 s, so anything mined before this point
+        // could open the gate on a loaded runner and turn the assertion into a
+        // coin flip.
+        let (shut, _) = node.one_iteration(&mut |_: &mut RunningNode<_, _>| {});
+        assert_eq!(shut.disc, crate::looptime::DiscoveryTimings::default());
+        assert_eq!(shut.discovery, Duration::ZERO, "and the sum with it");
+
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint();
         for _ in 0..CHECKPOINT_CADENCE_BLOCKS * 2 {
@@ -4707,15 +4743,10 @@ mod tests {
             node.note_slots_reached();
             node.try_checkpoint();
         }
-        // Nothing may mine from inside the iterations below: a moving tip would
-        // make the second pass's "unchanged" premise false.
+        // Nothing may mine from inside the iteration below: a tip that moves
+        // inside the measured pass would leave the phase timing a different
+        // chain from the one the assertions are about.
         node.set_mine_interval(Duration::from_secs(86_400));
-        node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
-
-        // A pass with the gate SHUT: the block does not run, and the split says
-        // so rather than reporting whatever was left in it.
-        let (shut, _) = node.one_iteration(&mut |_: &mut RunningNode<_, _>| {});
-        assert_eq!(shut.disc, crate::looptime::DiscoveryTimings::default());
 
         // A pass with the gate OPEN, against views that have never been built:
         // all three refreshes do real work.
