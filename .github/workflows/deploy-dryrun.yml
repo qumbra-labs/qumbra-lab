@@ -99,6 +99,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Inside a `container:` the default step shell is `sh` (dash): `set -o pipefail`
+# and `${VAR:0:12}` are illegal there, and this file's own first run (32921406354)
+# died at its first step on exactly that. bash exists in rust:1.95-bookworm
+# (release-binaries.yml makes the same declaration for the same reason).
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0        # incremental is a loss on a cold build
