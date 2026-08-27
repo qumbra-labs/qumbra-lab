@@ -384,14 +384,35 @@ mod tests {
 
     /// Coverage must survive the header verbatim — including Empty, which is a
     /// covered state and NOT a range of zero.
+    ///
+    /// Read through `read_header`, not `open`, and the difference is the point:
+    /// the header's job is to SAY what the artifact covers, and `open`'s job is
+    /// to refuse a state with no resumable watermark. `Coverage::Empty` is a
+    /// legitimate thing for a header to carry and an illegitimate thing to
+    /// resume from, so testing the round trip through `open` conflated the two.
+    /// It did, in the first version of this file: the NoWatermark gate landed in
+    /// the same commit and this assertion was left calling `open().unwrap()` on
+    /// Empty. CI caught it — see the note on the PR.
     #[test]
     fn coverage_survives_the_header_including_empty() {
         let w = wallet(1);
         for cov in [Coverage::Empty, Coverage::range(0, 0), Coverage::range(5, 9)] {
             let h = ResumeHeader { genesis: G, coverage: cov, finalized: true };
             let art = seal(&w, &h, &N, b"x");
-            let (back, _) = open(&w, &G, &art).unwrap();
-            assert_eq!(back.coverage, cov, "coverage {cov:?} did not survive");
+            assert_eq!(
+                read_header(&art).unwrap().coverage,
+                cov,
+                "coverage {cov:?} did not survive the header"
+            );
+        }
+        // And the ones that CAN be resumed from still open, so this test is not
+        // quietly asserting only the weaker half.
+        for cov in [Coverage::range(0, 0), Coverage::range(5, 9)] {
+            let h = ResumeHeader { genesis: G, coverage: cov, finalized: true };
+            let art = seal(&w, &h, &N, b"x");
+            let (back, body) = open(&w, &G, &art).expect("a finalized non-empty state opens");
+            assert_eq!(back.coverage, cov);
+            assert_eq!(body, b"x");
         }
         // Empty and 0..=0 must not encode to the same thing: one says nothing
         // was served, the other says height 0 was.
