@@ -130,6 +130,15 @@ impl WalletRegistry {
         self.names.len()
     }
 
+    /// Every synced name with its entry, name-ordered. A shell labelling its
+    /// own addresses filters this on `NameEntry.address` (the wallet-macos
+    /// Addresses sidebar, the follow-up lab #660's review parked on this) —
+    /// resolution verdicts stay [`Self::resolve`]'s job, so expiry arithmetic
+    /// is not re-derived at a surface.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &NameEntry)> {
+        self.names.iter().map(|(name, entry)| (name.as_str(), entry))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
@@ -908,6 +917,24 @@ mod tests {
         std::fs::write(dir.join(REGISTRY_FILE), "something else\n").unwrap();
         assert!(WalletRegistry::load(&dir).is_err(), "unknown header refuses");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iter_yields_every_synced_entry_name_ordered() {
+        let mut reg = WalletRegistry::default();
+        reg.apply_page(&page(
+            vec![
+                BlockNames { height: 9_100, riders: vec![reveal(b"bob")] },
+                BlockNames { height: 9_101, riders: vec![reveal(b"alice")] },
+            ],
+            0,
+            9_101,
+        ));
+        let collected: Vec<(&str, u64)> =
+            reg.iter().map(|(name, entry)| (name, entry.registered)).collect();
+        assert_eq!(collected, vec![("alice", 9_101), ("bob", 9_100)]);
+        // The entry carries the record address a shell filters on.
+        assert!(reg.iter().all(|(_, entry)| entry.address.len() == L1_ADDRESS_LEN));
     }
 
     #[test]
