@@ -24,6 +24,14 @@ pub mod ledger_blob;
 pub mod names;
 pub mod pairing;
 pub mod report;
+// MERGED INERT (lab #568 step 2): the resume artifact's codec and its tests.
+// Nothing consumes it yet — the `qmb_scan_*` resume arguments are step 3, and
+// they remove this attribute. Landing the codec alone is deliberate, the shape
+// lab #381 used for the name service: a sealed-artifact codec with its own
+// adversarial tests is reviewable in a way that the same codec buried inside an
+// ABI change is not.
+#[allow(dead_code)]
+mod resume;
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr, CString};
