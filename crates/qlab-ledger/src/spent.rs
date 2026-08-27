@@ -370,6 +370,18 @@ impl SpentCatchUp {
 /// The widest range a set of per-address served-ranges covers, or `None` when
 /// nothing was served. Lifted out of the CLI so both shells ask the question the
 /// same way (lab #407).
+///
+/// 🔴 **This is a HULL, not a union, and that makes it wrong on any resume
+/// path.** `0..=100` and `200..=300` reduce to `0..=300`, and the hundred blocks
+/// nobody scanned are gone from the value — after which nothing downstream can
+/// see them missing (`covers_outputs` checks only the two ends, and `render`'s
+/// `range: (u64, u64)` cannot represent a hole, so it prints as solid).
+///
+/// It is correct where it is used today, because every address in one scan is
+/// asked for the same range and the inputs therefore overlap by construction.
+/// It is not correct for combining coverage from **different** scans: use
+/// [`crate::coverage::Coverage::merge`], which refuses a merge that would span
+/// unscanned heights (lab #568).
 pub fn widest_range(
     ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
 ) -> Option<(u64, u64)> {
