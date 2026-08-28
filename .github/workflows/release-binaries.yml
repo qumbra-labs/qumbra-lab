@@ -13,12 +13,13 @@
 # WHAT THIS FILE COSTS, STATED BEFORE ANYTHING ELSE
 #
 # `macos-14` is GitHub-hosted arm64 and bills PRIVATE-repo minutes at a 10x
-# multiplier. This repo's CI budget is a $20/month cap with `Stop usage: Yes`
-# (docs/ci-runner-cost-decision.md §4, measured 2026-08-02), and `qumbra-arm64-8`
-# already draws on it at ~$0.014/min. **Exhausting that cap stops `suite-arm64.yml`
-# too** — i.e. an expensive release cut can take the ACCEPTANCE BAR down with it,
-# which is a worse failure than a release that did not happen. Three consequences,
-# all deliberate:
+# multiplier. The hard-stop budget documented in
+# docs/ci-runner-cost-decision.md §10 and its RETIRED section is scoped to the
+# Linux ARM 8-core SKU; it protects `explorer-image`, `node-image`,
+# `kit-fixture-mint`, and this release's `linux-aarch64-glibc` leg. The
+# macOS/Windows legs do not draw on that cap, and the self-hosted acceptance bar
+# is outside it. A release cut is still a deliberate spend decision under R3.
+# Three consequences remain deliberate:
 #
 #   1. `workflow_dispatch` ONLY, gated on typing `confirm=release`. This file has
 #      no push trigger, no schedule, and must never grow one. (node-image.yml took

@@ -1,14 +1,11 @@
 # THE ON-DEMAND GRAVITON LANE. Deploy #130's S2 half — the yaml side of a
 # machine that exists as a STOPPED m7g.2xlarge and runs only while a suite runs.
 #
-# This is a different RUNNER LANE, not a second copy of the suite lane:
-# `suite-arm64.yml` is the GitHub-hosted lane (`qumbra-arm64-8`, per-minute
-# billing, fresh VM + actions/cache every run); this file starts a persistent
-# AWS instance whose warm `target/` is the whole point, runs the same bar on
-# it, and stops it after. Per deploy #130 S6, the hosted lane STAYS
-# dispatchable as fallback/overflow — the default moves to `graviton-rig`
-# only after the first live suite passes here, and that flip is the
-# coordinator's, not this file's.
+# This is the acceptance suite lane. Its hosted start/stop jobs wake persistent
+# AWS instances, the self-hosted suite job runs the bar with a warm `target/`,
+# and the stop job parks the iron afterward. The former GitHub-hosted comparison
+# lane was retired in e9bf14c after its comparison finished; there is no sibling
+# acceptance workflow to keep in sync or use as fallback.
 #
 # THE CONTRACT WITH THE DEPLOY HALF (deploy #130 S1/S3/S4, coordinator-
 # executed): three repository VARIABLES, set after `terraform/ci-runner/` is
@@ -29,9 +26,9 @@
 # is stored anywhere in GitHub (deploy #130 S3: zero long-lived keys).
 # `id-token: write` below is the OIDC mechanism itself, not a data grant —
 # it lets the job mint its own identity assertion and nothing else. The
-# suite job holds neither: it gets `contents: read`, exactly like
-# suite-arm64's. 🔴 IF A CHANGE TO THIS FILE APPEARS TO NEED A SECRET, THAT
-# IS A STOP (S7) — do not add one, do not widen a grant to reach around it.
+# suite job holds neither: `contents: read` is its whole grant.
+# 🔴 IF A CHANGE TO THIS FILE APPEARS TO NEED A SECRET, THAT IS A STOP (S7) —
+# do not add one, do not widen a grant to reach around it.
 #
 # THE STOP-SAFETY INVARIANT: concurrent PRs must not stop each other's iron.
 # The stop job runs `if: always()` — deliberately not `!cancelled()`, so a
@@ -47,12 +44,13 @@
 name: suite (graviton-rig)
 
 on:
-  # Same two filters as suite-arm64.yml, same two questions — see the long
-  # rationale there; it is not restated. The label differs BY NAME:
-  # `verify-graviton` instead of `verify`, so the coordinator chooses the
-  # lane per tree and applying one label can never bill both. While S6
-  # holds, `verify` stays the acceptance default and this label is the
-  # explicit "run it on the rig-to-be".
+  # Recovered from suite-arm64.yml, retired e9bf14c: the two filters answer
+  # different questions. `paths` runs the bar only when Rust or its dependency
+  # graph changed; a docs/workflow-only PR cannot fail it and should not wake
+  # the rig. `types: [labeled]` runs only on a tree the coordinator intends to
+  # read, rather than every intermediate builder push. `verify-graviton` is
+  # that explicit "this is the tree" signal; re-applying it reruns the current
+  # head, while `workflow_dispatch` remains the deliberate manual path.
   pull_request:
     types: [labeled]
     paths:
@@ -63,9 +61,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Per PR, superseded runs cancelled — as suite-arm64. Cancellation does not
-  # bypass the stop job: `if: always()` runs on a cancelled run too, and its
-  # check sees the superseding run as active, so the iron stays up for it.
+  # Per PR, superseded runs are cancelled because their answer is about a tree
+  # nobody will merge. Cancellation does not bypass the stop job: `if: always()`
+  # runs on a cancelled run too, and its check sees the superseding run as
+  # active, so the iron stays up for it.
   group: acceptance-graviton-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -148,11 +147,11 @@ jobs:
       # protected by S1's 2 h idle watchdog, so the sat-queued failure mode
       # costs minutes of hosted time, not a night of Graviton.
 
-  # ── job B ── the bar, verbatim, on the rig-to-be.
+  # ── job B ── the bar on the self-hosted Graviton rig.
   suite:
     needs: start
     runs-on: [self-hosted, graviton-rig]
-    timeout-minutes: 120      # same figure, same reason as suite-arm64
+    timeout-minutes: 120      # beyond this it is not viable as the bar
     permissions:
       contents: read
     env:
@@ -185,19 +184,26 @@ jobs:
           rustc --version; cargo --version; cmake --version | head -1
           echo "target   $CARGO_TARGET_DIR"; df -h "$HOME" | tail -1
 
-      # Identical command to suite-arm64's — it is the bar (CLAUDE.md §5)
-      # and the whole comparison depends on it not drifting.
+      # This command is the bar. CLAUDE.md §5 records its invocation; if the
+      # command changes, update §5 in the same PR.
       - name: Full workspace suite, serial, unfiltered
         run: |
           set -o pipefail
           /usr/bin/time -v cargo test --release --workspace --locked \
             -- --test-threads=1 2>&1 | tee suite.log
 
-      # The reconciliation, verbatim in substance from suite-arm64.yml —
-      # same table, same non-gate posture (pass/fail is the suite step's
-      # exit code; the greps are a human cross-check and are not allowed to
-      # turn a green suite red — see the long rationale there). If that
-      # step changes shape, change BOTH files in the same PR.
+      # Recovered from suite-arm64.yml, retired e9bf14c: this table lives in
+      # the job summary because its arithmetic is what a human reads at
+      # acceptance; burying it in the full log makes reconciliation easy to
+      # skip. It rules on nothing. `set -o pipefail` makes cargo's exit code the
+      # suite step's result, while these greps remain a visible human cross-check
+      # that cannot turn a green suite red. If the suite command changes, update
+      # this interpretation and CLAUDE.md §5 in the same PR.
+      #
+      # In particular, `panicked at` is reachable on a green run: this workspace
+      # has passing `#[should_panic]` tests, and a panic on a spawned thread can
+      # escape the harness's normal output capture. A gate that can fire on a
+      # correct run teaches readers to ignore it, so the count is advisory.
       - name: Reconciliation and the four answers
         if: always()
         run: |
@@ -239,8 +245,9 @@ jobs:
             echo "| \`panicked at\` | $panic_c | $(mark $panic_c) |"
             echo "| \`^error\` | $err_c | $(mark $err_c) |"
             echo
-            echo "Advisory, not a gate — see suite-arm64.yml's step comment for why \`panicked at\`"
-            echo "is reachable on a green run. **Pass/fail is the suite step's exit code.**"
+            echo "Advisory, not a gate: a passing \`#[should_panic]\` test can emit \`panicked at\`"
+            echo "from a spawned thread outside the harness's normal output capture."
+            echo "**Pass/fail is the suite step's exit code.**"
             echo
             echo "### Cost of the run"
             echo

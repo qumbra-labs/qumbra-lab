@@ -4,9 +4,8 @@
 #
 # It is **build + consensus identity + smoke** on `x86_64-pc-windows-msvc`. It is
 # NOT the acceptance bar and must never be described as one. The bar is the full
-# unfiltered workspace suite on the arm64 lane (`suite-arm64.yml`, CLAUDE.md §5),
-# and lab #478 says so in as many words: "Full workspace suite on Windows is NOT
-# the bar (the arm64 lane stays the bar); the windows leg is build+identity+smoke".
+# unfiltered workspace suite in `acceptance-graviton.yml` (`verify-graviton`,
+# CLAUDE.md §5); this Windows leg is build + identity + smoke.
 #
 # The question this lane answers is the one no amount of reading answers: **does
 # the RandomX C++ chain, built by MSVC, produce the same hashes as everybody
@@ -21,15 +20,15 @@
 #
 # `windows-latest` is GitHub-hosted and bills PRIVATE-repo minutes at a **2x**
 # multiplier — cheaper than macos-14's 10x, dearer than ubuntu's 1x. This repo's
-# CI budget is a $20/month cap with `Stop usage: Yes`
-# (docs/ci-runner-cost-decision.md §4), and exhausting it stops `suite-arm64.yml`
-# too, i.e. an over-eager Windows lane can take the ACCEPTANCE BAR down with it.
+# hosted-Actions hard stop is scoped to the Linux ARM 8-core SKU
+# (docs/ci-runner-cost-decision.md §10 and RETIRED section). It protects the
+# remaining hosted ARM jobs (`explorer-image`, `node-image`, `kit-fixture-mint`),
+# not this Windows SKU; the self-hosted acceptance bar does not draw on it.
 #
-# So the trigger is the same shape `suite-arm64.yml` settled on, for the same
-# measured reason (roughly half a month's spend once bought numbers nobody read):
-# the **`verify` label**, which is the coordinator's explicit "this is the tree",
-# plus `workflow_dispatch`. Not `synchronize` — a builder's intermediate push is a
-# number about a tree nobody will merge.
+# So the trigger keeps the acceptance lane's label-gated shape: the **`verify`
+# label** is the coordinator's explicit "this is the Windows tree", plus
+# `workflow_dispatch`. Not `synchronize` — a builder's intermediate push is a
+# number about a tree nobody will merge, while Windows minutes still bill at 2x.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # WHY THE TESTS ARE THE ONES THEY ARE, AND WHAT IS DELIBERATELY ABSENT
@@ -90,10 +89,9 @@ on:
       - ".github/workflows/scripts/windows-cmake-generator.sh"
   workflow_dispatch:
 
-# SECRETS POSTURE, copied from suite-arm64.yml because it is the same posture:
-# this workflow reads NO secret and must never need one. It builds a repo the
-# runner can already read and downloads one public file. If a change here appears
-# to need a credential, that is a STOP, not a widening.
+# SECRETS POSTURE: this workflow reads NO secret and must never need one. It
+# builds a repo the runner can already read and downloads one public file. If a
+# change here appears to need a credential, that is a STOP, not a widening.
 permissions:
   contents: read
 
@@ -131,8 +129,8 @@ jobs:
     # 150, not 120: the measured job is ~125 min on a cold-ish cache (3 build +
     # 90 node-lib + ~30 wallet-lib + the cheap steps), and 120 killed run
     # 32103510578 mid-wallet. This is headroom over a measurement, not a guess —
-    # and it is capped rather than removed because a windows runner bills at 2×
-    # and this repo's Actions budget also pays for the arm64 acceptance bar.
+    # and it is capped rather than removed because a Windows runner bills at 2x.
+    # The acceptance bar is self-hosted and no longer shares this spend surface.
     timeout-minutes: 150
 
     steps:
@@ -298,7 +296,7 @@ jobs:
             echo "| rustc | \`$(rustc -V)\` |"
             echo
             echo "**This lane is build + RandomX identity + targeted tests + \`check\`.**"
-            echo "It is NOT the acceptance bar — that is \`suite-arm64.yml\`, unchanged."
+            echo "It is NOT the acceptance bar — that is \`acceptance-graviton.yml\` (\`verify-graviton\`)."
             echo
             echo "Step order is a budget decision: the cheap Windows-specific checks"
             echo "run first and \`qumbra-node --lib\` runs LAST, so a timeout costs the"
