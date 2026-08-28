@@ -11,3 +11,14 @@
 
 pub mod narrow;
 pub mod reference;
+
+// THROWAWAY — lab #691 red-path demo. `qlab_air`'s lib is test binary #1 of
+// 115 in cargo's order; a failure here under --no-fail-fast must leave the
+// other 142 result sets in the log. This commit is reverted on the branch.
+#[cfg(test)]
+mod red_path_demo_691 {
+    #[test]
+    fn deliberately_red() {
+        panic!("baton #691 red-path demo");
+    }
+}
