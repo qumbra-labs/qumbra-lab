@@ -14,8 +14,9 @@
 # a workflow that does not exist on the default branch yet). The branch is a
 # trigger vehicle, deleted after the artifact is downloaded.
 #
-# Runner: the hosted arm64 lane (`qumbra-arm64-8`, suite-arm64's runner), so
-# the fixture's provenance arch matches the acceptance lane that verifies it.
+# Runner: the hosted ARM lane (`qumbra-arm64-8`), one of the remaining jobs the
+# ARM SKU hard stop protects. Its provenance architecture matches the self-hosted
+# Graviton acceptance lane that verifies the committed fixture afterward.
 # The job builds only qlab-vask's dependency graph in release (~minutes) and
 # proves once (~1 s measured on M5 Max at this config; docs/disclosure-run2.md).
 #
