@@ -97,8 +97,9 @@ reveal / renew），区块 body 换 **v3 编码**承诺（第一次经由 halt �
   `name service:` 行在出厂构建读 `INERT`,本步翻常量后读 `ARMED — … above
   height {h}`。作为 step-0 验收的一部分,确认它在你盖章的高度翻成 `ARMED`。
 
-第 0 步的验收 = `suite-arm64` 上的全量套件（重负载不落笔记本——2026-08-12 起
-的常规），算术逐项对账。
+第 0 步的验收 = `acceptance-graviton.yml` 上的全量套件，由 `verify-graviton` 标签触发
+（重负载不落笔记本——2026-08-12 起的常规），算术逐项对账。*（跑道于 2026-08-28 更正，
+lab #692：`suite-arm64.yml` 已于 2026-08-21 退役，`e9bf14c`。）*
 
 ## 3. 只构建一个镜像——resume/名字-armed 变体
 

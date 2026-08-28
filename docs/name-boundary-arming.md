@@ -118,8 +118,10 @@ On a worktree from current `main`:
   constant. Confirm it flips to `ARMED` at your stamped height as part of
   step-0 acceptance.
 
-Acceptance for step 0 = the full suite on `suite-arm64` (heavy runs stay off
-the laptop — standing rule since 2026-08-12), arithmetic reconciled.
+Acceptance for step 0 = the full suite on `acceptance-graviton.yml`, triggered by the
+`verify-graviton` label (heavy runs stay off the laptop — standing rule since
+2026-08-12), arithmetic reconciled. *(Lane corrected 2026-08-28, lab #692:
+`suite-arm64.yml` was retired 2026-08-21, `e9bf14c`.)*
 
 ## 3. Build ONE image — the resume/name-armed variant
 
