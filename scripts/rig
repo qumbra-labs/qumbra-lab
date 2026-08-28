@@ -7,7 +7,7 @@
 # the coordinator's. On 2026-08-02 a measurement read 2.1x its true value because
 # a suite started underneath it. `mkdir` is atomic; a `ps` snapshot is not.
 #
-#   scripts/rig run -- cargo test --release --workspace -- --test-threads=1
+#   scripts/rig run -- cargo test --release --workspace --no-fail-fast -- --test-threads=1
 #   scripts/rig ps               # who is running, who is queued, recent history
 #   scripts/rig log [-f]         # the current holder's log (tail; -f to follow)
 #   scripts/rig status           # holder one-liner (kept stable for scripts)

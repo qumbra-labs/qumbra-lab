@@ -103,8 +103,15 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
 5. 🔴 **The acceptance bar is the full unfiltered workspace suite, serial:**
 
    ```sh
-   cargo test --release --workspace -- --test-threads=1
+   cargo test --release --workspace --no-fail-fast -- --test-threads=1
    ```
+
+   *(`--no-fail-fast` added 2026-08-28, lab #691. Without it cargo stops at the first failing
+   **binary**, and the CI lane's reconciliation printed the partial sums in the same table as a
+   complete run: run `32922325707` executed 25 of the workspace's 143 test result sets — 115
+   binaries + 28 doc-test sets, derived from `cargo metadata` — and reported
+   `passed=836 failed=1 ignored=3`. On a green run the flag changes nothing; on a red run one
+   cycle returns every failure instead of the next single one, at the cost of a longer red run.)*
 
    **Never a mode-scoped filter, and — amended 2026-08-01 — never a crate-scoped one either.**
    A filtered run structurally cannot see other modules' cross-checks. That first cost a stale
@@ -124,7 +131,11 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    run locally.** It runs on the **on-demand Graviton lane**,
    `.github/workflows/acceptance-graviton.yml`, triggered by the **`verify-graviton`** label on a
    PR (or `workflow_dispatch` on a branch). A green run **is** the acceptance bar — pass/fail
-   equivalence, reconciled counts in the job summary.
+   equivalence, reconciled counts in the job summary. **Read the summary's Completeness line
+   before the counts** (added 2026-08-28, #691): it says `N of M expected` test result sets and
+   whether cargo returned; a red `TRUNCATED` / `INCOMPLETE` line there means the counts below it
+   are a partial run, however healthy they look. The lane's exit code is still the only gate — the
+   reconciliation reports and never rules.
 
    *(Updated 2026-08-21. The bar used to be `suite-arm64.yml` on the GitHub-hosted
    `qumbra-arm64-8`, with the Graviton lane named as "the same bar on cheaper iron once its
@@ -155,7 +166,7 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    🔴 **Take the lock. It is not a courtesy queue — it is the only way any of the jobs finish.**
 
    ```sh
-   scripts/rig run -- cargo test --release --workspace -- --test-threads=1
+   scripts/rig run -- cargo test --release --workspace --no-fail-fast -- --test-threads=1
    ```
 
    `scripts/rig` is an actual mutex on this machine (`~/.qumbra-rig.lock`, created with `mkdir`,
@@ -185,13 +196,15 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    instructions-retired nearly flat** — that pattern means something else was running, and the
    number should be discarded rather than caveated.
 
-   **Enumerating is not accepting — two phases, two flag sets (added 2026-08-04, from the
-   mint-combo baton).** Cargo stops at the first failing test *binary*, so a change with a wide
-   blast radius reveals its breakage one crate per ~20-minute rig pass — that baton spent four
-   passes listing what one would have shown. When you are *enumerating* what a change breaks,
-   run the bar's command **plus `--no-fail-fast`** (still serial, still rig-locked). The
-   **acceptance** run stays the unmodified command above, verbatim — the two phases answer
-   different questions ("what is red" vs "is it green") and only the second is the bar.
+   **Enumerating and accepting are one run now (amended 2026-08-28, #691; the rule below it
+   dates from 2026-08-04).** The bar's command carries `--no-fail-fast` itself, so a red run lists
+   every failure and a green run is unaffected — the two questions ("what is red" / "is it
+   green") are answered by the same invocation and there is no longer a second flag set. *(The
+   2026-08-04 rule from the mint-combo baton — enumerate with `--no-fail-fast`, accept with the
+   verbatim command without it — existed because cargo stops at the first failing test binary and
+   that baton spent four rig passes listing what one would have shown. It was right about the
+   enumeration and wrong to keep the flag out of the bar: the acceptance lane's own summary then
+   reported a 25-of-143 run in the same table as a complete one, which is what #691 fixed.)*
 
    **Reconcile the arithmetic out loud**: your total must equal `main`'s baseline plus your new
    tests. Verify the negatives too — `FAILED` (case-sensitive), `panicked at`, `^error` all zero.
