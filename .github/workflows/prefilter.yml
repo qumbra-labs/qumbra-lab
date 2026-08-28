@@ -136,6 +136,17 @@ jobs:
       - name: explorer-provenance (the explorer image's readback)
         run: .github/workflows/tests/explorer-provenance/run.sh
 
+      # The acceptance lane's reconciliation against two REAL suite.log
+      # artifacts (lab #691): the "this run was cut off — these counts are
+      # partial" branch fires only when a 50-minute Graviton suite is killed,
+      # which nobody rehearses, so this is the only place it ever executes.
+      # One case in it calls the runner's preinstalled cargo for
+      # `cargo metadata --no-deps` on a three-line fixture workspace — a
+      # manifest read, not a build; the job stays toolchain-free in the
+      # sense that matters (nothing here compiles a crate).
+      - name: suite-reconcile (the acceptance lane's truncation detector)
+        run: .github/workflows/tests/suite-reconcile/run.sh
+
       # `deploy/dry-run.sh` is deliberately NOT a fourth line here. It needs a
       # release `qumbra-node` — a `cargo build --release -p qumbra-node` on
       # every PR for a script that changes rarely (PR #670's objection). It has

@@ -183,8 +183,12 @@ case "$verdict" in
   complete)
     if [ -z "$expected" ]; then
       loud "Denominator unknown: $expected_note — completeness judged on cargo returning only (exit $cargo_rc, $results_c result sets)."
+    elif [ "$cargo_rc" = 0 ]; then
+      echo "✅ Complete and green: cargo returned 0 and every expected test result set is present." >> "$summary"
+      echo >> "$summary"
     else
-      echo "✅ Complete: cargo returned and every expected test result set is present." >> "$summary"
+      echo "🟠 Complete but RED: cargo exited $cargo_rc, and every expected test result set is present —" \
+           "with \`--no-fail-fast\` that means the failures below are ALL of them, not the first one." >> "$summary"
       echo >> "$summary"
     fi
     ;;
