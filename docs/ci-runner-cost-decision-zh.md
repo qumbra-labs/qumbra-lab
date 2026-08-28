@@ -14,12 +14,14 @@ English: [`ci-runner-cost-decision.md`](./ci-runner-cost-decision.md) —— 技
 
 ## 1. 今天实际在跑的是什么
 
-`.github/workflows/suite-arm64.yml` 在 **GitHub 托管的 arm64 larger runner**（`qumbra-arm64-8`）
-上跑 `cargo test --release --workspace -- --test-threads=1`，触发条件是 `pull_request` 且改动了
-`crates/**`、`Cargo.toml` 或 `Cargo.lock`，外加 `workflow_dispatch`。
+`.github/workflows/acceptance-graviton.yml` 在**自托管 AWS Graviton rig** 上运行
+`cargo test --release --workspace --locked -- --test-threads=1`；当 `crates/**`、`Cargo.toml`
+或 `Cargo.lock` 有改动时，由 `verify-graviton` 标签触发，另外保留 `workflow_dispatch`。
+托管的 start/stop job 只唤醒队列所需的持久实例，并在 lane 清空后停机；suite job 本身使用实例的热缓存。
 
-它自己的文件头仍然写着 —— 而且是对的 —— **它不是验收标准**，`CLAUDE.md` §5 的 rig 才是。这一点没有
-变，本文档也不改变它。
+这就是 `CLAUDE.md` §5 记录的验收标准。原 GitHub 托管比较 lane
+`.github/workflows/suite-arm64.yml` 在比较任务完成后于 2026-08-21 退役；下文带日期的测量和退役记录
+仍是历史证据，不是当前拓扑。
 
 ## 2. 已经定了的，不在讨论范围
 

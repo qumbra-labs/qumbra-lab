@@ -18,12 +18,15 @@ technical detail.
 
 ## 1. What is actually running today
 
-`.github/workflows/suite-arm64.yml` runs `cargo test --release --workspace -- --test-threads=1`
-on a **GitHub-hosted arm64 larger runner** (`qumbra-arm64-8`), triggered on `pull_request` when
-`crates/**`, `Cargo.toml` or `Cargo.lock` change, plus `workflow_dispatch`.
+`.github/workflows/acceptance-graviton.yml` runs
+`cargo test --release --workspace --locked -- --test-threads=1` on a **self-hosted AWS Graviton
+rig**, triggered by the `verify-graviton` label when `crates/**`, `Cargo.toml`, or `Cargo.lock`
+changes, plus `workflow_dispatch`. Hosted start/stop jobs wake only the persistent instances the
+queue needs and park them after the lane drains; the suite job itself uses their warm cache.
 
-Its own header still says, correctly, that **it is not the acceptance bar** — `CLAUDE.md` §5's rig
-run is. That has not changed and nothing in this document changes it.
+This is the acceptance bar recorded in `CLAUDE.md` §5. The former GitHub-hosted comparison lane,
+`.github/workflows/suite-arm64.yml`, was retired on 2026-08-21 after its comparison finished; the
+dated measurements and retirement record below remain historical evidence, not current topology.
 
 ## 2. What was decided, and it is not in question
 
