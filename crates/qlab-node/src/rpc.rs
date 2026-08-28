@@ -2505,6 +2505,14 @@ mod tests {
     ///   is not simply every root.
     /// - **a reorg**, after which `roots_by_height` has been rebuilt from
     ///   genesis and the abandoned branch's roots must be gone from BOTH.
+    ///
+    /// The reorg is taken *before* the finality walk, and the walk starts at
+    /// height 1. Both are forced by the node rather than chosen: a rewind under
+    /// a finalized head is `RewindError::PastFinalized`, and re-finalizing the
+    /// already-finalized genesis is `FinalizeMarkError::NotAdvancing`. The
+    /// ordering is also what makes the staleness claim testable at all — an
+    /// abandoned root can only be *observed* on the wire once finality has
+    /// advanced over the heights that replaced it.
     #[test]
     fn anchor_set_matches_the_full_chain_recomputation() {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
@@ -2534,42 +2542,42 @@ mod tests {
             assert_anchor_derivations_agree(rpc.node(), &format!("height {}", step + 1));
         }
 
-        // Finality walking up the chain, one height at a time: the set changes
-        // on every step and the two derivations must change together. This is
-        // where a floor/ceiling off-by-one shows itself.
-        let heights: Vec<u64> = (0..=rpc.node().tip_height()).collect();
-        for h in heights {
-            let hash = main_chain_of(rpc.node())
-                .into_iter()
-                .find(|b| b.header.height == h)
-                .expect("main chain holds every height")
-                .header()
-                .header_hash();
-            assert!(rpc.node_mut().finalize(hash).unwrap().is_recorded());
-            assert_anchor_derivations_agree(rpc.node(), &format!("finalized {h}"));
-        }
-        // …and the set is not vacuously empty at the end of all that, or every
-        // assertion above compared two empty vectors.
-        let served = anchor_set(rpc.node());
-        assert!(!served.roots.is_empty(), "the chain really does offer anchors");
-        assert!(
-            served.roots.len() < served.tip_height as usize + 1,
-            "and repeated roots really were collapsed: {} roots over {} heights",
-            served.roots.len(),
-            served.tip_height + 1
-        );
-
-        // A reorg: rewind two blocks and build a different suffix. Both
-        // derivations are rebuilt from genesis by `rewind_to`, so a root that
-        // existed only on the abandoned branch must be in neither.
+        // ── the reorg, taken BEFORE the finality walk ────────────────────────
+        //
+        // The order is forced, not stylistic. `rewind_path` refuses
+        // `PastFinalized`, so the only reachable rewind is one whose undone
+        // heights are still unfinalized — a walk that has already finalized the
+        // tip cannot then rewind under it. Lab #673 review: this test's first
+        // shape walked finality to the tip and *then* rewound, which is a state
+        // the node correctly refuses to enter.
+        let undone_from = rpc.node().tip_height() - 2;
         let target = main_chain_of(rpc.node())
             .into_iter()
-            .find(|b| b.header.height == rpc.node().tip_height() - 2)
+            .find(|b| b.header.height == undone_from)
             .expect("two below the tip")
             .header()
             .header_hash();
-        let abandoned: Vec<Hash32> = anchor_set(rpc.node()).roots;
-        rpc.node_mut().rewind_to(target).expect("rewind to an ancestor");
+
+        // The roots that exist ONLY on the branch about to be abandoned — what
+        // `roots_by_height` must no longer hold once `rewind_to` has rebuilt it
+        // from genesis. Captured off the live tree while that branch is still
+        // applied, because afterwards it is unreconstructable by design.
+        let pre = main_chain_roots_of(rpc.node());
+        let retained: std::collections::HashSet<Hash32> =
+            pre.iter().filter(|(h, _)| *h <= undone_from).map(|(_, r)| *r).collect();
+        let abandoned_only: Vec<Hash32> = pre
+            .iter()
+            .filter(|(h, _)| *h > undone_from)
+            .map(|(_, r)| *r)
+            .filter(|r| !retained.contains(r))
+            .collect();
+        assert!(
+            !abandoned_only.is_empty(),
+            "the abandoned suffix must contribute a root of its own, or the \
+             staleness check at the end of this test proves nothing"
+        );
+
+        rpc.node_mut().rewind_to(target).expect("rewind to an unfinalized ancestor");
         assert_anchor_derivations_agree(rpc.node(), "immediately after the rewind");
         for step in 0..4u64 {
             let tx = tx_with(anchor, &[cm, cm + 1], &[cm, cm + 1], fee);
@@ -2577,8 +2585,60 @@ mod tests {
             apply_block_with_shape(rpc.node_mut(), vec![tx], step % 2 == 0);
             assert_anchor_derivations_agree(rpc.node(), &format!("reorg block {step}"));
         }
-        let after: Vec<Hash32> = anchor_set(rpc.node()).roots;
-        assert_ne!(abandoned, after, "the reorg really did change the anchor set");
+
+        // Finality walking up the POST-REORG chain, one height at a time: the
+        // set changes on every step and the two derivations must change
+        // together. This is where a floor/ceiling off-by-one shows itself.
+        //
+        // The walk starts at 1 and not 0: the fixture already finalized
+        // genesis, and `set_finalized` refuses a head that does not strictly
+        // advance (`FinalizeMarkError::NotAdvancing`). The refusal is asserted
+        // by its own value rather than by `unwrap().is_recorded()`, so the next
+        // drift here reads as the reason instead of as a bare `false`.
+        let heights: Vec<u64> = (1..=rpc.node().tip_height()).collect();
+        for h in heights {
+            let hash = main_chain_of(rpc.node())
+                .into_iter()
+                .find(|b| b.header.height == h)
+                .expect("main chain holds every height")
+                .header()
+                .header_hash();
+            let outcome =
+                rpc.node_mut().finalize(hash).expect("finalizing a main-chain block");
+            assert!(outcome.is_recorded(), "finalizing height {h} was refused: {outcome:?}");
+            assert_anchor_derivations_agree(rpc.node(), &format!("finalized {h}"));
+        }
+
+        // Finality now covers the WHOLE post-reorg chain and the age window is
+        // far wider than it, so every root `roots_by_height` still holds is
+        // inside the served range: if the rewind had left one of the abandoned
+        // branch's roots behind, this is the assertion it reaches the wire past.
+        let served = anchor_set(rpc.node());
+        assert_eq!(
+            served.finalized_height,
+            Some(served.tip_height),
+            "the walk finalized every height, so nothing is excluded for lack of finality"
+        );
+        for stale in &abandoned_only {
+            assert!(
+                !served.roots.contains(stale),
+                "a root that existed only on the abandoned branch is being served as an anchor"
+            );
+            assert!(
+                !rpc.node().is_valid_anchor(stale),
+                "…and the per-root check has to agree with the served set"
+            );
+        }
+
+        // …and the set is not vacuously empty at the end of all that, or every
+        // assertion above compared two empty vectors.
+        assert!(!served.roots.is_empty(), "the chain really does offer anchors");
+        assert!(
+            served.roots.len() < served.tip_height as usize + 1,
+            "and repeated roots really were collapsed: {} roots over {} heights",
+            served.roots.len(),
+            served.tip_height + 1
+        );
     }
 
     /// The bound that makes the new derivation cheap is a claim about the
