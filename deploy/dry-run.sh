@@ -73,7 +73,18 @@ fail() { echo "  FAIL- $*" >&2; exit 1; }
 
 # A path's permission bits as octal, without a leading 0. BSD stat (macOS, where
 # the staging half of a deploy runs) and GNU stat (Linux) spell this differently.
-mode_of() { stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+#
+# 🔴 GNU FIRST, and the order is load-bearing. This used to try the BSD spelling
+# first and fall back to GNU — which is backwards, because the two failure modes
+# are not symmetric. BSD `stat -c` is a usage error: exit non-zero, NOTHING on
+# stdout, so the `||` arm runs and the capture holds the mode alone. GNU
+# `stat -f` is `--file-system`: it takes '%OLp' as a FILE (fails, exit 1) and then
+# prints the filesystem block for "$1" to stdout — so the capture held five lines
+# of overlayfs statistics followed by the mode, and every `assert_key_modes`
+# failed on a directory that was correctly 0700. Found the first time this script
+# ran on Linux (deploy-dryrun.yml run 32921493225, 2026-08-26): it had only ever
+# run on the macOS rig before, where the first arm always won.
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1"; }
 
 # Assert keys/ is 0700 and every committee key in it is 0600, then report. `where`
 # labels the failure message: the same invariant is checked in three places, and a

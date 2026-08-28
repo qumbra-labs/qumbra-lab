@@ -1,0 +1,179 @@
+# `deploy/dry-run.sh`, executed — when, and only when, it can have broken.
+#
+# WHY THIS EXISTS (PR #670's review, Multica QUM-178). Nothing in CI ran
+# `deploy/deploy.sh` or `deploy/dry-run.sh`. `prefilter.yml`'s `shell-suites`
+# runs three named suites and none of them is this one; the cargo suite does
+# not shell out to `deploy/`. That is how PR #655 could merge with a green
+# tick and leave `dry-run.sh` red on node0/2/3 until a human ran it: the break
+# was real and loud at generation time, and invisible to the tick.
+# `deploy/README.md` says a green tick on a PR that touched neither path below
+# says nothing about `deploy/`. This workflow is the other half: it makes the
+# tick mean something when those paths change.
+#
+# WHY IT IS NOT A FOURTH LINE IN `shell-suites`. `dry-run.sh` needs a RELEASE
+# `qumbra-node` — it runs the real binary through `genesis init` and
+# `qumbra-node check` on every laid-down node. Unconditionally, that is a
+# `cargo build --release -p qumbra-node` on every PR for a script that changes
+# rarely (the builder's objection on #670, and it is correct: `crates/**` moved
+# in 65 of the 100 PRs merged 2026-08-20..26, so "every PR" is most PRs).
+# Gated on paths it costs nothing where it cannot have broken, and fires exactly
+# where the gap is open. `shell-suites`' own comment says a suite is added "as a
+# deliberate line in a diff"; this file is that line, in its own workflow
+# because `on.paths` is a workflow-level filter — a job inside `prefilter.yml`
+# cannot be paths-gated without a third-party changed-files action, and the
+# suites there are deliberately toolchain-free and two-second.
+#
+# WHY `crates/qumbra-node/**` IS IN THE FILTER, MEASURED. `dry-run.sh`'s
+# acceptance is `qumbra-node check` on four real configs, so a change to the
+# node's config validation breaks it without touching `deploy/` — which is
+# EXACTLY what #655 did (`crates/qumbra-node/src/{config,main,run}.rs`; the
+# `deploy/` hunks in #655 were the operator-facing follow-through). Over the
+# 100 most recently merged PRs (#514..#679, 2026-08-20T02:18Z..08-26T01:50Z,
+# `gh pr list --state merged --limit 100 --json files`):
+#
+#     deploy/**                   6 / 100
+#     crates/qumbra-node/**      14 / 100
+#     either                     17 / 100     (3 touched both)
+#     crates/**                  65 / 100     (the unconditional alternative)
+#     Cargo.lock | Cargo.toml     9 / 100
+#
+# So the node filter takes the trigger rate from 6 % to 17 % of PRs, and 17 %
+# of a ~4-minute ubuntu job is tolerable where 65 % was not. Pushes per PR in
+# the same window: 151 `pull_request` prefilter runs over 99 branches ≈ 1.5,
+# so expect ≈ 1.5 runs per triggering PR, not 1. NOT in the filter, on
+# purpose: `Cargo.lock` (a dependency bump anywhere in the workspace would fire
+# this for nothing 9 % of the time) and the rest of `crates/**` (`qlab-p2p`
+# owns `miner_rkm`'s parser, so a change there CAN break `check` — that residual
+# is accepted and named here rather than closed by firing on 65 % of PRs).
+#
+# WHAT IT COSTS. `ubuntu-latest`, the 1x lane. The build is one crate: the
+# release lane's Linux x86_64 leg builds `qumbra-node --release` cold, in this
+# same container, in 2 m 28 s (run 32803403486, 2026-08-25). Plus ~30 s of
+# container init + apt and a few seconds for the script itself, the job is
+# ~4 minutes billed at 1x. No `actions/cache`: at 2.5 minutes cold, a restore
+# + save of a release `target/` would cost about what it saves, and it would
+# compete for the repo's 10 GB cache quota with `prefilter.yml`'s debug cache
+# and the Windows lane's.
+#
+# WHY THE CONTAINER. `rust:1.95-bookworm` is what `release-binaries.yml` builds
+# the fleet's Linux binaries in — same rustc, same glibc, same Debian the T0
+# hosts run. `dry-run.sh` had only ever run on macOS before this workflow
+# (#670's disclosure: BSD `grep -w`, BSD `stat`); its first Linux run should
+# be on the platform the fleet actually uses, not on whatever the runner image
+# ships this month. The container runs as root: `dry-run.sh`'s mode assertions
+# check what `install -d -m 700` and `cp` PRODUCED, never what root may read,
+# so uid 0 does not weaken them.
+#
+# WHAT MUST NOT CHANGE TO MAKE THIS GREEN. `dry-run.sh`'s assertions are the
+# acceptance for the deploy path (#670 rewrote its fixture); if it goes red here
+# for a real reason, that is the point of the file. `hosts.example` ships as a
+# `--no-mining` template, deliberately — a placeholder key that reaches a host
+# is structurally valid, mines, and pays a key nobody holds. Do not add keys to
+# a fixture to make a run pass.
+name: deploy dry-run
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "crates/qumbra-node/**"
+      - ".github/workflows/deploy-dryrun.yml"
+  # main as well, same paths: the PR run is against a merge ref of the main of
+  # its moment, and this project has been bitten by numbers that outlived the
+  # tree they were measured on. Restricted to main so a branch push does not
+  # bill once as push and once as pull_request (prefilter.yml's observation).
+  push:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - "crates/qumbra-node/**"
+      - ".github/workflows/deploy-dryrun.yml"
+  workflow_dispatch:
+
+# Reads the repo, writes nothing, needs no secret. If a change here appears to
+# need a credential, that is a STOP, not a widening (windows-x86_64.yml, same).
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Inside a `container:` the default step shell is `sh` (dash): `set -o pipefail`
+# and `${VAR:0:12}` are illegal there, and this file's own first run (32921406354)
+# died at its first step on exactly that. bash exists in rust:1.95-bookworm
+# (release-binaries.yml makes the same declaration for the same reason).
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0        # incremental is a loss on a cold build
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.95-bookworm
+    # Measured ~4 min (see header); 20 is headroom over a measurement, not a
+    # guess, and it is capped because a hung `check` must not bill for six hours.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # randomx-rs drives cmake and needs a C++ compiler. The image ships g++
+      # but not cmake; installing both explicitly means an image change fails
+      # here, by name, rather than inside a dependency's build script.
+      - name: C++ toolchain for randomx-rs
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends cmake g++
+
+      # Every tool `dry-run.sh` branches on, in the log. `stat` in particular:
+      # the script's `mode_of` helper has a BSD arm and a GNU arm, and this is
+      # the first time the GNU arm is the one that runs.
+      - name: Toolchain and platform provenance
+        run: |
+          set -euo pipefail
+          rustc -V; cargo -V; uname -m
+          ldd --version | sed -n 1p
+          bash --version | sed -n 1p
+          stat --version | sed -n 1p
+          echo "umask $(umask)  uid $(id -u)"
+
+      # DEFAULT features — the same `cargo build --release -p qumbra-node` the
+      # script runs for itself when no binary is present, and what #670's macOS
+      # run used. The `rule-boundary-resume` variant differs only in release.rs's
+      # boundary behaviour; `genesis init` and `check` are the same code in both.
+      # Built here rather than left to the script so `--locked` applies (the
+      # committed Cargo.lock is what CI must check, prefilter.yml's rule) and so
+      # the build's time is its own step in the log.
+      - name: Build qumbra-node (release, --locked)
+        run: cargo build --release --locked -p qumbra-node
+
+      # The whole point of the file. Exit code is the verdict; the script prints
+      # `ok  -` per assertion and `FAIL-` naming the host and the invariant.
+      - name: deploy/dry-run.sh
+        run: deploy/dry-run.sh
+
+      - name: What this run did and did not prove
+        if: always()
+        run: |
+          {
+            echo "## deploy dry-run (\`${GITHUB_SHA:0:12}\`)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| ran | \`deploy/dry-run.sh\` — local mode, 4 node dirs, 4 passes |"
+            echo "| binary | \`qumbra-node\` release, default features, \`--locked\`, built in this job |"
+            echo "| platform | \`$(uname -m)\` · \`$(rustc -V)\` · \`$(ldd --version | sed -n 1p)\` |"
+            echo "| gate | \`paths: deploy/**, crates/qumbra-node/**\` and this file |"
+            echo
+            echo "**Not covered here, and named rather than implied:**"
+            echo "- remote mode (\`rsync\`/\`ssh\` to a real host) — local mode only, by design of the script"
+            echo "- the cargo suite — this job claims nothing about the crates; the bar is the \`verify-graviton\` lane"
+            echo "- a PR that touches neither path above: this workflow does not run, and the tick says nothing about \`deploy/\`"
+          } >> "$GITHUB_STEP_SUMMARY"

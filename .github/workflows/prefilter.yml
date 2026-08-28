@@ -135,3 +135,10 @@ jobs:
 
       - name: explorer-provenance (the explorer image's readback)
         run: .github/workflows/tests/explorer-provenance/run.sh
+
+      # `deploy/dry-run.sh` is deliberately NOT a fourth line here. It needs a
+      # release `qumbra-node` — a `cargo build --release -p qumbra-node` on
+      # every PR for a script that changes rarely (PR #670's objection). It has
+      # its own workflow, `deploy-dryrun.yml`, gated on `paths: deploy/**` and
+      # `crates/qumbra-node/**`, so it fires exactly where the gap it closes is
+      # open and costs nothing elsewhere. This job stays toolchain-free.

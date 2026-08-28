@@ -50,9 +50,13 @@ the genesis is minted or a payload exists, naming every keyless host and the
 cleanly, every node preflighting with `mining = false`. Exits non-zero on the
 first failed assertion.
 
-🔴 **`dry-run.sh` is not in CI.** The suite runs `cargo test` only and nothing in
-`crates/` shells out to `deploy.sh`; a green tick says nothing about this
-directory. After touching anything here, run `deploy/dry-run.sh` and paste it.
+🔴 **`dry-run.sh` runs in CI only when `deploy/**` or `crates/qumbra-node/**`
+changes** (`.github/workflows/deploy-dryrun.yml`, from PR #670's review). The cargo
+suite does not run it and nothing in `crates/` shells out to `deploy.sh`, so on a PR
+that touches neither path the tick still says nothing about this directory. The
+node path is in the filter because `qumbra-node check` is this script's acceptance
+and PR #655 broke it from `crates/qumbra-node/` alone. After touching anything
+here, the `deploy dry-run` check is the evidence — link it, or paste a local run.
 
 The mode check runs three times over and is worth understanding before editing it.
 On 2026-07-31 the T0 net was found with `drwxr-xr-x /opt/qumbra/keys` while every
