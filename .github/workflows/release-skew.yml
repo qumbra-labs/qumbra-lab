@@ -2,11 +2,13 @@
 #
 # WHAT THIS IS NOT: an attempt to automate the release lane. `release-binaries.yml`
 # is `workflow_dispatch`-only, gated on typing `confirm=release`, and its header
-# explains why in cost terms — a 10x-billed `macos-14` leg against a $20/month cap
-# with `Stop usage: Yes`, so an expensive cut can take `suite-arm64.yml`, the
-# acceptance bar, down with it. **That decision is correct and this file does not
-# touch it.** Spending the budget stays Larry's call, every time (R3). This file
-# only ever reports.
+# explains why in cost terms — a 10x-billed `macos-14` leg and an explicit R3
+# spend decision. The hosted-Actions hard stop is now scoped to the Linux ARM
+# 8-core SKU and protects `explorer-image`, `node-image`, `kit-fixture-mint`, and
+# the release lane's `linux-aarch64-glibc` leg. Its macOS/Windows legs and the
+# self-hosted acceptance bar do not draw on that cap
+# (docs/ci-runner-cost-decision.md §10 and RETIRED section). This file does not
+# automate the release decision; it only ever reports.
 #
 # WHAT IT IS: the missing instrument. On 2026-08-22 the published binaries sat at
 # `RPC_VERSION = 0x06` while the live fleet had moved to `0x07`, so following the

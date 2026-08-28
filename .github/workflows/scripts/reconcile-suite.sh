@@ -26,7 +26,8 @@
 # code, with no launcher in between. Everything here is a human cross-check
 # and is deliberately not allowed to turn a green suite red. This script exits
 # 0 on every path, including the loud ones. (Rationale inherited from the
-# retired suite-arm64.yml, restated here because that file is gone:
+# retired suite-arm64.yml (removed 2026-08-21, e9bf14c), restated here
+# because that file is gone:
 # `panicked at` is reachable on a GREEN run — this workspace has
 # `#[should_panic]` tests, and a panic raised on a spawned thread escapes the
 # harness's output capture — so a gate that CAN fire on a correct run teaches
