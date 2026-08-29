@@ -343,7 +343,16 @@ fn a_discovery_refresh_on_an_unchanged_tip_copies_nothing() {
     // The first pass builds the projection from nothing: it copies, and it must.
     let (built, first) = measure(|| node.refresh_discovery());
     assert!(built, "a projection that has never been built is not current");
-    assert!(first.allocs > 24, "building it really does allocate: {first:?}");
+    // `> 0`, not `> 24`. This guard's job is only to prove the instrument is not
+    // blind — that "zero on the second pass" is a fact about the second pass and
+    // not about `measure` seeing nothing. `> 24` additionally assumed the build
+    // allocates once per block; it does not. Measured on the rig: 6 allocations
+    // for 9,616 bytes over a 24-block chain, which is amortised `Vec` growth
+    // (~log2(24) doublings), not per-block. The `one per block` figure in this
+    // test's doc comment describes the CLONE the fix removed, not the build.
+    // The third guard below already states the property this way.
+    assert!(first.allocs > 0, "building it really does allocate: {first:?}");
+    assert!(first.bytes > 0, "and it costs real bytes: {first:?}");
 
     // The second, with the tip exactly where the first left it. This is the
     // fourteen-in-fifteen case, and it is now free.
