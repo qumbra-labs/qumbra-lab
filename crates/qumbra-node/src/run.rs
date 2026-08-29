@@ -1158,6 +1158,27 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.mine_interval = d;
     }
 
+    /// Expire the discovery-refresh gate so the next loop pass runs one real
+    /// refresh (issue #673's split, driven from a test).
+    ///
+    /// The cadence itself stays [`DISCOVERY_REFRESH`] and is deliberately not
+    /// tunable — 5 s is a staleness bound argued at the constant, not a knob —
+    /// so this expires the timer rather than shortening the period. Without it
+    /// a test that wants to see the phase split has to burn five seconds of
+    /// wall clock to see it once. Returns whether the gate is now open, so a
+    /// caller need not assume the monotonic clock had five seconds behind it.
+    pub fn expire_discovery_refresh(&mut self) -> bool {
+        match Instant::now().checked_sub(DISCOVERY_REFRESH) {
+            Some(t) => {
+                self.last_discovery_refresh = t;
+                true
+            }
+            // The process has been up for less than the cadence: nothing to
+            // expire against, and saying so beats silently not expiring.
+            None => false,
+        }
+    }
+
     /// Override the #362 boundary vote re-push cadence (tests set 0 to re-push on
     /// every loop pass).
     ///
@@ -2089,12 +2110,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// encoder between the block and the served bytes, which is what makes a served
     /// group that differs from the committed one unconstructible rather than
     /// unlikely. Incremental: an unchanged tip returns without touching the view.
+    ///
+    /// ## Lab #673: the check comes before the clone
+    ///
+    /// This used to clone the entire `DiscoveryView` — one `BlockDiscovery` per
+    /// main-chain block, each carrying its block's committed groups, riders and
+    /// nullifiers as owned `Vec`s — and only then ask
+    /// [`DiscoveryView::refresh`] whether anything had changed, discarding the
+    /// copy when it had not. `DISCOVERY_REFRESH` is 5 s against a FROZEN 75 s
+    /// block time, so at steady state **fourteen of every fifteen of those
+    /// deep copies were built and thrown away**.
+    ///
+    /// The check does not need the copy: `refresh`'s own first act is to
+    /// compare the projection's tip hash against the chain's, and that reads
+    /// nothing it would mutate. [`DiscoveryView::tip_hash`] is that predicate,
+    /// extracted so both callers ask the identical question rather than two
+    /// questions that agree today.
+    ///
+    /// The Arc-swap discipline is unchanged and is why the early return is
+    /// safe: the snapshot is still built whole and published by replacing the
+    /// `Arc` under the lock, so a reader sees the old projection or the new one
+    /// and never a half-built one. What is held across the check is an `Arc`
+    /// clone — the same refcount bump a serving thread takes — not the lock.
     pub fn refresh_discovery(&mut self) -> bool {
-        let mut next = (**self
-            .discovery_view
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()))
-        .clone();
+        let tip = self.p2p.node().state().chain().tip_hash();
+        let current =
+            Arc::clone(&self.discovery_view.lock().unwrap_or_else(|p| p.into_inner()));
+        if current.tip_hash() == Some(tip) {
+            return false;
+        }
+        let mut next = (*current).clone();
         if !next.refresh(self.p2p.node().state().chain()) {
             return false;
         }
@@ -3044,9 +3089,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         if self.discovery_server.is_some()
             && self.last_discovery_refresh.elapsed() >= DISCOVERY_REFRESH
         {
+            // Issue #673: three refreshes behind one gate, and the phase
+            // number was their sum — which is why "discovery costs 13 s" was a
+            // statement nobody could act on. Its own cursor, so the split is
+            // exact and `phases.discovery` below still measures the whole
+            // block including the gate arithmetic.
+            let mut d = t;
             self.refresh_discovery();
+            phases.disc.view = lap(&mut d);
             self.refresh_leaves();
+            phases.disc.leaves = lap(&mut d);
             self.refresh_anchors();
+            phases.disc.anchors = lap(&mut d);
             self.last_discovery_refresh = Instant::now();
         }
         phases.discovery = lap(&mut t);
@@ -4646,6 +4700,107 @@ mod tests {
         assert_eq!(lines.len(), 1, "one slow line, no window line off-cadence: {lines:?}");
         assert!(lines[0].starts_with("LOOP kind=slow unit=ms "), "{}", lines[0]);
         assert!(lines[0].contains(" phase=hook "), "{}", lines[0]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #673 S1 — the split is wired to the three refreshes, on the real
+    /// loop.**
+    ///
+    /// [`crate::looptime`]'s unit tests prove the line format and the
+    /// attribution arithmetic against synthetic numbers. This proves the
+    /// wiring, and it proves it the one way a mis-placed `lap` cursor cannot
+    /// survive: **the three sub-timers must partition the phase they split.**
+    /// A cursor that failed to advance would charge a refresh for its
+    /// predecessor and the sum would exceed `discovery`; a timer bracketing the
+    /// wrong statement would leave a hole and the sum would fall short of it by
+    /// more than the gate's own arithmetic.
+    ///
+    /// Deliberately NOT a wall-clock threshold on any single refresh — that is
+    /// a flake generator on a shared runner, and it is not the claim either.
+    /// The cost-shape claim (which refresh's work tracks the chain) is settled
+    /// deterministically in `tests/discovery_phase_cost.rs`.
+    #[test]
+    fn the_discovery_phase_is_partitioned_by_its_three_refreshes() {
+        let (config, genesis, base) = rig("i673_split", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+
+        // A pass with the gate SHUT: the block does not run, and the split says
+        // so rather than reporting whatever was left in it. Taken FIRST, while
+        // the process is milliseconds old — `last_discovery_refresh` is set at
+        // startup and the cadence is 5 s, so anything mined before this point
+        // could open the gate on a loaded runner and turn the assertion into a
+        // coin flip.
+        let (shut, _) = node.one_iteration(&mut |_: &mut RunningNode<_, _>| {});
+        assert_eq!(shut.disc, crate::looptime::DiscoveryTimings::default());
+        // NOT `assert_eq!(shut.discovery, Duration::ZERO)`. The phase is not the
+        // sum: the `lap` that writes `phases.discovery` sits OUTSIDE the gate, so
+        // even a shut pass pays `discovery_server.is_some()`, one `elapsed()` and
+        // one `Instant::now()`. On the Graviton runner that is 159 ns, measured —
+        // not noise, and it does not go away on a re-run. The same partition
+        // invariant as the open-gate case below, with the same 1 ms slack, is the
+        // claim that is both true and worth making here.
+        assert!(
+            shut.disc.total() <= shut.discovery,
+            "the split cannot exceed the phase it splits: {:?} vs {:?}",
+            shut.disc.total(),
+            shut.discovery
+        );
+        assert!(
+            shut.discovery - shut.disc.total() < Duration::from_millis(1),
+            "a shut gate costs the gate check and nothing else: {:?}",
+            shut.discovery
+        );
+
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS * 2 {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        // Nothing may mine from inside the iteration below: a tip that moves
+        // inside the measured pass would leave the phase timing a different
+        // chain from the one the assertions are about.
+        node.set_mine_interval(Duration::from_secs(86_400));
+
+        // A pass with the gate OPEN, against views that have never been built:
+        // all three refreshes do real work.
+        assert!(node.expire_discovery_refresh(), "the process has been up longer than the cadence");
+        let (open, _) = node.one_iteration(&mut |_: &mut RunningNode<_, _>| {});
+        assert!(open.disc.view > Duration::ZERO, "refresh_discovery is timed: {:?}", open.disc);
+        assert!(open.disc.leaves > Duration::ZERO, "refresh_leaves is timed: {:?}", open.disc);
+        assert!(open.disc.anchors > Duration::ZERO, "refresh_anchors is timed: {:?}", open.disc);
+
+        // 🔴 The partition. Everything in `discovery` that is not one of the
+        // three is the gate's own `elapsed()` and one `Instant::now()` — tens of
+        // nanoseconds. A millisecond of slack is three orders of magnitude of
+        // headroom and still catches a whole refresh going untimed.
+        assert!(
+            open.disc.total() <= open.discovery,
+            "the split cannot exceed the phase it splits: {:?} vs {:?}",
+            open.disc.total(),
+            open.discovery
+        );
+        assert!(
+            open.discovery - open.disc.total() < Duration::from_millis(1),
+            "and it must not fall short of it either — an untimed refresh would              show up here: phase {:?}, split {:?} ({:?})",
+            open.discovery,
+            open.disc.total(),
+            open.disc
+        );
+
+        // And the attribution descends, which is the whole deliverable: a
+        // 13-second discovery phase now names a function.
+        let (name, d) = open.worst();
+        if name.starts_with("discovery") {
+            assert!(
+                matches!(name.as_str(), "discovery.view" | "discovery.leaves" | "discovery.anchors"),
+                "a discovery-dominated iteration names one of the three: {name}"
+            );
+            assert_eq!(d, open.disc.worst().1, "with that refresh's own number");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

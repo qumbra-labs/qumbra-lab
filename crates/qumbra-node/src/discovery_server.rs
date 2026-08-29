@@ -426,6 +426,18 @@ impl DiscoveryView {
         self.blocks.last().map(|b| b.height)
     }
 
+    /// The header hash of the highest block this projection holds.
+    ///
+    /// **The refresh predicate, extracted so it has one definition** (lab
+    /// #673). [`Self::refresh`] answers "is there anything to do" by comparing
+    /// this against the chain's tip hash — hash and not height, so a reorg to a
+    /// sibling at the same height is a change rather than a no-op — and
+    /// [`crate::run::RunningNode::refresh_discovery`] now asks the same
+    /// question BEFORE cloning the view, which is where the cost was.
+    pub fn tip_hash(&self) -> Option<Hash32> {
+        self.blocks.last().map(|b| b.hash)
+    }
+
     /// Re-project from a node's main chain, reusing what is already indexed.
     ///
     /// The walk goes tip → genesis and stops at the first height whose recorded
@@ -436,7 +448,7 @@ impl DiscoveryView {
     /// the state machine already committed to.
     pub fn refresh<C: qlab_node::ChainStore>(&mut self, chain: &C) -> bool {
         let tip = chain.tip_hash();
-        if self.blocks.last().map(|b| b.hash) == Some(tip) {
+        if self.tip_hash() == Some(tip) {
             return false;
         }
         let mut fresh: Vec<BlockDiscovery> = Vec::new();

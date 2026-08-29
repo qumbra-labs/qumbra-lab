@@ -80,6 +80,62 @@ pub const SLOW_ITERATION_MS: u64 = 1_000;
 /// the ninth is volume, and it is counted rather than printed.
 pub const MAX_SLOW_LINES_PER_WINDOW: u64 = 8;
 
+/// **Where the `discovery` phase's time actually goes** (issue #673).
+///
+/// `discovery` is not one statement — it is three refresh calls behind one
+/// `DISCOVERY_REFRESH` gate, and the phase number is their *sum*. The live
+/// reading that opened #673 ("13.1 s, and it grows with the chain") is
+/// therefore a statement about a sum, and the fleet has three candidate
+/// explanations that want three different fixes. This is the split that
+/// decides between them instead of arguing about them — the same move
+/// [`qlab_p2p::ticktime::TickTimings`] made for `pump`, for the same reason.
+///
+/// Additive: `view + leaves + anchors` is the whole of the phase, up to the
+/// rounding of the clock reads themselves, and on an iteration where the gate
+/// did not fire all three are zero along with `discovery`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiscoveryTimings {
+    /// `refresh_discovery` — the `/v1/compact` projection.
+    pub view: Duration,
+    /// `refresh_leaves` — the `/v1/tree/leaves` projection.
+    pub leaves: Duration,
+    /// `refresh_anchors` — the `/v1/anchors` projection.
+    pub anchors: Duration,
+}
+
+impl DiscoveryTimings {
+    /// The three refreshes, in the order the loop runs them.
+    pub fn phases(&self) -> [(&'static str, Duration); 3] {
+        [("discview", self.view), ("discleaves", self.leaves), ("discanchors", self.anchors)]
+    }
+
+    /// Wall time this refresh pass accounts for.
+    pub fn total(&self) -> Duration {
+        self.phases().iter().map(|(_, d)| *d).sum()
+    }
+
+    /// The refresh that dominated the pass, named as the sub-phase the
+    /// attribution reports (`view` / `leaves` / `anchors`, without the `disc`
+    /// prefix the wire field carries). Ties go to the earlier call in run
+    /// order, so the answer is stable rather than map-ordered.
+    pub fn worst(&self) -> (&'static str, Duration) {
+        let mut worst = ("view", Duration::ZERO);
+        for (name, d) in [("view", self.view), ("leaves", self.leaves), ("anchors", self.anchors)] {
+            if d > worst.1 {
+                worst = (name, d);
+            }
+        }
+        worst
+    }
+
+    /// Fold another pass in (window accumulation).
+    pub fn add(&mut self, o: &DiscoveryTimings) {
+        self.view += o.view;
+        self.leaves += o.leaves;
+        self.anchors += o.anchors;
+    }
+}
+
 /// Per-phase durations for one iteration of the node's main loop.
 ///
 /// The phases are the loop's own statements, in order. `pump` is
@@ -98,7 +154,13 @@ pub struct LoopPhases {
     /// `/metrics` snapshot render, when a listener is bound.
     pub metrics: Duration,
     /// Discovery/leaf/anchor refresh, when a discovery server is bound.
+    ///
+    /// Kept as the sum of [`Self::disc`]'s three parts so the series #673 was
+    /// opened on stays continuous across this split — a reader comparing a
+    /// pre-#673 archive against a post-#673 one is comparing the same quantity.
     pub discovery: Duration,
+    /// `discovery`'s own three-way split (issue #673).
+    pub disc: DiscoveryTimings,
     /// `drain_remote_submits` — the submitter queue.
     pub submit: Duration,
     /// `/v1/telemetry` snapshot render, when a listener is bound.
@@ -169,6 +231,13 @@ impl LoopPhases {
             let (sub, d) = self.tick.worst();
             return (format!("pump.{sub}"), d);
         }
+        // Issue #673: the same descent, for the same reason. `discovery` is
+        // three refreshes behind one gate, so naming the phase alone is the
+        // difference between "it was in the discovery block" and an answer.
+        if worst.0 == "discovery" {
+            let (sub, d) = self.disc.worst();
+            return (format!("discovery.{sub}"), d);
+        }
         (worst.0.to_string(), worst.1)
     }
 
@@ -180,6 +249,7 @@ impl LoopPhases {
         self.boundary += o.boundary;
         self.metrics += o.metrics;
         self.discovery += o.discovery;
+        self.disc.add(&o.disc);
         self.submit += o.submit;
         self.telsrv += o.telsrv;
         self.sample += o.sample;
@@ -197,6 +267,13 @@ impl LoopPhases {
             s.push_str(&format!("{name}={} ", ms(d)));
         }
         s.push_str(&format!("sleep={}", ms(self.sleep)));
+        // #673's split, appended rather than inserted: every existing `awk`
+        // over an archive reads these lines by key, and the three keys are new
+        // names (`discview`/`discleaves`/`discanchors`), so nothing that greps
+        // `discovery=` matches one of them by accident.
+        for (name, d) in self.disc.phases() {
+            s.push_str(&format!(" {name}={}", ms(d)));
+        }
         for (name, d) in self.tick.phases() {
             s.push_str(&format!(" {name}={}", ms(d)));
         }
@@ -507,9 +584,88 @@ mod tests {
             "pump=", "journal=", "mine=", "boundary=", "metrics=", "discovery=", "submit=",
             "telsrv=", "sample=", "maintain=", "snapshot=", "hook=", "sleep=", "dials=",
             "poll=", "ratelimit=", "decode=", "dispatch=", "sync=", "send*=", "unit=ms",
+            "discview=", "discleaves=", "discanchors=",
         ] {
             assert!(slow.contains(key), "slow line is missing {key}: {slow}");
             assert!(window.contains(key), "window line is missing {key}: {window}");
         }
+    }
+
+    // ── issue #673: the discovery phase's three-way split ────────────────────
+
+    /// The whole point of the split: an iteration whose `discovery` phase is
+    /// 13 s must say **which of the three refreshes** spent it. Before this,
+    /// `phase=discovery` was the end of the line and the answer had to be
+    /// argued from source.
+    #[test]
+    fn a_discovery_dominated_iteration_names_the_refresh_that_spent_it() {
+        for (disc, expect) in [
+            (DiscoveryTimings { anchors: msd(13_000), ..Default::default() }, "discovery.anchors"),
+            (DiscoveryTimings { leaves: msd(13_000), ..Default::default() }, "discovery.leaves"),
+            (DiscoveryTimings { view: msd(13_000), ..Default::default() }, "discovery.view"),
+        ] {
+            let p = LoopPhases { discovery: disc.total(), disc, ..Default::default() };
+            let mut j = LoopJournal::new();
+            let line = j.note(&p).expect("13 s is above any threshold");
+            assert!(line.contains(&format!(" phase={expect} ")), "expected {expect} in: {line}");
+            assert!(line.contains(" phase_ms=13000.0 "), "with its number: {line}");
+        }
+    }
+
+    /// The live shape #673 is about, as the fleet reported it: the three
+    /// refreshes are wildly unequal and the sum said nothing about which. The
+    /// attribution names the dominant one and the fields carry all three, so a
+    /// reader can check the split rather than take the name on trust.
+    #[test]
+    fn the_split_is_on_the_line_beside_the_sum_it_decomposes() {
+        let disc = DiscoveryTimings { view: msd(12), leaves: msd(1), anchors: msd(13_100) };
+        let p = LoopPhases { discovery: disc.total(), disc, ..Default::default() };
+        let mut j = LoopJournal::new();
+        let line = j.note(&p).expect("above the threshold");
+        assert!(line.contains(" discovery=13113.0 "), "the sum is unchanged: {line}");
+        assert!(line.contains(" discview=12.0"), "{line}");
+        assert!(line.contains(" discleaves=1.0"), "{line}");
+        assert!(line.contains(" discanchors=13100.0"), "{line}");
+        assert!(line.contains(" phase=discovery.anchors "), "{line}");
+    }
+
+    /// `discovery` stays the sum of its parts, so an archive taken before this
+    /// split and one taken after are comparing the same quantity — the #673
+    /// fit was measured on the old series and must stay checkable against the
+    /// new one.
+    #[test]
+    fn the_sum_is_preserved_across_the_split() {
+        let disc = DiscoveryTimings { view: msd(3), leaves: msd(5), anchors: msd(7) };
+        assert_eq!(disc.total(), msd(15));
+        let p = LoopPhases { discovery: disc.total(), disc, ..Default::default() };
+        assert_eq!(p.busy(), msd(15), "the split is inside `discovery`, not beside it");
+    }
+
+    /// Window accumulation folds the split too, or the aggregate line would
+    /// carry a `discovery=` with three zeros under it.
+    #[test]
+    fn the_window_accumulates_the_split_with_everything_else() {
+        let mut j = LoopJournal::new();
+        let disc = DiscoveryTimings { view: msd(2), leaves: msd(1), anchors: msd(100) };
+        let p = LoopPhases { discovery: disc.total(), disc, ..Default::default() };
+        for _ in 0..10 {
+            j.note(&p);
+        }
+        let w = j.window_line();
+        assert!(w.contains(" discovery=1030.0 "), "{w}");
+        assert!(w.contains(" discanchors=1000.0"), "10 x 100 ms: {w}");
+        assert!(w.contains(" discleaves=10.0"), "{w}");
+        assert!(w.contains(" discview=20.0"), "{w}");
+        assert!(w.contains(" maxphase=discovery.anchors "), "{w}");
+    }
+
+    /// An iteration where the refresh gate did not fire attributes nothing to
+    /// discovery — the split must not manufacture a winner out of three zeros.
+    #[test]
+    fn a_pass_that_did_not_run_names_no_refresh() {
+        let (name, d) = DiscoveryTimings::default().worst();
+        assert_eq!((name, d), ("view", Duration::ZERO));
+        let (name, _) = LoopPhases::default().worst();
+        assert_eq!(name, "idle", "and it never reaches the descent at all");
     }
 }

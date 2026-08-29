@@ -1877,6 +1877,82 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         let first_in_window = heights.partition_point(|height| *height < floor);
         heights.get(first_in_window).is_some_and(|height| *height < block_height)
     }
+
+    /// **Every distinct valid anchor root, newest first** — what `/v1/anchors`
+    /// serves, read off the [`Self::apply_state`]-maintained index instead of
+    /// recomputed from the chain (lab #673).
+    ///
+    /// ## Why this is a method here and not a walk in `rpc.rs`
+    ///
+    /// [`crate::anchor_set`] used to derive this by walking the whole main
+    /// chain — `main_chain_of` (clone every `StoredBlock`, proofs included),
+    /// `main_chain_counts_of`, then `CommitmentTree::root_at` **once per
+    /// height**. `root_at` is deliberately the O(n) prefix walk (issue #386
+    /// kept it that way as the ground truth `root()` is pinned against), and
+    /// its own doc says historical anchors are "off the hot path". They are
+    /// not: the node's run loop calls this once per applied block, so the walk
+    /// was `O(heights x leaves)` Merkle node hashes on the loop that also
+    /// serves the network — lab #673's 13 s, and quadratic in the chain.
+    ///
+    /// Nothing needed recomputing. `roots_by_height` IS `height -> root after
+    /// that height`, maintained by the single `apply_state` funnel and rebuilt
+    /// from genesis by `rewind_to`, so it carries exactly the main chain and
+    /// exactly the quantity the walk was recomputing.
+    ///
+    /// ## The answer is bounded, so the derivation is too
+    ///
+    /// A valid anchor is a root at a height that is finalized **and** within
+    /// `MAX_ANCHOR_AGE_BLOCKS` of the tip. That is at most one age window of
+    /// heights whatever the chain's height, which is why the old shape was
+    /// paying `O(chain)` to produce an `O(window)` answer.
+    ///
+    /// ## Order, and why the key is the highest occurrence
+    ///
+    /// The walk this replaces went tip -> genesis and emitted each root the
+    /// first time it saw it, testing validity as a property of the ROOT rather
+    /// than of the height it was standing on ([`NodeState::is_valid_anchor`]
+    /// quantifies over all heights). Blocks that append no leaf repeat their
+    /// parent's root, so a root genuinely can occur at several heights — and
+    /// one that is valid via an in-window occurrence could first be REACHED at
+    /// a later, out-of-window height. The ordering key is therefore the
+    /// highest height at which the root occurs anywhere on the chain, which is
+    /// `anchor_heights_by_root`'s last entry (ascending, asserted by
+    /// `historical_anchor_index_matches_the_height_scan_after_snapshot_restore`).
+    /// Heights are unique per root under that key, so the order is total and
+    /// the tie-break the walk never needed is still not needed.
+    ///
+    /// This is QUM-111's rule applied one level up: the reverse index is a
+    /// derived acceleration structure, so every indexed answer must remain
+    /// identical to the scan it accelerates —
+    /// `anchor_set_matches_the_full_chain_recomputation` is the mutation lock.
+    pub fn valid_anchor_roots(&self) -> Vec<Hash32> {
+        let Some(finalized) = self.chain.finalized_height() else {
+            return Vec::new(); // nothing finalized => no valid anchors yet
+        };
+        let tip = self.chain.tip_height();
+        let floor = tip.saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
+        if floor > finalized {
+            // The whole age window is ahead of the finalized head: a real state
+            // on a net whose finality has stalled for a day, and `range` would
+            // panic on the inverted bounds rather than answer it.
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut keyed: Vec<(u64, Hash32)> = Vec::new();
+        for (_, root) in self.roots_by_height.range(floor..=finalized) {
+            if !seen.insert(*root) {
+                continue;
+            }
+            let highest = self
+                .anchor_heights_by_root
+                .get(root)
+                .and_then(|heights| heights.last().copied())
+                .expect("a root read out of roots_by_height is indexed by root in the same funnel");
+            keyed.push((highest, *root));
+        }
+        keyed.sort_unstable_by_key(|(height, _)| std::cmp::Reverse(*height));
+        keyed.into_iter().map(|(_, root)| root).collect()
+    }
 }
 
 impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C, N, T> {
