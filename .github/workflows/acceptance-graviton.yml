@@ -184,113 +184,59 @@ jobs:
           rustc --version; cargo --version; cmake --version | head -1
           echo "target   $CARGO_TARGET_DIR"; df -h "$HOME" | tail -1
 
-      # This command is the bar. CLAUDE.md §5 records its invocation; if the
-      # command changes, update §5 in the same PR.
+      # THE BAR (CLAUDE.md §5) — this command, verbatim. §5 quotes it; if the
+      # command changes, §5 changes in the same PR.
+      #
+      # `--no-fail-fast` (lab #691): without it cargo stops at the first failing
+      # BINARY and the reconciliation below printed the partial sums in the
+      # same table as a complete run — run 32922325707 executed 25 of 143
+      # result sets and reported `passed=836 failed=1 ignored=3`. On a green
+      # run the flag changes nothing; on a red run one cycle returns every
+      # failure instead of the next single one.
+      #
+      # `--test-threads=1` STAYS. Not a parallelism change: two 12 GB proves at
+      # once do not fit (windows-x86_64.yml's memory rationale, unchanged).
+      #
+      # `suite.exit` is written ONLY after cargo returns, with its exit code. Its
+      # absence is how the reconciliation knows the step was cut off (timeout,
+      # OOM of cargo itself, eviction, cancel) rather than finished. `rc` is
+      # cargo's own code via pipefail; the step still exits with it, so pass/
+      # fail stays this step's exit code and nothing else's.
       - name: Full workspace suite, serial, unfiltered
         run: |
           set -o pipefail
-          /usr/bin/time -v cargo test --release --workspace --locked \
-            -- --test-threads=1 2>&1 | tee suite.log
+          rc=0
+          /usr/bin/time -v cargo test --release --workspace --locked --no-fail-fast \
+            -- --test-threads=1 2>&1 | tee suite.log || rc=$?
+          echo "$rc" > suite.exit
+          exit "$rc"
 
-      # Recovered from suite-arm64.yml, retired e9bf14c: this table lives in
-      # the job summary because its arithmetic is what a human reads at
-      # acceptance; burying it in the full log makes reconciliation easy to
-      # skip. It rules on nothing. `set -o pipefail` makes cargo's exit code the
-      # suite step's result, while these greps remain a visible human cross-check
-      # that cannot turn a green suite red. If the suite command changes, update
-      # this interpretation and CLAUDE.md §5 in the same PR.
+      # The reconciliation — the job-summary table a human reads at acceptance,
+      # and (lab #691) the sentence that says when the numbers are PARTIAL.
+      # Same non-gate posture as ever: pass/fail is the suite step's exit code;
+      # the greps are a human cross-check and are not allowed to turn a green
+      # suite red — the script exits 0 on every path, including its loud ones.
+      # The body lives in scripts/reconcile-suite.sh so that its truncation
+      # branch can be exercised against saved logs (tests/suite-reconcile/,
+      # run by prefilter.yml); the rationale is in that script's header.
       #
-      # In particular, `panicked at` is reachable on a green run: this workspace
-      # has passing `#[should_panic]` tests, and a panic on a spawned thread can
-      # escape the harness's normal output capture. A gate that can fire on a
-      # correct run teaches readers to ignore it, so the count is advisory.
+      # `if: always()` is WHY the truncation detector exists: a run cut off by
+      # `timeout-minutes`, an OOM or an eviction still reaches this step, and
+      # without the check it would print 25 binaries' worth of counts with the
+      # same confidence as 143.
       - name: Reconciliation and the four answers
         if: always()
-        run: |
-          if [ ! -f suite.log ]; then
-            echo "## Workspace suite — graviton-rig" >> "$GITHUB_STEP_SUMMARY"
-            echo >> "$GITHUB_STEP_SUMMARY"
-            echo "🔴 **No \`suite.log\`.** The suite step did not get far enough to write one," \
-                 "so there is nothing to reconcile — this is not a zero-failure run." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          fail_c=$(grep -c 'FAILED' suite.log || true)
-          panic_c=$(grep -c 'panicked at' suite.log || true)
-          err_c=$(grep -cE '^error' suite.log || true)
-          mark() { [ "$1" = "0" ] && echo "OK" || echo "SEE LOG"; }
-
-          {
-            echo "## Workspace suite — graviton-rig (\`${GITHUB_SHA:0:12}\`)"
-            echo
-            echo "\`cargo test --release --workspace --locked -- --test-threads=1\`"
-            echo
-            echo "### Reconciliation"
-            echo
-            echo '| | passed | failed | ignored |'
-            echo '|---|---:|---:|---:|'
-            grep -E '^test result:' suite.log \
-              | awk '{p+=$4; f+=$6; i+=$8} END {print "| **total** | **"p"** | **"f"** | **"i"** |"}'
-            echo
-            echo "The coordinator's arithmetic is \`total == main's baseline + this branch's new tests\`."
-            echo "**This job does not know the baseline and does not assert one** — it reports the"
-            echo "left-hand side only. The per-binary table below is here so a delta is attributable"
-            echo "to a crate instead of to the workspace."
-            echo
-            echo "### Negatives"
-            echo
-            echo '| grep | count | |'
-            echo '|---|---:|---|'
-            echo "| \`FAILED\` (case-sensitive) | $fail_c | $(mark $fail_c) |"
-            echo "| \`panicked at\` | $panic_c | $(mark $panic_c) |"
-            echo "| \`^error\` | $err_c | $(mark $err_c) |"
-            echo
-            echo "Advisory, not a gate: a passing \`#[should_panic]\` test can emit \`panicked at\`"
-            echo "from a spawned thread outside the harness's normal output capture."
-            echo "**Pass/fail is the suite step's exit code.**"
-            echo
-            echo "### Cost of the run"
-            echo
-            echo '```'
-            grep -E 'Maximum resident set size' suite.log || echo "(time -v line not captured)"
-            grep -E 'Elapsed \(wall clock\)' suite.log || true
-            echo '```'
-            echo
-            echo "<details><summary>Per-binary counts</summary>"
-            echo
-            echo '| binary | passed | failed | ignored |'
-            echo '|---|---:|---:|---:|'
-            awk '
-              /^ *(Running|Doc-tests)/ { bin = $0; sub(/^ */, "", bin); next }
-              /^test result:/ {
-                name = bin
-                if (match(name, /\/deps\/[^)]*/))
-                  name = substr(name, RSTART + 6, RLENGTH - 6)
-                if (name == "") name = "(unattributed)"
-                print "| `" name "` | " $4 " | " $6 " | " $8 " |"
-              }
-            ' suite.log
-            echo
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "=== 2. counts ==="
-          grep -E '^test result:' suite.log \
-            | awk '{p+=$4; f+=$6; i+=$8} END {print "passed="p" failed="f" ignored="i}'
-          echo "(the rig baseline is compared by the coordinator at acceptance,"
-          echo " not asserted here -- this job reports, it does not rule)"
-          echo "=== negatives ==="
-          echo "FAILED(cs)=$fail_c  panicked=$panic_c  ^error=$err_c"
-          echo "=== 1. peak memory ==="
-          grep -E 'Maximum resident set size' suite.log || echo "(time -v line not captured)"
-          echo "=== 3. wall time ==="
-          grep -E 'Elapsed \(wall clock\)' suite.log || true
+        env:
+          SUITE_LANE: graviton-rig
+        run: bash .github/workflows/scripts/reconcile-suite.sh suite.log suite.exit
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: suite-log-graviton
-          path: suite.log
+          path: |
+            suite.log
+            suite.exit
           retention-days: 14
 
   # ── job C ── park the instance, unless someone else is using the lane.
