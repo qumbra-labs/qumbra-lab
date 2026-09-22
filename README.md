@@ -160,5 +160,5 @@ to `qumbra-design` and `qumbra-deploy` point at private repositories and will no
 
 ## License
 
-Not yet chosen. The crate manifests say `UNLICENSED`, which means all rights reserved until
-that changes. The spec and circuit repositories are Apache-2.0.
+This repository is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your
+option. This matches the terms of the qumbra and qumbra-circuit repositories.
