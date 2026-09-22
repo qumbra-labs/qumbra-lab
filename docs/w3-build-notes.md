@@ -256,10 +256,79 @@ asking on the issue first**. #700 explicitly asks for release-binary measurement
 Until answered: the code is pushed, the PR is open, the CI lane runs the tests. **No
 measurement has been taken; every number above is a projection and is labelled so.**
 
-## Stage 1 — status
+## Stage 0 — RULED (lab #700, 2026-09-22 ~17:55 +08)
+
+Gadget **(a) indexed Merkle — ruled** (not self-ruled). Every position above accepted; the envelope
+re-registered at 13–14 GB projected against the unchanged 16 GB / 20 s gate; rig ask answered:
+build YES, light lanes YES, heavy lanes (2^20 b8, S b16) NOT this baton; the CI runner is offline,
+so ONE scoped local test run of the three touched crates was permitted (never `--workspace`);
+workspace-suite acceptance is owed, not waived. Two stage-1 additions: the note twin must
+**refuse** an id ≥ 2^16; the `q` lie both ways and the option-4 forgery shape under the dummy
+latch as named negatives.
+
+---
+
+## Stage 1 — MEASURED (2026-09-22 18:43–18:47 +08; `docs/w3-run1.md` / `docs/w3-run2.md` + `-zh`)
+
+### The ruling's additions, as built (`e236f7f`)
+
+| test | pins |
+|---|---|
+| `qlab-note::l2note::l2_plaintext_refuses_an_asset_id_outside_the_registry_space` | `from_plaintext` returns `None` on `asset ≥ 2^16` (0xffff parses; 2^16 and `u64::MAX` refused, never truncated) |
+| `l2_neg_q_lie_is_unsat_both_ways` | `q = 0` on equal assets and `q = 1` on distinct assets, each against all eight other assignments, on witnesses honest in every other respect |
+| `l2_dummy_shape_forged_seed_is_refused` | under `dv = 1`: both seeds derive from the REAL slot 0's nullifier, the dummy's invented one feeds no seed, and a forged ρ′₀ / ρ′₁ with its commitment republished is refused under every assignment |
+
+### The scoped test run — 216 passed / 1 failed / 0 ignored, then the one fixed
+
+`scripts/rig run -- cargo test --release -p qlab-air -p qlab-note -p qlab-bench --no-fail-fast -- --test-threads=1`
+(`--no-fail-fast` per CLAUDE.md's enumerate-and-accept-in-one-run rule), wall 2,604 s, sampled
+peak test-binary RSS 16.7 GB (the bench crate's pre-existing prove-carrying tests, not the L2
+ones — declared in the run doc). `qlab-air` **64/0** (26 `l2::`), `qlab-note` **39/0** (4
+`l2note::`), `qlab-bench` 113/1: `l2shape_mock_program_is_the_padded_l1_shape` asserted 118
+non-dummy roles where the 118-perm program has 117 (warm-up convention). Fixed in `8a20234`;
+re-run alone under the lock: 1/1 in 6.2 s.
+
+**The one deliberate change after the run**: `any_assignment_satisfies` now iterates the 8
+`(o1a, o2a, f1)` assignments at the witness's `q` instead of 16 with `q` free — `q`'s two
+constraints read only the captured `A₁`/`A₂`, so its lie is refused independently
+(`l2_neg_q_lie_is_unsat_both_ways` is that proof), and the 16-way form cost ~27 of the 43
+minutes. The 8-way assertions are a strict subset of the ones the run executed; **the 8-way
+code has not itself been executed** — declared here and in the run doc.
+
+### What the measurement says (max of samples; every row zero swap; full tables in the run docs)
+
+| row | footprint | prove (clean sample) | fixed bytes |
+|---|---|---|---|
+| **shape S b4** | **6.80 GB** | **1.52 s** | **285,605 B** |
+| **shape S b8** | **13.76 GB** | **2.58 s** | **206,221 B** |
+| shape S @ 2^20 b4 (P-height proxy) | **14.11 GB** | 3.19 s | 297,989 B |
+| mock118 / mock240 | within 2 % of S at equal geometry | | |
+
+- 🔴 **The LDE law under-projects by ~15 % at this geometry** (6.78 vs 5.9; 13.76 vs 11.8; 14.11
+  vs 11.8), invisibly at the M3 point (2.59 vs 2.6). The stage-0 P projection inherits it:
+  **shape P at b4 re-projects to 15.6–15.9 GB** (= 2^20-b4 measured 13.9–14.1 × 790/702) against
+  the 16 GB gate — **1–3 % margin, not 15 %**. Prove ≈ 3.6 s against 20 s is not a concern. This
+  is the stage-1 headline for the coordinator; the lever named at stage 0 (b2) stands.
+- **Bytes came in −39 % under the book** (285.6 KB vs ~470 KB): proof size follows log_height
+  and width, not rows.
+- **b4 is the lane** on the design's own criterion (§2.5, RAM not bytes): b8 buys −28 % bytes for
+  2.0× RAM and +70 % prove.
+- Reproduction: bytes byte-identical; footprints to the megabyte on 4 of 6 rows; S b8 and s20 b4
+  take discrete values (13.48/13.76; 13.56/13.89/14.11) — a third and fourth sample each found a
+  pair inside ±1 %, and **max RSS was the reproducible metric at this size** (4/4 at 14.11 on
+  s20), the reverse of the 30 GB-class finding. Two contaminated-time samples (`sys` 2–3×,
+  instructions flat) discarded for prove time, kept for footprint.
+
+### Drafted measured-update block for `l2-own-circuit-decision.md` §2.3 (the coordinator carries it)
+
+> **Measured update (2026-09-22, [qumbra-lab PR #701](https://github.com/qumbra-labs/qumbra-lab/pull/701) — W3 stage 1, shape S real, reproduced twice + 3rd/4th samples, zero swap): shape S is built and measured; shape P is projected from its 2^20 twin.** Shape S as built: **702 columns** (643 + 59, accounted column by column and test-locked), **120 perms → 2^19** (registry opening = `AREG` + 16 `MERKLE` + a bind perm, 18/input), max constraint degree 4 / 4 quotient chunks (the L1's ceiling — 5-bit role codes with four materialized half-selectors), 100 public values (+ `registry_root`), asset ids = 16-bit registry indices (shape v1's id space = the registry depth), two-asset balance in assignment form with a both-ways-bound `q = [A₁ = A₂]`. **Measured (Apple M5 Max / 36 GiB, lab rev 8a20234, release binary under `/usr/bin/time -l` in `scripts/rig`, one lane per process, best-of-3 prove): b4/q43/g22 = 6.80 GB peak footprint / 1.52 s / 285,605 B fixed; b8/q29/g22 = 13.76 GB / 2.58 s / 206,221 B; the same AIR at 2^20 b4 = 14.11 GB / 3.19 s / 297,989 B.** Three corrections to this section's estimates: (1) the "~118 perms" is 120 (bind perm); (2) bytes are ~40 % under the pre-registration (proof size follows log_height and width, not rows); (3) RAM is ~15 % *over* the LDE-law projection at this geometry — and therefore **shape P at b4 projects to 15.6–15.9 GB against the 16 GB gate** (2^20-b4 measured × 790/702 columns, gadget (a) indexed Merkle as ruled), a 1–3 % margin; prove ≈ 3.6 s against 20 s. **The L2 lane is b4** (§2.5's criterion, now with both numbers: b8 = 2.0× RAM for −28 % bytes). b8's query count is q29/g22 (β ∈ [2.72, 2.87] bits/query bracketed from the three ruled lanes' 2197-corrected rates). Shape P's freeze gadget: **(a) indexed Merkle, depth 20 — ruled**; both gadgets land at 2^20 (S + allowlist + registry already exceed 2^19), so the gadget decides width, not height. b16 and 2^20-b8 not measured (heavy lanes deferred). Runs: lab `docs/w3-run{1,2}.md`.
+
+### Stage 1 — status
 
 | item | state |
 |---|---|
-| the AIR, the note twin + lock, `build_bucket_l2`, the six negatives, q69-style accounting, `l2shape` mode | written; `cargo check --tests` clean on `qlab-air`, `qlab-note`, `qlab-bench`; **not executed locally (rule); CI pending** |
-| measured at b4/b8, reproduced twice into `docs/w3-run{1,2}.md` | **blocked on the rig ask** |
-| measured-update block for `l2-own-circuit-decision.md` §2.3 | drafted after the numbers |
+| AIR, note twin + lock, `build_bucket_l2`, the six negatives + the ruling's three, q69-style accounting, `l2shape` mode | ✅ built; `qlab-air` 64/0, `qlab-note` 39/0, `qlab-bench` 114/0 after the one arithmetic fix (scoped run + single re-run, both under the lock) |
+| measured at b4/b8, reproduced twice, `docs/w3-run{1,2}.md` + `-zh` | ✅ (light lanes; heavy lanes deferred by ruling) |
+| measured-update block for §2.3 | ✅ drafted above |
+| workspace suite | **NOT RUN — runner offline** (owed) |
+| stage 2 (shape P) | baton 2 |
