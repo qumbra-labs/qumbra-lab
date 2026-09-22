@@ -351,7 +351,9 @@ mod tests {
     #[test]
     fn l2shape_mock_program_is_the_padded_l1_shape() {
         let (air, pvs) = mock_instance(118, 19);
-        assert_eq!(air.program.iter().filter(|r| **r != ROLE_DUMMY).count(), 118);
+        // 118 program perms INCLUDING the warm-up dummy at slot 0 — so 117
+        // non-dummy roles, the same convention as `SHAPE_S_PERMS` (120 = 1 + 119).
+        assert_eq!(air.program.iter().filter(|r| **r != ROLE_DUMMY).count(), 117);
         assert_eq!(air.program[0], ROLE_DUMMY);
         let end = air.program.iter().position(|r| *r == ROLE_END).unwrap();
         assert_eq!(end, 83, "END at slot 83 — the L1-shaped program is 84 perms");

@@ -2416,14 +2416,22 @@ mod tests {
         }
     }
 
-    /// Every selector assignment the prover could try, for a fixed witness
-    /// (`qinv` follows `q` in the fill, as an honest prover's would).
+    /// Every selector assignment the prover could try, for a fixed witness:
+    /// the eight `(o1a, o2a, f1)` combinations at the witness's honest `q`.
+    /// `q` is deliberately NOT iterated here: its two constraints read only
+    /// the captured `A₁`/`A₂` (`close·q·(A₁−A₂)`, `close·(1−q)·(qinv·(A₁−A₂)−1)`)
+    /// and no other column, so a lying `q` is refused whatever the rest of the
+    /// witness says — `l2_neg_q_lie_is_unsat_both_ways` proves both lies on
+    /// their own, and iterating them here would double every negative's cost
+    /// (a 2^19 `check_all_constraints` per assignment) for no extra coverage.
+    /// The stage-1 scoped run executed the 16-way form; this is its subset.
     fn any_assignment_satisfies(inst: &mut L2BucketInstance) -> bool {
-        for bits in 0..16u32 {
+        let q = inst.air.sel_q;
+        for bits in 0..8u32 {
             inst.air.sel_o1a = bits & 1 == 1;
             inst.air.sel_o2a = bits & 2 == 2;
             inst.air.sel_f1 = bits & 4 == 4;
-            inst.air.sel_q = bits & 8 == 8;
+            inst.air.sel_q = q;
             if sat(inst) {
                 return true;
             }
