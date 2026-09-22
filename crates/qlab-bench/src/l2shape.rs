@@ -1,7 +1,7 @@
 //! W3 (lab #700): the L2 circuit family measured — `l2shape` mode.
 //!
 //! ```text
-//! qlab-bench l2shape --shape s|s20|mock118|mock240|p [--only <lane substring>] [--power <note>]
+//! qlab-bench l2shape --shape s|s20|mock118|mock240|p|p19 [--only <lane substring>] [--power <note>]
 //! ```
 //!
 //! Same in-process prove/verify pattern as `bucket`: one shape per process,
@@ -22,10 +22,18 @@
 //!               height (341-perm capacity; the pipeline chains through the
 //!               padding and every padded block is a genuine Keccak round, so
 //!               the prover's work is the height's, not the program's).
-//! - `p`       — shape P: **not built** (stage 2, baton 2). Exits 2.
+//! - `p`       — shape P real (`qlab_air::l2p::build_bucket_l2p`), 212 perms @ 2^20:
+//!               a Cloaked asset-0 input + a Hybrid stablecoin input (freeze
+//!               tree live, allowlist on the dummy path), no vPublic. Stage 2.
+//! - `p19`     — **CANARY** (#700's rule: a 2^19 run of the same shape and lane
+//!               before any 2^20): the shape-P AIR at 2^19 in chain-only mode —
+//!               same 774 columns, half the rows; the P program does not fit
+//!               2^19 (212 perms > 170), so the canary prices width × height only.
 //!
 //! Lanes (the FRI points), each asserted ≥ 100 bits by `make_config_with`'s
 //! capacity proxy and labelled with its 2197-corrected figure:
+//! - `b2/q86/g22/fp16/a16`  — the interior lane's ruled point (`m4interior`),
+//!   100.2 corrected; shape P's second lane by the stage-1 ruling.
 //! - `b4/q43/g22/fp16/a16`  — the shipping leaf point (`m4treerec::AGG_CFG`),
 //!   101.6 corrected.
 //! - `b8/q29/g22/fp16/a16`  — derived the same way as q43 (see `B8_CFG`).
@@ -39,15 +47,28 @@ use std::time::Instant;
 use p3_air::symbolic::{get_max_constraint_degree, AirLayout};
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::Matrix;
-use p3_uni_stark::{prove, verify};
+use p3_air::{Air, BaseAir, DebugConstraintBuilder};
+use p3_uni_stark::{prove, verify, ProverConstraintFolder, SymbolicAirBuilder, VerifierConstraintFolder};
 use qlab_air::l2::{
-    build_bucket_l2, L2ShapeSAir, L2TxInput, L2TxOutput, L2_WIDTH, PROGRAM_SLOTS, PV_LEN,
-    ROLE_DUMMY, ROLE_END, ROLE_MERKLE, ROWS_PER_PERM, SHAPE_S_LOG_HEIGHT, SHAPE_S_PERMS,
+    build_bucket_l2, L2ShapeSAir, L2TxInput, L2TxOutput, PROGRAM_SLOTS, ROLE_DUMMY, ROLE_END,
+    ROLE_MERKLE, ROWS_PER_PERM, SHAPE_S_LOG_HEIGHT, SHAPE_S_PERMS,
 };
+use qlab_air::l2p::{build_bucket_l2p, L2ShapePAir, PolicyAsset, VPublic, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
 use qlab_consensus::CONSENSUS_CFG;
 
 use crate::m4treerec::AGG_CFG;
-use crate::{make_config_with, pc_len, FriCfg, Val, RUNS};
+use crate::{make_config_with, pc_len, Config, FriCfg, Val, RUNS};
+
+/// The b2 lane: the interior lane's ruled point (`m4interior.rs`; B″ q86 —
+/// 86 × 0.910 + 22 = 100.2 under the 2197-corrected accounting; capacity
+/// proxy 86 × 1 + 22 = 108).
+pub(crate) const B2_CFG: FriCfg = FriCfg {
+    log_blowup: 1,
+    num_queries: 86,
+    grind_bits: 22,
+    log_final_poly_len: 4,
+    max_log_arity: 4,
+};
 
 /// The b8 lane. **Derivation (the formula #700 asks for):** under the
 /// 2197-corrected accounting (`fri-soundness-accounting-2026-07.md` §6) the
@@ -73,7 +94,8 @@ pub(crate) const B8_CFG: FriCfg = FriCfg {
     max_log_arity: 4,
 };
 
-const LANES: [(&str, &str, FriCfg); 3] = [
+const LANES: [(&str, &str, FriCfg); 4] = [
+    ("b2/q86/g22/fp16/a16", "100.2 corrected (B″)", B2_CFG),
     ("b4/q43/g22/fp16/a16", "101.6 corrected (B″)", AGG_CFG),
     ("b8/q29/g22/fp16/a16", "≥100.9 corrected (bracketed, see B8_CFG)", B8_CFG),
     ("b16/q21/g22/fp16/a16", "100.6 corrected (B″)", CONSENSUS_CFG),
@@ -192,62 +214,219 @@ fn mock_instance(perms: usize, log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
     (air, pvs)
 }
 
-pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
-    let (label, mock, program_perms, air, pvs): (&str, bool, usize, L2ShapeSAir, Vec<Val>) =
-        match shape {
-            "s" => {
-                let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT);
-                ("shape S", false, SHAPE_S_PERMS, air, pvs)
-            }
-            "s20" => {
-                let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT + 1);
-                ("shape S @ 2^20 (P-height proxy)", false, SHAPE_S_PERMS, air, pvs)
-            }
-            "mock118" => {
-                let (air, pvs) = mock_instance(118, 19);
-                ("MOCK 118 @ 2^19", true, 118, air, pvs)
-            }
-            "mock240" => {
-                let (air, pvs) = mock_instance(118, 20);
-                ("MOCK 118-prog @ 2^20 (\"240\")", true, 118, air, pvs)
-            }
-            "p" => {
-                eprintln!("l2shape: shape P is stage 2 (baton 2) and is not built on this tree");
-                std::process::exit(2);
-            }
-            other => {
-                eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p");
-                std::process::exit(2);
-            }
-        };
+/// The deterministic shape-P instance every run measures: asset 0 (Cloaked,
+/// 50,000) + asset 7 (Hybrid: issuer, three frozen keys, redeem closed;
+/// 30,000) in, 49,000 (asset 0) + 30,000 (asset 7) out, fee 1,000, no
+/// vPublic. Every gadget is in the trace (fixed shape); the allowlist rides
+/// the dummy path (asset 7 is not Regulated).
+pub(crate) fn shape_p_instance(log_height: usize) -> (L2ShapePAir, Vec<Val>) {
+    let mut x = 0xfeed_face_cafe_beefu64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mk_in = |value: u64, asset: u64, rnd: &mut dyn FnMut() -> u64| L2TxInput {
+        sk: [rnd(), rnd(), rnd(), rnd()],
+        value,
+        asset,
+        rho: [rnd(), rnd(), rnd(), rnd()],
+        rseed: [rnd(), rnd(), rnd(), rnd()],
+        d: [rnd(), rnd()],
+    };
+    let mk_out = |value: u64, asset: u64, rnd: &mut dyn FnMut() -> u64| L2TxOutput {
+        value,
+        asset,
+        rkm: [rnd(), rnd(), rnd(), rnd()],
+        rho: [rnd(), rnd(), rnd(), rnd()],
+        rseed: [rnd(), rnd(), rnd(), rnd()],
+    };
+    let inputs = [mk_in(50_000, 0, &mut rnd), mk_in(30_000, 7, &mut rnd)];
+    let outputs = [mk_out(49_000, 0, &mut rnd), mk_out(30_000, 7, &mut rnd)];
+    let frozen = [[rnd(), rnd(), rnd(), rnd()], [rnd(), rnd(), rnd(), rnd()], [rnd(), rnd(), rnd(), rnd()]];
+    let assets = [
+        PolicyAsset::cloaked(0),
+        PolicyAsset::hybrid(7, [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004], false, &frozen),
+    ];
+    let inst = build_bucket_l2p(log_height, &inputs, &outputs, 1_000, &assets, [VPublic::NONE; 2]);
+    let pvs = inst.pvs.iter().map(|v| Val::from_u32(*v)).collect();
+    (inst.air, pvs)
+}
 
-    let height = 1usize << air.log_height;
-    let capacity = height / ROWS_PER_PERM;
+/// One lane through the real prover: best-of-`RUNS` prove and verify, the
+/// proof's postcard and bincode-fixed bytes, and the width read off the
+/// trace `prove` was handed.
+fn bench_lane<A>(
+    air: &A,
+    pvs: &[Val],
+    cfg: &FriCfg,
+    gen_trace: impl Fn(usize) -> p3_matrix::dense::RowMajorMatrix<Val>,
+) -> (f64, f64, usize, usize, usize)
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, Config>>
+        + for<'a> Air<VerifierConstraintFolder<'a, Config>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    let config = make_config_with(cfg);
+    let mut best_prove = f64::INFINITY;
+    let mut proof_opt = None;
+    let mut width = 0;
+    for _ in 0..RUNS {
+        let trace = gen_trace(cfg.log_blowup);
+        width = trace.width();
+        let t = Instant::now();
+        let proof = prove(&config, air, trace, pvs);
+        best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
+        proof_opt = Some(proof);
+    }
+    let proof = proof_opt.expect("RUNS > 0");
+    let proof_bytes = pc_len(&proof);
+    let fixed_bytes = bincode::serialize(&proof).expect("bincode").len();
+    let mut best_verify = f64::INFINITY;
+    for _ in 0..RUNS {
+        let t = Instant::now();
+        verify(&config, air, &proof, pvs).expect("verification failed");
+        best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    (best_prove, best_verify, proof_bytes, fixed_bytes, width)
+}
+
+/// What one shape hands the lane loop.
+struct ShapeUnderTest {
+    label: &'static str,
+    mock: bool,
+    canary: bool,
+    program_perms: usize,
+    log_height: usize,
+    width: usize,
+    pv_len: usize,
+    max_deg: usize,
+    statement: &'static str,
+    run: Box<dyn Fn(&FriCfg) -> (f64, f64, usize, usize, usize)>,
+}
+
+fn shape_s_under_test(label: &'static str, mock: bool, program_perms: usize, air: L2ShapeSAir, pvs: Vec<Val>) -> ShapeUnderTest {
     let layout = AirLayout::from_air::<Val>(&air);
     let max_deg = get_max_constraint_degree::<Val, _>(&air, layout);
-    let chunks = (max_deg.max(2) - 1).next_power_of_two();
+    let log_height = air.log_height;
+    let width = <L2ShapeSAir as BaseAir<Val>>::width(&air);
+    let pv_len = <L2ShapeSAir as BaseAir<Val>>::num_public_values(&air);
+    ShapeUnderTest {
+        label,
+        mock,
+        canary: false,
+        program_perms,
+        log_height,
+        width,
+        pv_len,
+        max_deg,
+        statement: "shape S — 2 inputs (2 assets), per input the L1 chain + a depth-16 \
+             registry opening bound to PV_REGROOT, 2 outputs, two-asset balance, mode = Cloaked",
+        run: Box::new(move |cfg| bench_lane(&air, &pvs, cfg, |b| air.generate_trace::<Val>(b))),
+    }
+}
 
-    println!("# qumbra-lab W3 l2shape bench — {label}{}", if mock { " — MOCK: geometry only, gates nothing" } else { "" });
+fn shape_p_under_test(label: &'static str, canary: bool, program_perms: usize, air: L2ShapePAir, pvs: Vec<Val>) -> ShapeUnderTest {
+    let layout = AirLayout::from_air::<Val>(&air);
+    let max_deg = get_max_constraint_degree::<Val, _>(&air, layout);
+    let log_height = air.log_height;
+    let width = <L2ShapePAir as BaseAir<Val>>::width(&air);
+    let pv_len = <L2ShapePAir as BaseAir<Val>>::num_public_values(&air);
+    ShapeUnderTest {
+        label,
+        mock: false,
+        canary,
+        program_perms,
+        log_height,
+        width,
+        pv_len,
+        max_deg,
+        statement: "shape P — shape S plus, per input: indexed-Merkle freeze non-membership \
+             (depth 20, low leaf + two 256-bit comparisons), allowlist membership (depth 20, \
+             dummy path when off), vPublic per row with AISS (issuer key) when required; \
+             mode read as flags",
+        run: Box::new(move |cfg| bench_lane(&air, &pvs, cfg, |b| air.generate_trace::<Val>(b))),
+    }
+}
+
+pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
+    let sut: ShapeUnderTest = match shape {
+        "s" => {
+            let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT);
+            shape_s_under_test("shape S", false, SHAPE_S_PERMS, air, pvs)
+        }
+        "s20" => {
+            let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT + 1);
+            shape_s_under_test("shape S @ 2^20 (P-height proxy)", false, SHAPE_S_PERMS, air, pvs)
+        }
+        "mock118" => {
+            let (air, pvs) = mock_instance(118, 19);
+            shape_s_under_test("MOCK 118 @ 2^19", true, 118, air, pvs)
+        }
+        "mock240" => {
+            let (air, pvs) = mock_instance(118, 20);
+            shape_s_under_test("MOCK 118-prog @ 2^20 (\"240\")", true, 118, air, pvs)
+        }
+        "p" => {
+            let (air, pvs) = shape_p_instance(SHAPE_P_LOG_HEIGHT);
+            shape_p_under_test("shape P", false, SHAPE_P_PERMS, air, pvs)
+        }
+        "p19" => {
+            let air = L2ShapePAir::chain_only(SHAPE_P_LOG_HEIGHT - 1);
+            let pvs = vec![Val::ZERO; <L2ShapePAir as BaseAir<Val>>::num_public_values(&air)];
+            shape_p_under_test("CANARY: shape-P AIR chain-only @ 2^19", true, 0, air, pvs)
+        }
+        other => {
+            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19");
+            std::process::exit(2);
+        }
+    };
+
+    let height = 1usize << sut.log_height;
+    let capacity = height / ROWS_PER_PERM;
+    let chunks = (sut.max_deg.max(2) - 1).next_power_of_two();
+    let label = sut.label;
+
+    println!(
+        "# qumbra-lab W3 l2shape bench — {label}{}",
+        if sut.mock {
+            " — MOCK: geometry only, gates nothing"
+        } else if sut.canary {
+            " — CANARY: width × height only, gates nothing but the 2^20 start"
+        } else {
+            ""
+        }
+    );
     println!();
     crate::print_env(power);
     println!(
-        "- AIR: qlab-air `l2::L2ShapeSAir` — {L2_WIDTH} cols x {ROWS_PER_PERM} rows/perm, \
-         program {program_perms} perms in a {capacity}-perm height (2^{}), \
-         max constraint degree {max_deg}, {chunks} quotient chunks, {PV_LEN} public values",
-        air.log_height
+        "- AIR: {} — {} cols x {ROWS_PER_PERM} rows/perm, \
+         program {} perms in a {capacity}-perm height (2^{}), \
+         max constraint degree {}, {chunks} quotient chunks, {} public values",
+        if shape.starts_with('p') { "qlab-air `l2p::L2ShapePAir`" } else { "qlab-air `l2::L2ShapeSAir`" },
+        sut.width,
+        sut.program_perms,
+        sut.log_height,
+        sut.max_deg,
+        sut.pv_len,
     );
-    if mock {
+    if sut.mock {
         println!(
             "- MOCK: the L1-shaped 84-perm program on the L2 AIR (assets 0, no registry \
-             opening) padded with ROLE_MERKLE slots after END to {program_perms}; prices \
+             opening) padded with ROLE_MERKLE slots after END to {}; prices \
              height × width only. House warning (#700): mocks undershot RAM 4× at M4 and \
-             width 5–9× at M1.6 — these numbers gate nothing."
+             width 5–9× at M1.6 — these numbers gate nothing.",
+            sut.program_perms
+        );
+    } else if sut.canary {
+        println!(
+            "- CANARY: the shape-P AIR with every perm slot dummy at 2^19 (the P program \
+             needs 2^20). #700's rule: footprint × 2 < 32 GB or the 2^20 run is not started."
         );
     } else {
-        println!(
-            "- statement: shape S — 2 inputs (2 assets), per input the L1 chain + a depth-16 \
-             registry opening bound to PV_REGROOT, 2 outputs, two-asset balance, mode = Cloaked"
-        );
+        println!("- statement: {}", sut.statement);
     }
     println!("- per cell: prove/verify = best of {RUNS} in-process runs; proof = postcard bytes and bincode-fixed bytes");
     println!("- peak footprint: read `phys_footprint` (peak) from the `/usr/bin/time -l` line wrapping THIS process; one lane per process");
@@ -261,31 +440,8 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
                 continue;
             }
         }
-        let config = make_config_with(cfg);
         eprintln!("== l2shape {label}: {name} ({}) ==", cfg.label());
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let mut best_prove = f64::INFINITY;
-            let mut proof_opt = None;
-            let mut width = 0;
-            for _ in 0..RUNS {
-                let trace = air.generate_trace::<Val>(cfg.log_blowup);
-                width = trace.width();
-                let t = Instant::now();
-                let proof = prove(&config, &air, trace, &pvs);
-                best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
-                proof_opt = Some(proof);
-            }
-            let proof = proof_opt.expect("RUNS > 0");
-            let proof_bytes = pc_len(&proof);
-            let fixed_bytes = bincode::serialize(&proof).expect("bincode").len();
-            let mut best_verify = f64::INFINITY;
-            for _ in 0..RUNS {
-                let t = Instant::now();
-                verify(&config, &air, &proof, &pvs).expect("verification failed");
-                best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
-            }
-            (best_prove, best_verify, proof_bytes, fixed_bytes, width)
-        }));
+        let result = catch_unwind(AssertUnwindSafe(|| (sut.run)(cfg)));
         match result {
             Ok((prove_ms, verify_ms, bytes, fixed, width)) => {
                 eprintln!(
@@ -297,11 +453,11 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
                     label,
                     name,
                     bits,
-                    program_perms,
+                    sut.program_perms,
                     capacity,
                     width,
-                    air.log_height,
-                    max_deg,
+                    sut.log_height,
+                    sut.max_deg,
                     prove_ms,
                     verify_ms,
                     bytes as f64 / 1024.0,
@@ -312,15 +468,16 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
                 eprintln!("  [l2shape {label} {name}] FAILED (panic during prove/verify — see stderr)");
                 println!(
                     "| {} | {} | {} | {}/{} | {} | {} | {} | FAILED | FAILED | FAILED | FAILED |",
-                    label, name, bits, program_perms, capacity, L2_WIDTH, air.log_height, max_deg,
+                    label, name, bits, sut.program_perms, capacity, sut.width, sut.log_height, sut.max_deg,
                 );
             }
         }
     }
     println!();
     println!(
-        "Envelope (#700, informational at stage 1 — the gate is shape P at b4): \
-         P ≤ 16 GB peak footprint and ≤ 20 s prove. Proof bytes and verify time are informational."
+        "Envelope (#700): shape P ≤ 16 GB peak footprint and ≤ 20 s prove, judged at the L2 lane \
+         (b4/q43 or b2/q86, whichever clears with the larger margin — stage-1 ruling). \
+         Proof bytes and verify time are informational."
     );
 }
 
@@ -342,6 +499,39 @@ mod tests {
         assert!(28.0 * 2.72 + 22.0 < 100.0, "q28 does not clear the conservative end");
         assert_eq!(AGG_CFG.label(), "b4/q43/g22/fp16/a16");
         assert_eq!(CONSENSUS_CFG.label(), "b16/q21/g22/fp16/a16");
+        assert_eq!(B2_CFG.label(), "b2/q86/g22/fp16/a16");
+        assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
+    }
+
+    /// Shape P through the real prover at the b2/q86 lane (2^20 × 774, the
+    /// ~8 GB-class lane — the b4 twin is the bench's job, not the suite's):
+    /// the honest instance proves and verifies, then each of `anchor`, `nf₁`,
+    /// `fee`, `registry_root`, and the two vPublic surfaces (`vpa₂`, `m₂`)
+    /// flipped in turn must make `verify` Err — the L1's
+    /// `rejects_a_tampered_public_surface` pair on shape P.
+    #[test]
+    fn l2shape_shape_p_prove_verify_and_tampered_pv_b2() {
+        use qlab_air::l2::{PV_ANCHOR, PV_FEE, PV_NF1, PV_REGROOT};
+        use qlab_air::l2p::{PV_VP2, PV_LEN};
+        let (air, pvs) = shape_p_instance(SHAPE_P_LOG_HEIGHT);
+        assert_eq!(pvs.len(), PV_LEN);
+        let config = make_config_with(&B2_CFG);
+        let trace = air.generate_trace::<Val>(B2_CFG.log_blowup);
+        assert_eq!(trace.width(), 774, "the shape-P width, read off the matrix prove is handed");
+        let proof = prove(&config, &air, trace, &pvs);
+        verify(&config, &air, &proof, &pvs).expect("shape P must verify at b2/q86");
+        for (idx, name) in [
+            (PV_ANCHOR + 2, "anchor"),
+            (PV_NF1 + 5, "nf1"),
+            (PV_FEE, "fee"),
+            (PV_REGROOT + 9, "registry_root"),
+            (PV_VP2 + 5, "vpa2"),
+            (PV_VP2 + 1, "m2 (a mint of 1 claimed after the fact)"),
+        ] {
+            let mut bad = pvs.clone();
+            bad[idx] += Val::ONE;
+            assert!(verify(&config, &air, &proof, &bad).is_err(), "a proof verified against a tampered {name}");
+        }
     }
 
     /// The MOCK program is the L1-shaped 84 perms plus MERKLE padding and its

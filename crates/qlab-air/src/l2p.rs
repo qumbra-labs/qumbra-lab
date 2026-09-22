@@ -1413,8 +1413,12 @@ where
                 );
             }
         }
-        // The comparison flags advance on M rows below z = 63.
-        let adv = mrow.clone() * (AB::Expr::ONE - u63.clone());
+        // The comparison flags advance from every M row (gate `mrow` alone —
+        // a second periodic factor would make these degree 5): from z = 63
+        // the recurrence lands on the T row's first slot, which is free and
+        // simply holds it; T rows are unconstrained; the next M row's z = 0
+        // is re-seeded by the same-row `sel(0)` constraints.
+        let adv = mrow.clone();
         for blk in 0..2 {
             for l in 0..4 {
                 let (x, y) = xy(blk, l, &next);
@@ -2223,14 +2227,16 @@ impl L2ShapePAir {
                 uv[l] ^ uu[(x + 4) % 5] ^ uu[5 + (x + 1) % 5]
             });
 
-            // Comparison flags for this row (M rows only; T rows hold 0).
-            if mrow {
+            // Comparison flags for this row: M rows run the recurrence (seeded
+            // at z = 0); the first T row carries it one step further (the
+            // `mrow`-gated transition from z = 63 lands there); other T rows 0.
+            if mrow || z == 0 {
                 for blk in 0..2 {
                     for l in 0..4 {
                         let (x, y) = if blk == 0 { (wbit[l], a[l]) } else { (a[l], wbit[5 + l]) };
                         let same = 1 - x - y + 2 * x * y; // 1 iff x == y
                         let lt_bit = (1 - x) * y;
-                        if z == 0 {
+                        if z == 0 && mrow {
                             cmp_lt[blk][l] = lt_bit;
                             cmp_eq[blk][l] = same;
                         } else {
@@ -2828,9 +2834,13 @@ mod tests {
         let pvs = pvs_of(&a);
         let trace = a.air.generate_trace::<F>(0);
         check_constraints(&a.air, &trace, &pvs);
-        let b = bucket(0x9e90_0002, 60, 9, 40, 9, 70, 9, 30, 9, 0, [VPublic::NONE; 2]);
-        assert!(b.air.sel_q && b.air.rg == [true, true]);
-        assert!(sat(&b), "two Regulated inputs of one asset, summed");
+        // (Two Regulated inputs of one asset is NOT a legal bucket: it has
+        // no asset-0 note — `l2p_s_neg_no_fee_asset_note`'s ground. `q` is
+        // reachable only with both inputs in asset 0, where no policy applies.)
+        // Regulated on row 1, the fee asset on row 2.
+        let b = bucket(0x9e90_0002, 50, 9, 100, 0, 50, 9, 90, 0, 10, [VPublic::NONE; 2]);
+        assert!(!b.air.sel_f1 && b.air.rg == [true, false]);
+        assert!(sat(&b), "a Regulated input on row 1");
     }
 
     /// The `vPublic` edge (§3.1), positives: mint with the issuer key; redeem
@@ -2912,7 +2922,8 @@ mod tests {
     }
 
     /// The quotient degree does not move: max constraint degree **4** (the 21
-    /// materialized role selectors + EG3[1]), 4 quotient chunks.
+    /// materialized role selectors, EG3[1], the 16 comparison transitions),
+    /// 4 quotient chunks — the L1's ceiling exactly.
     #[test]
     fn l2p_quotient_degree_matches_the_l1() {
         use p3_air::symbolic::{get_max_constraint_degree, get_symbolic_constraints, AirLayout};
@@ -2927,7 +2938,14 @@ mod tests {
             *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
         }
         assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
-        assert_eq!(hist.get(&4).copied().unwrap_or(0), 22, "deg-4 constraints: 21 selectors + EG3[1]");
+        // The deg-4 population, pinned: 21 role selectors + EG3[1] (S's 17
+        // pattern) + 16 comparison-flag transitions (`mrow · same · flag`,
+        // the periodic gate counting one) + 16 bank-1 transitions (the
+        // ALW-gated allowlist legs, `EGB · ALW · pw · a`) + the three gate
+        // definitions CLOSE_CRED / EGB / EGBC (`gperm|bnd · sel · ep`).
+        // Materializing those to ≤ 3 would cost 4–5 columns for no quotient
+        // benefit (4 chunks either way) — recorded, not taken.
+        assert_eq!(hist.get(&4).copied().unwrap_or(0), 21 + 1 + 16 + 16 + 3, "deg-4 constraints");
     }
 
     /// Program geometry: 212 perms, fits 2^20, the per-input order.
@@ -3235,27 +3253,18 @@ mod tests {
         assert!(sat(&vpa), "precondition");
         vpa.pvs[pv_vp_asset(1)] = 3;
         assert!(!sat(&vpa), "a mint revealing the wrong asset VERIFIED");
-        let mut q2 = bucket(0x0a11_0777, 60, 7, 40, 7, 70, 7, 30, 7, 0, [VPublic::NONE; 2]);
+        // `q` is reachable only with both inputs in asset 0 (a bucket needs an
+        // asset-0 note), where the Cloaked rule already refuses any term; the
+        // `close_q · vPublic₂ = 0` leg is exercised here on top of it.
+        let mut q2 = bucket(0x0a11_0777, 60, 0, 40, 0, 70, 0, 25, 0, 5, [VPublic::NONE; 2]);
         assert!(sat(&q2), "precondition: same-asset spend");
-        // Move 10 from row 1's… no: under q the rows sum; put a term on row 2.
-        let mut q2b = bucket(0x0a11_0777, 60, 7, 40, 7, 70, 7, 40, 7, 0, [VPublic::NONE, VPublic::mint(10)]);
-        assert!(!sat(&q2b), "vPublic₂ under q VERIFIED");
-        q2b.air.vp = [VPublic::mint(10), VPublic::NONE];
-        q2b.pvs = vpa_swap(&q2b.pvs);
-        assert!(sat(&q2b), "the same mint on row 1 verifies");
+        let q2b = bucket(0x0a11_0777, 60, 0, 40, 0, 70, 0, 35, 0, 5, [VPublic::NONE, VPublic::mint(10)]);
+        assert!(q2b.air.sel_q && !sat(&q2b), "vPublic₂ under q VERIFIED");
         q2.pvs[pv_vp_sign(0)] = 2;
         assert!(!sat(&q2), "a non-bool sign VERIFIED");
         let mut nz_lie = bucket(0x0a11_0001, 100, 0, 50, 7, 90, 0, 150, 7, 10, [VPublic::NONE, VPublic::mint(100)]);
         nz_lie.air.vp[1] = VPublic::NONE; // the trace claims nz = 0 while the PVs carry 100
         assert!(!sat(&nz_lie), "a lied nz VERIFIED");
-    }
-    /// Swap the two rows' vPublic public values.
-    fn vpa_swap(pvs: &[u32]) -> Vec<u32> {
-        let mut out = pvs.to_vec();
-        for i in 0..6 {
-            out.swap(PV_VP1 + i, PV_VP2 + i);
-        }
-        out
     }
 
     // -----------------------------------------------------------------------
@@ -3479,12 +3488,25 @@ mod tests {
         forged.air.slot_witness[out1].w[5..9].copy_from_slice(&[0xbad_5eed, 1, 2, 3]);
         republish(&mut forged, 1);
         assert!(!any_assignment_satisfies(&mut forged), "a forged seed under the dummy shape VERIFIED");
-        // A nonzero dummy value.
+        // A nonzero dummy value (the builder refuses it, so it is built by
+        // hand through the witness API with `dv` set): the AIR refuses too.
         let mut minted = dummy.clone();
         minted.value = 500;
         let mut outs2 = outputs;
         outs2[1].value = 900;
-        let mut bad = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &minted, &outs2, 0, [VPublic::NONE; 2]);
+        let (_, _, cm_real) = derive_input_l2(&real);
+        let (w_real, anchor) = fabricated_single_tree(&cm_real);
+        let assets = [hybrid7(false), PolicyAsset::cloaked(0)];
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let policy = [
+            assets[0].policy_input_for(&derive_rkm_l2(&real), rw[0]).unwrap(),
+            assets[1].policy_input_for(&derive_rkm_l2(&minted), rw[1]).unwrap(),
+        ];
+        let mut bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &[real.clone(), minted.clone()], &outs2, 0, &[w_real, off_tree_witness()], anchor, &policy, root, [VPublic::NONE; 2],
+        );
+        bad.air.dv = true;
         assert!(!any_assignment_satisfies(&mut bad), "a nonzero dummy value is a mint");
         // A mint on the dummy's row (asset 0, Cloaked) is refused.
         let bad2 = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &dummy, &outs2, 0, [VPublic::NONE, VPublic::mint(500)]);

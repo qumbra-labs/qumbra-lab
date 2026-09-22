@@ -891,12 +891,12 @@ fn main() {
             return;
         }
         "l2shape" => {
-            // W3 (lab #700): `--shape s|s20|mock118|mock240|p`, optional
+            // W3 (lab #700): `--shape s|s20|mock118|mock240|p|p19`, optional
             // `--only <lane substring>`; one shape per process.
             let shape_pos = args.iter().position(|a| a == "--shape");
             let shape = shape_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             let Some(shape) = shape else {
-                eprintln!("l2shape: `--shape s|s20|mock118|mock240|p` is required");
+                eprintln!("l2shape: `--shape s|s20|mock118|mock240|p|p19` is required");
                 std::process::exit(2);
             };
             let only_pos = args.iter().position(|a| a == "--only");

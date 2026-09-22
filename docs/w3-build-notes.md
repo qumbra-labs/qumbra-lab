@@ -332,3 +332,131 @@ code has not itself been executed** — declared here and in the run doc.
 | measured-update block for §2.3 | ✅ drafted above |
 | workspace suite | **NOT RUN — runner offline** (owed) |
 | stage 2 (shape P) | baton 2 |
+
+---
+
+# Baton 2 (stage 2 — shape P; Multica QUM-182)
+
+Fresh session, the branch is the memory. Read in order: CLAUDE.md, #700 + the two rulings, the
+stage-0/1 posts, this file, `l2-own-circuit-decision.md` §2–§3. Same worktree
+(`../qumbra-lab-w3`, recreated from the branch), same PR #701, never merged by this session.
+
+## Stage 2 — the ruling's rows, checked on `49a632a`
+
+| the ruling says | what I found |
+|---|---|
+| carry-over (i): the 8-way `any_assignment_satisfies` unexecuted | ✅ `l2.rs:2428`, iterates `0..8` at the witness's `q` — executed first (below) |
+| carry-over (ii): no prover-stack tampered-PV test on L2 | ✅ `l2shape.rs` had `l2shape_shape_s_prove_verify_roundtrip_b4` only (honest surface) |
+| gadget (a) ruled: low-leaf opening, `key_lo < rkm < key_hi` bit-serial on `AFRZ`'s boundary rows, one depth-20 path, `ARKM′` | ✅ built as ruled, with one placement change the census did not have (the root binding, below) |
+| `AISS` same-row-bound to `AREG`'s issuer_key lanes | ❌ **not buildable as the census wrote it** — `AREG`'s boundary rows carry one chained digest, and the freeze fold's root is the better tenant (it saves a 16-column accumulator; `AISS` costs nothing on the bind bank's idle span). Position taken, reported |
+| "mode read as flags (Hybrid/Regulated/Cloaked-with-vPublic=0)" | ✅ built; §3.6's parenthetical "Cloaked (or issuer with mint only)" is NOT built — the ruling's phrase is the stricter one and was taken (a finding for the design doc, below) |
+| width ~790 decides the gate; > ~810 say so first | ✅ **774 by construction, read off the matrix** (`l2p_trace_width_is_read_off_the_matrix`) |
+| both lanes: `b4/q43/g22` and `b2/q86/g22` | ✅ `l2shape` gains `B2_CFG` (the `m4interior` point, imported by value) and `--shape p`, `--shape p19` (the canary) |
+
+## Stage 2 — the carry-overs (executed first, under the lock)
+
+- (i) `cargo test --release -p qlab-air -- --test-threads=1 l2_neg_output_asset_from_nowhere l2_neg_cross_asset_balance`: **2 passed / 0 failed, 110.15 s** — 18 `check_all_constraints` at 2^19 (each negative: one honest precondition + eight assignments). The 8-way helper is now executed code.
+- (ii) `l2shape_shape_s_tampered_pv_is_rejected_b4` (`l2shape.rs`): ONE 2^19 b4/q43 prove of the honest shape-S instance through `p3_uni_stark::prove`, then `anchor`, `nf₁`, `fee`, `registry_root` flipped in turn in the public values handed to `verify`, each must `Err`. **1 passed, 1.85 s** (the L1's `rejects_a_tampered_public_surface`, on L2). Commit `9aaa1cd`.
+
+## Stage 2 — shape P as built (`crates/qlab-air/src/l2p.rs`, a second fork of the engine)
+
+`l2.rs` is measured and test-locked at 702 / deg 4 / population 17, so P is **a new AIR type beside S**
+(`L2ShapePAir`), not an edit — the same discipline S applied to `narrow.rs`. Pure helpers are imported
+from `l2` (registry types, note block, `derive_input_l2`, the fabricated trees) and `narrow`.
+
+### Program (212 perms → 2^20; per input 102)
+
+```text
+[DUMMY]
+ANK NF BNF_k AISS ARKM AFRZ 20×MERKLE AREG 16×MERKLE BREG ARKM′ ACRED 20×MERKLE BALLOW ARKM″ ACM 32×MERKLE BANCHOR   (×2)
+ACMOUT_0 BCM1 ARHO ACMOUT_1 BCM2 BAL END
+```
+
+The registry opening moved from "between `BNF` and `ARKM`" (S) to **after the freeze fold**, because the
+freeze root is then the chained digest on `AREG`'s boundary rows — where the leaf's `freeze_root`
+lanes `W5..8` already are. The latch `L` still spans chain 1's `BNF2`-close → `BANCHOR`-close, so it still
+tells the two `AREG`s, the two `ACM`s and now the two policy chains apart. No new marker.
+
+### The binding problem the census under-priced, and the answer taken
+
+The Keccak chain carries one digest. `rkm` must be **chained** at three boundaries — `AFRZ` (the
+comparison reads it as `a[0..4]`), `ACRED` (`H(rkm ‖ D_CRED)` absorbs it) and `ACM` (the note block) — so
+it is derived three times (`ARKM`, then two `ROLE_ARKM2` with no bank-1 legs). The census's "+1
+selector, 0 other columns" is right about the perm and wrong about soundness: an unbound `ARKM′` lets
+the prover freeze-check any `rkm′` it likes. The three outputs must be tied together, cross-row, twice —
+and every cross-row tie in this engine is an equality-bank window (16 accumulator columns each if new).
+
+**Zero new accumulators.** Every window shape P needs rides a bank that is idle over exactly that span:
+
+| window | + leg | − leg | close | bank |
+|---|---|---|---|---|
+| `rkm@AFRZ = rkm′@ACRED` | `INJ_AFRZE` (a) | `INJ_ACREDE` (a) | `CLOSE_CRED`, reset | **third bank** `EQ3` — idle until the outputs |
+| `rkm′@ACRED = rkm″@ACM` | `INJ_ACREDE` (a) | `INJ3E` (a) | `EG[5]` (ACM's end) | **bind bank** `BQ` — idle between `BREG` and `BANCHOR` |
+| `AISS` digest = leaf.issuer_key | `EG[1]` (a at `ARKM`'s boundary) | `INJRE` (`W0..3`) | `CRQ = AREGE·RQ`, reset `AREGE` | **bind bank** — idle between `BNF` and `BREG` |
+| allow fold = leaf.allow_root | `EGB·ALW` (a at `BALLOW`) | `INJRE·ALW` (`W9..12`) | `EGBC` | **bank 1** — idle after `ARKM` closes |
+| freeze fold = leaf.freeze_root | — | — | same-row at `AREG`: `AG_Rk·(hy_k+rg_k)·(a[l] − W[5+l]) = 0` | none |
+
+The windows are sequential on each bank (`BQ`: `BNF` · AISS · `BREG` · rkm′ · `BANCHOR`), and every leg is
+`ep`-gated so the ring's wrap at 2^20 (212-slot period, 341 perms) fires nothing.
+
+### The comparison (gadget (a)'s one piece with no in-tree precedent)
+
+Two 256-bit comparisons, `key_lo < rkm` and `rkm < key_hi`, LSB → MSB over the 64 boundary rows: per
+lane a running `LT` (`(1−x)y + [x=y]·LT`) and `EQ` (`[x=y]·EQ`) flag, seeded same-row at `z = 0` by
+`sel(0)`, advanced by an `mrow`-gated transition (the first draft gated on `mrow·(1−u63)` and read
+**degree 5** — periodic columns count one each in Plonky3's symbolic accounting; gating on `mrow` alone
+lands the z=63 step on the T row's first slot, which is free and holds it), three materialized lane
+combines `C1..C3`, and the verdict `INJ_AFRZE·u63·(C3 − 1) = 0`. 22 columns. Keys are four little-endian
+lanes (lane 3 most significant); the tail leaf's `key_hi` is `MAX = 2^256 − 1` and the head's `key_lo`
+is 0, so strict `<` excludes only `rkm ∈ {0, MAX}` (hash outputs; negligible). The low leaf is
+`H(key_lo ‖ key_hi)` with a **leaf marker at lane 8 bit 3**, distinct from the Merkle node's pad at bit 0
+— a leaf never collides with an interior node.
+
+### `vPublic`, `AISS`, mode as flags
+
+- Public values +12 (`PV_LEN` 100 → 112): per balance row `s` (1 = redeem), four 16-bit chunks `m`, and
+  `vpa` — the asset id, bound to the row's captured asset when `m ≠ 0` (`close·Σm·(vpa − A_k) = 0`) and
+  0 by convention otherwise (issuance is public by design; a transfer reveals nothing). Chunk ranges are
+  the PV builder's job, as for `PV_FEE`.
+- Each row's borrow chain closes on `in − out − [fee] + (1 − 2s)·m = 0`; carry offset moved from −2 to
+  **−3** (range analysis: with the signed term the chunk carries span `[−3, 3]`). Under `q` the summed chain
+  carries `vPublic₁` and `vPublic₂` must be 0 (`close_q·Σm₂ = 0`, `close_q·s₂ = 0`).
+- Per input, constant witness bools bound in-circuit: `hy`/`rg` (to the `mode` lane's bits 0/1 at
+  `AREG`, every other bit 0, `hy·rg = 0`), `ropen` (to `flags` bit 0), `nz` (to `Σm ≠ 0` via the
+  nonzero-inverse `vpinv`); `REQ_k = nz_k·(1 − s_k·ropen_k)` materialized; `RQ`/`ALW` the current-input
+  muxes off `L`. Gates: freeze check ⇔ `hy ∨ rg`; allowlist ⇔ `rg`; `AISS` checked ⇔ `REQ`; and
+  **`Σm·(1 − hy − rg) = 0` — a Cloaked asset carries no `vPublic`.**
+- `AISS = H(isk ‖ D_I)`, `D_I` = lane 4 bit 7; `ACRED = H(rkm ‖ D_CRED)`, `D_CRED` = lane 4 bit 15 (W3's
+  placeholder, an L2 parameter).
+
+### Column accounting over 702 → **774** (test-locked in `l2p_trace_width_is_read_off_the_matrix`)
+
+| # | group | columns |
+|---|---|---|
+| 21 | program ring | 32 → 53 limbs (212 slots — exactly the program; a spare slot buys nothing at a fixed shape) |
+| 8 | roles | `sel` ×5 (`AISS`, `AFRZ`, `ACRED`, `BALLOW`, `ARKM2`), `inj` ×3 (`AISS`, `AFRZ`, `ACRED`; `ARKM2` shares `ARKM`'s) |
+| 7 | gates | `INJ_AFRZE`, `INJ_ACREDE`, `CLOSE_CRED`, `EGB`, `EGBC`, `AREGE`, `CRQ` |
+| 22 | comparisons | 2 × (`LT` ×4 + `EQ` ×4 + `C1..C3`) |
+| 14 | policy | `hy`, `rg`, `ropen`, `nz`, `vpinv`, `REQ` per input; `RQ`, `ALW` |
+| **72** | | 702 → **774** — 16 under the census's ~790 (no new accumulator), 36 under the ~810 line |
+
+Max constraint degree **4**, 4 quotient chunks (`l2p_quotient_degree_matches_the_l1`). The deg-4
+population is **57**, pinned: 21 selectors + `EG3[1]` (S's pattern) + 16 comparison transitions + 16
+bank-1 transitions (the `ALW`-gated legs) + `CLOSE_CRED`/`EGB`/`EGBC`. S's "everything new ≤ 3 by
+materialization" convention was **not** followed for those 35: materializing them costs 4–5 columns for
+no quotient benefit (4 chunks either way). Recorded as a position.
+
+### Findings for the design doc (the coordinator carries them)
+
+1. **§3.6's "Cloaked (or issuer with mint only)" is not what the ruling's "Cloaked-with-vPublic=0" says**,
+   and the ruling was built: a Cloaked leaf's rows carry `vPublic = 0`, full stop. An asset that mints
+   but has no policy is a Hybrid leaf without `redeem_open` in this v1. If the parenthetical is wanted,
+   it is one flag bit (`mint_only`) and one gate change, not a width change.
+2. **The census's "AISS same-row at AREG (0 columns)" and "bank for the root … shared with the allowlist
+   window" both assumed a boundary or a bank that turned out to be needed twice**; the layout above is
+   what actually closes, and it is 16 columns *narrower* than the census projected because the rkm
+   re-derivation the census listed at "0 other columns" is where the real binding cost was — and it
+   fits on idle banks.
+3. **Registry well-formedness is a registry-transaction invariant, not a shape-P check**: S accepts a
+   leaf with `mode = Cloaked` whatever its `freeze_root` says, so the third circuit must refuse a
+   Cloaked leaf with policy roots. Not W3 cargo; named so nobody assumes P covers it.
