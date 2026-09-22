@@ -9,5 +9,9 @@
 //! correct-semantics Keccak-f[1600] at 371 columns (vs the published
 //! 2,633-column AIR), validated against `reference::keccak_f`.
 
+//! W3 (issue #700): `l2::L2ShapeSAir`, the L2 circuit family's shape S — a
+//! new AIR type beside `narrow`, never an edit to it.
+
+pub mod l2;
 pub mod narrow;
 pub mod reference;

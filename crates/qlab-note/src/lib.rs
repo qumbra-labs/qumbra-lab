@@ -19,6 +19,7 @@ pub mod compact;
 pub mod derive;
 pub mod hash;
 pub mod kem;
+pub mod l2note;
 pub mod note;
 pub mod scan;
 pub mod wire;
