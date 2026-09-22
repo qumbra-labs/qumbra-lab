@@ -460,3 +460,53 @@ no quotient benefit (4 chunks either way). Recorded as a position.
 3. **Registry well-formedness is a registry-transaction invariant, not a shape-P check**: S accepts a
    leaf with `mode = Cloaked` whatever its `freeze_root` says, so the third circuit must refuse a
    Cloaked leaf with policy roots. Not W3 cargo; named so nobody assumes P covers it.
+
+## Stage 2 — MEASURED (2026-09-22 23:38–23:42 +08; `docs/w3-run3.md` / `w3-run4.md` + `-zh`)
+
+Rev `20723c9`, release binary directly under `/usr/bin/time -l` inside `scripts/rig run`, one shape × one
+lane per process, canary first, every row zero swap.
+
+| row | peak footprint | max RSS | prove (best of 3) | fixed B |
+|---|---|---|---|---|
+| CANARY: P AIR chain-only @ 2^19, b4 | 7.56 / 7.39 GB | 7.675 / 7.679 | 1.69 / 1.74 s | 300,293 |
+| **shape P @ 2^20, b4/q43/g22** | **15.06 / 15.11 GB** | **15.324 / 15.323** | **3.56 / 3.76 s** | **312,677** |
+| shape P, b2/q86/g22 | **NOT MEASURABLE** — see below | | | |
+
+- 🟢 **Shape P is inside the gate at b4: 15.11 GB peak footprint (max of two, 0.3 % apart), 15.32 GB max
+  RSS, against ≤ 16 GB — 5.6 % / 4.2 % margin; 3.6–3.8 s against ≤ 20 s.** Not a tuning round, not a
+  STOP. Stage 1's re-projection (15.6–15.9 GB) was 0.5–0.8 GB high because the width landed at 774, not
+  ~790; the LDE-law under-projection (~15–16 %) is unchanged at this width.
+- 🔴 **The b2 lane does not exist for a degree-4 AIR in p3-uni-stark 0.6.1.** With 4 quotient chunks the
+  quotient domain (4N) exceeds a blowup-2 LDE (2N): the PCS re-extends the trace through its iDFT
+  fallback (the canary's 10.5 GB at 2^19 b2 vs 7.6 at b4), the prover finishes, and **`verify` rejects
+  with `OodEvaluationMismatch`** — for P and (control run) for **S**. The interior lane's b2/q86 works
+  because that AIR has 2 chunks. Pinned by `l2shape_b2_is_not_a_lane_for_a_degree_4_air`. The stage-1
+  ruling's "measure at both b4 and b2; b2 is a live option" cannot be executed as written; **the second
+  lane needs a degree-3 variant** (~21 materialization columns → ~795; b2 then projects to ≈ 7.7 GB
+  [derived]). That is a change to the degree the ruling froze, so it is priced and **not built** —
+  coordinator's call.
+- **b4 is shape P's L2 lane** by default and by measurement. The thinnest margin W3 has produced, and a
+  real one (reproduced twice, swap-free). What it is *not*: a margin against a different machine's
+  allocator or a bigger registry/freeze/allow depth — every depth is an L2 parameter (§6) and each extra
+  level is one perm at fixed height (free) plus nothing in width; the height cliff is 341 perms (129
+  spare).
+- The P prover-stack tampered-PV test (`l2shape_shape_p_prove_verify_and_tampered_pv_b4`, one 2^20 b4
+  prove, 6 flipped surfaces incl. `vpa₂`/`m₂`) and the b2 pin: **2/2, 5.9 s**, sampled test-binary RSS
+  13.8 GB (1 Hz — under-samples a 20 s peak; the bench's 15.3 GB is the number).
+
+### Drafted measured-update block for `l2-own-circuit-decision.md` §2.3 (the coordinator carries it)
+
+> **Measured update (2026-09-22, [qumbra-lab PR #701](https://github.com/qumbra-labs/qumbra-lab/pull/701) — W3 stage 2, shape P built and measured, reproduced twice, zero swap; tracker [lab #700](https://github.com/qumbra-labs/qumbra-lab/issues/700)): shape P is real and inside the gate at b4; b2 is not a lane for this family.** Shape P as built: **774 columns** (702 + 72, accounted column by column and test-locked — 16 under the census's ~790 because no new equality bank was needed: every cross-row binding rides an existing bank's idle span), **212 perms → 2^20** (per input: `AISS`, `ARKM`, `AFRZ` + 20 `MERKLE`, `AREG` + 16 `MERKLE` + `BREG`, `ARKM′`, `ACRED` + 20 `MERKLE`, `BALLOW`, `ARKM″`, `ACM` + 32 `MERKLE` + `BANCHOR` = 102), max constraint degree 4 / 4 quotient chunks, 112 public values (+ `vPublic` per row: sign, four 16-bit chunks, and the revealed asset id). Gadget (a) as ruled: the indexed-Merkle low leaf `H(key_lo ‖ key_hi)` (leaf-marked, distinct from interior nodes), `key_lo < rkm < key_hi` bit-serial on `AFRZ`'s boundary rows (22 columns), one depth-20 path, **the fold's root same-row-equal to the leaf's `freeze_root` lanes at `AREG`** (zero columns — the registry opening sits after the freeze gadget for exactly this). `rkm` is chained at three boundaries and derived three times; the three derivations are tied by two windows on the third bank and the bind bank (the census's "0 other columns" re-derivation was unsound as written; this is where the binding cost was). `AISS` rides the bind bank's idle span, checked only when `REQ = nz·(1 − s·redeem_open)`. Mode read as flags: `hy`/`rg`/`redeem_open` bound bit-wise to the leaf; freeze ⇔ `hy ∨ rg`, allowlist ⇔ `rg`, **Cloaked ⇒ `vPublic = 0`** (§3.6's "issuer with mint only" parenthetical is not in v1 — one flag bit if wanted). **Measured (Apple M5 Max / 36 GiB, lab rev `20723c9`, release binary under `/usr/bin/time -l` in `scripts/rig run`, one lane per process, best of 3): b4/q43/g22 = 15.06 / 15.11 GB peak footprint, 15.32 GB max RSS, 3.56 / 3.76 s, 312,677 B fixed — inside the ≤ 16 GB / ≤ 20 s gate by 5.6 % (footprint) / 4.2 % (RSS) on RAM and 5× on time.** Two corrections to §2.3/§2.5 as amended at stage 1: (1) **the b2 lane is structurally unavailable to a degree-4 AIR in Plonky3 0.6.1** (4 quotient chunks need blowup ≥ 4; the prover re-extends and the verifier rejects with `OodEvaluationMismatch` — shape S too; the interior lane's b2 works at 2 chunks) — so "shape P is measured at both b4 and b2, its lane chosen by the larger margin" collapses to **b4, the only lane**, and a b2 option costs a degree-3 variant (~21 columns → ~795, ≈ 7.7 GB projected, not built); (2) the stage-1 P projection of 15.6–15.9 GB was 0.5–0.8 GB high (width 774, not ~790). The proof is 312,677 B (+4.9 % over S at the same height for +10 % width). The named fallback (one policy input per transaction → 2^19) is **not needed**. Registry well-formedness (a Cloaked leaf must carry no policy roots) is the registry transaction's invariant, not shape P's — named so it is not assumed covered. Runs: lab `docs/w3-run{3,4}.md`; workspace suite **not run — runner offline** (owed).
+
+### Stage 2 — status
+
+| item | state |
+|---|---|
+| carry-overs (i), (ii) | ✅ executed / built and run (`9aaa1cd`) |
+| shape P AIR, builders, policy trees, `l2shape --shape p|p19`, b2 lane | ✅ (`398210b`, `20723c9`, `a01d2bf`) |
+| the ruling's negatives + the S negatives on P | ✅ 31/31 `l2p::` (development run 1,489 s + 232 s; the scoped run below) |
+| measured at b4, reproduced twice, run docs + `-zh` | ✅ |
+| measured at b2 | ❌ **NOT MEASURABLE at degree 4** — finding, priced; a ruling is owed |
+| §2.3/§3 measured-update block | ✅ drafted above |
+| scoped test run (`-p qlab-air -p qlab-note` full, `-p qlab-bench l2` filtered) | SCOPED_STATUS |
+| workspace suite | **NOT RUN — runner offline** (owed) |
