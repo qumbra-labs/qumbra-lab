@@ -508,5 +508,5 @@ lane per process, canary first, every row zero swap.
 | measured at b4, reproduced twice, run docs + `-zh` | ✅ |
 | measured at b2 | ❌ **NOT MEASURABLE at degree 4** — finding, priced; a ruling is owed |
 | §2.3/§3 measured-update block | ✅ drafted above |
-| scoped test run (`-p qlab-air -p qlab-note` full, `-p qlab-bench l2` filtered) | ✅ **141/0/0** — `qlab-air` 95/0 (2,539 s), `qlab-note` 39/0, `qlab-bench` `l2` 5/0 + the skipped P b4 prover test 2/0 on its own; peak sampled 8.0 / 13.8 GB (`docs/w3-run4.md`) |
+| scoped test run (`-p qlab-air -p qlab-note` full, `-p qlab-bench l2` filtered) | ✅ **140 distinct tests / 0 failed** (141 result lines; the b2 pin ran twice) — `qlab-air` 95/0 (2,539 s), `qlab-note` 39/0, `qlab-bench` `l2` 5/0 + the skipped P b4 prover test 2/0 on its own; peak sampled 8.0 / 13.8 GB (`docs/w3-run4.md`) |
 | workspace suite | **NOT RUN — runner offline** (owed) |

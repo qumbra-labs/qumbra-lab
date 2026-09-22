@@ -47,7 +47,7 @@ QUMBRA_RIG_OWNER=QUM-182 scripts/rig run -- ./w3-logs/scoped.sh
 | `qlab-note` (lib) — in full | **39** (35 + 4 `l2note::`) | 0 | 0 | < 0.1 s |
 | `qlab-bench` (bin) — `l2` filtered, `--skip l2shape_shape_p_prove_verify_and_tampered_pv_b4` | **5** (`l2shape::` — lanes floor, mock, S roundtrip b4, S tampered-PV b4, the b2 pin) | 0 | 0 | 11.6 s |
 | (a) the skipped 15 GB test + the b2 pin, on their own under the same lock | **2** | 0 | 0 | 5.9 s |
-| **total** | **141** | **0** | 0 | wall (c1) 2,549 s + (c2) 13 s + (a) 25 s; sampled peak test-binary RSS at 1 Hz: **8.0 GB** (c1), 7.8 GB (c2), **13.8 GB** (a — the P prove; the bench's 15.3 GB is the true peak, 1 Hz under-samples a 4 s prove) |
+| **total** | **141** result lines = **140 distinct tests** (the b2 pin ran in both (a) and (c2)) | **0** | 0 | wall (c1) 2,549 s + (c2) 13 s + (a) 25 s; sampled peak test-binary RSS at 1 Hz: **8.0 GB** (c1), 7.8 GB (c2), **13.8 GB** (a — the P prove; the bench's 15.3 GB is the true peak, 1 Hz under-samples a 4 s prove) |
 
 Reconciled: `qlab-air` 95 = 38 (`main`) + 26 (stage 1) + 31 (stage 2); `qlab-note` 39 = 35 + 4; `qlab-bench` 5 = 6 `l2shape::` tests − 1 skipped (+ run in (a)). Negatives in the log: `FAILED` 0, `panicked at` 0, `^error` 0. The `l2p::` block is ~25 min of the 42 (31 tests, each a 2^20 × 774 `check_all_constraints`; the eight-way negatives eight of them).
 
