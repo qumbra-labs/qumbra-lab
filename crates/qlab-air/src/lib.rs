@@ -13,5 +13,6 @@
 //! new AIR type beside `narrow`, never an edit to it.
 
 pub mod l2;
+pub mod l2p;
 pub mod narrow;
 pub mod reference;
