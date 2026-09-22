@@ -503,23 +503,26 @@ mod tests {
         assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
     }
 
-    /// Shape P through the real prover at the b2/q86 lane (2^20 × 774, the
-    /// ~8 GB-class lane — the b4 twin is the bench's job, not the suite's):
-    /// the honest instance proves and verifies, then each of `anchor`, `nf₁`,
-    /// `fee`, `registry_root`, and the two vPublic surfaces (`vpa₂`, `m₂`)
-    /// flipped in turn must make `verify` Err — the L1's
-    /// `rejects_a_tampered_public_surface` pair on shape P.
+    /// Shape P through the real prover at the b4/q43 lane (2^20 × 774 — the
+    /// ~15 GB class; the local scoped run skips it by name and it was run
+    /// once on its own under the lock, see `docs/w3-run3.md`): the honest
+    /// instance proves and verifies, then each of `anchor`, `nf₁`, `fee`,
+    /// `registry_root`, and the two vPublic surfaces (`vpa₂`, `m₂`) flipped
+    /// in turn must make `verify` Err — the L1's
+    /// `rejects_a_tampered_public_surface` pair on shape P. (Not at b2: a
+    /// 4-quotient-chunk AIR does not verify at blowup 2 in p3-uni-stark
+    /// 0.6.1 — `l2shape_b2_is_not_a_lane_for_a_degree_4_air` pins that.)
     #[test]
-    fn l2shape_shape_p_prove_verify_and_tampered_pv_b2() {
+    fn l2shape_shape_p_prove_verify_and_tampered_pv_b4() {
         use qlab_air::l2::{PV_ANCHOR, PV_FEE, PV_NF1, PV_REGROOT};
         use qlab_air::l2p::{PV_VP2, PV_LEN};
         let (air, pvs) = shape_p_instance(SHAPE_P_LOG_HEIGHT);
         assert_eq!(pvs.len(), PV_LEN);
-        let config = make_config_with(&B2_CFG);
-        let trace = air.generate_trace::<Val>(B2_CFG.log_blowup);
+        let config = make_config_with(&AGG_CFG);
+        let trace = air.generate_trace::<Val>(AGG_CFG.log_blowup);
         assert_eq!(trace.width(), 774, "the shape-P width, read off the matrix prove is handed");
         let proof = prove(&config, &air, trace, &pvs);
-        verify(&config, &air, &proof, &pvs).expect("shape P must verify at b2/q86");
+        verify(&config, &air, &proof, &pvs).expect("shape P must verify at b4/q43");
         for (idx, name) in [
             (PV_ANCHOR + 2, "anchor"),
             (PV_NF1 + 5, "nf1"),
@@ -532,6 +535,34 @@ mod tests {
             bad[idx] += Val::ONE;
             assert!(verify(&config, &air, &proof, &bad).is_err(), "a proof verified against a tampered {name}");
         }
+    }
+
+    /// 🔴 Finding (stage 2): **b2 is not a lane for a degree-4 AIR** in
+    /// p3-uni-stark 0.6.1. With 4 quotient chunks and `log_blowup = 1` the
+    /// prover's quotient domain (4N) exceeds the committed LDE (2N); the PCS
+    /// falls back to re-extending the trace (`get_evaluations_on_domain`'s
+    /// iDFT path — the extra RAM the canary showed) and the verifier rejects
+    /// the proof with `OodEvaluationMismatch`. Pinned on a small chain-only
+    /// shape-P trace so the fact survives a prover bump: if this test starts
+    /// failing, b2 has become available and the stage-1 ruling's second lane
+    /// can be measured. The interior lane's b2/q86 works because that AIR has
+    /// 2 quotient chunks.
+    #[test]
+    fn l2shape_b2_is_not_a_lane_for_a_degree_4_air() {
+        let air = L2ShapePAir::chain_only(12);
+        let pvs = vec![Val::ZERO; <L2ShapePAir as BaseAir<Val>>::num_public_values(&air)];
+        let config = make_config_with(&B2_CFG);
+        let trace = air.generate_trace::<Val>(B2_CFG.log_blowup);
+        let proof = prove(&config, &air, trace, &pvs);
+        assert!(
+            verify(&config, &air, &proof, &pvs).is_err(),
+            "a 4-chunk AIR verified at b2 — the b2 lane has become available; re-measure shape P there"
+        );
+        // …and the same AIR at b4 verifies (the control).
+        let config4 = make_config_with(&AGG_CFG);
+        let trace4 = air.generate_trace::<Val>(AGG_CFG.log_blowup);
+        let proof4 = prove(&config4, &air, trace4, &pvs);
+        verify(&config4, &air, &proof4, &pvs).expect("the control at b4 must verify");
     }
 
     /// The MOCK program is the L1-shaped 84 perms plus MERKLE padding and its
