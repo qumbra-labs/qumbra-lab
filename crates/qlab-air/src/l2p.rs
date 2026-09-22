@@ -2608,3 +2608,886 @@ impl L2ShapePAir {
         state
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use p3_air::{check_all_constraints, check_constraints};
+    use p3_koala_bear::KoalaBear;
+    use p3_matrix::Matrix;
+
+    use super::*;
+    use crate::l2::ROLE_ACMOUT;
+    use crate::reference;
+
+    type F = KoalaBear;
+
+    fn zero_pvs() -> Vec<F> {
+        vec![F::ZERO; PV_LEN]
+    }
+    fn pvs_of(inst: &L2PBucketInstance) -> Vec<F> {
+        inst.pvs.iter().map(|v| F::from_u32(*v)).collect()
+    }
+    fn sat(inst: &L2PBucketInstance) -> bool {
+        let pvs = pvs_of(inst);
+        let trace = inst.air.generate_trace::<F>(0);
+        check_all_constraints(&inst.air, &trace, &pvs, Some(10)).is_ok()
+    }
+    fn digest(state: &[u64; 25]) -> [u64; 4] {
+        state[..4].try_into().unwrap()
+    }
+    fn slot_of(program: &[u32; PROGRAM_SLOTS], role: u32, nth: usize) -> usize {
+        program.iter().enumerate().filter(|(_, r)| **r == role).map(|(i, _)| i).nth(nth).unwrap()
+    }
+
+    struct Rnd(u64);
+    impl Rnd {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn d4(&mut self) -> [u64; 4] {
+            [self.next(), self.next(), self.next(), self.next()]
+        }
+        fn input(&mut self, value: u64, asset: u64) -> L2TxInput {
+            L2TxInput { sk: self.d4(), value, asset, rho: self.d4(), rseed: self.d4(), d: [self.next(), self.next()] }
+        }
+        fn output(&mut self, value: u64, asset: u64) -> L2TxOutput {
+            L2TxOutput { value, asset, rkm: self.d4(), rho: self.d4(), rseed: self.d4() }
+        }
+    }
+
+    const ISK7: [u64; 4] = [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004];
+    const ISK9: [u64; 4] = [0x15c9_0001, 0x15c9_0002, 0x15c9_0003, 0x15c9_0004];
+
+    fn frozen_keys() -> Vec<[u64; 4]> {
+        let mut r = Rnd(0xf7ee_0000_dead_beef);
+        (0..3).map(|_| r.d4()).collect()
+    }
+
+    /// Asset 7: a Hybrid stablecoin with three frozen keys, `redeem_open` per arg.
+    fn hybrid7(redeem_open: bool) -> PolicyAsset {
+        PolicyAsset::hybrid(7, ISK7, redeem_open, &frozen_keys())
+    }
+
+    /// The canonical honest shape-P instance: asset 0 (Cloaked, 100) + asset 7
+    /// (Hybrid, 50) in, 90 (asset 0) + 50 (asset 7) out, fee 10, no vPublic.
+    fn honest() -> L2PBucketInstance {
+        let mut r = Rnd(0x1234_5678_9abc_def0);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(50, 7)];
+        build_bucket_l2p(
+            SHAPE_P_LOG_HEIGHT,
+            &inputs,
+            &outputs,
+            10,
+            &[PolicyAsset::cloaked(0), hybrid7(false)],
+            [VPublic::NONE; 2],
+        )
+    }
+
+    /// A pseudo-random bucket with the given values/assets (assets 0, 7, 9
+    /// resolve to Cloaked / Hybrid / Regulated fixtures; anything else is
+    /// Cloaked). Regulated inputs are allowlisted by construction.
+    #[allow(clippy::too_many_arguments)]
+    fn bucket(
+        seed: u64,
+        v1: u64,
+        a1: u64,
+        v2: u64,
+        a2: u64,
+        o1: u64,
+        oa1: u64,
+        o2: u64,
+        oa2: u64,
+        fee: u64,
+        vp: [VPublic; 2],
+    ) -> L2PBucketInstance {
+        let mut r = Rnd(seed);
+        let inputs = [r.input(v1, a1), r.input(v2, a2)];
+        let outputs = [r.output(o1, oa1), r.output(o2, oa2)];
+        let asset_of = |a: u64, rkms: &[[u64; 4]]| match a {
+            7 => hybrid7(false),
+            9 => PolicyAsset::regulated(9, ISK9, false, &frozen_keys(), rkms),
+            x => PolicyAsset::cloaked(x),
+        };
+        let rkms: Vec<[u64; 4]> = inputs.iter().map(derive_rkm_l2).collect();
+        let assets = [asset_of(a1, &rkms), asset_of(a2, &rkms)];
+        build_bucket_l2p(SHAPE_P_LOG_HEIGHT, &inputs, &outputs, fee, &assets, vp)
+    }
+
+    #[test]
+    fn l2p_chain_only_satisfies_constraints() {
+        let air = L2ShapePAir::chain_only(10);
+        let trace = air.generate_trace::<F>(0);
+        check_constraints(&air, &trace, &zero_pvs());
+    }
+
+    #[test]
+    fn l2p_chain_matches_reference_rounds() {
+        let air = L2ShapePAir::chain_only(13);
+        let trace = air.generate_trace::<F>(0);
+        let blocks = (1usize << air.log_height) / 128;
+        for q in 0..blocks - 1 {
+            let cur = L2ShapePAir::extract_state(&trace, q);
+            let nxt = L2ShapePAir::extract_state(&trace, q + 1);
+            assert_eq!(nxt, reference::round(&cur, reference::RC[q % 24]), "block {q}");
+        }
+    }
+
+    /// The three shape-P blocks read off the trace against their host mirrors:
+    /// `AISS` = `issuer_key_of`, `AFRZ` = `freeze_leaf_hash`, `ACRED` =
+    /// `cred_of(rkm)` with `rkm` chained from `ARKM2`.
+    #[test]
+    fn l2p_policy_blocks_match_reference() {
+        let mut r = Rnd(0xb10c_0000_0000_0001);
+        let inp = r.input(5, 7);
+        let (nk, _, _) = derive_input_l2(&inp);
+        let rkm = derive_rkm_l2(&inp);
+        let (lo, hi) = (r.d4(), r.d4());
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        let mut sw = vec![L2PSlotWitness::default(); PROGRAM_SLOTS];
+        program[1] = ROLE_AISS;
+        sw[1].w[..4].copy_from_slice(&ISK7);
+        program[2] = ROLE_ARKM2;
+        sw[2].w[..4].copy_from_slice(&nk);
+        sw[2].w[5] = inp.d[0];
+        sw[2].w[6] = inp.d[1];
+        program[3] = ROLE_ACRED;
+        program[4] = ROLE_AFRZ;
+        sw[4].w[..4].copy_from_slice(&lo);
+        sw[4].w[5..9].copy_from_slice(&hi);
+        let air = L2ShapePAir { log_height: 15, program, slot_witness: sw, ..L2ShapePAir::chain_only(15) };
+        let trace = air.generate_trace::<F>(0);
+        assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 2)), issuer_key_of(&ISK7), "AISS");
+        assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 3)), rkm, "ARKM2 = rkm");
+        assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 4)), cred_of(&rkm), "ACRED");
+        assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 5)), freeze_leaf_hash(&lo, &hi), "AFRZ");
+    }
+
+    /// The bit-serial comparison: on `AFRZ`'s last boundary row the two
+    /// verdict columns read `[key_lo < rkm]` and `[rkm < key_hi]` exactly, for
+    /// keys on both sides of `rkm` (each lane order exercised).
+    #[test]
+    fn l2p_comparison_verdicts_read_off_the_trace() {
+        let mut r = Rnd(0xc0de_c0de_0000_0002);
+        let inp = r.input(5, 7);
+        let (nk, _, _) = derive_input_l2(&inp);
+        let rkm = derive_rkm_l2(&inp);
+        let cases: Vec<([u64; 4], [u64; 4])> = vec![
+            ([0; 4], KEY_MAX),
+            (rkm, KEY_MAX),                                       // key_lo = rkm: not <
+            ([0; 4], rkm),                                        // key_hi = rkm: not <
+            ([rkm[0], rkm[1], rkm[2], rkm[3].wrapping_sub(1)], KEY_MAX), // just below in the top lane
+            ([rkm[0].wrapping_add(1), rkm[1], rkm[2], rkm[3]], KEY_MAX), // above in the low lane
+            (r.d4(), r.d4()),
+        ];
+        for (lo, hi) in cases {
+            let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+            let mut sw = vec![L2PSlotWitness::default(); PROGRAM_SLOTS];
+            program[1] = ROLE_ARKM2;
+            sw[1].w[..4].copy_from_slice(&nk);
+            sw[1].w[5] = inp.d[0];
+            sw[1].w[6] = inp.d[1];
+            program[2] = ROLE_AFRZ;
+            sw[2].w[..4].copy_from_slice(&lo);
+            sw[2].w[5..9].copy_from_slice(&hi);
+            let air = L2ShapePAir { log_height: 13, program, slot_witness: sw, ..L2ShapePAir::chain_only(13) };
+            let trace = air.generate_trace::<F>(0);
+            let row = 2 * ROWS_PER_PERM_LOCAL + 63; // AFRZ's boundary, z = 63
+            let at = |blk: usize| trace.values[row * L2P_WIDTH + CMP_OFF + CMP_BLOCK * blk + CMP_C + 2];
+            assert_eq!(at(0), F::from_bool(key_lt(&lo, &rkm)), "key_lo < rkm for {lo:x?}");
+            assert_eq!(at(1), F::from_bool(key_lt(&rkm, &hi)), "rkm < key_hi for {hi:x?}");
+        }
+    }
+    const ROWS_PER_PERM_LOCAL: usize = 24 * 128;
+
+    /// The complete shape P — a Cloaked and a Hybrid input, every gadget in
+    /// the trace, no vPublic — satisfies the AIR with the real public values at 2^20.
+    #[test]
+    fn l2p_shape_p_satisfies_constraints() {
+        let inst = honest();
+        assert_eq!(inst.air.program.iter().filter(|r| **r != ROLE_DUMMY).count(), SHAPE_P_PERMS - 1);
+        assert!(inst.air.hy == [false, true] && inst.air.rg == [false, false]);
+        let pvs = pvs_of(&inst);
+        let trace = inst.air.generate_trace::<F>(0);
+        check_constraints(&inst.air, &trace, &pvs);
+    }
+
+    /// A Regulated input (freeze + allowlist both live) verifies; the same
+    /// asset on both rows (q, both Regulated) verifies with the summed close.
+    #[test]
+    fn l2p_regulated_inputs_satisfy() {
+        let a = bucket(0x9e90_0001, 100, 0, 50, 9, 90, 0, 50, 9, 10, [VPublic::NONE; 2]);
+        assert!(a.air.rg == [false, true]);
+        let pvs = pvs_of(&a);
+        let trace = a.air.generate_trace::<F>(0);
+        check_constraints(&a.air, &trace, &pvs);
+        let b = bucket(0x9e90_0002, 60, 9, 40, 9, 70, 9, 30, 9, 0, [VPublic::NONE; 2]);
+        assert!(b.air.sel_q && b.air.rg == [true, true]);
+        assert!(sat(&b), "two Regulated inputs of one asset, summed");
+    }
+
+    /// The `vPublic` edge (§3.1), positives: mint with the issuer key; redeem
+    /// on a `redeem_open` asset without it; redeem on a closed asset with it;
+    /// a mint on row 2; both rows carrying a term (two policy assets).
+    #[test]
+    fn l2p_vpublic_edges_satisfy() {
+        // Mint 100 of asset 7: 50 in + 100 minted = 150 out; asset 0 pays the fee.
+        let mint = bucket(0x0a11_0001, 100, 0, 50, 7, 90, 0, 150, 7, 10, [VPublic::NONE, VPublic::mint(100)]);
+        assert_eq!(mint.pvs[pv_vp_asset(1)], 7, "the minted asset is public");
+        assert_eq!(mint.pvs[pv_vp_asset(0)], 0, "no term on row 1 → nothing revealed");
+        assert!(sat(&mint), "mint with isk");
+        // Redeem 20 of asset 7 (closed): 50 in = 30 out + 20 redeemed, isk supplied.
+        let redeem_closed = bucket(0x0a11_0002, 100, 0, 50, 7, 90, 0, 30, 7, 10, [VPublic::NONE, VPublic::redeem(20)]);
+        assert!(sat(&redeem_closed), "closed redeem with isk");
+        // Redeem on a redeem_open asset WITHOUT the issuer key.
+        let mut r = Rnd(0x0a11_0003);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(30, 7)];
+        let mut open7 = hybrid7(true);
+        open7.isk = Some([0xbad; 4]); // a holder's guess — the leaf still carries the real issuer key
+        let real_leaf = hybrid7(true).leaf();
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [PolicyAsset::cloaked(0).leaf(), real_leaf];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let mut pol1 = open7.policy_input_for(&derive_rkm_l2(&inputs[1]), rw[1]).unwrap();
+        pol1.leaf = real_leaf;
+        let pol0 = PolicyAsset::cloaked(0).policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        let open = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root,
+            [VPublic::NONE, VPublic::redeem(20)],
+        );
+        assert!(open.air.ropen == [false, true]);
+        assert!(sat(&open), "open redeem without isk");
+        // Mint on row 1 (asset 7 is input 1), fee from row 2.
+        let mint1 = bucket(0x0a11_0004, 50, 7, 100, 0, 150, 7, 90, 0, 10, [VPublic::mint(100), VPublic::NONE]);
+        assert!(!mint1.air.sel_f1 && sat(&mint1), "mint on row 1");
+        // Two policy assets, a term each: mint 10 of 7, redeem 5 of 9 — no asset-0
+        // note is refused (fee assignment), so fee 0 still fails; give asset 0…
+        // not possible with two inputs in 7 and 9. Instead: row 1 asset 7 with
+        // a dummy? No — keep to what the 2×2 admits: redeem on both rows needs
+        // an asset-0 note, which one of the rows must be. So: asset 0 + asset 9,
+        // redeem 5 of 9 (Regulated, closed, isk supplied).
+        let two = bucket(0x0a11_0005, 100, 0, 50, 9, 90, 0, 45, 9, 10, [VPublic::NONE, VPublic::redeem(5)]);
+        assert!(sat(&two), "redeem on a Regulated row");
+    }
+
+    // -----------------------------------------------------------------------
+    // Column accounting and degree, in the q69 style.
+    // -----------------------------------------------------------------------
+
+    /// The trace width `prove` is handed: **774**, accounted column by column
+    /// over shape S's 702. Asserted against the matrix.
+    #[test]
+    fn l2p_trace_width_is_read_off_the_matrix() {
+        let air = L2ShapePAir::chain_only(10);
+        let trace = air.generate_trace::<F>(0);
+        assert_eq!(trace.width(), L2P_WIDTH, "width must be the matrix's own");
+
+        const SHAPE_S: usize = 702;
+        let ring = 21; // PR ring 32 → 53 limbs (212 program slots)
+        let roles = 5 // sel(AISS), sel(AFRZ), sel(ACRED), sel(BALLOW), sel(ARKM2) — NSEL 16 → 21
+            + 3; // inj(AISS), inj(AFRZ), inj(ACRED)                              — NINJ 7 → 10
+        let gates = 7; // INJ_AFRZE, INJ_ACREDE, CLOSE_CRED, EGB, EGBC, AREGE, CRQ
+        let comparisons = 2 * (4 + 4 + 3); // per 256-bit comparison: LT ×4, EQ ×4, C1..C3
+        let policy = 2 * 6 // hy, rg, ropen, nz, vpinv, REQ — per input
+            + 2; // RQ, ALW — the current-input muxes
+        assert_eq!(comparisons, 22);
+        assert_eq!(policy, 14);
+        assert_eq!(
+            trace.width(),
+            SHAPE_S + ring + roles + gates + comparisons + policy,
+            "width must be 702 plus exactly the columns named above"
+        );
+        assert_eq!(trace.width(), 774, "the shape-P width");
+        assert_eq!(crate::l2::L2_WIDTH, SHAPE_S, "the shape-S width this accounts over");
+    }
+
+    /// The quotient degree does not move: max constraint degree **4** (the 21
+    /// materialized role selectors + EG3[1]), 4 quotient chunks.
+    #[test]
+    fn l2p_quotient_degree_matches_the_l1() {
+        use p3_air::symbolic::{get_max_constraint_degree, get_symbolic_constraints, AirLayout};
+        let air = L2ShapePAir::chain_only(SHAPE_P_LOG_HEIGHT);
+        let layout = AirLayout::from_air::<F>(&air);
+        let deg = get_max_constraint_degree::<F, _>(&air, layout);
+        assert_eq!(deg, 4, "max constraint degree");
+        assert_eq!((deg - 1).next_power_of_two(), 4, "quotient chunks");
+        let cs = get_symbolic_constraints::<F, _>(&air, AirLayout::from_air::<F>(&air));
+        let mut hist = std::collections::BTreeMap::new();
+        for c in &cs {
+            *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
+        }
+        assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
+        assert_eq!(hist.get(&4).copied().unwrap_or(0), 22, "deg-4 constraints: 21 selectors + EG3[1]");
+    }
+
+    /// Program geometry: 212 perms, fits 2^20, the per-input order.
+    #[test]
+    fn l2p_program_geometry() {
+        let inst = honest();
+        assert_eq!(SHAPE_P_PERMS, 212);
+        assert_eq!(PROGRAM_SLOTS, 212);
+        assert!(SHAPE_P_PERMS * ROWS_PER_PERM_LOCAL <= 1 << SHAPE_P_LOG_HEIGHT);
+        assert!(SHAPE_P_PERMS * ROWS_PER_PERM_LOCAL > 1 << (SHAPE_P_LOG_HEIGHT - 1), "P does not fit 2^19");
+        let p = &inst.air.program;
+        assert_eq!(p[0], ROLE_DUMMY);
+        let mut want = vec![ROLE_ANK, ROLE_NF, ROLE_BNF1, ROLE_AISS, ROLE_ARKM, ROLE_AFRZ];
+        want.extend(std::iter::repeat(ROLE_MERKLE).take(FREEZE_DEPTH));
+        want.push(ROLE_AREG);
+        want.extend(std::iter::repeat(ROLE_MERKLE).take(REGISTRY_DEPTH));
+        want.extend([ROLE_BREG, ROLE_ARKM2, ROLE_ACRED]);
+        want.extend(std::iter::repeat(ROLE_MERKLE).take(ALLOW_DEPTH));
+        want.extend([ROLE_BALLOW, ROLE_ARKM2, ROLE_ACM]);
+        want.extend(std::iter::repeat(ROLE_MERKLE).take(MERKLE_DEPTH));
+        want.push(ROLE_BANCHOR);
+        assert_eq!(want.len(), 102);
+        assert_eq!(&p[1..1 + want.len()], &want[..], "input chain 1");
+        want[2] = ROLE_BNF2;
+        assert_eq!(&p[1 + want.len()..1 + 2 * want.len()], &want[..], "input chain 2");
+        let tail = [ROLE_ACMOUT, ROLE_BCM1, ROLE_ARHO, ROLE_ACMOUT, ROLE_BCM2, ROLE_BAL, ROLE_END];
+        assert_eq!(&p[1 + 2 * want.len()..SHAPE_P_PERMS], &tail[..]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The stage-2 negatives (lab #700 stage-1 ruling, item 2), each a real
+    // UNSAT under the honest selector assignment (the policy gadgets do not
+    // read the balance selectors; where a negative touches assets the eight
+    // assignments are iterated as in `l2.rs`).
+    // -----------------------------------------------------------------------
+
+    /// The honest fixture rebuilt with input 1's policy opening replaced.
+    fn honest_with_policy1(edit: impl FnOnce(&mut L2PolicyInput, &[u64; 4], &PolicyAsset)) -> L2PBucketInstance {
+        let mut r = Rnd(0x1234_5678_9abc_def0);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(50, 7)];
+        let assets = [PolicyAsset::cloaked(0), hybrid7(false)];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let rkm1 = derive_rkm_l2(&inputs[1]);
+        let pol0 = assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        let mut pol1 = assets[1].policy_input_for(&rkm1, rw[1]).unwrap();
+        edit(&mut pol1, &rkm1, &assets[1]);
+        build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root, [VPublic::NONE; 2],
+        )
+    }
+
+    /// 🔴 **Spend a frozen `rkm`**: the issuer freezes input 1's `rkm`; the
+    /// tree now holds `(prev, rkm)` and `(rkm, next)`. Every low leaf the
+    /// prover can open is refused — the two adjacent ones by the strict
+    /// comparisons alone (their paths are genuine), every other by range.
+    #[test]
+    fn l2p_neg_spend_frozen_rkm() {
+        let mut r = Rnd(0x1234_5678_9abc_def0);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(50, 7)];
+        let rkm1 = derive_rkm_l2(&inputs[1]);
+        let mut frozen = frozen_keys();
+        frozen.push(rkm1);
+        let frozen7 = PolicyAsset::hybrid(7, ISK7, false, &frozen);
+        assert!(frozen7.freeze.opening_for(&rkm1).is_none(), "precondition: rkm is a key");
+        let assets = [PolicyAsset::cloaked(0), frozen7.clone()];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol0 = assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        let n = frozen7.freeze.leaves.len();
+        assert_eq!(n, 5);
+        for i in 0..n {
+            let opening = frozen7.freeze.opening_at(i);
+            let kind = if opening.key_hi == rkm1 {
+                "predecessor (key_hi = rkm)"
+            } else if opening.key_lo == rkm1 {
+                "successor (key_lo = rkm)"
+            } else {
+                "unrelated leaf"
+            };
+            let pol1 = L2PolicyInput {
+                leaf: frozen7.leaf(),
+                reg_witness: rw[1],
+                freeze: opening,
+                allow: dummy_allow_witness(),
+                isk: [0; 4],
+            };
+            let bad = build_bucket_l2p_with_witnesses(
+                SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root, [VPublic::NONE; 2],
+            );
+            assert_eq!(opening.witness.fold_root(&freeze_leaf_hash(&opening.key_lo, &opening.key_hi)), frozen7.freeze.root, "every path is genuine");
+            assert!(!sat(&bad), "a frozen rkm VERIFIED through leaf {i} ({kind})");
+        }
+    }
+
+    /// 🔴 **Wrong low leaf**: a genuine leaf of the genuine tree whose range
+    /// does not contain `rkm` (the comparison refuses; the fold is fine).
+    #[test]
+    fn l2p_neg_wrong_low_leaf() {
+        let inst = honest();
+        assert!(sat(&inst), "precondition");
+        let asset = hybrid7(false);
+        let rkm1 = derive_rkm_l2(&{
+            let mut r = Rnd(0x1234_5678_9abc_def0);
+            let _ = r.input(100, 0);
+            r.input(50, 7)
+        });
+        let right = asset.freeze.opening_for(&rkm1).unwrap();
+        let wrong_ix = (0..asset.freeze.leaves.len())
+            .find(|i| asset.freeze.leaves[*i].0 != right.key_lo)
+            .unwrap();
+        let bad = honest_with_policy1(|pol, _, a| pol.freeze = a.freeze.opening_at(wrong_ix));
+        assert!(!sat(&bad), "a genuine leaf outside rkm's range VERIFIED");
+    }
+
+    /// 🔴 **Low-leaf range lie**: the range says `key_lo < rkm < key_hi` but
+    /// the leaf is not in the tree (forged bounds on a genuine path, and a
+    /// genuine leaf with one bound moved onto rkm).
+    #[test]
+    fn l2p_neg_low_leaf_range_lie() {
+        let forged = honest_with_policy1(|pol, rkm, _| {
+            pol.freeze.key_lo = [rkm[0].wrapping_sub(1), rkm[1], rkm[2], rkm[3]];
+            pol.freeze.key_hi = [rkm[0].wrapping_add(1), rkm[1], rkm[2], rkm[3]];
+        });
+        assert!(!sat(&forged), "a forged low leaf (range holds, not in the tree) VERIFIED");
+        let lo_lie = honest_with_policy1(|pol, rkm, _| pol.freeze.key_lo = *rkm);
+        assert!(!sat(&lo_lie), "key_lo = rkm VERIFIED");
+        let hi_lie = honest_with_policy1(|pol, rkm, _| pol.freeze.key_hi = *rkm);
+        assert!(!sat(&hi_lie), "key_hi = rkm VERIFIED");
+    }
+
+    /// 🔴 **Wrong sibling** in the freeze path (one sibling at level 5
+    /// replaced), and the same for the allowlist path of a Regulated input.
+    #[test]
+    fn l2p_neg_wrong_sibling() {
+        let bad = honest_with_policy1(|pol, _, _| pol.freeze.witness.siblings[5][0] ^= 1);
+        assert!(!sat(&bad), "a wrong freeze sibling VERIFIED");
+        let mut reg = bucket(0x51b1_0001, 100, 0, 50, 9, 90, 0, 50, 9, 10, [VPublic::NONE; 2]);
+        assert!(sat(&reg), "precondition: the Regulated spend verifies");
+        let s = slot_of(&reg.air.program, ROLE_ACRED, 1) + 6; // 5th MERKLE step of input 1's allow path
+        reg.air.slot_witness[s].w[0] ^= 1;
+        assert!(!sat(&reg), "a wrong allowlist sibling VERIFIED");
+    }
+
+    /// 🔴 **Mint without `isk`**: the mint from `l2p_vpublic_edges_satisfy`
+    /// with a wrong issuer secret (the leaf's issuer_key is the real one).
+    #[test]
+    fn l2p_neg_mint_without_isk() {
+        let mut r = Rnd(0x0a11_0001);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(150, 7)];
+        let assets = [PolicyAsset::cloaked(0), hybrid7(false)];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol0 = assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        let mut pol1 = assets[1].policy_input_for(&derive_rkm_l2(&inputs[1]), rw[1]).unwrap();
+        pol1.isk = [0xbad; 4];
+        let bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root,
+            [VPublic::NONE, VPublic::mint(100)],
+        );
+        assert!(!sat(&bad), "a mint without the issuer key VERIFIED");
+        // …and with the wrong isk but NO mint the instance verifies (the AISS
+        // window is unchecked when not required) — the refusal above is REQ's.
+        let outputs_ok = [outputs[0], L2TxOutput { value: 50, ..outputs[1] }];
+        let ok = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs_ok, 10, &w, anchor, &[pol0, pol1], root, [VPublic::NONE; 2],
+        );
+        assert!(sat(&ok), "a wrong isk with nothing to prove must not matter");
+    }
+
+    /// 🔴 **Redeem a non-`redeem_open` asset without `isk`** (refused), and
+    /// the `redeem_open` twin verifies (built in `l2p_vpublic_edges_satisfy`).
+    #[test]
+    fn l2p_neg_redeem_closed_without_isk() {
+        let mut r = Rnd(0x0a11_0002);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(30, 7)];
+        let assets = [PolicyAsset::cloaked(0), hybrid7(false)];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol0 = assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        let mut pol1 = assets[1].policy_input_for(&derive_rkm_l2(&inputs[1]), rw[1]).unwrap();
+        pol1.isk = [0xbad; 4];
+        let bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root,
+            [VPublic::NONE, VPublic::redeem(20)],
+        );
+        assert!(!bad.air.ropen[1]);
+        assert!(!sat(&bad), "a closed redeem without the issuer key VERIFIED");
+        // Lying `ropen = 1` is refused by the flags binding.
+        let mut lie = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root,
+            [VPublic::NONE, VPublic::redeem(20)],
+        );
+        lie.air.ropen[1] = true;
+        assert!(!sat(&lie), "a lied redeem_open VERIFIED");
+    }
+
+    /// 🔴 **`vPublic ≠ 0` on a Cloaked asset**: minting 10 of asset 0 (no
+    /// issuer, no mode bits) is refused — whatever the `hy`/`rg` witness says,
+    /// because those are bound to the leaf.
+    #[test]
+    fn l2p_neg_vpublic_on_cloaked() {
+        let mut bad = bucket(0xc10a_0001, 100, 0, 50, 7, 100, 0, 50, 7, 10, [VPublic::mint(10), VPublic::NONE]);
+        assert!(!sat(&bad), "a mint on a Cloaked asset VERIFIED");
+        bad.air.hy[0] = true; // claim Hybrid for asset 0: the mode lane refuses
+        assert!(!sat(&bad), "a mint on a Cloaked asset with a lied mode VERIFIED");
+        // A redeem on Cloaked likewise.
+        let bad2 = bucket(0xc10a_0002, 100, 0, 50, 7, 80, 0, 50, 7, 10, [VPublic::redeem(10), VPublic::NONE]);
+        assert!(!sat(&bad2), "a redeem on a Cloaked asset VERIFIED");
+    }
+
+    /// 🔴 **Allowlist path under the wrong root**: a Regulated input whose
+    /// `rkm` is NOT allowlisted opens (a) a genuine path of another holder's
+    /// credential — the leaf is not `cred(rkm)`; (b) a path under a different
+    /// allow tree — the root is not the leaf's.
+    #[test]
+    fn l2p_neg_allowlist_wrong_root() {
+        let mut r = Rnd(0xa110_0bad_0000_0001);
+        let inputs = [r.input(100, 0), r.input(50, 9)];
+        let outputs = [r.output(90, 0), r.output(50, 9)];
+        let rkm1 = derive_rkm_l2(&inputs[1]);
+        let other_rkm = r.d4();
+        // (a) the registry's asset 9 allowlists `other_rkm`, not ours.
+        let asset9 = PolicyAsset::regulated(9, ISK9, false, &frozen_keys(), &[other_rkm]);
+        assert!(asset9.policy_input_for(&rkm1, RegistryWitness { siblings: [[0; 4]; REGISTRY_DEPTH], path_bits: [false; REGISTRY_DEPTH] }).is_none());
+        let assets = [PolicyAsset::cloaked(0), asset9.clone()];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol0 = assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        let pol1 = L2PolicyInput {
+            leaf: asset9.leaf(),
+            reg_witness: rw[1],
+            freeze: asset9.freeze.opening_for(&rkm1).unwrap(),
+            allow: asset9.allow.witness_for(&cred_of(&other_rkm)).unwrap(),
+            isk: [0; 4],
+        };
+        let bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root, [VPublic::NONE; 2],
+        );
+        assert!(!sat(&bad), "another holder's credential path VERIFIED");
+        // (b) our own credential, genuinely in a DIFFERENT tree.
+        let elsewhere = AllowTree::new(&[cred_of(&rkm1)], 0xe15e_0000_0000_0001);
+        let pol1b = L2PolicyInput { allow: elsewhere.witnesses[0], ..pol1 };
+        let bad_b = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1b], root, [VPublic::NONE; 2],
+        );
+        assert!(!sat(&bad_b), "a credential path under another root VERIFIED");
+        // (c) and lying `rg = 0` to switch the allowlist off is refused by the
+        // mode binding.
+        let mut lie = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1b], root, [VPublic::NONE; 2],
+        );
+        lie.air.rg[1] = false;
+        assert!(!sat(&lie), "a lied mode (allowlist off) VERIFIED");
+        lie.air.rg[1] = true;
+        lie.air.hy[1] = true;
+        assert!(!sat(&lie), "hy ∧ rg VERIFIED");
+    }
+
+    /// 🔴 **The re-derivation lie** — the soundness anchor of the three-`ARKM`
+    /// layout: `ARKM′` (before `ACRED`) or `ARKM″` (before `ACM`) fed another
+    /// `nk` so a different `rkm` reaches the allowlist or the note. Each is
+    /// refused by its bank window (third bank / bind bank).
+    #[test]
+    fn l2p_neg_rkm_rederivation_lie() {
+        let inst = honest();
+        for (nth, name) in [(2usize, "ARKM′ (allowlist)"), (3, "ARKM″ (note)")] {
+            let mut bad = honest();
+            let s = slot_of(&bad.air.program, ROLE_ARKM2, nth);
+            bad.air.slot_witness[s].w[0] ^= 0x5eed;
+            assert!(!sat(&bad), "{name} with a different nk VERIFIED");
+        }
+        // And the first ARKM (the bank-1-bound one) lied likewise.
+        let mut bad = honest();
+        let s = slot_of(&bad.air.program, ROLE_ARKM, 1);
+        bad.air.slot_witness[s].w[0] ^= 0x5eed;
+        assert!(!sat(&bad), "ARKM with a different nk VERIFIED");
+        let _ = inst;
+    }
+
+    /// 🔴 **The public `vPublic` surface**: `vpa` not the row's asset; a term
+    /// on row 2 under `q`; a non-bool sign; a lied `nz`.
+    #[test]
+    fn l2p_neg_vpublic_surface() {
+        let mut vpa = bucket(0x0a11_0001, 100, 0, 50, 7, 90, 0, 150, 7, 10, [VPublic::NONE, VPublic::mint(100)]);
+        assert!(sat(&vpa), "precondition");
+        vpa.pvs[pv_vp_asset(1)] = 3;
+        assert!(!sat(&vpa), "a mint revealing the wrong asset VERIFIED");
+        let mut q2 = bucket(0x0a11_0777, 60, 7, 40, 7, 70, 7, 30, 7, 0, [VPublic::NONE; 2]);
+        assert!(sat(&q2), "precondition: same-asset spend");
+        // Move 10 from row 1's… no: under q the rows sum; put a term on row 2.
+        let mut q2b = bucket(0x0a11_0777, 60, 7, 40, 7, 70, 7, 40, 7, 0, [VPublic::NONE, VPublic::mint(10)]);
+        assert!(!sat(&q2b), "vPublic₂ under q VERIFIED");
+        q2b.air.vp = [VPublic::mint(10), VPublic::NONE];
+        q2b.pvs = vpa_swap(&q2b.pvs);
+        assert!(sat(&q2b), "the same mint on row 1 verifies");
+        q2.pvs[pv_vp_sign(0)] = 2;
+        assert!(!sat(&q2), "a non-bool sign VERIFIED");
+        let mut nz_lie = bucket(0x0a11_0001, 100, 0, 50, 7, 90, 0, 150, 7, 10, [VPublic::NONE, VPublic::mint(100)]);
+        nz_lie.air.vp[1] = VPublic::NONE; // the trace claims nz = 0 while the PVs carry 100
+        assert!(!sat(&nz_lie), "a lied nz VERIFIED");
+    }
+    /// Swap the two rows' vPublic public values.
+    fn vpa_swap(pvs: &[u32]) -> Vec<u32> {
+        let mut out = pvs.to_vec();
+        for i in 0..6 {
+            out.swap(PV_VP1 + i, PV_VP2 + i);
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // The shape-S negatives, re-run against shape P's AIR (they must still hold).
+    // -----------------------------------------------------------------------
+
+    fn cm_of_slot(w: &L2PSlotWitness) -> [u64; 4] {
+        let rkm: [u64; 4] = w.w[..4].try_into().unwrap();
+        let rho: [u64; 4] = w.w[5..9].try_into().unwrap();
+        let rseed: [u64; 4] = w.w[9..13].try_into().unwrap();
+        l2_cm(w.w[4], w.w[13], &rkm, &rho, &rseed)
+    }
+    fn republish(inst: &mut L2PBucketInstance, j: usize) {
+        let s = slot_of(&inst.air.program, ROLE_ACMOUT, j);
+        let cm = cm_of_slot(&inst.air.slot_witness[s]);
+        let base = if j == 0 { PV_CM1 } else { PV_CM2 };
+        for (k, c) in pv_chunks(&cm).iter().enumerate() {
+            inst.pvs[base + k] = *c;
+        }
+    }
+    /// The eight `(o1a, o2a, f1)` assignments at the witness's `q` (`l2.rs`'s
+    /// helper, same grounds).
+    fn any_assignment_satisfies(inst: &mut L2PBucketInstance) -> bool {
+        let q = inst.air.sel_q;
+        for bits in 0..8u32 {
+            inst.air.sel_o1a = bits & 1 == 1;
+            inst.air.sel_o2a = bits & 2 == 2;
+            inst.air.sel_f1 = bits & 4 == 4;
+            inst.air.sel_q = q;
+            if sat(inst) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn l2p_s_neg_output_asset_from_nowhere() {
+        let mut inst = honest();
+        let s = slot_of(&inst.air.program, ROLE_ACMOUT, 1);
+        inst.air.slot_witness[s].w[13] = 9;
+        republish(&mut inst, 1);
+        assert!(!any_assignment_satisfies(&mut inst), "an output in an asset neither input carries VERIFIED");
+    }
+
+    #[test]
+    fn l2p_s_neg_cross_asset_balance() {
+        let mut inst = bucket(0x5c05_0001, 100, 0, 50, 7, 80, 0, 60, 7, 10, [VPublic::NONE; 2]);
+        assert!(!any_assignment_satisfies(&mut inst), "cross-asset value movement VERIFIED");
+    }
+
+    #[test]
+    fn l2p_s_neg_fee_in_wrong_asset() {
+        let mut inst = bucket(0x5c05_0002, 100, 0, 50, 7, 100, 0, 40, 7, 10, [VPublic::NONE; 2]);
+        assert!(!any_assignment_satisfies(&mut inst), "a fee paid in asset 7 VERIFIED");
+    }
+
+    #[test]
+    fn l2p_s_neg_no_fee_asset_note() {
+        let mut inst = bucket(0x5c05_0003, 100, 3, 50, 7, 100, 3, 50, 7, 0, [VPublic::NONE; 2]);
+        assert!(!any_assignment_satisfies(&mut inst), "a transaction with no asset-0 note VERIFIED");
+    }
+
+    #[test]
+    fn l2p_s_neg_registry_leaf_under_wrong_root() {
+        let mut inst = honest();
+        inst.pvs[PV_REGROOT + 3] += 1;
+        assert!(!any_assignment_satisfies(&mut inst), "a forged registry root VERIFIED");
+        // Another asset's leaf (asset 5, Cloaked) genuinely opened while
+        // spending asset 7 — refused by the R = A binding.
+        let mut r = Rnd(0x1234_5678_9abc_def0);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(50, 7)];
+        let assets = [PolicyAsset::cloaked(0), PolicyAsset::cloaked(5)];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol = [
+            assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap(),
+            assets[1].policy_input_for(&derive_rkm_l2(&inputs[1]), rw[1]).unwrap(),
+        ];
+        let mut bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &pol, root, [VPublic::NONE; 2],
+        );
+        assert!(!any_assignment_satisfies(&mut bad), "opening another asset's registry leaf VERIFIED");
+    }
+
+    /// Shape S's negative 6 inverts on P: a Hybrid leaf is what P is for, and
+    /// P accepts Cloaked leaves too (a shape-S-class asset in a P transaction).
+    /// What P refuses is a leaf whose mode bits are not one of the three.
+    #[test]
+    fn l2p_s_neg_mode_bits_outside_the_three() {
+        let both = bucket(0x5c05_0006, 100, 0, 50, 7, 90, 0, 50, 7, 10, [VPublic::NONE; 2]);
+        assert!(sat(&both), "Cloaked + Hybrid verifies under P");
+        let mut r = Rnd(0x5c05_0007);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(50, 7)];
+        let mut weird = hybrid7(false);
+        weird.mode = 4; // bit 2: neither Hybrid nor Regulated nor Cloaked
+        let assets = [PolicyAsset::cloaked(0), weird];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol = [
+            assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap(),
+            assets[1].policy_input_for(&derive_rkm_l2(&inputs[1]), rw[1]).unwrap(),
+        ];
+        let mut bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &pol, root, [VPublic::NONE; 2],
+        );
+        for (hy, rg) in [(false, false), (true, false), (false, true)] {
+            bad.air.hy[1] = hy;
+            bad.air.rg[1] = rg;
+            assert!(!sat(&bad), "mode = 4 VERIFIED as hy={hy} rg={rg}");
+        }
+    }
+
+    #[test]
+    fn l2p_s_neg_q_lie_is_unsat_both_ways() {
+        let mut a = bucket(0x5c05_0008, 60, 0, 40, 0, 70, 0, 25, 0, 5, [VPublic::NONE; 2]);
+        assert!(sat(&a), "precondition: honest with q = 1");
+        for bits in 0..8u32 {
+            a.air.sel_o1a = bits & 1 == 1;
+            a.air.sel_o2a = bits & 2 == 2;
+            a.air.sel_f1 = bits & 4 == 4;
+            a.air.sel_q = false;
+            assert!(!sat(&a), "q = 0 on equal assets VERIFIED (assignment {bits})");
+        }
+        let mut b = bucket(0x5c05_0009, 100, 7, 50, 0, 100, 7, 40, 0, 10, [VPublic::NONE; 2]);
+        assert!(sat(&b), "precondition: honest with q = 0");
+        for bits in 0..8u32 {
+            b.air.sel_o1a = bits & 1 == 1;
+            b.air.sel_o2a = bits & 2 == 2;
+            b.air.sel_f1 = bits & 4 == 4;
+            b.air.sel_q = true;
+            assert!(!sat(&b), "q = 1 on distinct assets VERIFIED (assignment {bits})");
+        }
+    }
+
+    #[test]
+    fn l2p_s_public_value_negatives() {
+        let inst = honest();
+        let trace = inst.air.generate_trace::<F>(0);
+        for (idx, name) in [(PV_NF1 + 3, "nf1"), (PV_FEE, "fee"), (PV_ANCHOR, "anchor"), (PV_CM2 + 1, "cm2"), (PV_NF2 + 7, "nf2")] {
+            let mut pvs = pvs_of(&inst);
+            pvs[idx] += F::ONE;
+            assert!(!check_all_constraints(&inst.air, &trace, &pvs, Some(10)).is_ok(), "wrong {name} not caught");
+        }
+    }
+
+    #[test]
+    fn l2p_s_asset_id_is_a_16_bit_registry_index() {
+        let big = 1u64 << ASSET_BITS;
+        let mut b = honest();
+        let s = slot_of(&b.air.program, ROLE_ACMOUT, 0);
+        b.air.slot_witness[s].w[13] = big;
+        republish(&mut b, 0);
+        assert!(!any_assignment_satisfies(&mut b), "a 2^16 output asset VERIFIED");
+    }
+
+    #[test]
+    fn l2p_s_output_rho_is_still_bound() {
+        let mut inst = honest();
+        let s = slot_of(&inst.air.program, ROLE_ACMOUT, 0);
+        inst.air.slot_witness[s].w[5..9].copy_from_slice(&[0xdead_beef, 1, 2, 3]);
+        republish(&mut inst, 0);
+        assert!(!sat(&inst), "a free output seed VERIFIED on P");
+    }
+
+    // -----------------------------------------------------------------------
+    // The #219 dummy slot on P.
+    // -----------------------------------------------------------------------
+
+    fn dummy_parts() -> (L2TxInput, L2TxInput, [L2TxOutput; 2]) {
+        let real = L2TxInput {
+            sk: [0x11, 0x22, 0x33, 0x44],
+            value: 1_000,
+            asset: 7,
+            rho: [0x55, 0x66, 0x77, 0x88],
+            rseed: [0x99, 0xaa, 0xbb, 0xcc],
+            d: [0xd1, 0xd2],
+        };
+        let dummy = L2TxInput {
+            sk: [0xf00d, 0xf00e, 0xf00f, 0xf010],
+            value: 0,
+            asset: 0,
+            rho: [0xbeef01, 0xbeef02, 0xbeef03, 0xbeef04],
+            rseed: [0xcafe01, 0xcafe02, 0xcafe03, 0xcafe04],
+            d: [0, 0],
+        };
+        let outputs = [
+            L2TxOutput { value: 600, asset: 7, rkm: [2; 4], rho: [3; 4], rseed: [4; 4] },
+            L2TxOutput { value: 400, asset: 7, rkm: [5; 4], rho: [6; 4], rseed: [7; 4] },
+        ];
+        (real, dummy, outputs)
+    }
+
+    /// A one-real-input stablecoin spend with a dummy slot verifies (fee 0,
+    /// the dummy IS the asset-0 note); a forged seed under the dummy shape is
+    /// refused; a nonzero dummy value is a mint; `dv` cannot make slot 0 the dummy.
+    #[test]
+    fn l2p_dummy_shape_holds() {
+        let (real, dummy, outputs) = dummy_parts();
+        let inst = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &dummy, &outputs, 0, [VPublic::NONE; 2]);
+        assert!(inst.air.dv);
+        let pvs = pvs_of(&inst);
+        let trace = inst.air.generate_trace::<F>(0);
+        check_constraints(&inst.air, &trace, &pvs);
+        // Redeem 100 from the real input with the dummy in slot 1 (issuer-closed, isk supplied).
+        let mut outs = outputs;
+        outs[1].value = 300;
+        let redeem = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &dummy, &outs, 0, [VPublic::redeem(100), VPublic::NONE]);
+        assert!(sat(&redeem), "a redeem with a dummy slot");
+        // Forged seed under the dummy shape (option 4 on the latch).
+        let mut forged = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &dummy, &outputs, 0, [VPublic::NONE; 2]);
+        let out1 = slot_of(&forged.air.program, ROLE_ACMOUT, 1);
+        forged.air.slot_witness[out1].w[5..9].copy_from_slice(&[0xbad_5eed, 1, 2, 3]);
+        republish(&mut forged, 1);
+        assert!(!any_assignment_satisfies(&mut forged), "a forged seed under the dummy shape VERIFIED");
+        // A nonzero dummy value.
+        let mut minted = dummy.clone();
+        minted.value = 500;
+        let mut outs2 = outputs;
+        outs2[1].value = 900;
+        let mut bad = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &minted, &outs2, 0, [VPublic::NONE; 2]);
+        assert!(!any_assignment_satisfies(&mut bad), "a nonzero dummy value is a mint");
+        // A mint on the dummy's row (asset 0, Cloaked) is refused.
+        let bad2 = build_bucket_l2p_dummy1_fabricated(SHAPE_P_LOG_HEIGHT, &real, &hybrid7(false), &dummy, &outs2, 0, [VPublic::NONE, VPublic::mint(500)]);
+        assert!(!sat(&bad2), "a mint through the dummy row VERIFIED");
+    }
+}
