@@ -2348,25 +2348,49 @@ mod tests {
         let a = bucket(60, 0, 40, 0, 70, 0, 25, 0, 5);
         assert!(a.air.sel_o1a && a.air.sel_o2a && a.air.sel_f1 && a.air.sel_q);
         assert!(sat(&a), "same-asset spend: no per-row partition exists, only the sum");
-        // …and with `q` cleared on the same witness it is refused (qinv cannot
-        // invert 0), so the sum is reachable only through the bound selector.
-        let mut a_nq = bucket(60, 0, 40, 0, 70, 0, 25, 0, 5);
-        a_nq.air.sel_q = false;
-        assert!(!sat(&a_nq), "q = 0 with equal assets must be refused");
         // Fee asset on input 2: asset 7 (100) + asset 0 (50) → 100 (7) + 40 (0) + fee 10.
         let b = bucket(100, 7, 50, 0, 100, 7, 40, 0, 10);
         assert!(b.air.sel_o1a && !b.air.sel_o2a && !b.air.sel_f1 && !b.air.sel_q);
         assert!(sat(&b), "fee on input 2");
-        // …and `q` set on distinct assets is refused (the equality leg).
-        let mut b_q = bucket(100, 7, 50, 0, 100, 7, 40, 0, 10);
-        b_q.air.sel_q = true;
-        assert!(!sat(&b_q), "q = 1 with distinct assets must be refused");
         // Both outputs in the fee asset, stablecoin fully burned to… no: a
         // stablecoin input with no stablecoin output is unbalanced. Instead:
         // asset 0 pays everything, asset 7 passes through 1:1.
         let c = bucket(100, 0, 50, 7, 50, 7, 90, 0, 10);
         assert!(!c.air.sel_o1a && c.air.sel_o2a && c.air.sel_f1);
         assert!(sat(&c), "outputs swapped");
+    }
+
+    /// 🔴 The `q` lie, both directions (stage-0 ruling, the corner test's
+    /// negative twin). `q` is what makes the summed close reachable, so it is
+    /// bound both ways: clearing it on equal assets leaves `qinv · 0 = 1`
+    /// unsatisfiable, setting it on distinct assets fails `A₁ = A₂`. Each lie
+    /// is tried with every other selector assignment, on a witness that is
+    /// honest in every other respect.
+    #[test]
+    fn l2_neg_q_lie_is_unsat_both_ways() {
+        // Equal assets, `q` cleared: the honest sum (60 + 40 = 70 + 25 + 5)
+        // is only reachable through `q`.
+        let mut a = bucket(60, 0, 40, 0, 70, 0, 25, 0, 5);
+        assert!(sat(&a), "precondition: honest with q = 1");
+        for bits in 0..8u32 {
+            a.air.sel_o1a = bits & 1 == 1;
+            a.air.sel_o2a = bits & 2 == 2;
+            a.air.sel_f1 = bits & 4 == 4;
+            a.air.sel_q = false;
+            assert!(!sat(&a), "q = 0 on equal assets VERIFIED (assignment {bits})");
+        }
+        // Distinct assets, `q` set: the equality leg refuses, whatever the
+        // rows would otherwise sum to (here they even balance as a sum:
+        // 100 + 50 = 100 + 40 + 10).
+        let mut b = bucket(100, 7, 50, 0, 100, 7, 40, 0, 10);
+        assert!(sat(&b), "precondition: honest with q = 0");
+        for bits in 0..8u32 {
+            b.air.sel_o1a = bits & 1 == 1;
+            b.air.sel_o2a = bits & 2 == 2;
+            b.air.sel_f1 = bits & 4 == 4;
+            b.air.sel_q = true;
+            assert!(!sat(&b), "q = 1 on distinct assets VERIFIED (assignment {bits})");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2837,6 +2861,39 @@ mod tests {
         );
         inst.air.dv = true;
         assert!(!any_assignment_satisfies(&mut inst), "slot 0's anchor bind must fire regardless of dv");
+    }
+
+    /// 🔴 The option-4 forgery shape on the **latch** (stage-0 ruling): under
+    /// the dummy shape (`dv = 1`, slot 1 off-tree, anchor relaxed) both seeds
+    /// still derive from the REAL slot 0's nullifier, and a forged seed with
+    /// its commitment republished is refused — the latch's relaxation must not
+    /// reach the third bank. `narrow.rs`'s
+    /// `q215_dummy_composition_keeps_both_seeds_on_the_real_nullifier`, on L2.
+    #[test]
+    fn l2_dummy_shape_forged_seed_is_refused() {
+        let (real, dummy, outputs) = dummy_parts();
+        let inst = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        assert!(inst.air.dv && sat(&inst), "precondition: the honest dummy shape verifies");
+        let p = &inst.air.program;
+        let out0 = slot_of(p, ROLE_ACMOUT, 0);
+        let out1 = slot_of(p, ROLE_ACMOUT, 1);
+        let arho = slot_of(p, ROLE_ARHO, 0);
+        let seed = |sl: usize| -> [u64; 4] { inst.air.slot_witness[sl].w[5..9].try_into().unwrap() };
+        assert_eq!(seed(out0), derive_output_rho(&inst.nf[0], 0), "ρ′₀ = nf₀");
+        assert_eq!(seed(out1), derive_output_rho(&inst.nf[0], 1), "ρ′₁ = H(nf₀ ‖ D_P)");
+        assert_eq!(seed(arho), inst.nf[0], "ARHO absorbs slot 0's nullifier");
+        assert_ne!(seed(arho), inst.nf[1], "the dummy's invented nullifier feeds no seed");
+        // The forgery: output 1's seed is the prover's, the commitment is
+        // republished to open at it — every bind but the third bank holds.
+        let mut forged = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        forged.air.slot_witness[out1].w[5..9].copy_from_slice(&[0xbad_5eed, 1, 2, 3]);
+        republish(&mut forged, 1);
+        assert!(!any_assignment_satisfies(&mut forged), "a forged seed under the dummy shape VERIFIED");
+        // And output 0 the same way.
+        let mut forged0 = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        forged0.air.slot_witness[out0].w[5..9].copy_from_slice(&[0xdead_beef, 4, 5, 6]);
+        republish(&mut forged0, 0);
+        assert!(!any_assignment_satisfies(&mut forged0), "a forged ρ′₀ under the dummy shape VERIFIED");
     }
 
     /// The option-4 seed binding carries over: a prover-chosen ρ′₀ with the

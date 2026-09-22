@@ -61,6 +61,11 @@ impl L2Note {
         out
     }
 
+    /// Parse a plaintext produced by `to_plaintext`. Returns `None` on a
+    /// length mismatch, and **`None` on an asset id ≥ 2^16**: shape v1's id
+    /// space is the registry depth (`qlab_air::l2::ASSET_BITS`), and the
+    /// circuit refuses such a note on absorb — the wallet agrees by refusal,
+    /// never by truncation (stage-0 ruling on lab #700).
     pub fn from_plaintext(b: &[u8]) -> Option<L2Note> {
         if b.len() != L2_NOTE_PLAINTEXT_LEN {
             return None;
@@ -72,6 +77,9 @@ impl L2Note {
         };
         let value = rd(0);
         let asset = rd(8);
+        if asset >> qlab_air::l2::ASSET_BITS != 0 {
+            return None;
+        }
         let mut arrs = [[0u64; 4]; 3];
         let mut off = 16;
         for arr in arrs.iter_mut() {
@@ -106,6 +114,18 @@ mod tests {
         assert_eq!(pt.len(), 112, "the 112-B L2 note of §2.1");
         assert_eq!(L2Note::from_plaintext(&pt), Some(n));
         assert_eq!(L2Note::from_plaintext(&pt[..111]), None);
+    }
+
+    /// An id outside shape v1's 16-bit registry space is refused by the
+    /// parser, exactly as the circuit refuses it on absorb; 0xffff parses.
+    #[test]
+    fn l2_plaintext_refuses_an_asset_id_outside_the_registry_space() {
+        let mut n = sample(3, 0xffff);
+        assert_eq!(L2Note::from_plaintext(&n.to_plaintext()), Some(n), "0xffff is the largest legal id");
+        n.asset = 1 << qlab_air::l2::ASSET_BITS;
+        assert_eq!(L2Note::from_plaintext(&n.to_plaintext()), None, "2^16 must be refused, not truncated");
+        n.asset = u64::MAX;
+        assert_eq!(L2Note::from_plaintext(&n.to_plaintext()), None);
     }
 
     /// The asset is INSIDE the commitment: two notes equal in everything but
