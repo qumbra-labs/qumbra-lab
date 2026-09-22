@@ -4,8 +4,8 @@ Prototype lab for **Qumbra**, a post-quantum privacy-chain design exercise. This
 
 ## Ownership — read this first
 
-- **This is Larry's personal project.** It is NOT related to Larry's contract work for pqabelian (Abelian/QDay/USD9-swap, which lives under `~/develop/bidot-blochains/`). Do not frame anything here as "propose to Leo/pqabelian"; Larry is the sole decision-maker.
-- Repo is **private** (`lai3d/qumbra-lab`). Keep it that way; new sibling repos also default to `--private`.
+- **This is Larry's personal project**, unrelated to any client or employer work. Larry is the sole decision-maker; nothing here is proposed to, reviewed by, or owned by anyone else.
+- **This repo is PUBLIC as of 2026-09-22** (`qumbra-labs/qumbra-lab`). Everything committed here, including this file, is readable by strangers: no client names, no third parties' names, no local paths that describe other work. The sibling repos `qumbra-design` and `qumbra-deploy` stay private unless Larry says otherwise; new sibling repos still default to `--private`.
 - All Qumbra repos live under `~/develop/qumbra/` on disk.
 
 ## What Qumbra is, in one paragraph
@@ -16,7 +16,7 @@ A 2026 greenfield design for a post-quantum privacy L1: note-based UTXO, one glo
 
 The design docs are the **binding spec** for this repo (22 paired EN/ZH + six EN-only appendices; `qumbra-design/README.md` is the index and is authoritative on the count):
 
-- GitHub: [`lai3d/qumbra-design`](https://github.com/qumbra-labs/qumbra-design) (extracted 2026-07 from the bidot-blockchains-design notebook, history preserved)
+- GitHub: [`qumbra-labs/qumbra-design`](https://github.com/qumbra-labs/qumbra-design) — **private**; the link does not resolve for readers outside the org. Extracted 2026-07 from an earlier private notebook, history preserved.
 - Local clone: `~/develop/qumbra/qumbra-design/`
 
 Before touching the AIR, read at minimum: `transaction-model-and-anonymity-set.md` (the circuit's statement) and `performance-budget.md` (targets + the hash-choice framework). `benchmark-survey-2026-07.md` holds the sourced third-party numbers M1 validates against. Docs are EN with `-zh` pairs; EN is authoritative on technical details.
