@@ -43,6 +43,14 @@ QUMBRA_RIG_OWNER=QUM-182 scripts/rig run -- ./w3-logs/scoped.sh
 #      cargo test --release -p qlab-bench --no-fail-fast -- --test-threads=1 l2 --skip l2shape_shape_p_prove_verify_and_tampered_pv_b4
 ```
 
-SCOPED_RESULTS_ZH
+| crate / 步骤 | 通过 | 失败 | 忽略 | 时间 |
+|---|---|---|---|---|
+| `qlab-air`（lib）——全部 | **95**（37 narrow + 1 reference + 26 `l2::` + **31 `l2p::`**） | 0 | 0 | 2,539.4 s |
+| `qlab-note`（lib）——全部 | **39**（35 + 4 `l2note::`） | 0 | 0 | < 0.1 s |
+| `qlab-bench`（bin）——过滤 `l2`，`--skip l2shape_shape_p_prove_verify_and_tampered_pv_b4` | **5**（`l2shape::`——通道下限、mock、S b4 往返、S b4 篡改公开值、b2 钉子） | 0 | 0 | 11.6 s |
+| (a) 被跳过的 15 GB 测试 + b2 钉子，同一把锁下单独运行 | **2** | 0 | 0 | 5.9 s |
+| **合计** | **141** | **0** | 0 | 墙钟 (c1) 2,549 s + (c2) 13 s + (a) 25 s；1 Hz 采样的测试二进制峰值 RSS：**8.0 GB**（c1）、7.8 GB（c2）、**13.8 GB**（a——P 的 prove；bench 的 15.3 GB 才是真实峰值，1 Hz 对 4 s 的 prove 采样不足） |
+
+对账：`qlab-air` 95 = 38（`main`）+ 26（第一阶段）+ 31（第二阶段）；`qlab-note` 39 = 35 + 4；`qlab-bench` 5 = 6 个 `l2shape::` 测试 − 1 个跳过（在 (a) 中运行）。日志中的负项：`FAILED` 0、`panicked at` 0、`^error` 0。`l2p::` 块占 42 分钟中的约 25 分钟（31 个测试，每个都是 2^20 × 774 的 `check_all_constraints`；八路负项各八次）。
 
 - **工作区全套：未跑——运行器离线**（#701 的 `verify-graviton` 任务没有在线运行器；第零阶段裁定 §6 记为欠交，非豁免）。
