@@ -373,4 +373,35 @@ mod tests {
         let proof = prove(&config, &air, trace, &pvs);
         verify(&config, &air, &proof, &pvs).expect("shape S must verify at b4/q43");
     }
+
+    /// 🔴 Stage-2 carry-over (lab #700 stage-1 ruling, cargo item 0 (ii)): the
+    /// L1's `rejects_a_tampered_public_surface` pair, on L2. The honest shape-S
+    /// instance is proved ONCE at b4/q43 through the real prover; then each of
+    /// `anchor`, `nf₁`, `fee`, `registry_root` is flipped in turn in the public
+    /// values handed to `p3_uni_stark::verify`, which must Err — a proof for
+    /// one surface must not verify against another. (`l2::l2_public_value_negatives`
+    /// does the same through `check_all_constraints`; this is the prover-stack
+    /// twin, which the L2 lacked.)
+    #[test]
+    fn l2shape_shape_s_tampered_pv_is_rejected_b4() {
+        use qlab_air::l2::{PV_ANCHOR, PV_FEE, PV_NF1, PV_REGROOT};
+        let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT);
+        let config = make_config_with(&AGG_CFG);
+        let trace = air.generate_trace::<Val>(AGG_CFG.log_blowup);
+        let proof = prove(&config, &air, trace, &pvs);
+        verify(&config, &air, &proof, &pvs).expect("precondition: the honest surface verifies");
+        for (idx, name) in [
+            (PV_ANCHOR + 2, "anchor"),
+            (PV_NF1 + 5, "nf1"),
+            (PV_FEE, "fee"),
+            (PV_REGROOT + 9, "registry_root"),
+        ] {
+            let mut bad = pvs.clone();
+            bad[idx] += Val::ONE;
+            assert!(
+                verify(&config, &air, &proof, &bad).is_err(),
+                "a proof verified against a tampered {name}"
+            );
+        }
+    }
 }
