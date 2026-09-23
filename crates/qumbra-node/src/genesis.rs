@@ -534,6 +534,17 @@ pub enum GenesisError {
     KeyDoesNotMatchCommittee {
         index: usize,
     },
+    /// The L1 loader was handed an **Annulet** genesis (leading
+    /// `format_version` 32, lab #706) — refused before decoding a byte. This
+    /// is also `qumbra-node run`'s refusal until B2 lands the sequencer.
+    AnnuletGenesisNotServed,
+    /// The Annulet loader was handed a file whose leading `format_version` is
+    /// not 32 (`None`: shorter than four bytes).
+    NotAnnuletGenesis {
+        got: Option<u32>,
+    },
+    /// An Annulet genesis file is internally inconsistent.
+    BadAnnulet(&'static str),
 }
 
 impl std::fmt::Display for GenesisError {
@@ -565,6 +576,15 @@ impl std::fmt::Display for GenesisError {
             GenesisError::KeyDoesNotMatchCommittee { index } => {
                 write!(f, "signing key #{index} does not match committee₀")
             }
+            GenesisError::AnnuletGenesisNotServed => write!(
+                f,
+                "this is an Annulet (L2) genesis file (format_version 32): the L1 node \
+                 cannot run it — the Annulet node lands with B2 (lab #706)"
+            ),
+            GenesisError::NotAnnuletGenesis { got } => {
+                write!(f, "not an Annulet genesis file: leading format_version {got:?}, want 32")
+            }
+            GenesisError::BadAnnulet(why) => write!(f, "Annulet genesis: {why}"),
         }
     }
 }
@@ -719,7 +739,15 @@ impl GenesisFile {
     }
 
     /// Decode a genesis file from its on-disk bytes.
+    ///
+    /// An Annulet genesis (leading `format_version` 32) is refused **by name**
+    /// before decoding (lab #706) — never misparsed as an L1 file.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GenesisError> {
+        if crate::annulet_genesis::leading_format_version(bytes)
+            == Some(qlab_devnet::forms::ANNULET_GENESIS_FORMAT_VERSION)
+        {
+            return Err(GenesisError::AnnuletGenesisNotServed);
+        }
         bincode::deserialize(bytes).map_err(|e| GenesisError::Decode(e.to_string()))
     }
 

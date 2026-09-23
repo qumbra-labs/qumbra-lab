@@ -76,6 +76,9 @@ qlab-consensus = { path = "../qlab-consensus" }
 # the declared public surface (M10-T0-4, issue #68). Already built transitively
 # via qlab-consensus; named directly here for the verifier's reconstruction path.
 qlab-air = { path = "../qlab-air" }
+# The L2 note twin (`L2Note`, `L2_PAYLOAD_LEN`) for the Annulet genesis's
+# fee-unit notes (lab #706). Already built transitively via qlab-devnet.
+qlab-note = { path = "../qlab-note" }
 # The wallet KERNEL, for `mine` (lab #475). Two things come from here and
 # nothing else does:
 #
