@@ -540,11 +540,21 @@ pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
 pub const GENESIS_NOTES_NOT_ON_L1: &str =
     "genesis notes are served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #714)";
 
-/// The genesis notes, encoded once (they never change): `None` on an L1
-/// node. A projection of the genesis file — its hash travels in the body.
-#[derive(Default)]
-pub struct GenesisNotesView {
-    pub encoded: Option<Vec<u8>>,
+/// What the server needs to know about the node's chain form (lab #714 /
+/// #716): the form keys the `POST /v1/tx` decoder (an Annulet transaction
+/// carries its L2 surface on the wire), and the genesis notes are encoded
+/// once (they never change) — `None` on an L1 node. A projection of the
+/// genesis file; its hash travels in the body.
+pub struct FormView {
+    pub form: qlab_devnet::forms::GenesisForm,
+    pub genesis_notes: Option<Vec<u8>>,
+}
+
+impl Default for FormView {
+    /// An L1 (v4-wire) node: the historical server, which never had a form.
+    fn default() -> Self {
+        Self { form: qlab_devnet::forms::GenesisForm::V4, genesis_notes: None }
+    }
 }
 
 /// The registry projection the run loop refreshes (lab #710). `None` on an
@@ -631,7 +641,7 @@ impl DiscoveryServer {
             submits,
             None,
             Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
-            Arc::new(GenesisNotesView::default()),
+            Arc::new(FormView::default()),
         )
     }
 
@@ -646,7 +656,7 @@ impl DiscoveryServer {
         submits: mpsc::SyncSender<SubmitRequest>,
         mine: Option<crate::mine_rpc::MineServing>,
         registry: Arc<Mutex<Arc<RegistryView>>>,
-        genesis_notes: Arc<GenesisNotesView>,
+        form_view: Arc<FormView>,
     ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
@@ -726,7 +736,7 @@ impl DiscoveryServer {
                         );
                         continue;
                     }
-                    spawn_submit_handler(request, submits.clone(), Arc::clone(&inflight));
+                    spawn_submit_handler(request, submits.clone(), Arc::clone(&inflight), form_view.form);
                     continue;
                 }
 
@@ -793,7 +803,7 @@ impl DiscoveryServer {
                         Ok(snapshot.encoded.clone())
                     }
                     // Lab #714: the genesis notes (a projection of the genesis file).
-                    GENESIS_NOTES_PATH => match &genesis_notes.encoded {
+                    GENESIS_NOTES_PATH => match &form_view.genesis_notes {
                         Some(bytes) => Ok(bytes.clone()),
                         None => Err((400, GENESIS_NOTES_NOT_ON_L1.to_string())),
                     },
@@ -1015,6 +1025,7 @@ fn spawn_submit_handler(
     request: tiny_http::Request,
     submits: mpsc::SyncSender<SubmitRequest>,
     inflight: Arc<AtomicUsize>,
+    form: qlab_devnet::forms::GenesisForm,
 ) {
     // Claim a slot before spawning; the refusal must not cost a thread either.
     if inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_SUBMITS {
@@ -1029,7 +1040,7 @@ fn spawn_submit_handler(
     }
     std::thread::spawn(move || {
         let mut request = request;
-        let (code, body) = submit_verdict(&mut request, &submits);
+        let (code, body) = submit_verdict(&mut request, &submits, form);
         let _ = request
             .respond(tiny_http::Response::from_string(body).with_status_code(code));
         inflight.fetch_sub(1, Ordering::AcqRel);
@@ -1224,6 +1235,7 @@ fn mine_block_verdict(
 fn submit_verdict(
     request: &mut tiny_http::Request,
     submits: &mpsc::SyncSender<SubmitRequest>,
+    form: qlab_devnet::forms::GenesisForm,
 ) -> (u16, String) {
     // 1. The body, bounded BEFORE it is read: a declared oversize is refused on
     //    the header, an undeclared one on the byte that crosses the cap.
@@ -1244,8 +1256,9 @@ fn submit_verdict(
         return (413, format!("refused: body-too-large (> {MAX_TX_WIRE_BYTES} bytes)"));
     }
 
-    // 2. Decode — the same canonical wire the P2P layer speaks, same decoder.
-    let tx = match qlab_p2p::codec::decode_tx(&body) {
+    // 2. Decode — the same canonical wire the P2P layer speaks, same decoder,
+    //    keyed on the form (lab #716: an Annulet tx carries its L2 surface).
+    let tx = match qlab_p2p::codec::decode_tx_for(form, &body) {
         Ok(tx) => tx,
         Err(e) => return (400, format!("refused: decode {e:?}")),
     };

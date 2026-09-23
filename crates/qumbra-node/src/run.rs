@@ -2180,7 +2180,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             submit_tx,
             Some(mine),
             Arc::clone(&self.registry_view),
-            Arc::new(crate::discovery_server::GenesisNotesView { encoded: self.genesis_notes_body() }),
+            Arc::new(crate::discovery_server::FormView { form: self.form(), genesis_notes: self.genesis_notes_body() }),
         )?;
         self.refresh_registry();
         let bound = srv.addr();
