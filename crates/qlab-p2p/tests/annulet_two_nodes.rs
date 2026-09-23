@@ -17,7 +17,7 @@ use qlab_devnet::node::SimConfig;
 use qlab_devnet::pow::KeccakPow;
 use qlab_node::NodeState;
 use qlab_p2p::adapter::{NodeAdapter, EQUIVOCATION_REASON, UNSEALED_ON_ANNULET_REASON};
-use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+use qlab_p2p::n1::{BlockIngest, ChainView, CheckpointIngest, IngestOutcome, VotesOutcome};
 
 /// The mock proof verifier — accepted for B2 by the #708 ruling; B4 replaces it.
 #[derive(Clone)]
@@ -89,6 +89,32 @@ fn a_producer_and_a_follower_advance_ten_sealed_blocks_in_lockstep() {
     assert_eq!(producer.state().nullifier_count(), 16);
     assert_eq!(follower.state().nullifier_count(), 16);
     assert_eq!(producer.sealed_header_at(10), follower.sealed_header_at(10), "both serve the same sealed header");
+}
+
+/// The finality-consumer trace (lab #708): the view every telemetry surface
+/// reads says final = tip on Annulet (the committee tracker is never fed
+/// there), and the committee paths — checkpoint votes, checkpoint fast-sync
+/// — are refused by name rather than reaching an empty-committee tally.
+#[test]
+fn the_finality_view_is_the_tip_and_the_committee_paths_are_closed() {
+    use qlab_devnet::committee::Checkpoint;
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let mut a = adapter(&key);
+    assert_eq!(ChainView::finalized_height(&a), Some(0), "genesis is final");
+    let mut last = None;
+    for h in 1..=3u64 {
+        last = Some(a.seal_next_block(&key, 10 * h).expect("the producer seals"));
+        assert_eq!(ChainView::finalized_height(&a), Some(h), "final on acceptance, through the ChainView");
+    }
+    assert!(a.finality().finalized_height().is_none(), "the committee tracker stays untouched");
+    let (sealed, _) = last.unwrap();
+    let cp = Checkpoint { height: 3, block_hash: sealed.id(), root: a.state().commitment_root() };
+    assert!(matches!(a.ingest_checkpoint_votes_from(&cp, &[], true), VotesOutcome::Stale));
+    assert_eq!(a.finalized_checkpoint(), None);
+    assert_eq!(
+        a.ingest_finalized_headers(&[sealed.header]),
+        IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON)
+    );
 }
 
 #[test]

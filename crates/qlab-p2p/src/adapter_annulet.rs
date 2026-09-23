@@ -15,10 +15,13 @@
 //! loop that calls it on a cadence, the wire, the log record and `run` are
 //! B2b's.
 //!
-//! **Committee machinery is off on Annulet by construction:** the adapter's
-//! committee is empty and nothing on this path consults it; the checkpoint /
-//! vote / tally entry points get their named Annulet arms where `run` drives
-//! them (B2b), per the finality-consumer trace on lab #708.
+//! **Committee machinery is off on Annulet**, by name, not only by the empty
+//! committee (the finality-consumer trace on lab #708): checkpoint votes are
+//! `Stale` before the tally, checkpoint fast-sync is `Ignored`, and the
+//! `ChainView` finality every telemetry surface reads is the fork-choice
+//! pointer (final = tip), not the never-fed committee tracker. The `run`-side
+//! consumers (the round ledger, the boundary checkpoint, the committee
+//! gauges) get their Annulet arms with `run` (B2b).
 
 use super::*;
 use ml_dsa::{MlDsa65, VerifyingKey};

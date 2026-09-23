@@ -2601,8 +2601,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         self.chain.header(hash).is_some()
     }
     fn finalized_height(&self) -> Option<u64> {
-        // Committee checkpoints are the source of truth (as in `StubNode`).
-        self.finality.finalized_height()
+        match self.rules.form {
+            // Committee checkpoints are the source of truth (as in `StubNode`).
+            GenesisForm::V4 | GenesisForm::V5 => self.finality.finalized_height(),
+            // Lab #708 Q4: final on acceptance. The committee tracker is never
+            // fed on Annulet (no committee), so it would read `None` forever
+            // and every telemetry surface built on this view would report a
+            // stalled, degraded chain; the fork-choice pointer is the truth.
+            GenesisForm::Annulet => self.chain.finalized_height(),
+        }
     }
     fn stored_body(&self, hash: &Hash32) -> Option<BlockBody> {
         // The state machine's block store (issue #135): written inside
@@ -2768,6 +2775,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 
     fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: checkpoint fast-sync has no checkpoint to land on, and
+            // an Annulet header is judged only with its seal.
+            GenesisForm::Annulet => return IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON),
+        }
         // The tracker only advances through the roster/signature/quorum gate. Its
         // block may be ahead of our local chain on the explicit eager-fetch path;
         // this span is admitted only when its hash chain lands exactly on that
@@ -3084,6 +3097,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
         votes: &[Vote],
         explicitly_requested: bool,
     ) -> VotesOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: an Annulet net has no committee and no checkpoints —
+            // blocks are final on acceptance. A vote is no information here:
+            // `Stale` (not relayed, not penalised; the sender is on another
+            // net, like the halt arm below), and nothing reaches the tally.
+            GenesisForm::Annulet => return VotesOutcome::Stale,
+        }
         let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
             return VotesOutcome::Stale; // already finalized this variant
