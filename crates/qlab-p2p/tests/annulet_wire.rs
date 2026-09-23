@@ -68,7 +68,7 @@ fn node(id: u64, hub: &Arc<InProcHub>, key: &SequencerKey) -> Node {
 }
 
 fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
-    TxEntry {
+    let mut t = TxEntry {
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor,
@@ -77,10 +77,12 @@ fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
             bucket: ArityBucket::TwoByTwo,
             fee: FEES.tier_s,
         },
-        discovery: vec![0x00],
+        discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
         l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None }.encode(),
-    }
+    };
+    t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
+    t
 }
 
 fn run(nodes: &mut [&mut Node], rounds: u64, now: &mut u64) {

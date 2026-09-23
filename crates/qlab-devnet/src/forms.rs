@@ -64,6 +64,16 @@ pub enum GenesisForm {
 }
 
 impl GenesisForm {
+    /// The committed discovery payload width on this form (lab #714) — the
+    /// one selection point: the L1's 120-B `PAYLOAD_LEN` (104-B note + tag),
+    /// the Annulet's 128-B `L2_PAYLOAD_LEN` (112-B L2 note + tag).
+    pub fn discovery_payload_len(self) -> usize {
+        match self {
+            GenesisForm::V4 | GenesisForm::V5 => qlab_note::compact::PAYLOAD_LEN,
+            GenesisForm::Annulet => qlab_note::l2note::L2_PAYLOAD_LEN,
+        }
+    }
+
     /// Map a genesis file's `format_version` to its form set. `None` for
     /// versions this tree does not serve (v1–v3 are refused-with-a-reason
     /// history; anything above 5 is a later tree's business).

@@ -731,6 +731,10 @@ pub enum BodyError {
     L2NotTwoByTwo { index: usize },
     /// An Annulet body names a coinbase payee — the L2 has no block reward.
     CoinbaseOnAnnulet { got: usize },
+    /// An Annulet transaction's discovery payload `entry` carries an all-zero
+    /// AEAD tag — a `GenesisPlaintext`, valid only at height 0 (lab #714,
+    /// rule ii: every later output needs a full encrypted entry).
+    GenesisPlaintextInBody { index: usize, entry: usize },
     /// An Annulet transaction's surface names a registry root other than
     /// the block's parent's (lab #712, the §5 ruling): its registry openings
     /// were computed against another registry state.
@@ -1251,7 +1255,26 @@ pub fn check_tx_discovery(index: usize, tx: &TxEntry) -> Result<(), BodyError> {
         return Err(BodyError::DiscoveryNotCanonical { index });
     }
 
-    let described = contents_commitments(&recipients);
+    check_discovery_binds(index, &recipients, tx)
+}
+
+/// The discovery rule for one transaction under `form` (lab #714) — the
+/// mempool's single call, so pool and block cannot disagree.
+pub fn check_tx_discovery_for(form: crate::forms::GenesisForm, index: usize, tx: &TxEntry) -> Result<(), BodyError> {
+    match form {
+        crate::forms::GenesisForm::V4 | crate::forms::GenesisForm::V5 => check_tx_discovery(index, tx),
+        crate::forms::GenesisForm::Annulet => crate::annulet::check_tx_discovery_annulet(index, tx),
+    }
+}
+
+/// §4 rule 2, shared by both forms (lab #714): the committed region describes
+/// exactly the commitments the transaction declares, in order.
+pub(crate) fn check_discovery_binds(
+    index: usize,
+    recipients: &[RecipientBundle],
+    tx: &TxEntry,
+) -> Result<(), BodyError> {
+    let described = contents_commitments(recipients);
     let declared = &tx.public.commitments;
     let first_mismatch = if described.len() == declared.len() {
         described.iter().zip(declared).position(|(a, b)| a != b)
