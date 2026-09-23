@@ -17,6 +17,7 @@
 
 mod disclosure;
 mod geometry;
+mod l2shape;
 mod levers;
 mod m4anchor;
 mod m4assembly;
@@ -887,6 +888,20 @@ fn main() {
         }
         "disclosure" => {
             disclosure::run_disclosure(&power);
+            return;
+        }
+        "l2shape" => {
+            // W3 (lab #700): `--shape s|s20|mock118|mock240|p|p19`, optional
+            // `--only <lane substring>`; one shape per process.
+            let shape_pos = args.iter().position(|a| a == "--shape");
+            let shape = shape_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            let Some(shape) = shape else {
+                eprintln!("l2shape: `--shape s|s20|mock118|mock240|p|p19` is required");
+                std::process::exit(2);
+            };
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            l2shape::run_l2shape(&power, shape, only);
             return;
         }
         "bucket" => {
