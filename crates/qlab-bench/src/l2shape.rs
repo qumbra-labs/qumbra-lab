@@ -34,8 +34,9 @@
 //! capacity proxy and labelled with its 2197-corrected figure:
 //! - `b2/q86/g22/fp16/a16`  — the interior lane's ruled point (`m4interior`),
 //!   100.2 corrected; shape P's second lane by the stage-1 ruling.
-//! - `b4/q43/g22/fp16/a16`  — the shipping leaf point (`m4treerec::AGG_CFG`),
-//!   101.6 corrected.
+//! - `b4/q43/g22/fp16/a16`  — the L2 lane, read from `qlab_l2::L2_CFG_PROVISIONAL`
+//!   (lab #704: one source; equal in value to the M4 leaf point `AGG_CFG`,
+//!   not tied to it), 101.6 corrected.
 //! - `b8/q29/g22/fp16/a16`  — derived the same way as q43 (see `B8_CFG`).
 //! - `b16/q21/g22/fp16/a16` — the L1 consensus point; shape S only, and only
 //!   if the b8 run projects it under 32 GB (#700's canary rule; the operator
@@ -50,13 +51,13 @@ use p3_matrix::Matrix;
 use p3_air::{Air, BaseAir, DebugConstraintBuilder};
 use p3_uni_stark::{prove, verify, ProverConstraintFolder, SymbolicAirBuilder, VerifierConstraintFolder};
 use qlab_air::l2::{
-    build_bucket_l2, L2ShapeSAir, L2TxInput, L2TxOutput, PROGRAM_SLOTS, ROLE_DUMMY, ROLE_END,
-    ROLE_MERKLE, ROWS_PER_PERM, SHAPE_S_LOG_HEIGHT, SHAPE_S_PERMS,
+    L2ShapeSAir, L2TxInput, L2TxOutput, PROGRAM_SLOTS, ROLE_DUMMY, ROLE_END, ROLE_MERKLE,
+    ROWS_PER_PERM, SHAPE_S_LOG_HEIGHT, SHAPE_S_PERMS,
 };
-use qlab_air::l2p::{build_bucket_l2p, L2ShapePAir, PolicyAsset, VPublic, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
+use qlab_air::l2p::{L2ShapePAir, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
 use qlab_consensus::CONSENSUS_CFG;
+use qlab_l2::L2_CFG_PROVISIONAL as L2_CFG;
 
-use crate::m4treerec::AGG_CFG;
 use crate::{make_config_with, pc_len, Config, FriCfg, Val, RUNS};
 
 /// The b2 lane: the interior lane's ruled point (`m4interior.rs`; B″ q86 —
@@ -96,40 +97,17 @@ pub(crate) const B8_CFG: FriCfg = FriCfg {
 
 const LANES: [(&str, &str, FriCfg); 4] = [
     ("b2/q86/g22/fp16/a16", "100.2 corrected (B″)", B2_CFG),
-    ("b4/q43/g22/fp16/a16", "101.6 corrected (B″)", AGG_CFG),
+    ("b4/q43/g22/fp16/a16", "101.6 corrected (B″) — the L2 lane, provisional", L2_CFG),
     ("b8/q29/g22/fp16/a16", "≥100.9 corrected (bracketed, see B8_CFG)", B8_CFG),
     ("b16/q21/g22/fp16/a16", "100.6 corrected (B″)", CONSENSUS_CFG),
 ];
 
-/// The deterministic shape-S instance every run measures: asset 0 (100) +
-/// asset 7 (50) in, 90 (asset 0) + 50 (asset 7) out, fee 10.
+/// The deterministic shape-S instance every run measures: asset 0 (50,000) +
+/// asset 7 (30,000) in, 49,000 (asset 0) + 30,000 (asset 7) out, fee 1,000.
+/// Built by `qlab_l2::fixture` — one source for the bench and the goldens.
 fn shape_s_instance(log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
-    let mut x = 0xfeed_face_cafe_beefu64;
-    let mut rnd = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
-    let mk_in = |value: u64, asset: u64, rnd: &mut dyn FnMut() -> u64| L2TxInput {
-        sk: [rnd(), rnd(), rnd(), rnd()],
-        value,
-        asset,
-        rho: [rnd(), rnd(), rnd(), rnd()],
-        rseed: [rnd(), rnd(), rnd(), rnd()],
-        d: [rnd(), rnd()],
-    };
-    let mk_out = |value: u64, asset: u64, rnd: &mut dyn FnMut() -> u64| L2TxOutput {
-        value,
-        asset,
-        rkm: [rnd(), rnd(), rnd(), rnd()],
-        rho: [rnd(), rnd(), rnd(), rnd()],
-        rseed: [rnd(), rnd(), rnd(), rnd()],
-    };
-    let inputs = [mk_in(50_000, 0, &mut rnd), mk_in(30_000, 7, &mut rnd)];
-    let outputs = [mk_out(49_000, 0, &mut rnd), mk_out(30_000, 7, &mut rnd)];
-    let inst = build_bucket_l2(log_height, &inputs, &outputs, 1_000);
-    let pvs = inst.pvs.iter().map(|v| Val::from_u32(*v)).collect();
+    let inst = qlab_l2::fixture::shape_s_at(log_height);
+    let pvs = qlab_l2::public_values(&inst.pvs);
     (inst.air, pvs)
 }
 
@@ -218,39 +196,10 @@ fn mock_instance(perms: usize, log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
 /// 50,000) + asset 7 (Hybrid: issuer, three frozen keys, redeem closed;
 /// 30,000) in, 49,000 (asset 0) + 30,000 (asset 7) out, fee 1,000, no
 /// vPublic. Every gadget is in the trace (fixed shape); the allowlist rides
-/// the dummy path (asset 7 is not Regulated).
+/// the dummy path (asset 7 is not Regulated). Built by `qlab_l2::fixture`.
 pub(crate) fn shape_p_instance(log_height: usize) -> (L2ShapePAir, Vec<Val>) {
-    let mut x = 0xfeed_face_cafe_beefu64;
-    let mut rnd = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
-    let mk_in = |value: u64, asset: u64, rnd: &mut dyn FnMut() -> u64| L2TxInput {
-        sk: [rnd(), rnd(), rnd(), rnd()],
-        value,
-        asset,
-        rho: [rnd(), rnd(), rnd(), rnd()],
-        rseed: [rnd(), rnd(), rnd(), rnd()],
-        d: [rnd(), rnd()],
-    };
-    let mk_out = |value: u64, asset: u64, rnd: &mut dyn FnMut() -> u64| L2TxOutput {
-        value,
-        asset,
-        rkm: [rnd(), rnd(), rnd(), rnd()],
-        rho: [rnd(), rnd(), rnd(), rnd()],
-        rseed: [rnd(), rnd(), rnd(), rnd()],
-    };
-    let inputs = [mk_in(50_000, 0, &mut rnd), mk_in(30_000, 7, &mut rnd)];
-    let outputs = [mk_out(49_000, 0, &mut rnd), mk_out(30_000, 7, &mut rnd)];
-    let frozen = [[rnd(), rnd(), rnd(), rnd()], [rnd(), rnd(), rnd(), rnd()], [rnd(), rnd(), rnd(), rnd()]];
-    let assets = [
-        PolicyAsset::cloaked(0),
-        PolicyAsset::hybrid(7, [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004], false, &frozen),
-    ];
-    let inst = build_bucket_l2p(log_height, &inputs, &outputs, 1_000, &assets, [VPublic::NONE; 2]);
-    let pvs = inst.pvs.iter().map(|v| Val::from_u32(*v)).collect();
+    let inst = qlab_l2::fixture::shape_p_at(log_height);
+    let pvs = qlab_l2::public_values(&inst.pvs);
     (inst.air, pvs)
 }
 
@@ -497,7 +446,7 @@ mod tests {
         let bits_conservative = 29.0 * 2.72 + 22.0;
         assert!(bits_conservative >= 100.0, "{bits_conservative}");
         assert!(28.0 * 2.72 + 22.0 < 100.0, "q28 does not clear the conservative end");
-        assert_eq!(AGG_CFG.label(), "b4/q43/g22/fp16/a16");
+        assert_eq!(L2_CFG.label(), "b4/q43/g22/fp16/a16");
         assert_eq!(CONSENSUS_CFG.label(), "b16/q21/g22/fp16/a16");
         assert_eq!(B2_CFG.label(), "b2/q86/g22/fp16/a16");
         assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
@@ -518,8 +467,8 @@ mod tests {
         use qlab_air::l2p::{PV_VP2, PV_LEN};
         let (air, pvs) = shape_p_instance(SHAPE_P_LOG_HEIGHT);
         assert_eq!(pvs.len(), PV_LEN);
-        let config = make_config_with(&AGG_CFG);
-        let trace = air.generate_trace::<Val>(AGG_CFG.log_blowup);
+        let config = make_config_with(&L2_CFG);
+        let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
         assert_eq!(trace.width(), 774, "the shape-P width, read off the matrix prove is handed");
         let proof = prove(&config, &air, trace, &pvs);
         verify(&config, &air, &proof, &pvs).expect("shape P must verify at b4/q43");
@@ -559,8 +508,8 @@ mod tests {
             "a 4-chunk AIR verified at b2 — the b2 lane has become available; re-measure shape P there"
         );
         // …and the same AIR at b4 verifies (the control).
-        let config4 = make_config_with(&AGG_CFG);
-        let trace4 = air.generate_trace::<Val>(AGG_CFG.log_blowup);
+        let config4 = make_config_with(&L2_CFG);
+        let trace4 = air.generate_trace::<Val>(L2_CFG.log_blowup);
         let proof4 = prove(&config4, &air, trace4, &pvs);
         verify(&config4, &air, &proof4, &pvs).expect("the control at b4 must verify");
     }
@@ -589,8 +538,8 @@ mod tests {
     #[test]
     fn l2shape_shape_s_prove_verify_roundtrip_b4() {
         let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT);
-        let config = make_config_with(&AGG_CFG);
-        let trace = air.generate_trace::<Val>(AGG_CFG.log_blowup);
+        let config = make_config_with(&L2_CFG);
+        let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
         let proof = prove(&config, &air, trace, &pvs);
         verify(&config, &air, &proof, &pvs).expect("shape S must verify at b4/q43");
     }
@@ -607,8 +556,8 @@ mod tests {
     fn l2shape_shape_s_tampered_pv_is_rejected_b4() {
         use qlab_air::l2::{PV_ANCHOR, PV_FEE, PV_NF1, PV_REGROOT};
         let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT);
-        let config = make_config_with(&AGG_CFG);
-        let trace = air.generate_trace::<Val>(AGG_CFG.log_blowup);
+        let config = make_config_with(&L2_CFG);
+        let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
         let proof = prove(&config, &air, trace, &pvs);
         verify(&config, &air, &proof, &pvs).expect("precondition: the honest surface verifies");
         for (idx, name) in [

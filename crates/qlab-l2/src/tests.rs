@@ -14,9 +14,8 @@ fn l2_cfg_provisional_is_value_locked() {
     assert_eq!(L2_CFG_PROVISIONAL.log_final_poly_len, 4);
     assert_eq!(L2_CFG_PROVISIONAL.max_log_arity, 4);
     assert_eq!(L2_CFG_PROVISIONAL.label(), "b4/q43/g22/fp16/a16");
-    // 2197-corrected: 43 × 1.853 + 22 ≥ 100 (the capacity proxy is asserted
-    // inside make_config_with).
-    assert!(43.0 * 1.853 + 22.0 >= 100.0);
+    // 2197-corrected: 43 × 1.853 + 22 = 101.6 ≥ 100; the capacity proxy
+    // (43 × 2 + 22 = 108) is asserted inside make_config_with.
     let _ = make_config_l2();
 }
 

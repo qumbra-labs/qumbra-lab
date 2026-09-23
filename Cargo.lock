@@ -1545,6 +1545,7 @@ dependencies = [
  "qlab-consensus",
  "qlab-devnet",
  "qlab-disclosure",
+ "qlab-l2",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",

@@ -19,6 +19,12 @@ use qlab_air::l2::l2_cm;
 /// Serialized L2 note plaintext length: the L1's 104 plus the 8-B asset.
 pub const L2_NOTE_PLAINTEXT_LEN: usize = crate::note::NOTE_PLAINTEXT_LEN + 8;
 
+/// The L2 committed discovery payload: the 112-B L2 note plaintext plus the
+/// 16-B AEAD tag — [`crate::compact::PAYLOAD_LEN`]'s L2 twin (104 + 16 = 120
+/// there, 112 + 16 = **128** here; l2-roadmap A1 pins the constant, B5 frames
+/// it into the Annulet body and C1 decodes it).
+pub const L2_PAYLOAD_LEN: usize = L2_NOTE_PLAINTEXT_LEN + 16;
+
 /// An L2 output note.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct L2Note {
@@ -178,5 +184,41 @@ mod tests {
         let recovered = |n: &L2Note, j: usize| L2Note { rho: derive_output_rho(&inst.nf[0], j), ..*n };
         assert_eq!(recovered(&out0, 0).commitment(), inst.cm_out[0], "output 0 cm must match circuit");
         assert_eq!(recovered(&out1, 1).commitment(), inst.cm_out[1], "output 1 cm must match circuit");
+    }
+
+    /// The discovery payload width, derived and pinned.
+    #[test]
+    fn l2_payload_len_is_128() {
+        assert_eq!(L2_NOTE_PLAINTEXT_LEN, 112);
+        assert_eq!(L2_PAYLOAD_LEN, 128);
+        assert_eq!(L2_PAYLOAD_LEN - crate::compact::PAYLOAD_LEN, 8, "the asset lane, nothing else");
+    }
+
+    /// The v1 note block, hard-coded both ways (lab #704): the 112-B plaintext
+    /// of one fixed note and its commitment `cm = H(value ‖ asset ‖ rkm ‖ rho
+    /// ‖ rseed)`. Both literals were computed OUTSIDE this crate — the bytes
+    /// by `struct.pack('<QQ…')`, the `cm` by an independent Python Keccak-f
+    /// (checked against Keccak-256("") = c5d24601…) — so a change to the
+    /// packing, the lane order or the pad fails here by name.
+    #[test]
+    fn l2_golden_note_block() {
+        let n = L2Note {
+            value: 0x0102_0304_0506_0708,
+            asset: 7,
+            rkm: core::array::from_fn(|i| 0x1111_1111_1111_1101 + i as u64),
+            rho: core::array::from_fn(|i| 0x2222_2222_2222_2201 + i as u64),
+            rseed: core::array::from_fn(|i| 0x3333_3333_3333_3301 + i as u64),
+        };
+        const PLAINTEXT_HEX: &str = "0807060504030201070000000000000001111111111111110211111111111111\
+                                     0311111111111111041111111111111101222222222222220222222222222222\
+                                     0322222222222222042222222222222201333333333333330233333333333333\
+                                     03333333333333330433333333333333";
+        let hex: String = n.to_plaintext().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, PLAINTEXT_HEX.replace(' ', ""), "the v1 L2 note plaintext");
+        assert_eq!(
+            n.commitment(),
+            [0x4cf6_4eb8_8c6b_d549, 0x3ac0_64e2_e1f4_5669, 0x37ae_63a6_7c2d_9ec3, 0x2eed_9959_42cb_9af0],
+            "the v1 L2 note commitment"
+        );
     }
 }
