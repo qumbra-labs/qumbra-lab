@@ -481,6 +481,9 @@ pub enum NodeError {
 pub(crate) struct AnnuletSetup {
     fees: qlab_devnet::annulet::L2FeeTable,
     registry: crate::registry_store::MemRegistryStore,
+    /// The genesis notes' commitments, in genesis order (lab #710, B1 P13):
+    /// the fee unit's Phase-0 supply, applied at height 0.
+    genesis_cms: Vec<Hash32>,
 }
 
 impl AnnuletSetup {
@@ -488,6 +491,7 @@ impl AnnuletSetup {
     /// on genesis load too), refusing a mismatch by name.
     fn bound_to(
         genesis_header: &BlockHeader,
+        genesis_notes: &[qlab_devnet::annulet::GenesisNote],
         fees: qlab_devnet::annulet::L2FeeTable,
         leaves: &[crate::registry_store::RegistryLeaf],
     ) -> Result<Self, NodeError> {
@@ -497,7 +501,7 @@ impl AnnuletSetup {
         if header_root != registry.root_bytes() {
             return Err(NodeError::RegistryRootMismatch { height: 0, header: header_root, store: registry.root_bytes() });
         }
-        Ok(Self { fees, registry })
+        Ok(Self { fees, registry, genesis_cms: genesis_notes.iter().map(|n| n.cm).collect() })
     }
 }
 
@@ -786,6 +790,9 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// The asset registry (lab #710): `Some` exactly on an Annulet node,
     /// bound to every header's `registry_root`.
     registry: Option<crate::registry_store::MemRegistryStore>,
+    /// The Annulet genesis notes' commitments (empty on L1), kept so a
+    /// rebuild from genesis re-applies them.
+    annulet_genesis_cms: Vec<Hash32>,
 }
 
 /// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
@@ -851,7 +858,7 @@ impl MemNode {
             qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
-        let setup = AnnuletSetup::bound_to(&genesis_header, fees, registry)?;
+        let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
         let node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
@@ -1607,6 +1614,18 @@ impl MemNode {
                 let mut node = Self::from_bound_genesis(form, genesis, dir);
                 node.annulet_fees = Some(setup.fees);
                 node.registry = Some(setup.registry);
+                // Lab #710 (B1 P13): the genesis notes enter the commitment
+                // tree at height 0, in genesis order, through the append every
+                // block's outputs take — so the genesis anchor is the tree over
+                // them and block 1 anchors on it. They spend nothing (no
+                // nullifiers); their discovery payloads are B5's.
+                node.roots_by_height.clear();
+                node.anchor_heights_by_root.clear();
+                for cm in &setup.genesis_cms {
+                    node.append_commitment(*cm);
+                }
+                node.record_root_at(0);
+                node.annulet_genesis_cms = setup.genesis_cms;
                 let g = node.chain.genesis_block_hash();
                 node.chain.set_finalized(g).expect("genesis is final on acceptance (lab #708 Q4)");
                 node
@@ -1644,6 +1663,7 @@ impl MemNode {
             form,
             annulet_fees: None,
             registry: None,
+            annulet_genesis_cms: Vec::new(),
         }
     }
 
@@ -1653,8 +1673,8 @@ impl MemNode {
     /// params, and **genesis is final on acceptance** (Q4), so the genesis
     /// root is a valid anchor for block 1.
     ///
-    /// The genesis notes are bound, not applied — applying them to the
-    /// commitment tree is B3's (lab #706 P13). A data dir is B2b's (the
+    /// The genesis notes are bound **and applied** to the commitment tree at
+    /// height 0 (lab #710, B1 P13 — B3's). A data dir is B2b's (the
     /// Annulet log record); this constructor has none.
     pub fn in_memory_annulet(
         genesis_header: BlockHeader,
@@ -1667,7 +1687,7 @@ impl MemNode {
             qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
-        let setup = AnnuletSetup::bound_to(&genesis_header, fees, registry)
+        let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)
             .unwrap_or_else(|e| panic!("the Annulet genesis must bind its registry (lab #710): {e}"));
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         MemNode::from_genesis_with(GenesisForm::Annulet, genesis, None, Some(setup))
@@ -1714,7 +1734,17 @@ impl MemNode {
     }
 
     fn restore_from_snapshot(&mut self, snap: &Snapshot) {
-        for cm in &snap.commitments {
+        // Lab #710: an Annulet genesis has already appended its notes (the
+        // node was built from genesis before the snapshot is laid over it),
+        // and the snapshot's commitments begin with those same notes — the
+        // genesis hash matched, and the header binds them. Append only what
+        // follows; an L1 genesis holds none, so there it is every entry.
+        let held = self.commitments_ordered.len();
+        assert!(
+            snap.commitments.starts_with(&self.commitments_ordered),
+            "a snapshot of this genesis begins with the genesis commitments (lab #710)"
+        );
+        for cm in &snap.commitments[held..] {
             self.commitments.append(*cm);
         }
         self.commitments_ordered = snap.commitments.clone();
@@ -1929,7 +1959,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     }
 
     fn annulet_setup(&self) -> Option<AnnuletSetup> {
-        Some(AnnuletSetup { fees: self.annulet_fees?, registry: self.registry.clone()? })
+        Some(AnnuletSetup {
+            fees: self.annulet_fees?,
+            registry: self.registry.clone()?,
+            genesis_cms: self.annulet_genesis_cms.clone(),
+        })
     }
 
     /// Lab #710 Q6: an applied Annulet header must name this node's registry.
@@ -1964,6 +1998,24 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// leaf it matures plus its own output commitments, insert its nullifiers, and
     /// record the resulting root at this height. Used by both
     /// [`Self::apply_block`] and replay.
+    /// Append one output commitment — the one append every output takes: a
+    /// block's matured coinbase leaf and its transactions' outputs, and an
+    /// Annulet genesis's notes (lab #710).
+    fn append_commitment(&mut self, cm: Hash32) {
+        self.commitments.append(cm);
+        self.commitments_ordered.push(cm);
+    }
+
+    /// Record the commitment root after the outputs at `height` — the anchor
+    /// index every block (and an Annulet genesis) enters.
+    fn record_root_at(&mut self, height: u64) {
+        let root = self.commitments.root_bytes();
+        self.roots_by_height.insert(height, root);
+        let heights = self.anchor_heights_by_root.entry(root).or_default();
+        debug_assert!(heights.last().is_none_or(|h| *h < height));
+        heights.push(height);
+    }
+
     fn apply_state(&mut self, block: &StoredBlock) -> Result<Hash32, NodeError> {
         // The funnel guard (issue #77): every state mutation — fresh application
         // and disk-log replay alike — passes through here, so the header/body
@@ -2027,13 +2079,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             .put_block(block.clone())
             .map_err(NodeError::Chain)?;
         if let Some(cb) = matured {
-            self.commitments.append(cb);
-            self.commitments_ordered.push(cb);
+            self.append_commitment(cb);
         }
         for tx in &block.txs {
             for cm in &tx.commitments {
-                self.commitments.append(*cm);
-                self.commitments_ordered.push(*cm);
+                self.append_commitment(*cm);
             }
             for nf in &tx.nullifiers {
                 self.nullifiers.insert(*nf);
@@ -2048,11 +2098,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.names
             .apply_block_riders(block.header.height, block.txs.iter().map(|t| t.rider.as_slice()))
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
-        let root = self.commitments.root_bytes();
-        self.roots_by_height.insert(block.header.height, root);
-        let heights = self.anchor_heights_by_root.entry(root).or_default();
-        debug_assert!(heights.last().is_none_or(|height| *height < block.header.height));
-        heights.push(block.header.height);
+        self.record_root_at(block.header.height);
         // Issue #198: a block back in the applied chain is servable from the applied
         // store again, so the archive copy is dropped — and the archive is pruned to
         // the depth a rewind could still reach from the new tip. Guarded on
