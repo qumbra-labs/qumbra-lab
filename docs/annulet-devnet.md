@@ -18,7 +18,10 @@ The Annulet devnet is one sequencer, two followers and a fee-unit faucet, runnin
   - Its stock is the genesis notes its key owns, less every note whose nullifier is already on chain, so a restart never re-offers a granted note.
   - It refuses to start, by name, on an L1 genesis, on an Annulet genesis that is not the devnet's, and on a node that would be the sequencer.
   - It has no tickets and no rate limit: the stock is 16 grants.
-- **`POST /v1/tx` decodes by form.** Before B6 the node's HTTP submit surface decoded the L1 tx wire, so an Annulet transaction could not be submitted over HTTP at all. It now uses `decode_tx_for(form, …)`.
+- **`POST /v1/tx` decodes and caps by form: two findings in one route.**
+  - **The decode.** Before B6 the node's HTTP submit surface decoded the L1 tx wire, so an Annulet transaction could not be submitted over HTTP at all. It now uses `decode_tx_for(form, …)`.
+  - **The body cap.** The cap was 256 KiB, sized for the L1 proof, and it refused every L2 transaction: S is 288,332 B and P about 317 KB. The first lane run found it. It is now `max_tx_wire_bytes(form)`: L1 is unchanged, and Annulet is 512 KiB `[devnet-placeholder]`, which moves when the provisional lane's wire moves.
+  - **For whoever next touches this route:** any constant in it that was sized for the L1 transaction must be checked against the L2 one.
 
 ## How to run it
 
