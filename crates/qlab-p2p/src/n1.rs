@@ -196,6 +196,15 @@ pub trait ChainView {
     fn genesis_form(&self) -> qlab_devnet::forms::GenesisForm {
         qlab_devnet::forms::GenesisForm::V4
     }
+
+    /// The header named by `hash` as its **message unit** (lab #708): the
+    /// bare header on an L1 net; the sealed header on an Annulet net, whose
+    /// headers never travel without their seal. `None` when this node cannot
+    /// serve it (unknown — or, on an Annulet net, the unsealed genesis). The
+    /// default is the L1 answer; `NodeAdapter` overrides it by form.
+    fn wire_header(&self, hash: &Hash32) -> Option<crate::codec::WireHeader> {
+        self.header(hash).map(crate::codec::WireHeader::L1)
+    }
     fn tip_hash(&self) -> Hash32;
     fn tip_height(&self) -> u64;
     /// A header by its hash, if known (on any fork).
@@ -379,7 +388,30 @@ pub trait BlockIngest {
         }
         self.ingest_header(header)
     }
+
+    /// Ingest a header as it arrived on the wire (lab #708). The default
+    /// serves L1 headers and ignores a sealed one — a node without a
+    /// sequencer path cannot judge it; `NodeAdapter` overrides by form.
+    fn ingest_wire_header(&mut self, header: crate::codec::WireHeader) -> IngestOutcome {
+        match header {
+            crate::codec::WireHeader::L1(h) => self.ingest_header(h),
+            crate::codec::WireHeader::Sealed(_) => IngestOutcome::Ignored(SEALED_UNSERVED_REASON),
+        }
+    }
+
+    /// Ingest a full block whose header arrived as a message unit (lab #708);
+    /// see [`Self::ingest_wire_header`].
+    fn ingest_wire_block(&mut self, header: crate::codec::WireHeader, body: BlockBody) -> IngestOutcome {
+        match header {
+            crate::codec::WireHeader::L1(h) => self.ingest_block(h, body),
+            crate::codec::WireHeader::Sealed(_) => IngestOutcome::Ignored(SEALED_UNSERVED_REASON),
+        }
+    }
 }
+
+/// [`BlockIngest`]'s default answer to a sealed header: not a peer fault — the
+/// sender is on a sequencer net this node does not run.
+pub const SEALED_UNSERVED_REASON: &str = "sealed header on a node without a sequencer path";
 
 /// The transaction mempool, from the P2P layer's point of view.
 pub trait TxPool {

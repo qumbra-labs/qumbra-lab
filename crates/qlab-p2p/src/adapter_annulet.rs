@@ -101,7 +101,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             );
             return IngestOutcome::Rejected(EQUIVOCATION_REASON);
         }
-        self.insert_validated_header(sealed.header)
+        let outcome = self.insert_validated_header(sealed.header);
+        if outcome == IngestOutcome::Accepted {
+            self.pending_seals.insert(id, (sealed.header.height, sealed.sig.clone()));
+        }
+        outcome
     }
 
     /// Ingest a sealed block: the header (if new), then the body through the
@@ -129,6 +133,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 if self.chain.set_finalized(id).is_err() {
                     return IngestOutcome::Rejected("annulet final-on-acceptance refused by fork choice");
                 }
+                // The store holds this seal now; nothing at or below a final
+                // height can still be waiting for its body.
+                let applied = sealed.header.height;
+                self.pending_seals.retain(|_, (h, _)| *h > applied);
                 IngestOutcome::Accepted
             }
             Err(NodeError::Body(e)) => match Self::body_fault_class(&e) {
@@ -177,7 +185,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// for genesis, which is unsealed, and for unknown heights).
     pub fn sealed_header_at(&self, height: u64) -> Option<SealedHeader> {
         let id = self.chain.main_chain_hash_at(height)?;
-        self.state.chain().block(&id)?.sealed_header()
+        self.sealed_header_by_id(&id)
+    }
+
+    /// The sealed header named by `id`: from the store once its block is
+    /// applied, from the pending-seal map while only its header is known.
+    pub fn sealed_header_by_id(&self, id: &Hash32) -> Option<SealedHeader> {
+        if let Some(s) = self.state.chain().block(id).and_then(|b| b.sealed_header()) {
+            return Some(s);
+        }
+        let (_, sig) = self.pending_seals.get(id)?;
+        Some(SealedHeader { header: *self.chain.header(id)?, sig: sig.clone() })
+    }
+
+    /// Seals held for headers whose block is not applied yet (telemetry and
+    /// tests; bounded by the header-first window).
+    pub fn pending_seal_count(&self) -> usize {
+        self.pending_seals.len()
     }
 }
 

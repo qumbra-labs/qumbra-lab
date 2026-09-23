@@ -330,6 +330,11 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     sequencer_key: Option<ml_dsa::VerifyingKey<ml_dsa::MlDsa65>>,
     /// Refused equivocations (lab #708): `(height, kept id, refused id)`.
     equivocations: Vec<(u64, Hash32, Hash32)>,
+    /// Seals of accepted Annulet headers whose block is not applied yet
+    /// (lab #708): `id → (height, seal)`, so a header-first node can re-serve
+    /// the sealed unit. An applied block's seal lives in the store instead,
+    /// and its entry (and every entry at or below it) is dropped then.
+    pending_seals: HashMap<Hash32, (u64, Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]>)>,
 }
 
 /// **A finalize record this node refused to write, and why** (issue #204, from the
@@ -873,6 +878,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             breq_observed: 0,
             sequencer_key: None,
             equivocations: Vec::new(),
+            pending_seals: HashMap::new(),
         }
     }
 
@@ -2600,6 +2606,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     fn has_header(&self, hash: &Hash32) -> bool {
         self.chain.header(hash).is_some()
     }
+    fn wire_header(&self, hash: &Hash32) -> Option<crate::codec::WireHeader> {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => self.chain.header(hash).copied().map(crate::codec::WireHeader::L1),
+            GenesisForm::Annulet => self.sealed_header_by_id(hash).map(crate::codec::WireHeader::Sealed),
+        }
+    }
     fn finalized_height(&self) -> Option<u64> {
         match self.rules.form {
             // Committee checkpoints are the source of truth (as in `StubNode`).
@@ -2762,6 +2774,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
+    fn ingest_wire_header(&mut self, header: crate::codec::WireHeader) -> IngestOutcome {
+        match header {
+            crate::codec::WireHeader::L1(h) => self.ingest_header(h),
+            crate::codec::WireHeader::Sealed(s) => NodeAdapter::ingest_sealed_header(self, &s),
+        }
+    }
+
+    fn ingest_wire_block(&mut self, header: crate::codec::WireHeader, body: BlockBody) -> IngestOutcome {
+        match header {
+            crate::codec::WireHeader::L1(h) => self.ingest_block(h, body),
+            crate::codec::WireHeader::Sealed(s) => NodeAdapter::ingest_sealed_block(self, &s, body),
+        }
+    }
+
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
         match self.rules.form {
             GenesisForm::V4 | GenesisForm::V5 => {}
