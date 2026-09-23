@@ -345,6 +345,7 @@ impl Default for L2SlotWitness {
 }
 
 /// Shape S of the L2 circuit family.
+#[cfg_attr(test, derive(Clone))] // the test fan-out needs owned copies; non-test build unchanged
 pub struct L2ShapeSAir {
     pub log_height: usize,
     /// 5-bit role code per program slot (period 128 perms).
@@ -1363,6 +1364,7 @@ pub struct L2TxOutput {
 }
 
 /// Everything a prover/verifier pair needs for one shape-S instance.
+#[cfg_attr(test, derive(Clone))] // the test fan-out needs owned copies; non-test build unchanged
 pub struct L2BucketInstance {
     pub air: L2ShapeSAir,
     pub pvs: Vec<u32>,

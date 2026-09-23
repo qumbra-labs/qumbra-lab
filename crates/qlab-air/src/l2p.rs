@@ -396,6 +396,7 @@ impl Default for L2PSlotWitness {
 }
 
 /// Shape P of the L2 circuit family.
+#[cfg_attr(test, derive(Clone))] // the test fan-out needs owned copies; non-test build unchanged
 pub struct L2ShapePAir {
     pub log_height: usize,
     pub program: [u32; PROGRAM_SLOTS],
@@ -1775,6 +1776,7 @@ pub struct L2PolicyInput {
 }
 
 /// Everything a prover/verifier pair needs for one shape-P instance.
+#[cfg_attr(test, derive(Clone))] // the test fan-out needs owned copies; non-test build unchanged
 pub struct L2PBucketInstance {
     pub air: L2ShapePAir,
     pub pvs: Vec<u32>,

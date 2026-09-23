@@ -15,4 +15,7 @@ p3-matrix = "=0.6.1"
 # is cross-checked against.
 p3-keccak = "=0.6.1"
 p3-koala-bear = "=0.6.1"
+# The L2 test block's constraint scanner runs its rows on rayon (lab #700
+# baton 3, `src/l2test.rs`); same pin and feature as qlab-bench's.
+p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"] }
 p3-symmetric = "=0.6.1"

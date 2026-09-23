@@ -14,5 +14,7 @@
 
 pub mod l2;
 pub mod l2p;
+#[cfg(test)]
+pub mod l2test;
 pub mod narrow;
 pub mod reference;
