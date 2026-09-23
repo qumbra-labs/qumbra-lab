@@ -257,7 +257,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let genesis = GenesisFile::load(&node_cfg.genesis_file)?;
 
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis.form()?);
 
     let limits = FaucetLimits {
         ticket_policy: if svc.tickets_required() {

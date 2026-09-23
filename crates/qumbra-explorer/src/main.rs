@@ -159,7 +159,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let (cfg, node_cfg, genesis) = load(cfg_path)?;
 
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis.form()?);
     let mut node = RunningNode::start(&node_cfg, &genesis, RandomXPow::new(), verifier)?;
     // The same two clock opt-ins every binary takes: real wall-clock header
     // timestamps for LWMA, and a wall-clock observation clock for diagnostics.

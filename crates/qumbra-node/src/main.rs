@@ -359,7 +359,13 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // `--rehearsal-verifier` opts into the NO-OP stand-in and logs loudly
     // (M10-T0-4, issue #68 — the named M11 gate, closed early).
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
+    // Lab #712: the real verifier for the loaded form — the L2 verifier on an
+    // Annulet genesis (B2's rehearsal-only interim is retired).
+    let form = match &genesis {
+        qumbra_node::annulet_genesis::AnyGenesis::L1(g) => g.form()?,
+        qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => g.form()?,
+    };
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form);
     // Lab #300: bracket every pre-banner stage that can plausibly be expensive,
     // so a stall names the stage it is in instead of presenting as silence. The
     // RandomX constructor is lazy today (the ~256 MiB cache builds at first
@@ -379,17 +385,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     qlab_devnet::jprintln!("STARTUP node prepare begin (halt gates, genesis byte-verify, committee keys)");
     let prepared = match &genesis {
         qumbra_node::annulet_genesis::AnyGenesis::L1(g) => RunningNode::prepare(&config, g, pow, verifier)?,
-        qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => {
-            // The L2 transaction verifier is B4's: until it lands, the real L1
-            // verifier would refuse every L2 transaction, so an Annulet node
-            // runs only with the rehearsal verifier, asked for by name.
-            if !rehearsal_verifier {
-                return Err("an Annulet genesis runs only with --rehearsal-verifier until the L2 \
-                            transaction verifier lands (lab B4)"
-                    .into());
-            }
-            RunningNode::prepare_annulet(&config, g, pow, verifier)?
-        }
+        qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => RunningNode::prepare_annulet(&config, g, pow, verifier)?,
     };
     qlab_devnet::jprintln!("STARTUP node prepare done");
 
