@@ -21,7 +21,7 @@ The Annulet devnet is one sequencer, two followers and a fee-unit faucet, runnin
 - **`POST /v1/tx` decodes, caps and checks discovery by form: three findings in one route.**
   - **The decode.** Before B6 the node's HTTP submit surface decoded the L1 tx wire, so an Annulet transaction could not be submitted over HTTP at all. It now uses `decode_tx_for(form, …)`.
   - **The body cap.** The cap was 256 KiB, sized for the L1 proof, and it refused every L2 transaction: S is 288,332 B and P about 317 KB. The first lane run found it. It is now `max_tx_wire_bytes(form)`: L1 is unchanged, and Annulet is 512 KiB `[devnet-placeholder]`, which moves when the provisional lane's wire moves.
-  - **The discovery check.** The route's early §4 check was the L1 `check_tx_discovery`, so it refused the 256-B L2 payload section as malformed (expected 240). The second lane run found it. It is now `check_tx_discovery_for(form, …)`, the same check the mempool already used.
+  - **The discovery check.** The route's early §4 check was the L1 `check_tx_discovery`, so it refused the 256-B L2 payload section as malformed (expected 240). The second lane run found it. It is now `check_tx_discovery_for(form, …)`, the same check the mempool already used, and it is pinned by a unit test at the route (`run_annulet`: the L2-width section is admitted on Annulet and refused as malformed on L1). A sweep of the admission path for other L1-width constants found none outside tests (listed in the commit).
   - **For whoever next touches this route:** any constant in it that was sized for the L1 transaction must be checked against the L2 one.
 
 ## How to run it

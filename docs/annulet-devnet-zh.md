@@ -21,7 +21,7 @@ Annulet 开发网由一个 sequencer、两个 follower 和一个手续费单位�
 - **`POST /v1/tx` 的解码、请求体上限和 discovery 检查都改为按链形态区分：同一个接口上的三个问题。**
   - **解码。** B6 之前，节点的 HTTP 提交接口用的是 L1 交易线格式，Annulet 交易根本没法通过 HTTP 提交。现在改成了 `decode_tx_for(form, …)`。
   - **请求体上限。** 原来是 256 KiB，按 L1 证明定的，把所有 L2 交易都挡在了外面：S 交易 288,332 B，P 交易约 317 KB。这是第一次跑 lane 时发现的。现在改成 `max_tx_wire_bytes(form)`：L1 不变，Annulet 为 512 KiB `[devnet-placeholder]`，临时 lane 的线格式一变，这个值也跟着变。
-  - **discovery 检查。** 这个接口提前做的 §4 检查用的是 L1 的 `check_tx_discovery`，于是把 L2 那 256 B 的密文段当成格式错误拒掉了（它期望 240 B）。这是第二次跑 lane 时发现的。现在改成 `check_tx_discovery_for(form, …)`，和 mempool 已经在用的检查一致。
+  - **discovery 检查。** 这个接口提前做的 §4 检查用的是 L1 的 `check_tx_discovery`，于是把 L2 那 256 B 的密文段当成格式错误拒掉了（它期望 240 B）。这是第二次跑 lane 时发现的。现在改成 `check_tx_discovery_for(form, …)`，和 mempool 已经在用的检查一致；并在这个接口上加了单元测试钉住（`run_annulet`：L2 宽度的密文段在 Annulet 上放行，在 L1 上当格式错误拒掉）。顺带把整条准入路径扫了一遍，找按 L1 宽度定的其他常量，测试代码以外没有发现（清单写在提交说明里）。
   - **给以后改这个接口的人：** 这里凡是按 L1 交易大小定的常量，都要拿 L2 交易再核一遍。
 
 ## 怎么跑
