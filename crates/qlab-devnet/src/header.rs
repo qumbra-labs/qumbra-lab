@@ -64,6 +64,14 @@ pub const ANNULET_RESERVED_TAGS: [u8; 2] = [0x00, 0x00];
 /// signature would let the signer mint a second id for the same block.
 pub const ANNULET_HEADER_SIGNING_DOMAIN: &[u8] = b"qumbra:annulet:header:v1";
 
+/// Why an Annulet preimage did not parse ([`BlockHeader::from_annulet_preimage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnuletPreimageError {
+    WrongLength { got: usize },
+    BadVersion { got: u8 },
+    BadReservedByte { pos: usize, got: u8 },
+}
+
 /// The largest height a v5 header can carry (u48). At 75 s blocks this is
 /// ~669 million years of chain — the bound is generous, not a constraint.
 pub const V5_MAX_HEIGHT: u64 = (1 << 48) - 1;
@@ -258,6 +266,44 @@ impl BlockHeader {
         buf.extend_from_slice(&ANNULET_RESERVED_TAGS);
         debug_assert_eq!(buf.len(), HEADER_PREIMAGE_LEN_ANNULET);
         buf
+    }
+
+    /// Parse a 153-B Annulet preimage back into a header — **the one Annulet
+    /// preimage decoder** (the p2p codec and the sealed-header codec both call
+    /// it, lab #708): version `0x20`, u48 height, the anchor and registry
+    /// root, the body commitment, and the two reserved bytes, which must be
+    /// the fixed zeros. `difficulty`/`nonce` come back 0 by construction.
+    pub fn from_annulet_preimage(bytes: &[u8]) -> Result<BlockHeader, AnnuletPreimageError> {
+        if bytes.len() != HEADER_PREIMAGE_LEN_ANNULET {
+            return Err(AnnuletPreimageError::WrongLength { got: bytes.len() });
+        }
+        if bytes[32] != HEADER_VERSION_BYTE_ANNULET {
+            return Err(AnnuletPreimageError::BadVersion { got: bytes[32] });
+        }
+        for (i, want) in ANNULET_RESERVED_TAGS.iter().enumerate() {
+            if bytes[151 + i] != *want {
+                return Err(AnnuletPreimageError::BadReservedByte { pos: 151 + i, got: bytes[151 + i] });
+            }
+        }
+        let h32 = |at: usize| -> Hash32 { bytes[at..at + 32].try_into().expect("in range") };
+        let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("in range"));
+        let mut h6 = [0u8; 8];
+        h6[..6].copy_from_slice(&bytes[33..39]);
+        Ok(BlockHeader {
+            prev: h32(0),
+            height: u64::from_le_bytes(h6),
+            timestamp: u64_at(39),
+            difficulty: 0,
+            nonce: 0,
+            tx_body_commitment: h32(119),
+            aggregate_proof: AggregateProofSlot,
+            epoch_supply_attestation: EpochSupplyAttestation,
+            ext: HeaderExt::Annulet(AnnuletHeaderFields {
+                l1_anchor_height: u64_at(47),
+                l1_anchor_root: h32(55),
+                registry_root: h32(87),
+            }),
+        })
     }
 
     /// The message the Annulet sequencer signs:

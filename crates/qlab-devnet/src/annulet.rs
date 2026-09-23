@@ -543,9 +543,239 @@ mod tests {
     const GOLDEN_ANNULET_EMPTY_BODY: &str = "75dc7b561922b13da146bddeac8bc8e5d845cfff605cdcf94ade8993eaae52be";
     const GOLDEN_ANNULET_EMPTY_GENESIS: &str = "3ad958aa3bdcb443ab80a6ca45de2900fe60ecb208d90b7ef3eb42002be1d253";
 
+    // ── the seal and the header rule (lab #708) ──────────────────────────────
+
+    use crate::chain::ChainState;
+    use crate::validation::{validate_sealed_header_annulet, ValidationError};
+
+    const SEQ_SEED: [u8; 32] = [0x5E; 32];
+
+    fn ext(anchor: u64) -> AnnuletHeaderFields {
+        AnnuletHeaderFields { l1_anchor_height: anchor, l1_anchor_root: [0; 32], registry_root: [0x44; 32] }
+    }
+
+    fn genesis_chain() -> (ChainState, BlockHeader) {
+        let g = BlockHeader::genesis_annulet(ext(0), [0x22; 32], 0);
+        (ChainState::new_for(crate::forms::GenesisForm::Annulet, g), g)
+    }
+
+    #[test]
+    fn a_seal_round_trips_on_the_wire_and_verifies() {
+        let key = SequencerKey::from_seed(SEQ_SEED);
+        let (_, g) = genesis_chain();
+        let sealed = key.seal(BlockHeader::child_of_annulet(&g, 10, ext(0), [0x66; 32]));
+        let bytes = sealed.encode();
+        assert_eq!(bytes.len(), SEALED_HEADER_LEN_ANNULET);
+        assert_eq!(SEALED_HEADER_LEN_ANNULET, 3462);
+        assert_eq!(SealedHeader::decode(&bytes), Ok(sealed.clone()));
+        assert!(sealed.verifies_under(&key.verifying_key()));
+        assert_eq!(sealed.id(), sealed.header.header_hash_for(crate::forms::GenesisForm::Annulet), "the id ignores the seal");
+        assert_eq!(key.seal(sealed.header), sealed, "deterministic signer (crate default)");
+        assert_eq!(SealedHeader::decode(&bytes[..153]), Err(SealedHeaderError::WrongLength { got: 153 }), "a bare preimage is not a sealed header");
+    }
+
+    #[test]
+    fn a_seal_does_not_verify_under_another_key_or_over_another_header() {
+        let key = SequencerKey::from_seed(SEQ_SEED);
+        let other = SequencerKey::from_seed([0x5F; 32]);
+        let (_, g) = genesis_chain();
+        let h1 = BlockHeader::child_of_annulet(&g, 10, ext(0), [0x66; 32]);
+        let sealed = key.seal(h1);
+        assert!(!sealed.verifies_under(&other.verifying_key()), "wrong key");
+        // Replayed at another height: same seal, header moved one height up.
+        let mut replay = sealed.clone();
+        replay.header.height += 1;
+        assert!(!replay.verifies_under(&key.verifying_key()), "a seal replayed at another height");
+        // Over another registry root.
+        let mut rr = sealed.clone();
+        rr.header.ext = HeaderExt::Annulet(AnnuletHeaderFields { registry_root: [0x45; 32], ..ext(0) });
+        assert!(!rr.verifies_under(&key.verifying_key()), "a seal over a different registry root");
+        let mut junk = sealed;
+        junk.sig[100] ^= 1;
+        assert!(!junk.verifies_under(&key.verifying_key()), "a corrupted seal");
+    }
+
+    #[test]
+    fn the_sealed_header_rule_accepts_a_good_child_and_refuses_each_violation() {
+        let key = SequencerKey::from_seed(SEQ_SEED);
+        let vk = key.verifying_key();
+        let (chain, g) = genesis_chain();
+        let good = BlockHeader::child_of_annulet(&g, 10, ext(3), [0x66; 32]);
+        assert_eq!(validate_sealed_header_annulet(&chain, &key.seal(good), &vk), Ok(()));
+        let check = |h: BlockHeader| validate_sealed_header_annulet(&chain, &key.seal(h), &vk);
+        let mut t = good;
+        t.timestamp = 0;
+        assert_eq!(check(t), Ok(()), "equal timestamps are allowed");
+        let g2 = BlockHeader { timestamp: 20, ..g };
+        let (chain2, _) = (ChainState::new_for(crate::forms::GenesisForm::Annulet, g2), ());
+        let c2 = BlockHeader::child_of_annulet(&g2, 19, ext(0), [0x66; 32]);
+        assert_eq!(validate_sealed_header_annulet(&chain2, &key.seal(c2), &vk), Err(ValidationError::NonMonotonicTimestamp));
+        let mut h = good;
+        h.height = 2;
+        assert_eq!(check(h), Err(ValidationError::BadHeight));
+        let mut p = good;
+        p.prev = [9; 32];
+        assert_eq!(check(p), Err(ValidationError::UnknownParent));
+        let rr = BlockHeader { ext: HeaderExt::Annulet(AnnuletHeaderFields { registry_root: [0x45; 32], ..ext(3) }), ..good };
+        assert_eq!(check(rr), Err(ValidationError::RegistryRootChanged));
+        // Anchor regression needs a parent with a non-zero anchor.
+        let mut chain3 = chain.clone();
+        let parent = key.seal(good);
+        chain3.insert_header(parent.header).unwrap();
+        let back = BlockHeader::child_of_annulet(&parent.header, 11, ext(2), [0x67; 32]);
+        assert_eq!(
+            validate_sealed_header_annulet(&chain3, &key.seal(back), &vk),
+            Err(ValidationError::AnchorRegressed { parent: 3, got: 2 })
+        );
+        // The seal itself: a header sealed by another key.
+        let other = SequencerKey::from_seed([0x5F; 32]);
+        assert_eq!(validate_sealed_header_annulet(&chain, &other.seal(good), &vk), Err(ValidationError::BadSeal));
+    }
+
+    /// The header-only rule refuses an Annulet header by name: it cannot be
+    /// judged without its seal.
+    #[test]
+    fn the_header_only_rule_requires_the_seal_on_an_annulet_net() {
+        use crate::forms::{ChainRules, GenesisForm};
+        use crate::halt::RuleSchedule;
+        let (chain, g) = genesis_chain();
+        let child = BlockHeader::child_of_annulet(&g, 10, ext(0), [0x66; 32]);
+        let rules = ChainRules { form: GenesisForm::Annulet, halt: RuleSchedule::V1_0 };
+        assert_eq!(
+            crate::validation::validate_header_under(
+                &chain,
+                &crate::pow::KeccakPow,
+                &child,
+                75,
+                qlab_pow::keyblock::KeyBlockSchedule::default(),
+                &rules,
+            ),
+            Err(ValidationError::SealRequired)
+        );
+    }
+
+    /// Q3: each Annulet block weighs 1, so the tip advances with height —
+    /// under the L1 weight (difficulty 0) it would never leave genesis.
+    #[test]
+    fn the_annulet_tip_advances_one_block_at_a_time() {
+        let key = SequencerKey::from_seed(SEQ_SEED);
+        let (mut chain, g) = genesis_chain();
+        let mut parent = g;
+        for h in 1..=5u64 {
+            let child = key.seal(BlockHeader::child_of_annulet(&parent, 10 * h, ext(0), [h as u8; 32])).header;
+            let id = chain.insert_header(child).unwrap();
+            assert_eq!(chain.tip_hash(), id, "height {h}: the tip moves");
+            assert_eq!(chain.tip_height(), h);
+            parent = child;
+        }
+        assert_eq!(chain.tip_work(), 5, "cumulative weight = height");
+    }
+
     #[test]
     #[should_panic(expected = "genesis note payload width")]
     fn a_genesis_note_payload_must_be_128_bytes() {
         let _ = genesis_body_commitment_annulet(&[GenesisNote { cm: [1; 32], payload: vec![0; 120] }]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The seal (lab #708 Q2): the sequencer's signature, beside the header
+// ---------------------------------------------------------------------------
+
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa65, Signature, Signer, SigningKey, Verifier, VerifyingKey, B32};
+
+/// ML-DSA-65 signature length (FIPS 204), the seal's width.
+pub const ANNULET_SIG_LEN: usize = 3309;
+
+/// An Annulet `Header` message / `Headers` stride: the 153-B preimage ‖ the
+/// 3,309-B seal.
+pub const SEALED_HEADER_LEN_ANNULET: usize = crate::header::HEADER_PREIMAGE_LEN_ANNULET + ANNULET_SIG_LEN;
+
+/// The sequencer's signing key. Derived from a 32-byte seed exactly as a
+/// committee [`crate::committee::Validator`] is (`SigningKey::from_seed`), so
+/// the genesis `sequencer_key` (B1) and this key agree.
+pub struct SequencerKey {
+    signing_key: SigningKey<MlDsa65>,
+}
+
+impl SequencerKey {
+    /// Derive from a seed (a key file in the datadir, the committee-key
+    /// convention — never config/env inline, lab #708 Q6).
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let seed: B32 = seed.into();
+        Self { signing_key: SigningKey::<MlDsa65>::from_seed(&seed) }
+    }
+
+    /// The verifying key a genesis pins.
+    pub fn verifying_key(&self) -> VerifyingKey<MlDsa65> {
+        self.signing_key.verifying_key()
+    }
+
+    /// Seal `header`: sign [`BlockHeader::annulet_signing_message`]. ml-dsa
+    /// 0.1.1's `Signer` is the **deterministic** variant, so a seal is
+    /// reproducible — a property of the crate's default, not of the rule (a
+    /// hedged signer's seals verify just the same).
+    pub fn seal(&self, header: BlockHeader) -> SealedHeader {
+        let sig: Signature<MlDsa65> = self.signing_key.sign(&header.annulet_signing_message());
+        let enc = sig.encode();
+        let mut bytes = [0u8; ANNULET_SIG_LEN];
+        bytes.copy_from_slice(enc.as_slice());
+        SealedHeader { header, sig: Box::new(bytes) }
+    }
+}
+
+/// Decode a genesis-pinned sequencer verifying key.
+pub fn decode_sequencer_key(bytes: &[u8]) -> Option<VerifyingKey<MlDsa65>> {
+    let e = EncodedVerifyingKey::<MlDsa65>::try_from(bytes).ok()?;
+    Some(VerifyingKey::<MlDsa65>::decode(&e))
+}
+
+/// An Annulet header with its seal. `BlockHeader` stays `Copy` and its
+/// size unchanged; the seal travels beside it (lab #708 Q2) and is **not**
+/// part of the block id (`keccak(preimage)`, B1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedHeader {
+    pub header: BlockHeader,
+    pub sig: Box<[u8; ANNULET_SIG_LEN]>,
+}
+
+/// Why a sealed-header wire unit did not parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealedHeaderError {
+    WrongLength { got: usize },
+    Preimage(crate::header::AnnuletPreimageError),
+}
+
+impl SealedHeader {
+    /// Wire bytes: `preimage (153) ‖ sig (3,309)` = 3,462 B.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.header.preimage_for(crate::forms::GenesisForm::Annulet);
+        out.extend_from_slice(&self.sig[..]);
+        out
+    }
+
+    /// Parse the wire unit (length, then the preimage). The signature bytes
+    /// are carried as-is; whether they verify is [`Self::verifies_under`]'s
+    /// question, asked by validation.
+    pub fn decode(bytes: &[u8]) -> Result<SealedHeader, SealedHeaderError> {
+        if bytes.len() != SEALED_HEADER_LEN_ANNULET {
+            return Err(SealedHeaderError::WrongLength { got: bytes.len() });
+        }
+        let (pre, sig) = bytes.split_at(crate::header::HEADER_PREIMAGE_LEN_ANNULET);
+        let header = BlockHeader::from_annulet_preimage(pre).map_err(SealedHeaderError::Preimage)?;
+        Ok(SealedHeader { header, sig: Box::new(sig.try_into().expect("length checked")) })
+    }
+
+    /// The block id (the unsigned preimage's hash).
+    pub fn id(&self) -> Hash32 {
+        self.header.header_hash_for(crate::forms::GenesisForm::Annulet)
+    }
+
+    /// `true` iff the seal is a valid ML-DSA-65 signature by `key` over this
+    /// header's signing message.
+    pub fn verifies_under(&self, key: &VerifyingKey<MlDsa65>) -> bool {
+        let Ok(enc) = EncodedSignature::<MlDsa65>::try_from(&self.sig[..]) else { return false };
+        let Some(sig) = Signature::<MlDsa65>::decode(&enc) else { return false };
+        key.verify(&self.header.annulet_signing_message(), &sig).is_ok()
     }
 }

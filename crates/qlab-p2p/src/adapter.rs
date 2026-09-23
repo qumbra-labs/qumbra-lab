@@ -2357,6 +2357,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // a block mined for the pre-halt rules does not meet the target here.
             ValidationError::PowUnsatisfied => "invalid header: pow",
             ValidationError::UnknownSeed => "invalid header: seed",
+            // Lab #708: the Annulet (sequencer) rule.
+            ValidationError::SealRequired => "invalid header: unsealed on a sequencer net",
+            ValidationError::NotAnnuletHeader => "invalid header: not an Annulet header",
+            ValidationError::PowFieldsOnAnnulet => "invalid header: pow fields on Annulet",
+            ValidationError::AnchorRegressed { .. } => "invalid header: l1 anchor regressed",
+            ValidationError::RegistryRootChanged => "invalid header: registry root changed",
+            ValidationError::BadSeal => "invalid header: bad sequencer seal",
         }
     }
 
