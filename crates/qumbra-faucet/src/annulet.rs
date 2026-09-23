@@ -167,6 +167,39 @@ impl Served {
             .collect()
     }
 
+    /// **The recipient's detection** over heights `[from, to]`: every L2 note
+    /// `dk` opens, read the way a light wallet reads it — `/v1/compact` for
+    /// the bundles, `/v1/block/{h}/tx/{i}/full` for the 128-B payloads of the
+    /// groups it holds, each opened note's commitment checked against the
+    /// served cm.
+    pub fn detect(&self, dk: &qlab_note::kem::Dk, from: u64, to: u64) -> Result<Vec<L2Note>, AnnuletError> {
+        let blocks = qlab_cbserver::codec::decode_compact_response(&self.get(&format!("/v1/compact?from={from}&to={to}"))?)
+            .map_err(|e| AnnuletError::Served(format!("compact: {e:?}")))?;
+        let mut found = Vec::new();
+        for block in &blocks {
+            for group in &block.groups {
+                let mut full: Option<Vec<Vec<Vec<u8>>>> = None;
+                for (r, bundle) in group.recipients.iter().enumerate() {
+                    if full.is_none() {
+                        let body = self.get(&format!("/v1/block/{}/tx/{}/full", block.height, group.tx_index))?;
+                        full = Some(
+                            qlab_cbserver::codec::decode_full_response(&body)
+                                .map_err(|e| AnnuletError::Served(format!("full: {e:?}")))?,
+                        );
+                    }
+                    let payloads = &full.as_ref().expect("fetched above")[r];
+                    for d in qlab_cbserver::client::open_served_l2(dk, bundle, payloads) {
+                        if digest_bytes(&d.note.commitment()) != bundle.entries[d.index].cm {
+                            return Err(AnnuletError::Served("an opened note is not the served cm".into()));
+                        }
+                        found.push(d.note);
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Submit a transaction on the Annulet tx wire.
     pub fn submit(&self, tx: &TxEntry) -> Result<(), AnnuletError> {
         let wire = qlab_p2p::codec::encode_tx_annulet(tx);
