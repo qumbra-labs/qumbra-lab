@@ -574,3 +574,26 @@ Per call on the m7g.2xlarge: S generation ≈ 1.2 s, S full scan 15 s → ≈ 2 
 ≈ 3 s, P full scan 32 s → ≈ 4.5 s. Floor = the full scans: ≈ 14 at S (3.4 s) + ≈ 16 at P (7.5 s)
 ≈ 3 min. Negatives: S ≈ 15 fan-outs × 2 batches × 1.5 s + singles ≈ 1 min; P ≈ 13 × 2 × 3.5 +
 singles ≈ 3 min. **≈ 7–8 min `l2` + `l2p`** if the scan parallelises ≈ 8×; ≈ 9–10 at 5×.
+
+## Baton 3 — MEASURED on the lane (run [35822404788](https://github.com/qumbra-labs/qumbra-lab/actions/runs/35822404788), `workflow_dispatch` on `c7a0e8b`, m7g.2xlarge, rustc 1.97.1, 2026-09-23 05:26–06:25Z)
+
+**Green and complete: `verdict=complete cargo_returned=1 cargo_exit=0 results=144 of 144 expected`; `passed=2484 failed=0 ignored=15`; `FAILED(cs)=0 panicked=0 ^error=0`; suite step 58:06.74 wall; swaps 0; max RSS of the largest process 17.3 GB.** Per-block minutes from the stamped console (per-test wall = delta between consecutive stamped lines; a fixture's generation + first scan lands on the first test, alphabetically, that touches it):
+
+| block | tests | this run | run 35812033360 (timed out) | budget |
+|---|---|---|---|---|
+| `qlab-air::l2` | 26 | **1.34 min** | 38.8 min | |
+| `qlab-air::l2p` | 22 (31 before the collapse) | **3.81 min** | 72.6 min | |
+| `l2` + `l2p` | 48 | **5.15 min** | 111.4 min | ≤ 12 |
+| `qlab-air::l2test` | 4 | 0.2 s | — | |
+| `qlab-air` `narrow` + `reference` | 38 | 3.40 min | 3.5 min | |
+| `qlab-air` binary | 90 | **8.56 min** | 115 min | |
+| `qlab-note::l2note` | 4 | 0.0 s | never reached | |
+| `qlab-bench::l2shape` | 6 | 55.3 s | 63 s | |
+| `l2note` + `l2shape` | 10 | **0.92 min** | — | ≤ 3 |
+| whole suite | 144 sets | **58.1 min** | killed at 120 (1 of 144) | ≤ 70 target, 120 ceiling |
+
+Slowest L2 tests now: `l2p_s_negatives_hold_on_shape_p` 78.6 s (seven fan-outs, three singles, five public-value tampers, plus the `same_asset` and `fee_on_input_2` fixtures' first scans), `l2p_dummy_shape_holds` 24.2 s, `l2p_neg_vpublic_surface` 18.4 s (includes `mint100`'s first scan), `l2p_neg_spend_frozen_rkm` 17.3 s (five singles), `l2p_vpublic_edges_satisfy` 16.4 s (four fresh positives), `l2p_neg_rkm_rederivation_lie` 12.0 s (three singles + the honest fixture's first scan). Full per-test table: the run's `suite.log` artifact.
+
+**Against the projection (7–8 min for `l2` + `l2p`): 5.15 — the projection was high.** A fresh 2^20 positive (generate + every row) now costs ≈ 2 s (`l2p_regulated_inputs_satisfy`: two of them, 4.1 s) against ≈ 35 s before, i.e. > 8× on the scan; the extra comes from hoisting the periodic columns out of the row loop (p3's `periodic_values` rebuilds all 40 per row — an allocation-bound cost the 8× parallel estimate did not credit). Not separated into its two parts: nothing ran locally.
+
+**Not verified here:** the 17.3 GB max RSS is the suite step's largest process, not attributed per binary (`/usr/bin/time -v` on cargo); it is consistent with the fan-out projection (≈ 18 GB in `qlab-air`'s test binary) and above the 15.3 GB P prover test, but which of the two it is was not measured. The `ASSIGNMENT_FANOUT = 4` constant is the knob if the runner ever needs it smaller (cost: the fan-out loops run 2× longer, ≈ +3 min on this run's arithmetic).
