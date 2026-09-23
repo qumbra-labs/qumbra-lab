@@ -22,7 +22,10 @@ use qlab_devnet::body::{
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
-use crate::codec::{decode_header, encode_header, encode_tx, header_wire_len, tx_id, DecodeError, Reader};
+use crate::codec::{
+    decode_tx_for, decode_wire_header, encode_tx_for, encode_wire_header, header_msg_len, tx_id, DecodeError,
+    Reader, WireHeader,
+};
 use qlab_devnet::forms::GenesisForm;
 
 /// Project a list into the byte-frozen v4 announce pair.
@@ -113,7 +116,27 @@ pub struct BlockTxn {
     pub txs: Vec<TxEntry>,
 }
 
+impl BlockAnnounce {
+    /// The header as its message unit: sealed when the announce carries a
+    /// seal (an Annulet net), bare otherwise.
+    pub fn wire_header(&self) -> WireHeader {
+        match &self.seal {
+            Some(sig) => WireHeader::Sealed(qlab_devnet::annulet::SealedHeader { header: self.header, sig: sig.clone() }),
+            None => WireHeader::L1(self.header),
+        }
+    }
+}
+
 // --- BlockAnnounce ---
+//
+// **The Annulet frame (lab #708, served by B2):** the 3,462-B sealed header ‖
+// nonce ‖ *no coinbase section* (the L2 mints nothing) ‖ short ids ‖
+// prefilled, each transaction on the Annulet tx wire ([`encode_tx_for`]).
+// 🔴 **The seam B5 owns is inside the transaction codec, not here:** when B5
+// moves the L2 discovery payload from the L1 width (120 B) to 128 B, it changes
+// `encode_tx_annulet` / `decode_tx_annulet`, and this frame inherits the change
+// with no edit — B5 must not re-touch the frame. Until then the Annulet tx wire
+// frames the L1-width payload, as B1 left it.
 
 /// Encode a `BlockAnnounce`.
 pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
@@ -127,12 +150,14 @@ pub fn encode_announce_above(
     a: &BlockAnnounce,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&encode_header(form, &a.header));
+    out.extend_from_slice(&encode_wire_header(form, &a.wire_header()));
     out.extend_from_slice(&a.nonce.to_le_bytes());
     match form {
-        // Locally-built input only (the decoder refuses peers by error).
-        GenesisForm::Annulet => panic!(
-            "no compact block announce on an Annulet net yet: lands with B5 (lab #706)"
+        // No coinbase section: the L2 has none (locally-built input; a payee
+        // here is a program error).
+        GenesisForm::Annulet => assert!(
+            a.coinbase_payees.is_empty(),
+            "an Annulet announce carries no coinbase payee (lab #708)"
         ),
         GenesisForm::V4 => {
             // The v4 wire, byte-frozen: coinbase total ‖ rkm lanes.
@@ -165,7 +190,7 @@ pub fn encode_announce_above(
     write_varint(&mut out, a.prefilled.len() as u64);
     for pf in &a.prefilled {
         write_varint(&mut out, pf.index as u64);
-        let tx_bytes = encode_tx(&pf.tx);
+        let tx_bytes = encode_tx_for(form, &pf.tx);
         write_varint(&mut out, tx_bytes.len() as u64);
         out.extend_from_slice(&tx_bytes);
     }
@@ -183,18 +208,16 @@ pub fn decode_announce_above(
     form: GenesisForm,
     buf: &[u8],
 ) -> Result<BlockAnnounce, DecodeError> {
-    // Refused before reading a byte, so the refusal names the form rather
-    // than whichever field the Annulet bytes happen to truncate first.
-    match form {
-        GenesisForm::V4 | GenesisForm::V5 => {}
-        GenesisForm::Annulet => return Err(DecodeError::FormNotServed { form, owner: "B5" }),
-    }
     let mut r = Reader::new(buf);
-    let hdr_bytes = r.rest(header_wire_len(form), "announce.header")?;
-    let header = decode_header(form, &hdr_bytes)?;
+    let hdr_bytes = r.rest(header_msg_len(form), "announce.header")?;
+    let (header, seal) = match decode_wire_header(form, &hdr_bytes)? {
+        WireHeader::L1(h) => (h, None),
+        WireHeader::Sealed(s) => (s.header, Some(s.sig)),
+    };
     let nonce = r.u64_le("announce.nonce")?;
     let coinbase_payees = match form {
-        GenesisForm::Annulet => return Err(DecodeError::FormNotServed { form, owner: "B5" }),
+        // Served by B2 (lab #708): no coinbase section on the L2.
+        GenesisForm::Annulet => Vec::new(),
         GenesisForm::V4 => {
             let coinbase = r.u64_le("announce.coinbase")?;
             let mut coinbase_rkm = [0u64; 4];
@@ -239,10 +262,10 @@ pub fn decode_announce_above(
         let index = r.varint()? as u32;
         let tx_len = r.varint()? as usize;
         let tx_bytes = r.rest(tx_len, "announce.prefilled.tx")?;
-        prefilled.push(PrefilledTx { index, tx: crate::codec::decode_tx(&tx_bytes)? });
+        prefilled.push(PrefilledTx { index, tx: decode_tx_for(form, &tx_bytes)? });
     }
     r.finish()?;
-    Ok(BlockAnnounce { seal: None, header, nonce, coinbase_payees, short_ids, prefilled })
+    Ok(BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled, seal })
 }
 
 // --- GetBlockTxn ---
@@ -273,21 +296,31 @@ pub fn decode_get_block_txn(buf: &[u8]) -> Result<GetBlockTxn, DecodeError> {
 
 // --- BlockTxn ---
 
-/// Encode a `BlockTxn`.
+/// Encode a `BlockTxn` on the L1 tx wire (the frozen v4/v5 encoding).
 pub fn encode_block_txn(b: &BlockTxn) -> Vec<u8> {
+    encode_block_txn_for(GenesisForm::V4, b)
+}
+
+/// Encode a `BlockTxn` with each transaction on this net's tx wire (lab #708).
+pub fn encode_block_txn_for(form: GenesisForm, b: &BlockTxn) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&b.block_hash);
     write_varint(&mut out, b.txs.len() as u64);
     for tx in &b.txs {
-        let tx_bytes = encode_tx(tx);
+        let tx_bytes = encode_tx_for(form, tx);
         write_varint(&mut out, tx_bytes.len() as u64);
         out.extend_from_slice(&tx_bytes);
     }
     out
 }
 
-/// Decode a `BlockTxn`.
+/// Decode a `BlockTxn` on the L1 tx wire.
 pub fn decode_block_txn(buf: &[u8]) -> Result<BlockTxn, DecodeError> {
+    decode_block_txn_for(GenesisForm::V4, buf)
+}
+
+/// Decode a `BlockTxn` under this net's tx wire (lab #708).
+pub fn decode_block_txn_for(form: GenesisForm, buf: &[u8]) -> Result<BlockTxn, DecodeError> {
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("bt.block_hash")?;
     let n = r.varint()? as usize;
@@ -295,7 +328,7 @@ pub fn decode_block_txn(buf: &[u8]) -> Result<BlockTxn, DecodeError> {
     for _ in 0..n {
         let tx_len = r.varint()? as usize;
         let tx_bytes = r.rest(tx_len, "bt.tx")?;
-        txs.push(crate::codec::decode_tx(&tx_bytes)?);
+        txs.push(decode_tx_for(form, &tx_bytes)?);
     }
     r.finish()?;
     Ok(BlockTxn { block_hash, txs })
@@ -608,4 +641,123 @@ mod tests {
         ));
     }
 
+
+    // ── Lab #708: the announce frame, byte for byte ─────────────────────────
+    //
+    // The expected bytes were built by an independent Python encoder from the
+    // layouts (LEB128 varints, LE integers), not read back from this code.
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn golden_l1_tx() -> TxEntry {
+        TxEntry {
+            proof: b"pf".to_vec(),
+            public: TxPublic {
+                anchor: [0x01; 32],
+                nullifiers: vec![[0x02; 32]],
+                commitments: vec![[0x03; 32], [0x04; 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: 7,
+            },
+            discovery: vec![0x00],
+            rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+            l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        }
+    }
+
+    fn golden_l1_announce(form: GenesisForm) -> BlockAnnounce {
+        BlockAnnounce {
+            header: BlockHeader {
+                prev: [0x11; 32],
+                height: 7,
+                timestamp: 0x100,
+                difficulty: 1000,
+                nonce: 42,
+                ..BlockHeader::child_of_for(form, &BlockHeader::genesis(1000, 0), 0x100, 1000, [0x22; 32])
+            },
+            nonce: 0xDEAD_BEEF,
+            coinbase_payees: vec![CoinbasePayee { rkm: [1, 2, 3, 4], amount: 5000 }],
+            short_ids: vec![[0xAB; SHORTID_LEN]],
+            prefilled: vec![PrefilledTx { index: 0, tx: golden_l1_tx() }],
+            seal: None,
+        }
+    }
+
+    /// The L1 announce frames did not move (the ruling on lab #708: L1 announce
+    /// goldens byte-identical, asserted). No byte golden existed before B2b;
+    /// these pin the v4 and v5 frames as B2b found them.
+    #[test]
+    fn the_l1_announce_frames_are_byte_identical() {
+        let v4 = encode_announce(GenesisForm::V4, &golden_l1_announce(GenesisForm::V4));
+        assert_eq!(hex(&v4), "111111111111111111111111111111111111111111111111111111111111111107000000000000000001000000000000e8030000000000002a000000000000002222222222222222222222222222222222222222222222222222222222222222a659efbeadde000000008813000000000000010000000000000002000000000000000300000000000000040000000000000001abababababab01009001010101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040007000000000000000270660100");
+        let v5 = encode_announce(GenesisForm::V5, &golden_l1_announce(GenesisForm::V5));
+        assert_eq!(hex(&v5), "1111111111111111111111111111111111111111111111111111111111111111050700000000002a000000000000000001000000000000e8030000000000002222222222222222222222222222222222222222222222222222222222222222a659efbeadde00000000010100000000000000020000000000000003000000000000000400000000000000881300000000000001abababababab01009001010101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040007000000000000000270660100");
+        for (form, bytes) in [(GenesisForm::V4, &v4), (GenesisForm::V5, &v5)] {
+            let back = decode_announce(form, bytes).unwrap();
+            assert!(back.seal.is_none());
+            assert_eq!(encode_announce(form, &back), *bytes, "{form:?} round trip");
+        }
+    }
+
+    /// The Annulet announce (lab #708, served by B2): the 3,462-B sealed
+    /// header ‖ nonce ‖ no coinbase section ‖ short ids ‖ prefilled on the
+    /// Annulet tx wire. The seal is a synthetic fill — the codec carries it,
+    /// validation judges it.
+    #[test]
+    fn the_annulet_announce_frame_is_byte_for_byte() {
+        use qlab_devnet::annulet::{AnnuletHeaderFields, HeaderExt, L2ShapeTag, L2Surface, ANNULET_SIG_LEN};
+        let header = BlockHeader {
+            prev: [0x11; 32],
+            height: 7,
+            timestamp: 0x100,
+            difficulty: 0,
+            nonce: 0,
+            tx_body_commitment: [0x22; 32],
+            aggregate_proof: qlab_devnet::header::AggregateProofSlot,
+            epoch_supply_attestation: qlab_devnet::header::EpochSupplyAttestation,
+            ext: HeaderExt::Annulet(AnnuletHeaderFields {
+                l1_anchor_height: 9,
+                l1_anchor_root: [0x33; 32],
+                registry_root: [0x44; 32],
+            }),
+        };
+        let tx = TxEntry {
+            l2: L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None }.encode(),
+            ..golden_l1_tx()
+        };
+        let ann = BlockAnnounce {
+            header,
+            nonce: 0xDEAD_BEEF,
+            coinbase_payees: Vec::new(),
+            short_ids: vec![[0xAB; SHORTID_LEN]],
+            prefilled: vec![PrefilledTx { index: 0, tx: tx.clone() }],
+            seal: Some(Box::new([0xA5; ANNULET_SIG_LEN])),
+        };
+        let bytes = encode_announce(GenesisForm::Annulet, &ann);
+        let mut expected = String::from("111111111111111111111111111111111111111111111111111111111111111120070000000000000100000000000009000000000000003333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444422222222222222222222222222222222222222222222222222222222222222220000");
+        expected.push_str(&"a5".repeat(ANNULET_SIG_LEN));
+        expected.push_str("efbeadde0000000001abababababab0100b20101010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030404040404040404040404040404040404040404040404040404040404040404000700000000000000027066010021014444444444444444444444444444444444444444444444444444444444444444");
+        assert_eq!(hex(&bytes), expected);
+        assert_eq!(bytes.len(), 3659);
+        let back = decode_announce(GenesisForm::Annulet, &bytes).unwrap();
+        assert_eq!(back.seal, ann.seal);
+        assert_eq!(back.header, header);
+        assert!(back.coinbase_payees.is_empty());
+        assert_eq!(back.prefilled[0].tx.l2, tx.l2);
+        // An L1 announce on an Annulet net, and an Annulet one on an L1 net,
+        // are refused by the header's length — never misparsed.
+        let v4 = encode_announce(GenesisForm::V4, &golden_l1_announce(GenesisForm::V4));
+        assert!(matches!(
+            decode_announce(GenesisForm::Annulet, &v4),
+            Err(DecodeError::Truncated { .. }) | Err(DecodeError::WrongHeaderLen { .. })
+        ));
+        assert!(decode_announce(GenesisForm::V4, &bytes).is_err());
+        // An unsealed Annulet header (the bare 153-B preimage) cannot stand in
+        // for the sealed unit.
+        let mut unsealed = bytes[..153].to_vec();
+        unsealed.extend_from_slice(&bytes[153 + ANNULET_SIG_LEN..]);
+        assert!(decode_announce(GenesisForm::Annulet, &unsealed).is_err());
+    }
 }

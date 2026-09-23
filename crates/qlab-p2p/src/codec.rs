@@ -244,8 +244,14 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
 /// magic values would only invite a false "same rider/reservation machinery"
 /// reading. Activating either byte is an Annulet header-version change.
 fn decode_header_annulet(buf: &[u8]) -> Result<BlockHeader, DecodeError> {
+    BlockHeader::from_annulet_preimage(buf).map_err(annulet_preimage_error)
+}
+
+/// The one naming of an Annulet preimage refusal, for the bare preimage and
+/// the sealed header alike.
+fn annulet_preimage_error(e: qlab_devnet::header::AnnuletPreimageError) -> DecodeError {
     use qlab_devnet::header::AnnuletPreimageError as E;
-    BlockHeader::from_annulet_preimage(buf).map_err(|e| match e {
+    match e {
         // The caller checked the length; kept total rather than unreachable.
         E::WrongLength { got } => DecodeError::WrongHeaderLen {
             got,
@@ -253,7 +259,113 @@ fn decode_header_annulet(buf: &[u8]) -> Result<BlockHeader, DecodeError> {
         },
         E::BadVersion { got } => DecodeError::BadHeaderVersion { got },
         E::BadReservedByte { pos, got } => DecodeError::BadHeaderTag { pos, got },
-    })
+    }
+}
+
+// --------------------------------------------------------------------------
+// The header message unit, by form (lab #708)
+// --------------------------------------------------------------------------
+
+/// A header as it travels on a `Header` / `Headers` / `BlockAnnounce` message:
+/// the bare L1 header, or the Annulet **sealed** header (preimage ‖ seal,
+/// 3,462 B) — an Annulet header is never on the wire without its seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WireHeader {
+    L1(BlockHeader),
+    Sealed(qlab_devnet::annulet::SealedHeader),
+}
+
+impl WireHeader {
+    /// The header, without the seal.
+    pub fn header(&self) -> BlockHeader {
+        match self {
+            WireHeader::L1(h) => *h,
+            WireHeader::Sealed(s) => s.header,
+        }
+    }
+}
+
+/// The byte length of one header **message unit** on this net: the L1 header
+/// wire, or the Annulet sealed header (3,462 B; [`header_wire_len`] stays the
+/// 153-B preimage, as B1 defined it).
+pub fn header_msg_len(form: GenesisForm) -> usize {
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => header_wire_len(form),
+        GenesisForm::Annulet => qlab_devnet::annulet::SEALED_HEADER_LEN_ANNULET,
+    }
+}
+
+/// Encode one header message unit. A header of the wrong kind for `form` is
+/// locally-built input and panics.
+pub fn encode_wire_header(form: GenesisForm, h: &WireHeader) -> Vec<u8> {
+    match (form, h) {
+        (GenesisForm::V4 | GenesisForm::V5, WireHeader::L1(h)) => encode_header(form, h),
+        (GenesisForm::Annulet, WireHeader::Sealed(s)) => s.encode(),
+        (GenesisForm::V4 | GenesisForm::V5 | GenesisForm::Annulet, h) => {
+            panic!("a {form:?} net has no wire for {h:?} (lab #708)")
+        }
+    }
+}
+
+/// Decode one header message unit under this net's form. On an Annulet net
+/// a bare 153-B preimage (an unsealed header) is refused by length.
+pub fn decode_wire_header(form: GenesisForm, buf: &[u8]) -> Result<WireHeader, DecodeError> {
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => decode_header(form, buf).map(WireHeader::L1),
+        GenesisForm::Annulet => {
+            use qlab_devnet::annulet::{SealedHeader, SealedHeaderError, SEALED_HEADER_LEN_ANNULET};
+            match SealedHeader::decode(buf) {
+                Ok(s) => Ok(WireHeader::Sealed(s)),
+                Err(SealedHeaderError::WrongLength { got }) => {
+                    Err(DecodeError::WrongHeaderLen { got, want: SEALED_HEADER_LEN_ANNULET })
+                }
+                Err(SealedHeaderError::Preimage(e)) => Err(annulet_preimage_error(e)),
+            }
+        }
+    }
+}
+
+/// Encode a `Headers` batch of message units (the count, then each unit at
+/// [`header_msg_len`] stride).
+pub fn encode_wire_headers(form: GenesisForm, headers: &[WireHeader]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint(&mut out, headers.len() as u64);
+    for h in headers {
+        out.extend_from_slice(&encode_wire_header(form, h));
+    }
+    out
+}
+
+/// Decode a `Headers` batch of message units. The pre-allocation is capped by
+/// what the payload could hold, as in [`decode_headers`].
+pub fn decode_wire_headers(form: GenesisForm, buf: &[u8]) -> Result<Vec<WireHeader>, DecodeError> {
+    let mut r = Reader::new(buf);
+    let unit = header_msg_len(form);
+    let n = r.varint()? as usize;
+    let mut headers = Vec::with_capacity(n.min(buf.len() / unit));
+    for _ in 0..n {
+        let raw = r.rest(unit, "headers.item")?;
+        headers.push(decode_wire_header(form, &raw)?);
+    }
+    r.finish()?;
+    Ok(headers)
+}
+
+/// Encode a transaction for this net's `Tx` message (and every other place a
+/// transaction travels): the L1 wire, or the Annulet wire with its surface.
+pub fn encode_tx_for(form: GenesisForm, tx: &TxEntry) -> Vec<u8> {
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => encode_tx(tx),
+        GenesisForm::Annulet => encode_tx_annulet(tx),
+    }
+}
+
+/// Decode a transaction under this net's form ([`encode_tx_for`]'s inverse).
+pub fn decode_tx_for(form: GenesisForm, buf: &[u8]) -> Result<TxEntry, DecodeError> {
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => decode_tx(buf),
+        GenesisForm::Annulet => decode_tx_annulet(buf),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -1021,11 +1133,15 @@ mod tests {
         let _ = encode_tx(&annulet_tx());
     }
 
+    /// B1 refused the Annulet announce by name (owner B5); lab #708 moved
+    /// the frame to B2, which serves it (`compact::tests::
+    /// the_annulet_announce_frame_is_byte_for_byte`). An empty payload is now
+    /// an ordinary truncation, not a form refusal.
     #[test]
-    fn an_annulet_announce_is_refused_by_name_until_b5() {
+    fn the_annulet_announce_is_served_since_b2() {
         assert!(matches!(
             crate::compact::decode_announce(GenesisForm::Annulet, &[]),
-            Err(DecodeError::FormNotServed { form: GenesisForm::Annulet, owner: "B5" })
+            Err(DecodeError::Truncated { .. })
         ));
     }
 
