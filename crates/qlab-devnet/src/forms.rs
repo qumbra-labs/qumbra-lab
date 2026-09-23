@@ -31,6 +31,10 @@
 
 use crate::halt::RuleSchedule;
 
+/// The Annulet genesis `format_version` (lab #706 Q1): 32, leaving the L1
+/// series (4, 5, …) room. The Annulet header's version byte is the same value.
+pub const ANNULET_GENESIS_FORMAT_VERSION: u32 = 32;
+
 /// The consensus form set a genesis file selects. One value, chosen at genesis
 /// load, fanning out to header-form, body-form, coinbase-form and
 /// rule-schedule choices.
@@ -48,6 +52,15 @@ pub enum GenesisForm {
     /// with the cap at 1, and exact emission + the name rule native from
     /// height 0 — no boundary, no pins, no scar.
     V5,
+    /// Genesis format **32** — the **Annulet** L2 (lab #706, l2-roadmap B1):
+    /// sequencer-signed 153-byte header (version byte `0x20`, no difficulty,
+    /// no nonce, `l1_anchor` + `registry_root` in [`crate::annulet::HeaderExt`]),
+    /// an L2 body form whose transactions carry the L2 surface, **no coinbase**
+    /// (no block reward), no emission, no name service, no halt machinery.
+    /// Its genesis file is `qumbra_node::annulet_genesis::AnnuletGenesisFile`,
+    /// a different struct from the L1 `GenesisFile`, dispatched by this
+    /// leading `format_version`.
+    Annulet,
 }
 
 impl GenesisForm {
@@ -58,6 +71,7 @@ impl GenesisForm {
         match v {
             4 => Some(GenesisForm::V4),
             5 => Some(GenesisForm::V5),
+            ANNULET_GENESIS_FORMAT_VERSION => Some(GenesisForm::Annulet),
             _ => None,
         }
     }
@@ -67,6 +81,7 @@ impl GenesisForm {
         match self {
             GenesisForm::V4 => 4,
             GenesisForm::V5 => 5,
+            GenesisForm::Annulet => ANNULET_GENESIS_FORMAT_VERSION,
         }
     }
 
@@ -84,6 +99,8 @@ impl GenesisForm {
         match self {
             GenesisForm::V4 => crate::names::NAME_RULE_BOUNDARY_HEIGHT,
             GenesisForm::V5 => None,
+            // No name service on the L2: there is no boundary to display.
+            GenesisForm::Annulet => None,
         }
     }
 
@@ -106,6 +123,9 @@ impl GenesisForm {
         match self {
             GenesisForm::V4 => crate::names::NAME_RULE_BOUNDARY_HEIGHT,
             GenesisForm::V5 => Some(0),
+            // No name service on the L2: `None` = riders never active, so
+            // every name op is refused (`RiderBeforeBoundary`), which is the rule.
+            GenesisForm::Annulet => None,
         }
     }
 }
@@ -168,10 +188,11 @@ mod tests {
     }
 
     #[test]
-    fn maps_exactly_v4_and_v5_and_nothing_else() {
+    fn maps_exactly_v4_v5_and_annulet_and_nothing_else() {
         assert_eq!(GenesisForm::from_genesis_format_version(4), Some(GenesisForm::V4));
         assert_eq!(GenesisForm::from_genesis_format_version(5), Some(GenesisForm::V5));
-        for v in [0u32, 1, 2, 3, 6, 7, u32::MAX] {
+        assert_eq!(GenesisForm::from_genesis_format_version(32), Some(GenesisForm::Annulet));
+        for v in [0u32, 1, 2, 3, 6, 7, 31, 33, u32::MAX] {
             assert_eq!(GenesisForm::from_genesis_format_version(v), None, "v{v} must not map");
         }
     }
@@ -198,9 +219,20 @@ mod tests {
         assert_eq!(GenesisForm::V5.name_boundary(), None);
     }
 
+    /// The L2 has no name service (lab #706 P11): nothing to display, and
+    /// riders are never active — every name op is refused.
+    #[test]
+    fn annulet_has_no_name_service() {
+        assert_eq!(GenesisForm::Annulet.name_boundary(), None);
+        assert_eq!(GenesisForm::Annulet.rider_admit_boundary(), None);
+        for h in [0u64, 1, 1_000_000] {
+            assert!(!crate::names::riders_active_above(GenesisForm::Annulet.rider_admit_boundary(), h));
+        }
+    }
+
     #[test]
     fn round_trips_through_the_format_version() {
-        for form in [GenesisForm::V4, GenesisForm::V5] {
+        for form in [GenesisForm::V4, GenesisForm::V5, GenesisForm::Annulet] {
             assert_eq!(
                 GenesisForm::from_genesis_format_version(form.genesis_format_version()),
                 Some(form)

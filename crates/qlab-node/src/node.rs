@@ -449,6 +449,10 @@ pub enum NodeError {
     Rewind(RewindError),
     /// A persistence error.
     Io(io::Error),
+    /// This node was handed a chain form it does not serve yet (lab #706):
+    /// an Annulet block reaching the L1 node's state funnel. `owner` names the
+    /// milestone that lands the Annulet node path (sequencer B2, state B3).
+    FormNotServed { form: GenesisForm, owner: &'static str },
 }
 
 impl NodeError {
@@ -481,7 +485,11 @@ impl NodeError {
             | NodeError::Chain(_)
             | NodeError::SnapshotFinality(_)
             | NodeError::SnapshotFinalityNotLogged { .. }
-            | NodeError::Rewind(_) => "internal",
+            | NodeError::Rewind(_)
+            // A form this node cannot serve reaching its funnel is an internal
+            // wiring error (`run` refuses an Annulet genesis before a node
+            // exists), not a peer fault — the same bucket, enumerated.
+            | NodeError::FormNotServed { .. } => "internal",
         }
     }
 }
@@ -517,6 +525,10 @@ impl std::fmt::Display for NodeError {
             ),
             NodeError::Rewind(e) => write!(f, "rewind refused: {e}"),
             NodeError::Io(e) => write!(f, "persistence error: {e}"),
+            NodeError::FormNotServed { form, owner } => write!(
+                f,
+                "chain form {form:?} is not served by this node yet (lands with {owner}, lab #706)"
+            ),
         }
     }
 }
@@ -597,6 +609,11 @@ fn check_stored_binding_for(form: GenesisForm, block: &StoredBlock) -> Result<()
     let got = match form {
         GenesisForm::V4 => block.body().commitment_at(block.header.height),
         GenesisForm::V5 => block.body().commitment_v5_at(block.header.height),
+        // The L1 stored mirror cannot represent an Annulet block (lab #706
+        // persisted-bytes verdict); its stored form is B2/B3's.
+        GenesisForm::Annulet => {
+            return Err(NodeError::FormNotServed { form, owner: "B2/B3" });
+        }
     };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
@@ -1387,6 +1404,11 @@ impl MemNode {
         let expected_binding = match form {
             GenesisForm::V4 => genesis.body().commitment(),
             GenesisForm::V5 => genesis.body().commitment_v5(),
+            // Locally-built input, same class as the height assertion above.
+            GenesisForm::Annulet => panic!(
+                "the L1 node cannot open an Annulet genesis: the Annulet node path \
+                 lands with B2/B3 (lab #706)"
+            ),
         };
         assert_eq!(
             genesis.header.tx_body_commitment, expected_binding,
@@ -1584,6 +1606,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                         &header, &body, verifier, anchor_ok, &self.names,
                     )
                     .map_err(NodeError::Body)?,
+                    GenesisForm::Annulet => {
+                        return Err(NodeError::FormNotServed { form: self.form, owner: "B2/B3" });
+                    }
                 }
             }
             AnchorGate::SettledHistory => {
@@ -1597,6 +1622,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                         &header, &body, verifier, anchor_ok, &self.names,
                     )
                     .map_err(NodeError::Body)?,
+                    GenesisForm::Annulet => {
+                        return Err(NodeError::FormNotServed { form: self.form, owner: "B2/B3" });
+                    }
                 }
             }
         }

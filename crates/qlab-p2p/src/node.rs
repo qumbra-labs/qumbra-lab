@@ -1297,7 +1297,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             // T1 peer decodes with reject-trailing, so an appended field would
             // get this node banned by the very net it is a member of.
             let net_id = match self.node.genesis_form() {
-                qlab_devnet::forms::GenesisForm::V5 => self.local_net_id,
+                // An Annulet net is a new net like T2 (lab #706): it carries
+                // and requires the net identifier from its first peer.
+                qlab_devnet::forms::GenesisForm::V5
+                | qlab_devnet::forms::GenesisForm::Annulet => self.local_net_id,
                 qlab_devnet::forms::GenesisForm::V4 => None,
             };
             let v = VersionMsg {
@@ -2096,10 +2099,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let ours = self.local_net_id?;
         match v.net_id {
             Some(theirs) if theirs != ours => Some(NetRefusal::WrongNet { claimed: theirs }),
-            None if self.node.genesis_form() == qlab_devnet::forms::GenesisForm::V5 => {
-                Some(NetRefusal::NoNetId)
-            }
-            _ => None,
+            // Exhaustive over the form, not `== V5` (lab #706's grep-lock): a
+            // net whose genesis form requires the id refuses a peer without one.
+            None => match self.node.genesis_form() {
+                qlab_devnet::forms::GenesisForm::V5
+                | qlab_devnet::forms::GenesisForm::Annulet => Some(NetRefusal::NoNetId),
+                qlab_devnet::forms::GenesisForm::V4 => None,
+            },
+            Some(_) => None,
         }
     }
 

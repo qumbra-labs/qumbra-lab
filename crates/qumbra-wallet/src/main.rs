@@ -544,6 +544,9 @@ fn net_name(form: qlab_devnet::forms::GenesisForm) -> &'static str {
     match form {
         GenesisForm::V4 => "t1",
         GenesisForm::V5 => "t2",
+        // `resolve_net` never yields it today (the wallet's send path is L1;
+        // the L2 note layer is C1/C2) — named, not guessed, if it ever does.
+        GenesisForm::Annulet => "annulet",
     }
 }
 

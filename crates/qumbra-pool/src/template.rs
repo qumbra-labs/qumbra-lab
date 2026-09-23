@@ -50,6 +50,8 @@ pub enum TemplateError {
     Blob(String),
     Hex(HexError),
     UnknownForm(String),
+    /// A form with no PoW blob to mine (lab #706: Annulet).
+    NotMinable(GenesisForm),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -59,6 +61,9 @@ impl std::fmt::Display for TemplateError {
             TemplateError::Hex(e) => write!(f, "template hex: {e}"),
             TemplateError::UnknownForm(s) => {
                 write!(f, "unknown genesis form `{s}` (want v4 or v5)")
+            }
+            TemplateError::NotMinable(form) => {
+                write!(f, "no mining template on a {form:?} net: a pool mines PoW blocks; an Annulet (sequencer) net has none (lab #706)")
             }
         }
     }
@@ -81,7 +86,11 @@ impl From<HexError> for TemplateError {
 impl Template {
     /// Stock-xmrig is a v5-only product claim (#356 UNCLEAN on v4).
     pub fn serves_stock_xmrig(&self) -> bool {
-        self.form == GenesisForm::V5
+        // Exhaustive, not `== V5` (lab #706's grep-lock).
+        match self.form {
+            GenesisForm::V5 => true,
+            GenesisForm::V4 | GenesisForm::Annulet => false,
+        }
     }
 
     /// Serialize the hashing blob with `extra` written into the v5
@@ -103,6 +112,7 @@ impl Template {
                 debug_assert_eq!(blob.len(), HEADER_PREIMAGE_LEN_V4);
                 Ok(blob)
             }
+            GenesisForm::Annulet => Err(TemplateError::NotMinable(GenesisForm::Annulet)),
         }
     }
 }

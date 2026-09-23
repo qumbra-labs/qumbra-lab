@@ -214,6 +214,8 @@ pub fn coinbase_for(form: GenesisForm, h: u64) -> u64 {
     match form {
         GenesisForm::V4 => coinbase(h),
         GenesisForm::V5 => coinbase_exact(h),
+        // No emission on the L2 (lab #706 P9): nothing is minted per block.
+        GenesisForm::Annulet => 0,
     }
 }
 
@@ -282,6 +284,10 @@ mod tests {
             "above the boundary both forms are exact"
         );
         assert_eq!(coinbase_for(GenesisForm::V5, b + 1), coinbase_exact(b + 1));
+        // No emission on the L2 (lab #706 P9), at any height.
+        for h in [0u64, 1, b, b + 1, 4_600_000] {
+            assert_eq!(coinbase_for(GenesisForm::Annulet, h), 0);
+        }
     }
 
     /// **The boundary seam** (#299 + #303): the last `f64` block is the boundary

@@ -36,6 +36,7 @@ pub fn header_wire_len(form: GenesisForm) -> usize {
     match form {
         GenesisForm::V4 => HEADER_PREIMAGE_LEN_V4,
         GenesisForm::V5 => HEADER_PREIMAGE_LEN_V5,
+        GenesisForm::Annulet => qlab_devnet::header::HEADER_PREIMAGE_LEN_ANNULET,
     }
 }
 
@@ -75,6 +76,12 @@ pub enum DecodeError {
     /// refused by name before constructing a body this build cannot validate
     /// (the same grounds as `BadBucket`).
     TooManyCoinbasePayees { got: usize, cap: usize },
+    /// An Annulet header carried a non-zero `difficulty`/`nonce`-class field or
+    /// reserved tag byte — the form has neither (lab #706).
+    BadAnnuletHeader { what: &'static str },
+    /// A wire object this build does not serve on this net's form yet
+    /// (lab #706): `owner` names the milestone that lands it.
+    FormNotServed { form: GenesisForm, owner: &'static str },
 }
 
 impl From<CodecError> for DecodeError {
@@ -177,6 +184,7 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
     let mut r = Reader::new(buf);
     let prev = r.hash32("prev")?;
     let (height, nonce, timestamp, difficulty, tag_pos) = match form {
+        GenesisForm::Annulet => return decode_header_annulet(prev, r),
         GenesisForm::V4 => {
             let height = r.u64_le("height")?;
             let timestamp = r.u64_le("timestamp")?;
@@ -217,6 +225,47 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
         tx_body_commitment,
         aggregate_proof: AggregateProofSlot,
         epoch_supply_attestation: EpochSupplyAttestation,
+    })
+}
+
+/// The Annulet header tail after `prev` (lab #706 Q3): version `0x20`, u48
+/// height, timestamp, `l1_anchor{height, root}`, `registry_root`, body
+/// commitment, and the two reserved bytes fixed at `0x00 0x00` —
+/// reject-unknown on each, reject-trailing at the end. The length was checked
+/// by the caller, so a v4/v5 header on an Annulet net is refused by
+/// `WrongHeaderLen` before any of this reads it.
+fn decode_header_annulet(prev: Hash32, mut r: Reader<'_>) -> Result<BlockHeader, DecodeError> {
+    use qlab_devnet::annulet::{AnnuletHeaderFields, HeaderExt};
+    use qlab_devnet::header::{ANNULET_RESERVED_TAGS, HEADER_VERSION_BYTE_ANNULET};
+    let version = r.u8("header_format_version")?;
+    if version != HEADER_VERSION_BYTE_ANNULET {
+        return Err(DecodeError::BadHeaderVersion { got: version });
+    }
+    let mut h6 = [0u8; 8];
+    h6[..6].copy_from_slice(&r.rest(6, "height_u48")?);
+    let height = u64::from_le_bytes(h6);
+    let timestamp = r.u64_le("timestamp")?;
+    let l1_anchor_height = r.u64_le("l1_anchor_height")?;
+    let l1_anchor_root = r.hash32("l1_anchor_root")?;
+    let registry_root = r.hash32("registry_root")?;
+    let tx_body_commitment = r.hash32("tx_body_commitment")?;
+    for (i, want) in ANNULET_RESERVED_TAGS.iter().enumerate() {
+        let got = r.u8("annulet_reserved_tag")?;
+        if got != *want {
+            return Err(DecodeError::BadHeaderTag { pos: 151 + i, got });
+        }
+    }
+    r.finish()?;
+    Ok(BlockHeader {
+        prev,
+        height,
+        timestamp,
+        difficulty: 0,
+        nonce: 0,
+        tx_body_commitment,
+        aggregate_proof: AggregateProofSlot,
+        epoch_supply_attestation: EpochSupplyAttestation,
+        ext: HeaderExt::Annulet(AnnuletHeaderFields { l1_anchor_height, l1_anchor_root, registry_root }),
     })
 }
 
@@ -764,6 +813,82 @@ mod tests {
         assert!(matches!(
             decode_header(GenesisForm::V5, &bytes),
             Err(DecodeError::BadHeaderTag { pos: 96, .. })
+        ));
+    }
+
+    // ── Annulet header form (lab #706) ──────────────────────────────────────
+
+    fn annulet_header() -> BlockHeader {
+        use qlab_devnet::annulet::AnnuletHeaderFields;
+        let g = BlockHeader::genesis_annulet(
+            AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [0x44; 32] },
+            [0x22; 32],
+            0,
+        );
+        BlockHeader::child_of_annulet(
+            &g,
+            75,
+            AnnuletHeaderFields { l1_anchor_height: 9, l1_anchor_root: [0x55; 32], registry_root: [0x44; 32] },
+            [0x66; 32],
+        )
+    }
+
+    #[test]
+    fn annulet_header_round_trips_and_is_153_bytes() {
+        let h = annulet_header();
+        let bytes = encode_header(GenesisForm::Annulet, &h);
+        assert_eq!(bytes.len(), 153);
+        assert_eq!(header_wire_len(GenesisForm::Annulet), 153);
+        let back = decode_header(GenesisForm::Annulet, &bytes).unwrap();
+        assert_eq!(back, h, "ext, height, timestamp and the roots all survive the wire");
+        assert_eq!(back.header_hash_for(GenesisForm::Annulet), h.header_hash_for(GenesisForm::Annulet));
+    }
+
+    /// An L1 header on an Annulet net, and an Annulet header on either L1 net,
+    /// is refused by length — by name, never misparsed.
+    #[test]
+    fn annulet_and_l1_headers_are_refused_across_forms_by_name() {
+        let l1 = sample_header();
+        let an = encode_header(GenesisForm::Annulet, &annulet_header());
+        for (form, bytes) in [
+            (GenesisForm::V4, encode_header(GenesisForm::V4, &l1)),
+            (GenesisForm::V5, encode_header(GenesisForm::V5, &l1)),
+        ] {
+            assert!(matches!(
+                decode_header(GenesisForm::Annulet, &bytes),
+                Err(DecodeError::WrongHeaderLen { want: 153, .. })
+            ));
+            assert!(matches!(
+                decode_header(form, &an),
+                Err(DecodeError::WrongHeaderLen { got: 153, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn annulet_header_rejects_a_wrong_version_byte_and_nonzero_reserved_bytes() {
+        let good = encode_header(GenesisForm::Annulet, &annulet_header());
+        let mut v = good.clone();
+        v[32] = 0x05;
+        assert!(matches!(
+            decode_header(GenesisForm::Annulet, &v),
+            Err(DecodeError::BadHeaderVersion { got: 0x05 })
+        ));
+        for pos in [151usize, 152] {
+            let mut t = good.clone();
+            t[pos] = 0xA6;
+            assert!(matches!(
+                decode_header(GenesisForm::Annulet, &t),
+                Err(DecodeError::BadHeaderTag { pos: p, got: 0xA6 }) if p == pos
+            ));
+        }
+    }
+
+    #[test]
+    fn an_annulet_announce_is_refused_by_name_until_b5() {
+        assert!(matches!(
+            crate::compact::decode_announce(GenesisForm::Annulet, &[]),
+            Err(DecodeError::FormNotServed { form: GenesisForm::Annulet, owner: "B5" })
         ));
     }
 

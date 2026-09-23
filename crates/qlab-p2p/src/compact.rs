@@ -126,6 +126,10 @@ pub fn encode_announce_above(
     out.extend_from_slice(&encode_header(form, &a.header));
     out.extend_from_slice(&a.nonce.to_le_bytes());
     match form {
+        // Locally-built input only (the decoder refuses peers by error).
+        GenesisForm::Annulet => panic!(
+            "no compact block announce on an Annulet net yet: lands with B5 (lab #706)"
+        ),
         GenesisForm::V4 => {
             // The v4 wire, byte-frozen: coinbase total ‖ rkm lanes.
             let (coinbase, coinbase_rkm) = single_payee_parts(&a.coinbase_payees)
@@ -175,11 +179,18 @@ pub fn decode_announce_above(
     form: GenesisForm,
     buf: &[u8],
 ) -> Result<BlockAnnounce, DecodeError> {
+    // Refused before reading a byte, so the refusal names the form rather
+    // than whichever field the Annulet bytes happen to truncate first.
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => {}
+        GenesisForm::Annulet => return Err(DecodeError::FormNotServed { form, owner: "B5" }),
+    }
     let mut r = Reader::new(buf);
     let hdr_bytes = r.rest(header_wire_len(form), "announce.header")?;
     let header = decode_header(form, &hdr_bytes)?;
     let nonce = r.u64_le("announce.nonce")?;
     let coinbase_payees = match form {
+        GenesisForm::Annulet => return Err(DecodeError::FormNotServed { form, owner: "B5" }),
         GenesisForm::V4 => {
             let coinbase = r.u64_le("announce.coinbase")?;
             let mut coinbase_rkm = [0u64; 4];
