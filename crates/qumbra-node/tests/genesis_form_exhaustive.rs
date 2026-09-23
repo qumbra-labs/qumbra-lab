@@ -17,17 +17,60 @@
 //! `matches!(form, GenesisForm::X)` stays legal: it names its pattern, and its
 //! `false` is the caller's explicit decision.
 //!
-//! The scanner is lexical (line comments stripped, brace depth tracked), and it
+//! The scanner is lexical (string literals and line comments blanked, brace
+//! depth tracked), and it
 //! checks itself first against synthetic violations — a scan that found nothing
 //! because it looked at nothing must fail, not pass.
 
 use std::path::{Path, PathBuf};
 
-fn strip_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(i) => &line[..i],
-        None => line,
+/// Blank out string-literal contents and line comments, carrying an open
+/// string across lines (`"…\` continuations). A banned shape inside a string
+/// is data, not code — the synthetic samples in this very file are the case
+/// that taught it (the first lane run flagged its own self-test strings).
+/// Raw strings (`r"…"`, `r#"…"#`) are not modelled; none in this workspace
+/// spells a banned shape, and the self-test would show one that did.
+fn code_lines(text: &str) -> Vec<String> {
+    let mut in_str = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut code = String::with_capacity(line.len());
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_str = false;
+                    code.push('"');
+                }
+                i += 1;
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                break;
+            }
+            if c == '\'' && chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'\'') {
+                code.push_str("' '");
+                i += 3;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                code.push('"');
+                i += 1;
+                continue;
+            }
+            code.push(c);
+            i += 1;
+        }
+        out.push(code);
     }
+    out
 }
 
 fn is_variant_path_at(s: &str, i: usize) -> bool {
@@ -105,7 +148,8 @@ struct Violation {
 /// Scan one file's text. Returns the violations and how many form-match
 /// blocks were examined.
 fn scan(text: &str) -> (Vec<Violation>, usize) {
-    let lines: Vec<&str> = text.lines().map(strip_comment).collect();
+    let owned = code_lines(text);
+    let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut out = Vec::new();
     for (i, c) in lines.iter().enumerate() {
         if has_variant_comparison(c) {
@@ -169,6 +213,10 @@ fn the_scanner_catches_what_it_bans() {
     for (src, what) in [(bad_wild, "wildcard"), (bad_bind, "binding"), (bad_eq, "=="), (bad_ne, "!=")] {
         assert!(!scan(src).0.is_empty(), "the scanner missed a {what}");
     }
+    // A banned shape inside a string literal (even one continued across
+    // lines) is data, not code.
+    let in_string = "let s = \"if f == GenesisForm::V4 {}\";\nlet t = \"a \\\n  GenesisForm::V5 != g\";\n";
+    assert!(scan(in_string).0.is_empty(), "a string literal was scanned as code: {:?}", scan(in_string).0);
     let good = "match form {\n    GenesisForm::V4 => 1,\n    GenesisForm::V5 | GenesisForm::Annulet => {\n        match n { 1 => 2, _ => 3 }\n    }\n}\nlet b = matches!(f, GenesisForm::V5);\nmatch s { \"v4\" => Ok(GenesisForm::V4), other => Err(other) }\n";
     let (v, blocks) = scan(good);
     assert!(v.is_empty(), "false positives: {v:?}");
