@@ -387,7 +387,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     let bad_body = qlab_devnet::body::BlockBody::from_single_payee(vec![bad_tx.clone()], 0, [0; 4]);
     let bad_block_header =
         BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, bad_body.commitment());
-    let ann = BlockAnnounce {
+    let ann = BlockAnnounce { seal: None,
         header: bad_block_header,
         nonce: 0,
         coinbase_payees: Vec::new(),
@@ -412,7 +412,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
         qlab_devnet::body::BlockBody::from_single_payee(vec![soak_tx(anchor, 4, true)], 0, [0; 4]);
     let honest_header =
         BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, honest_body.commitment());
-    let ann_empty = BlockAnnounce {
+    let ann_empty = BlockAnnounce { seal: None,
         header: honest_header,
         nonce: 0,
         coinbase_payees: Vec::new(),

@@ -310,7 +310,7 @@ mod tests {
     use qlab_node::{StoredHeader, StoredTx};
 
     fn block(height: u64, txs: Vec<StoredTx>) -> StoredBlock {
-        StoredBlock {
+        StoredBlock { annulet: None,
             header: StoredHeader {
                 prev: [height.wrapping_sub(1) as u8; 32],
                 height,
@@ -326,7 +326,7 @@ mod tests {
     }
 
     fn tx(op: Option<&NameOp>, fee: u64) -> StoredTx {
-        StoredTx {
+        StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
             anchor: [0x0F; 32],
             nullifiers: vec![[1; 32]],
             commitments: vec![[2; 32]],

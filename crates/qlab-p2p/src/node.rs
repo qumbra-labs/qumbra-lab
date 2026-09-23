@@ -15,13 +15,11 @@ use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{
     checkpoint_id, checkpoint_query_height, checkpoint_query_id, decode_checkpoint_msg, decode_checkpoint_votes, decode_evidence_msg,
-    decode_headers, decode_inv, decode_locator, decode_tx, encode_checkpoint_msg,
-    encode_checkpoint_votes, encode_evidence_msg, encode_headers, encode_inv, encode_locator,
-    encode_tx, evidence_id, tx_id, InvItem, InvKind, InvVec,
+    decode_inv, decode_locator, encode_checkpoint_msg, encode_checkpoint_votes, encode_evidence_msg,
+    encode_inv, encode_locator, evidence_id, tx_id, InvItem, InvKind, InvVec,
 };
 use crate::compact::{
-    decode_announce, decode_block_txn, decode_get_block_txn, encode_announce, encode_block_txn,
-    encode_get_block_txn, reconstruct, short_id, BlockAnnounce, BlockTxn, GetBlockTxn, PrefilledTx,
+    decode_announce, decode_get_block_txn, encode_announce, encode_get_block_txn, reconstruct, short_id, BlockAnnounce, BlockTxn, GetBlockTxn, PrefilledTx,
     Reconstruct,
 };
 use crate::addrman::AddrManager;
@@ -1027,6 +1025,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     pub fn checkpoint_queries(&self) -> usize {
         self.cp_queries.len()
     }
+
+    /// The tip this node would ask peers about a finalized checkpoint for
+    /// ([`Self::checkpoint_query_target`]), or `None` when its finality has
+    /// caught its chain up and there is nothing to ask — the trigger itself,
+    /// observable without a peer (lab #708: always `None` on an Annulet net,
+    /// where finality is the tip).
+    pub fn checkpoint_query_trigger(&self) -> Option<u64> {
+        self.checkpoint_query_target()
+    }
     pub fn addrs_mut(&mut self) -> &mut AddrManager {
         &mut self.addrs
     }
@@ -1474,7 +1481,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
-        let ann = BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled };
+        let ann = BlockAnnounce { seal: None, header, nonce, coinbase_payees, short_ids, prefilled };
         let payload = encode_announce(self.node.genesis_form(), &ann);
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -2297,7 +2304,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         for it in items {
             match it.kind {
                 InvKind::Tx => match self.node.get_tx(&it.id) {
-                    Some(tx) => self.send(from, MsgType::Tx, encode_tx(&tx)),
+                    Some(tx) => {
+                        let bytes = crate::codec::encode_tx_for(self.node.genesis_form(), &tx);
+                        self.send(from, MsgType::Tx, bytes)
+                    }
                     None => not_found.push(it),
                 },
                 // **The door #130 (c) opens, and it needed no new envelope type.**
@@ -2328,7 +2338,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // the fix only helps between two nodes that both HAVE it. Every host
                 // deployed before it still bans an unknown type, so the reasoning
                 // above stands unchanged for as long as any such host is running.
-                InvKind::Block => match self.node.header(&it.id) {
+                InvKind::Block => match self.node.wire_header(&it.id) {
                     Some(h) => {
                         // Issue #371 S3: every gate that can stop a WHOLE body
                         // degrades to the same answer — the header, exactly the
@@ -2350,7 +2360,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                         };
                         let mut served = false;
                         if let Some(b) = body {
-                            let ann = whole_block_announce(h, b);
+                            let ann = whole_block_announce(h.clone(), b);
                             let bytes = encode_announce(self.node.genesis_form(), &ann);
                             let cost = bytes.len() as u64;
                             // Charged at the encoded answer size — the number
@@ -2369,7 +2379,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                         if !served {
                             // No body held, past a cap, or over a budget: the
                             // header, exactly as before.
-                            self.send(from, MsgType::Header, crate::codec::encode_header(self.node.genesis_form(), &h))
+                            self.send(
+                                from,
+                                MsgType::Header,
+                                crate::codec::encode_wire_header(self.node.genesis_form(), &h),
+                            )
                         }
                     }
                     None => not_found.push(it),
@@ -2436,7 +2450,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     // --- gossip payloads ---
 
     fn on_tx(&mut self, from: PeerId, payload: &[u8]) {
-        let tx = match decode_tx(payload) {
+        // Lab #708: the tx wire is the net's (an Annulet tx carries its surface).
+        let tx = match crate::codec::decode_tx_for(self.node.genesis_form(), payload) {
             Ok(t) => t,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
@@ -2458,13 +2473,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
 
     fn on_header(&mut self, from: PeerId, payload: &[u8]) {
-        let header = match crate::codec::decode_header(self.node.genesis_form(), payload) {
+        // Lab #708: the message unit is the net's — on an Annulet net the
+        // sealed header (3,462 B); a bare preimage is refused by length.
+        let wire = match crate::codec::decode_wire_header(self.node.genesis_form(), payload) {
             Ok(h) => h,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
                 return;
             }
         };
+        let header = wire.header();
         let id = header.header_hash_for(self.node.genesis_form());
         // 🔴 **Issue #229 — the answer that was easiest to leave out.** A peer
         // answers `GetData(Block)` with a bare `Header` when it holds the header and
@@ -2486,7 +2504,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // chain must not grow a competing below-finality path beside it. Above
         // the checkpoint, the ordinary path (including its orphan sync-kick,
         // which re-drives the GetHeaders loop) is unchanged.
-        if self.checkpoint_sync.is_some() {
+        // Checkpoint sync is L1 machinery (an Annulet net has no checkpoints,
+        // so no session ever starts there); a sealed header never enters it.
+        if let (true, crate::codec::WireHeader::L1(_)) = (self.checkpoint_sync.is_some(), &wire) {
             match self.ingest_checkpoint_sync_header(from, header) {
                 CheckpointHeaderOutcome::Buffered
                 | CheckpointHeaderOutcome::Admitted
@@ -2494,7 +2514,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 CheckpointHeaderOutcome::Fallback | CheckpointHeaderOutcome::AboveCheckpoint => {}
             }
         }
-        let outcome = self.node.ingest_header(header);
+        let outcome = self.node.ingest_wire_header(wire);
         if outcome.is_peer_fault() {
             self.peers.penalize(from, PENALTY_INVALID_OBJECT);
         }
@@ -2801,11 +2821,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let batch = answer_get_headers(&self.node, &loc, MAX_HEADERS_PER_BATCH);
-        self.send(from, MsgType::Headers, encode_headers(self.node.genesis_form(), &batch));
+        // Lab #708: served as message units (sealed on an Annulet net; 2,000 ×
+        // 3,462 B ≈ 6.9 MB fits MAX_PAYLOAD). A header this node cannot serve
+        // as its unit ends the batch there — the next locator round resumes.
+        let form = self.node.genesis_form();
+        let units: Vec<_> = batch
+            .iter()
+            .map_while(|h| self.node.wire_header(&h.header_hash_for(form)))
+            .collect();
+        self.send(from, MsgType::Headers, crate::codec::encode_wire_headers(form, &units));
     }
 
     fn on_headers(&mut self, from: PeerId, payload: &[u8]) {
-        let batch = match decode_headers(self.node.genesis_form(), payload) {
+        let batch = match crate::codec::decode_wire_headers(self.node.genesis_form(), payload) {
             Ok(b) => b,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
@@ -2816,8 +2844,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let mut accepted = 0;
         let mut buffered = 0;
         let mut dropped = 0;
-        for h in batch {
-            if self.checkpoint_sync.is_some() {
+        for wire in batch {
+            let h = wire.header();
+            if let (true, crate::codec::WireHeader::L1(_)) = (self.checkpoint_sync.is_some(), &wire) {
                 match self.ingest_checkpoint_sync_header(from, h) {
                     CheckpointHeaderOutcome::Buffered | CheckpointHeaderOutcome::Admitted => {
                         accepted += 1;
@@ -2838,7 +2867,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 }
             }
             let id = h.header_hash_for(self.node.genesis_form());
-            match self.node.ingest_header(h) {
+            match self.node.ingest_wire_header(wire) {
                 IngestOutcome::Accepted => {
                     accepted += 1;
                     self.seen.insert(id);
@@ -3163,15 +3192,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         } else {
             return; // we don't have that block's body
         };
-        self.send(
-            from,
-            MsgType::BlockTxn,
-            encode_block_txn(&BlockTxn { block_hash: req.block_hash, txs }),
+        let bytes = crate::compact::encode_block_txn_for(
+            self.node.genesis_form(),
+            &BlockTxn { block_hash: req.block_hash, txs },
         );
+        self.send(from, MsgType::BlockTxn, bytes);
     }
 
     fn on_block_txn(&mut self, from: PeerId, payload: &[u8]) {
-        let bt = match decode_block_txn(payload) {
+        let bt = match crate::compact::decode_block_txn_for(self.node.genesis_form(), payload) {
             Ok(b) => b,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
@@ -3201,9 +3230,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         txs: Vec<TxEntry>,
         except: Option<PeerId>,
     ) {
+        // Lab #708: the header as it arrived (sealed on an Annulet net), so the
+        // sequencer net's block goes through its sealed ingest.
         let outcome = self
             .node
-            .ingest_block(ann.header, BlockBody::new(txs.clone(), ann.coinbase_payees.clone()));
+            .ingest_wire_block(ann.wire_header(), BlockBody::new(txs.clone(), ann.coinbase_payees.clone()));
         // Orphan-triggered sync kick (M10-T0-1, issue #62 item 6 — the N7 finding):
         // an announced block whose parent is unknown was previously dropped, and
         // gap recovery relied solely on the taller-peer handshake. Instead, kick
@@ -3268,6 +3299,37 @@ where
     /// N1 traits deliberately flatten it to a relay decision
     /// ([`IngestOutcome`]), and widening them for one composition's benefit
     /// would put a wallet-facing shape on the peer wire's contract.
+    /// **Relay the producer's sealed block** (lab #708). The block was already
+    /// sealed and applied through the adapter's own ingest path
+    /// ([`crate::adapter::NodeAdapter::seal_next_block`] — the one a follower
+    /// runs), so this only caches the body for serving and announces the
+    /// sealed unit to every ready peer. Returns the peer count it went to.
+    pub fn relay_sealed_block(
+        &mut self,
+        sealed: &qlab_devnet::annulet::SealedHeader,
+        body: &BlockBody,
+        nonce: u64,
+    ) -> usize {
+        let bh = sealed.id();
+        self.blocks.insert(sealed.header.height, bh, body.txs.clone(), Vec::new());
+        self.seen.insert(bh);
+        let (prefilled, short_ids) = build_announce_parts(&body.txs, nonce);
+        let ann = BlockAnnounce {
+            header: sealed.header,
+            nonce,
+            coinbase_payees: Vec::new(),
+            short_ids,
+            prefilled,
+            seal: Some(sealed.sig.clone()),
+        };
+        let payload = encode_announce(crate::n1::ChainView::genesis_form(&self.node), &ann);
+        let peers = self.peers.ready_peers();
+        for pid in &peers {
+            self.send(*pid, MsgType::BlockAnnounce, payload.clone());
+        }
+        peers.len()
+    }
+
     pub fn announce_tx_typed(
         &mut self,
         tx: TxEntry,
@@ -3296,7 +3358,11 @@ where
 /// ids, and there are none. Fixing it rather than inventing one keeps the encoding
 /// a pure function of the block, so two nodes serving the same block serve the
 /// same bytes.
-fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
+fn whole_block_announce(wire: crate::codec::WireHeader, body: BlockBody) -> BlockAnnounce {
+    let (header, seal) = match wire {
+        crate::codec::WireHeader::L1(h) => (h, None),
+        crate::codec::WireHeader::Sealed(s) => (s.header, Some(s.sig)),
+    };
     let coinbase_payees = body.coinbase_payees;
     let prefilled = body
         .txs
@@ -3305,6 +3371,7 @@ fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
         .map(|(i, tx)| PrefilledTx { index: i as u32, tx })
         .collect();
     BlockAnnounce {
+        seal,
         header,
         nonce: 0,
         coinbase_payees,
@@ -3331,6 +3398,7 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::encode_headers;
     use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, StubNode, TxPool};
     use crate::transport::{
         CloseReason, ConnDirection, InProcHub, InProcTransport, TcpTransport,
@@ -4533,7 +4601,7 @@ mod tests {
         let bh = header.header_hash();
         // …announced with no transactions at all (fully-prefilled, empty).
         let (prefilled, short_ids) = build_announce_parts(&[], 0xBEEF);
-        let ann = BlockAnnounce {
+        let ann = BlockAnnounce { seal: None,
             header,
             nonce: 0xBEEF,
             coinbase_payees: Vec::new(),
@@ -4866,7 +4934,7 @@ mod tests {
         }
         assert!(!b.blocks.contains(&bh));
         let (prefilled, short_ids) = build_announce_parts(&txs, 0xC0DE);
-        let ann = BlockAnnounce {
+        let ann = BlockAnnounce { seal: None,
             header,
             nonce: 0xC0DE,
             coinbase_payees: Vec::new(),

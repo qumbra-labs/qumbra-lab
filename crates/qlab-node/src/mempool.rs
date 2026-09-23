@@ -87,6 +87,7 @@ use qlab_devnet::body::{
     check_tx_discovery, repeated_nullifier_in_tx, BlockBody, BodyError, TxEntry, TxVerifier,
 };
 use qlab_devnet::fees::posted_fee;
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::weight::{
     is_weight_admissible, quadratic_penalty, weight_limit, WeightGovernor, WeightParams,
@@ -147,6 +148,10 @@ impl Default for MempoolParams {
 pub enum MempoolError {
     /// Fee ≠ the posted price for the tx's bucket (protocol-spec §4, frozen §5).
     WrongFee { expected: u64, got: u64 },
+    /// The tx's L2 surface is refused (lab #708): present on an L1 net, or on
+    /// an Annulet net missing / malformed / not 2×2. Carries block
+    /// validation's own verdict (only the `L2*` variants of [`BodyError`]).
+    L2SurfaceInvalid(BodyError),
     /// The anchor is not a valid transaction anchor now (not finalized, or aged
     /// past the ≤ 1,152-block window — §4/§7).
     AnchorNotValid,
@@ -256,6 +261,12 @@ pub fn txid(entry: &TxEntry) -> TxId {
     if entry.rider != qlab_devnet::names::RIDER_ABSENT {
         buf.extend_from_slice(&(entry.rider.len() as u64).to_le_bytes());
         buf.extend_from_slice(&entry.rider);
+    }
+    // Lab #708: the L2 surface is part of identity for the same reason —
+    // presence-conditional, so every L1 txid is unchanged.
+    if entry.l2 != qlab_devnet::annulet::L2_SURFACE_ABSENT {
+        buf.extend_from_slice(&(entry.l2.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&entry.l2);
     }
     keccak256(&buf)
 }
@@ -534,20 +545,51 @@ impl Mempool {
         //    become valid, so it is refused here exactly as block validation
         //    refuses it (`RiderMalformed`).
         let prospective_height = state.tip_height() + 1;
-        let op = qlab_devnet::names::names_admit_op_above(
-            boundary,
-            &entry,
-            prospective_height,
-            names,
-        )
-        .map_err(MempoolError::RiderInvalid)?;
-
-        // 1. Posted-price fee (protocol-spec §4, frozen §5) PLUS the burned
-        //    name fee for any rider (the fee split — the reveal declares
-        //    `posted + name_fee`, and without this it was refused as WrongFee).
-        //    Cheapest — a pure function of the public bucket and the op.
-        let expected =
-            posted_fee(entry.public.bucket) + op.as_ref().map_or(0, qlab_devnet::names::name_fee_for);
+        // Lab #708 Q7: the form decides the rider, surface and fee rules — one
+        // funnel with a form arm, not a second mempool. `check_discovery` is
+        // the L1 §4 rule; the Annulet discovery group is B5's
+        // (`qlab_devnet::annulet::ANNULET_DISCOVERY_RULE_OWNER`).
+        let (op, expected, check_discovery) = match state.genesis_form() {
+            GenesisForm::V4 | GenesisForm::V5 => {
+                if entry.l2 != qlab_devnet::annulet::L2_SURFACE_ABSENT {
+                    return Err(MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceOnL1 { index: 0 }));
+                }
+                let op = qlab_devnet::names::names_admit_op_above(
+                    boundary,
+                    &entry,
+                    prospective_height,
+                    names,
+                )
+                .map_err(MempoolError::RiderInvalid)?;
+                // 1. Posted-price fee (protocol-spec §4, frozen §5) PLUS the
+                //    burned name fee for any rider (the fee split — the reveal
+                //    declares `posted + name_fee`, and without this it was
+                //    refused as WrongFee). Cheapest — a pure function of the
+                //    public bucket and the op.
+                let expected =
+                    posted_fee(entry.public.bucket) + op.as_ref().map_or(0, qlab_devnet::names::name_fee_for);
+                (op, expected, true)
+            }
+            GenesisForm::Annulet => {
+                // No name service on the L2.
+                if entry.rider != qlab_devnet::names::RIDER_ABSENT {
+                    return Err(MempoolError::RiderInvalid(BodyError::RiderBeforeBoundary { index: 0 }));
+                }
+                let surface = qlab_devnet::annulet::L2Surface::decode(&entry.l2)
+                    .map_err(|err| MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMalformed { index: 0, err }))?
+                    .ok_or(MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMissing { index: 0 }))?;
+                if entry.public.bucket != qlab_devnet::fees::ArityBucket::TwoByTwo
+                    || entry.public.nullifiers.len() != 2
+                    || entry.public.commitments.len() != 2
+                {
+                    return Err(MempoolError::L2SurfaceInvalid(BodyError::L2NotTwoByTwo { index: 0 }));
+                }
+                let fees = state
+                    .annulet_fee_table()
+                    .expect("an Annulet node state carries its genesis L2 fee table (lab #708)");
+                (None, fees.posted_fee_l2(surface.shape), false)
+            }
+        };
         if entry.public.fee != expected {
             return Err(MempoolError::WrongFee { expected, got: entry.public.fee });
         }
@@ -597,8 +639,10 @@ impl Mempool {
         //    O(tx bytes) decode + re-encode, dwarfed by the proof verify below;
         //    index 0 because the refusal names this candidate, not a block
         //    position.
-        if let Err(e) = check_tx_discovery(0, &entry) {
-            return Err(MempoolError::DiscoveryInvalid(e));
+        if check_discovery {
+            if let Err(e) = check_tx_discovery(0, &entry) {
+                return Err(MempoolError::DiscoveryInvalid(e));
+            }
         }
 
         // 8. Proof verify — last, the only non-trivial cost (consensus §1).

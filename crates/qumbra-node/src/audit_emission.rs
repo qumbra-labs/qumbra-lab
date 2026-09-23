@@ -690,7 +690,7 @@ mod tests {
     // --- lab #520: per-block expected is form-aware ---------------------------
 
     fn stub_block(height: u64, committed: u64) -> StoredBlock {
-        StoredBlock {
+        StoredBlock { annulet: None,
             header: StoredHeader {
                 prev: [0u8; 32],
                 height,

@@ -71,7 +71,7 @@ The gate is a test: `persist::tests::a_v4_block_reaches_disk_byte_identically_to
 | Annulet signing-message digest | `2d00955c…c9e3` | named run + Python |
 | Annulet empty-body commitment | `75dc7b56…52be` | named run + Python |
 | Annulet empty genesis-body commitment | `3ad958aa…d253` | named run + Python |
-| fixture Annulet genesis hash (3,031 B file) | `c0257d67…b19a` | named run ×2, byte-identical |
+| fixture Annulet genesis hash (3,047 B file; slot params added by lab #708) | `a73f547d…ead2` (B1: `c0257d67…b19a`) | named run ×2, byte-identical |
 | on-disk v4 block record | 362 B literal | Python bincode encoder |
 
 The local runs (both named by the #706 ruling; no proving):
@@ -87,7 +87,7 @@ The figures are for the `cargo → example` process tree with the examples alrea
 
 - **The parent-registry-root binding** of each transaction's surface (Q6): B4. The codec carries the value; `validate_body_annulet` does not read the chain.
 - **The discovery group of an Annulet transaction** (`ANNULET_DISCOVERY_RULE_OWNER = "B5"`). It is committed in the Annulet body preimage but not judged: the L1 codec frames 120-B payloads, the L2's are 128-B.
-- **The sequencer signature**: its carriage (block, wire, log) and verification are B2's. The header's signing message and id are fixed here.
+- **The sequencer signature**: its carriage (block, wire, log) and verification landed in B2 — see `annulet-sequencer.md`. The header's signing message and id are fixed here.
 - **Applying the genesis notes and registry leaves** to chain state: B3 (P13).
 - **The Annulet stored form** (log / snapshot): B2/B3. The L1 mirrors refuse Annulet values.
 - **`registry_root_of` is B3's contract fixed early**: depth 16, empty slot = zero digest, `qlab-air` Merkle node. B3's `RegistryTree` must reproduce it.

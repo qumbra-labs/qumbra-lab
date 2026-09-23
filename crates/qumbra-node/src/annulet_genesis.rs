@@ -11,8 +11,9 @@
 //!   refused by name;
 //! - [`GenesisFile::from_bytes`] refuses a leading 32 **by name**
 //!   (`GenesisError::AnnuletGenesisNotServed`) before decoding a byte — which
-//!   is also how `qumbra-node run` (and every other L1 loader: explorer,
-//!   faucet, mine) refuses an Annulet genesis until B2's producer exists;
+//!   is how every L1-only loader (explorer, faucet, mine) refuses an Annulet
+//!   genesis. `qumbra-node run` loads through [`load_any`] since B2b (lab
+//!   #708) and runs the sequencer net;
 //! - [`AnnuletGenesisFile::from_bytes`] refuses anything but 32 by name.
 //!
 //! What the file carries (Q2): the L2 fee table (Q7 — genesis parameters,
@@ -88,13 +89,21 @@ pub struct GenesisNoteRecord {
     pub payload: Vec<u8>,
 }
 
-/// The L2 genesis parameters (Q7): the posted fee tiers in fee-unit base
-/// units. **Placeholders** in the fixture (S = 1, P = 2), pending C2/B4's
-/// tariff; a real devnet mints its own values (B6).
+/// The L2 genesis parameters: the posted fee tiers in fee-unit base units
+/// (lab #706 Q7 — **placeholders** in the fixture, S = 1 / P = 2, pending
+/// C2/B4's tariff) and the sequencer's slot cadence (lab #708 Q5 — genesis
+/// parameters, not code constants: `slot_secs` = 10, an empty block at most
+/// every `max_empty_slots` = 6 slots, the §5 defaults). A real devnet mints
+/// its own values (B6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnuletParams {
     pub fee_tier_s: u64,
     pub fee_tier_p: u64,
+    /// The slot length in seconds (lab #708 Q5).
+    pub slot_secs: u64,
+    /// The producer seals an empty block at the latest every this many slots
+    /// with an empty pool (lab #708 Q5).
+    pub max_empty_slots: u64,
 }
 
 impl AnnuletParams {
@@ -132,6 +141,40 @@ pub struct AnnuletGenesisFile {
     /// The fee unit's whole Phase-0 supply (Q5), valid only at height 0.
     pub genesis_notes: Vec<GenesisNoteRecord>,
     pub genesis_header: AnnuletGenesisHeader,
+}
+
+/// The sequencer key file's name in a node's data dir (lab #708 Q6): its
+/// presence makes the node the **producer**; without it the node follows.
+/// Never config or env inline — the committee-key convention.
+pub const SEQUENCER_KEY_FILE: &str = "sequencer.key";
+
+/// The sequencer signing-key file (TOML, like the committee `KeyFile`): the
+/// 32-byte ML-DSA seed, hex-encoded. Read only by the node binary at start;
+/// `run` checks the derived key against the genesis `sequencer_key` and
+/// refuses a mismatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequencerKeyFile {
+    pub seed_hex: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+impl SequencerKeyFile {
+    /// The seed bytes.
+    pub fn seed(&self) -> Result<[u8; 32], GenesisError> {
+        let bytes = crate::genesis::hex_decode(&self.seed_hex).ok_or(GenesisError::BadHex)?;
+        bytes.try_into().map_err(|_| GenesisError::BadSeedLen)
+    }
+
+    /// Parse from TOML.
+    pub fn from_toml(text: &str) -> Result<Self, GenesisError> {
+        toml::from_str(text).map_err(|e| GenesisError::Parse(e.to_string()))
+    }
+
+    /// Serialize to TOML.
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).expect("SequencerKeyFile is always TOML-serializable")
+    }
 }
 
 /// Either kind of genesis file, as [`load_any`] returns it.
@@ -248,7 +291,8 @@ impl AnnuletGenesisFile {
         Ok(VerifyingKey::<MlDsa65>::decode(&e))
     }
 
-    fn notes(&self) -> Vec<GenesisNote> {
+    /// The genesis notes in the form the genesis-body commitment binds.
+    pub fn notes(&self) -> Vec<GenesisNote> {
         self.genesis_notes.iter().map(|n| GenesisNote { cm: n.cm, payload: n.payload.clone() }).collect()
     }
 
@@ -341,7 +385,7 @@ impl AnnuletGenesisFile {
     ///   *not encrypted*: a devnet genesis seals them to the faucet's
     ///   ML-KEM key (B6).
     pub fn fixture() -> Self {
-        let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2 };
+        let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, slot_secs: 10, max_empty_slots: 6 };
         let isk = [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004];
         let asset7 = RegistryLeafRecord {
             asset: 7,
@@ -382,8 +426,10 @@ mod tests {
     use super::*;
 
     /// The fixture's genesis hash — computed by the named
-    /// `annulet_fixture_genesis` run, twice, byte-identical (3,031 B file).
-    const FIXTURE_GENESIS_HASH: &str = "c0257d6719b1c4ea1c80565e10475df691d71dc5f0660dd81572a434ebccb19a";
+    /// `annulet_fixture_genesis` run, twice, byte-identical. **Re-pinned by
+    /// lab #708 (Q5)**: the slot parameters joined `AnnuletParams`; the B1
+    /// value was `c0257d67…b19a` (3,031 B file); now 3,047 B.
+    const FIXTURE_GENESIS_HASH: &str = "a73f547d6c7d8763fd4090ce4bd133e13a24f4880ad272975003629a2a61ead2";
 
     #[test]
     fn the_fixture_verifies_and_selects_the_annulet_form() {

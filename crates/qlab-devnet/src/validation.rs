@@ -28,7 +28,7 @@ use qlab_pow::keyblock::KeyBlockSchedule;
 use qlab_pow::lwma_next_difficulty;
 
 use crate::chain::ChainState;
-use crate::forms::ChainRules;
+use crate::forms::{ChainRules, GenesisForm};
 use crate::halt::pow_value;
 use crate::header::{BlockHeader, Hash32};
 use crate::params_devnet::LWMA_WINDOW_BLOCKS;
@@ -51,6 +51,23 @@ pub enum ValidationError {
     /// block is not reachable on the branch — should not happen for a well-linked
     /// header).
     UnknownSeed,
+    // --- lab #708: the Annulet (sequencer) header rule ---------------------
+    /// An Annulet header was presented without its seal — the header-only
+    /// rule cannot judge it ([`validate_sealed_header_annulet`] can).
+    SealRequired,
+    /// A header on an Annulet net without an Annulet extension.
+    NotAnnuletHeader,
+    /// An Annulet header with a non-zero `difficulty` or `nonce`.
+    PowFieldsOnAnnulet,
+    /// The header's `l1_anchor_height` is below its parent's (the anchor is
+    /// informational at Phase 0, but monotone).
+    AnchorRegressed { parent: u64, got: u64 },
+    /// The header's `registry_root` differs from its parent's — there are no
+    /// runtime registry changes until A2.
+    RegistryRootChanged,
+    /// The seal is not a valid signature by the genesis sequencer key over
+    /// this header's signing message.
+    BadSeal,
 }
 
 /// The RandomX **key-block seed** (RandomX key) for a block at `height` whose
@@ -164,6 +181,13 @@ pub fn validate_header_under<P: PowEngine>(
         return Err(ValidationError::NonMonotonicTimestamp);
     }
 
+    // Lab #708 Q1: the difficulty + PoW rule is the L1 forms'. An Annulet
+    // header is judged only WITH its seal (`validate_sealed_header_annulet`),
+    // which this header-only entry point does not have.
+    match rules.form {
+        GenesisForm::V4 | GenesisForm::V5 => {}
+        GenesisForm::Annulet => return Err(ValidationError::SealRequired),
+    }
     let expected = expected_difficulty(chain, &header.prev, target_block_time)
         .ok_or(ValidationError::UnknownParent)?;
     if header.difficulty != expected {
@@ -180,6 +204,48 @@ pub fn validate_header_under<P: PowEngine>(
     let value = pow_value(pow.pow_hash(rules.form, header, &seed), header.height, &rules.halt);
     if !satisfies_target_for(&value, header.difficulty, rules.form) {
         return Err(ValidationError::PowUnsatisfied);
+    }
+    Ok(())
+}
+
+/// **The Annulet header rule** (lab #708 Q1): what replaces difficulty + PoW
+/// on a sequencer net. In order: parent known, height = parent + 1,
+/// timestamp ≥ parent's, no PoW fields, an Annulet extension, `l1_anchor`
+/// height monotone (informational otherwise), `registry_root` unchanged from
+/// the parent's (no runtime registry updates until A2), and the seal verifies
+/// under the genesis-pinned sequencer key.
+///
+/// Equivocation (a second sealed header at an occupied height) is not a
+/// property of one header against its parent, so it is refused at ingest,
+/// not here.
+pub fn validate_sealed_header_annulet(
+    chain: &ChainState,
+    sealed: &crate::annulet::SealedHeader,
+    sequencer_key: &ml_dsa::VerifyingKey<ml_dsa::MlDsa65>,
+) -> Result<(), ValidationError> {
+    use crate::annulet::HeaderExt;
+    let header = &sealed.header;
+    let parent = chain.header(&header.prev).ok_or(ValidationError::UnknownParent)?;
+    if header.height != parent.height + 1 {
+        return Err(ValidationError::BadHeight);
+    }
+    if header.timestamp < parent.timestamp {
+        return Err(ValidationError::NonMonotonicTimestamp);
+    }
+    if header.difficulty != 0 || header.nonce != 0 {
+        return Err(ValidationError::PowFieldsOnAnnulet);
+    }
+    let (HeaderExt::Annulet(ext), HeaderExt::Annulet(pext)) = (header.ext, parent.ext) else {
+        return Err(ValidationError::NotAnnuletHeader);
+    };
+    if ext.l1_anchor_height < pext.l1_anchor_height {
+        return Err(ValidationError::AnchorRegressed { parent: pext.l1_anchor_height, got: ext.l1_anchor_height });
+    }
+    if ext.registry_root != pext.registry_root {
+        return Err(ValidationError::RegistryRootChanged);
+    }
+    if !sealed.verifies_under(sequencer_key) {
+        return Err(ValidationError::BadSeal);
     }
     Ok(())
 }

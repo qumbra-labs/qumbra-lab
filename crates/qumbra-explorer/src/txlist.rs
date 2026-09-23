@@ -629,7 +629,7 @@ mod tests {
     /// A stored transaction with a distinguishable surface. `proof` is real bytes
     /// so `wire_bytes` measures something.
     fn stored_tx(seed: u8, fee: u64, n_nf: usize, n_cm: usize, proof_len: usize) -> StoredTx {
-        StoredTx {
+        StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
             anchor: h32(seed),
             nullifiers: (0..n_nf).map(|i| h32(seed ^ (0x40 + i as u8))).collect(),
             commitments: (0..n_cm).map(|i| h32(seed ^ (0x80 + i as u8))).collect(),
@@ -642,7 +642,7 @@ mod tests {
     }
 
     fn stored_block(height: u64, txs: Vec<StoredTx>) -> StoredBlock {
-        StoredBlock {
+        StoredBlock { annulet: None,
             header: qlab_node::StoredHeader {
                 prev: h32(height.saturating_sub(1) as u8),
                 height,

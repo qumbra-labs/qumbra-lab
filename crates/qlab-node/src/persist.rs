@@ -135,6 +135,41 @@ enum WireRecord {
     Finalize(Hash32),
     /// Variant 2 — a rider-carrying block (lab #367), current layouts.
     BlockV4(StoredBlock),
+    /// Variant 3 — an **Annulet** block (lab #708): the sealed header's
+    /// extension and seal, and each transaction's L2 surface. Additive, like
+    /// variant 2: written only on an Annulet net, so an L1 log never holds one
+    /// and variants 0–2 (and `FORMAT_VERSION`) do not move.
+    AnnuletBlock(AnnuletWireBlock),
+}
+
+/// The Annulet block record (lab #708), its own frozen layout — explicit
+/// mirrors rather than the live types, so a later field on `StoredBlock` or
+/// `AnnuletHeaderFields` cannot move these bytes (the #101/#188 lesson,
+/// [`LegacyStoredTx`]). No coinbase (the L2 has none) and no rider (never
+/// active on an Annulet net; read back as absent).
+#[derive(Serialize, Deserialize)]
+struct AnnuletWireBlock {
+    header: crate::store::StoredHeader,
+    l1_anchor_height: u64,
+    l1_anchor_root: Hash32,
+    registry_root: Hash32,
+    /// The 3,309-B seal. Genesis (the one unsealed block) is never logged.
+    sig: Vec<u8>,
+    txs: Vec<AnnuletWireTx>,
+}
+
+/// One transaction of an [`AnnuletWireBlock`].
+#[derive(Serialize, Deserialize)]
+struct AnnuletWireTx {
+    anchor: Hash32,
+    nullifiers: Vec<Hash32>,
+    commitments: Vec<Hash32>,
+    bucket_actions: u32,
+    fee: u64,
+    proof: Vec<u8>,
+    discovery: Vec<u8>,
+    /// The canonical L2 surface bytes (`L2Surface::encode`).
+    l2: Vec<u8>,
 }
 
 fn rider_free(b: &StoredBlock) -> bool {
@@ -142,7 +177,43 @@ fn rider_free(b: &StoredBlock) -> bool {
 }
 
 impl From<&LogRecord> for WireRecord {
+    /// # Panics
+    ///
+    /// On an unsealed Annulet block (the genesis block, which is never
+    /// logged), and on an L1 block carrying an L2 surface: the L1 layouts have
+    /// no place for a surface (`StoredTx.l2` is `serde(skip)`), so writing one
+    /// would drop it silently.
     fn from(rec: &LogRecord) -> Self {
+        if let LogRecord::Block(b) = rec {
+            if let Some(a) = &b.annulet {
+                let sig = a.sig.as_ref().expect("an Annulet log record carries its seal (lab #708)");
+                return WireRecord::AnnuletBlock(AnnuletWireBlock {
+                    header: b.header.clone(),
+                    l1_anchor_height: a.ext.l1_anchor_height,
+                    l1_anchor_root: a.ext.l1_anchor_root,
+                    registry_root: a.ext.registry_root,
+                    sig: sig.to_vec(),
+                    txs: b
+                        .txs
+                        .iter()
+                        .map(|t| AnnuletWireTx {
+                            anchor: t.anchor,
+                            nullifiers: t.nullifiers.clone(),
+                            commitments: t.commitments.clone(),
+                            bucket_actions: t.bucket_actions,
+                            fee: t.fee,
+                            proof: t.proof.clone(),
+                            discovery: t.discovery.clone(),
+                            l2: t.l2.clone(),
+                        })
+                        .collect(),
+                });
+            }
+            assert!(
+                b.txs.iter().all(|t| t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT),
+                "an L2 surface has no L1 log record (lab #708)"
+            );
+        }
         match rec {
             LogRecord::Finalize(h) => WireRecord::Finalize(*h),
             LogRecord::Block(b) if rider_free(b) => WireRecord::Block(LegacyStoredBlock {
@@ -168,17 +239,51 @@ impl From<&LogRecord> for WireRecord {
     }
 }
 
+fn annulet_record_to_block(a: AnnuletWireBlock) -> StoredBlock {
+    let sig: Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]> =
+        Box::new(a.sig.as_slice().try_into().expect("seal length checked at read (check_record_shape)"));
+    StoredBlock {
+        header: a.header,
+        txs: a
+            .txs
+            .into_iter()
+            .map(|t| crate::store::StoredTx {
+                anchor: t.anchor,
+                nullifiers: t.nullifiers,
+                commitments: t.commitments,
+                bucket_actions: t.bucket_actions,
+                fee: t.fee,
+                proof: t.proof,
+                discovery: t.discovery,
+                rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+                l2: t.l2,
+            })
+            .collect(),
+        coinbase: 0,
+        coinbase_rkm: [0; 4],
+        annulet: Some(crate::store::AnnuletStoredSeal {
+            ext: qlab_devnet::annulet::AnnuletHeaderFields {
+                l1_anchor_height: a.l1_anchor_height,
+                l1_anchor_root: a.l1_anchor_root,
+                registry_root: a.registry_root,
+            },
+            sig: Some(sig),
+        }),
+    }
+}
+
 impl From<WireRecord> for LogRecord {
     fn from(rec: WireRecord) -> Self {
         match rec {
             WireRecord::Finalize(h) => LogRecord::Finalize(h),
             WireRecord::BlockV4(b) => LogRecord::Block(b),
-            WireRecord::Block(l) => LogRecord::Block(StoredBlock {
+            WireRecord::AnnuletBlock(a) => LogRecord::Block(annulet_record_to_block(a)),
+            WireRecord::Block(l) => LogRecord::Block(StoredBlock { annulet: None,
                 header: l.header,
                 txs: l
                     .txs
                     .into_iter()
-                    .map(|t| crate::store::StoredTx {
+                    .map(|t| crate::store::StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                         anchor: t.anchor,
                         nullifiers: t.nullifiers,
                         commitments: t.commitments,
@@ -290,6 +395,22 @@ fn check_record_buckets(rec: &WireRecord, record_index: usize) -> io::Result<()>
             check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
         }
         WireRecord::BlockV4(b) => {
+            check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
+        }
+        WireRecord::AnnuletBlock(b) => {
+            // Lab #708: the seal's width is fixed; any other length is corrupt
+            // data, refused by name here rather than panicking at conversion.
+            if b.sig.len() != qlab_devnet::annulet::ANNULET_SIG_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{BLOCK_LOG}: record {record_index} is an Annulet block whose seal is {} bytes, \
+                         not {}. This datadir is corrupt — re-sync it; do not start against it.",
+                        b.sig.len(),
+                        qlab_devnet::annulet::ANNULET_SIG_LEN
+                    ),
+                ));
+            }
             check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
         }
     }
@@ -727,7 +848,7 @@ mod tests {
     // --- lab #367: the rider's on-disk story --------------------------------
 
     fn a_stored_block(rider: Vec<u8>) -> StoredBlock {
-        StoredBlock {
+        StoredBlock { annulet: None,
             header: crate::store::StoredHeader {
                 prev: h(0x11),
                 height: 9_000,
@@ -736,7 +857,7 @@ mod tests {
                 nonce: 7,
                 tx_body_commitment: h(0x22),
             },
-            txs: vec![crate::store::StoredTx {
+            txs: vec![crate::store::StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 anchor: h(0x33),
                 nullifiers: vec![h(0x44)],
                 commitments: vec![h(0x55)],
@@ -915,4 +1036,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn annulet_golden_block() -> StoredBlock {
+        StoredBlock {
+            header: crate::store::StoredHeader {
+                prev: [0x11; 32],
+                height: 1,
+                timestamp: 10,
+                difficulty: 0,
+                nonce: 0,
+                tx_body_commitment: [0x22; 32],
+            },
+            txs: vec![crate::store::StoredTx {
+                anchor: [0x01; 32],
+                nullifiers: vec![[0x02; 32], [0x03; 32]],
+                commitments: vec![[0x04; 32], [0x05; 32]],
+                bucket_actions: 4,
+                fee: 1,
+                proof: b"ok".to_vec(),
+                discovery: vec![0x00],
+                rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+                l2: [&[0x01u8][..], &[0x44; 32][..]].concat(),
+            }],
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+            annulet: Some(crate::store::AnnuletStoredSeal {
+                ext: qlab_devnet::annulet::AnnuletHeaderFields {
+                    l1_anchor_height: 0x0102_0304_0506_0708,
+                    l1_anchor_root: [0x33; 32],
+                    registry_root: [0x44; 32],
+                },
+                sig: Some(Box::new([0xA5; qlab_devnet::annulet::ANNULET_SIG_LEN])),
+            }),
+        }
+    }
+
+    /// Lab #708: the Annulet log record (variant 3) byte for byte. The
+    /// expected bytes were built by an independent Python bincode-1.x encoder
+    /// (u32 variant index, u64 length prefixes, fixed-width LE integers) from
+    /// the layout, not read back from this code. The seal is a synthetic
+    /// `0xA5` fill — the log never verifies a seal (it is this node's own
+    /// accepted history), so the record's bytes do not depend on ML-DSA.
+    #[test]
+    fn the_annulet_log_record_is_variant_3_byte_for_byte() {
+        const PRE_SIG: &str = "03000000111111111111111111111111111111111111111111111111111111111111111101000000000000000a00000000000000000000000000000000000000000000002222222222222222222222222222222222222222222222222222222222222222080706050403020133333333333333333333333333333333333333333333333333333333333333334444444444444444444444444444444444444444444444444444444444444444";
+        const TX: &str = "010101010101010101010101010101010101010101010101010101010101010102000000000000000202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030302000000000000000404040404040404040404040404040404040404040404040404040404040404050505050505050505050505050505050505050505050505050505050505050504000000010000000000000002000000000000006f6b0100000000000000002100000000000000014444444444444444444444444444444444444444444444444444444444444444";
+        let block = annulet_golden_block();
+        let bytes = bincode::serialize(&WireRecord::from(&LogRecord::Block(block.clone()))).unwrap();
+        assert_eq!(bytes.len(), 3745);
+        let mut expected = PRE_SIG.to_string();
+        expected.push_str("ed0c000000000000"); // 3,309 as a u64 length
+        expected.push_str(&"a5".repeat(qlab_devnet::annulet::ANNULET_SIG_LEN));
+        expected.push_str("0100000000000000"); // one tx
+        expected.push_str(TX);
+        assert_eq!(to_hex(&bytes), expected);
+        assert_eq!(
+            to_hex(&qlab_devnet::hash::keccak256(&bytes)),
+            "7c378193986ca5f43262ddcded777fd4c54799dc176a1ecb3d8540da9fb06c68"
+        );
+        // Round trip through the reader's conversion: the seal, extension and
+        // surface come back; the rider reads as absent.
+        let back = LogRecord::from(bincode::deserialize::<WireRecord>(&bytes).unwrap());
+        match back {
+            LogRecord::Block(b) => {
+                assert_eq!(b.annulet, block.annulet);
+                assert_eq!(b.txs[0].l2, block.txs[0].l2);
+                assert_eq!(b.txs[0].rider, qlab_devnet::names::RIDER_ABSENT.to_vec());
+                assert_eq!(b.header(), block.header());
+            }
+            LogRecord::Finalize(_) => panic!("a block record"),
+        }
+    }
+
+    /// A seal of any other width is corrupt data, refused by name at read.
+    #[test]
+    fn an_annulet_record_with_a_short_seal_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i708-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rec = WireRecord::AnnuletBlock(AnnuletWireBlock {
+            header: annulet_golden_block().header,
+            l1_anchor_height: 0,
+            l1_anchor_root: [0; 32],
+            registry_root: [0; 32],
+            sig: vec![0xA5; 100],
+            txs: Vec::new(),
+        });
+        let bytes = bincode::serialize(&rec).unwrap();
+        let mut f = Vec::new();
+        f.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        f.extend_from_slice(&bytes);
+        fs::write(dir.join(BLOCK_LOG), f).unwrap();
+        let err = read_records(&dir).expect_err("a short seal is refused");
+        assert!(err.to_string().contains("seal is 100 bytes"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

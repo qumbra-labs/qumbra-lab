@@ -325,6 +325,16 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// the arming predicate needs it and nothing else on the adapter can see it —
     /// the in-flight map lives in `P2pNode`.
     breq_observed: usize,
+    /// The genesis-pinned sequencer verifying key — `Some` exactly on an
+    /// Annulet adapter (lab #708).
+    sequencer_key: Option<ml_dsa::VerifyingKey<ml_dsa::MlDsa65>>,
+    /// Refused equivocations (lab #708): `(height, kept id, refused id)`.
+    equivocations: Vec<(u64, Hash32, Hash32)>,
+    /// Seals of accepted Annulet headers whose block is not applied yet
+    /// (lab #708): `id → (height, seal)`, so a header-first node can re-serve
+    /// the sealed unit. An applied block's seal lives in the store instead,
+    /// and its entry (and every entry at or below it) is dropped then.
+    pending_seals: HashMap<Hash32, (u64, Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]>)>,
 }
 
 /// **A finalize record this node refused to write, and why** (issue #204, from the
@@ -467,6 +477,14 @@ impl std::fmt::Display for FinalizeRefusal {
 /// body (lab #706): the Annulet node path is B2's. A fact about this node, not
 /// the sender — the `Ignored` family's membership rule.
 pub const ANNULET_NOT_SERVED_REASON: &str = "annulet-form-not-served-until-B2";
+
+/// The [`IngestOutcome::Ignored`] reason for an **unsealed** header or block on
+/// an Annulet adapter (lab #708): judged only with its seal.
+pub const UNSEALED_ON_ANNULET_REASON: &str = "unsealed header on a sequencer net";
+
+#[path = "adapter_annulet.rs"]
+mod annulet;
+pub use annulet::EQUIVOCATION_REASON;
 
 pub const MAX_JOURNALLED_FINALIZE_REFUSALS: usize = 32;
 
@@ -805,6 +823,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         state: MemNode,
     ) -> Self {
         let genesis = BlockHeader::genesis_for(form, sim.genesis_difficulty, 0);
+        Self::assemble_on(form, genesis, committee, pow, verifier, sim, state)
+    }
+
+    /// [`Self::assemble`] over an explicit genesis header — the Annulet
+    /// constructor's seam (its genesis carries a registry root, lab #708).
+    fn assemble_on(
+        form: GenesisForm,
+        genesis: BlockHeader,
+        committee: EpochCommittee,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+        state: MemNode,
+    ) -> Self {
         NodeAdapter {
             chain: ChainState::new_for(form, genesis),
             pow,
@@ -844,6 +876,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             stip_moved_ms: None,
             stall_now_ms: 0,
             breq_observed: 0,
+            sequencer_key: None,
+            equivocations: Vec::new(),
+            pending_seals: HashMap::new(),
         }
     }
 
@@ -2357,6 +2392,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // a block mined for the pre-halt rules does not meet the target here.
             ValidationError::PowUnsatisfied => "invalid header: pow",
             ValidationError::UnknownSeed => "invalid header: seed",
+            // Lab #708: the Annulet (sequencer) rule.
+            ValidationError::SealRequired => "invalid header: unsealed on a sequencer net",
+            ValidationError::NotAnnuletHeader => "invalid header: not an Annulet header",
+            ValidationError::PowFieldsOnAnnulet => "invalid header: pow fields on Annulet",
+            ValidationError::AnchorRegressed { .. } => "invalid header: l1 anchor regressed",
+            ValidationError::RegistryRootChanged => "invalid header: registry root changed",
+            ValidationError::BadSeal => "invalid header: bad sequencer seal",
         }
     }
 
@@ -2533,6 +2575,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 _ => "rider rule",
             },
             MempoolError::ProofInvalid => "proof invalid",
+            // Lab #708: intrinsic to the tx's own bytes, like discovery.
+            MempoolError::L2SurfaceInvalid(_) => "l2 surface invalid",
         }
     }
 }
@@ -2562,9 +2606,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     fn has_header(&self, hash: &Hash32) -> bool {
         self.chain.header(hash).is_some()
     }
+    fn wire_header(&self, hash: &Hash32) -> Option<crate::codec::WireHeader> {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => self.chain.header(hash).copied().map(crate::codec::WireHeader::L1),
+            GenesisForm::Annulet => self.sealed_header_by_id(hash).map(crate::codec::WireHeader::Sealed),
+        }
+    }
     fn finalized_height(&self) -> Option<u64> {
-        // Committee checkpoints are the source of truth (as in `StubNode`).
-        self.finality.finalized_height()
+        match self.rules.form {
+            // Committee checkpoints are the source of truth (as in `StubNode`).
+            GenesisForm::V4 | GenesisForm::V5 => self.finality.finalized_height(),
+            // Lab #708 Q4: final on acceptance. The committee tracker is never
+            // fed on Annulet (no committee), so it would read `None` forever
+            // and every telemetry surface built on this view would report a
+            // stalled, degraded chain; the fork-choice pointer is the truth.
+            GenesisForm::Annulet => self.chain.finalized_height(),
+        }
     }
     fn stored_body(&self, hash: &Hash32) -> Option<BlockBody> {
         // The state machine's block store (issue #135): written inside
@@ -2717,11 +2774,39 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
+    fn ingest_wire_header(&mut self, header: crate::codec::WireHeader) -> IngestOutcome {
+        match header {
+            crate::codec::WireHeader::L1(h) => self.ingest_header(h),
+            crate::codec::WireHeader::Sealed(s) => NodeAdapter::ingest_sealed_header(self, &s),
+        }
+    }
+
+    fn ingest_wire_block(&mut self, header: crate::codec::WireHeader, body: BlockBody) -> IngestOutcome {
+        match header {
+            crate::codec::WireHeader::L1(h) => self.ingest_block(h, body),
+            crate::codec::WireHeader::Sealed(s) => NodeAdapter::ingest_sealed_block(self, &s, body),
+        }
+    }
+
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: an Annulet header is judged only with its seal
+            // (`ingest_sealed_header`). An unsealed one is unjudgeable here —
+            // this node cannot say whether it is valid, so the sender is not
+            // charged (the `Ignored` family's "this NODE cannot judge").
+            GenesisForm::Annulet => return IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON),
+        }
         self.submit_header(header)
     }
 
     fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: checkpoint fast-sync has no checkpoint to land on, and
+            // an Annulet header is judged only with its seal.
+            GenesisForm::Annulet => return IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON),
+        }
         // The tracker only advances through the roster/signature/quorum gate. Its
         // block may be ahead of our local chain on the explicit eager-fetch path;
         // this span is admitted only when its hash chain lands exactly on that
@@ -2778,6 +2863,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: see `ingest_header`; the sealed path is `ingest_sealed_block`.
+            GenesisForm::Annulet => return IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON),
+        }
         // 1. Body validity is checked independently of tip-extension: a body that is
         //    not the one this header committed to (issue #77), or an invalid tx proof
         //    / fee / in-block double-spend, is adversarial and is rejected + penalized
@@ -3033,6 +3123,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
         votes: &[Vote],
         explicitly_requested: bool,
     ) -> VotesOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: an Annulet net has no committee and no checkpoints —
+            // blocks are final on acceptance. A vote is no information here:
+            // `Stale` (not relayed, not penalised; the sender is on another
+            // net, like the halt arm below), and nothing reaches the tally.
+            GenesisForm::Annulet => return VotesOutcome::Stale,
+        }
         let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
             return VotesOutcome::Stale; // already finalized this variant
@@ -3287,9 +3385,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
     fn finality_status(&self) -> FinalityStatus {
         // Halt-aware (issue #74): `Halting`/`Halted` when a halt governs, the
         // ordinary Ebb-and-Flow pair otherwise. Single derivation, in qlab-devnet.
+        // Lab #708: finality through the one form-matched view (the committee
+        // tracker on L1, the fork-choice pointer on Annulet) — reading the
+        // tracker here directly reported every Annulet chain as degraded.
         halt_regime(
             self.chain.tip_height(),
-            self.finality.finalized_height(),
+            ChainView::finalized_height(self),
             DEGRADED_MODE_LAG_BLOCKS,
             self.rules.halt.halt_at(),
         )

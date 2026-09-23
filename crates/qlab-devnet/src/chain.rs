@@ -156,7 +156,15 @@ impl ChainState {
         if header.height != parent.header.height + 1 {
             return Err(InsertError::BadHeight);
         }
-        let cumulative_work = parent.cumulative_work + header.difficulty as u128;
+        // Lab #708 Q3: an Annulet block weighs 1 (cumulative weight = height)
+        // — its difficulty is 0 by rule, so under the L1 weight its tip would
+        // never move. Ties cannot arise there: one signer, and a second sealed
+        // header at an occupied height is refused at ingest as equivocation.
+        let weight = match self.form {
+            GenesisForm::V4 | GenesisForm::V5 => header.difficulty as u128,
+            GenesisForm::Annulet => 1,
+        };
+        let cumulative_work = parent.cumulative_work + weight;
         self.blocks.insert(hash, Entry { header, cumulative_work });
 
         // Heaviest-chain rule, gated by finality: adopt the new block as tip iff

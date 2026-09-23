@@ -527,6 +527,10 @@ pub enum RejectReason {
     RiderInvalid,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
+    /// The tx's L2 surface is refused (lab #708, `MempoolError::L2SurfaceInvalid`)
+    /// — additive: reachable only on an Annulet net, since the L1 tx decode
+    /// never yields a surface.
+    L2SurfaceInvalid,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
     // commitment tree's append schedule, so an immature spend has no witness against
     // any acceptable anchor and cannot reach a refusal reason at all. A wallet that wants
@@ -730,6 +734,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 SubmitOutcome::Rejected(RejectReason::RiderInvalid)
             }
             Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
+            Err(MempoolError::L2SurfaceInvalid(_)) => {
+                SubmitOutcome::Rejected(RejectReason::L2SurfaceInvalid)
+            }
         }
     }
 
