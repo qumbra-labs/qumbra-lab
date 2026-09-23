@@ -415,6 +415,116 @@ impl AnnuletGenesisFile {
     }
 }
 
+/// **The Annulet devnet's dev keys and stock** (lab #716, B6) — **devnet
+/// only**, labelled so exactly as the committee rehearsal keys are: every
+/// secret here is public by construction, so a devnet built from them holds
+/// nothing of value. The devnet genesis ([`AnnuletGenesisFile::devnet`])
+/// mints from these, and the journey harness spends with them.
+pub mod devnet {
+    use qlab_air::l2::L2TxInput;
+    use qlab_note::l2note::L2Note;
+
+    /// The faucet's dev spend key and diversifier: its `rkm` receives the
+    /// fee-unit stock.
+    pub const FAUCET_SK: [u64; 4] = [0xFA0C_E7DE_0001, 0xFA0C_E7DE_0002, 0xFA0C_E7DE_0003, 0xFA0C_E7DE_0004];
+    pub const FAUCET_D: [u64; 2] = [0xFA0C, 1];
+    /// The dev holder of the genesis-minted `USDT-test` note.
+    pub const HOLDER_SK: [u64; 4] = [0x401D_E7DE_0001, 0x401D_E7DE_0002, 0x401D_E7DE_0003, 0x401D_E7DE_0004];
+    pub const HOLDER_D: [u64; 2] = [0x401D, 1];
+    /// `USDT-test`'s dev issuer secret.
+    pub const USDT_ISSUER_ISK: [u64; 4] = [0x1557_7E57_0001, 0x1557_7E57_0002, 0x1557_7E57_0003, 0x1557_7E57_0004];
+    /// `USDT-test`'s registry index.
+    pub const USDT_TEST_ASSET: u64 = 1;
+    /// The sequencer's dev seed.
+    pub const SEQUENCER_SEED: [u8; 32] = [0xDE; 32];
+    /// Fee-unit stock notes minted to the faucet, one grant each.
+    pub const STOCK_NOTES: u64 = 16;
+    /// The genesis-minted `USDT-test` balance of the dev holder.
+    pub const HOLDER_USDT_VALUE: u64 = 1_000_000;
+    /// The devnet fee tiers (fee-unit base units): S = 1, P = 2.
+    pub const FEE_TIER_S: u64 = 1;
+    pub const FEE_TIER_P: u64 = 2;
+    /// One grant pays exactly one shape-P fee; a stock note carries the grant
+    /// plus the shape-S fee of the grant transaction that spends it whole —
+    /// so the faucet needs no change tracking.
+    pub const GRANT_VALUE: u64 = FEE_TIER_P;
+    pub const STOCK_NOTE_VALUE: u64 = GRANT_VALUE + FEE_TIER_S;
+
+    /// A key's receiving `rkm` (`H(nk ‖ D ‖ d)`, the circuit's derivation).
+    pub fn rkm(sk: [u64; 4], d: [u64; 2]) -> [u64; 4] {
+        qlab_air::l2p::derive_rkm_l2(&L2TxInput { sk, value: 0, asset: 0, rho: [0; 4], rseed: [0; 4], d })
+    }
+
+    /// `USDT-test`'s policy: Hybrid, the dev issuer, redeem closed, an empty
+    /// freeze tree — the object both the genesis registry leaf and the
+    /// harness's witnesses are built from, so the two cannot drift.
+    pub fn usdt_test_policy() -> qlab_air::l2p::PolicyAsset {
+        qlab_air::l2p::PolicyAsset::hybrid(USDT_TEST_ASSET, USDT_ISSUER_ISK, false, &[])
+    }
+
+    /// Stock note `i` (asset 0, [`STOCK_NOTE_VALUE`]) to the faucet.
+    pub fn stock_note(i: u64) -> L2Note {
+        L2Note {
+            value: STOCK_NOTE_VALUE,
+            asset: 0,
+            rkm: rkm(FAUCET_SK, FAUCET_D),
+            rho: [0x5700_C000 + i, 1, 2, 3],
+            rseed: [0x5EED_5700 + i, 4, 5, 6],
+        }
+    }
+
+    /// The dev holder's genesis-minted `USDT-test` note.
+    pub fn holder_usdt_note() -> L2Note {
+        L2Note {
+            value: HOLDER_USDT_VALUE,
+            asset: USDT_TEST_ASSET,
+            rkm: rkm(HOLDER_SK, HOLDER_D),
+            rho: [0x401D_0000, 1, 2, 3],
+            rseed: [0x401D_5EED, 4, 5, 6],
+        }
+    }
+}
+
+impl AnnuletGenesisFile {
+    /// **The Annulet devnet genesis** (lab #716): asset 0 and `USDT-test`
+    /// (Hybrid, dev issuer) registered; [`devnet::STOCK_NOTES`] fee-unit stock
+    /// notes to the faucet and one `USDT-test` note to the dev holder, all as
+    /// `GenesisPlaintext`s. Pinned by `annulet_devnet_genesis_hash_is_pinned`;
+    /// the fixture stays as it is.
+    pub fn devnet() -> Self {
+        let params = AnnuletParams {
+            fee_tier_s: devnet::FEE_TIER_S,
+            fee_tier_p: devnet::FEE_TIER_P,
+            slot_secs: 10,
+            max_empty_slots: 6,
+        };
+        let usdt = devnet::usdt_test_policy().leaf();
+        let usdt = RegistryLeafRecord {
+            asset: usdt.asset as u16,
+            issuer_key: usdt.issuer_key,
+            mode: usdt.mode,
+            freeze_root: usdt.freeze_root,
+            allow_root: usdt.allow_root,
+            flags: usdt.flags,
+        };
+        let record = |n: &qlab_note::l2note::L2Note| GenesisNoteRecord {
+            cm: h32(&n.commitment()),
+            payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec(),
+        };
+        let mut notes: Vec<GenesisNoteRecord> =
+            (0..devnet::STOCK_NOTES).map(|i| record(&devnet::stock_note(i))).collect();
+        notes.push(record(&devnet::holder_usdt_note()));
+        Self::assemble(
+            "annulet-devnet",
+            params,
+            devnet::SEQUENCER_SEED,
+            vec![RegistryLeafRecord::asset_zero(), usdt],
+            notes,
+            0,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +552,24 @@ mod tests {
         assert_eq!(g.genesis_notes.len(), 4);
         assert_eq!(g.params.fee_table().posted_fee_l2(qlab_devnet::annulet::L2ShapeTag::P), 2);
     }
+
+    /// The devnet genesis is deterministic, verifies, pins its hash, and
+    /// registers the harness's own `USDT-test` policy leaf (lab #716).
+    #[test]
+    fn annulet_devnet_genesis_hash_is_pinned() {
+        let a = AnnuletGenesisFile::devnet();
+        let b = AnnuletGenesisFile::devnet();
+        assert_eq!(a.to_bytes(), b.to_bytes(), "deterministic");
+        a.verify(Some(DEVNET_GENESIS_HASH)).expect("the devnet genesis verifies and pins itself");
+        assert_eq!(a.hash_hex(), DEVNET_GENESIS_HASH);
+        // Its registry leaf for USDT-test is the harness's PolicyAsset's.
+        assert_eq!(a.registry_genesis[1].leaf(), devnet::usdt_test_policy().leaf());
+        assert_eq!(a.genesis_notes.len() as u64, devnet::STOCK_NOTES + 1);
+    }
+
+    /// The devnet genesis hash — from the named `annulet_devnet_genesis` run,
+    /// twice, byte-identical (lab #716).
+    const DEVNET_GENESIS_HASH: &str = "6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374";
 
     #[test]
     /// Also the byte-identity proof of lab #710's delegation: `registry_root_of`
