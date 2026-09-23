@@ -346,6 +346,17 @@ pub fn decode_group_contents(b: &[u8]) -> Result<Vec<RecipientBundle>, CodecErro
 /// *"this is not a size decision"* — 64 B is 0.04 % of a transaction.
 pub const PAYLOAD_LEN: usize = crate::note::NOTE_PLAINTEXT_LEN + 16;
 
+/// The AEAD tag width at the end of every committed payload.
+pub const PAYLOAD_TAG_LEN: usize = 16;
+
+/// `true` iff `payload`'s trailing 16-byte AEAD tag is all zeros — the mark of
+/// a genesis [`crate::l2note::GenesisPlaintext`], which no honest encryption
+/// produces (probability 2⁻¹²⁸). A non-genesis body carrying one is refused by
+/// name (lab #714, rule ii).
+pub fn payload_tag_is_zero(payload: &[u8]) -> bool {
+    payload.len() >= PAYLOAD_TAG_LEN && payload[payload.len() - PAYLOAD_TAG_LEN..].iter().all(|b| *b == 0)
+}
+
 // ---- the committed discovery region -----------------------------------------
 //
 // `group_contents ‖ payloads` — the exact bytes a block body commits to since
@@ -368,12 +379,24 @@ pub fn encode_committed_discovery(
     recipients: &[RecipientBundle],
     payloads: &[Vec<u8>],
 ) -> Vec<u8> {
+    encode_committed_discovery_with_width(recipients, payloads, PAYLOAD_LEN)
+}
+
+/// [`encode_committed_discovery`] at an explicit payload width — the L1's
+/// [`PAYLOAD_LEN`] (120) or the Annulet's `L2_PAYLOAD_LEN` (128), selected by
+/// the chain form (lab #714). The region's framing is the same; only the fixed
+/// width of the payload section differs.
+pub fn encode_committed_discovery_with_width(
+    recipients: &[RecipientBundle],
+    payloads: &[Vec<u8>],
+    width: usize,
+) -> Vec<u8> {
     let want = contents_entry_count(recipients);
     assert_eq!(payloads.len(), want, "one payload per discovery entry (D4 order)");
     let mut out = Vec::new();
     write_group_contents(&mut out, recipients);
     for p in payloads {
-        assert_eq!(p.len(), PAYLOAD_LEN, "committed payloads are fixed-width");
+        assert_eq!(p.len(), width, "committed payloads are fixed-width");
         out.extend_from_slice(p);
     }
     out
@@ -388,16 +411,24 @@ pub fn encode_committed_discovery(
 pub fn decode_committed_discovery(
     b: &[u8],
 ) -> Result<(Vec<RecipientBundle>, Vec<Vec<u8>>), CodecError> {
+    decode_committed_discovery_with_width(b, PAYLOAD_LEN)
+}
+
+/// [`decode_committed_discovery`] at an explicit payload width (lab #714).
+pub fn decode_committed_discovery_with_width(
+    b: &[u8],
+    width: usize,
+) -> Result<(Vec<RecipientBundle>, Vec<Vec<u8>>), CodecError> {
     let mut pos = 0usize;
     let recipients = read_group_contents(b, &mut pos)?;
     let n = contents_entry_count(&recipients);
-    let expected = n * PAYLOAD_LEN;
+    let expected = n * width;
     let got = b.len() - pos;
     if got != expected {
         return Err(CodecError::PayloadSectionLen { expected, got });
     }
     let payloads = (0..n)
-        .map(|i| b[pos + i * PAYLOAD_LEN..pos + (i + 1) * PAYLOAD_LEN].to_vec())
+        .map(|i| b[pos + i * width..pos + (i + 1) * width].to_vec())
         .collect();
     Ok((recipients, payloads))
 }
@@ -434,7 +465,15 @@ pub fn committed_contents_prefix(b: &[u8]) -> Result<&[u8], CodecError> {
 pub fn committed_payloads_per_recipient(
     b: &[u8],
 ) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
-    let (recipients, flat) = decode_committed_discovery(b)?;
+    committed_payloads_per_recipient_with_width(b, PAYLOAD_LEN)
+}
+
+/// [`committed_payloads_per_recipient`] at an explicit payload width (lab #714).
+pub fn committed_payloads_per_recipient_with_width(
+    b: &[u8],
+    width: usize,
+) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
+    let (recipients, flat) = decode_committed_discovery_with_width(b, width)?;
     let mut out = Vec::with_capacity(recipients.len());
     let mut pos = 0usize;
     for r in &recipients {
@@ -682,5 +721,57 @@ mod tests {
             decode_group(&padded),
             Err(CodecError::NonCanonicalVarint { len: 2 })
         ));
+    }
+
+    /// 🔴 Lab #714: the **L2 sibling** of `qlab-cbserver`'s
+    /// `golden_bytes_lock_the_framing` — the Annulet committed region, i.e. the
+    /// same width-free `group_contents` prefix followed by 128-B payloads. The
+    /// expected digest comes from an independent Python encoder over the same
+    /// deterministic pattern. The L1 decoder refuses it by the payload section's
+    /// length, and the prefix `/v1/compact` projects is the same bytes at
+    /// either width.
+    #[test]
+    fn the_annulet_committed_region_is_byte_for_byte() {
+        let l2 = crate::l2note::L2_PAYLOAD_LEN;
+        let ct: [u8; CT_LEN] = core::array::from_fn(|i| (i % 256) as u8);
+        let e0 = CompactEntry { cm: [0xAA; 32], tag: [0xBB; 8], clue: ClueSlot::Empty };
+        let e1 = CompactEntry { cm: [0xCC; 32], tag: [0xDD; 8], clue: ClueSlot::Empty };
+        let recipients = vec![RecipientBundle { ct, entries: vec![e0, e1] }];
+        let p0: Vec<u8> = (0..l2).map(|i| (0x10 + i) as u8).collect();
+        let p1: Vec<u8> = (0..l2).map(|i| (0x80 + i) as u8).collect();
+        let region = encode_committed_discovery_with_width(&recipients, &[p0.clone(), p1.clone()], l2);
+        assert_eq!(region.len(), 1428);
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            hex(&crate::hash::keccak256(&region)),
+            "8f28ace31a1f194fa093a3b8b788b54690389fd646ec7f7928ff2797b74a5987"
+        );
+        // Round trip at the L2 width; refused at the L1 width, by length.
+        let (back, payloads) = decode_committed_discovery_with_width(&region, l2).unwrap();
+        assert_eq!(payloads, vec![p0.clone(), p1.clone()]);
+        assert_eq!(encode_committed_discovery_with_width(&back, &payloads, l2), region);
+        assert!(matches!(
+            decode_committed_discovery(&region),
+            Err(CodecError::PayloadSectionLen { expected, got }) if expected == 2 * PAYLOAD_LEN && got == 2 * l2
+        ));
+        // The served prefix is width-free: the same bytes as an L1 region's.
+        let l1 = encode_committed_discovery(&recipients, &[vec![0; PAYLOAD_LEN], vec![0; PAYLOAD_LEN]]);
+        assert_eq!(committed_contents_prefix(&region).unwrap(), committed_contents_prefix(&l1).unwrap());
+        assert_eq!(committed_contents_prefix(&region).unwrap().len(), 1172);
+        assert_eq!(
+            committed_payloads_per_recipient_with_width(&region, l2).unwrap(),
+            vec![vec![p0, p1]]
+        );
+    }
+
+    #[test]
+    fn a_zero_tag_marks_only_a_genesis_plaintext() {
+        let l2 = crate::l2note::L2_PAYLOAD_LEN;
+        let mut p = vec![7u8; l2];
+        assert!(!payload_tag_is_zero(&p));
+        p[l2 - PAYLOAD_TAG_LEN..].fill(0);
+        assert!(payload_tag_is_zero(&p));
+        p[l2 - 1] = 1;
+        assert!(!payload_tag_is_zero(&p));
     }
 }
