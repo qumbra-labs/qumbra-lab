@@ -144,3 +144,49 @@ fn an_l1_mempool_refuses_an_l2_surface() {
         Err(MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceOnL1 { index: 0 }))
     ));
 }
+
+/// B2b (lab #708): an Annulet node on disk logs each sealed block (persist
+/// variant 3) and its finalization, and a restart resumes to the same tip,
+/// final = tip, the same root and the same held seals. The same datadir under
+/// an L1 genesis is a foreign datadir, refused by name.
+#[test]
+fn an_annulet_node_on_disk_resumes_its_sealed_chain_across_a_restart() {
+    let dir = std::env::temp_dir().join(format!("qlab-annulet-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
+    let (tip, root, seal3) = {
+        let mut n = MemNode::open_annulet(&dir, g, &[], FEES).expect("a fresh datadir opens");
+        let mut parent = g;
+        let mut last = None;
+        for h in 1..=3u8 {
+            let body = BlockBody::new(vec![s_tx(&n, h * 2)], vec![]);
+            let sealed = sealed_child(&key, &parent, &body);
+            n.apply_sealed_block(&sealed, body, &OkProof).expect("applies");
+            parent = sealed.header;
+            last = Some(sealed);
+        }
+        (n.chain().tip_hash(), n.commitment_root(), last.unwrap())
+    };
+    let n = MemNode::open_annulet(&dir, g, &[], FEES).expect("the datadir resumes");
+    assert_eq!(n.chain().tip_hash(), tip);
+    assert_eq!(n.tip_height(), 3);
+    assert_eq!(n.finalized_height(), Some(3), "final = tip after replay");
+    assert_eq!(n.commitment_root(), root);
+    assert_eq!(n.nullifier_count(), 6);
+    assert_eq!(n.annulet_fee_table(), Some(FEES));
+    assert_eq!(n.chain().block(&tip).and_then(|b| b.sealed_header()), Some(seal3), "the seal survives the restart");
+    // An L1 genesis over this datadir: refused by name, before hashing.
+    let l1 = qlab_node::StoredBlock::from_parts(&BlockHeader::genesis(1, 0), &BlockBody::default());
+    match MemNode::open_for(qlab_devnet::forms::GenesisForm::V4, &dir, l1) {
+        Err(NodeError::LogFormMismatch { height: 1, .. }) => {}
+        Err(e) => panic!("expected LogFormMismatch, got {e}"),
+        Ok(_) => panic!("an Annulet datadir must not open under an L1 genesis"),
+    }
+    // And the L1 entry point refuses an Annulet form outright.
+    assert!(matches!(
+        MemNode::open_for(qlab_devnet::forms::GenesisForm::Annulet, &dir, qlab_node::StoredBlock::annulet_genesis(&g)),
+        Err(NodeError::FormNotServed { .. })
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
