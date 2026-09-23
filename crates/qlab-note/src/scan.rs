@@ -24,6 +24,7 @@ use rand::CryptoRng;
 use crate::derive::{aead_key, aead_nonce, detection_tag};
 use crate::hash::{digest_bytes, digest_from_bytes};
 use crate::kem::{decapsulate, encapsulate, Dk, Ek};
+use crate::l2note::L2Note;
 use crate::note::Note;
 use crate::wire::{ClueSlot, CompactEntry, RecipientBundle};
 
@@ -46,11 +47,51 @@ pub struct EncryptedOutputs {
     pub payloads: Vec<Vec<u8>>,
 }
 
-/// A detected + decrypted note and its output index.
+/// A detected + decrypted note and its output index — generic over the note
+/// plaintext (lab #714: the L1 [`Note`] and the Annulet [`L2Note`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct DetectedNote {
+pub struct Detected<N> {
     pub index: usize,
-    pub note: Note,
+    pub note: N,
+}
+
+/// An L1 detection (the historical name).
+pub type DetectedNote = Detected<Note>;
+
+/// A note plaintext the discovery AEAD carries (lab #714): the one encryptor
+/// and scanner serve the L1 [`Note`] (104 B) and the Annulet [`L2Note`]
+/// (112 B) — no second copy of the scheme.
+pub trait NotePlaintext: Sized + Clone {
+    /// The note commitment the discovery entry names.
+    fn commitment(&self) -> [u64; 4];
+    /// The plaintext the AEAD encrypts.
+    fn plaintext(&self) -> Vec<u8>;
+    /// Decode a decrypted plaintext (`None` when it is not one).
+    fn from_plaintext(b: &[u8]) -> Option<Self>;
+}
+
+impl NotePlaintext for Note {
+    fn commitment(&self) -> [u64; 4] {
+        Note::commitment(self)
+    }
+    fn plaintext(&self) -> Vec<u8> {
+        self.to_plaintext().to_vec()
+    }
+    fn from_plaintext(b: &[u8]) -> Option<Self> {
+        Note::from_plaintext(b)
+    }
+}
+
+impl NotePlaintext for L2Note {
+    fn commitment(&self) -> [u64; 4] {
+        L2Note::commitment(self)
+    }
+    fn plaintext(&self) -> Vec<u8> {
+        self.to_plaintext().to_vec()
+    }
+    fn from_plaintext(b: &[u8]) -> Option<Self> {
+        L2Note::from_plaintext(b)
+    }
 }
 
 /// Encrypt `notes` to a single recipient `ek`, sharing ONE ML-KEM ciphertext
@@ -59,6 +100,16 @@ pub struct DetectedNote {
 pub fn encrypt_to_recipient<R: CryptoRng>(
     ek: &Ek,
     notes: &[Note],
+    rng: &mut R,
+) -> EncryptedOutputs {
+    encrypt_notes_to_recipient(ek, notes, rng)
+}
+
+/// [`encrypt_to_recipient`] for any note plaintext (lab #714) — the L2's
+/// payloads are 112 + 16 = 128 B.
+pub fn encrypt_notes_to_recipient<N: NotePlaintext, R: CryptoRng>(
+    ek: &Ek,
+    notes: &[N],
     rng: &mut R,
 ) -> EncryptedOutputs {
     let (ct, k) = encapsulate(ek, rng);
@@ -71,7 +122,7 @@ pub fn encrypt_to_recipient<R: CryptoRng>(
             .expect("32-byte key");
         let nonce = Nonce::try_from(aead_nonce(&k, i as u32).as_slice()).expect("12-byte nonce");
         let payload = cipher
-            .encrypt(&nonce, note.to_plaintext().as_slice())
+            .encrypt(&nonce, note.plaintext().as_slice())
             .expect("AEAD encryption is infallible for a valid key/nonce");
         entries.push(CompactEntry {
             cm: digest_bytes(&cm),
@@ -180,6 +231,11 @@ pub fn recompute_matches(note: &Note, stored_cm_bytes: &[u8; 32]) -> bool {
 /// Scan a recipient's outputs with the recipient's decapsulation key. Returns
 /// the notes that are detected AND pass the mode's authenticity check.
 pub fn scan(dk: &Dk, out: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote> {
+    scan_notes::<Note>(dk, out, mode)
+}
+
+/// [`scan`] for any note plaintext (lab #714).
+pub fn scan_notes<N: NotePlaintext>(dk: &Dk, out: &EncryptedOutputs, mode: ScanMode) -> Vec<Detected<N>> {
     // decap once per (tx, recipient).
     let k = decapsulate(dk, &out.bundle.ct);
     let mut found = Vec::new();
@@ -199,7 +255,7 @@ pub fn scan(dk: &Dk, out: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote
         let Ok(pt) = cipher.decrypt(&nonce, payload.as_slice()) else {
             continue; // tampered payload / wrong key
         };
-        let Some(note) = Note::from_plaintext(&pt) else {
+        let Some(note) = N::from_plaintext(&pt) else {
             continue;
         };
         // 🔴 **The commitment recompute is a post-match OBLIGATION, in both
@@ -222,7 +278,7 @@ pub fn scan(dk: &Dk, out: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote
         // the recompute is added *after* the match rather than substituted for
         // anything. `FoSkip` is unchanged — it was already carrying this check as
         // its whole authenticity argument.
-        if !recompute_matches(&note, &entry.cm) {
+        if digest_bytes(&note.commitment()) != entry.cm {
             continue;
         }
         match mode {
@@ -234,7 +290,7 @@ pub fn scan(dk: &Dk, out: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote
                 // Authenticity rests on the recompute above, FO skipped.
             }
         }
-        found.push(DetectedNote { index: i, note });
+        found.push(Detected { index: i, note });
     }
     found
 }
@@ -456,5 +512,30 @@ mod tests {
             assert_eq!(found[0].note, n0);
             assert_eq!(found[1].note, n1);
         }
+    }
+
+    fn l2_note(seed: u64) -> L2Note {
+        let lane = |k: u64| core::array::from_fn::<u64, 4, _>(|i| seed ^ (k << 8) ^ (i as u64 + 1));
+        L2Note { value: 700 + seed, asset: 5, rkm: lane(1), rho: lane(2), rseed: lane(3) }
+    }
+
+    /// Lab #714: the one encryptor and scanner serve the Annulet note — 128-B
+    /// payloads that open to the `L2Note` whose commitment the entry names —
+    /// and an L1 scan does not mistake them for L1 notes.
+    #[test]
+    fn the_l2_note_round_trips_through_the_same_scheme() {
+        let mut rng = StdRng::seed_from_u64(71);
+        let kp = generate_keypair(&mut rng);
+        let ns = [l2_note(1), l2_note(2)];
+        let out = encrypt_notes_to_recipient(&kp.ek, &ns, &mut rng);
+        assert!(out.payloads.iter().all(|p| p.len() == crate::l2note::L2_PAYLOAD_LEN));
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            let found = scan_notes::<L2Note>(&kp.dk, &out, mode);
+            assert_eq!(found.len(), 2, "{mode:?}");
+            assert_eq!((found[0].note, found[1].note), (ns[0], ns[1]));
+            assert!(scan(&kp.dk, &out, mode).is_empty(), "{mode:?}: an L1 scan opens no L2 note");
+        }
+        let attacker = generate_keypair(&mut rng);
+        assert!(scan_notes::<L2Note>(&attacker.dk, &out, ScanMode::FullFo).is_empty());
     }
 }

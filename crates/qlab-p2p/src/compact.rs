@@ -132,11 +132,12 @@ impl BlockAnnounce {
 // **The Annulet frame (lab #708, served by B2):** the 3,462-B sealed header ‖
 // nonce ‖ *no coinbase section* (the L2 mints nothing) ‖ short ids ‖
 // prefilled, each transaction on the Annulet tx wire ([`encode_tx_for`]).
-// 🔴 **The seam B5 owns is inside the transaction codec, not here:** when B5
-// moves the L2 discovery payload from the L1 width (120 B) to 128 B, it changes
-// `encode_tx_annulet` / `decode_tx_annulet`, and this frame inherits the change
-// with no edit — B5 must not re-touch the frame. Until then the Annulet tx wire
-// frames the L1-width payload, as B1 left it.
+// The discovery payload width is **not** a property of this frame, nor of the
+// transaction codec (corrected by lab #714, B5): the tx wire carries the
+// discovery group as opaque length-prefixed bytes. The width — 120 B on the
+// L1, 128 B on Annulet — is judged by the committed-region codec
+// (`qlab_note::compact::*_with_width`) at body validation, keyed on the form
+// (`GenesisForm::discovery_payload_len`). The frame needed no edit.
 
 /// Encode a `BlockAnnounce`.
 pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {

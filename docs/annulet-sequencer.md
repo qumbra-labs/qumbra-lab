@@ -41,9 +41,9 @@ Every consumer of finality has a named decision on Annulet (the trace posted on 
 
 🔴 **Review checklist: any new consumer of finality must appear in the finality lock** — `run_annulet::tests::every_finality_surface_reads_final_at_the_tip_on_an_annulet_chain`, which drives 1,200 sealed blocks through a real `RunningNode` and asserts every finality-facing surface at once, with the same assertions shown failing on an L1 chain whose finality lags. A lexical lock cannot see a *missing* form decision; this test can.
 
-## The wire seam B5 owns
+## The announce frame and the discovery width
 
-The Annulet `BlockAnnounce` frame is served by B2 (the B1 owner moved by ruling): sealed header ‖ nonce ‖ no coinbase section ‖ short ids ‖ prefilled on the Annulet tx wire. **B5 owns the discovery payload width inside the transaction codec** (120 → 128 B) and changes only `encode_tx_annulet` / `decode_tx_annulet`; the frame inherits it with no edit.
+The Annulet `BlockAnnounce` frame is served by B2 (the B1 owner moved by ruling): sealed header ‖ nonce ‖ no coinbase section ‖ short ids ‖ prefilled on the Annulet tx wire. *(Corrected by B5, lab #714: the discovery payload width is not the transaction codec's either — the tx wire carries the discovery group as opaque bytes, and the width is judged by the committed-region codec at body validation. See `annulet-discovery.md`.)*
 
 ## Goldens and how they were computed
 
@@ -64,4 +64,4 @@ The Python cross-checks cover Keccak and framing; no independent ML-DSA implemen
 - **`qumbra-node check`** (preflight) still loads an L1 genesis only; an Annulet preflight is B6's.
 - **The form on the binary `/v1/telemetry` wire: B6.** The payload does not carry the form yet (ruled on lab #708: the bump is a fleet-visible L1 wire change and does not belong in B2). The recipe is the #212 append discipline: append a `form(u8)` tail **last** in `Telemetry::to_bytes`, so every earlier version's payload is an exact byte prefix; bump the shared `qlab_node::rpc::RPC_VERSION` (0x07 → 0x08); add a `FORM_SINCE_VERSION` gate in `decode_body`; add 0x07 to `READABLE_TELEMETRY_VERSIONS` so an opview reads un-rolled hosts; extend the per-version wire-order test; have `qumbra-opview` render the form. Until B6 no Annulet net serves `/v1/telemetry`.
 - **Out-of-order Annulet bodies are not buffered:** a body that arrives before its parent is applied answers `Orphan` and is re-asked, where the L1 path buffers it. Enough for B2's sync; B6 may want the buffer.
-- **Discovery of an Annulet transaction:** B5. **The registry-root binding of each surface:** B4. **Registry updates:** A2/B3.
+- **Discovery of an Annulet transaction:** landed in B5 (`annulet-discovery.md`). **The registry-root binding of each surface:** B4. **Registry updates:** A2/B3.

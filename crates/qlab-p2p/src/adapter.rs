@@ -2457,7 +2457,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::CoinbaseOnAnnulet { .. }
             // Lab #712: a surface root that is not its own header's — the
             // block contradicts itself, whatever this node's view.
-            | BodyError::L2RegistryRootStale { .. } => BodyFault::Intrinsic("bad body"),
+            | BodyError::L2RegistryRootStale { .. }
+            // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
+            | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:
             BodyError::RiderRule { err, .. } => match err {
                 // Grammar, record kind and record size read only the revealed

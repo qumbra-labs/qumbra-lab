@@ -337,3 +337,103 @@ mod tests {
         "0108070605040302011111111111111111222222222222222233333333333333334444444444444444";
     const GOLDEN_OPENING_HEX: &str = "01090000000000000011111111111111112222222222222222333333333333333344444444444444440700000000000000a100000000000000a200000000000000a300000000000000a4000000000000000200000000000000f100000000000000f200000000000000f300000000000000f400000000000000b100000000000000b200000000000000b300000000000000b4000000000000000f000000000000000101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030404040404040404040404040404040404040404040404040404040404040404050505050505050505050505050505050505050505050505050505050505050506060606060606060606060606060606060606060606060606060606060606060707070707070707070707070707070707070707070707070707070707070707080808080808080808080808080808080808080808080808080808080808080809090909090909090909090909090909090909090909090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f1010101010101010101010101010101010101010101010101010101010101010";
 }
+
+// ---------------------------------------------------------------------------
+// GET /v1/genesis/notes (lab #714, B5)
+// ---------------------------------------------------------------------------
+
+/// The genesis-notes wire's version byte.
+pub const GENESIS_NOTES_WIRE_VERSION: u8 = 1;
+
+/// One genesis note as served: its commitment and its 128-B
+/// `GenesisPlaintext` payload (plaintext ‖ zero tag, by construction).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedGenesisNote {
+    pub cm: [u8; 32],
+    pub payload: qlab_note::l2note::GenesisPlaintext,
+}
+
+/// Why a genesis-notes body did not decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenesisNotesWireError {
+    Truncated,
+    BadVersion { got: u8 },
+    /// Bytes after the declared notes.
+    Trailing,
+    /// A payload that is not a genesis plaintext (a nonzero tag).
+    NotGenesisPlaintext { index: usize },
+}
+
+/// Encode `GET /v1/genesis/notes` — a projection of the genesis file:
+/// `ver(u8) ‖ genesis_hash(32) ‖ n(u32 LE) ‖ [cm(32) ‖ payload(128)]×n`. The
+/// hash names the genesis file the notes were projected from.
+pub fn encode_genesis_notes(genesis_hash: &[u8; 32], notes: &[ServedGenesisNote]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 4 + notes.len() * (32 + qlab_note::l2note::L2_PAYLOAD_LEN));
+    out.push(GENESIS_NOTES_WIRE_VERSION);
+    out.extend_from_slice(genesis_hash);
+    out.extend_from_slice(&(notes.len() as u32).to_le_bytes());
+    for n in notes {
+        out.extend_from_slice(&n.cm);
+        out.extend_from_slice(&n.payload.0);
+    }
+    out
+}
+
+/// Decode `GET /v1/genesis/notes`: `(genesis_hash, notes)`. Every payload
+/// must be a genesis plaintext — a nonzero tag is refused by name.
+pub fn decode_genesis_notes(b: &[u8]) -> Result<([u8; 32], Vec<ServedGenesisNote>), GenesisNotesWireError> {
+    let w = qlab_note::l2note::L2_PAYLOAD_LEN;
+    if b.len() < 37 {
+        return Err(GenesisNotesWireError::Truncated);
+    }
+    if b[0] != GENESIS_NOTES_WIRE_VERSION {
+        return Err(GenesisNotesWireError::BadVersion { got: b[0] });
+    }
+    let hash: [u8; 32] = b[1..33].try_into().expect("32 bytes");
+    let n = u32::from_le_bytes(b[33..37].try_into().expect("4 bytes")) as usize;
+    let want = n.checked_mul(32 + w).and_then(|x| x.checked_add(37)).ok_or(GenesisNotesWireError::Truncated)?;
+    match b.len().cmp(&want) {
+        std::cmp::Ordering::Less => return Err(GenesisNotesWireError::Truncated),
+        std::cmp::Ordering::Greater => return Err(GenesisNotesWireError::Trailing),
+        std::cmp::Ordering::Equal => {}
+    }
+    let mut notes = Vec::with_capacity(n);
+    for i in 0..n {
+        let at = 37 + i * (32 + w);
+        let cm: [u8; 32] = b[at..at + 32].try_into().expect("32 bytes");
+        let p: [u8; qlab_note::l2note::L2_PAYLOAD_LEN] = b[at + 32..at + 32 + w].try_into().expect("128 bytes");
+        if !qlab_note::compact::payload_tag_is_zero(&p) {
+            return Err(GenesisNotesWireError::NotGenesisPlaintext { index: i });
+        }
+        notes.push(ServedGenesisNote { cm, payload: qlab_note::l2note::GenesisPlaintext(p) });
+    }
+    Ok((hash, notes))
+}
+
+#[cfg(test)]
+mod genesis_notes_tests {
+    use super::*;
+
+    #[test]
+    fn genesis_notes_round_trip_and_refuse_what_is_not_a_genesis_plaintext() {
+        let note = qlab_note::l2note::L2Note { value: 1, asset: 0, rkm: [1, 2, 3, 4], rho: [5; 4], rseed: [6; 4] };
+        let g = ServedGenesisNote { cm: [0x11; 32], payload: qlab_note::l2note::GenesisPlaintext::of(&note) };
+        let bytes = encode_genesis_notes(&[0x22; 32], std::slice::from_ref(&g));
+        assert_eq!(bytes.len(), 1 + 32 + 4 + 32 + 128);
+        let (h, back) = decode_genesis_notes(&bytes).unwrap();
+        assert_eq!((h, back), ([0x22; 32], vec![g.clone()]));
+        assert_eq!(qlab_note::l2note::GenesisPlaintext::open(&back_payload(&bytes)), Some(note));
+        let mut tagged = bytes.clone();
+        let last = tagged.len() - 1;
+        tagged[last] = 1;
+        assert_eq!(decode_genesis_notes(&tagged).err(), Some(GenesisNotesWireError::NotGenesisPlaintext { index: 0 }));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(decode_genesis_notes(&trailing).err(), Some(GenesisNotesWireError::Trailing));
+        assert_eq!(decode_genesis_notes(&bytes[..bytes.len() - 1]).err(), Some(GenesisNotesWireError::Truncated));
+    }
+
+    fn back_payload(bytes: &[u8]) -> Vec<u8> {
+        bytes[37 + 32..].to_vec()
+    }
+}

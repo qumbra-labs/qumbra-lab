@@ -17,7 +17,7 @@
 //!      claimed by another pooled tx (so an assembled block never in-block
 //!      double-spends);
 //!    - **discovery binds** — the §4 lone-tx discovery rules, via the same
-//!      [`check_tx_discovery`] block validation runs per tx (issue #278);
+//!      [`qlab_devnet::body::check_tx_discovery`] block validation runs per tx (issue #278);
 //!    - **proof validity** — via the injected [`TxVerifier`] (this crate stays
 //!      prover-free, exactly as [`crate::Node::apply_block`]).
 //!
@@ -83,9 +83,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use qlab_devnet::body::{
-    check_tx_discovery, repeated_nullifier_in_tx, BlockBody, BodyError, TxEntry, TxVerifier,
-};
+use qlab_devnet::body::{repeated_nullifier_in_tx, BlockBody, BodyError, TxEntry, TxVerifier};
 use qlab_devnet::fees::posted_fee;
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::hash::keccak256;
@@ -179,7 +177,7 @@ pub enum MempoolError {
     /// This exact transaction is already pooled.
     DuplicateTx,
     /// The tx fails the §4 discovery rules for a lone transaction (issue #278) —
-    /// carries [`check_tx_discovery`]'s verdict whole, so an admit-time refusal
+    /// carries [`qlab_devnet::body::check_tx_discovery`]'s verdict whole, so an admit-time refusal
     /// names exactly what block validation would have named (only the
     /// `Discovery*` variants of [`BodyError`] can appear here, with `index: 0`).
     DiscoveryInvalid(BodyError),
@@ -559,9 +557,8 @@ impl Mempool {
         //    refuses it (`RiderMalformed`).
         let prospective_height = state.tip_height() + 1;
         // Lab #708 Q7: the form decides the rider, surface and fee rules — one
-        // funnel with a form arm, not a second mempool. `check_discovery` is
-        // the L1 §4 rule; the Annulet discovery group is B5's
-        // (`qlab_devnet::annulet::ANNULET_DISCOVERY_RULE_OWNER`).
+        // funnel with a form arm, not a second mempool. The discovery rule is
+        // the form's (lab #714: the Annulet's at 128-B payloads, rule ii).
         let (op, expected, check_discovery) = match state.genesis_form() {
             GenesisForm::V4 | GenesisForm::V5 => {
                 if entry.l2 != qlab_devnet::annulet::L2_SURFACE_ABSENT {
@@ -627,7 +624,7 @@ impl Mempool {
                 let fees = state
                     .annulet_fee_table()
                     .expect("an Annulet node state carries its genesis L2 fee table (lab #708)");
-                (None, fees.posted_fee_l2(surface.shape), false)
+                (None, fees.posted_fee_l2(surface.shape), true)
             }
         };
         if entry.public.fee != expected {
@@ -680,7 +677,7 @@ impl Mempool {
         //    index 0 because the refusal names this candidate, not a block
         //    position.
         if check_discovery {
-            if let Err(e) = check_tx_discovery(0, &entry) {
+            if let Err(e) = qlab_devnet::body::check_tx_discovery_for(state.genesis_form(), 0, &entry) {
                 return Err(MempoolError::DiscoveryInvalid(e));
             }
         }

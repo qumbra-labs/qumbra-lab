@@ -55,7 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use qlab_cbserver::codec::{
-    committed_payloads_per_recipient, decode_committed_discovery, encode_committed_discovery,
+    committed_payloads_per_recipient, committed_payloads_per_recipient_with_width, decode_committed_discovery,
+    decode_committed_discovery_with_width, encode_committed_discovery,
     encode_compact_response, encode_full_response,
     read_varint, write_varint, BlockCoinbase, BlockNullifiers, CodecError, CoinbasePage,
     CompactBlock, CompactGroup, BlockNames, NamesPage, NullifierPage,
@@ -250,6 +251,10 @@ pub struct BlockDiscovery {
     /// Per transaction, in block order: the committed §2 group **contents**,
     /// verbatim. Coinbase contributes nothing (D5).
     pub groups: Vec<Vec<u8>>,
+    /// The committed payload width of these groups (lab #714): the L1's 120
+    /// or the Annulet's 128 — from the block itself (`StoredBlock::annulet`
+    /// is present exactly on Annulet blocks).
+    pub payload_len: usize,
     /// Every nullifier this block spends, in block order (transaction order,
     /// then each transaction's declared order) — `StoredTx::nullifiers`
     /// **cloned and concatenated**, never re-derived (lab issue #314).
@@ -320,6 +325,10 @@ impl BlockDiscovery {
             height: block.header.height,
             hash,
             groups: block.txs.iter().map(|t| t.discovery.clone()).collect(),
+            payload_len: match block.annulet {
+                Some(_) => qlab_devnet::forms::GenesisForm::Annulet.discovery_payload_len(),
+                None => qlab_note::compact::PAYLOAD_LEN,
+            },
             nullifiers: block.txs.iter().flat_map(|t| t.nullifiers.iter().copied()).collect(),
             coinbase_rkm: block.coinbase_rkm,
             coinbase: block.coinbase,
@@ -375,7 +384,7 @@ impl BlockDiscovery {
             .map(|(i, bytes)| {
                 Ok(CompactGroup {
                     tx_index: i as u64,
-                    recipients: decode_committed_discovery(bytes)?.0,
+                    recipients: decode_committed_discovery_with_width(bytes, self.payload_len)?.0,
                 })
             })
             .collect()
@@ -398,7 +407,7 @@ impl BlockDiscovery {
     /// and the served payload and no side table between them either.
     pub fn payloads_of(&self, tx_index: u64) -> Option<Result<Vec<Vec<Vec<u8>>>, CodecError>> {
         let bytes = self.groups.get(usize::try_from(tx_index).ok()?)?;
-        Some(committed_payloads_per_recipient(bytes))
+        Some(committed_payloads_per_recipient_with_width(bytes, self.payload_len))
     }
 }
 

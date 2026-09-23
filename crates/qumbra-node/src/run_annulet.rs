@@ -40,6 +40,8 @@ pub(super) struct AnnuletRun {
     last_slot: Instant,
     /// Consecutive slots that passed with an empty pool and no block.
     empty_run: u64,
+    /// `/v1/genesis/notes`, encoded once from the genesis file (lab #714).
+    genesis_notes: Vec<u8>,
 }
 
 impl AnnuletRun {
@@ -50,6 +52,19 @@ impl AnnuletRun {
             max_empty_slots: file.params.max_empty_slots,
             last_slot: Instant::now(),
             empty_run: 0,
+            genesis_notes: qlab_cbserver::registry::encode_genesis_notes(
+                &file.hash(),
+                &file
+                    .genesis_notes
+                    .iter()
+                    .map(|n| qlab_cbserver::registry::ServedGenesisNote {
+                        cm: n.cm,
+                        payload: qlab_note::l2note::GenesisPlaintext(
+                            n.payload.as_slice().try_into().expect("a verified genesis has 128-B payloads"),
+                        ),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -138,6 +153,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         verifier: V,
     ) -> Result<Self, RunError> {
         Self::prepare_annulet(config, genesis, pow, verifier)?.open()
+    }
+
+    /// The `/v1/genesis/notes` body (lab #714): `Some` exactly on an Annulet
+    /// node.
+    pub fn genesis_notes_body(&self) -> Option<Vec<u8>> {
+        self.annulet.as_ref().map(|a| a.genesis_notes.clone())
     }
 
     /// Whether this node is the Annulet producer.

@@ -86,7 +86,7 @@ The figures are for the `cargo → example` process tree with the examples alrea
 ## Named gaps (not B1's, owned by name)
 
 - **The parent-registry-root binding** of each transaction's surface (Q6): B4. The codec carries the value; `validate_body_annulet` does not read the chain.
-- **The discovery group of an Annulet transaction** (`ANNULET_DISCOVERY_RULE_OWNER = "B5"`). It is committed in the Annulet body preimage but not judged: the L1 codec frames 120-B payloads, the L2's are 128-B.
+- **The discovery group of an Annulet transaction**: landed in B5 (`annulet-discovery.md`) — judged at the 128-B width, keyed on the form.
 - **The sequencer signature**: its carriage (block, wire, log) and verification landed in B2 — see `annulet-sequencer.md`. The header's signing message and id are fixed here.
 - **Applying the genesis notes and registry leaves** to chain state: B3 (P13).
 - **The Annulet stored form** (log / snapshot): B2/B3. The L1 mirrors refuse Annulet values.

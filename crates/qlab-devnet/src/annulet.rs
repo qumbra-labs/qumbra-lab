@@ -297,11 +297,41 @@ pub fn genesis_body_commitment_annulet(notes: &[GenesisNote]) -> Hash32 {
     keccak256(&buf)
 }
 
-/// Who validates the Annulet discovery group. Not B1: the L1 discovery
-/// codec frames 120-B payloads, the L2's are 128-B, and the form-keyed framing
-/// is B5's. Until then [`validate_body_annulet`] commits the bytes (above) but
-/// does not judge them — named here so the gap cannot be forgotten.
-pub const ANNULET_DISCOVERY_RULE_OWNER: &str = "B5";
+/// **The Annulet discovery rule** for one transaction (lab #714): the L1's
+/// §4 rules at the L2 payload width — the committed region decodes exactly at
+/// 128-B payloads, re-encodes to itself, and describes exactly the declared
+/// commitments — plus **rule (ii)**: every payload is an encrypted entry, so
+/// a zero AEAD tag (a `GenesisPlaintext`, valid only at height 0) is refused
+/// by name.
+pub fn check_tx_discovery_annulet(index: usize, tx: &TxEntry) -> Result<(), BodyError> {
+    use qlab_note::compact::{decode_committed_discovery_with_width, encode_committed_discovery_with_width};
+    let width = crate::forms::GenesisForm::Annulet.discovery_payload_len();
+    let (recipients, payloads) = decode_committed_discovery_with_width(&tx.discovery, width)
+        .map_err(|err| BodyError::DiscoveryMalformed { index, err })?;
+    if encode_committed_discovery_with_width(&recipients, &payloads, width) != tx.discovery {
+        return Err(BodyError::DiscoveryNotCanonical { index });
+    }
+    crate::body::check_discovery_binds(index, &recipients, tx)?;
+    if let Some(entry) = payloads.iter().position(|p| qlab_note::compact::payload_tag_is_zero(p)) {
+        return Err(BodyError::GenesisPlaintextInBody { index, entry });
+    }
+    Ok(())
+}
+
+/// A **fixture** discovery group for an Annulet transaction (tests and
+/// benches only; a real transaction encrypts its outputs): one recipient with
+/// a zero ciphertext, one entry per commitment, and 128-B payloads whose tag
+/// is nonzero — so it passes [`check_tx_discovery_annulet`] structurally.
+pub fn placeholder_discovery_annulet(commitments: &[Hash32]) -> Vec<u8> {
+    use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+    let width = crate::forms::GenesisForm::Annulet.discovery_payload_len();
+    let entries = commitments.iter().map(|cm| CompactEntry { cm: *cm, tag: [0u8; 8], clue: ClueSlot::Empty }).collect();
+    qlab_note::compact::encode_committed_discovery_with_width(
+        &[RecipientBundle { ct: [0u8; qlab_note::kem::CT_LEN], entries }],
+        &vec![vec![0xA5u8; width]; commitments.len()],
+        width,
+    )
+}
 
 /// **The Annulet body rule** (lab #706). Cheap checks first:
 ///
@@ -310,13 +340,16 @@ pub const ANNULET_DISCOVERY_RULE_OWNER: &str = "B5";
 /// 3. per transaction: anchor final; name rider absent (no name service);
 ///    L2 surface present and canonical; bucket 2×2 with exactly 2 nullifiers
 ///    and 2 commitments; `fee == posted_fee_l2(shape)`; no nullifier repeated
-///    in the block; the surface's `registry_root` is the header's — which
+///    in the block; the discovery group is canonical at the 128-B payload
+///    width, binds the declared commitments, and carries no genesis plaintext
+///    ([`check_tx_discovery_annulet`], lab #714); the surface's
+///    `registry_root` is the header's — which
 ///    B2's header rule has proved equal to the **parent's** (lab #712, the
 ///    §5 ruling); the proof verifies (B4's `L2Verifier` in the node).
 ///
-/// **Not here, by name:** the sequencer signature (B2), the discovery group
-/// ([`ANNULET_DISCOVERY_RULE_OWNER`]), and the outstanding-supply rule, which
-/// needs chain state (the node's, over [`annulet_supply_delta`]).
+/// **Not here, by name:** the sequencer signature (B2) and the
+/// outstanding-supply rule, which needs chain state (the node's, over
+/// [`annulet_supply_delta`]).
 pub fn validate_body_annulet<V, F>(
     header: &BlockHeader,
     body: &BlockBody,
@@ -368,6 +401,7 @@ where
                 return Err(BodyError::DoubleSpendInBlock { index: i });
             }
         }
+        check_tx_discovery_annulet(i, tx)?;
         if !verifier.verify_tx(tx) {
             return Err(BodyError::ProofInvalid { index: i });
         }
@@ -439,10 +473,11 @@ mod tests {
             bucket: ArityBucket::TwoByTwo,
             fee: FEES.posted_fee_l2(surface.shape),
         };
+        let discovery = placeholder_discovery_annulet(&public.commitments);
         TxEntry {
             proof: b"ok".to_vec(),
             public,
-            discovery: vec![0x00],
+            discovery,
             rider: crate::names::RIDER_ABSENT.to_vec(),
             l2: surface.encode(),
         }
@@ -469,6 +504,51 @@ mod tests {
         let stale = L2Surface { registry_root: [0x45; 32], ..s_surface() };
         let body = BlockBody::new(vec![l2_tx(1, &s_surface()), l2_tx(9, &stale)], vec![]);
         assert_eq!(check(&body), Err(BodyError::L2RegistryRootStale { index: 1 }));
+    }
+
+    /// Lab #714: the Annulet discovery rule — 128-B payloads, canonical,
+    /// binding, and no genesis plaintext past height 0 — each refused by name.
+    #[test]
+    fn the_annulet_discovery_rule_refuses_each_violation_by_name() {
+        use qlab_note::compact::{encode_committed_discovery, PAYLOAD_LEN};
+        use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+        assert_eq!(check(&BlockBody::new(vec![l2_tx(1, &s_surface())], vec![])), Ok(()));
+        let bundle = |cms: &[Hash32]| RecipientBundle {
+            ct: [0u8; qlab_note::kem::CT_LEN],
+            entries: cms.iter().map(|cm| CompactEntry { cm: *cm, tag: [0; 8], clue: ClueSlot::Empty }).collect(),
+        };
+        // The L1's 120-B payload width is not the Annulet's.
+        let mut l1w = l2_tx(1, &s_surface());
+        l1w.discovery = encode_committed_discovery(&[bundle(&l1w.public.commitments)], &vec![vec![0xA5; PAYLOAD_LEN]; 2]);
+        assert!(matches!(
+            check(&BlockBody::new(vec![l1w], vec![])),
+            Err(BodyError::DiscoveryMalformed { index: 0, .. })
+        ));
+        // Rule (ii): a zero-tag (genesis plaintext) payload past height 0.
+        let mut zt = l2_tx(1, &s_surface());
+        let width = qlab_note::l2note::L2_PAYLOAD_LEN;
+        let mut genesis_like = vec![0xA5u8; width];
+        genesis_like[width - 16..].fill(0);
+        zt.discovery = qlab_note::compact::encode_committed_discovery_with_width(
+            &[bundle(&zt.public.commitments)],
+            &[vec![0xA5; width], genesis_like],
+            width,
+        );
+        assert_eq!(
+            check(&BlockBody::new(vec![zt], vec![])),
+            Err(BodyError::GenesisPlaintextInBody { index: 0, entry: 1 })
+        );
+        // A group that does not describe the declared commitments.
+        let mut nb = l2_tx(1, &s_surface());
+        nb.discovery = placeholder_discovery_annulet(&[[0x77; 32], [0x78; 32]]);
+        assert!(matches!(
+            check(&BlockBody::new(vec![nb], vec![])),
+            Err(BodyError::DiscoveryDoesNotBind { index: 0, .. })
+        ));
+        // The mempool's dispatcher agrees with the block rule on each form.
+        let good = l2_tx(1, &s_surface());
+        assert_eq!(crate::body::check_tx_discovery_for(crate::forms::GenesisForm::Annulet, 0, &good), Ok(()));
+        assert!(crate::body::check_tx_discovery_for(crate::forms::GenesisForm::V5, 0, &good).is_err());
     }
 
     /// Lab #712 Q2: the per-block supply delta is the signed sum of every

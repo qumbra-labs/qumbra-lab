@@ -98,6 +98,35 @@ impl L2Note {
     }
 }
 
+/// **A genesis note's payload: plaintext ‖ zero tag, by construction**
+/// (lab #714, rule i). The Annulet genesis mints the fee unit's Phase-0
+/// stock to the public faucet `rkm`, so its payloads are **not encrypted**:
+/// the note plaintext followed by a 16-byte all-zero tag, width
+/// [`L2_PAYLOAD_LEN`]. Named as its own type so it cannot be mistaken for an
+/// encrypted entry — it is safe only because the stock is public by design
+/// (spending still needs the faucet's `nk`), and a zero-tag payload anywhere
+/// but the genesis is refused (rule ii, `compact::payload_tag_is_zero`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisPlaintext(pub [u8; L2_PAYLOAD_LEN]);
+
+impl GenesisPlaintext {
+    /// The genesis payload of `note`.
+    pub fn of(note: &L2Note) -> Self {
+        let mut b = [0u8; L2_PAYLOAD_LEN];
+        b[..L2_NOTE_PLAINTEXT_LEN].copy_from_slice(&note.to_plaintext());
+        Self(b)
+    }
+
+    /// Read a genesis payload back: `None` unless it is exactly
+    /// `L2_PAYLOAD_LEN` bytes, its tag is all zeros, and the plaintext decodes.
+    pub fn open(payload: &[u8]) -> Option<L2Note> {
+        if payload.len() != L2_PAYLOAD_LEN || !crate::compact::payload_tag_is_zero(payload) {
+            return None;
+        }
+        L2Note::from_plaintext(&payload[..L2_NOTE_PLAINTEXT_LEN])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +249,20 @@ mod tests {
             [0x4cf6_4eb8_8c6b_d549, 0x3ac0_64e2_e1f4_5669, 0x37ae_63a6_7c2d_9ec3, 0x2eed_9959_42cb_9af0],
             "the v1 L2 note commitment"
         );
+    }
+
+    /// Lab #714 rule (i): a genesis payload is the plaintext and a zero tag,
+    /// and only that opens as one.
+    #[test]
+    fn a_genesis_plaintext_is_plaintext_and_a_zero_tag() {
+        let n = L2Note { value: 1, asset: 0, rkm: [1, 2, 3, 4], rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12] };
+        let g = GenesisPlaintext::of(&n);
+        assert_eq!(&g.0[..L2_NOTE_PLAINTEXT_LEN], &n.to_plaintext()[..]);
+        assert!(crate::compact::payload_tag_is_zero(&g.0));
+        assert_eq!(GenesisPlaintext::open(&g.0), Some(n));
+        let mut tagged = g.0;
+        tagged[L2_PAYLOAD_LEN - 1] = 1;
+        assert_eq!(GenesisPlaintext::open(&tagged), None, "a nonzero tag is not a genesis plaintext");
+        assert_eq!(GenesisPlaintext::open(&g.0[..L2_PAYLOAD_LEN - 1]), None);
     }
 }

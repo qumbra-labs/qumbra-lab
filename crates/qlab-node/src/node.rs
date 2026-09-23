@@ -1648,7 +1648,8 @@ impl MemNode {
                 // tree at height 0, in genesis order, through the append every
                 // block's outputs take — so the genesis anchor is the tree over
                 // them and block 1 anchors on it. They spend nothing (no
-                // nullifiers); their discovery payloads are B5's.
+                // nullifiers); their payloads are served by projection of the
+                // genesis file on /v1/genesis/notes (lab #714).
                 node.roots_by_height.clear();
                 node.anchor_heights_by_root.clear();
                 for cm in &setup.genesis_cms {

@@ -74,6 +74,12 @@ pub use qlab_note::compact::{
     write_entry, write_group, write_group_contents, write_varint, CodecError, CompactGroup,
     PAYLOAD_LEN,
 };
+// Lab #714: the committed region at an explicit payload width (the L1's 120,
+// the Annulet's 128).
+pub use qlab_note::compact::{
+    committed_payloads_per_recipient_with_width, decode_committed_discovery_with_width,
+    encode_committed_discovery_with_width, payload_tag_is_zero, PAYLOAD_TAG_LEN,
+};
 
 use crate::WIRE_VERSION;
 
