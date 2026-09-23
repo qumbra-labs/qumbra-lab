@@ -131,11 +131,13 @@ tiny_http = "=0.12.0"
 # The asset registry tree and its served wire (lab #710, B3). Already in the
 # graph through qlab-node; default features off, as qlab-node takes it.
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+# The L2 transaction verifier (lab #712, B4): `qlab_l2::verify_s/verify_p`.
+# No new weight — qlab-consensus and qlab-air are already dependencies — and
+# qumbra-ffi does not depend on this crate, so the wasm/iOS graph stays
+# prover-free (qlab-devnet keeps its own shape tag, lab #706 P7).
+qlab-l2 = { path = "../qlab-l2" }
 
 [dev-dependencies]
-# The L2 consensus crate, for the Annulet shape-tag cross-lock only (lab #706
-# P7: qlab-devnet keeps its own tag so the wasm/iOS graph stays prover-free).
-qlab-l2 = { path = "../qlab-l2" }
 # Issue #101 acceptance (`tests/coinbase_spend.rs`): the miner's key hierarchy —
 # `Wallet::rkm(d)` is what a block's `coinbase_rkm` carries, and `spend_input` is
 # the only spend-witness constructor, so this is what proves the minted note is

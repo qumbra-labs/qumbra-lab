@@ -24,7 +24,7 @@ B2 replaces proof-of-work with a signature rule on the Annulet form and produces
 
 ## Running a node on an Annulet genesis
 
-- `run` loads the genesis through `load_any`. An Annulet genesis runs **only with `--rehearsal-verifier`** until B4 lands the L2 transaction verifier (the L1 verifier would refuse every L2 transaction); without the flag it is refused by name.
+- `run` loads the genesis through `load_any`. *(B2 required `--rehearsal-verifier` on an Annulet genesis; B4 (lab #712) retired that: the real L2 verifier is now the Annulet default, and rehearsal stays a loud opt-in — see `annulet-verifier.md`.)*
 - **Role:** a `sequencer.key` file in the data dir (TOML, `seed_hex = "…"`, the committee-key convention) makes the node the producer. Its key must be the genesis `sequencer_key`, or `run` refuses to start. Without the file the node follows.
 - **Refused by name on an Annulet genesis:** `committee_key_paths` (no committee), `mining = true` (production is the key file's), a wrong pinned genesis hash.
 - **The slot rule:** at each `slot_secs` the producer seals when its pool is non-empty, and otherwise seals an empty block once `max_empty_slots` slots have passed empty. It does not seal while its state lags its header tip.
@@ -60,7 +60,7 @@ The Python cross-checks cover Keccak and framing; no independent ML-DSA implemen
 
 ## Named gaps (not B2's, owned by name)
 
-- **The L2 transaction verifier:** B4. Until then an Annulet node runs only with the rehearsal verifier.
+- **The L2 transaction verifier:** landed in B4 (`annulet-verifier.md`).
 - **`qumbra-node check`** (preflight) still loads an L1 genesis only; an Annulet preflight is B6's.
 - **The form on the binary `/v1/telemetry` wire: B6.** The payload does not carry the form yet (ruled on lab #708: the bump is a fleet-visible L1 wire change and does not belong in B2). The recipe is the #212 append discipline: append a `form(u8)` tail **last** in `Telemetry::to_bytes`, so every earlier version's payload is an exact byte prefix; bump the shared `qlab_node::rpc::RPC_VERSION` (0x07 → 0x08); add a `FORM_SINCE_VERSION` gate in `decode_body`; add 0x07 to `READABLE_TELEMETRY_VERSIONS` so an opview reads un-rolled hosts; extend the per-version wire-order test; have `qumbra-opview` render the form. Until B6 no Annulet net serves `/v1/telemetry`.
 - **Out-of-order Annulet bodies are not buffered:** a body that arrives before its parent is applied answers `Orphan` and is re-asked, where the L1 path buffers it. Enough for B2's sync; B6 may want the buffer.

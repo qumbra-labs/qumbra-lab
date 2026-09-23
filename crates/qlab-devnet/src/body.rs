@@ -731,6 +731,10 @@ pub enum BodyError {
     L2NotTwoByTwo { index: usize },
     /// An Annulet body names a coinbase payee — the L2 has no block reward.
     CoinbaseOnAnnulet { got: usize },
+    /// An Annulet transaction's surface names a registry root other than
+    /// the block's parent's (lab #712, the §5 ruling): its registry openings
+    /// were computed against another registry state.
+    L2RegistryRootStale { index: usize },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**

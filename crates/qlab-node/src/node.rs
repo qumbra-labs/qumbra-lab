@@ -472,6 +472,10 @@ pub enum NodeError {
     /// The genesis registry does not build (a duplicate or out-of-range
     /// asset) — a malformed genesis, refused by name.
     RegistryGenesis(crate::registry_store::RegistryError),
+    /// A block would take an asset's outstanding public supply below zero
+    /// (lab #712): a redeem exceeding what was ever minted. Issuance is public
+    /// arithmetic, and it cannot be negative.
+    SupplyUnderflow { height: u64, asset: u16, outstanding: i128, delta: i128 },
 }
 
 /// What an Annulet node carries beyond an L1 node (lab #708/#710): the
@@ -555,7 +559,7 @@ impl NodeError {
             | NodeError::RegistryGenesis(_) => "internal",
             // A block whose header names another registry root than this
             // node's state: refused like a bad body.
-            NodeError::RegistryRootMismatch { .. } => "bad_body",
+            NodeError::RegistryRootMismatch { .. } | NodeError::SupplyUnderflow { .. } => "bad_body",
         }
     }
 }
@@ -605,6 +609,10 @@ impl std::fmt::Display for NodeError {
                 hex8(store)
             ),
             NodeError::RegistryGenesis(e) => write!(f, "the genesis registry does not build: {e:?} (lab #710)"),
+            NodeError::SupplyUnderflow { height, asset, outstanding, delta } => write!(
+                f,
+                "block {height} takes asset {asset}'s outstanding supply from {outstanding} by {delta} below zero (lab #712)"
+            ),
             NodeError::LogFormMismatch { form, height } => write!(
                 f,
                 "the block log holds a record at height {height} of the other chain family than this \
@@ -723,6 +731,17 @@ pub trait NodeState {
     fn annulet_fee_table(&self) -> Option<qlab_devnet::annulet::L2FeeTable> {
         None
     }
+    /// The registry root the next block's transactions must name (lab #712):
+    /// the tip header's, `Some` exactly on an Annulet node.
+    fn annulet_registry_root(&self) -> Option<Hash32> {
+        None
+    }
+    /// The running outstanding public supply of `asset` (lab #712): Σ of
+    /// every applied block's `vPublic` delta. 0 on L1 and for untouched
+    /// assets.
+    fn outstanding_supply(&self, _asset: u16) -> i128 {
+        0
+    }
     /// The fork-choice tip height.
     fn tip_height(&self) -> u64;
     /// The fork-choice tip hash.
@@ -793,6 +812,16 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// The Annulet genesis notes' commitments (empty on L1), kept so a
     /// rebuild from genesis re-applies them.
     annulet_genesis_cms: Vec<Hash32>,
+    /// The running per-asset outstanding public supply (lab #712): Σ of every
+    /// applied block's `annulet_supply_delta`. Chain state, **recomputed**
+    /// (never persisted): folded in `apply_state` — which every replay and
+    /// rewind runs — and rebuilt from the held main chain at `open_annulet`
+    /// (the snapshot-prefix path skips `apply_state`). Never negative: a
+    /// block that would take an asset below zero is refused by name.
+    outstanding: BTreeMap<u16, i128>,
+    /// Each applied block's non-empty supply delta, by height — recorded for
+    /// D1's supply surface.
+    supply_deltas: BTreeMap<u64, BTreeMap<u16, i128>>,
 }
 
 /// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
@@ -861,7 +890,8 @@ impl MemNode {
         let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
-        let node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
+        let mut node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
+        node.recompute_supply();
         // Lab #710: the sidecar is checked against the store the genesis
         // built (Phase 0: the genesis is the whole registry history). A
         // sidecar that disagrees, or cannot be read, is replaced — said
@@ -1664,6 +1694,8 @@ impl MemNode {
             annulet_fees: None,
             registry: None,
             annulet_genesis_cms: Vec::new(),
+            outstanding: BTreeMap::new(),
+            supply_deltas: BTreeMap::new(),
         }
     }
 
@@ -1958,6 +1990,39 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.registry.as_ref().map(|r| r.root_bytes())
     }
 
+    /// The running per-asset outstanding public supply (lab #712).
+    pub fn outstanding_supplies(&self) -> &BTreeMap<u16, i128> {
+        &self.outstanding
+    }
+
+    /// The non-empty per-block supply deltas, by height (lab #712; D1 serves).
+    pub fn supply_deltas(&self) -> &BTreeMap<u64, BTreeMap<u16, i128>> {
+        &self.supply_deltas
+    }
+
+    /// Rebuild the outstanding supply and the per-block deltas from the held
+    /// main chain (lab #712) — the one pass that also covers a snapshot resume,
+    /// whose prefix blocks never ran `apply_state`.
+    fn recompute_supply(&mut self) {
+        self.outstanding.clear();
+        self.supply_deltas.clear();
+        // The main chain, walked back from the applied tip through `prev`.
+        let mut cursor = self.chain.tip_hash();
+        while let Some(block) = self.chain.block(&cursor) {
+            let delta = qlab_devnet::annulet::annulet_supply_delta(&block.body());
+            if !delta.is_empty() {
+                for (&asset, &d) in &delta {
+                    *self.outstanding.entry(asset).or_insert(0) += d;
+                }
+                self.supply_deltas.insert(block.header.height, delta);
+            }
+            if block.header.height == 0 {
+                break;
+            }
+            cursor = block.header.prev;
+        }
+    }
+
     fn annulet_setup(&self) -> Option<AnnuletSetup> {
         Some(AnnuletSetup {
             fees: self.annulet_fees?,
@@ -2021,6 +2086,20 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // and disk-log replay alike — passes through here, so the header/body
         // binding is re-established before anything is folded into state.
         check_stored_binding_for(self.form, block)?;
+        // Lab #712: the outstanding-supply rule, checked before any mutation.
+        let supply_delta = match self.form {
+            GenesisForm::V4 | GenesisForm::V5 => BTreeMap::new(),
+            GenesisForm::Annulet => {
+                let delta = qlab_devnet::annulet::annulet_supply_delta(&block.body());
+                for (&asset, &d) in &delta {
+                    let outstanding = self.outstanding.get(&asset).copied().unwrap_or(0);
+                    if outstanding + d < 0 {
+                        return Err(NodeError::SupplyUnderflow { height: block.header.height, asset, outstanding, delta: d });
+                    }
+                }
+                delta
+            }
+        };
         // Reject any nullifier already spent, or repeated within this block,
         // BEFORE mutating — so a rejected block leaves state untouched.
         let mut seen: Vec<Hash32> = Vec::new();
@@ -2099,6 +2178,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             .apply_block_riders(block.header.height, block.txs.iter().map(|t| t.rider.as_slice()))
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
         self.record_root_at(block.header.height);
+        if !supply_delta.is_empty() {
+            for (&asset, &d) in &supply_delta {
+                *self.outstanding.entry(asset).or_insert(0) += d;
+            }
+            self.supply_deltas.insert(block.header.height, supply_delta);
+        }
         // Issue #198: a block back in the applied chain is servable from the applied
         // store again, so the archive copy is dropped — and the archive is pruned to
         // the depth a rewind could still reach from the new tip. Guarded on
@@ -2347,6 +2432,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
 
     fn annulet_fee_table(&self) -> Option<qlab_devnet::annulet::L2FeeTable> {
         self.annulet_fees
+    }
+    fn annulet_registry_root(&self) -> Option<Hash32> {
+        self.registry_root_bytes()
+    }
+    fn outstanding_supply(&self, asset: u16) -> i128 {
+        self.outstanding.get(&asset).copied().unwrap_or(0)
     }
 
     fn tip_height(&self) -> u64 {
