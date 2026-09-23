@@ -267,6 +267,7 @@ mod tests {
         checkpoint_query: Option<u64>,
         committee_series: bool,
         open_rounds: usize,
+        names_its_form: bool,
     }
 
     fn surfaces<P: PowEngine, V: TxVerifier + Clone>(n: &RunningNode<P, V>) -> FinalitySurfaces {
@@ -282,6 +283,8 @@ mod tests {
             checkpoint_query: n.p2p().checkpoint_query_trigger(),
             committee_series: metrics.contains("\nqumbra_committee_size "),
             open_rounds: n.p2p().node().rounds().open_len(),
+            names_its_form: n.telemetry_sample().ends_with(" form=annulet finality=operator")
+                && metrics.contains("\nqumbra_chain_form{form=\"annulet\",finality=\"operator\"} 1\n"),
         }
     }
 
@@ -309,6 +312,9 @@ mod tests {
         }
         if s.open_rounds != 0 {
             v.push("checkpoint rounds open");
+        }
+        if !s.names_its_form {
+            v.push("form not named on the text surfaces");
         }
         v
     }
@@ -359,7 +365,14 @@ mod tests {
         }
         node.one_iteration(&mut |_| {});
         let v = annulet_shape_violations(&surfaces(&node));
-        for want in ["finalized_height != tip", "regime not final", "stall_depth != 0", "checkpoint polling armed", "committee gauges present"] {
+        for want in [
+            "finalized_height != tip",
+            "regime not final",
+            "stall_depth != 0",
+            "checkpoint polling armed",
+            "committee gauges present",
+            "form not named on the text surfaces",
+        ] {
             assert!(v.contains(&want), "the L1 contrast must show `{want}`: {v:?}");
         }
     }

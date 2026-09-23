@@ -1931,7 +1931,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             Some((i, o)) => (i.to_string(), o.to_string()),
             None => ("-".to_string(), "-".to_string()),
         };
-        format!(
+        // Lab #708: a sequencer net names itself, so its zero committee
+        // fields and final-at-tip read as the form's, never as a committee at
+        // zero. Appended, and only there: an L1 line is byte-identical.
+        let form_tail = match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => "",
+            GenesisForm::Annulet => " form=annulet finality=operator",
+        };
+        let line = format!(
             "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={} dfinbh={} snap={} pin={} pout={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
@@ -1963,7 +1970,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             snap,
             pin,
             pout,
-        )
+        );
+        format!("{line}{form_tail}")
     }
 
     // ---- issue #87: round diagnostics + structured metrics -------------------
@@ -1992,7 +2000,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// The current exposition text (also what a scrape would receive after the next
     /// refresh). Rendering is a few dozen string appends over integer state.
     pub fn metrics_text(&self) -> String {
-        render_metrics(self.p2p.node().metrics(), &self.live_gauges())
+        let text = render_metrics(self.p2p.node().metrics(), &self.live_gauges());
+        match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => text,
+            // Lab #708: the sequencer net names itself on the scrape (an info
+            // series), so absent committee series read as the form's.
+            GenesisForm::Annulet => format!(
+                "{text}# HELP qumbra_chain_form The chain form this node runs (lab #708); finality on this \
+form is operator governance, final on acceptance.\n# TYPE qumbra_chain_form gauge\n\
+qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
+            ),
+        }
     }
 
     /// Live levels for the exposition, read from node state at render time.
