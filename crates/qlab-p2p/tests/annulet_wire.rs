@@ -88,7 +88,11 @@ fn annulet_nodes_relay_transactions_and_sealed_blocks_and_a_joiner_syncs_by_wire
     let hub = InProcHub::new();
     let mut producer = node(1, &hub, &key);
     let mut follower = node(2, &hub, &key);
+    // A hub link only makes delivery possible; the handshake starts when each
+    // side adds the other as a peer (the in-process mesh convention).
     hub.link(PeerId(1), PeerId(2));
+    producer.add_peer(PeerId(2), None);
+    follower.add_peer(PeerId(1), None);
     let mut now = 0u64;
     run(&mut [&mut producer, &mut follower], 20, &mut now);
 
@@ -122,6 +126,8 @@ fn annulet_nodes_relay_transactions_and_sealed_blocks_and_a_joiner_syncs_by_wire
     // fetched as a sealed announce (the historical-body answer).
     let mut joiner = node(3, &hub, &key);
     hub.link(PeerId(3), PeerId(1));
+    joiner.add_peer(PeerId(1), None);
+    producer.add_peer(PeerId(3), None);
     run(&mut [&mut producer, &mut follower, &mut joiner], 400, &mut now);
     assert_eq!(joiner.node().tip_hash(), producer.node().tip_hash(), "the joiner synced the sealed headers");
     assert_eq!(joiner.node().state().tip_height(), 6, "and applied every historical body");
