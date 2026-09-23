@@ -262,6 +262,12 @@ pub fn txid(entry: &TxEntry) -> TxId {
         buf.extend_from_slice(&(entry.rider.len() as u64).to_le_bytes());
         buf.extend_from_slice(&entry.rider);
     }
+    // Lab #708: the L2 surface is part of identity for the same reason —
+    // presence-conditional, so every L1 txid is unchanged.
+    if entry.l2 != qlab_devnet::annulet::L2_SURFACE_ABSENT {
+        buf.extend_from_slice(&(entry.l2.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&entry.l2);
+    }
     keccak256(&buf)
 }
 

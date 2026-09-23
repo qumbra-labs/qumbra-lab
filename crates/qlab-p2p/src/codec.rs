@@ -493,6 +493,12 @@ pub fn encode_tx_annulet(tx: &TxEntry) -> Vec<u8> {
         tx.rider == qlab_devnet::names::RIDER_ABSENT,
         "no name rider on an Annulet transaction (lab #706)"
     );
+    annulet_wire_bytes(tx)
+}
+
+/// The Annulet wire's bytes without [`encode_tx_annulet`]'s input asserts —
+/// for [`tx_id`], which must be total over locally-built input.
+fn annulet_wire_bytes(tx: &TxEntry) -> Vec<u8> {
     let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() };
     let mut out = encode_tx(&l1);
     write_varint(&mut out, tx.l2.len() as u64);
@@ -592,8 +598,18 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
 /// A transaction's inventory id (there is no consensus tx-id in the devnet; the
 /// body commitment is the block-level digest — for per-tx gossip dedup we hash
 /// the canonical tx wire).
+///
+/// Lab #708: an L2-surface transaction's canonical wire is the Annulet one, so
+/// its id hashes that — keyed on the transaction's own bytes, not the net's
+/// form, so it is total (the pool computes an id before admission judges the
+/// transaction). For every L1 transaction (surface absent) the id is the
+/// L1 wire's hash, unchanged byte for byte.
 pub fn tx_id(tx: &TxEntry) -> Hash32 {
-    keccak256(&encode_tx(tx))
+    if tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT {
+        keccak256(&encode_tx(tx))
+    } else {
+        keccak256(&annulet_wire_bytes(tx))
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -984,6 +1000,19 @@ mod tests {
         let mut absent = l1_only.clone();
         absent.extend_from_slice(&[0x01, 0x00]); // varint 1 ‖ [0x00]
         assert!(matches!(decode_tx_annulet(&absent), Err(DecodeError::BadL2Surface)));
+    }
+
+    /// Lab #708: `tx_id` is total — an L2-surface transaction's id is the
+    /// hash of its Annulet wire (it used to hash the L1 wire and panic, which
+    /// the pool reaches before admission), and an L1 transaction's id is
+    /// unchanged.
+    #[test]
+    fn tx_id_hashes_each_transactions_own_wire() {
+        let tx = annulet_tx();
+        assert_eq!(tx_id(&tx), keccak256(&encode_tx_annulet(&tx)));
+        let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() };
+        assert_eq!(tx_id(&l1), keccak256(&encode_tx(&l1)));
+        assert_ne!(tx_id(&tx), tx_id(&l1), "the surface is part of the identity");
     }
 
     #[test]

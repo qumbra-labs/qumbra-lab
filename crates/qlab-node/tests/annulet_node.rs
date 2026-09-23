@@ -190,3 +190,24 @@ fn an_annulet_node_on_disk_resumes_its_sealed_chain_across_a_restart() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Lab #708: the L2 surface is part of a transaction's pool identity (like a
+/// rider, presence-conditional), so two transactions that differ only in
+/// their surface are two ids, and an L1 transaction's id is unchanged.
+#[test]
+fn the_l2_surface_is_part_of_pool_identity() {
+    let (n, _) = node();
+    let s = s_tx(&n, 7);
+    let p = TxEntry {
+        l2: L2Surface {
+            shape: L2ShapeTag::P,
+            registry_root: ROOT,
+            vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 1, asset: 7 }]),
+        }
+        .encode(),
+        ..s.clone()
+    };
+    assert_ne!(qlab_node::mempool::txid(&s), qlab_node::mempool::txid(&p));
+    let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..s.clone() };
+    assert_ne!(qlab_node::mempool::txid(&s), qlab_node::mempool::txid(&l1));
+}
