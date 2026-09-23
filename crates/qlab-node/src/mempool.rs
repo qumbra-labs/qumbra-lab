@@ -152,6 +152,9 @@ pub enum MempoolError {
     /// an Annulet net missing / malformed / not 2×2. Carries block
     /// validation's own verdict (only the `L2*` variants of [`BodyError`]).
     L2SurfaceInvalid(BodyError),
+    /// A redeem of `asset` exceeding its outstanding public supply net of
+    /// the redeems already pooled (lab #712): the block rule would refuse it.
+    RedeemExceedsOutstanding { asset: u16 },
     /// The anchor is not a valid transaction anchor now (not finalized, or aged
     /// past the ≤ 1,152-block window — §4/§7).
     AnchorNotValid,
@@ -235,6 +238,16 @@ pub struct MempoolTx {
     /// because the two consumers below run per pooled tx per block, and because
     /// re-decoding would be a second decoder to keep in step with the first.
     pub name_op: Option<qlab_devnet::names::NameOp>,
+}
+
+/// A surface's signed vPublic terms, `(asset, ±amount)` (lab #712).
+fn surface_terms(s: &qlab_devnet::annulet::L2Surface) -> Vec<(u16, i128)> {
+    s.vpublic
+        .iter()
+        .flatten()
+        .filter(|t| t.amount != 0)
+        .map(|t| (t.asset, if t.redeem { -(t.amount as i128) } else { t.amount as i128 }))
+        .collect()
 }
 
 /// Canonical Keccak-256 id of a transaction — the injective per-tx encoding the
@@ -583,6 +596,33 @@ impl Mempool {
                     || entry.public.commitments.len() != 2
                 {
                     return Err(MempoolError::L2SurfaceInvalid(BodyError::L2NotTwoByTwo { index: 0 }));
+                }
+                // Lab #712: the surface names the registry root the next
+                // block's parent (this tip) carries — the body rule's twin.
+                let root = state
+                    .annulet_registry_root()
+                    .expect("an Annulet node state carries its registry (lab #710)");
+                if surface.registry_root != root {
+                    return Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryRootStale { index: 0 }));
+                }
+                // Lab #712: a redeem must fit the outstanding supply after
+                // every redeem already pooled. Pooled mints are not counted:
+                // assembly may leave a mint out and keep the redeem, and the
+                // sequencer's own block would then be refused.
+                for (asset, d) in surface_terms(&surface) {
+                    if d < 0 {
+                        let pooled: i128 = self
+                            .txs
+                            .values()
+                            .filter_map(|t| qlab_devnet::annulet::L2Surface::decode(&t.entry.l2).ok().flatten())
+                            .flat_map(|s| surface_terms(&s))
+                            .filter(|&(a, v)| a == asset && v < 0)
+                            .map(|(_, v)| v)
+                            .sum();
+                        if state.outstanding_supply(asset) + pooled + d < 0 {
+                            return Err(MempoolError::RedeemExceedsOutstanding { asset });
+                        }
+                    }
                 }
                 let fees = state
                     .annulet_fee_table()

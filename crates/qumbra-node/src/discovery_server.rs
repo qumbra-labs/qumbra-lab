@@ -384,6 +384,9 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
             // Lab #708: reachable only on an Annulet net (the L1 decode never
             // yields a surface) — additive, named.
             MempoolError::L2SurfaceInvalid(e) => (400, format!("refused: l2-surface {e:?}")),
+            MempoolError::RedeemExceedsOutstanding { asset } => {
+                (409, format!("refused: redeem exceeds asset {asset}'s outstanding supply (lab #712)"))
+            }
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
             // wrapping; reaching here means that mapping broke.
             MempoolError::DuplicateTx => {

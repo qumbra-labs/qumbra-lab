@@ -531,6 +531,8 @@ pub enum RejectReason {
     /// — additive: reachable only on an Annulet net, since the L1 tx decode
     /// never yields a surface.
     L2SurfaceInvalid,
+    /// A redeem exceeding the asset's outstanding supply (lab #712).
+    RedeemExceedsOutstanding,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
     // commitment tree's append schedule, so an immature spend has no witness against
     // any acceptable anchor and cannot reach a refusal reason at all. A wallet that wants
@@ -736,6 +738,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
             Err(MempoolError::L2SurfaceInvalid(_)) => {
                 SubmitOutcome::Rejected(RejectReason::L2SurfaceInvalid)
+            }
+            Err(MempoolError::RedeemExceedsOutstanding { .. }) => {
+                SubmitOutcome::Rejected(RejectReason::RedeemExceedsOutstanding)
             }
         }
     }

@@ -2580,6 +2580,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             MempoolError::ProofInvalid => "proof invalid",
             // Lab #708: intrinsic to the tx's own bytes, like discovery.
             MempoolError::L2SurfaceInvalid(_) => "l2 surface invalid",
+            // Lab #712: judged against this node's chain state — another
+            // node's pool may differ, so not a peer fault by itself.
+            MempoolError::RedeemExceedsOutstanding { .. } => "redeem exceeds outstanding supply",
         }
     }
 }

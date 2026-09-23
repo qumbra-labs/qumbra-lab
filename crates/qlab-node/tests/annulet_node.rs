@@ -364,3 +364,97 @@ fn the_genesis_notes_survive_restart_exactly_once() {
     assert_eq!(by_replay.commitment_root(), root);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A P transaction carrying `terms` (mock-proved), at the P tier.
+fn p_tx(n: &MemNode, nf: u8, terms: [VPublicTerm; 2]) -> TxEntry {
+    let mut t = s_tx(n, nf);
+    t.l2 = L2Surface { shape: L2ShapeTag::P, registry_root: root(), vpublic: Some(terms) }.encode();
+    t.public.fee = FEES.tier_p;
+    t
+}
+
+fn mint(amount: u64, asset: u16) -> [VPublicTerm; 2] {
+    [VPublicTerm::NONE, VPublicTerm { redeem: false, amount, asset }]
+}
+
+fn redeem(amount: u64, asset: u16) -> [VPublicTerm; 2] {
+    [VPublicTerm::NONE, VPublicTerm { redeem: true, amount, asset }]
+}
+
+/// Lab #712 Q2: the node keeps the running outstanding supply, records each
+/// block's delta, and refuses by name a block that would take an asset below
+/// zero — leaving state untouched.
+#[test]
+fn outstanding_supply_is_chain_state_and_never_goes_negative() {
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let (mut n, g) = node();
+    let b1 = BlockBody::new(vec![p_tx(&n, 1, mint(100, 7))], vec![]);
+    let s1 = sealed_child(&key, &g, &b1);
+    n.apply_sealed_block(&s1, b1, &OkProof).unwrap();
+    let b2 = BlockBody::new(vec![p_tx(&n, 3, redeem(30, 7))], vec![]);
+    let s2 = sealed_child(&key, &s1.header, &b2);
+    n.apply_sealed_block(&s2, b2, &OkProof).unwrap();
+    assert_eq!(n.outstanding_supplies().get(&7), Some(&70));
+    assert_eq!(n.supply_deltas().get(&1).and_then(|d| d.get(&7)), Some(&100));
+    assert_eq!(n.supply_deltas().get(&2).and_then(|d| d.get(&7)), Some(&-30));
+    let b3 = BlockBody::new(vec![p_tx(&n, 5, redeem(71, 7))], vec![]);
+    let s3 = sealed_child(&key, &s2.header, &b3);
+    match n.apply_sealed_block(&s3, b3, &OkProof) {
+        Err(NodeError::SupplyUnderflow { height: 3, asset: 7, outstanding: 70, delta: -71 }) => {}
+        other => panic!("expected SupplyUnderflow, got {other:?}"),
+    }
+    assert_eq!(n.tip_height(), 2, "a refused block leaves state untouched");
+    assert_eq!(n.outstanding_supplies().get(&7), Some(&70));
+    // A redeem of an asset never minted is refused the same way.
+    let b4 = BlockBody::new(vec![p_tx(&n, 7, redeem(1, 9))], vec![]);
+    let s4 = sealed_child(&key, &s2.header, &b4);
+    assert!(matches!(n.apply_sealed_block(&s4, b4, &OkProof), Err(NodeError::SupplyUnderflow { asset: 9, .. })));
+}
+
+/// Recomputed, never persisted: the outstanding supply comes back after a
+/// restart over a snapshot (whose prefix skips `apply_state`) and by replay.
+#[test]
+fn outstanding_supply_is_recomputed_across_restart() {
+    let dir = std::env::temp_dir().join(format!("qlab-annulet-supply-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
+    {
+        let mut n = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+        let b1 = BlockBody::new(vec![p_tx(&n, 1, mint(100, 7))], vec![]);
+        let s1 = sealed_child(&key, &g, &b1);
+        n.apply_sealed_block(&s1, b1, &OkProof).unwrap();
+        n.save_snapshot().unwrap();
+    }
+    let over_snapshot = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+    assert_eq!(over_snapshot.outstanding_supplies().get(&7), Some(&100));
+    drop(over_snapshot);
+    std::fs::remove_file(dir.join("snapshot.bin")).unwrap();
+    let by_replay = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+    assert_eq!(by_replay.outstanding_supplies().get(&7), Some(&100));
+    assert_eq!(by_replay.supply_deltas().get(&1).and_then(|d| d.get(&7)), Some(&100));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lab #712: the pool refuses a stale registry root, and a redeem that
+/// exceeds the outstanding supply net of the redeems already pooled.
+#[test]
+fn the_annulet_mempool_refuses_a_stale_root_and_an_uncovered_redeem() {
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let (mut n, g) = node();
+    let b1 = BlockBody::new(vec![p_tx(&n, 1, mint(100, 7))], vec![]);
+    n.apply_sealed_block(&sealed_child(&key, &g, &b1), b1, &OkProof).unwrap();
+    let mut pool = Mempool::new(MempoolParams::default());
+    let mut stale = s_tx(&n, 3);
+    stale.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: [0x99; 32], vpublic: None }.encode();
+    assert!(matches!(
+        pool.admit(stale, &n, &OkProof, &EmptyNameView),
+        Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryRootStale { index: 0 }))
+    ));
+    assert!(pool.admit(p_tx(&n, 5, redeem(60, 7)), &n, &OkProof, &EmptyNameView).is_ok(), "60 of 100");
+    assert!(matches!(
+        pool.admit(p_tx(&n, 9, redeem(41, 7)), &n, &OkProof, &EmptyNameView),
+        Err(MempoolError::RedeemExceedsOutstanding { asset: 7 })
+    ), "60 pooled + 41 > 100");
+    assert!(pool.admit(p_tx(&n, 13, redeem(40, 7)), &n, &OkProof, &EmptyNameView).is_ok(), "60 + 40 = 100");
+}
