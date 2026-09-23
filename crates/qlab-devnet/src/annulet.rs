@@ -310,11 +310,13 @@ pub const ANNULET_DISCOVERY_RULE_OWNER: &str = "B5";
 /// 3. per transaction: anchor final; name rider absent (no name service);
 ///    L2 surface present and canonical; bucket 2×2 with exactly 2 nullifiers
 ///    and 2 commitments; `fee == posted_fee_l2(shape)`; no nullifier repeated
-///    in the block; the proof verifies (the verifier is B4's).
+///    in the block; the surface's `registry_root` is the header's — which
+///    B2's header rule has proved equal to the **parent's** (lab #712, the
+///    §5 ruling); the proof verifies (B4's `L2Verifier` in the node).
 ///
-/// **Not here, by name:** the parent-registry-root binding of each surface
-/// (Q6 — B4), the sequencer signature (B2), the discovery group
-/// ([`ANNULET_DISCOVERY_RULE_OWNER`]).
+/// **Not here, by name:** the sequencer signature (B2), the discovery group
+/// ([`ANNULET_DISCOVERY_RULE_OWNER`]), and the outstanding-supply rule, which
+/// needs chain state (the node's, over [`annulet_supply_delta`]).
 pub fn validate_body_annulet<V, F>(
     header: &BlockHeader,
     body: &BlockBody,
@@ -333,6 +335,10 @@ where
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch { expected: header.tx_body_commitment, got });
     }
+    let header_root = match header.ext {
+        HeaderExt::Annulet(ext) => Some(ext.registry_root),
+        _ => None,
+    };
     let mut seen_nf = std::collections::HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
@@ -350,6 +356,9 @@ where
         {
             return Err(BodyError::L2NotTwoByTwo { index: i });
         }
+        if Some(surface.registry_root) != header_root {
+            return Err(BodyError::L2RegistryRootStale { index: i });
+        }
         let expected = fees.posted_fee_l2(surface.shape);
         if tx.public.fee != expected {
             return Err(BodyError::WrongFee { index: i, expected, got: tx.public.fee });
@@ -364,6 +373,28 @@ where
         }
     }
     Ok(())
+}
+
+/// **The per-block supply delta** (lab #712, Q2): the net public issuance of
+/// a body, per asset — `+amount` for a mint term, `−amount` for a redeem
+/// term, summed over every surface's `vPublic` (shape P; shape S has none).
+/// A pure function of committed data (the body commitment binds every
+/// surface), so it is derived, never stored twice. Zero nets are dropped.
+/// Undecodable surfaces contribute nothing — a validated body has none.
+pub fn annulet_supply_delta(body: &BlockBody) -> std::collections::BTreeMap<u16, i128> {
+    let mut delta = std::collections::BTreeMap::new();
+    for tx in &body.txs {
+        let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { continue };
+        for term in surface.vpublic.iter().flatten() {
+            if term.amount == 0 {
+                continue;
+            }
+            let signed = if term.redeem { -(term.amount as i128) } else { term.amount as i128 };
+            *delta.entry(term.asset).or_insert(0i128) += signed;
+        }
+    }
+    delta.retain(|_, v| *v != 0);
+    delta
 }
 
 /// Convenience for fixtures and B2's producer: an L2 transaction entry with
@@ -427,6 +458,40 @@ mod tests {
 
     fn check(body: &BlockBody) -> Result<(), BodyError> {
         validate_body_annulet(&header_for(body), body, &OkProof, |r| *r == FINAL, &FEES)
+    }
+
+    /// Lab #712 (the §5 ruling): a surface whose registry root is not the
+    /// header's (= the parent's, by B2's header rule) is refused by name.
+    #[test]
+    fn a_surface_naming_another_registry_root_is_refused() {
+        let good = BlockBody::new(vec![l2_tx(1, &s_surface())], vec![]);
+        assert_eq!(check(&good), Ok(()));
+        let stale = L2Surface { registry_root: [0x45; 32], ..s_surface() };
+        let body = BlockBody::new(vec![l2_tx(1, &s_surface()), l2_tx(9, &stale)], vec![]);
+        assert_eq!(check(&body), Err(BodyError::L2RegistryRootStale { index: 1 }));
+    }
+
+    /// Lab #712 Q2: the per-block supply delta is the signed sum of every
+    /// surface's vPublic terms, per asset; zero nets are dropped.
+    #[test]
+    fn the_supply_delta_sums_vpublic_terms_per_asset() {
+        let t = |redeem, amount, asset| VPublicTerm { redeem, amount, asset };
+        let p = |a: VPublicTerm, b: VPublicTerm| L2Surface { vpublic: Some([a, b]), ..p_surface() };
+        let body = BlockBody::new(
+            vec![
+                l2_tx(1, &p(t(false, 100, 7), t(false, 5, 9))),
+                l2_tx(9, &p(t(true, 30, 7), VPublicTerm::NONE)),
+                l2_tx(17, &p(t(true, 5, 9), VPublicTerm::NONE)),
+                l2_tx(25, &s_surface()),
+            ],
+            vec![],
+        );
+        let d = annulet_supply_delta(&body);
+        assert_eq!(d.get(&7), Some(&70));
+        assert_eq!(d.get(&9), None, "a zero net is dropped");
+        assert_eq!(d.len(), 1);
+        let big = BlockBody::new(vec![l2_tx(1, &p(t(true, u64::MAX, 3), t(true, u64::MAX, 3)))], vec![]);
+        assert_eq!(annulet_supply_delta(&big).get(&3), Some(&(-2 * u64::MAX as i128)), "no overflow");
     }
 
     #[test]

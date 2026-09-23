@@ -2454,7 +2454,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::L2SurfaceMissing { .. }
             | BodyError::L2SurfaceMalformed { .. }
             | BodyError::L2NotTwoByTwo { .. }
-            | BodyError::CoinbaseOnAnnulet { .. } => BodyFault::Intrinsic("bad body"),
+            | BodyError::CoinbaseOnAnnulet { .. }
+            // Lab #712: a surface root that is not its own header's — the
+            // block contradicts itself, whatever this node's view.
+            | BodyError::L2RegistryRootStale { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:
             BodyError::RiderRule { err, .. } => match err {
                 // Grammar, record kind and record size read only the revealed
