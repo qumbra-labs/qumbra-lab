@@ -1474,7 +1474,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
-        let ann = BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled };
+        let ann = BlockAnnounce { seal: None, header, nonce, coinbase_payees, short_ids, prefilled };
         let payload = encode_announce(self.node.genesis_form(), &ann);
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -3304,7 +3304,7 @@ fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
         .enumerate()
         .map(|(i, tx)| PrefilledTx { index: i as u32, tx })
         .collect();
-    BlockAnnounce {
+    BlockAnnounce { seal: None,
         header,
         nonce: 0,
         coinbase_payees,
@@ -4533,7 +4533,7 @@ mod tests {
         let bh = header.header_hash();
         // …announced with no transactions at all (fully-prefilled, empty).
         let (prefilled, short_ids) = build_announce_parts(&[], 0xBEEF);
-        let ann = BlockAnnounce {
+        let ann = BlockAnnounce { seal: None,
             header,
             nonce: 0xBEEF,
             coinbase_payees: Vec::new(),
@@ -4866,7 +4866,7 @@ mod tests {
         }
         assert!(!b.blocks.contains(&bh));
         let (prefilled, short_ids) = build_announce_parts(&txs, 0xC0DE);
-        let ann = BlockAnnounce {
+        let ann = BlockAnnounce { seal: None,
             header,
             nonce: 0xC0DE,
             coinbase_payees: Vec::new(),

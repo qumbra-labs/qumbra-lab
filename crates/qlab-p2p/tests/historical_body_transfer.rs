@@ -351,7 +351,7 @@ fn a_served_body_that_does_not_match_the_header_commitment_is_charged_to_the_ser
     let (header, body) = blocks[1].clone();
     let mut forged_payees = body.coinbase_payees.clone();
     forged_payees[0].amount = forged_payees[0].amount.wrapping_add(1);
-    let forged = BlockAnnounce {
+    let forged = BlockAnnounce { seal: None,
         header,
         nonce: 0,
         coinbase_payees: forged_payees,
@@ -541,7 +541,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
         .collect();
     let body = BlockBody::from_single_payee(txs.clone(), 42, [7; 4]);
     let header = BlockHeader::child_of(&BlockHeader::genesis(1000, 0), 75, 1000, body.commitment());
-    let ann = BlockAnnounce {
+    let ann = BlockAnnounce { seal: None,
         header,
         nonce: 0,
         coinbase_payees: body.coinbase_payees.clone(),
@@ -575,7 +575,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
 
     // The contrast, so the choice is not merely asserted: the LIVE relay shape for
     // the same body leaves every non-prefilled slot missing on an empty mempool.
-    let live = BlockAnnounce {
+    let live = BlockAnnounce { seal: None,
         header,
         nonce: 0xABCD,
         coinbase_payees: body.coinbase_payees.clone(),
@@ -592,7 +592,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
 /// transaction prefilled, no short ids, and a `MsgType` that already existed.
 #[test]
 fn a_served_block_uses_the_existing_announce_codec_and_no_new_msg_type() {
-    let ann = BlockAnnounce {
+    let ann = BlockAnnounce { seal: None,
         header: BlockHeader::genesis(1000, 0),
         nonce: 0,
         coinbase_payees: vec![qlab_devnet::body::CoinbasePayee {
@@ -721,7 +721,7 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
     // 17 down to 3, none of which can apply — all of them buffer.
     let mut now = 20;
     for (h, body) in blocks[2..17].iter().rev() {
-        let ann = BlockAnnounce {
+        let ann = BlockAnnounce { seal: None,
             header: *h,
             nonce: 0,
             coinbase_payees: body.coinbase_payees.clone(),
@@ -752,7 +752,7 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
 
     // The frontier arrives: the whole buffered span drains in one pass.
     let (h2, b2) = &blocks[1];
-    let ann = BlockAnnounce {
+    let ann = BlockAnnounce { seal: None,
         header: *h2,
         nonce: 0,
         coinbase_payees: b2.coinbase_payees.clone(),

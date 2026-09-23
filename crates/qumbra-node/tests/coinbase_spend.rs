@@ -658,7 +658,7 @@ fn a_redirected_payout_key_is_rejected_by_the_header_binding() {
 fn a_pre_101_block_announcement_does_not_decode() {
     use qlab_p2p::compact::{decode_announce, encode_announce, BlockAnnounce};
 
-    let ann = BlockAnnounce {
+    let ann = BlockAnnounce { seal: None,
         header: BlockHeader::genesis(GENESIS_DIFFICULTY, 0),
         nonce: 0xABCD,
         coinbase_payees: vec![qlab_devnet::body::CoinbasePayee {

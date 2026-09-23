@@ -93,6 +93,10 @@ pub struct BlockAnnounce {
     pub coinbase_payees: Vec<CoinbasePayee>,
     pub short_ids: Vec<[u8; SHORTID_LEN]>,
     pub prefilled: Vec<PrefilledTx>,
+    /// The sequencer's seal over `header` — present exactly on an Annulet
+    /// net (lab #708), where the announce carries the 3,462-B sealed header
+    /// in place of the L1 header; `None` on every L1 announce.
+    pub seal: Option<Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]>>,
 }
 
 /// A request for the transactions a peer could not reconstruct, by index.
@@ -238,7 +242,7 @@ pub fn decode_announce_above(
         prefilled.push(PrefilledTx { index, tx: crate::codec::decode_tx(&tx_bytes)? });
     }
     r.finish()?;
-    Ok(BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled })
+    Ok(BlockAnnounce { seal: None, header, nonce, coinbase_payees, short_ids, prefilled })
 }
 
 // --- GetBlockTxn ---
@@ -398,7 +402,7 @@ mod tests {
 
     #[test]
     fn announce_round_trips() {
-        let a = BlockAnnounce {
+        let a = BlockAnnounce { seal: None,
             header: header(),
             nonce: 0xDEADBEEF,
             coinbase_payees: Vec::new(),
@@ -432,7 +436,7 @@ mod tests {
         let coinbase = tx(0);
         let t1 = tx(1);
         let t2 = tx(2);
-        let a = BlockAnnounce {
+        let a = BlockAnnounce { seal: None,
             header: header(),
             nonce,
             coinbase_payees: Vec::new(),
@@ -456,7 +460,7 @@ mod tests {
         let nonce = 7;
         let t1 = tx(1);
         let t2 = tx(2);
-        let a = BlockAnnounce {
+        let a = BlockAnnounce { seal: None,
             header: header(),
             nonce,
             coinbase_payees: Vec::new(),
@@ -472,7 +476,7 @@ mod tests {
     // ── v5 payee-list announce (lab #470 stage 2) ───────────────────────────
 
     fn sample_announce() -> BlockAnnounce {
-        BlockAnnounce {
+        BlockAnnounce { seal: None,
             header: header(),
             nonce: 0xDEADBEEF,
             coinbase_payees: vec![CoinbasePayee {
@@ -567,7 +571,7 @@ mod tests {
                 body.commitment_v5_above(Some(boundary), height),
             )
         };
-        let a = BlockAnnounce {
+        let a = BlockAnnounce { seal: None,
             header,
             nonce: 0,
             coinbase_payees: payees,
