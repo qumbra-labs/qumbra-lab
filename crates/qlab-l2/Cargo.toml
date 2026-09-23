@@ -1,0 +1,35 @@
+[package]
+name = "qlab-l2"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The Annulet (Qumbra L2) consensus crate — what `qlab-consensus` is for the
+# L1: the L2 lane, the prove/verify wrappers over shapes S and P, the shape
+# constants and their pins (lab issue #704, l2-roadmap A1).
+#
+# Workspace dependencies are EXACTLY `qlab-air` + `qlab-consensus`
+# (`l2_crate_deps_are_exactly_air_and_consensus` locks it): the AIRs, and the
+# single source of the StarkConfig plumbing. Nothing node-, devnet- or
+# note-shaped belongs here — B1/B4/C2 depend on this crate, not the reverse.
+
+[dependencies]
+qlab-air = { path = "../qlab-air" }
+qlab-consensus = { path = "../qlab-consensus" }
+
+# Plonky3, pinned exactly at 0.6.1 — must match qlab-consensus / qlab-bench.
+p3-air = "=0.6.1"
+p3-field = "=0.6.1"
+p3-matrix = "=0.6.1"
+p3-uni-stark = "=0.6.1"
+
+# The shape digest (Keccak-256, the same crate qlab-note/qlab-devnet use).
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[dev-dependencies]
+# The wire-length reads in the prove round-trip tests (bincode fixint is the
+# proof wire, protocol-spec §4).
+bincode = "1"
+# `l2_crate_deps_are_exactly_air_and_consensus` reads `cargo metadata`.
+serde_json = "1"
