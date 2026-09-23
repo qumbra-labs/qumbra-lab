@@ -41,16 +41,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// (binding `genesis_notes`), the genesis L2 fee table and the
     /// genesis-pinned sequencer key. The committee is empty — an Annulet net
     /// has none.
+    #[allow(clippy::too_many_arguments)]
     pub fn annulet(
         genesis_header: BlockHeader,
         genesis_notes: &[GenesisNote],
         fees: L2FeeTable,
+        registry: &[qlab_node::registry_store::RegistryLeaf],
         sequencer_key: VerifyingKey<MlDsa65>,
         pow: P,
         verifier: V,
         sim: SimConfig,
     ) -> Self {
-        let state = MemNode::in_memory_annulet(genesis_header, genesis_notes, fees);
+        let state = MemNode::in_memory_annulet(genesis_header, genesis_notes, fees, registry);
         let committee = EpochCommittee::genesis(
             EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
             CommitteeState::new(Committee::from_keys(Vec::new()), 0),
@@ -75,13 +77,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         genesis_header: BlockHeader,
         genesis_notes: &[GenesisNote],
         fees: L2FeeTable,
+        registry: &[qlab_node::registry_store::RegistryLeaf],
         sequencer_key: VerifyingKey<MlDsa65>,
         pow: P,
         verifier: V,
         sim: SimConfig,
     ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
-        let state = MemNode::open_annulet(&dir, genesis_header, genesis_notes, fees)?;
+        let state = MemNode::open_annulet(&dir, genesis_header, genesis_notes, fees, registry)?;
         let committee = EpochCommittee::genesis(
             EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
             CommitteeState::new(Committee::from_keys(Vec::new()), 0),

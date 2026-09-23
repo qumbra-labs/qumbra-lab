@@ -31,7 +31,8 @@ pub const DEPTH: usize = qlab_air::narrow::MERKLE_DEPTH;
 /// The all-empty leaf (an unused position).
 const EMPTY_LEAF: [u64; 4] = [0, 0, 0, 0];
 
-fn hash_node(left: &[u64; 4], right: &[u64; 4]) -> [u64; 4] {
+/// The consensus node hash (shared with the registry tree, lab #710).
+pub(crate) fn hash_node(left: &[u64; 4], right: &[u64; 4]) -> [u64; 4] {
     let st = merkle_node_state(left, right);
     [st[0], st[1], st[2], st[3]]
 }

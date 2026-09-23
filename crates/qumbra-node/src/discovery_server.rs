@@ -210,6 +210,12 @@ pub const NULLIFIERS_PATH: &str = "/v1/nullifiers";
 /// exists, by design, permanently.
 pub const NAMES_PATH: &str = "/v1/names";
 
+/// The registry-root route (lab #710, B3) — GET only, Annulet nets only.
+pub const REGISTRY_ROOT_PATH: &str = "/v1/registry/root";
+/// The registry-opening route's prefix: `/v1/registry/{asset}`, the asset id
+/// in canonical decimal (lab #710) — GET only, Annulet nets only.
+pub const REGISTRY_PATH_PREFIX: &str = "/v1/registry/";
+
 /// The per-block coinbase route (lab #415) — GET only, bulk over a range. There
 /// is no per-`rkm` form and there must never be one: the bytes are public (every
 /// block prints its own payee) but the *question* "did this key mine anything"
@@ -524,6 +530,49 @@ pub struct AnchorsView {
     pub encoded: Vec<u8>,
 }
 
+/// The registry projection the run loop refreshes (lab #710). `None` on an
+/// L1 node, whose registry routes refuse by name.
+#[derive(Default)]
+pub struct RegistryView {
+    pub served: Option<RegistryServed>,
+}
+
+/// What an Annulet node serves on the registry routes: the tree and the
+/// height its root was read at (immutable until A2, so the height only says
+/// how recently it was confirmed).
+pub struct RegistryServed {
+    pub height: u64,
+    pub tree: qlab_cbserver::registry::RegistryTree,
+}
+
+/// The named refusal an L1 node answers the registry routes with (not 404:
+/// the route exists; this chain form does not have a registry).
+pub const REGISTRY_NOT_ON_L1: &str =
+    "the asset registry is served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #710)";
+
+/// Answer a registry route from a view.
+fn respond_registry(view: &RegistryView, path: &str) -> Result<Vec<u8>, (u16, String)> {
+    let Some(served) = &view.served else { return Err((400, REGISTRY_NOT_ON_L1.to_string())) };
+    if path == REGISTRY_ROOT_PATH {
+        return Ok(qlab_cbserver::registry::encode_registry_root(served.height, &served.tree.root()));
+    }
+    let arg = &path[REGISTRY_PATH_PREFIX.len()..];
+    let asset = parse_asset_id(arg).ok_or_else(|| {
+        (400, format!("registry asset id `{arg}` is not a canonical decimal below 65536 (lab #710)"))
+    })?;
+    qlab_cbserver::registry::encode_registry_opening(&served.tree, served.height, asset)
+        .ok_or_else(|| (404, format!("asset {asset} is not registered (lab #710)")))
+}
+
+/// A canonical decimal asset id below `2^16`: digits only, no sign, no
+/// leading zero except `0` itself — one spelling per asset.
+fn parse_asset_id(s: &str) -> Option<u16> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+        return None;
+    }
+    s.parse::<u16>().ok()
+}
+
 /// A running discovery-server endpoint: bound address + worker thread + the
 /// shared projections the run loop refreshes + the submit queue it drains.
 pub struct DiscoveryServer {
@@ -557,7 +606,7 @@ impl DiscoveryServer {
         anchors: Arc<Mutex<Arc<AnchorsView>>>,
         submits: mpsc::SyncSender<SubmitRequest>,
     ) -> io::Result<Self> {
-        Self::start_with_mine(addr, view, leaves, anchors, submits, None)
+        Self::start_with_mine(addr, view, leaves, anchors, submits, None, Arc::new(Mutex::new(Arc::new(RegistryView::default()))))
     }
 
     /// [`Self::start`] plus the lab #511 mine-template / block-submit routes.
@@ -569,6 +618,7 @@ impl DiscoveryServer {
         anchors: Arc<Mutex<Arc<AnchorsView>>>,
         submits: mpsc::SyncSender<SubmitRequest>,
         mine: Option<crate::mine_rpc::MineServing>,
+        registry: Arc<Mutex<Arc<RegistryView>>>,
     ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
@@ -714,6 +764,15 @@ impl DiscoveryServer {
                         };
                         Ok(snapshot.encoded.clone())
                     }
+                    // Lab #710: the registry routes (root, and an opening by
+                    // asset id in the path).
+                    p if p == REGISTRY_ROOT_PATH || p.starts_with(REGISTRY_PATH_PREFIX) => {
+                        let snapshot = match registry.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(e) => Arc::clone(&e.into_inner()),
+                        };
+                        respond_registry(&snapshot, p)
+                    }
                     // The payload route carries its arguments in the path, so it
                     // is matched on shape rather than by equality. A path that
                     // is not this shape falls through to the 404 below.
@@ -730,6 +789,7 @@ impl DiscoveryServer {
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {COINBASE_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
+                                 {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, \
                                  {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
@@ -1985,4 +2045,27 @@ mod tests {
         );
         assert_eq!(view.blocks[0].hash, ghash, "the common prefix is untouched");
     }
+
+    /// Lab #710: the registry routes — refused by name on an L1 node; on an
+    /// Annulet node the root, openings that fold to it, a named 404 for an
+    /// unregistered asset and a 400 for a non-canonical id.
+    #[test]
+    fn the_registry_routes_answer_by_form_and_by_asset() {
+        use qlab_cbserver::registry::{decode_registry_opening, decode_registry_root, RegistryLeaf, RegistryTree};
+        let l1 = RegistryView::default();
+        assert_eq!(respond_registry(&l1, REGISTRY_ROOT_PATH), Err((400, REGISTRY_NOT_ON_L1.to_string())));
+        let tree = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(5)]).unwrap();
+        let root = tree.root();
+        let v = RegistryView { served: Some(RegistryServed { height: 7, tree }) };
+        assert_eq!(decode_registry_root(&respond_registry(&v, REGISTRY_ROOT_PATH).unwrap()), Ok((7, root)));
+        let o = decode_registry_opening(&respond_registry(&v, "/v1/registry/5").unwrap()).unwrap();
+        assert_eq!((o.height, o.root, o.leaf), (7, root, RegistryLeaf::cloaked(5)));
+        assert_eq!(o.witness.fold_root(&o.leaf.hash()), root);
+        assert_eq!(respond_registry(&v, "/v1/registry/6").unwrap_err().0, 404);
+        for bad in ["007", "65536", "-1", "", "5x", "+5"] {
+            let path = format!("{REGISTRY_PATH_PREFIX}{bad}");
+            assert_eq!(respond_registry(&v, &path).unwrap_err().0, 400, "`{bad}`");
+        }
+    }
+
 }

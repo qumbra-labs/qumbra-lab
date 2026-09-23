@@ -33,7 +33,7 @@
 use ml_dsa::{EncodedVerifyingKey, MlDsa65, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use qlab_air::l2::{RegistryLeaf, REGISTRY_DEPTH};
+use qlab_air::l2::RegistryLeaf;
 use qlab_devnet::annulet::{
     genesis_body_commitment_annulet, AnnuletHeaderFields, GenesisNote, L2FeeTable,
 };
@@ -56,7 +56,8 @@ pub struct RegistryLeafRecord {
 }
 
 impl RegistryLeafRecord {
-    fn leaf(&self) -> RegistryLeaf {
+    /// The circuit's leaf for this record.
+    pub fn leaf(&self) -> RegistryLeaf {
         RegistryLeaf {
             asset: self.asset as u64,
             issuer_key: self.issuer_key,
@@ -213,38 +214,21 @@ fn h32(d: &[u64; 4]) -> Hash32 {
     o
 }
 
-fn node(l: &[u64; 4], r: &[u64; 4]) -> [u64; 4] {
-    qlab_air::reference::merkle_node_state(l, r)[..4].try_into().expect("4 lanes")
-}
 
 /// **The registry root** of a genesis registry (B3's contract — see the module
 /// doc): a depth-16 sparse Merkle tree, leaf `i` = `RegistryLeaf::hash()` of
 /// asset `i`, empty slot = the zero digest.
 pub fn registry_root_of(leaves: &[RegistryLeafRecord]) -> [u64; 4] {
-    let mut empty = [[0u64; 4]; REGISTRY_DEPTH + 1];
-    for lvl in 0..REGISTRY_DEPTH {
-        empty[lvl + 1] = node(&empty[lvl], &empty[lvl]);
-    }
-    let mut level: std::collections::BTreeMap<u64, [u64; 4]> =
-        leaves.iter().map(|r| (r.asset as u64, r.leaf().hash())).collect();
-    for (lvl, empty_here) in empty.iter().enumerate().take(REGISTRY_DEPTH) {
-        let mut up = std::collections::BTreeMap::new();
-        for (&i, d) in &level {
-            let parent = i >> 1;
-            if up.contains_key(&parent) {
-                continue;
-            }
-            let (l, r) = if i & 1 == 0 {
-                (*d, *level.get(&(i | 1)).unwrap_or(empty_here))
-            } else {
-                (*level.get(&(i & !1)).unwrap_or(empty_here), *d)
-            };
-            up.insert(parent, node(&l, &r));
-        }
-        let _ = lvl;
-        level = up;
-    }
-    level.get(&0).copied().unwrap_or(empty[REGISTRY_DEPTH])
+    // Lab #710: one tree — the registry state's own. The fixture genesis
+    // hash pin (unchanged by this delegation) is the byte-identity proof.
+    qlab_cbserver::registry::RegistryTree::from_leaves(&registry_leaves(leaves))
+        .expect("a verified registry genesis has unique assets below 2^16")
+        .root()
+}
+
+/// The genesis registry as the circuit's leaves (lab #710).
+pub fn registry_leaves(leaves: &[RegistryLeafRecord]) -> Vec<RegistryLeaf> {
+    leaves.iter().map(RegistryLeafRecord::leaf).collect()
 }
 
 impl AnnuletGenesisFile {
@@ -424,6 +408,13 @@ impl AnnuletGenesisFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qlab_air::l2::REGISTRY_DEPTH;
+
+    /// The consensus node hash, spelled independently of the registry tree
+    /// for the dense reference fold below.
+    fn node(l: &[u64; 4], r: &[u64; 4]) -> [u64; 4] {
+        qlab_air::reference::merkle_node_state(l, r)[..4].try_into().expect("4 lanes")
+    }
 
     /// The fixture's genesis hash — computed by the named
     /// `annulet_fixture_genesis` run, twice, byte-identical. **Re-pinned by
@@ -443,7 +434,10 @@ mod tests {
     }
 
     #[test]
-    fn annulet_fixture_genesis_hash_is_pinned() {
+    /// Also the byte-identity proof of lab #710's delegation: `registry_root_of`
+    /// now runs `RegistryTree`, and the genesis header binds its root, so an
+    /// unchanged pin is an unchanged root.
+    fn annulet_fixture_genesis_hash_is_pinned_and_so_the_registry_tree_delegation_is_byte_identical() {
         let a = AnnuletGenesisFile::fixture();
         assert_eq!(a, AnnuletGenesisFile::fixture(), "the fixture is deterministic");
         assert_eq!(a.hash_hex(), FIXTURE_GENESIS_HASH);

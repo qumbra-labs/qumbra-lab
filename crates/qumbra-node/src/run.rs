@@ -527,6 +527,11 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// alone would serve a stale anchor set across exactly the event a waiting
     /// wallet is waiting for.
     anchors_sig: Option<(qlab_devnet::header::Hash32, Option<u64>)>,
+    /// The registry routes' projection (lab #710): `None` served on an L1
+    /// node (the routes refuse by name), the tree on an Annulet node.
+    registry_view: Arc<Mutex<Arc<crate::discovery_server::RegistryView>>>,
+    /// The applied tip the registry view was last read at.
+    registry_sig: Option<u64>,
     /// The `POST /v1/tx` rendezvous: the server enqueues, the run loop answers
     /// ([`Self::drain_remote_submits`]). `None` until the discovery endpoint
     /// starts.
@@ -948,6 +953,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     file.genesis_block_header(),
                     &file.notes(),
                     file.params.fee_table(),
+                    &crate::annulet_genesis::registry_leaves(&file.registry_genesis),
                     file.sequencer()?,
                     pow,
                     verifier,
@@ -1072,6 +1078,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             leaves_sig: None,
             anchors_view: Arc::new(Mutex::new(Arc::new(AnchorsView::default()))),
             anchors_sig: None,
+            registry_view: Arc::new(Mutex::new(Arc::new(crate::discovery_server::RegistryView::default()))),
+            registry_sig: None,
             submit_rx: None,
             context_rx: None,
             template_rx: None,
@@ -2171,7 +2179,9 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             Arc::clone(&self.anchors_view),
             submit_tx,
             Some(mine),
+            Arc::clone(&self.registry_view),
         )?;
+        self.refresh_registry();
         let bound = srv.addr();
         self.discovery_server = Some(srv);
         self.submit_rx = Some(submit_rx);
@@ -2286,6 +2296,30 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             *slot = snapshot;
         }
         self.anchors_sig = Some(sig);
+        true
+    }
+
+    /// Refresh the registry routes' projection (lab #710): on an Annulet node,
+    /// the tree and the applied tip it is served at; on an L1 node, nothing
+    /// (the routes refuse by name). The registry is immutable until A2, so a
+    /// refresh only moves the height.
+    pub fn refresh_registry(&mut self) -> bool {
+        let state = self.p2p.node().state();
+        let tip = state.chain().tip_height();
+        if self.registry_sig == Some(tip) {
+            return false;
+        }
+        let served = match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => None,
+            GenesisForm::Annulet => state.registry().map(|r| crate::discovery_server::RegistryServed {
+                height: tip,
+                tree: qlab_node::registry_store::RegistryStore::tree(r).clone(),
+            }),
+        };
+        if let Ok(mut slot) = self.registry_view.lock() {
+            *slot = Arc::new(crate::discovery_server::RegistryView { served });
+        }
+        self.registry_sig = Some(tip);
         true
     }
 
@@ -3210,6 +3244,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             phases.disc.leaves = lap(&mut d);
             self.refresh_anchors();
             phases.disc.anchors = lap(&mut d);
+            self.refresh_registry();
             self.last_discovery_refresh = Instant::now();
         }
         phases.discovery = lap(&mut t);

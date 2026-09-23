@@ -52,6 +52,7 @@ mod node;
 mod persist;
 mod replay_progress;
 pub mod recovery;
+pub mod registry_store;
 pub mod round;
 pub mod rpc;
 mod store;

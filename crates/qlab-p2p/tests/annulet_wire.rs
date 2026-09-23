@@ -36,11 +36,20 @@ type Adapter = NodeAdapter<KeccakPow, MockProofVerifier>;
 type Node = P2pNode<InProcTransport, Adapter>;
 
 const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
-const ROOT: Hash32 = [0x44; 32];
+/// The test registry (asset 0, Cloaked) and its root — lab #710: every
+/// header carries the root of the registry the node holds.
+fn registry() -> Vec<qlab_node::registry_store::RegistryLeaf> {
+    vec![qlab_node::registry_store::RegistryLeaf::cloaked(0)]
+}
+
+fn root() -> Hash32 {
+    use qlab_node::registry_store::RegistryStore as _;
+    qlab_node::registry_store::MemRegistryStore::from_genesis(&registry()).unwrap().root_bytes()
+}
 const SIM_TICK_MS: u64 = 10;
 
 fn genesis() -> BlockHeader {
-    let ext = AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: ROOT };
+    let ext = AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: root() };
     BlockHeader::genesis_annulet(ext, genesis_body_commitment_annulet(&[]), 0)
 }
 
@@ -49,6 +58,7 @@ fn node(id: u64, hub: &Arc<InProcHub>, key: &SequencerKey) -> Node {
         genesis(),
         &[],
         FEES,
+        &registry(),
         key.verifying_key(),
         KeccakPow,
         MockProofVerifier,
@@ -69,7 +79,7 @@ fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
         },
         discovery: vec![0x00],
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: ROOT, vpublic: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None }.encode(),
     }
 }
 
