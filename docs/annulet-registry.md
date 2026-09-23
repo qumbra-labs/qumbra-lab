@@ -41,7 +41,7 @@ GET /v1/registry/{asset}  →  ver ‖ height ‖ root(32) ‖ leaf(15 × u64 LE
 
 - The notes are appended at height 0, in genesis order, through `append_commitment` / `record_root_at`, the append every block's outputs take. There is no special-case insert.
 - The genesis anchor is the tree over the notes, and block 1 anchors on it.
-- The notes spend nothing, so there are no nullifiers. Their discovery payloads (`/v1/compact` at height 0) are B5's.
+- The notes spend nothing, so there are no nullifiers. Their payloads are served on `GET /v1/genesis/notes` (B5, `annulet-discovery.md`); `/v1/compact` at height 0 is groupless.
 - The genesis file and its hash do not move: the header binds the notes' body commitment, not the tree root.
 - Found on the way: `restore_from_snapshot` appended the snapshot's commitments onto a tree that already held the genesis notes. It now appends only what follows the held prefix.
 
@@ -67,5 +67,5 @@ No cargo run was needed; there were no local runs in B3.
 ## Named gaps (owned by name)
 
 - **Runtime registry updates: A2** (shape R). **The registry-root freshness rule for a transaction** (the parent header's root): B4.
-- **Genesis-note discovery** (`/v1/compact` at height 0): B5.
+- **Genesis-note serving:** landed in B5 (`/v1/genesis/notes`).
 - No live net has served the registry routes yet; B6 is the first.
