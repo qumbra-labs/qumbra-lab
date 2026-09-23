@@ -206,8 +206,12 @@ jobs:
         run: |
           set -o pipefail
           rc=0
+          # suite.log stays RAW (the reconcile script parses it); the job console gets a
+          # wall-clock stamp per line so a watcher can see where the run is and what each
+          # test cost — libtest's own --report-time is nightly-only (asked 2026-09-23).
           /usr/bin/time -v cargo test --release --workspace --locked --no-fail-fast \
-            -- --test-threads=1 2>&1 | tee suite.log || rc=$?
+            -- --test-threads=1 2>&1 | tee suite.log \
+            | awk '{ print strftime("[%H:%M:%S]"), $0; fflush() }' || rc=$?
           echo "$rc" > suite.exit
           exit "$rc"
 
