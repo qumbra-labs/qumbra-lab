@@ -325,6 +325,11 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// the arming predicate needs it and nothing else on the adapter can see it —
     /// the in-flight map lives in `P2pNode`.
     breq_observed: usize,
+    /// The genesis-pinned sequencer verifying key — `Some` exactly on an
+    /// Annulet adapter (lab #708).
+    sequencer_key: Option<ml_dsa::VerifyingKey<ml_dsa::MlDsa65>>,
+    /// Refused equivocations (lab #708): `(height, kept id, refused id)`.
+    equivocations: Vec<(u64, Hash32, Hash32)>,
 }
 
 /// **A finalize record this node refused to write, and why** (issue #204, from the
@@ -467,6 +472,14 @@ impl std::fmt::Display for FinalizeRefusal {
 /// body (lab #706): the Annulet node path is B2's. A fact about this node, not
 /// the sender — the `Ignored` family's membership rule.
 pub const ANNULET_NOT_SERVED_REASON: &str = "annulet-form-not-served-until-B2";
+
+/// The [`IngestOutcome::Ignored`] reason for an **unsealed** header or block on
+/// an Annulet adapter (lab #708): judged only with its seal.
+pub const UNSEALED_ON_ANNULET_REASON: &str = "unsealed header on a sequencer net";
+
+#[path = "adapter_annulet.rs"]
+mod annulet;
+pub use annulet::EQUIVOCATION_REASON;
 
 pub const MAX_JOURNALLED_FINALIZE_REFUSALS: usize = 32;
 
@@ -805,6 +818,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         state: MemNode,
     ) -> Self {
         let genesis = BlockHeader::genesis_for(form, sim.genesis_difficulty, 0);
+        Self::assemble_on(form, genesis, committee, pow, verifier, sim, state)
+    }
+
+    /// [`Self::assemble`] over an explicit genesis header — the Annulet
+    /// constructor's seam (its genesis carries a registry root, lab #708).
+    fn assemble_on(
+        form: GenesisForm,
+        genesis: BlockHeader,
+        committee: EpochCommittee,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+        state: MemNode,
+    ) -> Self {
         NodeAdapter {
             chain: ChainState::new_for(form, genesis),
             pow,
@@ -844,6 +871,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             stip_moved_ms: None,
             stall_now_ms: 0,
             breq_observed: 0,
+            sequencer_key: None,
+            equivocations: Vec::new(),
         }
     }
 
@@ -2727,6 +2756,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: an Annulet header is judged only with its seal
+            // (`ingest_sealed_header`). An unsealed one is unjudgeable here —
+            // this node cannot say whether it is valid, so the sender is not
+            // charged (the `Ignored` family's "this NODE cannot judge").
+            GenesisForm::Annulet => return IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON),
+        }
         self.submit_header(header)
     }
 
@@ -2787,6 +2824,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
+        match self.rules.form {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: see `ingest_header`; the sealed path is `ingest_sealed_block`.
+            GenesisForm::Annulet => return IngestOutcome::Ignored(UNSEALED_ON_ANNULET_REASON),
+        }
         // 1. Body validity is checked independently of tip-extension: a body that is
         //    not the one this header committed to (issue #77), or an invalid tx proof
         //    / fee / in-block double-spend, is adversarial and is rejected + penalized
