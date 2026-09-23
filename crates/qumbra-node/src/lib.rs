@@ -45,6 +45,7 @@
 //! The transaction-proof verifier is injected at the same `TxVerifier` seam the
 //! N7 stack has always exposed; T0-4 just makes the real verifier the default.
 
+pub mod annulet_genesis;
 pub mod audit_emission;
 pub mod audit_names;
 pub mod config;

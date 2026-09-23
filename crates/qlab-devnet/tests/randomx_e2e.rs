@@ -98,7 +98,7 @@ fn v5_pow_input_vector() {
     use qlab_devnet::forms::GenesisForm;
     use qlab_devnet::header::{AggregateProofSlot, BlockHeader, EpochSupplyAttestation};
 
-    let h = BlockHeader {
+    let h = BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: [0x11; 32],
         height: 0x0000_6655_4433_2211,
         timestamp: 0x8877_6655_4433_2211,

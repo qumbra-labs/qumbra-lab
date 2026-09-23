@@ -36,6 +36,7 @@ pub fn header_wire_len(form: GenesisForm) -> usize {
     match form {
         GenesisForm::V4 => HEADER_PREIMAGE_LEN_V4,
         GenesisForm::V5 => HEADER_PREIMAGE_LEN_V5,
+        GenesisForm::Annulet => qlab_devnet::header::HEADER_PREIMAGE_LEN_ANNULET,
     }
 }
 
@@ -75,6 +76,15 @@ pub enum DecodeError {
     /// refused by name before constructing a body this build cannot validate
     /// (the same grounds as `BadBucket`).
     TooManyCoinbasePayees { got: usize, cap: usize },
+    /// An Annulet header carried a non-zero `difficulty`/`nonce`-class field or
+    /// reserved tag byte — the form has neither (lab #706).
+    BadAnnuletHeader { what: &'static str },
+    /// A wire object this build does not serve on this net's form yet
+    /// (lab #706): `owner` names the milestone that lands it.
+    FormNotServed { form: GenesisForm, owner: &'static str },
+    /// An Annulet transaction's L2-surface section is absent or does not
+    /// decode canonically (lab #706).
+    BadL2Surface,
 }
 
 impl From<CodecError> for DecodeError {
@@ -177,6 +187,7 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
     let mut r = Reader::new(buf);
     let prev = r.hash32("prev")?;
     let (height, nonce, timestamp, difficulty, tag_pos) = match form {
+        GenesisForm::Annulet => return decode_header_annulet(prev, r),
         GenesisForm::V4 => {
             let height = r.u64_le("height")?;
             let timestamp = r.u64_le("timestamp")?;
@@ -208,7 +219,7 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
         return Err(DecodeError::BadHeaderTag { pos: tag_pos + 1, got: tag_b });
     }
     r.finish()?;
-    Ok(BlockHeader {
+    Ok(BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev,
         height,
         timestamp,
@@ -217,6 +228,53 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
         tx_body_commitment,
         aggregate_proof: AggregateProofSlot,
         epoch_supply_attestation: EpochSupplyAttestation,
+    })
+}
+
+/// The Annulet header tail after `prev` (lab #706 Q3): version `0x20`, u48
+/// height, timestamp, `l1_anchor{height, root}`, `registry_root`, body
+/// commitment, and the two reserved bytes fixed at `0x00 0x00` —
+/// reject-unknown on each, reject-trailing at the end.
+///
+/// **The reserved bytes are fixed zeros by ruling (#706), not the L1's
+/// `0xA6`/`0x59` tags.** Riders are never active on an Annulet net, and the
+/// preimage is already distinguishable from v4/v5 by length; reusing the L1
+/// magic values would only invite a false "same rider/reservation machinery"
+/// reading. Activating either byte is an Annulet header-version change. The length was checked
+/// by the caller, so a v4/v5 header on an Annulet net is refused by
+/// `WrongHeaderLen` before any of this reads it.
+fn decode_header_annulet(prev: Hash32, mut r: Reader<'_>) -> Result<BlockHeader, DecodeError> {
+    use qlab_devnet::annulet::{AnnuletHeaderFields, HeaderExt};
+    use qlab_devnet::header::{ANNULET_RESERVED_TAGS, HEADER_VERSION_BYTE_ANNULET};
+    let version = r.u8("header_format_version")?;
+    if version != HEADER_VERSION_BYTE_ANNULET {
+        return Err(DecodeError::BadHeaderVersion { got: version });
+    }
+    let mut h6 = [0u8; 8];
+    h6[..6].copy_from_slice(&r.rest(6, "height_u48")?);
+    let height = u64::from_le_bytes(h6);
+    let timestamp = r.u64_le("timestamp")?;
+    let l1_anchor_height = r.u64_le("l1_anchor_height")?;
+    let l1_anchor_root = r.hash32("l1_anchor_root")?;
+    let registry_root = r.hash32("registry_root")?;
+    let tx_body_commitment = r.hash32("tx_body_commitment")?;
+    for (i, want) in ANNULET_RESERVED_TAGS.iter().enumerate() {
+        let got = r.u8("annulet_reserved_tag")?;
+        if got != *want {
+            return Err(DecodeError::BadHeaderTag { pos: 151 + i, got });
+        }
+    }
+    r.finish()?;
+    Ok(BlockHeader {
+        prev,
+        height,
+        timestamp,
+        difficulty: 0,
+        nonce: 0,
+        tx_body_commitment,
+        aggregate_proof: AggregateProofSlot,
+        epoch_supply_attestation: EpochSupplyAttestation,
+        ext: HeaderExt::Annulet(AnnuletHeaderFields { l1_anchor_height, l1_anchor_root, registry_root }),
     })
 }
 
@@ -396,6 +454,13 @@ fn bucket_from_u8(v: u8) -> Result<ArityBucket, DecodeError> {
 
 /// Encode a transaction (public values + opaque proof).
 pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
+    // The L1 wire has no L2 section; dropping one silently would change the
+    // tx's identity (lab #706). A real assert (#253): unreachable from a peer,
+    // since `decode_tx` never produces a surface.
+    assert!(
+        tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT,
+        "an L2-surface transaction has no L1 wire encoding: use encode_tx_annulet (lab #706)"
+    );
     let mut out = Vec::new();
     let p = &tx.public;
     out.extend_from_slice(&p.anchor);
@@ -434,6 +499,69 @@ pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
         out.extend_from_slice(&tx.rider);
     }
     out
+}
+
+/// The **Annulet** transaction wire (lab #706 Q4): the L1 tx wire's fields
+/// through the discovery group, then a **mandatory** L2-surface section
+/// (`varint len ‖ bytes`). No name-rider section exists on this wire (no name
+/// service on the L2). Refuses a transaction without a surface or with a
+/// rider — locally-built input only.
+pub fn encode_tx_annulet(tx: &TxEntry) -> Vec<u8> {
+    assert!(
+        tx.l2 != qlab_devnet::annulet::L2_SURFACE_ABSENT,
+        "an Annulet transaction carries an L2 surface (lab #706)"
+    );
+    assert!(
+        tx.rider == qlab_devnet::names::RIDER_ABSENT,
+        "no name rider on an Annulet transaction (lab #706)"
+    );
+    let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() };
+    let mut out = encode_tx(&l1);
+    write_varint(&mut out, tx.l2.len() as u64);
+    out.extend_from_slice(&tx.l2);
+    out
+}
+
+/// Decode an Annulet transaction ([`encode_tx_annulet`]'s inverse). The
+/// surface section is required and must decode canonically as a present
+/// surface; an absent marker is refused (one encoding per transaction).
+pub fn decode_tx_annulet(buf: &[u8]) -> Result<TxEntry, DecodeError> {
+    let mut r = Reader::new(buf);
+    let (proof, discovery, public) = decode_tx_through_discovery(&mut r, buf.len())?;
+    let l2_len = r.varint()? as usize;
+    let l2 = r.rest(l2_len, "tx.l2")?;
+    match qlab_devnet::annulet::L2Surface::decode(&l2) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => return Err(DecodeError::BadL2Surface),
+    }
+    r.finish()?;
+    Ok(TxEntry { proof, discovery, public, rider: TxEntry::absent_rider(), l2 })
+}
+
+/// The tx wire's fields through the discovery group — shared by the L1 and
+/// Annulet decoders so the two cannot drift.
+fn decode_tx_through_discovery(
+    r: &mut Reader<'_>,
+    buf_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>, TxPublic), DecodeError> {
+    let anchor = r.hash32("tx.anchor")?;
+    let n_nf = r.varint()? as usize;
+    let mut nullifiers = Vec::with_capacity(n_nf.min(buf_len / 32));
+    for _ in 0..n_nf {
+        nullifiers.push(r.hash32("tx.nf")?);
+    }
+    let n_cm = r.varint()? as usize;
+    let mut commitments = Vec::with_capacity(n_cm.min(buf_len / 32));
+    for _ in 0..n_cm {
+        commitments.push(r.hash32("tx.cm")?);
+    }
+    let bucket = bucket_from_u8(r.u8("tx.bucket")?)?;
+    let fee = r.u64_le("tx.fee")?;
+    let proof_len = r.varint()? as usize;
+    let proof = r.rest(proof_len, "tx.proof")?;
+    let discovery_len = r.varint()? as usize;
+    let discovery = r.rest(discovery_len, "tx.discovery")?;
+    Ok((proof, discovery, TxPublic { anchor, nullifiers, commitments, bucket, fee }))
 }
 
 /// Decode a transaction body.
@@ -475,7 +603,7 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
         TxEntry::absent_rider()
     };
     r.finish()?;
-    Ok(TxEntry {
+    Ok(TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
         proof,
         discovery,
         public: TxPublic { anchor, nullifiers, commitments, bucket, fee },
@@ -764,6 +892,133 @@ mod tests {
         assert!(matches!(
             decode_header(GenesisForm::V5, &bytes),
             Err(DecodeError::BadHeaderTag { pos: 96, .. })
+        ));
+    }
+
+    // ── Annulet header form (lab #706) ──────────────────────────────────────
+
+    fn annulet_header() -> BlockHeader {
+        use qlab_devnet::annulet::AnnuletHeaderFields;
+        let g = BlockHeader::genesis_annulet(
+            AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [0x44; 32] },
+            [0x22; 32],
+            0,
+        );
+        BlockHeader::child_of_annulet(
+            &g,
+            75,
+            AnnuletHeaderFields { l1_anchor_height: 9, l1_anchor_root: [0x55; 32], registry_root: [0x44; 32] },
+            [0x66; 32],
+        )
+    }
+
+    #[test]
+    fn annulet_header_round_trips_and_is_153_bytes() {
+        let h = annulet_header();
+        let bytes = encode_header(GenesisForm::Annulet, &h);
+        assert_eq!(bytes.len(), 153);
+        assert_eq!(header_wire_len(GenesisForm::Annulet), 153);
+        let back = decode_header(GenesisForm::Annulet, &bytes).unwrap();
+        assert_eq!(back, h, "ext, height, timestamp and the roots all survive the wire");
+        assert_eq!(back.header_hash_for(GenesisForm::Annulet), h.header_hash_for(GenesisForm::Annulet));
+    }
+
+    /// An L1 header on an Annulet net, and an Annulet header on either L1 net,
+    /// is refused by length — by name, never misparsed.
+    #[test]
+    fn annulet_and_l1_headers_are_refused_across_forms_by_name() {
+        let l1 = sample_header();
+        let an = encode_header(GenesisForm::Annulet, &annulet_header());
+        for (form, bytes) in [
+            (GenesisForm::V4, encode_header(GenesisForm::V4, &l1)),
+            (GenesisForm::V5, encode_header(GenesisForm::V5, &l1)),
+        ] {
+            assert!(matches!(
+                decode_header(GenesisForm::Annulet, &bytes),
+                Err(DecodeError::WrongHeaderLen { want: 153, .. })
+            ));
+            assert!(matches!(
+                decode_header(form, &an),
+                Err(DecodeError::WrongHeaderLen { got: 153, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn annulet_header_rejects_a_wrong_version_byte_and_nonzero_reserved_bytes() {
+        let good = encode_header(GenesisForm::Annulet, &annulet_header());
+        let mut v = good.clone();
+        v[32] = 0x05;
+        assert!(matches!(
+            decode_header(GenesisForm::Annulet, &v),
+            Err(DecodeError::BadHeaderVersion { got: 0x05 })
+        ));
+        for pos in [151usize, 152] {
+            let mut t = good.clone();
+            t[pos] = 0xA6;
+            assert!(matches!(
+                decode_header(GenesisForm::Annulet, &t),
+                Err(DecodeError::BadHeaderTag { pos: p, got: 0xA6 }) if p == pos
+            ));
+        }
+    }
+
+    fn annulet_tx() -> TxEntry {
+        use qlab_devnet::annulet::{L2ShapeTag, L2Surface, VPublicTerm};
+        TxEntry {
+            proof: vec![0xAB; 40],
+            public: TxPublic {
+                anchor: [0x0F; 32],
+                nullifiers: vec![[1; 32], [2; 32]],
+                commitments: vec![[3; 32], [4; 32]],
+                bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
+                fee: 2,
+            },
+            discovery: vec![0x00],
+            rider: TxEntry::absent_rider(),
+            l2: L2Surface {
+                shape: L2ShapeTag::P,
+                registry_root: [0x44; 32],
+                vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: true, amount: 5, asset: 7 }]),
+            }
+            .encode(),
+        }
+    }
+
+    #[test]
+    fn an_annulet_tx_round_trips_with_its_surface() {
+        let tx = annulet_tx();
+        let bytes = encode_tx_annulet(&tx);
+        let back = decode_tx_annulet(&bytes).unwrap();
+        assert_eq!(back.l2, tx.l2);
+        assert_eq!(back.public, tx.public);
+        assert_eq!((back.proof, back.discovery, back.rider), (tx.proof.clone(), tx.discovery.clone(), tx.rider.clone()));
+        // The Annulet wire is the L1 wire's fields plus the surface section.
+        let l1_part = encode_tx(&TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() });
+        assert_eq!(&bytes[..l1_part.len()], &l1_part[..]);
+    }
+
+    #[test]
+    fn the_annulet_tx_wire_refuses_a_missing_or_absent_surface() {
+        let tx = annulet_tx();
+        let l1_only = encode_tx(&TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() });
+        assert!(decode_tx_annulet(&l1_only).is_err(), "no surface section");
+        let mut absent = l1_only.clone();
+        absent.extend_from_slice(&[0x01, 0x00]); // varint 1 ‖ [0x00]
+        assert!(matches!(decode_tx_annulet(&absent), Err(DecodeError::BadL2Surface)));
+    }
+
+    #[test]
+    #[should_panic(expected = "no L1 wire encoding")]
+    fn the_l1_tx_wire_refuses_an_l2_surface() {
+        let _ = encode_tx(&annulet_tx());
+    }
+
+    #[test]
+    fn an_annulet_announce_is_refused_by_name_until_b5() {
+        assert!(matches!(
+            crate::compact::decode_announce(GenesisForm::Annulet, &[]),
+            Err(DecodeError::FormNotServed { form: GenesisForm::Annulet, owner: "B5" })
         ));
     }
 

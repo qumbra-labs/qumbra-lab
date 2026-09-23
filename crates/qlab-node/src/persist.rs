@@ -787,6 +787,63 @@ mod tests {
         assert_eq!(&carrying_bytes[..4], &[2, 0, 0, 0], "rider-carrying ⇒ additive variant 2");
     }
 
+    /// 🔴 **The persisted-bytes gate of lab #706 (Q3), as a test.** A v4 block
+    /// built from a *live* `BlockHeader` + `BlockBody` — so it passes through
+    /// the `From` mirrors #706 touched (`ext`, `l2`) — is written through the
+    /// real [`append_record`] and the raw `blocks.log` bytes are compared with
+    /// a hex literal computed **outside Rust** (a Python bincode-fixint encoder
+    /// of the frozen v3 legacy layout: `u32 len ‖ variant 0 ‖ header ‖ txs ‖
+    /// coinbase ‖ rkm`). Adding `BlockHeader.ext` / `TxEntry.l2` moved no
+    /// on-disk byte; if this fails, an L1 datadir format moved.
+    #[test]
+    fn a_v4_block_reaches_disk_byte_identically_to_the_frozen_layout() {
+        use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
+        use qlab_devnet::fees::ArityBucket;
+        use qlab_devnet::header::BlockHeader;
+        let mut header = BlockHeader::genesis(256, 1000);
+        header.prev = [0x11; 32];
+        header.height = 7;
+        header.nonce = 99;
+        header.tx_body_commitment = [0x22; 32];
+        let tx = TxEntry {
+            proof: vec![0xAB; 5],
+            public: TxPublic {
+                anchor: [0x0A; 32],
+                nullifiers: vec![[0x0B; 32], [0x0C; 32]],
+                commitments: vec![[0x0D; 32], [0x0E; 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: 1_000_000,
+            },
+            discovery: vec![0x00],
+            rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+            l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        };
+        let body = BlockBody::from_single_payee(vec![tx], 12_345, [1, 2, 3, 4]);
+        let block = StoredBlock::from_parts(&header, &body);
+
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i706-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        append_record(&dir, &LogRecord::Block(block.clone())).unwrap();
+        let on_disk = fs::read(dir.join(BLOCK_LOG)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        const GOLDEN: &str = "660100000000000011111111111111111111111111111111111111111111111111111111111111110700000000000000\
+         e80300000000000000010000000000006300000000000000222222222222222222222222222222222222222222222222\
+         222222222222222201000000000000000a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\
+         02000000000000000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c\
+         0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c02000000000000000d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d\
+         0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e\
+         0200000040420f00000000000500000000000000ababababab0100000000000000003930000000000000010000000000\
+         0000020000000000000003000000000000000400000000000000";
+        let hex: String = on_disk.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN, "an L1 on-disk block record moved (lab #706 Q3 gate)");
+        assert_eq!(on_disk.len(), 362);
+        // …and the mirror round-trip is lossless on L1 (ext NONE, l2 absent).
+        assert_eq!(block.header(), header);
+        assert_eq!(block.body().txs[0].l2, qlab_devnet::annulet::L2_SURFACE_ABSENT);
+    }
+
     /// Both shapes round-trip through the real append/read path, and a legacy
     /// record reads back with the rider structurally absent — a fact of the
     /// format, not a migration guess.

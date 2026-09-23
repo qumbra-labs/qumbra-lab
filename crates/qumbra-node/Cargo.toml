@@ -76,6 +76,9 @@ qlab-consensus = { path = "../qlab-consensus" }
 # the declared public surface (M10-T0-4, issue #68). Already built transitively
 # via qlab-consensus; named directly here for the verifier's reconstruction path.
 qlab-air = { path = "../qlab-air" }
+# The L2 note twin (`L2Note`, `L2_PAYLOAD_LEN`) for the Annulet genesis's
+# fee-unit notes (lab #706). Already built transitively via qlab-devnet.
+qlab-note = { path = "../qlab-note" }
 # The wallet KERNEL, for `mine` (lab #475). Two things come from here and
 # nothing else does:
 #
@@ -126,6 +129,9 @@ serde_json = "1"
 tiny_http = "=0.12.0"
 
 [dev-dependencies]
+# The L2 consensus crate, for the Annulet shape-tag cross-lock only (lab #706
+# P7: qlab-devnet keeps its own tag so the wasm/iOS graph stays prover-free).
+qlab-l2 = { path = "../qlab-l2" }
 # Issue #101 acceptance (`tests/coinbase_spend.rs`): the miner's key hierarchy —
 # `Wallet::rkm(d)` is what a block's `coinbase_rkm` carries, and `spend_input` is
 # the only spend-witness constructor, so this is what proves the minted note is

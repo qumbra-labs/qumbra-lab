@@ -141,6 +141,11 @@ pub fn hash_to_work_value_for(hash: &Hash32, form: GenesisForm) -> u64 {
         GenesisForm::V5 => {
             u64::from_le_bytes(hash[24..32].try_into().expect("Hash32 has 32 bytes"))
         }
+        // No PoW on the L2 (lab #706): the worst possible work value. The
+        // refusal itself is `satisfies_target_for`'s explicit Annulet arm —
+        // this alone would not refuse, because an Annulet header's difficulty
+        // is 0 and `target_threshold(0)` is `u64::MAX`.
+        GenesisForm::Annulet => u64::MAX,
     }
 }
 
@@ -159,8 +164,18 @@ pub fn satisfies_target(hash: &Hash32, difficulty: u64) -> bool {
 /// forms: changing v4's would be a rule change nobody ordered, and v5's `<=`
 /// vs xmrig's strict `<` only matters at a pool's SHARE filter — stage-1 pool
 /// code mirrors xmrig's strictness there; consensus does not move for it.
+///
+/// **Annulet: never** (lab #706). An Annulet block is sealed by the
+/// sequencer's signature (B2), not by work; no hash satisfies a target on an
+/// Annulet net, so a PoW validation path handed an Annulet header refuses it
+/// rather than accepting difficulty 0's all-ones target.
 pub fn satisfies_target_for(hash: &Hash32, difficulty: u64, form: GenesisForm) -> bool {
-    hash_to_work_value_for(hash, form) <= target_threshold(difficulty)
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => {
+            hash_to_work_value_for(hash, form) <= target_threshold(difficulty)
+        }
+        GenesisForm::Annulet => false,
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +210,19 @@ mod tests {
         let nonce = found.expect("must find a valid nonce at difficulty 4");
         h.nonce = nonce;
         assert!(satisfies_target(&pow.pow_hash(GenesisForm::V4, &h, &[]), h.difficulty));
+    }
+
+    /// An Annulet header never satisfies a PoW target — not even at
+    /// difficulty 0, whose threshold is `u64::MAX` (lab #706).
+    #[test]
+    fn no_hash_satisfies_a_target_on_an_annulet_net() {
+        for d in [0u64, 1, 4, u64::MAX] {
+            assert!(!satisfies_target_for(&[0u8; 32], d, GenesisForm::Annulet), "difficulty {d}");
+        }
+        assert_eq!(hash_to_work_value_for(&[0u8; 32], GenesisForm::Annulet), u64::MAX);
+        // …while the same all-zero hash satisfies every L1 target.
+        assert!(satisfies_target_for(&[0u8; 32], u64::MAX, GenesisForm::V4));
+        assert!(satisfies_target_for(&[0u8; 32], u64::MAX, GenesisForm::V5));
     }
 
     #[test]

@@ -1662,7 +1662,7 @@ mod tests {
             fee: qlab_devnet::fees::posted_fee(qlab_devnet::fees::ArityBucket::TwoByTwo),
         };
         let discovery = qlab_devnet::body::placeholder_discovery(&public.commitments);
-        let tx = qlab_devnet::body::TxEntry { proof: b"ok".to_vec(), public, discovery, rider: qlab_devnet::body::TxEntry::absent_rider() };
+        let tx = qlab_devnet::body::TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: qlab_devnet::body::TxEntry::absent_rider() };
         qlab_p2p::codec::encode_tx(&tx)
     }
 

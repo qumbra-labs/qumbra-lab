@@ -142,6 +142,11 @@ impl MineBlockWire {
         let cap = match form {
             GenesisForm::V4 => 1,
             GenesisForm::V5 => coinbase_payee_cap_v5(header.height),
+            // `parse_form` never yields Annulet (the mining RPC serves only the
+            // PoW forms); the arm is the exhaustive statement of why.
+            GenesisForm::Annulet => {
+                return Err("no mining RPC on an Annulet (sequencer) net (lab #706)".into())
+            }
         };
         if payees.len() > cap {
             return Err(format!(
@@ -234,6 +239,7 @@ pub fn form_token(form: GenesisForm) -> String {
     match form {
         GenesisForm::V4 => "v4".into(),
         GenesisForm::V5 => "v5".into(),
+        GenesisForm::Annulet => "annulet".into(),
     }
 }
 
@@ -281,7 +287,7 @@ mod tests {
     use qlab_devnet::header::{AggregateProofSlot, EpochSupplyAttestation};
 
     fn sample_header() -> BlockHeader {
-        BlockHeader {
+        BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
             prev: [0x11; 32],
             height: 1,
             timestamp: 75,

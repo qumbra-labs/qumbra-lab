@@ -169,6 +169,9 @@ impl BlockSubmitter for NodeRpcClient {
         let form_s = match form {
             GenesisForm::V4 => "v4",
             GenesisForm::V5 => "v5",
+            GenesisForm::Annulet => {
+                return Err("a pool mines PoW blocks; an Annulet (sequencer) net has none (lab #706)".into());
+            }
         };
         let wire = MineBlockWire {
             form: form_s.into(),

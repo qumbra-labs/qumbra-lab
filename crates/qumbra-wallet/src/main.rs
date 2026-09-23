@@ -544,6 +544,9 @@ fn net_name(form: qlab_devnet::forms::GenesisForm) -> &'static str {
     match form {
         GenesisForm::V4 => "t1",
         GenesisForm::V5 => "t2",
+        // `resolve_net` never yields it today (the wallet's send path is L1;
+        // the L2 note layer is C1/C2) — named, not guessed, if it ever does.
+        GenesisForm::Annulet => "annulet",
     }
 }
 
@@ -1210,7 +1213,7 @@ mod tests {
             // the same rider from the saved salt and record.
             let build = builds.get();
             builds.set(build + 1);
-            let tx = TxEntry {
+            let tx = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: vec![build],
                 public: TxPublic {
                     anchor: [0x11; 32],

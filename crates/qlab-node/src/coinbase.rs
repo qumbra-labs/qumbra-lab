@@ -396,6 +396,8 @@ pub fn coinbase_note_parts_for(
             total_fees,
             total_name_burn,
         ),
+        // No block reward on the L2 (lab #706 P9): no coinbase note exists.
+        qlab_devnet::forms::GenesisForm::Annulet => None,
     }
 }
 

@@ -1883,6 +1883,7 @@ dependencies = [
  "qlab-cbserver",
  "qlab-consensus",
  "qlab-devnet",
+ "qlab-l2",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",

@@ -425,7 +425,7 @@ fn a_payment_that_attaches_no_discovery_cannot_reach_the_serving_path() {
     let (good, _notes) = payment_to(&recipient.ek, 2, 1, anchor, &mut rng);
     // The same payment with its group stripped to `n = 0`.
     let stripped =
-        TxEntry { proof: good.proof.clone(), public: good.public.clone(), discovery: TxEntry::empty_discovery(), rider: TxEntry::absent_rider() };
+        TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), proof: good.proof.clone(), public: good.public.clone(), discovery: TxEntry::empty_discovery(), rider: TxEntry::absent_rider() };
 
     let tip = node.tip_hash();
     let parent = node.chain().block(&tip).expect("tip stored").header();

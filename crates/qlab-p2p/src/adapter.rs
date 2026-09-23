@@ -463,6 +463,11 @@ impl std::fmt::Display for FinalizeRefusal {
 /// dropped. Same rule and same reason as [`MAX_JOURNALLED_REWINDS`]: the newest
 /// event is the one an operator is looking at, and the counter is the lossless
 /// record so a drop is visible as the count exceeding what was journalled.
+/// The [`IngestOutcome::Ignored`] reason an L1 adapter gives an Annulet block
+/// body (lab #706): the Annulet node path is B2's. A fact about this node, not
+/// the sender — the `Ignored` family's membership rule.
+pub const ANNULET_NOT_SERVED_REASON: &str = "annulet-form-not-served-until-B2";
+
 pub const MAX_JOURNALLED_FINALIZE_REFUSALS: usize = 32;
 
 /// How many [`RewindReport`]s are held for the journal before the oldest is dropped
@@ -1996,6 +2001,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let cap = match self.rules.form {
             GenesisForm::V4 => 1,
             GenesisForm::V5 => coinbase_payee_cap_v5(height),
+            GenesisForm::Annulet => return Err("no mined block on an Annulet (sequencer) net: the producer lands with B2 (lab #706)".into()),
         };
         if payees.is_empty() || payees.len() > cap {
             return Err(format!(
@@ -2007,6 +2013,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             return Err("coinbase-payee-zero-rkm".into());
         }
         match self.rules.form {
+            GenesisForm::Annulet => return Err("no mined block on an Annulet (sequencer) net: the producer lands with B2 (lab #706)".into()),
             GenesisForm::V5 => check_scheduled_coinbase_payees(height, payees)
                 .map_err(|e| format!("coinbase-payees: {e:?}"))?,
             GenesisForm::V4 => {
@@ -2241,6 +2248,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let bc = match self.rules.form {
             GenesisForm::V4 => body.commitment_at(candidate_height),
             GenesisForm::V5 => body.commitment_v5_at(candidate_height),
+            // No mined block on an Annulet (sequencer) net: the producer lands
+            // with B2 (lab #706). `None` is this function's "no candidate"
+            // answer; the mining paths that reach it never start on an
+            // Annulet net (`run` refuses the genesis).
+            GenesisForm::Annulet => return None,
         };
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
@@ -2394,6 +2406,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             BodyError::RiderMalformed { .. } | BodyError::RiderBeforeBoundary { .. } => {
                 BodyFault::Intrinsic("bad body")
             }
+            // Lab #706: each reads only the body's own bytes (surface
+            // presence/shape/canonicity, the bucket, the payee list).
+            BodyError::L2SurfaceOnL1 { .. }
+            | BodyError::L2SurfaceMissing { .. }
+            | BodyError::L2SurfaceMalformed { .. }
+            | BodyError::L2NotTwoByTwo { .. }
+            | BodyError::CoinbaseOnAnnulet { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:
             BodyError::RiderRule { err, .. } => match err {
                 // Grammar, record kind and record size read only the revealed
@@ -2813,6 +2832,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
                 anchor_ok,
                 self.state.names(),
             ),
+            // "This NODE cannot judge" (the `Ignored` family): the Annulet
+            // body rule is served from B2 on; the sender is not at fault.
+            GenesisForm::Annulet => return IngestOutcome::Ignored(ANNULET_NOT_SERVED_REASON),
         };
         match validate_result {
             Ok(()) => {}

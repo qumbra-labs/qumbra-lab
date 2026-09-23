@@ -212,6 +212,12 @@ pub struct TxEntry {
     /// wire the section is presence-conditional instead (`qlab-p2p::codec`
     /// says why the two choices differ).
     pub rider: Vec<u8>,
+    /// The transaction's **L2 surface** (lab #706 Q4): shape tag ‖
+    /// registry_root ‖ vPublic (shape P only), as committed bytes under the
+    /// `rider` discipline — **absence is `[0x00]`**
+    /// ([`crate::annulet::L2_SURFACE_ABSENT`]). Never in an L1 preimage or on
+    /// the L1 wire; L1 validation refuses a non-absent surface by name.
+    pub l2: Vec<u8>,
 }
 
 impl TxEntry {
@@ -223,7 +229,7 @@ impl TxEntry {
         recipients: &[RecipientBundle],
         payloads: &[Vec<u8>],
     ) -> Self {
-        Self {
+        Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof,
             public,
             discovery: encode_committed_discovery(recipients, payloads),
@@ -236,7 +242,7 @@ impl TxEntry {
     /// using this outside a fixture.
     pub fn with_placeholder_discovery(proof: Vec<u8>, public: TxPublic) -> Self {
         let discovery = placeholder_discovery(&public.commitments);
-        Self { proof, public, discovery, rider: Self::absent_rider() }
+        Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof, public, discovery, rider: Self::absent_rider() }
     }
 
     /// The canonical encoding of "this transaction attaches no discovery",
@@ -712,6 +718,19 @@ pub enum BodyError {
     /// The tx at `index` carries a well-formed rider that violates a name
     /// rule; `err` is the rule's own verdict, kept rather than flattened.
     RiderRule { index: usize, err: crate::names::NameRuleError },
+
+    // --- lab #706: the Annulet (L2) forms ------------------------------------
+    /// An L1 (v4/v5) transaction at `index` carries an L2 surface — never
+    /// valid on an L1 net (the L1 preimages and wire cannot represent it).
+    L2SurfaceOnL1 { index: usize },
+    /// An Annulet transaction at `index` carries no L2 surface.
+    L2SurfaceMissing { index: usize },
+    /// An Annulet transaction's L2 surface bytes do not decode canonically.
+    L2SurfaceMalformed { index: usize, err: crate::annulet::L2SurfaceError },
+    /// An Annulet transaction is not the 2×2 bucket (the only L2 bucket).
+    L2NotTwoByTwo { index: usize },
+    /// An Annulet body names a coinbase payee — the L2 has no block reward.
+    CoinbaseOnAnnulet { got: usize },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
@@ -1136,6 +1155,10 @@ where
                 pending_names.insert(record.name.clone());
             }
         }
+        // Lab #706: an L2 surface is never valid on an L1 net.
+        if tx.l2 != crate::annulet::L2_SURFACE_ABSENT {
+            return Err(BodyError::L2SurfaceOnL1 { index: i });
+        }
         for nf in &tx.public.nullifiers {
             if !seen_nf.insert(*nf) {
                 return Err(BodyError::DoubleSpendInBlock { index: i });
@@ -1314,7 +1337,7 @@ mod tests {
             fee: posted_fee(ArityBucket::TwoByTwo),
         };
         let discovery = placeholder_discovery(&public.commitments);
-        TxEntry { proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
+        TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
     }
 
     fn ct_pattern(base: u8) -> [u8; CT_LEN] {
@@ -1346,6 +1369,25 @@ mod tests {
         // A different body ⇒ different commitment.
         let other = BlockBody::from_single_payee(vec![good_tx(1)], 42, MINER_RKM);
         assert_ne!(body.commitment(), other.commitment());
+    }
+
+    /// Lab #706: an L2 surface on an L1 body is refused by name — the L1
+    /// preimages and wire have no place for it (and the commitment below
+    /// would not even see it, which is why the refusal must be explicit).
+    #[test]
+    fn an_l2_surface_on_an_l1_body_is_refused_by_name() {
+        let mut tx = good_tx(1);
+        tx.l2 = crate::annulet::L2Surface {
+            shape: crate::annulet::L2ShapeTag::S,
+            registry_root: [0x44; 32],
+            vpublic: None,
+        }
+        .encode();
+        let body = BlockBody::from_single_payee(vec![good_tx(2), tx], 0, [0; 4]);
+        assert_eq!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::L2SurfaceOnL1 { index: 1 })
+        );
     }
 
     #[test]
@@ -1627,7 +1669,7 @@ mod tests {
     /// A fixed body with every field pinned — the input to the golden vector.
     fn golden_body() -> BlockBody {
         BlockBody::from_single_payee(
-            vec![TxEntry {
+            vec![TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: vec![0xAB, 0xCD, 0xEF],
                 public: TxPublic {
                     anchor: [0x11; 32],
@@ -2177,7 +2219,7 @@ mod tests {
         );
 
         // And it passes the consensus rule it exists to pass.
-        let tx = TxEntry {
+        let tx = TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: FINAL_ANCHOR,
@@ -2195,7 +2237,7 @@ mod tests {
     #[test]
     fn discovery_round_trips_and_the_empty_body_does_not_collide_with_v1() {
         let cms = vec![[0x44u8; 32], [0x55u8; 32]];
-        let tx = TxEntry {
+        let tx = TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: FINAL_ANCHOR,

@@ -916,7 +916,7 @@ mod tests {
     use qlab_stratum::codec::{encode_request, encode_response};
 
     fn header(height: u64) -> BlockHeader {
-        BlockHeader {
+        BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
             prev: [0x11; 32],
             height,
             timestamp: 1_785_000_000,

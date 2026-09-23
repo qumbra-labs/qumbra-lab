@@ -211,6 +211,8 @@ impl AssembledCoinbase {
 pub enum AssembleError {
     Schedule(String),
     ZeroPoolRkm,
+    /// The net's form has no mined coinbase to assemble (lab #706: Annulet).
+    NoCoinbaseOnForm(GenesisForm),
 }
 
 impl std::fmt::Display for AssembleError {
@@ -218,6 +220,10 @@ impl std::fmt::Display for AssembleError {
         match self {
             AssembleError::Schedule(s) => write!(f, "payee schedule: {s}"),
             AssembleError::ZeroPoolRkm => write!(f, "pool_rkm must not be all-zero"),
+            AssembleError::NoCoinbaseOnForm(form) => write!(
+                f,
+                "no coinbase to assemble on a {form:?} net: a pool mines PoW blocks; an Annulet (sequencer) net has none (lab #706)"
+            ),
         }
     }
 }
@@ -267,6 +273,8 @@ pub fn payee_cap_above(
     match form {
         GenesisForm::V5 => coinbase_payee_cap_v5_above(payee_boundary, height),
         GenesisForm::V4 => 1,
+        // No block reward on the L2: no payee slot (lab #706).
+        GenesisForm::Annulet => 0,
     }
 }
 
@@ -297,6 +305,10 @@ pub fn assemble_coinbase_above(
     accounts: &Accounts,
     pool_rkm: [u64; 4],
 ) -> Result<AssembledCoinbase, AssembleError> {
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => {}
+        GenesisForm::Annulet => return Err(AssembleError::NoCoinbaseOnForm(form)),
+    }
     if pool_rkm == [0u64; 4] {
         return Err(AssembleError::ZeroPoolRkm);
     }
@@ -320,6 +332,7 @@ pub fn assemble_coinbase_above(
             };
             Ok(AssembledCoinbase::V4 { rkm, amount })
         }
+        GenesisForm::Annulet => Err(AssembleError::NoCoinbaseOnForm(form)),
     }
 }
 

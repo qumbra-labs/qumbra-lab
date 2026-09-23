@@ -314,6 +314,8 @@ impl SupplyLedger {
             // V5 has no grandfathered history and no pins. An empty table
             // makes a mistaken pin-read unrepresentable rather than ignored.
             GenesisForm::V5 => &[],
+            // No emission, so nothing to pin (lab #706).
+            GenesisForm::Annulet => &[],
         };
         Self::with_pins_for(form, epoch_length, pins)
     }
@@ -469,7 +471,13 @@ impl SupplyLedger {
 
         // The prefix accumulator is a v4-only input to the straddling case.
         // A v5 net has no boundary and must not consult this number.
-        if self.form == GenesisForm::V4 && block.height <= RULE_BOUNDARY_HEIGHT {
+        // (An exhaustive match, not `form == V4` — lab #706's grep-lock: a
+        // comparison would route a new form silently into one arm.)
+        let straddles = match self.form {
+            GenesisForm::V4 => block.height <= RULE_BOUNDARY_HEIGHT,
+            GenesisForm::V5 | GenesisForm::Annulet => false,
+        };
+        if straddles {
             self.straddle_prefix = self
                 .straddle_prefix
                 .checked_add(block.coinbase)
@@ -516,6 +524,9 @@ fn expected_for_row(
         return 0;
     }
     match form {
+        // No emission on the L2 (lab #706 P9); the per-asset supply
+        // dimension (mint/redeem via vPublic) is D1's.
+        GenesisForm::Annulet => 0,
         GenesisForm::V5 => {
             // Born exact: no boundary, no pins, no scar. Exactly what
             // `check_scheduled_coinbase_payees` enforces at every height ≥ 1.

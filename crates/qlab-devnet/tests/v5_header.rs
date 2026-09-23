@@ -19,7 +19,7 @@ use qlab_pow::keyblock::KeyBlockSchedule;
 
 /// The stage-1 golden fixture: every field byte-distinguishable.
 fn golden_header() -> BlockHeader {
-    BlockHeader {
+    BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: [0x11; 32],
         height: 0x0000_6655_4433_2211,
         timestamp: 0x8877_6655_4433_2211,

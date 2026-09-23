@@ -60,7 +60,7 @@ fn preimage_for_v5_is_byte_identical_to_stratum_blob_helpers() {
     for (i, b) in prev.iter_mut().enumerate() {
         *b = i as u8;
     }
-    let header = BlockHeader {
+    let header = BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev,
         height: 123_456,
         timestamp: 1_785_000_000,
