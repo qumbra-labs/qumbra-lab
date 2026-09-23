@@ -142,7 +142,20 @@ fn rider_free(b: &StoredBlock) -> bool {
 }
 
 impl From<&LogRecord> for WireRecord {
+    /// # Panics
+    ///
+    /// On an Annulet block (lab #708): the L1 layouts below have no place for
+    /// its extension, seal or L2 surfaces (`StoredBlock.annulet` /
+    /// `StoredTx.l2` are `serde(skip)`), so writing one here would drop them
+    /// silently. The Annulet log record is B2b's; until then an Annulet node
+    /// refuses a data dir before it applies anything (`Node::apply_sealed_block`).
     fn from(rec: &LogRecord) -> Self {
+        if let LogRecord::Block(b) = rec {
+            assert!(
+                b.annulet.is_none() && b.txs.iter().all(|t| t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT),
+                "an Annulet block has no L1 log record (lab #708; its record is B2b's)"
+            );
+        }
         match rec {
             LogRecord::Finalize(h) => WireRecord::Finalize(*h),
             LogRecord::Block(b) if rider_free(b) => WireRecord::Block(LegacyStoredBlock {

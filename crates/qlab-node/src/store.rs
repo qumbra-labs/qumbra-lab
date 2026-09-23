@@ -159,17 +159,11 @@ fn bucket_from_actions(actions: u32) -> ArityBucket {
 }
 
 impl From<&TxEntry> for StoredTx {
-    /// # Panics
-    ///
-    /// On a transaction with an L2 surface (lab #706) — the L1 stored mirror's
-    /// layout is frozen and has no place for it; L1 validation refuses such a
-    /// transaction by name before anything persists it.
+    /// Carries the L2 surface in memory (lab #708). What the L1 *layouts* cannot
+    /// represent is refused where bytes are written — `persist::WireRecord::from`
+    /// asserts every L1 log record surface-free — not here.
     fn from(t: &TxEntry) -> Self {
-        assert!(
-            t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT,
-            "the L1 StoredTx cannot represent an L2-surface transaction (lab #706)"
-        );
-        Self { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        Self { l2: t.l2.clone(),
             anchor: t.public.anchor,
             nullifiers: t.public.nullifiers.clone(),
             commitments: t.public.commitments.clone(),
@@ -184,7 +178,7 @@ impl From<&TxEntry> for StoredTx {
 
 impl From<&StoredTx> for TxEntry {
     fn from(s: &StoredTx) -> Self {
-        TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        TxEntry { l2: s.l2.clone(),
             proof: s.proof.clone(),
             discovery: s.discovery.clone(),
             rider: s.rider.clone(),
@@ -235,7 +229,57 @@ impl StoredBlock {
 
     /// The live devnet header this block round-trips to.
     pub fn header(&self) -> BlockHeader {
-        (&self.header).into()
+        let mut h: BlockHeader = (&self.header).into();
+        if let Some(a) = &self.annulet {
+            h.ext = qlab_devnet::annulet::HeaderExt::Annulet(a.ext);
+        }
+        h
+    }
+
+    /// An Annulet block from its sealed header and body (lab #708): the L1
+    /// mirror fields for the shared parts, the extension and seal in
+    /// [`AnnuletStoredSeal`], no coinbase (the L2 has none — the body rule has
+    /// already refused a payee).
+    pub fn from_sealed_parts(sealed: &qlab_devnet::annulet::SealedHeader, body: &BlockBody) -> Self {
+        assert!(body.coinbase_payees.is_empty(), "an Annulet body has no coinbase (lab #706)");
+        Self::annulet_block(&sealed.header, body, Some(sealed.sig.clone()))
+    }
+
+    /// The (unsealed) Annulet genesis block over an empty body.
+    pub fn annulet_genesis(header: &BlockHeader) -> Self {
+        assert_eq!(header.height, 0, "genesis height must be 0");
+        Self::annulet_block(header, &BlockBody::default(), None)
+    }
+
+    fn annulet_block(
+        header: &BlockHeader,
+        body: &BlockBody,
+        sig: Option<Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]>>,
+    ) -> Self {
+        let qlab_devnet::annulet::HeaderExt::Annulet(ext) = header.ext else {
+            panic!("an Annulet block needs an Annulet header (lab #708)")
+        };
+        Self {
+            header: StoredHeader {
+                prev: header.prev,
+                height: header.height,
+                timestamp: header.timestamp,
+                difficulty: header.difficulty,
+                nonce: header.nonce,
+                tx_body_commitment: header.tx_body_commitment,
+            },
+            txs: body.txs.iter().map(StoredTx::from).collect(),
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+            annulet: Some(AnnuletStoredSeal { ext, sig }),
+        }
+    }
+
+    /// The sealed header, for serving an Annulet block (`None` on L1 blocks
+    /// and on the unsealed Annulet genesis).
+    pub fn sealed_header(&self) -> Option<qlab_devnet::annulet::SealedHeader> {
+        let a = self.annulet.as_ref()?;
+        Some(qlab_devnet::annulet::SealedHeader { header: self.header(), sig: a.sig.clone()? })
     }
 
     /// The live devnet body this block round-trips to.

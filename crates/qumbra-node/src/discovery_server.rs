@@ -375,6 +375,9 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
             // rule failure) reaches the wallet as a named 400.
             MempoolError::RiderInvalid(e) => (400, format!("refused: rider {e:?}")),
             MempoolError::ProofInvalid => (400, "refused: proof-invalid".to_string()),
+            // Lab #708: reachable only on an Annulet net (the L1 decode never
+            // yields a surface) — additive, named.
+            MempoolError::L2SurfaceInvalid(e) => (400, format!("refused: l2-surface {e:?}")),
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
             // wrapping; reaching here means that mapping broke.
             MempoolError::DuplicateTx => {

@@ -2540,6 +2540,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 _ => "rider rule",
             },
             MempoolError::ProofInvalid => "proof invalid",
+            // Lab #708: intrinsic to the tx's own bytes, like discovery.
+            MempoolError::L2SurfaceInvalid(_) => "l2 surface invalid",
         }
     }
 }

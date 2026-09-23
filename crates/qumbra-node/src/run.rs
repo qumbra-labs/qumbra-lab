@@ -3331,6 +3331,7 @@ fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
         MempoolError::RiderInvalid(BodyError::RiderBeforeBoundary { .. }) => "rider-before-boundary",
         MempoolError::RiderInvalid(_) => "rider-rule",
         MempoolError::ProofInvalid => "proof-invalid",
+        MempoolError::L2SurfaceInvalid(_) => "l2-surface-invalid",
     }
 }
 

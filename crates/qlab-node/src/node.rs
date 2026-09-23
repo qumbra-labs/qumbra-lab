@@ -453,6 +453,13 @@ pub enum NodeError {
     /// an Annulet block reaching the L1 node's state funnel. `owner` names the
     /// milestone that lands the Annulet node path (sequencer B2, state B3).
     FormNotServed { form: GenesisForm, owner: &'static str },
+    /// An Annulet block reached the unsealed entry point (`apply_block`): on a
+    /// sequencer net a block is applied only with its seal
+    /// ([`Node::apply_sealed_block`], lab #708).
+    UnsealedOnAnnulet,
+    /// Final-on-acceptance (lab #708 Q4) was refused by the chain store for a
+    /// block this node had just applied — an internal invariant, named.
+    AnnuletFinality(FinalizeMarkError),
 }
 
 impl NodeError {
@@ -489,7 +496,9 @@ impl NodeError {
             // A form this node cannot serve reaching its funnel is an internal
             // wiring error (`run` refuses an Annulet genesis before a node
             // exists), not a peer fault — the same bucket, enumerated.
-            | NodeError::FormNotServed { .. } => "internal",
+            | NodeError::FormNotServed { .. }
+            | NodeError::UnsealedOnAnnulet
+            | NodeError::AnnuletFinality(_) => "internal",
         }
     }
 }
@@ -525,6 +534,13 @@ impl std::fmt::Display for NodeError {
             ),
             NodeError::Rewind(e) => write!(f, "rewind refused: {e}"),
             NodeError::Io(e) => write!(f, "persistence error: {e}"),
+            NodeError::UnsealedOnAnnulet => write!(
+                f,
+                "an Annulet block is applied only with its sequencer seal (lab #708)"
+            ),
+            NodeError::AnnuletFinality(e) => {
+                write!(f, "Annulet final-on-acceptance refused by the chain store: {e:?} (lab #708)")
+            }
             NodeError::FormNotServed { form, owner } => write!(
                 f,
                 "chain form {form:?} is not served by this node yet (lands with {owner}, lab #706)"
@@ -609,11 +625,9 @@ fn check_stored_binding_for(form: GenesisForm, block: &StoredBlock) -> Result<()
     let got = match form {
         GenesisForm::V4 => block.body().commitment_at(block.header.height),
         GenesisForm::V5 => block.body().commitment_v5_at(block.header.height),
-        // The L1 stored mirror cannot represent an Annulet block (lab #706
-        // persisted-bytes verdict); its stored form is B2/B3's.
-        GenesisForm::Annulet => {
-            return Err(NodeError::FormNotServed { form, owner: "B2/B3" });
-        }
+        // Lab #708: the Annulet body commitment (B1). Genesis never passes this
+        // funnel (it is bound at construction, over its genesis notes).
+        GenesisForm::Annulet => qlab_devnet::annulet::body_commitment_annulet(&block.body()),
     };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
@@ -634,6 +648,11 @@ pub trait NodeState {
     /// so a v5 node's templates mint the exact schedule and derive v5 leaves.
     fn genesis_form(&self) -> GenesisForm {
         GenesisForm::V4
+    }
+    /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node; the
+    /// mempool's Annulet arm prices admission with it.
+    fn annulet_fee_table(&self) -> Option<qlab_devnet::annulet::L2FeeTable> {
+        None
     }
     /// The fork-choice tip height.
     fn tip_height(&self) -> u64;
@@ -697,6 +716,8 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// (`open_for` / `in_memory_for`), BEFORE any record is replayed; there is
     /// no later setter (the install-before-run invariant, extended here).
     form: GenesisForm,
+    /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node.
+    annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
 }
 
 /// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
@@ -1404,16 +1425,23 @@ impl MemNode {
         let expected_binding = match form {
             GenesisForm::V4 => genesis.body().commitment(),
             GenesisForm::V5 => genesis.body().commitment_v5(),
-            // Locally-built input, same class as the height assertion above.
+            // Locally-built input, same class as the height assertion above:
+            // an Annulet genesis binds its genesis notes, which this signature
+            // does not carry.
             GenesisForm::Annulet => panic!(
-                "the L1 node cannot open an Annulet genesis: the Annulet node path \
-                 lands with B2/B3 (lab #706)"
+                "an Annulet genesis is opened with MemNode::in_memory_annulet (lab #708)"
             ),
         };
         assert_eq!(
             genesis.header.tx_body_commitment, expected_binding,
             "genesis must bind its own body (under the net's form)"
         );
+        Self::from_bound_genesis(form, genesis, dir)
+    }
+
+    /// [`Self::from_genesis`] after the genesis binding has been checked by
+    /// the caller (the L1 arms above; the Annulet constructor over its notes).
+    fn from_bound_genesis(form: GenesisForm, genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
         let commitments = MemCommitmentStore::default();
         let chain = MemChainStore::new_for(form, genesis);
         let mut roots_by_height = BTreeMap::new();
@@ -1436,7 +1464,35 @@ impl MemNode {
             recovery: RecoveryReport::default(),
             names: crate::name_registry::NameRegistry::default(),
             form,
+            annulet_fees: None,
         }
+    }
+
+    /// **An Annulet node** (lab #708), in memory: the genesis header must bind
+    /// `genesis_notes` under B1's genesis body commitment (checked here, the
+    /// constructor's panic class), the L2 fee table comes from the genesis
+    /// params, and **genesis is final on acceptance** (Q4), so the genesis
+    /// root is a valid anchor for block 1.
+    ///
+    /// The genesis notes are bound, not applied — applying them to the
+    /// commitment tree is B3's (lab #706 P13). A data dir is B2b's (the
+    /// Annulet log record); this constructor has none.
+    pub fn in_memory_annulet(
+        genesis_header: BlockHeader,
+        genesis_notes: &[qlab_devnet::annulet::GenesisNote],
+        fees: qlab_devnet::annulet::L2FeeTable,
+    ) -> MemNode {
+        assert_eq!(
+            genesis_header.tx_body_commitment,
+            qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
+            "the Annulet genesis must bind its genesis notes (lab #706)"
+        );
+        let genesis = StoredBlock::annulet_genesis(&genesis_header);
+        let mut node = MemNode::from_bound_genesis(GenesisForm::Annulet, genesis, None);
+        node.annulet_fees = Some(fees);
+        let g = node.chain.genesis_block_hash();
+        node.chain.set_finalized(g).expect("genesis is final on acceptance (lab #708 Q4)");
+        node
     }
 
     /// The genesis form this node's identities are keyed under (lab #470).
@@ -1606,9 +1662,8 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                         &header, &body, verifier, anchor_ok, &self.names,
                     )
                     .map_err(NodeError::Body)?,
-                    GenesisForm::Annulet => {
-                        return Err(NodeError::FormNotServed { form: self.form, owner: "B2/B3" });
-                    }
+                    // Lab #708: an Annulet block is applied only with its seal.
+                    GenesisForm::Annulet => return Err(NodeError::UnsealedOnAnnulet),
                 }
             }
             AnchorGate::SettledHistory => {
@@ -1622,9 +1677,8 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                         &header, &body, verifier, anchor_ok, &self.names,
                     )
                     .map_err(NodeError::Body)?,
-                    GenesisForm::Annulet => {
-                        return Err(NodeError::FormNotServed { form: self.form, owner: "B2/B3" });
-                    }
+                    // Lab #708: an Annulet block is applied only with its seal.
+                    GenesisForm::Annulet => return Err(NodeError::UnsealedOnAnnulet),
                 }
             }
         }
@@ -1634,6 +1688,51 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             persist::append_record(dir, &LogRecord::Block(block)).map_err(NodeError::Io)?;
         }
         Ok(hash)
+    }
+
+    /// **Apply a sealed Annulet block** (lab #708): the seal was validated by
+    /// the caller against the chain (`validate_sealed_header_annulet` — the
+    /// adapter's ingest does it before this); here the block must extend the
+    /// tip, the body passes B1's Annulet rule with this node's L2 fee table,
+    /// the state funnel runs, and the block is **final on acceptance**.
+    ///
+    /// **Finality here is operator governance** (l2-architecture §6.10,
+    /// §6.3's single sequencer), not BFT: with one signer and equivocation
+    /// refused at ingest there is no competing branch, so there is nothing
+    /// for a later finality to decide. Sequencer data withholding stays a
+    /// liveness failure only; nothing here upgrades it to safety.
+    pub fn apply_sealed_block<V: TxVerifier>(
+        &mut self,
+        sealed: &qlab_devnet::annulet::SealedHeader,
+        body: BlockBody,
+        verifier: &V,
+    ) -> Result<Hash32, NodeError> {
+        let fees = match (self.form, self.annulet_fees) {
+            (GenesisForm::Annulet, Some(fees)) => fees,
+            (GenesisForm::V4 | GenesisForm::V5 | GenesisForm::Annulet, _) => {
+                return Err(NodeError::FormNotServed { form: self.form, owner: "an Annulet node (in_memory_annulet)" });
+            }
+        };
+        if self.dir.is_some() {
+            // Refused before any mutation: the Annulet log record is B2b's.
+            return Err(NodeError::FormNotServed { form: self.form, owner: "B2b (the Annulet log record)" });
+        }
+        let header = sealed.header;
+        if header.prev != self.chain.tip_hash() {
+            return Err(NodeError::NotExtendingTip { expected: self.chain.tip_hash(), got: header.prev });
+        }
+        let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
+        qlab_devnet::annulet::validate_body_annulet(&header, &body, verifier, anchor_ok, &fees)
+            .map_err(NodeError::Body)?;
+        let block = StoredBlock::from_sealed_parts(sealed, &body);
+        let hash = self.apply_state(&block)?;
+        self.chain.set_finalized(hash).map_err(NodeError::AnnuletFinality)?;
+        Ok(hash)
+    }
+
+    /// The L2 fee table an Annulet node applies (`None` on an L1 node).
+    pub fn annulet_fee_table(&self) -> Option<qlab_devnet::annulet::L2FeeTable> {
+        self.annulet_fees
     }
 
     /// The ancestor at exactly `height` of the block whose parent hash is `from`,
@@ -1986,6 +2085,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
 impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C, N, T> {
     fn genesis_form(&self) -> GenesisForm {
         self.form
+    }
+
+    fn annulet_fee_table(&self) -> Option<qlab_devnet::annulet::L2FeeTable> {
+        self.annulet_fees
     }
 
     fn tip_height(&self) -> u64 {
