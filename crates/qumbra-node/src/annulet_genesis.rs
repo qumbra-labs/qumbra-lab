@@ -313,6 +313,15 @@ impl AnnuletGenesisFile {
         if self.genesis_notes.iter().any(|n| n.payload.len() != qlab_note::l2note::L2_PAYLOAD_LEN) {
             return Err(GenesisError::BadAnnulet("a genesis note payload is not L2_PAYLOAD_LEN (128) bytes"));
         }
+        // Lab #714 rule (i): every genesis payload is a GenesisPlaintext that
+        // opens to the note its commitment names.
+        if self.genesis_notes.iter().any(|n| {
+            qlab_note::l2note::GenesisPlaintext::open(&n.payload).is_none_or(|note| h32(&note.commitment()) != n.cm)
+        }) {
+            return Err(GenesisError::BadAnnulet(
+                "a genesis note payload is not a GenesisPlaintext opening to its commitment",
+            ));
+        }
         if genesis_body_commitment_annulet(&self.notes()) != self.genesis_header.body_commitment {
             return Err(GenesisError::BadAnnulet("genesis header body_commitment does not bind the genesis notes"));
         }
@@ -389,8 +398,9 @@ impl AnnuletGenesisFile {
                     rho: [0x6E0A_0000 + i, 1, 2, 3],
                     rseed: [0x5EED_0000 + i, 4, 5, 6],
                 };
-                let mut payload = note.to_plaintext().to_vec();
-                payload.extend_from_slice(&[0u8; 16]);
+                // Lab #714 rule (i): a genesis payload is a GenesisPlaintext
+                // (the note plaintext ‖ a zero tag) by construction.
+                let payload = qlab_note::l2note::GenesisPlaintext::of(&note).0.to_vec();
                 GenesisNoteRecord { cm: h32(&note.commitment()), payload }
             })
             .collect();
@@ -482,7 +492,15 @@ mod tests {
         assert!(matches!(bad_root.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("registry_root")));
         let mut bad_note = good.clone();
         bad_note.genesis_notes[2].cm[0] ^= 1;
-        assert!(matches!(bad_note.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("body_commitment")));
+        // Lab #714 rule (i) catches a note whose payload does not open to its cm.
+        assert!(matches!(bad_note.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("GenesisPlaintext")));
+        let mut tagged = good.clone();
+        let last = tagged.genesis_notes[1].payload.len() - 1;
+        tagged.genesis_notes[1].payload[last] = 1;
+        assert!(matches!(tagged.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("GenesisPlaintext")));
+        let mut bad_body = good.clone();
+        bad_body.genesis_header.body_commitment[0] ^= 1;
+        assert!(matches!(bad_body.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("body_commitment")));
         let mut short = good.clone();
         short.genesis_notes[0].payload.pop();
         assert!(matches!(short.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("128")));

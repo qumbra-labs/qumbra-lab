@@ -533,6 +533,20 @@ pub struct AnchorsView {
     pub encoded: Vec<u8>,
 }
 
+/// The genesis-notes route (lab #714, B5) — GET only, Annulet nets only.
+pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
+
+/// The named refusal an L1 node answers `/v1/genesis/notes` with.
+pub const GENESIS_NOTES_NOT_ON_L1: &str =
+    "genesis notes are served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #714)";
+
+/// The genesis notes, encoded once (they never change): `None` on an L1
+/// node. A projection of the genesis file — its hash travels in the body.
+#[derive(Default)]
+pub struct GenesisNotesView {
+    pub encoded: Option<Vec<u8>>,
+}
+
 /// The registry projection the run loop refreshes (lab #710). `None` on an
 /// L1 node, whose registry routes refuse by name.
 #[derive(Default)]
@@ -609,11 +623,21 @@ impl DiscoveryServer {
         anchors: Arc<Mutex<Arc<AnchorsView>>>,
         submits: mpsc::SyncSender<SubmitRequest>,
     ) -> io::Result<Self> {
-        Self::start_with_mine(addr, view, leaves, anchors, submits, None, Arc::new(Mutex::new(Arc::new(RegistryView::default()))))
+        Self::start_with_mine(
+            addr,
+            view,
+            leaves,
+            anchors,
+            submits,
+            None,
+            Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
+            Arc::new(GenesisNotesView::default()),
+        )
     }
 
     /// [`Self::start`] plus the lab #511 mine-template / block-submit routes.
     /// `mine = None` leaves those paths as 404 (the compact-only tests).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_mine(
         addr: &str,
         view: Arc<Mutex<Arc<DiscoveryView>>>,
@@ -622,6 +646,7 @@ impl DiscoveryServer {
         submits: mpsc::SyncSender<SubmitRequest>,
         mine: Option<crate::mine_rpc::MineServing>,
         registry: Arc<Mutex<Arc<RegistryView>>>,
+        genesis_notes: Arc<GenesisNotesView>,
     ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
@@ -767,6 +792,11 @@ impl DiscoveryServer {
                         };
                         Ok(snapshot.encoded.clone())
                     }
+                    // Lab #714: the genesis notes (a projection of the genesis file).
+                    GENESIS_NOTES_PATH => match &genesis_notes.encoded {
+                        Some(bytes) => Ok(bytes.clone()),
+                        None => Err((400, GENESIS_NOTES_NOT_ON_L1.to_string())),
+                    },
                     // Lab #710: the registry routes (root, and an opening by
                     // asset id in the path).
                     p if p == REGISTRY_ROOT_PATH || p.starts_with(REGISTRY_PATH_PREFIX) => {
@@ -792,7 +822,7 @@ impl DiscoveryServer {
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {COINBASE_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
-                                 {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, \
+                                 {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
                                  {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
@@ -1294,7 +1324,7 @@ mod tests {
         coinbase_rkm: [u64; 4],
     ) -> BlockDiscovery {
         let riders: Vec<Vec<u8>> = groups.iter().map(|_| vec![0x00]).collect();
-        BlockDiscovery {
+        BlockDiscovery { payload_len: qlab_note::compact::PAYLOAD_LEN,
             height,
             hash: [hash; 32],
             groups,
@@ -1315,7 +1345,7 @@ mod tests {
         nullifiers: Vec<Hash32>,
     ) -> BlockDiscovery {
         let riders: Vec<Vec<u8>> = groups.iter().map(|_| vec![0x00]).collect();
-        BlockDiscovery {
+        BlockDiscovery { payload_len: qlab_note::compact::PAYLOAD_LEN,
             height,
             hash: [hash; 32],
             groups,
@@ -1426,6 +1456,19 @@ mod tests {
     /// A node with nothing finalized serves an EMPTY anchor set, not a 404 and
     /// not an error: "there is nothing to anchor against yet" is a real state a
     /// young chain is in, and the wallet renders it as its own named refusal.
+    /// Lab #714: an L1 server refuses `/v1/genesis/notes` by name.
+    #[test]
+    fn an_l1_server_refuses_the_genesis_notes_route_by_name() {
+        let (srv, _submits) = serve_with(
+            Arc::new(Mutex::new(Arc::new(a_view()))),
+            no_leaves(),
+            Arc::new(Mutex::new(Arc::new(AnchorsView::default()))),
+        );
+        let (status, body) = get(srv.addr(), GENESIS_NOTES_PATH);
+        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+        assert_eq!(String::from_utf8(body).unwrap(), GENESIS_NOTES_NOT_ON_L1);
+    }
+
     #[test]
     fn a_chain_with_nothing_finalized_serves_an_empty_set_not_an_error() {
         let empty = qlab_node::AnchorSet {

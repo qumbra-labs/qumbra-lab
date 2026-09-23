@@ -561,6 +561,22 @@ fn resolve_claims(opened: Vec<LocatedNote>) -> (Vec<LocatedNote>, Vec<ShadowedNo
     (spendable, shadowed)
 }
 
+/// **Open a served Annulet output** (lab #714, B5): the recipient bundle a
+/// `/v1/compact` group carries and that recipient's payloads from
+/// `/v1/block/{h}/tx/{i}/full` (128 B each), scanned with the one scheme —
+/// `qlab_note::scan::scan_notes::<L2Note>` — so the detection, the AEAD and
+/// the commitment recompute are the L1's. Returns every `L2Note` this `dk`
+/// opens, with its output index. The asset-aware wallet store and scan over
+/// many blocks are C1's; this is the decode C1 builds on.
+pub fn open_served_l2(
+    dk: &qlab_note::kem::Dk,
+    bundle: &qlab_note::wire::RecipientBundle,
+    payloads: &[Vec<u8>],
+) -> Vec<qlab_note::scan::Detected<qlab_note::l2note::L2Note>> {
+    let out = qlab_note::scan::EncryptedOutputs { bundle: bundle.clone(), payloads: payloads.to_vec() };
+    qlab_note::scan::scan_notes::<qlab_note::l2note::L2Note>(dk, &out, qlab_note::scan::ScanMode::FullFo)
+}
+
 /// Run the light-client scan against `base_url` over `[from, to]`.
 ///
 /// `Err` is reserved for a scan that **never started**: only the `/v1/compact`

@@ -324,7 +324,7 @@ fn v1_names_serves_bulk_and_refuses_resolve_by_name() {
 
     // The rider-carrying serving path is a pure projection — tested at the
     // page function against a synthetic projection (no consensus involved).
-    let synthetic = qlab_node::BlockDiscovery {
+    let synthetic = qlab_node::BlockDiscovery { payload_len: qlab_note::compact::PAYLOAD_LEN,
         height: 7,
         hash: [0x77; 32],
         groups: vec![vec![0x00]],
