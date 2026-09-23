@@ -61,9 +61,10 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
     match args.first().map(String::as_str) {
         Some("genesis") => match args.get(1).map(String::as_str) {
             Some("init") => genesis_init(&args[2..]),
+            Some("annulet-devnet") => genesis_annulet_devnet(&args[2..]),
             _ => {
                 usage();
-                Err("expected `genesis init`".into())
+                Err("expected `genesis init` or `genesis annulet-devnet`".into())
             }
         },
         Some("run") => run_node(&args[1..]),
@@ -97,6 +98,9 @@ fn usage() {
            --launch                         T2 ceremony path: committee keys from OS randomness.\n      \
                                             Requires --t2. Hash is NOT reproducible.\n      \
            --difficulty N                   launch-only; default stays the current placeholder\n  \
+         qumbra-node genesis annulet-devnet [--out DIR] [--sequencer-data-dir DIR]\n      \
+                                            write the Annulet DEVNET genesis (pinned hash, dev keys);\n      \
+                                            with --sequencer-data-dir, also its DEV sequencer key file\n  \
          qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475). Finds or\n      \
                                             CREATES a wallet (its mnemonic is printed ONCE and the\n      \
                                             run waits for you to confirm), downloads + verifies\n      \
@@ -765,6 +769,35 @@ fn audit(args: &[String]) -> Result<(), Box<dyn Error>> {
             println!("audit written to {path}");
         }
         None => print!("{md}"),
+    }
+    Ok(())
+}
+
+/// `genesis annulet-devnet` (lab #716): write the Annulet **devnet** genesis
+/// — deterministic, hash-pinned, built from published **dev** keys — and, on
+/// request, the devnet's dev sequencer key file into a producer's data dir.
+/// What the devnet compose runs instead of a genesis ceremony; nothing here
+/// is a secret, and nothing here may be reused on a net that holds value.
+fn genesis_annulet_devnet(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
+    let out = std::path::PathBuf::from(flag(args, "--out").unwrap_or("."));
+    std::fs::create_dir_all(&out)?;
+    let g = AnnuletGenesisFile::devnet();
+    g.verify(None)?;
+    let path = out.join("genesis.qmb");
+    std::fs::write(&path, g.to_bytes())?;
+    println!("annulet devnet genesis: {} ({} bytes)", path.display(), g.to_bytes().len());
+    println!("genesis hash: {}", g.hash_hex());
+    if let Some(dir) = flag(args, "--sequencer-data-dir") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)?;
+        let kf = SequencerKeyFile {
+            seed_hex: devnet::SEQUENCER_SEED.iter().map(|b| format!("{b:02x}")).collect(),
+            note: "Annulet DEVNET sequencer key — a published dev key (lab #716); never for a net that holds value"
+                .into(),
+        };
+        std::fs::write(dir.join(SEQUENCER_KEY_FILE), kf.to_toml())?;
+        println!("dev sequencer key file: {}", dir.join(SEQUENCER_KEY_FILE).display());
     }
     Ok(())
 }

@@ -3,8 +3,8 @@
 //! Every Annulet test before B6 started the node in-process
 //! (`RunningNode::start_annulet`); `main`'s own path — `load_any`, the form's
 //! verifier selection, `prepare_annulet` from a config file — ran nowhere.
-//! This spawns `qumbra-node run` on the **devnet genesis** file with the
-//! devnet sequencer key file in the data dir and **without**
+//! This stages the devnet with `qumbra-node genesis annulet-devnet`, spawns
+//! `qumbra-node run` on it with the dev sequencer key file in the data dir and **without**
 //! `--rehearsal-verifier`, and checks, from outside the process:
 //!
 //! - the pinned genesis hash is accepted, the role is producer, and the
@@ -54,13 +54,22 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, Vec
 
 fn stage(base: &Path, g: &AnnuletGenesisFile, discovery: SocketAddr) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(base);
-    std::fs::create_dir_all(base.join("data")).unwrap();
-    std::fs::write(base.join("genesis.qmb"), g.to_bytes()).unwrap();
-    let kf = SequencerKeyFile {
-        seed_hex: devnet::SEQUENCER_SEED.iter().map(|b| format!("{b:02x}")).collect(),
-        note: "devnet sequencer key (test)".into(),
-    };
-    std::fs::write(base.join("data").join(SEQUENCER_KEY_FILE), kf.to_toml()).unwrap();
+    // Staged by the binary's own `genesis annulet-devnet` (what the devnet
+    // compose runs): the genesis file and the dev sequencer key file.
+    let out = Command::new(bin())
+        .args(["genesis", "annulet-devnet", "--out"])
+        .arg(base)
+        .arg("--sequencer-data-dir")
+        .arg(base.join("data"))
+        .output()
+        .expect("spawn genesis annulet-devnet");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.contains(&format!("genesis hash: {}", g.hash_hex())), "{printed}");
+    assert_eq!(std::fs::read(base.join("genesis.qmb")).unwrap(), g.to_bytes(), "byte-identical to the pinned devnet");
+    let key = SequencerKeyFile::from_toml(&std::fs::read_to_string(base.join("data").join(SEQUENCER_KEY_FILE)).unwrap())
+        .expect("a sequencer key file");
+    assert_eq!(key.seed().expect("a seed"), devnet::SEQUENCER_SEED);
     let cfg = format!(
         r#"
 data_dir = "{data}"
