@@ -122,7 +122,7 @@ impl Net {
                 for n in nodes.iter_mut() {
                     n.one_iteration(&mut |_| {});
                 }
-                if nodes[0].p2p().node().mempool().len() > 0 {
+                if !nodes[0].p2p().node().mempool().is_empty() {
                     ts = (ts + 1).max(wall());
                     nodes[0].seal_block_now(ts).expect("the producer seals");
                 }
