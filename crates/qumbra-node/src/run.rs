@@ -7932,7 +7932,7 @@ mod tests {
                 // A group binding a DIFFERENT commitment: §4 rule 2 must refuse it.
                 placeholder_discovery(&[[0xEE; 32]])
             };
-            TxEntry {
+            TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: b"rehearsal-accepts-anything".to_vec(),
                 public: TxPublic {
                     anchor,

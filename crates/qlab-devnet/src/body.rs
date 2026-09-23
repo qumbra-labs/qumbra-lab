@@ -212,6 +212,12 @@ pub struct TxEntry {
     /// wire the section is presence-conditional instead (`qlab-p2p::codec`
     /// says why the two choices differ).
     pub rider: Vec<u8>,
+    /// The transaction's **L2 surface** (lab #706 Q4): shape tag ‖
+    /// registry_root ‖ vPublic (shape P only), as committed bytes under the
+    /// `rider` discipline — **absence is `[0x00]`**
+    /// ([`crate::annulet::L2_SURFACE_ABSENT`]). Never in an L1 preimage or on
+    /// the L1 wire; L1 validation refuses a non-absent surface by name.
+    pub l2: Vec<u8>,
 }
 
 impl TxEntry {
@@ -223,7 +229,7 @@ impl TxEntry {
         recipients: &[RecipientBundle],
         payloads: &[Vec<u8>],
     ) -> Self {
-        Self {
+        Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof,
             public,
             discovery: encode_committed_discovery(recipients, payloads),
@@ -236,7 +242,7 @@ impl TxEntry {
     /// using this outside a fixture.
     pub fn with_placeholder_discovery(proof: Vec<u8>, public: TxPublic) -> Self {
         let discovery = placeholder_discovery(&public.commitments);
-        Self { proof, public, discovery, rider: Self::absent_rider() }
+        Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof, public, discovery, rider: Self::absent_rider() }
     }
 
     /// The canonical encoding of "this transaction attaches no discovery",
@@ -1314,7 +1320,7 @@ mod tests {
             fee: posted_fee(ArityBucket::TwoByTwo),
         };
         let discovery = placeholder_discovery(&public.commitments);
-        TxEntry { proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
+        TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
     }
 
     fn ct_pattern(base: u8) -> [u8; CT_LEN] {
@@ -1627,7 +1633,7 @@ mod tests {
     /// A fixed body with every field pinned — the input to the golden vector.
     fn golden_body() -> BlockBody {
         BlockBody::from_single_payee(
-            vec![TxEntry {
+            vec![TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: vec![0xAB, 0xCD, 0xEF],
                 public: TxPublic {
                     anchor: [0x11; 32],
@@ -2177,7 +2183,7 @@ mod tests {
         );
 
         // And it passes the consensus rule it exists to pass.
-        let tx = TxEntry {
+        let tx = TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: FINAL_ANCHOR,
@@ -2195,7 +2201,7 @@ mod tests {
     #[test]
     fn discovery_round_trips_and_the_empty_body_does_not_collide_with_v1() {
         let cms = vec![[0x44u8; 32], [0x55u8; 32]];
-        let tx = TxEntry {
+        let tx = TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: FINAL_ANCHOR,

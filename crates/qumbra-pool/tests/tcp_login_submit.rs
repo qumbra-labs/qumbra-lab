@@ -27,7 +27,7 @@ fn sample_template() -> Template {
 fn sample_template_at(height: u64) -> Template {
     Template {
         form: GenesisForm::V5,
-        header: BlockHeader {
+        header: BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
             prev: [0x11; 32],
             height,
             timestamp: 1_785_000_000,

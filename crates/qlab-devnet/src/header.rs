@@ -13,6 +13,7 @@
 //! and *activating* them later is a real, deliberate format change rather than a
 //! silent addition.
 
+use crate::annulet::HeaderExt;
 use crate::body::BlockBody;
 use crate::forms::GenesisForm;
 use crate::hash::keccak256;
@@ -90,6 +91,10 @@ pub struct BlockHeader {
     pub aggregate_proof: AggregateProofSlot,
     /// RESERVED — see [`EpochSupplyAttestation`]. Not computed at devnet.
     pub epoch_supply_attestation: EpochSupplyAttestation,
+    /// The per-form extension (lab #706): [`HeaderExt::NONE`] on every L1
+    /// header — the v4/v5 preimages do not contain it and refuse anything
+    /// else; an Annulet header carries its anchor and registry root here.
+    pub ext: HeaderExt,
 }
 
 impl BlockHeader {
@@ -219,7 +224,7 @@ impl BlockHeader {
     /// stage-3 golden pre-registered (`82c2707b…7ea5`) as what a v5 genesis
     /// header must bind.
     pub fn genesis_for(form: GenesisForm, difficulty: u64, timestamp: u64) -> Self {
-        Self {
+        Self { ext: crate::annulet::HeaderExt::NONE,
             prev: ZERO_HASH,
             height: 0,
             timestamp,
@@ -259,7 +264,7 @@ impl BlockHeader {
         difficulty: u64,
         tx_body_commitment: Hash32,
     ) -> Self {
-        Self {
+        Self { ext: crate::annulet::HeaderExt::NONE,
             prev: parent.header_hash_for(form),
             height: parent.height + 1,
             timestamp,
@@ -342,7 +347,7 @@ mod tests {
     /// A fixture header with every field byte distinguishable, so the offset
     /// assertions below cannot pass by coincidence.
     fn v5_fixture() -> BlockHeader {
-        BlockHeader {
+        BlockHeader { ext: crate::annulet::HeaderExt::NONE,
             prev: [0x11; 32],
             height: 0x0000_6655_4433_2211,       // 6 significant LE bytes
             timestamp: 0x8877_6655_4433_2211,

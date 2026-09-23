@@ -433,7 +433,7 @@ pub(crate) fn prove_bundle(bundle: &WitnessBundle) -> Result<SendArtifact, Strin
         output_commitment(&bundle.outputs[1]),
     ];
     assert_eq!(inst.cm_out, declared_cm, "bundle output cm seam");
-    let entry = TxEntry {
+    let entry = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
         proof: proof_bytes,
         public: TxPublic {
             anchor: digest_bytes(&bundle.anchor),

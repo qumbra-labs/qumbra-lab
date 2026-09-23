@@ -146,7 +146,7 @@ impl From<&TxEntry> for StoredTx {
 
 impl From<&StoredTx> for TxEntry {
     fn from(s: &StoredTx) -> Self {
-        TxEntry {
+        TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: s.proof.clone(),
             discovery: s.discovery.clone(),
             rider: s.rider.clone(),

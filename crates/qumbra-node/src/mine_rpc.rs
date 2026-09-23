@@ -281,7 +281,7 @@ mod tests {
     use qlab_devnet::header::{AggregateProofSlot, EpochSupplyAttestation};
 
     fn sample_header() -> BlockHeader {
-        BlockHeader {
+        BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
             prev: [0x11; 32],
             height: 1,
             timestamp: 75,

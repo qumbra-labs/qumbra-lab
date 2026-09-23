@@ -163,7 +163,7 @@ fn http_post(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> (String, St
 }
 
 fn grind_v5(wire: &MineTemplateWire) -> (qlab_devnet::header::BlockHeader, [u8; 32]) {
-    let mut header = qlab_devnet::header::BlockHeader {
+    let mut header = qlab_devnet::header::BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: hex32(&wire.prev),
         height: wire.height,
         timestamp: wire.timestamp,
@@ -593,7 +593,7 @@ fn template_header_decodes_under_v5() {
         coinbase_payees: vec![CoinbasePayeeWire { rkm: rkm_hex(&RIG_RKM), amount: 1 }],
         txs: vec![],
     };
-    let header = qlab_devnet::header::BlockHeader {
+    let header = qlab_devnet::header::BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: hex32(&wire.prev),
         height: 1,
         timestamp: 75,

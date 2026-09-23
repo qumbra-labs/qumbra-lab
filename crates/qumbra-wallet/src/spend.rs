@@ -812,7 +812,7 @@ mod tests {
             move |selected, _, _| {
                 prove_calls.borrow_mut().push("prove");
                 Ok(SendArtifact {
-                    entry: TxEntry {
+                    entry: TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                         proof: Vec::new(),
                         public: TxPublic {
                             anchor: selected.anchor(),

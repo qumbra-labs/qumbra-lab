@@ -208,7 +208,7 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
         return Err(DecodeError::BadHeaderTag { pos: tag_pos + 1, got: tag_b });
     }
     r.finish()?;
-    Ok(BlockHeader {
+    Ok(BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev,
         height,
         timestamp,
@@ -475,7 +475,7 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
         TxEntry::absent_rider()
     };
     r.finish()?;
-    Ok(TxEntry {
+    Ok(TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
         proof,
         discovery,
         public: TxPublic { anchor, nullifiers, commitments, bucket, fee },

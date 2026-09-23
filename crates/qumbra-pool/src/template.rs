@@ -222,7 +222,7 @@ pub fn header_from_parts(
     difficulty: u64,
     tx_body_commitment: &str,
 ) -> Result<BlockHeader, TemplateError> {
-    Ok(BlockHeader {
+    Ok(BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: hexutil::decode_exact(prev)?,
         height,
         timestamp,
@@ -240,7 +240,7 @@ mod tests {
     use qlab_stratum::blob::{extranonce_of, miner_nonce_of, V5_BLOB_LEN};
 
     fn sample_header(height: u64) -> BlockHeader {
-        BlockHeader {
+        BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
             prev: [0x11; 32],
             height,
             timestamp: 1_785_000_000,
