@@ -54,7 +54,17 @@ pub struct StoredHeader {
 }
 
 impl From<&BlockHeader> for StoredHeader {
+    /// # Panics
+    ///
+    /// On a header with an Annulet extension (lab #706): this is the **L1**
+    /// stored mirror and has no place for it — its layout is frozen (the
+    /// persisted-bytes verdict on #706). Unreachable from a peer; the Annulet
+    /// stored form is B2/B3's.
     fn from(h: &BlockHeader) -> Self {
+        assert!(
+            h.ext == qlab_devnet::annulet::HeaderExt::NONE,
+            "the L1 StoredHeader cannot represent an Annulet header (lab #706)"
+        );
         Self {
             prev: h.prev,
             height: h.height,
@@ -130,7 +140,16 @@ fn bucket_from_actions(actions: u32) -> ArityBucket {
 }
 
 impl From<&TxEntry> for StoredTx {
+    /// # Panics
+    ///
+    /// On a transaction with an L2 surface (lab #706) — the L1 stored mirror's
+    /// layout is frozen and has no place for it; L1 validation refuses such a
+    /// transaction by name before anything persists it.
     fn from(t: &TxEntry) -> Self {
+        assert!(
+            t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT,
+            "the L1 StoredTx cannot represent an L2-surface transaction (lab #706)"
+        );
         Self {
             anchor: t.public.anchor,
             nullifiers: t.public.nullifiers.clone(),

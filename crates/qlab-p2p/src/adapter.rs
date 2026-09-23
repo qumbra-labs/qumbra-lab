@@ -2406,6 +2406,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             BodyError::RiderMalformed { .. } | BodyError::RiderBeforeBoundary { .. } => {
                 BodyFault::Intrinsic("bad body")
             }
+            // Lab #706: each reads only the body's own bytes (surface
+            // presence/shape/canonicity, the bucket, the payee list).
+            BodyError::L2SurfaceOnL1 { .. }
+            | BodyError::L2SurfaceMissing { .. }
+            | BodyError::L2SurfaceMalformed { .. }
+            | BodyError::L2NotTwoByTwo { .. }
+            | BodyError::CoinbaseOnAnnulet { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:
             BodyError::RiderRule { err, .. } => match err {
                 // Grammar, record kind and record size read only the revealed

@@ -82,6 +82,9 @@ pub enum DecodeError {
     /// A wire object this build does not serve on this net's form yet
     /// (lab #706): `owner` names the milestone that lands it.
     FormNotServed { form: GenesisForm, owner: &'static str },
+    /// An Annulet transaction's L2-surface section is absent or does not
+    /// decode canonically (lab #706).
+    BadL2Surface,
 }
 
 impl From<CodecError> for DecodeError {
@@ -445,6 +448,13 @@ fn bucket_from_u8(v: u8) -> Result<ArityBucket, DecodeError> {
 
 /// Encode a transaction (public values + opaque proof).
 pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
+    // The L1 wire has no L2 section; dropping one silently would change the
+    // tx's identity (lab #706). A real assert (#253): unreachable from a peer,
+    // since `decode_tx` never produces a surface.
+    assert!(
+        tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT,
+        "an L2-surface transaction has no L1 wire encoding: use encode_tx_annulet (lab #706)"
+    );
     let mut out = Vec::new();
     let p = &tx.public;
     out.extend_from_slice(&p.anchor);
@@ -483,6 +493,69 @@ pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
         out.extend_from_slice(&tx.rider);
     }
     out
+}
+
+/// The **Annulet** transaction wire (lab #706 Q4): the L1 tx wire's fields
+/// through the discovery group, then a **mandatory** L2-surface section
+/// (`varint len ‖ bytes`). No name-rider section exists on this wire (no name
+/// service on the L2). Refuses a transaction without a surface or with a
+/// rider — locally-built input only.
+pub fn encode_tx_annulet(tx: &TxEntry) -> Vec<u8> {
+    assert!(
+        tx.l2 != qlab_devnet::annulet::L2_SURFACE_ABSENT,
+        "an Annulet transaction carries an L2 surface (lab #706)"
+    );
+    assert!(
+        tx.rider == qlab_devnet::names::RIDER_ABSENT,
+        "no name rider on an Annulet transaction (lab #706)"
+    );
+    let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() };
+    let mut out = encode_tx(&l1);
+    write_varint(&mut out, tx.l2.len() as u64);
+    out.extend_from_slice(&tx.l2);
+    out
+}
+
+/// Decode an Annulet transaction ([`encode_tx_annulet`]'s inverse). The
+/// surface section is required and must decode canonically as a present
+/// surface; an absent marker is refused (one encoding per transaction).
+pub fn decode_tx_annulet(buf: &[u8]) -> Result<TxEntry, DecodeError> {
+    let mut r = Reader::new(buf);
+    let (proof, discovery, public) = decode_tx_through_discovery(&mut r, buf.len())?;
+    let l2_len = r.varint()? as usize;
+    let l2 = r.rest(l2_len, "tx.l2")?;
+    match qlab_devnet::annulet::L2Surface::decode(&l2) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => return Err(DecodeError::BadL2Surface),
+    }
+    r.finish()?;
+    Ok(TxEntry { proof, discovery, public, rider: TxEntry::absent_rider(), l2 })
+}
+
+/// The tx wire's fields through the discovery group — shared by the L1 and
+/// Annulet decoders so the two cannot drift.
+fn decode_tx_through_discovery(
+    r: &mut Reader<'_>,
+    buf_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>, TxPublic), DecodeError> {
+    let anchor = r.hash32("tx.anchor")?;
+    let n_nf = r.varint()? as usize;
+    let mut nullifiers = Vec::with_capacity(n_nf.min(buf_len / 32));
+    for _ in 0..n_nf {
+        nullifiers.push(r.hash32("tx.nf")?);
+    }
+    let n_cm = r.varint()? as usize;
+    let mut commitments = Vec::with_capacity(n_cm.min(buf_len / 32));
+    for _ in 0..n_cm {
+        commitments.push(r.hash32("tx.cm")?);
+    }
+    let bucket = bucket_from_u8(r.u8("tx.bucket")?)?;
+    let fee = r.u64_le("tx.fee")?;
+    let proof_len = r.varint()? as usize;
+    let proof = r.rest(proof_len, "tx.proof")?;
+    let discovery_len = r.varint()? as usize;
+    let discovery = r.rest(discovery_len, "tx.discovery")?;
+    Ok((proof, discovery, TxPublic { anchor, nullifiers, commitments, bucket, fee }))
 }
 
 /// Decode a transaction body.
@@ -882,6 +955,57 @@ mod tests {
                 Err(DecodeError::BadHeaderTag { pos: p, got: 0xA6 }) if p == pos
             ));
         }
+    }
+
+    fn annulet_tx() -> TxEntry {
+        use qlab_devnet::annulet::{L2ShapeTag, L2Surface, VPublicTerm};
+        TxEntry {
+            proof: vec![0xAB; 40],
+            public: TxPublic {
+                anchor: [0x0F; 32],
+                nullifiers: vec![[1; 32], [2; 32]],
+                commitments: vec![[3; 32], [4; 32]],
+                bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
+                fee: 2,
+            },
+            discovery: vec![0x00],
+            rider: TxEntry::absent_rider(),
+            l2: L2Surface {
+                shape: L2ShapeTag::P,
+                registry_root: [0x44; 32],
+                vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: true, amount: 5, asset: 7 }]),
+            }
+            .encode(),
+        }
+    }
+
+    #[test]
+    fn an_annulet_tx_round_trips_with_its_surface() {
+        let tx = annulet_tx();
+        let bytes = encode_tx_annulet(&tx);
+        let back = decode_tx_annulet(&bytes).unwrap();
+        assert_eq!(back.l2, tx.l2);
+        assert_eq!(back.public, tx.public);
+        assert_eq!((back.proof, back.discovery, back.rider), (tx.proof.clone(), tx.discovery.clone(), tx.rider.clone()));
+        // The Annulet wire is the L1 wire's fields plus the surface section.
+        let l1_part = encode_tx(&TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() });
+        assert_eq!(&bytes[..l1_part.len()], &l1_part[..]);
+    }
+
+    #[test]
+    fn the_annulet_tx_wire_refuses_a_missing_or_absent_surface() {
+        let tx = annulet_tx();
+        let l1_only = encode_tx(&TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() });
+        assert!(decode_tx_annulet(&l1_only).is_err(), "no surface section");
+        let mut absent = l1_only.clone();
+        absent.extend_from_slice(&[0x01, 0x00]); // varint 1 ‖ [0x00]
+        assert!(matches!(decode_tx_annulet(&absent), Err(DecodeError::BadL2Surface)));
+    }
+
+    #[test]
+    #[should_panic(expected = "no L1 wire encoding")]
+    fn the_l1_tx_wire_refuses_an_l2_surface() {
+        let _ = encode_tx(&annulet_tx());
     }
 
     #[test]

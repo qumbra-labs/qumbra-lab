@@ -718,6 +718,19 @@ pub enum BodyError {
     /// The tx at `index` carries a well-formed rider that violates a name
     /// rule; `err` is the rule's own verdict, kept rather than flattened.
     RiderRule { index: usize, err: crate::names::NameRuleError },
+
+    // --- lab #706: the Annulet (L2) forms ------------------------------------
+    /// An L1 (v4/v5) transaction at `index` carries an L2 surface — never
+    /// valid on an L1 net (the L1 preimages and wire cannot represent it).
+    L2SurfaceOnL1 { index: usize },
+    /// An Annulet transaction at `index` carries no L2 surface.
+    L2SurfaceMissing { index: usize },
+    /// An Annulet transaction's L2 surface bytes do not decode canonically.
+    L2SurfaceMalformed { index: usize, err: crate::annulet::L2SurfaceError },
+    /// An Annulet transaction is not the 2×2 bucket (the only L2 bucket).
+    L2NotTwoByTwo { index: usize },
+    /// An Annulet body names a coinbase payee — the L2 has no block reward.
+    CoinbaseOnAnnulet { got: usize },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
@@ -1142,6 +1155,10 @@ where
                 pending_names.insert(record.name.clone());
             }
         }
+        // Lab #706: an L2 surface is never valid on an L1 net.
+        if tx.l2 != crate::annulet::L2_SURFACE_ABSENT {
+            return Err(BodyError::L2SurfaceOnL1 { index: i });
+        }
         for nf in &tx.public.nullifiers {
             if !seen_nf.insert(*nf) {
                 return Err(BodyError::DoubleSpendInBlock { index: i });
@@ -1352,6 +1369,25 @@ mod tests {
         // A different body ⇒ different commitment.
         let other = BlockBody::from_single_payee(vec![good_tx(1)], 42, MINER_RKM);
         assert_ne!(body.commitment(), other.commitment());
+    }
+
+    /// Lab #706: an L2 surface on an L1 body is refused by name — the L1
+    /// preimages and wire have no place for it (and the commitment below
+    /// would not even see it, which is why the refusal must be explicit).
+    #[test]
+    fn an_l2_surface_on_an_l1_body_is_refused_by_name() {
+        let mut tx = good_tx(1);
+        tx.l2 = crate::annulet::L2Surface {
+            shape: crate::annulet::L2ShapeTag::S,
+            registry_root: [0x44; 32],
+            vpublic: None,
+        }
+        .encode();
+        let body = BlockBody::from_single_payee(vec![good_tx(2), tx], 0, [0; 4]);
+        assert_eq!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::L2SurfaceOnL1 { index: 1 })
+        );
     }
 
     #[test]
