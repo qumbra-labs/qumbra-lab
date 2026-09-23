@@ -351,7 +351,7 @@ impl AnnuletGenesisFile {
             allow_root: [0; 4],
             flags: 0,
         };
-        let faucet_rkm = [0xFA0C_E7_01, 0xFA0C_E7_02, 0xFA0C_E7_03, 0xFA0C_E7_04];
+        let faucet_rkm = [0xFA0C_E701, 0xFA0C_E702, 0xFA0C_E703, 0xFA0C_E704];
         let notes = (0..4u64)
             .map(|i| {
                 let note = qlab_note::l2note::L2Note {
@@ -382,8 +382,8 @@ mod tests {
     use super::*;
 
     /// The fixture's genesis hash — computed by the named
-    /// `annulet_fixture_genesis` run (twice, byte-identical).
-    const FIXTURE_GENESIS_HASH: &str = "PENDING";
+    /// `annulet_fixture_genesis` run, twice, byte-identical (3,031 B file).
+    const FIXTURE_GENESIS_HASH: &str = "c0257d6719b1c4ea1c80565e10475df691d71dc5f0660dd81572a434ebccb19a";
 
     #[test]
     fn the_fixture_verifies_and_selects_the_annulet_form() {

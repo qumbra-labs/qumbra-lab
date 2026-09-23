@@ -531,6 +531,18 @@ mod tests {
         assert_ne!(none, body_commitment_annulet(&BlockBody::default()), "the genesis domain is its own");
     }
 
+    /// The empty-body commitments, hard-coded: the named `annulet_goldens`
+    /// run and an independent Python Keccak-256 agreed before pinning.
+    #[test]
+    fn annulet_empty_body_goldens() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(hex(&body_commitment_annulet(&BlockBody::default())), GOLDEN_ANNULET_EMPTY_BODY);
+        assert_eq!(hex(&genesis_body_commitment_annulet(&[])), GOLDEN_ANNULET_EMPTY_GENESIS);
+    }
+
+    const GOLDEN_ANNULET_EMPTY_BODY: &str = "75dc7b561922b13da146bddeac8bc8e5d845cfff605cdcf94ade8993eaae52be";
+    const GOLDEN_ANNULET_EMPTY_GENESIS: &str = "3ad958aa3bdcb443ab80a6ca45de2900fe60ecb208d90b7ef3eb42002be1d253";
+
     #[test]
     #[should_panic(expected = "genesis note payload width")]
     fn a_genesis_note_payload_must_be_128_bytes() {

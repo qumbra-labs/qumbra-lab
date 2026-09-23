@@ -723,7 +723,9 @@ mod tests {
     }
 
     /// The Annulet id and signing-message digest of the fixture, hard-coded
-    /// (lab #706; computed by the named `annulet_goldens` run).
+    /// (lab #706): computed by the named `annulet_goldens` run AND,
+    /// independently, by a Python Keccak-256 over the hand-assembled 153-B
+    /// preimage — both agreed before pinning.
     #[test]
     fn annulet_header_goldens() {
         let h = annulet_fixture();
@@ -732,6 +734,6 @@ mod tests {
         assert_eq!(hex(&crate::hash::keccak256(&h.annulet_signing_message())), GOLDEN_ANNULET_SIGNING_DIGEST);
     }
 
-    const GOLDEN_ANNULET_HEADER_ID: &str = "PENDING";
-    const GOLDEN_ANNULET_SIGNING_DIGEST: &str = "PENDING";
+    const GOLDEN_ANNULET_HEADER_ID: &str = "1bc6fce1c82cfb364d7649cc610c2c8835e8b5c43f4af9f27d3da4c6c4d88b97";
+    const GOLDEN_ANNULET_SIGNING_DIGEST: &str = "2d00955ca3683eac7ecaa83eabbfb18c0d717e42231f40fd6dfcff474116c9e3";
 }
