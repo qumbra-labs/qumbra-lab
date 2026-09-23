@@ -37,6 +37,7 @@ pub mod codec;
 pub mod data;
 #[cfg(feature = "devnet")]
 pub mod server;
+pub mod registry;
 pub mod tree;
 
 /// Format version byte that leads every §2 response (spec: "format version byte
