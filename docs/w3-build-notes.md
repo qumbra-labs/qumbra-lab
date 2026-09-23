@@ -510,3 +510,67 @@ lane per process, canary first, every row zero swap.
 | §2.3/§3 measured-update block | ✅ drafted above |
 | scoped test run (`-p qlab-air -p qlab-note` full, `-p qlab-bench l2` filtered) | ✅ **140 distinct tests / 0 failed** (141 result lines; the b2 pin ran twice) — `qlab-air` 95/0 (2,539 s), `qlab-note` 39/0, `qlab-bench` `l2` 5/0 + the skipped P b4 prover test 2/0 on its own; peak sampled 8.0 / 13.8 GB (`docs/w3-run4.md`) |
 | workspace suite | **NOT RUN — runner offline** (owed) |
+
+# Baton 3 (the CI bar — make the L2 test block fit 120 lane-minutes; Multica QUM-183)
+
+Fresh session, the branch is the memory. Read in order: CLAUDE.md (agents run NO `cargo test` on
+the rig — `cargo check` / `clippy` only; the lane is the bar), #700's 2026-09-23 ruling "The CI bar
+TIMED OUT on this branch" (the measured table, the budget, rules (a)–(d)), the stage-1/2 posts,
+this file, and the stamped console of run 35812033360. Same worktree (`../qumbra-lab-w3`, moved
+from the finished QUM-182 checkout), same PR #701, never merged by this session. **Nothing in this
+baton ran locally beyond `cargo check` / `cargo clippy`; every number below that is not a
+projection comes from the lane's stamped console.**
+
+## The ruling's rows, checked on `affa388` + the stamped console
+
+| the ruling says | what I found |
+|---|---|
+| 62 `l2::`/`l2p::` tests, 112.4 min; `qlab-air` legacy 5.5 min; 95/0 in 6,899 s | ✅ from the console: `l2::` 02:54:11→03:33:01 = 38.8 min (26 tests), `l2p::` →04:45:40 = 72.6 min (31 tests), `narrow`+`reference` →04:49:10 = 3.5 min (this run; the 5.5 is the ruling's figure) |
+| "each test regenerates a full trace and evaluates all constraints" | ✅ `sat()` = `generate_trace` + `check_all_constraints(…, Some(10))` per call; a 2^19 call ≈ 16 s, a 2^20 call ≈ 35 s |
+| the ten `l2p_s_*` re-runs ≈ 47 min | ✅ 03:53:51→04:42:09 = 48.3 min |
+| (a) one honest trace per module, negatives tamper a clone | ⚠️ **half-buildable**: the honest trace and its verdict are shared (`OnceLock` fixtures — the trace for public-value tampers, the verdict for every precondition); but a **witness** tamper cannot be a trace clone — a poked cell is refused by the Keccak round constraints, not by the binding the negative exists to test (the mint's forgery-shape standard: republish the matching commitment so only the bank can refuse). Witness tampers regenerate from the forged witness |
+| (b) `first_violation` early exit, "the violation sits at the tamper site, so most negatives become seconds" | ⚠️ **premise corrected, posted on #700 before the code**: a perm is 3,072 rows, the S program is 70 % of the trace and P's 62 %, the balance close is perm 118/120 and 210/212 — a lowest-row early exit on a balance tamper still scans ~70 %. Built as a *parallel* scanner (rayon, 8 vCPUs idle under `--test-threads=1`) that visits the **program's tail first, then its head** |
+| (c) collapse the ten `l2p_s_*` into one shared-fixture test; both q-lie tests' 2 × 8 on the shared fixture | ✅ `l2p_s_negatives_hold_on_shape_p` (S1–S10 named per tamper); `l2_neg_q_lie_is_unsat_both_ways` and S7 run on the `same_asset` / `fee_on_input_2` fixtures |
+| (d) statements, widths, locks, tamper list do not move | ✅ `l2.rs`/`l2p.rs` non-test diff = one `#[cfg_attr(test, derive(Clone))]` line per struct (four structs); the six L1 locks an empty diff; every tamper of stage 1/2 present by name in a message |
+| budget ≤ 12 min `l2`+`l2p`, ≤ 3 min `l2note`+`l2shape` | projection below; `l2note`+`l2shape` untouched (63 s on the truncated run) |
+
+## What was built (`crates/qlab-air/src/l2test.rs`, `#[cfg(test)]`, + the two test modules)
+
+- **`l2test::scan(air, trace, pvs, program_end: Option<usize>) -> Option<Violation>`** — p3-air 0.6.1's
+  `check_constraints` row loop verbatim (same `DebugConstraintBuilder`, selectors, wrap-around next
+  row), run over 2,048-row chunks on rayon; **stops at the first violation any worker finds** (one
+  violated constraint is the whole UNSAT claim), returns `None` only after every row was evaluated
+  (the whole SAT claim). The hint only orders the chunks: program tail-first interleaved with the head
+  (`last, first, last−1, second, …`), padding last. The periodic columns are built once per scan, not
+  once per row (p3's `periodic_values` rebuilds all 40 per row). `satisfied` / `assert_satisfied`
+  (positives) and `first_violation` (negatives) are the two names over it.
+- **Agreement with p3 pinned** (`l2test_scanner_agrees_with_p3_on_a_satisfied_trace`,
+  `l2test_scanner_reports_a_violation_p3_reports`): chain-only traces of both AIRs SAT under
+  `check_constraints` ⇒ `scan` returns `None` in both orders; a corrupted cell ⇒ `scan` returns a
+  `(row, constraint, label)` that `check_all_constraints` also lists, in three orders. Plus the chunk
+  order (`…is_a_permutation_tail_first`) and `fan_out` ordering.
+- **`l2test::fan_out(items, cap, f)`** — the eight `(o1a, o2a, f1)` assignments (`assignments_that_verify_at`)
+  regenerate their trace (the selectors feed the balance accumulators and carries, computed by the
+  generator in one row pass — not mine to refactor), **four at a time**, each trace dropped after its
+  scan: peak ≈ 4 × 3.24 GB + the P fixture 3.24 + the S fixture 1.47 ≈ **18 GB** on the 30 GB runner.
+- **Fixtures**: `l2` — `honest` (trace resident), `same_asset`, `fee_on_input_2`, `dummy1` (verdict
+  only); `l2p` — `honest` (trace resident), `same_asset`, `fee_on_input_2`, `regulated`, `mint100`.
+  Three positives that were fresh instances with their own seed now read a fixture with the same
+  values: P's `q2` (seed `0x0a11_0777` → `same_asset` `0x5c05_0008`), `wrong_sibling`'s `reg`
+  (`0x51b1_0001` → `regulated` `0x9e90_0001`), and S6's `both` (`0x5c05_0006` → the honest fixture).
+  Same statement, one full scan instead of two.
+- **Dev-dependency** `p3-maybe-rayon = "=0.6.1"` with `parallel` on `qlab-air` (already in the lock
+  through `qlab-bench`; the lock gains the edge — the lane runs `--locked`, `cargo check --locked` green).
+
+## Test inventory: `qlab-air` 95 → **90**
+
+`l2::` 26 (unchanged names), `l2p::` 31 → **22** (the ten `l2p_s_*` → `l2p_s_negatives_hold_on_shape_p`),
+`l2test::` **+4**, `narrow` 37, `reference` 1. Workspace expectation: 1 set of 144 changes count by
+−5; the reconciliation's baseline is the last green legacy run + this delta.
+
+## Projection [derived from the stamped per-test deltas of run 35812033360; the lane rules]
+
+Per call on the m7g.2xlarge: S generation ≈ 1.2 s, S full scan 15 s → ≈ 2 s at 8×; P generation
+≈ 3 s, P full scan 32 s → ≈ 4.5 s. Floor = the full scans: ≈ 14 at S (3.4 s) + ≈ 16 at P (7.5 s)
+≈ 3 min. Negatives: S ≈ 15 fan-outs × 2 batches × 1.5 s + singles ≈ 1 min; P ≈ 13 × 2 × 3.5 +
+singles ≈ 3 min. **≈ 7–8 min `l2` + `l2p`** if the scan parallelises ≈ 8×; ≈ 9–10 at 5×.
