@@ -116,6 +116,25 @@ pub struct StoredTx {
     /// its own additive log variant and keeps the frozen legacy layout for
     /// everything else. See `persist::WireRecord`.
     pub rider: Vec<u8>,
+    /// The transaction's L2 surface (lab #708) — **in-memory only**: never
+    /// written by an L1 layout (`serde(skip)`, so every L1 byte and both genesis
+    /// hashes are unchanged); the Annulet log record (B2b) writes it explicitly.
+    /// Absent is `[0x00]`, as on `TxEntry`.
+    #[serde(skip, default = "l2_absent")]
+    pub l2: Vec<u8>,
+}
+
+fn l2_absent() -> Vec<u8> {
+    qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec()
+}
+
+/// What an Annulet block carries beyond the L1 stored mirror (lab #708 Q2):
+/// the header extension and, for every block but genesis, the seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnuletStoredSeal {
+    pub ext: qlab_devnet::annulet::AnnuletHeaderFields,
+    /// `None` only for the (unsealed) genesis block.
+    pub sig: Option<Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]>>,
 }
 
 /// The bucket a persisted `bucket_actions` value names. **Strict since lab
@@ -150,7 +169,7 @@ impl From<&TxEntry> for StoredTx {
             t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT,
             "the L1 StoredTx cannot represent an L2-surface transaction (lab #706)"
         );
-        Self {
+        Self { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
             anchor: t.public.anchor,
             nullifiers: t.public.nullifiers.clone(),
             commitments: t.public.commitments.clone(),
@@ -193,6 +212,12 @@ pub struct StoredBlock {
     /// this field cannot rebuild the commitment tree. Adding it is an
     /// incompatible on-disk change, hence `persist::FORMAT_VERSION = 2`.
     pub coinbase_rkm: [u64; 4],
+    /// Present exactly on an Annulet net's blocks (lab #708) — **in-memory
+    /// only** (`serde(skip)`): no L1 layout writes it, and the L1 log refuses a
+    /// block carrying it (`persist::WireRecord::from`); the Annulet log record
+    /// (B2b) writes it explicitly.
+    #[serde(skip)]
+    pub annulet: Option<AnnuletStoredSeal>,
 }
 
 impl StoredBlock {
@@ -200,7 +225,7 @@ impl StoredBlock {
     pub fn from_parts(header: &BlockHeader, body: &BlockBody) -> Self {
         let (coinbase, coinbase_rkm) =
             body.single_payee_parts().expect("accepted body is at the current cap");
-        Self {
+        Self { annulet: None,
             header: header.into(),
             txs: body.txs.iter().map(StoredTx::from).collect(),
             coinbase,

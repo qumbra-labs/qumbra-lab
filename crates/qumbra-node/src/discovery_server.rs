@@ -1905,7 +1905,7 @@ mod tests {
     // ---- the incremental projection -----------------------------------------
 
     fn stored(height: u64, prev: Hash32, discovery: Vec<Vec<u8>>) -> StoredBlock {
-        StoredBlock {
+        StoredBlock { annulet: None,
             header: StoredHeader {
                 height,
                 prev,
@@ -1916,7 +1916,7 @@ mod tests {
             },
             txs: discovery
                 .into_iter()
-                .map(|d| StoredTx {
+                .map(|d| StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                     anchor: [0; 32],
                     nullifiers: vec![],
                     commitments: vec![],

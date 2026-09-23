@@ -173,12 +173,12 @@ impl From<WireRecord> for LogRecord {
         match rec {
             WireRecord::Finalize(h) => LogRecord::Finalize(h),
             WireRecord::BlockV4(b) => LogRecord::Block(b),
-            WireRecord::Block(l) => LogRecord::Block(StoredBlock {
+            WireRecord::Block(l) => LogRecord::Block(StoredBlock { annulet: None,
                 header: l.header,
                 txs: l
                     .txs
                     .into_iter()
-                    .map(|t| crate::store::StoredTx {
+                    .map(|t| crate::store::StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                         anchor: t.anchor,
                         nullifiers: t.nullifiers,
                         commitments: t.commitments,
@@ -727,7 +727,7 @@ mod tests {
     // --- lab #367: the rider's on-disk story --------------------------------
 
     fn a_stored_block(rider: Vec<u8>) -> StoredBlock {
-        StoredBlock {
+        StoredBlock { annulet: None,
             header: crate::store::StoredHeader {
                 prev: h(0x11),
                 height: 9_000,
@@ -736,7 +736,7 @@ mod tests {
                 nonce: 7,
                 tx_body_commitment: h(0x22),
             },
-            txs: vec![crate::store::StoredTx {
+            txs: vec![crate::store::StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 anchor: h(0x33),
                 nullifiers: vec![h(0x44)],
                 commitments: vec![h(0x55)],

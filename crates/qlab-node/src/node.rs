@@ -2201,7 +2201,7 @@ mod tests {
         let honest = BlockBody::from_single_payee(vec![tx([9u8; 32], 4)], 0, [0; 4]);
         let header = child_committing_to(&g_header, &honest);
         // …but whose persisted body is not that body.
-        let tampered = StoredBlock {
+        let tampered = StoredBlock { annulet: None,
             header: StoredHeader::from(&header),
             txs: Vec::new(),
             coinbase: 0,
@@ -2270,7 +2270,7 @@ mod tests {
         let honest2 = BlockBody::from_single_payee(vec![tx(root, 6)], 0, [0; 4]);
         let h2 = child_committing_to(&g_header, &honest2);
         let tampered =
-            StoredBlock {
+            StoredBlock { annulet: None,
                 header: StoredHeader::from(&h2),
                 txs: Vec::new(),
                 coinbase: 0,
@@ -2315,7 +2315,7 @@ mod tests {
         // takes it — whose stored body is not the body its header commits to.
         let honest2 = BlockBody::from_single_payee(vec![tx(root, 8)], 0, [0; 4]);
         let h2 = child_committing_to(&h1, &honest2);
-        let tampered = StoredBlock {
+        let tampered = StoredBlock { annulet: None,
             header: StoredHeader::from(&h2),
             txs: Vec::new(),
             coinbase: 0,
@@ -2534,7 +2534,7 @@ mod tests {
         let mk = |parent: &BlockHeader, nf: u8| {
             let body = BlockBody::from_single_payee(vec![tx([9u8; 32], nf)], 0, [0; 4]);
             let header = child_committing_to(parent, &body);
-            let stored = StoredBlock {
+            let stored = StoredBlock { annulet: None,
                 header: StoredHeader::from(&header),
                 txs: body.txs.iter().map(|t| t.into()).collect(),
                 coinbase: 0,
