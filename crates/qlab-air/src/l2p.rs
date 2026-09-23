@@ -14,11 +14,13 @@
 //! gated by the registry leaf's `mode`:
 //!
 //! - **freeze non-membership**, gadget (a) as RULED: an indexed (sorted) Merkle
-//!   tree of depth 20 over frozen `rkm` values. The prover opens the **low
-//!   leaf** `(key_lo, key_hi)` and proves `key_lo < rkm < key_hi` as two 256-bit
-//!   comparisons, **bit-serial on `AFRZ`'s boundary rows** — `rkm` arrives there
-//!   as the chained digest `a[0..4]` (the perm before is `ARKM`), `key_lo` rides
-//!   `W0..3` and `key_hi` `W5..8`, all three on the same 64 rows. The leaf is
+//!   tree of depth 20 over frozen **keys** `K = H(rkm ‖ D_FRZ)` (lab #704 Q1:
+//!   hashed, so a published freeze list does not hand out addresses). The
+//!   prover opens the **low leaf** `(key_lo, key_hi)` and proves
+//!   `key_lo < K < key_hi` as two 256-bit comparisons, **bit-serial on
+//!   `AFRZ`'s boundary rows** — `K` arrives there as the chained digest
+//!   `a[0..4]` (the perms before are `ARKM` → `AFKEY`), `key_lo` rides `W0..3`
+//!   and `key_hi` `W5..8`, all three on the same 64 rows. The leaf is
 //!   hashed by `AFRZ` and folded by 20 `MERKLE` steps; the fold's root arrives
 //!   as the chained digest at **`AREG`'s boundary rows**, where the leaf's
 //!   `freeze_root` lanes `W5..8` sit — a same-row bit-serial equality, zero
@@ -46,26 +48,26 @@
 //!   (the ruling's "Cloaked-with-vPublic=0"; §3.6's "issuer with mint only"
 //!   parenthetical is NOT built — recorded in the build notes as a finding).
 //!
-//! ### Program order (per input `k`; 102 perms each, 212 in all → 2^20)
+//! ### Program order (per input `k`; 103 perms each, 214 in all → 2^20)
 //!
 //! ```text
 //! [DUMMY]
-//! ANK → NF → BNF_k → AISS → ARKM → AFRZ → 20×MERKLE → AREG → 16×MERKLE → BREG
+//! ANK → NF → BNF_k → AISS → ARKM → AFKEY → AFRZ → 20×MERKLE → AREG → 16×MERKLE → BREG
 //!     → ARKM′ → ACRED → 20×MERKLE → BALLOW → ARKM″ → ACM → 32×MERKLE → BANCHOR   (×2)
 //! ACMOUT_0 → BCM1 → ARHO → ACMOUT_1 → BCM2 → BAL → END
 //! ```
 //!
 //! **Why three `ARKM`s and how they are bound.** The Keccak chain carries one
-//! digest; the freeze comparison, the credential hash and the note block each
+//! digest; the freeze key, the credential hash and the note block each
 //! need `rkm` chained at their boundary, so `rkm` is derived three times. The
 //! second and third (`ROLE_ARKM2`, no bank-1 legs) have free inputs, and their
 //! **outputs** are bound to the first's through two sequential equality windows
-//! on banks that are idle in the input chain: `rkm@AFRZ − rkm′@ACRED` on the
+//! on banks that are idle in the input chain: `rkm@AFKEY − rkm′@ACRED` on the
 //! third bank (`EQ3`, idle until the outputs), `rkm′@ACRED − rkm″@ACM` on the
 //! bind bank (idle between `BREG` and `BANCHOR`). No new accumulator: every
 //! cross-row binding in shape P rides an existing bank's idle span.
 //!
-//! ### Column accounting over `L2_WIDTH = 702` (+72 → 774) — see
+//! ### Column accounting over `L2_WIDTH = 702` (+76 → 778; +72 → 774 before lab #704 Q1) — see
 //! `l2p_trace_width_is_read_off_the_matrix`, every column named.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -108,20 +110,21 @@ const R_OFF: usize = UU_OFF + 10; // 371
 const B_OFF: usize = R_OFF + 24; // 395
 const PB_OFF: usize = B_OFF + 7; // 402
 const PH_OFF: usize = PB_OFF + 24; // 426
-/// 53 limbs × 4 slots = 212 program slots: exactly the shape-P program (no
-/// spare slot — the shape is fixed; a perm at a fixed height costs nothing,
-/// a ring limb costs a column).
-const PR_LIMBS: usize = 53;
+/// 54 limbs × 4 slots = 216 program slots: the 214-perm shape-P program plus
+/// two spare `DUMMY` slots (the shape is fixed; a perm at a fixed height costs
+/// nothing, a ring limb costs a column — lab #704 Q1 added the `AFKEY` perm
+/// per input, 212 → 214, one limb over the old exact fit).
+const PR_LIMBS: usize = 54;
 const PR_OFF: usize = PH_OFF + 4; // 430
 const ROLE_BITS: usize = 5;
 const D_OFF: usize = PR_OFF + PR_LIMBS; // 483
 const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 503
 const LO_OFF: usize = RB_OFF + ROLE_BITS; // 508
-/// Shape S's 16 role selectors + AISS, AFRZ, ACRED, BALLOW, ARKM2.
-const NSEL: usize = 21;
+/// Shape S's 16 role selectors + AISS, AFRZ, ACRED, BALLOW, ARKM2, AFKEY.
+const NSEL: usize = 22;
 const SEL_OFF: usize = LO_OFF + 4; // 512
-/// [mrk+nf, ank, arkm+arkm2, acm, acmout, arho, areg, aiss, afrz, acred]
-const NINJ: usize = 10;
+/// [mrk+nf, ank, arkm+arkm2, acm, acmout, arho, areg, aiss, afrz, acred, afkey]
+const NINJ: usize = 11;
 const INJ_OFF: usize = SEL_OFF + NSEL; // 533
 const G4_COL: usize = INJ_OFF + NINJ; // 543
 const PBIT_COL: usize = G4_COL + 1; // 544
@@ -173,11 +176,11 @@ const SG_OFF: usize = CQ_OFF + 2; // 716
 const BL2_OFF: usize = SG_OFF + 2; // 718
 const BLC2_OFF: usize = BL2_OFF + 4; // 722
 /// Shape S's width, reproduced here with the ring/selector/injection growth:
-/// 702 + 21 + 5 + 3 = 731.
+/// 702 + 22 + 6 + 4 = 734.
 const S_END: usize = BLC2_OFF + 9; // 731
 // --- shape P additions ---
-/// `inj(afrz) · ep` — the third bank's `+rkm` leg (and the comparison's
-/// assertion gate).
+/// `inj(afrz) · ep` — the comparison's assertion gate (the chained digest on
+/// `AFRZ`'s boundary is the freeze key `H(rkm ‖ D_FRZ)`, lab #704 Q1).
 const INJ_AFRZE_COL: usize = S_END; // 731
 /// `inj(acred) · ep` — the third bank's `−rkm′` leg and the bind bank's `+rkm′`.
 const INJ_ACREDE_COL: usize = INJ_AFRZE_COL + 1; // 732
@@ -191,12 +194,16 @@ const EGBC_COL: usize = EGB_COL + 1; // 735
 const AREGE_COL: usize = EGBC_COL + 1; // 736
 /// `AREGE · RQ` — the AISS window's gated close.
 const CRQ_COL: usize = AREGE_COL + 1; // 737
-/// Two 256-bit comparisons, bit-serial: `key_lo < rkm` (block 0) and
-/// `rkm < key_hi` (block 1). Per block: 4 running `LT` flags, 4 running `EQ`
+/// `inj(afkey) · ep` — the third bank's `+rkm` leg: `rkm` is the chained
+/// digest on `AFKEY`'s boundary (lab #704 Q1 moved the leg here from `AFRZ`,
+/// whose boundary now carries the hashed key).
+const INJ_AFKEYE_COL: usize = CRQ_COL + 1; // 738
+/// Two 256-bit comparisons, bit-serial: `key_lo < K` (block 0) and
+/// `K < key_hi` (block 1), `K = H(rkm ‖ D_FRZ)` the freeze key. Per block: 4 running `LT` flags, 4 running `EQ`
 /// flags (one per lane, LSB → MSB over z), and 3 materialized lane-combines
 /// `C1 = LT1 + EQ1·LT0`, `C2 = LT2 + EQ2·C1`, `C3 = LT3 + EQ3·C2` — `C3` at
 /// z = 63 is the 256-bit verdict.
-const CMP_OFF: usize = CRQ_COL + 1; // 738
+const CMP_OFF: usize = INJ_AFKEYE_COL + 1; // 739
 const CMP_BLOCK: usize = 11;
 const CMP_LT: usize = 0;
 const CMP_EQ: usize = 4;
@@ -216,19 +223,20 @@ const POL_RQ: usize = 12;
 const POL_ALW: usize = 13;
 
 /// The shape-P trace width.
-pub const L2P_WIDTH: usize = POL_OFF + 14; // 774
+pub const L2P_WIDTH: usize = POL_OFF + 14; // 778
 
 /// Program slots (= perm slots per program period).
-pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 212
+pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 216
 
 // Role codes 0..=16 are `l2.rs`'s (re-exported through the imports above);
-// 17..=21 are shape P's.
+// 17..=22 are shape P's.
 /// `issuer_key = H(isk ‖ D_I)`: isk = W0..4, D_I at lane 4 bit 7, pad at lane 5.
 pub const ROLE_AISS: u32 = 17;
 /// Freeze low leaf `H(key_lo ‖ key_hi)`: key_lo = W0..4 at lanes 0..4, key_hi
 /// = W5..9 at lanes 4..8, leaf marker at lane 8 bit 3 (≠ the Merkle node's
 /// pad at bit 0, so a leaf never collides with an interior node). The chained
-/// digest `a[0..4]` on its boundary rows is `rkm` — compared, not absorbed.
+/// digest `a[0..4]` on its boundary rows is the freeze key
+/// `K = H(rkm ‖ D_FRZ)` (from `AFKEY`) — compared, not absorbed.
 pub const ROLE_AFRZ: u32 = 18;
 /// `cred = H(rkm ‖ D_CRED)`: rkm = chained a[0..4], D_CRED at lane 4 bit 15,
 /// pad at lane 5.
@@ -238,6 +246,12 @@ pub const ROLE_ACRED: u32 = 19;
 pub const ROLE_BALLOW: u32 = 20;
 /// `rkm` re-derivation: `ARKM`'s message, no bank-1 legs.
 pub const ROLE_ARKM2: u32 = 21;
+/// The freeze key `K = H(rkm ‖ D_FRZ)`: rkm = chained a[0..4], **D_FRZ at
+/// lane 4 bit 31**, pad at lane 5 — `ACRED`'s block with the next domain bit
+/// (D_I = bit 7, D_CRED = bit 15, D_FRZ = bit 31; lab #704 Q1). The freeze
+/// tree is keyed by `K`, never by the raw `rkm`: a published freeze list
+/// tells a reader nothing about an address it does not already hold.
+pub const ROLE_AFKEY: u32 = 22;
 
 const SEL_CODES: [u32; NSEL] = [
     ROLE_MERKLE,
@@ -261,6 +275,7 @@ const SEL_CODES: [u32; NSEL] = [
     ROLE_ACRED,
     ROLE_BALLOW,
     ROLE_ARKM2,
+    ROLE_AFKEY,
 ];
 const SEL_ARHO: usize = 13;
 const SEL_AREG: usize = 14;
@@ -270,9 +285,11 @@ const SEL_AFRZ: usize = 17;
 const SEL_ACRED: usize = 18;
 const SEL_BALLOW: usize = 19;
 const SEL_ARKM2: usize = 20;
+const SEL_AFKEY: usize = 21;
 const INJ_AISS: usize = 7;
 const INJ_AFRZ: usize = 8;
 const INJ_ACRED: usize = 9;
+const INJ_AFKEY: usize = 10;
 
 /// Registry `flags` bit 0: holders may redeem without the issuer key.
 pub const FLAG_REDEEM_OPEN: u64 = 1;
@@ -685,6 +702,7 @@ where
         builder.assert_eq(local[INJ_OFF + INJ_AISS].clone(), bnd.clone() * sel_role(SEL_AISS));
         builder.assert_eq(local[INJ_OFF + INJ_AFRZ].clone(), bnd.clone() * sel_role(SEL_AFRZ));
         builder.assert_eq(local[INJ_OFF + INJ_ACRED].clone(), bnd.clone() * sel_role(SEL_ACRED));
+        builder.assert_eq(local[INJ_OFF + INJ_AFKEY].clone(), bnd.clone() * sel_role(SEL_AFKEY));
         builder.assert_eq(
             local[G4_COL].clone(),
             blast.clone() * local[PB_OFF + 1].clone() * local[PH_OFF + 1].clone(),
@@ -784,6 +802,14 @@ where
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
+            // AFKEY: rkm chained, D_FRZ = lane 4 bit 31, pad at lane 5.
+            let msg_afkey: AB::Expr = match l {
+                0..=3 => a(l),
+                4 => sel(5),
+                5 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
             let expr = a(l)
                 + inj(0) * (msg_mrk - a(l))
                 + inj(1) * (msg_ank - a(l))
@@ -794,7 +820,8 @@ where
                 + inj(6) * (msg_areg - a(l))
                 + inj(INJ_AISS) * (msg_aiss - a(l))
                 + inj(INJ_AFRZ) * (msg_afrz - a(l))
-                + inj(INJ_ACRED) * (msg_acred - a(l));
+                + inj(INJ_ACRED) * (msg_acred - a(l))
+                + inj(INJ_AFKEY) * (msg_afkey - a(l));
             builder.assert_eq(eff(l), expr);
         }
 
@@ -1047,6 +1074,7 @@ where
         // Shape-P gate columns.
         builder.assert_eq(local[INJ_AFRZE_COL].clone(), inj(INJ_AFRZ) * ep.clone());
         builder.assert_eq(local[INJ_ACREDE_COL].clone(), inj(INJ_ACRED) * ep.clone());
+        builder.assert_eq(local[INJ_AFKEYE_COL].clone(), inj(INJ_AFKEY) * ep.clone());
         builder.assert_eq(
             local[CLOSE_CRED_COL].clone(),
             gperm.clone() * sel_role(SEL_ACRED) * ep.clone(),
@@ -1074,7 +1102,8 @@ where
         }
 
         // --- The two 256-bit comparisons, bit-serial (LSB → MSB over z) ---
-        // Block 0: key_lo (W0..3) < rkm (a); block 1: rkm (a) < key_hi (W5..8).
+        // Block 0: key_lo (W0..3) < K (a); block 1: K (a) < key_hi (W5..8),
+        // K = H(rkm ‖ D_FRZ) the chained digest on AFRZ's boundary.
         // Per lane: LT_z = (1−x)·y + (1 − x − y + 2xy)·LT_{z−1}, EQ_z = EQ_{z−1}·(1 − x − y + 2xy),
         // seeded at z = 0 (same-row, `sel(0)`), advanced on M rows z < 63
         // (transition), free on T rows and at the M → T edge. The lane
@@ -1359,7 +1388,7 @@ where
             t.assert_eq(next[DV_COL].clone(), local[DV_COL].clone());
         }
         // The output-1 marker and the third bank: S's legs, plus the rkm
-        // window (+a at AFRZ's boundary, −a at ACRED's; reset at ACRED's end).
+        // window (+a at AFKEY's boundary, −a at ACRED's; reset at ACRED's end).
         {
             let arho_close =
                 local[EG3_OFF + 2].clone() * local[SEL_OFF + SEL_ARHO].clone();
@@ -1381,7 +1410,7 @@ where
                             - local[EG3_OFF + 1].clone()
                                 * per[35 + j].clone()
                                 * local[A_OFF + l].clone()
-                            + local[INJ_AFRZE_COL].clone()
+                            + local[INJ_AFKEYE_COL].clone()
                                 * per[35 + j].clone()
                                 * local[A_OFF + l].clone()
                             - local[INJ_ACREDE_COL].clone()
@@ -1463,6 +1492,18 @@ pub fn cred_of(rkm: &[u64; 4]) -> [u64; 4] {
     crate::reference::keccak_f(&st)[..4].try_into().unwrap()
 }
 
+/// The freeze key `K = H(rkm ‖ D_FRZ)` — the `ROLE_AFKEY` block (D_FRZ = lane 4
+/// bit 31, pad at lane 5). The freeze tree's keys are these, never raw `rkm`s
+/// (lab #704 Q1).
+pub fn freeze_key_of(rkm: &[u64; 4]) -> [u64; 4] {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(rkm);
+    st[4] = 1 << 31;
+    st[5] = 1;
+    st[16] = 1 << 63;
+    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
+}
+
 /// The indexed-Merkle low leaf `H(key_lo ‖ key_hi)` — the `ROLE_AFRZ` block
 /// (leaf marker at lane 8 bit 3, distinct from the interior node's pad).
 pub fn freeze_leaf_hash(key_lo: &[u64; 4], key_hi: &[u64; 4]) -> [u64; 4] {
@@ -1501,7 +1542,7 @@ pub fn key_lt(a: &[u64; 4], b: &[u64; 4]) -> bool {
 }
 
 /// The indexed tree's "no successor" sentinel: `key_hi = 2^256 − 1`. Strict
-/// `rkm < key_hi` then only excludes `rkm = MAX` (a hash output; negligible).
+/// `K < key_hi` then only excludes `K = MAX` (a hash output; negligible).
 pub const KEY_MAX: [u64; 4] = [u64::MAX; 4];
 
 /// A depth-20 authentication path (freeze tree and allowlist share the shape).
@@ -1594,8 +1635,9 @@ pub struct FreezeOpening {
 }
 
 /// An issuer's freeze tree (l2-own-circuit-decision §3.2), indexed/sorted:
-/// leaves `(k_i, k_{i+1})` over the sorted frozen keys with a `(0, k_1)` head
-/// and a `(k_n, MAX)` tail; the empty tree is the single leaf `(0, MAX)`.
+/// leaves `(k_i, k_{i+1})` over the sorted frozen **keys** `k = H(rkm ‖ D_FRZ)`
+/// ([`freeze_key_of`]) with a `(0, k_1)` head and a `(k_n, MAX)` tail; the
+/// empty tree is the single leaf `(0, MAX)`.
 #[derive(Clone)]
 pub struct FreezeTree {
     pub leaves: Vec<([u64; 4], [u64; 4])>,
@@ -1604,8 +1646,16 @@ pub struct FreezeTree {
 }
 
 impl FreezeTree {
-    pub fn new(frozen: &[[u64; 4]], seed: u64) -> Self {
-        let mut keys: Vec<[u64; 4]> = frozen.to_vec();
+    /// Freeze the addresses owning `frozen_rkms` — each is hashed to its key.
+    pub fn new(frozen_rkms: &[[u64; 4]], seed: u64) -> Self {
+        let keys: Vec<[u64; 4]> = frozen_rkms.iter().map(freeze_key_of).collect();
+        Self::from_keys(&keys, seed)
+    }
+
+    /// A tree over already-hashed keys — what an issuer publishes, and what a
+    /// wallet rebuilds its own witness from.
+    pub fn from_keys(frozen_keys: &[[u64; 4]], seed: u64) -> Self {
+        let mut keys: Vec<[u64; 4]> = frozen_keys.to_vec();
         keys.sort_by(|a, b| {
             if key_lt(a, b) {
                 core::cmp::Ordering::Less
@@ -1631,10 +1681,11 @@ impl FreezeTree {
         Self::new(&[], 0x0f7e_e2e0_0000_0001)
     }
 
-    /// The low leaf for `rkm`, or `None` when `rkm` is frozen (a key).
+    /// The low leaf for `rkm`'s key, or `None` when `rkm` is frozen.
     pub fn opening_for(&self, rkm: &[u64; 4]) -> Option<FreezeOpening> {
+        let k = freeze_key_of(rkm);
         for (i, (lo, hi)) in self.leaves.iter().enumerate() {
-            if key_lt(lo, rkm) && key_lt(rkm, hi) {
+            if key_lt(lo, &k) && key_lt(&k, hi) {
                 return Some(FreezeOpening { key_lo: *lo, key_hi: *hi, witness: self.witnesses[i] });
             }
         }
@@ -1787,10 +1838,11 @@ pub struct L2PBucketInstance {
 }
 
 /// Perm slots used by the shape-P program, INCLUDING the leading dummy
-/// warm-up slot: 1 + 2 × 102 + 7 = **212**, at 3072 rows each = 651,264 rows
-/// → 2^20 (1,048,576), 129 spare perm slots (62 % used).
+/// warm-up slot: 1 + 2 × 103 + 7 = **214**, at 3072 rows each = 657,408 rows
+/// → 2^20 (1,048,576), 127 spare perm slots (63 % used). (212 before lab #704
+/// Q1 added `AFKEY` per input.)
 pub const SHAPE_P_PERMS: usize = 1
-    + 2 * (3 + 1 + 1 + 1 + FREEZE_DEPTH + 1 + REGISTRY_DEPTH + 1 + 1 + 1 + ALLOW_DEPTH + 1 + 1 + 1 + MERKLE_DEPTH + 1)
+    + 2 * (3 + 1 + 1 + 1 + 1 + FREEZE_DEPTH + 1 + REGISTRY_DEPTH + 1 + 1 + 1 + ALLOW_DEPTH + 1 + 1 + 1 + MERKLE_DEPTH + 1)
     + 2 * 2
     + 1
     + 2;
@@ -1854,6 +1906,8 @@ pub fn build_bucket_l2p_with_witnesses(
         sw[slot].w[..4].copy_from_slice(&pol.isk);
         slot += 1;
         arkm(&mut program, &mut sw, &mut slot, ROLE_ARKM);
+        program[slot] = ROLE_AFKEY;
+        slot += 1;
         program[slot] = ROLE_AFRZ;
         sw[slot].w[..4].copy_from_slice(&pol.freeze.key_lo);
         sw[slot].w[5..9].copy_from_slice(&pol.freeze.key_hi);
@@ -2214,6 +2268,13 @@ impl L2ShapePAir {
                         16 => z63,
                         _ => 0,
                     },
+                    ROLE_AFKEY => match l {
+                        0..=3 => a[l],
+                        4 => (z == 31) as u32,
+                        5 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
                     _ => a[l],
                 }
             });
@@ -2308,6 +2369,7 @@ impl L2ShapePAir {
             row[INJ_OFF + INJ_AISS] = F::from_u32(bndv * selv[SEL_AISS]);
             row[INJ_OFF + INJ_AFRZ] = F::from_u32(bndv * selv[SEL_AFRZ]);
             row[INJ_OFF + INJ_ACRED] = F::from_u32(bndv * selv[SEL_ACRED]);
+            row[INJ_OFF + INJ_AFKEY] = F::from_u32(bndv * selv[SEL_AFKEY]);
             let g4 = ((t % 128 == 127) as u32) * pb[1] * ph[1];
             row[G4_COL] = F::from_u32(g4);
             let gpermv = ((t % 128 == 127) as u32) * pb[1];
@@ -2387,6 +2449,7 @@ impl L2ShapePAir {
             // Shape-P gates and constants.
             let inj_afrze = bndv * selv[SEL_AFRZ] * ep;
             let inj_acrede = bndv * selv[SEL_ACRED] * ep;
+            let inj_afkeye = bndv * selv[SEL_AFKEY] * ep;
             let close_cred = gpermv * selv[SEL_ACRED] * ep;
             let egb = bndv * selv[SEL_BALLOW] * ep;
             let egbc = gpermv * selv[SEL_BALLOW] * ep;
@@ -2401,6 +2464,7 @@ impl L2ShapePAir {
             row[EGBC_COL] = F::from_u32(egbc);
             row[AREGE_COL] = F::from_u32(arege);
             row[CRQ_COL] = F::from_u32(crq);
+            row[INJ_AFKEYE_COL] = F::from_u32(inj_afkeye);
             for blk in 0..2 {
                 for l in 0..4 {
                     row[CMP_OFF + CMP_BLOCK * blk + CMP_LT + l] = F::from_u32(cmp_lt[blk][l]);
@@ -2536,7 +2600,7 @@ impl L2ShapePAir {
                     let idx = 4 * l + jc;
                     eq3[idx] += g3pos as i64 * wgt * wbit[5 + l] as i64
                         - g3neg as i64 * wgt * a[l] as i64
-                        + inj_afrze as i64 * wgt * a[l] as i64
+                        + inj_afkeye as i64 * wgt * a[l] as i64
                         - inj_acrede as i64 * wgt * a[l] as i64;
                 }
                 om = om * (1 - gpermv * selv[10]) + g3close * selv[SEL_ARHO];
@@ -2639,7 +2703,7 @@ mod tests {
 
     const ROWS_PER_PERM_LOCAL: usize = 24 * 128;
     /// Rows the shape-P program occupies — the scanner's tail-first hint
-    /// (the balance close is perm 210 of 212; see `l2test`).
+    /// (the balance close is perm 212 of 214; see `l2test`).
     const PROGRAM_END: usize = SHAPE_P_PERMS * ROWS_PER_PERM_LOCAL;
 
     fn zero_pvs() -> Vec<F> {
@@ -2886,12 +2950,19 @@ mod tests {
         program[4] = ROLE_AFRZ;
         sw[4].w[..4].copy_from_slice(&lo);
         sw[4].w[5..9].copy_from_slice(&hi);
+        program[5] = ROLE_ARKM2;
+        sw[5].w[..4].copy_from_slice(&nk);
+        sw[5].w[5] = inp.d[0];
+        sw[5].w[6] = inp.d[1];
+        program[6] = ROLE_AFKEY;
         let air = L2ShapePAir { log_height: 15, program, slot_witness: sw, ..L2ShapePAir::chain_only(15) };
         let trace = air.generate_trace::<F>(0);
         assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 2)), issuer_key_of(&ISK7), "AISS");
         assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 3)), rkm, "ARKM2 = rkm");
         assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 4)), cred_of(&rkm), "ACRED");
         assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 5)), freeze_leaf_hash(&lo, &hi), "AFRZ");
+        assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 7)), freeze_key_of(&rkm), "AFKEY = H(rkm ‖ D_FRZ)");
+        assert_ne!(freeze_key_of(&rkm), cred_of(&rkm), "D_FRZ ≠ D_CRED");
     }
 
     /// The bit-serial comparison: on `AFRZ`'s last boundary row the two
@@ -3009,8 +3080,9 @@ mod tests {
     // Column accounting and degree, in the q69 style.
     // -----------------------------------------------------------------------
 
-    /// The trace width `prove` is handed: **774**, accounted column by column
-    /// over shape S's 702. Asserted against the matrix.
+    /// The trace width `prove` is handed: **778**, accounted column by column
+    /// over shape S's 702 (774 before lab #704 Q1's `AFKEY`: +1 ring limb,
+    /// +1 selector, +1 injection, +1 gate). Asserted against the matrix.
     #[test]
     fn l2p_trace_width_is_read_off_the_matrix() {
         let air = L2ShapePAir::chain_only(10);
@@ -3018,10 +3090,10 @@ mod tests {
         assert_eq!(trace.width(), L2P_WIDTH, "width must be the matrix's own");
 
         const SHAPE_S: usize = 702;
-        let ring = 21; // PR ring 32 → 53 limbs (212 program slots)
-        let roles = 5 // sel(AISS), sel(AFRZ), sel(ACRED), sel(BALLOW), sel(ARKM2) — NSEL 16 → 21
-            + 3; // inj(AISS), inj(AFRZ), inj(ACRED)                              — NINJ 7 → 10
-        let gates = 7; // INJ_AFRZE, INJ_ACREDE, CLOSE_CRED, EGB, EGBC, AREGE, CRQ
+        let ring = 22; // PR ring 32 → 54 limbs (216 program slots, 214 used)
+        let roles = 6 // sel(AISS), sel(AFRZ), sel(ACRED), sel(BALLOW), sel(ARKM2), sel(AFKEY) — NSEL 16 → 22
+            + 4; // inj(AISS), inj(AFRZ), inj(ACRED), inj(AFKEY)                                — NINJ 7 → 11
+        let gates = 8; // INJ_AFRZE, INJ_ACREDE, CLOSE_CRED, EGB, EGBC, AREGE, CRQ, INJ_AFKEYE
         let comparisons = 2 * (4 + 4 + 3); // per 256-bit comparison: LT ×4, EQ ×4, C1..C3
         let policy = 2 * 6 // hy, rg, ropen, nz, vpinv, REQ — per input
             + 2; // RQ, ALW — the current-input muxes
@@ -3032,11 +3104,11 @@ mod tests {
             SHAPE_S + ring + roles + gates + comparisons + policy,
             "width must be 702 plus exactly the columns named above"
         );
-        assert_eq!(trace.width(), 774, "the shape-P width");
+        assert_eq!(trace.width(), 778, "the shape-P width");
         assert_eq!(crate::l2::L2_WIDTH, SHAPE_S, "the shape-S width this accounts over");
     }
 
-    /// The quotient degree does not move: max constraint degree **4** (the 21
+    /// The quotient degree does not move: max constraint degree **4** (the 22
     /// materialized role selectors, EG3[1], the 16 comparison transitions),
     /// 4 quotient chunks — the L1's ceiling exactly.
     #[test]
@@ -3053,27 +3125,29 @@ mod tests {
             *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
         }
         assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
-        // The deg-4 population, pinned: 21 role selectors + EG3[1] (S's 17
+        // The deg-4 population, pinned: 22 role selectors + EG3[1] (S's 17
         // pattern) + 16 comparison-flag transitions (`mrow · same · flag`,
         // the periodic gate counting one) + 16 bank-1 transitions (the
         // ALW-gated allowlist legs, `EGB · ALW · pw · a`) + the three gate
         // definitions CLOSE_CRED / EGB / EGBC (`gperm|bnd · sel · ep`).
         // Materializing those to ≤ 3 would cost 4–5 columns for no quotient
         // benefit (4 chunks either way) — recorded, not taken.
-        assert_eq!(hist.get(&4).copied().unwrap_or(0), 21 + 1 + 16 + 16 + 3, "deg-4 constraints");
+        assert_eq!(hist.get(&4).copied().unwrap_or(0), 22 + 1 + 16 + 16 + 3, "deg-4 constraints");
     }
 
-    /// Program geometry: 212 perms, fits 2^20, the per-input order.
+    /// Program geometry: 214 perms (+2 spare ring slots), fits 2^20, the
+    /// per-input order.
     #[test]
     fn l2p_program_geometry() {
         let inst = &honest_fixture().inst;
-        assert_eq!(SHAPE_P_PERMS, 212);
-        assert_eq!(PROGRAM_SLOTS, 212);
+        assert_eq!(SHAPE_P_PERMS, 214);
+        assert_eq!(PROGRAM_SLOTS, 216);
+        assert!(p_spare_slots_are_dummy(&honest_fixture().inst.air.program));
         assert!(SHAPE_P_PERMS * ROWS_PER_PERM_LOCAL <= 1 << SHAPE_P_LOG_HEIGHT);
         assert!(SHAPE_P_PERMS * ROWS_PER_PERM_LOCAL > 1 << (SHAPE_P_LOG_HEIGHT - 1), "P does not fit 2^19");
         let p = &inst.air.program;
         assert_eq!(p[0], ROLE_DUMMY);
-        let mut want = vec![ROLE_ANK, ROLE_NF, ROLE_BNF1, ROLE_AISS, ROLE_ARKM, ROLE_AFRZ];
+        let mut want = vec![ROLE_ANK, ROLE_NF, ROLE_BNF1, ROLE_AISS, ROLE_ARKM, ROLE_AFKEY, ROLE_AFRZ];
         want.extend(std::iter::repeat(ROLE_MERKLE).take(FREEZE_DEPTH));
         want.push(ROLE_AREG);
         want.extend(std::iter::repeat(ROLE_MERKLE).take(REGISTRY_DEPTH));
@@ -3082,12 +3156,16 @@ mod tests {
         want.extend([ROLE_BALLOW, ROLE_ARKM2, ROLE_ACM]);
         want.extend(std::iter::repeat(ROLE_MERKLE).take(MERKLE_DEPTH));
         want.push(ROLE_BANCHOR);
-        assert_eq!(want.len(), 102);
+        assert_eq!(want.len(), 103);
         assert_eq!(&p[1..1 + want.len()], &want[..], "input chain 1");
         want[2] = ROLE_BNF2;
         assert_eq!(&p[1 + want.len()..1 + 2 * want.len()], &want[..], "input chain 2");
         let tail = [ROLE_ACMOUT, ROLE_BCM1, ROLE_ARHO, ROLE_ACMOUT, ROLE_BCM2, ROLE_BAL, ROLE_END];
         assert_eq!(&p[1 + 2 * want.len()..SHAPE_P_PERMS], &tail[..]);
+    }
+
+    fn p_spare_slots_are_dummy(p: &[u32; PROGRAM_SLOTS]) -> bool {
+        p[SHAPE_P_PERMS..].iter().all(|r| *r == ROLE_DUMMY)
     }
 
     // -----------------------------------------------------------------------
@@ -3142,10 +3220,11 @@ mod tests {
         assert_eq!(n, 5);
         for i in 0..n {
             let opening = frozen7.freeze.opening_at(i);
-            let kind = if opening.key_hi == rkm1 {
-                "predecessor (key_hi = rkm)"
-            } else if opening.key_lo == rkm1 {
-                "successor (key_lo = rkm)"
+            let k1 = freeze_key_of(&rkm1);
+            let kind = if opening.key_hi == k1 {
+                "predecessor (key_hi = K)"
+            } else if opening.key_lo == k1 {
+                "successor (key_lo = K)"
             } else {
                 "unrelated leaf"
             };
@@ -3189,15 +3268,70 @@ mod tests {
     #[test]
     fn l2p_neg_low_leaf_range_lie() {
         let forged = honest_with_policy1(|pol, rkm, _| {
-            pol.freeze.key_lo = [rkm[0].wrapping_sub(1), rkm[1], rkm[2], rkm[3]];
-            pol.freeze.key_hi = [rkm[0].wrapping_add(1), rkm[1], rkm[2], rkm[3]];
+            let k = freeze_key_of(rkm);
+            pol.freeze.key_lo = [k[0].wrapping_sub(1), k[1], k[2], k[3]];
+            pol.freeze.key_hi = [k[0].wrapping_add(1), k[1], k[2], k[3]];
         });
-        assert_unsat(&forged, "a forged low leaf (range holds, not in the tree)");
-        let lo_lie = honest_with_policy1(|pol, rkm, _| pol.freeze.key_lo = *rkm);
-        assert_unsat(&lo_lie, "key_lo = rkm");
-        let hi_lie = honest_with_policy1(|pol, rkm, _| pol.freeze.key_hi = *rkm);
-        assert_unsat(&hi_lie, "key_hi = rkm");
+        assert_unsat(&forged, "a forged low leaf (range holds on K, not in the tree)");
+        let lo_lie = honest_with_policy1(|pol, rkm, _| pol.freeze.key_lo = freeze_key_of(rkm));
+        assert_unsat(&lo_lie, "key_lo = K");
+        let hi_lie = honest_with_policy1(|pol, rkm, _| pol.freeze.key_hi = freeze_key_of(rkm));
+        assert_unsat(&hi_lie, "key_hi = K");
     }
+
+    /// 🔴 **A raw-`rkm`-keyed witness** (lab #704 Q1 — the mutation check for
+    /// the hashed key): the issuer freezes input 1, so the genuine tree over
+    /// `K = H(rkm ‖ D_FRZ)` holds `(0, K)` and `(K, MAX)`. The prover opens the
+    /// genuine leaf whose range brackets the RAW `rkm` — exactly what a
+    /// raw-keyed circuit (W3 as built) accepted. It must be UNSAT: the key
+    /// compared on `AFRZ`'s boundary is `K`, which no leaf brackets.
+    #[test]
+    fn l2p_neg_raw_rkm_keyed_witness() {
+        let mut r = Rnd(0x1234_5678_9abc_def0);
+        let inputs = [r.input(100, 0), r.input(50, 7)];
+        let outputs = [r.output(90, 0), r.output(50, 7)];
+        let rkm1 = derive_rkm_l2(&inputs[1]);
+        let k1 = freeze_key_of(&rkm1);
+        let frozen7 = PolicyAsset::hybrid(7, ISK7, false, &[rkm1]);
+        assert!(frozen7.freeze.opening_for(&rkm1).is_none(), "precondition: input 1 is frozen");
+        let i = (0..frozen7.freeze.leaves.len())
+            .find(|&i| {
+                let (lo, hi) = frozen7.freeze.leaves[i];
+                key_lt(&lo, &rkm1) && key_lt(&rkm1, &hi)
+            })
+            .expect("some genuine leaf brackets the raw rkm");
+        let opening = frozen7.freeze.opening_at(i);
+        assert!(
+            !(key_lt(&opening.key_lo, &k1) && key_lt(&k1, &opening.key_hi)),
+            "precondition: that leaf does not bracket K"
+        );
+        // Everything else genuine: the registry holds the frozen asset's leaf,
+        // the freeze path folds to its freeze_root.
+        let assets = [PolicyAsset::cloaked(0), frozen7.clone()];
+        let (_, _, cm1) = derive_input_l2(&inputs[0]);
+        let (_, _, cm2) = derive_input_l2(&inputs[1]);
+        let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        let leaves = [assets[0].leaf(), assets[1].leaf()];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let pol0 = assets[0].policy_input_for(&derive_rkm_l2(&inputs[0]), rw[0]).unwrap();
+        assert_eq!(
+            opening.witness.fold_root(&freeze_leaf_hash(&opening.key_lo, &opening.key_hi)),
+            frozen7.freeze.root,
+            "the path is genuine"
+        );
+        let pol1 = L2PolicyInput {
+            leaf: frozen7.leaf(),
+            reg_witness: rw[1],
+            freeze: opening,
+            allow: dummy_allow_witness(),
+            isk: [0; 4],
+        };
+        let bad = build_bucket_l2p_with_witnesses(
+            SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1], root, [VPublic::NONE; 2],
+        );
+        assert_unsat(&bad, "a raw-rkm-keyed freeze witness");
+    }
+
 
     /// 🔴 **Wrong sibling** in the freeze path (one sibling at level 5
     /// replaced), and the same for the allowlist path of a Regulated input.

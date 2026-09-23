@@ -1545,6 +1545,7 @@ dependencies = [
  "qlab-consensus",
  "qlab-devnet",
  "qlab-disclosure",
+ "qlab-l2",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",
@@ -1665,6 +1666,21 @@ version = "0.0.0"
 dependencies = [
  "serde_json",
  "tiny_http",
+]
+
+[[package]]
+name = "qlab-l2"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "p3-air",
+ "p3-field",
+ "p3-matrix",
+ "p3-uni-stark",
+ "qlab-air",
+ "qlab-consensus",
+ "serde_json",
+ "tiny-keccak",
 ]
 
 [[package]]

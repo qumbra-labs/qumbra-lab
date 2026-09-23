@@ -10,6 +10,9 @@ qlab-air = { path = "../qlab-air" }
 # (issue #38). The plumbing formerly defined here is re-exported from it so the
 # bench modules' `crate::{Val, Config, FriCfg, make_config_with}` still resolve.
 qlab-consensus = { path = "../qlab-consensus" }
+# The L2 consensus crate (lab #704): `l2shape` reads the L2 lane and the
+# measured fixtures from it — one source, never a local copy.
+qlab-l2 = { path = "../qlab-l2" }
 # M5 note-encryption prototype library (additive; see crates/qlab-note).
 qlab-note = { path = "../qlab-note" }
 # M6 consensus/network devnet library (additive; see crates/qlab-devnet). The
