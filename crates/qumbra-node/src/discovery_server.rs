@@ -98,7 +98,8 @@
 //!   paging loop to build and nothing that could silently truncate. The size is
 //!   the block's to decide, not the caller's, and consensus bounds it: the
 //!   payload count equals the transaction's declared commitment count
-//!   (`check_tx_discovery`), which the FROZEN 2×2 shape puts at 2, i.e. 240 B.
+//!   (`check_tx_discovery`), which the FROZEN 2×2 shape puts at 2, i.e. 240 B
+//!   (256 B on an Annulet node, at the 128-B L2 width).
 //!
 //! Still not the wallet-facing RPC:
 //!
