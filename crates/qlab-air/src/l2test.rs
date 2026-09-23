@@ -8,8 +8,8 @@
 //! decided the shape of this module:
 //!
 //! 1. A perm is 3,072 rows, so the shape-S program fills **70 %** of its 2^19
-//!    trace and shape P's **62 %** of 2^20, and the balance close — where most
-//!    tampers are refused — sits at perm 118 of 120 / 210 of 212. A
+//!    trace and shape P's **63 %** of 2^20, and the balance close — where most
+//!    tampers are refused — sits at perm 118 of 120 / 212 of 214. A
 //!    lowest-row-first early exit on a balance tamper therefore still scans
 //!    ~70 % of the rows. The scanner here visits the **program's tail first,
 //!    then its head**, so a close-row violation is found in the first chunks
@@ -51,7 +51,7 @@ pub const ROWS_PER_CHUNK: usize = 2048;
 const EXIT_CHECK_EVERY: usize = 256;
 
 /// How many selector-assignment traces [`fan_out`] generates at once. Four
-/// shape-P traces are 4 × 1,048,576 × 774 × 4 B ≈ 13 GB; with the two module
+/// shape-P traces are 4 × 1,048,576 × 778 × 4 B ≈ 13 GB; with the two module
 /// fixtures resident (≈ 3.24 + 1.47 GB) the block peaks ≈ 18 GB on the lane's
 /// 30 GB runner — the same class as the 15.3 GB shape-P prover test, and
 /// nothing else runs beside it under `--test-threads=1`.

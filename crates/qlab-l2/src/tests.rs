@@ -64,7 +64,7 @@ fn l2_shape_geometry_is_locked() {
     assert_eq!(get_max_constraint_degree::<Val, _>(&p, AirLayout::from_air::<Val>(&p)), 4);
 
     assert_eq!((Shape::S.width(), Shape::S.log_height(), Shape::S.perms(), Shape::S.pv_len()), (702, 19, 120, 100));
-    assert_eq!((Shape::P.log_height(), Shape::P.pv_len()), (20, 112));
+    assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (778, 20, 214, 112));
     for sh in [Shape::S, Shape::P] {
         assert!(sh.perms() * qlab_air::l2::ROWS_PER_PERM <= 1 << sh.log_height(), "{sh:?} fits its height");
     }

@@ -12,7 +12,8 @@
 //!   canonical program (every 5-bit role code), the tree depths, the asset
 //!   width, the mode/flag values, and **known-answer outputs of every host
 //!   hash the circuit mirrors** (note commitment, registry leaf, and for P the
-//!   issuer key, the credential, the freeze key and the freeze leaf). The
+//!   issuer key `D_I`, the credential `D_CRED`, the freeze key `D_FRZ` and the
+//!   freeze leaf). The
 //!   domain separators `D_I`, `D_CRED`, `D_FRZ` are not named constants in
 //!   `qlab-air` — they are lane/bit positions inside those blocks — so they
 //!   are pinned *through* the known answers, derived rather than re-typed.
@@ -139,6 +140,7 @@ pub fn constants_digest(shape: Shape) -> [u8; 32] {
         ]);
         h.words(&l2p::issuer_key_of(&o)); // D_I
         h.words(&l2p::cred_of(&o)); // D_CRED
+        h.words(&l2p::freeze_key_of(&o)); // D_FRZ
         h.words(&l2p::freeze_leaf_hash(&z, &o));
     }
     h.finish()

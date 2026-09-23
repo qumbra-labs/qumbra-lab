@@ -22,13 +22,13 @@
 //!               height (341-perm capacity; the pipeline chains through the
 //!               padding and every padded block is a genuine Keccak round, so
 //!               the prover's work is the height's, not the program's).
-//! - `p`       — shape P real (`qlab_air::l2p::build_bucket_l2p`), 212 perms @ 2^20:
+//! - `p`       — shape P real (`qlab_air::l2p::build_bucket_l2p`), 214 perms @ 2^20:
 //!               a Cloaked asset-0 input + a Hybrid stablecoin input (freeze
 //!               tree live, allowlist on the dummy path), no vPublic. Stage 2.
 //! - `p19`     — **CANARY** (#700's rule: a 2^19 run of the same shape and lane
 //!               before any 2^20): the shape-P AIR at 2^19 in chain-only mode —
-//!               same 774 columns, half the rows; the P program does not fit
-//!               2^19 (212 perms > 170), so the canary prices width × height only.
+//!               same 778 columns, half the rows; the P program does not fit
+//!               2^19 (214 perms > 170), so the canary prices width × height only.
 //!
 //! Lanes (the FRI points), each asserted ≥ 100 bits by `make_config_with`'s
 //! capacity proxy and labelled with its 2197-corrected figure:
@@ -452,7 +452,7 @@ mod tests {
         assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
     }
 
-    /// Shape P through the real prover at the b4/q43 lane (2^20 × 774 — the
+    /// Shape P through the real prover at the b4/q43 lane (2^20 × 778 — the
     /// ~15 GB class; the local scoped run skips it by name and it was run
     /// once on its own under the lock, see `docs/w3-run3.md`): the honest
     /// instance proves and verifies, then each of `anchor`, `nf₁`, `fee`,
@@ -469,7 +469,7 @@ mod tests {
         assert_eq!(pvs.len(), PV_LEN);
         let config = make_config_with(&L2_CFG);
         let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
-        assert_eq!(trace.width(), 774, "the shape-P width, read off the matrix prove is handed");
+        assert_eq!(trace.width(), qlab_l2::Shape::P.width(), "the shape-P width, read off the matrix prove is handed");
         let proof = prove(&config, &air, trace, &pvs);
         verify(&config, &air, &proof, &pvs).expect("shape P must verify at b4/q43");
         for (idx, name) in [
