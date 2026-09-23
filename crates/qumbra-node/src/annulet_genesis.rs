@@ -11,8 +11,9 @@
 //!   refused by name;
 //! - [`GenesisFile::from_bytes`] refuses a leading 32 **by name**
 //!   (`GenesisError::AnnuletGenesisNotServed`) before decoding a byte — which
-//!   is also how `qumbra-node run` (and every other L1 loader: explorer,
-//!   faucet, mine) refuses an Annulet genesis until B2's producer exists;
+//!   is how every L1-only loader (explorer, faucet, mine) refuses an Annulet
+//!   genesis. `qumbra-node run` loads through [`load_any`] since B2b (lab
+//!   #708) and runs the sequencer net;
 //! - [`AnnuletGenesisFile::from_bytes`] refuses anything but 32 by name.
 //!
 //! What the file carries (Q2): the L2 fee table (Q7 — genesis parameters,
@@ -142,6 +143,40 @@ pub struct AnnuletGenesisFile {
     pub genesis_header: AnnuletGenesisHeader,
 }
 
+/// The sequencer key file's name in a node's data dir (lab #708 Q6): its
+/// presence makes the node the **producer**; without it the node follows.
+/// Never config or env inline — the committee-key convention.
+pub const SEQUENCER_KEY_FILE: &str = "sequencer.key";
+
+/// The sequencer signing-key file (TOML, like the committee `KeyFile`): the
+/// 32-byte ML-DSA seed, hex-encoded. Read only by the node binary at start;
+/// `run` checks the derived key against the genesis `sequencer_key` and
+/// refuses a mismatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequencerKeyFile {
+    pub seed_hex: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+impl SequencerKeyFile {
+    /// The seed bytes.
+    pub fn seed(&self) -> Result<[u8; 32], GenesisError> {
+        let bytes = crate::genesis::hex_decode(&self.seed_hex).ok_or(GenesisError::BadHex)?;
+        bytes.try_into().map_err(|_| GenesisError::BadSeedLen)
+    }
+
+    /// Parse from TOML.
+    pub fn from_toml(text: &str) -> Result<Self, GenesisError> {
+        toml::from_str(text).map_err(|e| GenesisError::Parse(e.to_string()))
+    }
+
+    /// Serialize to TOML.
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).expect("SequencerKeyFile is always TOML-serializable")
+    }
+}
+
 /// Either kind of genesis file, as [`load_any`] returns it.
 #[derive(Debug)]
 pub enum AnyGenesis {
@@ -256,7 +291,8 @@ impl AnnuletGenesisFile {
         Ok(VerifyingKey::<MlDsa65>::decode(&e))
     }
 
-    fn notes(&self) -> Vec<GenesisNote> {
+    /// The genesis notes in the form the genesis-body commitment binds.
+    pub fn notes(&self) -> Vec<GenesisNote> {
         self.genesis_notes.iter().map(|n| GenesisNote { cm: n.cm, payload: n.payload.clone() }).collect()
     }
 

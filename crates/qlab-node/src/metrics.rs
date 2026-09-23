@@ -208,6 +208,12 @@ pub struct LiveGauges {
     pub committee_active: u64,
     /// Quorum threshold now in force.
     pub quorum: u64,
+    /// Whether this net has a committee at all (lab #708). `false` on an
+    /// Annulet (sequencer) net: the three committee series are then emitted
+    /// with no sample — absent by name, like `qumbra_finalized_height` before
+    /// any finality — rather than a "need 1 of 0" that reads as a stalled
+    /// quorum.
+    pub has_committee: bool,
     /// Currently-open checkpoint rounds in the ledger.
     pub open_rounds: u64,
     /// The scheduled halt height, if this release carries one (issue #74).
@@ -914,6 +920,13 @@ Separate series because the two answer the same question one protocol layer apar
             o.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
             continue;
         }
+        if !g.has_committee
+            && matches!(name, "qumbra_committee_size" | "qumbra_committee_active" | "qumbra_committee_quorum")
+        {
+            // Lab #708: no committee on this net — no sample, not a zero roster.
+            o.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+            continue;
+        }
         o.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}\n"));
     }
 
@@ -1108,6 +1121,7 @@ mod tests {
             committee_size: 21,
             committee_active: 21,
             quorum: 15,
+            has_committee: true,
             open_rounds: 2,
             throttled_frames: 5,
             throttled_getaddr: 2,

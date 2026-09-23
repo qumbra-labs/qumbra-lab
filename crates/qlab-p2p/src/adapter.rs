@@ -3385,9 +3385,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
     fn finality_status(&self) -> FinalityStatus {
         // Halt-aware (issue #74): `Halting`/`Halted` when a halt governs, the
         // ordinary Ebb-and-Flow pair otherwise. Single derivation, in qlab-devnet.
+        // Lab #708: finality through the one form-matched view (the committee
+        // tracker on L1, the fork-choice pointer on Annulet) — reading the
+        // tracker here directly reported every Annulet chain as degraded.
         halt_regime(
             self.chain.tip_height(),
-            self.finality.finalized_height(),
+            ChainView::finalized_height(self),
             DEGRADED_MODE_LAG_BLOCKS,
             self.rules.halt.halt_at(),
         )

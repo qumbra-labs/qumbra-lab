@@ -348,7 +348,10 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // `preflight`, so the two operator surfaces agree.
     qumbra_node::run::check_miner_payout(&config)?;
     qlab_devnet::jprintln!("STARTUP loading genesis file {}", config.genesis_file.display());
-    let genesis = GenesisFile::load(&config.genesis_file)?;
+    // Lab #708: dispatched by the file's leading format_version — an L1
+    // genesis runs the L1 node, an Annulet genesis the sequencer net.
+    let genesis_bytes = std::fs::read(&config.genesis_file)?;
+    let genesis = qumbra_node::annulet_genesis::load_any(&genesis_bytes)?;
     qlab_devnet::jprintln!("STARTUP genesis file loaded");
 
     // Real RandomX (N3) is the default engine. The tx verifier defaults to the
@@ -374,7 +377,20 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     //   byte-verify + hash pin, the committee key checks. A bind BEFORE these
     //   would hold a socket this process is about to refuse to run on.
     qlab_devnet::jprintln!("STARTUP node prepare begin (halt gates, genesis byte-verify, committee keys)");
-    let prepared = RunningNode::prepare(&config, &genesis, pow, verifier)?;
+    let prepared = match &genesis {
+        qumbra_node::annulet_genesis::AnyGenesis::L1(g) => RunningNode::prepare(&config, g, pow, verifier)?,
+        qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => {
+            // The L2 transaction verifier is B4's: until it lands, the real L1
+            // verifier would refuse every L2 transaction, so an Annulet node
+            // runs only with the rehearsal verifier, asked for by name.
+            if !rehearsal_verifier {
+                return Err("an Annulet genesis runs only with --rehearsal-verifier until the L2 \
+                            transaction verifier lands (lab B4)"
+                    .into());
+            }
+            RunningNode::prepare_annulet(&config, g, pow, verifier)?
+        }
+    };
     qlab_devnet::jprintln!("STARTUP node prepare done");
 
     // ② bind the telemetry listener. From this moment `GET /v1/ready` answers —
@@ -578,7 +594,13 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    qlab_devnet::jprintln!("  genesis hash: {}", genesis.hash_hex());
+    qlab_devnet::jprintln!(
+        "  genesis hash: {}",
+        match &genesis {
+            qumbra_node::annulet_genesis::AnyGenesis::L1(g) => g.hash_hex(),
+            qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => g.hash_hex(),
+        }
+    );
     qlab_devnet::jprintln!("  mining:       {}", config.mining);
     qlab_devnet::jprintln!("  template_serving: {}", config.template_serving);
     qlab_devnet::jprintln!("  committee keys held: {}", config.committee_key_paths.len());

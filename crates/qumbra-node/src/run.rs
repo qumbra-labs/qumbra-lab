@@ -275,6 +275,9 @@ pub enum RunError {
     /// #547). See [`check_miner_payout`] for why this is a refusal and not the
     /// warning it used to be.
     MiningWithoutPayout,
+    /// A configuration this Annulet (sequencer) genesis cannot run under,
+    /// refused by name before anything opens (lab #708).
+    Annulet(&'static str),
 }
 
 impl std::fmt::Display for RunError {
@@ -287,6 +290,7 @@ impl std::fmt::Display for RunError {
             RunError::Release(e) => write!(f, "release: {e}"),
             RunError::Supply(e) => write!(f, "supply attestation: {e:?}"),
             RunError::MiningWithoutPayout => write!(f, "{MINING_WITHOUT_PAYOUT}"),
+            RunError::Annulet(why) => write!(f, "annulet: {why} (lab #708)"),
         }
     }
 }
@@ -585,6 +589,10 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// Whether the durable halt marker for this halt has been written with
     /// `boundary_finalized = true` yet (it is rewritten once when H finalizes).
     marker_final_written: bool,
+    /// The sequencer-net run state (lab #708): `Some` exactly on an Annulet
+    /// genesis — the role (producer iff a sequencer key file was present) and
+    /// the slot clock.
+    annulet: Option<annulet::AnnuletRun>,
     /// **Issue #106: has this node ever been cleared to mine?** Latches `true` the
     /// first time [`Self::mine_gate`] permits a block and never clears.
     ///
@@ -691,7 +699,7 @@ impl MineGate {
 /// early: it is exactly `prepare` + `open`.
 pub struct PreparedNode<'a, P: PowEngine, V: TxVerifier + Clone> {
     config: &'a NodeConfig,
-    genesis: &'a GenesisFile,
+    genesis: PreparedGenesis<'a>,
     pow: P,
     verifier: V,
     release: Release,
@@ -702,6 +710,19 @@ pub struct PreparedNode<'a, P: PowEngine, V: TxVerifier + Clone> {
     finalizers: Vec<Finalizer>,
     sim: SimConfig,
 }
+
+/// The genesis a [`PreparedNode`] opens under (lab #708): an L1 genesis file,
+/// or an Annulet one with the sequencer key when this node is the producer.
+enum PreparedGenesis<'a> {
+    L1(&'a GenesisFile),
+    Annulet {
+        file: &'a crate::annulet_genesis::AnnuletGenesisFile,
+        sequencer: Option<qlab_devnet::annulet::SequencerKey>,
+    },
+}
+
+#[path = "run_annulet.rs"]
+mod annulet;
 
 impl<P: PowEngine, V: TxVerifier + Clone> PreparedNode<'_, P, V> {
     /// Phase ③: open the data dir (the replay), bind the P2P listener, dial the
@@ -848,7 +869,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 
         Ok(PreparedNode {
             config,
-            genesis,
+            genesis: PreparedGenesis::L1(genesis),
             pow,
             verifier,
             release,
@@ -885,35 +906,58 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // Lab #470 stage 4a: the form is installed AT CONSTRUCTION — before
         // the datadir replay — from the same genesis file the ChainRules
         // install below reads. One source, two arrival points, both checked.
-        let mut adapter =
-            NodeAdapter::open_for(genesis.form()?, &config.data_dir, committee, pow, verifier, sim)?;
-        // Issue #133's counter. Printed on EVERY start, zero included: the silence
-        // after a restart is what made this class of defect invisible five times over,
-        // because a node that restored nothing and a node that had nothing to restore
-        // printed the same thing — nothing. Note what this line does NOT claim: it
-        // reports what THIS node knows. Two nodes that observed different evidence
-        // still disagree about who may sign, and now they disagree durably; agreement
-        // needs the evidence on chain, which is a payload change and out of scope.
-        {
-            let restore = adapter.punishment_restore();
-            qlab_devnet::jprintln!("{}", restore.summary_line());
-            if restore.ledger_absent_on_populated_datadir {
-                qlab_devnet::jprintln!(WARN,
-                    "⚠️  this data dir already holds chain history but carried NO committee-\
-                     punishment ledger, so it was written by a binary predating issue #133. \
-                     Whether a punishment was ever applied against it is UNKNOWABLE — a \
-                     tombstone from before this upgrade is gone, and this node starts with \
-                     none. An empty ledger has been written, so later restarts are \
-                     unambiguous. If this net has ever seen an equivocation, re-check this \
-                     node's committee view against a peer that did not restart."
-                );
+        let (adapter, net_id, mine_interval, annulet) = match genesis {
+            PreparedGenesis::L1(genesis) => {
+                let mut adapter =
+                    NodeAdapter::open_for(genesis.form()?, &config.data_dir, committee, pow, verifier, sim)?;
+                // Issue #133's counter. Printed on EVERY start, zero included: the silence
+                // after a restart is what made this class of defect invisible five times over,
+                // because a node that restored nothing and a node that had nothing to restore
+                // printed the same thing — nothing. Note what this line does NOT claim: it
+                // reports what THIS node knows. Two nodes that observed different evidence
+                // still disagree about who may sign, and now they disagree durably; agreement
+                // needs the evidence on chain, which is a payload change and out of scope.
+                {
+                    let restore = adapter.punishment_restore();
+                    qlab_devnet::jprintln!("{}", restore.summary_line());
+                    if restore.ledger_absent_on_populated_datadir {
+                        qlab_devnet::jprintln!(WARN,
+                            "⚠️  this data dir already holds chain history but carried NO committee-\
+                             punishment ledger, so it was written by a binary predating issue #133. \
+                             Whether a punishment was ever applied against it is UNKNOWABLE — a \
+                             tombstone from before this upgrade is gone, and this node starts with \
+                             none. An empty ledger has been written, so later restarts are \
+                             unambiguous. If this net has ever seen an equivocation, re-check this \
+                             node's committee view against a peer that did not restart."
+                        );
+                    }
+                }
+                // The chain rules, installed once — THE one selection point (lab #470):
+                // the form set from the genesis file's format_version (= the network
+                // identity, Q1 ruling), the halt schedule from the compile-time RELEASE
+                // + marker (#74/#81). No runtime path to either (H1).
+                adapter.set_chain_rules(ChainRules { form: genesis.form()?, halt: rules });
+                (adapter, genesis.hash(), Duration::from_secs(genesis.frozen.block_time_secs), None)
             }
-        }
-        // The chain rules, installed once — THE one selection point (lab #470):
-        // the form set from the genesis file's format_version (= the network
-        // identity, Q1 ruling), the halt schedule from the compile-time RELEASE
-        // + marker (#74/#81). No runtime path to either (H1).
-        adapter.set_chain_rules(ChainRules { form: genesis.form()?, halt: rules });
+            // Lab #708: the sequencer net — its own open path (persist variant
+            // 3, final = tip), no committee, no punishment ledger, no halt.
+            PreparedGenesis::Annulet { file, sequencer } => {
+                let _ = (committee, rules);
+                let adapter = NodeAdapter::open_annulet(
+                    &config.data_dir,
+                    file.genesis_block_header(),
+                    &file.notes(),
+                    file.params.fee_table(),
+                    file.sequencer()?,
+                    pow,
+                    verifier,
+                    sim,
+                )?;
+                let run = annulet::AnnuletRun::new(file, sequencer);
+                qlab_devnet::jprintln!("{}", run.role_line());
+                (adapter, file.hash(), Duration::from_secs(file.params.slot_secs), Some(run))
+            }
+        };
         let transport = TcpTransport::bind(&config.listen_addr).map_err(RunError::Io)?;
         let bound = transport.local_addr().to_string();
         let node_id = node_id_from_addr(&bound);
@@ -923,7 +967,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // genesis block-header hash). On a v5-genesis net the P2P layer sends it
         // in `Version` and requires it of peers; on v4 it stays off the wire
         // (legacy-compat) and only polices a peer that names a different net.
-        p2p.set_net_id(genesis.hash());
+        p2p.set_net_id(net_id);
 
         // (6) Peer discovery (issue #83). The address book is restored from disk if a
         //     previous run persisted one, the configured `dial_peers` are (re-)applied
@@ -972,6 +1016,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // unchanged deliberately: #552 judged it worth having, and an operator
         // reading an old post-mortem will be searching for these exact words.
         match config.miner_rkm_lanes().map_err(RunError::Config)? {
+            // Lab #708: an Annulet net has no coinbase to pay.
+            Some(_) if annulet.is_some() => {}
             Some(rkm) => {
                 p2p.node_mut().set_miner_rkm(rkm);
                 qlab_devnet::jprintln!("miner payout: coinbase notes paid to the configured miner_rkm");
@@ -1003,7 +1049,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             finalizers,
             data_dir: config.data_dir.clone(),
             mining: config.mining,
-            mine_interval: Duration::from_secs(genesis.frozen.block_time_secs),
+            mine_interval,
             last_mine: Instant::now(),
             last_boundary_repush: Instant::now(),
             repush_interval: BOUNDARY_REPUSH_INTERVAL,
@@ -1055,7 +1101,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             body_wait: BodyWaitJournal::new(),
             started: Instant::now(),
             release,
-            halt_at: release.halt_at(),
+            // Lab #708: no halt-height machinery on an Annulet net.
+            halt_at: if annulet.is_some() { None } else { release.halt_at() },
             // "The marker for THIS release's halt is already in its final form", so
             // it may only be seeded from a marker that is actually about this halt.
             // Seeding it from any marker at all was unreachable under the height-keyed
@@ -1067,6 +1114,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             marker_final_written: marker
                 .filter(|m| !m.resumed && Some(m.height) == release.halt_at())
                 .is_some_and(|m| m.boundary_finalized),
+            annulet,
         })
     }
 
@@ -1139,6 +1187,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     }
 
     /// Tip height reported by the consensus chain view.
+    /// The genesis form this node runs (lab #708) — the one the adapter's
+    /// installed chain rules carry.
+    pub fn form(&self) -> GenesisForm {
+        self.p2p.node().genesis_form()
+    }
+
     pub fn tip_height(&self) -> u64 {
         self.p2p.node().tip_height()
     }
@@ -1372,9 +1426,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.halt_at,
         )
         .with_committee(
+            // Lab #708: no committee on a sequencer net. The served wire's
+            // fixed layout carries zeros ("no committee"), never the "need 1
+            // of 0" the empty roster's quorum rule would read.
             committee.roster as u64,
             committee.active as u64,
-            committee.need as u64,
+            match self.form() {
+                GenesisForm::V4 | GenesisForm::V5 => committee.need as u64,
+                GenesisForm::Annulet => 0,
+            },
         )
         .with_supply(supply)
         .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
@@ -1991,6 +2051,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             committee_size: ctx.roster as u64,
             committee_active: ctx.active as u64,
             quorum: ctx.need as u64,
+            has_committee: match self.form() {
+                GenesisForm::V4 | GenesisForm::V5 => true,
+                GenesisForm::Annulet => false,
+            },
             open_rounds: node.rounds().open_len() as u64,
             halt_at: self.halt_at,
             finalized_checkpoint_id: node.finality().latest().map(|cp| cp.identity()),
@@ -2422,6 +2486,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// resync the tip has already jumped hundreds of blocks by the time this runs,
     /// so all but the slot at the very edge of the jump are `backfill`.
     pub fn note_slots_reached(&mut self) {
+        match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: no checkpoint rounds on a sequencer net — opening one
+            // per cadence slot would diagnose each `QuorumImpossible` (roster
+            // 0, need 1) and count a false failure forever.
+            GenesisForm::Annulet => return,
+        }
         let tip = self.p2p.node().tip_height();
         while self.next_round_slot <= tip {
             // HALT (issue #74, H2): the committee stops checkpointing above H, so
@@ -2684,6 +2755,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// vote is on the wire can never let a restart equivocate). No-op for a verify-only
     /// node. The (partial) vote set now enters the cross-node tally + gossip (M10-T0-5).
     pub fn try_checkpoint(&mut self) {
+        match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: no committee, no checkpoints — by name, not only by
+            // the empty finalizer list (`run` refuses committee keys on an
+            // Annulet genesis, so the list is empty too).
+            GenesisForm::Annulet => return,
+        }
         if self.finalizers.is_empty() {
             return;
         }
@@ -2824,6 +2902,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// never-double-sign guard. Once the boundary finalizes, the condition
     /// goes false and this is inert.
     fn maintain_boundary_checkpoint(&mut self) {
+        match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => {}
+            // Lab #708: no halt boundary and no checkpoint on a sequencer net.
+            GenesisForm::Annulet => return,
+        }
         if let Some(h) = self.halt_at() {
             if self.tip_height() >= h && self.finalized_height() < Some(h) {
                 self.try_checkpoint();
@@ -3073,8 +3156,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // parked grind — gating the resume here would grind one ~25 ms slice
         // per 75 s, a ~99.97 % hashrate loss worse than the blocking defect
         // this replaced. Each call blocks for at most one slice.
-        if self.mining && self.try_mine() {
-            self.try_checkpoint();
+        match self.form() {
+            GenesisForm::V4 | GenesisForm::V5 => {
+                if self.mining && self.try_mine() {
+                    self.try_checkpoint();
+                }
+            }
+            // Lab #708: the sequencer's slot step (a follower's is a no-op).
+            GenesisForm::Annulet => {
+                self.seal_slot_if_due();
+            }
         }
         phases.mine = lap(&mut t);
         // #360: the call above is the loop's ONLY route to try_checkpoint,
@@ -3473,7 +3564,7 @@ mod tests {
 
     /// A test rig: temp data dir + genesis file + all-21 committee key files, and a
     /// config pointing at them. Returns (config, genesis, tempdir).
-    fn rig(tag: &str, mining: bool) -> (NodeConfig, GenesisFile, PathBuf) {
+    pub(super) fn rig(tag: &str, mining: bool) -> (NodeConfig, GenesisFile, PathBuf) {
         let base = std::env::temp_dir().join(format!("qmb_t01_run_{tag}"));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();

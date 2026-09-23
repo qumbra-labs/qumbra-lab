@@ -1025,6 +1025,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     pub fn checkpoint_queries(&self) -> usize {
         self.cp_queries.len()
     }
+
+    /// The tip this node would ask peers about a finalized checkpoint for
+    /// ([`Self::checkpoint_query_target`]), or `None` when its finality has
+    /// caught its chain up and there is nothing to ask — the trigger itself,
+    /// observable without a peer (lab #708: always `None` on an Annulet net,
+    /// where finality is the tip).
+    pub fn checkpoint_query_trigger(&self) -> Option<u64> {
+        self.checkpoint_query_target()
+    }
     pub fn addrs_mut(&mut self) -> &mut AddrManager {
         &mut self.addrs
     }

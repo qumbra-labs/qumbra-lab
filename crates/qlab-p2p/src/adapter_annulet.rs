@@ -64,6 +64,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         me
     }
 
+    /// **Open (or create) a disk-backed Annulet adapter** (lab #708, B2b):
+    /// the node resumes its sealed chain from the data dir
+    /// ([`MemNode::open_annulet`] — persist variant 3, final = tip after
+    /// replay), and the adapter's fork-choice view is the resumed chain. The
+    /// committee is empty, as in [`Self::annulet`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_annulet(
+        dir: impl AsRef<std::path::Path>,
+        genesis_header: BlockHeader,
+        genesis_notes: &[GenesisNote],
+        fees: L2FeeTable,
+        sequencer_key: VerifyingKey<MlDsa65>,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+    ) -> Result<Self, NodeError> {
+        let dir = dir.as_ref().to_path_buf();
+        let state = MemNode::open_annulet(&dir, genesis_header, genesis_notes, fees)?;
+        let committee = EpochCommittee::genesis(
+            EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
+            CommitteeState::new(Committee::from_keys(Vec::new()), 0),
+        );
+        let mut me = Self::assemble_on(GenesisForm::Annulet, genesis_header, committee, pow, verifier, sim, state);
+        me.dir = Some(dir);
+        me.chain = me.state.chain().chain().clone();
+        me.sequencer_key = Some(sequencer_key);
+        me.advance_epoch();
+        Ok(me)
+    }
+
     /// Refused equivocations so far: `(height, kept id, refused id)`.
     pub fn equivocations(&self) -> &[(u64, Hash32, Hash32)] {
         &self.equivocations
