@@ -75,6 +75,7 @@ to look up), not a zkVM, not a lattice-signature chain, and not a product.
 crates/                          29 crates in one workspace
   qlab-air/                      the fixed-shape AIR: Merkle path, PRF, commitment, balance
   qlab-consensus/                the frozen CONSENSUS_CFG + prove/verify wrappers (single source)
+  qlab-l2/                       the L2 (Annulet) consensus crate: shapes S/P v1 pins, provisional lane, prove/verify
   qlab-bench/                    bench harness: hash matrix × hardware, criterion-based
   qlab-pow/                      RandomX (light) + Zawy LWMA-1, exact integer form
   qlab-p2p/                      wire envelope, peer table, gossip, sync, discovery, transports
