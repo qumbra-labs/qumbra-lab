@@ -67,6 +67,11 @@ impl OwnedNote {
         L2TxInput { sk: self.key.sk, value: n.value, asset: n.asset, rho: n.rho, rseed: n.rseed, d: self.key.d }
     }
 
+    /// The nullifier spending this note publishes (the circuit's `nf`).
+    pub fn nullifier(&self) -> [u8; 32] {
+        digest_bytes(&qlab_air::l2::derive_input_l2(&self.input()).1)
+    }
+
     /// The note's commitment as served (lane-major bytes).
     pub fn cm(&self) -> [u8; 32] {
         digest_bytes(&self.note.commitment())
@@ -198,6 +203,26 @@ impl Served {
             }
         }
         Ok(found)
+    }
+
+    /// Every nullifier the node's main chain has published (`/v1/nullifiers`,
+    /// paged until a page ends short of the request).
+    pub fn spent_nullifiers(&self) -> Result<std::collections::HashSet<[u8; 32]>, AnnuletError> {
+        let mut spent = std::collections::HashSet::new();
+        let mut from = 0u64;
+        loop {
+            let page = qlab_cbserver::codec::NullifierPage::from_bytes(
+                &self.get(&format!("/v1/nullifiers?from={from}&to={}", u64::MAX))?,
+            )
+            .map_err(|e| AnnuletError::Served(format!("nullifiers: {e:?}")))?;
+            for b in &page.blocks {
+                spent.extend(b.nullifiers.iter().copied());
+            }
+            if page.blocks.is_empty() || page.to == u64::MAX || page.to < from {
+                return Ok(spent);
+            }
+            from = page.to + 1;
+        }
     }
 
     /// Submit a transaction on the Annulet tx wire.
@@ -393,6 +418,10 @@ pub fn build_p_send<R: rand::CryptoRng>(
 }
 
 /// **The Annulet faucet**: genesis stock, one whole note per grant.
+///
+/// Its stock is the genesis notes its key owns, less every one whose
+/// nullifier the chain already carries — so a restarted faucet never
+/// re-offers a note it granted before (the L1 faucet's #310, by construction).
 pub struct AnnuletFaucet {
     served: Served,
     key: SpendKey,
@@ -404,14 +433,21 @@ pub struct AnnuletFaucet {
 
 impl AnnuletFaucet {
     /// Start against a node: refuses by name unless `form` is Annulet, then
-    /// reads its stock (the genesis notes this key owns) from the node.
+    /// reads its stock from the node — the genesis notes this key owns whose
+    /// nullifiers are not on chain.
     pub fn start(served: Served, form: GenesisForm, key: SpendKey, change_ek: Ek, fee_s: u64) -> Result<Self, AnnuletError> {
         match form {
             GenesisForm::V4 | GenesisForm::V5 => return Err(AnnuletError::NotAnnulet),
             GenesisForm::Annulet => {}
         }
         let rkm = key.rkm();
-        let stock = served.genesis_notes()?.into_iter().filter(|n| n.rkm == rkm && n.asset == 0).collect();
+        let spent = served.spent_nullifiers()?;
+        let stock = served
+            .genesis_notes()?
+            .into_iter()
+            .filter(|n| n.rkm == rkm && n.asset == 0)
+            .filter(|n| !spent.contains(&OwnedNote { note: *n, key }.nullifier()))
+            .collect();
         Ok(Self { served, key, change: Recipient { rkm, ek: change_ek }, stock, next: 0, fee_s })
     }
 
@@ -435,4 +471,74 @@ impl AnnuletFaucet {
 /// A served cm as the lanes a commitment tree holds.
 pub fn cm_lanes(cm: &[u8; 32]) -> [u64; 4] {
     digest_from_bytes(cm)
+}
+
+/// The grant route of the Annulet faucet's HTTP surface.
+pub const GRANT_PATH: &str = "/v1/annulet/grant";
+
+/// **The Annulet faucet's HTTP surface** (lab #716): `POST /v1/annulet/grant`
+/// with an address string as the body grants one stock note to the address's
+/// `(rkm, ek)`; `GET /` answers the stock left. Grants are serialized (one
+/// prove at a time). The address is the wallet's existing encoding; which
+/// `rkm` it carries is the wallet's business — an L2-spendable one is
+/// `H(nk ‖ D ‖ d)`, and no user wallet derives it yet (C1).
+///
+/// **No tickets and no rate limit**: the devnet's stock is a fixed 16 grants,
+/// and the page says so. Returns the bound address; the server thread lives
+/// as long as the process.
+pub fn serve_grants(
+    listen: &str,
+    faucet: std::sync::Arc<std::sync::Mutex<AnnuletFaucet>>,
+) -> std::io::Result<SocketAddr> {
+    let server = tiny_http::Server::http(listen).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let addr = server
+        .server_addr()
+        .to_ip()
+        .ok_or_else(|| std::io::Error::other("the grant listener is not an IP socket"))?;
+    std::thread::spawn(move || {
+        for mut request in server.incoming_requests() {
+            let (code, body) = grant_verdict(&mut request, &faucet);
+            let _ = request.respond(tiny_http::Response::from_string(body).with_status_code(code));
+        }
+    });
+    Ok(addr)
+}
+
+fn grant_verdict(
+    request: &mut tiny_http::Request,
+    faucet: &std::sync::Mutex<AnnuletFaucet>,
+) -> (u16, String) {
+    let lock = || faucet.lock().unwrap_or_else(|p| p.into_inner());
+    match (request.method(), request.url()) {
+        (tiny_http::Method::Get, "/") => (
+            200,
+            format!(
+                "Annulet devnet faucet (lab #716): {} grant(s) of genesis stock left; POST an address to {GRANT_PATH}.\n",
+                lock().stock_left()
+            ),
+        ),
+        (tiny_http::Method::Post, GRANT_PATH) => {
+            let mut text = String::new();
+            if request.as_reader().take(16 * 1024).read_to_string(&mut text).is_err() {
+                return (400, "refused: body-unreadable".into());
+            }
+            let Some(address) = qlab_wallet::address::Address::decode(text.trim()) else {
+                return (400, "refused: address-undecodable".into());
+            };
+            let Some(ek) = address.encapsulation_key() else {
+                return (400, "refused: address-ek-invalid".into());
+            };
+            let to = Recipient { rkm: address.rkm_lanes(), ek };
+            match lock().grant(&to, &mut rand::rng()) {
+                Ok(note) => (200, format!("granted value={} cm={}\n", note.value, hex(&digest_bytes(&note.commitment())))),
+                Err(AnnuletError::StockExhausted) => (503, "unavailable: stock-exhausted\n".into()),
+                Err(e) => (502, format!("refused: {e}\n")),
+            }
+        }
+        _ => (404, "not found\n".into()),
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }

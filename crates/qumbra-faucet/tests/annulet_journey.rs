@@ -231,6 +231,12 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     let v = net.settle_at_least(v[0].state_tip + 1, "grant 2");
     eprintln!("B6 journey: 2 S grants sealed and applied on 3 nodes in {:?}", t.elapsed());
     assert_eq!(faucet.stock_left() as u64, devnet::STOCK_NOTES - 2);
+    // A restarted faucet (a fresh start against a follower) skips both
+    // granted notes by their on-chain nullifiers.
+    let restarted =
+        AnnuletFaucet::start(follower, GenesisForm::Annulet, faucet_key, faucet_kem.ek.clone(), devnet::FEE_TIER_S)
+            .expect("restarts");
+    assert_eq!(restarted.stock_left() as u64, devnet::STOCK_NOTES - 2);
     for n in [holder_fee, user_fee] {
         assert_eq!((n.value, n.asset), (devnet::GRANT_VALUE, 0));
     }
