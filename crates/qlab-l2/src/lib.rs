@@ -213,9 +213,9 @@ pub fn verify_p(pvs: &[Val], proof: &Proof<Config>) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The v1 shape digests (`digest::shape_digest`), lower-case hex.
-pub const SHAPE_S_DIGEST_V1: &str = "PENDING";
+pub const SHAPE_S_DIGEST_V1: &str = "7a6391bc98eed26b4bff7aaaa987f7d6ef657e27ad50746c9c519bcabdae6670";
 /// See [`SHAPE_S_DIGEST_V1`].
-pub const SHAPE_P_DIGEST_V1: &str = "PENDING";
+pub const SHAPE_P_DIGEST_V1: &str = "ad53d40e7d5ffd8235b701fab16856f428790b7ba33efc8915abe625f1bacaff";
 
 #[cfg(test)]
 mod tests;
