@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use qlab_air::l2::{RegistryLeaf, RegistryWitness, REGISTRY_DEPTH};
+pub use qlab_air::l2::{RegistryLeaf, RegistryWitness, REGISTRY_DEPTH};
 use qlab_note::hash::{digest_bytes, digest_from_bytes};
 
 use crate::tree::{hash_node, zeros};

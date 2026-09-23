@@ -948,6 +948,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     file.genesis_block_header(),
                     &file.notes(),
                     file.params.fee_table(),
+                    &crate::annulet_genesis::registry_leaves(&file.registry_genesis),
                     file.sequencer()?,
                     pow,
                     verifier,

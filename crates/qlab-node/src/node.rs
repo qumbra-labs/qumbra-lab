@@ -464,6 +464,50 @@ pub enum NodeError {
     /// (lab #708): an Annulet record under an L1 genesis or the reverse — a
     /// foreign datadir, refused before any record is hashed.
     LogFormMismatch { form: GenesisForm, height: u64 },
+    /// An Annulet header's `registry_root` is not the root of the registry
+    /// this node holds (lab #710) — at genesis load (`height` 0) or on a
+    /// block. The registry is immutable until A2, so on a healthy chain every
+    /// header carries the genesis registry's root.
+    RegistryRootMismatch { height: u64, header: Hash32, store: Hash32 },
+    /// The genesis registry does not build (a duplicate or out-of-range
+    /// asset) — a malformed genesis, refused by name.
+    RegistryGenesis(crate::registry_store::RegistryError),
+}
+
+/// What an Annulet node carries beyond an L1 node (lab #708/#710): the
+/// genesis fee table and the genesis registry, already bound to the genesis
+/// header's `registry_root`.
+#[derive(Clone)]
+pub(crate) struct AnnuletSetup {
+    fees: qlab_devnet::annulet::L2FeeTable,
+    registry: crate::registry_store::MemRegistryStore,
+}
+
+impl AnnuletSetup {
+    /// Build the registry and bind it to the genesis header (lab #710 Q6:
+    /// on genesis load too), refusing a mismatch by name.
+    fn bound_to(
+        genesis_header: &BlockHeader,
+        fees: qlab_devnet::annulet::L2FeeTable,
+        leaves: &[crate::registry_store::RegistryLeaf],
+    ) -> Result<Self, NodeError> {
+        use crate::registry_store::RegistryStore as _;
+        let registry = crate::registry_store::MemRegistryStore::from_genesis(leaves).map_err(NodeError::RegistryGenesis)?;
+        let header_root = annulet_registry_root(genesis_header);
+        if header_root != registry.root_bytes() {
+            return Err(NodeError::RegistryRootMismatch { height: 0, header: header_root, store: registry.root_bytes() });
+        }
+        Ok(Self { fees, registry })
+    }
+}
+
+/// The `registry_root` an Annulet header carries (zeros for an L1 header,
+/// which no Annulet path hands in).
+fn annulet_registry_root(h: &BlockHeader) -> Hash32 {
+    match h.ext {
+        qlab_devnet::annulet::HeaderExt::Annulet(ext) => ext.registry_root,
+        _ => [0; 32],
+    }
 }
 
 impl NodeError {
@@ -503,7 +547,11 @@ impl NodeError {
             | NodeError::FormNotServed { .. }
             | NodeError::UnsealedOnAnnulet
             | NodeError::AnnuletFinality(_)
-            | NodeError::LogFormMismatch { .. } => "internal",
+            | NodeError::LogFormMismatch { .. }
+            | NodeError::RegistryGenesis(_) => "internal",
+            // A block whose header names another registry root than this
+            // node's state: refused like a bad body.
+            NodeError::RegistryRootMismatch { .. } => "bad_body",
         }
     }
 }
@@ -546,6 +594,13 @@ impl std::fmt::Display for NodeError {
             NodeError::AnnuletFinality(e) => {
                 write!(f, "Annulet final-on-acceptance refused by the chain store: {e:?} (lab #708)")
             }
+            NodeError::RegistryRootMismatch { height, header, store } => write!(
+                f,
+                "header registry_root {} at height {height} is not this node's registry root {} (lab #710)",
+                hex8(header),
+                hex8(store)
+            ),
+            NodeError::RegistryGenesis(e) => write!(f, "the genesis registry does not build: {e:?} (lab #710)"),
             NodeError::LogFormMismatch { form, height } => write!(
                 f,
                 "the block log holds a record at height {height} of the other chain family than this \
@@ -728,6 +783,9 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     form: GenesisForm,
     /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node.
     annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
+    /// The asset registry (lab #710): `Some` exactly on an Annulet node,
+    /// bound to every header's `registry_root`.
+    registry: Option<crate::registry_store::MemRegistryStore>,
 }
 
 /// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
@@ -786,21 +844,43 @@ impl MemNode {
         genesis_header: BlockHeader,
         genesis_notes: &[qlab_devnet::annulet::GenesisNote],
         fees: qlab_devnet::annulet::L2FeeTable,
+        registry: &[crate::registry_store::RegistryLeaf],
     ) -> Result<Self, NodeError> {
         assert_eq!(
             genesis_header.tx_body_commitment,
             qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
+        let setup = AnnuletSetup::bound_to(&genesis_header, fees, registry)?;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
-        Self::open_inner(GenesisForm::Annulet, dir.as_ref(), genesis, Some(fees))
+        let dir = dir.as_ref();
+        let node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
+        // Lab #710: the sidecar is checked against the store the genesis
+        // built (Phase 0: the genesis is the whole registry history). A
+        // sidecar that disagrees, or cannot be read, is replaced — said
+        // aloud, never trusted.
+        match crate::registry_store::load_registry_at(dir) {
+            Ok(Some((held, _))) if Some(&held) == node.registry.as_ref() => {}
+            Ok(None) => {}
+            Ok(Some((held, at))) => qlab_devnet::jprintln!(
+                "REGISTRY sidecar at height {at} disagrees with the genesis registry (root {} vs {}); \
+                 rebuilt from genesis (lab #710 — immutable until A2)",
+                hex8(&crate::registry_store::RegistryStore::root_bytes(&held)),
+                hex8(&node.registry_root_bytes().unwrap_or_default())
+            ),
+            Err(e) => qlab_devnet::jprintln!("REGISTRY sidecar unusable ({e}); rebuilt from genesis (lab #710)"),
+        }
+        if let Some(reg) = &node.registry {
+            crate::registry_store::save_registry(dir, reg, node.chain.tip_height()).map_err(NodeError::Io)?;
+        }
+        Ok(node)
     }
 
     fn open_inner(
         form: GenesisForm,
         dir: &Path,
         genesis: StoredBlock,
-        fees: Option<qlab_devnet::annulet::L2FeeTable>,
+        annulet: Option<AnnuletSetup>,
     ) -> Result<Self, NodeError> {
         let dir = dir.to_path_buf();
         std::fs::create_dir_all(&dir).map_err(NodeError::Io)?;
@@ -858,7 +938,7 @@ impl MemNode {
         // and issue #225 a third — see [`Self::resume_from_snapshot`]. The reason
         // is carried into the [`RecoveryReport`] rather than dropped.
         if let Some(snap) = snapshot.as_ref() {
-            match Self::resume_from_snapshot(form, &dir, &genesis, fees, snap, &records)? {
+            match Self::resume_from_snapshot(form, &dir, &genesis, annulet.clone(), snap, &records)? {
                 SnapshotResume::Resumed(node) => return Ok(node),
                 SnapshotResume::Rejected(why) => {
                     // Lab #408: before conceding the genesis fold, try the
@@ -866,7 +946,7 @@ impl MemNode {
                     // when the log itself proves its tip is on the finalized
                     // main chain. Any failure inside the attempt falls back to
                     // the full replay, which stays the correctness anchor.
-                    if let Some(node) = Self::resume_near_tip(form, &dir, &genesis, fees, snap, &records, &why)
+                    if let Some(node) = Self::resume_near_tip(form, &dir, &genesis, annulet.clone(), snap, &records, &why)
                     {
                         return Ok(node);
                     }
@@ -874,7 +954,7 @@ impl MemNode {
                 }
             }
         }
-        Self::resume_by_replay(form, &dir, genesis, fees, &records, snapshot_rejected)
+        Self::resume_by_replay(form, &dir, genesis, annulet, &records, snapshot_rejected)
     }
 
     /// The snapshot-assisted resume. `Rejected` = this snapshot cannot be
@@ -911,11 +991,11 @@ impl MemNode {
         form: GenesisForm,
         dir: &Path,
         genesis: &StoredBlock,
-        fees: Option<qlab_devnet::annulet::L2FeeTable>,
+        annulet: Option<AnnuletSetup>,
         snap: &Snapshot,
         records: &[LogRecord],
     ) -> Result<SnapshotResume, NodeError> {
-        let mut node = Self::from_genesis_with(form, genesis.clone(), Some(dir.to_path_buf()), fees);
+        let mut node = Self::from_genesis_with(form, genesis.clone(), Some(dir.to_path_buf()), annulet);
         node.restore_from_snapshot(snap);
         // Lab #367: the registry sidecar rides the snapshot. Any problem with
         // a PRESENT sidecar is a fall-through to the full replay (which
@@ -1132,7 +1212,7 @@ impl MemNode {
         form: GenesisForm,
         dir: &Path,
         genesis: &StoredBlock,
-        fees: Option<qlab_devnet::annulet::L2FeeTable>,
+        annulet: Option<AnnuletSetup>,
         snap: &Snapshot,
         records: &[LogRecord],
         why: &SnapshotRejection,
@@ -1175,7 +1255,7 @@ impl MemNode {
 
         // (2) Derived state from the snapshot; the registry sidecar under the
         // same rule the honoured path applies (absent = pre-#367 = empty).
-        let mut node = Self::from_genesis_with(form, genesis.clone(), Some(dir.to_path_buf()), fees);
+        let mut node = Self::from_genesis_with(form, genesis.clone(), Some(dir.to_path_buf()), annulet);
         node.restore_from_snapshot(snap);
         match crate::name_registry::load_names_at(dir) {
             Ok(None) => {}
@@ -1287,11 +1367,11 @@ impl MemNode {
         form: GenesisForm,
         dir: &Path,
         genesis: StoredBlock,
-        fees: Option<qlab_devnet::annulet::L2FeeTable>,
+        annulet: Option<AnnuletSetup>,
         records: &[LogRecord],
         snapshot_rejected: Option<SnapshotRejection>,
     ) -> Result<Self, NodeError> {
-        let mut node = Self::from_genesis_with(form, genesis, Some(dir.to_path_buf()), fees);
+        let mut node = Self::from_genesis_with(form, genesis, Some(dir.to_path_buf()), annulet);
         // Lab #287: every record is applied, so walk total == final replayed_records.
         // `records` is already in memory from `open`; the total is free.
         let mut progress = ReplayProgress::start(records.len(), "from genesis");
@@ -1375,6 +1455,7 @@ impl MemNode {
             // crash between the block record and its `Finalize` record cannot
             // leave a replayed Annulet node with finality behind its tip.
             GenesisForm::Annulet => {
+                self.check_registry_binding(&block.header())?;
                 self.chain.set_finalized(hash).map_err(NodeError::AnnuletFinality)?;
             }
         }
@@ -1452,7 +1533,7 @@ impl MemNode {
 
         // Built beside the live state and swapped in only on success, so a failure
         // anywhere in the re-fold leaves the node exactly as it was.
-        let mut rebuilt = Self::from_genesis_with(self.form, kept[0].clone(), self.dir.clone(), self.annulet_fees);
+        let mut rebuilt = Self::from_genesis_with(self.form, kept[0].clone(), self.dir.clone(), self.annulet_setup());
         for block in &kept[1..] {
             rebuilt.apply_state(block)?;
         }
@@ -1518,13 +1599,14 @@ impl MemNode {
         form: GenesisForm,
         genesis: StoredBlock,
         dir: Option<PathBuf>,
-        fees: Option<qlab_devnet::annulet::L2FeeTable>,
+        annulet: Option<AnnuletSetup>,
     ) -> Self {
-        match (form, fees) {
+        match (form, annulet) {
             (GenesisForm::V4 | GenesisForm::V5, None) => Self::from_genesis(form, genesis, dir),
-            (GenesisForm::Annulet, Some(fees)) => {
+            (GenesisForm::Annulet, Some(setup)) => {
                 let mut node = Self::from_bound_genesis(form, genesis, dir);
-                node.annulet_fees = Some(fees);
+                node.annulet_fees = Some(setup.fees);
+                node.registry = Some(setup.registry);
                 let g = node.chain.genesis_block_hash();
                 node.chain.set_finalized(g).expect("genesis is final on acceptance (lab #708 Q4)");
                 node
@@ -1561,6 +1643,7 @@ impl MemNode {
             names: crate::name_registry::NameRegistry::default(),
             form,
             annulet_fees: None,
+            registry: None,
         }
     }
 
@@ -1577,14 +1660,17 @@ impl MemNode {
         genesis_header: BlockHeader,
         genesis_notes: &[qlab_devnet::annulet::GenesisNote],
         fees: qlab_devnet::annulet::L2FeeTable,
+        registry: &[crate::registry_store::RegistryLeaf],
     ) -> MemNode {
         assert_eq!(
             genesis_header.tx_body_commitment,
             qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
+        let setup = AnnuletSetup::bound_to(&genesis_header, fees, registry)
+            .unwrap_or_else(|e| panic!("the Annulet genesis must bind its registry (lab #710): {e}"));
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
-        MemNode::from_genesis_with(GenesisForm::Annulet, genesis, None, Some(fees))
+        MemNode::from_genesis_with(GenesisForm::Annulet, genesis, None, Some(setup))
     }
 
     /// The genesis form this node's identities are keyed under (lab #470).
@@ -1809,6 +1895,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         if header.prev != self.chain.tip_hash() {
             return Err(NodeError::NotExtendingTip { expected: self.chain.tip_hash(), got: header.prev });
         }
+        self.check_registry_binding(&header)?;
         let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
         qlab_devnet::annulet::validate_body_annulet(&header, &body, verifier, anchor_ok, &fees)
             .map_err(NodeError::Body)?;
@@ -1828,6 +1915,31 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// The L2 fee table an Annulet node applies (`None` on an L1 node).
     pub fn annulet_fee_table(&self) -> Option<qlab_devnet::annulet::L2FeeTable> {
         self.annulet_fees
+    }
+
+    /// The asset registry an Annulet node holds (lab #710; `None` on L1).
+    pub fn registry(&self) -> Option<&crate::registry_store::MemRegistryStore> {
+        self.registry.as_ref()
+    }
+
+    /// The registry root as header bytes (`None` on L1).
+    pub fn registry_root_bytes(&self) -> Option<Hash32> {
+        use crate::registry_store::RegistryStore as _;
+        self.registry.as_ref().map(|r| r.root_bytes())
+    }
+
+    fn annulet_setup(&self) -> Option<AnnuletSetup> {
+        Some(AnnuletSetup { fees: self.annulet_fees?, registry: self.registry.clone()? })
+    }
+
+    /// Lab #710 Q6: an applied Annulet header must name this node's registry.
+    fn check_registry_binding(&self, header: &BlockHeader) -> Result<(), NodeError> {
+        let Some(store) = self.registry_root_bytes() else { return Ok(()) };
+        let got = annulet_registry_root(header);
+        if got != store {
+            return Err(NodeError::RegistryRootMismatch { height: header.height, header: got, store });
+        }
+        Ok(())
     }
 
     /// The ancestor at exactly `height` of the block whose parent hash is `from`,
@@ -2014,7 +2126,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // Lab #367: the registry sidecar rides every snapshot write (its
         // format note explains why it is not a Snapshot field).
         crate::name_registry::save_names(dir, &self.names, self.chain.tip_height())
-            .map_err(NodeError::Io)
+            .map_err(NodeError::Io)?;
+        // Lab #710: the registry sidecar rides the snapshot too (Annulet).
+        if let Some(reg) = &self.registry {
+            crate::registry_store::save_registry(dir, reg, self.chain.tip_height()).map_err(NodeError::Io)?;
+        }
+        Ok(())
     }
 
     /// Borrow the name registry (lab #367) — the local-resolve surface and

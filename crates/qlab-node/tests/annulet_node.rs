@@ -25,15 +25,24 @@ impl TxVerifier for OkProof {
 }
 
 const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
-const ROOT: Hash32 = [0x44; 32];
+/// The test registry (asset 0, Cloaked) and its root — lab #710: every
+/// header carries the root of the registry the node holds.
+fn registry() -> Vec<qlab_node::registry_store::RegistryLeaf> {
+    vec![qlab_node::registry_store::RegistryLeaf::cloaked(0)]
+}
+
+fn root() -> Hash32 {
+    use qlab_node::registry_store::RegistryStore as _;
+    qlab_node::registry_store::MemRegistryStore::from_genesis(&registry()).unwrap().root_bytes()
+}
 
 fn ext() -> AnnuletHeaderFields {
-    AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: ROOT }
+    AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: root() }
 }
 
 fn node() -> (MemNode, BlockHeader) {
     let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
-    (MemNode::in_memory_annulet(g, &[], FEES), g)
+    (MemNode::in_memory_annulet(g, &[], FEES, &registry()), g)
 }
 
 fn s_tx(node: &MemNode, nf: u8) -> TxEntry {
@@ -48,7 +57,7 @@ fn s_tx(node: &MemNode, nf: u8) -> TxEntry {
         },
         discovery: vec![0x00],
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: ROOT, vpublic: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None }.encode(),
     }
 }
 
@@ -108,7 +117,7 @@ fn the_annulet_mempool_prices_with_the_l2_table_and_refuses_what_block_validatio
     let mut p = s_tx(&n, 3);
     p.l2 = L2Surface {
         shape: L2ShapeTag::P,
-        registry_root: ROOT,
+        registry_root: root(),
         vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 5, asset: 7 }]),
     }
     .encode();
@@ -156,7 +165,7 @@ fn an_annulet_node_on_disk_resumes_its_sealed_chain_across_a_restart() {
     let key = SequencerKey::from_seed([0x5E; 32]);
     let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
     let (tip, root, seal3) = {
-        let mut n = MemNode::open_annulet(&dir, g, &[], FEES).expect("a fresh datadir opens");
+        let mut n = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).expect("a fresh datadir opens");
         let mut parent = g;
         let mut last = None;
         for h in 1..=3u8 {
@@ -168,7 +177,7 @@ fn an_annulet_node_on_disk_resumes_its_sealed_chain_across_a_restart() {
         }
         (n.chain().tip_hash(), n.commitment_root(), last.unwrap())
     };
-    let n = MemNode::open_annulet(&dir, g, &[], FEES).expect("the datadir resumes");
+    let n = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).expect("the datadir resumes");
     assert_eq!(n.chain().tip_hash(), tip);
     assert_eq!(n.tip_height(), 3);
     assert_eq!(n.finalized_height(), Some(3), "final = tip after replay");
@@ -201,7 +210,7 @@ fn the_l2_surface_is_part_of_pool_identity() {
     let p = TxEntry {
         l2: L2Surface {
             shape: L2ShapeTag::P,
-            registry_root: ROOT,
+            registry_root: root(),
             vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 1, asset: 7 }]),
         }
         .encode(),
@@ -210,4 +219,73 @@ fn the_l2_surface_is_part_of_pool_identity() {
     assert_ne!(qlab_node::mempool::txid(&s), qlab_node::mempool::txid(&p));
     let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..s.clone() };
     assert_ne!(qlab_node::mempool::txid(&s), qlab_node::mempool::txid(&l1));
+}
+
+/// Lab #710 Q6: the registry is bound to the header — at genesis load and on
+/// every applied block — and a mismatch is refused by name.
+#[test]
+fn the_registry_root_is_bound_at_genesis_load_and_on_every_block() {
+    // Genesis load: a header naming another root than the registry built.
+    let dir = std::env::temp_dir().join(format!("qlab-annulet-reg-bind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let wrong = AnnuletHeaderFields { registry_root: [0x99; 32], ..ext() };
+    let g_wrong = BlockHeader::genesis_annulet(wrong, genesis_body_commitment_annulet(&[]), 0);
+    match MemNode::open_annulet(&dir, g_wrong, &[], FEES, &registry()) {
+        Err(NodeError::RegistryRootMismatch { height: 0, header, store }) => {
+            assert_eq!(header, [0x99; 32]);
+            assert_eq!(store, root());
+        }
+        Err(e) => panic!("expected RegistryRootMismatch at genesis, got {e}"),
+        Ok(_) => panic!("a genesis naming another registry root must not open"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // A block naming another root (sealed and otherwise valid).
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let (mut n, g) = node();
+    assert_eq!(n.registry_root_bytes(), Some(root()));
+    let body = BlockBody::new(vec![], vec![]);
+    let sealed = key.seal(BlockHeader::child_of_annulet(&g, 10, wrong, body_commitment_annulet(&body)));
+    match n.apply_sealed_block(&sealed, body, &OkProof) {
+        Err(NodeError::RegistryRootMismatch { height: 1, .. }) => {}
+        other => panic!("expected RegistryRootMismatch at height 1, got {other:?}"),
+    }
+    assert_eq!(n.tip_height(), 0, "nothing applied");
+}
+
+/// Lab #710: the registry root reproduces across restart — from the
+/// `registry.bin` sidecar, from the genesis when the sidecar is gone, and from
+/// the genesis when the sidecar is unreadable — and the store is immutable
+/// over the blocks between (Phase 0; updates arrive with A2).
+#[test]
+fn the_registry_reproduces_across_restart_from_the_sidecar_and_from_genesis() {
+    use qlab_node::registry_store::REGISTRY_FILE;
+    let dir = std::env::temp_dir().join(format!("qlab-annulet-reg-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
+    {
+        let mut n = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+        let mut parent = g;
+        for h in 1..=3u8 {
+            let body = BlockBody::new(vec![s_tx(&n, h * 2)], vec![]);
+            let sealed = sealed_child(&key, &parent, &body);
+            n.apply_sealed_block(&sealed, body, &OkProof).unwrap();
+            parent = sealed.header;
+        }
+        assert_eq!(n.registry_root_bytes(), Some(root()), "immutable over the blocks");
+    }
+    assert!(dir.join(REGISTRY_FILE).exists(), "the sidecar is written at open");
+    let from_sidecar = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+    assert_eq!(from_sidecar.registry_root_bytes(), Some(root()));
+    assert_eq!(from_sidecar.tip_height(), 3);
+    drop(from_sidecar);
+    std::fs::remove_file(dir.join(REGISTRY_FILE)).unwrap();
+    let from_genesis = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+    assert_eq!(from_genesis.registry_root_bytes(), Some(root()));
+    assert!(dir.join(REGISTRY_FILE).exists(), "and rewritten");
+    drop(from_genesis);
+    std::fs::write(dir.join(REGISTRY_FILE), b"junk").unwrap();
+    let from_junk = MemNode::open_annulet(&dir, g, &[], FEES, &registry()).unwrap();
+    assert_eq!(from_junk.registry_root_bytes(), Some(root()), "an unreadable sidecar is rebuilt, not trusted");
+    let _ = std::fs::remove_dir_all(&dir);
 }
