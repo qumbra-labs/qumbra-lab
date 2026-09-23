@@ -233,6 +233,26 @@ pub const COINBASE_PATH: &str = "/v1/coinbase";
 /// does; not a frozen number.
 pub const MAX_TX_WIRE_BYTES: usize = 256 * 1024;
 
+/// The most bytes `POST /v1/tx` will read on an **Annulet** node (lab #716).
+///
+/// Basis: an L2 transaction carries an L2-lane proof — shape S ≈ 285.6 KB and
+/// shape P ≈ 312.7 KB at the provisional lane (W3's measured sizes) — plus
+/// the surface and a 128-B-payload discovery group, so ≈ 288–317 KB. The L1
+/// cap above refused every one of them (the B6 journey's first lane run: an
+/// S grant of 288,332 B answered `body-too-large`). 512 KiB covers P with
+/// slack. `[devnet-placeholder]` — moves with the L2 lane, which is
+/// provisional.
+pub const MAX_TX_WIRE_BYTES_ANNULET: usize = 512 * 1024;
+
+/// The `POST /v1/tx` body cap for `form`.
+pub fn max_tx_wire_bytes(form: qlab_devnet::forms::GenesisForm) -> usize {
+    use qlab_devnet::forms::GenesisForm;
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => MAX_TX_WIRE_BYTES,
+        GenesisForm::Annulet => MAX_TX_WIRE_BYTES_ANNULET,
+    }
+}
+
 /// Submissions the run loop can owe verdicts on at once; a fuller queue answers
 /// `503 unavailable: submit-queue-full` without touching the node. Sized to the
 /// loop's appetite, not the client's: each verdict costs a real proof verify on
@@ -1239,21 +1259,23 @@ fn submit_verdict(
 ) -> (u16, String) {
     // 1. The body, bounded BEFORE it is read: a declared oversize is refused on
     //    the header, an undeclared one on the byte that crosses the cap.
+    //    The cap is the form's (lab #716: an L2 proof is ~2× the L1 one).
+    let cap = max_tx_wire_bytes(form);
     if let Some(len) = request.body_length() {
-        if len > MAX_TX_WIRE_BYTES {
-            return (413, format!("refused: body-too-large ({len} > {MAX_TX_WIRE_BYTES} bytes)"));
+        if len > cap {
+            return (413, format!("refused: body-too-large ({len} > {cap} bytes)"));
         }
     }
     let mut body = Vec::new();
     {
         use std::io::Read;
-        let mut bounded = request.as_reader().take(MAX_TX_WIRE_BYTES as u64 + 1);
+        let mut bounded = request.as_reader().take(cap as u64 + 1);
         if bounded.read_to_end(&mut body).is_err() {
             return (400, "refused: body-unreadable".to_string());
         }
     }
-    if body.len() > MAX_TX_WIRE_BYTES {
-        return (413, format!("refused: body-too-large (> {MAX_TX_WIRE_BYTES} bytes)"));
+    if body.len() > cap {
+        return (413, format!("refused: body-too-large (> {cap} bytes)"));
     }
 
     // 2. Decode — the same canonical wire the P2P layer speaks, same decoder,
