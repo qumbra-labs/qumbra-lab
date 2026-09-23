@@ -2129,14 +2129,22 @@ impl L2ShapeSAir {
 
 #[cfg(test)]
 mod tests {
-    use p3_air::{check_all_constraints, check_constraints};
+    use std::sync::OnceLock;
+
+    use p3_air::check_constraints;
     use p3_koala_bear::KoalaBear;
+    use p3_matrix::dense::RowMajorMatrix;
     use p3_matrix::Matrix;
 
     use super::*;
+    use crate::l2test::{self, Violation, ASSIGNMENT_FANOUT};
     use crate::reference;
 
     type F = KoalaBear;
+
+    /// Rows the shape-S program occupies — the scanner's tail-first hint
+    /// (the balance close is perm 118 of 120; see `l2test`).
+    const PROGRAM_END: usize = SHAPE_S_PERMS * ROWS_PER_PERM;
 
     fn zero_pvs() -> Vec<F> {
         vec![F::ZERO; PV_LEN]
@@ -2144,16 +2152,128 @@ mod tests {
     fn pvs_of(inst: &L2BucketInstance) -> Vec<F> {
         inst.pvs.iter().map(|v| F::from_u32(*v)).collect()
     }
-    fn sat(inst: &L2BucketInstance) -> bool {
-        let pvs = pvs_of(inst);
-        let trace = inst.air.generate_trace::<F>(0);
-        check_all_constraints(&inst.air, &trace, &pvs, Some(10)).is_ok()
-    }
     fn digest(state: &[u64; 25]) -> [u64; 4] {
         state[..4].try_into().unwrap()
     }
     fn slot_of(program: &[u32; PROGRAM_SLOTS], role: u32, nth: usize) -> usize {
         program.iter().enumerate().filter(|(_, r)| **r == role).map(|(i, _)| i).nth(nth).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // The cost model (lab #700 baton 3): SAT claims scan every row, in
+    // parallel; UNSAT claims stop at the first violation, tail first; the
+    // honest instances are generated and scanned once for the module.
+    // -----------------------------------------------------------------------
+
+    /// A SAT claim: generate, then every row. Positives only.
+    fn assert_sat(inst: &L2BucketInstance, what: &str) {
+        let pvs = pvs_of(inst);
+        let trace = inst.air.generate_trace::<F>(0);
+        l2test::assert_satisfied(&inst.air, &trace, &pvs, what);
+    }
+    /// An UNSAT claim: generate, then the first violation found.
+    fn refused(inst: &L2BucketInstance) -> Option<Violation> {
+        let pvs = pvs_of(inst);
+        let trace = inst.air.generate_trace::<F>(0);
+        l2test::first_violation(&inst.air, &trace, &pvs, PROGRAM_END)
+    }
+    fn assert_unsat(inst: &L2BucketInstance, what: &str) {
+        assert!(refused(inst).is_some(), "{what} VERIFIED");
+    }
+
+    /// Every selector assignment the prover could try, for a fixed witness:
+    /// the eight `(o1a, o2a, f1)` combinations at `q`. `q` is deliberately
+    /// NOT iterated with them: its two constraints read only the captured
+    /// `A₁`/`A₂` (`close·q·(A₁−A₂)`, `close·(1−q)·(qinv·(A₁−A₂)−1)`) and no
+    /// other column, so a lying `q` is refused whatever the rest of the
+    /// witness says — `l2_neg_q_lie_is_unsat_both_ways` proves both lies on
+    /// their own (through this same helper, at the lied `q`). Each assignment
+    /// regenerates the trace (the selectors feed the balance accumulators and
+    /// carries), `ASSIGNMENT_FANOUT` at a time. Returns the assignments that
+    /// VERIFIED — which must be none.
+    fn assignments_that_verify_at(inst: &L2BucketInstance, q: bool) -> Vec<u32> {
+        let variants: Vec<(u32, L2BucketInstance)> = (0..8u32)
+            .map(|bits| {
+                let mut v = inst.clone();
+                v.air.sel_o1a = bits & 1 == 1;
+                v.air.sel_o2a = bits & 2 == 2;
+                v.air.sel_f1 = bits & 4 == 4;
+                v.air.sel_q = q;
+                (bits, v)
+            })
+            .collect();
+        l2test::fan_out(variants, ASSIGNMENT_FANOUT, |(bits, v)| (bits, refused(&v)))
+            .into_iter()
+            .filter(|(_, r)| r.is_none())
+            .map(|(bits, _)| bits)
+            .collect()
+    }
+    fn assert_refused_under_every_assignment(inst: &L2BucketInstance, what: &str) {
+        let ok = assignments_that_verify_at(inst, inst.air.sel_q);
+        assert!(ok.is_empty(), "{what} VERIFIED under selector assignment(s) {ok:?}");
+    }
+
+    /// An honest instance with its trace and verdict, generated and scanned
+    /// once for the module (rule (a)); public-value tampers read the trace
+    /// and positives read the verdict.
+    struct Fixture {
+        inst: L2BucketInstance,
+        trace: RowMajorMatrix<F>,
+        pvs: Vec<F>,
+        verdict: Result<(), Violation>,
+    }
+    impl Fixture {
+        fn new(inst: L2BucketInstance) -> Self {
+            let pvs = pvs_of(&inst);
+            let trace = inst.air.generate_trace::<F>(0);
+            let verdict = l2test::satisfied(&inst.air, &trace, &pvs);
+            Fixture { inst, trace, pvs, verdict }
+        }
+        fn assert_sat(&self, what: &str) {
+            if let Err(v) = &self.verdict {
+                panic!("{what}: constraints not satisfied on {v}");
+            }
+        }
+    }
+    /// An instance and its verdict, the trace dropped after the one scan.
+    struct Verdict {
+        inst: L2BucketInstance,
+        verdict: Result<(), Violation>,
+    }
+    impl Verdict {
+        fn new(inst: L2BucketInstance) -> Self {
+            let f = Fixture::new(inst);
+            Verdict { inst: f.inst, verdict: f.verdict }
+        }
+        fn assert_sat(&self, what: &str) {
+            if let Err(v) = &self.verdict {
+                panic!("{what}: constraints not satisfied on {v}");
+            }
+        }
+    }
+
+    static HONEST: OnceLock<Fixture> = OnceLock::new();
+    /// The canonical honest instance (`honest()`), trace resident for the module.
+    fn honest_fixture() -> &'static Fixture {
+        HONEST.get_or_init(|| Fixture::new(honest()))
+    }
+    static SAME_ASSET: OnceLock<Verdict> = OnceLock::new();
+    /// Both inputs asset 0: 60 + 40 = 70 + 25 + 5 — the `q = 1` corner.
+    fn same_asset() -> &'static Verdict {
+        SAME_ASSET.get_or_init(|| Verdict::new(bucket(60, 0, 40, 0, 70, 0, 25, 0, 5)))
+    }
+    static FEE_ON_INPUT_2: OnceLock<Verdict> = OnceLock::new();
+    /// Fee asset on input 2: asset 7 (100) + asset 0 (50) → 100 (7) + 40 (0) + fee 10.
+    fn fee_on_input_2() -> &'static Verdict {
+        FEE_ON_INPUT_2.get_or_init(|| Verdict::new(bucket(100, 7, 50, 0, 100, 7, 40, 0, 10)))
+    }
+    static DUMMY1: OnceLock<Verdict> = OnceLock::new();
+    /// The honest one-real-input dummy shape (`dummy_parts()`, fee 1).
+    fn dummy1() -> &'static Verdict {
+        DUMMY1.get_or_init(|| {
+            let (real, dummy, outputs) = dummy_parts();
+            Verdict::new(build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1))
+        })
     }
 
     /// A deterministic pseudo-random two-asset bucket: input 1 in asset `a1`,
@@ -2332,14 +2452,13 @@ mod tests {
 
     /// The complete shape S — two inputs in two assets, both registry
     /// openings, two outputs, the two-asset balance, every public binding —
-    /// satisfies the AIR with the real public values at 2^19.
+    /// satisfies the AIR with the real public values at 2^19 (the module
+    /// fixture's full scan).
     #[test]
     fn l2_shape_s_satisfies_constraints() {
-        let inst = honest();
-        assert_eq!(inst.air.program.iter().filter(|r| **r != ROLE_DUMMY).count(), SHAPE_S_PERMS - 1);
-        let pvs = pvs_of(&inst);
-        let trace = inst.air.generate_trace::<F>(0);
-        check_constraints(&inst.air, &trace, &pvs);
+        let fx = honest_fixture();
+        assert_eq!(fx.inst.air.program.iter().filter(|r| **r != ROLE_DUMMY).count(), SHAPE_S_PERMS - 1);
+        fx.assert_sat("shape S, the honest instance at 2^19");
     }
 
     /// Same-asset spend (both inputs asset 0) and a two-asset spend where the
@@ -2347,19 +2466,19 @@ mod tests {
     #[test]
     fn l2_shape_s_selector_corners_satisfy() {
         // Both asset 0: 60 + 40 = 70 + 25 + 5.
-        let a = bucket(60, 0, 40, 0, 70, 0, 25, 0, 5);
-        assert!(a.air.sel_o1a && a.air.sel_o2a && a.air.sel_f1 && a.air.sel_q);
-        assert!(sat(&a), "same-asset spend: no per-row partition exists, only the sum");
+        let a = same_asset();
+        assert!(a.inst.air.sel_o1a && a.inst.air.sel_o2a && a.inst.air.sel_f1 && a.inst.air.sel_q);
+        a.assert_sat("same-asset spend: no per-row partition exists, only the sum");
         // Fee asset on input 2: asset 7 (100) + asset 0 (50) → 100 (7) + 40 (0) + fee 10.
-        let b = bucket(100, 7, 50, 0, 100, 7, 40, 0, 10);
-        assert!(b.air.sel_o1a && !b.air.sel_o2a && !b.air.sel_f1 && !b.air.sel_q);
-        assert!(sat(&b), "fee on input 2");
+        let b = fee_on_input_2();
+        assert!(b.inst.air.sel_o1a && !b.inst.air.sel_o2a && !b.inst.air.sel_f1 && !b.inst.air.sel_q);
+        b.assert_sat("fee on input 2");
         // Both outputs in the fee asset, stablecoin fully burned to… no: a
         // stablecoin input with no stablecoin output is unbalanced. Instead:
         // asset 0 pays everything, asset 7 passes through 1:1.
         let c = bucket(100, 0, 50, 7, 50, 7, 90, 0, 10);
         assert!(!c.air.sel_o1a && c.air.sel_o2a && c.air.sel_f1);
-        assert!(sat(&c), "outputs swapped");
+        assert_sat(&c, "outputs swapped");
     }
 
     /// 🔴 The `q` lie, both directions (stage-0 ruling, the corner test's
@@ -2367,32 +2486,22 @@ mod tests {
     /// bound both ways: clearing it on equal assets leaves `qinv · 0 = 1`
     /// unsatisfiable, setting it on distinct assets fails `A₁ = A₂`. Each lie
     /// is tried with every other selector assignment, on a witness that is
-    /// honest in every other respect.
+    /// honest in every other respect (the two shared fixtures).
     #[test]
     fn l2_neg_q_lie_is_unsat_both_ways() {
         // Equal assets, `q` cleared: the honest sum (60 + 40 = 70 + 25 + 5)
         // is only reachable through `q`.
-        let mut a = bucket(60, 0, 40, 0, 70, 0, 25, 0, 5);
-        assert!(sat(&a), "precondition: honest with q = 1");
-        for bits in 0..8u32 {
-            a.air.sel_o1a = bits & 1 == 1;
-            a.air.sel_o2a = bits & 2 == 2;
-            a.air.sel_f1 = bits & 4 == 4;
-            a.air.sel_q = false;
-            assert!(!sat(&a), "q = 0 on equal assets VERIFIED (assignment {bits})");
-        }
+        let a = same_asset();
+        a.assert_sat("precondition: honest with q = 1");
+        let ok = assignments_that_verify_at(&a.inst, false);
+        assert!(ok.is_empty(), "q = 0 on equal assets VERIFIED (assignment(s) {ok:?})");
         // Distinct assets, `q` set: the equality leg refuses, whatever the
         // rows would otherwise sum to (here they even balance as a sum:
         // 100 + 50 = 100 + 40 + 10).
-        let mut b = bucket(100, 7, 50, 0, 100, 7, 40, 0, 10);
-        assert!(sat(&b), "precondition: honest with q = 0");
-        for bits in 0..8u32 {
-            b.air.sel_o1a = bits & 1 == 1;
-            b.air.sel_o2a = bits & 2 == 2;
-            b.air.sel_f1 = bits & 4 == 4;
-            b.air.sel_q = true;
-            assert!(!sat(&b), "q = 1 on distinct assets VERIFIED (assignment {bits})");
-        }
+        let b = fee_on_input_2();
+        b.assert_sat("precondition: honest with q = 0");
+        let ok = assignments_that_verify_at(&b.inst, true);
+        assert!(ok.is_empty(), "q = 1 on distinct assets VERIFIED (assignment(s) {ok:?})");
     }
 
     // -----------------------------------------------------------------------
@@ -2418,29 +2527,6 @@ mod tests {
         }
     }
 
-    /// Every selector assignment the prover could try, for a fixed witness:
-    /// the eight `(o1a, o2a, f1)` combinations at the witness's honest `q`.
-    /// `q` is deliberately NOT iterated here: its two constraints read only
-    /// the captured `A₁`/`A₂` (`close·q·(A₁−A₂)`, `close·(1−q)·(qinv·(A₁−A₂)−1)`)
-    /// and no other column, so a lying `q` is refused whatever the rest of the
-    /// witness says — `l2_neg_q_lie_is_unsat_both_ways` proves both lies on
-    /// their own, and iterating them here would double every negative's cost
-    /// (a 2^19 `check_all_constraints` per assignment) for no extra coverage.
-    /// The stage-1 scoped run executed the 16-way form; this is its subset.
-    fn any_assignment_satisfies(inst: &mut L2BucketInstance) -> bool {
-        let q = inst.air.sel_q;
-        for bits in 0..8u32 {
-            inst.air.sel_o1a = bits & 1 == 1;
-            inst.air.sel_o2a = bits & 2 == 2;
-            inst.air.sel_f1 = bits & 4 == 4;
-            inst.air.sel_q = q;
-            if sat(inst) {
-                return true;
-            }
-        }
-        false
-    }
-
     /// 🔴 Negative 1 — **asset from nowhere**: output 0's asset is neither
     /// input's. The forgery is complete (commitment republished, balance rows
     /// arranged so the value arithmetic holds under either assignment) and it
@@ -2448,15 +2534,13 @@ mod tests {
     #[test]
     fn l2_neg_output_asset_from_nowhere() {
         // Honest: asset 0 (100) + asset 7 (50) → 90 (asset 0) + 50 (asset 7), fee 10.
-        let mut inst = honest();
-        assert!(sat(&inst), "the honest instance verifies — else the negative is vacuous");
+        let fx = honest_fixture();
+        fx.assert_sat("the honest instance verifies — else the negative is vacuous");
+        let mut inst = fx.inst.clone();
         let s = slot_of(&inst.air.program, ROLE_ACMOUT, 1);
         inst.air.slot_witness[s].w[13] = 9; // a third asset, value unchanged (50)
         republish(&mut inst, 1);
-        assert!(
-            !any_assignment_satisfies(&mut inst),
-            "an output in an asset neither input carries VERIFIED"
-        );
+        assert_refused_under_every_assignment(&inst, "an output in an asset neither input carries");
     }
 
     /// 🔴 Negative 2 — **cross-asset balance**: value moved from asset 0 to
@@ -2464,12 +2548,11 @@ mod tests {
     #[test]
     fn l2_neg_cross_asset_balance() {
         // asset 0: 100 in, 80 out, fee 10 (10 short); asset 7: 50 in, 60 out.
-        let mut inst = bucket(100, 0, 50, 7, 80, 0, 60, 7, 10);
-        assert!(!any_assignment_satisfies(&mut inst), "cross-asset value movement VERIFIED");
-        // …and the same numbers balanced per asset DO verify, so the refusal
-        // above is the per-asset rows' doing.
-        let ok = bucket(100, 0, 50, 7, 90, 0, 50, 7, 10);
-        assert!(sat(&ok));
+        let inst = bucket(100, 0, 50, 7, 80, 0, 60, 7, 10);
+        assert_refused_under_every_assignment(&inst, "cross-asset value movement");
+        // …and the same numbers balanced per asset DO verify (they are the
+        // honest fixture's), so the refusal above is the per-asset rows' doing.
+        honest_fixture().assert_sat("the same numbers balanced per asset");
     }
 
     /// 🔴 Negative 3 — **fee charged in the wrong asset**: the fee is public in
@@ -2477,8 +2560,8 @@ mod tests {
     #[test]
     fn l2_neg_fee_in_wrong_asset() {
         // asset 0: 100 in, 100 out (fee unpaid); asset 7: 50 in, 40 out (fee "paid" here).
-        let mut inst = bucket(100, 0, 50, 7, 100, 0, 40, 7, 10);
-        assert!(!any_assignment_satisfies(&mut inst), "a fee paid in asset 7 VERIFIED");
+        let inst = bucket(100, 0, 50, 7, 100, 0, 40, 7, 10);
+        assert_refused_under_every_assignment(&inst, "a fee paid in asset 7");
     }
 
     /// 🔴 Negative 4 — **no asset-0 note**: two policy-free stablecoin inputs,
@@ -2486,11 +2569,11 @@ mod tests {
     /// `f1 ⇒ A₁ = 0`, `¬f1 ⇒ A₂ = 0` has no satisfying value.
     #[test]
     fn l2_neg_no_fee_asset_note() {
-        let mut inst = bucket(100, 3, 50, 7, 100, 3, 50, 7, 0);
-        assert!(!any_assignment_satisfies(&mut inst), "a transaction with no asset-0 note VERIFIED");
+        let inst = bucket(100, 3, 50, 7, 100, 3, 50, 7, 0);
+        assert_refused_under_every_assignment(&inst, "a transaction with no asset-0 note");
         // The same shape with input 2 in asset 0 verifies.
         let ok = bucket(100, 3, 50, 0, 100, 3, 50, 0, 0);
-        assert!(sat(&ok));
+        assert_sat(&ok, "the same shape with input 2 in asset 0");
     }
 
     /// 🔴 Negative 5 — **registry leaf under the wrong root**, two ways: (a) a
@@ -2499,9 +2582,9 @@ mod tests {
     #[test]
     fn l2_neg_registry_leaf_under_wrong_root() {
         // (a)
-        let mut inst = honest();
+        let mut inst = honest_fixture().inst.clone();
         inst.pvs[PV_REGROOT + 3] += 1;
-        assert!(!any_assignment_satisfies(&mut inst), "a forged registry root VERIFIED");
+        assert_refused_under_every_assignment(&inst, "a forged registry root");
 
         // (b) Build a registry holding asset 0 and asset 5, then spend asset 7
         //     while opening asset 5's leaf: the path is genuine, the root is
@@ -2527,17 +2610,17 @@ mod tests {
         let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(5)];
         let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
         assert_eq!(rw[1].fold_root(&leaves[1].hash()), root, "precondition: asset 5's opening is genuine");
-        let mut bad = build_bucket_l2_with_witnesses(
+        let bad = build_bucket_l2_with_witnesses(
             SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw, root,
         );
-        assert!(!any_assignment_satisfies(&mut bad), "opening another asset's registry leaf VERIFIED");
+        assert_refused_under_every_assignment(&bad, "opening another asset's registry leaf");
     }
 
     /// 🔴 Negative 6 — **`mode ≠ Cloaked` under shape S**: asset 7's leaf is
     /// Hybrid, genuinely in the registry, genuinely opened. Shape S refuses.
     #[test]
     fn l2_neg_mode_not_cloaked() {
-        let inst = honest();
+        let fx = honest_fixture();
         let inputs_asset = [0u64, 7];
         let mut leaves = [RegistryLeaf::cloaked(inputs_asset[0]), RegistryLeaf::cloaked(inputs_asset[1])];
         leaves[1].mode = MODE_HYBRID;
@@ -2572,11 +2655,11 @@ mod tests {
         let (_, _, cm1) = derive_input_l2(&inputs[0]);
         let (_, _, cm2) = derive_input_l2(&inputs[1]);
         let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
-        assert_eq!(anchor, inst.anchor, "same fixture as `honest()`");
-        let mut bad = build_bucket_l2_with_witnesses(
+        assert_eq!(anchor, fx.inst.anchor, "same fixture as `honest()`");
+        let bad = build_bucket_l2_with_witnesses(
             SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw, root,
         );
-        assert!(!any_assignment_satisfies(&mut bad), "a Hybrid leaf VERIFIED under shape S");
+        assert_refused_under_every_assignment(&bad, "a Hybrid leaf under shape S");
         // The Cloaked twin of the same registry verifies, so the refusal is
         // the mode constraint's.
         leaves[1].mode = MODE_CLOAKED;
@@ -2584,18 +2667,21 @@ mod tests {
         let ok = build_bucket_l2_with_witnesses(
             SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw2, root2,
         );
-        assert!(sat(&ok), "a Cloaked leaf with issuer_key + flags set still verifies");
+        assert_sat(&ok, "a Cloaked leaf with issuer_key + flags set");
     }
 
-    /// Wrong public values are still caught: nf1, fee, anchor (the L1 set).
+    /// Wrong public values are still caught: nf1, fee, anchor (the L1 set) —
+    /// on the fixture's trace, only the public values move.
     #[test]
     fn l2_public_value_negatives() {
-        let inst = honest();
-        let trace = inst.air.generate_trace::<F>(0);
+        let fx = honest_fixture();
         for (idx, name) in [(PV_NF1 + 3, "nf1"), (PV_FEE, "fee"), (PV_ANCHOR, "anchor"), (PV_CM2 + 1, "cm2")] {
-            let mut pvs = pvs_of(&inst);
+            let mut pvs = fx.pvs.clone();
             pvs[idx] += F::ONE;
-            assert!(!check_all_constraints(&inst.air, &trace, &pvs, Some(10)).is_ok(), "wrong {name} not caught");
+            assert!(
+                l2test::first_violation(&fx.inst.air, &fx.trace, &pvs, PROGRAM_END).is_some(),
+                "wrong {name} not caught"
+            );
         }
     }
 
@@ -2605,18 +2691,18 @@ mod tests {
     fn l2_asset_id_is_a_16_bit_registry_index() {
         let big = 1u64 << ASSET_BITS;
         // Input.
-        let mut a = bucket(100, big, 50, 0, 100, big, 40, 0, 10);
-        assert!(!any_assignment_satisfies(&mut a), "a 2^16 input asset VERIFIED");
+        let a = bucket(100, big, 50, 0, 100, big, 40, 0, 10);
+        assert_refused_under_every_assignment(&a, "a 2^16 input asset");
         // Output (commitment republished).
-        let mut b = honest();
+        let mut b = honest_fixture().inst.clone();
         let s = slot_of(&b.air.program, ROLE_ACMOUT, 0);
         b.air.slot_witness[s].w[13] = big;
         republish(&mut b, 0);
-        assert!(!any_assignment_satisfies(&mut b), "a 2^16 output asset VERIFIED");
+        assert_refused_under_every_assignment(&b, "a 2^16 output asset");
         // The largest legal id verifies (both inputs in it, fee asset on… no
         // fee asset would be refused; so asset 0 + 0xffff).
         let ok = bucket(100, 0, 50, 0xffff, 90, 0, 50, 0xffff, 10);
-        assert!(sat(&ok));
+        assert_sat(&ok, "asset 0 + the largest legal id 0xffff");
     }
 
     // -----------------------------------------------------------------------
@@ -2690,7 +2776,7 @@ mod tests {
     /// (perm 0 dummy, perm 1 the ANK override, perm 2 the first reader).
     #[test]
     fn l2_program_geometry() {
-        let inst = honest();
+        let inst = &honest_fixture().inst;
         assert_eq!(SHAPE_S_PERMS, 120);
         assert!(SHAPE_S_PERMS * ROWS_PER_PERM <= 1 << SHAPE_S_LOG_HEIGHT);
         assert!(SHAPE_S_PERMS <= PROGRAM_SLOTS);
@@ -2717,16 +2803,16 @@ mod tests {
     /// the "which input" signal for both the note asset and the leaf asset.
     #[test]
     fn l2_latch_span_covers_chain_1_including_its_registry_opening() {
-        let inst = honest();
-        let p = &inst.air.program;
+        let fx = honest_fixture();
+        let p = &fx.inst.air.program;
         let bnf2 = slot_of(p, ROLE_BNF2, 0);
         let areg2 = slot_of(p, ROLE_AREG, 1);
         let banchor2 = slot_of(p, ROLE_BANCHOR, 1);
         assert_eq!(areg2, bnf2 + 1, "chain 1's AREG follows its BNF2");
-        let trace = inst.air.generate_trace::<F>(0);
+        let trace = &fx.trace;
         let lo = areg2 * ROWS_PER_PERM;
         let hi = (banchor2 + 1) * ROWS_PER_PERM;
-        for row in 0..(1usize << inst.air.log_height) {
+        for row in 0..(1usize << fx.inst.air.log_height) {
             let l = trace.values[row * L2_WIDTH + LATCH_COL];
             let want = if (lo..hi).contains(&row) { F::ONE } else { F::ZERO };
             assert_eq!(l, want, "latch at row {row} (span {lo}..{hi})");
@@ -2785,18 +2871,16 @@ mod tests {
     /// dummy slot's witness is genuinely off the commitment tree.
     #[test]
     fn l2_dummy1_satisfies_constraints() {
-        let (real, dummy, outputs) = dummy_parts();
-        let inst = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
-        assert!(inst.air.dv);
+        let (_, dummy, _) = dummy_parts();
+        let fx = dummy1();
+        assert!(fx.inst.air.dv);
         let (_, _, cm_dummy) = derive_input_l2(&dummy);
-        assert_ne!(off_tree_witness().fold_root(&cm_dummy), inst.anchor, "precondition: dummy off-tree");
-        let pvs = pvs_of(&inst);
-        let trace = inst.air.generate_trace::<F>(0);
-        check_constraints(&inst.air, &trace, &pvs);
+        assert_ne!(off_tree_witness().fold_root(&cm_dummy), fx.inst.anchor, "precondition: dummy off-tree");
+        fx.assert_sat("the one-real-input dummy shape");
         // And with dv = 0 the same instance is refused (the latch is doing it).
-        let mut inert = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        let mut inert = fx.inst.clone();
         inert.air.dv = false;
-        assert!(!sat(&inert));
+        assert_unsat(&inert, "the dummy shape with dv = 0");
     }
 
     /// A stablecoin one-input spend with a dummy: asset 7 in, asset 7 out,
@@ -2810,10 +2894,10 @@ mod tests {
         outputs[1].asset = 7;
         outputs[1].value = 400;
         let inst = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 0);
-        assert!(sat(&inst), "a fee-less stablecoin spend with a dummy asset-0 slot");
+        assert_sat(&inst, "a fee-less stablecoin spend with a dummy asset-0 slot");
         outputs[1].value = 399;
-        let mut bad = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
-        assert!(!any_assignment_satisfies(&mut bad), "a fee with no real asset-0 input VERIFIED");
+        let bad = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        assert_refused_under_every_assignment(&bad, "a fee with no real asset-0 input");
     }
 
     /// 🔴 The dummy's value AND asset are forced to 0 by the AIR, not the
@@ -2842,12 +2926,12 @@ mod tests {
         };
         let mut minted = dummy.clone();
         minted.value = 500;
-        let mut a = build(&minted, 501, RegistryLeaf::cloaked(0));
-        assert!(!any_assignment_satisfies(&mut a), "a nonzero dummy value is a mint");
+        let a = build(&minted, 501, RegistryLeaf::cloaked(0));
+        assert_refused_under_every_assignment(&a, "a nonzero dummy value (a mint)");
         let mut wrong_asset = dummy.clone();
         wrong_asset.asset = 7;
-        let mut b = build(&wrong_asset, 1, RegistryLeaf::cloaked(7));
-        assert!(!any_assignment_satisfies(&mut b), "a dummy in a non-fee asset VERIFIED");
+        let b = build(&wrong_asset, 1, RegistryLeaf::cloaked(7));
+        assert_refused_under_every_assignment(&b, "a dummy in a non-fee asset");
     }
 
     /// `dv` cannot make slot 0 the dummy (the latch's span is chain 1's).
@@ -2870,7 +2954,7 @@ mod tests {
             root,
         );
         inst.air.dv = true;
-        assert!(!any_assignment_satisfies(&mut inst), "slot 0's anchor bind must fire regardless of dv");
+        assert_refused_under_every_assignment(&inst, "slot 0 declared the dummy (its anchor bind must fire regardless of dv)");
     }
 
     /// 🔴 The option-4 forgery shape on the **latch** (stage-0 ruling): under
@@ -2881,9 +2965,10 @@ mod tests {
     /// `q215_dummy_composition_keeps_both_seeds_on_the_real_nullifier`, on L2.
     #[test]
     fn l2_dummy_shape_forged_seed_is_refused() {
-        let (real, dummy, outputs) = dummy_parts();
-        let inst = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
-        assert!(inst.air.dv && sat(&inst), "precondition: the honest dummy shape verifies");
+        let fx = dummy1();
+        assert!(fx.inst.air.dv);
+        fx.assert_sat("precondition: the honest dummy shape verifies");
+        let inst = &fx.inst;
         let p = &inst.air.program;
         let out0 = slot_of(p, ROLE_ACMOUT, 0);
         let out1 = slot_of(p, ROLE_ACMOUT, 1);
@@ -2895,30 +2980,30 @@ mod tests {
         assert_ne!(seed(arho), inst.nf[1], "the dummy's invented nullifier feeds no seed");
         // The forgery: output 1's seed is the prover's, the commitment is
         // republished to open at it — every bind but the third bank holds.
-        let mut forged = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        let mut forged = inst.clone();
         forged.air.slot_witness[out1].w[5..9].copy_from_slice(&[0xbad_5eed, 1, 2, 3]);
         republish(&mut forged, 1);
-        assert!(!any_assignment_satisfies(&mut forged), "a forged seed under the dummy shape VERIFIED");
+        assert_refused_under_every_assignment(&forged, "a forged seed under the dummy shape");
         // And output 0 the same way.
-        let mut forged0 = build_bucket_l2_dummy1_fabricated(SHAPE_S_LOG_HEIGHT, &real, &dummy, &outputs, 1);
+        let mut forged0 = inst.clone();
         forged0.air.slot_witness[out0].w[5..9].copy_from_slice(&[0xdead_beef, 4, 5, 6]);
         republish(&mut forged0, 0);
-        assert!(!any_assignment_satisfies(&mut forged0), "a forged ρ′₀ under the dummy shape VERIFIED");
+        assert_refused_under_every_assignment(&forged0, "a forged ρ′₀ under the dummy shape");
     }
 
     /// The option-4 seed binding carries over: a prover-chosen ρ′₀ with the
     /// matching commitment republished is refused on L2 too.
     #[test]
     fn l2_output_rho_is_still_bound() {
-        let mut inst = honest();
+        let fx = honest_fixture();
+        let mut inst = fx.inst.clone();
         let s = slot_of(&inst.air.program, ROLE_ACMOUT, 0);
         inst.air.slot_witness[s].w[5..9].copy_from_slice(&[0xdead_beef, 1, 2, 3]);
         republish(&mut inst, 0);
-        assert!(!sat(&inst), "a free output seed VERIFIED on L2");
+        assert_unsat(&inst, "a free output seed on L2");
         // The published commitments are openings at the derived seeds.
-        let inst = honest();
-        let s0 = slot_of(&inst.air.program, ROLE_ACMOUT, 0);
-        let seed: [u64; 4] = inst.air.slot_witness[s0].w[5..9].try_into().unwrap();
-        assert_eq!(seed, derive_output_rho(&inst.nf[0], 0));
+        let s0 = slot_of(&fx.inst.air.program, ROLE_ACMOUT, 0);
+        let seed: [u64; 4] = fx.inst.air.slot_witness[s0].w[5..9].try_into().unwrap();
+        assert_eq!(seed, derive_output_rho(&fx.inst.nf[0], 0));
     }
 }
