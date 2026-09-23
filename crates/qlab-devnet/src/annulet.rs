@@ -671,6 +671,59 @@ mod tests {
         assert_eq!(chain.tip_work(), 5, "cumulative weight = height");
     }
 
+    /// The seal goldens (lab #708), from the named `annulet_seal_goldens`
+    /// run; the digests were re-hashed independently in Python from the wire
+    /// hex, which also re-built the 153-B preimage field by field.
+    ///
+    /// - **Load-bearing:** the fixture key's seal over the B1 fixture header
+    ///   verifies, the wire is 3,462 B, round-trips, and its id is B1's id.
+    /// - **Valid only while the crate's default signer stays deterministic**
+    ///   (ml-dsa 0.1.1's `Signer`): the signature and wire digests. A move to
+    ///   hedged signing changes them without changing the rule — re-pin then;
+    ///   the verification golden must not move.
+    #[test]
+    fn the_seal_goldens() {
+        use crate::header::{AggregateProofSlot, EpochSupplyAttestation};
+        let h = BlockHeader {
+            prev: [0x11; 32],
+            height: 0x0000_6655_4433_2211,
+            timestamp: 0x8877_6655_4433_2211,
+            difficulty: 0,
+            nonce: 0,
+            tx_body_commitment: [0x22; 32],
+            aggregate_proof: AggregateProofSlot,
+            epoch_supply_attestation: EpochSupplyAttestation,
+            ext: HeaderExt::Annulet(AnnuletHeaderFields {
+                l1_anchor_height: 0x0102_0304_0506_0708,
+                l1_anchor_root: [0x33; 32],
+                registry_root: [0x44; 32],
+            }),
+        };
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let key = SequencerKey::from_seed([0x5E; 32]);
+        let sealed = key.seal(h);
+        let wire = sealed.encode();
+        // Load-bearing.
+        assert!(sealed.verifies_under(&key.verifying_key()));
+        assert_eq!(wire.len(), SEALED_HEADER_LEN_ANNULET);
+        assert_eq!(wire.len(), 3462);
+        assert_eq!(SealedHeader::decode(&wire).unwrap(), sealed);
+        assert_eq!(hex(&sealed.id()), "1bc6fce1c82cfb364d7649cc610c2c8835e8b5c43f4af9f27d3da4c6c4d88b97");
+        assert_eq!(
+            hex(&keccak256(key.verifying_key().encode().as_slice())),
+            "263cee4046d7f19124c65e62a17fe6893300508a4119c26d17e39fbd711381df",
+            "the fixture sequencer key"
+        );
+        // Deterministic-signer goldens.
+        assert_eq!(hex(&keccak256(&sealed.sig[..])), "e02a1bd09b1fc70240e41a73bffeef01d8a25d0c2e9b5db16eb0e1d6d739fc43");
+        assert_eq!(hex(&keccak256(&wire)), "9ed2e2dcd6b8127376bb287b6db1ebff65860d8321ca5d200a2f3a05b9238ee4");
+        // Framing refusals.
+        assert_eq!(SealedHeader::decode(&wire[..3461]), Err(SealedHeaderError::WrongLength { got: 3461 }));
+        let mut bad = wire.clone();
+        bad[32] = 0x05;
+        assert!(matches!(SealedHeader::decode(&bad), Err(SealedHeaderError::Preimage(_))));
+    }
+
     #[test]
     #[should_panic(expected = "genesis note payload width")]
     fn a_genesis_note_payload_must_be_128_bytes() {

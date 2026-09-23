@@ -88,13 +88,21 @@ pub struct GenesisNoteRecord {
     pub payload: Vec<u8>,
 }
 
-/// The L2 genesis parameters (Q7): the posted fee tiers in fee-unit base
-/// units. **Placeholders** in the fixture (S = 1, P = 2), pending C2/B4's
-/// tariff; a real devnet mints its own values (B6).
+/// The L2 genesis parameters: the posted fee tiers in fee-unit base units
+/// (lab #706 Q7 — **placeholders** in the fixture, S = 1 / P = 2, pending
+/// C2/B4's tariff) and the sequencer's slot cadence (lab #708 Q5 — genesis
+/// parameters, not code constants: `slot_secs` = 10, an empty block at most
+/// every `max_empty_slots` = 6 slots, the §5 defaults). A real devnet mints
+/// its own values (B6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnuletParams {
     pub fee_tier_s: u64,
     pub fee_tier_p: u64,
+    /// The slot length in seconds (lab #708 Q5).
+    pub slot_secs: u64,
+    /// The producer seals an empty block at the latest every this many slots
+    /// with an empty pool (lab #708 Q5).
+    pub max_empty_slots: u64,
 }
 
 impl AnnuletParams {
@@ -341,7 +349,7 @@ impl AnnuletGenesisFile {
     ///   *not encrypted*: a devnet genesis seals them to the faucet's
     ///   ML-KEM key (B6).
     pub fn fixture() -> Self {
-        let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2 };
+        let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, slot_secs: 10, max_empty_slots: 6 };
         let isk = [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004];
         let asset7 = RegistryLeafRecord {
             asset: 7,
@@ -382,8 +390,10 @@ mod tests {
     use super::*;
 
     /// The fixture's genesis hash — computed by the named
-    /// `annulet_fixture_genesis` run, twice, byte-identical (3,031 B file).
-    const FIXTURE_GENESIS_HASH: &str = "c0257d6719b1c4ea1c80565e10475df691d71dc5f0660dd81572a434ebccb19a";
+    /// `annulet_fixture_genesis` run, twice, byte-identical. **Re-pinned by
+    /// lab #708 (Q5)**: the slot parameters joined `AnnuletParams`; the B1
+    /// value was `c0257d67…b19a` (3,031 B file); now 3,047 B.
+    const FIXTURE_GENESIS_HASH: &str = "a73f547d6c7d8763fd4090ce4bd133e13a24f4880ad272975003629a2a61ead2";
 
     #[test]
     fn the_fixture_verifies_and_selects_the_annulet_form() {

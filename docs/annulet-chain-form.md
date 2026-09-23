@@ -71,7 +71,7 @@ The gate is a test: `persist::tests::a_v4_block_reaches_disk_byte_identically_to
 | Annulet signing-message digest | `2d00955c…c9e3` | named run + Python |
 | Annulet empty-body commitment | `75dc7b56…52be` | named run + Python |
 | Annulet empty genesis-body commitment | `3ad958aa…d253` | named run + Python |
-| fixture Annulet genesis hash (3,031 B file) | `c0257d67…b19a` | named run ×2, byte-identical |
+| fixture Annulet genesis hash (3,047 B file; slot params added by lab #708) | `a73f547d…ead2` (B1: `c0257d67…b19a`) | named run ×2, byte-identical |
 | on-disk v4 block record | 362 B literal | Python bincode encoder |
 
 The local runs (both named by the #706 ruling; no proving):
