@@ -50,7 +50,9 @@ pub const HEADER_PREIMAGE_LEN_ANNULET: usize = 153;
 pub const HEADER_VERSION_BYTE_ANNULET: u8 = 0x20;
 
 /// The two reserved tag bytes an Annulet preimage ends with (offsets 151–152):
-/// fixed `0x00 0x00` (lab #706 ruling). The L1's rung-1 reservations
+/// fixed `0x00 0x00` by ruling (lab #706) — deliberately **not** the L1's
+/// `0xA6`/`0x59` magic values, which would suggest the L1's rider/reservation
+/// machinery applies here (riders are never active on Annulet). The L1's rung-1 reservations
 /// ([`AggregateProofSlot`], [`EpochSupplyAttestation`]) are L1 fields; an
 /// Annulet header reserves its own two bytes and activating either is a
 /// header-version change.

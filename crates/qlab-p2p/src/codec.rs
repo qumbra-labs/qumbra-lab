@@ -234,7 +234,13 @@ pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, Decod
 /// The Annulet header tail after `prev` (lab #706 Q3): version `0x20`, u48
 /// height, timestamp, `l1_anchor{height, root}`, `registry_root`, body
 /// commitment, and the two reserved bytes fixed at `0x00 0x00` —
-/// reject-unknown on each, reject-trailing at the end. The length was checked
+/// reject-unknown on each, reject-trailing at the end.
+///
+/// **The reserved bytes are fixed zeros by ruling (#706), not the L1's
+/// `0xA6`/`0x59` tags.** Riders are never active on an Annulet net, and the
+/// preimage is already distinguishable from v4/v5 by length; reusing the L1
+/// magic values would only invite a false "same rider/reservation machinery"
+/// reading. Activating either byte is an Annulet header-version change. The length was checked
 /// by the caller, so a v4/v5 header on an Annulet net is refused by
 /// `WrongHeaderLen` before any of this reads it.
 fn decode_header_annulet(prev: Hash32, mut r: Reader<'_>) -> Result<BlockHeader, DecodeError> {
