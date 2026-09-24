@@ -68,6 +68,11 @@ pub trait NotePlaintext: Sized + Clone {
     fn plaintext(&self) -> Vec<u8>;
     /// Decode a decrypted plaintext (`None` when it is not one).
     fn from_plaintext(b: &[u8]) -> Option<Self>;
+    /// The note's value, in its asset's units (lab #718: a scan's sums).
+    fn value(&self) -> u64;
+    /// The uniqueness seed ρ — the half of `nf = H(nk ‖ ρ)` a scanner holds
+    /// (lab #718: the nullifier-claim key, L1 and L2 alike).
+    fn rho(&self) -> [u64; 4];
 }
 
 impl NotePlaintext for Note {
@@ -80,6 +85,12 @@ impl NotePlaintext for Note {
     fn from_plaintext(b: &[u8]) -> Option<Self> {
         Note::from_plaintext(b)
     }
+    fn value(&self) -> u64 {
+        self.value
+    }
+    fn rho(&self) -> [u64; 4] {
+        self.rho
+    }
 }
 
 impl NotePlaintext for L2Note {
@@ -91,6 +102,12 @@ impl NotePlaintext for L2Note {
     }
     fn from_plaintext(b: &[u8]) -> Option<Self> {
         L2Note::from_plaintext(b)
+    }
+    fn value(&self) -> u64 {
+        self.value
+    }
+    fn rho(&self) -> [u64; 4] {
+        self.rho
     }
 }
 
