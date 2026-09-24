@@ -458,6 +458,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 🔴 **The submit route's early discovery check is the form's** (lab #716,
+    /// the third L1-only seam on `POST /v1/tx`, found by the B6 journey's
+    /// second lane run). One transaction whose group carries two outputs at
+    /// the **L2 width** (128-B payloads, a 256-B section): an Annulet node's
+    /// `submit_remote_tx` admits it, and an L1 node refuses it at that same
+    /// check as a malformed section (expected 240) — so the check is keyed,
+    /// and not merely permissive.
+    #[test]
+    fn the_submit_routes_discovery_check_takes_the_l2_width_on_annulet_and_refuses_it_on_l1() {
+        use crate::discovery_server::{TxRefusal, TxSubmitOutcome};
+        use qlab_devnet::annulet::{L2ShapeTag, L2Surface};
+        use qlab_devnet::body::{BodyError, TxEntry, TxPublic};
+        use qlab_devnet::fees::ArityBucket;
+        use qlab_note::l2note::{L2Note, L2_PAYLOAD_LEN};
+        use rand::SeedableRng;
+
+        let (config, genesis, base) = annulet_rig("i716_submit_width", true);
+        let mut node = start(&config, &genesis);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(716);
+        let wallet = qlab_note::kem::generate_keypair(&mut rng);
+        let note = |k: u64| L2Note { value: k, asset: 0, rkm: [k; 4], rho: [k + 1; 4], rseed: [k + 2; 4] };
+        let notes = [note(10), note(20)];
+        let out = qlab_note::scan::encrypt_notes_to_recipient(&wallet.ek, &notes, &mut rng);
+        assert!(out.payloads.iter().all(|p| p.len() == L2_PAYLOAD_LEN));
+        let state = node.p2p().node().state();
+        let tx = TxEntry {
+            proof: b"ok".to_vec(),
+            public: TxPublic {
+                anchor: state.commitment_root(),
+                nullifiers: vec![[0x71; 32], [0x72; 32]],
+                commitments: notes.iter().map(|n| qlab_note::hash::digest_bytes(&n.commitment())).collect(),
+                bucket: ArityBucket::TwoByTwo,
+                fee: genesis.params.fee_tier_s,
+            },
+            discovery: qlab_note::compact::encode_committed_discovery_with_width(
+                std::slice::from_ref(&out.bundle),
+                &out.payloads,
+                L2_PAYLOAD_LEN,
+            ),
+            rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+            l2: L2Surface {
+                shape: L2ShapeTag::S,
+                registry_root: state.registry_root_bytes().expect("an Annulet state has a registry"),
+                vpublic: None,
+            }
+            .encode(),
+        };
+
+        // Annulet: past the discovery check and admitted (rehearsal verifier).
+        let annulet = node.submit_remote_tx(tx.clone());
+        assert!(matches!(annulet, TxSubmitOutcome::Accepted { .. }), "{annulet:?}");
+        let _ = std::fs::remove_dir_all(&base);
+
+        // L1: the same bytes refused AT the discovery check, as a malformed section.
+        let (config, genesis, _base) = super::super::tests::rig("i716_submit_width_l1", false);
+        let mut l1 = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        match l1.submit_remote_tx(tx) {
+            TxSubmitOutcome::Refused(TxRefusal::Discovery(BodyError::DiscoveryMalformed { .. })) => {}
+            other => panic!("an L1 node must refuse the 128-B section at the discovery check: {other:?}"),
+        }
+    }
+
     /// A restarted producer resumes its sealed chain from the data dir
     /// (persist variant 3): same tip, final = tip, and it keeps sealing.
     #[test]

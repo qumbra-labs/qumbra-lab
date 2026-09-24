@@ -98,7 +98,8 @@
 //!   paging loop to build and nothing that could silently truncate. The size is
 //!   the block's to decide, not the caller's, and consensus bounds it: the
 //!   payload count equals the transaction's declared commitment count
-//!   (`check_tx_discovery`), which the FROZEN 2×2 shape puts at 2, i.e. 240 B.
+//!   (`check_tx_discovery`), which the FROZEN 2×2 shape puts at 2, i.e. 240 B
+//!   (256 B on an Annulet node, at the 128-B L2 width).
 //!
 //! Still not the wallet-facing RPC:
 //!
@@ -232,6 +233,26 @@ pub const COINBASE_PATH: &str = "/v1/coinbase";
 /// before it is read. `[devnet-placeholder]` — moves if the consensus wire
 /// does; not a frozen number.
 pub const MAX_TX_WIRE_BYTES: usize = 256 * 1024;
+
+/// The most bytes `POST /v1/tx` will read on an **Annulet** node (lab #716).
+///
+/// Basis: an L2 transaction carries an L2-lane proof — shape S ≈ 285.6 KB and
+/// shape P ≈ 312.7 KB at the provisional lane (W3's measured sizes) — plus
+/// the surface and a 128-B-payload discovery group, so ≈ 288–317 KB. The L1
+/// cap above refused every one of them (the B6 journey's first lane run: an
+/// S grant of 288,332 B answered `body-too-large`). 512 KiB covers P with
+/// slack. `[devnet-placeholder]` — moves with the L2 lane, which is
+/// provisional.
+pub const MAX_TX_WIRE_BYTES_ANNULET: usize = 512 * 1024;
+
+/// The `POST /v1/tx` body cap for `form`.
+pub fn max_tx_wire_bytes(form: qlab_devnet::forms::GenesisForm) -> usize {
+    use qlab_devnet::forms::GenesisForm;
+    match form {
+        GenesisForm::V4 | GenesisForm::V5 => MAX_TX_WIRE_BYTES,
+        GenesisForm::Annulet => MAX_TX_WIRE_BYTES_ANNULET,
+    }
+}
 
 /// Submissions the run loop can owe verdicts on at once; a fuller queue answers
 /// `503 unavailable: submit-queue-full` without touching the node. Sized to the
@@ -540,11 +561,21 @@ pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
 pub const GENESIS_NOTES_NOT_ON_L1: &str =
     "genesis notes are served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #714)";
 
-/// The genesis notes, encoded once (they never change): `None` on an L1
-/// node. A projection of the genesis file — its hash travels in the body.
-#[derive(Default)]
-pub struct GenesisNotesView {
-    pub encoded: Option<Vec<u8>>,
+/// What the server needs to know about the node's chain form (lab #714 /
+/// #716): the form keys the `POST /v1/tx` decoder (an Annulet transaction
+/// carries its L2 surface on the wire), and the genesis notes are encoded
+/// once (they never change) — `None` on an L1 node. A projection of the
+/// genesis file; its hash travels in the body.
+pub struct FormView {
+    pub form: qlab_devnet::forms::GenesisForm,
+    pub genesis_notes: Option<Vec<u8>>,
+}
+
+impl Default for FormView {
+    /// An L1 (v4-wire) node: the historical server, which never had a form.
+    fn default() -> Self {
+        Self { form: qlab_devnet::forms::GenesisForm::V4, genesis_notes: None }
+    }
 }
 
 /// The registry projection the run loop refreshes (lab #710). `None` on an
@@ -631,7 +662,7 @@ impl DiscoveryServer {
             submits,
             None,
             Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
-            Arc::new(GenesisNotesView::default()),
+            Arc::new(FormView::default()),
         )
     }
 
@@ -646,7 +677,7 @@ impl DiscoveryServer {
         submits: mpsc::SyncSender<SubmitRequest>,
         mine: Option<crate::mine_rpc::MineServing>,
         registry: Arc<Mutex<Arc<RegistryView>>>,
-        genesis_notes: Arc<GenesisNotesView>,
+        form_view: Arc<FormView>,
     ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
@@ -726,7 +757,7 @@ impl DiscoveryServer {
                         );
                         continue;
                     }
-                    spawn_submit_handler(request, submits.clone(), Arc::clone(&inflight));
+                    spawn_submit_handler(request, submits.clone(), Arc::clone(&inflight), form_view.form);
                     continue;
                 }
 
@@ -793,7 +824,7 @@ impl DiscoveryServer {
                         Ok(snapshot.encoded.clone())
                     }
                     // Lab #714: the genesis notes (a projection of the genesis file).
-                    GENESIS_NOTES_PATH => match &genesis_notes.encoded {
+                    GENESIS_NOTES_PATH => match &form_view.genesis_notes {
                         Some(bytes) => Ok(bytes.clone()),
                         None => Err((400, GENESIS_NOTES_NOT_ON_L1.to_string())),
                     },
@@ -1015,6 +1046,7 @@ fn spawn_submit_handler(
     request: tiny_http::Request,
     submits: mpsc::SyncSender<SubmitRequest>,
     inflight: Arc<AtomicUsize>,
+    form: qlab_devnet::forms::GenesisForm,
 ) {
     // Claim a slot before spawning; the refusal must not cost a thread either.
     if inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_SUBMITS {
@@ -1029,7 +1061,7 @@ fn spawn_submit_handler(
     }
     std::thread::spawn(move || {
         let mut request = request;
-        let (code, body) = submit_verdict(&mut request, &submits);
+        let (code, body) = submit_verdict(&mut request, &submits, form);
         let _ = request
             .respond(tiny_http::Response::from_string(body).with_status_code(code));
         inflight.fetch_sub(1, Ordering::AcqRel);
@@ -1224,28 +1256,32 @@ fn mine_block_verdict(
 fn submit_verdict(
     request: &mut tiny_http::Request,
     submits: &mpsc::SyncSender<SubmitRequest>,
+    form: qlab_devnet::forms::GenesisForm,
 ) -> (u16, String) {
     // 1. The body, bounded BEFORE it is read: a declared oversize is refused on
     //    the header, an undeclared one on the byte that crosses the cap.
+    //    The cap is the form's (lab #716: an L2 proof is ~2× the L1 one).
+    let cap = max_tx_wire_bytes(form);
     if let Some(len) = request.body_length() {
-        if len > MAX_TX_WIRE_BYTES {
-            return (413, format!("refused: body-too-large ({len} > {MAX_TX_WIRE_BYTES} bytes)"));
+        if len > cap {
+            return (413, format!("refused: body-too-large ({len} > {cap} bytes)"));
         }
     }
     let mut body = Vec::new();
     {
         use std::io::Read;
-        let mut bounded = request.as_reader().take(MAX_TX_WIRE_BYTES as u64 + 1);
+        let mut bounded = request.as_reader().take(cap as u64 + 1);
         if bounded.read_to_end(&mut body).is_err() {
             return (400, "refused: body-unreadable".to_string());
         }
     }
-    if body.len() > MAX_TX_WIRE_BYTES {
-        return (413, format!("refused: body-too-large (> {MAX_TX_WIRE_BYTES} bytes)"));
+    if body.len() > cap {
+        return (413, format!("refused: body-too-large (> {cap} bytes)"));
     }
 
-    // 2. Decode — the same canonical wire the P2P layer speaks, same decoder.
-    let tx = match qlab_p2p::codec::decode_tx(&body) {
+    // 2. Decode — the same canonical wire the P2P layer speaks, same decoder,
+    //    keyed on the form (lab #716: an Annulet tx carries its L2 surface).
+    let tx = match qlab_p2p::codec::decode_tx_for(form, &body) {
         Ok(tx) => tx,
         Err(e) => return (400, format!("refused: decode {e:?}")),
     };

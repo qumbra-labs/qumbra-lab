@@ -2180,7 +2180,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             submit_tx,
             Some(mine),
             Arc::clone(&self.registry_view),
-            Arc::new(crate::discovery_server::GenesisNotesView { encoded: self.genesis_notes_body() }),
+            Arc::new(crate::discovery_server::FormView { form: self.form(), genesis_notes: self.genesis_notes_body() }),
         )?;
         self.refresh_registry();
         let bound = srv.addr();
@@ -2362,8 +2362,8 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
     ///    its own named token (`nullifier-repeated-in-tx`) rather than the
     ///    flattened pool verdict.
     /// 2. **The §4 discovery↔cm binding** —
-    ///    [`qlab_devnet::body::check_tx_discovery`], the same consensus function
-    ///    `validate_body` runs per block. `NodeRpc::submit_tx`'s own discovery
+    ///    [`qlab_devnet::body::check_tx_discovery_for`] at this node's form, the
+    ///    same consensus function the form's body rule runs per block. `NodeRpc::submit_tx`'s own discovery
     ///    check compares separately-submitted artifacts against the committed
     ///    bytes; over this wire there are no separate artifacts — the group IS
     ///    in the body — so the §4 rules are the whole check, and they are
@@ -2393,7 +2393,9 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         if qlab_node::repeated_nullifier_in_tx(p).is_some() {
             return TxSubmitOutcome::Refused(TxRefusal::RepeatedNullifier);
         }
-        if let Err(e) = qlab_devnet::body::check_tx_discovery(0, &tx) {
+        // Lab #716: at this node's form's width (an Annulet group is 128-B
+        // payloads; the L1 check refused every L2 transaction as malformed).
+        if let Err(e) = qlab_devnet::body::check_tx_discovery_for(self.form(), 0, &tx) {
             return TxSubmitOutcome::Refused(TxRefusal::Discovery(e));
         }
         use qlab_p2p::adapter::TxSubmitRefusal as R;

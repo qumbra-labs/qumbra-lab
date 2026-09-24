@@ -1832,14 +1832,17 @@ dependencies = [
 name = "qumbra-faucet"
 version = "0.0.0"
 dependencies = [
+ "bincode",
  "ctrlc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus-client",
+ "qlab-air",
  "qlab-cbserver",
  "qlab-devnet",
  "qlab-faucet",
+ "qlab-l2",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",

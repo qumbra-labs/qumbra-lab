@@ -80,6 +80,7 @@ fn dispatch(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>
         Some("ticket") => ticket(&args[1..]),
         Some("check") => check(&args[1..]),
         Some("run") => run(&args[1..], telemetry),
+        Some("annulet") => annulet(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -99,7 +100,9 @@ fn usage() {
          qumbra-faucet address --config FILE       print the receive address + the miner_rkm to pay\n  \
          qumbra-faucet ticket --config FILE --id N issue one single-use grant ticket\n  \
          qumbra-faucet check --config FILE         validate the deployment; bind nothing, mine nothing\n  \
-         qumbra-faucet run --config FILE           run the keyless node + the HTTP listener\n"
+         qumbra-faucet run --config FILE           run the keyless node + the HTTP listener\n  \
+         qumbra-faucet annulet --node-config FILE [--listen ADDR]\n                                            \
+         the Annulet devnet faucet: a keyless follower + genesis-stock grants (lab #716)\n"
     );
 }
 
@@ -472,4 +475,73 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
             None => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt}"),
         }
     }
+}
+
+/// **The Annulet devnet faucet** (lab #716): a keyless follower in process,
+/// its discovery endpoint as the faucet's served source, and one grant per
+/// genesis stock note over `POST /v1/annulet/grant`.
+///
+/// Refuses, by name and before anything binds: an L1 genesis (that is
+/// `qumbra-faucet run`), any genesis other than the devnet's (the only
+/// Annulet faucet key is the devnet's **dev** key, public by construction),
+/// and a node that would be the sequencer.
+fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_faucet::annulet::{serve_grants, AnnuletFaucet, Served, SpendKey};
+    use qumbra_node::annulet_genesis::{devnet, load_any, AnnuletGenesisFile, AnyGenesis};
+    let cfg_path = flag(args, "--node-config").ok_or("annulet requires --node-config FILE")?;
+    let listen = flag(args, "--listen").unwrap_or("127.0.0.1:8090");
+    let node_cfg = NodeConfig::load(cfg_path)?;
+    let genesis = match load_any(&std::fs::read(&node_cfg.genesis_file)?)? {
+        AnyGenesis::L1(_) => {
+            return Err("the genesis is an L1 form; the Annulet faucet refuses to start on it \
+                        (lab #716) — the L1 faucet is `qumbra-faucet run`"
+                .into())
+        }
+        AnyGenesis::Annulet(g) => g,
+    };
+    if genesis.hash() != AnnuletGenesisFile::devnet().hash() {
+        return Err("this Annulet genesis is not the devnet genesis; the Annulet faucet holds only the \
+                    devnet dev key (lab #716)"
+            .into());
+    }
+    // An Annulet net has no PoW; the engine parameter is unused on it.
+    let mut node = RunningNode::start_annulet(
+        &node_cfg,
+        &genesis,
+        qlab_devnet::pow::KeccakPow,
+        qumbra_node::verifier::L2Verifier,
+    )?;
+    if node.is_sequencer() {
+        return Err("the faucet's node would be the sequencer (a sequencer key file is in its data dir); \
+                    the faucet runs a keyless follower"
+            .into());
+    }
+    let discovery = node.start_discovery_endpoint(node_cfg.discovery_bind().unwrap_or("127.0.0.1:0"))?;
+    node.refresh_discovery();
+    node.refresh_leaves();
+    node.refresh_registry();
+    let key = SpendKey { sk: devnet::FAUCET_SK, d: devnet::FAUCET_D };
+    let change = qlab_note::kem::generate_keypair(&mut rand::rng());
+    let faucet = AnnuletFaucet::start(
+        Served { addr: discovery },
+        genesis.form()?,
+        key,
+        change.ek,
+        genesis.params.fee_tier_s,
+    )?;
+    let stock = faucet.stock_left();
+    let bound = serve_grants(listen, Arc::new(std::sync::Mutex::new(faucet)))?;
+    qlab_devnet::jprintln!("qumbra-faucet annulet running (lab #716)");
+    qlab_devnet::jprintln!("  grants:         http://{bound}{}", qumbra_faucet::annulet::GRANT_PATH);
+    qlab_devnet::jprintln!("  stock:          {stock} genesis note(s) unspent");
+    qlab_devnet::jprintln!("  node listen:    {}", node.listen_addr());
+    qlab_devnet::jprintln!("  node discovery: http://{discovery}/");
+    qlab_devnet::jprintln!("  genesis hash:   {}", genesis.hash_hex());
+    qlab_devnet::jprintln!(WARN, "  ⚠️  DEV KEY: the faucet key is the devnet's published dev key. No tickets, no rate limit.");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let sig = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
+    node.run_until(&shutdown);
+    qlab_devnet::jprintln!("shutdown complete");
+    Ok(())
 }

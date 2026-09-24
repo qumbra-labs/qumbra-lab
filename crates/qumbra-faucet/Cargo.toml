@@ -61,6 +61,11 @@ qlab-devnet = { path = "../qlab-devnet" }
 # also takes) and `peers()` for the status page's peer count. Already in the graph
 # via qumbra-node; named because this binary uses it directly.
 qlab-p2p = { path = "../qlab-p2p" }
+# Annulet mode (lab #716, B6): the L2 spend assembly — the circuit's host-side
+# builders, the L2 prover/verifier lane, and the proof's wire encoding.
+qlab-air = { path = "../qlab-air" }
+qlab-l2 = { path = "../qlab-l2" }
+bincode = "1"
 # TOML service config, same posture and same `=`-free pin as the node's.
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
