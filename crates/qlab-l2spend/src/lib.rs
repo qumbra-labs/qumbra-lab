@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
 use qlab_air::l2::{L2TxInput, L2TxOutput, RegistryLeaf, MODE_CLOAKED, MODE_HYBRID, MODE_REGULATED};
-use qlab_air::l2p::{dummy_allow_witness, FreezeTree, L2PolicyInput, PolicyAsset, VPublic};
+use qlab_air::l2p::{dummy_allow_witness, CanonicalFreezeTree, L2PolicyInput, PolicyWitness, VPublic};
 use qlab_air::narrow::MerkleWitness;
 use qlab_cbserver::registry::{decode_genesis_notes, decode_registry_opening, RegistryOpening};
 use qlab_cbserver::tree::CommitmentTree;
@@ -45,6 +45,13 @@ pub enum SpendError {
     NeedsIssuerWitness { asset: u64, why: &'static str },
     /// The inputs' registry openings were computed against different roots.
     RegistryMoved,
+    /// The published freeze list does not rebuild the served `freeze_root`:
+    /// it is not the issuer's current list (lab #722).
+    FreezeListStale { asset: u64 },
+    /// This address is on the asset's freeze list (lab #722).
+    Frozen { asset: u64 },
+    /// The allowlist witness does not fold to the served `allow_root`.
+    NotAllowlisted { asset: u64 },
 }
 
 impl std::fmt::Display for SpendError {
@@ -59,6 +66,15 @@ impl std::fmt::Display for SpendError {
             ),
             SpendError::RegistryMoved => {
                 write!(f, "the registry moved between the two openings; retry")
+            }
+            SpendError::FreezeListStale { asset } => write!(
+                f,
+                "asset {asset}: the freeze list does not rebuild the registry's freeze root — fetch the \
+                 issuer's current list"
+            ),
+            SpendError::Frozen { asset } => write!(f, "asset {asset}: this address is frozen by the issuer"),
+            SpendError::NotAllowlisted { asset } => {
+                write!(f, "asset {asset}: the allowlist witness does not open the registry's allow root")
             }
         }
     }
@@ -247,37 +263,59 @@ pub struct Built {
     pub shape: L2ShapeTag,
 }
 
-/// **The policy inputs of a transfer** (vPublic = 0), from the served
-/// opening alone. A Cloaked leaf opens the empty freeze tree. A Hybrid leaf
-/// opens the freeze tree rebuilt **empty under the circuit's own constructor**
-/// (`PolicyAsset::hybrid`), and is used only when that root is the served
-/// `freeze_root` — otherwise the issuer's witness is needed. Regulated always
-/// needs the issuer's allowlist witness. `isk` is zero: a transfer proves no
-/// issuer action (lab #720).
-pub fn policy_for_transfer(opening: &RegistryOpening, rkm: &[u64; 4]) -> Result<L2PolicyInput, SpendError> {
+/// What one input's policy needs beyond the served opening (lab #722): the
+/// issuer's **published freeze-key list** (Hybrid and Regulated), a
+/// Regulated holder's **allowlist witness** (the issuer hands it over), and
+/// the issuer secret for a mint or a closed redeem (zero otherwise).
+#[derive(Clone, Default)]
+pub struct PolicyContext {
+    pub freeze_keys: Vec<[u64; 4]>,
+    pub allow_witness: Option<PolicyWitness>,
+    pub isk: [u64; 4],
+}
+
+/// **The policy inputs of one P input**, from the served opening and the
+/// published data. A Cloaked leaf opens the empty canonical tree (its path
+/// is not checked against a root). A Hybrid or Regulated leaf opens the
+/// **canonical** freeze tree rebuilt from the published key list, used only
+/// when that root is the served `freeze_root`; a frozen `rkm` is refused by
+/// name before any proving. A Regulated leaf also needs the holder's
+/// allowlist witness folding to the served `allow_root`.
+pub fn policy_input(opening: &RegistryOpening, rkm: &[u64; 4], ctx: &PolicyContext) -> Result<L2PolicyInput, SpendError> {
     let leaf: RegistryLeaf = opening.leaf;
-    let freeze = match leaf.mode {
-        MODE_CLOAKED => FreezeTree::empty(),
-        MODE_HYBRID => {
-            let rebuilt = PolicyAsset::hybrid(leaf.asset, [0; 4], false, &[]).freeze;
-            if rebuilt.root != leaf.freeze_root {
-                return Err(SpendError::NeedsIssuerWitness {
-                    asset: leaf.asset,
-                    why: "the asset's freeze tree is not empty, so its non-membership opening is the issuer's",
-                });
+    let tree = match leaf.mode {
+        MODE_CLOAKED => CanonicalFreezeTree::empty(),
+        MODE_HYBRID | MODE_REGULATED => {
+            let tree = CanonicalFreezeTree::from_keys(&ctx.freeze_keys);
+            if tree.root != leaf.freeze_root {
+                return Err(SpendError::FreezeListStale { asset: leaf.asset });
             }
-            rebuilt
-        }
-        MODE_REGULATED => {
-            return Err(SpendError::NeedsIssuerWitness { asset: leaf.asset, why: "a Regulated asset needs the issuer's allowlist witness" })
+            tree
         }
         _ => return Err(SpendError::Served(format!("asset {}: unknown registry mode {}", leaf.asset, leaf.mode))),
     };
-    let freeze = freeze.opening_for(rkm).ok_or(SpendError::NeedsIssuerWitness {
-        asset: leaf.asset,
-        why: "this rkm has no freeze non-membership opening",
-    })?;
-    Ok(L2PolicyInput { leaf, reg_witness: opening.witness, freeze, allow: dummy_allow_witness(), isk: [0; 4] })
+    let freeze = tree.opening_for(rkm).ok_or(SpendError::Frozen { asset: leaf.asset })?;
+    let allow = if leaf.mode == MODE_REGULATED {
+        let w = ctx.allow_witness.ok_or(SpendError::NeedsIssuerWitness {
+            asset: leaf.asset,
+            why: "a Regulated asset needs the holder's allowlist witness, which the issuer hands over",
+        })?;
+        if w.fold_root(&qlab_air::l2p::cred_of(rkm)) != leaf.allow_root {
+            return Err(SpendError::NotAllowlisted { asset: leaf.asset });
+        }
+        w
+    } else {
+        dummy_allow_witness()
+    };
+    Ok(L2PolicyInput { leaf, reg_witness: opening.witness, freeze, allow, isk: ctx.isk })
+}
+
+/// A transfer's policy input with an **empty** published freeze list and no
+/// issuer secret (C2's case): a Hybrid asset whose freeze tree is not empty
+/// is refused as [`SpendError::FreezeListStale`] — pass the issuer's list via
+/// [`policy_input`].
+pub fn policy_for_transfer(opening: &RegistryOpening, rkm: &[u64; 4]) -> Result<L2PolicyInput, SpendError> {
+    policy_input(opening, rkm, &PolicyContext::default())
 }
 
 /// The shape a transfer of `leaf`'s asset needs.
@@ -433,6 +471,23 @@ pub fn build_p<E: Endpoint, R: rand::CryptoRng>(
     fee: u64,
     rng: &mut R,
 ) -> Result<Built, SpendError> {
+    build_p_with(served, inputs, outs, fee, [&PolicyContext::default(), &PolicyContext::default()], [VPublic::NONE; 2], rng)
+}
+
+/// **A shape-P spend with issuance** (lab #722): each input's policy from
+/// its [`PolicyContext`], and a `vPublic` per row — `VPublic::mint(v)` /
+/// `VPublic::redeem(v)` on the row of the asset being issued or burned (the
+/// issuer's `isk` in that row's context unless the asset is `redeem_open`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_p_with<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: [&L2TxInput; 2],
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    rng: &mut R,
+) -> Result<Built, SpendError> {
     let tree = served.commitment_tree()?;
     let anchor = tree.root();
     let regs = [served.registry(inputs[0].asset)?, served.registry(inputs[1].asset)?];
@@ -440,7 +495,7 @@ pub fn build_p<E: Endpoint, R: rand::CryptoRng>(
         return Err(SpendError::RegistryMoved);
     }
     let rkm = |i: &L2TxInput| qlab_air::l2p::derive_rkm_l2(i);
-    let policy = [policy_for_transfer(&regs[0], &rkm(inputs[0]))?, policy_for_transfer(&regs[1], &rkm(inputs[1]))?];
+    let policy = [policy_input(&regs[0], &rkm(inputs[0]), ctx[0])?, policy_input(&regs[1], &rkm(inputs[1]), ctx[1])?];
     let outputs = l2_outputs(outs, rng);
     let inst = qlab_air::l2p::build_bucket_l2p_with_witnesses(
         qlab_l2::LOG_HEIGHT_P,
@@ -451,13 +506,20 @@ pub fn build_p<E: Endpoint, R: rand::CryptoRng>(
         anchor,
         &policy,
         regs[0].root,
-        [VPublic::NONE; 2],
+        vp,
     );
     let (_, proof) = qlab_l2::prove_p(&inst);
     let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
     let discovery = discovery_for(&notes, outs, rng);
+    let term = |k: usize| {
+        if vp[k].amount == 0 {
+            VPublicTerm::NONE
+        } else {
+            VPublicTerm { redeem: vp[k].redeem, amount: vp[k].amount, asset: inputs[k].asset as u16 }
+        }
+    };
     let surface =
-        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&regs[0].root), vpublic: Some([VPublicTerm::NONE; 2]) };
+        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&regs[0].root), vpublic: Some([term(0), term(1)]) };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 
@@ -474,22 +536,41 @@ mod tests {
         RegistryOpening { height: 0, root: [0; 4], leaf, witness }
     }
 
-    /// Q5: an empty Hybrid freeze tree is rebuilt and used; a non-empty one,
-    /// and a Regulated asset, are refused by name.
+    fn hybrid_leaf(asset: u64, frozen: &[[u64; 4]]) -> RegistryLeaf {
+        RegistryLeaf {
+            asset,
+            issuer_key: qlab_air::l2p::issuer_key_of(&[7; 4]),
+            mode: MODE_HYBRID,
+            freeze_root: CanonicalFreezeTree::from_rkms(frozen).root,
+            allow_root: [0; 4],
+            flags: 0,
+        }
+    }
+
+    /// Lab #720/#722: the policy is built from the served leaf plus the
+    /// published list — and refused by name when the list is stale, when
+    /// the holder is frozen, and for a Regulated asset without a witness.
     #[test]
-    fn transfer_policy_is_built_only_for_what_the_wallet_can_open() {
+    fn policy_inputs_are_built_from_the_published_list_and_refused_by_name() {
         let rkm = [9u64; 4];
-        let empty = PolicyAsset::hybrid(1, [7; 4], false, &[]);
-        let pol = policy_for_transfer(&opening(empty.leaf()), &rkm).expect("an empty freeze tree is rebuildable");
+        let empty = hybrid_leaf(1, &[]);
+        let pol = policy_for_transfer(&opening(empty), &rkm).expect("an empty freeze tree needs no list");
         assert_eq!(pol.isk, [0; 4], "a transfer carries no issuer secret");
-        assert_eq!(pol.leaf, empty.leaf(), "the served leaf, as served");
-        let frozen = PolicyAsset::hybrid(1, [7; 4], false, &[[1; 4]]);
-        assert!(matches!(policy_for_transfer(&opening(frozen.leaf()), &rkm), Err(SpendError::NeedsIssuerWitness { asset: 1, .. })));
-        let regulated = PolicyAsset::regulated(2, [7; 4], false, &[], &[rkm]);
-        assert!(matches!(policy_for_transfer(&opening(regulated.leaf()), &rkm), Err(SpendError::NeedsIssuerWitness { asset: 2, .. })));
-        assert!(policy_for_transfer(&opening(PolicyAsset::cloaked(0).leaf()), &rkm).is_ok());
-        assert_eq!(shape_for(&PolicyAsset::cloaked(0).leaf()), L2ShapeTag::S);
-        assert_eq!(shape_for(&empty.leaf()), L2ShapeTag::P);
+        assert_eq!(pol.leaf, empty, "the served leaf, as served");
+        let frozen = hybrid_leaf(1, &[[1; 4]]);
+        assert_eq!(policy_for_transfer(&opening(frozen), &rkm).err(), Some(SpendError::FreezeListStale { asset: 1 }));
+        let list = PolicyContext { freeze_keys: vec![qlab_air::l2p::freeze_key_of(&[1; 4])], ..Default::default() };
+        assert!(policy_input(&opening(frozen), &rkm, &list).is_ok(), "the published list rebuilds the root");
+        assert_eq!(policy_input(&opening(frozen), &[1; 4], &list).err(), Some(SpendError::Frozen { asset: 1 }));
+        let allow = qlab_air::l2p::CanonicalAllowTree::from_rkms(&[rkm]);
+        let regulated = RegistryLeaf { mode: MODE_REGULATED, allow_root: allow.root, ..hybrid_leaf(2, &[]) };
+        assert!(matches!(policy_for_transfer(&opening(regulated), &rkm), Err(SpendError::NeedsIssuerWitness { asset: 2, .. })));
+        let with = PolicyContext { allow_witness: allow.witness_for(&qlab_air::l2p::cred_of(&rkm)), ..Default::default() };
+        assert!(policy_input(&opening(regulated), &rkm, &with).is_ok());
+        assert_eq!(policy_input(&opening(regulated), &[5; 4], &with).err(), Some(SpendError::NotAllowlisted { asset: 2 }));
+        assert!(policy_for_transfer(&opening(RegistryLeaf::cloaked(0)), &rkm).is_ok());
+        assert_eq!(shape_for(&RegistryLeaf::cloaked(0)), L2ShapeTag::S);
+        assert_eq!(shape_for(&empty), L2ShapeTag::P);
     }
 
     #[test]
