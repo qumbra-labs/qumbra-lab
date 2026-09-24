@@ -64,6 +64,11 @@ pub enum RegistryError {
     /// A registry update before A2 lands shape R: the registry is immutable
     /// after genesis until then.
     UpdatesArriveWithA2,
+    /// **The registry invariant broken** (lab #724): slot `slot` holds a leaf
+    /// whose asset lane is not `slot`. Shapes S and P prove *a* path to the
+    /// root and trust the leaf's asset lane, so this invariant is what makes
+    /// them sound; every registry write must keep it.
+    SlotAssetMismatch { slot: u64, asset: u64 },
 }
 
 impl RegistryTree {
@@ -96,7 +101,25 @@ impl RegistryTree {
             }
             levels.push(up);
         }
-        Ok(Self { leaves: by_asset, levels })
+        let tree = Self { leaves: by_asset, levels };
+        tree.check_invariant()?;
+        Ok(tree)
+    }
+
+    /// **The registry invariant** (lab #724, consensus-critical): every slot
+    /// `i` holds the empty digest or a leaf whose asset lane is `i`. Genesis
+    /// places each leaf at its own asset index, so this holds by construction
+    /// today; the check keeps it true against any future writer (shape R
+    /// enforces the same on every registry transaction).
+    pub fn check_invariant(&self) -> Result<(), RegistryError> {
+        for (&slot, digest) in &self.levels[0] {
+            match self.leaves.get(&(slot as u16)) {
+                Some(l) if l.asset == slot && l.hash() == *digest => {}
+                Some(l) => return Err(RegistryError::SlotAssetMismatch { slot, asset: l.asset }),
+                None => return Err(RegistryError::SlotAssetMismatch { slot, asset: u64::MAX }),
+            }
+        }
+        Ok(())
     }
 
     /// The registry root (the empty tree's root when no asset is registered).
@@ -276,6 +299,49 @@ mod tests {
         let mut w = t.witness(5).unwrap();
         w.siblings[3][0] ^= 1;
         assert_ne!(w.fold_root(&RegistryLeaf::cloaked(5).hash()), t.root());
+    }
+
+    /// Lab #724: the registry invariant — slot `i` holds the empty digest or a
+    /// leaf of asset `i` — holds for a built tree, and a tree whose slot
+    /// carries another asset's leaf is refused by name.
+    /// Shape R's host-side opener (`qlab_air::l2r::registry_opening`, which
+    /// the fixtures and benches write with) is this tree: same root, same
+    /// siblings and path bits for every registered slot — and for an empty
+    /// slot, the opening a registration needs, whose fold of the zero digest
+    /// is this tree's root and of the new leaf the root after the write.
+    #[test]
+    fn shape_r_opener_agrees_with_the_tree() {
+        use qlab_air::l2r::registry_opening;
+        let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(5), hybrid(7), RegistryLeaf::cloaked(65_535)];
+        let t = RegistryTree::from_leaves(&leaves).unwrap();
+        for l in &leaves {
+            let (w, root) = registry_opening(&leaves, l.asset);
+            let tw = t.witness(l.asset as u16).unwrap();
+            assert_eq!(root, t.root());
+            assert_eq!((w.siblings, w.path_bits), (tw.siblings, tw.path_bits), "asset {}", l.asset);
+        }
+        let (w, root) = registry_opening(&leaves, 6);
+        assert_eq!(root, t.root());
+        assert_eq!(w.fold_root(&[0; 4]), t.root(), "slot 6 is empty: the zero digest folds to the root");
+        let mut after = leaves.to_vec();
+        after.push(hybrid(6));
+        let t2 = RegistryTree::from_leaves(&after).unwrap();
+        assert_eq!(w.fold_root(&hybrid(6).hash()), t2.root(), "the registration's new root");
+    }
+
+    #[test]
+    fn slot_i_holds_only_a_leaf_of_asset_i() {
+        let leaves = [RegistryLeaf::cloaked(0), hybrid(7), RegistryLeaf::cloaked(65_535)];
+        let t = RegistryTree::from_leaves(&leaves).unwrap();
+        assert_eq!(t.check_invariant(), Ok(()));
+        for l in &leaves {
+            assert_eq!(t.levels[0].get(&l.asset), Some(&l.hash()), "asset {} sits at slot {}", l.asset, l.asset);
+        }
+        // A hand-planted tree: asset 7's leaf copied into slot 9.
+        let mut planted = t.clone();
+        planted.levels[0].insert(9, hybrid(7).hash());
+        planted.leaves.insert(9, hybrid(7));
+        assert_eq!(planted.check_invariant(), Err(RegistryError::SlotAssetMismatch { slot: 9, asset: 7 }));
     }
 
     #[test]

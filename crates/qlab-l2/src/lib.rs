@@ -11,11 +11,12 @@
 //! - **the shapes** — [`Shape`] with its geometry and PV layout, re-exported
 //!   from `qlab-air` (never re-typed), the canonical program, and the
 //!   [`digest`] that pins each shape's v1 constants and constraint set.
-//! - **prove / verify** — [`prove_s`]/[`verify_s`], [`prove_p`]/[`verify_p`].
-//!   Verification takes no instance: both AIRs' `eval` read exactly one struct
-//!   field, `program`, so the verifier's AIR is a pure function of the shape
-//!   ([`verifier_air_s`], [`verifier_air_p`]; lab #704 P13, locked by
-//!   `l2_verifier_air_is_instance_independent`).
+//! - **prove / verify** — [`prove_s`]/[`verify_s`], [`prove_p`]/[`verify_p`],
+//!   [`prove_r`]/[`verify_r`] (shape R, registry writes — lab #724).
+//!   Verification takes no instance: every AIR's `eval` reads exactly one
+//!   struct field, `program`, so the verifier's AIR is a pure function of the
+//!   shape ([`verifier_air_s`], [`verifier_air_p`], [`verifier_air_r`]; lab
+//!   #704 P13, locked by `l2_verifier_air_is_instance_independent`).
 //! - **fixtures** — the deterministic instances W3 measured ([`fixture`]).
 //!
 //! Workspace dependencies are exactly `qlab-air` + `qlab-consensus`
@@ -36,6 +37,10 @@ pub use qlab_air::l2::{
 pub use qlab_air::l2p::{
     pv_vec_l2p as pv_vec_p, L2PBucketInstance, L2ShapePAir, PolicyAsset, VPublic, ALLOW_DEPTH,
     FLAG_REDEEM_OPEN, FREEZE_DEPTH, PV_VP1, PV_VP2,
+};
+pub use qlab_air::l2r::{
+    pv_vec_r, L2ShapeRAir, L2ShapeRInstance, RegistryWrite, PV_ASSET as PV_R_ASSET,
+    PV_NEW_ROOT as PV_R_NEW_ROOT, PV_OLD_ROOT as PV_R_OLD_ROOT,
 };
 
 pub mod digest;
@@ -88,6 +93,21 @@ pub fn make_config_l2() -> Config {
 pub const LOG_HEIGHT_S: usize = qlab_air::l2::SHAPE_S_LOG_HEIGHT;
 /// log2 of the shape-P trace height (214 perms → 2^20).
 pub const LOG_HEIGHT_P: usize = qlab_air::l2p::SHAPE_P_LOG_HEIGHT;
+/// log2 of the shape-R trace height (79 perms → 2^18).
+pub const LOG_HEIGHT_R: usize = qlab_air::l2r::SHAPE_R_LOG_HEIGHT;
+
+/// **`fee_tier_r` — a labelled PLACEHOLDER** (lab #724, fee option (c)): the
+/// fee a shape-R transaction pays, in fee-unit base units, in its own asset-0
+/// spend. R takes the fee as a public value; the node checks it against this
+/// tier when it applies R transactions (milestone B3b), where the value moves
+/// into the Annulet genesis parameters beside `fee_tier_s` / `fee_tier_p` —
+/// A2 deliberately leaves the genesis and its hash untouched.
+///
+/// **Registration is permissionless into 65,536 slots** (asset ids are 16-bit
+/// registry indices; asset 0 is the fee asset and never writable), so
+/// **`fee_tier_r` is the only price on exhausting the registry's slots**. The
+/// placeholder is not that price; the pilot's tariff must be.
+pub const FEE_TIER_R_PLACEHOLDER: u64 = 4;
 
 /// A shape of the L2 transaction circuit family. The shape is public, as
 /// bucket arity is on L1 (`l2-own-circuit-decision` §2.3).
@@ -98,6 +118,9 @@ pub enum Shape {
     /// Policy assets (Hybrid / Regulated): S + freeze non-membership +
     /// allowlist membership + `vPublic`.
     P,
+    /// Registry writes: one slot registered (empty → leaf) or updated (leaf →
+    /// leaf, issuer key proven), with a 1-in / 1-out fee spend.
+    R,
 }
 
 impl Shape {
@@ -106,6 +129,7 @@ impl Shape {
         match self {
             Shape::S => qlab_air::l2::L2_WIDTH,
             Shape::P => qlab_air::l2p::L2P_WIDTH,
+            Shape::R => qlab_air::l2r::L2R_WIDTH,
         }
     }
     /// log2 of the trace height.
@@ -113,6 +137,7 @@ impl Shape {
         match self {
             Shape::S => LOG_HEIGHT_S,
             Shape::P => LOG_HEIGHT_P,
+            Shape::R => LOG_HEIGHT_R,
         }
     }
     /// Program perms, including the leading dummy warm-up slot.
@@ -120,6 +145,7 @@ impl Shape {
         match self {
             Shape::S => qlab_air::l2::SHAPE_S_PERMS,
             Shape::P => qlab_air::l2p::SHAPE_P_PERMS,
+            Shape::R => qlab_air::l2r::SHAPE_R_PERMS,
         }
     }
     /// Public-value vector length.
@@ -127,13 +153,14 @@ impl Shape {
         match self {
             Shape::S => qlab_air::l2::PV_LEN,
             Shape::P => qlab_air::l2p::PV_LEN,
+            Shape::R => qlab_air::l2r::PV_LEN,
         }
     }
     /// Offset of the row-`k` `vPublic` block (`redeem`, four 16-bit chunks of
     /// `amount`, `vpa`) — shape P only.
     pub const fn pv_vpublic(self, k: usize) -> Option<usize> {
         match self {
-            Shape::S => None,
+            Shape::S | Shape::R => None,
             Shape::P => Some(if k == 0 { PV_VP1 } else { PV_VP2 }),
         }
     }
@@ -145,9 +172,11 @@ impl Shape {
 pub fn canonical_program(shape: Shape) -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     static P: OnceLock<Vec<u32>> = OnceLock::new();
+    static R: OnceLock<Vec<u32>> = OnceLock::new();
     match shape {
         Shape::S => S.get_or_init(|| fixture::shape_s().air.program.to_vec()),
         Shape::P => P.get_or_init(|| fixture::shape_p().air.program.to_vec()),
+        Shape::R => R.get_or_init(|| fixture::shape_r().air.program.to_vec()),
     }
 }
 
@@ -164,6 +193,14 @@ pub fn verifier_air_p() -> L2ShapePAir {
     L2ShapePAir {
         program: canonical_program(Shape::P).try_into().expect("P program length"),
         ..L2ShapePAir::chain_only(LOG_HEIGHT_P)
+    }
+}
+
+/// The witness-free shape-R AIR a verifier uses.
+pub fn verifier_air_r() -> L2ShapeRAir {
+    L2ShapeRAir {
+        program: canonical_program(Shape::R).try_into().expect("R program length"),
+        ..L2ShapeRAir::chain_only(LOG_HEIGHT_R)
     }
 }
 
@@ -208,6 +245,21 @@ pub fn verify_p(pvs: &[Val], proof: &Proof<Config>) -> bool {
         && verify(&make_config_l2(), &verifier_air_p(), proof, pvs).is_ok()
 }
 
+/// Prove a shape-R instance under the L2 lane.
+pub fn prove_r(inst: &L2ShapeRInstance) -> (Vec<Val>, Proof<Config>) {
+    assert_eq!(inst.air.log_height, LOG_HEIGHT_R, "shape R proves at 2^{LOG_HEIGHT_R}");
+    let pvs = public_values(&inst.pvs);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
+    (pvs, proof)
+}
+
+/// `true` iff `proof` is a valid shape-R proof for `pvs` under the L2 lane.
+pub fn verify_r(pvs: &[Val], proof: &Proof<Config>) -> bool {
+    pvs.len() == Shape::R.pv_len()
+        && verify(&make_config_l2(), &verifier_air_r(), proof, pvs).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // Pins
 // ---------------------------------------------------------------------------
@@ -216,6 +268,8 @@ pub fn verify_p(pvs: &[Val], proof: &Proof<Config>) -> bool {
 pub const SHAPE_S_DIGEST_V1: &str = "7a6391bc98eed26b4bff7aaaa987f7d6ef657e27ad50746c9c519bcabdae6670";
 /// See [`SHAPE_S_DIGEST_V1`].
 pub const SHAPE_P_DIGEST_V1: &str = "ad53d40e7d5ffd8235b701fab16856f428790b7ba33efc8915abe625f1bacaff";
+/// See [`SHAPE_S_DIGEST_V1`] (lab #724).
+pub const SHAPE_R_DIGEST_V1: &str = "40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d";
 
 #[cfg(test)]
 mod tests;

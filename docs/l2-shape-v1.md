@@ -61,3 +61,37 @@ Apple M5 Max / 36 GiB, release binary directly under `/usr/bin/time -l` inside `
 ## 4. Tests added by A1
 
 `qlab-l2`: `l2_cfg_provisional_is_value_locked`, `l2_crate_deps_are_exactly_air_and_consensus`, `l2_shape_geometry_is_locked`, `l2_verifier_air_is_instance_independent`, `l2_prove_verify_roundtrip_s`, `l2_prove_verify_roundtrip_p`, `l2_shape_digests_are_pinned`, `l2_golden_pv_vectors`. `qlab-note`: `l2_payload_len_is_128`, `l2_golden_note_block`. `qlab-air`: `l2p_neg_raw_rkm_keyed_witness`. Existing tests were updated for P v1; none were removed.
+
+## 5. Shape R — registry writes (A2, lab #724)
+
+Added 2026-09-24. A third shape, pinned the same way as S and P. It is a circuit before it is a wire shape: the node applies R transactions from milestone B3b, which also adds R's wire tag and moves `fee_tier_r` into the Annulet genesis.
+
+**What it proves.** One registry slot is written, and the transaction pays for it:
+- A **registration** puts a leaf into an **empty** slot. It is permissionless.
+- An **update** replaces a leaf. The writer must prove the issuer secret behind the *old* leaf's `issuer_key` (the `AISS` block, `D_I`).
+- In both cases the written slot **is** the new leaf's asset id. The path bits of both folds are bound to it, so the registry invariant S and P rely on holds after every write: slot `i` holds the empty digest or a leaf whose asset lane is `i`.
+- **Asset 0 is never writable.**
+- `mode` is 0, 1 or 2. **Cloaked ⇒** no freeze root, no allow root, no flags. **Hybrid ⇒** no allow root. **Regulated** may carry both roots.
+- **The fee** rides a 1-in / 1-out spend in asset 0, carried inside R itself. The fee is a public value; the output's `ρ` is the input's nullifier.
+
+| object | v1 value | pinned by |
+|---|---|---|
+| shape R geometry | **726** columns · **79** perms · 2^18 rows · degree 4 · **85** public values | `l2_shape_geometry_is_locked`; `qlab-air` `l2r_trace_width_is_read_off_the_matrix`, `l2r_quotient_degree_is_4`, `l2r_program_geometry` |
+| PV layout | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 | `l2_shape_geometry_is_locked`, `l2_golden_pv_vectors` |
+| role codes | `AREG_OLD` = S's `AREG` (15), `BREG_OLD` = S's `BREG` (16), `AISS` = P's (17); new: `AREG_NEW` 23, `MO` 24, `MN` 25, `BREG_NEW` 26 | the shape digest |
+| shape digest | R `40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d` (1,181 constraints) | `l2_shape_digests_are_pinned` |
+
+**How the two folds share one set of siblings.** The old and new roots are folded level by level in alternation, `MO_i` then `MN_i`, over the same sibling. Both steps read their running digest from witness lanes through a new injection class, because one Keccak chain cannot carry two digests at once.
+
+Three banks of 16 accumulators tie those witnesses to the chain:
+- `C_old` carries the old digest from one `MO` to the next.
+- `C_new` carries the new digest from one `MN` to the next.
+- `SIB` makes each level's sibling the same in both folds.
+
+A fourth bank (`ISS`) checks the issuer key on an update.
+
+The alternative the stage-0 ruling asked to price was one equality per level. It would cost **+240 columns (966)**. Neither option needs degree 5.
+
+**Why R has no epoch column.** 79 perms fit inside one period of the 128-slot program ring at 2^18, so no second copy of the program ever runs for an epoch column to switch off.
+
+Rig measurement is owed (coordinator's rig): `qlab-bench l2shape --shape r`.

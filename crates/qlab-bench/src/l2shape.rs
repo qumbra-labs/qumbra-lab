@@ -1,7 +1,7 @@
 //! W3 (lab #700): the L2 circuit family measured — `l2shape` mode.
 //!
 //! ```text
-//! qlab-bench l2shape --shape s|s20|mock118|mock240|p|p19 [--only <lane substring>] [--power <note>]
+//! qlab-bench l2shape --shape s|s20|mock118|mock240|p|p19|r [--only <lane substring>] [--power <note>]
 //! ```
 //!
 //! Same in-process prove/verify pattern as `bucket`: one shape per process,
@@ -25,6 +25,9 @@
 //! - `p`       — shape P real (`qlab_air::l2p::build_bucket_l2p`), 214 perms @ 2^20:
 //!               a Cloaked asset-0 input + a Hybrid stablecoin input (freeze
 //!               tree live, allowlist on the dummy path), no vPublic. Stage 2.
+//! - `r`       — shape R real (`qlab_l2::fixture::shape_r`, lab #724), 79 perms
+//!               @ 2^18: the fixture's update of asset 7 (key rotation + a new
+//!               freeze root) with its asset-0 fee spend.
 //! - `p19`     — **CANARY** (#700's rule: a 2^19 run of the same shape and lane
 //!               before any 2^20): the shape-P AIR at 2^19 in chain-only mode —
 //!               same 778 columns, half the rows; the P program does not fit
@@ -55,6 +58,7 @@ use qlab_air::l2::{
     ROWS_PER_PERM, SHAPE_S_LOG_HEIGHT, SHAPE_S_PERMS,
 };
 use qlab_air::l2p::{L2ShapePAir, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
+use qlab_air::l2r::{L2ShapeRAir, SHAPE_R_PERMS};
 use qlab_consensus::CONSENSUS_CFG;
 use qlab_l2::L2_CFG_PROVISIONAL as L2_CFG;
 
@@ -300,6 +304,31 @@ fn shape_p_under_test(label: &'static str, canary: bool, program_perms: usize, a
     }
 }
 
+fn shape_r_under_test() -> ShapeUnderTest {
+    let inst = qlab_l2::fixture::shape_r();
+    let pvs = qlab_l2::public_values(&inst.pvs);
+    let air = inst.air;
+    let layout = AirLayout::from_air::<Val>(&air);
+    let max_deg = get_max_constraint_degree::<Val, _>(&air, layout);
+    let log_height = air.log_height;
+    let width = <L2ShapeRAir as BaseAir<Val>>::width(&air);
+    let pv_len = <L2ShapeRAir as BaseAir<Val>>::num_public_values(&air);
+    ShapeUnderTest {
+        label: "shape R",
+        mock: false,
+        canary: false,
+        program_perms: SHAPE_R_PERMS,
+        log_height,
+        width,
+        pv_len,
+        max_deg,
+        statement: "shape R — one registry slot written (registration into an empty slot, or \
+             update with the issuer key proven), the old and new depth-16 folds interleaved \
+             over one set of siblings, path = asset, mode => roots; a 1-in/1-out asset-0 fee spend",
+        run: Box::new(move |cfg| bench_lane(&air, &pvs, cfg, |b| air.generate_trace::<Val>(b))),
+    }
+}
+
 pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
     let sut: ShapeUnderTest = match shape {
         "s" => {
@@ -322,13 +351,14 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
             let (air, pvs) = shape_p_instance(SHAPE_P_LOG_HEIGHT);
             shape_p_under_test("shape P", false, SHAPE_P_PERMS, air, pvs)
         }
+        "r" => shape_r_under_test(),
         "p19" => {
             let air = L2ShapePAir::chain_only(SHAPE_P_LOG_HEIGHT - 1);
             let pvs = vec![Val::ZERO; <L2ShapePAir as BaseAir<Val>>::num_public_values(&air)];
             shape_p_under_test("CANARY: shape-P AIR chain-only @ 2^19", true, 0, air, pvs)
         }
         other => {
-            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19");
+            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r");
             std::process::exit(2);
         }
     };
@@ -354,7 +384,13 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
         "- AIR: {} — {} cols x {ROWS_PER_PERM} rows/perm, \
          program {} perms in a {capacity}-perm height (2^{}), \
          max constraint degree {}, {chunks} quotient chunks, {} public values",
-        if shape.starts_with('p') { "qlab-air `l2p::L2ShapePAir`" } else { "qlab-air `l2::L2ShapeSAir`" },
+        if shape.starts_with('p') {
+            "qlab-air `l2p::L2ShapePAir`"
+        } else if shape == "r" {
+            "qlab-air `l2r::L2ShapeRAir`"
+        } else {
+            "qlab-air `l2::L2ShapeSAir`"
+        },
         sut.width,
         sut.program_perms,
         sut.log_height,

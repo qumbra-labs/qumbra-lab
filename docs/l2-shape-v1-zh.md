@@ -61,3 +61,37 @@ Apple M5 Max / 36 GiB，release 二进制直接跑在 `scripts/rig run` 里的 `
 ## 4. A1 新增的测试
 
 `qlab-l2`：`l2_cfg_provisional_is_value_locked`、`l2_crate_deps_are_exactly_air_and_consensus`、`l2_shape_geometry_is_locked`、`l2_verifier_air_is_instance_independent`、`l2_prove_verify_roundtrip_s`、`l2_prove_verify_roundtrip_p`、`l2_shape_digests_are_pinned`、`l2_golden_pv_vectors`。`qlab-note`：`l2_payload_len_is_128`、`l2_golden_note_block`。`qlab-air`：`l2p_neg_raw_rkm_keyed_witness`。已有测试按 P v1 更新，没有删除任何测试。
+
+## 5. Shape R —— 注册表写入（A2，lab #724）
+
+2026-09-24 新增。第三个 shape，钉法和 S、P 相同。它现在只是电路，还不是线上的 shape：节点从 B3b 里程碑起才应用 R 交易；R 的线上标签、以及把 `fee_tier_r` 写进 Annulet genesis，也都在 B3b。
+
+**它证明什么。** 一笔交易写一个注册表槽位，并自己付手续费：
+- **注册**：往一个**空**槽位放进叶子，任何人都能做。
+- **更新**：替换已有叶子。写入方必须证明自己知道*旧*叶子 `issuer_key` 背后的发行方私钥（`AISS` 块，`D_I`）。
+- 两种情况下，写入的槽位**就是**新叶子的资产 id：新旧两条折叠的路径位都绑定到它。所以每次写入之后，S 和 P 依赖的注册表不变式照样成立：槽位 `i` 要么是空摘要，要么放着资产字段为 `i` 的叶子。
+- **资产 0 永远不可写。**
+- `mode` 只能是 0、1、2。**Cloaked ⇒** 没有冻结根、没有白名单根、flags 清零。**Hybrid ⇒** 没有白名单根。**Regulated** 两个根都可以有。
+- **手续费**由 R 自带的一进一出资产 0 花费支付。手续费是公开值；输出的 `ρ` 就是输入的 nullifier。
+
+| 对象 | v1 取值 | 由谁钉住 |
+|---|---|---|
+| shape R 几何 | **726** 列 · **79** 次置换 · 2^18 行 · 次数 4 · **85** 个公开值 | `l2_shape_geometry_is_locked`；`qlab-air` 的 `l2r_trace_width_is_read_off_the_matrix`、`l2r_quotient_degree_is_4`、`l2r_program_geometry` |
+| 公开值布局 | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 | `l2_shape_geometry_is_locked`、`l2_golden_pv_vectors` |
+| 角色码 | `AREG_OLD` 就是 S 的 `AREG`（15），`BREG_OLD` 就是 S 的 `BREG`（16），`AISS` 沿用 P 的（17）；新增 `AREG_NEW` 23、`MO` 24、`MN` 25、`BREG_NEW` 26 | shape 摘要 |
+| shape 摘要 | R `40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d`（1,181 条约束） | `l2_shape_digests_are_pinned` |
+
+**两条折叠怎么共用一套兄弟节点。** 旧根和新根逐层交替折叠：先 `MO_i`，再 `MN_i`，用的是同一个兄弟节点。一条 Keccak 链一次只能带一个摘要，所以这两步都通过一种新的注入方式，从见证 lane 里读当前摘要。
+
+三个各 16 个累加器的 bank 把这些见证和链绑在一起：
+- `C_old` 把旧摘要从一个 `MO` 带到下一个；
+- `C_new` 把新摘要从一个 `MN` 带到下一个；
+- `SIB` 保证每一层的兄弟节点在两条折叠里相同。
+
+第四个 bank（`ISS`）在更新时检查发行方密钥。
+
+stage-0 裁定要求报价的另一方案，是每层单独做一个等式，要**多 240 列（共 966 列）**。两种方案都不需要次数 5。
+
+**R 为什么没有 epoch 列。** 79 次置换在 2^18 下放得进 128 槽程序环的一个周期，程序不会再跑第二遍，也就没有需要 epoch 列去关掉的东西。
+
+rig 实测待做（协调者的 rig）：`qlab-bench l2shape --shape r`。
