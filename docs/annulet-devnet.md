@@ -81,6 +81,13 @@ docker build -f deploy/docker/Dockerfile --target runtime -t qumbra-lab:annulet-
   > attestation surfaces, and the path to Phase 1; it is not yet Qumbra's money. The doc says so
   > because the pilot's press copy will be tempted not to.
 
+## Policy assets: the freeze list and the allowlist (C3, lab #722)
+
+- **The freeze tree is canonical.** It is a depth-20 indexed tree over the sorted keys `H(rkm ‖ D_FRZ)`, with empty subtrees padded by the circuit hash's own zero chain and no seed. Its root is a function of the key list alone. The goldens are an empty root of `f8d82fd6…c7cac22d` and a three-key root of `ab4045d7…07d689a6`, checked against an independent full-width encoder. Before C3 the trees were seeded test fixtures that no one could rebuild from a list; those fixtures are now test-only by name.
+- **The witness model.** The issuer publishes the sorted freeze-key list, and every wallet rebuilds the tree and its own non-membership opening from it. No issuer oracle is asked, because an oracle would learn every holder who asked. **Disclosure:** anyone who already knows a holder's `rkm` can test whether it is frozen or allowlisted; anyone who does not learns nothing from the lists.
+- **Regulated assets.** `cred = H(rkm ‖ D_CRED)` is fixed by the circuit. The issuer, which already knows each admitted holder's `rkm`, hands the holder its membership witness and publishes the cred list, so the holder can rebuild after a root change.
+- **What is not yet live:** `issuer freeze add/remove` prints a new root, but putting a new root on chain needs registry transactions (A2/C4). Until then, the freeze in force is the one the genesis carries.
+
 ## Deferred, with reasons
 
 - **The binary telemetry form tail goes to D1.** No Annulet `/v1/telemetry` consumer ships in B6 (the explorer and opview are D1's). The text surfaces already name the form (`form=annulet finality=operator`, B2), and a fleet-visible `RPC_VERSION` bump should arrive with the milestone that can use it. The #212 recipe travels with it.

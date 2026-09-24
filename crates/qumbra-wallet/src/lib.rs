@@ -128,6 +128,8 @@ mod build_rev_tests {
 pub mod annulet;
 #[cfg(feature = "prove")]
 pub mod annulet_send;
+#[cfg(feature = "prove")]
+pub mod issuer;
 pub mod bundle;
 pub mod coinbase;
 pub mod contacts;

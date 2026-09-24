@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use qlab_devnet::annulet::L2ShapeTag;
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
-use qlab_l2spend::{build_p, build_s, shape_for, Endpoint, Out, Recipient, Served, SpendError};
+use qlab_air::l2p::VPublic;
+use qlab_l2spend::{build_p_with, build_s, shape_for, Endpoint, Out, Recipient, Served, SpendError};
 use qlab_wallet::address::Address;
 use rand::rngs::StdRng;
 
@@ -69,6 +70,14 @@ pub enum SendRefusal {
     Spend(SpendError),
     /// A fee-split was admitted but its note did not appear in the tree.
     SplitNotIncluded { waited_secs: u64 },
+    /// This wallet holds no issuer secret for `asset` whose key is the
+    /// registry's `issuer_key` (lab #722).
+    NotTheIssuer { asset: u16 },
+    /// A mint rides an issuer-held note of the asset, and there is none
+    /// (lab #722 P3).
+    NoIssuerNote { asset: u16 },
+    /// The issuer file could not be read.
+    Issuer(String),
 }
 
 impl std::fmt::Display for SendRefusal {
@@ -95,6 +104,16 @@ impl std::fmt::Display for SendRefusal {
                 write!(f, "the endpoint's /v1/annulet/params name a different genesis than it serves")
             }
             SendRefusal::Spend(e) => write!(f, "{e}"),
+            SendRefusal::NotTheIssuer { asset } => write!(
+                f,
+                "this wallet holds no issuer secret for asset {asset} matching the registry's issuer key"
+            ),
+            SendRefusal::NoIssuerNote { asset } => write!(
+                f,
+                "a mint rides an issuer-held note of asset {asset} and this wallet holds none (lab #722 P3: \
+                 the genesis seeds one; an issuer that spends its last one cannot mint again)"
+            ),
+            SendRefusal::Issuer(e) => write!(f, "issuer file: {e}"),
             SendRefusal::SplitNotIncluded { waited_secs } => write!(
                 f,
                 "the fee-split was admitted but its note was not in the served tree after {waited_secs} s; \
@@ -190,21 +209,24 @@ fn wait_in_tree<E: Endpoint>(served: &Served<E>, cm: &[u64; 4], timeout: Duratio
     }
 }
 
-/// **The send**: verify the form (and pin), read the tariff, scan, plan,
-/// fee-split if needed, then prove and submit the transfer. `scan_to` bounds
-/// the scan (a balance is a claim about a range).
-#[allow(clippy::too_many_arguments)]
-pub fn send_annulet<E: Endpoint>(
+/// What every Annulet spend starts from: the verified endpoint, its tariff,
+/// and this wallet's per-asset index (lab #720/#722).
+pub struct Session<E: Endpoint> {
+    pub served: Served<E>,
+    pub tiers: Tiers,
+    pub index: AssetIndex,
+    pub genesis_hash: [u8; 32],
+}
+
+/// Verify the form (and pin), read the tariff (checked against the served
+/// genesis), and scan to `scan_to`.
+pub fn open_session<E: Endpoint>(
     w: &WalletDir,
     endpoint: E,
-    asset: u16,
-    amount: u64,
-    to: &Address,
     scan_to: u64,
     pin: Option<[u8; 32]>,
-    split_wait: Duration,
     rng: &mut StdRng,
-) -> Result<SendReport, SendRefusal> {
+) -> Result<Session<E>, SendRefusal> {
     let served = Served::new(endpoint);
     let mut fetch = |p: &str| served.endpoint.get(p);
     let report = scan_annulet(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Form)?;
@@ -214,55 +236,111 @@ pub fn send_annulet<E: Endpoint>(
     }
     let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p };
     let index = report.index.ok_or(SendRefusal::NoBalance)?;
-    let shape = shape_for(&served.registry(u64::from(asset))?.leaf);
-    let plan = plan_send(&index, asset, amount, shape, tiers)?;
+    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash })
+}
 
+/// This wallet's receiving [`Recipient`] (address 0: change, split notes).
+pub fn me(w: &WalletDir) -> Recipient {
+    recipient_of(&w.wallet().address_at_index(0)).expect("the wallet's own address has an ek")
+}
+
+/// **An exact-`tariff` asset-0 fee note**: one the wallet holds, or one
+/// split off a larger asset-0 note first (shape S, its own S fee from the same
+/// input), waited for until it is in the served tree. Returns the fee note and,
+/// when a split was made, the note it minted.
+pub fn exact_fee_note<E: Endpoint>(
+    w: &WalletDir,
+    session: &Session<E>,
+    tariff: u64,
+    split_wait: Duration,
+    rng: &mut StdRng,
+) -> Result<(OwnedL2Note, Option<qlab_note::l2note::L2Note>), SendRefusal> {
+    if let Some(fee) = session.index.spendable(0).iter().find(|n| n.note.value == tariff) {
+        return Ok((fee.clone(), None));
+    }
+    let split_needs = tariff + session.tiers.s;
+    let source = session
+        .index
+        .spendable(0)
+        .iter()
+        .filter(|n| n.note.value >= split_needs)
+        .min_by_key(|n| n.note.value)
+        .ok_or(SendRefusal::NoFeeSource { tariff, split_needs })?;
     let wallet = w.wallet();
+    let split = build_s(
+        &session.served,
+        &[&source.spend_input(&wallet)],
+        &[
+            Out { to: me(w), value: tariff, asset: 0 },
+            Out { to: me(w), value: source.note.value - tariff - session.tiers.s, asset: 0 },
+        ],
+        session.tiers.s,
+        rng,
+    )?;
+    session.served.submit(&split.tx)?;
+    let made = split.outputs[0];
+    wait_in_tree(&session.served, &made.commitment(), split_wait)?;
+    let owned = OwnedL2Note::from_genesis(&wallet, 0, qlab_note::hash::digest_bytes(&made.commitment()), made)
+        .expect("the split paid this wallet's address 0");
+    Ok((owned, Some(made)))
+}
+
+/// **The send**: verify the form (and pin), read the tariff, scan, plan,
+/// fee-split if needed, then prove and submit the transfer. `scan_to` bounds
+/// the scan (a balance is a claim about a range). `freeze_keys` is the
+/// asset issuer's published freeze list (lab #722; empty for an asset with an
+/// empty freeze tree): an address on it is refused before anything is proved.
+#[allow(clippy::too_many_arguments)]
+pub fn send_annulet<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    asset: u16,
+    amount: u64,
+    to: &Address,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    freeze_keys: &[[u64; 4]],
+    split_wait: Duration,
+    rng: &mut StdRng,
+) -> Result<SendReport, SendRefusal> {
+    let session = open_session(w, endpoint, scan_to, pin, rng)?;
+    let leaf = session.served.registry(u64::from(asset))?.leaf;
+    let shape = shape_for(&leaf);
+    let wallet = w.wallet();
+    if shape == L2ShapeTag::P
+        && qlab_air::l2p::CanonicalFreezeTree::from_keys(freeze_keys).is_frozen(&wallet.rkm(wallet.diversifier_at_index(0)))
+    {
+        return Err(SendRefusal::Spend(SpendError::Frozen { asset: u64::from(asset) }));
+    }
+    let tiers = session.tiers;
+    let plan = plan_send(&session.index, asset, amount, shape, tiers)?;
     let recipient = recipient_of(to).ok_or(SendRefusal::Spend(SpendError::Served("the recipient address has no valid ek".into())))?;
-    let me = recipient_of(&wallet.address_at_index(0)).expect("the wallet's own address has an ek");
     let a = u64::from(asset);
+    let served = &session.served;
 
     let (split_fee_note, built) = match &plan {
         Plan::FeeAsset { note } => {
             let input = note.spend_input(&wallet);
             let outs = [
                 Out { to: recipient, value: amount, asset: 0 },
-                Out { to: me, value: note.note.value - amount - tiers.s, asset: 0 },
+                Out { to: me(w), value: note.note.value - amount - tiers.s, asset: 0 },
             ];
-            (None, build_s(&served, &[&input], &outs, tiers.s, rng)?)
+            (None, build_s(served, &[&input], &outs, tiers.s, rng)?)
         }
-        Plan::WithFeeNote { note, fee, shape } | Plan::SplitFirst { note, source: fee, shape } => {
-            // A split first: one exact-tariff note to ourselves, change to ourselves.
-            let (fee_note, split_note) = if let Plan::SplitFirst { source, .. } = &plan {
-                let tariff = tiers.of(*shape);
-                let split = build_s(
-                    &served,
-                    &[&source.spend_input(&wallet)],
-                    &[
-                        Out { to: me.clone(), value: tariff, asset: 0 },
-                        Out { to: me.clone(), value: source.note.value - tariff - tiers.s, asset: 0 },
-                    ],
-                    tiers.s,
-                    rng,
-                )?;
-                served.submit(&split.tx)?;
-                let made = split.outputs[0];
-                wait_in_tree(&served, &made.commitment(), split_wait)?;
-                let owned = OwnedL2Note::from_genesis(&wallet, 0, qlab_note::hash::digest_bytes(&made.commitment()), made)
-                    .expect("the split paid this wallet's address 0");
-                (owned, Some(made))
-            } else {
-                (fee.clone(), None)
-            };
+        Plan::WithFeeNote { note, shape, .. } | Plan::SplitFirst { note, shape, .. } => {
+            let tariff = tiers.of(*shape);
+            let (fee_note, split_note) = exact_fee_note(w, &session, tariff, split_wait, rng)?;
             let inputs = [note.spend_input(&wallet), fee_note.spend_input(&wallet)];
             let outs = [
                 Out { to: recipient, value: amount, asset: a },
-                Out { to: me, value: note.note.value - amount, asset: a },
+                Out { to: me(w), value: note.note.value - amount, asset: a },
             ];
-            let tariff = tiers.of(*shape);
             let built = match shape {
-                L2ShapeTag::S => build_s(&served, &[&inputs[0], &inputs[1]], &outs, tariff, rng)?,
-                L2ShapeTag::P => build_p(&served, [&inputs[0], &inputs[1]], &outs, tariff, rng)?,
+                L2ShapeTag::S => build_s(served, &[&inputs[0], &inputs[1]], &outs, tariff, rng)?,
+                L2ShapeTag::P => {
+                    let ctx = qlab_l2spend::PolicyContext { freeze_keys: freeze_keys.to_vec(), ..Default::default() };
+                    build_p_with(served, [&inputs[0], &inputs[1]], &outs, tariff, [&ctx, &Default::default()], [VPublic::NONE; 2], rng)?
+                }
             };
             (split_note, built)
         }

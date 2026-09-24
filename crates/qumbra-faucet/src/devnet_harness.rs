@@ -52,6 +52,9 @@ pub struct View {
     pub root: [u8; 32],
     pub nullifiers: usize,
     pub ready_peers: usize,
+    /// The first four `(asset, outstanding public supply)` entries (lab #722:
+    /// B4's recomputed state, compared across the three nodes).
+    pub supplies: [(u16, i128); 4],
 }
 
 /// The three nodes, owned by one driver thread that runs each one's real
@@ -117,6 +120,13 @@ impl Net {
                         root: s.commitment_root(),
                         nullifiers: s.nullifier_count(),
                         ready_peers: n.p2p().peers().ready_peers().len(),
+                        supplies: {
+                            let mut out = [(0u16, 0i128); 4];
+                            for (slot, (a, v)) in out.iter_mut().zip(s.outstanding_supplies()) {
+                                *slot = (*a, *v);
+                            }
+                            out
+                        },
                     };
                     // Serve the new tip at once rather than on the 5-s cadence.
                     if now[i] != last[i] {
@@ -147,7 +157,10 @@ impl Net {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let v = self.views();
-            let agree = v.iter().all(|x| (x.header_tip, x.state_tip, x.root, x.nullifiers) == (v[0].header_tip, v[0].state_tip, v[0].root, v[0].nullifiers));
+            let agree = v.iter().all(|x| {
+                (x.header_tip, x.state_tip, x.root, x.nullifiers, x.supplies)
+                    == (v[0].header_tip, v[0].state_tip, v[0].root, v[0].nullifiers, v[0].supplies)
+            });
             if v[0].nullifiers == nullifiers && agree {
                 return v;
             }

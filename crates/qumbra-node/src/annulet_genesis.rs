@@ -56,6 +56,18 @@ pub struct RegistryLeafRecord {
 }
 
 impl RegistryLeafRecord {
+    /// The record of a circuit leaf (lab #722: test genesis assembly).
+    pub fn of(l: &RegistryLeaf) -> Self {
+        RegistryLeafRecord {
+            asset: u16::try_from(l.asset).expect("a registry index is 16-bit"),
+            issuer_key: l.issuer_key,
+            mode: l.mode,
+            freeze_root: l.freeze_root,
+            allow_root: l.allow_root,
+            flags: l.flags,
+        }
+    }
+
     /// The circuit's leaf for this record.
     pub fn leaf(&self) -> RegistryLeaf {
         RegistryLeaf {
@@ -88,6 +100,14 @@ impl RegistryLeafRecord {
 pub struct GenesisNoteRecord {
     pub cm: Hash32,
     pub payload: Vec<u8>,
+}
+
+impl GenesisNoteRecord {
+    /// A genesis note record: the committed cm and the note's
+    /// `GenesisPlaintext` (lab #722: test genesis assembly).
+    pub fn of(n: &qlab_note::l2note::L2Note) -> Self {
+        GenesisNoteRecord { cm: h32(&n.commitment()), payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec() }
+    }
 }
 
 /// The L2 genesis parameters: the posted fee tiers in fee-unit base units

@@ -489,23 +489,42 @@ pub fn build_p_with<E: Endpoint, R: rand::CryptoRng>(
     rng: &mut R,
 ) -> Result<Built, SpendError> {
     let tree = served.commitment_tree()?;
-    let anchor = tree.root();
     let regs = [served.registry(inputs[0].asset)?, served.registry(inputs[1].asset)?];
     if regs[0].root != regs[1].root {
         return Err(SpendError::RegistryMoved);
     }
     let rkm = |i: &L2TxInput| qlab_air::l2p::derive_rkm_l2(i);
     let policy = [policy_input(&regs[0], &rkm(inputs[0]), ctx[0])?, policy_input(&regs[1], &rkm(inputs[1]), ctx[1])?];
+    prove_p_with_policies(&tree, inputs, outs, fee, policy, regs[0].root, vp, rng)
+}
+
+/// **The P assembly below the policy check** (lab #722): prove against the
+/// given policy inputs and `registry_root` as they are. The wallet never calls
+/// this directly — [`build_p_with`] builds the policies from served data and
+/// refuses what it cannot open. It exists so a test can hand-forge a spend
+/// (a stale leaf, a frozen key) and show that the NODE refuses it.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_p_with_policies<R: rand::CryptoRng>(
+    tree: &CommitmentTree,
+    inputs: [&L2TxInput; 2],
+    outs: &[Out; 2],
+    fee: u64,
+    policy: [L2PolicyInput; 2],
+    registry_root: [u64; 4],
+    vp: [VPublic; 2],
+    rng: &mut R,
+) -> Result<Built, SpendError> {
+    let anchor = tree.root();
     let outputs = l2_outputs(outs, rng);
     let inst = qlab_air::l2p::build_bucket_l2p_with_witnesses(
         qlab_l2::LOG_HEIGHT_P,
         &[inputs[0].clone(), inputs[1].clone()],
         &outputs,
         fee,
-        &[witness_of(&tree, inputs[0])?, witness_of(&tree, inputs[1])?],
+        &[witness_of(tree, inputs[0])?, witness_of(tree, inputs[1])?],
         anchor,
         &policy,
-        regs[0].root,
+        registry_root,
         vp,
     );
     let (_, proof) = qlab_l2::prove_p(&inst);
@@ -519,7 +538,7 @@ pub fn build_p_with<E: Endpoint, R: rand::CryptoRng>(
         }
     };
     let surface =
-        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&regs[0].root), vpublic: Some([term(0), term(1)]) };
+        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]) };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 
