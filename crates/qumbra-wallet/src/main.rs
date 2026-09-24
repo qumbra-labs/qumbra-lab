@@ -450,6 +450,12 @@ fn usage() {
                 the balance transactions-only, and the report says so)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\
+         --net  annulet (scan only, lab #718) — the Annulet L2 net: the scan reads\n\
+                /v1/genesis/notes first and REFUSES an endpoint that does not serve\n\
+                an Annulet chain; balances are per asset (asset 0 = fee units, not\n\
+                QMB); no coinbase. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
+                against any endpoint you do not trust, because without it the\n\
+                wallet reports whatever Annulet chain the endpoint serves\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
                 build was CUT for when it carries the release lane\'s stamp, and to\n\
                 t1 only for an unstamped build; the flag overrides either. A\n\
@@ -599,6 +605,14 @@ fn resolve_net(
     match net {
         "t1" => Ok((GenesisForm::V4, source)),
         "t2" => Ok((GenesisForm::V5, source)),
+        // Lab #718: the Annulet net is `scan`'s alone for now — `scan` takes
+        // it before this function is reached. Every other command here is an
+        // L1 flow (send, history, names), and the L2 send path is C2's.
+        "annulet" if matches!(source, NetSource::Flag) => Err(
+            "--net annulet is accepted by `scan` only (lab #718): send, history and names are \
+             L1 flows here, and the L2 send path is not built yet"
+                .into(),
+        ),
         other => Err(match source {
             NetSource::Stamp => format!(
                 "this build is stamped for net {other}, which this wallet cannot name (it knows: \
@@ -1121,6 +1135,11 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
+    // Lab #718: the Annulet net's scan — its form verified against the
+    // endpoint's own genesis, optionally pinned; the L1 path below unchanged.
+    if flag(args, "--net") == Some("annulet") {
+        return scan_annulet_cmd(args, &w, url, from, to);
+    }
     let report = qumbra_wallet::scan::scan_report(&w, url, from, to, genesis_form_of(args)?);
     print!(
         "{}",
@@ -1133,6 +1152,25 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
             &report.coinbase_coverage,
         )
     );
+    Ok(())
+}
+
+/// `scan --net annulet` (lab #718): verify the endpoint serves an Annulet
+/// chain (and the pinned genesis, when `--genesis-hash` is given), scan at the
+/// L2 width, and report per asset.
+fn scan_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u64) -> Result<(), Box<dyn Error>> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    eprintln!(
+        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
+        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
+    );
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    let mut fetch = qumbra_wallet::net::scan_fetch(url);
+    let report = qumbra_wallet::annulet::scan_annulet(w, &mut fetch, from, to, pin, &mut rng)?;
+    print!("{}", qumbra_wallet::annulet::render(&report, url, (from, to)));
     Ok(())
 }
 
@@ -1346,6 +1384,14 @@ mod tests {
         // Unstamped and unasked — a plain `cargo build`. Unchanged from before
         // #581, so no developer's existing command moves.
         assert_eq!(resolve_net(None, None).unwrap(), (GenesisForm::V4, NetSource::Fallback));
+    }
+
+    /// Lab #718: `--net annulet` belongs to `scan`; every other command here
+    /// is an L1 flow and refuses it by name rather than running L1 rules.
+    #[test]
+    fn net_annulet_outside_scan_is_refused_by_name() {
+        let err = resolve_net(Some("annulet"), None).unwrap_err().to_string();
+        assert!(err.contains("accepted by `scan` only"), "{err}");
     }
 
     #[test]

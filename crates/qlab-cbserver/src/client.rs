@@ -89,7 +89,7 @@ use std::net::TcpStream;
 
 use qlab_note::kem::Dk;
 use qlab_note::note::Note;
-use qlab_note::scan::{detect_matches, scan, DetectedNote, EncryptedOutputs, ScanMode};
+use qlab_note::scan::{detect_matches, scan_notes, Detected, EncryptedOutputs, NotePlaintext, ScanMode};
 use qlab_note::wire::CM_LEN;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -166,9 +166,10 @@ pub struct NoteRef {
 pub struct NullifierClaim([u64; 4]);
 
 impl NullifierClaim {
-    /// The claim `note` stakes: its ρ, verbatim.
-    pub fn of(note: &Note) -> Self {
-        Self(note.rho)
+    /// The claim `note` stakes: its ρ, verbatim. The L1 and L2 notes derive
+    /// `nf = H(nk ‖ ρ)` identically (lab #718), so one claim type serves both.
+    pub fn of<N: NotePlaintext>(note: &N) -> Self {
+        Self(note.rho())
     }
 
     /// ρ, for a caller that holds `nk` and wants the actual nullifier.
@@ -177,19 +178,21 @@ impl NullifierClaim {
     }
 }
 
-/// A detected note located within the chain.
+/// A detected note located within the chain — generic over the note
+/// plaintext (lab #718), the L1 [`Note`] by default so every L1 caller reads
+/// exactly the type it always did.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct LocatedNote {
+pub struct LocatedNote<N = Note> {
     pub height: u64,
     pub tx_index: u64,
     pub recipient_index: usize,
     /// The **committed** commitment of the entry this note was detected on.
     /// Recorded from the compact bundle, not recomputed from the plaintext.
     pub cm: [u8; CM_LEN],
-    pub detected: DetectedNote,
+    pub detected: Detected<N>,
 }
 
-impl LocatedNote {
+impl<N: NotePlaintext> LocatedNote<N> {
     /// The chain's name for this output.
     pub fn at(&self) -> NoteRef {
         NoteRef {
@@ -257,9 +260,9 @@ pub struct UnopenedOutput {
 /// choice of which one survives is the wallet's and is stated in
 /// [`ScanOutcome::notes`].
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ShadowedNote {
+pub struct ShadowedNote<N = Note> {
     /// The note in full — a wallet must be able to show its user what it lost.
-    pub note: LocatedNote,
+    pub note: LocatedNote<N>,
     /// The note that claims the nullifier. Within one scan this is one of
     /// [`ScanOutcome::notes`]; after [`ScanOutcome::shadow_against`] it may be a
     /// note from an earlier scan.
@@ -350,7 +353,7 @@ pub struct ScanStats {
 }
 
 /// Result of a scan.
-pub struct ScanOutcome {
+pub struct ScanOutcome<N = Note> {
     /// Outputs opened, authenticated **and spendable** — at most one per
     /// [`NullifierClaim`].
     ///
@@ -366,7 +369,7 @@ pub struct ScanOutcome {
     /// is its maximum and this list holds exactly that. Taking the first-seen
     /// instead would understate the balance **and hand the attacker the reported
     /// number**, since the attacker chooses the order the two notes land in.
-    pub notes: Vec<LocatedNote>,
+    pub notes: Vec<LocatedNote<N>>,
     /// Outputs detected on the chain and **not** opened. Never folded into
     /// `notes`, and never silently dropped — see [`Completeness`].
     pub unopened: Vec<UnopenedOutput>,
@@ -374,11 +377,11 @@ pub struct ScanOutcome {
     /// note in `notes` (or, after [`Self::shadow_against`], in an earlier scan)
     /// already claims their nullifier. Never folded into `notes`, never summed
     /// into a balance, never dropped.
-    pub shadowed: Vec<ShadowedNote>,
+    pub shadowed: Vec<ShadowedNote<N>>,
     pub stats: ScanStats,
 }
 
-impl ScanOutcome {
+impl<N: NotePlaintext> ScanOutcome<N> {
     /// Did this scan see everything the committed discovery says is ours, and can
     /// what it saw be spent?
     pub fn completeness(&self) -> Completeness {
@@ -400,14 +403,14 @@ impl ScanOutcome {
     /// `u128` because the sum of `u64` values is not a `u64`; a wallet that
     /// saturates or wraps here would be reporting an attacker-chosen number.
     pub fn spendable_value(&self) -> u128 {
-        self.notes.iter().map(|n| u128::from(n.detected.note.value)).sum()
+        self.notes.iter().map(|n| u128::from(n.detected.note.value())).sum()
     }
 
     /// The value this scan detected, opened, and had to write off — the sum of
     /// [`Self::shadowed`]. Never part of a balance; this is what a wallet tells
     /// its user it lost.
     pub fn shadowed_value(&self) -> u128 {
-        self.shadowed.iter().map(|s| u128::from(s.note.detected.note.value)).sum()
+        self.shadowed.iter().map(|s| u128::from(s.note.detected.note.value())).sum()
     }
 
     /// The nullifier claims this scan's spendable notes stake — what a wallet
@@ -519,8 +522,8 @@ impl ClaimSet {
 /// toward the earlier **committed** position and then the committed `cm`, so the
 /// outcome does not depend on iteration order, on which node served the range, or
 /// on the order the notes happened to be decrypted in.
-fn outranks(a: &LocatedNote, b: &LocatedNote) -> bool {
-    match a.detected.note.value.cmp(&b.detected.note.value) {
+fn outranks<N: NotePlaintext>(a: &LocatedNote<N>, b: &LocatedNote<N>) -> bool {
+    match a.detected.note.value().cmp(&b.detected.note.value()) {
         Ordering::Greater => true,
         Ordering::Less => false,
         Ordering::Equal => a.at() < b.at(),
@@ -532,7 +535,7 @@ fn outranks(a: &LocatedNote, b: &LocatedNote) -> bool {
 /// Keyed on ρ alone (see [`NullifierClaim`]) — no `nf`, no `nk`, no secret the
 /// scanner does not already hold. Relative order within each output list is
 /// preserved, so the two lists read in chain order.
-fn resolve_claims(opened: Vec<LocatedNote>) -> (Vec<LocatedNote>, Vec<ShadowedNote>) {
+fn resolve_claims<N: NotePlaintext>(opened: Vec<LocatedNote<N>>) -> (Vec<LocatedNote<N>>, Vec<ShadowedNote<N>>) {
     let mut best: BTreeMap<NullifierClaim, usize> = BTreeMap::new();
     for (i, note) in opened.iter().enumerate() {
         let claim = note.claim();
@@ -622,6 +625,26 @@ where
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// [`light_client_scan_with`] on an **Annulet** net (lab #718): the same
+/// driver instantiated at [`qlab_note::l2note::L2Note`] — one orchestration,
+/// so the L1 and L2 scans cannot drift on what counts as detected, opened,
+/// unopened or shadowed. The 128-B payloads need no width here: each `/full`
+/// payload carries its own length.
+pub fn light_client_scan_l2_with<F>(
+    fetch: &mut F,
+    dk: &Dk,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> std::io::Result<ScanOutcome<qlab_note::l2note::L2Note>>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    scan_over_for::<qlab_note::l2note::L2Note, F>(fetch, dk, from, to, config, rng)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 #[cfg(feature = "devnet")]
 /// The light-client scan flow, run **fully in-process** against a `&Devnet`
 /// via `crate::server::route` — no socket, no `TcpStream`. Behaviourally
@@ -651,9 +674,9 @@ pub fn scan_local(
 /// [`light_client_scan_with`]'s fetch closure. Supply that request's result with
 /// [`ScanDriver::supply`], then call [`ScanDriver::step`] again. `Done` and
 /// `Failed` are terminal.
-pub enum ScanDriverStep {
+pub enum ScanDriverStep<N = Note> {
     Need(String),
-    Done(ScanOutcome),
+    Done(ScanOutcome<N>),
     Failed(String),
 }
 
@@ -684,7 +707,7 @@ struct PendingRequest {
 /// `Need` is outstanding. `StdRng` is deliberately passed per step rather than
 /// borrowed by the driver, so it remains usable by a suspended caller and the
 /// existing synchronous entry points preserve their caller-owned RNG state.
-pub struct ScanDriver {
+pub struct ScanDriver<N = Note> {
     dk: Dk,
     to: u64,
     config: ScanConfig,
@@ -692,15 +715,26 @@ pub struct ScanDriver {
     blocks: Vec<CompactBlock>,
     tx_space: Vec<(u64, u64)>,
     stats: ScanStats,
-    notes: Vec<LocatedNote>,
+    notes: Vec<LocatedNote<N>>,
     unopened: Vec<UnopenedOutput>,
     phase: DriverPhase,
     pending: Option<PendingRequest>,
     fatal: Option<String>,
 }
 
-impl ScanDriver {
+impl ScanDriver<Note> {
+    /// The L1 driver — the constructor every L1 caller names, concrete so
+    /// `ScanDriver::new(..)` still infers the L1 note (lab #718).
     pub fn new(dk: Dk, from: u64, to: u64, config: ScanConfig) -> Self {
+        Self::new_for(dk, from, to, config)
+    }
+}
+
+impl<N: NotePlaintext> ScanDriver<N> {
+    /// The driver for any note plaintext (lab #718: `L2Note` on an Annulet
+    /// net). The same orchestration; the payload width is the plaintext's,
+    /// carried by each `/full` payload's own framing.
+    pub fn new_for(dk: Dk, from: u64, to: u64, config: ScanConfig) -> Self {
         Self {
             dk,
             to,
@@ -718,7 +752,7 @@ impl ScanDriver {
     }
 
     /// Advance until the scan needs one path, completes, or fails.
-    pub fn step(&mut self, rng: &mut StdRng) -> ScanDriverStep {
+    pub fn step(&mut self, rng: &mut StdRng) -> ScanDriverStep<N> {
         if let Some(err) = &self.fatal {
             return ScanDriverStep::Failed(err.clone());
         }
@@ -941,7 +975,7 @@ impl ScanDriver {
                                 bundle: group.recipients[*recipient_index].clone(),
                                 payloads: payloads.clone(),
                             };
-                            let found = scan(&self.dk, &encrypted, self.config.mode);
+                            let found = scan_notes::<N>(&self.dk, &encrypted, self.config.mode);
                             let opened: Vec<usize> =
                                 found.iter().map(|detected| detected.index).collect();
                             for detected in found {
@@ -982,7 +1016,8 @@ impl ScanDriver {
     }
 }
 
-/// Synchronous adapter over the one scan orchestration in [`ScanDriver`].
+/// Synchronous adapter over the one scan orchestration in [`ScanDriver`], at
+/// the L1 note (the name every existing call site uses).
 fn scan_over<F>(
     fetch: &mut F,
     dk: &Dk,
@@ -994,7 +1029,22 @@ fn scan_over<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let mut driver = ScanDriver::new(dk.clone(), from, to, config);
+    scan_over_for::<Note, F>(fetch, dk, from, to, config, rng)
+}
+
+/// [`scan_over`] for any note plaintext (lab #718).
+fn scan_over_for<N: NotePlaintext, F>(
+    fetch: &mut F,
+    dk: &Dk,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> Result<ScanOutcome<N>, String>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let mut driver = ScanDriver::<N>::new_for(dk.clone(), from, to, config);
     loop {
         match driver.step(rng) {
             ScanDriverStep::Need(path) => driver.supply(fetch(&path)),

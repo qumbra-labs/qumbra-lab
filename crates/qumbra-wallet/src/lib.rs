@@ -125,6 +125,7 @@ mod build_rev_tests {
     }
 }
 
+pub mod annulet;
 pub mod bundle;
 pub mod coinbase;
 pub mod contacts;
