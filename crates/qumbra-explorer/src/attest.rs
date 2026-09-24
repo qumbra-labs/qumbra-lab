@@ -372,4 +372,32 @@ mod tests {
             assert!(v.get("assets").is_none(), "{doc}");
         }
     }
+
+    /// The done-when, against B6's devnet genesis: `USDT-test` (asset 1) shows
+    /// its genesis issuance — recomputed from the genesis file's public
+    /// plaintext notes — and its registry leaf; the fee unit's genesis stock
+    /// is a genesis row too. (Its `vPublic` figures are zero until something
+    /// mints or redeems; the node's outstanding counts those only — B3b.)
+    #[test]
+    fn the_devnet_genesis_shows_usdt_test() {
+        use qumbra_node::annulet_genesis::{devnet, registry_leaves, AnnuletGenesisFile};
+        let g = AnnuletGenesisFile::devnet();
+        let n = MemNode::in_memory_annulet(
+            g.genesis_block_header(),
+            &g.notes(),
+            g.params.fee_table(),
+            &registry_leaves(&g.registry_genesis),
+        );
+        let issuance = qlab_node::asset_supply::genesis_issuance(&g.notes()).unwrap();
+        let doc: AttestDocument = serde_json::from_str(&attest_document(&n, &issuance)).unwrap();
+        let usdt = devnet::USDT_TEST_ASSET as u16;
+        let row = doc.genesis.iter().find(|r| r.asset == usdt).expect("USDT-test's genesis row");
+        assert_eq!(row.issued, devnet::HOLDER_USDT_VALUE.to_string());
+        assert!(doc.genesis.iter().any(|r| r.asset == 0), "the fee unit's genesis stock");
+        assert!(doc.node_agrees, "{:?}", doc.node_divergences);
+        let reg: serde_json::Value = serde_json::from_str(&registry_document(&n)).unwrap();
+        let leaf = reg["assets"].as_array().unwrap().iter().find(|a| a["asset"] == usdt).unwrap();
+        assert_eq!(leaf["mode"], "hybrid");
+    }
 }
+
