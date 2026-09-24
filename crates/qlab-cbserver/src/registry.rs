@@ -410,6 +410,71 @@ pub fn decode_genesis_notes(b: &[u8]) -> Result<([u8; 32], Vec<ServedGenesisNote
     Ok((hash, notes))
 }
 
+/// The route an Annulet node serves its fee tiers on (lab #720).
+pub const ANNULET_PARAMS_PATH: &str = "/v1/annulet/params";
+pub const ANNULET_PARAMS_WIRE_VERSION: u8 = 1;
+/// `version ‖ genesis_hash(32) ‖ fee_tier_s u64 LE ‖ fee_tier_p u64 LE`.
+pub const ANNULET_PARAMS_LEN: usize = 1 + 32 + 8 + 8;
+
+/// `GET /v1/annulet/params` (lab #720): the posted fee tiers of the genesis
+/// the node runs, under that genesis's hash — the tariff a wallet must pay
+/// exactly (fee notes are exact-tariff). `[devnet-placeholder]` values until
+/// the pilot prices them; the route carries whatever the genesis says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnnuletParams {
+    pub genesis_hash: [u8; 32],
+    pub fee_tier_s: u64,
+    pub fee_tier_p: u64,
+}
+
+/// Why an Annulet params body did not decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnuletParamsWireError {
+    /// Not exactly [`ANNULET_PARAMS_LEN`] bytes.
+    Length { got: usize },
+    BadVersion { got: u8 },
+}
+
+pub fn encode_annulet_params(p: &AnnuletParams) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ANNULET_PARAMS_LEN);
+    out.push(ANNULET_PARAMS_WIRE_VERSION);
+    out.extend_from_slice(&p.genesis_hash);
+    out.extend_from_slice(&p.fee_tier_s.to_le_bytes());
+    out.extend_from_slice(&p.fee_tier_p.to_le_bytes());
+    out
+}
+
+pub fn decode_annulet_params(b: &[u8]) -> Result<AnnuletParams, AnnuletParamsWireError> {
+    if b.len() != ANNULET_PARAMS_LEN {
+        return Err(AnnuletParamsWireError::Length { got: b.len() });
+    }
+    if b[0] != ANNULET_PARAMS_WIRE_VERSION {
+        return Err(AnnuletParamsWireError::BadVersion { got: b[0] });
+    }
+    Ok(AnnuletParams {
+        genesis_hash: b[1..33].try_into().expect("32 bytes"),
+        fee_tier_s: u64::from_le_bytes(b[33..41].try_into().expect("8 bytes")),
+        fee_tier_p: u64::from_le_bytes(b[41..49].try_into().expect("8 bytes")),
+    })
+}
+
+#[cfg(test)]
+mod annulet_params_tests {
+    use super::*;
+
+    #[test]
+    fn annulet_params_round_trip_and_refuse_by_name() {
+        let p = AnnuletParams { genesis_hash: [0x6f; 32], fee_tier_s: 1, fee_tier_p: 2 };
+        let b = encode_annulet_params(&p);
+        assert_eq!(b.len(), ANNULET_PARAMS_LEN);
+        assert_eq!(decode_annulet_params(&b), Ok(p));
+        assert_eq!(decode_annulet_params(&b[..48]), Err(AnnuletParamsWireError::Length { got: 48 }));
+        let mut v2 = b.clone();
+        v2[0] = 2;
+        assert_eq!(decode_annulet_params(&v2), Err(AnnuletParamsWireError::BadVersion { got: 2 }));
+    }
+}
+
 #[cfg(test)]
 mod genesis_notes_tests {
     use super::*;

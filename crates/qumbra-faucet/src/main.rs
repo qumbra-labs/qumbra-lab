@@ -486,7 +486,7 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
 /// Annulet faucet key is the devnet's **dev** key, public by construction),
 /// and a node that would be the sequencer.
 fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qumbra_faucet::annulet::{serve_grants, AnnuletFaucet, Served, SpendKey};
+    use qumbra_faucet::annulet::{served, serve_grants, AnnuletFaucet, SpendKey};
     use qumbra_node::annulet_genesis::{devnet, load_any, AnnuletGenesisFile, AnyGenesis};
     let cfg_path = flag(args, "--node-config").ok_or("annulet requires --node-config FILE")?;
     let listen = flag(args, "--listen").unwrap_or("127.0.0.1:8090");
@@ -523,7 +523,7 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     let key = SpendKey { sk: devnet::FAUCET_SK, d: devnet::FAUCET_D };
     let change = qlab_note::kem::generate_keypair(&mut rand::rng());
     let faucet = AnnuletFaucet::start(
-        Served { addr: discovery },
+        served(discovery),
         genesis.form()?,
         key,
         change.ek,

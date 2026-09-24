@@ -67,7 +67,7 @@ docker build -f deploy/docker/Dockerfile --target runtime -t qumbra-lab:annulet-
 ## 没证明什么
 
 - **compose 能跑起来。** 它只被解析过（`docker compose config`），第一次起是之后另行安排的一步。
-- **用户钱包。** 这里的花费组装（`qumbra_faucet::annulet`）其实是 L2 花费的钱包一侧，因为水龙头先用得上才在这里写；C2 会把它挪进钱包。*（C1 更正，lab #718：这里原先说还没有用户钱包能推导出可在 L2 花费的 `rkm`，这是错的。钱包的 `rkm = H(nk ‖ D ‖ d)` 和 `nf = H(nk ‖ ρ)` 与 L2 电路的推导逐个 lane 一致，现有钱包地址本来就能收可花的 L2 票据，现在有测试证明。C1 加上了扫描：`qumbra-wallet scan --net annulet`。）*
+- **用户钱包。** 这里的花费组装（`qumbra_faucet::annulet`）其实是 L2 花费的钱包一侧，因为水龙头先用得上才在这里写；C2 会把它挪进钱包。*（C1 更正，lab #718：这里原先说还没有用户钱包能推导出可在 L2 花费的 `rkm`，这是错的。钱包的 `rkm = H(nk ‖ D ‖ d)` 和 `nf = H(nk ‖ ρ)` 与 L2 电路的推导逐个 lane 一致，现有钱包地址本来就能收可花的 L2 票据，现在有测试证明。C1 加上了扫描：`qumbra-wallet scan --net annulet`。）* *（C2，lab #720：花费组装已移到 `qlab-l2spend`，钱包和水龙头共用一份；`qumbra-wallet send --net annulet` 可以从普通钱包发送，钱包里没有面额恰好等于手续费的 asset-0 票据时，会先拆出一张。一笔交易最多只能动用一张非手续费资产的票据，这类资产的两张票据在 2×2 里无法合并，已作为试点的设计层阻断项记录。）*
 - **发行方操作。** 铸造、赎回、冻结、白名单和非零 vPublic 属于 C3。这里的冻结树是空的，也从不更新。
 - **运行时修改注册表。** A2 之前，注册表只在 genesis 里设定。
 - **浏览器或证明页面。** 属于 D1。

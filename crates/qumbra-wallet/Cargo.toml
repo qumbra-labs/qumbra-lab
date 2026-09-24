@@ -54,6 +54,9 @@ qlab-air = { path = "../qlab-air" }
 qlab-consensus = { path = "../qlab-consensus", optional = true }
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
 qlab-p2p = { path = "../qlab-p2p", optional = true }
+# The L2 spend assembly (lab #720): selection is here, the witness assembly,
+# the prove and the tx wire are qlab-l2spend's — shared with the faucet.
+qlab-l2spend = { path = "../qlab-l2spend", optional = true }
 # The served wires this wallet consumes, decoded by their OWN codecs, never a
 # second reading of them: `TreeLeaves` (golden-frozen by #275, stamp rider 1)
 # and `AnchorSet`. Adds NO crate to the build — qlab-p2p above already depends
@@ -121,7 +124,7 @@ default = ["net", "prove", "randomx", "host"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.
-prove = ["dep:qlab-consensus", "dep:qlab-p2p"]
+prove = ["dep:qlab-consensus", "dep:qlab-p2p", "dep:qlab-l2spend"]
 # the RandomX C++ chain, via the qlab-devnet/qlab-node passthroughs.
 randomx = ["qlab-devnet/randomx", "qlab-node/randomx"]
 # the native-messaging prover host (lab #400 rung): prove + submit behind a

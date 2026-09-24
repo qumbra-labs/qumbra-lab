@@ -99,6 +99,7 @@
 //! from a file this process never echoes, and the ticket secret redacts itself.
 
 pub mod annulet;
+pub mod devnet_harness;
 pub mod config;
 pub mod harvest;
 pub mod http;
