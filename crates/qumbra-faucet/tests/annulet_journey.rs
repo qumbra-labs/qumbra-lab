@@ -157,16 +157,19 @@ impl Net {
         *self.views.lock().unwrap()
     }
 
-    /// Wait until every node has applied height ≥ `h` and all three agree.
-    fn settle_at_least(&self, h: u64, what: &str) -> [View; 3] {
+    /// Wait until every node has applied exactly `nullifiers` spends and all
+    /// three agree. **Keyed on the spends, not the tip** (the first full lane
+    /// run): the producer's slot rule also seals EMPTY blocks, so "the tip
+    /// moved" is not evidence that a submitted transaction was included.
+    fn settle_spends(&self, nullifiers: usize, what: &str) -> [View; 3] {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let v = self.views();
             let agree = v.iter().all(|x| (x.header_tip, x.state_tip, x.root, x.nullifiers) == (v[0].header_tip, v[0].state_tip, v[0].root, v[0].nullifiers));
-            if v[0].state_tip >= h && agree {
+            if v[0].nullifiers == nullifiers && agree {
                 return v;
             }
-            assert!(Instant::now() < deadline, "{what}: the net did not settle at ≥ {h}: {v:?}");
+            assert!(Instant::now() < deadline, "{what}: the net did not settle at {nullifiers} nullifiers: {v:?}");
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -215,7 +218,7 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
         AnnuletFaucet::start(seq, GenesisForm::Annulet, faucet_key, faucet_kem.ek.clone(), devnet::FEE_TIER_S)
             .expect("the Annulet faucet starts on an Annulet node");
     assert_eq!(faucet.stock_left() as u64, devnet::STOCK_NOTES);
-    net.settle_at_least(0, "genesis");
+    net.settle_spends(0, "genesis");
     // Both followers are connected to the sequencer before anything is sealed.
     let deadline = Instant::now() + Duration::from_secs(30);
     while net.views()[0].ready_peers < 2 {
@@ -226,9 +229,9 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     // 2. Two grants (shape S): the holder's fee note, the recipient's.
     let t = Instant::now();
     let holder_fee = faucet.grant(&holder, &mut rng).expect("grant 1 (to the holder) is admitted");
-    let v = net.settle_at_least(1, "grant 1");
+    net.settle_spends(2, "grant 1");
     let user_fee = faucet.grant(&user, &mut rng).expect("grant 2 (to the recipient) is admitted");
-    let v = net.settle_at_least(v[0].state_tip + 1, "grant 2");
+    net.settle_spends(4, "grant 2");
     eprintln!("B6 journey: 2 S grants sealed and applied on 3 nodes in {:?}", t.elapsed());
     assert_eq!(faucet.stock_left() as u64, devnet::STOCK_NOTES - 2);
     // A restarted faucet (a fresh start against a follower) skips both
@@ -250,7 +253,7 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     let send = build_p_send(&seq, [&holder_usdt, &holder_fee], [&usdt, &asset0], &user, &holder, tier_p, &mut rng)
         .expect("the holder's P send builds and proves");
     seq.submit(&send.tx).expect("the holder's P send is admitted");
-    let v = net.settle_at_least(v[0].state_tip + 1, "the holder's send");
+    let v = net.settle_spends(6, "the holder's send");
     eprintln!("B6 journey: holder → recipient USDT-test (P) sealed and applied in {:?}", t.elapsed());
 
     // 4. The recipient detects its two notes through a FOLLOWER's served
@@ -272,14 +275,15 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     let back = build_p_send(&follower, [&user_usdt, &user_fee], [&usdt, &asset0], &holder, &user, tier_p, &mut rng)
         .expect("the recipient's P spend builds and proves");
     seq.submit(&back.tx).expect("the recipient's P spend is admitted");
-    let v = net.settle_at_least(v[0].state_tip + 1, "the recipient's spend");
+    let v = net.settle_spends(8, "the recipient's spend");
     eprintln!("B6 journey: recipient → holder USDT-test (P) sealed and applied in {:?}", t.elapsed());
 
     // A spent note stays spent: the recipient's spend again is refused.
-    assert!(matches!(seq.submit(&back.tx), Err(AnnuletError::Refused(_))));
+    let again = seq.submit(&back.tx);
+    assert!(matches!(again, Err(AnnuletError::Refused(_))), "{again:?}");
 
     // The three nodes agree: tip, commitment root, and the four spends'
-    // eight nullifiers (two real + two dummy per S, two real per P).
+    // eight nullifiers (a real and a dummy per S grant, two real per P).
     assert!(v.iter().all(|x| x.root == v[0].root && x.state_tip == v[0].state_tip), "{v:?}");
     assert_eq!(v[0].nullifiers, 8, "{v:?}");
     let holder_back = Served { addr: net.served[1] }.detect(&holder_kem.dk, 1, v[1].state_tip).unwrap();
