@@ -1,5 +1,6 @@
-//! Print the literals `qlab-l2` pins (lab #704 Q5): the two shape digests, the
-//! two fixture PV vectors, and the golden note block's commitment. **No
+//! Print the literals `qlab-l2` pins (lab #704 Q5, #724): the three shape
+//! digests, the three fixture PV vectors, and the golden note block's
+//! commitment. **No
 //! proving** — instance builders (host Keccak) and Plonky3's symbolic
 //! evaluation only; seconds, well under 1 GB.
 //!
@@ -10,7 +11,7 @@
 use qlab_l2::{digest, fixture, Shape};
 
 fn main() {
-    for shape in [Shape::S, Shape::P] {
+    for shape in [Shape::S, Shape::P, Shape::R] {
         let c1 = digest::constants_digest(shape);
         let (k1, n1) = digest::constraints_digest(shape);
         let (k2, n2) = digest::constraints_digest(shape);
@@ -27,6 +28,8 @@ fn main() {
     let pv_p = fixture::shape_p().pvs;
     println!("const GOLDEN_PV_S: [u32; {}] = {:?};", pv_s.len(), pv_s);
     println!("const GOLDEN_PV_P: [u32; {}] = {:?};", pv_p.len(), pv_p);
+    let pv_r = fixture::shape_r().pvs;
+    println!("const GOLDEN_PV_R: [u32; {}] = {:?};", pv_r.len(), pv_r);
     let f = |b: u64| -> [u64; 4] { core::array::from_fn(|i| b + i as u64) };
     let cm = qlab_air::l2::l2_cm(
         0x0102_0304_0506_0708,

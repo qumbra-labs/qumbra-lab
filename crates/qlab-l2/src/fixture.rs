@@ -1,4 +1,4 @@
-//! The deterministic shape-S and shape-P instances — one source.
+//! The deterministic shape-S, shape-P and shape-R instances — one source.
 //!
 //! These are the instances W3 measured (`qlab-bench l2shape`, lab #700,
 //! `docs/w3-run{1..4}.md`), moved here unchanged so the bench, this crate's
@@ -10,7 +10,9 @@
 //! a regression lock on the PV layout and on every host hash that feeds it.
 
 use qlab_air::l2::{build_bucket_l2, L2BucketInstance, L2TxInput, L2TxOutput};
-use qlab_air::l2p::{build_bucket_l2p, L2PBucketInstance, PolicyAsset, VPublic};
+use qlab_air::l2::{RegistryLeaf, MODE_HYBRID};
+use qlab_air::l2p::{build_bucket_l2p, issuer_key_of, L2PBucketInstance, PolicyAsset, VPublic};
+use qlab_air::l2r::{build_shape_r, registry_opening, L2ShapeRInstance, RegistryWrite};
 
 /// The fixtures' xorshift64 stream (the bench's, verbatim).
 struct Rnd(u64);
@@ -79,4 +81,55 @@ pub fn shape_p_at(log_height: usize) -> L2PBucketInstance {
 /// Shape P at its own height (2^20).
 pub fn shape_p() -> L2PBucketInstance {
     shape_p_at(crate::LOG_HEIGHT_P)
+}
+
+/// The next issuer secret of asset 7 — what the shape-R fixture rotates to.
+pub const ISK_7_NEXT: [u64; 4] = [0x15c7_0101, 0x15c7_0102, 0x15c7_0103, 0x15c7_0104];
+
+/// The registry the shape-R fixture writes into: asset 0 (Cloaked) and
+/// asset 7 (Hybrid, issuer [`ISK_7`], a published freeze root).
+pub fn shape_r_registry() -> Vec<RegistryLeaf> {
+    let mut r = Rnd(SEED ^ 0x52);
+    vec![
+        RegistryLeaf::cloaked(0),
+        RegistryLeaf {
+            asset: 7,
+            issuer_key: issuer_key_of(&ISK_7),
+            mode: MODE_HYBRID,
+            freeze_root: r.d4(),
+            allow_root: [0; 4],
+            flags: 0,
+        },
+    ]
+}
+
+/// Shape R at `log_height`: **an update** of asset 7 — the issuer proves
+/// [`ISK_7`], rotates the key to [`ISK_7_NEXT`] and publishes a new freeze
+/// root — paid by a 50,000 → 50,000 − fee spend in asset 0, fee
+/// [`crate::FEE_TIER_R_PLACEHOLDER`].
+pub fn shape_r_at(log_height: usize) -> L2ShapeRInstance {
+    let mut r = Rnd(SEED ^ 0x52);
+    let _ = r.d4(); // the registry's freeze root
+    let fee = crate::FEE_TIER_R_PLACEHOLDER;
+    let input = r.input(50_000, 0);
+    let output = r.output(50_000 - fee, 0);
+    let registry = shape_r_registry();
+    let old = registry[1];
+    let new = RegistryLeaf {
+        issuer_key: issuer_key_of(&ISK_7_NEXT),
+        freeze_root: r.d4(),
+        ..old
+    };
+    let write = RegistryWrite {
+        isk: ISK_7,
+        old_leaf: Some(old),
+        new_leaf: new,
+        opening: registry_opening(&registry, 7).0,
+    };
+    build_shape_r(log_height, &input, &output, fee, &write)
+}
+
+/// Shape R at its own height (2^18).
+pub fn shape_r() -> L2ShapeRInstance {
+    shape_r_at(crate::LOG_HEIGHT_R)
 }

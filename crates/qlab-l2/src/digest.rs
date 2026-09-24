@@ -13,7 +13,7 @@
 //!   width, the mode/flag values, and **known-answer outputs of every host
 //!   hash the circuit mirrors** (note commitment, registry leaf, and for P the
 //!   issuer key `D_I`, the credential `D_CRED`, the freeze key `D_FRZ` and the
-//!   freeze leaf). The
+//!   freeze leaf; for R `D_I` and a non-Cloaked registry leaf). The
 //!   domain separators `D_I`, `D_CRED`, `D_FRZ` are not named constants in
 //!   `qlab-air` — they are lane/bit positions inside those blocks — so they
 //!   are pinned *through* the known answers, derived rather than re-typed.
@@ -43,6 +43,7 @@ use tiny_keccak::{Hasher, Keccak};
 
 use qlab_air::l2::{self, RegistryLeaf};
 use qlab_air::l2p;
+use qlab_air::l2r;
 use qlab_air::narrow::MERKLE_DEPTH;
 
 use crate::{Shape, Val};
@@ -90,6 +91,7 @@ fn tag(shape: Shape) -> u64 {
     match shape {
         Shape::S => 0x53, // 'S'
         Shape::P => 0x50, // 'P'
+        Shape::R => 0x52, // 'R'
     }
 }
 
@@ -103,15 +105,27 @@ pub fn constants_digest(shape: Shape) -> [u8; 32] {
         .usize(l2::ROWS_PER_PERM);
     // PV layout.
     h.usize(shape.pv_len());
-    h.words(&[
-        l2::PV_ANCHOR as u64,
-        l2::PV_NF1 as u64,
-        l2::PV_NF2 as u64,
-        l2::PV_CM1 as u64,
-        l2::PV_CM2 as u64,
-        l2::PV_FEE as u64,
-        l2::PV_REGROOT as u64,
-    ]);
+    if shape == Shape::R {
+        h.words(&[
+            l2r::PV_ANCHOR as u64,
+            l2r::PV_NF as u64,
+            l2r::PV_CM as u64,
+            l2r::PV_FEE as u64,
+            l2r::PV_OLD_ROOT as u64,
+            l2r::PV_NEW_ROOT as u64,
+            l2r::PV_ASSET as u64,
+        ]);
+    } else {
+        h.words(&[
+            l2::PV_ANCHOR as u64,
+            l2::PV_NF1 as u64,
+            l2::PV_NF2 as u64,
+            l2::PV_CM1 as u64,
+            l2::PV_CM2 as u64,
+            l2::PV_FEE as u64,
+            l2::PV_REGROOT as u64,
+        ]);
+    }
     if shape == Shape::P {
         h.words(&[l2p::PV_VP1 as u64, l2p::PV_VP2 as u64]);
     }
@@ -142,6 +156,19 @@ pub fn constants_digest(shape: Shape) -> [u8; 32] {
         h.words(&l2p::cred_of(&o)); // D_CRED
         h.words(&l2p::freeze_key_of(&o)); // D_FRZ
         h.words(&l2p::freeze_leaf_hash(&z, &o));
+    }
+    if shape == Shape::R {
+        h.words(&l2p::issuer_key_of(&o)); // D_I
+        let leaf = RegistryLeaf {
+            asset: 7,
+            issuer_key: o,
+            mode: l2::MODE_REGULATED,
+            freeze_root: [5, 6, 7, 8],
+            allow_root: [9, 10, 11, 12],
+            flags: 1,
+        };
+        h.words(&leaf.hash()); // every leaf lane, not only Cloaked's
+        h.words(&l2r::registry_zeros()[l2::REGISTRY_DEPTH]); // the empty registry
     }
     h.finish()
 }
@@ -232,6 +259,7 @@ pub fn constraints_digest(shape: Shape) -> ([u8; 32], usize) {
         .spawn(move || match shape {
             Shape::S => constraints_digest_of(&crate::verifier_air_s()),
             Shape::P => constraints_digest_of(&crate::verifier_air_p()),
+            Shape::R => constraints_digest_of(&crate::verifier_air_r()),
         })
         .expect("spawn the digest thread")
         .join()

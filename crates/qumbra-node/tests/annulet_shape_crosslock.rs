@@ -8,10 +8,15 @@
 use qlab_devnet::annulet::{L2ShapeTag, L2_SURFACE_LEN_P, L2_SURFACE_LEN_S};
 use qlab_l2::Shape;
 
-fn tag_of(shape: Shape) -> L2ShapeTag {
+/// Shape R (registry writes, lab #724) is a circuit before it is a wire
+/// shape: the node applies R transactions from milestone B3b, which adds its
+/// tag. Until then R maps to no tag — explicitly, so this match stays
+/// exhaustive and B3b's tag lands here as a one-line change.
+fn tag_of(shape: Shape) -> Option<L2ShapeTag> {
     match shape {
-        Shape::S => L2ShapeTag::S,
-        Shape::P => L2ShapeTag::P,
+        Shape::S => Some(L2ShapeTag::S),
+        Shape::P => Some(L2ShapeTag::P),
+        Shape::R => None,
     }
 }
 
@@ -22,15 +27,17 @@ fn shape_of(tag: L2ShapeTag) -> Shape {
     }
 }
 
-/// The two enums are the same set, both ways (both matches are exhaustive,
-/// so a shape added on either side fails to compile here first).
+/// The two enums are the same set, both ways, save R before B3b (both
+/// matches are exhaustive, so a shape added on either side fails to compile
+/// here first).
 #[test]
 fn the_wire_tag_and_the_circuit_shape_are_one_set() {
     for shape in [Shape::S, Shape::P] {
-        assert_eq!(shape_of(tag_of(shape)), shape);
+        assert_eq!(tag_of(shape).map(shape_of), Some(shape));
     }
+    assert_eq!(tag_of(Shape::R), None, "R has no wire tag before B3b");
     for tag in [L2ShapeTag::S, L2ShapeTag::P] {
-        assert_eq!(tag_of(shape_of(tag)), tag);
+        assert_eq!(tag_of(shape_of(tag)), Some(tag));
         assert_eq!(L2ShapeTag::from_byte(tag.byte()), Some(tag));
     }
 }

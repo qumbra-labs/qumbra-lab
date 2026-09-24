@@ -65,7 +65,14 @@ fn l2_shape_geometry_is_locked() {
 
     assert_eq!((Shape::S.width(), Shape::S.log_height(), Shape::S.perms(), Shape::S.pv_len()), (702, 19, 120, 100));
     assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (778, 20, 214, 112));
-    for sh in [Shape::S, Shape::P] {
+    let r = verifier_air_r();
+    assert_eq!(<L2ShapeRAir as BaseAir<Val>>::width(&r), Shape::R.width());
+    assert_eq!(<L2ShapeRAir as BaseAir<Val>>::num_public_values(&r), 85);
+    assert_eq!(get_max_constraint_degree::<Val, _>(&r, AirLayout::from_air::<Val>(&r)), 4);
+    assert_eq!((Shape::R.width(), Shape::R.log_height(), Shape::R.perms(), Shape::R.pv_len()), (726, 18, 79, 85));
+    assert_eq!((PV_R_OLD_ROOT, PV_R_NEW_ROOT, PV_R_ASSET), (52, 68, 84));
+    assert_eq!(Shape::R.pv_vpublic(0), None);
+    for sh in [Shape::S, Shape::P, Shape::R] {
         assert!(sh.perms() * qlab_air::l2::ROWS_PER_PERM <= 1 << sh.log_height(), "{sh:?} fits its height");
     }
     assert_eq!(PV_REGROOT, 84);
@@ -153,6 +160,24 @@ fn l2_verifier_air_is_instance_independent() {
     for (i, p) in p_programs.iter().enumerate() {
         assert_eq!(&p[..], canonical_program(Shape::P), "shape-P builder {i}");
     }
+
+    // Shape R: a registration (REG = 1) and the fixture's update (REG = 0),
+    // the latter at another height, emit one program.
+    let reg = fixture::shape_r_registry();
+    let new9 = RegistryLeaf { asset: 9, ..RegistryLeaf::cloaked(9) };
+    let write = RegistryWrite {
+        isk: [0; 4],
+        old_leaf: None,
+        new_leaf: new9,
+        opening: qlab_air::l2r::registry_opening(&reg, 9).0,
+    };
+    let r_programs = [
+        qlab_air::l2r::build_shape_r(LOG_HEIGHT_R, &inp(90, 20, 0), &out(11, 10, 0), 10, &write).air.program,
+        fixture::shape_r_at(LOG_HEIGHT_R + 1).air.program,
+    ];
+    for (i, p) in r_programs.iter().enumerate() {
+        assert_eq!(&p[..], canonical_program(Shape::R), "shape-R builder {i}");
+    }
 }
 
 /// Shape S through the real prover under the provisional lane, verified by
@@ -191,11 +216,34 @@ fn l2_prove_verify_roundtrip_p() {
     assert!(!verify_s(&pvs[..Shape::S.pv_len()], &proof), "a P proof is not an S proof");
 }
 
+/// Shape R through the real prover under the provisional lane — the
+/// fixture's update of asset 7 — verified by the canonical AIR. A moved new
+/// root and a moved asset id are refused; an R proof is not an S proof.
+#[test]
+fn l2_prove_verify_roundtrip_r() {
+    let inst = fixture::shape_r();
+    let (pvs, proof) = prove_r(&inst);
+    assert!(verify_r(&pvs, &proof), "the honest shape-R proof verifies");
+    let mut bad = pvs.clone();
+    bad[PV_R_NEW_ROOT + 5] += Val::ONE;
+    assert!(!verify_r(&bad, &proof), "a tampered new registry root is refused");
+    let mut bad = pvs.clone();
+    bad[PV_R_ASSET] = Val::from_u32(8);
+    assert!(!verify_r(&bad, &proof), "a write of 7 claimed as a write of 8 is refused");
+    let mut long = pvs.clone();
+    long.resize(Shape::S.pv_len(), Val::ZERO);
+    assert!(!verify_s(&long, &proof), "an R proof is not an S proof");
+}
+
 /// Q4: the digest is deterministic (computed twice, compared) and pinned.
 /// On a mismatch the message carries the computed value.
 #[test]
 fn l2_shape_digests_are_pinned() {
-    for (shape, pin) in [(Shape::S, SHAPE_S_DIGEST_V1), (Shape::P, SHAPE_P_DIGEST_V1)] {
+    for (shape, pin) in [
+        (Shape::S, SHAPE_S_DIGEST_V1),
+        (Shape::P, SHAPE_P_DIGEST_V1),
+        (Shape::R, SHAPE_R_DIGEST_V1),
+    ] {
         let a = digest::shape_digest(shape);
         let b = digest::shape_digest(shape);
         assert_eq!(a, b, "{shape:?}: the shape digest is not deterministic");
@@ -210,6 +258,7 @@ fn l2_shape_digests_are_pinned() {
 fn l2_golden_pv_vectors() {
     assert_eq!(fixture::shape_s().pvs, GOLDEN_PV_S, "shape-S fixture PVs");
     assert_eq!(fixture::shape_p().pvs, GOLDEN_PV_P, "shape-P fixture PVs");
+    assert_eq!(fixture::shape_r().pvs, GOLDEN_PV_R, "shape-R fixture PVs");
 }
 
 const GOLDEN_PV_S: [u32; 100] = [
@@ -235,3 +284,4 @@ const GOLDEN_PV_P: [u32; 112] = [
     64399, 4798, 55940, 64131, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0,
 ];
+const GOLDEN_PV_R: [u32; 85] = [0; 85]; // PENDING: the named l2_goldens run
