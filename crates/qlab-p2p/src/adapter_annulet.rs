@@ -186,8 +186,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
 
     /// **The producer's step** (lab #708; the slot loop is B2b's): assemble a
     /// body from the pool (no coinbase — the L2 has none), build the child of
-    /// the tip with the parent's anchor and registry root (the anchor source
-    /// is a stub at Phase 0; no runtime registry updates until A2), seal it,
+    /// the tip with the parent's anchor (a stub at Phase 0) and the registry
+    /// root after the block (lab #728: a pooled write's, else the parent's), seal it,
     /// and apply it **through [`Self::ingest_sealed_block`]** — the path every
     /// follower runs. Returns the sealed header and body to relay.
     pub fn seal_next_block(&mut self, key: &SequencerKey, timestamp: u64) -> Result<(SealedHeader, BlockBody), String> {
@@ -200,10 +200,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         };
         let template = self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, [0; 4]);
         let body = BlockBody::new(template.body.txs, Vec::new());
+        // Lab #728: the header carries the registry AFTER the block — the
+        // write's root when the template holds one (the pool admits at most
+        // one), the parent's otherwise. A template the body rule would refuse
+        // is refused below, by the same ingest a follower runs.
+        let registry_root = match qlab_devnet::annulet::annulet_registry_write(&body) {
+            Ok(Some((_, _, w))) => w.new_root,
+            Ok(None) | Err(_) => pext.registry_root,
+        };
         let ext = AnnuletHeaderFields {
             l1_anchor_height: pext.l1_anchor_height,
             l1_anchor_root: pext.l1_anchor_root,
-            registry_root: pext.registry_root,
+            registry_root,
         };
         let header =
             BlockHeader::child_of_annulet(&parent, timestamp.max(parent.timestamp), ext, body_commitment_annulet(&body));

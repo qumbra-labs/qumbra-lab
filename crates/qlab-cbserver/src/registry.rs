@@ -61,9 +61,9 @@ pub enum RegistryError {
     AssetOutOfRange { asset: u64 },
     /// Two leaves for one asset.
     DuplicateAsset { asset: u16 },
-    /// A registry update before A2 lands shape R: the registry is immutable
-    /// after genesis until then.
-    UpdatesArriveWithA2,
+    /// A write to asset 0's slot — the fee unit's leaf is pinned at genesis
+    /// and never writable (lab #724, enforced in-circuit by shape R too).
+    AssetZeroNotWritable,
     /// **The registry invariant broken** (lab #724): slot `slot` holds a leaf
     /// whose asset lane is not `slot`. Shapes S and P prove *a* path to the
     /// root and trust the leaf's asset lane, so this invariant is what makes
@@ -144,9 +144,29 @@ impl RegistryTree {
         Some(witness_at(&self.levels, asset))
     }
 
-    /// The single update seam — refused until A2 lands shape R.
-    pub fn apply_update(&mut self, _leaf: RegistryLeaf) -> Result<(), RegistryError> {
-        Err(RegistryError::UpdatesArriveWithA2)
+    /// The opening of **any** slot, registered or empty (lab #728): what a
+    /// registration proves against. Unlike [`Self::witness`], an empty slot
+    /// answers — its leaf is the zero digest.
+    pub fn opening_at(&self, slot: u16) -> RegistryWitness {
+        witness_at(&self.levels, slot)
+    }
+
+    /// **The registry write** (lab #728, shape R applied): `leaf` replaces
+    /// slot `leaf.asset` — a registration into an empty slot or an update of
+    /// the leaf there. The tree is rebuilt through [`Self::from_leaves`], so
+    /// the registry invariant is re-checked on every write. Asset 0 is never
+    /// writable; an out-of-range asset is refused as at genesis.
+    pub fn apply_update(&mut self, leaf: RegistryLeaf) -> Result<(), RegistryError> {
+        if leaf.asset >= 1u64 << REGISTRY_DEPTH {
+            return Err(RegistryError::AssetOutOfRange { asset: leaf.asset });
+        }
+        if leaf.asset == 0 {
+            return Err(RegistryError::AssetZeroNotWritable);
+        }
+        let mut leaves: BTreeMap<u16, RegistryLeaf> = self.leaves.clone();
+        leaves.insert(leaf.asset as u16, leaf);
+        *self = Self::from_leaves(&leaves.into_values().collect::<Vec<_>>())?;
+        Ok(())
     }
 }
 
@@ -344,11 +364,37 @@ mod tests {
         assert_eq!(planted.check_invariant(), Err(RegistryError::SlotAssetMismatch { slot: 9, asset: 7 }));
     }
 
+    /// Lab #728: a registration into an empty slot and an update of a leaf
+    /// each move the root to exactly the tree built from the new leaf set; the
+    /// empty slot's opening folds the zero digest to the old root and the new
+    /// leaf to the new one; asset 0 and out-of-range assets are refused.
     #[test]
-    fn the_empty_registry_root_is_the_zero_ladder_and_updates_wait_for_a2() {
-        let mut t = RegistryTree::from_leaves(&[]).unwrap();
+    fn a_registry_write_moves_the_root_to_the_rebuilt_trees() {
+        let base = [RegistryLeaf::cloaked(0), hybrid(7)];
+        let mut t = RegistryTree::from_leaves(&base).unwrap();
+        let old = t.root();
+        let opening = t.opening_at(9);
+        assert!(t.witness(9).is_none(), "the served witness stays leaf-only");
+        assert_eq!(opening.fold_root(&[0; 4]), old, "an empty slot's opening folds the zero digest");
+        t.apply_update(hybrid(9)).unwrap();
+        assert_eq!(t.root(), RegistryTree::from_leaves(&[base[0], base[1], hybrid(9)]).unwrap().root());
+        assert_eq!(opening.fold_root(&hybrid(9).hash()), t.root(), "the same opening folds the new leaf");
+        // An update: asset 7 rotates its issuer key.
+        let rotated = RegistryLeaf { issuer_key: [0xAB; 4], ..hybrid(7) };
+        t.apply_update(rotated).unwrap();
+        assert_eq!(t.leaf(7), Some(&rotated));
+        assert_eq!(t.check_invariant(), Ok(()));
+        assert_eq!(t.apply_update(RegistryLeaf::cloaked(0)), Err(RegistryError::AssetZeroNotWritable));
+        assert_eq!(
+            t.apply_update(RegistryLeaf::cloaked(1 << 16)),
+            Err(RegistryError::AssetOutOfRange { asset: 1 << 16 })
+        );
+    }
+
+    #[test]
+    fn the_empty_registry_root_is_the_zero_ladder() {
+        let t = RegistryTree::from_leaves(&[]).unwrap();
         assert_eq!(t.root(), zeros()[REGISTRY_DEPTH]);
-        assert_eq!(t.apply_update(RegistryLeaf::cloaked(1)), Err(RegistryError::UpdatesArriveWithA2));
         assert_eq!(
             RegistryTree::from_leaves(&[RegistryLeaf::cloaked(3), RegistryLeaf::cloaked(3)]),
             Err(RegistryError::DuplicateAsset { asset: 3 })

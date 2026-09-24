@@ -430,25 +430,13 @@ where
     // surface binds the root BEFORE it — the parent's — which is the header
     // root when the block writes nothing, and the (one) write's old root when
     // it does. The node ties that pre-block root to its own tree on apply.
-    let mut write_index = None;
-    for (i, tx) in body.txs.iter().enumerate() {
-        if let Ok(Some(surface)) = L2Surface::decode(&tx.l2) {
-            if surface.shape == L2ShapeTag::R {
-                if write_index.is_some() {
-                    return Err(BodyError::L2SecondRegistryWrite { index: i });
-                }
-                write_index = Some(i);
-            }
-        }
-    }
-    let pre_root = match write_index {
+    let pre_root = match annulet_registry_write(body)? {
         None => header_root,
-        Some(i) => {
-            let w = L2Surface::decode(&body.txs[i].l2).ok().flatten().expect("decoded above");
-            if Some(w.write.expect("an R surface carries its write").new_root) != header_root {
+        Some((i, old_root, w)) => {
+            if Some(w.new_root) != header_root {
                 return Err(BodyError::L2RegistryWriteRootMismatch { index: i });
             }
-            Some(w.registry_root)
+            Some(old_root)
         }
     };
     let mut seen_nf = std::collections::HashSet::new();
@@ -462,22 +450,7 @@ where
         let surface = L2Surface::decode(&tx.l2)
             .map_err(|err| BodyError::L2SurfaceMalformed { index: i, err })?
             .ok_or(BodyError::L2SurfaceMissing { index: i })?;
-        // Lab #728 Q2: every Annulet surface declares the 2×2 bucket (the L1
-        // type's only L2 value — the Annulet prices by shape); the SHAPE gates
-        // the counts: S/P spend two and make two, R spends one and makes one.
-        if tx.public.bucket != ArityBucket::TwoByTwo {
-            return Err(BodyError::L2NotTwoByTwo { index: i });
-        }
-        let (want_nf, want_cm) = match surface.shape {
-            L2ShapeTag::S | L2ShapeTag::P => (2, 2),
-            L2ShapeTag::R => (1, 1),
-        };
-        if tx.public.nullifiers.len() != want_nf || tx.public.commitments.len() != want_cm {
-            return Err(match surface.shape {
-                L2ShapeTag::S | L2ShapeTag::P => BodyError::L2NotTwoByTwo { index: i },
-                L2ShapeTag::R => BodyError::L2RegistryWriteArity { index: i },
-            });
-        }
+        check_l2_arity(&tx.public, surface.shape, i)?;
         if Some(surface.registry_root) != pre_root {
             return Err(BodyError::L2RegistryRootStale { index: i });
         }
@@ -518,6 +491,45 @@ pub fn annulet_supply_delta(body: &BlockBody) -> std::collections::BTreeMap<u16,
     }
     delta.retain(|_, v| *v != 0);
     delta
+}
+
+/// Lab #728 Q2: every Annulet surface declares the 2×2 bucket (the L1
+/// type's only L2 value — the Annulet prices by shape); the SHAPE gates the
+/// counts: S/P spend two and make two, R spends one and makes one. The one
+/// rule the body check and the mempool both apply (`index` names the tx).
+pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: usize) -> Result<(), BodyError> {
+    if public.bucket != ArityBucket::TwoByTwo {
+        return Err(BodyError::L2NotTwoByTwo { index });
+    }
+    let (want_nf, want_cm) = match shape {
+        L2ShapeTag::S | L2ShapeTag::P => (2, 2),
+        L2ShapeTag::R => (1, 1),
+    };
+    if public.nullifiers.len() != want_nf || public.commitments.len() != want_cm {
+        return Err(match shape {
+            L2ShapeTag::S | L2ShapeTag::P => BodyError::L2NotTwoByTwo { index },
+            L2ShapeTag::R => BodyError::L2RegistryWriteArity { index },
+        });
+    }
+    Ok(())
+}
+
+/// A body's registry write (lab #728): `(tx index, the root it was proven
+/// against, the write)` for its one shape-R transaction, `None` when it has
+/// none, and a second R refused by index. The one scan both
+/// [`validate_body_annulet`] and the node's apply read, so the two cannot
+/// disagree about which transaction writes.
+pub fn annulet_registry_write(body: &BlockBody) -> Result<Option<(usize, Hash32, RegistryWriteSurface)>, BodyError> {
+    let mut found = None;
+    for (i, tx) in body.txs.iter().enumerate() {
+        let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { continue };
+        let Some(write) = surface.write else { continue };
+        if found.is_some() {
+            return Err(BodyError::L2SecondRegistryWrite { index: i });
+        }
+        found = Some((i, surface.registry_root, write));
+    }
+    Ok(found)
 }
 
 /// Convenience for fixtures and B2's producer: an L2 transaction entry with

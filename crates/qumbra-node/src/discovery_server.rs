@@ -408,6 +408,11 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
             MempoolError::RedeemExceedsOutstanding { asset } => {
                 (409, format!("refused: redeem exceeds asset {asset}'s outstanding supply (lab #712)"))
             }
+            // Lab #728: judged against this pool — retry after the pooled
+            // write lands (and rebind the new root).
+            MempoolError::RegistryWriteAlreadyPooled => {
+                (409, "refused: a registry write is already pooled (lab #728)".to_string())
+            }
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
             // wrapping; reaching here means that mapping broke.
             MempoolError::DuplicateTx => {

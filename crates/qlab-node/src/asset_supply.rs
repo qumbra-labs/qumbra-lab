@@ -38,8 +38,8 @@ pub const REPLAY: &str =
 
 /// How genesis issuance relates to the node's figure — stated in the document.
 pub const GENESIS_NOTE: &str = "genesis issuance is recomputed from the genesis file's public \
-     plaintext notes (each commitment checked); the node's outstanding figure counts vPublic \
-     flows only";
+     plaintext notes (each commitment checked) and is outstanding from height 0: an asset's \
+     outstanding figure is its genesis issuance plus vPublic minted minus redeemed";
 
 /// Per asset, the value the genesis notes issue — recomputed from their public
 /// plaintext payloads, **each commitment checked** against the recorded `cm`.
@@ -61,7 +61,10 @@ pub fn genesis_issuance(notes: &[GenesisNote]) -> Result<BTreeMap<u16, u128>, St
 }
 
 /// The attestation document's version.
-pub const ATTEST_VERSION: u32 = 1;
+///
+/// 2 (lab #728): `outstanding` counts genesis issuance, and an asset issued
+/// only at genesis has an `assets` row. Version 1 counted `vPublic` flows only.
+pub const ATTEST_VERSION: u32 = 2;
 
 /// One asset's public issuance at one height (or in total).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,9 +138,14 @@ impl AssetLedger {
         t
     }
 
-    /// Per asset, the outstanding public supply `Σ minted − Σ redeemed`.
+    /// Per asset, the outstanding public supply: genesis issuance
+    /// `+ Σ minted − Σ redeemed` (lab #728 Q7 — the node's own rule).
     pub fn outstanding(&self) -> BTreeMap<u16, i128> {
-        self.totals().into_iter().map(|(a, f)| (a, f.net())).collect()
+        let mut out: BTreeMap<u16, i128> = self.genesis.iter().map(|(a, v)| (*a, *v as i128)).collect();
+        for (a, f) in self.totals() {
+            *out.entry(a).or_default() += f.net();
+        }
+        out
     }
 
     /// Compare against the node's own state (`MemNode::outstanding_supplies`
@@ -180,6 +188,7 @@ impl AssetLedger {
     /// [`Self::compare_with_node`] found, served verbatim (never reconciled).
     pub fn document(&self, node_divergences: Vec<String>) -> AttestDocument {
         let totals = self.totals();
+        let outstanding = self.outstanding();
         AttestDocument {
             v: ATTEST_VERSION,
             label: LABEL.to_string(),
@@ -192,13 +201,17 @@ impl AssetLedger {
                 .iter()
                 .map(|(asset, v)| GenesisRow { asset: *asset, issued: v.to_string() })
                 .collect(),
-            assets: totals
+            // One row per asset issued at genesis or by a flow.
+            assets: outstanding
                 .iter()
-                .map(|(asset, f)| AssetRow {
-                    asset: *asset,
-                    minted: f.minted.to_string(),
-                    redeemed: f.redeemed.to_string(),
-                    outstanding: f.net().to_string(),
+                .map(|(asset, o)| {
+                    let f = totals.get(asset).copied().unwrap_or_default();
+                    AssetRow {
+                        asset: *asset,
+                        minted: f.minted.to_string(),
+                        redeemed: f.redeemed.to_string(),
+                        outstanding: o.to_string(),
+                    }
                 })
                 .collect(),
             flows: self
@@ -292,8 +305,9 @@ pub struct AttestDocument {
     pub genesis_note: String,
     /// Per asset, the genesis issuance (recomputed from the genesis file).
     pub genesis: Vec<GenesisRow>,
-    /// Per asset, the `vPublic` totals over the chain (what the node's
-    /// outstanding figure counts).
+    /// Per asset issued at genesis or by a flow: the `vPublic` totals over
+    /// the chain, and the outstanding figure (genesis + minted − redeemed —
+    /// the node's own).
     pub assets: Vec<AssetRow>,
     /// Per height and asset, the public flows (only non-empty rows).
     pub flows: Vec<FlowRow>,
@@ -457,5 +471,26 @@ mod tests {
         let mut bad = notes.clone();
         bad[2].cm[0] ^= 1;
         assert_eq!(genesis_issuance(&bad).unwrap_err(), "genesis note 2: plaintext does not open its commitment");
+    }
+
+    /// Lab #728 Q7: genesis issuance is outstanding from height 0. An asset
+    /// issued only at genesis has an `assets` row (minted and redeemed zero);
+    /// an asset with both adds them; the document's own figures reproduce.
+    #[test]
+    fn genesis_issuance_counts_toward_outstanding() {
+        let (blocks, mut node_out, node_deltas) = chain();
+        let l = ledger(&blocks).with_genesis(BTreeMap::from([(3u16, 50u128), (7, 100)]));
+        assert_eq!(l.outstanding(), BTreeMap::from([(3u16, 50i128), (7, 1_400), (9, 40)]));
+        let doc = l.document(Vec::new());
+        let row = |a: u16| doc.assets.iter().find(|r| r.asset == a).unwrap();
+        assert_eq!((row(3).minted.as_str(), row(3).redeemed.as_str(), row(3).outstanding.as_str()), ("0", "0", "50"));
+        assert_eq!(row(7).outstanding, "1400");
+        assert!(l.compare_claimed(&doc).is_empty());
+        // A node that counts flows only (version 1's figure) is named.
+        let d = l.compare_with_node(&node_out, &node_deltas);
+        assert!(d.contains(&"outstanding asset=3: recomputed 50, node 0".to_string()), "{d:?}");
+        node_out.insert(3, 50);
+        node_out.insert(7, 1_400);
+        assert!(l.compare_with_node(&node_out, &node_deltas).is_empty());
     }
 }

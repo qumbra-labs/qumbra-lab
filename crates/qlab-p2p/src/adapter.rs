@@ -2590,6 +2590,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // Lab #712: judged against this node's chain state — another
             // node's pool may differ, so not a peer fault by itself.
             MempoolError::RedeemExceedsOutstanding { .. } => "redeem exceeds outstanding supply",
+            // Lab #728: judged against this pool — not a peer fault.
+            MempoolError::RegistryWriteAlreadyPooled => "registry write already pooled",
         }
     }
 }

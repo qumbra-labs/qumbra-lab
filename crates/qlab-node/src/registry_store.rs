@@ -56,6 +56,14 @@ impl MemRegistryStore {
     }
 }
 
+impl MemRegistryStore {
+    /// Apply one registry write (lab #728): the leaf whose 15 lanes an R
+    /// surface carries replaces its slot.
+    pub fn apply_write(&mut self, leaf_lanes: &[u64; 15]) -> Result<(), RegistryError> {
+        self.tree.apply_update(leaf_of(leaf_lanes))
+    }
+}
+
 impl RegistryStore for MemRegistryStore {
     fn tree(&self) -> &RegistryTree {
         &self.tree
@@ -75,7 +83,9 @@ fn lanes_of(l: &RegistryLeaf) -> [u64; 15] {
     l.state()[..15].try_into().expect("15 lanes")
 }
 
-fn leaf_of(x: &[u64; 15]) -> RegistryLeaf {
+/// A leaf from its 15 lanes (`RegistryLeaf::state()[..15]` order) — the
+/// sidecar's form and the R surface's (lab #728).
+pub fn leaf_of(x: &[u64; 15]) -> RegistryLeaf {
     RegistryLeaf {
         asset: x[0],
         issuer_key: [x[1], x[2], x[3], x[4]],

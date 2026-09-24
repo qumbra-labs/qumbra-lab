@@ -3484,6 +3484,7 @@ fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
         MempoolError::ProofInvalid => "proof-invalid",
         MempoolError::L2SurfaceInvalid(_) => "l2-surface-invalid",
         MempoolError::RedeemExceedsOutstanding { .. } => "redeem-exceeds-outstanding",
+        MempoolError::RegistryWriteAlreadyPooled => "registry-write-already-pooled",
     }
 }
 

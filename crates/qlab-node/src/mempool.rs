@@ -153,6 +153,9 @@ pub enum MempoolError {
     /// A redeem of `asset` exceeding its outstanding public supply net of
     /// the redeems already pooled (lab #712): the block rule would refuse it.
     RedeemExceedsOutstanding { asset: u16 },
+    /// A registry write (shape R, lab #728) while another is already pooled:
+    /// a block carries at most one, and each binds the root the other moves.
+    RegistryWriteAlreadyPooled,
     /// The anchor is not a valid transaction anchor now (not finalized, or aged
     /// past the ≤ 1,152-block window — §4/§7).
     AnchorNotValid,
@@ -251,6 +254,17 @@ fn surface_terms(s: &qlab_devnet::annulet::L2Surface) -> Vec<(u16, i128)> {
 /// Canonical Keccak-256 id of a transaction — the injective per-tx encoding the
 /// body commitment uses (protocol-spec §6): `anchor ‖ nfs ‖ cms ‖ bucket(u8) ‖
 /// fee(8 LE) ‖ proof_len(8 LE) ‖ proof`.
+/// Lab #728: a pooled Annulet transaction whose surface binds a registry
+/// root other than the state's — every one, once a registry write lands. The
+/// block rule would refuse it; it can never be mined. `false` on L1.
+fn annulet_root_stale<S: NodeState>(entry: &TxEntry, state: &S) -> bool {
+    let Some(root) = state.annulet_registry_root() else { return false };
+    match qlab_devnet::annulet::L2Surface::decode(&entry.l2) {
+        Ok(Some(s)) => s.registry_root != root,
+        Ok(None) | Err(_) => false,
+    }
+}
+
 pub fn txid(entry: &TxEntry) -> TxId {
     let mut buf = Vec::new();
     buf.extend_from_slice(&entry.public.anchor);
@@ -588,12 +602,8 @@ impl Mempool {
                 let surface = qlab_devnet::annulet::L2Surface::decode(&entry.l2)
                     .map_err(|err| MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMalformed { index: 0, err }))?
                     .ok_or(MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMissing { index: 0 }))?;
-                if entry.public.bucket != qlab_devnet::fees::ArityBucket::TwoByTwo
-                    || entry.public.nullifiers.len() != 2
-                    || entry.public.commitments.len() != 2
-                {
-                    return Err(MempoolError::L2SurfaceInvalid(BodyError::L2NotTwoByTwo { index: 0 }));
-                }
+                qlab_devnet::annulet::check_l2_arity(&entry.public, surface.shape, 0)
+                    .map_err(MempoolError::L2SurfaceInvalid)?;
                 // Lab #712: the surface names the registry root the next
                 // block's parent (this tip) carries — the body rule's twin.
                 let root = state
@@ -601,6 +611,20 @@ impl Mempool {
                     .expect("an Annulet node state carries its registry (lab #710)");
                 if surface.registry_root != root {
                     return Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryRootStale { index: 0 }));
+                }
+                // Lab #728: one registry write per root. Every pooled surface
+                // binds this root, and a block holds at most one write, so a
+                // second write could never share a block with the first — and
+                // after the first lands, the second binds a stale root.
+                if surface.write.is_some()
+                    && self.txs.values().any(|t| {
+                        qlab_devnet::annulet::L2Surface::decode(&t.entry.l2)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|s| s.write.is_some())
+                    })
+                {
+                    return Err(MempoolError::RegistryWriteAlreadyPooled);
                 }
                 // Lab #712: a redeem must fit the outstanding supply after
                 // every redeem already pooled. Pooled mints are not counted:
@@ -784,6 +808,7 @@ impl Mempool {
             .filter(|tx| {
                 tx.entry.public.nullifiers.iter().any(|nf| spent.contains(nf))
                     || !state.is_valid_anchor(&tx.entry.public.anchor)
+                    || annulet_root_stale(&tx.entry, state)
             })
             .map(|tx| tx.txid)
             .collect();
