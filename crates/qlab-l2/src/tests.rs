@@ -304,4 +304,7 @@ const GOLDEN_PV_R: [u32; 85] = [
 ];
 /// A3's seed commitment for the shape-R fixture (lab #731): `PV_CM_SEED..`.
 /// From the named `l2_goldens` run.
-const GOLDEN_PV_R_SEED: [u32; 16] = [0; 16]; // PIN: from the named run
+const GOLDEN_PV_R_SEED: [u32; 16] = [
+    50464, 706, 23711, 6850, 64557, 55703, 13693, 8882, 29261, 54369, 37076, 54735,
+    34478, 54309, 240, 48738,
+];

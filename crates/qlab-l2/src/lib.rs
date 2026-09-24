@@ -268,8 +268,10 @@ pub fn verify_r(pvs: &[Val], proof: &Proof<Config>) -> bool {
 pub const SHAPE_S_DIGEST_V1: &str = "7a6391bc98eed26b4bff7aaaa987f7d6ef657e27ad50746c9c519bcabdae6670";
 /// See [`SHAPE_S_DIGEST_V1`].
 pub const SHAPE_P_DIGEST_V1: &str = "ad53d40e7d5ffd8235b701fab16856f428790b7ba33efc8915abe625f1bacaff";
-/// See [`SHAPE_S_DIGEST_V1`] (lab #724).
-pub const SHAPE_R_DIGEST_V1: &str = "40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d";
+/// See [`SHAPE_S_DIGEST_V1`] (lab #724; re-pinned by A3, lab #731 — the seed
+/// output — from `40bbc9fe…1f6d`, 1,181 constraints, to 1,225; the named
+/// `l2_goldens` run, twice, byte-identical).
+pub const SHAPE_R_DIGEST_V1: &str = "5f081f55850e414421347e047b55c05887acec87c57e8d7b47f2a4a0d050507f";
 
 #[cfg(test)]
 mod tests;

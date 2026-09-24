@@ -72,14 +72,15 @@ Apple M5 Max / 36 GiB，release 二进制直接跑在 `scripts/rig run` 里的 `
 - 两种情况下，写入的槽位**就是**新叶子的资产 id：新旧两条折叠的路径位都绑定到它。所以每次写入之后，S 和 P 依赖的注册表不变式照样成立：槽位 `i` 要么是空摘要，要么放着资产字段为 `i` 的叶子。
 - **资产 0 永远不可写。**
 - `mode` 只能是 0、1、2。**Cloaked ⇒** 没有冻结根、没有白名单根、flags 清零。**Hybrid ⇒** 没有白名单根。**Regulated** 两个根都可以有。
-- **手续费**由 R 自带的一进一出资产 0 花费支付。手续费是公开值；输出的 `ρ` 就是输入的 nullifier。
+- **手续费**由 R 自带的一笔资产 0 花费支付（一进）。手续费是公开值；找零输出的 `ρ` 就是输入的 nullifier。
+- **种子**（A3，lab #731，2026-09-25）：每一笔写入，注册和更新都一样，同时给写入者造一张**被写资产的 0 值票据**。增发要挂在该资产的一行输入上，没有它，运行时注册的资产永远增发不了。种子的 `ρ` 是 shape S 第二个输出的推导 `H(nf ‖ D_P|1)`（`ARHO`）；金额逐位为 0；资产等于新叶子的资产；承诺是公开值 `cm_seed`。R 因此是一进两出。
 
 | 对象 | v1 取值 | 由谁钉住 |
 |---|---|---|
-| shape R 几何 | **726** 列 · **79** 次置换 · 2^18 行 · 次数 4 · **85** 个公开值 | `l2_shape_geometry_is_locked`；`qlab-air` 的 `l2r_trace_width_is_read_off_the_matrix`、`l2r_quotient_degree_is_4`、`l2r_program_geometry` |
-| 公开值布局 | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 | `l2_shape_geometry_is_locked`、`l2_golden_pv_vectors` |
-| 角色码 | `AREG_OLD` 就是 S 的 `AREG`（15），`BREG_OLD` 就是 S 的 `BREG`（16），`AISS` 沿用 P 的（17）；新增 `AREG_NEW` 23、`MO` 24、`MN` 25、`BREG_NEW` 26 | shape 摘要 |
-| shape 摘要 | R `40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d`（1,181 条约束） | `l2_shape_digests_are_pinned` |
+| shape R 几何 | **734** 列 · **82** 次置换 · 2^18 行 · 次数 4 · **101** 个公开值 *（A3；A2 时是 726 · 79 · 85）* | `l2_shape_geometry_is_locked`；`qlab-air` 的 `l2r_trace_width_is_read_off_the_matrix`、`l2r_quotient_degree_is_4`、`l2r_program_geometry` |
+| 公开值布局 | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 · `cm_seed` 85（A3 追加） | `l2_shape_geometry_is_locked`、`l2_golden_pv_vectors` |
+| 角色码 | `AREG_OLD` 就是 S 的 `AREG`（15），`BREG_OLD` 就是 S 的 `BREG`（16），`AISS` 沿用 P 的（17）；新增 `AREG_NEW` 23、`MO` 24、`MN` 25、`BREG_NEW` 26；A3：`ARHO` 沿用 S 的（14），`BCM2` 沿用 S 的（11），新增 `ACMOUT2` 27 | shape 摘要 |
+| shape 摘要 | R `5f081f55850e414421347e047b55c05887acec87c57e8d7b47f2a4a0d050507f`（1,225 条约束；A3 重钉，A2 时是 `40bbc9fe…1f6d`，1,181 条） | `l2_shape_digests_are_pinned` |
 
 **两条折叠怎么共用一套兄弟节点。** 旧根和新根逐层交替折叠：先 `MO_i`，再 `MN_i`，用的是同一个兄弟节点。一条 Keccak 链一次只能带一个摘要，所以这两步都通过一种新的注入方式，从见证 lane 里读当前摘要。
 
@@ -92,6 +93,6 @@ Apple M5 Max / 36 GiB，release 二进制直接跑在 `scripts/rig run` 里的 `
 
 stage-0 裁定要求报价的另一方案，是每层单独做一个等式，要**多 240 列（共 966 列）**。两种方案都不需要次数 5。
 
-**R 为什么没有 epoch 列。** 79 次置换在 2^18 下放得进 128 槽程序环的一个周期，程序不会再跑第二遍，也就没有需要 epoch 列去关掉的东西。
+**R 为什么没有 epoch 列。** 82 次置换在 2^18 下放得进 128 槽程序环的一个周期，程序不会再跑第二遍，也就没有需要 epoch 列去关掉的东西。
 
 rig 实测待做（协调者的 rig）：`qlab-bench l2shape --shape r`。

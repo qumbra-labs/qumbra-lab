@@ -72,14 +72,15 @@ Added 2026-09-24. A third shape, pinned the same way as S and P. It is a circuit
 - In both cases the written slot **is** the new leaf's asset id. The path bits of both folds are bound to it, so the registry invariant S and P rely on holds after every write: slot `i` holds the empty digest or a leaf whose asset lane is `i`.
 - **Asset 0 is never writable.**
 - `mode` is 0, 1 or 2. **Cloaked ⇒** no freeze root, no allow root, no flags. **Hybrid ⇒** no allow root. **Regulated** may carry both roots.
-- **The fee** rides a 1-in / 1-out spend in asset 0, carried inside R itself. The fee is a public value; the output's `ρ` is the input's nullifier.
+- **The fee** rides a 1-in spend in asset 0, carried inside R itself. The fee is a public value; the change output's `ρ` is the input's nullifier.
+- **The seed** (A3, lab #731, 2026-09-25): every write, registration and update alike, also creates a **0-value note of the written asset** to the writer. A mint rides an input row of its asset, so without it a runtime-registered asset could never be minted. Its `ρ` is shape S's output-1 derivation `H(nf ‖ D_P|1)` (`ARHO`); its value is zero bit by bit; its asset equals the new leaf's; its commitment is the public value `cm_seed`. R is 1-in / 2-out.
 
 | object | v1 value | pinned by |
 |---|---|---|
-| shape R geometry | **726** columns · **79** perms · 2^18 rows · degree 4 · **85** public values | `l2_shape_geometry_is_locked`; `qlab-air` `l2r_trace_width_is_read_off_the_matrix`, `l2r_quotient_degree_is_4`, `l2r_program_geometry` |
-| PV layout | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 | `l2_shape_geometry_is_locked`, `l2_golden_pv_vectors` |
-| role codes | `AREG_OLD` = S's `AREG` (15), `BREG_OLD` = S's `BREG` (16), `AISS` = P's (17); new: `AREG_NEW` 23, `MO` 24, `MN` 25, `BREG_NEW` 26 | the shape digest |
-| shape digest | R `40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d` (1,181 constraints) | `l2_shape_digests_are_pinned` |
+| shape R geometry | **734** columns · **82** perms · 2^18 rows · degree 4 · **101** public values *(A3; A2 was 726 · 79 · 85)* | `l2_shape_geometry_is_locked`; `qlab-air` `l2r_trace_width_is_read_off_the_matrix`, `l2r_quotient_degree_is_4`, `l2r_program_geometry` |
+| PV layout | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 · `cm_seed` 85 (A3, appended) | `l2_shape_geometry_is_locked`, `l2_golden_pv_vectors` |
+| role codes | `AREG_OLD` = S's `AREG` (15), `BREG_OLD` = S's `BREG` (16), `AISS` = P's (17); new: `AREG_NEW` 23, `MO` 24, `MN` 25, `BREG_NEW` 26; A3: `ARHO` = S's (14), `BCM2` = S's (11), new `ACMOUT2` 27 | the shape digest |
+| shape digest | R `5f081f55850e414421347e047b55c05887acec87c57e8d7b47f2a4a0d050507f` (1,225 constraints; A3 re-pin — A2 was `40bbc9fe…1f6d`, 1,181) | `l2_shape_digests_are_pinned` |
 
 **How the two folds share one set of siblings.** The old and new roots are folded level by level in alternation, `MO_i` then `MN_i`, over the same sibling. Both steps read their running digest from witness lanes through a new injection class, because one Keccak chain cannot carry two digests at once.
 
@@ -92,6 +93,6 @@ A fourth bank (`ISS`) checks the issuer key on an update.
 
 The alternative the stage-0 ruling asked to price was one equality per level. It would cost **+240 columns (966)**. Neither option needs degree 5.
 
-**Why R has no epoch column.** 79 perms fit inside one period of the 128-slot program ring at 2^18, so no second copy of the program ever runs for an epoch column to switch off.
+**Why R has no epoch column.** 82 perms fit inside one period of the 128-slot program ring at 2^18, so no second copy of the program ever runs for an epoch column to switch off.
 
 Rig measurement is owed (coordinator's rig): `qlab-bench l2shape --shape r`.
