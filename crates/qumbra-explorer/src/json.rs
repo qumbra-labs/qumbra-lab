@@ -576,6 +576,26 @@ mod tests {
         assert_eq!(v["finality"]["head1"]["stall_depth"], 4);
     }
 
+    /// Lab #726 Q4: on an Annulet chain the supply block does not carry the
+    /// L1 emission ledger (an all-zero table that would read as data) — it
+    /// says it does not apply and points at the per-asset attestation. The
+    /// L1 form of the same telemetry is unchanged.
+    #[test]
+    fn an_annulet_chains_supply_block_points_at_the_attestation() {
+        let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
+            .with_supply(vec![epoch_row(14, 0, 0)]);
+        let v = parse(&health_for_form(&t, "aa", 30, "annulet-devnet", true));
+        assert_eq!(v["supply"]["coverage"], "NOT_APPLICABLE");
+        assert_eq!(v["supply"]["form"], "annulet");
+        assert_eq!(v["supply"]["see"], crate::attest::ATTEST_PATH);
+        assert!(v["supply"].get("epochs").is_none(), "no emission rows on the L2");
+        assert_eq!(
+            health_for_form(&t, "aa", 30, "x", false),
+            health(&t, "aa", 30, "x"),
+            "the L1 document is byte-identical"
+        );
+    }
+
     #[test]
     fn complete_coverage_carries_the_epoch_rows_and_the_shared_token_spelling() {
         let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)

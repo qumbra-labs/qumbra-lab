@@ -48,6 +48,7 @@
 pub mod annulet_genesis;
 pub mod audit_emission;
 pub mod audit_names;
+pub mod audit_supply_l2;
 pub mod config;
 pub mod discovery_server;
 pub mod emission_pins;

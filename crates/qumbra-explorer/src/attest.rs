@@ -62,17 +62,21 @@ fn main_chain_bodies<C: ChainStore>(chain: &C) -> (u64, Vec<(u64, qlab_devnet::b
 
 /// The recomputed ledger of `node`'s main chain, and its comparison against
 /// the node's own supply state. `None` on an L1 chain.
-pub fn ledger_of(node: &MemNode) -> Option<(AssetLedger, Vec<String>)> {
+pub fn ledger_of(
+    node: &MemNode,
+    genesis: &std::collections::BTreeMap<u16, u128>,
+) -> Option<(AssetLedger, Vec<String>)> {
     node.registry()?;
     let (tip, bodies) = main_chain_bodies(node.chain());
-    let ledger = AssetLedger::fold(tip, bodies.iter().map(|(h, b)| (*h, b)));
+    let ledger = AssetLedger::fold(tip, bodies.iter().map(|(h, b)| (*h, b))).with_genesis(genesis.clone());
     let divergences = ledger.compare_with_node(node.outstanding_supplies(), node.supply_deltas());
     Some((ledger, divergences))
 }
 
-/// The attestation document for `node`.
-pub fn attest_document(node: &MemNode) -> String {
-    match ledger_of(node) {
+/// The attestation document for `node`; `genesis` is the genesis file's
+/// issuance per asset (`qlab_node::asset_supply::genesis_issuance`).
+pub fn attest_document(node: &MemNode, genesis: &std::collections::BTreeMap<u16, u128>) -> String {
+    match ledger_of(node, genesis) {
         None => not_annulet(ATTEST_PATH),
         Some((ledger, divergences)) => encode(&ledger.document(divergences)),
     }
@@ -125,15 +129,22 @@ pub fn encode(d: &AttestDocument) -> String {
         })
         .collect();
     let divergences: Vec<String> = d.node_divergences.iter().map(|s| jstr(s)).collect();
+    let genesis: Vec<String> = d
+        .genesis
+        .iter()
+        .map(|r| format!("{{\"asset\":{},\"issued\":{}}}", r.asset, jstr(&r.issued)))
+        .collect();
     format!(
         "{{\"v\":{},\"available\":true,\"label\":{},\"framing\":{},\"replay\":{},\
-         \"tip_height\":{},\"assets\":[{}],\"flows\":[{}],\"node_agrees\":{},\
-         \"node_divergences\":[{}]}}",
+         \"tip_height\":{},\"genesis_note\":{},\"genesis\":[{}],\"assets\":[{}],\
+         \"flows\":[{}],\"node_agrees\":{},\"node_divergences\":[{}]}}",
         d.v,
         jstr(&d.label),
         jstr(&d.framing),
         jstr(&d.replay),
         d.tip_height,
+        jstr(&d.genesis_note),
+        genesis.join(","),
         assets.join(","),
         flows.join(","),
         d.node_agrees,
@@ -189,4 +200,176 @@ pub fn registry_document(node: &MemNode) -> String {
         hex32(&root),
         leaves.join(",")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qlab_devnet::annulet::{
+        body_commitment_annulet, genesis_body_commitment_annulet, AnnuletHeaderFields, L2FeeTable,
+        L2ShapeTag, L2Surface, SequencerKey, VPublicTerm,
+    };
+    use qlab_devnet::body::{BlockBody, TxEntry, TxPublic, TxVerifier};
+    use qlab_devnet::fees::ArityBucket;
+    use qlab_devnet::header::BlockHeader;
+    use qlab_node::registry_store::{MemRegistryStore, RegistryLeaf};
+    use qlab_node::NodeState;
+
+    struct OkProof;
+    impl TxVerifier for OkProof {
+        fn verify_tx(&self, e: &TxEntry) -> bool {
+            e.proof == b"ok"
+        }
+    }
+
+    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+
+    /// A genesis issuance as the binary computes it from the genesis file.
+    fn issuance() -> std::collections::BTreeMap<u16, u128> {
+        std::collections::BTreeMap::from([(0u16, 4u128), (7, 1_000)])
+    }
+
+    /// Asset 0 plus asset 7 as a Hybrid leaf with a freeze root.
+    fn registry() -> Vec<RegistryLeaf> {
+        let mut a7 = RegistryLeaf::cloaked(7);
+        a7.mode = 1;
+        a7.issuer_key = [1, 2, 3, 4];
+        a7.freeze_root = [5, 6, 7, 8];
+        vec![RegistryLeaf::cloaked(0), a7]
+    }
+
+    fn ext() -> AnnuletHeaderFields {
+        let root = MemRegistryStore::from_genesis(&registry()).unwrap().root_bytes();
+        AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: root }
+    }
+
+    fn p_tx(n: &MemNode, nf: u8, redeem: bool, amount: u64) -> TxEntry {
+        let mut t = TxEntry {
+            proof: b"ok".to_vec(),
+            public: TxPublic {
+                anchor: n.commitment_root(),
+                nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32]],
+                commitments: vec![[nf.wrapping_add(1); 32], [nf.wrapping_add(101); 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: FEES.tier_p,
+            },
+            discovery: Vec::new(),
+            rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+            l2: L2Surface {
+                shape: L2ShapeTag::P,
+                registry_root: ext().registry_root,
+                vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem, amount, asset: 7 }]),
+            }
+            .encode(),
+        };
+        t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
+        t
+    }
+
+    /// An in-memory Annulet node: mint 500 of asset 7, then redeem 120.
+    fn annulet_node() -> MemNode {
+        let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
+        let mut n = MemNode::in_memory_annulet(g, &[], FEES, &registry());
+        let key = SequencerKey::from_seed([0x5E; 32]);
+        let mut parent = g;
+        for (i, (redeem, amount)) in [(false, 500), (true, 120)].into_iter().enumerate() {
+            let body = BlockBody::new(vec![p_tx(&n, 20 + 2 * i as u8, redeem, amount)], vec![]);
+            let sealed = key.seal(BlockHeader::child_of_annulet(
+                &parent,
+                parent.timestamp + 10,
+                ext(),
+                body_commitment_annulet(&body),
+            ));
+            n.apply_sealed_block(&sealed, body, &OkProof).unwrap();
+            parent = sealed.header;
+        }
+        n
+    }
+
+    /// The served attestation is the shared document, byte for byte in
+    /// meaning: `serde_json` reads it back as `AttestDocument` (what the audit
+    /// tool's `--claimed` parses), equal to the ledger's own document; it
+    /// carries the label, the framing, the replay command, and agrees with the
+    /// node.
+    #[test]
+    fn served_attestation_parses_as_the_shared_document() {
+        let n = annulet_node();
+        let served = attest_document(&n, &issuance());
+        let parsed: AttestDocument = serde_json::from_str(&served).expect("real JSON, the shared shape");
+        let (ledger, divergences) = ledger_of(&n, &issuance()).unwrap();
+        assert!(divergences.is_empty(), "{divergences:?}");
+        assert_eq!(parsed, ledger.document(Vec::new()));
+        assert_eq!(parsed.label, "issuance ≠ reserves");
+        assert_eq!(
+            parsed.framing,
+            "Issuance integrity recomputed from public block bodies; replay it yourself with \
+             `qumbra-node audit-supply-l2`. Not a consensus commitment."
+        );
+        assert!(parsed.node_agrees);
+        let a7 = parsed.assets.iter().find(|r| r.asset == 7).unwrap();
+        assert_eq!((a7.minted.as_str(), a7.redeemed.as_str(), a7.outstanding.as_str()), ("500", "120", "380"));
+        let v: serde_json::Value = serde_json::from_str(&served).unwrap();
+        assert_eq!(v["available"], true);
+        // Genesis issuance is its own row, beside (not inside) the vPublic
+        // figures the node's outstanding counts.
+        let g7 = parsed.genesis.iter().find(|r| r.asset == 7).unwrap();
+        assert_eq!(g7.issued, "1000");
+        assert!(parsed.genesis_note.contains("vPublic flows only"));
+    }
+
+    /// Aggregates only: no key anywhere in the document could name a holder,
+    /// a note or a transaction. (Keys, not text: the framing itself says
+    /// "not a consensus commitment".)
+    #[test]
+    fn the_attestation_carries_no_per_holder_field() {
+        fn keys(v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, x) in m {
+                        out.push(k.clone());
+                        keys(x, out);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| keys(x, out)),
+                _ => {}
+            }
+        }
+        let v: serde_json::Value = serde_json::from_str(&attest_document(&annulet_node(), &issuance())).unwrap();
+        let mut all = Vec::new();
+        keys(&v, &mut all);
+        for k in &all {
+            for forbidden in ["nullifier", "commitment", "address", "rkm", "balance", "holder", "tx"] {
+                assert!(!k.contains(forbidden), "key {k} names a {forbidden}");
+            }
+        }
+        assert!(all.contains(&"outstanding".to_string()), "the walk saw the figures");
+    }
+
+    /// The registry: every leaf, its mode by name, its roots, the root.
+    #[test]
+    fn the_registry_document_lists_every_leaf() {
+        let n = annulet_node();
+        let v: serde_json::Value = serde_json::from_str(&registry_document(&n)).unwrap();
+        assert_eq!(v["available"], true);
+        let assets = v["assets"].as_array().unwrap();
+        assert_eq!(assets.len(), 2);
+        let a7 = assets.iter().find(|a| a["asset"] == 7).unwrap();
+        assert_eq!(a7["mode"], "hybrid");
+        assert_eq!(a7["redeem_open"], false);
+        assert_eq!(a7["freeze_root"], lanes_hex(&[5, 6, 7, 8]));
+        assert_eq!(v["root"], hex32(&ext().registry_root));
+        assert_eq!(v["height"], 2);
+    }
+
+    /// On an L1 chain both documents say they do not apply, and carry no
+    /// figures.
+    #[test]
+    fn an_l1_chain_serves_no_attestation() {
+        let n = MemNode::in_memory(qlab_node::genesis_block(1, 0));
+        for doc in [attest_document(&n, &issuance()), registry_document(&n)] {
+            let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+            assert_eq!(v["available"], false);
+            assert!(v.get("assets").is_none(), "{doc}");
+        }
+    }
 }

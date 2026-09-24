@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use qlab_devnet::annulet::L2Surface;
+use qlab_devnet::annulet::{GenesisNote, L2Surface};
 use qlab_devnet::body::BlockBody;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,30 @@ pub const FRAMING: &str = "Issuance integrity recomputed from public block bodie
 /// The do-it-yourself command printed beside the figures.
 pub const REPLAY: &str =
     "qumbra-node audit-supply-l2 --data-dir <dir> --genesis <annulet-genesis> [--claimed <this document>]";
+
+/// How genesis issuance relates to the node's figure — stated in the document.
+pub const GENESIS_NOTE: &str = "genesis issuance is recomputed from the genesis file's public \
+     plaintext notes (each commitment checked); the node's outstanding figure counts vPublic \
+     flows only";
+
+/// Per asset, the value the genesis notes issue — recomputed from their public
+/// plaintext payloads, **each commitment checked** against the recorded `cm`.
+/// An Annulet genesis note is `GenesisPlaintext` (note plaintext ‖ zero tag)
+/// by construction (lab #714 rule (i)); anything else is refused by index.
+pub fn genesis_issuance(notes: &[GenesisNote]) -> Result<BTreeMap<u16, u128>, String> {
+    let mut out: BTreeMap<u16, u128> = BTreeMap::new();
+    for (i, n) in notes.iter().enumerate() {
+        let note = qlab_note::l2note::GenesisPlaintext::open(&n.payload)
+            .ok_or_else(|| format!("genesis note {i}: payload is not a genesis plaintext"))?;
+        if qlab_note::hash::digest_bytes(&note.commitment()) != n.cm {
+            return Err(format!("genesis note {i}: plaintext does not open its commitment"));
+        }
+        let asset = u16::try_from(note.asset).map_err(|_| format!("genesis note {i}: asset beyond 16 bits"))?;
+        *out.entry(asset).or_default() += u128::from(note.value);
+    }
+    out.retain(|_, v| *v != 0);
+    Ok(out)
+}
 
 /// The attestation document's version.
 pub const ATTEST_VERSION: u32 = 1;
@@ -60,6 +84,9 @@ pub struct AssetLedger {
     /// The main-chain tip height the ledger was folded to.
     pub tip_height: u64,
     pub flows: BTreeMap<u64, BTreeMap<u16, Flow>>,
+    /// Per asset, the genesis issuance ([`genesis_issuance`]); empty unless
+    /// set with [`Self::with_genesis`].
+    pub genesis: BTreeMap<u16, u128>,
 }
 
 impl AssetLedger {
@@ -86,7 +113,13 @@ impl AssetLedger {
             }
         }
         flows.retain(|_, m| !m.is_empty());
-        Self { tip_height, flows }
+        Self { tip_height, flows, genesis: BTreeMap::new() }
+    }
+
+    /// Attach the genesis issuance.
+    pub fn with_genesis(mut self, genesis: BTreeMap<u16, u128>) -> Self {
+        self.genesis = genesis;
+        self
     }
 
     /// Per asset, the totals over the whole chain.
@@ -153,6 +186,12 @@ impl AssetLedger {
             framing: FRAMING.to_string(),
             replay: REPLAY.to_string(),
             tip_height: self.tip_height,
+            genesis_note: GENESIS_NOTE.to_string(),
+            genesis: self
+                .genesis
+                .iter()
+                .map(|(asset, v)| GenesisRow { asset: *asset, issued: v.to_string() })
+                .collect(),
             assets: totals
                 .iter()
                 .map(|(asset, f)| AssetRow {
@@ -195,6 +234,12 @@ impl AssetLedger {
             ));
         }
         let mine = self.document(Vec::new());
+        diff_rows(
+            &mine.genesis.iter().map(|r| (r.asset.to_string(), r)).collect(),
+            &claimed.genesis.iter().map(|r| (r.asset.to_string(), r)).collect(),
+            "genesis asset",
+            &mut out,
+        );
         diff_rows(
             &mine.assets.iter().map(|r| (r.asset.to_string(), r)).collect(),
             &claimed.assets.iter().map(|r| (r.asset.to_string(), r)).collect(),
@@ -243,7 +288,12 @@ pub struct AttestDocument {
     /// The do-it-yourself command ([`REPLAY`]).
     pub replay: String,
     pub tip_height: u64,
-    /// Per asset, the chain totals.
+    /// Always [`GENESIS_NOTE`].
+    pub genesis_note: String,
+    /// Per asset, the genesis issuance (recomputed from the genesis file).
+    pub genesis: Vec<GenesisRow>,
+    /// Per asset, the `vPublic` totals over the chain (what the node's
+    /// outstanding figure counts).
     pub assets: Vec<AssetRow>,
     /// Per height and asset, the public flows (only non-empty rows).
     pub flows: Vec<FlowRow>,
@@ -259,6 +309,12 @@ pub struct AssetRow {
     pub minted: String,
     pub redeemed: String,
     pub outstanding: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisRow {
+    pub asset: u16,
+    pub issued: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,5 +438,24 @@ mod tests {
         assert!(d.iter().any(|m| m.starts_with("flow height=2 asset=9:") && m.contains("missing from the claim")), "{d:?}");
         assert!(d.iter().any(|m| m.starts_with("flow height=3 asset=7:") && m.contains("absent from the recomputation")), "{d:?}");
         assert_eq!(d.len(), 3, "{d:?}");
+    }
+
+    /// Genesis issuance is read off the public plaintext notes, each checked
+    /// against its commitment; a note whose plaintext does not open its `cm`
+    /// is refused by index, never counted.
+    #[test]
+    fn genesis_issuance_is_commitment_checked() {
+        use qlab_note::l2note::{GenesisPlaintext, L2Note};
+        let note = |value: u64, asset: u64, i: u64| L2Note { value, asset, rkm: [i; 4], rho: [i, 1, 2, 3], rseed: [i, 4, 5, 6] };
+        let rec = |n: &L2Note| GenesisNote {
+            cm: qlab_note::hash::digest_bytes(&n.commitment()),
+            payload: GenesisPlaintext::of(n).0.to_vec(),
+        };
+        let notes = vec![rec(&note(1, 0, 1)), rec(&note(1, 0, 2)), rec(&note(900, 7, 3))];
+        let g = genesis_issuance(&notes).unwrap();
+        assert_eq!(g, BTreeMap::from([(0u16, 2u128), (7, 900)]));
+        let mut bad = notes.clone();
+        bad[2].cm[0] ^= 1;
+        assert_eq!(genesis_issuance(&bad).unwrap_err(), "genesis note 2: plaintext does not open its commitment");
     }
 }
