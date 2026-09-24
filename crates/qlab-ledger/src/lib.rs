@@ -14,6 +14,7 @@
 //! events in states the ledger already knows how to say — `FeeInseparable` and
 //! `Unavailable` — rather than a fabricated number or a new sentinel.
 
+pub mod assets;
 pub mod coverage;
 pub mod history;
 pub mod sends;
