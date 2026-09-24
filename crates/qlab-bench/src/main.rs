@@ -33,6 +33,7 @@ mod m5note;
 mod m6devnet;
 mod n7soak;
 mod narrow_bench;
+mod registry_admit;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
@@ -888,6 +889,11 @@ fn main() {
         }
         "disclosure" => {
             disclosure::run_disclosure(&power);
+            return;
+        }
+        "registry-admit" => {
+            // L2-C4a Q8 (lab #730): the pool's per-admission registry check.
+            registry_admit::run_registry_admit(&power);
             return;
         }
         "l2shape" => {

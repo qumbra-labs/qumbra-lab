@@ -61,6 +61,29 @@ GET /v1/registry/slot/{asset}  →  ver ‖ height ‖ root(32) ‖ slot(u16 LE)
 - **The done-when** (`qumbra-faucet/tests/annulet_registry_write.rs`): on the devnet harness, register asset 9 into its empty slot, then update it (rotate the issuer key, proving the current one, opening read from a follower). After each write the sequencer and both followers agree on the registry root the write declared; a follower serves the new leaf; the payer detects both change notes. **Two real R proves.**
 - **Q6, the genesis-file invariant, is a demonstration:** a genesis registry record has no slot field. It is placed at its own asset lane, so "asset 9's leaf at slot 10" cannot be written. The nearest expressible attempt, a repeated asset, is refused by `verify` (`a_genesis_registry_record_can_only_sit_at_its_own_slot`).
 
+## Registry writes from the wallet (C4a, lab #730)
+
+`qumbra-wallet issuer …` writes the registry (shape R). Every write pays with the smallest asset-0 note of at least the R tariff, and the change comes back, so no exact-tariff split is needed. Every write also returns A3's seed: a 0-value note of the asset, which a first mint rides on.
+
+- **`issuer register --asset N --mode cloaked|hybrid|regulated [--freeze-list F] [--allow-list F] [--redeem-open]`** writes a new asset into an **empty** slot, and is permissionless.
+  - The issuer secret is generated and written to `issuer.v1` **before** submission, so a landed registration is never orphaned. A retried registration reuses the secret already held.
+  - A taken slot is `SlotTaken`, refused before proving. The loser of a race against a still-pooled write is `RegistryRaced`.
+  - There is no `--asset-name`: a registry leaf has no name field.
+- **`issuer update --asset N [--mode …] [--freeze-list F] [--allow-list F] [--redeem-open|--redeem-closed] [--rotate-key]`** rewrites a leaf this wallet holds the secret for.
+  - `mode ⇒ roots` is checked before proving. A Cloaked leaf carries no lists and no flags. Becoming Regulated needs `--allow-list`. Going back to Cloaked drops every root.
+  - `--rotate-key` records the new secret as `issuer.v1`'s pending `asset N next …` line before submission. The secret in force is whichever one the served leaf's `issuer_key` matches, and a pending one is promoted when the chain shows it.
+  - An older binary refuses the `next` line by name.
+- **`issuer freeze add|remove --publish`** and **`issuer allow add|remove --publish`** put the list's new canonical root on chain as an update.
+  - The allow list is published like the freeze list, as credential hashes `H(rkm ‖ D_CRED)` in `qumbra allow-list v1`.
+  - Every pooled spend bound to the old root is evicted. Holders re-read the leaf and re-prove, and a wallet holding the pre-update list is refused with `FreezeListStale`.
+- **The pool check's cost:** `qlab-bench registry-admit` prices one admission (clone the registry, write the leaf, read the root) at 1, 1,000 and 65,536 leaves. The number is measured on the rig; the lane runs a smoke only.
+- **The done-when** (`qumbra-wallet/tests/annulet_registry.rs`) runs on the devnet harness, over a test genesis:
+  - a Cloaked registration and a Regulated one;
+  - a slot race whose loser is named;
+  - a freeze published at runtime, after which the frozen holder is refused;
+  - a key rotation;
+  - Hybrid → Regulated under the rotated key.
+
 ## Goldens and how they were computed
 
 | golden | value | computed by |
