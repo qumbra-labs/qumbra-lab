@@ -31,6 +31,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("miner-rkm") => miner_rkm(&args[1..]),
         Some("send") => send(&args[1..]),
         Some("names") => names(&args[1..]),
+        Some("issuer") => issuer(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -457,7 +458,11 @@ fn usage() {
                 pays an exact-tariff asset-0 fee note (split off a larger one first\n\
                 when there is none) and moves at most one note of the asset (notes\n\
                 of a non-fee asset cannot be merged in 2x2). Nothing is written to\n\
-                the wallet dir. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
+                the wallet dir. A policy asset's sender passes the issuer's\n\
+                published freeze list with --freeze-list FILE (a frozen address is\n\
+                refused before anything is proved). `issuer keygen|freeze|mint|\n\
+                redeem --asset N` are the issuer's verbs (lab #722; the secret stays\n\
+                in this wallet dir's issuer.v1). --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
                 against any endpoint you do not trust, because without it the\n\
                 wallet reports whatever Annulet chain the endpoint serves\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
@@ -1164,6 +1169,87 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `issuer …` (lab #722): an Annulet asset issuer's verbs. The issuer secret
+/// lives in the wallet dir's `issuer.v1` (never in a node); the freeze list
+/// is a published file of key hashes.
+fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::issuer::{freeze_update, lanes_hex, read_key_list, write_key_list, IssuerFile};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let asset = || -> Result<u16, Box<dyn Error>> {
+        Ok(flag(args, "--asset").ok_or("issuer requires --asset N")?.parse().map_err(|_| "--asset must be below 65536")?)
+    };
+    let list = |path: &str| -> Result<Vec<[u64; 4]>, Box<dyn Error>> {
+        match std::fs::read_to_string(path) {
+            Ok(t) => Ok(read_key_list(&t)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    match args.first().map(String::as_str) {
+        Some("keygen") => {
+            let dir = dir_of(args)?;
+            let mut isk = [0u64; 4];
+            for l in isk.iter_mut() {
+                *l = rand::rng().next_u64();
+            }
+            IssuerFile::add(&dir, asset()?, isk)?;
+            println!("issuer_key = {}  (the registry leaf's issuer key)", lanes_hex(&qlab_air::l2p::issuer_key_of(&isk)));
+            Ok(())
+        }
+        Some("freeze") => {
+            let path = flag(args, "--list").ok_or("issuer freeze requires --list FILE (the published list)")?;
+            let keys = list(path)?;
+            let (keys, root) = match args.get(1).map(String::as_str) {
+                Some(verb @ ("add" | "remove")) => {
+                    let addr = flag(args, "--address").ok_or("issuer freeze add/remove requires --address ADDR")?;
+                    let addr = qlab_wallet::address::Address::decode(addr).ok_or("--address is not a wallet address")?;
+                    let (keys, root) = freeze_update(&keys, &addr, verb == "add");
+                    std::fs::write(path, write_key_list(&keys))?;
+                    (keys, root)
+                }
+                Some("root") => {
+                    let t = qlab_air::l2p::CanonicalFreezeTree::from_keys(&keys);
+                    (t.keys, t.root)
+                }
+                _ => return Err("issuer freeze add|remove|root".into()),
+            };
+            println!("freeze list: {} key(s); root {}", keys.len(), lanes_hex(&root));
+            println!("(publishing a new root on chain needs a registry transaction — A2/C4; until then the genesis root is in force)");
+            Ok(())
+        }
+        Some(verb @ ("mint" | "redeem")) => {
+            let dir = dir_of(args)?;
+            let url = flag(args, "--url").ok_or("issuer mint/redeem requires --url")?;
+            let scan_to: u64 = flag(args, "--scan-to").ok_or("requires --scan-to HEIGHT")?.parse()?;
+            let amount: u64 = flag(args, "--amount").ok_or("requires --amount")?.parse()?;
+            let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+            let keys = match flag(args, "--freeze-list") {
+                Some(p) => list(p)?,
+                None => Vec::new(),
+            };
+            let w = WalletDir::open(&dir)?;
+            let mut seed = [0u8; 32];
+            rand::rng().fill_bytes(&mut seed);
+            let mut rng = StdRng::from_seed(seed);
+            let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
+            let wait = std::time::Duration::from_secs(120);
+            let report = if verb == "mint" {
+                let to = flag(args, "--to").ok_or("issuer mint requires --to ADDRESS")?;
+                let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
+                qumbra_wallet::issuer::issuer_mint(&w, endpoint, asset()?, amount, &to, &keys, scan_to, pin, wait, &mut rng)?
+            } else {
+                qumbra_wallet::issuer::redeem(&w, endpoint, asset()?, amount, &keys, scan_to, pin, wait, &mut rng)?
+            };
+            println!("{verb}ed {amount} of asset {} (shape P, vPublic {}{amount})", asset()?, if verb == "mint" { "+" } else { "-" });
+            if let Some(n) = report.split_fee_note {
+                println!("fee-split first: made an exact-tariff fee note of {}", n.value);
+            }
+            Ok(())
+        }
+        _ => Err("issuer keygen|freeze|mint|redeem (lab #722)".into()),
+    }
+}
+
 /// `send --net annulet` (lab #720): scan, plan (fee-split first when there is
 /// no exact-tariff fee note), prove, submit. Writes nothing to the wallet dir.
 fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1179,6 +1265,11 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     let to = flag(args, "--to").ok_or("send --net annulet requires --to ADDRESS")?;
     let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
     let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    // Lab #722: the asset issuer's published freeze-key list, when it has one.
+    let freeze_keys = match flag(args, "--freeze-list") {
+        Some(path) => qumbra_wallet::issuer::read_key_list(&std::fs::read_to_string(path)?)?,
+        None => Vec::new(),
+    };
     let w = WalletDir::open(&dir)?;
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
@@ -1196,6 +1287,7 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         &to,
         scan_to,
         pin,
+        &freeze_keys,
         std::time::Duration::from_secs(120),
         &mut rng,
     )?;

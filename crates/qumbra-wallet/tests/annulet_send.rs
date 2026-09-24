@@ -128,6 +128,7 @@ fn an_ordinary_wallet_fee_splits_and_sends_usdt_test_through_a_follower() {
         &t_addr,
         v[1].state_tip,
         Some(hash),
+        &[],
         Duration::from_secs(60),
         &mut rng,
     )

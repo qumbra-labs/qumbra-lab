@@ -8,7 +8,7 @@ Annulet 开发网由一个 sequencer、两个 follower 和一个手续费单位�
 
 ## 里面有什么
 
-- **开发网 genesis**，即 `AnnuletGenesisFile::devnet()`。它是确定性的，哈希已钉住：`6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`（5,230 B），`examples/annulet_devnet_genesis` 跑两次，逐字节一致。内容：
+- **开发网 genesis**，即 `AnnuletGenesisFile::devnet()`。它是确定性的，哈希已钉住：`831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef`（5,230 B），`examples/annulet_devnet_genesis` 跑两次，逐字节一致。*（C3 重新钉住，lab #722：原来是 `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`。`USDT-test` 的冻结树根从带种子的测试夹具树，换成了规范的空树，任何钱包都能按发行方公开的名单自己重建。）*内容：
   - 注册表里有两种资产：asset 0（Cloaked），以及 asset 1 上的 `USDT-test`（Hybrid，开发用发行方密钥，冻结树为空）；
   - 16 张**库存票据**，每张正好够一次发放，都发给水龙头的 `rkm`。一张库存票据价值 `tier_p + tier_s` = 3，一次发放把它整张花掉：2 给申请人，1 是 S 手续费。不找零，也不回收；
   - 一张 genesis 铸出的 `USDT-test` 票据（1,000,000），归开发用的 **holder** 密钥。
@@ -82,6 +82,13 @@ docker build -f deploy/docker/Dockerfile --target runtime -t qumbra-lab:annulet-
   > because the pilot's press copy will be tempted not to.
 
   意思是：在 Phase 0 的方案 (a) 下（L2 上没有 QMB），稳定币试点老实说就是**一条读取 L1 锚点的侧链**。它对 Qumbra 的价值在于共用的工具链、共用的钱包、证明页面，以及通往 Phase 1 的路，但它还不是 Qumbra 的钱。文档之所以把这点写明，是因为试点对外宣传时会忍不住不这么说。
+
+## 政策资产：冻结名单和白名单（C3，lab #722）
+
+- **冻结树是规范树。** 它是一棵深度 20 的索引树，按排好序的键 `H(rkm ‖ D_FRZ)` 构造，空子树用电路哈希自己的零值链填充，不用种子，所以树根完全由名单决定。已钉住两个基准值：空树根 `f8d82fd6…c7cac22d`，三个键的树根 `ab4045d7…07d689a6`，并用一个独立的全宽编码器核对过。C3 之前的树是带种子的测试夹具，谁都无法从名单重建；这些夹具现在在名字上就标明只供测试。
+- **见证数据的提供方式。** 发行方公开排好序的冻结键名单，每个钱包自己重建这棵树，并生成自己"不在名单里"的证明。不设发行方在线查询，因为那样发行方会知道所有来问的持有人。**公开到什么程度：** 已经知道某个持有人 `rkm` 的人，能查出它是否被冻结、是否在白名单上；不知道的人从名单里什么也得不到。
+- **Regulated 资产。** 凭证 `cred = H(rkm ‖ D_CRED)` 由电路定死。发行方本来就知道每个准入持有人的 `rkm`，由它把白名单证明交给持有人，同时公开凭证名单，树根变了之后持有人也能自己重建。
+- **还没上线的部分：** `issuer freeze add/remove` 会算出新的树根，但把新树根写上链需要注册表交易（A2/C4）。在那之前，生效的冻结名单就是 genesis 里的那份。
 
 ## 推迟的事项及原因
 

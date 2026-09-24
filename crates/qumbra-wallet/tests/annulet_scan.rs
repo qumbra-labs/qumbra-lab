@@ -218,3 +218,20 @@ fn no_nullifier_stream_no_figure() {
     assert!(qumbra_wallet::annulet::render_for_test(&report).contains("balance:  UNAVAILABLE"));
     let _ = std::fs::remove_dir_all(&w.dir);
 }
+
+/// A chain still at its genesis (tip 0): the genesis notes are a balance —
+/// the spend stream covers height 0 and there is no height 1 to ask for
+/// (lab #722: the first C3 lane run's mint at tip 0 read `NoBalance`).
+#[test]
+fn a_chain_at_its_genesis_quotes_the_genesis_notes() {
+    let w = wallet_dir("tip0", 0x66);
+    let a0 = w.wallet().address_at_index(0);
+    let usdt = note_to(&a0, 5, 1, 60);
+    let genesis = vec![ServedGenesisNote { cm: digest_bytes(&usdt.commitment()), payload: GenesisPlaintext::of(&usdt) }];
+    let chain = FixtureChain { genesis, blocks: BTreeMap::new(), nullifiers: BTreeMap::new(), tip: 0, annulet: true };
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut fetch = |p: &str| chain.fetch(p);
+    let report = scan_annulet(&w, &mut fetch, 0, 0, None, &mut rng).unwrap();
+    assert_eq!(report.index.expect("a figure at tip 0").balances(), vec![(1, 5)]);
+    let _ = std::fs::remove_dir_all(&w.dir);
+}

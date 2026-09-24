@@ -8,7 +8,7 @@ The Annulet devnet is one sequencer, two followers and a fee-unit faucet, runnin
 
 ## What is in it
 
-- **The devnet genesis**, `AnnuletGenesisFile::devnet()`. It is deterministic, and its hash is pinned: `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374` (5,230 B), reproduced byte-identically by two runs of `examples/annulet_devnet_genesis`. It contains:
+- **The devnet genesis**, `AnnuletGenesisFile::devnet()`. It is deterministic, and its hash is pinned: `831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef` (5,230 B), reproduced byte-identically by two runs of `examples/annulet_devnet_genesis`. *(Re-pinned in C3, lab #722: it was `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`. `USDT-test`'s freeze root moved from the seeded fixture tree to the canonical empty tree, which any wallet rebuilds from the issuer's published list.)* It contains:
   - a registry of two assets: asset 0 (Cloaked), and `USDT-test` at asset 1 (Hybrid, a dev issuer key, an empty freeze tree);
   - 16 **stock notes** of exactly one grant each, to the faucet's `rkm`. A stock note is worth `tier_p + tier_s` = 3. One grant spends one note whole: 2 go to the requester and 1 is the S fee. There is no change and no harvest;
   - one genesis-minted `USDT-test` note (1,000,000) to a dev **holder** key.
@@ -80,6 +80,13 @@ docker build -f deploy/docker/Dockerfile --target runtime -t qumbra-lab:annulet-
   > reads L1 anchors**: its value to Qumbra is the shared toolchain, the shared wallet, the
   > attestation surfaces, and the path to Phase 1; it is not yet Qumbra's money. The doc says so
   > because the pilot's press copy will be tempted not to.
+
+## Policy assets: the freeze list and the allowlist (C3, lab #722)
+
+- **The freeze tree is canonical.** It is a depth-20 indexed tree over the sorted keys `H(rkm ‖ D_FRZ)`, with empty subtrees padded by the circuit hash's own zero chain and no seed. Its root is a function of the key list alone. The goldens are an empty root of `f8d82fd6…c7cac22d` and a three-key root of `ab4045d7…07d689a6`, checked against an independent full-width encoder. Before C3 the trees were seeded test fixtures that no one could rebuild from a list; those fixtures are now test-only by name.
+- **The witness model.** The issuer publishes the sorted freeze-key list, and every wallet rebuilds the tree and its own non-membership opening from it. No issuer oracle is asked, because an oracle would learn every holder who asked. **Disclosure:** anyone who already knows a holder's `rkm` can test whether it is frozen or allowlisted; anyone who does not learns nothing from the lists.
+- **Regulated assets.** `cred = H(rkm ‖ D_CRED)` is fixed by the circuit. The issuer, which already knows each admitted holder's `rkm`, hands the holder its membership witness and publishes the cred list, so the holder can rebuild after a root change.
+- **What is not yet live:** `issuer freeze add/remove` prints a new root, but putting a new root on chain needs registry transactions (A2/C4). Until then, the freeze in force is the one the genesis carries.
 
 ## Deferred, with reasons
 

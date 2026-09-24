@@ -162,7 +162,7 @@ fn the_binary_runs_an_annulet_devnet_genesis_as_producer_under_the_l2_verifier()
     let (status, body) = request(discovery, "GET", &format!("/v1/registry/{}", devnet::USDT_TEST_ASSET), &[]);
     assert_eq!(status, 200);
     let opening = qlab_cbserver::registry::decode_registry_opening(&body).expect("decodes");
-    assert_eq!(opening.leaf, devnet::usdt_test_policy().leaf());
+    assert_eq!(opening.leaf, devnet::usdt_test_leaf());
 
     // POST /v1/tx speaks the Annulet tx wire: a well-formed L2 transaction
     // with a garbage proof gets past the decode and is refused by a later check.

@@ -1577,7 +1577,7 @@ pub const POLICY_SUB_LEVELS: usize = 3;
 /// Fabricate a depth-20 policy tree over `leaves` (≤ 8; empty slots hold the
 /// zero digest, which no leaf hash equals) and return every leaf's witness
 /// and the root.
-pub fn fabricated_policy_tree(leaves: &[[u64; 4]], seed: u64) -> (Vec<PolicyWitness>, [u64; 4]) {
+pub fn fabricated_policy_tree_for_tests(leaves: &[[u64; 4]], seed: u64) -> (Vec<PolicyWitness>, [u64; 4]) {
     let slots = 1usize << POLICY_SUB_LEVELS;
     assert!(leaves.len() <= slots, "fabricated policy tree holds at most {slots} leaves");
     let mut x = seed | 1;
@@ -1626,6 +1626,153 @@ pub fn fabricated_policy_tree(leaves: &[[u64; 4]], seed: u64) -> (Vec<PolicyWitn
     (witnesses, root)
 }
 
+/// The circuit hash's zero chain for the policy trees (lab #722):
+/// `zeros[0]` is the empty-leaf digest `[0; 4]` (no leaf hash equals it) and
+/// `zeros[i] = H(zeros[i-1] ‖ zeros[i-1])` under the MERKLE node hash the
+/// AIR folds with. `zeros[POLICY_DEPTH]` is the root of an all-empty tree.
+pub fn policy_zeros() -> [[u64; 4]; POLICY_DEPTH + 1] {
+    let mut z = [[0u64; 4]; POLICY_DEPTH + 1];
+    for i in 1..=POLICY_DEPTH {
+        z[i] = crate::reference::merkle_node_state(&z[i - 1], &z[i - 1])[..4].try_into().unwrap();
+    }
+    z
+}
+
+/// **The canonical depth-20 policy tree** (lab #722) over `leaves` placed at
+/// positions `0..n`, every other slot empty: each level is computed only as
+/// far as it holds a real node, and an absent node is `zeros[level]`. No seed
+/// — the root is a function of the leaf list alone, so anyone holding the
+/// list rebuilds it. Returns every leaf's witness and the root.
+pub fn canonical_policy_tree(leaves: &[[u64; 4]]) -> (Vec<PolicyWitness>, [u64; 4]) {
+    assert!(leaves.len() <= 1 << POLICY_DEPTH, "a depth-{POLICY_DEPTH} tree holds at most 2^{POLICY_DEPTH} leaves");
+    let zeros = policy_zeros();
+    let mut levels: Vec<Vec<[u64; 4]>> = vec![leaves.to_vec()];
+    for lvl in 0..POLICY_DEPTH {
+        let cur = &levels[lvl];
+        let next: Vec<[u64; 4]> = cur
+            .chunks(2)
+            .map(|p| {
+                let r = if p.len() == 2 { p[1] } else { zeros[lvl] };
+                crate::reference::merkle_node_state(&p[0], &r)[..4].try_into().unwrap()
+            })
+            .collect();
+        levels.push(next);
+    }
+    let root = levels[POLICY_DEPTH].first().copied().unwrap_or(zeros[POLICY_DEPTH]);
+    let witnesses = (0..leaves.len())
+        .map(|i| {
+            let mut siblings = [[0u64; 4]; POLICY_DEPTH];
+            let mut path_bits = [false; POLICY_DEPTH];
+            let mut pos = i;
+            for lvl in 0..POLICY_DEPTH {
+                siblings[lvl] = levels[lvl].get(pos ^ 1).copied().unwrap_or(zeros[lvl]);
+                path_bits[lvl] = pos & 1 == 1;
+                pos >>= 1;
+            }
+            PolicyWitness { siblings, path_bits }
+        })
+        .collect();
+    (witnesses, root)
+}
+
+fn key_order(a: &[u64; 4], b: &[u64; 4]) -> core::cmp::Ordering {
+    if key_lt(a, b) {
+        core::cmp::Ordering::Less
+    } else if a == b {
+        core::cmp::Ordering::Equal
+    } else {
+        core::cmp::Ordering::Greater
+    }
+}
+
+/// **An issuer's freeze tree, canonical** (lab #722): the indexed tree over
+/// the sorted frozen keys `K = H(rkm ‖ D_FRZ)` — leaves `(0, k₁), (k₁, k₂), …,
+/// (kₙ, MAX)` — on [`canonical_policy_tree`]. What the issuer publishes is the
+/// sorted key list; any wallet rebuilds this tree, its root, and its own
+/// non-membership opening from that list alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalFreezeTree {
+    /// The sorted, deduplicated frozen keys (the published list).
+    pub keys: Vec<[u64; 4]>,
+    pub leaves: Vec<([u64; 4], [u64; 4])>,
+    pub root: [u64; 4],
+}
+
+impl CanonicalFreezeTree {
+    /// The tree over the addresses owning `frozen_rkms` (each hashed to its key).
+    pub fn from_rkms(frozen_rkms: &[[u64; 4]]) -> Self {
+        Self::from_keys(&frozen_rkms.iter().map(freeze_key_of).collect::<Vec<_>>())
+    }
+
+    /// The tree over already-hashed keys, in any order (sorted and deduplicated here).
+    pub fn from_keys(frozen_keys: &[[u64; 4]]) -> Self {
+        let mut keys = frozen_keys.to_vec();
+        keys.sort_by(key_order);
+        keys.dedup();
+        assert!(!keys.contains(&[0; 4]) && !keys.contains(&KEY_MAX), "0 and MAX are the sentinels");
+        let mut bounds = vec![[0u64; 4]];
+        bounds.extend(keys.iter().copied());
+        bounds.push(KEY_MAX);
+        let leaves: Vec<([u64; 4], [u64; 4])> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+        let digests: Vec<[u64; 4]> = leaves.iter().map(|(lo, hi)| freeze_leaf_hash(lo, hi)).collect();
+        let (_, root) = canonical_policy_tree(&digests);
+        Self { keys, leaves, root }
+    }
+
+    /// The empty freeze tree (one `(0, MAX)` leaf).
+    pub fn empty() -> Self {
+        Self::from_keys(&[])
+    }
+
+    /// Whether `rkm`'s key is frozen.
+    pub fn is_frozen(&self, rkm: &[u64; 4]) -> bool {
+        self.keys.binary_search_by(|k| key_order(k, &freeze_key_of(rkm))).is_ok()
+    }
+
+    /// The low-leaf non-membership opening for `rkm`, or `None` when frozen.
+    pub fn opening_for(&self, rkm: &[u64; 4]) -> Option<FreezeOpening> {
+        let k = freeze_key_of(rkm);
+        let i = self.leaves.iter().position(|(lo, hi)| key_lt(lo, &k) && key_lt(&k, hi))?;
+        Some(self.opening_at(i))
+    }
+
+    /// Leaf `i`'s opening regardless of any key — for the negatives.
+    pub fn opening_at(&self, i: usize) -> FreezeOpening {
+        let digests: Vec<[u64; 4]> = self.leaves.iter().map(|(lo, hi)| freeze_leaf_hash(lo, hi)).collect();
+        let (witnesses, _) = canonical_policy_tree(&digests);
+        let (lo, hi) = self.leaves[i];
+        FreezeOpening { key_lo: lo, key_hi: hi, witness: witnesses[i] }
+    }
+}
+
+/// **An issuer's allowlist, canonical** (lab #722): the sorted credential
+/// commitments `cred = H(rkm ‖ D_CRED)` as leaves of [`canonical_policy_tree`].
+#[derive(Clone)]
+pub struct CanonicalAllowTree {
+    pub creds: Vec<[u64; 4]>,
+    pub witnesses: Vec<PolicyWitness>,
+    pub root: [u64; 4],
+}
+
+impl CanonicalAllowTree {
+    pub fn from_creds(creds: &[[u64; 4]]) -> Self {
+        let mut creds = creds.to_vec();
+        creds.sort_by(key_order);
+        creds.dedup();
+        let (witnesses, root) = canonical_policy_tree(&creds);
+        Self { creds, witnesses, root }
+    }
+
+    /// The allowlist over the holders owning `rkms`.
+    pub fn from_rkms(rkms: &[[u64; 4]]) -> Self {
+        Self::from_creds(&rkms.iter().map(cred_of).collect::<Vec<_>>())
+    }
+
+    pub fn witness_for(&self, cred: &[u64; 4]) -> Option<PolicyWitness> {
+        self.creds.iter().position(|c| c == cred).map(|i| self.witnesses[i])
+    }
+}
+
 /// One non-membership opening: the low leaf and its path.
 #[derive(Clone, Copy)]
 pub struct FreezeOpening {
@@ -1646,15 +1793,17 @@ pub struct FreezeTree {
 }
 
 impl FreezeTree {
-    /// Freeze the addresses owning `frozen_rkms` — each is hashed to its key.
-    pub fn new(frozen_rkms: &[[u64; 4]], seed: u64) -> Self {
+    /// **Test fixture** (lab #722): freeze the addresses owning
+    /// `frozen_rkms` over the seeded fabricated tree. A real issuer or wallet
+    /// uses [`CanonicalFreezeTree`].
+    pub fn fixture_for_tests(frozen_rkms: &[[u64; 4]], seed: u64) -> Self {
         let keys: Vec<[u64; 4]> = frozen_rkms.iter().map(freeze_key_of).collect();
-        Self::from_keys(&keys, seed)
+        Self::fixture_from_keys_for_tests(&keys, seed)
     }
 
-    /// A tree over already-hashed keys — what an issuer publishes, and what a
-    /// wallet rebuilds its own witness from.
-    pub fn from_keys(frozen_keys: &[[u64; 4]], seed: u64) -> Self {
+    /// **Test fixture** over already-hashed keys (seeded, ≤ 7 keys) — not
+    /// rebuildable from the key list alone; see [`CanonicalFreezeTree`].
+    pub fn fixture_from_keys_for_tests(frozen_keys: &[[u64; 4]], seed: u64) -> Self {
         let mut keys: Vec<[u64; 4]> = frozen_keys.to_vec();
         keys.sort_by(|a, b| {
             if key_lt(a, b) {
@@ -1672,13 +1821,13 @@ impl FreezeTree {
         bounds.push(KEY_MAX);
         let leaves: Vec<([u64; 4], [u64; 4])> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
         let digests: Vec<[u64; 4]> = leaves.iter().map(|(lo, hi)| freeze_leaf_hash(lo, hi)).collect();
-        let (witnesses, root) = fabricated_policy_tree(&digests, seed);
+        let (witnesses, root) = fabricated_policy_tree_for_tests(&digests, seed);
         Self { leaves, witnesses, root }
     }
 
-    /// The empty tree — what a non-freeze asset's dummy path is over.
-    pub fn empty() -> Self {
-        Self::new(&[], 0x0f7e_e2e0_0000_0001)
+    /// **Test fixture**: the empty seeded tree (a Cloaked fixture's path).
+    pub fn fixture_empty_for_tests() -> Self {
+        Self::fixture_for_tests(&[], 0x0f7e_e2e0_0000_0001)
     }
 
     /// The low leaf for `rkm`'s key, or `None` when `rkm` is frozen.
@@ -1708,8 +1857,10 @@ pub struct AllowTree {
 }
 
 impl AllowTree {
-    pub fn new(creds: &[[u64; 4]], seed: u64) -> Self {
-        let (witnesses, root) = fabricated_policy_tree(creds, seed);
+    /// **Test fixture** (lab #722): the seeded fabricated allowlist. A real
+    /// issuer uses [`CanonicalAllowTree`].
+    pub fn fixture_for_tests(creds: &[[u64; 4]], seed: u64) -> Self {
+        let (witnesses, root) = fabricated_policy_tree_for_tests(creds, seed);
         Self { creds: creds.to_vec(), witnesses, root }
     }
 
@@ -1720,7 +1871,7 @@ impl AllowTree {
 
 /// The dummy allowlist path a non-Regulated input spends its trace on.
 pub fn dummy_allow_witness() -> PolicyWitness {
-    AllowTree::new(&[[0xd0, 0xd1, 0xd2, 0xd3]], 0xa110_0000_0000_0d0d).witnesses[0]
+    CanonicalAllowTree::from_creds(&[[0xd0, 0xd1, 0xd2, 0xd3]]).witnesses[0]
 }
 
 /// One asset as the registry and the prover see it: the leaf plus the trees
@@ -1744,8 +1895,8 @@ impl PolicyAsset {
             mode: MODE_CLOAKED,
             redeem_open: false,
             isk: None,
-            freeze: FreezeTree::empty(),
-            allow: AllowTree::new(&[], 0xa110_0000_0000_0000 ^ asset),
+            freeze: FreezeTree::fixture_empty_for_tests(),
+            allow: AllowTree::fixture_for_tests(&[], 0xa110_0000_0000_0000 ^ asset),
         }
     }
 
@@ -1756,8 +1907,8 @@ impl PolicyAsset {
             mode: MODE_HYBRID,
             redeem_open,
             isk: Some(isk),
-            freeze: FreezeTree::new(frozen, 0xf7ee_0000_0000_0000 ^ asset),
-            allow: AllowTree::new(&[], 0xa110_0000_0000_0000 ^ asset),
+            freeze: FreezeTree::fixture_for_tests(frozen, 0xf7ee_0000_0000_0000 ^ asset),
+            allow: AllowTree::fixture_for_tests(&[], 0xa110_0000_0000_0000 ^ asset),
         }
     }
 
@@ -1776,8 +1927,8 @@ impl PolicyAsset {
             mode: MODE_REGULATED,
             redeem_open,
             isk: Some(isk),
-            freeze: FreezeTree::new(frozen, 0xf7ee_0000_0000_0000 ^ asset),
-            allow: AllowTree::new(&creds, 0xa110_0000_0000_0000 ^ asset),
+            freeze: FreezeTree::fixture_for_tests(frozen, 0xf7ee_0000_0000_0000 ^ asset),
+            allow: AllowTree::fixture_for_tests(&creds, 0xa110_0000_0000_0000 ^ asset),
         }
     }
 
@@ -1796,7 +1947,7 @@ impl PolicyAsset {
     /// `rkm` has no opening — the caller's negative supplies one by hand.
     pub fn policy_input_for(&self, rkm: &[u64; 4], reg_witness: RegistryWitness) -> Option<L2PolicyInput> {
         let freeze = if self.mode == MODE_CLOAKED {
-            FreezeTree::empty().opening_for(rkm)?
+            FreezeTree::fixture_empty_for_tests().opening_for(rkm)?
         } else {
             self.freeze.opening_for(rkm)?
         };
@@ -3452,7 +3603,7 @@ mod tests {
         );
         assert_unsat(&bad, "another holder's credential path");
         // (b) our own credential, genuinely in a DIFFERENT tree.
-        let elsewhere = AllowTree::new(&[cred_of(&rkm1)], 0xe15e_0000_0000_0001);
+        let elsewhere = AllowTree::fixture_for_tests(&[cred_of(&rkm1)], 0xe15e_0000_0000_0001);
         let pol1b = L2PolicyInput { allow: elsewhere.witnesses[0], ..pol1 };
         let bad_b = build_bucket_l2p_with_witnesses(
             SHAPE_P_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &[pol0, pol1b], root, [VPublic::NONE; 2],
@@ -3734,3 +3885,49 @@ mod tests {
         assert_unsat(&bad2, "a mint through the dummy row");
     }
 }
+
+/// **The canonical policy tree** (lab #722): goldens pinned from the named
+/// run of `examples/canonical_policy_tree_goldens` (twice, byte-identical),
+/// whose independent encoder folds the full padded 2^20 leaf array.
+#[cfg(test)]
+mod canonical_tree_tests {
+    use super::*;
+
+    const EMPTY_ROOT: [u64; 4] = [0xf8d82fd66d2735bb, 0xd8bf72a840613477, 0xf06f185fb6a4c488, 0x80c09ad3c7cac22d];
+    const THREE_KEY_ROOT: [u64; 4] = [0xab4045d7128feeb8, 0xfcc918c5a405d481, 0x642dac75d472a9c2, 0xf257044207d689a6];
+
+    fn three_keys() -> Vec<[u64; 4]> {
+        (1..=3u64).map(|i| freeze_key_of(&[i, i, i, i])).collect()
+    }
+
+    #[test]
+    fn the_canonical_freeze_tree_roots_are_the_pinned_goldens() {
+        assert_eq!(CanonicalFreezeTree::empty().root, EMPTY_ROOT);
+        assert_eq!(CanonicalFreezeTree::from_keys(&three_keys()).root, THREE_KEY_ROOT);
+        // Order- and duplicate-free: the published list is a set.
+        let mut shuffled = three_keys();
+        shuffled.reverse();
+        shuffled.push(shuffled[0]);
+        assert_eq!(CanonicalFreezeTree::from_keys(&shuffled).root, THREE_KEY_ROOT);
+        assert_eq!(CanonicalFreezeTree::from_rkms(&[[1; 4], [2; 4], [3; 4]]).root, THREE_KEY_ROOT);
+    }
+
+    #[test]
+    fn every_opening_folds_to_the_root_and_a_frozen_key_has_none() {
+        let t = CanonicalFreezeTree::from_rkms(&[[1; 4], [2; 4], [3; 4]]);
+        assert!(t.is_frozen(&[2; 4]) && !t.is_frozen(&[9; 4]));
+        assert!(t.opening_for(&[2; 4]).is_none(), "a frozen rkm has no non-membership opening");
+        for rkm in [[9u64; 4], [0x77; 4], [u64::MAX - 1; 4]] {
+            let o = t.opening_for(&rkm).expect("an unfrozen rkm opens");
+            let k = freeze_key_of(&rkm);
+            assert!(key_lt(&o.key_lo, &k) && key_lt(&k, &o.key_hi));
+            assert_eq!(o.witness.fold_root(&freeze_leaf_hash(&o.key_lo, &o.key_hi)), t.root);
+        }
+        let allow = CanonicalAllowTree::from_rkms(&[[4; 4], [5; 4]]);
+        let w = allow.witness_for(&cred_of(&[5; 4])).expect("an allowlisted holder has a witness");
+        assert_eq!(w.fold_root(&cred_of(&[5; 4])), allow.root);
+        assert!(allow.witness_for(&cred_of(&[6; 4])).is_none());
+        assert_eq!(policy_zeros()[POLICY_DEPTH], CanonicalAllowTree::from_creds(&[]).root, "an empty allowlist is the zero chain's top");
+    }
+}
+

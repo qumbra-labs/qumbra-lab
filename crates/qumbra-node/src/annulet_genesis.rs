@@ -56,6 +56,18 @@ pub struct RegistryLeafRecord {
 }
 
 impl RegistryLeafRecord {
+    /// The record of a circuit leaf (lab #722: test genesis assembly).
+    pub fn of(l: &RegistryLeaf) -> Self {
+        RegistryLeafRecord {
+            asset: u16::try_from(l.asset).expect("a registry index is 16-bit"),
+            issuer_key: l.issuer_key,
+            mode: l.mode,
+            freeze_root: l.freeze_root,
+            allow_root: l.allow_root,
+            flags: l.flags,
+        }
+    }
+
     /// The circuit's leaf for this record.
     pub fn leaf(&self) -> RegistryLeaf {
         RegistryLeaf {
@@ -88,6 +100,14 @@ impl RegistryLeafRecord {
 pub struct GenesisNoteRecord {
     pub cm: Hash32,
     pub payload: Vec<u8>,
+}
+
+impl GenesisNoteRecord {
+    /// A genesis note record: the committed cm and the note's
+    /// `GenesisPlaintext` (lab #722: test genesis assembly).
+    pub fn of(n: &qlab_note::l2note::L2Note) -> Self {
+        GenesisNoteRecord { cm: h32(&n.commitment()), payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec() }
+    }
 }
 
 /// The L2 genesis parameters: the posted fee tiers in fee-unit base units
@@ -384,7 +404,9 @@ impl AnnuletGenesisFile {
             asset: 7,
             issuer_key: qlab_air::l2p::issuer_key_of(&isk),
             mode: qlab_air::l2::MODE_HYBRID,
-            freeze_root: qlab_air::l2p::FreezeTree::empty().root,
+            // The fixture genesis keeps the seeded fixture tree: its hash and
+            // the B-track goldens are pinned to it (lab #722: fixture only).
+            freeze_root: qlab_air::l2p::FreezeTree::fixture_empty_for_tests().root,
             allow_root: [0; 4],
             flags: 0,
         };
@@ -455,11 +477,18 @@ pub mod devnet {
         qlab_air::l2p::derive_rkm_l2(&L2TxInput { sk, value: 0, asset: 0, rho: [0; 4], rseed: [0; 4], d })
     }
 
-    /// `USDT-test`'s policy: Hybrid, the dev issuer, redeem closed, an empty
-    /// freeze tree — the object both the genesis registry leaf and the
-    /// harness's witnesses are built from, so the two cannot drift.
-    pub fn usdt_test_policy() -> qlab_air::l2p::PolicyAsset {
-        qlab_air::l2p::PolicyAsset::hybrid(USDT_TEST_ASSET, USDT_ISSUER_ISK, false, &[])
+    /// `USDT-test`'s registry leaf: Hybrid, the dev issuer, redeem closed,
+    /// and the **canonical** empty freeze tree (lab #722 — the seeded fixture
+    /// tree it used before could not be rebuilt from a published list).
+    pub fn usdt_test_leaf() -> qlab_air::l2::RegistryLeaf {
+        qlab_air::l2::RegistryLeaf {
+            asset: USDT_TEST_ASSET,
+            issuer_key: qlab_air::l2p::issuer_key_of(&USDT_ISSUER_ISK),
+            mode: qlab_air::l2::MODE_HYBRID,
+            freeze_root: qlab_air::l2p::CanonicalFreezeTree::empty().root,
+            allow_root: [0; 4],
+            flags: 0,
+        }
     }
 
     /// Stock note `i` (asset 0, [`STOCK_NOTE_VALUE`]) to the faucet.
@@ -498,7 +527,7 @@ impl AnnuletGenesisFile {
             slot_secs: 10,
             max_empty_slots: 6,
         };
-        let usdt = devnet::usdt_test_policy().leaf();
+        let usdt = devnet::usdt_test_leaf();
         let usdt = RegistryLeafRecord {
             asset: usdt.asset as u16,
             issuer_key: usdt.issuer_key,
@@ -562,14 +591,15 @@ mod tests {
         assert_eq!(a.to_bytes(), b.to_bytes(), "deterministic");
         a.verify(Some(DEVNET_GENESIS_HASH)).expect("the devnet genesis verifies and pins itself");
         assert_eq!(a.hash_hex(), DEVNET_GENESIS_HASH);
-        // Its registry leaf for USDT-test is the harness's PolicyAsset's.
-        assert_eq!(a.registry_genesis[1].leaf(), devnet::usdt_test_policy().leaf());
+        // Its registry leaf for USDT-test is the canonical one (lab #722).
+        assert_eq!(a.registry_genesis[1].leaf(), devnet::usdt_test_leaf());
         assert_eq!(a.genesis_notes.len() as u64, devnet::STOCK_NOTES + 1);
     }
 
     /// The devnet genesis hash — from the named `annulet_devnet_genesis` run,
-    /// twice, byte-identical (lab #716).
-    const DEVNET_GENESIS_HASH: &str = "6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374";
+    /// twice, byte-identical (lab #716; re-pinned in lab #722 when USDT-test
+    /// moved to the canonical freeze tree — it was `6f0978eb…f374`).
+    const DEVNET_GENESIS_HASH: &str = "831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef";
 
     #[test]
     /// Also the byte-identity proof of lab #710's delegation: `registry_root_of`
