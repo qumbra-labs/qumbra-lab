@@ -45,7 +45,7 @@ impl TxVerifier for MockProofVerifier {
 
 type Node = P2pNode<InProcTransport, NodeAdapter<KeccakPow, MockProofVerifier>>;
 
-const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 const SIM_TICK_MS: u64 = 10;
 
 fn registry() -> Vec<qlab_node::registry_store::RegistryLeaf> {

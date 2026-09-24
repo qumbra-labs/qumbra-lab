@@ -120,6 +120,13 @@ impl GenesisNoteRecord {
 pub struct AnnuletParams {
     pub fee_tier_s: u64,
     pub fee_tier_p: u64,
+    /// **`fee_tier_r` — a labelled PLACEHOLDER** (lab #728, from A2's
+    /// `qlab_l2::FEE_TIER_R_PLACEHOLDER`): the fee a registry write (shape R)
+    /// pays. Registration is permissionless into 65,536 slots (asset ids are
+    /// 16-bit registry indices; asset 0 is never writable), so **this tier is
+    /// the only price on exhausting the registry** — the pilot's tariff must
+    /// set it; the fixture and devnet values are not that price.
+    pub fee_tier_r: u64,
     /// The slot length in seconds (lab #708 Q5).
     pub slot_secs: u64,
     /// The producer seals an empty block at the latest every this many slots
@@ -130,7 +137,7 @@ pub struct AnnuletParams {
 impl AnnuletParams {
     /// As the body rule consumes them.
     pub fn fee_table(&self) -> L2FeeTable {
-        L2FeeTable { tier_s: self.fee_tier_s, tier_p: self.fee_tier_p }
+        L2FeeTable { tier_s: self.fee_tier_s, tier_p: self.fee_tier_p, tier_r: self.fee_tier_r }
     }
 }
 
@@ -398,7 +405,13 @@ impl AnnuletGenesisFile {
     ///   *not encrypted*: a devnet genesis seals them to the faucet's
     ///   ML-KEM key (B6).
     pub fn fixture() -> Self {
-        let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, slot_secs: 10, max_empty_slots: 6 };
+        let params = AnnuletParams {
+            fee_tier_s: 1,
+            fee_tier_p: 2,
+            fee_tier_r: qlab_l2::FEE_TIER_R_PLACEHOLDER,
+            slot_secs: 10,
+            max_empty_slots: 6,
+        };
         let isk = [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004];
         let asset7 = RegistryLeafRecord {
             asset: 7,
@@ -466,6 +479,12 @@ pub mod devnet {
     /// The devnet fee tiers (fee-unit base units): S = 1, P = 2.
     pub const FEE_TIER_S: u64 = 1;
     pub const FEE_TIER_P: u64 = 2;
+    /// Shape R's devnet tier (lab #728) — a labelled placeholder, set to one
+    /// faucet grant ([`GRANT_VALUE`]) because R spends exactly **one** fee
+    /// note: a registrant pays a registration with one grant. (The fixture
+    /// genesis uses `qlab_l2::FEE_TIER_R_PLACEHOLDER` = 4; neither is the
+    /// pilot's price.)
+    pub const FEE_TIER_R: u64 = GRANT_VALUE;
     /// One grant pays exactly one shape-P fee; a stock note carries the grant
     /// plus the shape-S fee of the grant transaction that spends it whole —
     /// so the faucet needs no change tracking.
@@ -524,6 +543,7 @@ impl AnnuletGenesisFile {
         let params = AnnuletParams {
             fee_tier_s: devnet::FEE_TIER_S,
             fee_tier_p: devnet::FEE_TIER_P,
+            fee_tier_r: devnet::FEE_TIER_R,
             slot_secs: 10,
             max_empty_slots: 6,
         };

@@ -2458,6 +2458,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // Lab #712: a surface root that is not its own header's — the
             // block contradicts itself, whatever this node's view.
             | BodyError::L2RegistryRootStale { .. }
+            // Lab #728: the write's arity, a second write, and a write whose
+            // new root is not its own header's — each reads only the pair.
+            | BodyError::L2RegistryWriteArity { .. }
+            | BodyError::L2SecondRegistryWrite { .. }
+            | BodyError::L2RegistryWriteRootMismatch { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
             | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:

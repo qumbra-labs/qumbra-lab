@@ -100,8 +100,11 @@ pub enum L2VerifyError {
     NoSurface,
     /// The surface bytes are not canonical.
     SurfaceMalformed,
-    /// Not the 2×2 bucket (2 nullifiers, 2 commitments).
+    /// Not the 2×2 bucket (2 nullifiers, 2 commitments) — shapes S and P.
     NotTwoByTwo,
+    /// A registry write (shape R) that is not 1 nullifier / 1 commitment
+    /// under the 2×2 bucket declaration (lab #728 Q2).
+    RegistryWriteArity,
     /// The proof bytes do not decode strictly.
     ProofDecode,
     /// The decoded proof's structure is not the one the L2 config implies
@@ -121,17 +124,45 @@ impl L2Verifier {
             Err(_) => return Err(L2VerifyError::SurfaceMalformed),
         };
         let p = &entry.public;
-        if p.bucket != ArityBucket::TwoByTwo || p.nullifiers.len() != 2 || p.commitments.len() != 2 {
-            return Err(L2VerifyError::NotTwoByTwo);
+        // Lab #728 Q2: every Annulet surface declares the 2×2 bucket; the
+        // shape gates the counts.
+        let arity_ok = p.bucket == ArityBucket::TwoByTwo
+            && match surface.shape {
+                L2ShapeTag::S | L2ShapeTag::P => p.nullifiers.len() == 2 && p.commitments.len() == 2,
+                L2ShapeTag::R => p.nullifiers.len() == 1 && p.commitments.len() == 1,
+            };
+        if !arity_ok {
+            return Err(match surface.shape {
+                L2ShapeTag::S | L2ShapeTag::P => L2VerifyError::NotTwoByTwo,
+                L2ShapeTag::R => L2VerifyError::RegistryWriteArity,
+            });
         }
         let proof = decode_proof_strict(&entry.proof)?;
-        let (anchor, nf1, nf2, cm1, cm2, root) = (
-            digest_words(&p.anchor),
+        let (anchor, root) = (digest_words(&p.anchor), digest_words(&surface.registry_root));
+        if surface.shape == L2ShapeTag::R {
+            // Shape R (lab #728): one input, one output, the write's roots and
+            // the written slot (the new leaf's asset lane). The leaf itself is
+            // not a public value — the node binds it by applying it to its own
+            // tree and requiring `new_root`.
+            let Some(w) = surface.write else { return Err(L2VerifyError::SurfaceMalformed) };
+            check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_R)?;
+            let pvs = qlab_l2::pv_vec_r(
+                &anchor,
+                &digest_words(&p.nullifiers[0]),
+                &digest_words(&p.commitments[0]),
+                p.fee,
+                &root,
+                &digest_words(&w.new_root),
+                w.asset(),
+            );
+            let verified = qlab_l2::verify_r(&qlab_l2::public_values(&pvs), &proof);
+            return verified.then_some(()).ok_or(L2VerifyError::ProofInvalid);
+        }
+        let (nf1, nf2, cm1, cm2) = (
             digest_words(&p.nullifiers[0]),
             digest_words(&p.nullifiers[1]),
             digest_words(&p.commitments[0]),
             digest_words(&p.commitments[1]),
-            digest_words(&surface.registry_root),
         );
         let verified = match (surface.shape, surface.vpublic) {
             (L2ShapeTag::S, None) => {
@@ -144,8 +175,11 @@ impl L2Verifier {
                 let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms));
                 qlab_l2::verify_p(&qlab_l2::public_values(&pvs), &proof)
             }
-            // A canonical surface pairs S with no vPublic and P with some.
-            (L2ShapeTag::S, Some(_)) | (L2ShapeTag::P, None) => return Err(L2VerifyError::SurfaceMalformed),
+            // A canonical surface pairs S with no vPublic and P with some; R
+            // returned above.
+            (L2ShapeTag::S, Some(_)) | (L2ShapeTag::P, None) | (L2ShapeTag::R, _) => {
+                return Err(L2VerifyError::SurfaceMalformed)
+            }
         };
         verified.then_some(()).ok_or(L2VerifyError::ProofInvalid)
     }
@@ -474,7 +508,7 @@ mod tests {
             },
             discovery: vec![0x00],
             rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-            l2: qlab_devnet::annulet::L2Surface { shape: surface_shape, registry_root: h32(root), vpublic }.encode(),
+            l2: qlab_devnet::annulet::L2Surface { shape: surface_shape, registry_root: h32(root), vpublic, write: None }.encode(),
         }
     }
 

@@ -222,7 +222,7 @@ mod tests {
         }
     }
 
-    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 
     /// A genesis issuance as the binary computes it from the genesis file.
     fn issuance() -> std::collections::BTreeMap<u16, u128> {
@@ -259,6 +259,7 @@ mod tests {
                 shape: L2ShapeTag::P,
                 registry_root: ext().registry_root,
                 vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem, amount, asset: 7 }]),
+                write: None,
             }
             .encode(),
         };

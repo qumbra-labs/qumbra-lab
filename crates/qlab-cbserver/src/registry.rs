@@ -478,9 +478,12 @@ pub fn decode_genesis_notes(b: &[u8]) -> Result<([u8; 32], Vec<ServedGenesisNote
 
 /// The route an Annulet node serves its fee tiers on (lab #720).
 pub const ANNULET_PARAMS_PATH: &str = "/v1/annulet/params";
-pub const ANNULET_PARAMS_WIRE_VERSION: u8 = 1;
-/// `version ‖ genesis_hash(32) ‖ fee_tier_s u64 LE ‖ fee_tier_p u64 LE`.
-pub const ANNULET_PARAMS_LEN: usize = 1 + 32 + 8 + 8;
+/// v2 (lab #728) adds `fee_tier_r`: an existing route's bytes changed, so the
+/// version moved (the PR #315 rule).
+pub const ANNULET_PARAMS_WIRE_VERSION: u8 = 2;
+/// `version ‖ genesis_hash(32) ‖ fee_tier_s u64 LE ‖ fee_tier_p u64 LE ‖
+/// fee_tier_r u64 LE`.
+pub const ANNULET_PARAMS_LEN: usize = 1 + 32 + 8 + 8 + 8;
 
 /// `GET /v1/annulet/params` (lab #720): the posted fee tiers of the genesis
 /// the node runs, under that genesis's hash — the tariff a wallet must pay
@@ -491,6 +494,8 @@ pub struct AnnuletParams {
     pub genesis_hash: [u8; 32],
     pub fee_tier_s: u64,
     pub fee_tier_p: u64,
+    /// Shape R's tier (lab #728) — the registry-write price.
+    pub fee_tier_r: u64,
 }
 
 /// Why an Annulet params body did not decode.
@@ -507,6 +512,7 @@ pub fn encode_annulet_params(p: &AnnuletParams) -> Vec<u8> {
     out.extend_from_slice(&p.genesis_hash);
     out.extend_from_slice(&p.fee_tier_s.to_le_bytes());
     out.extend_from_slice(&p.fee_tier_p.to_le_bytes());
+    out.extend_from_slice(&p.fee_tier_r.to_le_bytes());
     out
 }
 
@@ -521,6 +527,7 @@ pub fn decode_annulet_params(b: &[u8]) -> Result<AnnuletParams, AnnuletParamsWir
         genesis_hash: b[1..33].try_into().expect("32 bytes"),
         fee_tier_s: u64::from_le_bytes(b[33..41].try_into().expect("8 bytes")),
         fee_tier_p: u64::from_le_bytes(b[41..49].try_into().expect("8 bytes")),
+        fee_tier_r: u64::from_le_bytes(b[49..57].try_into().expect("8 bytes")),
     })
 }
 
@@ -530,14 +537,16 @@ mod annulet_params_tests {
 
     #[test]
     fn annulet_params_round_trip_and_refuse_by_name() {
-        let p = AnnuletParams { genesis_hash: [0x6f; 32], fee_tier_s: 1, fee_tier_p: 2 };
+        let p = AnnuletParams { genesis_hash: [0x6f; 32], fee_tier_s: 1, fee_tier_p: 2, fee_tier_r: 4 };
         let b = encode_annulet_params(&p);
         assert_eq!(b.len(), ANNULET_PARAMS_LEN);
         assert_eq!(decode_annulet_params(&b), Ok(p));
         assert_eq!(decode_annulet_params(&b[..48]), Err(AnnuletParamsWireError::Length { got: 48 }));
-        let mut v2 = b.clone();
-        v2[0] = 2;
-        assert_eq!(decode_annulet_params(&v2), Err(AnnuletParamsWireError::BadVersion { got: 2 }));
+        // v1 (no fee_tier_r) is refused by name, not misread (lab #728).
+        let mut v1 = b.clone();
+        v1[0] = 1;
+        assert_eq!(decode_annulet_params(&v1), Err(AnnuletParamsWireError::BadVersion { got: 1 }));
+        assert_eq!(ANNULET_PARAMS_LEN, 57);
     }
 }
 

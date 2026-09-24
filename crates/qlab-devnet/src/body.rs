@@ -739,6 +739,16 @@ pub enum BodyError {
     /// the block's parent's (lab #712, the §5 ruling): its registry openings
     /// were computed against another registry state.
     L2RegistryRootStale { index: usize },
+    /// A registry write (shape R, lab #728) that is not 1 nullifier / 1
+    /// commitment — R spends one fee note and makes one.
+    L2RegistryWriteArity { index: usize },
+    /// A second registry write in one block (lab #728 Q4): every surface binds
+    /// the parent's root and the header carries one post-block root, so a
+    /// block holds at most one write.
+    L2SecondRegistryWrite { index: usize },
+    /// A registry write whose `new_root` is not the block header's
+    /// `registry_root` — the block contradicts itself (lab #728).
+    L2RegistryWriteRootMismatch { index: usize },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
@@ -1408,6 +1418,7 @@ mod tests {
             shape: crate::annulet::L2ShapeTag::S,
             registry_root: [0x44; 32],
             vpublic: None,
+            write: None,
         }
         .encode();
         let body = BlockBody::from_single_payee(vec![good_tx(2), tx], 0, [0; 4]);

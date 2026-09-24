@@ -48,7 +48,7 @@ fn p_tx(n: &MemNode, g: &AnnuletGenesisFile, nf: u8, terms: [VPublicTerm; 2]) ->
         },
         discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::P, registry_root: g.genesis_header.registry_root, vpublic: Some(terms) }
+        l2: L2Surface { shape: L2ShapeTag::P, registry_root: g.genesis_header.registry_root, vpublic: Some(terms), write: None }
             .encode(),
     };
     t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);

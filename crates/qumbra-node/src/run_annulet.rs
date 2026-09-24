@@ -58,6 +58,7 @@ impl AnnuletRun {
                 genesis_hash: file.hash(),
                 fee_tier_s: file.params.fee_tier_s,
                 fee_tier_p: file.params.fee_tier_p,
+                fee_tier_r: file.params.fee_tier_r,
             }),
             genesis_notes: qlab_cbserver::registry::encode_genesis_notes(
                 &file.hash(),
@@ -515,6 +516,7 @@ mod tests {
                 shape: L2ShapeTag::S,
                 registry_root: state.registry_root_bytes().expect("an Annulet state has a registry"),
                 vpublic: None,
+                write: None,
             }
             .encode(),
         };

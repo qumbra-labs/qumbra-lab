@@ -457,7 +457,7 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
     let (_, proof) = qlab_l2::prove_s(&inst);
     let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
     let discovery = discovery_for(&notes, outs, rng);
-    let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None };
+    let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None, write: None };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::S })
 }
 
@@ -538,7 +538,7 @@ pub fn prove_p_with_policies<R: rand::CryptoRng>(
         }
     };
     let surface =
-        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]) };
+        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]), write: None };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 

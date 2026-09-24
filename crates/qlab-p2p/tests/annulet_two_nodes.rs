@@ -28,7 +28,7 @@ impl TxVerifier for MockProofVerifier {
     }
 }
 
-const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 /// The test registry (asset 0, Cloaked) and its root — lab #710: every
 /// header carries the root of the registry the node holds.
 fn registry() -> Vec<qlab_node::registry_store::RegistryLeaf> {
@@ -64,7 +64,7 @@ fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
         },
         discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None, write: None }.encode(),
     };
     t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
     t

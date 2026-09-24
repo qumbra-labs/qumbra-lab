@@ -177,7 +177,7 @@ fn the_binary_runs_an_annulet_devnet_genesis_as_producer_under_the_l2_verifier()
         },
         discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: opening_root(&opening), vpublic: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: opening_root(&opening), vpublic: None, write: None }.encode(),
     };
     let (status, body) = request(discovery, "POST", "/v1/tx", &qlab_p2p::codec::encode_tx_annulet(&tx));
     let body = String::from_utf8_lossy(&body).into_owned();

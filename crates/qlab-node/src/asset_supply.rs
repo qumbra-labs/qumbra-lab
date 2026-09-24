@@ -348,7 +348,7 @@ mod tests {
             fee: posted_fee(ArityBucket::TwoByTwo),
         });
         let shape = if terms.is_some() { L2ShapeTag::P } else { L2ShapeTag::S };
-        tx.l2 = L2Surface { shape, registry_root: [9; 32], vpublic: terms }.encode();
+        tx.l2 = L2Surface { shape, registry_root: [9; 32], vpublic: terms, write: None }.encode();
         tx
     }
 

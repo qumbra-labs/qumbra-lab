@@ -38,7 +38,7 @@ fn record(leaf: RegistryLeaf) -> RegistryLeafRecord {
 }
 
 fn genesis(leaves: &[RegistryLeaf]) -> AnnuletGenesisFile {
-    let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, slot_secs: 10, max_empty_slots: 6 };
+    let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, fee_tier_r: 4, slot_secs: 10, max_empty_slots: 6 };
     let mut records = vec![RegistryLeafRecord::asset_zero()];
     records.extend(leaves.iter().copied().map(record));
     AnnuletGenesisFile::assemble("annulet-b3-test", params, [0x5E; 32], records, Vec::new(), 0)

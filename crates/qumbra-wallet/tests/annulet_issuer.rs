@@ -82,7 +82,7 @@ fn mint_transfer_frozen_refused_redeem_with_the_supply_ledger_matching() {
     ];
     let g = AnnuletGenesisFile::assemble(
         "annulet-c3-test",
-        AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, slot_secs: 10, max_empty_slots: 6 },
+        AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, fee_tier_r: 4, slot_secs: 10, max_empty_slots: 6 },
         devnet::SEQUENCER_SEED,
         vec![RegistryLeafRecord::asset_zero(), RegistryLeafRecord::of(&usdt_c3)],
         notes.iter().map(GenesisNoteRecord::of).collect(),

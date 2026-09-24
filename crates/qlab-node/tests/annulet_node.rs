@@ -24,7 +24,7 @@ impl TxVerifier for OkProof {
     }
 }
 
-const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 /// The test registry (asset 0, Cloaked) and its root — lab #710: every
 /// header carries the root of the registry the node holds.
 fn registry() -> Vec<qlab_node::registry_store::RegistryLeaf> {
@@ -57,7 +57,7 @@ fn s_tx(node: &MemNode, nf: u8) -> TxEntry {
         },
         discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None, write: None }.encode(),
     };
     t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
     t
@@ -121,6 +121,7 @@ fn the_annulet_mempool_prices_with_the_l2_table_and_refuses_what_block_validatio
         shape: L2ShapeTag::P,
         registry_root: root(),
         vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 5, asset: 7 }]),
+        write: None,
     }
     .encode();
     p.public.fee = 1;
@@ -214,6 +215,7 @@ fn the_l2_surface_is_part_of_pool_identity() {
             shape: L2ShapeTag::P,
             registry_root: root(),
             vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 1, asset: 7 }]),
+            write: None,
         }
         .encode(),
         ..s.clone()
@@ -370,7 +372,7 @@ fn the_genesis_notes_survive_restart_exactly_once() {
 /// A P transaction carrying `terms` (mock-proved), at the P tier.
 fn p_tx(n: &MemNode, nf: u8, terms: [VPublicTerm; 2]) -> TxEntry {
     let mut t = s_tx(n, nf);
-    t.l2 = L2Surface { shape: L2ShapeTag::P, registry_root: root(), vpublic: Some(terms) }.encode();
+    t.l2 = L2Surface { shape: L2ShapeTag::P, registry_root: root(), vpublic: Some(terms), write: None }.encode();
     t.public.fee = FEES.tier_p;
     t
 }
@@ -448,7 +450,7 @@ fn the_annulet_mempool_refuses_a_stale_root_and_an_uncovered_redeem() {
     n.apply_sealed_block(&sealed_child(&key, &g, &b1), b1, &OkProof).unwrap();
     let mut pool = Mempool::new(MempoolParams::default());
     let mut stale = s_tx(&n, 3);
-    stale.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: [0x99; 32], vpublic: None }.encode();
+    stale.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: [0x99; 32], vpublic: None, write: None }.encode();
     assert!(matches!(
         pool.admit(stale, &n, &OkProof, &EmptyNameView),
         Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryRootStale { index: 0 }))
