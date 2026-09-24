@@ -36,6 +36,18 @@ Annulet 开发网由一个 sequencer、两个 follower 和一个手续费单位�
 | `qlab-p2p/tests/annulet_sync.rs` (b) | 新节点在**默认**限流器下追上 4,100 个 sealed 区块：两整批 2,000 个 3,462 B 的区块头，外加余下的一批。整批不超过 `MAX_PAYLOAD`，也在一次入站字节突发额度之内。 |
 | `qlab-p2p/tests/annulet_sync.rs` (c) | 新节点的第一批区块体请求丢失，随后区块体倒序到达，最前沿那块扣着不给。它在 `BODY_REQUEST_TIMEOUT_MS` 之后重新请求，最终追到链头。 |
 
+**journey 实测。** 机器是 Graviton m7g.2xlarge（run 自报 aarch64、8 核、30 GiB），`--release`，`--test-threads=1`。
+
+| 步骤 | 耗时 | lane run |
+|---|---|---|
+| 2 次 S 发放（水龙头 → holder、水龙头 → 收款方），三节点封块并应用 | 19.2 s | 35936692340 |
+| holder → 收款方 `USDT-test`（P），封块并应用 | 21.8 s | 35936692340 |
+| 收款方通过 follower 2 找到自己的两张票据（外人一张也找不到） | 含在下一步里 | 35936692340 |
+| 收款方 → holder `USDT-test`（P），封块并应用 | 19.5 s | 35936692340 |
+| **整个 journey 通过**：重复提交被拒，**三个节点全部对齐在 8 个 nullifier**，链头和承诺树根一致，holder 在 follower 1 上找回自己的票据 | **57.86 s** | **35941580527**（2,602 / 0 / 15，157 组结果全部到齐） |
+
+分步耗时取自 35936692340：那次每一步都跑完了，只在最后读到旧状态时失败，这个问题已经修掉。测试通过时 cargo 不打印它的 stderr，所以通过的那次只有整体耗时。点名测试 (b) 和 (c) 合计 5.40 s。
+
 **compose（还没起过）：** 在 `qumbra-deploy` 的 `compose/docker-compose.annulet-devnet.yml`。先在本仓库构建 lab 镜像：
 
 ```sh

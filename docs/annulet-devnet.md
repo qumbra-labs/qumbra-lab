@@ -36,6 +36,18 @@ The Annulet devnet is one sequencer, two followers and a fee-unit faucet, runnin
 | `qlab-p2p/tests/annulet_sync.rs` (b) | A joiner catches up 4,100 sealed blocks (two full 2,000-header batches of 3,462-B units plus a remainder) through the **default** rate limiter. The full batch fits `MAX_PAYLOAD` and one inbound byte burst. |
 | `qlab-p2p/tests/annulet_sync.rs` (c) | A joiner's first body asks are lost, and bodies then arrive backwards with the frontier withheld. It re-asks after `BODY_REQUEST_TIMEOUT_MS` and converges to the tip. |
 
+**The journey, measured.** Graviton m7g.2xlarge (aarch64, 8 CPUs, 30 GiB as the run reports it), `--release`, `--test-threads=1`.
+
+| step | time | lane run |
+|---|---|---|
+| 2 S grants (faucet → holder, faucet → recipient), sealed and applied on 3 nodes | 19.2 s | 35936692340 |
+| holder → recipient `USDT-test` (P), sealed and applied | 21.8 s | 35936692340 |
+| recipient detects its two notes through follower 2 (a stranger finds none) | inside the next step | 35936692340 |
+| recipient → holder `USDT-test` (P), sealed and applied | 19.5 s | 35936692340 |
+| **the whole journey, green**: the double submit is refused, **3 of 3 nodes agree at 8 nullifiers** with the same tip and commitment root, and the holder finds its note on follower 1 | **57.86 s** | **35941580527** (2,602 / 0 / 15, 157 of 157 result sets) |
+
+The per-step lines come from 35936692340. That run executed every step and failed only a stale final read, which is fixed. Cargo prints a passing test's stderr to nobody, so the green run gives the whole-test time only. The named tests (b) and (c) take 5.40 s together.
+
 **The compose (not yet brought up):** `qumbra-deploy` `compose/docker-compose.annulet-devnet.yml`. First build the lab image from this repo:
 
 ```sh
