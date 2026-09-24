@@ -67,10 +67,10 @@ fn l2_shape_geometry_is_locked() {
     assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (778, 20, 214, 112));
     let r = verifier_air_r();
     assert_eq!(<L2ShapeRAir as BaseAir<Val>>::width(&r), Shape::R.width());
-    assert_eq!(<L2ShapeRAir as BaseAir<Val>>::num_public_values(&r), 85);
+    assert_eq!(<L2ShapeRAir as BaseAir<Val>>::num_public_values(&r), 101);
     assert_eq!(get_max_constraint_degree::<Val, _>(&r, AirLayout::from_air::<Val>(&r)), 4);
-    assert_eq!((Shape::R.width(), Shape::R.log_height(), Shape::R.perms(), Shape::R.pv_len()), (726, 18, 79, 85));
-    assert_eq!((PV_R_OLD_ROOT, PV_R_NEW_ROOT, PV_R_ASSET), (52, 68, 84));
+    assert_eq!((Shape::R.width(), Shape::R.log_height(), Shape::R.perms(), Shape::R.pv_len()), (734, 18, 82, 101));
+    assert_eq!((PV_R_OLD_ROOT, PV_R_NEW_ROOT, PV_R_ASSET, PV_R_CM_SEED), (52, 68, 84, 85));
     assert_eq!(Shape::R.pv_vpublic(0), None);
     for sh in [Shape::S, Shape::P, Shape::R] {
         assert!(sh.perms() * qlab_air::l2::ROWS_PER_PERM <= 1 << sh.log_height(), "{sh:?} fits its height");
@@ -172,7 +172,7 @@ fn l2_verifier_air_is_instance_independent() {
         opening: qlab_air::l2r::registry_opening(&reg, 9).0,
     };
     let r_programs = [
-        qlab_air::l2r::build_shape_r(LOG_HEIGHT_R, &inp(90, 20, 0), &out(11, 10, 0), 10, &write).air.program,
+        qlab_air::l2r::build_shape_r(LOG_HEIGHT_R, &inp(90, 20, 0), &out(11, 10, 0), 10, &write, &SeedOutput { rkm: [3; 4], rseed: [4; 4] }).air.program,
         fixture::shape_r_at(LOG_HEIGHT_R + 1).air.program,
     ];
     for (i, p) in r_programs.iter().enumerate() {
@@ -230,6 +230,10 @@ fn l2_prove_verify_roundtrip_r() {
     let mut bad = pvs.clone();
     bad[PV_R_ASSET] = Val::from_u32(8);
     assert!(!verify_r(&bad, &proof), "a write of 7 claimed as a write of 8 is refused");
+    let mut bad = pvs.clone();
+    bad[PV_R_CM_SEED + 3] += Val::ONE;
+    assert!(!verify_r(&bad, &proof), "a tampered seed commitment is refused (A3)");
+    assert!(!verify_r(&pvs[..85], &proof), "A2's 85-value surface is not an R surface any more");
     let mut long = pvs.clone();
     long.resize(Shape::S.pv_len(), Val::ZERO);
     assert!(!verify_s(&long, &proof), "an R proof is not an S proof");
@@ -258,7 +262,10 @@ fn l2_shape_digests_are_pinned() {
 fn l2_golden_pv_vectors() {
     assert_eq!(fixture::shape_s().pvs, GOLDEN_PV_S, "shape-S fixture PVs");
     assert_eq!(fixture::shape_p().pvs, GOLDEN_PV_P, "shape-P fixture PVs");
-    assert_eq!(fixture::shape_r().pvs, GOLDEN_PV_R, "shape-R fixture PVs");
+    // A3 appended the seed's commitment; A2's 85 values do not move.
+    let pv_r = fixture::shape_r().pvs;
+    assert_eq!(pv_r[..85], GOLDEN_PV_R, "shape-R fixture PVs — A2's prefix, byte for byte");
+    assert_eq!(pv_r[85..], GOLDEN_PV_R_SEED, "shape-R fixture PVs — A3's seed commitment");
 }
 
 const GOLDEN_PV_S: [u32; 100] = [
@@ -284,6 +291,7 @@ const GOLDEN_PV_P: [u32; 112] = [
     64399, 4798, 55940, 64131, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0,
 ];
+/// A2's shape-R fixture PVs (lab #724), unchanged by A3.
 const GOLDEN_PV_R: [u32; 85] = [
     40210, 52722, 42049, 47202, 16866, 52166, 40001, 49227, 20318, 14605, 28596, 16898,
     16795, 50602, 26734, 50280, 14021, 16243, 19640, 27876, 42645, 29850, 43298, 11495,
@@ -294,3 +302,6 @@ const GOLDEN_PV_R: [u32; 85] = [
     1297, 62073, 47258, 33591, 46455, 7806, 53660, 31912, 45838, 16982, 8526, 31527,
     7,
 ];
+/// A3's seed commitment for the shape-R fixture (lab #731): `PV_CM_SEED..`.
+/// From the named `l2_goldens` run.
+const GOLDEN_PV_R_SEED: [u32; 16] = [0; 16]; // PIN: from the named run

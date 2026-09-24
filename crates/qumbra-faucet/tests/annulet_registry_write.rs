@@ -11,7 +11,9 @@
 //! After each write all three nodes agree on the tip, the commitment root,
 //! the nullifiers, the supplies **and the registry root**, which is the root
 //! the write declared; a follower serves the new leaf; the payer detects both
-//! change notes; a replayed write is refused. 2 real R proves (≈ 3.5 GB each).
+//! change notes **and both seeds** (A3, lab #731: every write mints a 0-value
+//! note of the written asset to the writer — the note a first mint rides on);
+//! a replayed write is refused. 2 real R proves (≈ 3.5 GB each).
 
 use qlab_air::l2::{RegistryLeaf, MODE_HYBRID};
 use qlab_air::l2p::{issuer_key_of, CanonicalFreezeTree};
@@ -80,10 +82,17 @@ fn a_registry_write_registers_then_updates_and_converges_on_three_nodes() {
     let held = served(net.served[1]).registry_slot(ASSET).unwrap();
     assert_eq!((held.leaf, digest_bytes(&held.root)), (Some(updated), upd.new_root), "follower 1 serves the update");
 
-    // The payer finds both change notes through a follower.
+    // The payer finds both change notes and both seeds through a follower.
     let mine = follower.detect(&kem.dk, 1, v[2].state_tip).expect("the follower serves discovery");
     assert!(mine.contains(&reg.output) && mine.contains(&upd.output), "{mine:?}");
     assert_eq!((reg.output.value, reg.output.asset), (devnet::STOCK_NOTE_VALUE - tier_r, 0));
+    assert!(mine.contains(&reg.seed) && mine.contains(&upd.seed), "the registrant holds both seeds: {mine:?}");
+    for seed in [reg.seed, upd.seed] {
+        assert_eq!((seed.value, seed.asset, seed.rkm), (0, ASSET, payer.rkm()), "a 0-value note of asset 9 to the writer");
+    }
+    assert_eq!(mine.iter().filter(|n| n.asset == ASSET).count(), 2, "exactly the two seeds of asset 9");
+    // The seeds issue nothing: asset 9 has no outstanding supply.
+    assert!(v.iter().all(|x| x.supplies.iter().all(|(a, s)| *a != ASSET as u16 || *s == 0)), "{v:?}");
 
     // A replayed write is refused: its fee note is spent and its root is gone.
     assert!(seq.submit(&upd.tx).is_err());

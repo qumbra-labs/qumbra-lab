@@ -495,15 +495,16 @@ pub fn annulet_supply_delta(body: &BlockBody) -> std::collections::BTreeMap<u16,
 
 /// Lab #728 Q2: every Annulet surface declares the 2×2 bucket (the L1
 /// type's only L2 value — the Annulet prices by shape); the SHAPE gates the
-/// counts: S/P spend two and make two, R spends one and makes one. The one
-/// rule the body check and the mempool both apply (`index` names the tx).
+/// counts: S/P spend two and make two, R spends one and makes two — the fee
+/// change and the seed (A3, lab #731). The one rule the body check and the
+/// mempool both apply (`index` names the tx).
 pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: usize) -> Result<(), BodyError> {
     if public.bucket != ArityBucket::TwoByTwo {
         return Err(BodyError::L2NotTwoByTwo { index });
     }
     let (want_nf, want_cm) = match shape {
         L2ShapeTag::S | L2ShapeTag::P => (2, 2),
-        L2ShapeTag::R => (1, 1),
+        L2ShapeTag::R => (1, 2),
     };
     if public.nullifiers.len() != want_nf || public.commitments.len() != want_cm {
         return Err(match shape {
@@ -721,11 +722,11 @@ mod tests {
         }
     }
 
-    /// An R transaction: one nullifier, one commitment, at tier R.
+    /// An R transaction: one nullifier, two commitments (the fee change and
+    /// A3's seed), at tier R.
     fn r_tx(nf: u8, surface: &L2Surface) -> TxEntry {
         let mut t = l2_tx(nf, surface);
         t.public.nullifiers.truncate(1);
-        t.public.commitments.truncate(1);
         t.discovery = placeholder_discovery_annulet(&t.public.commitments);
         t
     }
@@ -788,6 +789,12 @@ mod tests {
         // A write that spends two notes.
         let wide = BlockBody::new(vec![l2_tx(1, &r_surface(new))], vec![]);
         assert_eq!(check_at(&wide, new), Err(BodyError::L2RegistryWriteArity { index: 0 }));
+        // A3: an R without its seed (A2's 1×1) is refused by the same name.
+        let mut unseeded = r_tx(1, &r_surface(new));
+        unseeded.public.commitments.truncate(1);
+        unseeded.discovery = placeholder_discovery_annulet(&unseeded.public.commitments);
+        let unseeded = BlockBody::new(vec![unseeded], vec![]);
+        assert_eq!(check_at(&unseeded, new), Err(BodyError::L2RegistryWriteArity { index: 0 }));
         // An S transaction with R's arity is still an S arity error.
         let narrow_s = BlockBody::new(vec![r_tx(1, &s_surface())], vec![]);
         assert_eq!(check_at(&narrow_s, [0x44; 32]), Err(BodyError::L2NotTwoByTwo { index: 0 }));

@@ -39,8 +39,8 @@ pub use qlab_air::l2p::{
     FLAG_REDEEM_OPEN, FREEZE_DEPTH, PV_VP1, PV_VP2,
 };
 pub use qlab_air::l2r::{
-    pv_vec_r, L2ShapeRAir, L2ShapeRInstance, RegistryWrite, PV_ASSET as PV_R_ASSET,
-    PV_NEW_ROOT as PV_R_NEW_ROOT, PV_OLD_ROOT as PV_R_OLD_ROOT,
+    pv_vec_r, L2ShapeRAir, L2ShapeRInstance, RegistryWrite, SeedOutput, PV_ASSET as PV_R_ASSET,
+    PV_CM_SEED as PV_R_CM_SEED, PV_NEW_ROOT as PV_R_NEW_ROOT, PV_OLD_ROOT as PV_R_OLD_ROOT,
 };
 
 pub mod digest;

@@ -502,12 +502,12 @@ fn write_9() -> ([u64; 15], Hash32) {
     (lanes, s.root_bytes())
 }
 
-/// An R transaction (mock-proved): one in, one out, at the R tier, proven
-/// against `old_root`, declaring `new_root` and the leaf.
+/// An R transaction (mock-proved): one in, two out (the fee change and A3's
+/// seed), at the R tier, proven against `old_root`, declaring `new_root` and
+/// the leaf.
 fn r_tx(n: &MemNode, nf: u8, old_root: Hash32, new_root: Hash32, leaf_lanes: [u64; 15]) -> TxEntry {
     let mut t = s_tx(n, nf);
     t.public.nullifiers.truncate(1);
-    t.public.commitments.truncate(1);
     t.public.fee = FEES.tier_r;
     t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
     t.l2 = L2Surface {

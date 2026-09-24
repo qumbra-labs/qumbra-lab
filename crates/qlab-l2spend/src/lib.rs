@@ -476,11 +476,14 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::S })
 }
 
-/// An assembled registry write (shape R) and its one output note.
+/// An assembled registry write (shape R) and its two output notes.
 pub struct BuiltR {
     pub tx: TxEntry,
     /// The fee change, to the payer.
     pub output: L2Note,
+    /// The seed (A3, lab #731): a 0-value note of the written asset, to the
+    /// payer — what an issuer's first mint of the asset rides on.
+    pub seed: L2Note,
     /// The registry root the write moves to (header bytes).
     pub new_root: [u8; 32],
 }
@@ -491,7 +494,8 @@ pub struct BuiltR {
 /// (`isk` is the issuer secret behind that leaf's `issuer_key`). One asset-0
 /// fee note pays `fee`; the change goes to `change`. The slot's opening and
 /// root come from `/v1/registry/slot/{asset}`, the fee note's witness from the
-/// served commitment tree. Proves (≈ 3.5 GB, under a second on the rig).
+/// served commitment tree. Every write also seeds a 0-value note of the
+/// written asset to `change` (A3). Proves (≈ 3.5 GB, under a second on the rig).
 pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
     served: &Served<E>,
     fee_input: &L2TxInput,
@@ -510,6 +514,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
     let slot = served.registry_slot(new_leaf.asset)?;
     let write = qlab_air::l2r::RegistryWrite { isk, old_leaf: slot.leaf, new_leaf, opening: slot.witness };
     let out = L2TxOutput { value: change_value, asset: 0, rkm: change.rkm, rho: [0; 4], rseed: random_d4(rng) };
+    let seed = qlab_air::l2r::SeedOutput { rkm: change.rkm, rseed: random_d4(rng) };
     let inst = qlab_air::l2r::build_shape_r_with_witnesses(
         qlab_l2::LOG_HEIGHT_R,
         fee_input,
@@ -518,6 +523,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
         &out,
         fee,
         &write,
+        &seed,
     );
     if inst.old_root != slot.root {
         return Err(SpendError::RegistryMoved);
@@ -526,9 +532,23 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
     // R's output takes the input's nullifier as its ρ (option 4, `ρ′₀ = nf₀`).
     let note = L2Note { value: out.value, asset: 0, rkm: out.rkm, rho: inst.nf, rseed: out.rseed };
     assert_eq!(note.commitment(), inst.cm_out, "the change note is the one the proof commits");
-    let enc = qlab_note::scan::encrypt_notes_to_recipient(&change.ek, std::slice::from_ref(&note), rng);
-    let discovery =
-        qlab_note::compact::encode_committed_discovery_with_width(std::slice::from_ref(&enc.bundle), &enc.payloads, L2_PAYLOAD_LEN);
+    // The seed's ρ is shape S's output-1 derivation over the nullifier.
+    let seed_note = L2Note {
+        value: 0,
+        asset: new_leaf.asset,
+        rkm: seed.rkm,
+        rho: qlab_air::narrow::derive_output_rho(&inst.nf, 1),
+        rseed: seed.rseed,
+    };
+    assert_eq!(seed_note.commitment(), inst.cm_seed, "the seed note is the one the proof commits");
+    let mut bundles = Vec::new();
+    let mut payloads = Vec::new();
+    for n in [&note, &seed_note] {
+        let enc = qlab_note::scan::encrypt_notes_to_recipient(&change.ek, std::slice::from_ref(n), rng);
+        bundles.push(enc.bundle);
+        payloads.extend(enc.payloads);
+    }
+    let discovery = qlab_note::compact::encode_committed_discovery_with_width(&bundles, &payloads, L2_PAYLOAD_LEN);
     let new_root = digest_bytes(&inst.new_root);
     let surface = L2Surface {
         shape: L2ShapeTag::R,
@@ -544,7 +564,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
         public: TxPublic {
             anchor: digest_bytes(&anchor),
             nullifiers: vec![digest_bytes(&inst.nf)],
-            commitments: vec![digest_bytes(&inst.cm_out)],
+            commitments: vec![digest_bytes(&inst.cm_out), digest_bytes(&inst.cm_seed)],
             bucket: ArityBucket::TwoByTwo,
             fee,
         },
@@ -552,7 +572,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
         l2: surface.encode(),
     };
-    Ok(BuiltR { tx, output: note, new_root })
+    Ok(BuiltR { tx, output: note, seed: seed_note, new_root })
 }
 
 /// **A shape-P transfer** (vPublic = 0) of two real inputs — a policy-asset

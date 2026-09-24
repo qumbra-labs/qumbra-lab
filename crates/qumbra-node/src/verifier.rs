@@ -129,7 +129,7 @@ impl L2Verifier {
         let arity_ok = p.bucket == ArityBucket::TwoByTwo
             && match surface.shape {
                 L2ShapeTag::S | L2ShapeTag::P => p.nullifiers.len() == 2 && p.commitments.len() == 2,
-                L2ShapeTag::R => p.nullifiers.len() == 1 && p.commitments.len() == 1,
+                L2ShapeTag::R => p.nullifiers.len() == 1 && p.commitments.len() == 2,
             };
         if !arity_ok {
             return Err(match surface.shape {
@@ -140,10 +140,11 @@ impl L2Verifier {
         let proof = decode_proof_strict(&entry.proof)?;
         let (anchor, root) = (digest_words(&p.anchor), digest_words(&surface.registry_root));
         if surface.shape == L2ShapeTag::R {
-            // Shape R (lab #728): one input, one output, the write's roots and
-            // the written slot (the new leaf's asset lane). The leaf itself is
-            // not a public value — the node binds it by applying it to its own
-            // tree and requiring `new_root`.
+            // Shape R (lab #728): one input, two outputs — the fee change and
+            // A3's seed (lab #731) — the write's roots and the written slot
+            // (the new leaf's asset lane). The leaf itself is not a public
+            // value — the node binds it by applying it to its own tree and
+            // requiring `new_root`.
             let Some(w) = surface.write else { return Err(L2VerifyError::SurfaceMalformed) };
             check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_R)?;
             let pvs = qlab_l2::pv_vec_r(
@@ -154,6 +155,7 @@ impl L2Verifier {
                 &root,
                 &digest_words(&w.new_root),
                 w.asset(),
+                &digest_words(&p.commitments[1]),
             );
             let verified = qlab_l2::verify_r(&qlab_l2::public_values(&pvs), &proof);
             return verified.then_some(()).ok_or(L2VerifyError::ProofInvalid);
