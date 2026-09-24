@@ -22,6 +22,8 @@ use qlab_devnet::pow::RandomXPow;
 use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
+use qlab_node::ChainStore;
+use qumbra_explorer::attest;
 use qumbra_explorer::blocks::{self, BlocksView};
 use qumbra_explorer::checkpoints;
 use qumbra_explorer::config::ExplorerConfig;
@@ -169,12 +171,21 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // Serialize once before binding, so the first request served is never blank —
     // the faucet's rule, kept across the split.
     let genesis_hash = genesis.hash_hex();
-    let page = Arc::new(RwLock::new(json::health(
+    let annulet = genesis.form()? == qlab_devnet::forms::GenesisForm::Annulet;
+    let page = Arc::new(RwLock::new(json::health_for_form(
         &node.telemetry(),
         &genesis_hash,
         cfg.refresh_secs,
         &genesis.network,
+        annulet,
     )));
+
+    // The per-asset attestation and the registry (lab #726), projected once
+    // pre-bind for the same first-read rule; re-projected when the tip moves.
+    // On an L1 chain each document says it does not apply.
+    let attest_page = Arc::new(RwLock::new(attest::attest_document(node.state())));
+    let assets_page = Arc::new(RwLock::new(attest::registry_document(node.state())));
+    let mut attest_tip = node.state().chain().tip_hash();
 
     // And project the transaction-existence view once for the same reason: the
     // first `/v1/txlist` read must be answered from the chain this process
@@ -233,6 +244,8 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
             vitals: Arc::clone(&vitals_page),
             blocks: Arc::clone(&blocks_view),
             names: Arc::clone(&names_view),
+            attest: Arc::clone(&attest_page),
+            assets: Arc::clone(&assets_page),
             degraded: Arc::clone(&degraded),
         },
         Arc::clone(&metrics),
@@ -275,6 +288,16 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         server.addr(),
         http::VITALS_PATH,
         vitals::SAMPLE_SECS
+    );
+    qlab_devnet::jprintln!(
+        "  attestation:    http://{}{}  (per-asset issuance, Annulet only — issuance ≠ reserves)",
+        server.addr(),
+        attest::ATTEST_PATH
+    );
+    qlab_devnet::jprintln!(
+        "  registry:       http://{}{}  (every registered asset's leaf, Annulet only)",
+        server.addr(),
+        attest::REGISTRY_PATH
     );
     qlab_devnet::jprintln!("  page:           served separately (qumbra-explorer-web) — no / here");
     match &metrics_server {
@@ -319,7 +342,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         let t = n.telemetry();
         let seen = json::fingerprint(&t);
         if last_seen != Some(seen) || last_render.elapsed() >= refresh {
-            let body = json::health(&t, &genesis_hash, cfg.refresh_secs, &genesis.network);
+            let body = json::health_for_form(&t, &genesis_hash, cfg.refresh_secs, &genesis.network, annulet);
             // 🔴 The loud swallow (lab #486 stage-1 scope): `publish` writes
             // THROUGH a poisoned lock — the projection never darks — and a
             // poison observation is logged once and latched into /healthz's
@@ -338,6 +361,18 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         // rule nobody asked for.
         txlist::refresh_shared(&txlist_view, n.state().chain());
         blocks::refresh_shared(&blocks_view, n.state().chain());
+        // The attestation re-folds the main chain when the tip moves (a reorg
+        // included — the fold walks tip to genesis, so nothing is patched).
+        let tip = n.state().chain().tip_hash();
+        if tip != attest_tip {
+            attest_tip = tip;
+            if http::publish(&attest_page, attest::attest_document(n.state())) {
+                note_poisoned(attest::ATTEST_PATH, &degraded);
+            }
+            if http::publish(&assets_page, attest::registry_document(n.state())) {
+                note_poisoned(attest::REGISTRY_PATH, &degraded);
+            }
+        }
         names::refresh_shared(&names_view, n.state().chain());
         // The finality ticker re-serializes only when the record moved — the
         // decision rule lives in the library (`checkpoints::refreshed_document`)
