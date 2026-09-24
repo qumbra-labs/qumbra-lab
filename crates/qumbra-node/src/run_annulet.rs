@@ -42,6 +42,8 @@ pub(super) struct AnnuletRun {
     empty_run: u64,
     /// `/v1/genesis/notes`, encoded once from the genesis file (lab #714).
     genesis_notes: Vec<u8>,
+    /// `/v1/annulet/params`, encoded once from the genesis file (lab #720).
+    params: Vec<u8>,
 }
 
 impl AnnuletRun {
@@ -52,6 +54,11 @@ impl AnnuletRun {
             max_empty_slots: file.params.max_empty_slots,
             last_slot: Instant::now(),
             empty_run: 0,
+            params: qlab_cbserver::registry::encode_annulet_params(&qlab_cbserver::registry::AnnuletParams {
+                genesis_hash: file.hash(),
+                fee_tier_s: file.params.fee_tier_s,
+                fee_tier_p: file.params.fee_tier_p,
+            }),
             genesis_notes: qlab_cbserver::registry::encode_genesis_notes(
                 &file.hash(),
                 &file
@@ -159,6 +166,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// node.
     pub fn genesis_notes_body(&self) -> Option<Vec<u8>> {
         self.annulet.as_ref().map(|a| a.genesis_notes.clone())
+    }
+
+    /// The `/v1/annulet/params` body (lab #720): `Some` exactly on an
+    /// Annulet node.
+    pub fn annulet_params_body(&self) -> Option<Vec<u8>> {
+        self.annulet.as_ref().map(|a| a.params.clone())
     }
 
     /// Whether this node is the Annulet producer.

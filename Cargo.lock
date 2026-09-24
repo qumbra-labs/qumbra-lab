@@ -1684,6 +1684,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-l2spend"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "qlab-air",
+ "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-l2",
+ "qlab-node",
+ "qlab-note",
+ "qlab-p2p",
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "qlab-ledger"
 version = "0.0.0"
 dependencies = [
@@ -1832,7 +1847,6 @@ dependencies = [
 name = "qumbra-faucet"
 version = "0.0.0"
 dependencies = [
- "bincode",
  "ctrlc",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1842,7 +1856,7 @@ dependencies = [
  "qlab-cbserver",
  "qlab-devnet",
  "qlab-faucet",
- "qlab-l2",
+ "qlab-l2spend",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",

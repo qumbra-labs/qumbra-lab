@@ -557,6 +557,10 @@ pub struct AnchorsView {
 /// The genesis-notes route (lab #714, B5) — GET only, Annulet nets only.
 pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
 
+/// The named refusal an L1 node answers `/v1/annulet/params` with (lab #720).
+pub const ANNULET_PARAMS_NOT_ON_L1: &str =
+    "Annulet params are served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #720)";
+
 /// The named refusal an L1 node answers `/v1/genesis/notes` with.
 pub const GENESIS_NOTES_NOT_ON_L1: &str =
     "genesis notes are served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #714)";
@@ -569,12 +573,15 @@ pub const GENESIS_NOTES_NOT_ON_L1: &str =
 pub struct FormView {
     pub form: qlab_devnet::forms::GenesisForm,
     pub genesis_notes: Option<Vec<u8>>,
+    /// `/v1/annulet/params` (lab #720): the fee tiers under the genesis hash,
+    /// encoded once; `None` on an L1 node.
+    pub annulet_params: Option<Vec<u8>>,
 }
 
 impl Default for FormView {
     /// An L1 (v4-wire) node: the historical server, which never had a form.
     fn default() -> Self {
-        Self { form: qlab_devnet::forms::GenesisForm::V4, genesis_notes: None }
+        Self { form: qlab_devnet::forms::GenesisForm::V4, genesis_notes: None, annulet_params: None }
     }
 }
 
@@ -827,6 +834,12 @@ impl DiscoveryServer {
                     GENESIS_NOTES_PATH => match &form_view.genesis_notes {
                         Some(bytes) => Ok(bytes.clone()),
                         None => Err((400, GENESIS_NOTES_NOT_ON_L1.to_string())),
+                    },
+                    // Lab #720: the fee tiers a wallet pays exactly. A pure
+                    // route addition (no RPC_VERSION bump, PR #315's rule).
+                    qlab_cbserver::registry::ANNULET_PARAMS_PATH => match &form_view.annulet_params {
+                        Some(bytes) => Ok(bytes.clone()),
+                        None => Err((400, ANNULET_PARAMS_NOT_ON_L1.to_string())),
                     },
                     // Lab #710: the registry routes (root, and an opening by
                     // asset id in the path).
