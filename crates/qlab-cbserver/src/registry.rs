@@ -304,6 +304,31 @@ mod tests {
     /// Lab #724: the registry invariant — slot `i` holds the empty digest or a
     /// leaf of asset `i` — holds for a built tree, and a tree whose slot
     /// carries another asset's leaf is refused by name.
+    /// Shape R's host-side opener (`qlab_air::l2r::registry_opening`, which
+    /// the fixtures and benches write with) is this tree: same root, same
+    /// siblings and path bits for every registered slot — and for an empty
+    /// slot, the opening a registration needs, whose fold of the zero digest
+    /// is this tree's root and of the new leaf the root after the write.
+    #[test]
+    fn shape_r_opener_agrees_with_the_tree() {
+        use qlab_air::l2r::registry_opening;
+        let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(5), hybrid(7), RegistryLeaf::cloaked(65_535)];
+        let t = RegistryTree::from_leaves(&leaves).unwrap();
+        for l in &leaves {
+            let (w, root) = registry_opening(&leaves, l.asset);
+            let tw = t.witness(l.asset as u16).unwrap();
+            assert_eq!(root, t.root());
+            assert_eq!((w.siblings, w.path_bits), (tw.siblings, tw.path_bits), "asset {}", l.asset);
+        }
+        let (w, root) = registry_opening(&leaves, 6);
+        assert_eq!(root, t.root());
+        assert_eq!(w.fold_root(&[0; 4]), t.root(), "slot 6 is empty: the zero digest folds to the root");
+        let mut after = leaves.to_vec();
+        after.push(hybrid(6));
+        let t2 = RegistryTree::from_leaves(&after).unwrap();
+        assert_eq!(w.fold_root(&hybrid(6).hash()), t2.root(), "the registration's new root");
+    }
+
     #[test]
     fn slot_i_holds_only_a_leaf_of_asset_i() {
         let leaves = [RegistryLeaf::cloaked(0), hybrid(7), RegistryLeaf::cloaked(65_535)];
