@@ -225,11 +225,13 @@ impl Served {
         }
     }
 
-    /// Submit a transaction on the Annulet tx wire.
+    /// Submit a transaction on the Annulet tx wire. `202 accepted` and
+    /// `200 duplicate` (already pending — retry-safe by the route's design)
+    /// are both success; everything else is the node's named refusal.
     pub fn submit(&self, tx: &TxEntry) -> Result<(), AnnuletError> {
         let wire = qlab_p2p::codec::encode_tx_annulet(tx);
         match self.request("POST", "/v1/tx", &wire)? {
-            (200, _) => Ok(()),
+            (202, _) | (200, _) => Ok(()),
             (_, body) => Err(AnnuletError::Refused(String::from_utf8_lossy(&body).into_owned())),
         }
     }
