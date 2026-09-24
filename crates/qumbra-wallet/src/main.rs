@@ -460,9 +460,15 @@ fn usage() {
                 of a non-fee asset cannot be merged in 2x2). Nothing is written to\n\
                 the wallet dir. A policy asset's sender passes the issuer's\n\
                 published freeze list with --freeze-list FILE (a frozen address is\n\
-                refused before anything is proved). `issuer keygen|freeze|mint|\n\
-                redeem --asset N` are the issuer's verbs (lab #722; the secret stays\n\
-                in this wallet dir's issuer.v1). --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
+                refused before anything is proved). `issuer keygen|freeze|allow|mint|\n\
+                redeem|register|update --asset N` are the issuer's verbs (lab #722,\n\
+                #730; the secret stays in this wallet dir's issuer.v1). `register\n\
+                --mode cloaked|hybrid|regulated` writes a new asset into an empty\n\
+                registry slot, `update` changes a held leaf (--freeze-list,\n\
+                --allow-list, --mode, --redeem-open|--redeem-closed, --rotate-key),\n\
+                and `freeze add|remove --publish` puts the new root on chain; each\n\
+                write pays one asset-0 note (change back) and returns a 0-value seed\n\
+                note of the asset, which a first mint rides on. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
                 against any endpoint you do not trust, because without it the\n\
                 wallet reports whatever Annulet chain the endpoint serves\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
@@ -1185,6 +1191,56 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
             Err(e) => Err(e.into()),
         }
     };
+    let allow_list = |path: &str| -> Result<Vec<[u64; 4]>, Box<dyn Error>> {
+        match std::fs::read_to_string(path) {
+            Ok(t) => Ok(qumbra_wallet::issuer::read_allow_list(&t)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    // A registry write (lab #730): the session's inputs, and the policy flags.
+    type WriteCtx = (WalletDir, qumbra_wallet::annulet_send::WalletEndpoint, u64, Option<[u8; 32]>, StdRng);
+    let write_ctx = || -> Result<WriteCtx, Box<dyn Error>> {
+        let dir = dir_of(args)?;
+        let url = flag(args, "--url").ok_or("a registry write requires --url")?;
+        let scan_to: u64 = flag(args, "--scan-to").ok_or("requires --scan-to HEIGHT")?.parse()?;
+        let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+        let mut seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut seed);
+        Ok((WalletDir::open(&dir)?, qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() }, scan_to, pin, StdRng::from_seed(seed)))
+    };
+    let policy = || -> Result<qumbra_wallet::issuer::LeafPolicy, Box<dyn Error>> {
+        let mode = match flag(args, "--mode") {
+            Some(m) => Some(qumbra_wallet::issuer::parse_mode(m).ok_or("--mode is cloaked, hybrid or regulated")?),
+            None => None,
+        };
+        let redeem_open = match (has_flag(args, "--redeem-open"), has_flag(args, "--redeem-closed")) {
+            (true, true) => return Err("--redeem-open and --redeem-closed contradict".into()),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        };
+        Ok(qumbra_wallet::issuer::LeafPolicy {
+            mode,
+            freeze_keys: flag(args, "--freeze-list").map(list).transpose()?,
+            allow_creds: flag(args, "--allow-list").map(allow_list).transpose()?,
+            redeem_open,
+        })
+    };
+    let report_write = |verb: &str, r: &qumbra_wallet::issuer::RegistryReport| {
+        println!(
+            "{verb} asset {} ({} leaf); registry root now {}",
+            r.leaf.asset,
+            ["cloaked", "hybrid", "regulated"].get(r.leaf.mode as usize).unwrap_or(&"?"),
+            r.new_root.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        println!("issuer_key = {}", lanes_hex(&r.leaf.issuer_key));
+        println!(
+            "change {} fee units back; seed: a 0-value note of asset {} (a first mint rides on it)",
+            r.change.value, r.seed.asset
+        );
+        println!("(every pooled spend bound to the old root is evicted: holders re-read the leaf and re-prove)");
+    };
     match args.first().map(String::as_str) {
         Some("keygen") => {
             let dir = dir_of(args)?;
@@ -1214,7 +1270,56 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
                 _ => return Err("issuer freeze add|remove|root".into()),
             };
             println!("freeze list: {} key(s); root {}", keys.len(), lanes_hex(&root));
-            println!("(publishing a new root on chain needs a registry transaction — A2/C4; until then the genesis root is in force)");
+            if has_flag(args, "--publish") {
+                let (w, endpoint, scan_to, pin, mut rng) = write_ctx()?;
+                let p = qumbra_wallet::issuer::LeafPolicy { freeze_keys: Some(keys), ..Default::default() };
+                let r = qumbra_wallet::issuer::issuer_update(&w, endpoint, asset()?, &p, false, scan_to, pin, &mut rng)?;
+                report_write("published the freeze root of", &r);
+            } else {
+                println!("(local until published: `issuer freeze … --publish --asset N --url … --scan-to …`)");
+            }
+            Ok(())
+        }
+        Some("allow") => {
+            let path = flag(args, "--list").ok_or("issuer allow requires --list FILE (the published list)")?;
+            let creds = allow_list(path)?;
+            let (creds, root) = match args.get(1).map(String::as_str) {
+                Some(verb @ ("add" | "remove")) => {
+                    let addr = flag(args, "--address").ok_or("issuer allow add/remove requires --address ADDR")?;
+                    let addr = qlab_wallet::address::Address::decode(addr).ok_or("--address is not a wallet address")?;
+                    let (creds, root) = qumbra_wallet::issuer::allow_update(&creds, &addr, verb == "add");
+                    std::fs::write(path, qumbra_wallet::issuer::write_allow_list(&creds))?;
+                    (creds, root)
+                }
+                Some("root") => {
+                    let t = qlab_air::l2p::CanonicalAllowTree::from_creds(&creds);
+                    (t.creds, t.root)
+                }
+                _ => return Err("issuer allow add|remove|root".into()),
+            };
+            println!("allow list: {} credential(s); root {}", creds.len(), lanes_hex(&root));
+            if has_flag(args, "--publish") {
+                let (w, endpoint, scan_to, pin, mut rng) = write_ctx()?;
+                let p = qumbra_wallet::issuer::LeafPolicy { allow_creds: Some(creds), ..Default::default() };
+                let r = qumbra_wallet::issuer::issuer_update(&w, endpoint, asset()?, &p, false, scan_to, pin, &mut rng)?;
+                report_write("published the allow root of", &r);
+            }
+            Ok(())
+        }
+        Some("register") => {
+            let (w, endpoint, scan_to, pin, mut rng) = write_ctx()?;
+            let r = qumbra_wallet::issuer::issuer_register(&w, endpoint, asset()?, &policy()?, scan_to, pin, &mut rng)?;
+            report_write("registered", &r);
+            Ok(())
+        }
+        Some("update") => {
+            let (w, endpoint, scan_to, pin, mut rng) = write_ctx()?;
+            let rotate = has_flag(args, "--rotate-key");
+            let r = qumbra_wallet::issuer::issuer_update(&w, endpoint, asset()?, &policy()?, rotate, scan_to, pin, &mut rng)?;
+            report_write("updated", &r);
+            if rotate {
+                println!("(the new issuer secret is pending in issuer.v1 and becomes the one in force once the chain shows it)");
+            }
             Ok(())
         }
         Some(verb @ ("mint" | "redeem")) => {
@@ -1246,7 +1351,7 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        _ => Err("issuer keygen|freeze|mint|redeem (lab #722)".into()),
+        _ => Err("issuer keygen|freeze|allow|mint|redeem|register|update (lab #722, #730)".into()),
     }
 }
 

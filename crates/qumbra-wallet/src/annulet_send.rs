@@ -82,6 +82,18 @@ pub enum SendRefusal {
     NoIssuerNote { asset: u16 },
     /// The issuer file could not be read.
     Issuer(String),
+    /// A registration into a slot that already holds a leaf (C4a, lab #730).
+    SlotTaken { asset: u16 },
+    /// An update of a slot that holds no leaf.
+    SlotEmpty { asset: u16 },
+    /// The leaf asked for is not one shape R writes (mode ⇒ roots, asset 0,
+    /// a Cloaked asset with a policy list …) — refused before proving.
+    LeafRefused(String),
+    /// No asset-0 note of at least the R tariff to pay a registry write.
+    NoRegistryFeeNote { tariff: u64 },
+    /// Another registry write was pooled or landed first: this one binds a
+    /// root that is gone. Re-read the slot and write again.
+    RegistryRaced(String),
 }
 
 impl std::fmt::Display for SendRefusal {
@@ -118,6 +130,25 @@ impl std::fmt::Display for SendRefusal {
                  the genesis seeds one; an issuer that spends its last one cannot mint again)"
             ),
             SendRefusal::Issuer(e) => write!(f, "issuer file: {e}"),
+            SendRefusal::SlotTaken { asset } => write!(
+                f,
+                "registry slot {asset} already holds a leaf: a registration writes an empty slot (an issuer \
+                 changes its own leaf with `issuer update`)"
+            ),
+            SendRefusal::SlotEmpty { asset } => {
+                write!(f, "registry slot {asset} holds no leaf: register it first")
+            }
+            SendRefusal::LeafRefused(why) => write!(f, "the registry leaf is refused before proving: {why}"),
+            SendRefusal::NoRegistryFeeNote { tariff } => write!(
+                f,
+                "no asset-0 note of at least {tariff} (the registry-write tariff) to pay with; the change \
+                 comes back, so any note that large will do"
+            ),
+            SendRefusal::RegistryRaced(node) => write!(
+                f,
+                "another registry write was pooled or landed first, so this one binds a registry root that is \
+                 gone ({node}); re-read the slot and write again"
+            ),
             SendRefusal::SplitNotIncluded { waited_secs } => write!(
                 f,
                 "the fee-split was admitted but its note was not in the served tree after {waited_secs} s; \
