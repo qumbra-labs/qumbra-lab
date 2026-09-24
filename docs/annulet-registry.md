@@ -50,11 +50,20 @@ GET /v1/registry/slot/{asset}  →  ver ‖ height ‖ root(32) ‖ slot(u16 LE)
 - The genesis file and its hash do not move: the header binds the notes' body commitment, not the tree root.
 - Found on the way: `restore_from_snapshot` appended the snapshot's commitments onto a tree that already held the genesis notes. It now appends only what follows the held prefix.
 
+## Registry writes (B3b, lab #728)
+
+- **One write per block, carried whole.** Shape R's 185-B surface is `0x03 ‖ old_root ‖ new_root ‖ the new leaf's 15 lanes`. The body rule allows at most one R per block; the header's `registry_root` is the root *after* the block (the write's `new_root`, or the parent's when nothing is written); every surface in the block binds the root *before* it.
+- **The node writes the leaf it was shown.** `apply_state` computes the registry after the block before any mutation: the write must be proven against this node's root (`RegistryWriteNotOnParent`), writing its leaf must reach the declared root (`RegistryWriteRootMismatch`), the slot must be writable (`RegistryWrite` — asset 0 is pinned), and the header must carry the result (`RegistryRootMismatch`). Each is refused by name with state untouched. A cheap parent check runs before proofs are verified.
+- **The pool admits only a write that will apply**, and one at a time: a write whose leaf does not reach its root is `RegistryWriteInvalid`, a second write is `RegistryWriteAlreadyPooled`. When a write lands, every pooled surface still bound to the old root is evicted. (Pooling a write that cannot apply would fail the producer's own block every slot, with nothing to evict it.)
+- **The producer** sets the header root from the template's write.
+- **Genesis supply** (Q7): the genesis notes' issuance is outstanding from height 0, so a redeem of genesis supply is not an underflow. A genesis note that does not open its commitment is refused (`GenesisIssuance`).
+- **Q6, the genesis-file invariant, is a demonstration:** a genesis registry record has no slot field. It is placed at its own asset lane, so "asset 9's leaf at slot 10" cannot be written. The nearest expressible attempt, a repeated asset, is refused by `verify` (`a_genesis_registry_record_can_only_sit_at_its_own_slot`).
+
 ## Goldens and how they were computed
 
 | golden | value | computed by |
 |---|---|---|
-| fixture Annulet genesis hash (unchanged) | `a73f547d…ead2` | B2's pin; unchanged across the delegation, so it proves byte-identity |
+| fixture Annulet genesis hash (unchanged in B3) | `a73f547d…ead2` | B2's pin; unchanged across the delegation, so it proves byte-identity. *(B3b re-pinned it to `85dd805d…6cce`, 3,055 B, when `fee_tier_r` joined `AnnuletParams`; devnet `831de12f…e9ef` → `00c70e55…7e03`, 5,238 B. Named run ×2 each, byte-identical.)* |
 | registry root body (41 B) | hex literal | independent Python encoder over synthetic digests |
 | registry opening body (673 B) | hex literal | independent Python encoder over synthetic digests |
 | commitment-tree root over leaves `[1;32], [2;32], [3;32]` | `b358f03f…2bae` | independent Python Keccak-f[1600]: self-checked against Keccak-256(""), and its empty tree reproduces `qlab-cbserver`'s existing `27ae5ba0…d757`. *(B3b: pinned on the tree directly. The node test's genesis notes are real plaintexts now — the node seeds supply from them — so the genesis anchor is asserted equal to the tree over their commitments in order.)* |

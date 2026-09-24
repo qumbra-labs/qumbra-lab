@@ -168,3 +168,47 @@ fn what_cannot_run_is_refused_by_name() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Lab #728 Q7, on the devnet genesis: USDT-test's genesis issuance is
+/// outstanding from height 0, so redeeming all of it applies (it was refused
+/// as an underflow before B3b), one unit more is refused by name, and the
+/// audit recomputes the same figure the node holds.
+#[test]
+fn the_devnet_genesis_usdt_test_is_redeemable() {
+    use qumbra_node::annulet_genesis::devnet;
+    let dir = std::env::temp_dir().join(format!("qumbra-audit-supply-usdt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let g = AnnuletGenesisFile::devnet();
+    let usdt = devnet::USDT_TEST_ASSET as u16;
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let mut n = MemNode::open_annulet(
+        &dir,
+        g.genesis_block_header(),
+        &g.notes(),
+        g.params.fee_table(),
+        &registry_leaves(&g.registry_genesis),
+    )
+    .expect("open the devnet genesis");
+    assert_eq!(n.outstanding_supply(usdt), devnet::HOLDER_USDT_VALUE as i128, "genesis issuance, from height 0");
+    let parent = g.genesis_block_header();
+    let seal = |body: &BlockBody| {
+        key.seal(BlockHeader::child_of_annulet(&parent, parent.timestamp + 10, ext(&g), body_commitment_annulet(body)))
+    };
+    let over = BlockBody::new(vec![p_tx(&n, &g, 30, term(true, devnet::HOLDER_USDT_VALUE + 1, usdt))], vec![]);
+    match n.apply_sealed_block(&seal(&over), over, &OkProof) {
+        Err(qlab_node::NodeError::SupplyUnderflow { asset, outstanding, .. }) => {
+            assert_eq!((asset, outstanding), (usdt, devnet::HOLDER_USDT_VALUE as i128));
+        }
+        other => panic!("expected SupplyUnderflow past the genesis issuance, got {other:?}"),
+    }
+    let all = BlockBody::new(vec![p_tx(&n, &g, 32, term(true, devnet::HOLDER_USDT_VALUE, usdt))], vec![]);
+    n.apply_sealed_block(&seal(&all), all, &OkProof).expect("the genesis issuance is redeemable");
+    assert_eq!(n.outstanding_supply(usdt), 0);
+    let (node_out, node_deltas) = (n.outstanding_supplies().clone(), n.supply_deltas().clone());
+    drop(n);
+    let r = audit_with_claim(&dir, &g, None).expect("audits");
+    assert_eq!(r.ledger.outstanding().get(&usdt), Some(&0));
+    let d = r.ledger.compare_with_node(&node_out, &node_deltas);
+    assert!(d.is_empty(), "the audit and the node agree: {d:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

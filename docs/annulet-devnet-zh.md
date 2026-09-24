@@ -8,7 +8,7 @@ Annulet 开发网由一个 sequencer、两个 follower 和一个手续费单位�
 
 ## 里面有什么
 
-- **开发网 genesis**，即 `AnnuletGenesisFile::devnet()`。它是确定性的，哈希已钉住：`831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef`（5,230 B），`examples/annulet_devnet_genesis` 跑两次，逐字节一致。*（C3 重新钉住，lab #722：原来是 `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`。`USDT-test` 的冻结树根从带种子的测试夹具树，换成了规范的空树，任何钱包都能按发行方公开的名单自己重建。）*内容：
+- **开发网 genesis**，即 `AnnuletGenesisFile::devnet()`。它是确定性的，哈希已钉住：`00c70e55c95e8f6519e956884bf6ffc56476fe1b3cd196983a46e1f4221d7e03`（5,238 B），`examples/annulet_devnet_genesis` 跑两次，逐字节一致。*（B3b 重新钉住，lab #728：genesis 参数里加了 `fee_tier_r`；原来是 `831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef`，5,230 B。）* *（C3 重新钉住，lab #722：原来是 `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`。`USDT-test` 的冻结树根从带种子的测试夹具树，换成了规范的空树，任何钱包都能按发行方公开的名单自己重建。）*内容：
   - 注册表里有两种资产：asset 0（Cloaked），以及 asset 1 上的 `USDT-test`（Hybrid，开发用发行方密钥，冻结树为空）；
   - 16 张**库存票据**，每张正好够一次发放，都发给水龙头的 `rkm`。一张库存票据价值 `tier_p + tier_s` = 3，一次发放把它整张花掉：2 给申请人，1 是 S 手续费。不找零，也不回收；
   - 一张 genesis 铸出的 `USDT-test` 票据（1,000,000），归开发用的 **holder** 密钥。
