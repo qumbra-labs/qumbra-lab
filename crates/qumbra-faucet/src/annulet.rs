@@ -230,10 +230,18 @@ impl Served {
     /// are both success; everything else is the node's named refusal.
     pub fn submit(&self, tx: &TxEntry) -> Result<(), AnnuletError> {
         let wire = qlab_p2p::codec::encode_tx_annulet(tx);
-        match self.request("POST", "/v1/tx", &wire)? {
-            (202, _) | (200, _) => Ok(()),
-            (_, body) => Err(AnnuletError::Refused(String::from_utf8_lossy(&body).into_owned())),
-        }
+        let (status, body) = self.request("POST", "/v1/tx", &wire)?;
+        submit_verdict(status, &body)
+    }
+}
+
+/// Read `POST /v1/tx`'s answer. The route is one for every form
+/// (`render_submit_outcome`): `202 accepted <txid>` and `200 duplicate <txid>`
+/// are success; any other status is the node's named refusal, carried whole.
+pub fn submit_verdict(status: u16, body: &[u8]) -> Result<(), AnnuletError> {
+    match status {
+        202 | 200 => Ok(()),
+        _ => Err(AnnuletError::Refused(String::from_utf8_lossy(body).into_owned())),
     }
 }
 
@@ -543,4 +551,26 @@ fn grant_verdict(
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qumbra_node::discovery_server::{render_submit_outcome, TxRefusal, TxSubmitOutcome};
+
+    /// The client reads the node's own renderings (lab #716: it once took only
+    /// `200`, so the node's `202 accepted` read as a refusal).
+    #[test]
+    fn the_client_reads_every_submit_rendering_the_node_produces() {
+        let txid = [0xA5; 32];
+        let (code, body) = render_submit_outcome(&TxSubmitOutcome::Accepted { txid });
+        assert!(submit_verdict(code, body.as_bytes()).is_ok(), "{code} {body}");
+        let (code, body) = render_submit_outcome(&TxSubmitOutcome::Duplicate { txid });
+        assert!(submit_verdict(code, body.as_bytes()).is_ok(), "{code} {body}");
+        let (code, body) = render_submit_outcome(&TxSubmitOutcome::Refused(TxRefusal::RepeatedNullifier));
+        match submit_verdict(code, body.as_bytes()) {
+            Err(AnnuletError::Refused(text)) => assert_eq!(text, body),
+            other => panic!("a refusal is carried whole: {other:?}"),
+        }
+    }
 }
