@@ -133,6 +133,15 @@ where
     }
 }
 
+/// Where the nullifier stream must start for owned genesis notes: height 1
+/// is the first a genesis note can be spent in, and height 0 when the scan
+/// starts there — so a chain still at its genesis (tip 0) is covered by the
+/// genesis block itself rather than asked for a height 1 that does not
+/// exist yet (lab #722: C3's first lane run, a mint at tip 0 read `NoBalance`).
+fn genesis_from(from: u64) -> u64 {
+    from.min(1)
+}
+
 /// One address's row: its scan, or why the scan never started.
 pub struct AnnuletRow {
     pub index: u64,
@@ -207,14 +216,15 @@ where
     }
 
     // The nullifier stream must cover everything the owned notes could have
-    // been spent in: a genesis note from height 1 on.
+    // been spent in: a genesis note from height 1 on (from 0 when the scan
+    // starts at 0, which also covers a chain still at its genesis).
     let outputs = widest_range(
         rows.iter()
             .filter_map(|r| r.scan.as_ref().ok())
             .map(|o| o.stats.compact_range_served)
-            .chain(std::iter::once((genesis_owned > 0).then_some((1, 1)))),
+            .chain(std::iter::once((genesis_owned > 0).then_some((genesis_from(from), genesis_from(from))))),
     );
-    let nf_from = if genesis_owned > 0 { from.min(1) } else { from };
+    let nf_from = if genesis_owned > 0 { genesis_from(from) } else { from };
     let source = FetchNullifiers(RefCell::new(fetch));
     let (spent, set): (SpentCoverage, Option<SpentSet>) = coverage_for(&source, nf_from, to, outputs);
 
