@@ -105,6 +105,9 @@ serde_json = { version = "1", optional = true }
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
 qumbra-node = { path = "../qumbra-node" }
+# Lab #730 C4b: the e2e reads each node's `/v1/attest` document through the
+# explorer's own code (`qumbra_explorer::attest::attest_document`). Dev-only.
+qumbra-explorer = { path = "../qumbra-explorer" }
 # Lab #631: `tests/http_framing.rs` drives the wallet's public GET against a
 # real `tiny_http` on a loopback port. Same `=` pin as every other HTTP
 # surface in the tree. Dev-only — the shipped binary's graph is unchanged.

@@ -460,6 +460,18 @@ pub fn issuer_update<E: Endpoint>(
 pub struct IssueReport {
     pub outputs: [qlab_note::l2note::L2Note; 2],
     pub split_fee_note: Option<qlab_note::l2note::L2Note>,
+    /// **Re-armed** (C4b, lab #730): the issuance left this wallet holding a
+    /// note of the asset — what the next mint rides on. A mint rides one
+    /// issuer-held note of the asset and returns its value to the issuer, so a
+    /// mint re-arms itself; when this is `false` the next mint needs a note
+    /// of the asset first — a registry update (`issuer update`) seeds one.
+    pub rearmed: bool,
+}
+
+/// Whether `outputs` leave `w` holding a note of `asset` (the re-arm check).
+fn rearmed(w: &WalletDir, outputs: &[qlab_note::l2note::L2Note; 2], asset: u16) -> bool {
+    let mine = me(w).rkm;
+    outputs.iter().any(|n| n.asset == u64::from(asset) && n.rkm == mine)
 }
 
 /// **Mint** `amount` of `asset` to `to`, on the row of an issuer-held note of
@@ -500,7 +512,8 @@ pub fn issuer_mint<E: Endpoint>(
         rng,
     )?;
     session.served.submit(&built.tx)?;
-    Ok(IssueReport { outputs: built.outputs, split_fee_note: split })
+    let rearmed = rearmed(w, &built.outputs, asset);
+    Ok(IssueReport { outputs: built.outputs, split_fee_note: split, rearmed })
 }
 
 /// **Redeem** `amount` of `asset` from a note this wallet holds: with the
@@ -550,7 +563,8 @@ pub fn redeem<E: Endpoint>(
         rng,
     )?;
     session.served.submit(&built.tx)?;
-    Ok(IssueReport { outputs: built.outputs, split_fee_note: split })
+    let rearmed = rearmed(w, &built.outputs, asset);
+    Ok(IssueReport { outputs: built.outputs, split_fee_note: split, rearmed })
 }
 
 #[cfg(test)]
