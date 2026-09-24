@@ -956,7 +956,9 @@ mod tests {
         p.prev = [9; 32];
         assert_eq!(check(p), Err(ValidationError::UnknownParent));
         let rr = BlockHeader { ext: HeaderExt::Annulet(AnnuletHeaderFields { registry_root: [0x45; 32], ..ext(3) }), ..good };
-        assert_eq!(check(rr), Err(ValidationError::RegistryRootChanged));
+        // Lab #728: a header may move the registry root (a registry write);
+        // the body rule and the node's apply bind it, not the header check.
+        assert_eq!(check(rr), Ok(()));
         // Anchor regression needs a parent with a non-zero anchor.
         let mut chain3 = chain.clone();
         let parent = key.seal(good);

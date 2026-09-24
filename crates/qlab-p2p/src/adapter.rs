@@ -2397,7 +2397,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             ValidationError::NotAnnuletHeader => "invalid header: not an Annulet header",
             ValidationError::PowFieldsOnAnnulet => "invalid header: pow fields on Annulet",
             ValidationError::AnchorRegressed { .. } => "invalid header: l1 anchor regressed",
-            ValidationError::RegistryRootChanged => "invalid header: registry root changed",
             ValidationError::BadSeal => "invalid header: bad sequencer seal",
         }
     }
