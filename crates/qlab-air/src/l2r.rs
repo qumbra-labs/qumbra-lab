@@ -1236,7 +1236,8 @@ pub fn build_shape_r_with_witnesses(
         };
         put(ROLE_MO, fold_w(&d_old));
         if lvl == REGISTRY_DEPTH - 1 {
-            put(ROLE_BREG_OLD, L2RSlotWitness::default());
+            // BREG_OLD carries level 16's path bit across to MN_16.
+            put(ROLE_BREG_OLD, L2RSlotWitness { pbit: bit, ..Default::default() });
         }
         put(ROLE_MN, fold_w(&d_new));
         d_old = node(&d_old);
@@ -1675,5 +1676,538 @@ impl L2ShapeRAir {
             }
         }
         state
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use p3_air::check_constraints;
+    use p3_koala_bear::KoalaBear;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_matrix::Matrix;
+
+    use super::*;
+    use crate::l2::{MODE_CLOAKED, MODE_HYBRID, MODE_REGULATED};
+    use crate::l2p::issuer_key_of;
+    use crate::l2test::{self, Violation};
+    use crate::reference;
+
+    type F = KoalaBear;
+
+    fn pvs_of(inst: &L2ShapeRInstance) -> Vec<F> {
+        inst.pvs.iter().map(|v| F::from_u32(*v)).collect()
+    }
+    fn digest(state: &[u64; 25]) -> [u64; 4] {
+        state[..4].try_into().unwrap()
+    }
+    fn slot_of(program: &[u32; PROGRAM_SLOTS], role: u32, nth: usize) -> usize {
+        program.iter().enumerate().filter(|(_, r)| **r == role).map(|(i, _)| i).nth(nth).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // The cost model is `l2::tests`' (lab #700 baton 3): the two honest
+    // instances are generated and scanned once for the module; every UNSAT
+    // claim stops at its first violation, the scan starting at the perm the
+    // tamper targets. Each negative also PINS that perm: a refusal anywhere
+    // else would be a different claim than the one the test names.
+    // -----------------------------------------------------------------------
+
+    /// The first violation, visiting the program tail-first up to and
+    /// including perm `slot` — a scheduling hint only (`l2test::scan`).
+    fn first_violation_near(inst: &L2ShapeRInstance, trace: &RowMajorMatrix<F>, pvs: &[F], slot: usize) -> Option<Violation> {
+        l2test::first_violation(&inst.air, trace, pvs, (slot + 1) * ROWS_PER_PERM)
+    }
+    /// An UNSAT claim refused **at perm `slot`**.
+    fn assert_refused_at(inst: &L2ShapeRInstance, slot: usize, what: &str) {
+        let trace = inst.air.generate_trace::<F>(0);
+        assert_trace_refused_at(inst, &trace, &pvs_of(inst), slot, what);
+    }
+    fn assert_trace_refused_at(inst: &L2ShapeRInstance, trace: &RowMajorMatrix<F>, pvs: &[F], slot: usize, what: &str) {
+        match first_violation_near(inst, trace, pvs, slot) {
+            None => panic!("{what} VERIFIED"),
+            Some(v) => assert_eq!(
+                v.row / ROWS_PER_PERM,
+                slot,
+                "{what}: refused, but at {v} (perm {}), not at perm {slot}",
+                v.row / ROWS_PER_PERM
+            ),
+        }
+    }
+
+    struct Fixture {
+        inst: L2ShapeRInstance,
+        trace: RowMajorMatrix<F>,
+        pvs: Vec<F>,
+        verdict: Result<(), Violation>,
+    }
+    impl Fixture {
+        fn new(inst: L2ShapeRInstance) -> Self {
+            let pvs = pvs_of(&inst);
+            let trace = inst.air.generate_trace::<F>(0);
+            let verdict = l2test::satisfied(&inst.air, &trace, &pvs);
+            Fixture { inst, trace, pvs, verdict }
+        }
+        fn assert_sat(&self, what: &str) {
+            if let Err(v) = &self.verdict {
+                panic!("{what}: constraints not satisfied on {v}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The registry and the fee spend every instance shares.
+    // -----------------------------------------------------------------------
+
+    const ISK0: [u64; 4] = [0x1500, 0x1501, 0x1502, 0x1503];
+    const ISK7: [u64; 4] = [0x7a11, 0x7a12, 0x7a13, 0x7a14];
+    const ISK7B: [u64; 4] = [0x7b21, 0x7b22, 0x7b23, 0x7b24];
+    const ISK9: [u64; 4] = [0x9c31, 0x9c32, 0x9c33, 0x9c34];
+    /// Any 256 bits — a registration's isk is never checked.
+    const ISK_NONE: [u64; 4] = [0xdead, 0xbeef, 0xf00d, 0xcafe];
+
+    fn leaf(asset: u64, isk: &[u64; 4], mode: u64, freeze_root: [u64; 4], allow_root: [u64; 4], flags: u64) -> RegistryLeaf {
+        RegistryLeaf { asset, issuer_key: issuer_key_of(isk), mode, freeze_root, allow_root, flags }
+    }
+    /// The registry before every write: asset 0 (Cloaked, with an issuer so
+    /// the asset-0 negative has a key to prove), asset 7 (Hybrid, a freeze
+    /// root published), asset 8 (Cloaked). Slot 9 is empty and its level-0
+    /// sibling (slot 8) is not.
+    fn registry() -> Vec<RegistryLeaf> {
+        vec![
+            leaf(0, &ISK0, MODE_CLOAKED, [0; 4], [0; 4], 0),
+            leaf(7, &ISK7, MODE_HYBRID, [0xf1, 0xf2, 0xf3, 0xf4], [0; 4], 1),
+            leaf(8, &ISK_NONE, MODE_CLOAKED, [0; 4], [0; 4], 0),
+        ]
+    }
+    fn leaf_of(asset: u64) -> RegistryLeaf {
+        *registry().iter().find(|l| l.asset == asset).unwrap()
+    }
+
+    const FEE: u64 = 7;
+    /// The fee spend: 100 in asset 0 → 93 out in asset 0 + fee 7.
+    fn fee_parts() -> (L2TxInput, L2TxOutput) {
+        let input = L2TxInput {
+            sk: [0x5a1, 0x5a2, 0x5a3, 0x5a4],
+            value: 100,
+            asset: 0,
+            rho: [0x6b1, 0x6b2, 0x6b3, 0x6b4],
+            rseed: [0x7c1, 0x7c2, 0x7c3, 0x7c4],
+            d: [0x8d1, 0x8d2],
+        };
+        let output = L2TxOutput {
+            value: 100 - FEE,
+            asset: 0,
+            rkm: [0x9e1, 0x9e2, 0x9e3, 0x9e4],
+            rho: [0; 4], // overridden: ρ = nf
+            rseed: [0xaf1, 0xaf2, 0xaf3, 0xaf4],
+        };
+        (input, output)
+    }
+
+    /// A write at `slot` of the shared registry.
+    fn write_at(slot: u64, isk: [u64; 4], old_leaf: Option<RegistryLeaf>, new_leaf: RegistryLeaf) -> RegistryWrite {
+        RegistryWrite { isk, old_leaf, new_leaf, opening: registry_opening(&registry(), slot).0 }
+    }
+    fn instance(write: &RegistryWrite) -> L2ShapeRInstance {
+        let (fin, fout) = fee_parts();
+        build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, write)
+    }
+    /// A registration of `new` into its own (empty) slot.
+    fn register(new: RegistryLeaf) -> L2ShapeRInstance {
+        instance(&write_at(new.asset, ISK_NONE, None, new))
+    }
+    /// An update of asset 7 with `isk`.
+    fn update7(isk: [u64; 4], new: RegistryLeaf) -> L2ShapeRInstance {
+        instance(&write_at(7, isk, Some(leaf_of(7)), new))
+    }
+
+    /// Registration: asset 9 as Regulated, both policy roots and a flag set.
+    fn register_leaf() -> RegistryLeaf {
+        leaf(9, &ISK9, MODE_REGULATED, [1, 2, 3, 4], [5, 6, 7, 8], 3)
+    }
+    /// Update: asset 7 rotates its issuer_key and publishes a new freeze root.
+    fn update_leaf() -> RegistryLeaf {
+        leaf(7, &ISK7B, MODE_HYBRID, [0xa1, 0xa2, 0xa3, 0xa4], [0; 4], 1)
+    }
+
+    static REGISTER: OnceLock<Fixture> = OnceLock::new();
+    fn register_fixture() -> &'static Fixture {
+        REGISTER.get_or_init(|| Fixture::new(register(register_leaf())))
+    }
+    static UPDATE: OnceLock<Fixture> = OnceLock::new();
+    fn update_fixture() -> &'static Fixture {
+        UPDATE.get_or_init(|| Fixture::new(update7(ISK7, update_leaf())))
+    }
+
+    /// Program slots of the roles the negatives pin.
+    fn at(role: u32) -> usize {
+        slot_of(&register_fixture().inst.air.program, role, 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Geometry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn l2r_chain_only_satisfies_constraints() {
+        let air = L2ShapeRAir::chain_only(10);
+        let trace = air.generate_trace::<F>(0);
+        check_constraints(&air, &trace, &vec![F::ZERO; PV_LEN]);
+    }
+
+    /// Width 726, every column named. Engine and M3 machinery as `l2.rs`
+    /// (491 up to the selectors), then shape R's own.
+    #[test]
+    fn l2r_trace_width_is_read_off_the_matrix() {
+        let air = L2ShapeRAir::chain_only(10);
+        let trace = air.generate_trace::<F>(0);
+        assert_eq!(trace.width(), L2R_WIDTH, "width must be the matrix's own");
+        let engine = 402; // narrow's Keccak-f engine, verbatim
+        let machinery = 24 + 4 + 32 + 20 + 5 + 4; // PB, PH, PR (32 limbs), D, RB, LO
+        let roles = 17 // SEL: 11 of S's roles + AISS, AREG_OLD/NEW, MO, MN, BREG_OLD/NEW
+            + 6 // INJ: mrk+nf, ank, arkm, acm, acmout, aiss
+            + 4 // INJOLD, INJNEW, MOB, MNB (the split leaf / MERKLE_W flags)
+            + 1 // G4
+            + 1 // NFB
+            + 7 // CL: arkm, acm, acmout, bal, mo, mn, areg_old
+            + 1 // BGCAP
+            + 5; // BGC: banchor, bnf1, bcm1, breg_old, breg_new
+        let witness = 1 + 15 + 25; // PBIT, W, EFF
+        let banks = 16 // BQ
+            + 32 // EQ: banks 1 (nk) and 2 (ρ)
+            + 16 // EQ3: output ρ = nf
+            + 4 + 9; // BL + BLC: the one balance chain
+        let registry = 16 * 4 // C_old, C_new, SIB, ISS
+            + 2 // POW, PACC
+            + 3 // AC_OLD, AC_NEW, MC
+            + 6; // REG, DC, DR, MINV, RINV, AINV
+        assert_eq!(machinery, 89);
+        assert_eq!(roles, 42);
+        assert_eq!(registry, 75);
+        assert_eq!(trace.width(), engine + machinery + roles + witness + banks + registry);
+        assert_eq!(trace.width(), 726, "the shape-R width");
+        // Sibling sharing, option (ii) — a 16-accumulator equality per level
+        // instead of the one SIB bank closed at every MN — would be 15 × 16 =
+        // 240 columns more: 966.
+        assert_eq!(trace.width() + 15 * 16, 966);
+    }
+
+    /// Max constraint degree 4 (the ruling's ceiling), 4 quotient chunks. The
+    /// degree-4 population: the 17 role selectors, the two REG-gated banks
+    /// (C_old's seed, ISS: 16 each), the path-bit tie, the PACC step and the
+    /// three mode closes (the cubic and the two nonzero-inverse legs).
+    #[test]
+    fn l2r_quotient_degree_is_4() {
+        use p3_air::symbolic::{get_max_constraint_degree, get_symbolic_constraints, AirLayout};
+        let air = L2ShapeRAir::chain_only(SHAPE_R_LOG_HEIGHT);
+        let deg = get_max_constraint_degree::<F, _>(&air, AirLayout::from_air::<F>(&air));
+        assert_eq!(deg, 4, "max constraint degree — degree 5 is a stop-point (lab #724)");
+        assert_eq!((deg - 1).next_power_of_two(), 4, "quotient chunks");
+        let cs = get_symbolic_constraints::<F, _>(&air, AirLayout::from_air::<F>(&air));
+        let deg4 = cs.iter().filter(|c| c.degree_multiple() == 4).count();
+        assert_eq!(deg4, 17 + 16 + 16 + 1 + 1 + 3, "deg-4 constraints");
+    }
+
+    /// 79 perms in 2^18, one ring period (no epoch), the program as documented.
+    #[test]
+    fn l2r_program_geometry() {
+        // (Fits 2^18 and one ring period: the module's const asserts.)
+        assert_eq!(SHAPE_R_PERMS, 79);
+        let p = &register_fixture().inst.air.program;
+        let mut want = vec![ROLE_DUMMY, ROLE_ANK, ROLE_NF, ROLE_BNF1, ROLE_ARKM, ROLE_ACM];
+        want.extend(std::iter::repeat_n(ROLE_MERKLE, MERKLE_DEPTH));
+        want.extend([ROLE_BANCHOR, ROLE_ACMOUT, ROLE_BCM1, ROLE_AISS, ROLE_AREG_OLD, ROLE_AREG_NEW]);
+        for _ in 0..REGISTRY_DEPTH - 1 {
+            want.extend([ROLE_MO, ROLE_MN]);
+        }
+        want.extend([ROLE_MO, ROLE_BREG_OLD, ROLE_MN, ROLE_BREG_NEW, ROLE_BAL]);
+        assert_eq!(want.len(), SHAPE_R_PERMS);
+        assert_eq!(&p[..SHAPE_R_PERMS], &want[..]);
+        assert!(p[SHAPE_R_PERMS..].iter().all(|r| *r == ROLE_DUMMY));
+        // Role codes stay unique across the family: R's four new ones are
+        // above shape P's 17..=22.
+        for code in [ROLE_AREG_NEW, ROLE_MO, ROLE_MN, ROLE_BREG_NEW] {
+            assert!(code > 22 && code < 32);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Positives
+    // -----------------------------------------------------------------------
+
+    /// Registration into an empty slot: asset 9, Regulated, both policy roots
+    /// and a flag set. The public roots are the registry's before and after.
+    #[test]
+    fn l2r_registration_satisfies_constraints() {
+        let fx = register_fixture();
+        assert!(fx.inst.air.reg);
+        let before = registry();
+        let mut after = before.clone();
+        after.push(register_leaf());
+        assert_eq!(fx.inst.old_root, registry_opening(&before, 9).1, "old root = the registry's");
+        assert_eq!(fx.inst.new_root, registry_opening(&after, 9).1, "new root = the registry with the leaf");
+        assert_ne!(fx.inst.old_root, fx.inst.new_root);
+        fx.assert_sat("registration of asset 9 (Regulated, both roots) at 2^18");
+    }
+
+    /// Update: asset 7 rotates its issuer_key (isk proven for the OLD key) and
+    /// publishes a new freeze root.
+    #[test]
+    fn l2r_update_satisfies_constraints() {
+        let fx = update_fixture();
+        assert!(!fx.inst.air.reg);
+        let before = registry();
+        let after: Vec<RegistryLeaf> =
+            before.iter().map(|l| if l.asset == 7 { update_leaf() } else { *l }).collect();
+        assert_eq!(fx.inst.old_root, registry_opening(&before, 7).1);
+        assert_eq!(fx.inst.new_root, registry_opening(&after, 7).1);
+        fx.assert_sat("update of asset 7 (key rotation + new freeze root) at 2^18");
+    }
+
+    /// The chain the AIR advances is the reference one, read off the
+    /// registration fixture's trace: AISS, both leaf blocks, both roots.
+    #[test]
+    fn l2r_registry_chain_matches_reference() {
+        let fx = register_fixture();
+        let out_of = |role: u32| digest(&L2ShapeRAir::extract_state(&fx.trace, 24 * (at(role) + 1)));
+        assert_eq!(out_of(ROLE_AISS), issuer_key_of(&ISK_NONE), "AISS = H(isk ‖ D_I)");
+        assert_eq!(out_of(ROLE_AREG_OLD), RegistryLeaf { asset: 0, issuer_key: [0; 4], mode: 0, freeze_root: [0; 4], allow_root: [0; 4], flags: 0 }.hash());
+        assert_eq!(out_of(ROLE_AREG_NEW), register_leaf().hash(), "the new leaf block");
+        // Slot 9 is odd: MO_1 folds the empty slot as the right child.
+        let w = registry_opening(&registry(), 9).0;
+        assert!(w.path_bits[0]);
+        assert_eq!(out_of(ROLE_MO), digest(&reference::merkle_node_state(&w.siblings[0], &[0; 4])));
+        let breg_old = at(ROLE_BREG_OLD);
+        let breg_new = at(ROLE_BREG_NEW);
+        assert_eq!(digest(&L2ShapeRAir::extract_state(&fx.trace, 24 * breg_old)), fx.inst.old_root);
+        assert_eq!(digest(&L2ShapeRAir::extract_state(&fx.trace, 24 * breg_new)), fx.inst.new_root);
+        // The fee output's ρ is the input's nullifier.
+        let (fin, fout) = fee_parts();
+        let (_, nf, _) = derive_input_l2(&fin);
+        assert_eq!(fx.inst.nf, nf);
+        assert_eq!(fx.inst.cm_out, l2_cm(fout.value, 0, &fout.rkm, &nf, &fout.rseed));
+    }
+
+    // -----------------------------------------------------------------------
+    // Negatives — the ruling's list. Each is a complete forgery where one
+    // exists (public values republished to match), refused at a pinned perm.
+    // -----------------------------------------------------------------------
+
+    /// 🔴 Registration over a live leaf: "register" asset 7 into slot 7. The
+    /// builder folds the zero digest, so its old root is not the registry's;
+    /// published against the registry's real root, the old-root bind refuses.
+    #[test]
+    fn l2r_neg_register_over_a_live_leaf() {
+        let mut inst = register(leaf(7, &ISK9, MODE_CLOAKED, [0; 4], [0; 4], 0));
+        let real = registry_opening(&registry(), 7).1;
+        assert_ne!(inst.old_root, real, "slot 7 is live: the empty-slot fold is another root");
+        for (k, c) in pv_chunks(&real).iter().enumerate() {
+            inst.pvs[PV_OLD_ROOT + k] = *c;
+        }
+        assert_refused_at(&inst, at(ROLE_BREG_OLD), "a registration over a live leaf");
+    }
+
+    /// 🔴 Update without the issuer's secret: a wrong isk for asset 7.
+    #[test]
+    fn l2r_neg_update_with_a_wrong_isk() {
+        update_fixture().assert_sat("precondition: the right isk verifies");
+        let inst = update7(ISK7B, update_leaf());
+        assert_refused_at(&inst, at(ROLE_AREG_OLD), "an update with the NEW key's isk");
+        let inst = update7(ISK_NONE, update_leaf());
+        assert_refused_at(&inst, at(ROLE_AREG_OLD), "an update with an unrelated isk");
+    }
+
+    /// 🔴 Update that skips the isk by claiming a registration: REG = 1 on a
+    /// live slot needs the old fold to start from the empty digest — the
+    /// same refusal as registering over a live leaf, reached from the trace.
+    #[test]
+    fn l2r_neg_update_disguised_as_registration() {
+        let fx = update_fixture();
+        let mut inst = fx.inst.clone();
+        inst.air.reg = true;
+        assert_refused_at(&inst, at(ROLE_MO), "an update with REG = 1");
+    }
+
+    /// 🔴 mode ⇒ roots, each leg, with the declarations honest (refused on
+    /// AREG_NEW's rows) and lied (refused at the registry close).
+    #[test]
+    fn l2r_neg_mode_implies_roots() {
+        let anew = at(ROLE_AREG_NEW);
+        let rclose = at(ROLE_BREG_NEW);
+        let cases: [(&str, RegistryLeaf, usize, u64); 3] = [
+            ("Cloaked with a freeze root", leaf(9, &ISK9, MODE_CLOAKED, [1, 0, 0, 0], [0; 4], 0), DC_COL, 0),
+            ("Cloaked with a flag", leaf(9, &ISK9, MODE_CLOAKED, [0; 4], [0; 4], 1), DC_COL, 0),
+            ("Hybrid with an allow root", leaf(9, &ISK9, MODE_HYBRID, [0; 4], [0, 0, 0, 1 << 63], 0), DR_COL, 1),
+        ];
+        for (what, bad, col, lie) in cases {
+            let inst = register(bad);
+            let trace = inst.air.generate_trace::<F>(0);
+            let pvs = pvs_of(&inst);
+            assert_trace_refused_at(&inst, &trace, &pvs, anew, what);
+            // The declaration lied so the per-row leg is off: the close refuses.
+            let mut lied = trace;
+            for row in 0..lied.height() {
+                lied.values[row * L2R_WIDTH + col] = F::from_u64(lie);
+            }
+            assert_trace_refused_at(&inst, &lied, &pvs, rclose, &format!("{what}, declaration lied"));
+        }
+        // Regulated takes both roots — the registration fixture.
+        register_fixture().assert_sat("Regulated with both roots");
+    }
+
+    /// 🔴 The mode lane is 0, 1 or 2: 3 fails the cubic at the close, 4 (a
+    /// bit above the two) fails on AREG_NEW's rows.
+    #[test]
+    fn l2r_neg_mode_out_of_range() {
+        let inst = register(leaf(9, &ISK9, 3, [0; 4], [0; 4], 0));
+        assert_refused_at(&inst, at(ROLE_BREG_NEW), "mode 3");
+        let inst = register(leaf(9, &ISK9, 4, [0; 4], [0; 4], 0));
+        assert_refused_at(&inst, at(ROLE_AREG_NEW), "mode 4");
+    }
+
+    /// 🔴 Asset 0 is never writable — even by the holder of its isk.
+    #[test]
+    fn l2r_neg_asset_0_is_not_writable() {
+        let new0 = leaf(0, &ISK7B, MODE_CLOAKED, [0; 4], [0; 4], 0);
+        let inst = instance(&write_at(0, ISK0, Some(leaf_of(0)), new0));
+        assert_refused_at(&inst, at(ROLE_BREG_NEW), "an update of asset 0 with its isk");
+    }
+
+    /// 🔴 The planting registration: asset 9's leaf into the EMPTY slot 10 —
+    /// a complete, consistent write of a tree that would break the registry
+    /// invariant S and P rely on. Only path = asset refuses it.
+    #[test]
+    fn l2r_neg_planting_registration() {
+        let planted = register_leaf();
+        let inst = instance(&write_at(10, ISK_NONE, None, planted));
+        assert_eq!(inst.old_root, registry_opening(&registry(), 10).1, "honest old root: slot 10 is empty");
+        assert_refused_at(&inst, at(ROLE_BREG_NEW), "asset 9's leaf planted at slot 10");
+    }
+
+    /// 🔴 An update cannot move an asset: in a (planted, invariant-breaking)
+    /// tree holding asset 9's leaf at slot 7, rewriting slot 7 as asset 7
+    /// with 9's isk is refused by `AC_OLD = AC_NEW`.
+    #[test]
+    fn l2r_neg_update_changes_the_asset() {
+        let squatter = leaf(9, &ISK9, MODE_CLOAKED, [0; 4], [0; 4], 0);
+        let mut tree = registry();
+        tree.retain(|l| l.asset != 7);
+        let (mut opening, _) = registry_opening(&tree, 7);
+        opening.path_bits = core::array::from_fn(|l| (7u64 >> l) & 1 == 1);
+        let write = RegistryWrite {
+            isk: ISK9,
+            old_leaf: Some(squatter),
+            new_leaf: leaf(7, &ISK9, MODE_CLOAKED, [0; 4], [0; 4], 0),
+            opening,
+        };
+        assert_refused_at(&instance(&write), at(ROLE_BREG_NEW), "an update from asset 9 to asset 7");
+    }
+
+    /// Recompute the new chain from AREG_NEW's leaf through every MN's own
+    /// (path bit, sibling), rewrite the MN digests and republish the new root
+    /// — a tamper of MN's witness leaves the new fold internally consistent.
+    fn republish_new_chain(inst: &mut L2ShapeRInstance) {
+        let p = inst.air.program;
+        let anew = slot_of(&p, ROLE_AREG_NEW, 0);
+        let w = inst.air.slot_witness[anew].w;
+        let mut d = RegistryLeaf {
+            asset: w[13],
+            issuer_key: w[..4].try_into().unwrap(),
+            mode: w[4],
+            freeze_root: w[5..9].try_into().unwrap(),
+            allow_root: w[9..13].try_into().unwrap(),
+            flags: w[14],
+        }
+        .hash();
+        for lvl in 0..REGISTRY_DEPTH {
+            let s = slot_of(&p, ROLE_MN, lvl);
+            let sw = &mut inst.air.slot_witness[s];
+            sw.w[4..8].copy_from_slice(&d);
+            let sib: [u64; 4] = sw.w[..4].try_into().unwrap();
+            let st = if sw.pbit {
+                reference::merkle_node_state(&sib, &d)
+            } else {
+                reference::merkle_node_state(&d, &sib)
+            };
+            d = digest(&st);
+        }
+        inst.new_root = d;
+        for (k, c) in pv_chunks(&d).iter().enumerate() {
+            inst.pvs[PV_NEW_ROOT + k] = *c;
+        }
+    }
+
+    /// 🔴 The new fold on another path than the old: MN_4's path bit flipped
+    /// (the new root republished) — refused by the MO → MN path-bit tie.
+    /// Level 16's tie runs across BREG_OLD, so it is tampered too.
+    #[test]
+    fn l2r_neg_new_fold_on_another_path() {
+        for lvl in [3usize, REGISTRY_DEPTH - 1] {
+            let mut inst = update_fixture().inst.clone();
+            let s = slot_of(&inst.air.program, ROLE_MN, lvl);
+            inst.air.slot_witness[s].pbit ^= true;
+            republish_new_chain(&mut inst);
+            // The tie fires on the last row of the perm before MN.
+            assert_refused_at(&inst, s - 1, &format!("MN level {} on another path", lvl + 1));
+        }
+    }
+
+    /// 🔴 Reordered siblings: MN_3 and MN_4 swap siblings (the new root
+    /// republished) — the SIB bank refuses at MN_3's close.
+    #[test]
+    fn l2r_neg_reordered_siblings() {
+        let mut inst = update_fixture().inst.clone();
+        let (s3, s4) = (slot_of(&inst.air.program, ROLE_MN, 2), slot_of(&inst.air.program, ROLE_MN, 3));
+        let a3: [u64; 4] = inst.air.slot_witness[s3].w[..4].try_into().unwrap();
+        let a4: [u64; 4] = inst.air.slot_witness[s4].w[..4].try_into().unwrap();
+        assert_ne!(a3, a4);
+        inst.air.slot_witness[s3].w[..4].copy_from_slice(&a4);
+        inst.air.slot_witness[s4].w[..4].copy_from_slice(&a3);
+        republish_new_chain(&mut inst);
+        assert_refused_at(&inst, s3, "the new fold with levels 3/4's siblings swapped");
+    }
+
+    /// 🔴 A published asset id that is not the written slot's.
+    #[test]
+    fn l2r_neg_asset_public_value_lie() {
+        let fx = register_fixture();
+        let mut pvs = fx.pvs.clone();
+        pvs[PV_ASSET] = F::from_u32(10);
+        assert_trace_refused_at(&fx.inst, &fx.trace, &pvs, at(ROLE_BREG_NEW), "PV_ASSET = 10 for a write of 9");
+    }
+
+    /// 🔴 The fee spend: an output worth more than the input minus the fee;
+    /// a fee paid in asset 7; an output ρ that is not the nullifier (the
+    /// commitment republished to match it).
+    #[test]
+    fn l2r_neg_fee_spend() {
+        let write = write_at(9, ISK_NONE, None, register_leaf());
+        let (fin, mut fout) = fee_parts();
+        fout.value += 1;
+        let inst = build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, &write);
+        assert_refused_at(&inst, at(ROLE_BAL), "100 in, 94 out + fee 7");
+
+        let (mut fin, mut fout) = fee_parts();
+        fin.asset = 7;
+        fout.asset = 7;
+        let inst = build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, &write);
+        assert_refused_at(&inst, at(ROLE_ACM), "the fee paid in asset 7");
+
+        let mut inst = register_fixture().inst.clone();
+        let s = at(ROLE_ACMOUT);
+        let rho = [0x1111, 0x2222, 0x3333, 0x4444];
+        inst.air.slot_witness[s].w[5..9].copy_from_slice(&rho);
+        let (_, fout) = fee_parts();
+        let cm = l2_cm(fout.value, 0, &fout.rkm, &rho, &fout.rseed);
+        for (k, c) in pv_chunks(&cm).iter().enumerate() {
+            inst.pvs[PV_CM + k] = *c;
+        }
+        assert_refused_at(&inst, s, "an output ρ that is not the nullifier");
     }
 }
