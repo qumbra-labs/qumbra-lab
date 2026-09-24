@@ -687,6 +687,12 @@ pub fn scan_fetch(base_url: &str) -> impl FnMut(&str) -> Result<Vec<u8>, String>
 /// payload. Turning them into `io::Error` would discard exactly the typed
 /// vocabulary A1 was chosen for.
 fn http_post(base_url: &str, path: &str, body: &[u8]) -> std::io::Result<(u16, String)> {
+    http_post_bytes(base_url, path, body).map(|(s, b)| (s, String::from_utf8_lossy(&b).trim().to_string()))
+}
+
+/// [`http_post`] with the body as bytes and no trimming (lab #720: the L2
+/// spend assembly's endpoint reads the node's verdict itself).
+pub fn http_post_bytes(base_url: &str, path: &str, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
     use std::io::Write;
 
     let (mut stream, host) = connect(base_url)?;
@@ -699,8 +705,7 @@ fn http_post(base_url: &str, path: &str, body: &[u8]) -> std::io::Result<(u16, S
     stream.write_all(body)?;
     stream.flush()?;
 
-    let (status, bytes) = read_response(stream.as_mut())?;
-    Ok((status, String::from_utf8_lossy(&bytes).trim().to_string()))
+    read_response(stream.as_mut())
 }
 
 #[cfg(test)]

@@ -450,10 +450,14 @@ fn usage() {
                 the balance transactions-only, and the report says so)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\
-         --net  annulet (scan only, lab #718) — the Annulet L2 net: the scan reads\n\
+         --net  annulet (scan and send, lab #718/#720) — the Annulet L2 net: it reads\n\
                 /v1/genesis/notes first and REFUSES an endpoint that does not serve\n\
                 an Annulet chain; balances are per asset (asset 0 = fee units, not\n\
-                QMB); no coinbase. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
+                QMB); no coinbase. `send --net annulet --asset N --amount V --to ADDR`\n\
+                pays an exact-tariff asset-0 fee note (split off a larger one first\n\
+                when there is none) and moves at most one note of the asset (notes\n\
+                of a non-fee asset cannot be merged in 2x2). Nothing is written to\n\
+                the wallet dir. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
                 against any endpoint you do not trust, because without it the\n\
                 wallet reports whatever Annulet chain the endpoint serves\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
@@ -609,8 +613,8 @@ fn resolve_net(
         // it before this function is reached. Every other command here is an
         // L1 flow (send, history, names), and the L2 send path is C2's.
         "annulet" if matches!(source, NetSource::Flag) => Err(
-            "--net annulet is accepted by `scan` only (lab #718): send, history and names are \
-             L1 flows here, and the L2 send path is not built yet"
+            "--net annulet is accepted by `scan` and `send` only (lab #718/#720): history and names \
+             are L1 flows here"
                 .into(),
         ),
         other => Err(match source {
@@ -833,6 +837,11 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// double-claimed nullifiers (#244's discipline, untouched).
 fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_wallet::spend::{execute, SendError, SendRequest, SendStep};
+
+    // Lab #720: the Annulet send — its own flow, before any L1 file is read.
+    if flag(args, "--net") == Some("annulet") {
+        return send_annulet_cmd(args);
+    }
 
     let dir = dir_of(args)?;
     let url = flag(args, "--url").ok_or("send requires --url (compact/scan endpoint)")?;
@@ -1155,6 +1164,51 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `send --net annulet` (lab #720): scan, plan (fee-split first when there is
+/// no exact-tariff fee note), prove, submit. Writes nothing to the wallet dir.
+fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("send --net annulet requires --url (the node's discovery server)")?;
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
+    let asset: u16 = flag(args, "--asset")
+        .ok_or("send --net annulet requires --asset N (0 is the fee unit)")?
+        .parse()
+        .map_err(|_| "--asset must be a registry index below 65536")?;
+    let amount: u64 = flag(args, "--amount").ok_or("send requires --amount")?.parse()?;
+    let to = flag(args, "--to").ok_or("send --net annulet requires --to ADDRESS")?;
+    let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
+    let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    let w = WalletDir::open(&dir)?;
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    eprintln!(
+        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
+        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
+    );
+    let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
+    let report = qumbra_wallet::annulet_send::send_annulet(
+        &w,
+        endpoint,
+        asset,
+        amount,
+        &to,
+        scan_to,
+        pin,
+        std::time::Duration::from_secs(120),
+        &mut rng,
+    )?;
+    if let Some(fee) = report.split_fee_note {
+        println!("fee-split: made an exact-tariff fee note of {} (asset 0) first", fee.value);
+    }
+    println!(
+        "sent {amount} of asset {asset} (shape {:?}); change {} back to this wallet",
+        report.shape, report.outputs[1].value
+    );
+    Ok(())
+}
+
 /// `scan --net annulet` (lab #718): verify the endpoint serves an Annulet
 /// chain (and the pinned genesis, when `--genesis-hash` is given), scan at the
 /// L2 width, and report per asset.
@@ -1386,12 +1440,12 @@ mod tests {
         assert_eq!(resolve_net(None, None).unwrap(), (GenesisForm::V4, NetSource::Fallback));
     }
 
-    /// Lab #718: `--net annulet` belongs to `scan`; every other command here
-    /// is an L1 flow and refuses it by name rather than running L1 rules.
+    /// Lab #718/#720: `--net annulet` belongs to `scan` and `send`; every other
+    /// command here is an L1 flow and refuses it by name.
     #[test]
     fn net_annulet_outside_scan_is_refused_by_name() {
         let err = resolve_net(Some("annulet"), None).unwrap_err().to_string();
-        assert!(err.contains("accepted by `scan` only"), "{err}");
+        assert!(err.contains("accepted by `scan` and `send` only"), "{err}");
     }
 
     #[test]
