@@ -218,7 +218,11 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // the faucet's rule, kept across the split.
     let genesis_hash = genesis_hash_hex(&genesis);
     let network = genesis_network(&genesis).to_string();
-    let annulet = genesis_form(&genesis)? == qlab_devnet::forms::GenesisForm::Annulet;
+    // Exhaustive by rule (lab #706): a new form must decide here.
+    let annulet = match genesis_form(&genesis)? {
+        qlab_devnet::forms::GenesisForm::Annulet => true,
+        qlab_devnet::forms::GenesisForm::V4 | qlab_devnet::forms::GenesisForm::V5 => false,
+    };
     let page = Arc::new(RwLock::new(json::health_for_form(
         &node.telemetry(),
         &genesis_hash,
