@@ -30,15 +30,27 @@
 //!   the fee asset — S's input chain once, one output, balance `in = out + fee`
 //!   on one borrow chain, both notes asset 0. The output's `ρ` is the input's
 //!   nullifier (option 4's `ρ′₀ = nf₀`; the third bank, one window).
+//! - **the seed** (A3, lab #731, ruled on #730): every write — registration
+//!   and update alike, no `REG` mux — also creates a **0-value note of the
+//!   written asset** to the writer. A mint rides an input row of its asset and
+//!   no transaction can create an asset's first note otherwise, so without it a
+//!   runtime-registered asset could never be minted (and an issuer who spent
+//!   every note of an asset could never mint it again). The seed's `ρ` is S's
+//!   output-1 derivation `H(nf ‖ D_P|1)` (`ARHO`, its `nf` tied to the public
+//!   one through bank 3), injected from the chain into `ACMOUT2`; its value is
+//!   zero bit by bit, its asset equals the new leaf's at the registry close,
+//!   and its commitment is bound to a public value by `BCM2`.
 //!
-//! Public values: `anchor ‖ nf ‖ cm ‖ fee ‖ old_root ‖ new_root ‖ asset`.
+//! Public values: `anchor ‖ nf ‖ cm ‖ fee ‖ old_root ‖ new_root ‖ asset ‖
+//! cm_seed`.
 //!
-//! ### Program order (79 perms → 2^18)
+//! ### Program order (82 perms → 2^18)
 //!
 //! ```text
 //! [DUMMY]
 //! ANK → NF → BNF1 → ARKM → ACM → 32×MERKLE → BANCHOR          the fee input
 //! ACMOUT → BCM1                                               the fee output
+//! ARHO → ACMOUT2 → BCM2                                       the seed output
 //! AISS → AREG_OLD → AREG_NEW                                  isk, both leaves
 //! (MO_i → MN_i) for i = 1..15 → MO_16 → BREG_OLD → MN_16 → BREG_NEW
 //! BAL
@@ -70,13 +82,13 @@
 //!
 //! ### No epoch
 //!
-//! 79 perms fit one period of the 128-slot program ring at 2^18 (85.3 perms),
+//! 82 perms fit one period of the 128-slot program ring at 2^18 (85.3 perms),
 //! so there is no wrapped second program for S's epoch column to switch off —
 //! R has no `EP`, `GWRAP`, `SE` or `ROLE_END`. A taller trace only adds rows
 //! whose gates re-fire against the same public values: more constraints on
 //! the prover, never fewer.
 //!
-//! ### Column accounting: 726 — see `l2r_trace_width_is_read_off_the_matrix`.
+//! ### Column accounting: 734 — see `l2r_trace_width_is_read_off_the_matrix`.
 
 use std::collections::BTreeMap;
 
@@ -86,12 +98,12 @@ use p3_matrix::dense::RowMajorMatrix;
 
 use crate::l2::{
     derive_input_l2, l2_cm, L2TxInput, L2TxOutput, RegistryLeaf, RegistryWitness, ASSET_BITS,
-    REGISTRY_DEPTH, ROLE_ACM, ROLE_ACMOUT, ROLE_ANK, ROLE_AREG, ROLE_ARKM, ROLE_BAL,
-    ROLE_BANCHOR, ROLE_BCM1, ROLE_BNF1, ROLE_BREG, ROLE_DUMMY, ROLE_MERKLE, ROLE_NF,
+    REGISTRY_DEPTH, ROLE_ACM, ROLE_ACMOUT, ROLE_ANK, ROLE_AREG, ROLE_ARHO, ROLE_ARKM, ROLE_BAL,
+    ROLE_BANCHOR, ROLE_BCM1, ROLE_BCM2, ROLE_BNF1, ROLE_BREG, ROLE_DUMMY, ROLE_MERKLE, ROLE_NF,
     ROWS_PER_PERM,
 };
 use crate::l2p::ROLE_AISS;
-use crate::narrow::{fabricated_single_tree, pv_chunks, MerkleWitness, MERKLE_DEPTH};
+use crate::narrow::{derive_output_rho, fabricated_single_tree, pv_chunks, MerkleWitness, MERKLE_DEPTH};
 use crate::reference::{RC, RHO};
 
 // ---------------------------------------------------------------------------
@@ -123,24 +135,26 @@ const ROLE_BITS: usize = 5;
 const D_OFF: usize = PR_OFF + PR_LIMBS; // 462: 20: bit-decomposition of PR[0]
 const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 482: 5: current perm's role bits
 const LO_OFF: usize = RB_OFF + ROLE_BITS; // 487: 4: materialized low half-selectors
-const NSEL: usize = 17; // materialized role selectors, order = SEL_CODES
+const NSEL: usize = 20; // materialized role selectors, order = SEL_CODES
 const SEL_OFF: usize = LO_OFF + 4; // 491
-/// Injection flags [mrk+nf, ank, arkm, acm, acmout, aiss] (the two leaf and the
-/// two `MERKLE_W` classes are carried by the four split flags below).
-const NINJ: usize = 6;
-const INJ_OFF: usize = SEL_OFF + NSEL; // 508
-const INJOLD_COL: usize = INJ_OFF + NINJ; // 514: bnd·sel(AREG_OLD)
-const INJNEW_COL: usize = INJOLD_COL + 1; // 515: bnd·sel(AREG_NEW)
-const MOB_COL: usize = INJNEW_COL + 1; // 516: bnd·sel(MO)
-const MNB_COL: usize = MOB_COL + 1; // 517: bnd·sel(MN)
-const G4_COL: usize = MNB_COL + 1; // 518: program-ring rotation gate
-const PBIT_COL: usize = G4_COL + 1; // 519: merkle path bit (constant per perm)
+/// Injection flags [mrk+nf, ank, arkm, acm, acmout, aiss, arho, acmout2] (the
+/// two leaf and the two `MERKLE_W` classes are carried by the four split flags
+/// below).
+const NINJ: usize = 8;
+const INJ_OFF: usize = SEL_OFF + NSEL; // 511
+const INJOLD_COL: usize = INJ_OFF + NINJ; // 519: bnd·sel(AREG_OLD)
+const INJNEW_COL: usize = INJOLD_COL + 1; // 520: bnd·sel(AREG_NEW)
+const MOB_COL: usize = INJNEW_COL + 1; // 521: bnd·sel(MO)
+const MNB_COL: usize = MOB_COL + 1; // 522: bnd·sel(MN)
+const G4_COL: usize = MNB_COL + 1; // 523: program-ring rotation gate
+const PBIT_COL: usize = G4_COL + 1; // 524: merkle path bit (constant per perm)
 const NW: usize = 15;
-const W_OFF: usize = PBIT_COL + 1; // 520: 15 witness lanes (role-multiplexed)
-const NFB_COL: usize = W_OFF + NW; // 535: bnd·sel(NF) — banks 1 and 2's pos gate
-/// Close gates `gperm·sel(role)` [arkm, acm, acmout, bal, mo, mn, areg_old].
-const NCL: usize = 7;
-const CL_OFF: usize = NFB_COL + 1; // 536
+const W_OFF: usize = PBIT_COL + 1; // 525: 15 witness lanes (role-multiplexed)
+const NFB_COL: usize = W_OFF + NW; // 540: bnd·sel(NF) — banks 1 and 2's pos gate
+/// Close gates `gperm·sel(role)` [arkm, acm, acmout, bal, mo, mn, areg_old,
+/// arho].
+const NCL: usize = 8;
+const CL_OFF: usize = NFB_COL + 1; // 541
 const CL_ARKM: usize = 0;
 const CL_ACM: usize = 1;
 const CL_ACMOUT: usize = 2;
@@ -148,37 +162,39 @@ const CL_BAL: usize = 3;
 const CL_MO: usize = 4;
 const CL_MN: usize = 5;
 const CL_AOLD: usize = 6;
-const BGCAP_COL: usize = CL_OFF + NCL; // 543: bind capture gate
-/// Bind close gates [banchor, bnf1, bcm1, breg_old, breg_new]; the last is
-/// also R's registry close row (`RCLOSE`).
-const NBGC: usize = 5;
-const BGC_OFF: usize = BGCAP_COL + 1; // 544
+const CL_ARHO: usize = 7;
+const BGCAP_COL: usize = CL_OFF + NCL; // 549: bind capture gate
+/// Bind close gates [banchor, bnf1, bcm1, breg_old, breg_new, bcm2]; index 4
+/// (`BREG_NEW`) is also R's registry close row (`RCLOSE`).
+const NBGC: usize = 6;
+const BGC_OFF: usize = BGCAP_COL + 1; // 550
 const BGC_BREG_NEW: usize = 4;
-const BQ_OFF: usize = BGC_OFF + NBGC; // 549: 16: bind bank
-const EQ_OFF: usize = BQ_OFF + 16; // 565: 32: banks 1 (nk) and 2 (rho)
-const EQ3_OFF: usize = EQ_OFF + 32; // 597: 16: bank 3 (output rho = nf)
-const BL_OFF: usize = EQ3_OFF + 16; // 613: 4: balance accumulators
-const BLC_OFF: usize = BL_OFF + 4; // 617: 9: carry encodings
-const EFF_OFF: usize = BLC_OFF + 9; // 626: 25: effective round input
-const CO_OFF: usize = EFF_OFF + 25; // 651: 16: C_old — old-chain carry
-const CN_OFF: usize = CO_OFF + 16; // 667: 16: C_new — new-chain carry
-const SB_OFF: usize = CN_OFF + 16; // 683: 16: SIB — shared siblings
-const IS_OFF: usize = SB_OFF + 16; // 699: 16: ISS — H(isk ‖ D_I) = old issuer_key
-const POW_COL: usize = IS_OFF + 16; // 715: 2^level at MO's first row
-const PACC_COL: usize = POW_COL + 1; // 716: Σ pbit_i·2^i over MO
-const AC_OLD_COL: usize = PACC_COL + 1; // 717: old leaf asset (chunk 0 of W13)
-const AC_NEW_COL: usize = AC_OLD_COL + 1; // 718: new leaf asset
-const MC_COL: usize = AC_NEW_COL + 1; // 719: new leaf mode (chunk 0 of W4)
+const BQ_OFF: usize = BGC_OFF + NBGC; // 556: 16: bind bank
+const EQ_OFF: usize = BQ_OFF + 16; // 572: 32: banks 1 (nk) and 2 (rho)
+const EQ3_OFF: usize = EQ_OFF + 32; // 604: 16: bank 3 (output rho = nf; ARHO's nf)
+const BL_OFF: usize = EQ3_OFF + 16; // 620: 4: balance accumulators
+const BLC_OFF: usize = BL_OFF + 4; // 624: 9: carry encodings
+const EFF_OFF: usize = BLC_OFF + 9; // 633: 25: effective round input
+const CO_OFF: usize = EFF_OFF + 25; // 658: 16: C_old — old-chain carry
+const CN_OFF: usize = CO_OFF + 16; // 674: 16: C_new — new-chain carry
+const SB_OFF: usize = CN_OFF + 16; // 690: 16: SIB — shared siblings
+const IS_OFF: usize = SB_OFF + 16; // 706: 16: ISS — H(isk ‖ D_I) = old issuer_key
+const POW_COL: usize = IS_OFF + 16; // 722: 2^level at MO's first row
+const PACC_COL: usize = POW_COL + 1; // 723: Σ pbit_i·2^i over MO
+const AC_OLD_COL: usize = PACC_COL + 1; // 724: old leaf asset (chunk 0 of W13)
+const AC_NEW_COL: usize = AC_OLD_COL + 1; // 725: new leaf asset
+const MC_COL: usize = AC_NEW_COL + 1; // 726: new leaf mode (chunk 0 of W4)
+const AC_SEED_COL: usize = MC_COL + 1; // 727: seed note asset (chunk 0 of W13 at ACMOUT2)
 /// Per-transaction declarations, constant for the trace.
-const REG_COL: usize = MC_COL + 1; // 720: 1 = registration, 0 = update
-const DC_COL: usize = REG_COL + 1; // 721: [mode = Cloaked]
-const DR_COL: usize = DC_COL + 1; // 722: [mode = Regulated]
-const MINV_COL: usize = DR_COL + 1; // 723: mode⁻¹ when mode ≠ 0
-const RINV_COL: usize = MINV_COL + 1; // 724: (mode − 2)⁻¹ when mode ≠ 2
-const AINV_COL: usize = RINV_COL + 1; // 725: asset⁻¹ (asset 0 unwritable)
+const REG_COL: usize = AC_SEED_COL + 1; // 728: 1 = registration, 0 = update
+const DC_COL: usize = REG_COL + 1; // 729: [mode = Cloaked]
+const DR_COL: usize = DC_COL + 1; // 730: [mode = Regulated]
+const MINV_COL: usize = DR_COL + 1; // 731: mode⁻¹ when mode ≠ 0
+const RINV_COL: usize = MINV_COL + 1; // 732: (mode − 2)⁻¹ when mode ≠ 2
+const AINV_COL: usize = RINV_COL + 1; // 733: asset⁻¹ (asset 0 unwritable)
 
 /// The shape-R trace width.
-pub const L2R_WIDTH: usize = AINV_COL + 1; // 726
+pub const L2R_WIDTH: usize = AINV_COL + 1; // 734
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 128
@@ -195,6 +211,11 @@ pub const ROLE_BREG_NEW: u32 = 26;
 pub const ROLE_AREG_OLD: u32 = ROLE_AREG;
 /// The old-root bind — shape S's `ROLE_BREG`.
 pub const ROLE_BREG_OLD: u32 = ROLE_BREG;
+/// The seed output (A3): shape S's output commitment block with its `ρ`
+/// lanes taken from the chain (`ARHO`'s output) instead of the witness. The
+/// seed's `ρ` derivation is shape S's own `ROLE_ARHO`; its bind is S's
+/// `ROLE_BCM2`.
+pub const ROLE_ACMOUT2: u32 = 27;
 
 /// Role codes in materialized-selector order.
 const SEL_CODES: [u32; NSEL] = [
@@ -215,6 +236,9 @@ const SEL_CODES: [u32; NSEL] = [
     ROLE_MN,
     ROLE_BREG_OLD,
     ROLE_BREG_NEW,
+    ROLE_ARHO,
+    ROLE_ACMOUT2,
+    ROLE_BCM2,
 ];
 const SEL_MERKLE: usize = 0;
 const SEL_NF: usize = 1;
@@ -233,11 +257,15 @@ const SEL_MO: usize = 13;
 const SEL_MN: usize = 14;
 const SEL_BROLD: usize = 15;
 const SEL_BRNEW: usize = 16;
+const SEL_ARHO: usize = 17;
+const SEL_ACMOUT2: usize = 18;
+const SEL_BCM2: usize = 19;
 /// The bind roles, in `BGC` order.
-const BIND_SELS: [usize; NBGC] = [SEL_BANCHOR, SEL_BNF1, SEL_BCM1, SEL_BROLD, SEL_BRNEW];
+const BIND_SELS: [usize; NBGC] = [SEL_BANCHOR, SEL_BNF1, SEL_BCM1, SEL_BROLD, SEL_BRNEW, SEL_BCM2];
 
 /// Public-value layout: anchor, nf, cm (16 chunks each), fee (4), old and new
-/// registry root (16 each), the written asset id (one element).
+/// registry root (16 each), the written asset id (one element), the seed
+/// note's commitment (16 — A3, appended so every earlier offset holds).
 pub const PV_ANCHOR: usize = 0;
 pub const PV_NF: usize = 16;
 pub const PV_CM: usize = 32;
@@ -245,10 +273,12 @@ pub const PV_FEE: usize = 48;
 pub const PV_OLD_ROOT: usize = 52;
 pub const PV_NEW_ROOT: usize = 68;
 pub const PV_ASSET: usize = 84;
-pub const PV_LEN: usize = 85;
-const PV_BIND: [usize; NBGC] = [PV_ANCHOR, PV_NF, PV_CM, PV_OLD_ROOT, PV_NEW_ROOT];
+pub const PV_CM_SEED: usize = 85;
+pub const PV_LEN: usize = 101;
+const PV_BIND: [usize; NBGC] = [PV_ANCHOR, PV_NF, PV_CM, PV_OLD_ROOT, PV_NEW_ROOT, PV_CM_SEED];
 
 /// Build the full public-value vector for a shape-R instance.
+#[allow(clippy::too_many_arguments)]
 pub fn pv_vec_r(
     anchor: &[u64; 4],
     nf: &[u64; 4],
@@ -257,6 +287,7 @@ pub fn pv_vec_r(
     old_root: &[u64; 4],
     new_root: &[u64; 4],
     asset: u64,
+    cm_seed: &[u64; 4],
 ) -> Vec<u32> {
     let mut out = Vec::with_capacity(PV_LEN);
     for d in [anchor, nf, cm] {
@@ -268,14 +299,15 @@ pub fn pv_vec_r(
     out.extend_from_slice(&pv_chunks(old_root));
     out.extend_from_slice(&pv_chunks(new_root));
     out.push(asset as u32);
+    out.extend_from_slice(&pv_chunks(cm_seed));
     debug_assert_eq!(out.len(), PV_LEN);
     out
 }
 
 /// Perm slots used by the shape-R program, INCLUDING the leading dummy slot:
-/// 1 + (5 + 32 + 1) + 2 + 3 + 2 × 16 + 2 + 1 = **79**, at 3072 rows each =
-/// 242,688 rows → 2^18 (262,144), 6.3 spare perm slots.
-pub const SHAPE_R_PERMS: usize = 1 + (5 + MERKLE_DEPTH + 1) + 2 + 3 + 2 * REGISTRY_DEPTH + 2 + 1;
+/// 1 + (5 + 32 + 1) + 2 + 3 + 3 + 2 × 16 + 2 + 1 = **82**, at 3072 rows each =
+/// 251,904 rows → 2^18 (262,144), 3.3 spare perm slots.
+pub const SHAPE_R_PERMS: usize = 1 + (5 + MERKLE_DEPTH + 1) + 2 + 3 + 3 + 2 * REGISTRY_DEPTH + 2 + 1;
 /// log2 of the shape-R trace height.
 pub const SHAPE_R_LOG_HEIGHT: usize = 18;
 const _: () = assert!(SHAPE_R_PERMS * ROWS_PER_PERM <= 1 << SHAPE_R_LOG_HEIGHT);
@@ -592,7 +624,7 @@ where
             local[INJ_OFF].clone(),
             bnd.clone() * (sel_role(SEL_MERKLE) + sel_role(SEL_NF)),
         );
-        for (i, s) in [SEL_ANK, SEL_ARKM, SEL_ACM, SEL_ACMOUT, SEL_AISS].iter().enumerate() {
+        for (i, s) in [SEL_ANK, SEL_ARKM, SEL_ACM, SEL_ACMOUT, SEL_AISS, SEL_ARHO, SEL_ACMOUT2].iter().enumerate() {
             builder.assert_eq(local[INJ_OFF + 1 + i].clone(), bnd.clone() * sel_role(*s));
         }
         for (col, s) in [
@@ -674,6 +706,27 @@ where
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
+            // ARHO (shape S's): nf = W0..4, D_P = lane 4 bit 3, pad at lane 5
+            // — `narrow::derive_output_rho(nf, 1)`.
+            let msg_arho: AB::Expr = match l {
+                0..=3 => w(l),
+                4 => sel(2),
+                5 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
+            // ACMOUT2 (A3's seed): ACMOUT's block with ρ from the chain —
+            // ARHO's output, the perm right before it.
+            let msg_acmout2: AB::Expr = match l {
+                0 => w(4),
+                1 => w(13),
+                2..=5 => w(l - 2),
+                6..=9 => a(l - 6),
+                10..=13 => w(l - 1),
+                14 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
             // Registry leaf (shape S's AREG block), old and new alike.
             let msg_areg: AB::Expr = match l {
                 0 => w(13),
@@ -702,6 +755,8 @@ where
                 + inj(3) * (msg_acm - a(l))
                 + inj(4) * (msg_acmout - a(l))
                 + inj(5) * (msg_aiss - a(l))
+                + inj(6) * (msg_arho - a(l))
+                + inj(7) * (msg_acmout2 - a(l))
                 + (injold.clone() + injnew.clone()) * (msg_areg - a(l))
                 + (mob.clone() + mnb.clone()) * (msg_mw - a(l));
             builder.assert_eq(eff(l), expr);
@@ -709,7 +764,7 @@ where
 
         // --- Close gates ---
         let cl = |k: usize| local[CL_OFF + k].clone();
-        for (k, s) in [SEL_ARKM, SEL_ACM, SEL_ACMOUT, SEL_BAL, SEL_MO, SEL_MN, SEL_AOLD]
+        for (k, s) in [SEL_ARKM, SEL_ACM, SEL_ACMOUT, SEL_BAL, SEL_MO, SEL_MN, SEL_AOLD, SEL_ARHO]
             .iter()
             .enumerate()
         {
@@ -746,6 +801,9 @@ where
             builder.assert_zero(cl(CL_ACM) * local[EQ_OFF + 16 + j].clone());
             // Output ρ = the input's nullifier (option 4's ρ′₀ = nf₀).
             builder.assert_zero(cl(CL_ACMOUT) * (local[EQ3_OFF + j].clone() - pv(PV_NF + j)));
+            // A3: ARHO absorbs the same nf — bank 3 held `pv(nf)` after
+            // ACMOUT's close, ARHO subtracts its W0..3, and it closes at zero.
+            builder.assert_zero(cl(CL_ARHO) * local[EQ3_OFF + j].clone());
             builder.assert_zero(cl(CL_MO) * local[CO_OFF + j].clone());
             builder.assert_zero(cl(CL_MN) * local[CN_OFF + j].clone());
             builder.assert_zero(cl(CL_MN) * local[SB_OFF + j].clone());
@@ -793,13 +851,17 @@ where
         builder.assert_bool(dc.clone());
         builder.assert_bool(dr.clone());
         builder.when_first_row().assert_eq(local[POW_COL].clone(), AB::Expr::ONE);
-        for col in [PACC_COL, AC_OLD_COL, AC_NEW_COL, MC_COL] {
+        for col in [PACC_COL, AC_OLD_COL, AC_NEW_COL, MC_COL, AC_SEED_COL] {
             builder.when_first_row().assert_zero(local[col].clone());
         }
         // Both leaves' asset lanes are 16-bit; the mode lane is 2-bit.
         let hi16 = AB::Expr::ONE - lo16;
         builder.assert_zero(injold.clone() * hi16.clone() * w(13));
-        builder.assert_zero(injnew.clone() * hi16 * w(13));
+        builder.assert_zero(injnew.clone() * hi16.clone() * w(13));
+        // A3's seed: value zero, bit by bit; asset lane 16-bit (so its chunk
+        // 0, captured in AC_SEED, is the whole asset — closed at RCLOSE).
+        builder.assert_zero(inj(7) * w(4));
+        builder.assert_zero(inj(7) * hi16 * w(13));
         builder.assert_zero(injnew.clone() * (AB::Expr::ONE - lo2) * w(4));
         // mode ⇒ roots, bit by bit on the new leaf's boundary rows.
         for l in 0..4 {
@@ -823,7 +885,9 @@ where
             builder.assert_zero(
                 rclose.clone() * (local[AINV_COL].clone() * ac_new.clone() - AB::Expr::ONE),
             );
-            builder.assert_zero(rclose.clone() * (ac_new - pv(PV_ASSET)));
+            builder.assert_zero(rclose.clone() * (ac_new.clone() - pv(PV_ASSET)));
+            // A3: the seed note is of the written asset.
+            builder.assert_zero(rclose.clone() * (local[AC_SEED_COL].clone() - ac_new));
             // mode ∈ {0, 1, 2}, and the two declarations are its indicators.
             builder.assert_zero(
                 rclose.clone() * mc.clone() * (mc.clone() - AB::Expr::ONE) * (mc.clone() - two.clone()),
@@ -962,10 +1026,11 @@ where
                     local[EQ_OFF + 16 + idx].clone() + nfb.clone() * pwk(j) * w(l)
                         - inj(3) * pwk(j) * w(5 + l),
                 );
-                // Bank 3: the output's ρ lanes W5..8.
+                // Bank 3: the output's ρ lanes W5..8; ARHO's nf W0..3 back out.
                 t.assert_eq(
                     next[EQ3_OFF + idx].clone(),
-                    local[EQ3_OFF + idx].clone() + inj(4) * pwk(j) * w(5 + l),
+                    local[EQ3_OFF + idx].clone() + inj(4) * pwk(j) * w(5 + l)
+                        - inj(6) * pwk(j) * w(l),
                 );
                 // C_old: +a at MN (MO's output) and at AREG_NEW when updating
                 // (the old leaf hash), −W4..7 at MO.
@@ -1025,6 +1090,10 @@ where
         t.assert_eq(
             next[MC_COL].clone(),
             local[MC_COL].clone() + injnew * pwk(0) * w(4),
+        );
+        t.assert_eq(
+            next[AC_SEED_COL].clone(),
+            local[AC_SEED_COL].clone() + inj(7) * pwk(0) * w(13),
         );
         // The declarations are per-transaction: constant.
         for col in [REG_COL, DC_COL, DR_COL, MINV_COL, RINV_COL, AINV_COL] {
@@ -1096,6 +1165,15 @@ pub struct RegistryWrite {
     pub opening: RegistryWitness,
 }
 
+/// The seed output's free fields (A3): whose it is and its blinding. Its
+/// value is 0, its asset the written one and its `ρ` `H(nf ‖ D_P|1)` — all
+/// fixed by the circuit, so the builder takes none of them.
+#[derive(Clone, Copy, Debug)]
+pub struct SeedOutput {
+    pub rkm: [u64; 4],
+    pub rseed: [u64; 4],
+}
+
 /// Everything a prover/verifier pair needs for one shape-R instance.
 #[cfg_attr(test, derive(Clone))]
 pub struct L2ShapeRInstance {
@@ -1106,6 +1184,8 @@ pub struct L2ShapeRInstance {
     pub cm_out: [u64; 4],
     pub old_root: [u64; 4],
     pub new_root: [u64; 4],
+    /// The seed note's commitment (A3).
+    pub cm_seed: [u64; 4],
 }
 
 /// Shape R against a **fabricated** commitment tree holding the fee input
@@ -1116,10 +1196,11 @@ pub fn build_shape_r(
     fee_out: &L2TxOutput,
     fee: u64,
     write: &RegistryWrite,
+    seed: &SeedOutput,
 ) -> L2ShapeRInstance {
     let (_, _, cm) = derive_input_l2(fee_in);
     let (witness, anchor) = fabricated_single_tree(&cm);
-    build_shape_r_with_witnesses(log_height, fee_in, &witness, anchor, fee_out, fee, write)
+    build_shape_r_with_witnesses(log_height, fee_in, &witness, anchor, fee_out, fee, write, seed)
 }
 
 /// Shape R from a caller-supplied commitment-tree witness + anchor. Both roots
@@ -1128,6 +1209,7 @@ pub fn build_shape_r(
 /// the registry's current root is an unprovable instance against that root.
 /// Nothing is asserted: an unbalanced or ill-formed write is simply
 /// unprovable, which is what the negatives test.
+#[allow(clippy::too_many_arguments)]
 pub fn build_shape_r_with_witnesses(
     log_height: usize,
     fee_in: &L2TxInput,
@@ -1136,9 +1218,12 @@ pub fn build_shape_r_with_witnesses(
     fee_out: &L2TxOutput,
     fee: u64,
     write: &RegistryWrite,
+    seed: &SeedOutput,
 ) -> L2ShapeRInstance {
     let (nk, nf, _) = derive_input_l2(fee_in);
     let cm_out = l2_cm(fee_out.value, fee_out.asset, &fee_out.rkm, &nf, &fee_out.rseed);
+    let seed_rho = derive_output_rho(&nf, 1);
+    let cm_seed = l2_cm(0, write.new_leaf.asset, &seed.rkm, &seed_rho, &seed.rseed);
 
     let old_digest = write.old_leaf.map_or([0u64; 4], |l| l.hash());
     let new_digest = write.new_leaf.hash();
@@ -1197,6 +1282,18 @@ pub fn build_shape_r_with_witnesses(
         }),
     );
     put(ROLE_BCM1, L2RSlotWitness::default());
+    // The seed (A3): ρ = H(nf ‖ D_P|1), then the 0-value note of the written
+    // asset, its ρ lanes read from the chain (W5..8 stay empty).
+    put(ROLE_ARHO, lanes(&|w| w[..4].copy_from_slice(&nf)));
+    put(
+        ROLE_ACMOUT2,
+        lanes(&|w| {
+            w[..4].copy_from_slice(&seed.rkm);
+            w[9..13].copy_from_slice(&seed.rseed);
+            w[13] = write.new_leaf.asset;
+        }),
+    );
+    put(ROLE_BCM2, L2RSlotWitness::default());
     // The write: isk, the two leaves.
     put(ROLE_AISS, lanes(&|w| w[..4].copy_from_slice(&write.isk)));
     let leaf_lanes = |l: &RegistryLeaf| {
@@ -1248,7 +1345,7 @@ pub fn build_shape_r_with_witnesses(
     put(ROLE_BAL, L2RSlotWitness::default());
     assert_eq!(slot, SHAPE_R_PERMS, "program layout drifted");
 
-    let pvs = pv_vec_r(&anchor, &nf, &cm_out, fee, &old_root, &new_root, write.new_leaf.asset);
+    let pvs = pv_vec_r(&anchor, &nf, &cm_out, fee, &old_root, &new_root, write.new_leaf.asset, &cm_seed);
     L2ShapeRInstance {
         air: L2ShapeRAir {
             log_height,
@@ -1263,6 +1360,7 @@ pub fn build_shape_r_with_witnesses(
         cm_out,
         old_root,
         new_root,
+        cm_seed,
     }
 }
 
@@ -1303,7 +1401,7 @@ impl L2ShapeRAir {
         let mut is = [0i64; 16];
         let mut pow: i64 = 1;
         let mut pacc: i64 = 0;
-        let (mut ac_old, mut ac_new, mut mc) = (0i64, 0i64, 0i64);
+        let (mut ac_old, mut ac_new, mut mc, mut ac_seed) = (0i64, 0i64, 0i64, 0i64);
 
         // The declarations, off the new leaf's witness (chunk 0 of the lanes
         // the circuit captures). A program without AREG_NEW gets 0s.
@@ -1412,6 +1510,23 @@ impl L2ShapeRAir {
                         16 => z63,
                         _ => 0,
                     },
+                    ROLE_ARHO => match l {
+                        0..=3 => wbit[l],
+                        4 => (z == 3) as u32,
+                        5 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_ACMOUT2 => match l {
+                        0 => wbit[4],
+                        1 => wbit[13],
+                        2..=5 => wbit[l - 2],
+                        6..=9 => a[l - 6],
+                        10..=13 => wbit[l - 1],
+                        14 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
                     ROLE_AREG_OLD | ROLE_AREG_NEW => match l {
                         0 => wbit[13],
                         1..=4 => wbit[l - 1],
@@ -1496,6 +1611,8 @@ impl L2ShapeRAir {
                 bndv * selv[SEL_ACM],
                 bndv * selv[SEL_ACMOUT],
                 bndv * selv[SEL_AISS],
+                bndv * selv[SEL_ARHO],
+                bndv * selv[SEL_ACMOUT2],
             ];
             for (i, vv) in injv.iter().enumerate() {
                 row[INJ_OFF + i] = F::from_u32(*vv);
@@ -1510,7 +1627,7 @@ impl L2ShapeRAir {
             row[G4_COL] = F::from_u32(gpermv * ph[1]);
             let clv: [u32; NCL] = core::array::from_fn(|k| {
                 gpermv
-                    * selv[[SEL_ARKM, SEL_ACM, SEL_ACMOUT, SEL_BAL, SEL_MO, SEL_MN, SEL_AOLD][k]]
+                    * selv[[SEL_ARKM, SEL_ACM, SEL_ACMOUT, SEL_BAL, SEL_MO, SEL_MN, SEL_AOLD, SEL_ARHO][k]]
             });
             for (k, vv) in clv.iter().enumerate() {
                 row[CL_OFF + k] = F::from_u32(*vv);
@@ -1564,6 +1681,7 @@ impl L2ShapeRAir {
             row[AC_OLD_COL] = sgn(ac_old);
             row[AC_NEW_COL] = sgn(ac_new);
             row[MC_COL] = sgn(mc);
+            row[AC_SEED_COL] = sgn(ac_seed);
             row[REG_COL] = F::from_u32(reg);
             row[DC_COL] = F::from_u32(dcv);
             row[DR_COL] = F::from_u32(drv);
@@ -1588,7 +1706,7 @@ impl L2ShapeRAir {
                     bq[idx] += bgcap as i64 * wgt * al;
                     eq[idx] += nfb * wgt * al - injv[2] as i64 * wgt * wb(l);
                     eq[16 + idx] += nfb * wgt * wb(l) - injv[3] as i64 * wgt * wb(5 + l);
-                    eq3[idx] += injv[4] as i64 * wgt * wb(5 + l);
+                    eq3[idx] += injv[4] as i64 * wgt * wb(5 + l) - injv[6] as i64 * wgt * wb(l);
                     co[idx] += (mnb + injnew * not_reg) * wgt * al - mob * wgt * wb(4 + l);
                     cn[idx] += mob * wgt * al - mnb * wgt * wb(4 + l);
                     sb[idx] += (mob - mnb) * wgt * wb(l);
@@ -1599,6 +1717,7 @@ impl L2ShapeRAir {
                     ac_old += injold * wgt * wb(13);
                     ac_new += injnew * wgt * wb(13);
                     mc += injnew * wgt * wb(4);
+                    ac_seed += injv[7] as i64 * wgt * wb(13);
                 }
                 if mob == 1 && z == 0 {
                     pacc += pbv as i64 * pow;
@@ -1810,13 +1929,16 @@ mod tests {
         (input, output)
     }
 
+    /// The seed's owner and blinding (A3).
+    const SEED: SeedOutput = SeedOutput { rkm: [0xb01, 0xb02, 0xb03, 0xb04], rseed: [0xc01, 0xc02, 0xc03, 0xc04] };
+
     /// A write at `slot` of the shared registry.
     fn write_at(slot: u64, isk: [u64; 4], old_leaf: Option<RegistryLeaf>, new_leaf: RegistryLeaf) -> RegistryWrite {
         RegistryWrite { isk, old_leaf, new_leaf, opening: registry_opening(&registry(), slot).0 }
     }
     fn instance(write: &RegistryWrite) -> L2ShapeRInstance {
         let (fin, fout) = fee_parts();
-        build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, write)
+        build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, write, &SEED)
     }
     /// A registration of `new` into its own (empty) slot.
     fn register(new: RegistryLeaf) -> L2ShapeRInstance {
@@ -1861,8 +1983,10 @@ mod tests {
         check_constraints(&air, &trace, &vec![F::ZERO; PV_LEN]);
     }
 
-    /// Width 726, every column named. Engine and M3 machinery as `l2.rs`
-    /// (491 up to the selectors), then shape R's own.
+    /// Width 734, every column named. Engine and M3 machinery as `l2.rs`
+    /// (491 up to the selectors), then shape R's own. A3's seed output added 8:
+    /// three selectors (ARHO, ACMOUT2, BCM2), two injection flags, ARHO's close
+    /// gate, BCM2's bind close and the seed-asset capture.
     #[test]
     fn l2r_trace_width_is_read_off_the_matrix() {
         let air = L2ShapeRAir::chain_only(10);
@@ -1870,36 +1994,36 @@ mod tests {
         assert_eq!(trace.width(), L2R_WIDTH, "width must be the matrix's own");
         let engine = 402; // narrow's Keccak-f engine, verbatim
         let machinery = 24 + 4 + 32 + 20 + 5 + 4; // PB, PH, PR (32 limbs), D, RB, LO
-        let roles = 17 // SEL: 11 of S's roles + AISS, AREG_OLD/NEW, MO, MN, BREG_OLD/NEW
-            + 6 // INJ: mrk+nf, ank, arkm, acm, acmout, aiss
+        let roles = 20 // SEL: 11 of S's roles + AISS, AREG_OLD/NEW, MO, MN, BREG_OLD/NEW, ARHO, ACMOUT2, BCM2
+            + 8 // INJ: mrk+nf, ank, arkm, acm, acmout, aiss, arho, acmout2
             + 4 // INJOLD, INJNEW, MOB, MNB (the split leaf / MERKLE_W flags)
             + 1 // G4
             + 1 // NFB
-            + 7 // CL: arkm, acm, acmout, bal, mo, mn, areg_old
+            + 8 // CL: arkm, acm, acmout, bal, mo, mn, areg_old, arho
             + 1 // BGCAP
-            + 5; // BGC: banchor, bnf1, bcm1, breg_old, breg_new
+            + 6; // BGC: banchor, bnf1, bcm1, breg_old, breg_new, bcm2
         let witness = 1 + 15 + 25; // PBIT, W, EFF
         let banks = 16 // BQ
             + 32 // EQ: banks 1 (nk) and 2 (ρ)
-            + 16 // EQ3: output ρ = nf
+            + 16 // EQ3: output ρ = nf, and ARHO's nf
             + 4 + 9; // BL + BLC: the one balance chain
         let registry = 16 * 4 // C_old, C_new, SIB, ISS
             + 2 // POW, PACC
-            + 3 // AC_OLD, AC_NEW, MC
+            + 4 // AC_OLD, AC_NEW, MC, AC_SEED
             + 6; // REG, DC, DR, MINV, RINV, AINV
         assert_eq!(machinery, 89);
-        assert_eq!(roles, 42);
-        assert_eq!(registry, 75);
+        assert_eq!(roles, 49);
+        assert_eq!(registry, 76);
         assert_eq!(trace.width(), engine + machinery + roles + witness + banks + registry);
-        assert_eq!(trace.width(), 726, "the shape-R width");
+        assert_eq!(trace.width(), 734, "the shape-R width (A2's 726 + A3's 8)");
         // Sibling sharing, option (ii) — a 16-accumulator equality per level
         // instead of the one SIB bank closed at every MN — would be 15 × 16 =
-        // 240 columns more: 966.
-        assert_eq!(trace.width() + 15 * 16, 966);
+        // 240 columns more: 974.
+        assert_eq!(trace.width() + 15 * 16, 974);
     }
 
     /// Max constraint degree 4 (the ruling's ceiling), 4 quotient chunks. The
-    /// degree-4 population: the 17 role selectors, the two REG-gated banks
+    /// degree-4 population: the 20 role selectors (A3 added three), the two REG-gated banks
     /// (C_old's seed, ISS: 16 each), the path-bit tie, the PACC step and the
     /// three mode closes (the cubic and the two nonzero-inverse legs).
     #[test]
@@ -1911,18 +2035,20 @@ mod tests {
         assert_eq!((deg - 1).next_power_of_two(), 4, "quotient chunks");
         let cs = get_symbolic_constraints::<F, _>(&air, AirLayout::from_air::<F>(&air));
         let deg4 = cs.iter().filter(|c| c.degree_multiple() == 4).count();
-        assert_eq!(deg4, 17 + 16 + 16 + 1 + 1 + 3, "deg-4 constraints");
+        assert_eq!(deg4, 20 + 16 + 16 + 1 + 1 + 3, "deg-4 constraints");
     }
 
-    /// 79 perms in 2^18, one ring period (no epoch), the program as documented.
+    /// 82 perms in 2^18, one ring period (no epoch), the program as documented.
     #[test]
     fn l2r_program_geometry() {
         // (Fits 2^18 and one ring period: the module's const asserts.)
-        assert_eq!(SHAPE_R_PERMS, 79);
+        assert_eq!(SHAPE_R_PERMS, 82);
         let p = &register_fixture().inst.air.program;
         let mut want = vec![ROLE_DUMMY, ROLE_ANK, ROLE_NF, ROLE_BNF1, ROLE_ARKM, ROLE_ACM];
         want.extend(std::iter::repeat_n(ROLE_MERKLE, MERKLE_DEPTH));
-        want.extend([ROLE_BANCHOR, ROLE_ACMOUT, ROLE_BCM1, ROLE_AISS, ROLE_AREG_OLD, ROLE_AREG_NEW]);
+        want.extend([ROLE_BANCHOR, ROLE_ACMOUT, ROLE_BCM1]);
+        want.extend([ROLE_ARHO, ROLE_ACMOUT2, ROLE_BCM2]);
+        want.extend([ROLE_AISS, ROLE_AREG_OLD, ROLE_AREG_NEW]);
         for _ in 0..REGISTRY_DEPTH - 1 {
             want.extend([ROLE_MO, ROLE_MN]);
         }
@@ -1930,11 +2056,15 @@ mod tests {
         assert_eq!(want.len(), SHAPE_R_PERMS);
         assert_eq!(&p[..SHAPE_R_PERMS], &want[..]);
         assert!(p[SHAPE_R_PERMS..].iter().all(|r| *r == ROLE_DUMMY));
-        // Role codes stay unique across the family: R's four new ones are
-        // above shape P's 17..=22.
-        for code in [ROLE_AREG_NEW, ROLE_MO, ROLE_MN, ROLE_BREG_NEW] {
+        // Role codes stay unique across the family: R's five new ones are
+        // above shape P's 17..=22; ARHO and BCM2 are shape S's own.
+        for code in [ROLE_AREG_NEW, ROLE_MO, ROLE_MN, ROLE_BREG_NEW, ROLE_ACMOUT2] {
             assert!(code > 22 && code < 32);
         }
+        let mut codes = SEL_CODES.to_vec();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), NSEL, "no two selectors share a role code");
     }
 
     // -----------------------------------------------------------------------
@@ -1992,6 +2122,25 @@ mod tests {
         let (_, nf, _) = derive_input_l2(&fin);
         assert_eq!(fx.inst.nf, nf);
         assert_eq!(fx.inst.cm_out, l2_cm(fout.value, 0, &fout.rkm, &nf, &fout.rseed));
+        // A3's seed: ARHO is S's output-1 ρ derivation over this nf, and
+        // ACMOUT2 commits the 0-value note of the written asset with it.
+        let rho = derive_output_rho(&nf, 1);
+        assert_eq!(out_of(ROLE_ARHO), rho, "ARHO = H(nf ‖ D_P|1)");
+        let cm_seed = l2_cm(0, 9, &SEED.rkm, &rho, &SEED.rseed);
+        assert_eq!(out_of(ROLE_ACMOUT2), cm_seed, "the seed commitment");
+        assert_eq!(fx.inst.cm_seed, cm_seed);
+        assert_eq!(&fx.inst.pvs[PV_CM_SEED..PV_LEN], &pv_chunks(&cm_seed)[..]);
+    }
+
+    /// A3: the update's seed is of the updated asset — the ruling's "every
+    /// write", which re-arms minting for an issuer holding no note of it.
+    #[test]
+    fn l2r_update_seeds_the_updated_asset() {
+        let fx = update_fixture();
+        fx.assert_sat("precondition");
+        let (fin, _) = fee_parts();
+        let (_, nf, _) = derive_input_l2(&fin);
+        assert_eq!(fx.inst.cm_seed, l2_cm(0, 7, &SEED.rkm, &derive_output_rho(&nf, 1), &SEED.rseed));
     }
 
     // -----------------------------------------------------------------------
@@ -2190,13 +2339,13 @@ mod tests {
         let write = write_at(9, ISK_NONE, None, register_leaf());
         let (fin, mut fout) = fee_parts();
         fout.value += 1;
-        let inst = build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, &write);
+        let inst = build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, &write, &SEED);
         assert_refused_at(&inst, at(ROLE_BAL), "100 in, 94 out + fee 7");
 
         let (mut fin, mut fout) = fee_parts();
         fin.asset = 7;
         fout.asset = 7;
-        let inst = build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, &write);
+        let inst = build_shape_r(SHAPE_R_LOG_HEIGHT, &fin, &fout, FEE, &write, &SEED);
         assert_refused_at(&inst, at(ROLE_ACM), "the fee paid in asset 7");
 
         let mut inst = register_fixture().inst.clone();
@@ -2209,5 +2358,89 @@ mod tests {
             inst.pvs[PV_CM + k] = *c;
         }
         assert_refused_at(&inst, s, "an output ρ that is not the nullifier");
+    }
+
+    // -----------------------------------------------------------------------
+    // A3 — the seed output (lab #731, ruled on #730). Complete forgeries: the
+    // seed's commitment is republished to match each tamper, so only the
+    // constraint the test names can refuse it.
+    // -----------------------------------------------------------------------
+
+    /// Rewrite the seed slot's witness with `f`, recompute its commitment from
+    /// the lanes the circuit hashes (ρ from `rho`), and republish it.
+    fn republish_seed(inst: &mut L2ShapeRInstance, rho: [u64; 4], f: impl Fn(&mut [u64; NW])) {
+        let s = slot_of(&inst.air.program, ROLE_ACMOUT2, 0);
+        f(&mut inst.air.slot_witness[s].w);
+        let w = inst.air.slot_witness[s].w;
+        let cm = l2_cm(w[4], w[13], &w[..4].try_into().unwrap(), &rho, &w[9..13].try_into().unwrap());
+        inst.cm_seed = cm;
+        for (k, c) in pv_chunks(&cm).iter().enumerate() {
+            inst.pvs[PV_CM_SEED + k] = *c;
+        }
+    }
+    fn seed_rho(inst: &L2ShapeRInstance) -> [u64; 4] {
+        derive_output_rho(&inst.nf, 1)
+    }
+
+    /// 🔴 A nonzero seed: value 5 minted out of nothing — refused on
+    /// ACMOUT2's own rows (the value lane is zero bit by bit).
+    #[test]
+    fn l2r_neg_seed_with_a_value() {
+        register_fixture().assert_sat("precondition");
+        for (what, v) in [("value 5", 5u64), ("value 2^63", 1 << 63)] {
+            let mut inst = register_fixture().inst.clone();
+            let rho = seed_rho(&inst);
+            republish_seed(&mut inst, rho, |w| w[4] = v);
+            assert_refused_at(&inst, at(ROLE_ACMOUT2), &format!("a seed of {what}"));
+        }
+        let mut inst = update_fixture().inst.clone();
+        let rho = seed_rho(&inst);
+        republish_seed(&mut inst, rho, |w| w[4] = 1);
+        assert_refused_at(&inst, at(ROLE_ACMOUT2), "an update's seed of value 1");
+    }
+
+    /// 🔴 A seed of another asset than the one written: 8 for a write of 9
+    /// (refused at the registry close), 0 — a free fee-unit note — and one
+    /// above 16 bits whose chunk 0 matches (refused on ACMOUT2's rows).
+    #[test]
+    fn l2r_neg_seed_of_a_wrong_asset() {
+        let rclose = at(ROLE_BREG_NEW);
+        for (what, asset) in [("asset 8 for a write of 9", 8u64), ("asset 0 for a write of 9", 0)] {
+            let mut inst = register_fixture().inst.clone();
+            let rho = seed_rho(&inst);
+            republish_seed(&mut inst, rho, |w| w[13] = asset);
+            assert_refused_at(&inst, rclose, what);
+        }
+        let mut inst = register_fixture().inst.clone();
+        let rho = seed_rho(&inst);
+        republish_seed(&mut inst, rho, |w| w[13] = 9 + (1 << 16));
+        assert_refused_at(&inst, at(ROLE_ACMOUT2), "asset 9 + 2^16 (chunk 0 = 9)");
+        let mut inst = update_fixture().inst.clone();
+        let rho = seed_rho(&inst);
+        republish_seed(&mut inst, rho, |w| w[13] = 9);
+        assert_refused_at(&inst, rclose, "an update of 7 seeding asset 9");
+    }
+
+    /// 🔴 The seed's ρ off another nullifier: ARHO absorbs a made-up nf (so
+    /// the seed could collide with, or shadow, another note's ρ); the
+    /// commitment republished — refused at ARHO's close (bank 3).
+    #[test]
+    fn l2r_neg_seed_rho_off_another_nf() {
+        let mut inst = register_fixture().inst.clone();
+        let arho = at(ROLE_ARHO);
+        let fake = [0x1234, 0x5678, 0x9abc, 0xdef0];
+        inst.air.slot_witness[arho].w[..4].copy_from_slice(&fake);
+        republish_seed(&mut inst, derive_output_rho(&fake, 1), |_| {});
+        assert_refused_at(&inst, arho, "ARHO over a nullifier that is not the public one");
+    }
+
+    /// 🔴 A published seed commitment that is not the one committed: BCM2
+    /// refuses.
+    #[test]
+    fn l2r_neg_seed_commitment_lie() {
+        let fx = register_fixture();
+        let mut pvs = fx.pvs.clone();
+        pvs[PV_CM_SEED + 5] += F::ONE;
+        assert_trace_refused_at(&fx.inst, &fx.trace, &pvs, at(ROLE_BCM2), "a republished seed cm");
     }
 }

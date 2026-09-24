@@ -114,6 +114,7 @@ pub fn constants_digest(shape: Shape) -> [u8; 32] {
             l2r::PV_OLD_ROOT as u64,
             l2r::PV_NEW_ROOT as u64,
             l2r::PV_ASSET as u64,
+            l2r::PV_CM_SEED as u64,
         ]);
     } else {
         h.words(&[
@@ -169,6 +170,7 @@ pub fn constants_digest(shape: Shape) -> [u8; 32] {
         };
         h.words(&leaf.hash()); // every leaf lane, not only Cloaked's
         h.words(&l2r::registry_zeros()[l2::REGISTRY_DEPTH]); // the empty registry
+        h.words(&qlab_air::narrow::derive_output_rho(&o, 1)); // D_P — the seed's ρ (A3)
     }
     h.finish()
 }

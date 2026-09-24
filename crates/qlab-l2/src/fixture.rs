@@ -12,7 +12,7 @@
 use qlab_air::l2::{build_bucket_l2, L2BucketInstance, L2TxInput, L2TxOutput};
 use qlab_air::l2::{RegistryLeaf, MODE_HYBRID};
 use qlab_air::l2p::{build_bucket_l2p, issuer_key_of, L2PBucketInstance, PolicyAsset, VPublic};
-use qlab_air::l2r::{build_shape_r, registry_opening, L2ShapeRInstance, RegistryWrite};
+use qlab_air::l2r::{build_shape_r, registry_opening, L2ShapeRInstance, RegistryWrite, SeedOutput};
 
 /// The fixtures' xorshift64 stream (the bench's, verbatim).
 struct Rnd(u64);
@@ -106,7 +106,9 @@ pub fn shape_r_registry() -> Vec<RegistryLeaf> {
 /// Shape R at `log_height`: **an update** of asset 7 — the issuer proves
 /// [`ISK_7`], rotates the key to [`ISK_7_NEXT`] and publishes a new freeze
 /// root — paid by a 50,000 → 50,000 − fee spend in asset 0, fee
-/// [`crate::FEE_TIER_R_PLACEHOLDER`].
+/// [`crate::FEE_TIER_R_PLACEHOLDER`] — and seeds a 0-value note of asset 7
+/// (A3). The seed is drawn after every earlier draw, so the first 85 public
+/// values are A2's, byte for byte.
 pub fn shape_r_at(log_height: usize) -> L2ShapeRInstance {
     let mut r = Rnd(SEED ^ 0x52);
     let _ = r.d4(); // the registry's freeze root
@@ -126,7 +128,8 @@ pub fn shape_r_at(log_height: usize) -> L2ShapeRInstance {
         new_leaf: new,
         opening: registry_opening(&registry, 7).0,
     };
-    build_shape_r(log_height, &input, &output, fee, &write)
+    let seed = SeedOutput { rkm: r.d4(), rseed: r.d4() };
+    build_shape_r(log_height, &input, &output, fee, &write, &seed)
 }
 
 /// Shape R at its own height (2^18).
