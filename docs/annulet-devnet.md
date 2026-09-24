@@ -8,7 +8,7 @@ The Annulet devnet is one sequencer, two followers and a fee-unit faucet, runnin
 
 ## What is in it
 
-- **The devnet genesis**, `AnnuletGenesisFile::devnet()`. It is deterministic, and its hash is pinned: `831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef` (5,230 B), reproduced byte-identically by two runs of `examples/annulet_devnet_genesis`. *(Re-pinned in C3, lab #722: it was `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`. `USDT-test`'s freeze root moved from the seeded fixture tree to the canonical empty tree, which any wallet rebuilds from the issuer's published list.)* It contains:
+- **The devnet genesis**, `AnnuletGenesisFile::devnet()`. It is deterministic, and its hash is pinned: `00c70e55c95e8f6519e956884bf6ffc56476fe1b3cd196983a46e1f4221d7e03` (5,238 B), reproduced byte-identically by two runs of `examples/annulet_devnet_genesis`. *(Re-pinned in B3b, lab #728: `fee_tier_r` joined the genesis params; it was `831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef`, 5,230 B.)* *(Re-pinned in C3, lab #722: it was `6f0978eb2c56d6967a8c0ade9d1096ab8c4e79a9d846de53e39613cb43ddf374`. `USDT-test`'s freeze root moved from the seeded fixture tree to the canonical empty tree, which any wallet rebuilds from the issuer's published list.)* It contains:
   - a registry of two assets: asset 0 (Cloaked), and `USDT-test` at asset 1 (Hybrid, a dev issuer key, an empty freeze tree);
   - 16 **stock notes** of exactly one grant each, to the faucet's `rkm`. A stock note is worth `tier_p + tier_s` = 3. One grant spends one note whole: 2 go to the requester and 1 is the S fee. There is no change and no harvest;
   - one genesis-minted `USDT-test` note (1,000,000) to a dev **holder** key.

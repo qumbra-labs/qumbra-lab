@@ -27,17 +27,20 @@ The commitment tree is an append-only frontier over sequential positions. The re
 ```text
 GET /v1/registry/root     →  ver(u8 = 1) ‖ height(u64 LE) ‖ root(32)
 GET /v1/registry/{asset}  →  ver ‖ height ‖ root(32) ‖ leaf(15 × u64 LE) ‖ 16 × sibling(32)
+GET /v1/registry/slot/{asset}  →  ver ‖ height ‖ root(32) ‖ slot(u16 LE) ‖ occupied(u8 0/1) ‖ leaf(15 × u64 LE, zero when empty) ‖ 16 × sibling(32)   (676 B, B3b)
 ```
 
 - Digests are lane-major little-endian (the node's `h32`). The leaf lanes are `RegistryLeaf::state()[0..15]`.
 - **Every answer names the root it was computed against.** A wallet binds its transaction to a header's registry root (B4's rule), so it must know which root an opening matches.
 - **Path bits do not travel.** An opening is for position `asset`, so the decoder derives them from the asset id rather than trusting a second copy.
-- The asset id is canonical decimal below 65,536 (400 otherwise). An unregistered asset gets a named 404. On an L1 node both routes refuse by name with 400.
+- The asset id is canonical decimal below 65,536 (400 otherwise). An unregistered asset gets a named 404 on `/v1/registry/{asset}`. On an L1 node every registry route refuses by name with 400.
+- **The slot route answers every slot** (B3b, lab #728 Q5): a registration proves against an *empty* slot, which `/v1/registry/{asset}` 404s. An empty slot's leaf digest is zero; the decoder refuses an occupancy byte other than 0/1, an empty slot carrying a non-zero lane, and an occupied slot whose leaf is of another asset, each by name. A pure route addition: no `RPC_VERSION` bump.
+- **The served tree moves with registry writes** (B3b): the run loop re-projects it at every new tip, so the `height` is the applied tip the root holds at.
 - The codec lives in `qlab-cbserver::registry`, so the wallet side (C1) decodes with the same code.
 
 ## Persistence
 
-`registry.bin` is a versioned bincode sidecar written with tmp + rename, at open and with every snapshot, carrying the height it was captured at. It is not part of the block log: `persist::FORMAT_VERSION` stays 3, and B1's 362-B persisted-bytes gate is untouched. On open, the sidecar is honoured only if it equals the registry the genesis builds (Phase 0: the genesis is the whole registry history). One that disagrees or cannot be read is rebuilt from genesis and the node says so (a `REGISTRY` line). It is never trusted.
+`registry.bin` is a versioned bincode sidecar written with tmp + rename, at open and with every snapshot, carrying the height it was captured at. It is not part of the block log: `persist::FORMAT_VERSION` stays 3, and B1's 362-B persisted-bytes gate is untouched. **The registry is chain state, the sidecar a cache** (B3b, lab #728 Q3): every resume path derives the registry from the log — full replay through `apply_state`, a snapshot resume by re-folding the held main chain's writes over the genesis registry before its tail replays — and the sidecar is compared against that derivation. One that disagrees or cannot be read is rewritten from the chain and the node says so (a `REGISTRY` line). It is never trusted.
 
 ## The genesis notes (B1 P13)
 
@@ -47,14 +50,25 @@ GET /v1/registry/{asset}  →  ver ‖ height ‖ root(32) ‖ leaf(15 × u64 LE
 - The genesis file and its hash do not move: the header binds the notes' body commitment, not the tree root.
 - Found on the way: `restore_from_snapshot` appended the snapshot's commitments onto a tree that already held the genesis notes. It now appends only what follows the held prefix.
 
+## Registry writes (B3b, lab #728)
+
+- **One write per block, carried whole.** Shape R's 185-B surface is `0x03 ‖ old_root ‖ new_root ‖ the new leaf's 15 lanes`. The body rule allows at most one R per block; the header's `registry_root` is the root *after* the block (the write's `new_root`, or the parent's when nothing is written); every surface in the block binds the root *before* it.
+- **The node writes the leaf it was shown.** `apply_state` computes the registry after the block before any mutation: the write must be proven against this node's root (`RegistryWriteNotOnParent`), writing its leaf must reach the declared root (`RegistryWriteRootMismatch`), the slot must be writable (`RegistryWrite` — asset 0 is pinned), and the header must carry the result (`RegistryRootMismatch`). Each is refused by name with state untouched. A cheap parent check runs before proofs are verified.
+- **The pool admits only a write that will apply**, and one at a time: a write whose leaf does not reach its root is `RegistryWriteInvalid`, a second write is `RegistryWriteAlreadyPooled`. When a write lands, every pooled surface still bound to the old root is evicted. (Pooling a write that cannot apply would fail the producer's own block every slot, with nothing to evict it.)
+- **The producer** sets the header root from the template's write.
+- **Genesis supply** (Q7): the genesis notes' issuance is outstanding from height 0, so a redeem of genesis supply is not an underflow. A genesis note that does not open its commitment is refused (`GenesisIssuance`).
+- **Building one:** `qlab_l2spend::build_r` reads the slot's opening from `/v1/registry/slot/{asset}` and the fee note's witness from the served tree, proves R, and returns the transaction, the change note and the new root. The wallet CLI for registry transactions is C4's.
+- **The done-when** (`qumbra-faucet/tests/annulet_registry_write.rs`): on the devnet harness, register asset 9 into its empty slot, then update it (rotate the issuer key, proving the current one, opening read from a follower). After each write the sequencer and both followers agree on the registry root the write declared; a follower serves the new leaf; the payer detects both change notes. **Two real R proves.**
+- **Q6, the genesis-file invariant, is a demonstration:** a genesis registry record has no slot field. It is placed at its own asset lane, so "asset 9's leaf at slot 10" cannot be written. The nearest expressible attempt, a repeated asset, is refused by `verify` (`a_genesis_registry_record_can_only_sit_at_its_own_slot`).
+
 ## Goldens and how they were computed
 
 | golden | value | computed by |
 |---|---|---|
-| fixture Annulet genesis hash (unchanged) | `a73f547d…ead2` | B2's pin; unchanged across the delegation, so it proves byte-identity |
+| fixture Annulet genesis hash (unchanged in B3) | `a73f547d…ead2` | B2's pin; unchanged across the delegation, so it proves byte-identity. *(B3b re-pinned it to `85dd805d…6cce`, 3,055 B, when `fee_tier_r` joined `AnnuletParams`; devnet `831de12f…e9ef` → `00c70e55…7e03`, 5,238 B. Named run ×2 each, byte-identical.)* |
 | registry root body (41 B) | hex literal | independent Python encoder over synthetic digests |
 | registry opening body (673 B) | hex literal | independent Python encoder over synthetic digests |
-| genesis anchor over three synthetic notes | `b358f03f…2bae` | independent Python Keccak-f[1600]: self-checked against Keccak-256(""), and its empty tree reproduces `qlab-cbserver`'s existing `27ae5ba0…d757` |
+| commitment-tree root over leaves `[1;32], [2;32], [3;32]` | `b358f03f…2bae` | independent Python Keccak-f[1600]: self-checked against Keccak-256(""), and its empty tree reproduces `qlab-cbserver`'s existing `27ae5ba0…d757`. *(B3b: pinned on the tree directly. The node test's genesis notes are real plaintexts now — the node seeds supply from them — so the genesis anchor is asserted equal to the tree over their commitments in order.)* |
 
 No cargo run was needed; there were no local runs in B3.
 
@@ -68,6 +82,6 @@ No cargo run was needed; there were no local runs in B3.
 
 ## Named gaps (owned by name)
 
-- **Runtime registry updates: A2** (shape R). **The registry-root freshness rule for a transaction** (the parent header's root): B4.
+- **Runtime registry updates:** landed in B3b (shape R; lab #728). **The registry-root freshness rule for a transaction** (the parent header's root): B4.
 - **Genesis-note serving:** landed in B5 (`/v1/genesis/notes`).
 - No live net has served the registry routes yet; B6 is the first.

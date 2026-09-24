@@ -5,18 +5,16 @@
 //! the wire tag `qlab_devnet::annulet::L2ShapeTag` is a local copy of the
 //! shape set. This crate sees both; the lock lives here.
 
-use qlab_devnet::annulet::{L2ShapeTag, L2_SURFACE_LEN_P, L2_SURFACE_LEN_S};
+use qlab_devnet::annulet::{L2ShapeTag, L2_SURFACE_LEN_P, L2_SURFACE_LEN_R, L2_SURFACE_LEN_S};
 use qlab_l2::Shape;
 
-/// Shape R (registry writes, lab #724) is a circuit before it is a wire
-/// shape: the node applies R transactions from milestone B3b, which adds its
-/// tag. Until then R maps to no tag — explicitly, so this match stays
-/// exhaustive and B3b's tag lands here as a one-line change.
-fn tag_of(shape: Shape) -> Option<L2ShapeTag> {
+/// Shape R (registry writes) carries its wire tag since B3b (lab #728) —
+/// the sets are 1:1 again.
+fn tag_of(shape: Shape) -> L2ShapeTag {
     match shape {
-        Shape::S => Some(L2ShapeTag::S),
-        Shape::P => Some(L2ShapeTag::P),
-        Shape::R => None,
+        Shape::S => L2ShapeTag::S,
+        Shape::P => L2ShapeTag::P,
+        Shape::R => L2ShapeTag::R,
     }
 }
 
@@ -24,20 +22,19 @@ fn shape_of(tag: L2ShapeTag) -> Shape {
     match tag {
         L2ShapeTag::S => Shape::S,
         L2ShapeTag::P => Shape::P,
+        L2ShapeTag::R => Shape::R,
     }
 }
 
-/// The two enums are the same set, both ways, save R before B3b (both
-/// matches are exhaustive, so a shape added on either side fails to compile
-/// here first).
+/// The two enums are the same set, both ways (both matches are exhaustive,
+/// so a shape added on either side fails to compile here first).
 #[test]
 fn the_wire_tag_and_the_circuit_shape_are_one_set() {
-    for shape in [Shape::S, Shape::P] {
-        assert_eq!(tag_of(shape).map(shape_of), Some(shape));
+    for shape in [Shape::S, Shape::P, Shape::R] {
+        assert_eq!(shape_of(tag_of(shape)), shape);
     }
-    assert_eq!(tag_of(Shape::R), None, "R has no wire tag before B3b");
-    for tag in [L2ShapeTag::S, L2ShapeTag::P] {
-        assert_eq!(tag_of(shape_of(tag)), Some(tag));
+    for tag in [L2ShapeTag::S, L2ShapeTag::P, L2ShapeTag::R] {
+        assert_eq!(tag_of(shape_of(tag)), tag);
         assert_eq!(L2ShapeTag::from_byte(tag.byte()), Some(tag));
     }
 }
@@ -56,4 +53,11 @@ fn the_surface_carries_the_circuits_extra_public_values() {
     assert_eq!(L2_SURFACE_LEN_S, 1 + 32, "tag + registry_root (the 16 PV chunks at PV_REGROOT)");
     assert_eq!(qlab_l2::PV_REGROOT + 16, Shape::S.pv_len(), "registry_root is S's last PV block");
     assert_eq!(qlab_l2::ASSET_BITS, 16, "the wire's u16 asset id is the circuit's registry index");
+    // R (lab #728): old root + new root + the written slot are public; the
+    // surface carries the old root (tag + root, as S), the new root, and the
+    // whole new leaf (15 lanes) whose lane 0 is the slot.
+    assert_eq!(L2_SURFACE_LEN_R, L2_SURFACE_LEN_S + 32 + 15 * 8);
+    assert_eq!(L2_SURFACE_LEN_R, 185);
+    assert_eq!(Shape::R.pv_len(), 85);
+    assert_eq!((qlab_l2::PV_R_OLD_ROOT, qlab_l2::PV_R_NEW_ROOT, qlab_l2::PV_R_ASSET), (52, 68, 84));
 }

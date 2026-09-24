@@ -93,6 +93,7 @@ fn an_annulet_output_is_served_by_projection_and_opened_by_the_wallet_side() {
             shape: L2ShapeTag::S,
             registry_root: state.registry_root_bytes().unwrap(),
             vpublic: None,
+            write: None,
         }
         .encode(),
     };

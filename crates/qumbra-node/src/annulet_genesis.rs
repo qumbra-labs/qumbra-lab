@@ -120,6 +120,13 @@ impl GenesisNoteRecord {
 pub struct AnnuletParams {
     pub fee_tier_s: u64,
     pub fee_tier_p: u64,
+    /// **`fee_tier_r` — a labelled PLACEHOLDER** (lab #728, from A2's
+    /// `qlab_l2::FEE_TIER_R_PLACEHOLDER`): the fee a registry write (shape R)
+    /// pays. Registration is permissionless into 65,536 slots (asset ids are
+    /// 16-bit registry indices; asset 0 is never writable), so **this tier is
+    /// the only price on exhausting the registry** — the pilot's tariff must
+    /// set it; the fixture and devnet values are not that price.
+    pub fee_tier_r: u64,
     /// The slot length in seconds (lab #708 Q5).
     pub slot_secs: u64,
     /// The producer seals an empty block at the latest every this many slots
@@ -130,7 +137,7 @@ pub struct AnnuletParams {
 impl AnnuletParams {
     /// As the body rule consumes them.
     pub fn fee_table(&self) -> L2FeeTable {
-        L2FeeTable { tier_s: self.fee_tier_s, tier_p: self.fee_tier_p }
+        L2FeeTable { tier_s: self.fee_tier_s, tier_p: self.fee_tier_p, tier_r: self.fee_tier_r }
     }
 }
 
@@ -398,7 +405,13 @@ impl AnnuletGenesisFile {
     ///   *not encrypted*: a devnet genesis seals them to the faucet's
     ///   ML-KEM key (B6).
     pub fn fixture() -> Self {
-        let params = AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, slot_secs: 10, max_empty_slots: 6 };
+        let params = AnnuletParams {
+            fee_tier_s: 1,
+            fee_tier_p: 2,
+            fee_tier_r: qlab_l2::FEE_TIER_R_PLACEHOLDER,
+            slot_secs: 10,
+            max_empty_slots: 6,
+        };
         let isk = [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004];
         let asset7 = RegistryLeafRecord {
             asset: 7,
@@ -466,6 +479,12 @@ pub mod devnet {
     /// The devnet fee tiers (fee-unit base units): S = 1, P = 2.
     pub const FEE_TIER_S: u64 = 1;
     pub const FEE_TIER_P: u64 = 2;
+    /// Shape R's devnet tier (lab #728) — a labelled placeholder, set to one
+    /// faucet grant ([`GRANT_VALUE`]) because R spends exactly **one** fee
+    /// note: a registrant pays a registration with one grant. (The fixture
+    /// genesis uses `qlab_l2::FEE_TIER_R_PLACEHOLDER` = 4; neither is the
+    /// pilot's price.)
+    pub const FEE_TIER_R: u64 = GRANT_VALUE;
     /// One grant pays exactly one shape-P fee; a stock note carries the grant
     /// plus the shape-S fee of the grant transaction that spends it whole —
     /// so the faucet needs no change tracking.
@@ -524,6 +543,7 @@ impl AnnuletGenesisFile {
         let params = AnnuletParams {
             fee_tier_s: devnet::FEE_TIER_S,
             fee_tier_p: devnet::FEE_TIER_P,
+            fee_tier_r: devnet::FEE_TIER_R,
             slot_secs: 10,
             max_empty_slots: 6,
         };
@@ -568,8 +588,10 @@ mod tests {
     /// The fixture's genesis hash — computed by the named
     /// `annulet_fixture_genesis` run, twice, byte-identical. **Re-pinned by
     /// lab #708 (Q5)**: the slot parameters joined `AnnuletParams`; the B1
-    /// value was `c0257d67…b19a` (3,031 B file); now 3,047 B.
-    const FIXTURE_GENESIS_HASH: &str = "a73f547d6c7d8763fd4090ce4bd133e13a24f4880ad272975003629a2a61ead2";
+    /// value was `c0257d67…b19a` (3,031 B file), then 3,047 B `a73f547d…ead2`.
+    /// **Re-pinned by lab #728 (Q8)**: `fee_tier_r` joined `AnnuletParams`;
+    /// now 3,055 B.
+    const FIXTURE_GENESIS_HASH: &str = "85dd805d1ecd720de91b9af4a9ef394ae40e24afe80f102956f4201abc2b6cce";
 
     #[test]
     fn the_fixture_verifies_and_selects_the_annulet_form() {
@@ -598,8 +620,10 @@ mod tests {
 
     /// The devnet genesis hash — from the named `annulet_devnet_genesis` run,
     /// twice, byte-identical (lab #716; re-pinned in lab #722 when USDT-test
-    /// moved to the canonical freeze tree — it was `6f0978eb…f374`).
-    const DEVNET_GENESIS_HASH: &str = "831de12f95b07762fa843d823824ca589fa331d5a7a552098eaf0fcd3be9e9ef";
+    /// moved to the canonical freeze tree — it was `6f0978eb…f374`; re-pinned
+    /// in lab #728 when `fee_tier_r` joined `AnnuletParams` — it was
+    /// `831de12f…e9ef`, 5,230 B; now 5,238 B).
+    const DEVNET_GENESIS_HASH: &str = "00c70e55c95e8f6519e956884bf6ffc56476fe1b3cd196983a46e1f4221d7e03";
 
     #[test]
     /// Also the byte-identity proof of lab #710's delegation: `registry_root_of`
@@ -669,6 +693,37 @@ mod tests {
         key.sequencer_key.truncate(10);
         assert!(matches!(key.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("sequencer")));
         assert!(matches!(good.verify(Some("00")), Err(GenesisError::WrongGenesisHash { .. })));
+    }
+
+    /// Lab #728 Q6 — **a demonstration, not a refusal test, because the file
+    /// the question imagines cannot be written.** A genesis registry record
+    /// has no slot field: it carries its asset lane, and the tree places it at
+    /// that slot (`RegistryTree::from_leaves`). So "asset 9's leaf at slot 10"
+    /// is not expressible in the format; the nearest attempts are a record
+    /// repeated or out of order, which `verify` refuses by name. Asserted:
+    /// every record of the fixture plus an added asset 9 sits at its own slot,
+    /// slot 10 stays empty, the tree's invariant holds, and a duplicate asset
+    /// is refused.
+    #[test]
+    fn a_genesis_registry_record_can_only_sit_at_its_own_slot() {
+        let mut records = AnnuletGenesisFile::fixture().registry_genesis;
+        let mut nine = RegistryLeaf::cloaked(9);
+        nine.mode = 1;
+        nine.issuer_key = [9, 9, 9, 9];
+        records.push(RegistryLeafRecord::of(&nine));
+        records.sort_by_key(|r| r.asset);
+        let tree = qlab_cbserver::registry::RegistryTree::from_leaves(&registry_leaves(&records)).unwrap();
+        for r in &records {
+            assert_eq!(tree.leaf(r.asset), Some(&r.leaf()), "asset {} sits at slot {}", r.asset, r.asset);
+        }
+        assert_eq!(tree.leaf(10), None, "slot 10 is empty: nothing can name it for asset 9");
+        assert_eq!(tree.leaves().count(), records.len());
+        assert_eq!(tree.check_invariant(), Ok(()));
+        // The nearest expressible attempt: asset 9 twice.
+        let mut file = AnnuletGenesisFile::fixture();
+        file.registry_genesis = records.clone();
+        file.registry_genesis.push(RegistryLeafRecord::of(&nine));
+        assert!(matches!(file.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("strictly ascending")));
     }
 
     /// The registry root is the sparse depth-16 tree it claims to be: a

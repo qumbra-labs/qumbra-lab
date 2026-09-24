@@ -1086,6 +1086,7 @@ mod tests {
                 shape: L2ShapeTag::P,
                 registry_root: [0x44; 32],
                 vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: true, amount: 5, asset: 7 }]),
+                write: None,
             }
             .encode(),
         }

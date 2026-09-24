@@ -2397,7 +2397,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             ValidationError::NotAnnuletHeader => "invalid header: not an Annulet header",
             ValidationError::PowFieldsOnAnnulet => "invalid header: pow fields on Annulet",
             ValidationError::AnchorRegressed { .. } => "invalid header: l1 anchor regressed",
-            ValidationError::RegistryRootChanged => "invalid header: registry root changed",
             ValidationError::BadSeal => "invalid header: bad sequencer seal",
         }
     }
@@ -2458,6 +2457,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // Lab #712: a surface root that is not its own header's — the
             // block contradicts itself, whatever this node's view.
             | BodyError::L2RegistryRootStale { .. }
+            // Lab #728: the write's arity, a second write, and a write whose
+            // new root is not its own header's — each reads only the pair.
+            | BodyError::L2RegistryWriteArity { .. }
+            | BodyError::L2SecondRegistryWrite { .. }
+            | BodyError::L2RegistryWriteRootMismatch { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
             | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:
@@ -2585,6 +2589,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // Lab #712: judged against this node's chain state — another
             // node's pool may differ, so not a peer fault by itself.
             MempoolError::RedeemExceedsOutstanding { .. } => "redeem exceeds outstanding supply",
+            // Lab #728: judged against this pool — not a peer fault.
+            MempoolError::RegistryWriteAlreadyPooled => "registry write already pooled",
+            MempoolError::RegistryWriteInvalid => "registry write invalid",
         }
     }
 }

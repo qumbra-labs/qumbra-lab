@@ -44,6 +44,9 @@ pub const REGISTRY_WIRE_VERSION: u8 = 1;
 pub const REGISTRY_ROOT_LEN: usize = 1 + 8 + 32;
 /// `GET /v1/registry/{asset}` body length.
 pub const REGISTRY_OPENING_LEN: usize = REGISTRY_ROOT_LEN + 15 * 8 + REGISTRY_DEPTH * 32;
+/// `GET /v1/registry/slot/{asset}` (lab #728): root header ‖ slot (u16 LE) ‖
+/// occupied (0/1) ‖ the leaf's 15 lanes (all zero when empty) ‖ 16 siblings.
+pub const REGISTRY_SLOT_OPENING_LEN: usize = REGISTRY_ROOT_LEN + 2 + 1 + 15 * 8 + REGISTRY_DEPTH * 32;
 
 /// A built registry tree: every non-empty node, per level.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,9 +64,9 @@ pub enum RegistryError {
     AssetOutOfRange { asset: u64 },
     /// Two leaves for one asset.
     DuplicateAsset { asset: u16 },
-    /// A registry update before A2 lands shape R: the registry is immutable
-    /// after genesis until then.
-    UpdatesArriveWithA2,
+    /// A write to asset 0's slot — the fee unit's leaf is pinned at genesis
+    /// and never writable (lab #724, enforced in-circuit by shape R too).
+    AssetZeroNotWritable,
     /// **The registry invariant broken** (lab #724): slot `slot` holds a leaf
     /// whose asset lane is not `slot`. Shapes S and P prove *a* path to the
     /// root and trust the leaf's asset lane, so this invariant is what makes
@@ -144,9 +147,29 @@ impl RegistryTree {
         Some(witness_at(&self.levels, asset))
     }
 
-    /// The single update seam — refused until A2 lands shape R.
-    pub fn apply_update(&mut self, _leaf: RegistryLeaf) -> Result<(), RegistryError> {
-        Err(RegistryError::UpdatesArriveWithA2)
+    /// The opening of **any** slot, registered or empty (lab #728): what a
+    /// registration proves against. Unlike [`Self::witness`], an empty slot
+    /// answers — its leaf is the zero digest.
+    pub fn opening_at(&self, slot: u16) -> RegistryWitness {
+        witness_at(&self.levels, slot)
+    }
+
+    /// **The registry write** (lab #728, shape R applied): `leaf` replaces
+    /// slot `leaf.asset` — a registration into an empty slot or an update of
+    /// the leaf there. The tree is rebuilt through [`Self::from_leaves`], so
+    /// the registry invariant is re-checked on every write. Asset 0 is never
+    /// writable; an out-of-range asset is refused as at genesis.
+    pub fn apply_update(&mut self, leaf: RegistryLeaf) -> Result<(), RegistryError> {
+        if leaf.asset >= 1u64 << REGISTRY_DEPTH {
+            return Err(RegistryError::AssetOutOfRange { asset: leaf.asset });
+        }
+        if leaf.asset == 0 {
+            return Err(RegistryError::AssetZeroNotWritable);
+        }
+        let mut leaves: BTreeMap<u16, RegistryLeaf> = self.leaves.clone();
+        leaves.insert(leaf.asset as u16, leaf);
+        *self = Self::from_leaves(&leaves.into_values().collect::<Vec<_>>())?;
+        Ok(())
     }
 }
 
@@ -188,6 +211,13 @@ pub enum RegistryWireError {
     WrongLength { got: usize, want: usize },
     BadVersion { got: u8 },
     AssetOutOfRange { asset: u64 },
+    /// A slot body's occupancy byte is neither 0 nor 1 (lab #728).
+    BadOccupancy { got: u8 },
+    /// A slot body says empty but carries a non-zero lane (lab #728).
+    EmptySlotCarriesLeaf,
+    /// A slot body's leaf is of another asset than its slot (lab #728) —
+    /// the registry invariant, refused on the wire too.
+    SlotAssetMismatch { slot: u16, asset: u64 },
 }
 
 /// Encode a `GET /v1/registry/root` body.
@@ -240,6 +270,82 @@ pub fn encode_opening_parts(
     }
     debug_assert_eq!(out.len(), REGISTRY_OPENING_LEN);
     out
+}
+
+/// The opening of any slot, registered or empty (lab #728): what a
+/// registration or an update proves against, and the root it was computed
+/// against (the B3 rule).
+#[derive(Clone)]
+pub struct RegistrySlotOpening {
+    pub height: u64,
+    pub root: [u64; 4],
+    pub slot: u16,
+    /// `None` for an empty slot, whose leaf digest is zero.
+    pub leaf: Option<RegistryLeaf>,
+    /// Siblings from the wire; path bits derived from `slot`.
+    pub witness: RegistryWitness,
+}
+
+impl RegistrySlotOpening {
+    /// The leaf digest the opening folds: the leaf's hash, or zero for an
+    /// empty slot.
+    pub fn leaf_digest(&self) -> [u64; 4] {
+        self.leaf.as_ref().map_or([0; 4], RegistryLeaf::hash)
+    }
+}
+
+/// Encode a `GET /v1/registry/slot/{asset}` body — every slot answers.
+pub fn encode_registry_slot(tree: &RegistryTree, height: u64, slot: u16) -> Vec<u8> {
+    let mut out = encode_registry_root(height, &tree.root());
+    out.extend_from_slice(&slot.to_le_bytes());
+    let lanes: [u64; 15] = match tree.leaf(slot) {
+        Some(l) => l.state()[..15].try_into().expect("15 lanes"),
+        None => [0; 15],
+    };
+    out.push(u8::from(tree.leaf(slot).is_some()));
+    for lane in &lanes {
+        out.extend_from_slice(&lane.to_le_bytes());
+    }
+    for s in &tree.opening_at(slot).siblings {
+        out.extend_from_slice(&digest_bytes(s));
+    }
+    debug_assert_eq!(out.len(), REGISTRY_SLOT_OPENING_LEN);
+    out
+}
+
+/// Decode a `GET /v1/registry/slot/{asset}` body.
+pub fn decode_registry_slot(b: &[u8]) -> Result<RegistrySlotOpening, RegistryWireError> {
+    if b.len() != REGISTRY_SLOT_OPENING_LEN {
+        return Err(RegistryWireError::WrongLength { got: b.len(), want: REGISTRY_SLOT_OPENING_LEN });
+    }
+    let (height, root) = head(b)?;
+    let slot = u16::from_le_bytes([b[REGISTRY_ROOT_LEN], b[REGISTRY_ROOT_LEN + 1]]);
+    let occupied = b[REGISTRY_ROOT_LEN + 2];
+    let lane0 = REGISTRY_ROOT_LEN + 3;
+    let lane = |i: usize| u64::from_le_bytes(b[lane0 + i * 8..lane0 + i * 8 + 8].try_into().expect("8 bytes"));
+    let d4 = |i: usize| [lane(i), lane(i + 1), lane(i + 2), lane(i + 3)];
+    let leaf = match occupied {
+        0 if (0..15).all(|i| lane(i) == 0) => None,
+        0 => return Err(RegistryWireError::EmptySlotCarriesLeaf),
+        1 if lane(0) != u64::from(slot) => {
+            return Err(RegistryWireError::SlotAssetMismatch { slot, asset: lane(0) })
+        }
+        1 => Some(RegistryLeaf {
+            asset: lane(0),
+            issuer_key: d4(1),
+            mode: lane(5),
+            freeze_root: d4(6),
+            allow_root: d4(10),
+            flags: lane(14),
+        }),
+        got => return Err(RegistryWireError::BadOccupancy { got }),
+    };
+    let sib0 = lane0 + 15 * 8;
+    let siblings = core::array::from_fn(|i| {
+        let at = sib0 + i * 32;
+        digest_from_bytes(b[at..at + 32].try_into().expect("32 bytes"))
+    });
+    Ok(RegistrySlotOpening { height, root, slot, leaf, witness: RegistryWitness { siblings, path_bits: path_bits_of(slot) } })
 }
 
 /// Decode a `GET /v1/registry/{asset}` body.
@@ -329,6 +435,42 @@ mod tests {
         assert_eq!(w.fold_root(&hybrid(6).hash()), t2.root(), "the registration's new root");
     }
 
+    /// Lab #728 Q5: the slot route answers every slot — a registered one
+    /// with its leaf, an empty one with none — and each opening folds its
+    /// leaf digest to the root it carries; a registration's new leaf folds
+    /// to the root after the write. Malformed bodies are refused by name.
+    #[test]
+    fn the_slot_opening_answers_empty_and_registered_slots() {
+        let leaves = [RegistryLeaf::cloaked(0), hybrid(7)];
+        let t = RegistryTree::from_leaves(&leaves).unwrap();
+        for slot in [0u16, 7, 6, 65_535] {
+            let b = encode_registry_slot(&t, 12, slot);
+            assert_eq!(b.len(), REGISTRY_SLOT_OPENING_LEN);
+            let o = decode_registry_slot(&b).unwrap();
+            assert_eq!((o.height, o.root, o.slot), (12, t.root(), slot));
+            assert_eq!(o.leaf.as_ref(), t.leaf(slot), "slot {slot}");
+            assert_eq!(o.witness.fold_root(&o.leaf_digest()), t.root(), "slot {slot} folds to the root");
+        }
+        let empty = decode_registry_slot(&encode_registry_slot(&t, 12, 6)).unwrap();
+        assert_eq!(empty.leaf, None);
+        let mut after = t.clone();
+        after.apply_update(hybrid(6)).unwrap();
+        assert_eq!(empty.witness.fold_root(&hybrid(6).hash()), after.root(), "the registration's new root");
+        // Refusals.
+        let good = encode_registry_slot(&t, 12, 6);
+        let occ = REGISTRY_ROOT_LEN + 2;
+        let mut bad = good.clone();
+        bad[occ] = 2;
+        assert_eq!(decode_registry_slot(&bad).err(), Some(RegistryWireError::BadOccupancy { got: 2 }));
+        let mut bad = good.clone();
+        bad[occ + 1] = 1;
+        assert_eq!(decode_registry_slot(&bad).err(), Some(RegistryWireError::EmptySlotCarriesLeaf));
+        let mut bad = encode_registry_slot(&t, 12, 7);
+        bad[REGISTRY_ROOT_LEN] = 8;
+        assert_eq!(decode_registry_slot(&bad).err(), Some(RegistryWireError::SlotAssetMismatch { slot: 8, asset: 7 }));
+        assert!(matches!(decode_registry_slot(&good[1..]), Err(RegistryWireError::WrongLength { .. })));
+    }
+
     #[test]
     fn slot_i_holds_only_a_leaf_of_asset_i() {
         let leaves = [RegistryLeaf::cloaked(0), hybrid(7), RegistryLeaf::cloaked(65_535)];
@@ -344,11 +486,37 @@ mod tests {
         assert_eq!(planted.check_invariant(), Err(RegistryError::SlotAssetMismatch { slot: 9, asset: 7 }));
     }
 
+    /// Lab #728: a registration into an empty slot and an update of a leaf
+    /// each move the root to exactly the tree built from the new leaf set; the
+    /// empty slot's opening folds the zero digest to the old root and the new
+    /// leaf to the new one; asset 0 and out-of-range assets are refused.
     #[test]
-    fn the_empty_registry_root_is_the_zero_ladder_and_updates_wait_for_a2() {
-        let mut t = RegistryTree::from_leaves(&[]).unwrap();
+    fn a_registry_write_moves_the_root_to_the_rebuilt_trees() {
+        let base = [RegistryLeaf::cloaked(0), hybrid(7)];
+        let mut t = RegistryTree::from_leaves(&base).unwrap();
+        let old = t.root();
+        let opening = t.opening_at(9);
+        assert!(t.witness(9).is_none(), "the served witness stays leaf-only");
+        assert_eq!(opening.fold_root(&[0; 4]), old, "an empty slot's opening folds the zero digest");
+        t.apply_update(hybrid(9)).unwrap();
+        assert_eq!(t.root(), RegistryTree::from_leaves(&[base[0], base[1], hybrid(9)]).unwrap().root());
+        assert_eq!(opening.fold_root(&hybrid(9).hash()), t.root(), "the same opening folds the new leaf");
+        // An update: asset 7 rotates its issuer key.
+        let rotated = RegistryLeaf { issuer_key: [0xAB; 4], ..hybrid(7) };
+        t.apply_update(rotated).unwrap();
+        assert_eq!(t.leaf(7), Some(&rotated));
+        assert_eq!(t.check_invariant(), Ok(()));
+        assert_eq!(t.apply_update(RegistryLeaf::cloaked(0)), Err(RegistryError::AssetZeroNotWritable));
+        assert_eq!(
+            t.apply_update(RegistryLeaf::cloaked(1 << 16)),
+            Err(RegistryError::AssetOutOfRange { asset: 1 << 16 })
+        );
+    }
+
+    #[test]
+    fn the_empty_registry_root_is_the_zero_ladder() {
+        let t = RegistryTree::from_leaves(&[]).unwrap();
         assert_eq!(t.root(), zeros()[REGISTRY_DEPTH]);
-        assert_eq!(t.apply_update(RegistryLeaf::cloaked(1)), Err(RegistryError::UpdatesArriveWithA2));
         assert_eq!(
             RegistryTree::from_leaves(&[RegistryLeaf::cloaked(3), RegistryLeaf::cloaked(3)]),
             Err(RegistryError::DuplicateAsset { asset: 3 })
@@ -478,9 +646,12 @@ pub fn decode_genesis_notes(b: &[u8]) -> Result<([u8; 32], Vec<ServedGenesisNote
 
 /// The route an Annulet node serves its fee tiers on (lab #720).
 pub const ANNULET_PARAMS_PATH: &str = "/v1/annulet/params";
-pub const ANNULET_PARAMS_WIRE_VERSION: u8 = 1;
-/// `version ‖ genesis_hash(32) ‖ fee_tier_s u64 LE ‖ fee_tier_p u64 LE`.
-pub const ANNULET_PARAMS_LEN: usize = 1 + 32 + 8 + 8;
+/// v2 (lab #728) adds `fee_tier_r`: an existing route's bytes changed, so the
+/// version moved (the PR #315 rule).
+pub const ANNULET_PARAMS_WIRE_VERSION: u8 = 2;
+/// `version ‖ genesis_hash(32) ‖ fee_tier_s u64 LE ‖ fee_tier_p u64 LE ‖
+/// fee_tier_r u64 LE`.
+pub const ANNULET_PARAMS_LEN: usize = 1 + 32 + 8 + 8 + 8;
 
 /// `GET /v1/annulet/params` (lab #720): the posted fee tiers of the genesis
 /// the node runs, under that genesis's hash — the tariff a wallet must pay
@@ -491,6 +662,8 @@ pub struct AnnuletParams {
     pub genesis_hash: [u8; 32],
     pub fee_tier_s: u64,
     pub fee_tier_p: u64,
+    /// Shape R's tier (lab #728) — the registry-write price.
+    pub fee_tier_r: u64,
 }
 
 /// Why an Annulet params body did not decode.
@@ -507,6 +680,7 @@ pub fn encode_annulet_params(p: &AnnuletParams) -> Vec<u8> {
     out.extend_from_slice(&p.genesis_hash);
     out.extend_from_slice(&p.fee_tier_s.to_le_bytes());
     out.extend_from_slice(&p.fee_tier_p.to_le_bytes());
+    out.extend_from_slice(&p.fee_tier_r.to_le_bytes());
     out
 }
 
@@ -521,6 +695,7 @@ pub fn decode_annulet_params(b: &[u8]) -> Result<AnnuletParams, AnnuletParamsWir
         genesis_hash: b[1..33].try_into().expect("32 bytes"),
         fee_tier_s: u64::from_le_bytes(b[33..41].try_into().expect("8 bytes")),
         fee_tier_p: u64::from_le_bytes(b[41..49].try_into().expect("8 bytes")),
+        fee_tier_r: u64::from_le_bytes(b[49..57].try_into().expect("8 bytes")),
     })
 }
 
@@ -530,14 +705,16 @@ mod annulet_params_tests {
 
     #[test]
     fn annulet_params_round_trip_and_refuse_by_name() {
-        let p = AnnuletParams { genesis_hash: [0x6f; 32], fee_tier_s: 1, fee_tier_p: 2 };
+        let p = AnnuletParams { genesis_hash: [0x6f; 32], fee_tier_s: 1, fee_tier_p: 2, fee_tier_r: 4 };
         let b = encode_annulet_params(&p);
         assert_eq!(b.len(), ANNULET_PARAMS_LEN);
         assert_eq!(decode_annulet_params(&b), Ok(p));
         assert_eq!(decode_annulet_params(&b[..48]), Err(AnnuletParamsWireError::Length { got: 48 }));
-        let mut v2 = b.clone();
-        v2[0] = 2;
-        assert_eq!(decode_annulet_params(&v2), Err(AnnuletParamsWireError::BadVersion { got: 2 }));
+        // v1 (no fee_tier_r) is refused by name, not misread (lab #728).
+        let mut v1 = b.clone();
+        v1[0] = 1;
+        assert_eq!(decode_annulet_params(&v1), Err(AnnuletParamsWireError::BadVersion { got: 1 }));
+        assert_eq!(ANNULET_PARAMS_LEN, 57);
     }
 }
 

@@ -23,7 +23,9 @@ use std::net::{SocketAddr, TcpStream};
 use qlab_air::l2::{L2TxInput, L2TxOutput, RegistryLeaf, MODE_CLOAKED, MODE_HYBRID, MODE_REGULATED};
 use qlab_air::l2p::{dummy_allow_witness, CanonicalFreezeTree, L2PolicyInput, PolicyWitness, VPublic};
 use qlab_air::narrow::MerkleWitness;
-use qlab_cbserver::registry::{decode_genesis_notes, decode_registry_opening, RegistryOpening};
+use qlab_cbserver::registry::{
+    decode_genesis_notes, decode_registry_opening, decode_registry_slot, RegistryOpening, RegistrySlotOpening,
+};
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::annulet::{L2ShapeTag, L2Surface, VPublicTerm};
 use qlab_devnet::body::{TxEntry, TxPublic};
@@ -52,6 +54,8 @@ pub enum SpendError {
     Frozen { asset: u64 },
     /// The allowlist witness does not fold to the served `allow_root`.
     NotAllowlisted { asset: u64 },
+    /// A registry write's fee note holds less than the fee (lab #728).
+    FeeExceedsInput { have: u64, fee: u64 },
 }
 
 impl std::fmt::Display for SpendError {
@@ -75,6 +79,9 @@ impl std::fmt::Display for SpendError {
             SpendError::Frozen { asset } => write!(f, "asset {asset}: this address is frozen by the issuer"),
             SpendError::NotAllowlisted { asset } => {
                 write!(f, "asset {asset}: the allowlist witness does not open the registry's allow root")
+            }
+            SpendError::FeeExceedsInput { have, fee } => {
+                write!(f, "the fee note holds {have}, less than the registry-write fee {fee}")
             }
         }
     }
@@ -162,6 +169,14 @@ impl<E: Endpoint> Served<E> {
     pub fn registry(&self, asset: u64) -> Result<RegistryOpening, SpendError> {
         let body = served(self.endpoint.get(&format!("/v1/registry/{asset}")))?;
         served(decode_registry_opening(&body).map_err(|e| format!("registry {asset}: {e:?}")))
+    }
+
+    /// The opening of registry slot `asset`, registered or empty, with the
+    /// root it was computed against (lab #728 — what a registry write proves
+    /// against).
+    pub fn registry_slot(&self, asset: u64) -> Result<RegistrySlotOpening, SpendError> {
+        let body = served(self.endpoint.get(&format!("/v1/registry/slot/{asset}")))?;
+        served(decode_registry_slot(&body).map_err(|e| format!("registry slot {asset}: {e:?}")))
     }
 
     /// The genesis notes, opened, with the served genesis hash.
@@ -457,8 +472,87 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
     let (_, proof) = qlab_l2::prove_s(&inst);
     let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
     let discovery = discovery_for(&notes, outs, rng);
-    let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None };
+    let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None, write: None };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::S })
+}
+
+/// An assembled registry write (shape R) and its one output note.
+pub struct BuiltR {
+    pub tx: TxEntry,
+    /// The fee change, to the payer.
+    pub output: L2Note,
+    /// The registry root the write moves to (header bytes).
+    pub new_root: [u8; 32],
+}
+
+/// **A shape-R registry write** (lab #728): `new_leaf` replaces registry slot
+/// `new_leaf.asset` — a **registration** when the served slot is empty
+/// (permissionless; `isk` is not read), an **update** when it holds a leaf
+/// (`isk` is the issuer secret behind that leaf's `issuer_key`). One asset-0
+/// fee note pays `fee`; the change goes to `change`. The slot's opening and
+/// root come from `/v1/registry/slot/{asset}`, the fee note's witness from the
+/// served commitment tree. Proves (≈ 3.5 GB, under a second on the rig).
+pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    fee_input: &L2TxInput,
+    change: &Recipient,
+    fee: u64,
+    new_leaf: RegistryLeaf,
+    isk: [u64; 4],
+    rng: &mut R,
+) -> Result<BuiltR, SpendError> {
+    let change_value = fee_input
+        .value
+        .checked_sub(fee)
+        .ok_or(SpendError::FeeExceedsInput { have: fee_input.value, fee })?;
+    let tree = served.commitment_tree()?;
+    let anchor = tree.root();
+    let slot = served.registry_slot(new_leaf.asset)?;
+    let write = qlab_air::l2r::RegistryWrite { isk, old_leaf: slot.leaf, new_leaf, opening: slot.witness };
+    let out = L2TxOutput { value: change_value, asset: 0, rkm: change.rkm, rho: [0; 4], rseed: random_d4(rng) };
+    let inst = qlab_air::l2r::build_shape_r_with_witnesses(
+        qlab_l2::LOG_HEIGHT_R,
+        fee_input,
+        &witness_of(&tree, fee_input)?,
+        anchor,
+        &out,
+        fee,
+        &write,
+    );
+    if inst.old_root != slot.root {
+        return Err(SpendError::RegistryMoved);
+    }
+    let (_, proof) = qlab_l2::prove_r(&inst);
+    // R's output takes the input's nullifier as its ρ (option 4, `ρ′₀ = nf₀`).
+    let note = L2Note { value: out.value, asset: 0, rkm: out.rkm, rho: inst.nf, rseed: out.rseed };
+    assert_eq!(note.commitment(), inst.cm_out, "the change note is the one the proof commits");
+    let enc = qlab_note::scan::encrypt_notes_to_recipient(&change.ek, std::slice::from_ref(&note), rng);
+    let discovery =
+        qlab_note::compact::encode_committed_discovery_with_width(std::slice::from_ref(&enc.bundle), &enc.payloads, L2_PAYLOAD_LEN);
+    let new_root = digest_bytes(&inst.new_root);
+    let surface = L2Surface {
+        shape: L2ShapeTag::R,
+        registry_root: digest_bytes(&inst.old_root),
+        vpublic: None,
+        write: Some(qlab_devnet::annulet::RegistryWriteSurface {
+            new_root,
+            leaf_lanes: new_leaf.state()[..15].try_into().expect("15 lanes"),
+        }),
+    };
+    let tx = TxEntry {
+        proof: bincode::serialize(&proof).expect("a proof serializes"),
+        public: TxPublic {
+            anchor: digest_bytes(&anchor),
+            nullifiers: vec![digest_bytes(&inst.nf)],
+            commitments: vec![digest_bytes(&inst.cm_out)],
+            bucket: ArityBucket::TwoByTwo,
+            fee,
+        },
+        discovery,
+        rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+        l2: surface.encode(),
+    };
+    Ok(BuiltR { tx, output: note, new_root })
 }
 
 /// **A shape-P transfer** (vPublic = 0) of two real inputs — a policy-asset
@@ -538,7 +632,7 @@ pub fn prove_p_with_policies<R: rand::CryptoRng>(
         }
     };
     let surface =
-        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]) };
+        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]), write: None };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 

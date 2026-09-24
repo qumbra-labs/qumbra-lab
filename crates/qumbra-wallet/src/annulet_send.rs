@@ -40,6 +40,9 @@ use crate::store::WalletDir;
 pub struct Tiers {
     pub s: u64,
     pub p: u64,
+    /// Shape R's tier (lab #728) — a registry write, never a send; carried so
+    /// the table is the genesis's whole.
+    pub r: u64,
 }
 
 impl Tiers {
@@ -47,6 +50,7 @@ impl Tiers {
         match shape {
             L2ShapeTag::S => self.s,
             L2ShapeTag::P => self.p,
+            L2ShapeTag::R => self.r,
         }
     }
 }
@@ -234,7 +238,7 @@ pub fn open_session<E: Endpoint>(
     if params.genesis_hash != report.genesis_hash {
         return Err(SendRefusal::ParamsGenesisMismatch);
     }
-    let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p };
+    let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p, r: params.fee_tier_r };
     let index = report.index.ok_or(SendRefusal::NoBalance)?;
     Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash })
 }
@@ -341,6 +345,8 @@ pub fn send_annulet<E: Endpoint>(
                     let ctx = qlab_l2spend::PolicyContext { freeze_keys: freeze_keys.to_vec(), ..Default::default() };
                     build_p_with(served, [&inputs[0], &inputs[1]], &outs, tariff, [&ctx, &Default::default()], [VPublic::NONE; 2], rng)?
                 }
+                // `shape_for` plans S or P only: R is a registry write, never a send.
+                L2ShapeTag::R => unreachable!("a send is planned as shape S or P, never R (lab #728)"),
             };
             (split_note, built)
         }
@@ -374,7 +380,7 @@ mod tests {
     use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
     use qlab_wallet::Wallet;
 
-    const TIERS: Tiers = Tiers { s: 1, p: 2 };
+    const TIERS: Tiers = Tiers { s: 1, p: 2, r: 4 };
 
     fn wallet() -> Wallet {
         Wallet::from_master_seed(&MasterSeed::from_entropy([3u8; ENTROPY_LEN]), 0)

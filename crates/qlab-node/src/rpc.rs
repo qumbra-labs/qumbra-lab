@@ -542,6 +542,11 @@ pub enum RejectReason {
     L2SurfaceInvalid,
     /// A redeem exceeding the asset's outstanding supply (lab #712).
     RedeemExceedsOutstanding,
+    /// A registry write while another is pooled (lab #728) — additive,
+    /// reachable only on an Annulet net.
+    RegistryWriteAlreadyPooled,
+    /// A registry write the block rule would refuse (lab #728) — additive.
+    RegistryWriteInvalid,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
     // commitment tree's append schedule, so an immature spend has no witness against
     // any acceptable anchor and cannot reach a refusal reason at all. A wallet that wants
@@ -750,6 +755,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             }
             Err(MempoolError::RedeemExceedsOutstanding { .. }) => {
                 SubmitOutcome::Rejected(RejectReason::RedeemExceedsOutstanding)
+            }
+            Err(MempoolError::RegistryWriteAlreadyPooled) => {
+                SubmitOutcome::Rejected(RejectReason::RegistryWriteAlreadyPooled)
+            }
+            Err(MempoolError::RegistryWriteInvalid) => {
+                SubmitOutcome::Rejected(RejectReason::RegistryWriteInvalid)
             }
         }
     }

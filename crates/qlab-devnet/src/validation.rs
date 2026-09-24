@@ -62,9 +62,12 @@ pub enum ValidationError {
     /// The header's `l1_anchor_height` is below its parent's (the anchor is
     /// informational at Phase 0, but monotone).
     AnchorRegressed { parent: u64, got: u64 },
-    /// The header's `registry_root` differs from its parent's — there are no
-    /// runtime registry changes until A2.
-    RegistryRootChanged,
+    // NOTE (lab #728): there is no `RegistryRootChanged`. A block's registry
+    // write (shape R) moves the root, and a header alone cannot say whether
+    // its body writes; the binding is the body rule's (the header root is the
+    // write's `new_root`, or the parent's when nothing is written) and the
+    // node's apply (writing the leaf reaches it). A header-level variant would
+    // be unreachable on an honest net and refuse every registry write.
     /// The seal is not a valid signature by the genesis sequencer key over
     /// this header's signing message.
     BadSeal,
@@ -240,9 +243,6 @@ pub fn validate_sealed_header_annulet(
     };
     if ext.l1_anchor_height < pext.l1_anchor_height {
         return Err(ValidationError::AnchorRegressed { parent: pext.l1_anchor_height, got: ext.l1_anchor_height });
-    }
-    if ext.registry_root != pext.registry_root {
-        return Err(ValidationError::RegistryRootChanged);
     }
     if !sealed.verifies_under(sequencer_key) {
         return Err(ValidationError::BadSeal);

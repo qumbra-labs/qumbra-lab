@@ -465,10 +465,26 @@ pub enum NodeError {
     /// foreign datadir, refused before any record is hashed.
     LogFormMismatch { form: GenesisForm, height: u64 },
     /// An Annulet header's `registry_root` is not the root of the registry
-    /// this node holds (lab #710) — at genesis load (`height` 0) or on a
-    /// block. The registry is immutable until A2, so on a healthy chain every
-    /// header carries the genesis registry's root.
+    /// this node holds after the block (lab #710, #728) — at genesis load
+    /// (`height` 0) or on a block. A block without a registry write carries
+    /// its parent's root; a block with one carries the root after the write.
     RegistryRootMismatch { height: u64, header: Hash32, store: Hash32 },
+    /// A block's registry write (shape R, lab #728) was proven against a
+    /// registry root that is not this node's root before the block — a write
+    /// on another registry history.
+    RegistryWriteNotOnParent { height: u64, surface: Hash32, store: Hash32 },
+    /// Writing the R surface's leaf into this node's registry does not reach
+    /// the root the surface declares (lab #728): the leaf and the declared
+    /// root disagree about the tree they describe.
+    RegistryWriteRootMismatch { height: u64, surface: Hash32, rebuilt: Hash32 },
+    /// A block's registry write is refused by the registry itself (lab #728):
+    /// asset 0's pinned slot, or a slot out of range.
+    RegistryWrite { height: u64, err: crate::registry_store::RegistryError },
+    /// The Annulet genesis notes do not state their issuance (lab #728 Q7):
+    /// a note whose payload is not a genesis plaintext, or does not open its
+    /// commitment. Genesis supply seeds the outstanding figure, so a genesis
+    /// that cannot state it is refused by name.
+    GenesisIssuance(String),
     /// The genesis registry does not build (a duplicate or out-of-range
     /// asset) — a malformed genesis, refused by name.
     RegistryGenesis(crate::registry_store::RegistryError),
@@ -484,10 +500,15 @@ pub enum NodeError {
 #[derive(Clone)]
 pub(crate) struct AnnuletSetup {
     fees: qlab_devnet::annulet::L2FeeTable,
+    /// The GENESIS registry — never a later one: a rebuild from genesis
+    /// re-applies every block's write over it (lab #728).
     registry: crate::registry_store::MemRegistryStore,
     /// The genesis notes' commitments, in genesis order (lab #710, B1 P13):
     /// the fee unit's Phase-0 supply, applied at height 0.
     genesis_cms: Vec<Hash32>,
+    /// The genesis notes' per-asset issuance (lab #728 Q7), recomputed from
+    /// their public plaintexts with each commitment checked.
+    genesis_supply: BTreeMap<u16, i128>,
 }
 
 impl AnnuletSetup {
@@ -505,7 +526,15 @@ impl AnnuletSetup {
         if header_root != registry.root_bytes() {
             return Err(NodeError::RegistryRootMismatch { height: 0, header: header_root, store: registry.root_bytes() });
         }
-        Ok(Self { fees, registry, genesis_cms: genesis_notes.iter().map(|n| n.cm).collect() })
+        let genesis_supply = crate::asset_supply::genesis_issuance(genesis_notes)
+            .map_err(NodeError::GenesisIssuance)?
+            .into_iter()
+            .map(|(asset, v)| {
+                let v = i128::try_from(v).map_err(|_| NodeError::GenesisIssuance(format!("asset {asset}: issuance beyond i128")))?;
+                Ok((asset, v))
+            })
+            .collect::<Result<_, NodeError>>()?;
+        Ok(Self { fees, registry, genesis_cms: genesis_notes.iter().map(|n| n.cm).collect(), genesis_supply })
     }
 }
 
@@ -556,10 +585,15 @@ impl NodeError {
             | NodeError::UnsealedOnAnnulet
             | NodeError::AnnuletFinality(_)
             | NodeError::LogFormMismatch { .. }
-            | NodeError::RegistryGenesis(_) => "internal",
-            // A block whose header names another registry root than this
-            // node's state: refused like a bad body.
-            NodeError::RegistryRootMismatch { .. } | NodeError::SupplyUnderflow { .. } => "bad_body",
+            | NodeError::RegistryGenesis(_)
+            | NodeError::GenesisIssuance(_) => "internal",
+            // A block whose header or registry write names another registry
+            // than this node's state: refused like a bad body.
+            NodeError::RegistryRootMismatch { .. }
+            | NodeError::RegistryWriteNotOnParent { .. }
+            | NodeError::RegistryWriteRootMismatch { .. }
+            | NodeError::RegistryWrite { .. }
+            | NodeError::SupplyUnderflow { .. } => "bad_body",
         }
     }
 }
@@ -609,6 +643,22 @@ impl std::fmt::Display for NodeError {
                 hex8(store)
             ),
             NodeError::RegistryGenesis(e) => write!(f, "the genesis registry does not build: {e:?} (lab #710)"),
+            NodeError::RegistryWriteNotOnParent { height, surface, store } => write!(
+                f,
+                "block {height}'s registry write is proven against root {} but this node's registry root is {} (lab #728)",
+                hex8(surface),
+                hex8(store)
+            ),
+            NodeError::RegistryWriteRootMismatch { height, surface, rebuilt } => write!(
+                f,
+                "block {height}'s registry write declares root {} but writing its leaf yields {} (lab #728)",
+                hex8(surface),
+                hex8(rebuilt)
+            ),
+            NodeError::RegistryWrite { height, err } => {
+                write!(f, "block {height}'s registry write is refused by the registry: {err:?} (lab #728)")
+            }
+            NodeError::GenesisIssuance(e) => write!(f, "the Annulet genesis does not state its issuance: {e} (lab #728)"),
             NodeError::SupplyUnderflow { height, asset, outstanding, delta } => write!(
                 f,
                 "block {height} takes asset {asset}'s outstanding supply from {outstanding} by {delta} below zero (lab #712)"
@@ -742,6 +792,16 @@ pub trait NodeState {
     fn outstanding_supply(&self, _asset: u16) -> i128 {
         0
     }
+    /// The root writing `leaf_lanes` into this node's registry reaches, or
+    /// the registry's refusal (lab #728) — what the mempool checks a
+    /// registry write against, so a write the block rule would refuse never
+    /// pools. `None` on L1.
+    fn annulet_registry_write_root(
+        &self,
+        _leaf_lanes: &[u64; 15],
+    ) -> Option<Result<Hash32, crate::registry_store::RegistryError>> {
+        None
+    }
     /// The fork-choice tip height.
     fn tip_height(&self) -> u64;
     /// The fork-choice tip hash.
@@ -807,12 +867,22 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node.
     annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
     /// The asset registry (lab #710): `Some` exactly on an Annulet node,
-    /// bound to every header's `registry_root`.
+    /// bound to every header's `registry_root`. Moved only by a block's
+    /// registry write (shape R, lab #728), in `apply_state` — so it is chain
+    /// state like the tree, rebuilt from the held main chain wherever a path
+    /// skips `apply_state` ([`Self::recompute_annulet_state`]).
     registry: Option<crate::registry_store::MemRegistryStore>,
+    /// The genesis registry (lab #728): what a rebuild from genesis starts
+    /// from. `registry` is no longer it once a write has applied.
+    registry_genesis: Option<crate::registry_store::MemRegistryStore>,
+    /// The genesis notes' per-asset issuance (lab #728 Q7): the outstanding
+    /// figure's starting point. Empty on L1.
+    genesis_supply: BTreeMap<u16, i128>,
     /// The Annulet genesis notes' commitments (empty on L1), kept so a
     /// rebuild from genesis re-applies them.
     annulet_genesis_cms: Vec<Hash32>,
-    /// The running per-asset outstanding public supply (lab #712): Σ of every
+    /// The running per-asset outstanding public supply (lab #712): the
+    /// genesis issuance (lab #728 Q7) plus Σ of every
     /// applied block's `annulet_supply_delta`. Chain state, **recomputed**
     /// (never persisted): folded in `apply_state` — which every replay and
     /// rewind runs — and rebuilt from the held main chain at `open_annulet`
@@ -890,22 +960,22 @@ impl MemNode {
         let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
-        let mut node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
-        node.recompute_supply();
-        // Lab #710: the sidecar is checked against the store the genesis
-        // built (Phase 0: the genesis is the whole registry history). A
-        // sidecar that disagrees, or cannot be read, is replaced — said
-        // aloud, never trusted.
+        let node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
+        // Lab #710, #728: the registry is chain state — every resume path
+        // derives it from the log (replay through `apply_state`, a snapshot
+        // through `recompute_annulet_state`). The sidecar is checked against
+        // that derivation; one that disagrees, or cannot be read, is
+        // replaced — said aloud, never trusted.
         match crate::registry_store::load_registry_at(dir) {
             Ok(Some((held, _))) if Some(&held) == node.registry.as_ref() => {}
             Ok(None) => {}
             Ok(Some((held, at))) => qlab_devnet::jprintln!(
-                "REGISTRY sidecar at height {at} disagrees with the genesis registry (root {} vs {}); \
-                 rebuilt from genesis (lab #710 — immutable until A2)",
+                "REGISTRY sidecar at height {at} disagrees with the chain-derived registry (root {} vs {}); \
+                 rewritten from the chain (lab #728)",
                 hex8(&crate::registry_store::RegistryStore::root_bytes(&held)),
                 hex8(&node.registry_root_bytes().unwrap_or_default())
             ),
-            Err(e) => qlab_devnet::jprintln!("REGISTRY sidecar unusable ({e}); rebuilt from genesis (lab #710)"),
+            Err(e) => qlab_devnet::jprintln!("REGISTRY sidecar unusable ({e}); rewritten from the chain (lab #728)"),
         }
         if let Some(reg) = &node.registry {
             crate::registry_store::save_registry(dir, reg, node.chain.tip_height()).map_err(NodeError::Io)?;
@@ -1163,6 +1233,10 @@ impl MemNode {
             .iter()
             .filter(|r| matches!(r, LogRecord::Block(b) if b.header.height > snap.applied_height))
             .count();
+        // Lab #712, #728: the prefix went in by `put_block` alone, so the
+        // Annulet chain state the tail's `apply_state` reads is re-derived
+        // here, before the first tail block needs it.
+        node.recompute_annulet_state()?;
         let mut progress = ReplayProgress::start(
             tail_blocks,
             &format!("past snapshot at height {}", snap.applied_height),
@@ -1354,6 +1428,9 @@ impl MemNode {
             .iter()
             .filter(|r| matches!(r, LogRecord::Block(b) if b.header.height > snap.applied_height))
             .count();
+        // Lab #712, #728: as on the honoured path — the prefix skipped
+        // `apply_state`, so the Annulet chain state is re-derived first.
+        node.recompute_annulet_state().ok()?;
         let mut progress = ReplayProgress::start(
             tail_blocks,
             &format!("near-tip catch-up past rejected snapshot at height {}", snap.applied_height),
@@ -1492,7 +1569,6 @@ impl MemNode {
             // crash between the block record and its `Finalize` record cannot
             // leave a replayed Annulet node with finality behind its tip.
             GenesisForm::Annulet => {
-                self.check_registry_binding(&block.header())?;
                 self.chain.set_finalized(hash).map_err(NodeError::AnnuletFinality)?;
             }
         }
@@ -1643,7 +1719,12 @@ impl MemNode {
             (GenesisForm::Annulet, Some(setup)) => {
                 let mut node = Self::from_bound_genesis(form, genesis, dir);
                 node.annulet_fees = Some(setup.fees);
+                node.registry_genesis = Some(setup.registry.clone());
                 node.registry = Some(setup.registry);
+                // Lab #728 Q7: the genesis notes' issuance is outstanding from
+                // height 0 — a redeem of genesis supply is not an underflow.
+                node.outstanding = setup.genesis_supply.clone();
+                node.genesis_supply = setup.genesis_supply;
                 // Lab #710 (B1 P13): the genesis notes enter the commitment
                 // tree at height 0, in genesis order, through the append every
                 // block's outputs take — so the genesis anchor is the tree over
@@ -1694,6 +1775,8 @@ impl MemNode {
             form,
             annulet_fees: None,
             registry: None,
+            registry_genesis: None,
+            genesis_supply: BTreeMap::new(),
             annulet_genesis_cms: Vec::new(),
             outstanding: BTreeMap::new(),
             supply_deltas: BTreeMap::new(),
@@ -1958,7 +2041,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         if header.prev != self.chain.tip_hash() {
             return Err(NodeError::NotExtendingTip { expected: self.chain.tip_hash(), got: header.prev });
         }
-        self.check_registry_binding(&header)?;
+        self.check_registry_parent(&header, &body)?;
         let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
         qlab_devnet::annulet::validate_body_annulet(&header, &body, verifier, anchor_ok, &fees)
             .map_err(NodeError::Body)?;
@@ -2005,7 +2088,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// main chain (lab #712) — the one pass that also covers a snapshot resume,
     /// whose prefix blocks never ran `apply_state`.
     fn recompute_supply(&mut self) {
-        self.outstanding.clear();
+        self.outstanding = self.genesis_supply.clone();
         self.supply_deltas.clear();
         // The main chain, walked back from the applied tip through `prev`.
         let mut cursor = self.chain.tip_hash();
@@ -2027,18 +2110,99 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     fn annulet_setup(&self) -> Option<AnnuletSetup> {
         Some(AnnuletSetup {
             fees: self.annulet_fees?,
-            registry: self.registry.clone()?,
+            registry: self.registry_genesis.clone()?,
             genesis_cms: self.annulet_genesis_cms.clone(),
+            genesis_supply: self.genesis_supply.clone(),
         })
     }
 
-    /// Lab #710 Q6: an applied Annulet header must name this node's registry.
-    fn check_registry_binding(&self, header: &BlockHeader) -> Result<(), NodeError> {
-        let Some(store) = self.registry_root_bytes() else { return Ok(()) };
-        let got = annulet_registry_root(header);
-        if got != store {
-            return Err(NodeError::RegistryRootMismatch { height: header.height, header: got, store });
+    /// Lab #710 Q6, #728: the registry binding a block is checked against
+    /// before its proofs are — cheap, no tree rebuilt. A block that writes
+    /// nothing carries this node's root; a block that writes proves its write
+    /// against this node's root. What the write reaches is [`Self::registry_after`]'s.
+    fn check_registry_parent(&self, header: &BlockHeader, body: &BlockBody) -> Result<(), NodeError> {
+        use crate::registry_store::RegistryStore as _;
+        let Some(store) = &self.registry else { return Ok(()) };
+        let pre = store.root_bytes();
+        match qlab_devnet::annulet::annulet_registry_write(body).map_err(NodeError::Body)? {
+            None => {
+                let got = annulet_registry_root(header);
+                if got != pre {
+                    return Err(NodeError::RegistryRootMismatch { height: header.height, header: got, store: pre });
+                }
+            }
+            Some((_, old_root, _)) => {
+                if old_root != pre {
+                    return Err(NodeError::RegistryWriteNotOnParent { height: header.height, surface: old_root, store: pre });
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// **The registry after `block`** (lab #728), computed before any
+    /// mutation: `None` when the block writes nothing. The write must be
+    /// proven against this node's root before the block, writing its leaf
+    /// must reach the root it declares, and the header must carry the root
+    /// after the block — every one refused by name, state untouched.
+    fn registry_after(
+        &self,
+        header: &BlockHeader,
+        body: &BlockBody,
+    ) -> Result<Option<crate::registry_store::MemRegistryStore>, NodeError> {
+        use crate::registry_store::RegistryStore as _;
+        self.check_registry_parent(header, body)?;
+        let Some(store) = &self.registry else { return Ok(None) };
+        let Some((_, _, w)) = qlab_devnet::annulet::annulet_registry_write(body).map_err(NodeError::Body)? else {
+            return Ok(None);
+        };
+        let height = header.height;
+        let mut next = store.clone();
+        next.apply_write(&w.leaf_lanes).map_err(|err| NodeError::RegistryWrite { height, err })?;
+        let rebuilt = next.root_bytes();
+        if rebuilt != w.new_root {
+            return Err(NodeError::RegistryWriteRootMismatch { height, surface: w.new_root, rebuilt });
+        }
+        let got = annulet_registry_root(header);
+        if got != rebuilt {
+            return Err(NodeError::RegistryRootMismatch { height, header: got, store: rebuilt });
+        }
+        Ok(Some(next))
+    }
+
+    /// **Rebuild the Annulet chain state a path that skips `apply_state`
+    /// leaves stale** (lab #712, #728) — a snapshot resume installs its prefix
+    /// blocks with `put_block` alone. The registry is re-derived from the
+    /// genesis registry through every held main-chain block's write, each
+    /// header's root checked on the way; the outstanding supply from the
+    /// genesis issuance through every block's delta. A no-op on L1.
+    fn recompute_annulet_state(&mut self) -> Result<(), NodeError> {
+        use crate::registry_store::RegistryStore as _;
+        let Some(mut reg) = self.registry_genesis.clone() else { return Ok(()) };
+        let mut path = Vec::new();
+        let mut cursor = self.chain.tip_hash();
+        while let Some(block) = self.chain.block(&cursor) {
+            if block.header.height == 0 {
+                break;
+            }
+            path.push(cursor);
+            cursor = block.header.prev;
+        }
+        for hash in path.iter().rev() {
+            let block = self.chain.block(hash).expect("walked above");
+            let height = block.header.height;
+            if let Some((_, _, w)) =
+                qlab_devnet::annulet::annulet_registry_write(&block.body()).map_err(NodeError::Body)?
+            {
+                reg.apply_write(&w.leaf_lanes).map_err(|err| NodeError::RegistryWrite { height, err })?;
+            }
+            let got = annulet_registry_root(&block.header());
+            if got != reg.root_bytes() {
+                return Err(NodeError::RegistryRootMismatch { height, header: got, store: reg.root_bytes() });
+            }
+        }
+        self.registry = Some(reg);
+        self.recompute_supply();
         Ok(())
     }
 
@@ -2100,6 +2264,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 }
                 delta
             }
+        };
+        // Lab #728: the registry after this block, also before any mutation.
+        let registry_after = match self.form {
+            GenesisForm::V4 | GenesisForm::V5 => None,
+            GenesisForm::Annulet => self.registry_after(&block.header(), &block.body())?,
         };
         // Reject any nullifier already spent, or repeated within this block,
         // BEFORE mutating — so a rejected block leaves state untouched.
@@ -2179,6 +2348,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             .apply_block_riders(block.header.height, block.txs.iter().map(|t| t.rider.as_slice()))
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
         self.record_root_at(block.header.height);
+        if let Some(next) = registry_after {
+            self.registry = Some(next);
+        }
         if !supply_delta.is_empty() {
             for (&asset, &d) in &supply_delta {
                 *self.outstanding.entry(asset).or_insert(0) += d;
@@ -2436,6 +2608,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
     }
     fn annulet_registry_root(&self) -> Option<Hash32> {
         self.registry_root_bytes()
+    }
+    fn annulet_registry_write_root(
+        &self,
+        leaf_lanes: &[u64; 15],
+    ) -> Option<Result<Hash32, crate::registry_store::RegistryError>> {
+        use crate::registry_store::RegistryStore as _;
+        let mut next = self.registry.clone()?;
+        Some(next.apply_write(leaf_lanes).map(|()| next.root_bytes()))
     }
     fn outstanding_supply(&self, asset: u16) -> i128 {
         self.outstanding.get(&asset).copied().unwrap_or(0)

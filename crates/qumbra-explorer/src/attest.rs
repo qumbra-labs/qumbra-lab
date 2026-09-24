@@ -222,11 +222,28 @@ mod tests {
         }
     }
 
-    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 
-    /// A genesis issuance as the binary computes it from the genesis file.
+    /// Genesis notes: four fee-unit notes of 1, and 1,000 of asset 7 — real
+    /// genesis plaintexts, since the node seeds its outstanding figure from
+    /// them (lab #728 Q7).
+    fn genesis_notes() -> Vec<qlab_devnet::annulet::GenesisNote> {
+        use qlab_note::l2note::{GenesisPlaintext, L2Note};
+        let note = |value: u64, asset: u64, i: u64| L2Note { value, asset, rkm: [i; 4], rho: [i, 1, 2, 3], rseed: [i, 4, 5, 6] };
+        [note(1, 0, 1), note(1, 0, 2), note(1, 0, 3), note(1, 0, 4), note(1_000, 7, 5)]
+            .iter()
+            .map(|n| qlab_devnet::annulet::GenesisNote {
+                cm: qlab_note::hash::digest_bytes(&n.commitment()),
+                payload: GenesisPlaintext::of(n).0.to_vec(),
+            })
+            .collect()
+    }
+
+    /// The genesis issuance as the binary computes it from the genesis file.
     fn issuance() -> std::collections::BTreeMap<u16, u128> {
-        std::collections::BTreeMap::from([(0u16, 4u128), (7, 1_000)])
+        let i = qlab_node::asset_supply::genesis_issuance(&genesis_notes()).unwrap();
+        assert_eq!(i, std::collections::BTreeMap::from([(0u16, 4u128), (7, 1_000)]));
+        i
     }
 
     /// Asset 0 plus asset 7 as a Hybrid leaf with a freeze root.
@@ -259,6 +276,7 @@ mod tests {
                 shape: L2ShapeTag::P,
                 registry_root: ext().registry_root,
                 vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem, amount, asset: 7 }]),
+                write: None,
             }
             .encode(),
         };
@@ -268,8 +286,9 @@ mod tests {
 
     /// An in-memory Annulet node: mint 500 of asset 7, then redeem 120.
     fn annulet_node() -> MemNode {
-        let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&[]), 0);
-        let mut n = MemNode::in_memory_annulet(g, &[], FEES, &registry());
+        let notes = genesis_notes();
+        let g = BlockHeader::genesis_annulet(ext(), genesis_body_commitment_annulet(&notes), 0);
+        let mut n = MemNode::in_memory_annulet(g, &notes, FEES, &registry());
         let key = SequencerKey::from_seed([0x5E; 32]);
         let mut parent = g;
         for (i, (redeem, amount)) in [(false, 500), (true, 120)].into_iter().enumerate() {
@@ -307,14 +326,18 @@ mod tests {
         );
         assert!(parsed.node_agrees);
         let a7 = parsed.assets.iter().find(|r| r.asset == 7).unwrap();
-        assert_eq!((a7.minted.as_str(), a7.redeemed.as_str(), a7.outstanding.as_str()), ("500", "120", "380"));
+        assert_eq!((a7.minted.as_str(), a7.redeemed.as_str(), a7.outstanding.as_str()), ("500", "120", "1380"));
         let v: serde_json::Value = serde_json::from_str(&served).unwrap();
         assert_eq!(v["available"], true);
-        // Genesis issuance is its own row, beside (not inside) the vPublic
-        // figures the node's outstanding counts.
+        // Genesis issuance is its own row AND counts toward outstanding
+        // (lab #728 Q7): 1,000 + 500 − 120. The fee unit, issued only at
+        // genesis, has an assets row too.
         let g7 = parsed.genesis.iter().find(|r| r.asset == 7).unwrap();
         assert_eq!(g7.issued, "1000");
-        assert!(parsed.genesis_note.contains("vPublic flows only"));
+        let a0 = parsed.assets.iter().find(|r| r.asset == 0).unwrap();
+        assert_eq!(a0.outstanding, "4");
+        assert!(parsed.genesis_note.contains("outstanding from height 0"));
+        assert_eq!(parsed.v, 2);
     }
 
     /// Aggregates only: no key anywhere in the document could name a holder,
@@ -376,8 +399,9 @@ mod tests {
     /// The done-when, against B6's devnet genesis: `USDT-test` (asset 1) shows
     /// its genesis issuance — recomputed from the genesis file's public
     /// plaintext notes — and its registry leaf; the fee unit's genesis stock
-    /// is a genesis row too. (Its `vPublic` figures are zero until something
-    /// mints or redeems; the node's outstanding counts those only — B3b.)
+    /// is a genesis row too. Genesis issuance is outstanding from height 0
+    /// (lab #728 Q7): USDT-test's outstanding figure is its genesis issuance,
+    /// on the node and in the document alike.
     #[test]
     fn the_devnet_genesis_shows_usdt_test() {
         use qumbra_node::annulet_genesis::{devnet, registry_leaves, AnnuletGenesisFile};
@@ -394,6 +418,9 @@ mod tests {
         let row = doc.genesis.iter().find(|r| r.asset == usdt).expect("USDT-test's genesis row");
         assert_eq!(row.issued, devnet::HOLDER_USDT_VALUE.to_string());
         assert!(doc.genesis.iter().any(|r| r.asset == 0), "the fee unit's genesis stock");
+        let out = doc.assets.iter().find(|r| r.asset == usdt).expect("USDT-test's assets row");
+        assert_eq!(out.outstanding, devnet::HOLDER_USDT_VALUE.to_string());
+        assert_eq!(n.outstanding_supplies().get(&usdt), Some(&(devnet::HOLDER_USDT_VALUE as i128)));
         assert!(doc.node_agrees, "{:?}", doc.node_divergences);
         let reg: serde_json::Value = serde_json::from_str(&registry_document(&n)).unwrap();
         let leaf = reg["assets"].as_array().unwrap().iter().find(|a| a["asset"] == usdt).unwrap();

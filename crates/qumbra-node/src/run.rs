@@ -2306,8 +2306,8 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
 
     /// Refresh the registry routes' projection (lab #710): on an Annulet node,
     /// the tree and the applied tip it is served at; on an L1 node, nothing
-    /// (the routes refuse by name). The registry is immutable until A2, so a
-    /// refresh only moves the height.
+    /// (the routes refuse by name). Keyed on the tip: a block's registry
+    /// write (lab #728) moves the tree, and the next refresh serves it.
     pub fn refresh_registry(&mut self) -> bool {
         let state = self.p2p.node().state();
         let tip = state.chain().tip_height();
@@ -3484,6 +3484,8 @@ fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
         MempoolError::ProofInvalid => "proof-invalid",
         MempoolError::L2SurfaceInvalid(_) => "l2-surface-invalid",
         MempoolError::RedeemExceedsOutstanding { .. } => "redeem-exceeds-outstanding",
+        MempoolError::RegistryWriteAlreadyPooled => "registry-write-already-pooled",
+        MempoolError::RegistryWriteInvalid => "registry-write-invalid",
     }
 }
 

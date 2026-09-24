@@ -67,14 +67,18 @@ pub enum L2ShapeTag {
     S,
     /// Shape P — policy (Hybrid / Regulated) assets, with `vPublic`.
     P,
+    /// Shape R — a registry write (lab #728): one slot registered or
+    /// updated, with its own 1-in / 1-out fee spend.
+    R,
 }
 
 impl L2ShapeTag {
-    /// The wire byte: `0x01` S, `0x02` P.
+    /// The wire byte: `0x01` S, `0x02` P, `0x03` R.
     pub const fn byte(self) -> u8 {
         match self {
             L2ShapeTag::S => 0x01,
             L2ShapeTag::P => 0x02,
+            L2ShapeTag::R => 0x03,
         }
     }
     /// The inverse of [`Self::byte`]; any other byte is unknown.
@@ -82,6 +86,7 @@ impl L2ShapeTag {
         match b {
             0x01 => Some(L2ShapeTag::S),
             0x02 => Some(L2ShapeTag::P),
+            0x03 => Some(L2ShapeTag::R),
             _ => None,
         }
     }
@@ -109,19 +114,46 @@ impl VPublicTerm {
 ///
 /// **Registry-root binding (Q6):** `registry_root` must equal the **parent**
 /// header's `registry_root`. B4's verifier enforces it (it holds the chain);
-/// this codec only carries the value.
+/// this codec only carries the value. For shape R it is the write's
+/// **old** root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct L2Surface {
     pub shape: L2ShapeTag,
     pub registry_root: Hash32,
-    /// `Some` exactly for shape P (the two rows' terms), `None` for S.
+    /// `Some` exactly for shape P (the two rows' terms), `None` for S and R.
     pub vpublic: Option<[VPublicTerm; 2]>,
+    /// `Some` exactly for shape R (lab #728): the write — the root after it
+    /// and the new leaf, whole. `None` for S and P.
+    pub write: Option<RegistryWriteSurface>,
+}
+
+/// The registry write an R surface carries (lab #728 Q1): the root after the
+/// write, and the new leaf's 15 lanes in `RegistryLeaf::state()[..15]` order
+/// — `asset ‖ issuer_key[4] ‖ mode ‖ freeze_root[4] ‖ allow_root[4] ‖ flags`,
+/// the order B3's served opening already uses. The written slot is lane 0.
+///
+/// The node applies the leaf to its own tree and requires the result to be
+/// `new_root`; the proof binds `new_root` to the leaf the circuit hashed, so
+/// the leaf written is the leaf proven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryWriteSurface {
+    pub new_root: Hash32,
+    pub leaf_lanes: [u64; 15],
+}
+
+impl RegistryWriteSurface {
+    /// The written slot — the new leaf's asset lane.
+    pub fn asset(&self) -> u64 {
+        self.leaf_lanes[0]
+    }
 }
 
 /// Encoded surface lengths: S = tag ‖ root; P = S ‖ 2 × (redeem ‖ amount ‖ asset).
 pub const L2_SURFACE_LEN_S: usize = 1 + 32;
 /// See [`L2_SURFACE_LEN_S`].
 pub const L2_SURFACE_LEN_P: usize = L2_SURFACE_LEN_S + 2 * (1 + 8 + 2);
+/// R = tag ‖ old root ‖ new root ‖ the new leaf's 15 lanes (u64 LE) — 185 B.
+pub const L2_SURFACE_LEN_R: usize = L2_SURFACE_LEN_S + 32 + 15 * 8;
 
 /// Why an L2 surface was refused. Canonicity is byte-level (the rider rule):
 /// a surface decodes only if re-encoding reproduces its bytes.
@@ -143,21 +175,27 @@ pub enum L2SurfaceError {
 impl L2Surface {
     /// The canonical bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(L2_SURFACE_LEN_P);
+        let mut out = Vec::with_capacity(L2_SURFACE_LEN_R);
         out.push(self.shape.byte());
         out.extend_from_slice(&self.registry_root);
-        match (self.shape, &self.vpublic) {
-            (L2ShapeTag::S, None) => {}
-            (L2ShapeTag::P, Some(terms)) => {
+        match (self.shape, &self.vpublic, &self.write) {
+            (L2ShapeTag::S, None, None) => {}
+            (L2ShapeTag::P, Some(terms), None) => {
                 for t in terms {
                     out.push(t.redeem as u8);
                     out.extend_from_slice(&t.amount.to_le_bytes());
                     out.extend_from_slice(&t.asset.to_le_bytes());
                 }
             }
-            // A locally-built surface whose vPublic does not match its shape
-            // is a program error (the decoder cannot produce one).
-            (shape, v) => panic!("L2 surface shape {shape:?} with vpublic {v:?} (lab #706)"),
+            (L2ShapeTag::R, None, Some(w)) => {
+                out.extend_from_slice(&w.new_root);
+                for lane in &w.leaf_lanes {
+                    out.extend_from_slice(&lane.to_le_bytes());
+                }
+            }
+            // A locally-built surface whose parts do not match its shape is a
+            // program error (the decoder cannot produce one).
+            (shape, v, w) => panic!("L2 surface shape {shape:?} with vpublic {v:?} and write {w:?} (lab #706/#728)"),
         }
         out
     }
@@ -173,13 +211,14 @@ impl L2Surface {
         let want = match shape {
             L2ShapeTag::S => L2_SURFACE_LEN_S,
             L2ShapeTag::P => L2_SURFACE_LEN_P,
+            L2ShapeTag::R => L2_SURFACE_LEN_R,
         };
         if bytes.len() != want {
             return Err(L2SurfaceError::WrongLength { got: bytes.len(), want });
         }
         let registry_root: Hash32 = rest[..32].try_into().expect("length checked");
         let vpublic = match shape {
-            L2ShapeTag::S => None,
+            L2ShapeTag::S | L2ShapeTag::R => None,
             L2ShapeTag::P => {
                 let mut terms = [VPublicTerm::NONE; 2];
                 for (row, term) in terms.iter_mut().enumerate() {
@@ -199,7 +238,18 @@ impl L2Surface {
                 Some(terms)
             }
         };
-        Ok(Some(L2Surface { shape, registry_root, vpublic }))
+        let write = match shape {
+            L2ShapeTag::S | L2ShapeTag::P => None,
+            L2ShapeTag::R => {
+                let new_root: Hash32 = rest[32..64].try_into().expect("length checked");
+                let leaf_lanes: [u64; 15] = core::array::from_fn(|i| {
+                    let at = 64 + 8 * i;
+                    u64::from_le_bytes(rest[at..at + 8].try_into().expect("len"))
+                });
+                Some(RegistryWriteSurface { new_root, leaf_lanes })
+            }
+        };
+        Ok(Some(L2Surface { shape, registry_root, vpublic, write }))
     }
 }
 
@@ -215,6 +265,9 @@ impl L2Surface {
 pub struct L2FeeTable {
     pub tier_s: u64,
     pub tier_p: u64,
+    /// Shape R's tier (lab #728) — a labelled placeholder until the pilot
+    /// prices it; the only price on exhausting the registry's slots.
+    pub tier_r: u64,
 }
 
 impl L2FeeTable {
@@ -223,6 +276,7 @@ impl L2FeeTable {
         match shape {
             L2ShapeTag::S => self.tier_s,
             L2ShapeTag::P => self.tier_p,
+            L2ShapeTag::R => self.tier_r,
         }
     }
 }
@@ -372,6 +426,19 @@ where
         HeaderExt::Annulet(ext) => Some(ext.registry_root),
         _ => None,
     };
+    // Lab #728: the header's root is the registry AFTER this block. Every
+    // surface binds the root BEFORE it — the parent's — which is the header
+    // root when the block writes nothing, and the (one) write's old root when
+    // it does. The node ties that pre-block root to its own tree on apply.
+    let pre_root = match annulet_registry_write(body)? {
+        None => header_root,
+        Some((i, old_root, w)) => {
+            if Some(w.new_root) != header_root {
+                return Err(BodyError::L2RegistryWriteRootMismatch { index: i });
+            }
+            Some(old_root)
+        }
+    };
     let mut seen_nf = std::collections::HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
@@ -383,13 +450,8 @@ where
         let surface = L2Surface::decode(&tx.l2)
             .map_err(|err| BodyError::L2SurfaceMalformed { index: i, err })?
             .ok_or(BodyError::L2SurfaceMissing { index: i })?;
-        if tx.public.bucket != ArityBucket::TwoByTwo
-            || tx.public.nullifiers.len() != 2
-            || tx.public.commitments.len() != 2
-        {
-            return Err(BodyError::L2NotTwoByTwo { index: i });
-        }
-        if Some(surface.registry_root) != header_root {
+        check_l2_arity(&tx.public, surface.shape, i)?;
+        if Some(surface.registry_root) != pre_root {
             return Err(BodyError::L2RegistryRootStale { index: i });
         }
         let expected = fees.posted_fee_l2(surface.shape);
@@ -431,6 +493,45 @@ pub fn annulet_supply_delta(body: &BlockBody) -> std::collections::BTreeMap<u16,
     delta
 }
 
+/// Lab #728 Q2: every Annulet surface declares the 2×2 bucket (the L1
+/// type's only L2 value — the Annulet prices by shape); the SHAPE gates the
+/// counts: S/P spend two and make two, R spends one and makes one. The one
+/// rule the body check and the mempool both apply (`index` names the tx).
+pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: usize) -> Result<(), BodyError> {
+    if public.bucket != ArityBucket::TwoByTwo {
+        return Err(BodyError::L2NotTwoByTwo { index });
+    }
+    let (want_nf, want_cm) = match shape {
+        L2ShapeTag::S | L2ShapeTag::P => (2, 2),
+        L2ShapeTag::R => (1, 1),
+    };
+    if public.nullifiers.len() != want_nf || public.commitments.len() != want_cm {
+        return Err(match shape {
+            L2ShapeTag::S | L2ShapeTag::P => BodyError::L2NotTwoByTwo { index },
+            L2ShapeTag::R => BodyError::L2RegistryWriteArity { index },
+        });
+    }
+    Ok(())
+}
+
+/// A body's registry write (lab #728): `(tx index, the root it was proven
+/// against, the write)` for its one shape-R transaction, `None` when it has
+/// none, and a second R refused by index. The one scan both
+/// [`validate_body_annulet`] and the node's apply read, so the two cannot
+/// disagree about which transaction writes.
+pub fn annulet_registry_write(body: &BlockBody) -> Result<Option<(usize, Hash32, RegistryWriteSurface)>, BodyError> {
+    let mut found = None;
+    for (i, tx) in body.txs.iter().enumerate() {
+        let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { continue };
+        let Some(write) = surface.write else { continue };
+        if found.is_some() {
+            return Err(BodyError::L2SecondRegistryWrite { index: i });
+        }
+        found = Some((i, surface.registry_root, write));
+    }
+    Ok(found)
+}
+
 /// Convenience for fixtures and B2's producer: an L2 transaction entry with
 /// its surface encoded.
 pub fn with_surface(mut tx: TxEntry, surface: &L2Surface) -> TxEntry {
@@ -451,10 +552,10 @@ mod tests {
     }
 
     const FINAL: Hash32 = [0x0F; 32];
-    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2 };
+    const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 
     fn s_surface() -> L2Surface {
-        L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None }
+        L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None }
     }
 
     fn p_surface() -> L2Surface {
@@ -462,6 +563,7 @@ mod tests {
             shape: L2ShapeTag::P,
             registry_root: [0x44; 32],
             vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 100, asset: 7 }]),
+            write: None,
         }
     }
 
@@ -589,7 +691,7 @@ mod tests {
     #[test]
     fn non_canonical_surfaces_are_refused_by_name() {
         assert_eq!(L2Surface::decode(&[]), Err(L2SurfaceError::Empty));
-        assert_eq!(L2Surface::decode(&[0x03; 33]), Err(L2SurfaceError::UnknownShape { got: 0x03 }));
+        assert_eq!(L2Surface::decode(&[0x04; 33]), Err(L2SurfaceError::UnknownShape { got: 0x04 }));
         let mut s = s_surface().encode();
         s.push(0);
         assert_eq!(L2Surface::decode(&s), Err(L2SurfaceError::WrongLength { got: 34, want: 33 }));
@@ -602,6 +704,98 @@ mod tests {
         let mut z = p_surface().encode();
         z[33 + 9] = 7; // row 0: amount 0 naming an asset
         assert_eq!(L2Surface::decode(&z), Err(L2SurfaceError::NonCanonicalZeroTerm { row: 0 }));
+    }
+
+    /// A registry write (lab #728): old root `[0x44;32]` (the fixture
+    /// header's), new root `new_root`, asset-9 leaf lanes.
+    fn r_surface(new_root: Hash32) -> L2Surface {
+        let mut leaf_lanes = [0u64; 15];
+        leaf_lanes[0] = 9;
+        leaf_lanes[1] = 0x1111;
+        leaf_lanes[5] = 1;
+        L2Surface {
+            shape: L2ShapeTag::R,
+            registry_root: [0x44; 32],
+            vpublic: None,
+            write: Some(RegistryWriteSurface { new_root, leaf_lanes }),
+        }
+    }
+
+    /// An R transaction: one nullifier, one commitment, at tier R.
+    fn r_tx(nf: u8, surface: &L2Surface) -> TxEntry {
+        let mut t = l2_tx(nf, surface);
+        t.public.nullifiers.truncate(1);
+        t.public.commitments.truncate(1);
+        t.discovery = placeholder_discovery_annulet(&t.public.commitments);
+        t
+    }
+
+    /// A header whose post-block registry root is `root`.
+    fn check_at(body: &BlockBody, root: Hash32) -> Result<(), BodyError> {
+        let h = BlockHeader::genesis_annulet(
+            AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: root },
+            body_commitment_annulet(body),
+            0,
+        );
+        validate_body_annulet(&h, body, &OkProof, |r| *r == FINAL, &FEES)
+    }
+
+    /// Lab #728 Q1: the R surface round-trips at 185 B, and S and P are
+    /// **byte-identical** to their pre-R encodings (hard-coded here).
+    #[test]
+    fn the_r_surface_round_trips_and_s_and_p_bytes_do_not_move() {
+        let r = r_surface([0x55; 32]);
+        let b = r.encode();
+        assert_eq!(b.len(), L2_SURFACE_LEN_R);
+        assert_eq!(b[0], 0x03);
+        assert_eq!(&b[1..33], &[0x44; 32]);
+        assert_eq!(&b[33..65], &[0x55; 32]);
+        assert_eq!(&b[65..73], &9u64.to_le_bytes(), "lane 0 = the written slot");
+        assert_eq!(L2Surface::decode(&b), Ok(Some(r)));
+        assert_eq!(r.write.unwrap().asset(), 9);
+        let mut s = vec![0x01u8];
+        s.extend_from_slice(&[0x44; 32]);
+        assert_eq!(s_surface().encode(), s, "S bytes unchanged");
+        let mut p = vec![0x02u8];
+        p.extend_from_slice(&[0x44; 32]);
+        p.extend_from_slice(&[0u8; 11]);
+        p.push(0);
+        p.extend_from_slice(&100u64.to_le_bytes());
+        p.extend_from_slice(&7u16.to_le_bytes());
+        assert_eq!(p_surface().encode(), p, "P bytes unchanged");
+        let mut short = b.clone();
+        short.pop();
+        assert_eq!(L2Surface::decode(&short), Err(L2SurfaceError::WrongLength { got: 184, want: 185 }));
+    }
+
+    /// Lab #728 Q3/Q4: a block carrying one registry write — the write binds
+    /// the pre-block root, the header carries the post-block root, and the S
+    /// transaction beside it binds the pre-block root too.
+    #[test]
+    fn a_block_with_one_registry_write_passes_and_each_misuse_is_refused_by_name() {
+        let new = [0x55; 32];
+        let one = BlockBody::new(vec![r_tx(1, &r_surface(new)), l2_tx(9, &s_surface())], vec![]);
+        assert_eq!(check_at(&one, new), Ok(()));
+        // The header must carry the write's new root.
+        assert_eq!(check_at(&one, [0x44; 32]), Err(BodyError::L2RegistryWriteRootMismatch { index: 0 }));
+        // A second write in the block.
+        let two = BlockBody::new(vec![r_tx(1, &r_surface(new)), r_tx(9, &r_surface(new))], vec![]);
+        assert_eq!(check_at(&two, new), Err(BodyError::L2SecondRegistryWrite { index: 1 }));
+        // An S transaction binding the post-block root is stale.
+        let stale_s = L2Surface { registry_root: new, ..s_surface() };
+        let bad = BlockBody::new(vec![r_tx(1, &r_surface(new)), l2_tx(9, &stale_s)], vec![]);
+        assert_eq!(check_at(&bad, new), Err(BodyError::L2RegistryRootStale { index: 1 }));
+        // A write that spends two notes.
+        let wide = BlockBody::new(vec![l2_tx(1, &r_surface(new))], vec![]);
+        assert_eq!(check_at(&wide, new), Err(BodyError::L2RegistryWriteArity { index: 0 }));
+        // An S transaction with R's arity is still an S arity error.
+        let narrow_s = BlockBody::new(vec![r_tx(1, &s_surface())], vec![]);
+        assert_eq!(check_at(&narrow_s, [0x44; 32]), Err(BodyError::L2NotTwoByTwo { index: 0 }));
+        // R pays tier R.
+        let mut cheap = r_tx(1, &r_surface(new));
+        cheap.public.fee = FEES.tier_s;
+        let body = BlockBody::new(vec![cheap], vec![]);
+        assert_eq!(check_at(&body, new), Err(BodyError::WrongFee { index: 0, expected: FEES.tier_r, got: FEES.tier_s }));
     }
 
     #[test]
@@ -762,7 +956,9 @@ mod tests {
         p.prev = [9; 32];
         assert_eq!(check(p), Err(ValidationError::UnknownParent));
         let rr = BlockHeader { ext: HeaderExt::Annulet(AnnuletHeaderFields { registry_root: [0x45; 32], ..ext(3) }), ..good };
-        assert_eq!(check(rr), Err(ValidationError::RegistryRootChanged));
+        // Lab #728: a header may move the registry root (a registry write);
+        // the body rule and the node's apply bind it, not the header check.
+        assert_eq!(check(rr), Ok(()));
         // Anchor regression needs a parent with a non-zero anchor.
         let mut chain3 = chain.clone();
         let parent = key.seal(good);

@@ -216,6 +216,11 @@ pub const REGISTRY_ROOT_PATH: &str = "/v1/registry/root";
 /// The registry-opening route's prefix: `/v1/registry/{asset}`, the asset id
 /// in canonical decimal (lab #710) — GET only, Annulet nets only.
 pub const REGISTRY_PATH_PREFIX: &str = "/v1/registry/";
+/// The slot-opening route's prefix: `/v1/registry/slot/{asset}` (lab #728 Q5)
+/// — the opening of ANY slot, registered or empty, with the root it was
+/// computed against: what a registration or an update proves against. A
+/// pure route addition (no `RPC_VERSION` bump, the PR #315 rule).
+pub const REGISTRY_SLOT_PREFIX: &str = "/v1/registry/slot/";
 
 /// The per-block coinbase route (lab #415) — GET only, bulk over a range. There
 /// is no per-`rkm` form and there must never be one: the bytes are public (every
@@ -408,6 +413,16 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
             MempoolError::RedeemExceedsOutstanding { asset } => {
                 (409, format!("refused: redeem exceeds asset {asset}'s outstanding supply (lab #712)"))
             }
+            // Lab #728: judged against this pool — retry after the pooled
+            // write lands (and rebind the new root).
+            MempoolError::RegistryWriteAlreadyPooled => {
+                (409, "refused: a registry write is already pooled (lab #728)".to_string())
+            }
+            MempoolError::RegistryWriteInvalid => (
+                400,
+                "refused: the registry write's leaf does not reach its declared root on this registry (lab #728)"
+                    .to_string(),
+            ),
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
             // wrapping; reaching here means that mapping broke.
             MempoolError::DuplicateTx => {
@@ -593,8 +608,8 @@ pub struct RegistryView {
 }
 
 /// What an Annulet node serves on the registry routes: the tree and the
-/// height its root was read at (immutable until A2, so the height only says
-/// how recently it was confirmed).
+/// applied tip height it was read at — a registry write (lab #728) moves the
+/// tree, so a served root names the height it holds at.
 pub struct RegistryServed {
     pub height: u64,
     pub tree: qlab_cbserver::registry::RegistryTree,
@@ -610,6 +625,12 @@ fn respond_registry(view: &RegistryView, path: &str) -> Result<Vec<u8>, (u16, St
     let Some(served) = &view.served else { return Err((400, REGISTRY_NOT_ON_L1.to_string())) };
     if path == REGISTRY_ROOT_PATH {
         return Ok(qlab_cbserver::registry::encode_registry_root(served.height, &served.tree.root()));
+    }
+    if let Some(arg) = path.strip_prefix(REGISTRY_SLOT_PREFIX) {
+        let slot = parse_asset_id(arg).ok_or_else(|| {
+            (400, format!("registry slot `{arg}` is not a canonical decimal below 65536 (lab #728)"))
+        })?;
+        return Ok(qlab_cbserver::registry::encode_registry_slot(&served.tree, served.height, slot));
     }
     let arg = &path[REGISTRY_PATH_PREFIX.len()..];
     let asset = parse_asset_id(arg).ok_or_else(|| {
@@ -866,7 +887,7 @@ impl DiscoveryServer {
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {COINBASE_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
-                                 {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
+                                 {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {REGISTRY_SLOT_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
                                  {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
@@ -2159,6 +2180,30 @@ mod tests {
         assert_eq!(respond_registry(&v, "/v1/registry/6").unwrap_err().0, 404);
         for bad in ["007", "65536", "-1", "", "5x", "+5"] {
             let path = format!("{REGISTRY_PATH_PREFIX}{bad}");
+            assert_eq!(respond_registry(&v, &path).unwrap_err().0, 400, "`{bad}`");
+        }
+    }
+
+    /// Lab #728 Q5: the slot route answers every slot — an empty one too,
+    /// which `/v1/registry/{asset}` 404s — with the root it was computed
+    /// against, an opening that folds to it, and a 400 for a bad id; an L1
+    /// node refuses it by name like the other registry routes.
+    #[test]
+    fn the_slot_route_answers_empty_and_registered_slots() {
+        use qlab_cbserver::registry::{decode_registry_slot, RegistryLeaf, RegistryTree};
+        let l1 = RegistryView::default();
+        assert_eq!(respond_registry(&l1, "/v1/registry/slot/6"), Err((400, REGISTRY_NOT_ON_L1.to_string())));
+        let tree = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(5)]).unwrap();
+        let root = tree.root();
+        let v = RegistryView { served: Some(RegistryServed { height: 7, tree }) };
+        let empty = decode_registry_slot(&respond_registry(&v, "/v1/registry/slot/6").unwrap()).unwrap();
+        assert_eq!((empty.height, empty.root, empty.slot, empty.leaf.is_none()), (7, root, 6, true));
+        assert_eq!(empty.witness.fold_root(&[0; 4]), root, "the empty slot's zero digest folds to the root");
+        let held = decode_registry_slot(&respond_registry(&v, "/v1/registry/slot/5").unwrap()).unwrap();
+        assert_eq!(held.leaf, Some(RegistryLeaf::cloaked(5)));
+        assert_eq!(held.witness.fold_root(&held.leaf_digest()), root);
+        for bad in ["007", "65536", "", "x"] {
+            let path = format!("{REGISTRY_SLOT_PREFIX}{bad}");
             assert_eq!(respond_registry(&v, &path).unwrap_err().0, 400, "`{bad}`");
         }
     }

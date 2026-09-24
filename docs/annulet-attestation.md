@@ -6,7 +6,7 @@
 
 - `GET /v1/attest` — the per-asset **attestation**:
   - **genesis rows**: each asset's genesis issuance, recomputed from the genesis file's public plaintext notes, each commitment checked;
-  - **asset rows**: Σ minted, Σ redeemed and outstanding from the public `vPublic` terms of every main-chain block body;
+  - **asset rows**: Σ minted and Σ redeemed from the public `vPublic` terms of every main-chain block body, and outstanding = genesis issuance + minted − redeemed — one row per asset issued at genesis or by a flow;
   - **flow rows**: those terms per height;
   - whether the node's own supply state agrees. Every disagreement is named, never reconciled.
 - `GET /v1/assets` — the **registry**: every registered asset's leaf (mode, issuer key, freeze and allow roots, flags) and the registry root. Registry leaves are public by design.
@@ -29,4 +29,4 @@ qumbra-node audit-supply-l2 --data-dir <dir> --genesis <annulet-genesis> [--clai
 - With `--claimed` it reads a served `/v1/attest` document and names every row that does not reproduce: `DIVERGENT asset 7: …`, `DIVERGENT flow height=2 asset=7: …`, `DIVERGENT genesis asset 0: …`.
 - Exit codes: **0** reproduces, **1** does not, **2** cannot run.
 
-**Known gap (named follow-up, B3b).** The node's outstanding figure counts `vPublic` flows only. It does not yet seed genesis issuance, so a redeem of a genesis-minted note is refused as a supply underflow. That is why the document carries genesis rows *beside* the flow totals, with a note saying so. When B3b seeds the node's supply from genesis, the two agree and the note goes.
+**Genesis supply counts (B3b, lab #728; document version 2).** The node's outstanding figure starts from each asset's genesis issuance, so a redeem of genesis supply is not an underflow and a redeem past genesis + minted is. The document's `outstanding` is the same figure. Version 1 (L2-D1) counted `vPublic` flows only and said so in its `genesis_note`; the audit tool refuses to compare a version-1 document against a version-2 recomputation, by name.
