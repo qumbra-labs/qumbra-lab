@@ -1349,6 +1349,17 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
             if let Some(n) = report.split_fee_note {
                 println!("fee-split first: made an exact-tariff fee note of {}", n.value);
             }
+            if verb == "mint" {
+                if report.rearmed {
+                    println!("re-armed: this wallet still holds a note of asset {} for the next mint", asset()?);
+                } else {
+                    println!(
+                        "NOT re-armed: this wallet holds no note of asset {} now — the next mint needs one; \
+                         a registry update (`issuer update`) seeds a 0-value note",
+                        asset()?
+                    );
+                }
+            }
             Ok(())
         }
         _ => Err("issuer keygen|freeze|allow|mint|redeem|register|update (lab #722, #730)".into()),

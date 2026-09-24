@@ -60,6 +60,11 @@ pub struct View {
     pub registry_root: [u8; 32],
 }
 
+/// A read of one node's state the driver takes whenever that node's view
+/// moves (lab #730 C4b: the explorer's `/v1/attest` document, computed by the
+/// explorer's own code over each node). Runs on the driver thread.
+pub type Probe = Arc<dyn Fn(&qlab_node::MemNode) -> String + Send + Sync>;
+
 /// The three nodes, owned by one driver thread that runs each one's real
 /// loop step and seals whenever the producer's pool is non-empty (the slot
 /// rule's non-empty arm, without waiting out the 10-s slot).
@@ -67,6 +72,7 @@ pub struct Net {
     /// The discovery endpoints: the sequencer, follower 1, follower 2.
     pub served: [SocketAddr; 3],
     views: Arc<Mutex<[View; 3]>>,
+    probes: Arc<Mutex<[String; 3]>>,
     stop: Arc<AtomicBool>,
     driver: Option<std::thread::JoinHandle<()>>,
     bases: Vec<std::path::PathBuf>,
@@ -76,6 +82,13 @@ impl Net {
     /// Start the three nodes on `g`; `name` keeps concurrent harnesses' data
     /// dirs apart.
     pub fn start(g: &AnnuletGenesisFile, name: &str) -> Self {
+        Self::start_probed(g, name, None)
+    }
+
+    /// [`Self::start`] with a [`Probe`] taken per node on every view change,
+    /// **before** the views are published — so once [`Self::settle_spends`]
+    /// returns, [`Self::probes`] describes the settled state.
+    pub fn start_probed(g: &AnnuletGenesisFile, name: &str, probe: Option<Probe>) -> Self {
         let bases: Vec<_> = ["seq", "f1", "f2"].iter().map(|t| data_dir(name, t)).collect();
         let kf = SequencerKeyFile {
             seed_hex: devnet::SEQUENCER_SEED.iter().map(|b| format!("{b:02x}")).collect(),
@@ -83,6 +96,8 @@ impl Net {
         };
         std::fs::write(bases[0].join("data").join(SEQUENCER_KEY_FILE), kf.to_toml()).unwrap();
         let views = Arc::new(Mutex::new([View::default(); 3]));
+        let probes: Arc<Mutex<[String; 3]>> = Arc::new(Mutex::new(Default::default()));
+        let probes2 = probes.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (g2, bases2, views2, stop2) = (g.clone(), bases.clone(), views.clone(), stop.clone());
@@ -134,6 +149,9 @@ impl Net {
                     };
                     // Serve the new tip at once rather than on the 5-s cadence.
                     if now[i] != last[i] {
+                        if let Some(p) = &probe {
+                            probes2.lock().unwrap()[i] = p(n.p2p().node().state());
+                        }
                         n.refresh_discovery();
                         n.refresh_leaves();
                         n.refresh_anchors();
@@ -146,11 +164,16 @@ impl Net {
             }
         });
         let served = rx.recv_timeout(Duration::from_secs(60)).expect("the three nodes start");
-        Net { served, views, stop, driver: Some(driver), bases }
+        Net { served, views, probes, stop, driver: Some(driver), bases }
     }
 
     pub fn views(&self) -> [View; 3] {
         *self.views.lock().unwrap()
+    }
+
+    /// The latest [`Probe`] output per node (empty without a probe).
+    pub fn probes(&self) -> [String; 3] {
+        self.probes.lock().unwrap().clone()
     }
 
     /// Wait until every node has applied exactly `nullifiers` spends and all

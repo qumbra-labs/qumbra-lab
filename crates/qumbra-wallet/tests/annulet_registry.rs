@@ -134,11 +134,18 @@ fn register_update_freeze_rotate_and_change_mode_at_runtime() {
     let hybrid = LeafPolicy { mode: Some(MODE_HYBRID), ..Default::default() };
     let won = issuer_register(&h, at(0), 13, &hybrid, v[0].state_tip, pin, &mut rng).expect("H registers asset 13");
     let lost = issuer_register(&issuer, at(0), 13, &hybrid, v[0].state_tip, pin, &mut rng);
-    assert!(
-        matches!(lost, Err(SendRefusal::SlotTaken { asset: 13 }) | Err(SendRefusal::RegistryRaced(_))),
-        "the second registration of slot 13 is refused by name: {:?}",
-        lost.err()
-    );
+    let branch = match &lost {
+        Err(SendRefusal::SlotTaken { asset: 13 }) => "SlotTaken (H's write had landed)",
+        Err(SendRefusal::RegistryRaced(_)) => "RegistryRaced (H's write was still pooled)",
+        other => panic!("the second registration of slot 13 must be refused by name: {:?}", other.as_ref().err()),
+    };
+    // Written to the stderr HANDLE, not through `eprintln!`: libtest captures
+    // the print macros of a passing test, and the lane log is where this is
+    // read (lab #730: which race branch ran).
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "C4a slot race on asset 13: the loser got {branch}");
+    }
     let v = net.settle_spends(3, "the race");
     assert_eq!(agree(&v), won.new_root);
     assert_eq!(follower.registry(13).unwrap().leaf.issuer_key, won.leaf.issuer_key, "the slot is H's");
@@ -184,6 +191,92 @@ fn register_update_freeze_rotate_and_change_mode_at_runtime() {
     assert!(v.iter().all(|x| x.supplies.iter().any(|(a, s)| *a == USDT && *s == 50)), "{v:?}");
 
     for d in [&issuer.dir, &h.dir, &f.dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// **C4b's done-when** (lab #730): an asset registered at runtime is minted on
+/// its R seed and then moves between two holders — with the node's supply and
+/// the explorer's `/v1/attest` document (the explorer's own code, over each
+/// node) agreeing after every step.
+///
+/// 1. The issuer registers asset 21 (Hybrid, an empty freeze tree); the seed
+///    is its only note of the asset. Outstanding 0.
+/// 2. **The issuer mints 1,000 to `H` on the seed** (P, vPublic +1,000). The
+///    mint re-arms: the issuer holds a note of 21 again (the seed's 0 back).
+/// 3. **`H` sends 400 to `K`** (P, vPublic 0) — two non-issuer wallets.
+///
+/// 1 R + 2 P proves.
+#[test]
+fn a_runtime_asset_is_minted_on_its_seed_and_moves_between_holders() {
+    const NEW: u16 = 21;
+    let (issuer, h, k) = (wallet("mint-issuer", 0x51), wallet("mint-h", 0x52), wallet("mint-k", 0x53));
+    let notes = [note(&issuer, 10, 0, 11), note(&issuer, 2, 0, 12), note(&h, 2, 0, 13)];
+    let g = AnnuletGenesisFile::assemble(
+        "annulet-c4b-test",
+        AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, fee_tier_r: 4, slot_secs: 10, max_empty_slots: 6 },
+        devnet::SEQUENCER_SEED,
+        vec![RegistryLeafRecord::asset_zero()],
+        notes.iter().map(GenesisNoteRecord::of).collect(),
+        0,
+    );
+    let issuance = qlab_node::asset_supply::genesis_issuance(&g.notes()).unwrap();
+    let probe: qumbra_faucet::devnet_harness::Probe =
+        std::sync::Arc::new(move |n: &qlab_node::MemNode| qumbra_explorer::attest::attest_document(n, &issuance));
+    let net = Net::start_probed(&g, "c4b", Some(probe));
+    net.wait_connected();
+    let pin = Some(g.hash());
+    let urls: Vec<String> = net.served.iter().map(|a| format!("http://{a}")).collect();
+    let at = |i: usize| WalletEndpoint { url: urls[i].clone() };
+    let wait = Duration::from_secs(60);
+    let mut rng = StdRng::seed_from_u64(7301);
+    // Every node's /v1/attest agrees with that node, and all three state the
+    // same outstanding figure for `NEW`.
+    let attested = |what: &str| -> Vec<serde_json::Value> {
+        let docs: Vec<serde_json::Value> = net.probes().iter().map(|d| serde_json::from_str(d).expect("/v1/attest is JSON")).collect();
+        for (i, d) in docs.iter().enumerate() {
+            assert_eq!(d["node_agrees"], true, "{what}: node {i}'s /v1/attest disagrees with it: {}", d["node_divergences"]);
+        }
+        docs
+    };
+    let outstanding = |d: &serde_json::Value| -> String {
+        d["assets"].as_array().unwrap().iter().find(|r| r["asset"] == NEW).map_or("0".into(), |r| r["outstanding"].as_str().unwrap().to_string())
+    };
+    let supply = |v: &View| v.supplies.iter().find(|(a, _)| *a == NEW).map_or(0, |(_, s)| *s);
+    let v = net.settle_spends(0, "genesis");
+    attested("genesis");
+
+    // 1. Register 21 at runtime; its seed is the issuer's only note of it.
+    let hybrid = LeafPolicy { mode: Some(MODE_HYBRID), ..Default::default() };
+    let reg = issuer_register(&issuer, at(0), NEW, &hybrid, v[0].state_tip, pin, &mut rng).expect("registers 21");
+    assert_eq!((reg.seed.asset, reg.seed.value), (u64::from(NEW), 0));
+    let v = net.settle_spends(1, "register 21");
+    let docs = attested("register 21");
+    assert!(v.iter().all(|x| supply(x) == 0) && docs.iter().all(|d| outstanding(d) == "0"), "{v:?}");
+
+    // 2. The issuer mints 1,000 to H — on the seed.
+    let to_h = h.wallet().address_at_index(0);
+    let mint = qumbra_wallet::issuer::issuer_mint(&issuer, at(1), NEW, 1_000, &to_h, &[], v[1].state_tip, pin, wait, &mut rng)
+        .expect("the issuer mints on the R seed");
+    assert!(mint.split_fee_note.is_none(), "the genesis fee note was exact");
+    assert!(mint.rearmed, "the mint returns the seed's row to the issuer: re-armed");
+    assert_eq!((mint.outputs[1].asset, mint.outputs[1].value), (u64::from(NEW), 0));
+    let v = net.settle_spends(3, "the mint");
+    let docs = attested("the mint");
+    assert!(v.iter().all(|x| supply(x) == 1_000), "{v:?}");
+    assert!(docs.iter().all(|d| outstanding(d) == "1000"), "/v1/attest states 1,000 on every node");
+
+    // 3. H sends 400 to K: a P spend of the new asset between non-issuers.
+    let to_k = k.wallet().address_at_index(0);
+    send_annulet(&h, at(2), NEW, 400, &to_k, v[2].state_tip, pin, &[], wait, &mut rng).expect("H pays K in asset 21");
+    let v = net.settle_spends(5, "H → K");
+    let docs = attested("H → K");
+    assert!(v.iter().all(|x| supply(x) == 1_000) && docs.iter().all(|d| outstanding(d) == "1000"), "a transfer issues nothing");
+    let ks = qumbra_wallet::annulet_send::open_session(&k, at(1), v[1].state_tip, pin, &mut rng).expect("K scans");
+    let held: Vec<u64> = ks.index.spendable(NEW).iter().map(|n| n.note.value).collect();
+    assert_eq!(held, vec![400], "K holds the 400 of asset 21");
+
+    for d in [&issuer.dir, &h.dir, &k.dir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

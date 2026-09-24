@@ -1978,6 +1978,7 @@ dependencies = [
  "qlab-p2p",
  "qlab-wallet",
  "qrcode",
+ "qumbra-explorer",
  "qumbra-faucet",
  "qumbra-node",
  "rand 0.10.2",
