@@ -269,7 +269,7 @@ pub const SHAPE_S_DIGEST_V1: &str = "7a6391bc98eed26b4bff7aaaa987f7d6ef657e27ad5
 /// See [`SHAPE_S_DIGEST_V1`].
 pub const SHAPE_P_DIGEST_V1: &str = "ad53d40e7d5ffd8235b701fab16856f428790b7ba33efc8915abe625f1bacaff";
 /// See [`SHAPE_S_DIGEST_V1`] (lab #724).
-pub const SHAPE_R_DIGEST_V1: &str = "PENDING";
+pub const SHAPE_R_DIGEST_V1: &str = "40bbc9fe839df1d817b34bfb0335408beec112076b603f3a3e87c58399381f6d";
 
 #[cfg(test)]
 mod tests;

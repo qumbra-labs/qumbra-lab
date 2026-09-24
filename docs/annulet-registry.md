@@ -4,6 +4,8 @@ B3 makes the asset registry chain state: a depth-16 Merkle tree of `AREG` leaves
 
 **Immutable after genesis until A2.** Runtime registry updates arrive with shape R. Until then the only update seam, `RegistryTree::apply_update`, answers `RegistryError::UpdatesArriveWithA2`, and nothing calls it.
 
+*Update 2026-09-24 (A2, lab #724):* shape R, the registry-write circuit, has landed (`qlab-air::l2r`, `docs/l2-shape-v1.md` §5). The node does not apply R transactions until **B3b**, so the seam above still refuses. A2 also enforces the registry invariant when genesis loads (`RegistryTree::check_invariant`, `RegistryError::SlotAssetMismatch`). R enforces the same invariant on every write.
+
 ## What landed
 
 | piece | where |
