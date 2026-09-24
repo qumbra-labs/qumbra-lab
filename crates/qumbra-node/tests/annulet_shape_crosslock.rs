@@ -58,6 +58,12 @@ fn the_surface_carries_the_circuits_extra_public_values() {
     // whole new leaf (15 lanes) whose lane 0 is the slot.
     assert_eq!(L2_SURFACE_LEN_R, L2_SURFACE_LEN_S + 32 + 15 * 8);
     assert_eq!(L2_SURFACE_LEN_R, 185);
-    assert_eq!(Shape::R.pv_len(), 85);
-    assert_eq!((qlab_l2::PV_R_OLD_ROOT, qlab_l2::PV_R_NEW_ROOT, qlab_l2::PV_R_ASSET), (52, 68, 84));
+    // A3 (lab #731): the seed's commitment is public too (PV_CM_SEED, 16
+    // chunks appended) — carried as the transaction's second commitment, not
+    // on the surface, which does not move.
+    assert_eq!(Shape::R.pv_len(), 85 + 16);
+    assert_eq!(
+        (qlab_l2::PV_R_OLD_ROOT, qlab_l2::PV_R_NEW_ROOT, qlab_l2::PV_R_ASSET, qlab_l2::PV_R_CM_SEED),
+        (52, 68, 84, 85)
+    );
 }
