@@ -792,6 +792,16 @@ pub trait NodeState {
     fn outstanding_supply(&self, _asset: u16) -> i128 {
         0
     }
+    /// The root writing `leaf_lanes` into this node's registry reaches, or
+    /// the registry's refusal (lab #728) — what the mempool checks a
+    /// registry write against, so a write the block rule would refuse never
+    /// pools. `None` on L1.
+    fn annulet_registry_write_root(
+        &self,
+        _leaf_lanes: &[u64; 15],
+    ) -> Option<Result<Hash32, crate::registry_store::RegistryError>> {
+        None
+    }
     /// The fork-choice tip height.
     fn tip_height(&self) -> u64;
     /// The fork-choice tip hash.
@@ -2598,6 +2608,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
     }
     fn annulet_registry_root(&self) -> Option<Hash32> {
         self.registry_root_bytes()
+    }
+    fn annulet_registry_write_root(
+        &self,
+        leaf_lanes: &[u64; 15],
+    ) -> Option<Result<Hash32, crate::registry_store::RegistryError>> {
+        use crate::registry_store::RegistryStore as _;
+        let mut next = self.registry.clone()?;
+        Some(next.apply_write(leaf_lanes).map(|()| next.root_bytes()))
     }
     fn outstanding_supply(&self, asset: u16) -> i128 {
         self.outstanding.get(&asset).copied().unwrap_or(0)

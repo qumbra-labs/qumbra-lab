@@ -44,6 +44,9 @@ pub const REGISTRY_WIRE_VERSION: u8 = 1;
 pub const REGISTRY_ROOT_LEN: usize = 1 + 8 + 32;
 /// `GET /v1/registry/{asset}` body length.
 pub const REGISTRY_OPENING_LEN: usize = REGISTRY_ROOT_LEN + 15 * 8 + REGISTRY_DEPTH * 32;
+/// `GET /v1/registry/slot/{asset}` (lab #728): root header ‖ slot (u16 LE) ‖
+/// occupied (0/1) ‖ the leaf's 15 lanes (all zero when empty) ‖ 16 siblings.
+pub const REGISTRY_SLOT_OPENING_LEN: usize = REGISTRY_ROOT_LEN + 2 + 1 + 15 * 8 + REGISTRY_DEPTH * 32;
 
 /// A built registry tree: every non-empty node, per level.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +211,13 @@ pub enum RegistryWireError {
     WrongLength { got: usize, want: usize },
     BadVersion { got: u8 },
     AssetOutOfRange { asset: u64 },
+    /// A slot body's occupancy byte is neither 0 nor 1 (lab #728).
+    BadOccupancy { got: u8 },
+    /// A slot body says empty but carries a non-zero lane (lab #728).
+    EmptySlotCarriesLeaf,
+    /// A slot body's leaf is of another asset than its slot (lab #728) —
+    /// the registry invariant, refused on the wire too.
+    SlotAssetMismatch { slot: u16, asset: u64 },
 }
 
 /// Encode a `GET /v1/registry/root` body.
@@ -260,6 +270,82 @@ pub fn encode_opening_parts(
     }
     debug_assert_eq!(out.len(), REGISTRY_OPENING_LEN);
     out
+}
+
+/// The opening of any slot, registered or empty (lab #728): what a
+/// registration or an update proves against, and the root it was computed
+/// against (the B3 rule).
+#[derive(Clone)]
+pub struct RegistrySlotOpening {
+    pub height: u64,
+    pub root: [u64; 4],
+    pub slot: u16,
+    /// `None` for an empty slot, whose leaf digest is zero.
+    pub leaf: Option<RegistryLeaf>,
+    /// Siblings from the wire; path bits derived from `slot`.
+    pub witness: RegistryWitness,
+}
+
+impl RegistrySlotOpening {
+    /// The leaf digest the opening folds: the leaf's hash, or zero for an
+    /// empty slot.
+    pub fn leaf_digest(&self) -> [u64; 4] {
+        self.leaf.as_ref().map_or([0; 4], RegistryLeaf::hash)
+    }
+}
+
+/// Encode a `GET /v1/registry/slot/{asset}` body — every slot answers.
+pub fn encode_registry_slot(tree: &RegistryTree, height: u64, slot: u16) -> Vec<u8> {
+    let mut out = encode_registry_root(height, &tree.root());
+    out.extend_from_slice(&slot.to_le_bytes());
+    let lanes: [u64; 15] = match tree.leaf(slot) {
+        Some(l) => l.state()[..15].try_into().expect("15 lanes"),
+        None => [0; 15],
+    };
+    out.push(u8::from(tree.leaf(slot).is_some()));
+    for lane in &lanes {
+        out.extend_from_slice(&lane.to_le_bytes());
+    }
+    for s in &tree.opening_at(slot).siblings {
+        out.extend_from_slice(&digest_bytes(s));
+    }
+    debug_assert_eq!(out.len(), REGISTRY_SLOT_OPENING_LEN);
+    out
+}
+
+/// Decode a `GET /v1/registry/slot/{asset}` body.
+pub fn decode_registry_slot(b: &[u8]) -> Result<RegistrySlotOpening, RegistryWireError> {
+    if b.len() != REGISTRY_SLOT_OPENING_LEN {
+        return Err(RegistryWireError::WrongLength { got: b.len(), want: REGISTRY_SLOT_OPENING_LEN });
+    }
+    let (height, root) = head(b)?;
+    let slot = u16::from_le_bytes([b[REGISTRY_ROOT_LEN], b[REGISTRY_ROOT_LEN + 1]]);
+    let occupied = b[REGISTRY_ROOT_LEN + 2];
+    let lane0 = REGISTRY_ROOT_LEN + 3;
+    let lane = |i: usize| u64::from_le_bytes(b[lane0 + i * 8..lane0 + i * 8 + 8].try_into().expect("8 bytes"));
+    let d4 = |i: usize| [lane(i), lane(i + 1), lane(i + 2), lane(i + 3)];
+    let leaf = match occupied {
+        0 if (0..15).all(|i| lane(i) == 0) => None,
+        0 => return Err(RegistryWireError::EmptySlotCarriesLeaf),
+        1 if lane(0) != u64::from(slot) => {
+            return Err(RegistryWireError::SlotAssetMismatch { slot, asset: lane(0) })
+        }
+        1 => Some(RegistryLeaf {
+            asset: lane(0),
+            issuer_key: d4(1),
+            mode: lane(5),
+            freeze_root: d4(6),
+            allow_root: d4(10),
+            flags: lane(14),
+        }),
+        got => return Err(RegistryWireError::BadOccupancy { got }),
+    };
+    let sib0 = lane0 + 15 * 8;
+    let siblings = core::array::from_fn(|i| {
+        let at = sib0 + i * 32;
+        digest_from_bytes(b[at..at + 32].try_into().expect("32 bytes"))
+    });
+    Ok(RegistrySlotOpening { height, root, slot, leaf, witness: RegistryWitness { siblings, path_bits: path_bits_of(slot) } })
 }
 
 /// Decode a `GET /v1/registry/{asset}` body.
@@ -347,6 +433,42 @@ mod tests {
         after.push(hybrid(6));
         let t2 = RegistryTree::from_leaves(&after).unwrap();
         assert_eq!(w.fold_root(&hybrid(6).hash()), t2.root(), "the registration's new root");
+    }
+
+    /// Lab #728 Q5: the slot route answers every slot — a registered one
+    /// with its leaf, an empty one with none — and each opening folds its
+    /// leaf digest to the root it carries; a registration's new leaf folds
+    /// to the root after the write. Malformed bodies are refused by name.
+    #[test]
+    fn the_slot_opening_answers_empty_and_registered_slots() {
+        let leaves = [RegistryLeaf::cloaked(0), hybrid(7)];
+        let t = RegistryTree::from_leaves(&leaves).unwrap();
+        for slot in [0u16, 7, 6, 65_535] {
+            let b = encode_registry_slot(&t, 12, slot);
+            assert_eq!(b.len(), REGISTRY_SLOT_OPENING_LEN);
+            let o = decode_registry_slot(&b).unwrap();
+            assert_eq!((o.height, o.root, o.slot), (12, t.root(), slot));
+            assert_eq!(o.leaf.as_ref(), t.leaf(slot), "slot {slot}");
+            assert_eq!(o.witness.fold_root(&o.leaf_digest()), t.root(), "slot {slot} folds to the root");
+        }
+        let empty = decode_registry_slot(&encode_registry_slot(&t, 12, 6)).unwrap();
+        assert_eq!(empty.leaf, None);
+        let mut after = t.clone();
+        after.apply_update(hybrid(6)).unwrap();
+        assert_eq!(empty.witness.fold_root(&hybrid(6).hash()), after.root(), "the registration's new root");
+        // Refusals.
+        let good = encode_registry_slot(&t, 12, 6);
+        let occ = REGISTRY_ROOT_LEN + 2;
+        let mut bad = good.clone();
+        bad[occ] = 2;
+        assert_eq!(decode_registry_slot(&bad).err(), Some(RegistryWireError::BadOccupancy { got: 2 }));
+        let mut bad = good.clone();
+        bad[occ + 1] = 1;
+        assert_eq!(decode_registry_slot(&bad).err(), Some(RegistryWireError::EmptySlotCarriesLeaf));
+        let mut bad = encode_registry_slot(&t, 12, 7);
+        bad[REGISTRY_ROOT_LEN] = 8;
+        assert_eq!(decode_registry_slot(&bad).err(), Some(RegistryWireError::SlotAssetMismatch { slot: 8, asset: 7 }));
+        assert!(matches!(decode_registry_slot(&good[1..]), Err(RegistryWireError::WrongLength { .. })));
     }
 
     #[test]

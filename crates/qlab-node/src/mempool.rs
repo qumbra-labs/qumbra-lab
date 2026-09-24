@@ -156,6 +156,10 @@ pub enum MempoolError {
     /// A registry write (shape R, lab #728) while another is already pooled:
     /// a block carries at most one, and each binds the root the other moves.
     RegistryWriteAlreadyPooled,
+    /// A registry write the block rule would refuse (lab #728): its leaf,
+    /// written into this node's registry, does not reach the root it
+    /// declares, or the registry refuses the slot (asset 0, out of range).
+    RegistryWriteInvalid,
     /// The anchor is not a valid transaction anchor now (not finalized, or aged
     /// past the ≤ 1,152-block window — §4/§7).
     AnchorNotValid,
@@ -611,6 +615,17 @@ impl Mempool {
                     .expect("an Annulet node state carries its registry (lab #710)");
                 if surface.registry_root != root {
                     return Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryRootStale { index: 0 }));
+                }
+                // Lab #728: the write must be one the block rule applies —
+                // its leaf, written into this registry, reaches the root it
+                // declares. A pooled write the producer's own block would
+                // refuse is never evicted by a block that cannot land: the
+                // #278 wedge, here for registry writes.
+                if let Some(w) = surface.write {
+                    match state.annulet_registry_write_root(&w.leaf_lanes) {
+                        Some(Ok(reached)) if reached == w.new_root => {}
+                        Some(Ok(_)) | Some(Err(_)) | None => return Err(MempoolError::RegistryWriteInvalid),
+                    }
                 }
                 // Lab #728: one registry write per root. Every pooled surface
                 // binds this root, and a block holds at most one write, so a

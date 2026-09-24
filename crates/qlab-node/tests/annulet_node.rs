@@ -716,8 +716,8 @@ fn a_genesis_that_cannot_state_its_issuance_does_not_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Lab #728: the pool admits one registry write (at the R arity), refuses a
-/// second by name, and once the write lands evicts every pooled surface
+/// Lab #728: the pool admits one registry write (at the R arity, and only
+/// one the block rule applies), refuses a second by name, and once the write lands evicts every pooled surface
 /// still bound to the root it moved.
 #[test]
 fn the_pool_holds_one_registry_write_and_evicts_the_old_root_after_it() {
@@ -730,6 +730,12 @@ fn the_pool_holds_one_registry_write_and_evicts_the_old_root_after_it() {
     assert!(matches!(
         pool.admit(wide, &n, &OkProof, &EmptyNameView),
         Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryWriteArity { index: 0 }))
+    ));
+    // A write whose leaf does not reach its declared root would fail the
+    // producer's own block forever: refused at the door, not pooled.
+    assert!(matches!(
+        pool.admit(r_tx(&n, 11, root(), [0x55; 32], lanes), &n, &OkProof, &EmptyNameView),
+        Err(MempoolError::RegistryWriteInvalid)
     ));
     let write = r_tx(&n, 1, root(), new, lanes);
     pool.admit(write.clone(), &n, &OkProof, &EmptyNameView).expect("one write");
