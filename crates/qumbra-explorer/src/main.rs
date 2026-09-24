@@ -22,6 +22,8 @@ use qlab_devnet::pow::RandomXPow;
 use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
+use qlab_node::ChainStore;
+use qumbra_explorer::attest;
 use qumbra_explorer::blocks::{self, BlocksView};
 use qumbra_explorer::checkpoints;
 use qumbra_explorer::config::ExplorerConfig;
@@ -33,7 +35,7 @@ use qumbra_explorer::telemetry::Telemetry;
 use qumbra_explorer::txlist::{self, TxListView};
 use qumbra_explorer::vitals;
 use qumbra_node::config::NodeConfig;
-use qumbra_node::genesis::GenesisFile;
+use qumbra_node::annulet_genesis::{load_any, AnyGenesis};
 use qumbra_node::run::RunningNode;
 use qumbra_node::verifier::select_verifier;
 
@@ -94,12 +96,48 @@ fn has_flag(args: &[String], name: &str) -> bool {
 
 /// Load both configs with every refusal applied in the same order for `check`
 /// and `run` — the faucet's `load` discipline.
-fn load(cfg_path: &str) -> Result<(ExplorerConfig, NodeConfig, GenesisFile), Box<dyn Error>> {
+fn load(cfg_path: &str) -> Result<(ExplorerConfig, NodeConfig, AnyGenesis), Box<dyn Error>> {
     let cfg = ExplorerConfig::load(cfg_path)?;
     let node = NodeConfig::load(&cfg.node_config)?;
     cfg.check_observer(&node)?;
-    let genesis = GenesisFile::load(&node.genesis_file)?;
+    // Lab #726: dispatched by the file's leading format_version, as the node
+    // binary does — an L1 genesis runs the L1 observer, an Annulet genesis a
+    // keyless Annulet follower (the attestation and registry routes).
+    let genesis = load_any(&std::fs::read(&node.genesis_file)?)?;
     Ok((cfg, node, genesis))
+}
+
+/// The loaded genesis file's hash, either form.
+fn genesis_hash_hex(g: &AnyGenesis) -> String {
+    match g {
+        AnyGenesis::L1(g) => g.hash_hex(),
+        AnyGenesis::Annulet(g) => g.hash_hex(),
+    }
+}
+
+/// The network label, either form.
+fn genesis_network(g: &AnyGenesis) -> &str {
+    match g {
+        AnyGenesis::L1(g) => &g.network,
+        AnyGenesis::Annulet(g) => &g.network,
+    }
+}
+
+/// The consensus form, either form.
+fn genesis_form(g: &AnyGenesis) -> Result<qlab_devnet::forms::GenesisForm, Box<dyn Error>> {
+    Ok(match g {
+        AnyGenesis::L1(g) => g.form()?,
+        AnyGenesis::Annulet(g) => g.form()?,
+    })
+}
+
+/// Per asset, the genesis issuance (lab #726): recomputed from an Annulet
+/// genesis's public plaintext notes, each commitment checked; empty on L1.
+fn genesis_issuance(g: &AnyGenesis) -> Result<std::collections::BTreeMap<u16, u128>, Box<dyn Error>> {
+    match g {
+        AnyGenesis::L1(_) => Ok(Default::default()),
+        AnyGenesis::Annulet(g) => Ok(qlab_node::asset_supply::genesis_issuance(&g.notes())?),
+    }
 }
 
 fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -109,8 +147,8 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  api listen:     {}", cfg.listen_addr);
     println!("  node listen:    {}", node.listen_addr);
     println!("  dial peers:     {}", node.dial_peers.len());
-    println!("  genesis file hash: {}", genesis.hash_hex());
-    println!("  network:        {} (banner label source — served, never hardcoded)", genesis.network);
+    println!("  genesis file hash: {}", genesis_hash_hex(&genesis));
+    println!("  network:        {} (banner label source — served, never hardcoded)", genesis_network(&genesis));
     println!("  committee keys: 0 (keyless — enforced)");
     println!("  mining:         false (enforced)");
     println!(
@@ -159,8 +197,18 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let (cfg, node_cfg, genesis) = load(cfg_path)?;
 
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis.form()?);
-    let mut node = RunningNode::start(&node_cfg, &genesis, RandomXPow::new(), verifier)?;
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis_form(&genesis)?);
+    let mut node = match &genesis {
+        AnyGenesis::L1(g) => RunningNode::start(&node_cfg, g, RandomXPow::new(), verifier)?,
+        // An Annulet net has no PoW; the engine parameter is unused on it.
+        AnyGenesis::Annulet(g) => RunningNode::start_annulet(&node_cfg, g, RandomXPow::new(), verifier)?,
+    };
+    if node.is_sequencer() {
+        return Err("the explorer's node would be the sequencer (a sequencer key file is in its data \
+                    dir); the explorer runs a keyless follower"
+            .into());
+    }
+    let issuance = genesis_issuance(&genesis)?;
     // The same two clock opt-ins every binary takes: real wall-clock header
     // timestamps for LWMA, and a wall-clock observation clock for diagnostics.
     node.set_mining_clock(MiningClock::WallClock);
@@ -168,13 +216,27 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
 
     // Serialize once before binding, so the first request served is never blank —
     // the faucet's rule, kept across the split.
-    let genesis_hash = genesis.hash_hex();
-    let page = Arc::new(RwLock::new(json::health(
+    let genesis_hash = genesis_hash_hex(&genesis);
+    let network = genesis_network(&genesis).to_string();
+    // Exhaustive by rule (lab #706): a new form must decide here.
+    let annulet = match genesis_form(&genesis)? {
+        qlab_devnet::forms::GenesisForm::Annulet => true,
+        qlab_devnet::forms::GenesisForm::V4 | qlab_devnet::forms::GenesisForm::V5 => false,
+    };
+    let page = Arc::new(RwLock::new(json::health_for_form(
         &node.telemetry(),
         &genesis_hash,
         cfg.refresh_secs,
-        &genesis.network,
+        &network,
+        annulet,
     )));
+
+    // The per-asset attestation and the registry (lab #726), projected once
+    // pre-bind for the same first-read rule; re-projected when the tip moves.
+    // On an L1 chain each document says it does not apply.
+    let attest_page = Arc::new(RwLock::new(attest::attest_document(node.state(), &issuance)));
+    let assets_page = Arc::new(RwLock::new(attest::registry_document(node.state())));
+    let mut attest_tip = node.state().chain().tip_hash();
 
     // And project the transaction-existence view once for the same reason: the
     // first `/v1/txlist` read must be answered from the chain this process
@@ -198,7 +260,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // net serves its height, a native-names v5 (T2) net serves `null` (names
     // from height 0, no boundary). Seeded here and preserved through every
     // re-projection, so the field never carries T1's 19,008 onto T2.
-    let name_boundary = genesis.form()?.name_boundary();
+    let name_boundary = genesis_form(&genesis)?.name_boundary();
     let names_view = Arc::new(Mutex::new(Arc::new(NameEventsView {
         name_boundary,
         ..NameEventsView::default()
@@ -233,6 +295,8 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
             vitals: Arc::clone(&vitals_page),
             blocks: Arc::clone(&blocks_view),
             names: Arc::clone(&names_view),
+            attest: Arc::clone(&attest_page),
+            assets: Arc::clone(&assets_page),
             degraded: Arc::clone(&degraded),
         },
         Arc::clone(&metrics),
@@ -275,6 +339,16 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         server.addr(),
         http::VITALS_PATH,
         vitals::SAMPLE_SECS
+    );
+    qlab_devnet::jprintln!(
+        "  attestation:    http://{}{}  (per-asset issuance, Annulet only — issuance ≠ reserves)",
+        server.addr(),
+        attest::ATTEST_PATH
+    );
+    qlab_devnet::jprintln!(
+        "  registry:       http://{}{}  (every registered asset's leaf, Annulet only)",
+        server.addr(),
+        attest::REGISTRY_PATH
     );
     qlab_devnet::jprintln!("  page:           served separately (qumbra-explorer-web) — no / here");
     match &metrics_server {
@@ -319,7 +393,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         let t = n.telemetry();
         let seen = json::fingerprint(&t);
         if last_seen != Some(seen) || last_render.elapsed() >= refresh {
-            let body = json::health(&t, &genesis_hash, cfg.refresh_secs, &genesis.network);
+            let body = json::health_for_form(&t, &genesis_hash, cfg.refresh_secs, &network, annulet);
             // 🔴 The loud swallow (lab #486 stage-1 scope): `publish` writes
             // THROUGH a poisoned lock — the projection never darks — and a
             // poison observation is logged once and latched into /healthz's
@@ -338,6 +412,18 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         // rule nobody asked for.
         txlist::refresh_shared(&txlist_view, n.state().chain());
         blocks::refresh_shared(&blocks_view, n.state().chain());
+        // The attestation re-folds the main chain when the tip moves (a reorg
+        // included — the fold walks tip to genesis, so nothing is patched).
+        let tip = n.state().chain().tip_hash();
+        if tip != attest_tip {
+            attest_tip = tip;
+            if http::publish(&attest_page, attest::attest_document(n.state(), &issuance)) {
+                note_poisoned(attest::ATTEST_PATH, &degraded);
+            }
+            if http::publish(&assets_page, attest::registry_document(n.state())) {
+                note_poisoned(attest::REGISTRY_PATH, &degraded);
+            }
+        }
         names::refresh_shared(&names_view, n.state().chain());
         // The finality ticker re-serializes only when the record moved — the
         // decision rule lives in the library (`checkpoints::refreshed_document`)

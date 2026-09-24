@@ -43,6 +43,7 @@
 //! the tests assert it — so a snapshot can never silently diverge from a genesis
 //! replay.
 
+pub mod asset_supply;
 pub mod coinbase;
 pub mod emission;
 pub mod mempool;

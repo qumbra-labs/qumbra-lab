@@ -262,6 +262,10 @@ pub struct Surfaces {
     pub blocks: Arc<Mutex<Arc<BlocksView>>>,
     /// `/v1/names/events?from=&to=` — snapshot, encoded per request.
     pub names: Arc<Mutex<Arc<NameEventsView>>>,
+    /// `/v1/attest` — pre-serialized (lab #726; Annulet only).
+    pub attest: Arc<RwLock<String>>,
+    /// `/v1/assets` — the registry, pre-serialized (lab #726; Annulet only).
+    pub assets: Arc<RwLock<String>>,
     /// Set by the run loop when [`publish`] observed a poisoned lock — a writer
     /// panicked at some point in process history. The projections keep serving
     /// (publish writes through), but `/healthz` answers **503 `degraded`**
@@ -287,6 +291,8 @@ impl Default for Surfaces {
             vitals: Arc::new(RwLock::new(crate::vitals::VitalsRing::new().document())),
             blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
             names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+            attest: Arc::new(RwLock::new("{\"v\":1,\"available\":false}".to_string())),
+            assets: Arc::new(RwLock::new("{\"v\":1,\"available\":false}".to_string())),
             degraded: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -329,8 +335,17 @@ impl ExplorerServer {
         surfaces: Surfaces,
         metrics: Arc<ExplorerMetrics>,
     ) -> io::Result<ExplorerServer> {
-        let Surfaces { health: page, txlist, checkpoints, vitals, blocks, names, degraded } =
-            surfaces;
+        let Surfaces {
+            health: page,
+            txlist,
+            checkpoints,
+            vitals,
+            blocks,
+            names,
+            attest,
+            assets,
+            degraded,
+        } = surfaces;
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -403,6 +418,16 @@ impl ExplorerServer {
                             .map(|p| p.clone())
                             .unwrap_or_else(|e| e.into_inner().clone());
                         (CHECKPOINTS_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
+                    }
+                    (tiny_http::Method::Get, crate::attest::ATTEST_PATH) => {
+                        let body =
+                            attest.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
+                        (crate::attest::ATTEST_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
+                    }
+                    (tiny_http::Method::Get, crate::attest::REGISTRY_PATH) => {
+                        let body =
+                            assets.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
+                        (crate::attest::REGISTRY_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
                     }
                     (tiny_http::Method::Get, VITALS_PATH) => {
                         let body = vitals
@@ -630,6 +655,8 @@ mod tests {
                 vitals: Arc::clone(&s.vitals),
                 blocks: Arc::clone(&s.blocks),
                 names: Arc::clone(&s.names),
+                attest: Arc::clone(&s.attest),
+                assets: Arc::clone(&s.assets),
                 degraded: Arc::clone(&s.degraded),
             },
         )

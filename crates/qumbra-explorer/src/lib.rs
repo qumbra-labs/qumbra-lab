@@ -94,6 +94,7 @@
 //!
 //! [issue #212]: https://github.com/qumbra-labs/qumbra-lab/issues/212
 
+pub mod attest;
 pub mod blocks;
 pub mod checkpoints;
 pub mod config;

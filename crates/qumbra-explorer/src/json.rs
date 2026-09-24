@@ -74,6 +74,29 @@ pub const HEALTH_VERSION: u32 = 1;
 /// [`GenesisFile::hash_hex`]: qumbra_node::genesis::GenesisFile::hash_hex
 /// [`GenesisFile::network`]: qumbra_node::genesis::GenesisFile::network
 pub fn health(t: &Telemetry, genesis_file_hash: &str, refresh_secs: u64, network: &str) -> String {
+    health_for_form(t, genesis_file_hash, refresh_secs, network, false)
+}
+
+/// The supply block of an **Annulet** chain (lab #726 Q4): there is no
+/// emission on the L2, so the L1 coinbase ledger would be an all-zero table
+/// that reads as data. It says so and points at the per-asset attestation.
+fn annulet_supply() -> String {
+    format!(
+        "{{\"coverage\":\"NOT_APPLICABLE\",\"form\":\"annulet\",\
+         \"note\":\"no emission on the L2 — supply is per asset\",\"see\":\"{}\"}}",
+        crate::attest::ATTEST_PATH
+    )
+}
+
+/// [`health`], with the chain's form: an Annulet chain's `supply` block is
+/// [`annulet_supply`] instead of the L1 emission ledger.
+pub fn health_for_form(
+    t: &Telemetry,
+    genesis_file_hash: &str,
+    refresh_secs: u64,
+    network: &str,
+    annulet: bool,
+) -> String {
     format!(
         "{{\"v\":{HEALTH_VERSION},\
          \"genesis_file_hash\":\"{genesis}\",\
@@ -113,7 +136,7 @@ pub fn health(t: &Telemetry, genesis_file_hash: &str, refresh_secs: u64, network
         roster = t.committee_size,
         active = t.committee_active,
         quorum = t.committee_quorum,
-        supply = supply(t),
+        supply = if annulet { annulet_supply() } else { supply(t) },
     )
 }
 
@@ -551,6 +574,26 @@ mod tests {
         let t = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 0, MAX_LAG);
         let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(v["finality"]["head1"]["stall_depth"], 4);
+    }
+
+    /// Lab #726 Q4: on an Annulet chain the supply block does not carry the
+    /// L1 emission ledger (an all-zero table that would read as data) — it
+    /// says it does not apply and points at the per-asset attestation. The
+    /// L1 form of the same telemetry is unchanged.
+    #[test]
+    fn an_annulet_chains_supply_block_points_at_the_attestation() {
+        let t = Telemetry::assemble(14, Some(8), Some(75), 0, 3, 1, MAX_LAG)
+            .with_supply(vec![epoch_row(14, 0, 0)]);
+        let v = parse(&health_for_form(&t, "aa", 30, "annulet-devnet", true));
+        assert_eq!(v["supply"]["coverage"], "NOT_APPLICABLE");
+        assert_eq!(v["supply"]["form"], "annulet");
+        assert_eq!(v["supply"]["see"], crate::attest::ATTEST_PATH);
+        assert!(v["supply"].get("epochs").is_none(), "no emission rows on the L2");
+        assert_eq!(
+            health_for_form(&t, "aa", 30, "x", false),
+            health(&t, "aa", 30, "x"),
+            "the L1 document is byte-identical"
+        );
     }
 
     #[test]

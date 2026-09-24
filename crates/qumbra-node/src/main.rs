@@ -48,6 +48,10 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("audit-names") {
         return cmd_audit_names(&args[1..]);
     }
+    // audit-supply-l2 shares the same exit-code contract (lab #726).
+    if args.first().map(String::as_str) == Some("audit-supply-l2") {
+        return cmd_audit_supply_l2(&args[1..]);
+    }
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -178,6 +182,28 @@ fn cmd_audit_names(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("qumbra-node audit-names: {e}");
             ExitCode::from(qumbra_node::audit_names::EXIT_CANNOT_RUN)
+        }
+    }
+}
+
+fn cmd_audit_supply_l2(args: &[String]) -> ExitCode {
+    use qumbra_node::audit_supply_l2::{self as a, EXIT_CANNOT_RUN};
+    let (dir, genesis, claimed) = match a::parse_args(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("qumbra-node audit-supply-l2: {e}");
+            eprintln!("usage: qumbra-node audit-supply-l2 --data-dir DIR --genesis ANNULET_GENESIS [--claimed ATTEST_JSON]");
+            return ExitCode::from(EXIT_CANNOT_RUN);
+        }
+    };
+    match a::audit_supply_l2(&dir, &genesis, claimed.as_deref()) {
+        Ok(report) => {
+            println!("{}", report.format_output());
+            ExitCode::from(report.exit_code())
+        }
+        Err(e) => {
+            eprintln!("qumbra-node audit-supply-l2: {e}");
+            ExitCode::from(EXIT_CANNOT_RUN)
         }
     }
 }
