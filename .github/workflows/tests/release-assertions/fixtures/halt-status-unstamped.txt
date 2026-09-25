@@ -3,12 +3,12 @@ qumbra-node halt-status (issue #74)
   build rev:    unstamped — not built by the release lane
   halt plan:    no halt scheduled
   revision:     v1.1-exact-emission
-  frozen digest: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
-  rule domain:  56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0
+  frozen digest: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
+  rule domain:  adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426
   resumes past: height 8640 (post-halt rules apply above it)
   halt marker:  none on disk (this node has never halted)
   name service: INERT — no boundary in this build; riders refused at every height (#367)
   snapshot:     not read — pass --config to report this data dir's snapshot (#359)
   frozen digest (recomputed from THIS binary's constants):
-    a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+    22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
   validate:     OK — this release is startable
