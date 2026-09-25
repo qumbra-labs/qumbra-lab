@@ -3,11 +3,11 @@ qumbra-node halt-status (issue #74)
   build rev:    BUILDREV
   halt plan:    ARMED — halts at height 8640
   revision:     v1.0
-  frozen digest: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
-  rule domain:  0fea450384b0b286e2400f0cfa38b13eb4cfb01a1379c84085217cc059a0cd10
+  frozen digest: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
+  rule domain:  bb85853e9c7b40ff62b1e76933e5f6fa23c7c566252b2b8747a595dd6915e802
   halt marker:  none on disk (this node has never halted)
   name service: INERT — no boundary in this build; riders refused at every height (#367)
   snapshot:     not read — pass --config to report this data dir's snapshot (#359)
   frozen digest (recomputed from THIS binary's constants):
-    a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+    22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
   validate:     OK — this release is startable

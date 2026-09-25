@@ -142,9 +142,9 @@ expect() {
   out=$(cd "$TMP" && NODE_BIN="$node" WALLET_BIN="$wallet" POOL_BIN="$pool" \
         EXPECTED_BUILD_REV="$BUILD_REV" \
         NET="$CUT_NET" GENESIS_HASH="$T2_HASH" \
-        FROZEN_PIN=a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b \
+        FROZEN_PIN=22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e \
         EXPECTED_REVISION=v1.1-exact-emission \
-        EXPECTED_DOMAIN=56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0 \
+        EXPECTED_DOMAIN=adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426 \
         RULE_BOUNDARY_HEIGHT=8640 \
         bash "$GATE" 2>&1)
   rc=$?
@@ -244,11 +244,11 @@ pin() { # $1 = name, $2 = file, $3 = grep -F pattern
   fi
 }
 pin "FROZEN_PIN matches release-binaries.yml" "$WORKFLOW" \
-    "FROZEN_PIN: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b"
+    "FROZEN_PIN: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e"
 pin "EXPECTED_REVISION matches release-binaries.yml" "$WORKFLOW" \
     "EXPECTED_REVISION: v1.1-exact-emission"
 pin "EXPECTED_DOMAIN matches release-binaries.yml" "$WORKFLOW" \
-    "EXPECTED_DOMAIN: 56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0"
+    "EXPECTED_DOMAIN: adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426"
 pin "RULE_BOUNDARY_HEIGHT matches release-binaries.yml" "$WORKFLOW" \
     'RULE_BOUNDARY_HEIGHT: "8640"'
 
@@ -256,9 +256,9 @@ pin "RULE_BOUNDARY_HEIGHT matches release-binaries.yml" "$WORKFLOW" \
 # by two routes. If their pins ever disagree, one of them is publishing something
 # the other would refuse, and nothing else in the tree would notice.
 pin "node-image.yml agrees on the frozen digest" "$NODE_IMAGE" \
-    'FROZEN_PIN="a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b"'
+    'FROZEN_PIN="22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e"'
 pin "node-image.yml agrees on the resume rule domain" "$NODE_IMAGE" \
-    'EXP_DOMAIN="56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0"'
+    'EXP_DOMAIN="adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426"'
 
 # Lab #516: the four T1-hardwired sites moved into select-release-net.sh. The
 # workflow must still mention that script, and the T2 pin must live in it.
