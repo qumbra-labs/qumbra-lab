@@ -353,7 +353,9 @@ jobs:
           - platform: linux-x86_64-glibc
             runner: ubuntu-latest
           - platform: linux-aarch64-glibc
-            runner: qumbra-arm64-8
+            # Standard hosted arm64 (4 vCPU), free for this public repo: the
+            # org's free plan can no longer schedule the paid qumbra-arm64-8.
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container:
       image: rust:1.95-bookworm

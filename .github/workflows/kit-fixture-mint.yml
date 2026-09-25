@@ -14,8 +14,9 @@
 # a workflow that does not exist on the default branch yet). The branch is a
 # trigger vehicle, deleted after the artifact is downloaded.
 #
-# Runner: the hosted ARM lane (`qumbra-arm64-8`), one of the remaining jobs the
-# ARM SKU hard stop protects. Its provenance architecture matches the self-hosted
+# Runner: the standard hosted arm64 runner (`ubuntu-24.04-arm`, 4 vCPU; free for
+# this public repo — the org's free plan can no longer schedule the paid
+# `qumbra-arm64-8` it used before). Its provenance architecture matches the self-hosted
 # Graviton acceptance lane that verifies the committed fixture afterward.
 # The job builds only qlab-vask's dependency graph in release (~minutes) and
 # proves once (~1 s measured on M5 Max at this config; docs/disclosure-run2.md).
@@ -42,7 +43,7 @@ permissions:
 
 jobs:
   mint:
-    runs-on: qumbra-arm64-8
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
