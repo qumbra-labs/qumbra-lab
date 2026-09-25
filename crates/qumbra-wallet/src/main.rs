@@ -456,8 +456,10 @@ fn usage() {
                 an Annulet chain; balances are per asset (asset 0 = fee units, not\n\
                 QMB); no coinbase. `send --net annulet --asset N --amount V --to ADDR`\n\
                 pays an exact-tariff asset-0 fee note (split off a larger one first\n\
-                when there is none) and moves at most one note of the asset (notes\n\
-                of a non-fee asset cannot be merged in 2x2). Nothing is written to\n\
+                when there is none); when no one note of the asset covers the\n\
+                amount it merges notes first (3x2, one exact fee note each) and\n\
+                prints the whole plan with its total fee before proving anything\n\
+                (--plan-only stops there). Nothing is written to\n\
                 the wallet dir. A policy asset's sender passes the issuer's\n\
                 published freeze list with --freeze-list FILE (a frozen address is\n\
                 refused before anything is proved). `issuer keygen|freeze|allow|mint|\n\
@@ -1366,8 +1368,9 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// `send --net annulet` (lab #720): scan, plan (fee-split first when there is
-/// no exact-tariff fee note), prove, submit. Writes nothing to the wallet dir.
+/// `send --net annulet` (lab #720; A4): scan, plan (fee-splits, merges, the
+/// payment), print the plan before anything is proved, prove, submit — or
+/// stop after the plan with `--plan-only`. Writes nothing to the wallet dir.
 fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     let dir = dir_of(args)?;
@@ -1395,7 +1398,13 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
     );
     let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
-    let report = qumbra_wallet::annulet_send::send_annulet(
+    let plan_only = args.iter().any(|a| a == "--plan-only");
+    // A4 (design #283 Q5): the whole plan, with its total fee, before any proof.
+    let mut on_plan = |plan: &qumbra_wallet::annulet_send::SendPlan| {
+        print!("{plan}");
+        !plan_only
+    };
+    let report = match qumbra_wallet::annulet_send::send_annulet(
         &w,
         endpoint,
         asset,
@@ -1405,14 +1414,24 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         pin,
         &freeze_keys,
         std::time::Duration::from_secs(120),
+        &mut on_plan,
         &mut rng,
-    )?;
+    ) {
+        Err(qumbra_wallet::annulet_send::SendRefusal::PlanDeclined) if plan_only => {
+            println!("--plan-only: nothing proved or submitted");
+            return Ok(());
+        }
+        other => other?,
+    };
     if let Some(fee) = report.split_fee_note {
         println!("fee-split: made an exact-tariff fee note of {} (asset 0) first", fee.value);
     }
     println!(
-        "sent {amount} of asset {asset} (shape {:?}); change {} back to this wallet",
-        report.shape, report.outputs[1].value
+        "sent {amount} of asset {asset} (shape {:?}) after {} merge(s); change {} back to this wallet; fee {} in all",
+        report.shape,
+        report.plan.merges(),
+        report.outputs[1].value,
+        report.plan.total_fee()
     );
     Ok(())
 }

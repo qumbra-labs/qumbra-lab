@@ -41,7 +41,13 @@ fn p_tx(n: &MemNode, g: &AnnuletGenesisFile, nf: u8, terms: [VPublicTerm; 2]) ->
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor: n.commitment_root(),
-            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32]],
+            // S/P spend three (A4): slot 3's fee-input nullifier is never a
+            // uniform `[x; 32]`, so it cannot collide with another fixture's.
+            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32], {
+                let mut f = [nf; 32];
+                f[31] = !nf;
+                f
+            }],
             commitments: vec![[nf.wrapping_add(1); 32], [nf.wrapping_add(101); 32]],
             bucket: ArityBucket::TwoByTwo,
             fee: g.params.fee_tier_p,

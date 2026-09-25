@@ -102,18 +102,18 @@ fn mint_transfer_frozen_refused_redeem_with_the_supply_ledger_matching() {
     let to_h = h.wallet().address_at_index(0);
     issuer_mint(&issuer, WalletEndpoint { url: urls[0].clone() }, ASSET, 1_000, &to_h, &keys, v[0].state_tip, Some(hash), wait, &mut rng)
         .expect("the issuer mints");
-    let v = net.settle_spends(2, "the mint");
+    let v = net.settle_spends(3, "the mint");
     assert!(v.iter().all(|x| supply(x) == 1_050), "supply = genesis + minted, on all three: {v:?}");
 
     // 2. H sends 400 to the issuer (C2's send, through follower 1).
     let to_issuer = issuer.wallet().address_at_index(0);
-    send_annulet(&h, WalletEndpoint { url: urls[1].clone() }, ASSET, 400, &to_issuer, v[1].state_tip, Some(hash), &keys, wait, &mut rng)
+    send_annulet(&h, WalletEndpoint { url: urls[1].clone() }, ASSET, 400, &to_issuer, v[1].state_tip, Some(hash), &keys, wait, &mut |_| true, &mut rng)
         .expect("an unfrozen holder transfers");
-    let v = net.settle_spends(4, "the transfer");
+    let v = net.settle_spends(6, "the transfer");
     assert!(v.iter().all(|x| supply(x) == 1_050), "a transfer issues nothing: {v:?}");
 
     // 3a. F is frozen: its wallet refuses before proving.
-    let refused = send_annulet(&f, WalletEndpoint { url: urls[2].clone() }, ASSET, 10, &to_h, v[2].state_tip, Some(hash), &keys, wait, &mut rng);
+    let refused = send_annulet(&f, WalletEndpoint { url: urls[2].clone() }, ASSET, 10, &to_h, v[2].state_tip, Some(hash), &keys, wait, &mut |_| true, &mut rng);
     assert!(
         matches!(refused, Err(SendRefusal::Spend(SpendError::Frozen { asset: 2 }))),
         "the frozen holder is refused by its own wallet: {:?}",
@@ -167,13 +167,13 @@ fn mint_transfer_frozen_refused_redeem_with_the_supply_ledger_matching() {
     assert!(matches!(verdict, Err(SpendError::Refused(_))), "the node refuses a spend under a stale leaf: {verdict:?}");
     assert_eq!(freeze_key_of(&rkm0(&f)), keys[0], "the published list is F's key");
     std::thread::sleep(Duration::from_secs(2));
-    let v = net.settle_spends(4, "nothing moved");
+    let v = net.settle_spends(6, "nothing moved");
     assert!(v.iter().all(|x| supply(x) == 1_050));
 
     // 4. The issuer redeems 150 from the 400 it received.
     redeem(&issuer, WalletEndpoint { url: urls[0].clone() }, ASSET, 150, &keys, v[0].state_tip, Some(hash), wait, &mut rng)
         .expect("the issuer redeems");
-    let v = net.settle_spends(6, "the redeem");
+    let v = net.settle_spends(9, "the redeem");
     assert!(v.iter().all(|x| supply(x) == 900), "supply = genesis + minted − redeemed, on all three: {v:?}");
 
     for d in [&issuer.dir, &h.dir, &f.dir] {

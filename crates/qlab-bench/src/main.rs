@@ -18,6 +18,7 @@
 mod disclosure;
 mod geometry;
 mod l2shape;
+mod zkpeak;
 mod levers;
 mod m4anchor;
 mod m4assembly;
@@ -419,7 +420,9 @@ fn breakdown_proof(proof: &Proof<Config>) -> Breakdown {
     let total = pc_len(proof);
     let commitments = pc_len(&proof.commitments);
     let zeta_opened = pc_len(&proof.opened_values);
-    let fri = &proof.opening_proof;
+    // `(random-codeword openings, FRI proof)` — the hiding PCS's opening proof.
+    let zk_openings = pc_len(&proof.opening_proof.0);
+    let fri = &proof.opening_proof.1;
     let fri_commits = pc_len(&fri.commit_phase_commits);
     let final_poly = pc_len(&fri.final_poly);
     let pow = pc_len(&fri.commit_pow_witnesses) + pc_len(&fri.query_pow_witness);
@@ -448,7 +451,8 @@ fn breakdown_proof(proof: &Proof<Config>) -> Breakdown {
         + fri_sibling_values
         + fri_fold_paths
         + final_poly
-        + pow;
+        + pow
+        + zk_openings;
     let residual = total.saturating_sub(accounted);
 
     Breakdown {
@@ -897,17 +901,37 @@ fn main() {
             return;
         }
         "l2shape" => {
-            // W3 (lab #700): `--shape s|s20|mock118|mock240|p|p19`, optional
-            // `--only <lane substring>`; one shape per process.
+            // W3 (lab #700): `--shape s|s20|mock118|mock240|p|p19|r|s3|p3`,
+            // optional `--only <lane substring>` and `--pcs hiding|nonhiding`;
+            // one shape per process.
             let shape_pos = args.iter().position(|a| a == "--shape");
             let shape = shape_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             let Some(shape) = shape else {
-                eprintln!("l2shape: `--shape s|s20|mock118|mock240|p|p19|r` is required");
+                eprintln!("l2shape: `--shape s|s20|mock118|mock240|p|p19|r|s3|p3` is required");
                 std::process::exit(2);
             };
             let only_pos = args.iter().position(|a| a == "--only");
             let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
-            l2shape::run_l2shape(&power, shape, only);
+            // `--pcs hiding|nonhiding` (default hiding): A4's rig gate compares
+            // shapes under ONE PCS, so both configs are selectable.
+            let pcs_pos = args.iter().position(|a| a == "--pcs");
+            let pcs = match pcs_pos.and_then(|i| args.get(i + 1)).map(String::as_str) {
+                None => l2shape::PcsKind::Hiding,
+                Some(p) => l2shape::PcsKind::parse(p).unwrap_or_else(|| {
+                    eprintln!("l2shape: unknown --pcs `{p}`; expected hiding|nonhiding");
+                    std::process::exit(2);
+                }),
+            };
+            l2shape::run_l2shape(&power, shape, only, pcs);
+            return;
+        }
+        "zkpeak" => {
+            let case_pos = args.iter().position(|a| a == "--case");
+            let Some(case) = case_pos.and_then(|i| args.get(i + 1)) else {
+                eprintln!("zkpeak: `--case l1|p19|p` is required");
+                std::process::exit(2);
+            };
+            zkpeak::run_zkpeak(&power, case);
             return;
         }
         "bucket" => {

@@ -30,6 +30,9 @@ p3-merkle-tree = "=0.6.1"
 p3-symmetric = "=0.6.1"
 p3-uni-stark = "=0.6.1"
 
+# The prover's randomness (the hiding PCS): ChaCha20 seeded from the OS.
+rand = { version = "0.10", features = ["chacha"] }
+
 [dev-dependencies]
 # The byte-identical wire regression (145,609 B) serializes a real proof.
 bincode = "1"

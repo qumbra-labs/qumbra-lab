@@ -79,7 +79,15 @@ use qlab_node::{genesis_block, StoredBlock};
 /// only fail later, when a transaction's proof is 148,625 B against a genesis
 /// recording 145,609. That is the "much worse error" #188's bump exists to
 /// prevent, and the same remedy applies.
-pub const GENESIS_FORMAT_VERSION: u32 = 4;
+///
+/// **6 since the re-mint** (the security re-mint):
+/// `consensus_wire_bytes` moved 148,625 → 182,745 (hiding PCS) and
+/// `consensus_fri` gained "/zk" — the same stale-config-and-file hazard as
+/// #188 and the mint, so the version moves. It cannot move to 5: the version
+/// selects the net's form (`GenesisForm::from_genesis_format_version`) and 5
+/// is T2's. T1 → 6, T2 → 7; 4 and 5 are refused by name
+/// ([`GenesisError::PreRemintGenesis`]).
+pub const GENESIS_FORMAT_VERSION: u32 = 6;
 
 /// **5 — the T2 genesis format** (lab #470): the version whose form set is
 /// [`GenesisForm::V5`] — stratum-compatible 97-byte header, one body form
@@ -87,7 +95,14 @@ pub const GENESIS_FORMAT_VERSION: u32 = 4;
 /// emission + the name rule native from height ≥ 1. One binary serves both
 /// formats; the loaded file's version selects the net (`GenesisFile::form`,
 /// the Q1 ruling). The devnet-placeholder shape note above applies unchanged.
-pub const GENESIS_FORMAT_VERSION_T2: u32 = 5;
+///
+/// **7 since the re-mint** (the security re-mint; see [`GENESIS_FORMAT_VERSION`]).
+pub const GENESIS_FORMAT_VERSION_T2: u32 = 7;
+
+/// The genesis format versions before the re-mint (T1 = 4, T2 = 5): a file
+/// carrying one records the non-hiding wire and is refused by name, never
+/// loaded — except as the INPUT of `genesis init --t2 --remint-from`.
+pub const PRE_REMINT_FORMAT_VERSIONS: [u32; 2] = [4, 5];
 
 /// The FROZEN consensus wire size in bytes (qlab-consensus
 /// `consensus_wire_is_148625_bytes`; consensus-parameters §1). Baked so the
@@ -104,7 +119,13 @@ pub const GENESIS_FORMAT_VERSION_T2: u32 = 5;
 /// is serialized into the genesis file and therefore inside the genesis hash. The
 /// two changes that move it both went unconditional in this baton, so there is no
 /// feature that returns the old wire.
-pub const CONSENSUS_WIRE_BYTES: u64 = 148_625;
+///
+/// 🔴 **Moved 148,625 → 182,745 by the re-mint** (the security re-mint,
+/// stage 4): the hiding PCS — trace committed at 2N, twice the quotient
+/// chunks, random codewords, salted Merkle leaves. Measured on the
+/// Graviton acceptance lane (two runs, identical), the same value
+/// qlab-consensus pins as `WIRE_BYTES`.
+pub const CONSENSUS_WIRE_BYTES: u64 = 182_745;
 
 /// T0 genesis PoW difficulty — `[devnet-placeholder]`, NOT frozen. Chosen low so
 /// a real-RandomX rehearsal net mines on laptop hardware; the real launch
@@ -122,6 +143,10 @@ pub const LAUNCH_MODE_BANNER: &str = "LAUNCH — keys from OS randomness, hash N
 
 /// Banner line for the rehearsal path (`genesis init` / `genesis init --t2`
 /// without `--launch`). The `[devnet-placeholder]` tag is the pre-#506 note.
+/// Banner line for `genesis init --t2 --remint-from` (the security re-mint).
+pub const REMINT_MODE_BANNER: &str =
+    "RE-MINT — committee, network and difficulty carried from the live T2 genesis; no key files written";
+
 pub const REHEARSAL_MODE_BANNER: &str =
     "rehearsal — deterministic committee seeds [devnet-placeholder]";
 
@@ -159,6 +184,13 @@ pub struct GenesisInitPlan {
     /// on the launch path; the parser refuses the flag without `--launch` so a
     /// fat-finger cannot move the rehearsal pin.
     pub difficulty: u64,
+    /// `--remint-from FILE` — the live pre-re-mint T2 genesis to carry the
+    /// committee, network and difficulty from (the security re-mint).
+    /// Requires [`Self::t2`] and [`Self::remint_expect`]; refuses `--launch`
+    /// and `--difficulty` (both come from the file).
+    pub remint_from: Option<std::path::PathBuf>,
+    /// `--remint-expect HEX` — the pinned genesis hash the input must have.
+    pub remint_expect: Option<String>,
 }
 
 impl GenesisInitPlan {
@@ -170,6 +202,8 @@ impl GenesisInitPlan {
         let mut t2 = false;
         let mut launch = false;
         let mut difficulty: Option<u64> = None;
+        let mut remint_from: Option<std::path::PathBuf> = None;
+        let mut remint_expect: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -185,6 +219,16 @@ impl GenesisInitPlan {
                 "--launch" => {
                     launch = true;
                     i += 1;
+                }
+                "--remint-from" => {
+                    let v = args.get(i + 1).ok_or("--remint-from requires the live T2 genesis file")?;
+                    remint_from = Some(std::path::PathBuf::from(v));
+                    i += 2;
+                }
+                "--remint-expect" => {
+                    let v = args.get(i + 1).ok_or("--remint-expect requires the pinned genesis hash (hex)")?;
+                    remint_expect = Some(v.to_string());
+                    i += 2;
                 }
                 "--difficulty" => {
                     let v = args.get(i + 1).ok_or("--difficulty requires a u64")?;
@@ -208,11 +252,27 @@ impl GenesisInitPlan {
                     .into(),
             );
         }
+        if remint_from.is_some() || remint_expect.is_some() {
+            if !t2 {
+                return Err("`--remint-from` requires `--t2` (T1 is re-minted as a code pin only)".into());
+            }
+            if launch || difficulty.is_some() {
+                return Err(
+                    "`--remint-from` refuses `--launch` / `--difficulty`: the committee and the difficulty come from the file"
+                        .into(),
+                );
+            }
+            if remint_from.is_none() || remint_expect.is_none() {
+                return Err("`--remint-from FILE` and `--remint-expect HASH` go together".into());
+            }
+        }
         Ok(Self {
             out,
             t2,
             launch,
             difficulty: difficulty.unwrap_or(T0_GENESIS_DIFFICULTY),
+            remint_from,
+            remint_expect,
         })
     }
 }
@@ -330,6 +390,17 @@ pub struct FrozenParams {
     pub checkpoint_cadence_blocks_not_frozen: u64,
 }
 
+/// The frozen `consensus_fri` label: the FRI point, plus "/zk" when the
+/// consensus PCS is hiding (`qlab_consensus::IS_ZK`, locked against the
+/// config's own `is_zk()`). Re-mint ruling Q-A (the security re-mint).
+pub fn consensus_fri_label() -> String {
+    if qlab_consensus::IS_ZK == 1 {
+        format!("{}/zk", CONSENSUS_CFG.label())
+    } else {
+        CONSENSUS_CFG.label()
+    }
+}
+
 impl FrozenParams {
     /// The FROZEN v1.0 table, sourced from the single-source code constants where
     /// they exist and pinned as `[FROZEN §n]` literals where the genesis file is
@@ -337,7 +408,9 @@ impl FrozenParams {
     pub fn v1_0() -> Self {
         Self {
             // §1
-            consensus_fri: CONSENSUS_CFG.label(),
+            // "/zk" when the consensus PCS is hiding (re-mint Q-A): the table
+            // states the property, not only its byte count.
+            consensus_fri: consensus_fri_label(),
             log_height: LOG_HEIGHT as u32,
             consensus_wire_bytes: CONSENSUS_WIRE_BYTES,
             agg_leaf_lane: "b4/q43/g22".to_string(),
@@ -446,6 +519,7 @@ impl KeyFile {
 ///   post-#115: bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f
 ///   post-#188: 566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f
 ///   post-mint: 138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
+///   re-mint:   82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af   (the security re-mint — format 6, wire 182,745, "/zk")
 /// ```
 ///
 /// **#101 — `coinbase_rkm`, a consequence rather than a decision.** [`StoredBlock`]
@@ -545,6 +619,13 @@ pub enum GenesisError {
     },
     /// An Annulet genesis file is internally inconsistent.
     BadAnnulet(&'static str),
+    /// A pre-re-mint genesis (format 4 = T1, 5 = T2): it records the
+    /// non-hiding wire; this binary proves and verifies the hiding one.
+    PreRemintGenesis {
+        got: u32,
+    },
+    /// `--remint-from`: the input is not what the re-mint may start from.
+    RemintInput(String),
 }
 
 impl std::fmt::Display for GenesisError {
@@ -556,6 +637,13 @@ impl std::fmt::Display for GenesisError {
             GenesisError::WrongFormatVersion { got, want } => {
                 write!(f, "genesis format version {got} != expected {want}")
             }
+            GenesisError::PreRemintGenesis { got } => write!(
+                f,
+                "genesis format version {got} is a pre-re-mint genesis (4 = T1, 5 = T2): it records the \
+                 non-hiding 148,625-B wire, and this binary proves the hiding one — load the re-minted \
+                 genesis (6 / 7)"
+            ),
+            GenesisError::RemintInput(why) => write!(f, "--remint-from refused: {why}"),
             GenesisError::WrongCommitteeSize { got, want } => {
                 write!(f, "committee has {got} keys, frozen size is {want}")
             }
@@ -704,6 +792,53 @@ impl GenesisFile {
         (Self::new_t2_with_committee_seeds(difficulty, &seeds), seeds)
     }
 
+    /// **The T2 re-mint** (the security re-mint):
+    /// the live T2 genesis `old` with only what the re-mint moves replaced —
+    /// the FrozenParams table (wire 182,745, "/zk") and the format version (7).
+    /// Carried unchanged: the network name, the 21 committee **verifying**
+    /// keys (public; the hosts keep their key files, and no seed exists here),
+    /// the genesis difficulty, and the genesis block (rebuilt from form and
+    /// difficulty and required to equal the live one byte-for-byte).
+    ///
+    /// Deterministic: the same input file gives the same output, so builder
+    /// and coordinator can each reproduce it byte-identically.
+    ///
+    /// Refused by name: an input whose genesis hash is not `expect_hex` (the
+    /// pinned live hash), one that is not a pre-re-mint T2 file (format 5),
+    /// a committee of the wrong size, or a genesis block this tree does not
+    /// rebuild identically.
+    pub fn remint_t2_from(old: &GenesisFile, expect_hex: &str) -> Result<Self, GenesisError> {
+        let got = old.hash_hex();
+        if !got.eq_ignore_ascii_case(expect_hex) {
+            return Err(GenesisError::RemintInput(format!(
+                "the input's genesis hash is {got}, not the expected {expect_hex}"
+            )));
+        }
+        if old.format_version != 5 {
+            return Err(GenesisError::RemintInput(format!(
+                "the input is format {}, not the pre-re-mint T2 format 5",
+                old.format_version
+            )));
+        }
+        let n = pd::FROZEN_COMMITTEE_SIZE;
+        if old.committee_keys.len() != n {
+            return Err(GenesisError::RemintInput(format!(
+                "the input carries {} committee keys, the frozen committee is {n}",
+                old.committee_keys.len()
+            )));
+        }
+        let new = Self::t2_from_committee_keys(old.committee_keys.clone(), old.genesis_difficulty);
+        if new.genesis_block != old.genesis_block {
+            return Err(GenesisError::RemintInput(
+                "this tree does not rebuild the input's genesis block byte-for-byte (form or difficulty drift)"
+                    .into(),
+            ));
+        }
+        let new = GenesisFile { network: old.network.clone(), ..new };
+        new.committee()?;
+        Ok(new)
+    }
+
     /// The genesis hash: keccak256 over the file's canonical bincode. This is the
     /// value printed on `genesis init` and asserted on startup.
     ///
@@ -772,6 +907,9 @@ impl GenesisFile {
     /// maps and the version the startup gate accepts are the same fact in two
     /// places on purpose: the gate is the refusal, this is the fan-out.
     pub fn form(&self) -> Result<GenesisForm, GenesisError> {
+        if PRE_REMINT_FORMAT_VERSIONS.contains(&self.format_version) {
+            return Err(GenesisError::PreRemintGenesis { got: self.format_version });
+        }
         GenesisForm::from_genesis_format_version(self.format_version).ok_or(
             GenesisError::WrongFormatVersion {
                 got: self.format_version,
@@ -1094,9 +1232,13 @@ mod tests {
     fn genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_devnet_t0().hash_hex(),
-            "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb",
+            // The security re-mint: named `genesis init` runs ×2,
+            // file sha256 bbe96cd6…0810, 41,757 B, byte-identical.
+            "82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af",
         );
         for superseded in [
+            // post-mint — T1 until the 08-21 cutover.
+            "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb",
             // pre-#101 — the T0 net on t0-wan-2.
             "4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3",
             // post-#101 / pre-#115 — never deployed.
@@ -1262,10 +1404,16 @@ mod tests {
     #[test]
     fn form_maps_the_format_version_and_refuses_the_rest() {
         let mut gf = GenesisFile::new_devnet_t0();
+        assert_eq!(gf.format_version, 6, "T1 is format 6 since the re-mint (the security re-mint)");
         assert_eq!(gf.form().unwrap(), GenesisForm::V4);
-        gf.format_version = 5;
+        gf.format_version = 7;
         assert_eq!(gf.form().unwrap(), GenesisForm::V5);
-        for v in [0u32, 1, 2, 3, 6] {
+        // The pre-re-mint formats refuse by their own name, not as "unknown".
+        for v in PRE_REMINT_FORMAT_VERSIONS {
+            gf.format_version = v;
+            assert!(matches!(gf.form(), Err(GenesisError::PreRemintGenesis { got }) if got == v), "v{v}");
+        }
+        for v in [0u32, 1, 2, 3, 8] {
             gf.format_version = v;
             assert!(
                 matches!(gf.form(), Err(GenesisError::WrongFormatVersion { got, .. }) if got == v),
@@ -1283,7 +1431,9 @@ mod tests {
     fn t2_genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_t2().hash_hex(),
-            "0e55ccb316ea5dab39c16e0d7db056a1ccf06b167050244dc610a22ca1771df0",
+            // The security re-mint: named `genesis init --t2` runs ×2,
+            // file sha256 b60509cf…3dc6, 41,750 B, byte-identical; was 0e55ccb3….
+            "f2f8350c6e400e2e654ffcbcfe40453e6f5d9bfb770061e7df5f639bf402cf16",
         );
         assert_ne!(
             GenesisFile::new_t2().hash_hex(),
@@ -1334,11 +1484,14 @@ mod tests {
         assert!(GenesisFile::new_devnet_t0().verify_startup(None).is_ok());
         assert!(GenesisFile::new_t2().verify_startup(None).is_ok());
         let mut gf = GenesisFile::new_t2();
-        gf.format_version = 6;
+        gf.format_version = 8;
         assert!(matches!(
             gf.verify_startup(None),
-            Err(GenesisError::WrongFormatVersion { got: 6, .. })
+            Err(GenesisError::WrongFormatVersion { got: 8, .. })
         ));
+        // A pre-re-mint T2 file (format 5) is refused by name at startup.
+        gf.format_version = 5;
+        assert!(matches!(gf.verify_startup(None), Err(GenesisError::PreRemintGenesis { got: 5 })));
     }
 
     #[test]
@@ -1563,5 +1716,106 @@ mod tests {
         // pretend to be one.
         assert!(mode_banner(false).contains("[devnet-placeholder]"));
         assert!(!mode_banner(true).contains("[devnet-placeholder]"));
+    }
+
+    // ── The security re-mint ─────────
+
+    /// A stand-in for the live pre-re-mint T2 genesis: format 5, the
+    /// non-hiding table (148,625 B, no "/zk"), a non-default difficulty and
+    /// committee keys that are not the rehearsal ones — the shape a launch
+    /// file has, from injected seeds (no randomness, no secret).
+    fn pre_remint_t2() -> GenesisFile {
+        let seeds: Vec<[u8; 32]> = (0..pd::FROZEN_COMMITTEE_SIZE).map(|i| [0xA0 ^ i as u8; 32]).collect();
+        let mut gf = GenesisFile::new_t2_with_committee_seeds(4_242, &seeds);
+        gf.format_version = 5;
+        gf.frozen.consensus_wire_bytes = 148_625;
+        gf.frozen.consensus_fri = CONSENSUS_CFG.label();
+        gf
+    }
+
+    #[test]
+    fn remint_carries_committee_network_difficulty_and_block_and_moves_only_the_table() {
+        let old = pre_remint_t2();
+        let new = GenesisFile::remint_t2_from(&old, &old.hash_hex()).expect("a pre-re-mint T2 file re-mints");
+        assert_eq!(new.format_version, GENESIS_FORMAT_VERSION_T2);
+        assert_eq!(new.format_version, 7);
+        assert_eq!(new.network, old.network);
+        assert_eq!(new.committee_keys, old.committee_keys, "the 21 verifying keys are carried");
+        assert_eq!(new.genesis_difficulty, 4_242);
+        assert_eq!(new.genesis_block, old.genesis_block, "the genesis block is byte-identical");
+        assert_eq!(new.frozen, FrozenParams::v1_0());
+        assert_eq!(new.frozen.consensus_wire_bytes, 182_745);
+        assert!(new.frozen.consensus_fri.ends_with("/zk"), "{}", new.frozen.consensus_fri);
+        assert_ne!(new.hash_hex(), old.hash_hex());
+        new.verify_startup(None).expect("the re-minted file passes the startup gate");
+        // Deterministic: builder and coordinator reproduce it byte-for-byte.
+        let again = GenesisFile::remint_t2_from(&old, &old.hash_hex()).unwrap();
+        assert_eq!(again.to_bytes(), new.to_bytes());
+        // Only the table and the version differ from the input.
+        let mut back = new.clone();
+        back.format_version = old.format_version;
+        back.frozen = old.frozen.clone();
+        assert_eq!(back.to_bytes(), old.to_bytes(), "nothing else moved");
+    }
+
+    #[test]
+    fn remint_refuses_a_wrong_hash_a_wrong_format_a_wrong_committee_and_a_drifted_block() {
+        let old = pre_remint_t2();
+        let refused = |gf: &GenesisFile, expect: &str| match GenesisFile::remint_t2_from(gf, expect) {
+            Err(GenesisError::RemintInput(why)) => why,
+            other => panic!("expected a RemintInput refusal, got {:?}", other.map(|g| g.hash_hex())),
+        };
+        let why = refused(&old, &"00".repeat(32));
+        assert!(why.contains("genesis hash"), "{why}");
+        for v in [4u32, 6, 7] {
+            let mut g = old.clone();
+            g.format_version = v;
+            assert!(refused(&g, &g.hash_hex()).contains("format"), "v{v}");
+        }
+        let mut short = old.clone();
+        short.committee_keys.pop();
+        assert!(refused(&short, &short.hash_hex()).contains("committee"));
+        // A file whose recorded difficulty does not rebuild its own block.
+        let mut drift = old.clone();
+        drift.genesis_difficulty += 1;
+        assert!(refused(&drift, &drift.hash_hex()).contains("genesis block"));
+    }
+
+    /// The hosts keep their key files: files that open the pre-re-mint
+    /// genesis open the re-minted one, index for index.
+    #[test]
+    fn the_hosts_key_files_open_the_re_minted_genesis() {
+        let mut old = GenesisFile::new_t2();
+        old.format_version = 5;
+        old.frozen.consensus_wire_bytes = 148_625;
+        old.frozen.consensus_fri = CONSENSUS_CFG.label();
+        let dir = std::env::temp_dir().join(format!("qmb_remint_keys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = old.write_committee_key_files(&dir).expect("write the old key files");
+        let new = GenesisFile::remint_t2_from(&old, &old.hash_hex()).unwrap();
+        let vals = new.load_validators(&paths).expect("the carried committee opens the old key files");
+        assert_eq!(vals.len(), pd::FROZEN_COMMITTEE_SIZE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_init_parse_remint_rules() {
+        let ok = GenesisInitPlan::parse(&args(&["--t2", "--remint-from", "live.qmb", "--remint-expect", "ab"])).unwrap();
+        assert_eq!(ok.remint_from, Some(std::path::PathBuf::from("live.qmb")));
+        assert_eq!(ok.remint_expect.as_deref(), Some("ab"));
+        assert!(!ok.launch);
+        let e = GenesisInitPlan::parse(&args(&["--remint-from", "f", "--remint-expect", "ab"])).unwrap_err();
+        assert!(e.contains("requires `--t2`"), "{e}");
+        let e = GenesisInitPlan::parse(&args(&["--t2", "--remint-from", "f"])).unwrap_err();
+        assert!(e.contains("go together"), "{e}");
+        let e = GenesisInitPlan::parse(&args(&["--t2", "--remint-expect", "ab"])).unwrap_err();
+        assert!(e.contains("go together"), "{e}");
+        let e = GenesisInitPlan::parse(&args(&["--t2", "--launch", "--remint-from", "f", "--remint-expect", "ab"])).unwrap_err();
+        assert!(e.contains("refuses `--launch`"), "{e}");
+        let e = GenesisInitPlan::parse(&args(&["--t2", "--launch", "--difficulty", "9", "--remint-from", "f", "--remint-expect", "ab"]))
+            .unwrap_err();
+        assert!(e.contains("refuses `--launch`"), "{e}");
+        let plain = GenesisInitPlan::parse(&args(&["--t2"])).unwrap();
+        assert_eq!((plain.remint_from, plain.remint_expect), (None, None));
     }
 }

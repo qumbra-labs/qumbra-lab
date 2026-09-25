@@ -170,7 +170,7 @@ fn the_binary_runs_an_annulet_devnet_genesis_as_producer_under_the_l2_verifier()
         proof: vec![0u8; 64],
         public: TxPublic {
             anchor: [0x11; 32],
-            nullifiers: vec![[0x71; 32], [0x72; 32]],
+            nullifiers: vec![[0x71; 32], [0x72; 32], [0x73; 32]],
             commitments: vec![[0x81; 32], [0x82; 32]],
             bucket: ArityBucket::TwoByTwo,
             fee: g.params.fee_tier_s,

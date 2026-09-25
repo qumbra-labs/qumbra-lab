@@ -198,7 +198,9 @@ pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
     use p3_uni_stark::prove;
 
     use crate::m4gate::{build_gate_trace, build_interior_trace, GateShape, VerifierGateAir};
-    use crate::{make_config_with, FriCfg};
+    use crate::FriCfg;
+    // Re-gated by the re-mint: M4 runs on the legacy non-hiding config.
+    use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
     println!("# qumbra-lab M4 step 1 stage 3: interior peak-RSS gate (m4interior)");
     println!();

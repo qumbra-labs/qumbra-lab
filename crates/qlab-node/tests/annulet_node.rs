@@ -50,7 +50,13 @@ fn s_tx(node: &MemNode, nf: u8) -> TxEntry {
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor: node.commitment_root(),
-            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32]],
+            // S/P spend three (A4): slot 3's fee-input nullifier is never a
+            // uniform `[x; 32]`, so it cannot collide with another fixture's.
+            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32], {
+                let mut f = [nf; 32];
+                f[31] = !nf;
+                f
+            }],
             commitments: vec![[nf.wrapping_add(1); 32], [nf.wrapping_add(101); 32]],
             bucket: ArityBucket::TwoByTwo,
             fee: 1,
@@ -85,7 +91,7 @@ fn an_annulet_node_applies_sealed_blocks_and_finalizes_each_on_acceptance() {
         assert_eq!(held.body().txs[0].l2, s_tx(&n, 0).l2, "the L2 surface is held");
         parent = sealed.header;
     }
-    assert_eq!(n.nullifier_count(), 6);
+    assert_eq!(n.nullifier_count(), 9, "three S spends × three nullifiers (A4)");
 }
 
 #[test]
@@ -185,7 +191,7 @@ fn an_annulet_node_on_disk_resumes_its_sealed_chain_across_a_restart() {
     assert_eq!(n.tip_height(), 3);
     assert_eq!(n.finalized_height(), Some(3), "final = tip after replay");
     assert_eq!(n.commitment_root(), root);
-    assert_eq!(n.nullifier_count(), 6);
+    assert_eq!(n.nullifier_count(), 9, "three S spends × three nullifiers (A4)");
     assert_eq!(n.annulet_fee_table(), Some(FEES));
     assert_eq!(n.chain().block(&tip).and_then(|b| b.sealed_header()), Some(seal3), "the seal survives the restart");
     // An L1 genesis over this datadir: refused by name, before hashing.

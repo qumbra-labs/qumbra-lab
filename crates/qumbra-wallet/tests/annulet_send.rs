@@ -28,7 +28,7 @@ use qumbra_faucet::annulet::{served, OwnedNote, SpendKey};
 use qumbra_faucet::devnet_harness::Net;
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile};
 use qumbra_wallet::annulet::scan_annulet;
-use qumbra_wallet::annulet_send::{send_annulet, Plan, WalletEndpoint};
+use qumbra_wallet::annulet_send::{send_annulet, SendPlan, WalletEndpoint};
 use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -92,7 +92,7 @@ fn an_ordinary_wallet_fee_splits_and_sends_usdt_test_through_a_follower() {
     .expect("the two-stock-note S builds and proves");
     assert_eq!(2 * devnet::STOCK_NOTE_VALUE, 3 + tier_p + tier_s);
     seq.submit(&fund.tx).expect("admitted");
-    net.settle_spends(2, "the funding S");
+    net.settle_spends(3, "the funding S");
 
     // 2. The holder sends W its USDT-test (P), paying with its 2.
     let usdt = OwnedNote { note: devnet::holder_usdt_note(), key: holder_key }.input();
@@ -109,7 +109,7 @@ fn an_ordinary_wallet_fee_splits_and_sends_usdt_test_through_a_follower() {
     )
     .expect("the holder's P builds and proves");
     seq.submit(&to_w.tx).expect("admitted");
-    let v = net.settle_spends(4, "the holder's P");
+    let v = net.settle_spends(6, "the holder's P");
 
     // 3. W scans through follower 1 — the real wallet scan over its own transport.
     assert_eq!(balances(&w, &urls[1], v[1].state_tip, hash), vec![(0, 3), (1, devnet::HOLDER_USDT_VALUE as u128)]);
@@ -130,14 +130,21 @@ fn an_ordinary_wallet_fee_splits_and_sends_usdt_test_through_a_follower() {
         Some(hash),
         &[],
         Duration::from_secs(60),
+        &mut |plan: &SendPlan| {
+            eprintln!("{plan}");
+            true
+        },
         &mut rng,
     )
     .expect("the wallet's send: fee-split, then P");
-    assert!(matches!(report.plan, Plan::SplitFirst { .. }), "no exact P-tariff note: {:?}", report.plan);
+    // No exact P-tariff note: one fee-split (round 0), then the payment of
+    // one covering note (round 1); no merge.
+    assert_eq!((report.plan.splits(), report.plan.merges(), report.plan.rounds()), (1, 0, 2), "{}", report.plan);
+    assert_eq!(report.plan.total_fee(), tier_s + tier_p, "{}", report.plan);
     assert_eq!(report.split_fee_note.map(|n: L2Note| (n.value, n.asset)), Some((tier_p, 0)));
     assert_eq!(report.outputs[0].value, 250_000);
     assert_eq!(report.outputs[1].value, devnet::HOLDER_USDT_VALUE - 250_000);
-    let v = net.settle_spends(8, "the split and the send");
+    let v = net.settle_spends(12, "the split and the send");
     eprintln!("C2: W's fee-split (S) + send (P), sealed and applied on 3 nodes in {:?}", started.elapsed());
     assert_eq!(snapshot(&w), before, "send --net annulet leaves the wallet dir byte-identical (P8)");
 

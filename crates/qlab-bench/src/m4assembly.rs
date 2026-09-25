@@ -22,7 +22,9 @@ use crate::m4gate::{build_interior_trace, GateShape, VerifierGateAir};
 use crate::m4interior::{epoch_fee_sum_expected, merge_root, EPOCH_FEE_LIMBS, MERGE_ROOT_LIMBS};
 use crate::m4treerec::{leaf_proof, leaf_proof_variant, walk_leaf, AGG_CFG};
 use crate::m4gaterec::Schedule;
-use crate::{make_config_with, FriCfg, Val};
+use crate::{FriCfg, Val};
+// Re-gated by the re-mint: M4 aggregates the legacy non-hiding proof shape.
+use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
 /// Issue #24 consumer-side invariant as a hard predicate: the interior proof's
 /// exposed root public values (`opvs[2·n_opvs .. 2·n_opvs+MERGE_ROOT_LIMBS]`,

@@ -109,7 +109,7 @@ qumbra-credit-ref --listen 127.0.0.1:8484 \
 
 | 数字 | 值 | 基础 |
 |---|---|---|
-| 信封大小 | **150,695 B**(约 147 KiB) | 已提交的 V1 黄金 fixture:钉定 b16/q20/g22/a16 配置下 postcard 序列化的证明(`fixtures/README.md`——注意旧文档里流传的"~122 KB"是 bincode 证明大小,编解码器弄错了) |
+| 信封大小 | **189,437 B**(约 185 KiB;安全重铸的隐藏 PCS——此前为 150,695 B) | 已提交的 V1 黄金 fixture:钉定 b16/q20/g22/a16 配置下 postcard 序列化的证明(`fixtures/README.md`——注意旧文档里流传的"~122 KB"是 bincode 证明大小,编解码器弄错了) |
 | 验证 | **26.0 ms** | b16/q20/g22,Apple M5 Max,复现两次(`docs/disclosure-run1.md`/`-run2.md`)——单线程约 40 次/秒,远超任何充值速率 |
 | 充值方出证明 | 0.59–0.99 s | 同一测试机与同批运行,每次运行 1 个计时样本 |
 | 充值 → 可入账 | 约 2.5–11.5 分钟 | 由 devnet 最终性钉定常量推出的算术,不是测量——`docs/kit-confirmation-policy.md` §4 |

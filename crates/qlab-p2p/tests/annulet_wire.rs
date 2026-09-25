@@ -72,7 +72,13 @@ fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor,
-            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32]],
+            // S/P spend three (A4): slot 3's fee-input nullifier is never a
+            // uniform `[x; 32]`, so it cannot collide with another fixture's.
+            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32], {
+                let mut f = [nf; 32];
+                f[31] = !nf;
+                f
+            }],
             commitments: vec![[nf.wrapping_add(1); 32], [nf.wrapping_add(101); 32]],
             bucket: ArityBucket::TwoByTwo,
             fee: FEES.tier_s,
@@ -130,7 +136,7 @@ fn annulet_nodes_relay_transactions_and_sealed_blocks_and_a_joiner_syncs_by_wire
     assert_eq!(carried, 6, "three blocks carried two S transactions each");
     for n in [&producer, &follower] {
         assert_eq!(ChainView::finalized_height(n.node()), Some(6), "final on acceptance, by wire");
-        assert_eq!(n.node().state().nullifier_count(), 12);
+        assert_eq!(n.node().state().nullifier_count(), 18, "six S transactions × three nullifiers (A4)");
     }
     assert_eq!(producer.node().state().commitment_root(), follower.node().state().commitment_root());
 

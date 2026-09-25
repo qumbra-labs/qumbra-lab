@@ -10,8 +10,13 @@
 //! a regression lock on the PV layout and on every host hash that feeds it.
 
 use qlab_air::l2::{build_bucket_l2, L2BucketInstance, L2TxInput, L2TxOutput};
+use qlab_air::l2::{
+    build_bucket_l2_with_witnesses, derive_input_l2, fabricated_registry_tree, fabricated_tree3,
+    FeeSlot,
+};
 use qlab_air::l2::{RegistryLeaf, MODE_HYBRID};
 use qlab_air::l2p::{build_bucket_l2p, issuer_key_of, L2PBucketInstance, PolicyAsset, VPublic};
+use qlab_air::l2p::{build_bucket_l2p_with_witnesses, derive_rkm_l2};
 use qlab_air::l2r::{build_shape_r, registry_opening, L2ShapeRInstance, RegistryWrite, SeedOutput};
 
 /// The fixtures' xorshift64 stream (the bench's, verbatim).
@@ -81,6 +86,74 @@ pub fn shape_p_at(log_height: usize) -> L2PBucketInstance {
 /// Shape P at its own height (2^20).
 pub fn shape_p() -> L2PBucketInstance {
     shape_p_at(crate::LOG_HEIGHT_P)
+}
+
+/// Seed of the A4 merge fixtures' stream (distinct from [`SEED`], so the
+/// merge notes never collide with the 2×2 fixtures' nullifiers).
+const SEED_MERGE: u64 = 0xa4a4_3e3e_f33d_0003;
+
+/// The A4 merge the 3×2 shapes exist for (design #283): two asset-7 notes
+/// (30,000 + 20,000) in, 50,000 + a 0-value change (both asset 7) out, the
+/// 1,000 fee paid by slot 3's **exact** asset-0 note (`d3 = 0`). All three
+/// notes sit in one fabricated commitment tree. Returns the three inputs'
+/// notes alongside so a caller can derive commitments.
+fn merge_notes() -> ([L2TxInput; 2], [L2TxOutput; 2], L2TxInput) {
+    let mut r = Rnd(SEED_MERGE);
+    let inputs = [r.input(30_000, 7), r.input(20_000, 7)];
+    let outputs = [r.output(50_000, 7), r.output(0, 7)];
+    let fee_note = r.input(1_000, 0);
+    (inputs, outputs, fee_note)
+}
+
+/// Shape S3 at `log_height`: [`merge_notes`] with asset 7 Cloaked.
+pub fn shape_s3_merge_at(log_height: usize) -> L2BucketInstance {
+    let (inputs, outputs, fee_note) = merge_notes();
+    let cms = [&inputs[0], &inputs[1], &fee_note].map(|i| derive_input_l2(i).2);
+    let (w, anchor) = fabricated_tree3([&cms[0], &cms[1], &cms[2]]);
+    let leaves = [RegistryLeaf::cloaked(7), RegistryLeaf::cloaked(7)];
+    let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    build_bucket_l2_with_witnesses(
+        log_height,
+        &inputs,
+        &outputs,
+        1_000,
+        &[w[0], w[1]],
+        anchor,
+        &leaves,
+        &rw,
+        root,
+        &FeeSlot::Exact { input: fee_note, witness: w[2] },
+    )
+}
+
+/// Shape P3 at `log_height`: [`merge_notes`] with asset 7 Hybrid (issuer
+/// [`ISK_7`], three frozen keys, redeem closed), no vPublic.
+pub fn shape_p3_merge_at(log_height: usize) -> L2PBucketInstance {
+    let (inputs, outputs, fee_note) = merge_notes();
+    let cms = [&inputs[0], &inputs[1], &fee_note].map(|i| derive_input_l2(i).2);
+    let (w, anchor) = fabricated_tree3([&cms[0], &cms[1], &cms[2]]);
+    let mut r = Rnd(SEED_MERGE ^ 0xf0f0);
+    let frozen = [r.d4(), r.d4(), r.d4()];
+    let asset = PolicyAsset::hybrid(7, ISK_7, false, &frozen);
+    let leaf = asset.leaf().hash();
+    let (rw, root) = fabricated_registry_tree(&leaf, &leaf);
+    let policy = [0, 1].map(|i| {
+        asset
+            .policy_input_for(&derive_rkm_l2(&inputs[i]), rw[i])
+            .expect("merge fixture: rkm frozen")
+    });
+    build_bucket_l2p_with_witnesses(
+        log_height,
+        &inputs,
+        &outputs,
+        1_000,
+        &[w[0], w[1]],
+        anchor,
+        &policy,
+        root,
+        [VPublic::NONE; 2],
+        &FeeSlot::Exact { input: fee_note, witness: w[2] },
+    )
 }
 
 /// The next issuer secret of asset 7 — what the shape-R fixture rotates to.

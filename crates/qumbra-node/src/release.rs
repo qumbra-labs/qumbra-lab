@@ -174,9 +174,21 @@ pub const DRILL_HALT_HEIGHT: u64 = 16;
 /// Pre-mint value, recorded so the break is legible rather than restorable:
 /// `19564eca…4571`. (The schema-0 marker fixture further down still quotes it, and
 /// must — it is a historical artifact of #74, not a pin.)
+///
+/// 🔴 **Moved again by the re-mint, 2026-09-25, identifier again NOT bumped**
+/// (the security re-mint; the same
+/// rule as the mint above). Pre-re-mint value: `a54e73ce…7b5b`
+/// (`a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b`). The delta: the NF path-bit constraint, the hiding PCS,
+/// `consensus_wire_bytes` 148,625 → 182,745, `consensus_fri` + "/zk", genesis
+/// formats 6 (T1) / 7 (T2), and A4's S3/P3 shapes. It is safe here for the
+/// mint's reason: the re-mint is a re-genesis with no boundary — the old T2
+/// chain ends at the roll and is never continued under the new digest, and old
+/// binaries refuse format 7 while new ones refuse 4 / 5, so no node ever runs
+/// a mixed digest. [`REVISION_V1_1_EXACT_EMISSION`] and [`REVISION_V1_0_1_DRILL`]
+/// moved with it (each still differs from v1.0 by identifier only).
 pub const REVISION_V1_0: Revision = Revision {
     id: "v1.0",
-    frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
+    frozen_digest_hex: "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
 };
 
 /// **The emission-rule revision** (lab #299 + #303): the parameter set in force
@@ -203,7 +215,7 @@ pub const REVISION_V1_0: Revision = Revision {
 /// last bullet: the schedule rule rides the revision machinery.
 pub const REVISION_V1_1_EXACT_EMISSION: Revision = Revision {
     id: "v1.1-exact-emission",
-    frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
+    frozen_digest_hex: "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
 };
 
 /// The **deliberately inert** revision the drill upgrades to (H5). It moves **no**
@@ -212,7 +224,7 @@ pub const REVISION_V1_1_EXACT_EMISSION: Revision = Revision {
 /// drive on it.
 pub const REVISION_V1_0_1_DRILL: Revision = Revision {
     id: "v1.0.1-drill",
-    frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
+    frozen_digest_hex: "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
 };
 
 /// What this binary is: its name, its halt schedule, the revision it carries, and

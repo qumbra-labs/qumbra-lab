@@ -89,9 +89,9 @@ pub fn make_config_l2() -> Config {
 // The shapes
 // ---------------------------------------------------------------------------
 
-/// log2 of the shape-S trace height (120 perms → 2^19).
+/// log2 of the shape-S trace height (158 perms → 2^19; A4's S3).
 pub const LOG_HEIGHT_S: usize = qlab_air::l2::SHAPE_S_LOG_HEIGHT;
-/// log2 of the shape-P trace height (214 perms → 2^20).
+/// log2 of the shape-P trace height (252 perms → 2^20; A4's P3).
 pub const LOG_HEIGHT_P: usize = qlab_air::l2p::SHAPE_P_LOG_HEIGHT;
 /// log2 of the shape-R trace height (79 perms → 2^18).
 pub const LOG_HEIGHT_R: usize = qlab_air::l2r::SHAPE_R_LOG_HEIGHT;
@@ -265,13 +265,19 @@ pub fn verify_r(pvs: &[Val], proof: &Proof<Config>) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The v1 shape digests (`digest::shape_digest`), lower-case hex.
-pub const SHAPE_S_DIGEST_V1: &str = "7a6391bc98eed26b4bff7aaaa987f7d6ef657e27ad50746c9c519bcabdae6670";
+///
+/// A4 (design #283): S3/P3 — the 3×2 shapes (slot 3 the fee input,
+/// `d3` exact-or-dummy) over the NF operand-order constraint. S 721 cols /
+/// 158 perms / 1,113 constraints; P 798 / 252 / 1,328. Named `l2_goldens`
+/// run, twice, byte-identical.
+pub const SHAPE_S_DIGEST_V1: &str = "0bd458286dc5608d25d17c6f8b1f2652387722a6a9c82a14aa97b7b5d03cf6a2";
 /// See [`SHAPE_S_DIGEST_V1`].
-pub const SHAPE_P_DIGEST_V1: &str = "ad53d40e7d5ffd8235b701fab16856f428790b7ba33efc8915abe625f1bacaff";
-/// See [`SHAPE_S_DIGEST_V1`] (lab #724; re-pinned by A3, lab #731 — the seed
-/// output — from `40bbc9fe…1f6d`, 1,181 constraints, to 1,225; the named
-/// `l2_goldens` run, twice, byte-identical).
-pub const SHAPE_R_DIGEST_V1: &str = "5f081f55850e414421347e047b55c05887acec87c57e8d7b47f2a4a0d050507f";
+pub const SHAPE_P_DIGEST_V1: &str = "57a1bc84601dad21c54d84728915ead38d25a48cd9a76cdf344924c51f47f9c0";
+/// See [`SHAPE_S_DIGEST_V1`] (lab #724; A3 lab #731 on main pins `5f081f55…507f`).
+/// With the NF operand-order constraint over A3 — 1,226 constraints
+/// (A3's 1,225 + 1); A2+NF was `cfdc4cbd…89e0`. Named `l2_goldens` run, twice,
+/// byte-identical.
+pub const SHAPE_R_DIGEST_V1: &str = "f1723d5d3729c32269936e9fff02bf3986de596bce8bb174ae0c892c51d496bd";
 
 #[cfg(test)]
 mod tests;

@@ -8,22 +8,26 @@
 
 | object | v1 value | pinned by |
 |---|---|---|
-| shape S geometry | 702 columns · 120 perms · 2^19 rows · max constraint degree 4 (4 quotient chunks) · 100 public values | `l2_shape_geometry_is_locked`; `qlab-air` `l2_trace_width_is_read_off_the_matrix`, `l2_quotient_degree_matches_the_l1` |
-| shape P geometry | **778** columns · **214** perms (216-slot ring) · 2^20 rows · degree 4 · 112 public values | `l2_shape_geometry_is_locked`; `qlab-air` `l2p_trace_width_is_read_off_the_matrix`, `l2p_quotient_degree_matches_the_l1`, `l2p_program_geometry` |
-| PV layout | `anchor` 0 · `nf₁` 16 · `nf₂` 32 · `cm₁` 48 · `cm₂` 64 · `fee` 80 (four 16-bit chunks) · `registry_root` 84 · P only: `vPublic₁` 100, `vPublic₂` 106 (each `redeem`, four 16-bit chunks of `amount`, `vpa`) | `l2_shape_geometry_is_locked`, `l2_golden_pv_vectors` |
+| shape S geometry | **721** columns · **158** perms · 2^19 rows · max constraint degree 4 (4 quotient chunks) · **116** public values (S3, A4 — see §1.2) | `l2_shape_geometry_is_locked`; `qlab-air` `l2_trace_width_is_read_off_the_matrix`, `l2_quotient_degree_matches_the_l1` |
+| shape P geometry | **798** columns · **252** perms (252-slot ring) · 2^20 rows · degree 4 · **128** public values (P3, A4) | `l2_shape_geometry_is_locked`; `qlab-air` `l2p_trace_width_is_read_off_the_matrix`, `l2p_quotient_degree_matches_the_l1`, `l2p_program_geometry` |
+| PV layout | `anchor` 0 · `nf₁` 16 · `nf₂` 32 · `cm₁` 48 · `cm₂` 64 · `fee` 80 (four 16-bit chunks) · `registry_root` 84 · P only: `vPublic₁` 100, `vPublic₂` 106 (each `redeem`, four 16-bit chunks of `amount`, `vpa`) · A4: `nf₃` (slot 3, the fee input) appended — S 100, P 112 | `l2_shape_geometry_is_locked`, `l2_golden_pv_vectors` |
 | the program | every slot's 5-bit role code; every builder emits the same program, so a verifier's AIR is a function of the shape alone | `l2_verifier_air_is_instance_independent`; the shape digest |
 | the note block | `cm = H(value ‖ asset ‖ rkm ‖ ρ ‖ rseed)`; 112-B plaintext `value(8 LE) ‖ asset(8 LE) ‖ rkm ‖ ρ ‖ rseed` | `qlab-note` `l2_golden_note_block` (literals computed outside Rust), `l2_commitment_matches_qlab_air_build_bucket_l2` |
 | discovery payload | `L2_PAYLOAD_LEN = 128` (112-B note + 16-B tag) | `qlab-note` `l2_payload_len_is_128` |
 | in-circuit domains (P) | `D_I` = lane 4 bit 7 (`issuer_key = H(isk ‖ D_I)`) · `D_CRED` = lane 4 bit 15 (`cred = H(rkm ‖ D_CRED)`) · **`D_FRZ` = lane 4 bit 31** (`K = H(rkm ‖ D_FRZ)`, the freeze key) | known answers inside the shape digest; `l2p_policy_blocks_match_reference` |
 | asset id space | 16-bit registry index (bits 16..63 forced zero); registry depth 16 | `l2_asset_id_is_a_16_bit_registry_index`; `l2_shape_geometry_is_locked` |
 | tree depths | commitment 32 · registry 16 · freeze 20 (indexed, sorted, keyed by `K`) · allowlist 20 | the shape digest |
-| **shape digests** | S `7a6391bc98eed26b4bff7aaaa987f7d6ef657e27ad50746c9c519bcabdae6670` · P `ad53d40e7d5ffd8235b701fab16856f428790b7ba33efc8915abe625f1bacaff` | `l2_shape_digests_are_pinned` |
+| **shape digests** | S `0bd458286dc5608d25d17c6f8b1f2652387722a6a9c82a14aa97b7b5d03cf6a2` · P `57a1bc84601dad21c54d84728915ead38d25a48cd9a76cdf344924c51f47f9c0` | `l2_shape_digests_are_pinned` |
 
 **The shape digest** (`qlab_l2::digest`) is `Keccak-256(b"qumbra:l2:shape:v1" ‖ tag ‖ constants ‖ constraints)`:
 - *constants*: geometry, the PV layout, the canonical program, depths, modes and flags, plus known-answer outputs of every host hash the circuit mirrors. The domains are lane/bit positions inside hash blocks, not named constants, so they are pinned through those outputs rather than re-typed.
-- *constraints*: a structural content hash of Plonky3's symbolic constraint set — S has 1,057 constraints, P has 1,270. A constraint edit that moves no constant still moves the digest.
+- *constraints*: a structural content hash of Plonky3's symbolic constraint set — S has 1,113 constraints, P has 1,328 (A4). A constraint edit that moves no constant still moves the digest.
 - The digest is computed twice in the test, which checks it is deterministic.
 - **A Plonky3 bump that moves it is a freeze event.** Re-pin only with the coordinator.
+
+### 1.2 A4 (2026-09-25, landed with the security re-mint): S3/P3, the 3×2 shapes
+
+Design #283 ruled (a): S and P gain a third input, **slot 3, for the fee** — `ANK → NF → BNF3 → ARKM → ACMF → 32×MERKLE → BANCHOR`, asset forced to 0, its nullifier published as `nf₃` (`PV_NF3`). Slot 3 is **exact or dummy** (`d3`, a witness): `d3 = 0` spends an asset-0 note worth exactly the fee and the balance rows carry none, so two notes of one asset can merge; `d3 = 1` is a dummy and the fee comes from an asset-0 row as before. Both publish three nullifiers, so the anonymity set is not split. S 702 → 721 cols, 120 → 158 perms (still 2^19; 12 perms of height budget left); P 778 → 798, 214 → 252 (still 2^20). Measured non-hiding b4 (the Graviton rig): S3 6.94 GB; P3 15.17–15.73 GB — P has no budget left in the 16 GB class. Digests and golden PVs re-pinned from a named `l2_goldens` run, twice, byte-identical; the v1 PV prefixes do not move.
 
 ### 1.1 The one change to W3's shape P: the freeze key is hashed
 
@@ -80,7 +84,7 @@ Added 2026-09-24. A third shape, pinned the same way as S and P. It is a circuit
 | shape R geometry | **734** columns · **82** perms · 2^18 rows · degree 4 · **101** public values *(A3; A2 was 726 · 79 · 85)* | `l2_shape_geometry_is_locked`; `qlab-air` `l2r_trace_width_is_read_off_the_matrix`, `l2r_quotient_degree_is_4`, `l2r_program_geometry` |
 | PV layout | `anchor` 0 · `nf` 16 · `cm` 32 · `fee` 48 · `old_root` 52 · `new_root` 68 · `asset` 84 · `cm_seed` 85 (A3, appended) | `l2_shape_geometry_is_locked`, `l2_golden_pv_vectors` |
 | role codes | `AREG_OLD` = S's `AREG` (15), `BREG_OLD` = S's `BREG` (16), `AISS` = P's (17); new: `AREG_NEW` 23, `MO` 24, `MN` 25, `BREG_NEW` 26; A3: `ARHO` = S's (14), `BCM2` = S's (11), new `ACMOUT2` 27 | the shape digest |
-| shape digest | R `5f081f55850e414421347e047b55c05887acec87c57e8d7b47f2a4a0d050507f` (1,225 constraints; A3 re-pin — A2 was `40bbc9fe…1f6d`, 1,181) | `l2_shape_digests_are_pinned` |
+| shape digest | R `f1723d5d3729c32269936e9fff02bf3986de596bce8bb174ae0c892c51d496bd` (A3 + the NF path-bit constraint: 1,226; before the fix `5f081f55…507f`) (1,225 constraints; A3 re-pin — A2 was `40bbc9fe…1f6d`, 1,181) | `l2_shape_digests_are_pinned` |
 
 **How the two folds share one set of siblings.** The old and new roots are folded level by level in alternation, `MO_i` then `MN_i`, over the same sibling. Both steps read their running digest from witness lanes through a new injection class, because one Keccak chain cannot carry two digests at once.
 

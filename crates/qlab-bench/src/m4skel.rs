@@ -37,7 +37,9 @@ use p3_uni_stark::{prove, verify};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use crate::{keccak_inputs, make_config_with, pc_len, FriCfg, Val, RUNS};
+use crate::{keccak_inputs, pc_len, FriCfg, Val, RUNS};
+// Re-gated by the re-mint: M4 runs on the legacy non-hiding config.
+use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
 // ---------------------------------------------------------------------------
 // Lane composition: evaluate a foreign AIR at a column offset

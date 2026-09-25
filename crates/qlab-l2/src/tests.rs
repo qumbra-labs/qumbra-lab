@@ -55,16 +55,19 @@ fn l2_crate_deps_are_exactly_air_and_consensus() {
 #[test]
 fn l2_shape_geometry_is_locked() {
     let s = verifier_air_s();
-    assert_eq!(<L2ShapeSAir as BaseAir<Val>>::width(&s), 702);
-    assert_eq!(<L2ShapeSAir as BaseAir<Val>>::num_public_values(&s), 100);
+    assert_eq!(<L2ShapeSAir as BaseAir<Val>>::width(&s), 721);
+    assert_eq!(<L2ShapeSAir as BaseAir<Val>>::num_public_values(&s), 116);
     assert_eq!(get_max_constraint_degree::<Val, _>(&s, AirLayout::from_air::<Val>(&s)), 4);
     let p = verifier_air_p();
     assert_eq!(<L2ShapePAir as BaseAir<Val>>::width(&p), Shape::P.width());
-    assert_eq!(<L2ShapePAir as BaseAir<Val>>::num_public_values(&p), 112);
+    assert_eq!(<L2ShapePAir as BaseAir<Val>>::num_public_values(&p), 128);
     assert_eq!(get_max_constraint_degree::<Val, _>(&p, AirLayout::from_air::<Val>(&p)), 4);
 
-    assert_eq!((Shape::S.width(), Shape::S.log_height(), Shape::S.perms(), Shape::S.pv_len()), (702, 19, 120, 100));
-    assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (778, 20, 214, 112));
+    // A4 (S3/P3): slot 3's fee chain and `PV_NF3` appended after each
+    // shape's v1 PVs.
+    assert_eq!((Shape::S.width(), Shape::S.log_height(), Shape::S.perms(), Shape::S.pv_len()), (721, 19, 158, 116));
+    assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (798, 20, 252, 128));
+    assert_eq!((qlab_air::l2::PV_NF3, qlab_air::l2p::PV_NF3), (100, 112));
     let r = verifier_air_r();
     assert_eq!(<L2ShapeRAir as BaseAir<Val>>::width(&r), Shape::R.width());
     assert_eq!(<L2ShapeRAir as BaseAir<Val>>::num_public_values(&r), 101);
@@ -260,8 +263,12 @@ fn l2_shape_digests_are_pinned() {
 /// fabricated anchor and registry root).
 #[test]
 fn l2_golden_pv_vectors() {
-    assert_eq!(fixture::shape_s().pvs, GOLDEN_PV_S, "shape-S fixture PVs");
-    assert_eq!(fixture::shape_p().pvs, GOLDEN_PV_P, "shape-P fixture PVs");
+    // A4 appended slot 3's nullifier; the v1 prefixes do not move.
+    let (pv_s, pv_p) = (fixture::shape_s().pvs, fixture::shape_p().pvs);
+    assert_eq!(pv_s[..100], GOLDEN_PV_S, "shape-S fixture PVs — the v1 prefix, byte for byte");
+    assert_eq!(pv_s[100..], GOLDEN_PV_NF3, "shape-S fixture PVs — A4's nf3");
+    assert_eq!(pv_p[..112], GOLDEN_PV_P, "shape-P fixture PVs — the v1 prefix, byte for byte");
+    assert_eq!(pv_p[112..], GOLDEN_PV_NF3, "shape-P fixture PVs — A4's nf3 (the same dummy slot 3)");
     // A3 appended the seed's commitment; A2's 85 values do not move.
     let pv_r = fixture::shape_r().pvs;
     assert_eq!(pv_r[..85], GOLDEN_PV_R, "shape-R fixture PVs — A2's prefix, byte for byte");
@@ -290,6 +297,13 @@ const GOLDEN_PV_P: [u32; 112] = [
     5516, 10200, 58993, 14765, 15376, 30000, 51619, 7131, 37300, 39386, 41061, 21527,
     64399, 4798, 55940, 64131, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0,
+];
+/// A4: the S/P fixtures' slot-3 nullifier (`PV_NF3..`) — the dummy fee
+/// input both fixtures derive from input 1's ρ. From the named `l2_goldens`
+/// run.
+const GOLDEN_PV_NF3: [u32; 16] = [
+    51833, 16215, 28991, 42064, 9855, 14274, 48732, 11757, 17817, 62036, 1191, 61283,
+    34831, 47635, 28968, 37238,
 ];
 /// A2's shape-R fixture PVs (lab #724), unchanged by A3.
 const GOLDEN_PV_R: [u32; 85] = [

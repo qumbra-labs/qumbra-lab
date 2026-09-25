@@ -641,6 +641,11 @@ where
             blast.clone() * local[PB_OFF + 1].clone() * local[PH_OFF + 1].clone(),
         );
         builder.assert_bool(local[PBIT_COL].clone());
+        // The NF path-bit fix: NF absorbs through the Merkle mux, whose path bit would swap
+        // (nk ‖ ρ) into (ρ ‖ nk) — a second nullifier for the same note. NF's
+        // operand order is fixed: PBIT is 0 on every NF row (it is constant
+        // within a perm, so this covers the boundary rows; degree 2).
+        builder.assert_zero(local[SEL_OFF + SEL_NF].clone() * local[PBIT_COL].clone());
         for i in 0..NW {
             builder.assert_bool(local[W_OFF + i].clone());
         }
@@ -2442,5 +2447,39 @@ mod tests {
         let mut pvs = fx.pvs.clone();
         pvs[PV_CM_SEED + 5] += F::ONE;
         assert_trace_refused_at(&fx.inst, &fx.trace, &pvs, at(ROLE_BCM2), "a republished seed cm");
+    }
+
+    /// NF path-bit regression (shape R): the fee input's NF perm with its path bit
+    /// set. R's output ρ is the nullifier, so the complete forgery rebinds
+    /// the public nf, moves the output's ρ lanes to the swapped nullifier and
+    /// republishes the output commitment — refused at the NF perm only.
+    #[test]
+    fn l2r_swapped_nf_is_unsat() {
+        let fx = register_fixture();
+        fx.assert_sat("precondition: the honest instance verifies");
+        let mut inst = fx.inst.clone();
+        let slot = at(ROLE_NF);
+        let nk = digest(&L2ShapeRAir::extract_state(&fx.trace, 24 * slot));
+        let rho: [u64; 4] = inst.air.slot_witness[slot].w[..4].try_into().unwrap();
+        let nf = digest(&reference::merkle_node_state(&rho, &nk));
+        assert_ne!(nf, inst.nf, "the swap is a different nullifier");
+        inst.air.slot_witness[slot].pbit = true;
+        let out = at(ROLE_ACMOUT);
+        inst.air.slot_witness[out].w[5..9].copy_from_slice(&nf);
+        let (_, fout) = fee_parts();
+        let cm = l2_cm(fout.value, 0, &fout.rkm, &nf, &fout.rseed);
+        for (k, c) in pv_chunks(&nf).iter().enumerate() {
+            inst.pvs[PV_NF + k] = *c;
+        }
+        for (k, c) in pv_chunks(&cm).iter().enumerate() {
+            inst.pvs[PV_CM + k] = *c;
+        }
+        // A3's seed follows the swapped nf too: ARHO absorbs it, the seed's
+        // ρ and commitment are re-derived — so only the NF perm can refuse.
+        let arho = at(ROLE_ARHO);
+        inst.air.slot_witness[arho].w[..4].copy_from_slice(&nf);
+        inst.nf = nf;
+        republish_seed(&mut inst, derive_output_rho(&nf, 1), |_| {});
+        assert_refused_at(&inst, slot, "a swapped-NF second nullifier");
     }
 }

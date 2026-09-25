@@ -225,6 +225,22 @@ where
     scan(air, main, public_values, Some(program_end))
 }
 
+/// Every constraint violated on ONE row — for a targeted negative whose claim
+/// is "refused, and refused *here*" (the row a gate lives on), which a
+/// whole-trace scan cannot state: it stops at whichever violation it meets.
+pub fn violations_at<F, A>(air: &A, main: &RowMajorMatrix<F>, public_values: &[F], row: usize) -> Vec<Violation>
+where
+    F: Field,
+    A: for<'a> Air<DebugConstraintBuilder<'a, F>> + BaseAir<F>,
+{
+    assert!(row < main.height(), "row {row} outside the trace");
+    let periodic: Vec<Vec<F>> = BaseAir::<F>::periodic_columns(air);
+    eval_row(air, main, public_values, &periodic, row)
+        .into_iter()
+        .map(|f| Violation { row, constraint: f.constraint, label: f.label })
+        .collect()
+}
+
 /// Panic in `check_constraints`'s own words if the trace does not satisfy the AIR.
 pub fn assert_satisfied<F, A>(air: &A, main: &RowMajorMatrix<F>, public_values: &[F], what: &str)
 where

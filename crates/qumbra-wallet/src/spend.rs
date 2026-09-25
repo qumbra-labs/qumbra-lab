@@ -401,7 +401,11 @@ fn preflight_urls_with_limit(
 /// Phase 2: current-state preflight followed by the real STARK. No wallet dir,
 /// network handle, caller-provided wallet RNG, or second key source is reachable
 /// here; all witness/key bytes come from `bundle`, and current chain state
-/// arrives as decoded public data. The prover's own randomness remains internal.
+/// arrives as decoded public data. The prover's own randomness remains internal:
+/// the proof is zero-knowledge (hiding PCS), and its masks, random codewords and
+/// Merkle salts come from `qlab_consensus::ProverRng`, freshly seeded from the
+/// operating system inside the config — never from the wallet's RNG, and never
+/// shared between two proofs (a cloned config reseeds).
 #[cfg(feature = "prove")]
 pub fn prove(
     bundle: &WitnessBundle,

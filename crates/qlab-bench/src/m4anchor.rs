@@ -27,7 +27,9 @@ use rand::{Rng, SeedableRng};
 #[allow(unused_imports)]
 use p3_field::PrimeField32;
 
-use crate::{make_config_with, pc_len, FriCfg, Val, RUNS};
+use crate::{pc_len, FriCfg, Val, RUNS};
+// Re-gated by the re-mint: M4 runs on the legacy non-hiding config.
+use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
 /// One degree-4 binomial-extension multiplication per row.
 /// Columns: a[0..4], b[0..4], c[0..4]. W = 3 (KoalaBear x^4 − 3).

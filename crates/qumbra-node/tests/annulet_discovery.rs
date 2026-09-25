@@ -78,7 +78,7 @@ fn an_annulet_output_is_served_by_projection_and_opened_by_the_wallet_side() {
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor: state.commitment_root(),
-            nullifiers: vec![[0x71; 32], [0x72; 32]],
+            nullifiers: vec![[0x71; 32], [0x72; 32], [0x73; 32]],
             commitments: notes.iter().map(|n| digest_bytes(&n.commitment())).collect(),
             bucket: ArityBucket::TwoByTwo,
             fee: g.params.fee_tier_s,

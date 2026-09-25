@@ -1587,6 +1587,7 @@ dependencies = [
  "p3-symmetric",
  "p3-uni-stark",
  "qlab-air",
+ "rand 0.10.2",
 ]
 
 [[package]]
@@ -1633,6 +1634,7 @@ dependencies = [
  "p3-uni-stark",
  "postcard",
  "qlab-air",
+ "qlab-consensus",
  "qlab-note",
  "qlab-wallet",
  "rand 0.10.2",

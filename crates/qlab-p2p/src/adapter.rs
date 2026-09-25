@@ -2452,7 +2452,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             BodyError::L2SurfaceOnL1 { .. }
             | BodyError::L2SurfaceMissing { .. }
             | BodyError::L2SurfaceMalformed { .. }
-            | BodyError::L2NotTwoByTwo { .. }
+            | BodyError::L2WrongArity { .. }
             | BodyError::CoinbaseOnAnnulet { .. }
             // Lab #712: a surface root that is not its own header's — the
             // block contradicts itself, whatever this node's view.
