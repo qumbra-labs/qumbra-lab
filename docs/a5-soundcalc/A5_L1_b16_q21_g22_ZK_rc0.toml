@@ -5,7 +5,7 @@
 # committed width + NUM_RANDOM_CODEWORDS. Quotient chunks and the randomizer
 # matrix are NOT in batch_size (same convention as the re-mint record).
 [zkevm]
-name = "QumbraA5"
+name = "A5_L1_b16_q21_g22_ZK_rc0"
 protocol_family = "FRI_STARK"
 field = "KoalaBear^4"
 hash_size_bits = 256
