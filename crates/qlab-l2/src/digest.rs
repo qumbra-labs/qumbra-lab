@@ -235,20 +235,32 @@ fn node_hash(
     out
 }
 
-fn constraints_digest_of<A>(air: &A) -> ([u8; 32], usize)
+/// The structural constraint-set digest of any AIR over [`Val`], under
+/// `domain` — the mechanism behind the shape digests, exposed so the L1
+/// circuit's constraint set can be pinned the same way (the re-mint's L1
+/// constraints digest, named in its revision doc). Call it on a large-stack
+/// thread (see [`constraints_digest`]).
+pub fn constraints_digest_with_domain<A>(domain: &[u8], air: &A) -> ([u8; 32], usize)
 where
     A: p3_air::Air<p3_air::symbolic::SymbolicAirBuilder<Val>> + BaseAir<Val>,
 {
     let layout = AirLayout::from_air::<Val>(air);
     let constraints = get_symbolic_constraints::<Val, _>(air, layout);
     let mut memo = HashMap::new();
-    let mut h = H::new(b"qumbra:l2:shape:v1:constraints");
+    let mut h = H::new(domain);
     h.usize(constraints.len());
     for c in &constraints {
         let n = node_hash(c, &mut memo);
         h.bytes(&n);
     }
     (h.finish(), constraints.len())
+}
+
+fn constraints_digest_of<A>(air: &A) -> ([u8; 32], usize)
+where
+    A: p3_air::Air<p3_air::symbolic::SymbolicAirBuilder<Val>> + BaseAir<Val>,
+{
+    constraints_digest_with_domain(b"qumbra:l2:shape:v1:constraints", air)
 }
 
 /// Digest (ii): the symbolic constraint set of `shape`'s canonical AIR, and

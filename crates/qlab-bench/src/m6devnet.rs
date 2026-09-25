@@ -32,7 +32,7 @@ use qlab_devnet::node::{Node, SimConfig};
 use qlab_devnet::params_devnet::{BOND_AMOUNT, CHECKPOINT_CADENCE_BLOCKS, COMMITTEE_SIZE, SIM_BLOCK_TIME_SECS};
 use qlab_devnet::pow::KeccakPow;
 
-use crate::m4gaterec::{consensus_proof_seeded, CONSENSUS_CFG};
+use crate::m4gaterec::{bucket_instance_seeded, CONSENSUS_CFG};
 use crate::{make_config_with, Config, Val, RUNS};
 
 /// Number of real M3 proofs pre-generated and reused. A block carries up to this
@@ -101,7 +101,11 @@ pub fn run_m6devnet(power: &str) {
     let mut proof_bytes = 0usize;
     for i in 0..POOL {
         let t = Instant::now();
-        let (inst, pvs, proof) = consensus_proof_seeded(pool_seed(i));
+        // The hiding consensus proof (the M4 recorder's `consensus_proof_seeded`
+        // is the legacy non-hiding shape since the re-mint).
+        let (inst, pvs) = bucket_instance_seeded(pool_seed(i));
+        let trace = inst.air.generate_trace::<Val>(CONSENSUS_CFG.log_blowup);
+        let proof = p3_uni_stark::prove(&config, &inst.air, trace, &pvs);
         let secs = t.elapsed().as_secs_f64();
         let bytes = bincode::serialize(&proof).expect("bincode proof").len();
         proof_bytes = bytes;

@@ -644,6 +644,11 @@ where
         );
         // Witness bits.
         builder.assert_bool(local[PBIT_COL].clone());
+        // The NF path-bit fix: NF absorbs through the Merkle mux, whose path bit would swap
+        // (nk ‖ ρ) into (ρ ‖ nk) — a second nullifier for the same note. NF's
+        // operand order is fixed: PBIT is 0 on every NF row (it is constant
+        // within a perm, so this covers the boundary rows; degree 2).
+        builder.assert_zero(local[SEL_OFF + 1].clone() * local[PBIT_COL].clone());
         for i in 0..13 {
             builder.assert_bool(local[W_OFF + i].clone());
         }
@@ -2910,7 +2915,8 @@ mod tests {
                 *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
             }
             // 873 pre-mint + 7 (latch) + 57 (option 4) = 937.
-            assert_eq!(cs.len(), 937, "symbolic constraint count");
+            // + 1 (the NF path-bit fix: NF operand order, `sel(NF)·PBIT = 0`, degree 2).
+            assert_eq!(cs.len(), 938, "symbolic constraint count");
             assert_eq!(hist.get(&4).copied().unwrap_or(0), 15, "deg-4 constraints");
             assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
         }
@@ -3631,5 +3637,33 @@ mod tests {
                 "rho'_0 = nf_0 — the structural half of the ruling"
             );
         }
+    }
+
+    /// NF path-bit regression: the second input's NF perm with its path bit set
+    /// absorbs `(ρ ‖ nk)` instead of `(nk ‖ ρ)` — a second nullifier for the
+    /// same note. Complete forgery: the public nf2 is rebound to what the
+    /// swapped perm outputs, so only the NF operand-order constraint refuses.
+    #[test]
+    fn nf_swapped_nf_is_unsat() {
+        let (mut inst, fee) = test_bucket(10, 6, 4, 8);
+        let slot = inst.air.program.iter().enumerate().filter(|(_, r)| **r == ROLE_NF).map(|(i, _)| i).nth(1).unwrap();
+        let honest = inst.air.generate_trace::<F>(0);
+        let pvs_of = |nf2: &[u64; 4]| -> Vec<F> {
+            pv_vec(&inst.anchor, &inst.nf[0], nf2, &inst.cm_out[0], &inst.cm_out[1], fee)
+                .iter()
+                .map(|v| F::from_u32(*v))
+                .collect()
+        };
+        assert!(check_all_constraints(&inst.air, &honest, &pvs_of(&inst.nf[1]), Some(10)).is_ok(), "control");
+        let nk = digest(&NarrowKeccakAir::extract_state(&honest, 24 * slot));
+        let rho: [u64; 4] = inst.air.slot_witness[slot].w[..4].try_into().unwrap();
+        let nf2_swapped = digest(&crate::reference::merkle_node_state(&rho, &nk));
+        assert_ne!(nf2_swapped, inst.nf[1], "the swap is a different nullifier");
+        drop(honest);
+        inst.air.slot_witness[slot].pbit = true;
+        let trace = inst.air.generate_trace::<F>(0);
+        assert_eq!(digest(&NarrowKeccakAir::extract_state(&trace, 24 * (slot + 1))), nf2_swapped);
+        let report = check_all_constraints(&inst.air, &trace, &pvs_of(&nf2_swapped), Some(10));
+        assert!(!report.is_ok(), "a swapped-NF second nullifier VERIFIED");
     }
 }

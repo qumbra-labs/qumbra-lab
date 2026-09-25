@@ -147,7 +147,7 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 
 - `genesis.qmb`——**格式 v5，网络 `qumbra-t2`**
   （[`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636)）；
-- `expected_genesis_hash`——`d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3`；
+- `expected_genesis_hash`——`dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5`；
 - `dial_peers` 的初始 P2P 种子地址——`"18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"`。
 
 分发：`genesis.qmb` 从 **`https://seed.qumbra.org/genesis.qmb`** 下载（裸服务名在
@@ -265,7 +265,7 @@ data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
 dial_peers = ["18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
-expected_genesis_hash = "d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3"
+expected_genesis_hash = "dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5"
 mining = false
 ```
 

@@ -119,7 +119,9 @@ use crate::m4gaterec::{
     Schedule, CONSENSUS_CFG,
 };
 use crate::m4skel::LaneBuilder;
-use crate::{make_config_with, pc_len, FriCfg, Val, RUNS};
+use crate::{pc_len, FriCfg, Val, RUNS};
+// Re-gated by the re-mint: M4 runs on the legacy non-hiding config.
+use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
 pub(crate) type Ext = BinomialExtensionField<Val, 4>;
 

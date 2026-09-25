@@ -67,9 +67,9 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     // 2. Two grants (shape S): the holder's fee note, the recipient's.
     let t = Instant::now();
     let holder_fee = faucet.grant(&holder, &mut rng).expect("grant 1 (to the holder) is admitted");
-    net.settle_spends(2, "grant 1");
+    net.settle_spends(3, "grant 1");
     let user_fee = faucet.grant(&user, &mut rng).expect("grant 2 (to the recipient) is admitted");
-    net.settle_spends(4, "grant 2");
+    net.settle_spends(6, "grant 2");
     eprintln!("B6 journey: 2 S grants sealed and applied on 3 nodes in {:?}", t.elapsed());
     assert_eq!(faucet.stock_left() as u64, devnet::STOCK_NOTES - 2);
     // A restarted faucet (a fresh start against a follower) skips both
@@ -95,7 +95,7 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     let send = qlab_l2spend::build_p(&seq, [&holder_usdt, &holder_fee], &outs, tier_p, &mut rng)
         .expect("the holder's P send builds and proves");
     seq.submit(&send.tx).expect("the holder's P send is admitted");
-    let v = net.settle_spends(6, "the holder's send");
+    let v = net.settle_spends(9, "the holder's send");
     eprintln!("B6 journey: holder → recipient USDT-test (P) sealed and applied in {:?}", t.elapsed());
 
     // 4. The recipient detects its two notes through a FOLLOWER's served
@@ -121,7 +121,7 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     let back = qlab_l2spend::build_p(&follower, [&user_usdt, &user_fee], &outs, tier_p, &mut rng)
         .expect("the recipient's P spend builds and proves");
     seq.submit(&back.tx).expect("the recipient's P spend is admitted");
-    let v = net.settle_spends(8, "the recipient's spend");
+    let v = net.settle_spends(12, "the recipient's spend");
     eprintln!("B6 journey: recipient → holder USDT-test (P) sealed and applied in {:?}", t.elapsed());
 
     // A spent note stays spent: the recipient's spend again is refused.
@@ -129,9 +129,10 @@ fn the_annulet_devnet_journey_grant_send_detect_spend_across_three_nodes() {
     assert!(matches!(again, Err(SpendError::Refused(_))), "{again:?}");
 
     // The three nodes agree: tip, commitment root, and the four spends'
-    // eight nullifiers (a real and a dummy per S grant, two real per P).
+    // twelve nullifiers (a real and a dummy per S grant, two real per P,
+    // plus slot 3's dummy fee input on every one — A4).
     assert!(v.iter().all(|x| x.root == v[0].root && x.state_tip == v[0].state_tip), "{v:?}");
-    assert_eq!(v[0].nullifiers, 8, "{v:?}");
+    assert_eq!(v[0].nullifiers, 12, "{v:?}");
     let holder_back = served(net.served[1]).detect(&holder_kem.dk, 1, v[1].state_tip).unwrap();
     assert!(holder_back.contains(&back.outputs[0]), "the holder finds its USDT-test back on follower 1");
 }

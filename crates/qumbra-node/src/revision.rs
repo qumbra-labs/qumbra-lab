@@ -405,9 +405,12 @@ mod tests {
         // test firing is the evidence the frozen set actually changed, exactly as
         // `sensitivity` below says every covered field should behave.
         //   pre-mint: 19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571
+        // 🔴 Moved again by the The security re-mint: wire 148,625 →
+        // 182,745 and `consensus_fri` + "/zk". From the named `halt-status` runs ×2.
+        //   pre-re-mint: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
         assert_eq!(
             own_frozen_digest_hex(),
-            "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
+            "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
         );
     }
 

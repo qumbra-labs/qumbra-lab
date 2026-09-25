@@ -100,8 +100,10 @@ pub enum L2VerifyError {
     NoSurface,
     /// The surface bytes are not canonical.
     SurfaceMalformed,
-    /// Not the 2×2 bucket (2 nullifiers, 2 commitments) — shapes S and P.
-    NotTwoByTwo,
+    /// Not the 3×2 shapes' arity (3 nullifiers — two inputs and the fee
+    /// input, A4 — and 2 commitments) — shapes S and P, under the 2×2 bucket
+    /// declaration.
+    WrongArity,
     /// A registry write (shape R) that is not 1 nullifier / 1 commitment
     /// under the 2×2 bucket declaration (lab #728 Q2).
     RegistryWriteArity,
@@ -128,12 +130,12 @@ impl L2Verifier {
         // shape gates the counts.
         let arity_ok = p.bucket == ArityBucket::TwoByTwo
             && match surface.shape {
-                L2ShapeTag::S | L2ShapeTag::P => p.nullifiers.len() == 2 && p.commitments.len() == 2,
+                L2ShapeTag::S | L2ShapeTag::P => p.nullifiers.len() == 3 && p.commitments.len() == 2,
                 L2ShapeTag::R => p.nullifiers.len() == 1 && p.commitments.len() == 2,
             };
         if !arity_ok {
             return Err(match surface.shape {
-                L2ShapeTag::S | L2ShapeTag::P => L2VerifyError::NotTwoByTwo,
+                L2ShapeTag::S | L2ShapeTag::P => L2VerifyError::WrongArity,
                 L2ShapeTag::R => L2VerifyError::RegistryWriteArity,
             });
         }
@@ -166,15 +168,17 @@ impl L2Verifier {
             digest_words(&p.commitments[0]),
             digest_words(&p.commitments[1]),
         );
+        // A4: slot 3's nullifier (the fee input's, or a dummy's fresh one).
+        let nf3 = digest_words(&p.nullifiers[2]);
         let verified = match (surface.shape, surface.vpublic) {
             (L2ShapeTag::S, None) => {
                 check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_S)?;
-                let pvs = qlab_l2::pv_vec_s(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root);
+                let pvs = qlab_l2::pv_vec_s(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &nf3);
                 qlab_l2::verify_s(&qlab_l2::public_values(&pvs), &proof)
             }
             (L2ShapeTag::P, Some(terms)) => {
                 check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_P)?;
-                let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms));
+                let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms), &nf3);
                 qlab_l2::verify_p(&qlab_l2::public_values(&pvs), &proof)
             }
             // A canonical surface pairs S with no vPublic and P with some; R
@@ -220,9 +224,11 @@ fn decode_proof_strict(bytes: &[u8]) -> Result<Proof<Config>, L2VerifyError> {
 fn check_proof_shape(proof: &Proof<Config>, log_height: usize) -> Result<(), L2VerifyError> {
     let cfg = qlab_l2::L2_CFG_PROVISIONAL;
     let checks = [
-        ("degree_bits", proof.degree_bits, log_height),
-        ("query_proofs", proof.opening_proof.query_proofs.len(), cfg.num_queries),
-        ("final_poly", proof.opening_proof.final_poly.len(), 1usize << cfg.log_final_poly_len),
+        // The hiding PCS commits the trace at twice its height.
+        ("degree_bits", proof.degree_bits, log_height + qlab_consensus::IS_ZK),
+        // `(random-codeword openings, FRI proof)` — the hiding PCS's proof.
+        ("query_proofs", proof.opening_proof.1.query_proofs.len(), cfg.num_queries),
+        ("final_poly", proof.opening_proof.1.final_poly.len(), 1usize << cfg.log_final_poly_len),
     ];
     for (what, got, want) in checks {
         if got != want {
@@ -316,6 +322,36 @@ fn pvs_u32_from_public(p: &TxPublic) -> Option<Vec<u32>> {
 fn digest_words(h: &Hash32) -> [u64; 4] {
     core::array::from_fn(|i| u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().expect("8 bytes")))
 }
+
+/// Domain of the L1 constraints digest.
+pub const L1_CONSTRAINTS_DOMAIN: &[u8] = b"qumbra:l1:constraints:v1";
+
+/// **The L1 constraints digest** (the re-mint): a structural hash of Plonky3's
+/// symbolic constraint set for the canonical witness-free L1 AIR — the AIR
+/// [`ConsensusVerifier`] verifies against — by the mechanism the L2 shape
+/// digests use (`qlab_l2::digest`). Until the re-mint, the L1 constraint set
+/// was locked only by a constraint-count test and seen by `FrozenParams` only
+/// through the wire byte count; this makes a constraint edit that moves
+/// neither visible. Pinned as [`L1_CONSTRAINTS_DIGEST`] and named in the
+/// re-mint's revision doc. Returns `(digest, constraint count)`.
+pub fn l1_constraints_digest() -> ([u8; 32], usize) {
+    std::thread::Builder::new()
+        .name("l1-constraints-digest".into())
+        .stack_size(512 << 20)
+        .spawn(|| {
+            let air = canonical_bucket_instance().air;
+            qlab_l2::digest::constraints_digest_with_domain(L1_CONSTRAINTS_DOMAIN, &air)
+        })
+        .expect("spawn the digest thread")
+        .join()
+        .expect("the digest thread panicked")
+}
+
+/// The pinned [`l1_constraints_digest`], lower-case hex: 938 constraints (937
+/// + the NF operand-order constraint (the NF path-bit fix)), taken from a coordinator-named
+/// `l1_constraints_digest` example run (0.42 s, 5.5 MB).
+pub const L1_CONSTRAINTS_DIGEST: Option<&str> =
+    Some("feb13b33921b5b5ff5f41c14fcc7a3d9296122c98e13cf87f56fae9a72774938");
 
 /// A canonical 2×2-bucket instance whose `.air` is exactly the AIR the prover
 /// used. The AIR's constraints read only the structural program ring, trace, and
@@ -492,6 +528,7 @@ mod tests {
     fn l2_entry(
         anchor: &[u64; 4],
         nf: &[[u64; 4]; 2],
+        nf3: &[u64; 4],
         cm: &[[u64; 4]; 2],
         root: &[u64; 4],
         fee: u64,
@@ -503,7 +540,7 @@ mod tests {
             proof: bincode::serialize(proof).expect("serialize proof"),
             public: TxPublic {
                 anchor: h32(anchor),
-                nullifiers: vec![h32(&nf[0]), h32(&nf[1])],
+                nullifiers: vec![h32(&nf[0]), h32(&nf[1]), h32(nf3)],
                 commitments: vec![h32(&cm[0]), h32(&cm[1])],
                 bucket: ArityBucket::TwoByTwo,
                 fee,
@@ -516,19 +553,32 @@ mod tests {
 
     fn s_entry() -> TxEntry {
         let (i, proof) = s_proof();
-        l2_entry(&i.anchor, &i.nf, &i.cm_out, &i.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::S, None, proof)
+        l2_entry(&i.anchor, &i.nf, &i.nf3, &i.cm_out, &i.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::S, None, proof)
     }
 
     fn p_entry() -> TxEntry {
         let (i, proof) = p_proof();
         let none = [qlab_devnet::annulet::VPublicTerm::NONE; 2];
-        l2_entry(&i.anchor, &i.nf, &i.cm_out, &i.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::P, Some(none), proof)
+        l2_entry(&i.anchor, &i.nf, &i.nf3, &i.cm_out, &i.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::P, Some(none), proof)
     }
 
     #[test]
     fn the_l2_verifier_accepts_real_s_and_p_proofs_and_is_the_annulet_default() {
         assert_eq!(L2Verifier.check(&s_entry()), Ok(()));
         assert_eq!(L2Verifier.check(&p_entry()), Ok(()));
+        // The cap assert (the security re-mint): a real S3/P3 transaction under the hiding PCS
+        // fits POST /v1/tx's Annulet cap. These entries stub the discovery
+        // group, so a real one's 2 × 128-B-payload group is allowed for with
+        // 8 KiB of room (measured: P3 ≈ 442 KB postcard / 383 KB fixed).
+        const DISCOVERY_ALLOWANCE: usize = 8 * 1024;
+        for (name, e) in [("S", s_entry()), ("P", p_entry())] {
+            let wire = qlab_p2p::codec::encode_tx_annulet(&e).len();
+            assert!(
+                wire + DISCOVERY_ALLOWANCE <= crate::discovery_server::MAX_TX_WIRE_BYTES_ANNULET,
+                "{name}: {wire} B + {DISCOVERY_ALLOWANCE} B of discovery exceeds the {} B Annulet cap",
+                crate::discovery_server::MAX_TX_WIRE_BYTES_ANNULET
+            );
+        }
         let (v, log) = select_verifier(false, qlab_devnet::forms::GenesisForm::Annulet);
         assert!(matches!(v, NodeVerifier::L2(_)));
         assert!(log.contains("real L2 verifier"), "{log}");
@@ -551,22 +601,35 @@ mod tests {
         let mut e = s_entry();
         e.public.nullifiers[1][0] ^= 1;
         assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::ProofInvalid), "nullifier");
+        // A4: the fee input's nullifier is bound too (PV_NF3).
+        let mut e = s_entry();
+        e.public.nullifiers[2][0] ^= 1;
+        assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::ProofInvalid), "fee-input nullifier");
+        let mut e = p_entry();
+        e.public.nullifiers[2][0] ^= 1;
+        assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::ProofInvalid), "P fee-input nullifier");
         let (i, proof) = s_proof();
         let mut other_root = i.registry_root;
         other_root[0] ^= 1;
-        let e = l2_entry(&i.anchor, &i.nf, &i.cm_out, &other_root, 1_000, qlab_devnet::annulet::L2ShapeTag::S, None, proof);
+        let e = l2_entry(&i.anchor, &i.nf, &i.nf3, &i.cm_out, &other_root, 1_000, qlab_devnet::annulet::L2ShapeTag::S, None, proof);
         assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::ProofInvalid), "registry root");
         // An S proof declared as P: refused on its structure, before verify.
         let none = [qlab_devnet::annulet::VPublicTerm::NONE; 2];
-        let e = l2_entry(&i.anchor, &i.nf, &i.cm_out, &i.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::P, Some(none), proof);
+        let e = l2_entry(&i.anchor, &i.nf, &i.nf3, &i.cm_out, &i.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::P, Some(none), proof);
         assert_eq!(
             L2Verifier.check(&e),
-            Err(L2VerifyError::ProofShape { what: "degree_bits", got: qlab_l2::LOG_HEIGHT_S, want: qlab_l2::LOG_HEIGHT_P })
+            // Under the hiding PCS a proof's degree_bits is the trace's log
+            // height + IS_ZK (the committed trace is randomized to 2N).
+            Err(L2VerifyError::ProofShape {
+                what: "degree_bits",
+                got: qlab_l2::LOG_HEIGHT_S + qlab_consensus::IS_ZK,
+                want: qlab_l2::LOG_HEIGHT_P + qlab_consensus::IS_ZK,
+            })
         );
         // A P proof with a vPublic term it did not prove.
         let (pi, pproof) = p_proof();
         let lie = [qlab_devnet::annulet::VPublicTerm::NONE, qlab_devnet::annulet::VPublicTerm { redeem: false, amount: 5, asset: 7 }];
-        let e = l2_entry(&pi.anchor, &pi.nf, &pi.cm_out, &pi.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::P, Some(lie), pproof);
+        let e = l2_entry(&pi.anchor, &pi.nf, &pi.nf3, &pi.cm_out, &pi.registry_root, 1_000, qlab_devnet::annulet::L2ShapeTag::P, Some(lie), pproof);
         assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::ProofInvalid), "vPublic");
     }
 
@@ -585,7 +648,14 @@ mod tests {
         assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::ProofDecode), "truncation");
         let mut e = s_entry();
         e.public.nullifiers.truncate(1);
-        assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::NotTwoByTwo));
+        assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::WrongArity));
+        // A4: the pre-A4 2×2 surface (no fee input) is the wrong arity.
+        let mut e = s_entry();
+        e.public.nullifiers.truncate(2);
+        assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::WrongArity), "2×2 on S");
+        let mut e = p_entry();
+        e.public.nullifiers.truncate(2);
+        assert_eq!(L2Verifier.check(&e), Err(L2VerifyError::WrongArity), "2×2 on P");
     }
 
     /// 🔴 The L1/L2 separation, both ways (the lab #712 ruling on Q1/Q4):
@@ -596,7 +666,7 @@ mod tests {
     fn l1_and_l2_proofs_are_separated_both_ways() {
         // L1 → L2: a real M3 proof dressed with an L2 surface.
         let (l1, l1proof) = l1_proof();
-        let e = l2_entry(&l1.anchor, &l1.nf, &l1.cm_out, &[0; 4], 1_000, qlab_devnet::annulet::L2ShapeTag::S, None, l1proof);
+        let e = l2_entry(&l1.anchor, &l1.nf, &[0; 4], &l1.cm_out, &[0; 4], 1_000, qlab_devnet::annulet::L2ShapeTag::S, None, l1proof);
         match L2Verifier.check(&e) {
             Err(L2VerifyError::ProofShape { .. }) => {}
             other => panic!("an L1 proof must be refused by structure, got {other:?}"),
@@ -621,10 +691,25 @@ mod tests {
             qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 0x0001_0002_0003_0004, asset: 9 },
             qlab_devnet::annulet::VPublicTerm { redeem: false, amount: 77, asset: 3 },
         ];
-        let pvs = qlab_l2::pv_vec_p(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &[0; 4], 0, &[0; 4], &vpublic(&t), &vpublic_assets(&t));
+        let pvs = qlab_l2::pv_vec_p(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &[0; 4], 0, &[0; 4], &vpublic(&t), &vpublic_assets(&t), &[0; 4]);
         let v1 = qlab_l2::PV_VP1;
         assert_eq!(&pvs[v1..v1 + 6], &[1, 4, 3, 2, 1, 9]);
         let v2 = qlab_l2::PV_VP2;
         assert_eq!(&pvs[v2..v2 + 6], &[0, 77, 0, 0, 0, 3]);
+    }
+
+    /// The L1 constraints digest is deterministic and pinned (PENDING until
+    /// the re-mint's named run; fails loudly with the computed value).
+    #[test]
+    fn l1_constraints_digest_is_pinned() {
+        let (a, n) = l1_constraints_digest();
+        let (b, m) = l1_constraints_digest();
+        assert_eq!((a, n), (b, m), "the L1 constraints digest is not deterministic");
+        assert_eq!(n, 938, "the L1 constraint count (937 + the NF path-bit constraint)");
+        let hex = qlab_l2::digest::hex(&a);
+        match L1_CONSTRAINTS_DIGEST {
+            Some(pin) => assert_eq!(hex, pin, "the L1 constraints digest moved — a revision event"),
+            None => panic!("L1_CONSTRAINTS_DIGEST is PENDING — computed {hex} ({n} constraints)"),
+        }
     }
 }

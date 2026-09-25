@@ -111,10 +111,11 @@ const B_OFF: usize = R_OFF + 24; // 395: 7: bit-decomposition of R[0]
 // --- M3 program machinery, widened: 5-bit role codes, 32-limb ring ---
 const PB_OFF: usize = B_OFF + 7; // 402: 24: perm-boundary ring [1,0,..,0]
 const PH_OFF: usize = PB_OFF + 24; // 426: 4: perm-phase ring (mod-4 counter)
-/// Program-ring limbs. 4 slots × 5 bits = 20 bits per limb; 32 limbs = 128
-/// program slots (shape S uses 120). `narrow.rs` has 24 limbs × 4 slots × 4
-/// bits — 15 role codes fit 4 bits, and shape S's 17 do not.
-const PR_LIMBS: usize = 32;
+/// Program-ring limbs. 4 slots × 5 bits = 20 bits per limb; 40 limbs = 160
+/// program slots (shape S3 uses 158; S used 120 of 32 limbs' 128). `narrow.rs`
+/// has 24 limbs × 4 slots × 4 bits — 15 role codes fit 4 bits, and shape S's
+/// 17 do not.
+const PR_LIMBS: usize = 40;
 const PR_OFF: usize = PH_OFF + 4; // 430: 32: program ring, 4 slots x 5 bits/limb
 /// Role-code width in bits.
 const ROLE_BITS: usize = 5;
@@ -124,9 +125,9 @@ const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 482: 5: current perm's role bits
 /// selector `lo · pair(r2, r3) · bit(r4)` stays at degree 4 — the ceiling the
 /// 13 L1 selectors already set. Without them the selector would be degree 5.
 const LO_OFF: usize = RB_OFF + ROLE_BITS; // 487: 4
-const NSEL: usize = 16; // materialized role selectors, order = SEL_CODES
+const NSEL: usize = 18; // materialized role selectors, order = SEL_CODES
 const SEL_OFF: usize = LO_OFF + 4; // 491
-const NINJ: usize = 7; // injection flags [mrk+nf, ank, arkm, acm, acmout, arho, areg]
+const NINJ: usize = 8; // injection flags [mrk+nf, ank, arkm, acm, acmout, arho, areg, acmf]
 const INJ_OFF: usize = SEL_OFF + NSEL; // 507
 const G4_COL: usize = INJ_OFF + NINJ; // 514: program-ring rotation gate
 const PBIT_COL: usize = G4_COL + 1; // 515: merkle path bit (constant per perm)
@@ -145,8 +146,8 @@ const SE_AREG: usize = 7;
 const BQ_OFF: usize = SE_OFF + NSE; // 579: 16: bind bank
 const BGCAP_COL: usize = BQ_OFF + 16; // 595: bind capture gate
 const BGRST_COL: usize = BGCAP_COL + 1; // 596: bind reset gate
-/// 6 bind close gates [banchor, bnf1, bnf2, bcm1, bcm2, breg].
-const NBGC: usize = 6;
+/// 7 bind close gates [banchor, bnf1, bnf2, bcm1, bcm2, breg, bnf3].
+const NBGC: usize = 7;
 const BGC_OFF: usize = BGRST_COL + 1; // 597
 const BL_OFF: usize = BGC_OFF + NBGC; // 603: 4: balance row 1 accumulators
 const BLC_OFF: usize = BL_OFF + 4; // 607: 9: row-1 carry encodings
@@ -188,13 +189,26 @@ const CQ_OFF: usize = QINV_COL + 1; // 685
 /// `AG[o1]·o1a`, `AG[o2]·o2a` — materialized so the row legs stay degree 3.
 const SG_OFF: usize = CQ_OFF + 2; // 687
 const BL2_OFF: usize = SG_OFF + 2; // 689: 4: balance row 2 accumulators
-const BLC2_OFF: usize = BL2_OFF + 4; // 693: 9: row-2 carry encodings
+const BLC2_OFF: usize = BL2_OFF + 4; // 693+: 9: row-2 carry encodings
+// --- Shape S3 (A4): the dedicated fee input ---
+/// The fee bank: the fee input's value (W4 at `ACMF`), four 16-bit chunks,
+/// closed at `BAL` against `(1 − d3) · fee`.
+const FB_OFF: usize = BLC2_OFF + 9;
+/// `L3` — the fee chain's latch: high from `BNF3`'s close through the fee
+/// chain's `BANCHOR` close (the #219 latch's construction, for slot 3).
+const L3_COL: usize = FB_OFF + 4;
+/// `d3` — slot 3 is a dummy (`1`: the fee is charged to a row by `f1`) or a
+/// real asset-0 note worth exactly the fee (`0`). A witness, constant.
+const D3_COL: usize = L3_COL + 1;
+/// `L3 · d3` — relaxes the fee chain's anchor bind, as `L·dv` does slot 1's.
+const L3D3_COL: usize = D3_COL + 1;
 
-/// The shape-S trace width.
-pub const L2_WIDTH: usize = BLC2_OFF + 9; // 702
+/// The shape-S3 trace width: S's 702 + 19 (ring +8, two selectors, one
+/// injection flag, one bind close, the fee bank, `L3`, `d3`, `L3·d3`).
+pub const L2_WIDTH: usize = L3D3_COL + 1; // 721
 
 /// Program slots (= perm slots per program period).
-pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 128
+pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 160
 
 // Role codes. 0..=14 are `narrow.rs`'s, kept identical so a reader of one file
 // reads the other; 15 and 16 are shape S's. 5-bit codes leave 17..=31 for
@@ -227,6 +241,12 @@ pub const ROLE_AREG: u32 = 15;
 /// Registry-root bind: no injection; the bind bank captures `a[0..4]` (the
 /// depth-16 fold's root) on its boundary rows and closes against `PV_REGROOT`.
 pub const ROLE_BREG: u32 = 16;
+/// A4 (S3/P3): the fee input's nullifier bind (`PV_NF3`).
+pub const ROLE_BNF3: u32 = 28;
+/// A4: the fee input's note block — `ROLE_ACM`'s message, its own injection
+/// flag (so it never enters the balance rows), asset forced to 0, value into
+/// the fee bank.
+pub const ROLE_ACMF: u32 = 29;
 
 /// Role codes in materialized-selector order. One list, read by both the AIR
 /// and the trace generator.
@@ -247,10 +267,14 @@ const SEL_CODES: [u32; NSEL] = [
     ROLE_ARHO,
     ROLE_AREG,
     ROLE_BREG,
+    ROLE_BNF3,
+    ROLE_ACMF,
 ];
 const SEL_ARHO: usize = 13;
 const SEL_AREG: usize = 14;
 const SEL_BREG: usize = 15;
+const SEL_BNF3: usize = 16;
+const SEL_ACMF: usize = 17;
 
 /// Registry leaf `mode` values (l2-own-circuit-decision §3.6).
 pub const MODE_CLOAKED: u64 = 0;
@@ -258,7 +282,8 @@ pub const MODE_HYBRID: u64 = 1;
 pub const MODE_REGULATED: u64 = 2;
 
 /// Public-value layout: the L1's 84 (anchor, nf1, nf2, cm1, cm2 as 16 chunks
-/// each, fee as 4) followed by `registry_root` as 16 chunks.
+/// each, fee as 4) followed by `registry_root` as 16 chunks, then (A4) the
+/// fee input's nullifier as 16 chunks — appended, so every earlier offset holds.
 pub const PV_ANCHOR: usize = 0;
 pub const PV_NF1: usize = 16;
 pub const PV_NF2: usize = 32;
@@ -266,9 +291,11 @@ pub const PV_CM1: usize = 48;
 pub const PV_CM2: usize = 64;
 pub const PV_FEE: usize = 80;
 pub const PV_REGROOT: usize = 84;
-pub const PV_LEN: usize = 100;
+pub const PV_NF3: usize = 100;
+pub const PV_LEN: usize = 116;
 
 /// Build the full public-value vector for a shape-S instance.
+#[allow(clippy::too_many_arguments)]
 pub fn pv_vec_l2(
     anchor: &[u64; 4],
     nf1: &[u64; 4],
@@ -277,6 +304,7 @@ pub fn pv_vec_l2(
     cm2: &[u64; 4],
     fee: u64,
     registry_root: &[u64; 4],
+    nf3: &[u64; 4],
 ) -> Vec<u32> {
     let mut out = Vec::with_capacity(PV_LEN);
     for d in [anchor, nf1, nf2, cm1, cm2] {
@@ -286,6 +314,7 @@ pub fn pv_vec_l2(
         out.push(((fee >> (16 * j)) & 0xffff) as u32);
     }
     out.extend_from_slice(&pv_chunks(registry_root));
+    out.extend_from_slice(&pv_chunks(nf3));
     debug_assert_eq!(out.len(), PV_LEN);
     out
 }
@@ -364,6 +393,9 @@ pub struct L2ShapeSAir {
     pub sel_f1: bool,
     /// `q` — the two inputs carry the same asset (bound both ways in-circuit).
     pub sel_q: bool,
+    /// A4: slot 3 (the dedicated fee input) is a dummy — the fee is charged
+    /// to a row by `f1` — rather than an asset-0 note worth exactly the fee.
+    pub d3: bool,
 }
 
 impl L2ShapeSAir {
@@ -379,6 +411,7 @@ impl L2ShapeSAir {
             sel_o2a: true,
             sel_f1: true,
             sel_q: true,
+            d3: true,
         }
     }
 
@@ -638,11 +671,22 @@ where
             local[INJ_OFF + 6].clone(),
             bnd.clone() * sel_role(SEL_AREG),
         );
+        // S3 (A4): the fee input's note block is its own injection class, so
+        // it never enters the balance rows' `INJ3E` captures.
+        builder.assert_eq(
+            local[INJ_OFF + 7].clone(),
+            bnd.clone() * sel_role(SEL_ACMF),
+        );
         builder.assert_eq(
             local[G4_COL].clone(),
             blast.clone() * local[PB_OFF + 1].clone() * local[PH_OFF + 1].clone(),
         );
         builder.assert_bool(local[PBIT_COL].clone());
+        // The NF path-bit fix: NF absorbs through the Merkle mux, whose path bit would swap
+        // (nk ‖ ρ) into (ρ ‖ nk) — a second nullifier for the same note. NF's
+        // operand order is fixed: PBIT is 0 on every NF row (it is constant
+        // within a perm, so this covers the boundary rows; degree 2).
+        builder.assert_zero(local[SEL_OFF + 1].clone() * local[PBIT_COL].clone());
         for i in 0..NW {
             builder.assert_bool(local[W_OFF + i].clone());
         }
@@ -723,10 +767,11 @@ where
                 + inj(0) * (msg_mrk - a(l))
                 + inj(1) * (msg_ank - a(l))
                 + inj(2) * (msg_arkm - a(l))
-                + inj(3) * (msg_acm - a(l))
+                + inj(3) * (msg_acm.clone() - a(l))
                 + inj(4) * (msg_acmout - a(l))
                 + inj(5) * (msg_arho - a(l))
-                + inj(6) * (msg_areg - a(l));
+                + inj(6) * (msg_areg - a(l))
+                + inj(7) * (msg_acm.clone() - a(l));
             builder.assert_eq(eff(l), expr);
         }
 
@@ -768,7 +813,10 @@ where
         );
         let se_src: [usize; 4] = [1, 3, 4, 5]; // nf, arkm, acm, acmout
         for (i, si) in se_src.iter().enumerate() {
-            builder.assert_eq(local[SE_OFF + i].clone(), sel_role(*si) * ep.clone());
+            // S3 (A4): the fee input's `ACMF` closes bank 2 like `ACM` (its ρ
+            // is the one its nullifier used) — so `SE[acm]` counts both.
+            let s_i = if i == 2 { sel_role(*si) + sel_role(SEL_ACMF) } else { sel_role(*si) };
+            builder.assert_eq(local[SE_OFF + i].clone(), s_i * ep.clone());
         }
         // Shape S: BREG joins the bind roles.
         let bindsum = sel_role(6)
@@ -776,7 +824,8 @@ where
             + sel_role(8)
             + sel_role(9)
             + sel_role(10)
-            + sel_role(SEL_BREG);
+            + sel_role(SEL_BREG)
+            + sel_role(SEL_BNF3);
         builder.assert_eq(local[SE_OFF + 4].clone(), bindsum * ep.clone());
         builder.assert_eq(local[SE_OFF + 5].clone(), sel_role(11) * ep.clone());
         builder.assert_eq(
@@ -795,7 +844,7 @@ where
             local[BGRST_COL].clone(),
             gperm.clone() * local[SE_OFF + 4].clone(),
         );
-        for (i, si) in [6usize, 7, 8, 9, 10, SEL_BREG].iter().enumerate() {
+        for (i, si) in [6usize, 7, 8, 9, 10, SEL_BREG, SEL_BNF3].iter().enumerate() {
             builder.assert_eq(
                 local[BGC_OFF + i].clone(),
                 gperm.clone() * sel_role(*si),
@@ -807,16 +856,18 @@ where
             .map(|v| (*v).into())
             .collect();
         let pv = |i: usize| -> AB::Expr { pvs[i].clone() };
-        let pv_base: [usize; NBGC] = [PV_ANCHOR, PV_NF1, PV_NF2, PV_CM1, PV_CM2, PV_REGROOT];
+        let pv_base: [usize; NBGC] = [PV_ANCHOR, PV_NF1, PV_NF2, PV_CM1, PV_CM2, PV_REGROOT, PV_NF3];
         for (x, base) in pv_base.iter().enumerate() {
             for j in 0..16 {
                 let close = local[BGC_OFF + x].clone()
                     * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone());
                 // #219: `L·dv` relaxes the ANCHOR close and nothing else — the
                 // registry bind of a dummy slot still fires (it opens asset 0's
-                // leaf, which is pinned at genesis).
+                // leaf, which is pinned at genesis). A4: `L3·d3` relaxes the fee
+                // chain's the same way. `L` and `L3` are never both high, so the
+                // relaxation stays linear.
                 let close = if x == 0 {
-                    (AB::Expr::ONE - local[LDV_COL].clone()) * close
+                    (AB::Expr::ONE - local[LDV_COL].clone() - local[L3D3_COL].clone()) * close
                 } else {
                     close
                 };
@@ -947,14 +998,22 @@ where
         let close_nq = local[CQ_OFF + 1].clone();
         let w16 = AB::Expr::from_u32(1 << 16);
         let f1 = local[SEL2_OFF + S2_F1].clone();
+        // A4: the rows owe the fee only when slot 3 is a dummy (`d3`); a real
+        // slot-3 fee note pays it whole, and the fee bank checks that.
+        let d3 = local[D3_COL].clone();
         let acc = |bl: usize, j: usize| local[bl + j].clone();
         let summed = |j: usize| local[BL_OFF + j].clone() + local[BL2_OFF + j].clone();
         // (gate, accumulator at chunk j, carry block, fee selector)
         type Chain<'a, E> = (E, Box<dyn Fn(usize) -> E + 'a>, usize, E);
         let chains: [Chain<'_, AB::Expr>; 3] = [
-            (close_nq.clone(), Box::new(move |j| acc(BL_OFF, j)), BLC_OFF, f1.clone()),
-            (close_nq.clone(), Box::new(move |j| acc(BL2_OFF, j)), BLC2_OFF, AB::Expr::ONE - f1.clone()),
-            (close_q.clone(), Box::new(summed), BLC_OFF, AB::Expr::ONE),
+            (close_nq.clone(), Box::new(move |j| acc(BL_OFF, j)), BLC_OFF, d3.clone() * f1.clone()),
+            (
+                close_nq.clone(),
+                Box::new(move |j| acc(BL2_OFF, j)),
+                BLC2_OFF,
+                d3.clone() * (AB::Expr::ONE - f1.clone()),
+            ),
+            (close_q.clone(), Box::new(summed), BLC_OFF, d3.clone()),
         ];
         for (gate, bl, blc, fsel) in chains.iter() {
             let feev = |j: usize| fsel.clone() * pv(PV_FEE + j) * ep.clone();
@@ -985,8 +1044,25 @@ where
         builder.assert_zero(
             close.clone() * (AB::Expr::ONE - o2a) * (ac(AG_O2) - ac(AG_IN2)),
         );
-        builder.assert_zero(close.clone() * f1.clone() * ac(AG_IN1));
-        builder.assert_zero(close.clone() * (AB::Expr::ONE - f1) * ac(AG_IN2));
+        // The row that pays the fee is asset 0 — only when a row pays it (d3).
+        builder.assert_zero(close.clone() * d3.clone() * f1.clone() * ac(AG_IN1));
+        builder.assert_zero(close.clone() * d3.clone() * (AB::Expr::ONE - f1) * ac(AG_IN2));
+        // A4 — the fee input: an asset-0 note (every bit of its asset lane is
+        // zero on `ACMF`'s rows), worth exactly the fee when real, 0 when a
+        // dummy (the bank closes at `(1 − d3)·fee`, chunk by chunk).
+        builder.assert_zero(inj(7) * w(13));
+        for j in 0..4 {
+            builder.assert_zero(
+                close.clone()
+                    * (local[FB_OFF + j].clone()
+                        - (AB::Expr::ONE - d3.clone()) * pv(PV_FEE + j) * ep.clone()),
+            );
+            builder.when_first_row().assert_zero(local[FB_OFF + j].clone());
+        }
+        builder.assert_bool(d3.clone());
+        builder.assert_bool(local[L3_COL].clone());
+        builder.when_first_row().assert_zero(local[L3_COL].clone());
+        builder.assert_eq(local[L3D3_COL].clone(), local[L3_COL].clone() * d3);
         // Each registry opening is for the asset the input actually carries.
         builder.assert_zero(close.clone() * (ac(AG_R1) - ac(AG_IN1)));
         builder.assert_zero(close * (ac(AG_R2) - ac(AG_IN2)));
@@ -1162,6 +1238,20 @@ where
             t.assert_eq(next[SEL2_OFF + k].clone(), local[SEL2_OFF + k].clone());
         }
         t.assert_eq(next[QINV_COL].clone(), local[QINV_COL].clone());
+        // A4: the fee bank (+v at the fee input), the fee chain's latch (set at
+        // `BNF3`'s close, reset at the next `BANCHOR` close), `d3` constant.
+        for j in 0..4 {
+            t.assert_eq(
+                next[FB_OFF + j].clone(),
+                local[FB_OFF + j].clone()
+                    + local[INJ_OFF + 7].clone() * per[35 + j].clone() * local[W_OFF + 4].clone(),
+            );
+        }
+        t.assert_eq(
+            next[L3_COL].clone(),
+            local[L3_COL].clone() * (AB::Expr::ONE - local[BGC_OFF].clone()) + local[BGC_OFF + 6].clone(),
+        );
+        t.assert_eq(next[D3_COL].clone(), local[D3_COL].clone());
         // The latch and dv (verbatim).
         {
             t.assert_eq(
@@ -1363,6 +1453,91 @@ pub struct L2TxOutput {
     pub rseed: [u64; 4],
 }
 
+/// Slot 3 of the 3×2 shapes (A4): the dedicated fee input.
+#[derive(Clone)]
+pub enum FeeSlot {
+    /// `d3 = 0`: an asset-0 note worth **exactly** the fee, spent whole, with
+    /// its commitment-tree witness (it folds to the same anchor as the inputs).
+    /// The rows then carry no fee — two notes of one asset can merge.
+    Exact { input: L2TxInput, witness: MerkleWitness },
+    /// `d3 = 1`: a dummy (value 0, asset 0, prover-invented `sk`/`ρ` so its
+    /// published nullifier is fresh, off-tree). The fee is charged to an
+    /// asset-0 row by `f1`, exactly as in shape S before A4.
+    Dummy { input: L2TxInput },
+}
+
+impl FeeSlot {
+    pub(crate) fn input(&self) -> &L2TxInput {
+        match self {
+            FeeSlot::Exact { input, .. } | FeeSlot::Dummy { input } => input,
+        }
+    }
+    pub(crate) fn witness(&self) -> MerkleWitness {
+        match self {
+            FeeSlot::Exact { witness, .. } => *witness,
+            FeeSlot::Dummy { .. } => off_tree_witness(),
+        }
+    }
+    /// `d3`.
+    pub fn is_dummy(&self) -> bool {
+        matches!(self, FeeSlot::Dummy { .. })
+    }
+}
+
+/// A deterministic dummy fee input for fabricated fixtures and benches:
+/// value 0, asset 0, `sk`/`ρ` derived from `seed` (a caller spending for real
+/// draws them fresh, so the dummy's nullifier never repeats on chain).
+pub fn dummy_fee_input(seed: &[u64; 4]) -> L2TxInput {
+    L2TxInput {
+        sk: core::array::from_fn(|i| seed[i] ^ 0xF3E3_D0D0_0000_0003),
+        value: 0,
+        asset: 0,
+        rho: core::array::from_fn(|i| seed[(i + 1) % 4] ^ 0xF3E3_D0D0_0000_0033),
+        rseed: core::array::from_fn(|i| seed[(i + 2) % 4] ^ 0xF3E3_D0D0_0000_0333),
+        d: [0, 0],
+    }
+}
+
+/// A fabricated commitment tree holding three notes at leaves 0, 1, 2 (A4's
+/// merge fixtures: two inputs and a real fee note). Leaf 3 is an arbitrary
+/// filler; levels 2.. are shared random siblings.
+pub fn fabricated_tree3(cms: [&[u64; 4]; 3]) -> ([MerkleWitness; 3], [u64; 4]) {
+    let node = |l: &[u64; 4], r: &[u64; 4]| -> [u64; 4] {
+        crate::reference::merkle_node_state(l, r)[..4].try_into().unwrap()
+    };
+    let mut x = 0x0a4a_3e3e_f33d_0003u64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let filler = [rnd(), rnd(), rnd(), rnd()];
+    let upper: Vec<[u64; 4]> = (2..MERKLE_DEPTH).map(|_| [rnd(), rnd(), rnd(), rnd()]).collect();
+    let n01 = node(cms[0], cms[1]);
+    let n23 = node(cms[2], &filler);
+    let build = |pos: usize| {
+        let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
+        let mut path_bits = [false; MERKLE_DEPTH];
+        siblings[0] = match pos {
+            0 => *cms[1],
+            1 => *cms[0],
+            _ => filler,
+        };
+        path_bits[0] = pos == 1;
+        siblings[1] = if pos < 2 { n23 } else { n01 };
+        path_bits[1] = pos == 2;
+        for (i, sib) in upper.iter().enumerate() {
+            siblings[i + 2] = *sib;
+        }
+        MerkleWitness { siblings, path_bits }
+    };
+    let ws = [build(0), build(1), build(2)];
+    let root = ws[0].fold_root(cms[0]);
+    debug_assert!(ws.iter().zip(cms).all(|(w, cm)| w.fold_root(cm) == root), "one root");
+    (ws, root)
+}
+
 /// Everything a prover/verifier pair needs for one shape-S instance.
 #[cfg_attr(test, derive(Clone))] // the test fan-out needs owned copies; non-test build unchanged
 pub struct L2BucketInstance {
@@ -1372,13 +1547,17 @@ pub struct L2BucketInstance {
     pub registry_root: [u64; 4],
     pub nf: [[u64; 4]; 2],
     pub cm_out: [[u64; 4]; 2],
+    /// A4: slot 3's nullifier (the fee note's, or a dummy's fresh one).
+    pub nf3: [u64; 4],
 }
 
-/// Perm slots used by the shape-S program, INCLUDING the leading dummy
-/// warm-up slot: 1 + 2 × (5 + 32 + 1 + 18) + (2 + 3) + 2 = **120**, at 3072
-/// rows each = 368,640 rows → 2^19 (524,288), 50.7 spare perm slots.
+/// Perm slots used by the shape-S3 program, INCLUDING the leading dummy
+/// warm-up slot: 1 + 2 × (5 + 32 + 1 + 18) + (5 + 32 + 1) + (2 + 3) + 2 =
+/// **158**, at 3072 rows each = 485,376 rows → 2^19 (524,288), 12.7 spare
+/// perm slots — **S's height budget: 12 perms** (A4 Q2, ruled). S was 120.
 pub const SHAPE_S_PERMS: usize =
-    1 + 2 * (5 + MERKLE_DEPTH + 1 + (1 + REGISTRY_DEPTH + 1)) + 2 * 2 + 1 + 2;
+    1 + 2 * (5 + MERKLE_DEPTH + 1 + (1 + REGISTRY_DEPTH + 1)) + (5 + MERKLE_DEPTH + 1) + 2 * 2 + 1 + 2;
+const _: () = assert!(SHAPE_S_PERMS <= PROGRAM_SLOTS);
 /// log2 of the shape-S trace height.
 pub const SHAPE_S_LOG_HEIGHT: usize = 19;
 
@@ -1451,6 +1630,7 @@ pub fn build_bucket_l2(
         &leaves,
         &rw,
         registry_root,
+        &FeeSlot::Dummy { input: dummy_fee_input(&inputs[0].rho) },
     )
 }
 
@@ -1468,9 +1648,12 @@ pub fn build_bucket_l2_with_witnesses(
     reg_leaves: &[RegistryLeaf; 2],
     reg_witnesses: &[RegistryWitness; 2],
     registry_root: [u64; 4],
+    fee_slot: &FeeSlot,
 ) -> L2BucketInstance {
     let (nk1, nf1, _cm1) = derive_input_l2(&inputs[0]);
     let (nk2, nf2, _cm2) = derive_input_l2(&inputs[1]);
+    let fee_in = fee_slot.input();
+    let (nk3, nf3, _cm3) = derive_input_l2(fee_in);
 
     let out_rho = [derive_output_rho(&nf1, 0), derive_output_rho(&nf1, 1)];
     let cmo1 = l2_cm(outputs[0].value, outputs[0].asset, &outputs[0].rkm, &out_rho[0], &outputs[0].rseed);
@@ -1532,6 +1715,38 @@ pub fn build_bucket_l2_with_witnesses(
     };
     input_chain(&inputs[0], &nk1, &witnesses[0], &reg_leaves[0], &reg_witnesses[0], ROLE_BNF1);
     input_chain(&inputs[1], &nk2, &witnesses[1], &reg_leaves[1], &reg_witnesses[1], ROLE_BNF2);
+    // A4: the fee chain — R's fee input: no registry opening (asset 0 is
+    // forced), `ACMF` for the note block.
+    {
+        program[slot] = ROLE_ANK;
+        sw[slot].w[..4].copy_from_slice(&fee_in.sk);
+        slot += 1;
+        program[slot] = ROLE_NF;
+        sw[slot].w[..4].copy_from_slice(&fee_in.rho);
+        slot += 1;
+        program[slot] = ROLE_BNF3;
+        slot += 1;
+        program[slot] = ROLE_ARKM;
+        sw[slot].w[..4].copy_from_slice(&nk3);
+        sw[slot].w[5] = fee_in.d[0];
+        sw[slot].w[6] = fee_in.d[1];
+        slot += 1;
+        program[slot] = ROLE_ACMF;
+        sw[slot].w[4] = fee_in.value;
+        sw[slot].w[5..9].copy_from_slice(&fee_in.rho);
+        sw[slot].w[9..13].copy_from_slice(&fee_in.rseed);
+        sw[slot].w[13] = fee_in.asset;
+        slot += 1;
+        let fw = fee_slot.witness();
+        for (sib, bit) in fw.siblings.iter().zip(fw.path_bits.iter()) {
+            program[slot] = ROLE_MERKLE;
+            sw[slot].w[..4].copy_from_slice(sib);
+            sw[slot].pbit = *bit;
+            slot += 1;
+        }
+        program[slot] = ROLE_BANCHOR;
+        slot += 1;
+    }
     for (j, (o, bcm)) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]).enumerate() {
         if j == 1 {
             program[slot] = ROLE_ARHO;
@@ -1564,7 +1779,7 @@ pub fn build_bucket_l2_with_witnesses(
     let sel_f1 = a1 == 0;
     let sel_q = a1 == inputs[1].asset;
 
-    let pvs = pv_vec_l2(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root);
+    let pvs = pv_vec_l2(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &nf3);
     L2BucketInstance {
         air: L2ShapeSAir {
             log_height,
@@ -1576,12 +1791,14 @@ pub fn build_bucket_l2_with_witnesses(
             sel_o2a,
             sel_f1,
             sel_q,
+            d3: fee_slot.is_dummy(),
         },
         pvs,
         anchor,
         registry_root,
         nf: [nf1, nf2],
         cm_out: [cmo1, cmo2],
+        nf3,
     }
 }
 
@@ -1601,6 +1818,7 @@ pub fn build_bucket_l2_dummy1(
     reg_leaves: &[RegistryLeaf; 2],
     reg_witnesses: &[RegistryWitness; 2],
     registry_root: [u64; 4],
+    fee_slot: &FeeSlot,
 ) -> L2BucketInstance {
     assert_eq!(dummy.value, 0, "a dummy input slot contributes 0 to the balance");
     assert_eq!(dummy.asset, 0, "a dummy input slot carries asset 0 (#700)");
@@ -1615,6 +1833,7 @@ pub fn build_bucket_l2_dummy1(
         reg_leaves,
         reg_witnesses,
         registry_root,
+        fee_slot,
     );
     inst.air.dv = true;
     inst
@@ -1646,6 +1865,7 @@ pub fn build_bucket_l2_dummy1_fabricated(
         &leaves,
         &rw,
         registry_root,
+        &FeeSlot::Dummy { input: dummy_fee_input(&real.rho) },
     )
 }
 
@@ -1683,6 +1903,10 @@ impl L2ShapeSAir {
         let mut bl2 = [0i64; 4];
         let mut latch: u32 = 0;
         let dvv: u32 = self.dv as u32;
+        // A4: the fee chain's latch, `d3`, the fee bank.
+        let mut l3: u32 = 0;
+        let d3v: u32 = self.d3 as u32;
+        let mut fb = [0i64; 4];
         let mut eq3 = [0i64; 16];
         let mut om: u32 = 0;
         let mut ac = [0i64; 6];
@@ -1777,11 +2001,11 @@ impl L2ShapeSAir {
                         16 => z63,
                         _ => 0,
                     },
-                    ROLE_ACM | ROLE_ACMOUT => match l {
+                    ROLE_ACM | ROLE_ACMOUT | ROLE_ACMF => match l {
                         0 => wbit[4],
                         1 => wbit[13],
                         2..=5 => {
-                            if role_now == ROLE_ACM {
+                            if role_now == ROLE_ACM || role_now == ROLE_ACMF {
                                 a[l - 2]
                             } else {
                                 wbit[l - 2]
@@ -1810,7 +2034,7 @@ impl L2ShapeSAir {
             let g_e1pos = (bnd_now && role_now == ROLE_NF) as i64;
             let g_e1neg = (bnd_now && role_now == ROLE_ARKM) as i64;
             let g_e2pos = g_e1pos;
-            let g_e2neg = (bnd_now && role_now == ROLE_ACM) as i64;
+            let g_e2neg = (bnd_now && (role_now == ROLE_ACM || role_now == ROLE_ACMF)) as i64;
             let c: [u32; 5] = core::array::from_fn(|x| {
                 eff[x] ^ eff[x + 5] ^ eff[x + 10] ^ eff[x + 15] ^ eff[x + 20]
             });
@@ -1871,15 +2095,17 @@ impl L2ShapeSAir {
             }
             row[INJ_OFF + 5] = F::from_u32(bndv * selv[SEL_ARHO]);
             row[INJ_OFF + 6] = F::from_u32(bndv * selv[SEL_AREG]);
+            let injf = bndv * selv[SEL_ACMF];
+            row[INJ_OFF + 7] = F::from_u32(injf);
             let g4 = ((t % 128 == 127) as u32) * pb[1] * ph[1];
             row[G4_COL] = F::from_u32(g4);
             let gpermv = ((t % 128 == 127) as u32) * pb[1];
-            let bindsum = selv[6] + selv[7] + selv[8] + selv[9] + selv[10] + selv[SEL_BREG];
+            let bindsum = selv[6] + selv[7] + selv[8] + selv[9] + selv[10] + selv[SEL_BREG] + selv[SEL_BNF3];
             let mut se = [0u32; NSE];
             se[..6].copy_from_slice(&[
                 selv[1] * ep,
                 selv[3] * ep,
-                selv[4] * ep,
+                (selv[4] + selv[SEL_ACMF]) * ep,
                 selv[5] * ep,
                 bindsum * ep,
                 selv[11] * ep,
@@ -1902,13 +2128,17 @@ impl L2ShapeSAir {
             let bgrst = gpermv * se[4];
             row[BGCAP_COL] = F::from_u32(bgcap);
             row[BGRST_COL] = F::from_u32(bgrst);
-            for (i, si) in [6usize, 7, 8, 9, 10, SEL_BREG].iter().enumerate() {
+            for (i, si) in [6usize, 7, 8, 9, 10, SEL_BREG, SEL_BNF3].iter().enumerate() {
                 row[BGC_OFF + i] = F::from_u32(gpermv * selv[*si]);
             }
             let (bgc_banchor, bgc_bnf2) = (gpermv * selv[6], gpermv * selv[8]);
+            let bgc_bnf3 = gpermv * selv[SEL_BNF3];
             row[LATCH_COL] = F::from_u32(latch);
             row[DV_COL] = F::from_u32(dvv);
             row[LDV_COL] = F::from_u32(latch * dvv);
+            row[L3_COL] = F::from_u32(l3);
+            row[D3_COL] = F::from_u32(d3v);
+            row[L3D3_COL] = F::from_u32(l3 * d3v);
             let (g3pos, g3neg, g3close) = (
                 bndv * se[SE_RHO],
                 bndv * se[3] * om,
@@ -1918,7 +2148,9 @@ impl L2ShapeSAir {
             row[EG3_OFF] = F::from_u32(g3pos);
             row[EG3_OFF + 1] = F::from_u32(g3neg);
             row[EG3_OFF + 2] = F::from_u32(g3close);
-            let inj3e = bndv * se[2];
+            // INJ3E is `ACM`'s alone (the fee input's `ACMF` never enters the
+            // balance rows), even though `SE[acm]` counts both for bank 2.
+            let inj3e = bndv * selv[4] * ep;
             let inj4e = bndv * se[3];
             let injre = bndv * se[SE_AREG];
             row[INJ3E_COL] = F::from_u32(inj3e);
@@ -1963,6 +2195,9 @@ impl L2ShapeSAir {
             for (j, acc) in bl2.iter().enumerate() {
                 row[BL2_OFF + j] = sgn(*acc);
             }
+            for (j, acc) in fb.iter().enumerate() {
+                row[FB_OFF + j] = sgn(*acc);
+            }
             for (k, acc) in ac.iter().enumerate() {
                 row[AC_OFF + k] = sgn(*acc);
             }
@@ -1971,14 +2206,16 @@ impl L2ShapeSAir {
             // whole fee (row 2's chain is unchecked; encoded anyway).
             {
                 let fee_row = |row_fee: u64, j: usize| ((row_fee >> (16 * j)) & 0xffff) as i64;
+                // A4: the rows owe the fee only under `d3`.
+                let row_fee = if self.d3 { self.fee } else { 0 };
                 let (fee1, chain1): (u64, [i64; 4]) = if self.sel_q {
-                    (self.fee, core::array::from_fn(|j| bl[j] + bl2[j]))
+                    (row_fee, core::array::from_fn(|j| bl[j] + bl2[j]))
                 } else if self.sel_f1 {
-                    (self.fee, bl)
+                    (row_fee, bl)
                 } else {
                     (0, bl)
                 };
-                let fee2 = if self.sel_f1 { 0 } else { self.fee };
+                let fee2 = if self.sel_f1 { 0 } else { row_fee };
                 for (accs, off, rf) in [(chain1, BLC_OFF, fee1), (bl2, BLC2_OFF, fee2)] {
                     let mut cc = [0i64; 3];
                     let mut prev = 0i64;
@@ -2034,6 +2271,7 @@ impl L2ShapeSAir {
                         ac[k] += (ag[k] as i64) * wgt * wbit[13] as i64;
                     }
                 }
+                fb[jc] += (injf as i64) * wgt * vb;
                 if bgrst == 1 {
                     bq = [0i64; 16];
                 }
@@ -2048,6 +2286,7 @@ impl L2ShapeSAir {
                 om = om * (1 - gpermv * selv[10]) + g3close * selv[SEL_ARHO];
                 ep *= 1 - gwrap;
                 latch = latch * (1 - bgc_banchor) + bgc_bnf2;
+                l3 = l3 * (1 - bgc_banchor) + bgc_bnf3;
             }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
@@ -2612,6 +2851,7 @@ mod tests {
         assert_eq!(rw[1].fold_root(&leaves[1].hash()), root, "precondition: asset 5's opening is genuine");
         let bad = build_bucket_l2_with_witnesses(
             SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw, root,
+            &FeeSlot::Dummy { input: dummy_fee_input(&inputs[0].rho) },
         );
         assert_refused_under_every_assignment(&bad, "opening another asset's registry leaf");
     }
@@ -2658,6 +2898,7 @@ mod tests {
         assert_eq!(anchor, fx.inst.anchor, "same fixture as `honest()`");
         let bad = build_bucket_l2_with_witnesses(
             SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw, root,
+            &FeeSlot::Dummy { input: dummy_fee_input(&inputs[0].rho) },
         );
         assert_refused_under_every_assignment(&bad, "a Hybrid leaf under shape S");
         // The Cloaked twin of the same registry verifies, so the refusal is
@@ -2666,6 +2907,7 @@ mod tests {
         let (rw2, root2) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
         let ok = build_bucket_l2_with_witnesses(
             SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw2, root2,
+            &FeeSlot::Dummy { input: dummy_fee_input(&inputs[0].rho) },
         );
         assert_sat(&ok, "a Cloaked leaf with issuer_key + flags set");
     }
@@ -2719,7 +2961,7 @@ mod tests {
         assert_eq!(trace.width(), L2_WIDTH, "width must be the matrix's own");
 
         const L1_MINTED: usize = 643;
-        let roles_5bit = 8 // PR ring 24 → 32 limbs (4 slots × 5 bits; 128 program slots)
+        let roles_5bit = 16 // PR ring 24 → 40 limbs (4 slots × 5 bits; 160 program slots — S3, A4)
             + 4 // D: PR[0] decomposition 16 → 20 bits
             + 1 // RB: role bits 4 → 5
             + 4; // LO: the four materialized low half-selectors (degree stays 4)
@@ -2737,16 +2979,22 @@ mod tests {
             + 2; // SG: AG[o1]·o1a, AG[o2]·o2a
         let balance_row_2 = 4 // BL2 accumulators
             + 9; // BLC2 carry encodings
-        assert_eq!(roles_5bit, 17);
+        let fee_input = 2 // sel(BNF3), sel(ACMF)                — NSEL 16 → 18 (A4)
+            + 1 // inj(ACMF)                                    — NINJ 7 → 8
+            + 1 // BGC[bnf3]                                    — NBGC 6 → 7
+            + 4 // FB: the fee bank
+            + 3; // L3, d3, L3·d3
+        assert_eq!(roles_5bit, 25);
+        assert_eq!(fee_input, 11);
         assert_eq!(shape_s_roles, 6);
         assert_eq!(assets, 21);
         assert_eq!(balance_row_2, 13);
         assert_eq!(
             trace.width(),
-            L1_MINTED + roles_5bit + shape_s_roles + witness + assets + balance_row_2,
+            L1_MINTED + roles_5bit + shape_s_roles + witness + assets + balance_row_2 + fee_input,
             "width must be 643 plus exactly the columns named above"
         );
-        assert_eq!(trace.width(), 702, "the shape-S width");
+        assert_eq!(trace.width(), 721, "the shape-S3 width (S's 702 + A4's 19)");
         assert_eq!(crate::narrow::NARROW_WIDTH, L1_MINTED, "the L1 width this accounts over");
     }
 
@@ -2767,17 +3015,18 @@ mod tests {
             *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
         }
         assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
-        // The deg-4 population is exactly the 16 role selectors: the L1's 15
-        // (14 selectors + EG3[1]) becomes 16 selectors + EG3[1] = 17.
-        assert_eq!(hist.get(&4).copied().unwrap_or(0), 17, "deg-4 constraints");
+        // The deg-4 population: the 18 role selectors + EG3[1], and (A4) the
+        // two row-fee chains' four chunk closes each (`close·d3·f1·fee·ep`)
+        // plus the two row-fee asset bindings (`close·d3·f1·A`): 19 + 8 + 2.
+        assert_eq!(hist.get(&4).copied().unwrap_or(0), 29, "deg-4 constraints");
     }
 
-    /// Program geometry: 120 perms, fits 2^19, the warm-up severing holds
+    /// Program geometry: 158 perms (A4's fee chain), fits 2^19, the warm-up severing holds
     /// (perm 0 dummy, perm 1 the ANK override, perm 2 the first reader).
     #[test]
     fn l2_program_geometry() {
         let inst = &honest_fixture().inst;
-        assert_eq!(SHAPE_S_PERMS, 120);
+        assert_eq!(SHAPE_S_PERMS, 158);
         assert!(SHAPE_S_PERMS * ROWS_PER_PERM <= 1 << SHAPE_S_LOG_HEIGHT);
         assert!(SHAPE_S_PERMS <= PROGRAM_SLOTS);
         let p = &inst.air.program;
@@ -2793,8 +3042,14 @@ mod tests {
         assert_eq!(&p[1..1 + want.len()], &want[..], "input chain 1");
         want[2] = ROLE_BNF2;
         assert_eq!(&p[1 + want.len()..1 + 2 * want.len()], &want[..], "input chain 2");
+        // A4: the fee chain — R's fee input, `ACMF` for the note block.
+        let mut fee = vec![ROLE_ANK, ROLE_NF, ROLE_BNF3, ROLE_ARKM, ROLE_ACMF];
+        fee.extend(std::iter::repeat(ROLE_MERKLE).take(MERKLE_DEPTH));
+        fee.push(ROLE_BANCHOR);
+        let at = 1 + 2 * want.len();
+        assert_eq!(&p[at..at + fee.len()], &fee[..], "the fee chain");
         let tail = [ROLE_ACMOUT, ROLE_BCM1, ROLE_ARHO, ROLE_ACMOUT, ROLE_BCM2, ROLE_BAL, ROLE_END];
-        assert_eq!(&p[1 + 2 * want.len()..SHAPE_S_PERMS], &tail[..]);
+        assert_eq!(&p[at + fee.len()..SHAPE_S_PERMS], &tail[..]);
         assert!(p[SHAPE_S_PERMS..].iter().all(|r| *r == ROLE_DUMMY));
     }
 
@@ -2920,6 +3175,7 @@ mod tests {
                 &leaves,
                 &rw,
                 root,
+                &FeeSlot::Dummy { input: dummy_fee_input(&real.rho) },
             );
             inst.air.dv = true;
             inst
@@ -2952,6 +3208,7 @@ mod tests {
             &leaves,
             &rw,
             root,
+            &FeeSlot::Dummy { input: dummy_fee_input(&real.rho) },
         );
         inst.air.dv = true;
         assert_refused_under_every_assignment(&inst, "slot 0 declared the dummy (its anchor bind must fire regardless of dv)");
@@ -3005,5 +3262,167 @@ mod tests {
         let s0 = slot_of(&fx.inst.air.program, ROLE_ACMOUT, 0);
         let seed: [u64; 4] = fx.inst.air.slot_witness[s0].w[5..9].try_into().unwrap();
         assert_eq!(seed, derive_output_rho(&fx.inst.nf[0], 0));
+    }
+
+    /// NF path-bit regression (shape S): the second input's NF perm with its path bit
+    /// set — a second nullifier for the same note, the public nf2 rebound to
+    /// match. Only the NF operand-order constraint refuses it.
+    #[test]
+    fn l2_swapped_nf_is_unsat() {
+        let fx = honest_fixture();
+        fx.assert_sat("precondition: the honest instance verifies");
+        let mut inst = fx.inst.clone();
+        let slot = slot_of(&inst.air.program, ROLE_NF, 1);
+        let nk = digest(&L2ShapeSAir::extract_state(&fx.trace, 24 * slot));
+        let rho: [u64; 4] = inst.air.slot_witness[slot].w[..4].try_into().unwrap();
+        let nf2 = digest(&reference::merkle_node_state(&rho, &nk));
+        assert_ne!(nf2, inst.nf[1], "the swap is a different nullifier");
+        inst.air.slot_witness[slot].pbit = true;
+        for (k, c) in pv_chunks(&nf2).iter().enumerate() {
+            inst.pvs[PV_NF2 + k] = *c;
+        }
+        assert_unsat(&inst, "a swapped-NF second nullifier");
+    }
+
+    // -----------------------------------------------------------------------
+    // A4 (design #283): the 3×2 merge. One positive (`d3 = 0`) and the six
+    // ruled negatives, each a complete forgery built through the builder
+    // (the trace is honest to its lying witness) and refused by the
+    // early-exit scanner.
+    // -----------------------------------------------------------------------
+
+    /// Slot 3 as a test asks for it.
+    enum Slot3 {
+        /// A real note in the commitment tree (`d3 = 0`).
+        Exact { value: u64, asset: u64 },
+        /// A dummy (`d3 = 1`) carrying `value`.
+        Dummy { value: u64 },
+    }
+
+    /// The merge: two asset-7 notes (30 + 20) in, `outs` (asset 7) out,
+    /// `fee` public, slot 3 as given. Selectors are the builder's honest ones
+    /// (A₁ = A₂ = 7 ⇒ `q`, both outputs on row 1, `f1` off).
+    fn merge(outs: [u64; 2], fee: u64, slot: Slot3) -> L2BucketInstance {
+        let mut x = 0xa4a4_3e3e_f33d_0003u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut mk_in = |value: u64, asset: u64| L2TxInput {
+            sk: [rnd(), rnd(), rnd(), rnd()],
+            value,
+            asset,
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+            d: [0, 0],
+        };
+        let inputs = [mk_in(30, 7), mk_in(20, 7)];
+        let fee_in = match slot {
+            Slot3::Exact { value, asset } => mk_in(value, asset),
+            Slot3::Dummy { value } => mk_in(value, 0),
+        };
+        let outputs = outs.map(|v| L2TxOutput { value: v, asset: 7, rkm: [v + 1; 4], rho: [0; 4], rseed: [v + 2; 4] });
+        let cm = |i: &L2TxInput| derive_input_l2(i).2;
+        let (ws, anchor, fee_slot) = match slot {
+            Slot3::Exact { .. } => {
+                let (w, anchor) = fabricated_tree3([&cm(&inputs[0]), &cm(&inputs[1]), &cm(&fee_in)]);
+                ([w[0], w[1]], anchor, FeeSlot::Exact { input: fee_in, witness: w[2] })
+            }
+            Slot3::Dummy { .. } => {
+                let (w, anchor) = fabricated_shared_tree(&cm(&inputs[0]), &cm(&inputs[1]));
+                (w, anchor, FeeSlot::Dummy { input: fee_in })
+            }
+        };
+        let leaves = [RegistryLeaf::cloaked(7), RegistryLeaf::cloaked(7)];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        build_bucket_l2_with_witnesses(SHAPE_S_LOG_HEIGHT, &inputs, &outputs, fee, &ws, anchor, &leaves, &rw, root, &fee_slot)
+    }
+
+    /// The honest merge: 30 + 20 → 50 + 0, the fee 10 paid whole by slot 3.
+    fn honest_merge() -> L2BucketInstance {
+        merge([50, 0], 10, Slot3::Exact { value: 10, asset: 0 })
+    }
+
+    #[test]
+    fn l2_a4_merge_with_an_exact_fee_note_satisfies() {
+        let inst = honest_merge();
+        assert!(!inst.air.d3 && inst.air.sel_q && !inst.air.sel_f1, "the builder's merge: d3 = 0, q, no row fee");
+        assert_sat(&inst, "A4 merge (d3 = 0)");
+    }
+
+    #[test]
+    fn l2_neg_a4_fee_value_not_the_tariff() {
+        assert_unsat(&merge([50, 0], 10, Slot3::Exact { value: 11, asset: 0 }), "a d3 = 0 fee note worth 11 for a fee of 10");
+        assert_unsat(&merge([50, 0], 10, Slot3::Exact { value: 9, asset: 0 }), "a d3 = 0 fee note worth 9 for a fee of 10");
+    }
+
+    #[test]
+    fn l2_neg_a4_fee_input_asset_not_zero() {
+        assert_unsat(&merge([50, 0], 10, Slot3::Exact { value: 10, asset: 7 }), "a fee note of asset 7");
+    }
+
+    #[test]
+    fn l2_neg_a4_nf3_bind_lie() {
+        let mut inst = honest_merge();
+        inst.pvs[PV_NF3] ^= 1;
+        assert_unsat(&inst, "a published fee-input nullifier the fee chain did not derive");
+    }
+
+    #[test]
+    fn l2_neg_a4_dummy_fee_input_with_a_value() {
+        // A d3 = 1 spend that is otherwise honest (asset 0 pays the row fee):
+        // its dummy slot 3 carries 5.
+        let honest_d3 = honest();
+        assert!(honest_d3.air.d3, "the 2-asset spend is d3 = 1");
+        let mut r = 0x5107_3d3du64;
+        let mut rnd = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let inputs = [
+            L2TxInput { sk: [rnd(); 4], value: 100, asset: 0, rho: [rnd(); 4], rseed: [rnd(); 4], d: [0, 0] },
+            L2TxInput { sk: [rnd(); 4], value: 50, asset: 7, rho: [rnd(); 4], rseed: [rnd(); 4], d: [0, 0] },
+        ];
+        let outputs = [
+            L2TxOutput { value: 90, asset: 0, rkm: [1; 4], rho: [0; 4], rseed: [2; 4] },
+            L2TxOutput { value: 50, asset: 7, rkm: [3; 4], rho: [0; 4], rseed: [4; 4] },
+        ];
+        let (w, anchor) = fabricated_shared_tree(&derive_input_l2(&inputs[0]).2, &derive_input_l2(&inputs[1]).2);
+        let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)];
+        let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+        let build = |value: u64| {
+            let mut dummy = dummy_fee_input(&[9, 8, 7, 6]);
+            dummy.value = value;
+            build_bucket_l2_with_witnesses(
+                SHAPE_S_LOG_HEIGHT, &inputs, &outputs, 10, &w, anchor, &leaves, &rw, root, &FeeSlot::Dummy { input: dummy },
+            )
+        };
+        // The control: the same spend with a 0 dummy is found honest by the
+        // same early-exit scanner (else the negative measures nothing).
+        assert!(refused(&build(0)).is_none(), "control: the value-0 dummy spend");
+        assert_unsat(&build(5), "a d3 = 1 dummy fee input worth 5");
+    }
+
+    #[test]
+    fn l2_neg_a4_d3_1_row_fee_on_a_non_zero_asset_row() {
+        // Two asset-7 notes, a dummy slot 3: the fee can only come from a row,
+        // and neither row is asset 0 — 30 + 20 = 40 + 0 + fee 10 "in asset 7".
+        assert_refused_under_every_assignment(&merge([40, 0], 10, Slot3::Dummy { value: 0 }), "a d3 = 1 fee on an asset-7 row");
+    }
+
+    #[test]
+    fn l2_neg_a4_merge_over_issue() {
+        assert_refused_under_every_assignment(
+            &merge([50, 1], 10, Slot3::Exact { value: 10, asset: 0 }),
+            "a merge minting 1 (30 + 20 → 50 + 1)",
+        );
+        assert_refused_under_every_assignment(
+            &merge([51, 0], 10, Slot3::Exact { value: 10, asset: 0 }),
+            "a merge minting 1 (30 + 20 → 51 + 0)",
+        );
     }
 }

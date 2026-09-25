@@ -727,8 +727,10 @@ pub enum BodyError {
     L2SurfaceMissing { index: usize },
     /// An Annulet transaction's L2 surface bytes do not decode canonically.
     L2SurfaceMalformed { index: usize, err: crate::annulet::L2SurfaceError },
-    /// An Annulet transaction is not the 2×2 bucket (the only L2 bucket).
-    L2NotTwoByTwo { index: usize },
+    /// An Annulet S/P transaction does not have the 3×2 shapes' arity (three
+    /// nullifiers — two inputs and the fee input, A4 — and two commitments),
+    /// or does not declare the 2×2 bucket.
+    L2WrongArity { index: usize },
     /// An Annulet body names a coinbase payee — the L2 has no block reward.
     CoinbaseOnAnnulet { got: usize },
     /// An Annulet transaction's discovery payload `entry` carries an all-zero

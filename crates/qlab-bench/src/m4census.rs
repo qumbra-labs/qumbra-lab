@@ -45,7 +45,9 @@ use p3_symmetric::{
 use p3_uni_stark::{prove, verify, StarkConfig};
 use qlab_air::narrow::{build_bucket, TxInput, TxOutput, BUCKET_PERMS, NARROW_WIDTH};
 
-use crate::{keccak_inputs, make_config_with, pc_len, Challenge, Dft, FriCfg, Val, RUNS};
+use crate::{keccak_inputs, pc_len, Challenge, Dft, FriCfg, Val, RUNS};
+// Re-gated by the re-mint: M4 runs on the legacy non-hiding config.
+use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
 // ---------------------------------------------------------------------------
 // Counting adapters
@@ -333,7 +335,7 @@ fn census_bucket() -> usize {
     // which shift the query set; M1.6 recorded this as ±0.2 KB jitter.)
     let plain_config = make_config_with(&CONSENSUS_CFG);
     let bytes = postcard::to_allocvec(&proof).expect("serialize counting proof");
-    let cross: p3_uni_stark::Proof<crate::Config> =
+    let cross: p3_uni_stark::Proof<qlab_consensus::legacy::LegacyNonHidingConfig> =
         postcard::from_bytes(&bytes).expect("deserialize into plain-config proof");
     verify(&plain_config, &inst.air, &cross, &pvs)
         .expect("plain config must accept the counting config's proof");

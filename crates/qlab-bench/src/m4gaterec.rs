@@ -40,7 +40,9 @@ use p3_uni_stark::{prove, Proof};
 use qlab_air::narrow::{build_bucket, BucketInstance, TxInput, TxOutput};
 
 use crate::m4gate::FLUSH_BLOCKS;
-use crate::{make_config_with, Config, FriCfg, Val};
+use crate::{FriCfg, Val};
+// Re-gated by the re-mint: M4 records the legacy non-hiding proof shape.
+use qlab_consensus::legacy::{make_legacy_config_with as make_config_with, LegacyNonHidingConfig as Config};
 
 pub(crate) type Ext = BinomialExtensionField<Val, 4>;
 

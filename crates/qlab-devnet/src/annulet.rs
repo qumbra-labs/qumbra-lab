@@ -392,8 +392,8 @@ pub fn placeholder_discovery_annulet(commitments: &[Hash32]) -> Vec<u8> {
 /// 1. no coinbase payee (no block reward);
 /// 2. the header binds [`body_commitment_annulet`];
 /// 3. per transaction: anchor final; name rider absent (no name service);
-///    L2 surface present and canonical; bucket 2×2 with exactly 2 nullifiers
-///    and 2 commitments; `fee == posted_fee_l2(shape)`; no nullifier repeated
+///    L2 surface present and canonical; bucket 2×2 with the shape's arity
+///    ([`check_l2_arity`]: S/P 3 nullifiers, R 1; 2 commitments); `fee == posted_fee_l2(shape)`; no nullifier repeated
 ///    in the block; the discovery group is canonical at the 128-B payload
 ///    width, binds the declared commitments, and carries no genesis plaintext
 ///    ([`check_tx_discovery_annulet`], lab #714); the surface's
@@ -495,20 +495,20 @@ pub fn annulet_supply_delta(body: &BlockBody) -> std::collections::BTreeMap<u16,
 
 /// Lab #728 Q2: every Annulet surface declares the 2×2 bucket (the L1
 /// type's only L2 value — the Annulet prices by shape); the SHAPE gates the
-/// counts: S/P spend two and make two, R spends one and makes two — the fee
+/// counts: S/P spend three (two inputs and the fee input, A4) and make two, R spends one and makes two — the fee
 /// change and the seed (A3, lab #731). The one rule the body check and the
 /// mempool both apply (`index` names the tx).
 pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: usize) -> Result<(), BodyError> {
     if public.bucket != ArityBucket::TwoByTwo {
-        return Err(BodyError::L2NotTwoByTwo { index });
+        return Err(BodyError::L2WrongArity { index });
     }
     let (want_nf, want_cm) = match shape {
-        L2ShapeTag::S | L2ShapeTag::P => (2, 2),
+        L2ShapeTag::S | L2ShapeTag::P => (3, 2),
         L2ShapeTag::R => (1, 2),
     };
     if public.nullifiers.len() != want_nf || public.commitments.len() != want_cm {
         return Err(match shape {
-            L2ShapeTag::S | L2ShapeTag::P => BodyError::L2NotTwoByTwo { index },
+            L2ShapeTag::S | L2ShapeTag::P => BodyError::L2WrongArity { index },
             L2ShapeTag::R => BodyError::L2RegistryWriteArity { index },
         });
     }
@@ -571,7 +571,8 @@ mod tests {
     fn l2_tx(nf: u8, surface: &L2Surface) -> TxEntry {
         let public = TxPublic {
             anchor: FINAL,
-            nullifiers: vec![[nf; 32], [nf.wrapping_add(1); 32]],
+            // S/P spend three (A4): two inputs and slot 3's fee input.
+            nullifiers: vec![[nf; 32], [nf.wrapping_add(1); 32], [nf.wrapping_add(0x80); 32]],
             commitments: vec![[nf.wrapping_add(2); 32], [nf.wrapping_add(3); 32]],
             bucket: ArityBucket::TwoByTwo,
             fee: FEES.posted_fee_l2(surface.shape),
@@ -786,7 +787,7 @@ mod tests {
         let stale_s = L2Surface { registry_root: new, ..s_surface() };
         let bad = BlockBody::new(vec![r_tx(1, &r_surface(new)), l2_tx(9, &stale_s)], vec![]);
         assert_eq!(check_at(&bad, new), Err(BodyError::L2RegistryRootStale { index: 1 }));
-        // A write that spends two notes.
+        // A write that spends three notes (S/P's arity).
         let wide = BlockBody::new(vec![l2_tx(1, &r_surface(new))], vec![]);
         assert_eq!(check_at(&wide, new), Err(BodyError::L2RegistryWriteArity { index: 0 }));
         // A3: an R without its seed (A2's 1×1) is refused by the same name.
@@ -797,7 +798,7 @@ mod tests {
         assert_eq!(check_at(&unseeded, new), Err(BodyError::L2RegistryWriteArity { index: 0 }));
         // An S transaction with R's arity is still an S arity error.
         let narrow_s = BlockBody::new(vec![r_tx(1, &s_surface())], vec![]);
-        assert_eq!(check_at(&narrow_s, [0x44; 32]), Err(BodyError::L2NotTwoByTwo { index: 0 }));
+        assert_eq!(check_at(&narrow_s, [0x44; 32]), Err(BodyError::L2WrongArity { index: 0 }));
         // R pays tier R.
         let mut cheap = r_tx(1, &r_surface(new));
         cheap.public.fee = FEES.tier_s;
@@ -827,9 +828,10 @@ mod tests {
         let mut fee = l2_tx(1, &p_surface());
         fee.public.fee = 1; // the S tier on a P transaction
         assert_eq!(check(&body(vec![fee])), Err(BodyError::WrongFee { index: 0, expected: 2, got: 1 }));
-        let mut one_in = l2_tx(1, &s_surface());
-        one_in.public.nullifiers.pop();
-        assert_eq!(check(&body(vec![one_in])), Err(BodyError::L2NotTwoByTwo { index: 0 }));
+        // A4: the pre-A4 2×2 (no fee input) is the wrong arity for S.
+        let mut two_in = l2_tx(1, &s_surface());
+        two_in.public.nullifiers.pop();
+        assert_eq!(check(&body(vec![two_in])), Err(BodyError::L2WrongArity { index: 0 }));
         assert_eq!(
             check(&body(vec![l2_tx(1, &s_surface()), l2_tx(2, &s_surface())])),
             Err(BodyError::DoubleSpendInBlock { index: 1 }),

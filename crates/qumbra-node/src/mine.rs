@@ -115,7 +115,8 @@ pub struct NetProfile {
 /// release and this is the identity such a binary must carry.
 pub const NET_T1: NetProfile = NetProfile {
     net: "t1",
-    genesis_hash: "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb",
+    // The security re-mint: was 138e1524… (T1 is a code pin only).
+    genesis_hash: "82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af",
     genesis_url: PUBLISHED_GENESIS_URL,
     seeds: PUBLIC_SEEDS,
 };
@@ -134,7 +135,10 @@ pub const NET_T1: NetProfile = NetProfile {
 /// the file actually served at [`PUBLISHED_GENESIS_URL`], on every release cut.
 pub const NET_T2: NetProfile = NetProfile {
     net: "t2",
-    genesis_hash: "d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3",
+    // The security re-mint: the re-minted live T2 genesis
+    // (`genesis init --t2 --remint-from` over d1dad4ea…), named runs ×2,
+    // file sha256 03a28137…277f, 41,750 B. Was d1dad4ea….
+    genesis_hash: "dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5",
     genesis_url: PUBLISHED_GENESIS_URL,
     seeds: PUBLIC_SEEDS,
 };

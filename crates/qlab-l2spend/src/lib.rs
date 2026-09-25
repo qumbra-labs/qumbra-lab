@@ -56,6 +56,9 @@ pub enum SpendError {
     NotAllowlisted { asset: u64 },
     /// A registry write's fee note holds less than the fee (lab #728).
     FeeExceedsInput { have: u64, fee: u64 },
+    /// A4: slot 3's fee note must be asset 0 and worth exactly the fee — it
+    /// is spent whole and the 3×2 shapes have no fee change.
+    FeeNoteNotExact { value: u64, asset: u64, fee: u64 },
 }
 
 impl std::fmt::Display for SpendError {
@@ -83,6 +86,11 @@ impl std::fmt::Display for SpendError {
             SpendError::FeeExceedsInput { have, fee } => {
                 write!(f, "the fee note holds {have}, less than the registry-write fee {fee}")
             }
+            SpendError::FeeNoteNotExact { value, asset, fee } => write!(
+                f,
+                "slot 3's fee note is {value} of asset {asset}; it must be exactly {fee} of asset 0 \
+                 (spent whole — the 3×2 shapes have no fee change)"
+            ),
         }
     }
 }
@@ -380,6 +388,29 @@ fn discovery_for<R: rand::CryptoRng>(notes: &[L2Note; 2], outs: &[Out; 2], rng: 
     qlab_note::compact::encode_committed_discovery_with_width(&bundles, &payloads, L2_PAYLOAD_LEN)
 }
 
+/// A4: a dummy slot-3 fee input (`d3 = 1`) with fresh `sk`/`ρ`.
+fn dummy_fee_slot<R: Rng>(rng: &mut R) -> qlab_air::l2::FeeSlot {
+    qlab_air::l2::FeeSlot::Dummy {
+        input: L2TxInput { sk: random_d4(rng), value: 0, asset: 0, rho: random_d4(rng), rseed: random_d4(rng), d: [0, 0] },
+    }
+}
+
+/// A4: slot 3 as asked — an exact-`fee` asset-0 note with its witness in
+/// `tree` (`d3 = 0`: the rows carry no fee, so two notes of one asset merge),
+/// or a fresh dummy (`d3 = 1`: the fee from an asset-0 row, as before A4).
+fn fee_slot_for<R: Rng>(
+    tree: &CommitmentTree,
+    exact: Option<&L2TxInput>,
+    fee: u64,
+    rng: &mut R,
+) -> Result<qlab_air::l2::FeeSlot, SpendError> {
+    let Some(note) = exact else { return Ok(dummy_fee_slot(rng)) };
+    if note.asset != 0 || note.value != fee {
+        return Err(SpendError::FeeNoteNotExact { value: note.value, asset: note.asset, fee });
+    }
+    Ok(qlab_air::l2::FeeSlot::Exact { input: note.clone(), witness: witness_of(tree, note)? })
+}
+
 fn random_d4<R: Rng>(rng: &mut R) -> [u64; 4] {
     [rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()]
 }
@@ -394,10 +425,12 @@ fn l2_outputs<R: Rng>(outs: &[Out; 2], rng: &mut R) -> [L2TxOutput; 2] {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry(
     proof: &qlab_l2::Proof<qlab_l2::Config>,
     anchor: &[u64; 4],
     nf: &[[u64; 4]; 2],
+    nf3: &[u64; 4],
     cm_out: &[[u64; 4]; 2],
     fee: u64,
     surface: L2Surface,
@@ -407,7 +440,9 @@ fn entry(
         proof: bincode::serialize(proof).expect("a proof serializes"),
         public: TxPublic {
             anchor: digest_bytes(anchor),
-            nullifiers: nf.iter().map(digest_bytes).collect(),
+            // A4: the two inputs' nullifiers, then slot 3's (the fee input's,
+            // or a dummy's fresh one) — the 3×2 shapes publish three.
+            nullifiers: nf.iter().chain(std::iter::once(nf3)).map(digest_bytes).collect(),
             commitments: cm_out.iter().map(digest_bytes).collect(),
             bucket: ArityBucket::TwoByTwo,
             fee,
@@ -428,10 +463,41 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
     fee: u64,
     rng: &mut R,
 ) -> Result<Built, SpendError> {
+    build_s_slot(served, inputs, outs, fee, None, rng)
+}
+
+/// **A4's merge on shape S** (`d3 = 0`): two real inputs — two notes of one
+/// Cloaked asset, typically — and `fee_note`, an asset-0 note worth exactly
+/// `fee`, in slot 3. The rows carry no fee.
+pub fn build_s_merge<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: [&L2TxInput; 2],
+    outs: &[Out; 2],
+    fee: u64,
+    fee_note: &L2TxInput,
+    rng: &mut R,
+) -> Result<Built, SpendError> {
+    build_s_slot(served, &inputs, outs, fee, Some(fee_note), rng)
+}
+
+fn build_s_slot<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: &[&L2TxInput],
+    outs: &[Out; 2],
+    fee: u64,
+    exact_fee: Option<&L2TxInput>,
+    rng: &mut R,
+) -> Result<Built, SpendError> {
     assert!(matches!(inputs.len(), 1 | 2), "a 2×2 bucket takes one or two real inputs");
+    // A single real input rides #219's dummy slot 1; an exact fee note is
+    // only ever planned beside two real inputs (a merge or a two-note pay).
+    assert!(exact_fee.is_none() || inputs.len() == 2, "an exact slot-3 fee note is built with two real inputs");
     let tree = served.commitment_tree()?;
     let anchor = tree.root();
     let outputs = l2_outputs(outs, rng);
+    // A4: slot 3 — the exact fee note, or a dummy whose sk/ρ are drawn fresh
+    // because its nullifier is published.
+    let fee_slot = fee_slot_for(&tree, exact_fee, fee, rng)?;
     let inst = if let [a, b] = inputs {
         let regs = [served.registry(a.asset)?, served.registry(b.asset)?];
         if regs[0].root != regs[1].root {
@@ -447,6 +513,7 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
             &[regs[0].leaf, regs[1].leaf],
             &[regs[0].witness, regs[1].witness],
             regs[0].root,
+            &fee_slot,
         )
     } else {
         let real = inputs[0];
@@ -467,13 +534,14 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
             &[reg.leaf, reg0.leaf],
             &[reg.witness, reg0.witness],
             reg.root,
+            &fee_slot,
         )
     };
     let (_, proof) = qlab_l2::prove_s(&inst);
     let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
     let discovery = discovery_for(&notes, outs, rng);
     let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None, write: None };
-    Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::S })
+    Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::S })
 }
 
 /// An assembled registry write (shape R) and its two output notes.
@@ -602,6 +670,35 @@ pub fn build_p_with<E: Endpoint, R: rand::CryptoRng>(
     vp: [VPublic; 2],
     rng: &mut R,
 ) -> Result<Built, SpendError> {
+    build_p_slot(served, inputs, outs, fee, ctx, vp, None, rng)
+}
+
+/// **A4's merge on shape P** (`d3 = 0`, vPublic = 0): two real inputs — two
+/// notes of one policy asset, typically, each with its own policy context —
+/// and `fee_note`, an asset-0 note worth exactly `fee`, in slot 3.
+pub fn build_p_merge<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: [&L2TxInput; 2],
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    fee_note: &L2TxInput,
+    rng: &mut R,
+) -> Result<Built, SpendError> {
+    build_p_slot(served, inputs, outs, fee, ctx, [VPublic::NONE; 2], Some(fee_note), rng)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_p_slot<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: [&L2TxInput; 2],
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    exact_fee: Option<&L2TxInput>,
+    rng: &mut R,
+) -> Result<Built, SpendError> {
     let tree = served.commitment_tree()?;
     let regs = [served.registry(inputs[0].asset)?, served.registry(inputs[1].asset)?];
     if regs[0].root != regs[1].root {
@@ -609,7 +706,8 @@ pub fn build_p_with<E: Endpoint, R: rand::CryptoRng>(
     }
     let rkm = |i: &L2TxInput| qlab_air::l2p::derive_rkm_l2(i);
     let policy = [policy_input(&regs[0], &rkm(inputs[0]), ctx[0])?, policy_input(&regs[1], &rkm(inputs[1]), ctx[1])?];
-    prove_p_with_policies(&tree, inputs, outs, fee, policy, regs[0].root, vp, rng)
+    let fee_slot = fee_slot_for(&tree, exact_fee, fee, rng)?;
+    prove_p_slot(&tree, inputs, outs, fee, policy, regs[0].root, vp, &fee_slot, rng)
 }
 
 /// **The P assembly below the policy check** (lab #722): prove against the
@@ -628,6 +726,22 @@ pub fn prove_p_with_policies<R: rand::CryptoRng>(
     vp: [VPublic; 2],
     rng: &mut R,
 ) -> Result<Built, SpendError> {
+    let fee_slot = dummy_fee_slot(rng);
+    prove_p_slot(tree, inputs, outs, fee, policy, registry_root, vp, &fee_slot, rng)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_p_slot<R: rand::CryptoRng>(
+    tree: &CommitmentTree,
+    inputs: [&L2TxInput; 2],
+    outs: &[Out; 2],
+    fee: u64,
+    policy: [L2PolicyInput; 2],
+    registry_root: [u64; 4],
+    vp: [VPublic; 2],
+    fee_slot: &qlab_air::l2::FeeSlot,
+    rng: &mut R,
+) -> Result<Built, SpendError> {
     let anchor = tree.root();
     let outputs = l2_outputs(outs, rng);
     let inst = qlab_air::l2p::build_bucket_l2p_with_witnesses(
@@ -640,6 +754,7 @@ pub fn prove_p_with_policies<R: rand::CryptoRng>(
         &policy,
         registry_root,
         vp,
+        fee_slot,
     );
     let (_, proof) = qlab_l2::prove_p(&inst);
     let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
@@ -653,7 +768,7 @@ pub fn prove_p_with_policies<R: rand::CryptoRng>(
     };
     let surface =
         L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]), write: None };
-    Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
+    Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 
 #[cfg(test)]

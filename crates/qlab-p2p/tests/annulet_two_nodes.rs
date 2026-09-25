@@ -57,7 +57,13 @@ fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor,
-            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32]],
+            // S/P spend three (A4): slot 3's fee-input nullifier is never a
+            // uniform `[x; 32]`, so it cannot collide with another fixture's.
+            nullifiers: vec![[nf; 32], [nf.wrapping_add(100); 32], {
+                let mut f = [nf; 32];
+                f[31] = !nf;
+                f
+            }],
             commitments: vec![[nf.wrapping_add(1); 32], [nf.wrapping_add(101); 32]],
             bucket: ArityBucket::TwoByTwo,
             fee: FEES.tier_s,
@@ -97,8 +103,9 @@ fn a_producer_and_a_follower_advance_ten_sealed_blocks_in_lockstep() {
         assert_eq!(a.chain().tip_work(), 10, "weight 1 per block — no tie is possible");
     }
     assert_eq!(producer.state().commitment_root(), follower.state().commitment_root());
-    assert_eq!(producer.state().nullifier_count(), 16);
-    assert_eq!(follower.state().nullifier_count(), 16);
+    // Eight S transactions × three nullifiers each (A4: slot 3's fee input).
+    assert_eq!(producer.state().nullifier_count(), 24);
+    assert_eq!(follower.state().nullifier_count(), 24);
     assert_eq!(producer.sealed_header_at(10), follower.sealed_header_at(10), "both serve the same sealed header");
 }
 

@@ -15,7 +15,9 @@ use p3_uni_stark::{prove, verify, Proof};
 
 use crate::m4gate::{build_gate_trace, GateShape, VerifierGateAir, GATE_WIDTH};
 use crate::m4gaterec::{self, Schedule};
-use crate::{make_config_with, Config, FriCfg, Val};
+use crate::{FriCfg, Val};
+// Re-gated by the re-mint: M4 aggregates the legacy non-hiding proof shape.
+use qlab_consensus::legacy::{make_legacy_config_with as make_config_with, LegacyNonHidingConfig as Config};
 
 /// The aggregation-lane config the leaf commits at. Per aggregation-rung1 §4,
 /// "at b4 the aggregation lane needs ~40–45 queries for 100 bits". B″ (issue

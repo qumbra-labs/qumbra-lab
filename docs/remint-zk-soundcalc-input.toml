@@ -1,0 +1,69 @@
+# The security re-mint: the hiding lane, modeled by parameters.
+# soundcalc (rev 809896fb) has no ZK model; ZK enters as: trace committed at 2N,
+# ZK-effective AIR degree d+1, committed width + NUM_RANDOM_CODEWORDS (4).
+# Non-ZK twins carry today's real values (q21, degree 4, measured widths/counts).
+[zkevm]
+name = "QumbraRemint"
+protocol_family = "FRI_STARK"
+field = "KoalaBear^4"
+hash_size_bits = 256
+
+[[circuits]]
+name = "L1_b16_q21_g22_nonZK"
+rho = 0.0625
+trace_length = 262144          # 2^18
+air_max_degree = 4
+num_columns = 643
+num_constraints = 938
+batch_size = 643
+opening_points = 2
+power_batching = true
+num_queries = 21
+fri_folding_factors = [16, 16, 16, 4]   # 2^22 -> 2^8
+fri_early_stop_degree = 256
+grinding_query_phase = 22
+
+[[circuits]]
+name = "L1_b16_q21_g22_ZK"
+rho = 0.0625
+trace_length = 524288          # 2^19: committed at 2N
+air_max_degree = 5             # d + is_zk
+num_columns = 647
+num_constraints = 938
+batch_size = 647               # + 4 random codewords
+opening_points = 2
+power_batching = true
+num_queries = 21
+fri_folding_factors = [16, 16, 16, 8]   # 2^23 -> 2^8
+fri_early_stop_degree = 256
+grinding_query_phase = 22
+
+[[circuits]]
+name = "L2P_b4_q43_g22_nonZK"
+rho = 0.25
+trace_length = 1048576         # 2^20
+air_max_degree = 4
+num_columns = 778
+num_constraints = 1271
+batch_size = 778
+opening_points = 2
+power_batching = true
+num_queries = 43
+fri_folding_factors = [16, 16, 16, 16]  # 2^22 -> 2^6
+fri_early_stop_degree = 64
+grinding_query_phase = 22
+
+[[circuits]]
+name = "L2P_b4_q43_g22_ZK"
+rho = 0.25
+trace_length = 2097152         # 2^21: committed at 2N
+air_max_degree = 5
+num_columns = 782
+num_constraints = 1271
+batch_size = 782
+opening_points = 2
+power_batching = true
+num_queries = 43
+fri_folding_factors = [16, 16, 16, 16, 2]  # 2^23 -> 2^6
+fri_early_stop_degree = 64
+grinding_query_phase = 22

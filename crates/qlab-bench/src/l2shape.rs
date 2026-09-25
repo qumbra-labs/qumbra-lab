@@ -22,16 +22,20 @@
 //!               height (341-perm capacity; the pipeline chains through the
 //!               padding and every padded block is a genuine Keccak round, so
 //!               the prover's work is the height's, not the program's).
-//! - `p`       — shape P real (`qlab_air::l2p::build_bucket_l2p`), 214 perms @ 2^20:
-//!               a Cloaked asset-0 input + a Hybrid stablecoin input (freeze
-//!               tree live, allowlist on the dummy path), no vPublic. Stage 2.
+//! - `p`       — shape P real (`qlab_air::l2p::build_bucket_l2p`), 252 perms @ 2^20
+//!               (P3, A4): a Cloaked asset-0 input + a Hybrid stablecoin input
+//!               (freeze tree live, allowlist on the dummy path), no vPublic,
+//!               slot 3 a dummy fee input (`d3 = 1`). Stage 2.
+//! - `s3`/`p3` — A4's merge (`qlab_l2::fixture::shape_{s3,p3}_merge_at`): two
+//!               asset-7 notes into one, the fee paid by an exact asset-0 note in
+//!               slot 3 (`d3 = 0`). `--pcs hiding|nonhiding` picks the PCS.
 //! - `r`       — shape R real (`qlab_l2::fixture::shape_r`, lab #724), 79 perms
 //!               @ 2^18: the fixture's update of asset 7 (key rotation + a new
 //!               freeze root) with its asset-0 fee spend.
 //! - `p19`     — **CANARY** (#700's rule: a 2^19 run of the same shape and lane
 //!               before any 2^20): the shape-P AIR at 2^19 in chain-only mode —
-//!               same 778 columns, half the rows; the P program does not fit
-//!               2^19 (214 perms > 170), so the canary prices width × height only.
+//!               same 798 columns, half the rows; the P program does not fit
+//!               2^19 (252 perms > 170), so the canary prices width × height only.
 //!
 //! Lanes (the FRI points), each asserted ≥ 100 bits by `make_config_with`'s
 //! capacity proxy and labelled with its 2197-corrected figure:
@@ -61,6 +65,8 @@ use qlab_air::l2p::{L2ShapePAir, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
 use qlab_air::l2r::{L2ShapeRAir, SHAPE_R_PERMS};
 use qlab_consensus::CONSENSUS_CFG;
 use qlab_l2::L2_CFG_PROVISIONAL as L2_CFG;
+
+use qlab_consensus::legacy::{make_legacy_config_with, LegacyNonHidingConfig};
 
 use crate::{make_config_with, pc_len, Config, FriCfg, Val, RUNS};
 
@@ -123,7 +129,7 @@ fn shape_s_instance(log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
 fn mock_instance(perms: usize, log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
     use qlab_air::l2::{
         build_bucket_l2_with_witnesses, derive_input_l2, fabricated_registry_tree, RegistryLeaf,
-        ROLE_AREG, ROLE_BREG,
+        ROLE_AREG, ROLE_BREG, ROLE_ANK, ROLE_BANCHOR,
     };
     use qlab_air::narrow::fabricated_shared_tree;
     let mut x = 0x0118_0240_a11e_0700u64;
@@ -148,6 +154,7 @@ fn mock_instance(perms: usize, log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
     let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
     let inst = build_bucket_l2_with_witnesses(
         log_height, &inputs, &outputs, 1_000, &w, anchor, &leaves, &rw, root,
+        &qlab_air::l2::FeeSlot::Dummy { input: qlab_air::l2::dummy_fee_input(&inputs[0].rho) },
     );
     let mut air = inst.air;
     // Strip the registry chains: AREG + 16 MERKLE + BREG per input → the
@@ -157,6 +164,18 @@ fn mock_instance(perms: usize, log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
     let mut i = 0usize;
     let mut out = 0usize;
     while i < SHAPE_S_PERMS {
+        // A4: slot 3's fee chain (ANK → NF → BNF3 → … → BANCHOR) is not part
+        // of the L1 shape either — skipped whole, so its bank legs leave
+        // together; with the fixture's dummy slot 3 (d3 = 1) the fee bank
+        // closes at 0 and the L3 latch never sets.
+        if air.program[i] == ROLE_ANK && air.program[i + 2] == qlab_air::l2::ROLE_BNF3 {
+            let mut j = i + 3;
+            while air.program[j] != ROLE_BANCHOR {
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
         if air.program[i] == ROLE_AREG {
             // skip AREG, its 16 MERKLE steps and BREG
             let mut j = i + 1;
@@ -207,43 +226,83 @@ pub(crate) fn shape_p_instance(log_height: usize) -> (L2ShapePAir, Vec<Val>) {
     (inst.air, pvs)
 }
 
+/// The PCS a run proves under (A4 rig gate, #283): the re-mint's hiding
+/// config (`make_config_with`, the default) or the provisional non-hiding one
+/// the current lane pins (`qlab_consensus::legacy`). Same FRI point either
+/// way; only the commitment scheme differs, so a lane-relative comparison
+/// (P3 vs P under one PCS) is what the gate reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PcsKind {
+    Hiding,
+    NonHiding,
+}
+
+impl PcsKind {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hiding" => Some(Self::Hiding),
+            "nonhiding" => Some(Self::NonHiding),
+            _ => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hiding => "hiding (HidingFriPcs)",
+            Self::NonHiding => "non-hiding (TwoAdicFriPcs, provisional)",
+        }
+    }
+}
+
 /// One lane through the real prover: best-of-`RUNS` prove and verify, the
 /// proof's postcard and bincode-fixed bytes, and the width read off the
-/// trace `prove` was handed.
+/// trace `prove` was handed. A macro so the two PCS configs share one body
+/// (their `StarkConfig` types differ; the AIR bounds are per config).
+macro_rules! lane_body {
+    ($config:expr, $air:expr, $pvs:expr, $cfg:expr, $gen_trace:expr) => {{
+        let config = $config;
+        let mut best_prove = f64::INFINITY;
+        let mut proof_opt = None;
+        let mut width = 0;
+        for _ in 0..RUNS {
+            let trace = $gen_trace($cfg.log_blowup);
+            width = trace.width();
+            let t = Instant::now();
+            let proof = prove(&config, $air, trace, $pvs);
+            best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
+            proof_opt = Some(proof);
+        }
+        let proof = proof_opt.expect("RUNS > 0");
+        let proof_bytes = pc_len(&proof);
+        let fixed_bytes = bincode::serialize(&proof).expect("bincode").len();
+        let mut best_verify = f64::INFINITY;
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            verify(&config, $air, &proof, $pvs).expect("verification failed");
+            best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        (best_prove, best_verify, proof_bytes, fixed_bytes, width)
+    }};
+}
+
 fn bench_lane<A>(
     air: &A,
     pvs: &[Val],
     cfg: &FriCfg,
+    pcs: PcsKind,
     gen_trace: impl Fn(usize) -> p3_matrix::dense::RowMajorMatrix<Val>,
 ) -> (f64, f64, usize, usize, usize)
 where
     A: Air<SymbolicAirBuilder<Val>>
         + for<'a> Air<ProverConstraintFolder<'a, Config>>
         + for<'a> Air<VerifierConstraintFolder<'a, Config>>
+        + for<'a> Air<ProverConstraintFolder<'a, LegacyNonHidingConfig>>
+        + for<'a> Air<VerifierConstraintFolder<'a, LegacyNonHidingConfig>>
         + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
 {
-    let config = make_config_with(cfg);
-    let mut best_prove = f64::INFINITY;
-    let mut proof_opt = None;
-    let mut width = 0;
-    for _ in 0..RUNS {
-        let trace = gen_trace(cfg.log_blowup);
-        width = trace.width();
-        let t = Instant::now();
-        let proof = prove(&config, air, trace, pvs);
-        best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
-        proof_opt = Some(proof);
+    match pcs {
+        PcsKind::Hiding => lane_body!(make_config_with(cfg), air, pvs, cfg, gen_trace),
+        PcsKind::NonHiding => lane_body!(make_legacy_config_with(cfg), air, pvs, cfg, gen_trace),
     }
-    let proof = proof_opt.expect("RUNS > 0");
-    let proof_bytes = pc_len(&proof);
-    let fixed_bytes = bincode::serialize(&proof).expect("bincode").len();
-    let mut best_verify = f64::INFINITY;
-    for _ in 0..RUNS {
-        let t = Instant::now();
-        verify(&config, air, &proof, pvs).expect("verification failed");
-        best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
-    }
-    (best_prove, best_verify, proof_bytes, fixed_bytes, width)
 }
 
 /// What one shape hands the lane loop.
@@ -257,7 +316,7 @@ struct ShapeUnderTest {
     pv_len: usize,
     max_deg: usize,
     statement: &'static str,
-    run: Box<dyn Fn(&FriCfg) -> (f64, f64, usize, usize, usize)>,
+    run: Box<dyn Fn(&FriCfg, PcsKind) -> (f64, f64, usize, usize, usize)>,
 }
 
 fn shape_s_under_test(label: &'static str, mock: bool, program_perms: usize, air: L2ShapeSAir, pvs: Vec<Val>) -> ShapeUnderTest {
@@ -276,8 +335,9 @@ fn shape_s_under_test(label: &'static str, mock: bool, program_perms: usize, air
         pv_len,
         max_deg,
         statement: "shape S — 2 inputs (2 assets), per input the L1 chain + a depth-16 \
-             registry opening bound to PV_REGROOT, 2 outputs, two-asset balance, mode = Cloaked",
-        run: Box::new(move |cfg| bench_lane(&air, &pvs, cfg, |b| air.generate_trace::<Val>(b))),
+             registry opening bound to PV_REGROOT, 2 outputs, two-asset balance, mode = Cloaked; \
+             slot 3 a dummy fee input (d3 = 1, fee from a row)",
+        run: Box::new(move |cfg, pcs| bench_lane(&air, &pvs, cfg, pcs, |b| air.generate_trace::<Val>(b))),
     }
 }
 
@@ -299,8 +359,8 @@ fn shape_p_under_test(label: &'static str, canary: bool, program_perms: usize, a
         statement: "shape P — shape S plus, per input: indexed-Merkle freeze non-membership \
              (depth 20, low leaf + two 256-bit comparisons), allowlist membership (depth 20, \
              dummy path when off), vPublic per row with AISS (issuer key) when required; \
-             mode read as flags",
-        run: Box::new(move |cfg| bench_lane(&air, &pvs, cfg, |b| air.generate_trace::<Val>(b))),
+             mode read as flags; slot 3 a dummy fee input (d3 = 1, fee from a row)",
+        run: Box::new(move |cfg, pcs| bench_lane(&air, &pvs, cfg, pcs, |b| air.generate_trace::<Val>(b))),
     }
 }
 
@@ -325,11 +385,22 @@ fn shape_r_under_test() -> ShapeUnderTest {
         statement: "shape R — one registry slot written (registration into an empty slot, or \
              update with the issuer key proven), the old and new depth-16 folds interleaved \
              over one set of siblings, path = asset, mode => roots; a 1-in/1-out asset-0 fee spend",
-        run: Box::new(move |cfg| bench_lane(&air, &pvs, cfg, |b| air.generate_trace::<Val>(b))),
+        run: Box::new(move |cfg, pcs| bench_lane(&air, &pvs, cfg, pcs, |b| air.generate_trace::<Val>(b))),
     }
 }
 
-pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
+/// `s3`: the A4 merge — two asset-7 notes (30,000 + 20,000) into one
+/// (50,000 + a 0-value change), the fee paid by an exact 1,000 asset-0 note
+/// in slot 3 (`d3 = 0`). `s`/`p` are the same AIRs with `d3 = 1`.
+const S3_STATEMENT: &str = "shape S3 — 3 inputs × 2 outputs: two asset-7 inputs (each the \
+     L1 chain + a depth-16 registry opening) merged into one asset-7 output, the fee paid \
+     by slot 3's exact asset-0 note (d3 = 0: nullifier published, membership in the same \
+     anchor, rows carry no fee)";
+const P3_STATEMENT: &str = "shape P3 — shape S3's merge over two Hybrid asset-7 inputs, each \
+     with freeze non-membership + allowlist (dummy path) openings; slot 3's exact asset-0 \
+     fee note (d3 = 0)";
+
+pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: PcsKind) {
     let sut: ShapeUnderTest = match shape {
         "s" => {
             let (air, pvs) = shape_s_instance(SHAPE_S_LOG_HEIGHT);
@@ -351,6 +422,20 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
             let (air, pvs) = shape_p_instance(SHAPE_P_LOG_HEIGHT);
             shape_p_under_test("shape P", false, SHAPE_P_PERMS, air, pvs)
         }
+        "s3" => {
+            let inst = qlab_l2::fixture::shape_s3_merge_at(SHAPE_S_LOG_HEIGHT);
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut sut = shape_s_under_test("shape S3 (merge, exact fee note)", false, SHAPE_S_PERMS, inst.air, pvs);
+            sut.statement = S3_STATEMENT;
+            sut
+        }
+        "p3" => {
+            let inst = qlab_l2::fixture::shape_p3_merge_at(SHAPE_P_LOG_HEIGHT);
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut sut = shape_p_under_test("shape P3 (merge, exact fee note)", false, SHAPE_P_PERMS, inst.air, pvs);
+            sut.statement = P3_STATEMENT;
+            sut
+        }
         "r" => shape_r_under_test(),
         "p19" => {
             let air = L2ShapePAir::chain_only(SHAPE_P_LOG_HEIGHT - 1);
@@ -358,7 +443,7 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
             shape_p_under_test("CANARY: shape-P AIR chain-only @ 2^19", true, 0, air, pvs)
         }
         other => {
-            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r");
+            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r|s3|p3");
             std::process::exit(2);
         }
     };
@@ -413,6 +498,7 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
     } else {
         println!("- statement: {}", sut.statement);
     }
+    println!("- PCS: {}", pcs.label());
     println!("- per cell: prove/verify = best of {RUNS} in-process runs; proof = postcard bytes and bincode-fixed bytes");
     println!("- peak footprint: read `phys_footprint` (peak) from the `/usr/bin/time -l` line wrapping THIS process; one lane per process");
     println!();
@@ -426,7 +512,7 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>) {
             }
         }
         eprintln!("== l2shape {label}: {name} ({}) ==", cfg.label());
-        let result = catch_unwind(AssertUnwindSafe(|| (sut.run)(cfg)));
+        let result = catch_unwind(AssertUnwindSafe(|| (sut.run)(cfg, pcs)));
         match result {
             Ok((prove_ms, verify_ms, bytes, fixed, width)) => {
                 eprintln!(
@@ -488,7 +574,7 @@ mod tests {
         assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
     }
 
-    /// Shape P through the real prover at the b4/q43 lane (2^20 × 778 — the
+    /// Shape P through the real prover at the b4/q43 lane (2^20 × 798 — the
     /// ~15 GB class; the local scoped run skips it by name and it was run
     /// once on its own under the lock, see `docs/w3-run3.md`): the honest
     /// instance proves and verifies, then each of `anchor`, `nf₁`, `fee`,

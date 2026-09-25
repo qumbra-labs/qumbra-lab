@@ -12,6 +12,8 @@ publish.workspace = true
 # crate's binding spec (see packing.rs regression locks).
 
 [dependencies]
+# The prover stack (hiding PCS + prover randomness) — one site, the re-mint.
+qlab-consensus = { path = "../qlab-consensus" }
 # The commitment/address packings are cross-checked byte-for-byte against
 # these — never forked (see packing.rs). reference::keccak_f is the semantic
 # authority the disclosure AIR chains against.

@@ -265,6 +265,34 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
     // Lab #506: `--t2 --launch` is the T2 ceremony path — same v5 shape, OS-random
     // committee keys. Without `--launch` the rehearsal constructors are used
     // unchanged (the pin tests are the compat lock).
+    // The security re-mint: `--t2 --remint-from FILE
+    // --remint-expect HASH` carries the live T2 genesis's committee, network
+    // and difficulty into the re-minted table. It writes NO key files — the
+    // hosts keep theirs — and the input is identified by hash, never printed.
+    if let Some(from) = &plan.remint_from {
+        let expect = plan.remint_expect.as_deref().expect("parse pairs --remint-from with --remint-expect");
+        let old = GenesisFile::from_bytes(&std::fs::read(from)?)?;
+        let gf = GenesisFile::remint_t2_from(&old, expect)?;
+        let gpath = plan.out.join("genesis.qmb");
+        gf.write(&gpath)?;
+        let loaded = GenesisFile::load(&gpath)?;
+        let hash = loaded.hash_hex();
+        loaded.verify_startup(Some(&hash))?;
+        println!("qumbra-node genesis init");
+        println!("  network:        {}", gf.network);
+        println!("  format version: {} (re-mint; input format {})", gf.format_version, old.format_version);
+        println!("  mode:           {}", qumbra_node::genesis::REMINT_MODE_BANNER);
+        println!("  input genesis:  {} (matches --remint-expect)", old.hash_hex());
+        println!("  committee:      N={} quorum={} (carried)", gf.frozen.committee_size, gf.frozen.quorum);
+        println!("  difficulty:     {} (carried)", gf.genesis_difficulty);
+        println!("  consensus FRI:  {}", gf.frozen.consensus_fri);
+        println!("  consensus wire: {} B", gf.frozen.consensus_wire_bytes);
+        println!("  genesis file:   {}", gpath.display());
+        println!("  key files:      none written (the hosts keep theirs)");
+        println!("  GENESIS HASH:   {hash}");
+        println!("  self-verify:    OK");
+        return Ok(());
+    }
     let (gf, launch_seeds) = if plan.launch {
         let (gf, seeds) = GenesisFile::new_t2_launch(plan.difficulty);
         (gf, Some(seeds))

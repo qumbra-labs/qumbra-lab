@@ -79,8 +79,11 @@ impl GenesisForm {
     /// history; anything above 5 is a later tree's business).
     pub fn from_genesis_format_version(v: u32) -> Option<GenesisForm> {
         match v {
-            4 => Some(GenesisForm::V4),
-            5 => Some(GenesisForm::V5),
+            // The security re-mint: T1 = 6, T2 = 7. The
+            // pre-re-mint 4 / 5 map to nothing here; the genesis loaders refuse
+            // them by name before asking.
+            6 => Some(GenesisForm::V4),
+            7 => Some(GenesisForm::V5),
             ANNULET_GENESIS_FORMAT_VERSION => Some(GenesisForm::Annulet),
             _ => None,
         }
@@ -89,8 +92,8 @@ impl GenesisForm {
     /// The genesis-file `format_version` this form set is keyed to.
     pub fn genesis_format_version(self) -> u32 {
         match self {
-            GenesisForm::V4 => 4,
-            GenesisForm::V5 => 5,
+            GenesisForm::V4 => 6,
+            GenesisForm::V5 => 7,
             GenesisForm::Annulet => ANNULET_GENESIS_FORMAT_VERSION,
         }
     }
@@ -198,11 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn maps_exactly_v4_v5_and_annulet_and_nothing_else() {
-        assert_eq!(GenesisForm::from_genesis_format_version(4), Some(GenesisForm::V4));
-        assert_eq!(GenesisForm::from_genesis_format_version(5), Some(GenesisForm::V5));
+    fn maps_exactly_the_re_minted_v4_v5_and_annulet_and_nothing_else() {
+        // The security re-mint: T1 = 6, T2 = 7; the
+        // pre-re-mint 4 / 5 map to nothing.
+        assert_eq!(GenesisForm::from_genesis_format_version(6), Some(GenesisForm::V4));
+        assert_eq!(GenesisForm::from_genesis_format_version(7), Some(GenesisForm::V5));
         assert_eq!(GenesisForm::from_genesis_format_version(32), Some(GenesisForm::Annulet));
-        for v in [0u32, 1, 2, 3, 6, 7, 31, 33, u32::MAX] {
+        for v in [0u32, 1, 2, 3, 4, 5, 8, 31, 33, u32::MAX] {
             assert_eq!(GenesisForm::from_genesis_format_version(v), None, "v{v} must not map");
         }
     }

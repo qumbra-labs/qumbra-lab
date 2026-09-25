@@ -132,6 +132,7 @@ fn a_shape_s_spend_proves_against_a_served_registry_witness_and_not_against_a_st
         &[o0.leaf, o5.leaf],
         &[o0.witness, o5.witness],
         root_a,
+        &qlab_air::l2::FeeSlot::Dummy { input: qlab_air::l2::dummy_fee_input(&inputs[0].rho) },
     );
     let (pvs, proof) = qlab_l2::prove_s(&inst);
     assert!(qlab_l2::verify_s(&pvs, &proof), "the served witness proves");
@@ -140,9 +141,9 @@ fn a_shape_s_spend_proves_against_a_served_registry_witness_and_not_against_a_st
     let (_, body_b) = get(addr_b, "/v1/registry/root");
     let (_, root_b) = decode_registry_root(&body_b).unwrap();
     assert_ne!(root_a, root_b);
-    let chunks_b = &pv_vec_l2(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &[0; 4], 0, &root_b)[PV_REGROOT..];
+    let chunks_b = &pv_vec_l2(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &[0; 4], 0, &root_b, &[0; 4])[PV_REGROOT..PV_REGROOT + 16];
     let mut stale = inst.pvs.clone();
-    stale[PV_REGROOT..].copy_from_slice(chunks_b);
+    stale[PV_REGROOT..PV_REGROOT + 16].copy_from_slice(chunks_b);
     assert!(
         !qlab_l2::verify_s(&qlab_l2::public_values(&stale), &proof),
         "the proof is refused against a stale registry root"

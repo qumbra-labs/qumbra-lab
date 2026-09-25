@@ -27,10 +27,10 @@ use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_commit::ExtensionMmcs;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::PrimeCharacteristicRing;
-use p3_fri::{FriParameters, TwoAdicFriPcs};
+use p3_fri::{FriParameters, HidingFriPcs};
 use p3_keccak::{Keccak256Hash, KeccakF};
 use p3_koala_bear::KoalaBear;
-use p3_merkle_tree::MerkleTreeMmcs;
+use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
 use p3_uni_stark::{prove, verify, StarkConfig};
 
@@ -59,21 +59,98 @@ type ByteHash = Keccak256Hash;
 type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
 type FieldHash = SerializingHasher<U64Hash>;
 type MyCompress = CompressionFunctionFromHasher<U64Hash, 2, 4>;
-type ValMmcs = MerkleTreeMmcs<
+/// Field elements of salt per hiding-Merkle leaf: 4 × 31 bits = 124 bits of
+/// salt entropy per leaf (Plonky3's example value; re-derived in the re-mint's
+/// security accounting).
+pub const SALT_ELEMS: usize = 4;
+/// Random codewords `HidingFriPcs` appends to every committed matrix (and to
+/// the quotient chunks) — eprint 2024/1037 §4. Plonky3's example value;
+/// re-derived in the re-mint's security accounting.
+pub const NUM_RANDOM_CODEWORDS: usize = 4;
+
+type ValMmcs = MerkleTreeHidingMmcs<
     [Val; p3_keccak::VECTOR_LEN],
     [u64; p3_keccak::VECTOR_LEN],
     FieldHash,
     MyCompress,
+    ProverRng,
     2,
     4,
+    SALT_ELEMS,
 >;
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 type Challenger = SerializingChallenger32<Val, HashChallenger<u8, ByteHash, 32>>;
 /// The parallel radix-2 DIT DFT used by the FRI PCS.
 pub type Dft = p3_dft::Radix2DitParallel<Val>;
-type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
-/// The complete consensus `StarkConfig` (field, hash, FRI PCS, challenger).
+/// The hiding FRI PCS: the transaction proofs are zero-knowledge.
+type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, ProverRng>;
+/// The complete consensus `StarkConfig` (field, hash, hiding FRI PCS,
+/// challenger).
 pub type Config = StarkConfig<Pcs, Challenge, Challenger>;
+
+/// `1`: the PCS is hiding. A proof's `degree_bits` is the trace's log height
+/// **plus this** (the committed trace is randomized to twice its height), and
+/// the quotient is split into twice the chunks. Locked against the config's
+/// own `is_zk()` by `the_consensus_pcs_is_hiding`.
+pub const IS_ZK: usize = 1;
+
+// ---------------------------------------------------------------------------
+// The prover's randomness
+// ---------------------------------------------------------------------------
+
+/// The one RNG type the proof stack draws its masks, random codewords and
+/// Merkle salts from: ChaCha20, seeded from the operating system.
+///
+/// **Clone reseeds from the OS — it never copies state.** Plonky3's hiding
+/// PCS and MMCS hold their RNG inside the config, and their `Clone` clones
+/// it; with a state-copying RNG, a cloned config would hand two proofs the
+/// same masks and silently void zero knowledge. Making the *type* fork fresh
+/// entropy on every clone turns that hazard from a convention into a
+/// property: a config may be cloned, cached or shared freely.
+#[derive(Debug)]
+pub struct ProverRng(rand::rngs::ChaCha20Rng);
+
+impl ProverRng {
+    /// A fresh generator seeded with 32 bytes from the operating system.
+    pub fn from_os() -> Self {
+        use rand::{SeedableRng, TryRng};
+        let mut seed = [0u8; 32];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut seed)
+            .expect("the operating system's RNG is available");
+        Self(rand::rngs::ChaCha20Rng::from_seed(seed))
+    }
+
+    /// A deterministically seeded generator — **tests only**. A clone of it
+    /// still reseeds from the OS (see the type doc), so determinism holds only
+    /// for the draws the seeded instance itself makes.
+    pub fn seeded(seed: u64) -> Self {
+        use rand::SeedableRng;
+        Self(rand::rngs::ChaCha20Rng::seed_from_u64(seed))
+    }
+}
+
+impl Clone for ProverRng {
+    fn clone(&self) -> Self {
+        Self::from_os()
+    }
+}
+
+impl rand::TryRng for ProverRng {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(rand::Rng::next_u32(&mut self.0))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(rand::Rng::next_u64(&mut self.0))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        rand::Rng::fill_bytes(&mut self.0, dst);
+        Ok(())
+    }
+}
+
+impl rand::TryCryptoRng for ProverRng {}
 
 /// The Merkle cap height baked into the consensus `ValMmcs`
 /// (`ValMmcs::new(.., CAP_HEIGHT)`). Part of the wire: changing it changes the
@@ -149,12 +226,29 @@ pub const LOG_HEIGHT: usize = 18;
 /// Merkle cap height are held at the frozen consensus values; only the FRI
 /// parameters come from `cfg`. Every point must clear the ~100-bit security bar.
 pub fn make_config_with(cfg: &FriCfg) -> Config {
+    make_config_from(cfg, ProverRng::from_os)
+}
+
+/// [`make_config_with`] with deterministically seeded generators — **tests
+/// only** (production configs are always OS-seeded). The three consumers —
+/// the trace MMCS, the FRI MMCS and the PCS — get three distinct seeds.
+pub fn make_config_seeded(cfg: &FriCfg, seed: u64) -> Config {
+    let mut n = 0u64;
+    make_config_from(cfg, || {
+        n += 1;
+        ProverRng::seeded(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(n))
+    })
+}
+
+/// The one construction site. Each randomness consumer gets its **own**
+/// generator from `rng` — never a clone of another's.
+fn make_config_from(cfg: &FriCfg, mut rng: impl FnMut() -> ProverRng) -> Config {
     let byte_hash = ByteHash {};
     let u64_hash = U64Hash::new(KeccakF {});
     let field_hash = FieldHash::new(u64_hash);
     let compress = MyCompress::new(u64_hash);
-    let val_mmcs = ValMmcs::new(field_hash, compress, CAP_HEIGHT);
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let val_mmcs = ValMmcs::new(field_hash, compress.clone(), CAP_HEIGHT, rng());
+    let challenge_mmcs = ChallengeMmcs::new(ValMmcs::new(field_hash, compress, CAP_HEIGHT, rng()));
     let challenger = Challenger::from_hasher(vec![], byte_hash);
 
     let fri_params = FriParameters {
@@ -184,8 +278,53 @@ pub fn make_config_with(cfg: &FriCfg) -> Config {
         fri_params.conjectured_soundness_bits(),
     );
 
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params);
+    let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params, NUM_RANDOM_CODEWORDS, rng());
     Config::new(pcs, challenger)
+}
+
+/// **Legacy, non-hiding** — the pre-re-mint `TwoAdicFriPcs` stack, kept for
+/// exactly one consumer: the M4 aggregation bench (`qlab-bench` `m4*`), whose
+/// in-circuit recorder and gate AIR verify the non-hiding FRI proof shape.
+/// Rung-1 aggregation is **re-gated** by the re-mint: it measures aggregating
+/// proofs the network no longer produces, until it is extended to the hiding
+/// shape (a named post-re-mint milestone). Nothing that proves or verifies a
+/// transaction may use this module.
+pub mod legacy {
+    use super::*;
+    use p3_fri::TwoAdicFriPcs;
+    use p3_merkle_tree::MerkleTreeMmcs;
+
+    type LegacyValMmcs = MerkleTreeMmcs<
+        [Val; p3_keccak::VECTOR_LEN],
+        [u64; p3_keccak::VECTOR_LEN],
+        FieldHash,
+        MyCompress,
+        2,
+        4,
+    >;
+    type LegacyChallengeMmcs = ExtensionMmcs<Val, Challenge, LegacyValMmcs>;
+    type LegacyPcs = TwoAdicFriPcs<Val, Dft, LegacyValMmcs, LegacyChallengeMmcs>;
+    /// The pre-re-mint config (non-hiding).
+    pub type LegacyNonHidingConfig = StarkConfig<LegacyPcs, Challenge, Challenger>;
+
+    /// The pre-re-mint `make_config_with`, byte-for-byte.
+    pub fn make_legacy_config_with(cfg: &FriCfg) -> LegacyNonHidingConfig {
+        let u64_hash = U64Hash::new(KeccakF {});
+        let val_mmcs = LegacyValMmcs::new(FieldHash::new(u64_hash), MyCompress::new(u64_hash), CAP_HEIGHT);
+        let challenge_mmcs = LegacyChallengeMmcs::new(val_mmcs.clone());
+        let fri_params = FriParameters {
+            log_blowup: cfg.log_blowup,
+            log_final_poly_len: cfg.log_final_poly_len,
+            max_log_arity: cfg.max_log_arity,
+            num_queries: cfg.num_queries,
+            commit_proof_of_work_bits: 0,
+            query_proof_of_work_bits: cfg.grind_bits,
+            mmcs: challenge_mmcs,
+        };
+        assert!(fri_params.conjectured_soundness_bits() >= 100, "config {} below the floor", cfg.label());
+        let pcs = LegacyPcs::new(Dft::default(), val_mmcs, fri_params);
+        LegacyNonHidingConfig::new(pcs, Challenger::from_hasher(vec![], ByteHash {}))
+    }
 }
 
 /// The consensus config — `make_config_with(&CONSENSUS_CFG)`. This is the config
@@ -274,7 +413,23 @@ mod tests {
     /// The 116 B line holds only because the quotient degree does not move,
     /// which `q69_quotient_degree_does_not_move` asserts off Plonky3's own
     /// symbolic evaluation.
-    const WIRE_BYTES: usize = 148_625;
+    ///
+    /// **The re-mint (hiding PCS) moves it**: the committed trace doubles in
+    /// height, the quotient splits into twice the chunks, every matrix gains
+    /// random codewords and every Merkle leaf a salt. **182,745 B**, measured
+    /// on the Graviton acceptance lane: both readers
+    /// (`consensus_wire_is_pinned`, `q69_…`) measured it identically, and proof
+    /// bytes are deterministic across machines. Over the design's ≤ 150 KB
+    /// target — a design question, not this pin's. The genesis-side
+    /// `CONSENSUS_WIRE_BYTES` stays 148,625 until the genesis is re-minted.
+    const WIRE_BYTES: Option<usize> = Some(182_745);
+
+    fn assert_wire(bytes: usize, what: &str) {
+        match WIRE_BYTES {
+            Some(pin) => assert_eq!(bytes, pin, "{what}"),
+            None => panic!("{what}: WIRE_BYTES is PENDING the re-mint's rig measurement — measured {bytes} B"),
+        }
+    }
 
     /// The consensus wire is byte-identical at **148,625 B**, a permanent
     /// single-source regression pin. bincode fixint
@@ -282,17 +437,14 @@ mod tests {
     /// of the AIR shape + config only, so it is instance-independent (the grind
     /// nonce is a fixed-width field).
     #[test]
-    fn consensus_wire_is_148625_bytes() {
+    fn consensus_wire_is_pinned() {
         let inst = balanced_bucket();
         let (pvs, proof) = prove_bucket(&inst);
         assert!(verify_proof(&inst, &pvs, &proof));
         let bytes = bincode::serialize(&proof)
             .expect("bincode serialization failed")
             .len();
-        assert_eq!(
-            bytes, WIRE_BYTES,
-            "consensus wire — issue #215 (i) + #219, measured on one tree"
-        );
+        assert_wire(bytes, "consensus wire, measured on one tree");
     }
 
     // -----------------------------------------------------------------------
@@ -368,7 +520,7 @@ mod tests {
             "a dummy proof must not be distinguishable by size"
         );
         // The absolute lives in `WIRE_BYTES`, not here — see its note.
-        assert_eq!(d_bytes, WIRE_BYTES, "the minted wire");
+        assert_wire(d_bytes, "the minted wire");
     }
 
     /// The verifier binds the dummy instance to its declared surface exactly as
@@ -387,5 +539,58 @@ mod tests {
             !verify_proof(&dummy, &tampered, &proof),
             "a rewritten dummy nullifier must be refused by the real verifier"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The re-mint: the PCS is hiding, and its randomness is never shared.
+    // -----------------------------------------------------------------------
+
+    /// The config's own `is_zk()` is [`IS_ZK`] = 1.
+    #[test]
+    fn the_consensus_pcs_is_hiding() {
+        use p3_uni_stark::StarkGenericConfig;
+        assert_eq!(make_config().is_zk(), IS_ZK);
+        assert_eq!(IS_ZK, 1);
+        assert!(make_config_seeded(&CONSENSUS_CFG, 1).is_zk() == 1);
+    }
+
+    /// `ProverRng`: a seed reproduces its own stream; a CLONE does not
+    /// continue it — it reseeds from the OS, so two clones never share masks.
+    #[test]
+    fn prover_rng_clones_reseed_rather_than_copy() {
+        use rand::Rng;
+        let draw = |r: &mut ProverRng| (0..4).map(|_| r.next_u64()).collect::<Vec<_>>();
+        let (mut a, mut b) = (ProverRng::seeded(7), ProverRng::seeded(7));
+        assert_eq!(draw(&mut a), draw(&mut b), "a seed reproduces its stream");
+        let mut a2 = a.clone();
+        assert_ne!(draw(&mut a), draw(&mut a2), "a clone must not continue the parent's stream");
+        let (mut o1, mut o2) = (ProverRng::from_os(), ProverRng::from_os());
+        assert_ne!(draw(&mut o1), draw(&mut o2), "two OS-seeded generators differ");
+    }
+
+    /// Zero knowledge is live: two proofs of the SAME witness — from one
+    /// config, from a clone of it, and from a second config — are pairwise
+    /// different and all verify. A chain-only trace at 2^13 under the
+    /// consensus FRI point keeps this cheap while exercising the real PCS.
+    #[test]
+    fn two_proofs_of_one_witness_differ_and_both_verify() {
+        use qlab_air::narrow::NarrowKeccakAir;
+        let air = NarrowKeccakAir::chain_only(13);
+        let pvs = vec![Val::ZERO; <NarrowKeccakAir as p3_air::BaseAir<Val>>::num_public_values(&air)];
+        let prove_with = |config: &Config| {
+            let trace = air.generate_trace::<Val>(CONSENSUS_CFG.log_blowup);
+            let proof = prove(config, &air, trace, &pvs);
+            assert!(verify(&make_config(), &air, &proof, &pvs).is_ok(), "a hiding proof verifies");
+            bincode::serialize(&proof).expect("bincode")
+        };
+        let config = make_config();
+        let p1 = prove_with(&config);
+        let p2 = prove_with(&config);
+        let p3 = prove_with(&config.clone());
+        let p4 = prove_with(&make_config());
+        assert_eq!(p1.len(), p2.len(), "same shape, same size");
+        for (i, (x, y)) in [(&p1, &p2), (&p1, &p3), (&p2, &p3), (&p1, &p4)].iter().enumerate() {
+            assert_ne!(x, y, "pair {i}: two proofs of one witness must differ");
+        }
     }
 }

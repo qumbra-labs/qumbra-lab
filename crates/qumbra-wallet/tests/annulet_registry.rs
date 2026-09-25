@@ -159,9 +159,9 @@ fn register_update_freeze_rotate_and_change_mode_at_runtime() {
     assert_eq!(follower.registry(u64::from(USDT)).unwrap().leaf.freeze_root, CanonicalFreezeTree::from_keys(&keys).root);
     let to_h = h.wallet().address_at_index(0);
     let wait = Duration::from_secs(60);
-    let refused = send_annulet(&f, at(1), USDT, 10, &to_h, v[1].state_tip, pin, &keys, wait, &mut rng);
+    let refused = send_annulet(&f, at(1), USDT, 10, &to_h, v[1].state_tip, pin, &keys, wait, &mut |_| true, &mut rng);
     assert!(matches!(refused, Err(SendRefusal::Spend(SpendError::Frozen { asset: 2 }))), "{:?}", refused.err());
-    let stale = send_annulet(&f, at(1), USDT, 10, &to_h, v[1].state_tip, pin, &[], wait, &mut rng);
+    let stale = send_annulet(&f, at(1), USDT, 10, &to_h, v[1].state_tip, pin, &[], wait, &mut |_| true, &mut rng);
     assert!(
         matches!(stale, Err(SendRefusal::Spend(SpendError::FreezeListStale { asset: 2 }))),
         "the pre-freeze list no longer rebuilds the served root: {:?}",
@@ -261,15 +261,15 @@ fn a_runtime_asset_is_minted_on_its_seed_and_moves_between_holders() {
     assert!(mint.split_fee_note.is_none(), "the genesis fee note was exact");
     assert!(mint.rearmed, "the mint returns the seed's row to the issuer: re-armed");
     assert_eq!((mint.outputs[1].asset, mint.outputs[1].value), (u64::from(NEW), 0));
-    let v = net.settle_spends(3, "the mint");
+    let v = net.settle_spends(4, "the mint");
     let docs = attested("the mint");
     assert!(v.iter().all(|x| supply(x) == 1_000), "{v:?}");
     assert!(docs.iter().all(|d| outstanding(d) == "1000"), "/v1/attest states 1,000 on every node");
 
     // 3. H sends 400 to K: a P spend of the new asset between non-issuers.
     let to_k = k.wallet().address_at_index(0);
-    send_annulet(&h, at(2), NEW, 400, &to_k, v[2].state_tip, pin, &[], wait, &mut rng).expect("H pays K in asset 21");
-    let v = net.settle_spends(5, "H → K");
+    send_annulet(&h, at(2), NEW, 400, &to_k, v[2].state_tip, pin, &[], wait, &mut |_| true, &mut rng).expect("H pays K in asset 21");
+    let v = net.settle_spends(7, "H → K");
     let docs = attested("H → K");
     assert!(v.iter().all(|x| supply(x) == 1_000) && docs.iter().all(|d| outstanding(d) == "1000"), "a transfer issues nothing");
     let ks = qumbra_wallet::annulet_send::open_session(&k, at(1), v[1].state_tip, pin, &mut rng).expect("K scans");

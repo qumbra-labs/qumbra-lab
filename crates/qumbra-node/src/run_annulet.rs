@@ -501,7 +501,7 @@ mod tests {
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: state.commitment_root(),
-                nullifiers: vec![[0x71; 32], [0x72; 32]],
+                nullifiers: vec![[0x71; 32], [0x72; 32], [0x73; 32]],
                 commitments: notes.iter().map(|n| qlab_note::hash::digest_bytes(&n.commitment())).collect(),
                 bucket: ArityBucket::TwoByTwo,
                 fee: genesis.params.fee_tier_s,

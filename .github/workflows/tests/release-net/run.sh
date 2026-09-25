@@ -35,8 +35,8 @@ else
   FAIL=$((FAIL + 1)); echo "  FAIL keccak256(abc) — got $ABC_GOT want $ABC_WANT"
 fi
 
-T1=138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
-T2=d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3
+T1=82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af
+T2=dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5
 
 # The refusal this file exists for. Today (pre-cutover) the published file
 # hashes to T1; a T2 dispatch must die on this sentence, not on a generic mismatch.
