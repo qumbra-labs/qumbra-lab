@@ -59,13 +59,26 @@ on:
       - "Cargo.lock"
   # The first live calibration run (S6) arrives here, on main.
   workflow_dispatch:
+    inputs:
+      run:
+        description: "suite (the bar), pilot (the L2-E1 scenario), or both"
+        type: choice
+        options: [suite, pilot, both]
+        default: suite
 
 concurrency:
   # Per PR, superseded runs are cancelled because their answer is about a tree
   # nobody will merge. Cancellation does not bypass the stop job: `if: always()`
   # runs on a cancelled run too, and its check sees the superseding run as
   # active, so the iron stays up for it.
-  group: acceptance-graviton-${{ github.event.pull_request.number || github.ref }}
+  #
+  # THE LABEL IS PART OF THE GROUP (lab #740). `types: [labeled]` fires for
+  # ANY label, and with a per-PR group every label event cancelled the PR's
+  # running suite — harmless while one label meant one run, fatal once
+  # `verify-pilot` is applied beside `verify-graviton`. Keyed by label, the two
+  # runs coexist, re-applying either label still supersedes its own run, and
+  # an unrelated label lands in a group of its own whose jobs all skip.
+  group: acceptance-graviton-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || inputs.run || 'dispatch' }}
   cancel-in-progress: true
 
 # Deny-all at the top; each job states its own whole grant.
@@ -77,7 +90,8 @@ jobs:
   start:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.label.name == 'verify-graviton'
+      github.event.label.name == 'verify-graviton' ||
+      github.event.label.name == 'verify-pilot'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -150,6 +164,10 @@ jobs:
   # ── job B ── the bar on the self-hosted Graviton rig.
   suite:
     needs: start
+    # Not on a `verify-pilot` run: that label asks for the pilot alone.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.run != 'pilot') ||
+      github.event.label.name == 'verify-graviton'
     runs-on: [self-hosted, graviton-rig]
     timeout-minutes: 120      # beyond this it is not viable as the bar
     permissions:
@@ -243,9 +261,95 @@ jobs:
             suite.exit
           retention-days: 14
 
+  # ── job B′ ── the L2-E1 stablecoin pilot (lab #740): `annulet_pilot`, one
+  # named scenario on the three-node devnet harness — 2 R + 11 P + 1 S proves
+  # under the hiding PCS, ~12 lane-min. Too heavy for the suite's 100-min
+  # target, so it is its own run behind the `pilot` cargo feature — NOT
+  # `#[ignore]` (the prefilter compiles it on every PR, so it cannot rot).
+  #
+  # WHEN IT RUNS: at E1 acceptance, and before any release that changes an L2
+  # surface (the wallet's annulet verbs, the Annulet node, the L2 AIRs). A PR
+  # touching those carries BOTH labels.
+  #
+  # IT LIVES IN THIS WORKFLOW ON PURPOSE: start/stop count only this
+  # workflow's runs (see the stop job's 🔴 note), so a pilot in a second
+  # workflow would be a second rig user the stop guard cannot see.
+  #
+  # Its artifact is the evidence: `pilot.jsonl` (one JSON line per step,
+  # written by the test) is what `scripts/annulet-pilot-render.py` turns into
+  # the EN/ZH evidence pack; `pilot.log` is the stamped console the R prove
+  # times are read from.
+  pilot:
+    needs: start
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.run != 'suite') ||
+      github.event.label.name == 'verify-pilot'
+    runs-on: [self-hosted, graviton-rig]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Persistent target dir (shared with the suite job)
+        run: |
+          echo "CARGO_TARGET_DIR=$HOME/.cache/qumbra-lab-target" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.cache/qumbra-lab-target"
+
+      - name: Provenance
+        run: |
+          echo "commit   $(git rev-parse HEAD)"
+          echo "run      ${{ github.run_id }}"
+          uname -m; nproc; free -g | head -2
+          rustc --version; cargo --version
+
+      # `--nocapture` so the test's PILOT lines (per-step wall time, the R
+      # prove+submit times, the node's refusal) reach the stamped console.
+      # pilot.log is the stamped copy — the timing record; pilot.jsonl is the
+      # test's own evidence and carries no console timestamps.
+      - name: The pilot scenario
+        env:
+          PILOT_EVIDENCE_OUT: ${{ github.workspace }}/pilot.jsonl
+        run: |
+          set -o pipefail
+          rc=0
+          /usr/bin/time -v cargo test --release -p qumbra-wallet --features pilot --locked \
+            --test annulet_pilot -- --test-threads=1 --nocapture 2>&1 \
+            | awk '{ print strftime("[%H:%M:%S]"), $0; fflush() }' | tee pilot.log || rc=$?
+          echo "$rc" > pilot.exit
+          exit "$rc"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### L2-E1 pilot — run ${{ github.run_id }} @ $(git rev-parse --short HEAD)"
+            echo
+            echo "exit: $(cat pilot.exit 2>/dev/null || echo 'MISSING — the step was cut off')"
+            echo "evidence lines: $(wc -l < pilot.jsonl 2>/dev/null || echo 0)"
+            echo
+            echo '```'
+            grep -h 'PILOT \|test result' pilot.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pilot-evidence
+          path: |
+            pilot.jsonl
+            pilot.log
+            pilot.exit
+          retention-days: 90
+
   # ── job C ── park the instance, unless someone else is using the lane.
   stop:
-    needs: [start, suite]
+    needs: [start, suite, pilot]
     # `always()` so a failed or cancelled suite still parks the iron — but
     # re-gated on the same label condition as `start` (`types: [labeled]`
     # fires for ANY label, and a skipped start must not leave an always()
@@ -255,7 +359,8 @@ jobs:
     if: >-
       always() &&
       (github.event_name == 'workflow_dispatch' ||
-       github.event.label.name == 'verify-graviton') &&
+       github.event.label.name == 'verify-graviton' ||
+       github.event.label.name == 'verify-pilot') &&
       vars.CI_RUNNER_INSTANCE_ID != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
