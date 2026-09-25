@@ -4,6 +4,9 @@
 //! **without moving a statement**: same AIRs, same widths, same tamper list;
 //! only the cost model of *asserting* changes.
 //!
+//! Also compiled for other crates' tests behind the `test-support` feature:
+//! lab #742 moved `qlab-bench`'s M4 gate block onto the same scanner.
+//!
 //! Three facts from the timed-out lane run (35812033360, stamped console)
 //! decided the shape of this module:
 //!
