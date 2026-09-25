@@ -12,9 +12,11 @@ Needs `jq`. No docker, no network, no registry credential, no CI minutes — it 
 
 ## Why an offline test and not just a CI run
 
-The step it covers lives in the `image` job, which runs only on the paid
-`qumbra-arm64-8` runner (~$0.7/run against a $20/month cap,
-`docs/ci-runner-cost-decision.md` §4) and only after a full build+push. So the
+The step it covers lives in the `image` job, which runs only after a full
+build+push. (At the time it ran only on the paid `qumbra-arm64-8` runner, ~$0.7/run
+against a $20/month cap, `docs/ci-runner-cost-decision.md` §4; as of 2026-09-25 the org
+is on the free plan and the job runs on the standard hosted `ubuntu-24.04-arm`,
+free for this public repo — the offline test still avoids a real push.) So the
 step can be exercised *only* by spending the thing the workflow header exists to
 ration. Lab #428 — the bug these fixtures pin — was a readback that reported red
 after a genuinely-good, correctly-labelled publish; testing its fix by spending

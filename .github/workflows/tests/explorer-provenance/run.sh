@@ -2,12 +2,14 @@
 # Offline validation for the "Read the provenance back from the registry" step
 # of .github/workflows/explorer-image.yml.
 #
-# WHY THIS EXISTS: that step can only run on the PAID `qumbra-arm64-8` runner,
-# after a build+push that costs ~$0.7 against a $20/month cap. Its bug (lab
+# WHY THIS EXISTS: that step runs only in the `image` job (the hosted arm64
+# runner, `ubuntu-24.04-arm`; the paid `qumbra-arm64-8` until 2026-09-25), after a
+# full build+push. Its bug (lab
 # #428) was a readback that reported red on a genuinely-good, correctly-labelled
-# publish. Spending a paid run to test the fix for a step that only ever runs
-# after a paid run is the wrong trade, so the parsing and the assertion are
-# validated here instead, against captured `imagetools inspect` output.
+# publish. Testing the fix by pushing a real image (a build + a registry write)
+# for a step that only ever runs after one is the wrong trade, so the parsing and
+# the assertion are validated here instead, against captured `imagetools inspect`
+# output.
 #
 # NOT WIRED INTO ANY WORKFLOW. It costs nothing until a human runs it:
 #

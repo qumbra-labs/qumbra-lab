@@ -13,14 +13,12 @@
 #
 #   drift   free, runs often: "is the newest CI-PUBLISHED fleet image current
 #           with the consensus-affecting code?" Fails loudly when it is not.
-#   image   removes the "build it by hand from a laptop" step. Runs on the PAID
-#           `qumbra-arm64-8` (docs/ci-runner-cost-decision.md §4: measured
-#           ≈$0.014/min against a $20/month cap with stop-usage on; PR #191's
-#           "~$0.7/run" was the pre-measurement estimate for the 35-min suite —
-#           an image build is one release build of two leaf crates plus four
-#           leaf-feature recompiles, so expect the same order). It is
-#           `workflow_dispatch` ONLY and gated on typing `confirm=build`; this
-#           file must not become a second recurring charge on that runner.
+#   image   removes the "build it by hand from a laptop" step. Runs on the
+#           standard hosted `ubuntu-24.04-arm` (4 vCPU; free because this repo is public — the
+#           org is on the free plan as of 2026-09-25, where the paid `qumbra-arm64-8` larger
+#           runner can no longer be scheduled; it sat queued, never started). It stays
+#           `workflow_dispatch` ONLY and gated on typing `confirm=build`: an image
+#           build is a deliberate act, whatever the runner costs.
 #
 # WHAT `drift` CANNOT SEE, so nobody reads more into a green tick: it compares
 # the newest CI-published image against this repo. It cannot reach the fleet
@@ -204,7 +202,7 @@ jobs:
     # Manual only. The runner is charged per minute and its trigger was narrowed
     # for that reason; see the header.
     if: github.event_name == 'workflow_dispatch' && inputs.confirm == 'build'
-    runs-on: qumbra-arm64-8
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
