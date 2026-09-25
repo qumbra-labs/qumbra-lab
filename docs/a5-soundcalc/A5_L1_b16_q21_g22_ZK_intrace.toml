@@ -1,0 +1,26 @@
+# A5 stage 0 (lab issue: hiding-cost levers) — one lever variant per file.
+# Lever 4b on L1: in-trace masking (no 2N commit). Parameters only; ZK not modeled.
+# Modeling convention = docs/remint-zk-soundcalc-input.toml: soundcalc (rev 809896fb)
+# has no ZK model; ZK enters as trace committed at 2N (unless noted), AIR degree d+1,
+# committed width + NUM_RANDOM_CODEWORDS. Quotient chunks and the randomizer
+# matrix are NOT in batch_size (same convention as the re-mint record).
+[zkevm]
+name = "QumbraA5"
+protocol_family = "FRI_STARK"
+field = "KoalaBear^4"
+hash_size_bits = 256
+
+[[circuits]]
+name = "A5_L1_b16_q21_g22_ZK_intrace"
+rho = 0.0625
+trace_length = 262144    # 2^18 (NOT doubled: in-trace masking)
+air_max_degree = 5             # d = 4, + is_zk
+num_columns = 647
+num_constraints = 938
+batch_size = 647               # width + 4 random codewords
+opening_points = 2
+power_batching = true
+num_queries = 21
+fri_folding_factors = [16, 16, 16, 4]   # 2^22 -> 2^8
+fri_early_stop_degree = 256
+grinding_query_phase = 22
