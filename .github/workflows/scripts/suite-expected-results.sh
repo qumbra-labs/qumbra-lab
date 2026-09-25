@@ -42,13 +42,21 @@ dir="${1:-.}"
 command -v cargo >/dev/null 2>&1 || { echo "suite-expected-results: cargo not on PATH" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "suite-expected-results: python3 not on PATH (needed to read cargo metadata's JSON)" >&2; exit 2; }
 
-meta=$(cd "$dir" && cargo metadata --no-deps --offline --format-version 1 2>/dev/null) \
+# The metadata goes to python through a FILE, never argv: Linux caps a single
+# argument at MAX_ARG_STRLEN (128 KiB), and this workspace's `cargo metadata
+# --no-deps` JSON is ~126 KB with short local paths — longer on a runner, whose
+# absolute paths are repeated per target. Past the cap, exec fails with
+# "Argument list too long" and the denominator is lost.
+meta=$(mktemp) || { echo "suite-expected-results: mktemp failed" >&2; exit 2; }
+trap 'rm -f "$meta"' EXIT
+(cd "$dir" && cargo metadata --no-deps --offline --format-version 1 2>/dev/null) >"$meta" \
   || { echo "suite-expected-results: cargo metadata --no-deps failed in $dir" >&2; exit 2; }
 
 python3 - "$meta" <<'PY'
 import json, sys
 
-m = json.loads(sys.argv[1])
+with open(sys.argv[1]) as f:
+    m = json.load(f)
 members = set(m["workspace_members"])
 binaries = 0
 doctests = 0

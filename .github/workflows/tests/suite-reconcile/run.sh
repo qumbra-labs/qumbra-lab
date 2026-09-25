@@ -233,6 +233,18 @@ T
     FAIL=$((FAIL + 1)); echo "FAIL [derive] did not name the skipped bin"; sed 's/^/      | /' "$TMP/derive.err"; fi
   if grep -q '^suite-expected-results: 5 test binaries + 3 doc-test sets$' "$TMP/derive.err"; then PASS=$((PASS + 1)); else
     FAIL=$((FAIL + 1)); echo "FAIL [derive] wanted '5 test binaries + 3 doc-test sets'"; sed 's/^/      | /' "$TMP/derive.err"; fi
+  # Metadata past Linux's 128 KiB single-argument cap (MAX_ARG_STRLEN): a
+  # 200 KB package description. Handing the JSON to python as ONE argv string
+  # fails with "Argument list too long" and loses the denominator.
+  B="$TMP/bigmeta"; mkdir -p "$B/big/src"
+  printf '[workspace]\nmembers = ["big"]\nresolver = "2"\n' > "$B/Cargo.toml"
+  { printf '[package]\nname = "big"\nversion = "0.0.0"\nedition = "2021"\ndescription = "'
+    head -c 200000 /dev/zero | tr '\0' x
+    printf '"\n\n[lib]\ntest = false\n'; } > "$B/big/Cargo.toml"
+  : > "$B/big/src/lib.rs"
+  got=$(bash "$EXPECT" "$B" 2> "$TMP/bigmeta.err"); rc=$?
+  if [ "$rc" = 0 ] && [ "$got" = 1 ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); echo "FAIL [derive] metadata > 128 KiB: wanted 1 (rc 0), got '$got' (rc $rc)"; sed 's/^/      | /' "$TMP/bigmeta.err"; fi
   # No manifest ⇒ non-zero and a named reason, never a number.
   if out=$(bash "$EXPECT" "$TMP" 2>&1); then FAIL=$((FAIL + 1)); echo "FAIL [derive] printed '$out' for a directory with no manifest"; else PASS=$((PASS + 1)); fi
 else
