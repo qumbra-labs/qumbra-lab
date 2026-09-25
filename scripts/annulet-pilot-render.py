@@ -60,7 +60,7 @@ T = {
         "p5": "Minted 750 − redeemed 150 = 600; F's 150 is frozen but still outstanding.",
         "s6": "Timings",
         "p6": "R prove + submit, measured around the wallet verb (neither waits for inclusion): "
-        "register **{r1:.1} s**, freeze **{r2:.1} s**. Per-step wall time is in the steps table "
+        "register **{r1:.1f} s**, freeze **{r2:.1f} s**. Per-step wall time is in the steps table "
         "(proves, submits and settle waits together). The job's stamped console (`pilot.log` in the "
         "same artifact) carries the same lines with wall-clock stamps.",
     },
@@ -95,7 +95,7 @@ T = {
         "names": {"A": "A", "B": "B", "F_frozen": "F(已冻结)", "issuer": "发行方 I", "outstanding": "**流通量**"},
         "p5": "铸造 750 − 赎回 150 = 600;F 的 150 被冻结,但仍计入流通量。",
         "s6": "耗时",
-        "p6": "R 的证明加提交时间,在钱包命令外围计时(两者都不等上链):注册 **{r1:.1} s**,冻结 **{r2:.1} s**。"
+        "p6": "R 的证明加提交时间,在钱包命令外围计时(两者都不等上链):注册 **{r1:.1f} s**,冻结 **{r2:.1f} s**。"
         "每步耗时见步骤表(证明、提交和等待上链合计)。同一产物里的 `pilot.log` 是任务的带时间戳控制台,"
         "有同样的行和挂钟时间。",
     },
