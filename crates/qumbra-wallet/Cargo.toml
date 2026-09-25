@@ -101,6 +101,11 @@ serde_json = { version = "1", optional = true }
 # nodeless (the brief's A2 rejection); nothing below enters the library's
 # dependency graph. (`qlab-node` is NOT repeated here: it is a real dependency
 # above, for the served wires' codecs.)
+[[test]]
+name = "annulet_pilot"
+path = "tests/annulet_pilot.rs"
+required-features = ["pilot"]
+
 [dev-dependencies]
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
@@ -133,3 +138,8 @@ randomx = ["qlab-devnet/randomx", "qlab-node/randomx"]
 # the native-messaging prover host (lab #400 rung): prove + submit behind a
 # framed stdio pipe. In default so `cargo test` builds and exercises the bin.
 host = ["net", "prove", "dep:serde_json"]
+# L2-E1 (lab #740): the stablecoin pilot scenario (2 R + 11 P + 1 S proves,
+# ~12 lane-min under the hiding PCS) — too heavy for the suite's 100-min
+# target, so it is its own named run (`verify-pilot`), NOT `#[ignore]`: the
+# prefilter compiles it on every PR (`cargo check --features pilot --tests`).
+pilot = ["host"]

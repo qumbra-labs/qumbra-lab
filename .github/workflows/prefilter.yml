@@ -72,6 +72,13 @@ jobs:
       - name: cargo check --workspace --all-targets
         run: cargo check --workspace --all-targets --locked
 
+      # lab #740: the L2-E1 pilot scenario sits behind `--features pilot` so the
+      # workspace suite does not compile it (it runs as its own `verify-pilot`
+      # job on the Graviton lane). The step above therefore never sees it; this
+      # one does, so the pilot cannot rot between the runs that execute it.
+      - name: the pilot scenario compiles (--features pilot)
+        run: cargo check -p qumbra-wallet --features pilot --tests --locked
+
       # lab #400: the wallet core + the ffi kernel must stay wasm32-clean — the
       # browser shell builds from exactly this graph, and the last time a wasm
       # enablement lived only on a branch it silently rotted for nine days
