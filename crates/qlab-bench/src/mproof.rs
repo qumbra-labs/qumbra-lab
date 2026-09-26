@@ -170,63 +170,173 @@ pub(crate) fn decode(bytes: &[u8]) -> Proof<Config> {
     proof
 }
 
-pub(crate) fn run_mproof(power: &str, case: &str) {
-    println!("# qumbra-lab mproof — Merkle multi-proof codec prototype, case `{case}` (lab #742 4c)");
+/// Sibling digests of every tree, indexed `[query][level]`, in query order.
+fn sibling_table(proof: &Proof<Config>) -> Vec<(Tree, Vec<Vec<Digest>>)> {
+    let mut copy: Proof<Config> = bincode::deserialize(&bincode_fixint(proof)).expect("round-trip");
+    let mut trees: Vec<(Tree, Vec<Vec<Digest>>)> = Vec::new();
+    for (tree, path) in paths_mut(&mut copy) {
+        let row = std::mem::take(path);
+        match trees.iter_mut().find(|(t, _)| *t == tree) {
+            Some((_, rows)) => rows.push(row),
+            None => trees.push((tree, vec![row])),
+        }
+    }
+    trees
+}
+
+/// What the HASHING variant would additionally drop, read off the proof
+/// without hashing anything. Two queries' siblings at level `l` are equal
+/// iff the queries share their level-`l` ancestor (digests are
+/// collision-free), so grouping queries by their level-`l+1` sibling groups
+/// them by level-`(l+1)` ancestor. Inside one group the level-`l` siblings
+/// take one value (every member on the same side) or two (members on both
+/// sides) — and in the two-valued case each side's sibling IS the other
+/// side's path node, which a hashing decoder recomputes from that query's
+/// leaf. Those two digests (each sent once today as a literal) go.
+/// The top level (whose ancestor is a cap entry, not in the path) is not
+/// counted, so this is a lower bound.
+fn hashing_extra_digests(trees: &[(Tree, Vec<Vec<Digest>>)]) -> usize {
+    let mut extra = 0;
+    for (_, rows) in trees {
+        let depth = rows.iter().map(Vec::len).min().unwrap_or(0);
+        for l in 0..depth.saturating_sub(1) {
+            let mut groups: HashMap<Digest, Vec<Digest>> = HashMap::new();
+            for r in rows {
+                let g = groups.entry(r[l + 1]).or_default();
+                if !g.contains(&r[l]) {
+                    g.push(r[l]);
+                }
+            }
+            extra += groups.values().filter(|v| v.len() == 2).map(|_| 2).sum::<usize>();
+        }
+    }
+    extra
+}
+
+/// The hash-free codec's saving if the query positions were as spread out as
+/// the tree allows — the floor any padding scheme must pad to. At a level
+/// with `n` distinct nodes, `q` paths repeat at least `q − n` siblings; with a
+/// cap of `2^c` the highest path level has `2^(c+1)` nodes, the next `2^(c+2)`…
+/// Saving = 32·dups − one tag per sibling − one length byte per path − 4.
+fn worst_case_saving(trees: &[(Tree, Vec<Vec<Digest>>)]) -> i64 {
+    let cap = qlab_consensus::CAP_HEIGHT;
+    let (mut dups, mut sibs, mut paths) = (0i64, 0i64, 0i64);
+    for (_, rows) in trees {
+        let q = rows.len() as i64;
+        let depth = rows.iter().map(Vec::len).min().unwrap_or(0);
+        paths += q;
+        sibs += rows.iter().map(|r| r.len() as i64).sum::<i64>();
+        for l in 0..depth {
+            // level l (0 = leaf siblings) has 2^(depth + cap − l) nodes.
+            let nodes = 1i64.checked_shl((depth + cap - l) as u32).unwrap_or(i64::MAX);
+            dups += (q - nodes).max(0);
+        }
+    }
+    32 * dups - sibs - paths - 4
+}
+
+/// One proof's row.
+struct Row {
+    raw: usize,
+    coded: usize,
+    siblings: usize,
+    literals: usize,
+    hash_extra: usize,
+    enc_ms: f64,
+    dec_ms: f64,
+}
+
+pub(crate) fn run_mproof(power: &str, case: &str, count: usize) {
+    println!("# qumbra-lab mproof — Merkle multi-proof codec prototype, case `{case}`, {count} proof(s) (lab #742 4c)");
     println!();
     crate::print_env(power);
-    let t = Instant::now();
-    // (label, proof, verify-the-decoded-proof)
-    let (label, proof, verify): (String, Proof<Config>, Verify) = match case {
+    // One instance per case; every prove draws fresh OS randomness (hiding),
+    // so every proof has fresh Fiat–Shamir query positions.
+    let (label, prove, verify): (String, Box<dyn Fn() -> Proof<Config>>, Verify) = match case {
         "l1" => {
             let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
-            let (pvs, proof) = qlab_consensus::prove_bucket(&inst);
+            let inst = std::rc::Rc::new(inst);
+            let (pvs, _) = qlab_consensus::prove_bucket(&inst);
             let label = format!("L1 2×2 bucket @ {}", qlab_consensus::CONSENSUS_CFG.label());
-            (label, proof, Box::new(move |p: &Proof<Config>| qlab_consensus::verify_proof(&inst, &pvs, p)))
+            let i2 = inst.clone();
+            (
+                label,
+                Box::new(move || qlab_consensus::prove_bucket(&inst).1),
+                Box::new(move |p: &Proof<Config>| qlab_consensus::verify_proof(&i2, &pvs, p)),
+            )
         }
         "s3" => {
             let inst = qlab_l2::fixture::shape_s();
-            let (pvs, proof) = qlab_l2::prove_s(&inst);
+            let pvs = qlab_l2::prove_s(&inst).0;
             let label = format!("shape S3 @ {}", qlab_l2::L2_CFG_PROVISIONAL.label());
-            (label, proof, Box::new(move |p: &Proof<Config>| qlab_l2::verify_s(&pvs, p)))
+            (label, Box::new(move || qlab_l2::prove_s(&inst).1), Box::new(move |p: &Proof<Config>| qlab_l2::verify_s(&pvs, p)))
         }
         "p3" => {
             let inst = qlab_l2::fixture::shape_p();
-            let (pvs, proof) = qlab_l2::prove_p(&inst);
+            let pvs = qlab_l2::prove_p(&inst).0;
             let label = format!("shape P3 @ {}", qlab_l2::L2_CFG_PROVISIONAL.label());
-            (label, proof, Box::new(move |p: &Proof<Config>| qlab_l2::verify_p(&pvs, p)))
+            (label, Box::new(move || qlab_l2::prove_p(&inst).1), Box::new(move |p: &Proof<Config>| qlab_l2::verify_p(&pvs, p)))
         }
         other => {
             eprintln!("mproof: unknown --case `{other}`; expected l1|s3|p3");
             std::process::exit(2);
         }
     };
-    let prove_s = t.elapsed().as_secs_f64();
-    let original = bincode_fixint(&proof);
 
-    let t = Instant::now();
-    let (coded, st) = encode(&proof);
-    let enc_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t = Instant::now();
-    let decoded = decode(&coded);
-    let dec_ms = t.elapsed().as_secs_f64() * 1e3;
-
-    let identical = bincode_fixint(&decoded) == original;
-    let verifies = verify(&decoded);
-    let saved = original.len() as i64 - coded.len() as i64;
-
-    println!("| case | proof B (bincode fixint) | coded B | saved B | saved % | paths | siblings | sent as digests | encode ms | decode ms | byte-identical | decoded verifies |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
-    println!(
-        "| {label} | {} | {} | {saved} | {:.2} | {} | {} | {} | {enc_ms:.2} | {dec_ms:.2} | {identical} | {verifies} |",
-        original.len(),
-        coded.len(),
-        100.0 * saved as f64 / original.len() as f64,
-        st.paths,
-        st.siblings,
-        st.literals,
-    );
+    println!("## {label}");
     println!();
-    println!("prove {prove_s:.1} s (includes trace generation; not the measured quantity here).");
-    assert!(identical, "the codec must be lossless: decode(encode(p)) re-serializes to the original bytes");
-    assert!(verifies, "the decoded proof must verify");
+    println!("| # | proof B | coded B | saved B | siblings | sent as digests | + hashing variant: digests dropped | saved B, hashing (est.) | encode ms | decode ms |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    let mut rows = Vec::with_capacity(count);
+    let mut worst = None;
+    for k in 0..count {
+        let proof = prove();
+        let original = bincode_fixint(&proof);
+        let t = Instant::now();
+        let (coded, st) = encode(&proof);
+        let enc_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let decoded = decode(&coded);
+        let dec_ms = t.elapsed().as_secs_f64() * 1e3;
+        assert!(bincode_fixint(&decoded) == original, "proof {k}: the codec must be lossless");
+        assert!(verify(&decoded), "proof {k}: the decoded proof must verify");
+        let trees = sibling_table(&proof);
+        let hash_extra = hashing_extra_digests(&trees);
+        worst.get_or_insert_with(|| worst_case_saving(&trees));
+        let r = Row { raw: original.len(), coded: coded.len(), siblings: st.siblings, literals: st.literals, hash_extra, enc_ms, dec_ms };
+        let saved = r.raw as i64 - r.coded as i64;
+        println!(
+            "| {k} | {} | {} | {saved} | {} | {} | {} | {} | {:.2} | {:.2} |",
+            r.raw,
+            r.coded,
+            r.siblings,
+            r.literals,
+            r.hash_extra,
+            saved + 32 * r.hash_extra as i64,
+            r.enc_ms,
+            r.dec_ms
+        );
+        rows.push(r);
+    }
+    let saved: Vec<i64> = rows.iter().map(|r| r.raw as i64 - r.coded as i64).collect();
+    let hashed: Vec<i64> = rows.iter().zip(&saved).map(|(r, s)| s + 32 * r.hash_extra as i64).collect();
+    let stat = |v: &[i64]| {
+        let (mn, mx) = (*v.iter().min().unwrap(), *v.iter().max().unwrap());
+        let mean = v.iter().sum::<i64>() as f64 / v.len() as f64;
+        (mn, mean, mx)
+    };
+    let (smin, smean, smax) = stat(&saved);
+    let (hmin, hmean, hmax) = stat(&hashed);
+    println!();
+    println!("| over {count} proofs | min | mean | max |");
+    println!("|---|---|---|---|");
+    println!("| saved B, hash-free (measured) | {smin} | {smean:.0} | {smax} |");
+    println!("| saved B, + hashing variant (lower-bound estimate) | {hmin} | {hmean:.0} | {hmax} |");
+    println!();
+    println!(
+        "Padding floor (hash-free, analytic worst case over query positions, cap {}): **{} B** — what a fixed-size coded proof keeps.",
+        qlab_consensus::CAP_HEIGHT,
+        worst.unwrap_or(0)
+    );
+    println!("Raw proof size is fixed per shape: {} B.", rows[0].raw);
 }

@@ -930,10 +930,17 @@ fn main() {
             // lab #742 (A5 lever 4c stage 0): the Merkle multi-proof codec prototype.
             let case_pos = args.iter().position(|a| a == "--case");
             let Some(case) = case_pos.and_then(|i| args.get(i + 1)) else {
-                eprintln!("mproof: `--case l1|s3|p3` is required");
+                eprintln!("mproof: `--case l1|s3|p3 [--count N]` is required");
                 std::process::exit(2);
             };
-            mproof::run_mproof(&power, case);
+            let count = args
+                .iter()
+                .position(|a| a == "--count")
+                .and_then(|i| args.get(i + 1))
+                .map(|n| n.parse::<usize>().expect("--count takes a positive integer"))
+                .unwrap_or(1)
+                .max(1);
+            mproof::run_mproof(&power, case, count);
             return;
         }
         "zkpeak" => {
