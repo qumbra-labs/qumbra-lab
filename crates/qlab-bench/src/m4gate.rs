@@ -6398,6 +6398,19 @@ mod tests {
         qlab_air::l2test::first_violation(air, trace, opvs, trace.height()).is_some()
     }
 
+    /// [`unsat_under`] with ascending chunk order — for tampers that sit on
+    /// query rows mid-trace. Measured on lane run 36201443742 (lab PR #743): on
+    /// the gate AIR the parallel scan is no faster than a serial one, so
+    /// tail-first order reached these tampers LATER than p3's ascending loop did
+    /// (`interior_single_child_negatives` 116 → 236 s, `interior_two_child_
+    /// negatives` 102 → 177 s). Same verdict, different visiting order.
+    fn unsat_ascending<A>(air: &A, trace: &RowMajorMatrix<Val>, opvs: &[Val]) -> bool
+    where
+        A: for<'a> Air<DebugConstraintBuilder<'a, Val>> + BaseAir<Val> + Sync,
+    {
+        qlab_air::l2test::scan(air, trace, opvs, None).is_some()
+    }
+
     pub(crate) fn shared() -> &'static (Schedule, Vec<Val>, Vec<Ext>) {
         static CELL: OnceLock<(Schedule, Vec<Val>, Vec<Ext>)> = OnceLock::new();
         CELL.get_or_init(|| {
@@ -6508,10 +6521,11 @@ mod tests {
         );
     }
 
-    /// Wide analogue of `is_unsat`: check the mutated wide trace against the
-    /// `wide()`-shaped AIR in a spawned thread (panic == UNSAT == caught).
+    /// Wide analogue of `is_unsat`: the mutated wide trace against the
+    /// `wide()`-shaped AIR. Its only caller's tampers sit on query / draw rows,
+    /// so the scan is ascending ([`unsat_ascending`]).
     fn is_unsat_wide(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
-        unsat_under(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs)
+        unsat_ascending(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs)
     }
 
     /// `is_unsat_wide` against the interior AIR (`new_interior()`: doubled opvs
@@ -8171,7 +8185,9 @@ mod tests {
             let mut trace = base_trace.clone();
             let mut o = base_opvs.clone();
             mutate(&mut trace, &mut o);
-            assert!(is_unsat_interior(trace, o), "expected UNSAT (interior): {label}");
+            // Query-row tampers (child L / child R openings): ascending order.
+            let unsat = unsat_ascending(&VerifierGateAir::new_interior(), &trace, &o);
+            assert!(unsat, "expected UNSAT (interior): {label}");
         };
 
         probe("child-L opening: q0 preimage limb0", &|t, _o| {
