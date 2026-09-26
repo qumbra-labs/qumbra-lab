@@ -10,7 +10,8 @@
 //! 🔴 **NOT every gate column is bound, and this header claimed otherwise
 //! until 2026-07-31.** Issue #78's class-(2) audit found four columns that
 //! constraints *read* but nothing *determines*; three were confirmed by
-//! execution (`i78_*`/`gate_neg_asm_*` tests below), and two are now fixed.
+//! execution (`i78_*`/`gate_neg_asm_*` tests below). SCR now has explicit
+//! capture-or-hold constraints; finding 4 remains open.
 //! **A determined column is not a bound value** — read finding 1's and
 //! finding 4's rows together before concluding anything about the value
 //! pipeline:
@@ -19,7 +20,7 @@
 //! |---|---|
 //! | `FSFULL` (2924) | **FIXED** (issue #78 finding 3): bool + per-perm hold + pinned to `FSGATE@row15`, `:3114`. Was a free witness; `cfull ≡ 0` was reachable and the refill guard vacuous. |
 //! | `ASM0`/`ASM1` (3318/3319) | **DETERMINED** (issue #78 finding 1): capture-row pin + pending-row hold, 4 constraints, `:3389`. Was limbs 0–1 of *every* consumed value with no pin, no carry, not even a boolean. `gate_neg_asm_free_witness` (was SAT, now UNSAT) and `gate_neg_asm_gap8_hole` hold the evidence. **This did not close the value pipeline** — see the `W0C`/`W1C` row: the consumed value is now identically four transcript word cells, and on the dup chain none of the four is sponge-bound. |
-//! | `SCR` (3443…) | **OPEN** (finding 2): no hold outside the `mr` gate, so a fold intermediate is not carried from its write to its next read. `i78_finding2_scr_no_hold`. |
+//! | `SCR` (3443…) | **Capture-or-hold constrained** (finding 2): each slot carries outside its leaf-fold, higher-fold, or reduced-opening write rows. `gate_neg_scr_no_hold` inverts the historical SAT witness; wide/interior negatives cover the same gap. This is not a claim that finding 4 or full recursive soundness is closed. |
 //! | `W0C`/`W1C` (2657/2658) | **OPEN** (finding 4), and **it is now the whole gap**: pinned to the sponge on F0 perms only — see the scope note at `:2646`. Since finding 1's fix routes limbs 0–1 through the capture row's `W0C`/`W1C`, **all four** limbs of every consumed dup value are these columns, and on the dup chain / final-poly flush / query leaf absorbs nothing pins them. So a prover still chooses every consumed value; what changed is that closing finding 4 would now close all four limbs instead of two. |
 //!
 //! A reader who greps this header for reassurance should stop at the table.
@@ -4304,6 +4305,54 @@ where
             }
         }
 
+        // =====================================================================
+        // Issue #78 finding 2: SCR is shared by leaf folds, higher folds, and
+        // M_RO. Their blocks above constrain writes, but a scratch slot must
+        // also survive EVERY transition on which none of those blocks writes
+        // it. In particular, M_FHI writes one slot per row; the other slots
+        // cannot float until their next read, nor between absorb/fold perms.
+        //
+        // Reuse the already-bound write selectors. GF*VC and M_RO*sf have
+        // degree 2; FHG is materialized. Multiplying the complement by a
+        // linear carry keeps degree <= 3, with no new columns or fill changes.
+        // Child R already inherits SCR from child L, and pad/merge rows carry
+        // the last child's registers, so no boundary exemption is needed.
+        // =====================================================================
+        {
+            let mut writes = vec![AB::Expr::ZERO; 8];
+            for rf in 0..self.shape.n_fri_rounds() {
+                let la = self.shape.log_arities[rf];
+                for (i, write) in writes.iter_mut().enumerate().take(1usize << (la - 1)) {
+                    *write = write.clone()
+                        + cv(self.layout.gf + rf) * cv(self.layout.vc + 2 * i + 1);
+                }
+                // The final higher-fold pair writes RUNEV, not SCR.
+                let mut row = 0;
+                for level in 1..la {
+                    for write in writes.iter_mut().take(1usize << (la - 1 - level)) {
+                        if level + 1 < la {
+                            *write = write.clone()
+                                + cv(self.layout.fhg + fhg_index(&self.shape.log_arities, rf, row));
+                        }
+                        row += 1;
+                    }
+                }
+            }
+            for (slot, row) in [0usize, 1, 2, 4, 6].into_iter().enumerate() {
+                writes[slot] = writes[slot].clone()
+                    + cv(self.layout.msel + M_RO as usize) * sf(row);
+            }
+            let mut t = builder.when_transition();
+            for (slot, write) in writes.into_iter().enumerate() {
+                for limb in 0..4 {
+                    let column = self.layout.scr + 4 * slot + limb;
+                    t.assert_zero(
+                        (AB::Expr::ONE - write.clone()) * (nv(column) - cv(column)),
+                    );
+                }
+            }
+        }
+
         // The last-row phase anchor is the self.layout.qsel check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -6528,6 +6577,30 @@ mod tests {
         unsat_ascending(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs)
     }
 
+    /// Replay finding 2's former free interval in a selected child's region.
+    /// SCR0 is written at FHI row 0 and next read at row 4; rows 2/3 used
+    /// to float. Recompute derived columns so an unrelated stale auxiliary
+    /// cell cannot make this look like a successful hold test.
+    fn tamper_scr_hold_interval(
+        trace: &mut RowMajorMatrix<Val>,
+        layout: &GateLayout,
+        shape: &GateShape,
+        start: usize,
+        end: usize,
+    ) {
+        let w = layout.gate_width;
+        let selector = layout.msel + shape.m_fhi(0) as usize;
+        let first = (start..end).step_by(24)
+            .find(|&row| trace.values[row * w + selector] == Val::ONE)
+            .expect("round-0 M_FHI inside the selected child");
+        for offset in [2, 3] {
+            for limb in 0..4 {
+                trace.values[(first + offset) * w + layout.scr + limb] += Val::ONE;
+            }
+        }
+        fill_derived(&mut trace.values, layout, shape);
+    }
+
     /// `is_unsat_wide` against the interior AIR (`new_interior()`: doubled opvs
     /// + per-child routing). Used by the two-child per-lane negatives (2d-4).
     fn is_unsat_interior(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
@@ -8101,6 +8174,9 @@ mod tests {
             }
             panic!("no M_RO perm found (wide)");
         });
+        probe("issue #78: SCR held between FHI write/read (wide)", &|t, _o| {
+            tamper_scr_hold_interval(t, &l, &shape, q0, qrows[1]);
+        });
 
         // --- END endpoint pins (Option-A M_HORN / RUNEV soundness) -----------
         probe("bad-fold: RUNEV@q0", &|t, _o| {
@@ -8195,6 +8271,12 @@ mod tests {
         });
         probe("child-R opening: q0 preimage limb0", &|t, _o| {
             t.values[qr_r * w + pcol(0)] += one;
+        });
+        probe("child-L SCR hold between FHI write/read", &|t, _o| {
+            tamper_scr_hold_interval(t, &l, &shape, qr_l, meta.query_rows[1]);
+        });
+        probe("child-R SCR hold between FHI write/read", &|t, _o| {
+            tamper_scr_hold_interval(t, &l, &shape, qr_r, meta.query_rows[nq + 1]);
         });
         probe("child-R opvs: cap0 all-digest limb0 (second half)", &|_t, o| {
             for j in 0..shape.cap_len {
@@ -8814,12 +8896,11 @@ mod tests {
         );
     }
 
-    /// 🔴 #78 **finding 2 — OPEN GAP, pinned here as SAT.** `SCR` is the only
-    /// pipeline register without an unconditional carry (compare `runev`,
-    /// `pbuf`, `breg`, `inv2s`). In an `M_FHI` perm the pair schedule
+    /// Issue #78 finding 2, inverted: this exact tamper was SAT before the
+    /// SCR capture-or-hold constraints. In an `M_FHI` perm the pair schedule
     /// `[(1,0),(1,1),(1,2),(1,3),(2,0),(2,1),(3,0)]` pins only row r+1's single
-    /// target, so `scr[0]` — written at row 1, read again at row 4 — is
-    /// unheld at rows 2 and 3, and tampering it there is SATISFIABLE.
+    /// target, so `scr[0]` — written at row 1, read again at row 4 — was
+    /// formerly unheld at rows 2 and 3. That tamper must now be UNSAT.
     ///
     /// This confirms the MECHANISM (no carry between write and next read),
     /// which is what `gate_neg_mro` cannot see: that test tampers `SCR` inside
@@ -8831,7 +8912,7 @@ mod tests {
     /// CONTROL: `RUNEV` at the same two rows is UNSAT (which also proves the
     /// perm is live rather than pad).
     #[test]
-    fn i78_finding2_scr_no_hold() {
+    fn gate_neg_scr_no_hold() {
         let _g = heavy_lock();
         let (base, opvs, layout, shape) = i78_fixture();
         let w = layout.gate_width;
@@ -8850,9 +8931,21 @@ mod tests {
         }
         fill_derived(&mut t.values, &layout, &shape);
         assert!(
-            !is_unsat(t, opvs.clone()),
-            "#78 finding 2 is FIXED — SCR is held between write and read. Invert this test."
+            is_unsat(t, opvs.clone()),
+            "issue #78 finding 2 regressed: SCR is not held between write and read"
         );
+
+        // Cross-permutation carry is separate from the intra-FHI hole. SCR7
+        // is not read by the first pair, so this mutation is not a bad-fold
+        // endpoint test in disguise: it changes only the idle boundary span.
+        let mut cross = base.clone();
+        for row in [p * 24 - 1, p * 24] {
+            for limb in 0..4 {
+                cross.values[row * w + layout.scr + 4 * 7 + limb] += one;
+            }
+        }
+        fill_derived(&mut cross.values, &layout, &shape);
+        assert!(is_unsat(cross, opvs.clone()), "SCR must carry across permutation boundaries");
 
         // CONTROL — RUNEV carries unconditionally on the same rows.
         let mut c = base;
