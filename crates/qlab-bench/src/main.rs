@@ -19,6 +19,7 @@ mod disclosure;
 mod geometry;
 mod l2shape;
 mod zkpeak;
+mod f2;
 #[cfg(feature = "phasemem")]
 mod phasemem;
 
@@ -747,6 +748,14 @@ fn main() {
         .map(|(_, a)| a.as_str())
         .unwrap_or("matrix")
         .to_string();
+
+    if matches!(mode.as_str(), "f2fixture" | "f2census" | "f2price") {
+        if let Err(error) = f2::run(&mode, &args[1..], &power) {
+            eprintln!("{mode}: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
 
     // Poseidon2 round constants: fixed seed so every run proves the same AIR.
     let mut rng = SmallRng::seed_from_u64(42);
