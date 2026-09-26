@@ -1437,7 +1437,9 @@ mod tests {
             gf.format_version = v;
             assert!(matches!(gf.form(), Err(GenesisError::PreRemintGenesis { got }) if got == v), "v{v}");
         }
-        for v in [0u32, 1, 2, 3, 10] {
+        // u32::MAX, not the next integer: a literal "unknown" version collides
+        // with the next format bump (lab #747).
+        for v in [0u32, 1, 2, 3, u32::MAX] {
             gf.format_version = v;
             assert!(
                 matches!(gf.form(), Err(GenesisError::WrongFormatVersion { got, .. }) if got == v),
@@ -1455,9 +1457,10 @@ mod tests {
     fn t2_genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_t2().hash_hex(),
-            // The security re-mint: named `genesis init --t2` runs ×2,
-            // file sha256 b60509cf…3dc6, 41,750 B, byte-identical; was 0e55ccb3….
-            "f2f8350c6e400e2e654ffcbcfe40453e6f5d9bfb770061e7df5f639bf402cf16",
+            // Re-genesis batch 2 (lab #747): named `genesis init --t2` runs ×2,
+            // file sha256 55bc803c…baf1, 41,754 B, byte-identical, format 9;
+            // was f2f8350c… (batch 1), 0e55ccb3… before that.
+            "83776614914ed4e36aa4c467d5e82df0a7be9e2e041761489e8f5d84b262b54c",
         );
         assert_ne!(
             GenesisFile::new_t2().hash_hex(),
@@ -1508,10 +1511,10 @@ mod tests {
         assert!(GenesisFile::new_devnet_t0().verify_startup(None).is_ok());
         assert!(GenesisFile::new_t2().verify_startup(None).is_ok());
         let mut gf = GenesisFile::new_t2();
-        gf.format_version = 10;
+        gf.format_version = u32::MAX;
         assert!(matches!(
             gf.verify_startup(None),
-            Err(GenesisError::WrongFormatVersion { got: 10, .. })
+            Err(GenesisError::WrongFormatVersion { got: u32::MAX, .. })
         ));
         // A pre-re-mint (5) and a batch-1 (7) T2 file are refused by name at startup.
         for v in [5u32, 7] {

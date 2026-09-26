@@ -647,9 +647,12 @@ mod tests {
             assert!(matches!(load_any(&l1.to_bytes()), Ok(AnyGenesis::L1(_))));
         }
         let mut junk = an.clone();
-        junk[..4].copy_from_slice(&8u32.to_le_bytes());
-        assert!(matches!(load_any(&junk), Err(GenesisError::WrongFormatVersion { got: 8, .. })));
-        // The pre-re-mint T1 / T2 formats are refused by name (the security re-mint).
+        // An unserved version no format bump will ever take (lab #747: the literal
+        // 8 used here collided with batch 2's T1 format).
+        const NEVER_A_FORMAT: u32 = u32::MAX;
+        junk[..4].copy_from_slice(&NEVER_A_FORMAT.to_le_bytes());
+        assert!(matches!(load_any(&junk), Err(GenesisError::WrongFormatVersion { got: NEVER_A_FORMAT, .. })));
+        // The pre-re-mint (4 / 5) and batch-1 (6 / 7) T1 / T2 formats are refused by name.
         for v in crate::genesis::PRE_REMINT_FORMAT_VERSIONS {
             junk[..4].copy_from_slice(&v.to_le_bytes());
             assert!(matches!(load_any(&junk), Err(GenesisError::PreRemintGenesis { got }) if got == v), "v{v}");
@@ -666,10 +669,13 @@ mod tests {
         let err = GenesisFile::from_bytes(&an).unwrap_err();
         assert!(matches!(err, GenesisError::AnnuletGenesisNotServed), "{err}");
         assert!(err.to_string().contains("B2"), "the refusal names the milestone: {err}");
-        // The re-minted L1 files (T1 = 6, T2 = 7) and the
-        // pre-re-mint ones (4, 5) are all named as not-Annulet by their own
-        // version; the pre-re-mint refusal itself lives in the L1 loader.
-        for (l1, v) in [(GenesisFile::new_devnet_t0(), 6u32), (GenesisFile::new_t2(), 7)] {
+        // The batch-2 L1 files (T1 = 8, T2 = 9, lab #747) and the refused
+        // earlier ones (4–7) are all named as not-Annulet by their own version;
+        // the refusal by name itself lives in the L1 loader.
+        // Read from the constructors' own fields, never literals (lab #747's
+        // lesson: a literal version in a test goes stale at every format bump).
+        for l1 in [GenesisFile::new_devnet_t0(), GenesisFile::new_t2()] {
+            let v = l1.format_version;
             assert!(matches!(
                 AnnuletGenesisFile::from_bytes(&l1.to_bytes()),
                 Err(GenesisError::NotAnnuletGenesis { got: Some(g) }) if g == v
