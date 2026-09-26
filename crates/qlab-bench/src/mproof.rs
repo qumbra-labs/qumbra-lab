@@ -195,9 +195,14 @@ fn sibling_table(proof: &Proof<Config>) -> Vec<(Tree, Vec<Vec<Digest>>)> {
 /// leaf. Those two digests (each sent once today as a literal) go.
 /// The top level (whose ancestor is a cap entry, not in the path) is not
 /// counted, so this is a lower bound.
-fn hashing_extra_digests(trees: &[(Tree, Vec<Vec<Digest>>)]) -> usize {
-    let mut extra = 0;
-    for (_, rows) in trees {
+/// Returns `(input trees, FRI layer trees)`. Only the input-tree part is
+/// buildable without a Fiat–Shamir replay: an input leaf is fully in the
+/// proof (opened values + salt), but a commit-phase leaf also holds the
+/// folded value the verifier computes from transcript challenges.
+fn hashing_extra_digests(trees: &[(Tree, Vec<Vec<Digest>>)]) -> (usize, usize) {
+    let (mut inputs, mut layers) = (0, 0);
+    for (tree, rows) in trees {
+        let mut extra = 0;
         let depth = rows.iter().map(Vec::len).min().unwrap_or(0);
         for l in 0..depth.saturating_sub(1) {
             let mut groups: HashMap<Digest, Vec<Digest>> = HashMap::new();
@@ -209,8 +214,12 @@ fn hashing_extra_digests(trees: &[(Tree, Vec<Vec<Digest>>)]) -> usize {
             }
             extra += groups.values().filter(|v| v.len() == 2).map(|_| 2).sum::<usize>();
         }
+        match tree {
+            Tree::Input(_) => inputs += extra,
+            Tree::Layer(_) => layers += extra,
+        }
     }
-    extra
+    (inputs, layers)
 }
 
 /// The hash-free codec's saving if the query positions were as spread out as
@@ -241,7 +250,8 @@ struct Row {
     coded: usize,
     siblings: usize,
     literals: usize,
-    hash_extra: usize,
+    hash_extra_inputs: usize,
+    hash_extra_layers: usize,
     enc_ms: f64,
     dec_ms: f64,
 }
@@ -285,8 +295,8 @@ pub(crate) fn run_mproof(power: &str, case: &str, count: usize) {
 
     println!("## {label}");
     println!();
-    println!("| # | proof B | coded B | saved B | siblings | sent as digests | + hashing variant: digests dropped | saved B, hashing (est.) | encode ms | decode ms |");
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("| # | proof B | coded B | saved B | siblings | sent as digests | hashing: input-tree digests dropped | hashing: FRI-layer digests dropped | saved B, + input-tree hashing (buildable) | saved B, + all hashing | encode ms | decode ms |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     let mut rows = Vec::with_capacity(count);
     let mut worst = None;
     for k in 0..count {
@@ -301,37 +311,43 @@ pub(crate) fn run_mproof(power: &str, case: &str, count: usize) {
         assert!(bincode_fixint(&decoded) == original, "proof {k}: the codec must be lossless");
         assert!(verify(&decoded), "proof {k}: the decoded proof must verify");
         let trees = sibling_table(&proof);
-        let hash_extra = hashing_extra_digests(&trees);
+        let (hash_extra_inputs, hash_extra_layers) = hashing_extra_digests(&trees);
         worst.get_or_insert_with(|| worst_case_saving(&trees));
-        let r = Row { raw: original.len(), coded: coded.len(), siblings: st.siblings, literals: st.literals, hash_extra, enc_ms, dec_ms };
+        let r = Row { raw: original.len(), coded: coded.len(), siblings: st.siblings, literals: st.literals, hash_extra_inputs, hash_extra_layers, enc_ms, dec_ms };
         let saved = r.raw as i64 - r.coded as i64;
         println!(
-            "| {k} | {} | {} | {saved} | {} | {} | {} | {} | {:.2} | {:.2} |",
+            "| {k} | {} | {} | {saved} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} |",
             r.raw,
             r.coded,
             r.siblings,
             r.literals,
-            r.hash_extra,
-            saved + 32 * r.hash_extra as i64,
+            r.hash_extra_inputs,
+            r.hash_extra_layers,
+            saved + 32 * r.hash_extra_inputs as i64,
+            saved + 32 * (r.hash_extra_inputs + r.hash_extra_layers) as i64,
             r.enc_ms,
             r.dec_ms
         );
         rows.push(r);
     }
     let saved: Vec<i64> = rows.iter().map(|r| r.raw as i64 - r.coded as i64).collect();
-    let hashed: Vec<i64> = rows.iter().zip(&saved).map(|(r, s)| s + 32 * r.hash_extra as i64).collect();
+    let buildable: Vec<i64> = rows.iter().zip(&saved).map(|(r, s)| s + 32 * r.hash_extra_inputs as i64).collect();
+    let hashed: Vec<i64> =
+        rows.iter().zip(&saved).map(|(r, s)| s + 32 * (r.hash_extra_inputs + r.hash_extra_layers) as i64).collect();
     let stat = |v: &[i64]| {
         let (mn, mx) = (*v.iter().min().unwrap(), *v.iter().max().unwrap());
         let mean = v.iter().sum::<i64>() as f64 / v.len() as f64;
         (mn, mean, mx)
     };
     let (smin, smean, smax) = stat(&saved);
+    let (bmin, bmean, bmax) = stat(&buildable);
     let (hmin, hmean, hmax) = stat(&hashed);
     println!();
     println!("| over {count} proofs | min | mean | max |");
     println!("|---|---|---|---|");
     println!("| saved B, hash-free (measured) | {smin} | {smean:.0} | {smax} |");
-    println!("| saved B, + hashing variant (lower-bound estimate) | {hmin} | {hmean:.0} | {hmax} |");
+    println!("| saved B, + input-tree hashing (buildable; lower bound) | {bmin} | {bmean:.0} | {bmax} |");
+    println!("| saved B, + all hashing (needs a Fiat–Shamir replay; lower bound) | {hmin} | {hmean:.0} | {hmax} |");
     println!();
     println!(
         "Padding floor (hash-free, analytic worst case over query positions, cap {}): **{} B** — what a fixed-size coded proof keeps.",
