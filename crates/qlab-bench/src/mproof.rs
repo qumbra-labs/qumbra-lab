@@ -1,0 +1,232 @@
+//! `mproof` mode (lab #742, A5 lever 4c stage 0): a Merkle multi-proof codec
+//! prototype, measured on REAL hiding proofs — bench-only, nothing on any wire.
+//!
+//! ```text
+//! /usr/bin/time -v qlab-bench mproof --case l1   # the 2×2 bucket at CONSENSUS_CFG
+//! /usr/bin/time -v qlab-bench mproof --case s3   # shape S3 at the L2 lane
+//! /usr/bin/time -v qlab-bench mproof --case p3   # shape P3 at the L2 lane
+//! ```
+//!
+//! **What it removes.** A FRI proof carries, per query, one Merkle path per
+//! committed tree (the random-codeword, trace and quotient batches, then one
+//! per commit-phase layer). Paths of different queries through the same tree
+//! share every node above the level where they meet, so the siblings above
+//! that level are the **same digests, repeated** — once per query. The codec
+//! sends each distinct sibling digest once per `(tree, level)` and a one-byte
+//! back-reference for every repeat.
+//!
+//! **What it deliberately does not do.** It never hashes: the sibling a query
+//! needs at the meeting level is the *other* query's path node, recoverable
+//! only by hashing that path up — a further saving (one digest per meeting)
+//! left out so the decoder stays a pure table lookup. It needs no query
+//! indices and no transcript replay: dedup is by value inside `(tree, level)`,
+//! so the decode reproduces the original bytes exactly whatever the positions.
+//! Roots, openings, salts and the Fiat–Shamir transcript are untouched — the
+//! verifier sees the same `Proof` it sees today.
+//!
+//! **Format** (prototype, not a wire): `u32 LE body_len ‖ body ‖ stream`.
+//! `body` = the proof with every sibling vector emptied, in the lanes' own
+//! proof encoding (bincode fixint, as `qumbra-node`'s `decode_proof_strict`).
+//! `stream` = for each path in traversal order: `u8 len`, then per sibling a
+//! LEB128 tag — `0` + 32 digest bytes (a new digest), or `k ≥ 1` = the
+//! `(k−1)`-th distinct digest already sent at this `(tree, level)`.
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+use qlab_consensus::{Config, Proof};
+
+type Digest = [u64; 4];
+
+/// Checks a decoded proof against the case's public values.
+type Verify = Box<dyn Fn(&Proof<Config>) -> bool>;
+
+/// Tree identity inside one proof: input batch `b` (random, trace, quotient —
+/// the PCS's round order) or commit-phase layer `s`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Tree {
+    Input(usize),
+    Layer(usize),
+}
+
+/// Every sibling path of `proof`, in the one traversal order both directions use.
+fn paths_mut(proof: &mut Proof<Config>) -> Vec<(Tree, &mut Vec<Digest>)> {
+    let mut out = Vec::new();
+    for q in proof.opening_proof.1.query_proofs.iter_mut() {
+        for (b, batch) in q.input_proof.iter_mut().enumerate() {
+            out.push((Tree::Input(b), &mut batch.opening_proof.1));
+        }
+        for (s, step) in q.commit_phase_openings.iter_mut().enumerate() {
+            out.push((Tree::Layer(s), &mut step.opening_proof.1));
+        }
+    }
+    out
+}
+
+fn put_leb(out: &mut Vec<u8>, mut v: usize) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn get_leb(buf: &[u8], at: &mut usize) -> usize {
+    let (mut v, mut shift) = (0usize, 0);
+    loop {
+        let byte = buf[*at];
+        *at += 1;
+        v |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+fn bincode_fixint<T: serde::Serialize>(v: &T) -> Vec<u8> {
+    bincode::serialize(v).expect("bincode")
+}
+
+/// What one encode saw.
+#[derive(Default)]
+pub(crate) struct Stats {
+    pub siblings: usize,
+    pub literals: usize,
+    pub paths: usize,
+}
+
+pub(crate) fn encode(proof: &Proof<Config>) -> (Vec<u8>, Stats) {
+    // `Proof<Config>` is not `Clone`; copy it through its own encoding.
+    let mut stripped: Proof<Config> = bincode::deserialize(&bincode_fixint(proof)).expect("round-trip");
+    let mut stream = Vec::new();
+    let mut st = Stats::default();
+    let mut tables: HashMap<(Tree, usize), Vec<Digest>> = HashMap::new();
+    for (tree, path) in paths_mut(&mut stripped) {
+        let len = u8::try_from(path.len()).expect("a Merkle path is shorter than 256");
+        stream.push(len);
+        st.paths += 1;
+        for (level, d) in path.drain(..).enumerate() {
+            st.siblings += 1;
+            let table = tables.entry((tree, level)).or_default();
+            match table.iter().position(|x| *x == d) {
+                Some(k) => put_leb(&mut stream, k + 1),
+                None => {
+                    st.literals += 1;
+                    put_leb(&mut stream, 0);
+                    for w in d {
+                        stream.extend_from_slice(&w.to_le_bytes());
+                    }
+                    table.push(d);
+                }
+            }
+        }
+    }
+    let body = bincode_fixint(&stripped);
+    let mut out = Vec::with_capacity(4 + body.len() + stream.len());
+    out.extend_from_slice(&u32::try_from(body.len()).expect("body < 4 GiB").to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&stream);
+    (out, st)
+}
+
+pub(crate) fn decode(bytes: &[u8]) -> Proof<Config> {
+    use bincode::Options;
+    let body_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let body = &bytes[4..4 + body_len];
+    let mut proof: Proof<Config> = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(body)
+        .expect("the stripped body decodes");
+    let stream = &bytes[4 + body_len..];
+    let mut at = 0usize;
+    let mut tables: HashMap<(Tree, usize), Vec<Digest>> = HashMap::new();
+    for (tree, path) in paths_mut(&mut proof) {
+        let len = usize::from(stream[at]);
+        at += 1;
+        for level in 0..len {
+            let table = tables.entry((tree, level)).or_default();
+            let tag = get_leb(stream, &mut at);
+            let d = if tag == 0 {
+                let mut d = [0u64; 4];
+                for w in d.iter_mut() {
+                    *w = u64::from_le_bytes(stream[at..at + 8].try_into().unwrap());
+                    at += 8;
+                }
+                table.push(d);
+                d
+            } else {
+                table[tag - 1]
+            };
+            path.push(d);
+        }
+    }
+    assert_eq!(at, stream.len(), "the stream is consumed exactly");
+    proof
+}
+
+pub(crate) fn run_mproof(power: &str, case: &str) {
+    println!("# qumbra-lab mproof — Merkle multi-proof codec prototype, case `{case}` (lab #742 4c)");
+    println!();
+    crate::print_env(power);
+    let t = Instant::now();
+    // (label, proof, verify-the-decoded-proof)
+    let (label, proof, verify): (String, Proof<Config>, Verify) = match case {
+        "l1" => {
+            let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
+            let (pvs, proof) = qlab_consensus::prove_bucket(&inst);
+            let label = format!("L1 2×2 bucket @ {}", qlab_consensus::CONSENSUS_CFG.label());
+            (label, proof, Box::new(move |p: &Proof<Config>| qlab_consensus::verify_proof(&inst, &pvs, p)))
+        }
+        "s3" => {
+            let inst = qlab_l2::fixture::shape_s();
+            let (pvs, proof) = qlab_l2::prove_s(&inst);
+            let label = format!("shape S3 @ {}", qlab_l2::L2_CFG_PROVISIONAL.label());
+            (label, proof, Box::new(move |p: &Proof<Config>| qlab_l2::verify_s(&pvs, p)))
+        }
+        "p3" => {
+            let inst = qlab_l2::fixture::shape_p();
+            let (pvs, proof) = qlab_l2::prove_p(&inst);
+            let label = format!("shape P3 @ {}", qlab_l2::L2_CFG_PROVISIONAL.label());
+            (label, proof, Box::new(move |p: &Proof<Config>| qlab_l2::verify_p(&pvs, p)))
+        }
+        other => {
+            eprintln!("mproof: unknown --case `{other}`; expected l1|s3|p3");
+            std::process::exit(2);
+        }
+    };
+    let prove_s = t.elapsed().as_secs_f64();
+    let original = bincode_fixint(&proof);
+
+    let t = Instant::now();
+    let (coded, st) = encode(&proof);
+    let enc_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    let decoded = decode(&coded);
+    let dec_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let identical = bincode_fixint(&decoded) == original;
+    let verifies = verify(&decoded);
+    let saved = original.len() as i64 - coded.len() as i64;
+
+    println!("| case | proof B (bincode fixint) | coded B | saved B | saved % | paths | siblings | sent as digests | encode ms | decode ms | byte-identical | decoded verifies |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!(
+        "| {label} | {} | {} | {saved} | {:.2} | {} | {} | {} | {enc_ms:.2} | {dec_ms:.2} | {identical} | {verifies} |",
+        original.len(),
+        coded.len(),
+        100.0 * saved as f64 / original.len() as f64,
+        st.paths,
+        st.siblings,
+        st.literals,
+    );
+    println!();
+    println!("prove {prove_s:.1} s (includes trace generation; not the measured quantity here).");
+    assert!(identical, "the codec must be lossless: decode(encode(p)) re-serializes to the original bytes");
+    assert!(verifies, "the decoded proof must verify");
+}

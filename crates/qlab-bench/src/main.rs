@@ -19,6 +19,7 @@ mod disclosure;
 mod geometry;
 mod l2shape;
 mod zkpeak;
+mod mproof;
 mod levers;
 mod m4anchor;
 mod m4assembly;
@@ -923,6 +924,16 @@ fn main() {
                 }),
             };
             l2shape::run_l2shape(&power, shape, only, pcs);
+            return;
+        }
+        "mproof" => {
+            // lab #742 (A5 lever 4c stage 0): the Merkle multi-proof codec prototype.
+            let case_pos = args.iter().position(|a| a == "--case");
+            let Some(case) = case_pos.and_then(|i| args.get(i + 1)) else {
+                eprintln!("mproof: `--case l1|s3|p3` is required");
+                std::process::exit(2);
+            };
+            mproof::run_mproof(&power, case);
             return;
         }
         "zkpeak" => {
