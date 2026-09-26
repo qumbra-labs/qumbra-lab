@@ -36,7 +36,7 @@ mining = false
 
 # OPTIONAL safety pin: refuse to start unless the loaded genesis hashes to this
 # (the value `qumbra-node genesis init` prints). Uncomment to enforce.
-# expected_genesis_hash = "82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af"
+# expected_genesis_hash = "740ba41c06f1c0075e203380b9adc46cfbe84b4b28907f531254a90a2d8e518e"
 
 # REQUIRED WHEN `mining = true` — where mined coinbase notes are paid (issue
 # #101): your wallet's rkm, 64 hex characters (32 bytes, lane-major

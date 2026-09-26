@@ -322,3 +322,46 @@ const GOLDEN_PV_R_SEED: [u32; 16] = [
     50464, 706, 23711, 6850, 64557, 55703, 13693, 8882, 29261, 54369, 37076, 54735,
     34478, 54309, 240, 48738,
 ];
+
+/// Re-genesis batch 2 (lab #747): zero knowledge is live on every L2 shape at
+/// rc = 0 — two proofs of the SAME witness differ and both verify, and no
+/// random-codeword opening travels. Chain-only at 2^12 (as `l2shape`'s b2
+/// control) keeps each shape to seconds; the L2 lane is the real one. A macro
+/// because `generate_trace` is each shape's inherent method, not a trait's.
+macro_rules! hiding_smoke {
+    ($air:expr, $ty:ty) => {{
+        let air = $air;
+        let pvs = vec![Val::ZERO; <$ty as BaseAir<Val>>::num_public_values(&air)];
+        let prove_once = || {
+            let trace = air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+            let proof = prove(&make_config_l2(), &air, trace, &pvs);
+            assert!(verify(&make_config_l2(), &air, &proof, &pvs).is_ok(), "a hiding L2 proof verifies");
+            for round in &proof.opening_proof.0 {
+                for mat in round {
+                    for point in mat {
+                        assert!(point.is_empty(), "rc = 0: no random-codeword opening travels");
+                    }
+                }
+            }
+            bincode::serialize(&proof).expect("bincode")
+        };
+        let (p1, p2) = (prove_once(), prove_once());
+        assert_eq!(p1.len(), p2.len(), "same shape, same size");
+        assert_ne!(p1, p2, "two proofs of one witness must differ");
+    }};
+}
+
+#[test]
+fn shape_s_two_proofs_of_one_witness_differ_and_both_verify() {
+    hiding_smoke!(L2ShapeSAir::chain_only(12), L2ShapeSAir);
+}
+
+#[test]
+fn shape_p_two_proofs_of_one_witness_differ_and_both_verify() {
+    hiding_smoke!(qlab_air::l2p::L2ShapePAir::chain_only(12), qlab_air::l2p::L2ShapePAir);
+}
+
+#[test]
+fn shape_r_two_proofs_of_one_witness_differ_and_both_verify() {
+    hiding_smoke!(qlab_air::l2r::L2ShapeRAir::chain_only(12), qlab_air::l2r::L2ShapeRAir);
+}

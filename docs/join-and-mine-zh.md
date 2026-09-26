@@ -18,7 +18,7 @@ English: [`join-and-mine.md`](./join-and-mine.md) · **技术细节以英文版�
 > **不会带入**；T2 是从全新创世开始的公平重启——没有预挖、没有继承，区块 0 对所有人
 > （包括运营者）都是同一条起跑线。任何写着 T1 创世哈希（`138e1524…addb`）、`t1-*`
 > release tag、或高度 19,008 更新期限的东西，都属于已退役的网络，在这里不适用。T2 在
-> 构造上就是**另一个网络**：其创世文件为格式 **v5**、网络名 `qumbra-t2`
+> 构造上就是**另一个网络**：其创世文件为格式 **9**（v5 形式集）、网络名 `qumbra-t2`
 > （[`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636)），钉错创世的
 > 节点拒绝启动，接错网的对等节点在 P2P 握手时被点名拒绝
 > （[`peer.rs:45-47`](../crates/qlab-p2p/src/peer.rs#L45-L47)，lab #474）——你不可能
@@ -145,9 +145,9 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 
 公告同时一并发布这些网络身份输入：
 
-- `genesis.qmb`——**格式 v5，网络 `qumbra-t2`**
+- `genesis.qmb`——**格式 9（v5 形式集），网络 `qumbra-t2`**
   （[`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636)）；
-- `expected_genesis_hash`——`dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5`；
+- `expected_genesis_hash`——`59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1`；
 - `dial_peers` 的初始 P2P 种子地址——`"18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"`。
 
 分发：`genesis.qmb` 从 **`https://seed.qumbra.org/genesis.qmb`** 下载（裸服务名在
@@ -265,7 +265,7 @@ data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
 dial_peers = ["18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
-expected_genesis_hash = "dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5"
+expected_genesis_hash = "59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1"
 mining = false
 ```
 

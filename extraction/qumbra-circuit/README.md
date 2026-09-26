@@ -1,5 +1,18 @@
 # Qumbra transaction circuit + consensus verifier
 
+> **Snapshot: this tree is the pre-re-mint circuit, not the live wire.**
+> It was extracted at lab `f125bc7` (lab PR #458). It verifies with the **non-hiding**
+> `TwoAdicFriPcs`, and its committed proof is **148,625 B**.
+>
+> The live consensus circuit moved on twice:
+> - the security re-mint (2026-09-25, lab PR #737) switched to a hiding PCS
+>   (zero-knowledge) and added the nullifier path-bit fix;
+> - re-genesis batch 2 (lab #747) set hiding random codewords 4 → 0, so the wire is
+>   178,681 B.
+>
+> The live wire lives in the lab's `crates/qlab-consensus`. Everything below is accurate
+> **for this snapshot**. Re-extracting the current circuit is a separate, unscheduled step.
+
 The fixed-shape STARK circuit behind a Qumbra transaction, and the verifier that
 checks one — extracted from a private prototype lab into a standalone tree so
 that the circuit's shape, its frozen constants, and a real proof can all be

@@ -3,8 +3,8 @@ qumbra-node halt-status (issue #74)
   build rev:    BUILDREV
   halt plan:    no halt scheduled
   revision:     v1.1-exact-emission
-  frozen digest: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
-  rule domain:  adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426
+  frozen digest: ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4
+  rule domain:  90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1
   resumes past: height 8640 (post-halt rules apply above it)
   halt marker:  none on disk (this node has never halted)
   name service: INERT — no boundary in this build; riders refused at every height (#367)

@@ -186,9 +186,18 @@ pub const DRILL_HALT_HEIGHT: u64 = 16;
 /// binaries refuse format 7 while new ones refuse 4 / 5, so no node ever runs
 /// a mixed digest. [`REVISION_V1_1_EXACT_EMISSION`] and [`REVISION_V1_0_1_DRILL`]
 /// moved with it (each still differs from v1.0 by identifier only).
+///
+/// 🔴 **Moved a third time by re-genesis batch 2, 2026-09-26, identifier again
+/// NOT bumped** (lab #747; the same rule). Batch-1 value: `22ae5ad9…bd6e`
+/// (`22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e`). The
+/// delta: hiding random codewords 4 → 0 — `consensus_wire_bytes` 182,745 →
+/// 178,681, `consensus_fri` "/zk" → "/zk/rc0" — and genesis formats 8 (T1) /
+/// 9 (T2). Safe for the same reason: a re-genesis, no boundary; old binaries
+/// refuse format 9 and new ones refuse 4–7. Read from this tree's own
+/// `halt-status` (named runs, lab #747).
 pub const REVISION_V1_0: Revision = Revision {
     id: "v1.0",
-    frozen_digest_hex: "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
+    frozen_digest_hex: "ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4",
 };
 
 /// **The emission-rule revision** (lab #299 + #303): the parameter set in force
@@ -215,7 +224,7 @@ pub const REVISION_V1_0: Revision = Revision {
 /// last bullet: the schedule rule rides the revision machinery.
 pub const REVISION_V1_1_EXACT_EMISSION: Revision = Revision {
     id: "v1.1-exact-emission",
-    frozen_digest_hex: "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
+    frozen_digest_hex: "ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4",
 };
 
 /// The **deliberately inert** revision the drill upgrades to (H5). It moves **no**
@@ -224,7 +233,7 @@ pub const REVISION_V1_1_EXACT_EMISSION: Revision = Revision {
 /// drive on it.
 pub const REVISION_V1_0_1_DRILL: Revision = Revision {
     id: "v1.0.1-drill",
-    frozen_digest_hex: "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
+    frozen_digest_hex: "ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4",
 };
 
 /// What this binary is: its name, its halt schedule, the revision it carries, and

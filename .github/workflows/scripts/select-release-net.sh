@@ -35,8 +35,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KECCAK="$HERE/keccak256.py"
 
-T1_GENESIS_HASH=82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af
-T2_GENESIS_HASH=dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5
+T1_GENESIS_HASH=740ba41c06f1c0075e203380b9adc46cfbe84b4b28907f531254a90a2d8e518e
+T2_GENESIS_HASH=59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1
 # Same four public entry points T1 used (node0 is deliberately not one of them).
 # Lab #516: the hosts stay; the genesis they serve is what the cutover changes.
 DIAL_PEERS_BOTH='["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]'

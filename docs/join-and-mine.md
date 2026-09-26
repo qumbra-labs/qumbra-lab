@@ -22,7 +22,7 @@ block reward when you win one and makes you a full validator of the chain. The w
 > including the operators. Anything you have that names the T1 genesis hash
 > (`138e1524…addb`), a `t1-*` release tag, or the height-19,008 update deadline belongs
 > to the retired net and does not apply here. T2 is a **different network by
-> construction**: its genesis file is format **v5**, network `qumbra-t2`
+> construction**: its genesis file is format **9** (the v5 form set), network `qumbra-t2`
 > ([`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636)), a node
 > pinned to the wrong genesis refuses to start, and a wrong-net peer is refused by name
 > at the P2P handshake ([`peer.rs:45-47`](../crates/qlab-p2p/src/peer.rs#L45-L47),
@@ -165,9 +165,9 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 
 The announcement also publishes these network-identity inputs together:
 
-- `genesis.qmb` — **format v5, network `qumbra-t2`**
+- `genesis.qmb` — **format 9 (the v5 form set), network `qumbra-t2`**
   ([`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636));
-- `expected_genesis_hash` — `dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5`;
+- `expected_genesis_hash` — `59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1`;
 - the initial P2P seed addresses for `dial_peers` — `"18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"`.
 
 Distribution: `genesis.qmb` downloads from **`https://seed.qumbra.org/genesis.qmb`**
@@ -298,7 +298,7 @@ data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
 dial_peers = ["18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
-expected_genesis_hash = "dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5"
+expected_genesis_hash = "59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1"
 mining = false
 ```
 

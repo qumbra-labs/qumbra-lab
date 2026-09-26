@@ -76,14 +76,15 @@ impl GenesisForm {
 
     /// Map a genesis file's `format_version` to its form set. `None` for
     /// versions this tree does not serve (v1–v3 are refused-with-a-reason
-    /// history; anything above 5 is a later tree's business).
+    /// history, 4–7 are the refused pre-re-mint and batch-1 formats; anything
+    /// else is a later tree's business).
     pub fn from_genesis_format_version(v: u32) -> Option<GenesisForm> {
         match v {
-            // The security re-mint: T1 = 6, T2 = 7. The
-            // pre-re-mint 4 / 5 map to nothing here; the genesis loaders refuse
-            // them by name before asking.
-            6 => Some(GenesisForm::V4),
-            7 => Some(GenesisForm::V5),
+            // Re-genesis batch 2 (lab #747, rc = 0): T1 = 8, T2 = 9. The
+            // pre-re-mint 4 / 5 and batch 1's 6 / 7 map to nothing here; the
+            // genesis loaders refuse them by name before asking.
+            8 => Some(GenesisForm::V4),
+            9 => Some(GenesisForm::V5),
             ANNULET_GENESIS_FORMAT_VERSION => Some(GenesisForm::Annulet),
             _ => None,
         }
@@ -92,8 +93,8 @@ impl GenesisForm {
     /// The genesis-file `format_version` this form set is keyed to.
     pub fn genesis_format_version(self) -> u32 {
         match self {
-            GenesisForm::V4 => 6,
-            GenesisForm::V5 => 7,
+            GenesisForm::V4 => 8,
+            GenesisForm::V5 => 9,
             GenesisForm::Annulet => ANNULET_GENESIS_FORMAT_VERSION,
         }
     }
@@ -202,12 +203,12 @@ mod tests {
 
     #[test]
     fn maps_exactly_the_re_minted_v4_v5_and_annulet_and_nothing_else() {
-        // The security re-mint: T1 = 6, T2 = 7; the
-        // pre-re-mint 4 / 5 map to nothing.
-        assert_eq!(GenesisForm::from_genesis_format_version(6), Some(GenesisForm::V4));
-        assert_eq!(GenesisForm::from_genesis_format_version(7), Some(GenesisForm::V5));
+        // Re-genesis batch 2 (lab #747): T1 = 8, T2 = 9; the pre-re-mint
+        // 4 / 5 and batch 1's 6 / 7 map to nothing.
+        assert_eq!(GenesisForm::from_genesis_format_version(8), Some(GenesisForm::V4));
+        assert_eq!(GenesisForm::from_genesis_format_version(9), Some(GenesisForm::V5));
         assert_eq!(GenesisForm::from_genesis_format_version(32), Some(GenesisForm::Annulet));
-        for v in [0u32, 1, 2, 3, 4, 5, 8, 31, 33, u32::MAX] {
+        for v in [0u32, 1, 2, 3, 4, 5, 6, 7, 10, 31, 33, u32::MAX] {
             assert_eq!(GenesisForm::from_genesis_format_version(v), None, "v{v} must not map");
         }
     }
