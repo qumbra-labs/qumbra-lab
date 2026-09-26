@@ -24,7 +24,7 @@ for a verifiable envelope. Locked by `the_refusal_fixtures_refuse_by_name` /
 
 ## The QVASK_OK fixture (CI-minted, committed)
 
-`golden-envelope-v1.bin` (189,437 B) + `golden-chain-cm-v1.bin` (32 B): a real
+`golden-envelope-v1.bin` (184,689 B since re-genesis batch 2; 189,437 B at rc = 4) + `golden-chain-cm-v1.bin` (32 B): a real
 envelope at the pinned `DISCLOSURE_V1_CFG` (b16/q20/g22/a16) over the
 deterministic instance in `tests/golden_v1.rs`.
 
@@ -52,7 +52,17 @@ deterministic instance in `tests/golden_v1.rs`.
 - **Re-mint** (a V2 config, a statement change): push a `mint/**` branch — the
   workflow proves once and hands the files back as an artifact; commit them and
   the digest block above in the same commit.
-- ⚠️ **Size note (basis matters)**: the pre-re-mint envelope was 150,695 B (189,437 B under the hiding PCS) — the widely
+- **Re-genesis batch 2, 2026-09-26 (lab #747) — re-minted at rc = 0** (hiding
+  random codewords 4 → 0; the rc = 4 envelope no longer decodes under the
+  new PCS). Minted by the same generator via `kit-fixture-mint.yml` on
+  `ubuntu-24.04-arm` — run 36222603738, branch `mint/batch2-rc0` at `06f98c6`,
+  one prove, 11.40 s. Old → new: `golden-envelope-v1.bin` 189,437 B, keccak256
+  `75016a4c…5dc8`, sha256 `6336ec36…14c7` → **184,689 B, keccak256
+  `1bd7e32af331e23541f53587da7fd5d56a3fd9340cc29e4960a4aac4c03cebe2`, sha256
+  `7a874d93e4c8beef28bae8e576ca8ca74029f066cbd80923471ce16dd872d58b`**;
+  `golden-chain-cm-v1.bin` unchanged (keccak256 `97669513…1608`, sha256
+  `59360d8d…b9a6`).
+- ⚠️ **Size note (basis matters)**: the pre-re-mint envelope was 150,695 B (189,437 B under the hiding PCS at rc = 4; 184,689 B at rc = 0) — the widely
   cited "~122 KB" is `docs/disclosure-run1.md`'s **bincode-fixed** proof size
   (121.9 KB), but the §3 envelope serializes the proof with **postcard**
   (141.7 KB in the same table, and this artifact's config carries a16 arity).
