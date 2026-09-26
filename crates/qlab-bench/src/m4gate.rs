@@ -6362,10 +6362,41 @@ pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
 mod tests {
     use std::sync::OnceLock;
 
-    use p3_air::check_constraints;
+    use p3_air::{Air, BaseAir, DebugConstraintBuilder};
 
     use super::*;
     use crate::m4gaterec::{consensus_proof, walk};
+
+    /// Lab #742 (A5 lever 4f): the gate's SAT claims, on `qlab_air::l2test`'s
+    /// scanner rather than `p3_air::check_constraints`. p3-air 0.6.1's check is a
+    /// serial row loop, and this block's interior tests were 32.9 of the lane's
+    /// 95.4 test-minutes (run 36147079884) — almost all of it full 2^18 / 2^19
+    /// serial scans of the wide gate. The scanner evaluates every row with p3's
+    /// own builder (verbatim, pinned by `l2test`'s own tests), on rayon; a SAT
+    /// claim still visits every row. Same name and signature, so every call site
+    /// below is unchanged, and it panics in `check_constraints`' words.
+    fn check_constraints<A>(air: &A, main: &RowMajorMatrix<Val>, public_values: &[Val])
+    where
+        A: for<'a> Air<DebugConstraintBuilder<'a, Val>> + BaseAir<Val> + Sync,
+    {
+        qlab_air::l2test::assert_satisfied(air, main, public_values, "gate trace");
+    }
+
+    /// The UNSAT claim every `is_unsat*` below makes: SOME constraint is violated.
+    /// `first_violation` visits the trace tail-first (`last, first, last-1, …`
+    /// chunk order): the interior's merge region is its last perms and the query
+    /// openings sit near its head, so a tamper at either end is met in the first
+    /// chunks instead of after a full ascending pass. Early exit only — the
+    /// verdict is the same as a full scan's. A panic inside the AIR's `eval` is
+    /// no longer read as UNSAT (the old `thread::spawn(..).join().is_err()`
+    /// wrapper could not tell a violated constraint from a crash); it fails the
+    /// test, which is the stricter reading.
+    fn unsat_under<A>(air: &A, trace: &RowMajorMatrix<Val>, opvs: &[Val]) -> bool
+    where
+        A: for<'a> Air<DebugConstraintBuilder<'a, Val>> + BaseAir<Val> + Sync,
+    {
+        qlab_air::l2test::first_violation(air, trace, opvs, trace.height()).is_some()
+    }
 
     pub(crate) fn shared() -> &'static (Schedule, Vec<Val>, Vec<Ext>) {
         static CELL: OnceLock<(Schedule, Vec<Val>, Vec<Ext>)> = OnceLock::new();
@@ -6480,21 +6511,13 @@ mod tests {
     /// Wide analogue of `is_unsat`: check the mutated wide trace against the
     /// `wide()`-shaped AIR in a spawned thread (panic == UNSAT == caught).
     fn is_unsat_wide(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
-        std::thread::spawn(move || {
-            check_constraints(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs);
-        })
-        .join()
-        .is_err()
+        unsat_under(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs)
     }
 
     /// `is_unsat_wide` against the interior AIR (`new_interior()`: doubled opvs
     /// + per-child routing). Used by the two-child per-lane negatives (2d-4).
     fn is_unsat_interior(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
-        std::thread::spawn(move || {
-            check_constraints(&VerifierGateAir::new_interior(), &trace, &opvs);
-        })
-        .join()
-        .is_err()
+        unsat_under(&VerifierGateAir::new_interior(), &trace, &opvs)
     }
 
     /// M4 step 1 stage 2, slice 1a-i: `GateShape::narrow()` must reproduce the
@@ -7523,22 +7546,14 @@ mod tests {
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
     }
 
-    /// Run `check_constraints` in a spawned thread and report whether it
-    /// panicked (UNSAT). A spawned thread's panic — including rayon worker
-    /// panics that propagate into it — is reliably captured by `join()`,
-    /// unlike `catch_unwind` on the calling thread, which intermittently lets
-    /// the panic escape when many checks run concurrently under `cargo test`.
+    /// Whether the narrow gate refuses `trace` (see [`unsat_under`]).
     fn is_unsat(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
-        std::thread::spawn(move || {
-            check_constraints(&VerifierGateAir::new(), &trace, &opvs);
-        })
-        .join()
-        .is_err()
+        unsat_under(&VerifierGateAir::new(), &trace, &opvs)
     }
 
     /// Serialize ALL heavy work (trace build + rayon-parallel check) across the
     /// parallel test threads. Each build allocates a ~230 MB trace and
-    /// `check_constraints` is itself rayon-parallel; running several at once
+    /// the scanner is rayon-parallel; running several at once
     /// oversubscribes memory/CPU and has produced spurious failures. Holding
     /// this guard across the whole build+check body keeps them deterministic.
     fn heavy_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -7983,9 +7998,10 @@ mod tests {
     #[test]
     fn interior_single_child_satisfies() {
         let _g = heavy_lock();
-        let (leaf, opvs) = crate::m4treerec::leaf_proof();
-        let sched = crate::m4treerec::walk_leaf(&leaf, &opvs);
-        let (trace, meta) = build_gate_trace(&sched, &opvs, &GateShape::wide(), 0);
+        // The same leaf prove + walk `wide_shared()` caches for the negatives
+        // below — one ~12 GB leaf prove per process, not two (lab #742).
+        let (sched, opvs) = wide_shared();
+        let (trace, meta) = build_gate_trace(sched, opvs, &GateShape::wide(), 0);
         check_constraints(
             &VerifierGateAir::new_with_shape(GateShape::wide()),
             &trace,

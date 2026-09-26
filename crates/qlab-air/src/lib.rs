@@ -15,7 +15,7 @@
 pub mod l2;
 pub mod l2p;
 pub mod l2r;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod l2test;
 pub mod narrow;
 pub mod reference;

@@ -9,6 +9,14 @@ publish.workspace = true
 p3-air = "=0.6.1"
 p3-field = "=0.6.1"
 p3-matrix = "=0.6.1"
+# Only with `test-support` (below): `l2test`'s scanner runs its rows on rayon.
+p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"], optional = true }
+
+[features]
+# `l2test` — the parallel, tail-first constraint scanner — for OTHER crates'
+# tests (lab #742: qlab-bench's M4 gate block enables it as a dev-dependency).
+# Never a runtime feature: nothing outside a test may depend on it.
+test-support = ["dep:p3-maybe-rayon"]
 
 [dev-dependencies]
 # Published Keccak-f used as the authority the reference implementation

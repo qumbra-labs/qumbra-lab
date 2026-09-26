@@ -57,3 +57,7 @@ bincode = "1"
 # Serialize trait bound for per-component proof accounting (breakdown mode);
 # already in the dependency tree via the p3 crates.
 serde = "1"
+
+[dev-dependencies]
+# lab #742 (A5 lever 4f): the M4 gate tests scan with `qlab_air::l2test`.
+qlab-air = { path = "../qlab-air", features = ["test-support"] }
