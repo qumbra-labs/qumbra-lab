@@ -115,8 +115,9 @@ pub struct NetProfile {
 /// release and this is the identity such a binary must carry.
 pub const NET_T1: NetProfile = NetProfile {
     net: "t1",
-    // The security re-mint: was 138e1524… (T1 is a code pin only).
-    genesis_hash: "82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af",
+    // Re-genesis batch 2 (lab #747): was 82f900b6… (batch 1), 138e1524…
+    // before that (T1 is a code pin only).
+    genesis_hash: "740ba41c06f1c0075e203380b9adc46cfbe84b4b28907f531254a90a2d8e518e",
     genesis_url: PUBLISHED_GENESIS_URL,
     seeds: PUBLIC_SEEDS,
 };
@@ -135,10 +136,11 @@ pub const NET_T1: NetProfile = NetProfile {
 /// the file actually served at [`PUBLISHED_GENESIS_URL`], on every release cut.
 pub const NET_T2: NetProfile = NetProfile {
     net: "t2",
-    // The security re-mint: the re-minted live T2 genesis
-    // (`genesis init --t2 --remint-from` over d1dad4ea…), named runs ×2,
-    // file sha256 03a28137…277f, 41,750 B. Was d1dad4ea….
-    genesis_hash: "dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5",
+    // Re-genesis batch 2 (lab #747): `genesis init --t2 --remint-from` over
+    // batch 1's dc0edd5f… (format 7, file sha256 03a28137…277f), named runs ×2,
+    // file sha256 761d338c…d505, 41,754 B, format 9. Was dc0edd5f… (batch 1),
+    // d1dad4ea… before that.
+    genesis_hash: "59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1",
     genesis_url: PUBLISHED_GENESIS_URL,
     seeds: PUBLIC_SEEDS,
 };

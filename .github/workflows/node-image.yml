@@ -278,23 +278,23 @@ jobs:
           # than explorer-image.yml's symbol grep on purpose — a consensus
           # binary's "did it really recompile" question is "are its constants
           # the consensus constants", and halt-status answers it exactly.
-          # moved with the security re-mint (PR #737), as the 08-04 mint moved 19564eca → a54e73ce
-          FROZEN_PIN="22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e"
+          # moved with re-genesis batch 2 (lab #747, rc 4 → 0: 22ae5ad9 → ead6e181), as the security re-mint (PR #737) moved a54e73ce → 22ae5ad9
+          FROZEN_PIN="ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4"
           # The rule domain is Revision::digest — keccak over the IDENTIFIER as
           # well as the frozen digest (revision.rs, #81) — so the two variants
           # differ here by design even though their frozen digests are equal:
           # armed carries v1.0, resume carries v1.1-exact-emission. Both moved with
-          # the frozen digest in the security re-mint (PR #737); read from each
+          # the frozen digest in re-genesis batch 2 (lab #747); read from each
           # variant's own `halt-status`.
           case "${{ inputs.variant }}" in
             emission-resume)
               EXP_REVISION="v1.1-exact-emission"
-              EXP_DOMAIN="adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426"
+              EXP_DOMAIN="90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1"
               EXP_PLAN="resumes past: height 8640"
               ;;
             armed)
               EXP_REVISION="v1.0"
-              EXP_DOMAIN="bb85853e9c7b40ff62b1e76933e5f6fa23c7c566252b2b8747a595dd6915e802"
+              EXP_DOMAIN="c7b5d40be4784f792a53c5df9f9e17bfe31df2327ec7986edad59ffaf3733259"
               EXP_PLAN="ARMED — halts at height 8640"
               ;;
           esac

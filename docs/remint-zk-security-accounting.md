@@ -81,6 +81,24 @@ The paper's zero-knowledge conditions (Theorems 4, 6, 8) are on three objects. *
 
 **Recommendation:** keep 4, the upstream value. It costs a few columns of bytes. Taking it below upstream would be an optimization on a proof we did not write, for a gain we have not measured.
 
+> **Amended 2026-09-26: rc 4 → 0 on the T-net** (Larry's ruling on lab #742; built in re-genesis batch 2, lab #747; mainnet waits on the M13 audit).
+>
+> **Why the recommendation above changed.** It said two things: "a few columns of bytes" and "a gain we have not measured". **Both turned out to be false once measured.**
+> - `num_random_codewords` widens **every quotient chunk** (D + rc, so 4 → 8 columns, which doubles the quotient LDE) and the randomizer commitment (rc + D), not only the trace.
+> - The A5 phase table (lab PR #745's `zkpeak --phases`) shows all of it is resident through `open`, where the prover peaks: rc = 4 costs **≈ 1.25 GiB** of the P3 and L1 peaks.
+> - It also costs **4,064 B** of the L1 wire (182,745 → 178,681 B) and 7,584 B per L2 proof.
+>
+> **Why the argument above still holds at rc = 0.** The three conditions it names are each independent of rc in the code:
+> - `h = |H|` comes from the `w` interleaved random columns that `with_random_cols(w + 2·rc)` adds on top of rc;
+> - the `t_i` cover all D quotient columns whatever the chunk width;
+> - `R` is the randomizer's `+ D` columns, which remain at rc = 0.
+>
+> Soundcalc shows no term moving at whole bits (lab #742). Upstream Plonky3's own security accounting models rc as batched width only, and its unit tests use `hiding(0)`.
+>
+> **What changes in the claim: nothing, and the caveat stays.** The mapping of code to paper is still this document's reading, not a Plonky3 statement, and nobody outside has reviewed it. It is put to the M13 audit by name.
+>
+> The full analysis is qumbra-design `hiding-random-codewords-2026-09.md` (design PR #300). The pin is `rc_is_zero_and_no_random_openings_travel` in qlab-consensus, plus one hiding smoke test per L2 shape.
+
 **What this rests on:** the mapping of Plonky3's code to the paper's objects:
 - row interleaving ⇒ `h = |H|`;
 - the `+ D` columns ⇒ `R`;

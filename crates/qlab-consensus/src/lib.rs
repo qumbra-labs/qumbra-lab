@@ -63,10 +63,19 @@ type MyCompress = CompressionFunctionFromHasher<U64Hash, 2, 4>;
 /// salt entropy per leaf (Plonky3's example value; re-derived in the re-mint's
 /// security accounting).
 pub const SALT_ELEMS: usize = 4;
-/// Random codewords `HidingFriPcs` appends to every committed matrix (and to
-/// the quotient chunks) — eprint 2024/1037 §4. Plonky3's example value;
-/// re-derived in the re-mint's security accounting.
-pub const NUM_RANDOM_CODEWORDS: usize = 4;
+/// Random codewords `HidingFriPcs` appends to every committed matrix, to each
+/// quotient chunk and to the randomizer commitment.
+///
+/// **0 since re-genesis batch 2** (lab #747; Larry's ruling on lab #742,
+/// 2026-09-26: rc = 0 on the T-net, mainnet after the audit). It was 4 at the
+/// security re-mint — Plonky3's example value. On the eprint 2024/1037 reading
+/// the re-mint accounting used, none of the paper's zero-knowledge conditions
+/// (`h`, `h_p`, the FRI batch mask `R`) depends on this count; the analysis is
+/// qumbra-design `hiding-random-codewords-2026-09` and the dated amendment to
+/// `docs/remint-zk-security-accounting.md` §3. At 4 it cost 1.25 GiB of the P3
+/// and L1 peaks and 4,064 B of the L1 wire. `rc_is_zero_and_no_random_openings_travel`
+/// pins it.
+pub const NUM_RANDOM_CODEWORDS: usize = 0;
 
 type ValMmcs = MerkleTreeHidingMmcs<
     [Val; p3_keccak::VECTOR_LEN],
@@ -430,9 +439,15 @@ mod tests {
     /// on the Graviton acceptance lane: both readers
     /// (`consensus_wire_is_pinned`, `q69_…`) measured it identically, and proof
     /// bytes are deterministic across machines. Over the design's ≤ 150 KB
-    /// target — a design question, not this pin's. The genesis-side
-    /// `CONSENSUS_WIRE_BYTES` stays 148,625 until the genesis is re-minted.
-    const WIRE_BYTES: Option<usize> = Some(182_745);
+    /// target — a design question, not this pin's.
+    ///
+    /// **Re-genesis batch 2 (lab #747): 182,745 → 178,681 B** with
+    /// `NUM_RANDOM_CODEWORDS` 4 → 0. Each random codeword was 10 opened base
+    /// values per query (trace 1, quotient chunks 8, randomizer 1) plus 11
+    /// extension values of `opened_values_rand` (trace at ζ and ζ·g, 8 chunks,
+    /// randomizer): 4 × (21 × 40 + 176) = 4,064 B; every length prefix stays.
+    /// Equal to the genesis-side `CONSENSUS_WIRE_BYTES`.
+    const WIRE_BYTES: Option<usize> = Some(178_681);
 
     fn assert_wire(bytes: usize, what: &str) {
         match WIRE_BYTES {
@@ -602,5 +617,29 @@ mod tests {
         for (i, (x, y)) in [(&p1, &p2), (&p1, &p3), (&p2, &p3), (&p1, &p4)].iter().enumerate() {
             assert_ne!(x, y, "pair {i}: two proofs of one witness must differ");
         }
+    }
+
+    /// Re-genesis batch 2 (lab #747): rc = 0 is a checked property, not a
+    /// comment — the constant is 0, and a real proof carries no random-codeword
+    /// openings (every per-matrix, per-point vector of `opened_values_rand` is
+    /// empty). Chain-only 2^13, as above.
+    #[test]
+    fn rc_is_zero_and_no_random_openings_travel() {
+        use qlab_air::narrow::NarrowKeccakAir;
+        assert_eq!(NUM_RANDOM_CODEWORDS, 0, "rc = 0 on the T-net (lab #742 ruling)");
+        let air = NarrowKeccakAir::chain_only(13);
+        let pvs = vec![Val::ZERO; <NarrowKeccakAir as p3_air::BaseAir<Val>>::num_public_values(&air)];
+        let trace = air.generate_trace::<Val>(CONSENSUS_CFG.log_blowup);
+        let proof = prove(&make_config(), &air, trace, &pvs);
+        let rand = &proof.opening_proof.0;
+        assert!(!rand.is_empty(), "the hiding PCS still reports its rounds");
+        for (r, round) in rand.iter().enumerate() {
+            for (m, mat) in round.iter().enumerate() {
+                for (z, point) in mat.iter().enumerate() {
+                    assert!(point.is_empty(), "round {r} matrix {m} point {z}: a random-codeword opening travelled");
+                }
+            }
+        }
+        assert!(verify(&make_config(), &air, &proof, &pvs).is_ok());
     }
 }

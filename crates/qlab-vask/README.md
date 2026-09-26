@@ -121,7 +121,7 @@ test-locked (`qumbra-credit-ref/src/lib.rs`).
 
 | Figure | Value | Basis |
 |---|---|---|
-| envelope size | **189,437 B** (~185 KiB; the security re-mint's hiding PCS — 150,695 B before) | the committed V1 golden fixture: postcard-serialized proof at the pinned b16/q20/g22/a16 config (`fixtures/README.md` — note the stale "~122 KB" figure floating in older docs is the bincode proof size, wrong codec) |
+| envelope size | **184,689 B** (~180 KiB; the hiding PCS at rc = 0, re-genesis batch 2 — 189,437 B at rc = 4, 150,695 B before the security re-mint) | the committed V1 golden fixture: postcard-serialized proof at the pinned b16/q20/g22/a16 config (`fixtures/README.md` — note the stale "~122 KB" figure floating in older docs is the bincode proof size, wrong codec) |
 | verify | **26.0 ms** | b16/q20/g22, Apple M5 Max, reproduced twice (`docs/disclosure-run1.md`/`-run2.md`) — ~40 verifies/s single-thread, far above any deposit rate |
 | depositor's prove | 0.59–0.99 s | same rig and runs, 1 timing sample per run |
 | deposit → creditable | ~2.5–11.5 min | arithmetic from devnet finality pins, not a measurement — `docs/kit-confirmation-policy.md` §4 |

@@ -163,12 +163,12 @@ env:
   # REVISION_V1_1_EXACT_EMISSION / REVISION_V1_0 frozen_digest_hex, revision.rs
   # the same digest, node-image.yml FROZEN_PIN + resume EXP_DOMAIN, and
   # qlab_devnet::emission_exact::RULE_BOUNDARY_HEIGHT = 8_640. Unchanged.
-  # moved with the security re-mint (PR #737), as the 08-04 mint moved 19564eca → a54e73ce
-  FROZEN_PIN: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
+  # moved with re-genesis batch 2 (lab #747, rc 4 → 0: 22ae5ad9 → ead6e181), as the security re-mint (PR #737) moved a54e73ce → 22ae5ad9
+  FROZEN_PIN: ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4
   EXPECTED_REVISION: v1.1-exact-emission
   # the resume variant's rule domain (Revision::digest of v1.1-exact-emission),
-  # moved with the frozen digest in the security re-mint (PR #737)
-  EXPECTED_DOMAIN: adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426
+  # moved with the frozen digest in re-genesis batch 2 (lab #747)
+  EXPECTED_DOMAIN: 90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1
   RULE_BOUNDARY_HEIGHT: "8640"
   PUBLIC_REPO: qumbra-labs/qumbra
 

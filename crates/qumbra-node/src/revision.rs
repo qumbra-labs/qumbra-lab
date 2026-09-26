@@ -408,9 +408,13 @@ mod tests {
         // 🔴 Moved again by the The security re-mint: wire 148,625 →
         // 182,745 and `consensus_fri` + "/zk". From the named `halt-status` runs ×2.
         //   pre-re-mint: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+        // 🔴 Moved by re-genesis batch 2 (lab #747): rc 4 → 0 — wire 182,745 →
+        // 178,681 and `consensus_fri` "/zk" → "/zk/rc0". From this tree's
+        // `halt-status` (recomputed line), the named runs.
+        //   batch 1: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e
         assert_eq!(
             own_frozen_digest_hex(),
-            "22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e",
+            "ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4",
         );
     }
 

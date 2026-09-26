@@ -121,8 +121,8 @@ make_pool_stub() { # $1 = build rev line value
 # genesis actually being served. Same values as select-release-net.sh; the pin
 # checks at the bottom are what stop this copy going stale.
 CUT_NET=t2
-T1_HASH=82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af
-T2_HASH=dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5
+T1_HASH=740ba41c06f1c0075e203380b9adc46cfbe84b4b28907f531254a90a2d8e518e
+T2_HASH=59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1
 
 # expect <want:pass|fail> <name> <node-fixture> <node-rev> <wallet-rev>
 #        [baked-net] [baked-hash] [pool-rev] [wallet-net]
@@ -142,9 +142,9 @@ expect() {
   out=$(cd "$TMP" && NODE_BIN="$node" WALLET_BIN="$wallet" POOL_BIN="$pool" \
         EXPECTED_BUILD_REV="$BUILD_REV" \
         NET="$CUT_NET" GENESIS_HASH="$T2_HASH" \
-        FROZEN_PIN=22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e \
+        FROZEN_PIN=ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4 \
         EXPECTED_REVISION=v1.1-exact-emission \
-        EXPECTED_DOMAIN=adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426 \
+        EXPECTED_DOMAIN=90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1 \
         RULE_BOUNDARY_HEIGHT=8640 \
         bash "$GATE" 2>&1)
   rc=$?
@@ -244,11 +244,11 @@ pin() { # $1 = name, $2 = file, $3 = grep -F pattern
   fi
 }
 pin "FROZEN_PIN matches release-binaries.yml" "$WORKFLOW" \
-    "FROZEN_PIN: 22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e"
+    "FROZEN_PIN: ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4"
 pin "EXPECTED_REVISION matches release-binaries.yml" "$WORKFLOW" \
     "EXPECTED_REVISION: v1.1-exact-emission"
 pin "EXPECTED_DOMAIN matches release-binaries.yml" "$WORKFLOW" \
-    "EXPECTED_DOMAIN: adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426"
+    "EXPECTED_DOMAIN: 90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1"
 pin "RULE_BOUNDARY_HEIGHT matches release-binaries.yml" "$WORKFLOW" \
     'RULE_BOUNDARY_HEIGHT: "8640"'
 
@@ -256,9 +256,9 @@ pin "RULE_BOUNDARY_HEIGHT matches release-binaries.yml" "$WORKFLOW" \
 # by two routes. If their pins ever disagree, one of them is publishing something
 # the other would refuse, and nothing else in the tree would notice.
 pin "node-image.yml agrees on the frozen digest" "$NODE_IMAGE" \
-    'FROZEN_PIN="22ae5ad93a1208ae5d312492ad34de168e11beca5b69ba74339fbf17da4bbd6e"'
+    'FROZEN_PIN="ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4"'
 pin "node-image.yml agrees on the resume rule domain" "$NODE_IMAGE" \
-    'EXP_DOMAIN="adbabecc4c24f65101e40b98bae9417f1581e98f7c90c3ad9c124b23f156b426"'
+    'EXP_DOMAIN="90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1"'
 
 # Lab #516: the four T1-hardwired sites moved into select-release-net.sh. The
 # workflow must still mention that script, and the T2 pin must live in it.
@@ -266,9 +266,9 @@ SELECT="$HERE/../../scripts/select-release-net.sh"
 pin "workflow dispatches on net" "$WORKFLOW" \
     "id: pins"
 pin "T2 genesis pin lives in select-release-net.sh" "$SELECT" \
-    "T2_GENESIS_HASH=dc0edd5ff03553db56ae0fcf97bf022aa445fe1cfc57a63ee267b3ef4b4c75d5"
+    "T2_GENESIS_HASH=59d9f054bb15116dac40c42ddb67c7d377407eec3010e9f98a5cc76e9e0544b1"
 pin "T1 genesis pin still reachable" "$SELECT" \
-    "T1_GENESIS_HASH=82f900b63aec3bae74a782d301b261ade00784a1968e88ad5b26a5982e9067af"
+    "T1_GENESIS_HASH=740ba41c06f1c0075e203380b9adc46cfbe84b4b28907f531254a90a2d8e518e"
 pin "cutover refusal text" "$SELECT" \
     "published genesis is still t1 — run this after the cutover"
 
