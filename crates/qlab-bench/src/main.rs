@@ -935,10 +935,15 @@ fn main() {
         "zkpeak" => {
             let case_pos = args.iter().position(|a| a == "--case");
             let Some(case) = case_pos.and_then(|i| args.get(i + 1)) else {
-                eprintln!("zkpeak: `--case l1|p19|p [--phases]` is required");
+                eprintln!("zkpeak: `--case l1|p19|p [--phases] [--rc N]` is required");
                 std::process::exit(2);
             };
-            zkpeak::run_zkpeak(&power, case, args.iter().any(|a| a == "--phases"));
+            let rc = args
+                .iter()
+                .position(|a| a == "--rc")
+                .and_then(|i| args.get(i + 1))
+                .map(|n| n.parse::<usize>().expect("--rc takes a non-negative integer"));
+            zkpeak::run_zkpeak(&power, case, args.iter().any(|a| a == "--phases"), rc);
             return;
         }
         "bucket" => {

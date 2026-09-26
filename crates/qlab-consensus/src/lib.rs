@@ -226,7 +226,17 @@ pub const LOG_HEIGHT: usize = 18;
 /// Merkle cap height are held at the frozen consensus values; only the FRI
 /// parameters come from `cfg`. Every point must clear the ~100-bit security bar.
 pub fn make_config_with(cfg: &FriCfg) -> Config {
-    make_config_from(cfg, ProverRng::from_os)
+    make_config_from(cfg, NUM_RANDOM_CODEWORDS, ProverRng::from_os)
+}
+
+/// **Bench only** (lab #742 / #747): [`make_config_with`] with `rc` hiding random
+/// codewords instead of [`NUM_RANDOM_CODEWORDS`], so `qlab-bench zkpeak --rc N`
+/// can measure what rc costs. A proof made under any other `rc` than the
+/// constant is not a consensus proof: it neither verifies under
+/// [`make_config`] nor has the pinned wire size. Nothing outside `qlab-bench`
+/// calls this.
+pub fn make_config_with_rc(cfg: &FriCfg, rc: usize) -> Config {
+    make_config_from(cfg, rc, ProverRng::from_os)
 }
 
 /// [`make_config_with`] with deterministically seeded generators — **tests
@@ -234,7 +244,7 @@ pub fn make_config_with(cfg: &FriCfg) -> Config {
 /// the trace MMCS, the FRI MMCS and the PCS — get three distinct seeds.
 pub fn make_config_seeded(cfg: &FriCfg, seed: u64) -> Config {
     let mut n = 0u64;
-    make_config_from(cfg, || {
+    make_config_from(cfg, NUM_RANDOM_CODEWORDS, || {
         n += 1;
         ProverRng::seeded(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(n))
     })
@@ -242,7 +252,7 @@ pub fn make_config_seeded(cfg: &FriCfg, seed: u64) -> Config {
 
 /// The one construction site. Each randomness consumer gets its **own**
 /// generator from `rng` — never a clone of another's.
-fn make_config_from(cfg: &FriCfg, mut rng: impl FnMut() -> ProverRng) -> Config {
+fn make_config_from(cfg: &FriCfg, rc: usize, mut rng: impl FnMut() -> ProverRng) -> Config {
     let byte_hash = ByteHash {};
     let u64_hash = U64Hash::new(KeccakF {});
     let field_hash = FieldHash::new(u64_hash);
@@ -278,7 +288,7 @@ fn make_config_from(cfg: &FriCfg, mut rng: impl FnMut() -> ProverRng) -> Config 
         fri_params.conjectured_soundness_bits(),
     );
 
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params, NUM_RANDOM_CODEWORDS, rng());
+    let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params, rc, rng());
     Config::new(pcs, challenger)
 }
 

@@ -25,12 +25,20 @@
 //! cargo build --release -p qlab-bench --features phasemem
 //! /usr/bin/time -v target/release/qlab-bench zkpeak --case p --phases
 //! ```
+//!
+//! `--rc N` (lab #742 / #747, cases `l1` and `p`) proves under
+//! `qlab_consensus::make_config_with_rc` — the same config with `N` hiding
+//! random codewords instead of the constant — and verifies under the same `N`,
+//! so the peak (with `--phases`) and the wire bytes of an rc variant can be read
+//! before the constant moves. It calls `p3_uni_stark::prove` directly with the
+//! instance's own public values; `--rc` equal to the constant reproduces the
+//! default path.
 
 use std::time::Instant;
 
 use p3_field::PrimeCharacteristicRing;
 
-pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool) {
+pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize>) {
     if phases && !cfg!(feature = "phasemem") {
         eprintln!("zkpeak: `--phases` needs the bench build `cargo build --release -p qlab-bench --features phasemem`");
         std::process::exit(2);
@@ -45,8 +53,37 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool) {
     // closing `· between (to its end)` row.
     #[cfg(feature = "phasemem")]
     let root = phases.then(|| tracing::info_span!("zkpeak case (prove, then verify)").entered());
-    let (label, prove_s, verify_ok, bytes) = match case {
-        "l1" => {
+    let (label, prove_s, verify_ok, bytes) = match (case, rc) {
+        ("l1", Some(rc)) => {
+            let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
+            let cfg = qlab_consensus::CONSENSUS_CFG;
+            let pvs = qlab_consensus::public_values(&inst);
+            let trace = inst.air.generate_trace::<qlab_consensus::Val>(cfg.log_blowup);
+            let t = Instant::now();
+            let proof = p3_uni_stark::prove(&qlab_consensus::make_config_with_rc(&cfg, rc), &inst.air, trace, &pvs);
+            let secs = t.elapsed().as_secs_f64();
+            let ok = p3_uni_stark::verify(&qlab_consensus::make_config_with_rc(&cfg, rc), &inst.air, &proof, &pvs).is_ok();
+            let bytes = bincode::serialize(&proof).expect("bincode").len();
+            (format!("L1 2×2 bucket @ {} (2^{}), rc = {rc}", cfg.label(), qlab_consensus::LOG_HEIGHT), secs, ok, bytes)
+        }
+        ("p", Some(rc)) => {
+            let inst = qlab_l2::fixture::shape_p();
+            let cfg = qlab_l2::L2_CFG_PROVISIONAL;
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let trace = inst.air.generate_trace::<qlab_l2::Val>(cfg.log_blowup);
+            let t = Instant::now();
+            let proof = p3_uni_stark::prove(&qlab_consensus::make_config_with_rc(&cfg, rc), &inst.air, trace, &pvs);
+            let secs = t.elapsed().as_secs_f64();
+            let ok = p3_uni_stark::verify(&qlab_consensus::make_config_with_rc(&cfg, rc), &qlab_l2::verifier_air_p(), &proof, &pvs)
+                .is_ok();
+            let bytes = bincode::serialize(&proof).expect("bincode").len();
+            (format!("shape P @ {} (2^{}), rc = {rc}", cfg.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, bytes)
+        }
+        (_, Some(_)) => {
+            eprintln!("zkpeak: `--rc` is implemented for `--case l1|p` only");
+            std::process::exit(2);
+        }
+        ("l1", None) => {
             let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
             let t = Instant::now();
             let (pvs, proof) = qlab_consensus::prove_bucket(&inst);
@@ -55,7 +92,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool) {
             let bytes = bincode::serialize(&proof).expect("bincode").len();
             (format!("L1 2×2 bucket @ {} (2^{})", qlab_consensus::CONSENSUS_CFG.label(), qlab_consensus::LOG_HEIGHT), secs, ok, bytes)
         }
-        "p" => {
+        ("p", None) => {
             let inst = qlab_l2::fixture::shape_p();
             let t = Instant::now();
             let (pvs, proof) = qlab_l2::prove_p(&inst);
@@ -64,7 +101,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool) {
             let bytes = bincode::serialize(&proof).expect("bincode").len();
             (format!("shape P @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, bytes)
         }
-        "p19" => {
+        ("p19", None) => {
             use p3_air::BaseAir;
             use qlab_air::l2p::L2ShapePAir;
             let air = L2ShapePAir::chain_only(qlab_l2::LOG_HEIGHT_P - 1);
@@ -83,7 +120,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool) {
                 bytes,
             )
         }
-        other => {
+        (other, None) => {
             eprintln!("zkpeak: unknown --case `{other}`; expected l1|p19|p");
             std::process::exit(2);
         }
