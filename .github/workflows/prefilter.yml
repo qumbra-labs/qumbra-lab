@@ -79,6 +79,12 @@ jobs:
       - name: the pilot scenario compiles (--features pilot)
         run: cargo check -p qumbra-wallet --features pilot --tests --locked
 
+      # lab #742 (A5 lever 4a): `qlab-bench --features phasemem` is the bench
+      # build behind `zkpeak --phases` (counting allocator + tracing layer). No
+      # default build compiles it, so this step is what keeps it from rotting.
+      - name: the phase-memory bench build compiles (--features phasemem)
+        run: cargo check -p qlab-bench --features phasemem --locked
+
       # lab #400: the wallet core + the ffi kernel must stay wasm32-clean — the
       # browser shell builds from exactly this graph, and the last time a wasm
       # enablement lived only on a branch it silently rotted for nine days

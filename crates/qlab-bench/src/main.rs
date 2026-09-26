@@ -19,6 +19,13 @@ mod disclosure;
 mod geometry;
 mod l2shape;
 mod zkpeak;
+#[cfg(feature = "phasemem")]
+mod phasemem;
+
+// lab #742: only in a `--features phasemem` bench build (see phasemem.rs).
+#[cfg(feature = "phasemem")]
+#[global_allocator]
+static COUNTING: phasemem::Counting = phasemem::Counting;
 mod levers;
 mod m4anchor;
 mod m4assembly;
@@ -928,10 +935,10 @@ fn main() {
         "zkpeak" => {
             let case_pos = args.iter().position(|a| a == "--case");
             let Some(case) = case_pos.and_then(|i| args.get(i + 1)) else {
-                eprintln!("zkpeak: `--case l1|p19|p` is required");
+                eprintln!("zkpeak: `--case l1|p19|p [--phases]` is required");
                 std::process::exit(2);
             };
-            zkpeak::run_zkpeak(&power, case);
+            zkpeak::run_zkpeak(&power, case, args.iter().any(|a| a == "--phases"));
             return;
         }
         "bucket" => {

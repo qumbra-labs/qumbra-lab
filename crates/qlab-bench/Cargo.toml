@@ -58,6 +58,16 @@ bincode = "1"
 # already in the dependency tree via the p3 crates.
 serde = "1"
 
+# lab #742 (A5 lever 4a): `zkpeak --phases` — a counting global allocator plus
+# a `tracing` layer on Plonky3's own prover spans. A BENCH build only
+# (`cargo build --release -p qlab-bench --features phasemem`); pins match the
+# workspace's existing tracing pair (qumbra-faucet / qumbra-explorer).
+tracing = { version = "=0.1.44", optional = true }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"], optional = true }
+
+[features]
+phasemem = ["dep:tracing", "dep:tracing-subscriber"]
+
 [dev-dependencies]
 # lab #742 (A5 lever 4f): the M4 gate tests scan with `qlab_air::l2test`.
 qlab-air = { path = "../qlab-air", features = ["test-support"] }

@@ -14,15 +14,37 @@
 //! One case per process, one prove, one verify: the peak footprint of the
 //! wrapping `/usr/bin/time -l` IS the case's. Prints the proof's bincode
 //! (the wire) length so the pending `WIRE_BYTES` pin can be taken from it.
+//!
+//! `--phases` (lab #742, A5 lever 4a) adds a per-phase heap account of the
+//! prove — live bytes at each Plonky3 prover span boundary and the peak inside
+//! each phase — from a counting allocator. It needs the bench build
+//! `--features phasemem` (see `phasemem.rs`); without it the flag is refused
+//! by name rather than silently ignored.
+//!
+//! ```text
+//! cargo build --release -p qlab-bench --features phasemem
+//! /usr/bin/time -v target/release/qlab-bench zkpeak --case p --phases
+//! ```
 
 use std::time::Instant;
 
 use p3_field::PrimeCharacteristicRing;
 
-pub(crate) fn run_zkpeak(power: &str, case: &str) {
+pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool) {
+    if phases && !cfg!(feature = "phasemem") {
+        eprintln!("zkpeak: `--phases` needs the bench build `cargo build --release -p qlab-bench --features phasemem`");
+        std::process::exit(2);
+    }
     println!("# qumbra-lab zkpeak — case `{case}` under the hiding PCS (IS_ZK = {})", qlab_consensus::IS_ZK);
     println!();
     crate::print_env(power);
+    #[cfg(feature = "phasemem")]
+    let account = phases.then(crate::phasemem::install);
+    // The root window: the fixture build and trace generation show up as the
+    // `· between (before `prove`)` row under it, verify + serialization as its
+    // closing `· between (to its end)` row.
+    #[cfg(feature = "phasemem")]
+    let root = phases.then(|| tracing::info_span!("zkpeak case (prove, then verify)").entered());
     let (label, prove_s, verify_ok, bytes) = match case {
         "l1" => {
             let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
@@ -66,6 +88,16 @@ pub(crate) fn run_zkpeak(power: &str, case: &str) {
             std::process::exit(2);
         }
     };
+    #[cfg(feature = "phasemem")]
+    if let Some(account) = account {
+        drop(root);
+        println!("## Phase heap account (bytes live in the Rust allocator; not RSS)");
+        println!();
+        account.0.print();
+        println!();
+        println!("_Timings from a `phasemem` build are not publishable: every allocation pays two atomics._");
+        println!();
+    }
     println!("| case | prove s | verifies | wire bytes (bincode fixint) |");
     println!("|---|---|---|---|");
     println!("| {label} | {prove_s:.2} | {verify_ok} | {bytes} |");
