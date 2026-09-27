@@ -1,6 +1,7 @@
 //! Issue #750: F2's native hiding-proof census and symbolic pricing tools.
 //! These modes do not implement an aggregation circuit or declare a memory pass.
 mod counting;
+mod ood;
 mod price;
 
 use std::collections::BTreeMap;
@@ -279,6 +280,7 @@ fn census(shape: Shape, fixture: &Fixture) -> Result<Value> {
         .map(Val::from_u32)
         .collect();
     native_verify(shape, &pvs, &proof)?;
+    let ood = ood::verify_relation(shape, &proof, &pvs)?;
     // Both configurations consume exactly the same proof bytes. No proving
     // under the counting config and no alternate fixture construction.
     let counted_proof: Proof<counting::Config> = codec()
@@ -320,7 +322,7 @@ fn census(shape: Shape, fixture: &Fixture) -> Result<Value> {
         "fixture_producer_revision": fixture.producer_revision,
         "proof_bytes": {"evidence": "M", "value": fixture.proof.len()},
         "measured_hash_work": counts, "projected_opening_schedule": geometry.report(shape),
-        "symbolic_air": air, "complete_verifier_layout": false, "memory_gate_pass": false}),
+        "symbolic_air": air, "ood_algebra": ood, "complete_verifier_layout": false, "memory_gate_pass": false}),
     )
 }
 
@@ -443,6 +445,7 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
                 .as_u64()
                 .ok_or("missing quotient census")? as usize;
             json!({"symbolic_air": air, "projected_opening_schedule": price::geometry(shape, chunks).report(shape),
+                "ood_arithmetic": ood::price(shape)?,
                 "complete_verifier_layout": false, "memory_gate_pass": false})
         }
         "f2census" => census(shape, &read_fixture(Path::new(get("--proof-in")?))?)?,
@@ -520,9 +523,17 @@ mod tests {
             let report = census(shape, &fixture).unwrap();
             assert_eq!(report["native_verified"], true);
             assert_eq!(report["counting_native_verified"], true);
+            assert_eq!(report["ood_algebra"]["residual_zero"], true);
             assert_eq!(report["memory_gate_pass"], false);
             let g = price::geometry(shape, 8);
             let mut proof: Proof<Config> = codec().deserialize(&fixture.proof).unwrap();
+            let pvs: Vec<_> = fixture
+                .public_values
+                .iter()
+                .copied()
+                .map(Val::from_u32)
+                .collect();
+            ood::check_real_mutations(shape, &proof, &pvs);
             let random = proof.commitments.random.take();
             assert!(validate_geometry(shape, &proof, &g).is_err());
             proof.commitments.random = random;
