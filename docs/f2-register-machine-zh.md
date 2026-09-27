@@ -156,10 +156,10 @@ M4 gate 矩形本身：它写死在旧的非 hiding 配置上（固定 2^16 行�
 
 ### 约束分组与测试
 
-约束按 18 个具名分组依次求值（`keccak`、`bits`、`absorb`、`chain_state`、
+约束按 19 个具名分组依次求值（`keccak`、`bits`、`absorb`、`chain_state`、
 `flush_chain`、`bind_const`、`bind_cap`、`bind_inner_pv`、`canonical`、`digest_out`、
 `fs_reject`、`fs_select`、`fs_bind`、`bind_opened`、`in_public`、`in_hold`、`machine`、
-`machine_out`）。测试在 symbolic builder 上计数，把每个约束编号映射到分组；每个负例都在
+`machine_out`，以及 F2b-2b-ii 新增的 `opened_out`，见该节）。测试在 symbolic builder 上计数，把每个约束编号映射到分组；每个负例都在
 该分组所在的行上断言违反落在哪个分组：
 
 | 负例 | 拒绝位置 |
@@ -177,6 +177,7 @@ M4 gate 矩形本身：它写死在旧的非 hiding 配置上（固定 2^16 行�
 | 伪造 F0 元数据字（log_h），完整自洽的重放 | 只有 `bind_const`；α/ζ 行和最后一行干净 |
 | 吸收的内层 PV 与声明的不同，完整自洽的重放 | 只有 `bind_inner_pv` |
 | 把内层 PV 编码为 `word + p` | 只有 `canonical` |
+| 导出的 ζ、某个接入执行器的 opened value 或 randomizer 值，与执行器自己的单元／字不一致（F2b-2b-ii） | 只有 `opened_out`，在它所在的行 |
 
 诚实用例还把重放结果和原生 p3 challenger 交叉核对：α、ζ 必须一致，D2 的第一次抽样
 必须等于 verifier 的 fri_alpha，这就把 F2 消息的顺序钉死了。随后做一次全量 SAT 扫描，
@@ -368,3 +369,186 @@ proof（含它自己的 22 位 grind）和两次原生 22 位重新 grind（每�
 4. 某个负例依赖种子：β_0 的窗口里至少要有五个被接受的抽样（不满足的概率约 3·10⁻⁷，
    对固定种子而言结果是确定的）。
 
+## F2b-2b-ii：输入批次的打开
+
+F2b-2b-ii 在电路里核对每个 FRI query 在其下标处打开的三个输入批次：加盐的叶子、
+通往已提交 cap 的 Merkle 路径，以及这个 query 交给第一次折叠的 reduced opening。
+折叠和 final polynomial 属于 2b-iii。和 2a、2b-i 一样，这是仅用于测试的组件
+（`crates/qlab-bench/src/f2/ood/open.rs`），逐行扫描，从不 prove。它不引入任何新的
+内层 proof 声明：它认证的每个值，要么是 2a 或 2b-i 导出的公共输入，要么是它自己
+哈希进这些 cap 的字。
+
+### 原生事实（已对照源码）
+
+除非另行注明，行号均指 p3 0.6.1。
+
+- **批次顺序和打开点。** uni-stark `verifier.rs:453-510` 按顺序交给 PCS 三组声明：
+  randomizer（一个矩阵，4 列，在 ζ 处打开）、trace（一个矩阵，w 列，在 ζ 和 ζ·g_N 处
+  打开，g_N 是**原始** N 行域的生成元）、quotient（8 个 chunk 矩阵，各 4 列，在 ζ 处
+  打开）。`open_input` 也按这个顺序遍历（`verifier.rs:640-753`）。
+- **只有一个高度。** hiding PCS 把所有输入都提交在 2N 行上：`hiding_pcs.rs` 的
+  `commit`（105-131 行）把 trace 与随机行交错，`get_quotient_ldes`（168-256 行）把每个
+  大小为 N 的 chunk 按 `log_blowup + 1` 扩展，randomizer 直接在 2N 域上抽取（438-458 行）。
+  因此所有矩阵都在 2^lde 行，lde = log N + 1 + log_blowup（玩具为 11，S/P/R 为 22/23/21）。
+  约化后的下标就是 query 下标本身（`verifier.rs:687-691`），每个 query 只有一个 reduced
+  opening。
+- **叶子的序列化。** `hiding_mmcs.rs:169-176` 在每个矩阵行后面接上 4 个元素的盐。
+  `mmcs/batch.rs:200-206` 把同一高度的所有行当作一条流来哈希，按矩阵顺序依次是
+  行 ‖ 盐（`hash_iter_slices` 直接拼平，`hasher.rs:24-30`）。哈希器是
+  `PaddingFreeSponge<KeccakF, 25, 17, 4>` 外面套一层 `SerializingHasher`
+  （`qlab-consensus` `lib.rs:58-61`）。域元素取其 Monty 字，每两个打包成一个 u64，
+  低字在前；元素个数为奇数时，最后一个字单独占一个 u64（`p3-field integers.rs:494-507`）。
+  这个 sponge 对每块的 17 个 rate lane 是**覆盖写入**，不是异或，这一点和 challenger 用的
+  pad10*1 Keccak 不同。最后一块不满时，尾部 lane 保留上一次置换的输出；digest 取
+  lane 0..3（`sponge.rs:172-204`）。
+- **路径。** `CompressionFunctionFromHasher<_, 2, 4>` 就是对 左 ‖ 右（8 个 u64）
+  做一次全新的 sponge 置换（`compression.rs`）。第 t 层读下标的第 t 位，该位为 0 时
+  当前 digest 在左边（`mmcs/batch.rs:210-235`）。层级方案是二叉的，最上面
+  `CAP_HEIGHT` = 3 层并入 cap（`mmcs/mod.rs:262-297`）。cap 表项是 `index >> path`，
+  path = lde − 3。
+- **Reduced opening**（`verifier.rs:706-753`）。x = GENERATOR ·
+  ω_lde^{rev_lde(index)}（下标按位反转，域的平移就是域生成元）。对每个矩阵、每个点、
+  每一列，ro += α^k · (p(z) − p(x)) / (z − x)，k 是贯穿三个批次的同一个计数器（只有一个
+  高度，所以只有一个计数器）。z = x 在原生代码里是报错（`try_inverse`），这里表现为
+  无法满足的求逆约束。
+
+### 绑定了什么
+
+- **覆盖模式的 sponge。** 用的还是同一条 stock Keccak lane。每个置换 step-0 行上的
+  M 比特**就是**它的 rate 原像；没有 S 比特，因为没有东西被异或进去。capacity 只在
+  叶子的内部块之间传递，进入其他任何置换时都为零。叶子的字分四类：行值（规范的 Monty 字，
+  以 `R⁻¹ · word` 计入累加）、盐（自由的 witness 字，只参与哈希）、零，以及从上一次输出
+  带过来的尾部 lane。
+- **路径。** 在给第 t 层喂数据的那一行上，刚算出的 digest 必须放在子节点的左半边
+  （该 query 下标第 t 位为 0）或右半边（为 1）；另一半是兄弟节点，不加约束。最终 digest
+  等于由下标最高三位的 one-hot 选出的 cap 表项。cap 就是 2a 导出的 cap 公共值，逐 limb 对应。
+- **Reduced opening。** 在该 query 的叶子行上累加两个和 α^k · v：ζ 的项记为 Ax，
+  ζ·g_N 的项记为 Bx。到这一段的最后一行，ro = (Az − Ax)·inv_A + (Bz − Bx)·inv_B，
+  其中 (ζ − x)·inv_A = 1、(ζ·g_N − x)·inv_B = 1 都是扩域乘积约束。Az、Bz（即 Σ α^k z_k）
+  和 α 的各次幂在保持列里每个实例只算一次。x 是一串常数因子的连乘，每个下标位一个：
+  第 t 位乘上 ω^{2^{lde−1−t}}，这恰好就是按位反转。所有约束的 degree 都 ≤ 3。
+- **输出。** 每个 query 的 reduced opening 放在保持列里（所有行上取值相同），同时作为
+  公共输出，供 2b-iii 使用。
+
+**统一布局。** 每个 query 跑同一段置换序列：randomizer 叶子、randomizer 路径、trace 叶子、
+trace 路径、quotient 叶子、quotient 路径。每个 query 自己的值（下标位、cap one-hot、x 链、
+逆元、ro）是逐行寄存器，由分段选择器绑定到该 query 的公共下标上。所以 periodic 列的数量
+随叶子角色、层数和 query 数增长，而不随置换数增长（玩具 22 列；S 在 43 个 query 时 96 列）。
+
+### 与 2a、2b-i 的衔接
+
+F2b 的各部分是彼此独立的 AIR，通过公共值连接，和 2a 的 D2 用的是同一种接缝。为此，
+**2a 增加了一个分组 `opened_out`**：它把 ζ 和每一个 opened value 作为公共输出导出，而且
+**直接取自执行器自己的单元**。执行器读取的值，从执行器读的那一列保持列导出（首行；该列在
+所有行上不变）；执行器从不读取的 randomizer opening，则从它在 transcript 里的字导出（在其
+step-0 行上取 `R⁻¹ · word`）。2b-i 本来就导出 fri_alpha 和各个下标。在本组件里，这些值是
+公共**输入**，在第 0 行绑定到保持列（`opened_in`），并绑定到逐行的下标位（`index`）。
+于是 FRI 读到的 z 值就是执行器读到的那一份，接缝两侧各有一条对同一个公共值的等式，不存在
+可能对不上的第二份拷贝：
+
+- 交给 FRI 的 z 值与 2a 导出的不同：本组件的 `opened_in`，第 0 行；
+- 导出值与执行器的单元或字不同：2a 的 `opened_out`，在它所在的行。
+
+接缝测试把三个组件的公共值逐段比对：cap、ζ 和 z 值对照 2a 在 log 8 下对同一个 proof 的
+导出，fri_alpha 和本实例覆盖的下标对照 2b-i 的导出。
+
+### 约束分组与测试
+
+共 20 个具名分组：`keccak`、`bits`、`absorb`、`capacity`、`bind_zero`、`bind_carry`、
+`bind_child`、`cap`、`canonical`、`accumulate`、`opened_in`、`index`、`cap_select`、
+`x_point`、`inverse`、`alpha_pow`、`z_sum`、`reduce`、`hold`、`ro_out`。fixture 直接用
+2b-i 的：同一个固定种子的 log 8 玩具 proof（每个测试二进制只生成一次），连同它的下标和
+fri_alpha。实例覆盖两个 cap 表项不同的 query。每个负例都扫描**全部**行，并断言违反的
+（行，分组）集合与预期完全相同：
+
+| 负例 | 拒绝位置 |
+|---|---|
+| 改一个盐 | 只有 `cap`，该批次的 cap 行 |
+| 改一个行值、另选新盐，ro 一致地重算 | 只有 `cap`（叶子规范且自洽，所以此前没有任何约束拒绝它，也没有任何约束放它过去） |
+| 交换两个兄弟节点 | 只有 `cap` |
+| 子节点放错一侧，下标位不动 | 该层喂数据那一行的 `bind_child`，外加 `cap` |
+| 翻转一个下标位，放置方向、x 和 ro 都随之改变 | 该段每一行的 `index`，外加三个批次的 `cap` |
+| 选错 cap 表项 | 该 query 寄存器所在各行的 `cap_select`，外加三个批次的 `cap` |
+| 交给 FRI 的 z 值 ≠ 2a 的导出，Az 和 ro 重算（一个执行器读取的 trace 值，以及 randomizer） | 只有 `opened_in`，第 0 行 |
+| fri_alpha ≠ 2b-i 的导出，α 的各次幂、Az/Bz 和 ro 重算 | 只有 `opened_in`，第 0 行 |
+| 用**未经**位反转的下标算 x，逆元和 ro 重算 | 只有 `x_point`，在该 query 寄存器所在各行 |
+| 改一个 reduced opening（保持列和公共输出一致） | 只有 `reduce`，该段最后一行 |
+
+在 2a 一侧，新增的负例分别改动导出的 ζ、一个接入执行器的 opened value 和一个 randomizer
+值；每一种都只被 `opened_out` 拒绝，而且就在它所在的行，ζ 的 digest 行和最后一行保持干净。
+
+**原生交叉核对**（诚实用例），覆盖**全部 43 个** query，而不只是实例覆盖的两个：
+
+- p3 自己的 hiding MMCS（`verify_batch`）在完整下标处接受每个批次的打开；
+- lab 对叶子哈希和路径的原生重放到达同一个 cap 表项；
+- 按 uni-stark 的顺序喂入 proof 里的 opened values、逐项照搬 `open_input` 的原生实现，
+  其结果等于电路按 (Az − Ax)/(ζ − x) + … 分组计算的结果；
+- 这个值**正是** FRI 折叠的输入：把它插到第 0 轮兄弟值中 `index % 16` 的位置，p3 的
+  commit-phase MMCS 接受这一行。这样 reduced opening 就被钉在已提交的 codeword 上，
+  与两份实现都无关。
+
+诚实用例还做一次 SAT 扫描，检查保持列和公共输出里的 reduced opening 等于原生值、最大约束
+degree ≤ 3 **[P，由 CI 检查]**，并检查玩具布局与 `price::input_openings` 一致（宽度、高度、
+periodic 列数和公共值个数）。
+
+### 尺寸 **[P，源码推导]**
+
+玩具（w = 2，log 8，lde 11，path 8，40 个 opened 项，2 个 query）：每个 query 有
+1 + 1 + 2 个叶子置换（分别 8、6、64 个元素）加 3 × 8 次压缩，共 28 个；两个 query 共
+56 个置换、1,344 行，高度 2,048。宽度 4,187 = 2,633（Keccak）+ 1,088（M）+ 68（规范性）+
+8（累加器）+ 46（寄存器，2·lde + 24）+ 344（保持列，16 + 8·40 + 4·2）。periodic 列 22 个，
+公共值 562 个。
+
+`f2price` 现在按形状给出 43 个 query 下的 `input_openings`（`price::input_openings`，由
+`input_openings_split_the_census` 钉住）：
+
+| 形状 | 每 query 叶子 / 压缩 | 每 query 置换 | 叶子 / 压缩 × 43 | lane 行数（补齐后） | opened 项 | 列数 | periodic | PV |
+|---|---|---|---|---|---|---|---|---|
+| S（w 721，lde 22） | 25 / 57 | 82 | 1,075 / 2,451 | 84,624（2^17） | 1,478 | 15,877 | 96 | 6,519 |
+| P（w 798，lde 23） | 27 / 60 | 87 | 1,161 / 2,580 | 89,784（2^17） | 1,632 | 17,111 | 99 | 7,135 |
+| R（w 734，lde 21） | 25 / 54 | 79 | 1,075 / 2,322 | 81,528（2^17） | 1,504 | 16,083 | 95 | 6,623 |
+
+**与 census 对账。** 把 FRI commit 阶段的份额（S 每个 query 8 个叶子置换、36 个路径置换）
+加到输入份额上，S 在 43 个 query 时得到 1,075 + 344 = **1,419** 个叶子置换和
+2,451 + 1,548 = **3,999** 个路径置换，正是 census 实测的数。测试对三种形状都按 census
+的几何做了同样的拆分断言。
+
+**Reduced opening 的算术量。** 每个 query：每个 opened 项一次扩域乘基域（S 为 1,478 次），
+lde 次基域乘法算 x，两次求逆检查，两次扩域乘法。每个实例：α 的各次幂 terms − 1 次扩域乘法，
+Az/Bz 共 terms 次。
+
+**一个布局上的发现，没有在这里解决。** 到了 L2 的宽度，稠密的保持表（α 的幂和 z 值，
+8·terms 列）占了宽度的大头：S 的 15.9k 列里有 11.8k 是它们。生产布局应当把这两张表放进
+行里，用一列 periodic 下标去索引，而不是横向铺开。这里把数字列出来，是为了让这个杠杆
+看得见；本片不实现它。
+
+### 尚未绑定（2b-iii）
+
+commit 阶段的打开（兄弟值、FRI 的 Merkle 路径）、用 β 做的折叠，以及 final polynomial 的
+求值。reduced opening 已经为那个组件导出。在 2b-iii 用上它们之前，
+`pcs_input_bindings_complete` 保持 **false**，`complete_verifier_layout` 和
+`memory_gate_pass` 也一样。
+
+### 验证
+
+本地没有跑任何测试、proof 或 benchmark。本地预检为
+`cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
+和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`open.rs` 五个、`bind.rs` 一个、
+`price.rs` 一个，共七个。**[P，待 CI]**：以 2b-i 待定的 2,775 为基线，应为 2,782 项通过、
+0 失败、15 项忽略。
+
+新测试在 Graviton lane 上的预计耗时为 10–40 秒 **[P]**。proof 与 2b-i 的 fixture 共用
+（每个测试二进制一份）。其余是 2a 在 log 8 下的导出重放、43 个 query 的原生 MMCS 与折叠
+核对、约十二个 2,048 × 4,187 的 trace、一次并行 SAT 扫描、约十一次并行的全表违反扫描，
+以及一次 symbolic degree 计算。
+
+尚未验证，按最可能先出问题排序：
+
+1. lab 原生 `Walk` 复现的叶子序列化和覆盖语义（奇数字的打包、quotient 叶子第二块里带过来的
+   尾部 lane）。诚实用例里“根等于 cap”的断言和 p3 的 `verify_batch` 会暴露不一致。
+2. reduced opening 的分组方式和项的顺序是否与逐项的原生实现一致，以及两者是否与折叠一致。
+   第 0 轮的 commit-phase 核对是独立的锚点。
+3. 负例里（行，分组）集合是否精确。某个负例若多触发一个分组（比如 padding 行上的寄存器，
+   或者被改动的保持列触发 `hold`），会明确失败而不是悄悄通过；正确的修法是把多出来的行写进
+   预期，而不是放宽断言。
+4. 表里手算的 S/P/R 数字：`input_openings_split_the_census` 把它们钉住，算错会让 CI 失败。

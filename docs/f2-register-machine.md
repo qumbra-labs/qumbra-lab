@@ -189,10 +189,11 @@ change to the schedule. It costs 4 columns per input (160 for the toy) and is
 
 ### Constraint groups and tests
 
-Constraints are evaluated in 18 named groups (`keccak`, `bits`, `absorb`,
+Constraints are evaluated in 19 named groups (`keccak`, `bits`, `absorb`,
 `chain_state`, `flush_chain`, `bind_const`, `bind_cap`, `bind_inner_pv`,
 `canonical`, `digest_out`, `fs_reject`, `fs_select`, `fs_bind`, `bind_opened`,
-`in_public`, `in_hold`, `machine`, `machine_out`). The test maps each constraint
+`in_public`, `in_hold`, `machine`, `machine_out`, and `opened_out`, added by
+F2b-2b-ii; see there). The test maps each constraint
 index to its group by counting on the symbolic builder, and every negative asserts
 the group its violation lands in, on the row where that group lives:
 
@@ -211,6 +212,7 @@ the group its violation lands in, on the row where that group lives:
 | F0 metadata word (log_h) forged, consistent replay | `bind_const` only; α/ζ rows and terminal row clean |
 | inner PV absorbed ≠ declared PV, consistent replay | `bind_inner_pv` only |
 | inner PV encoded as `word + p` | `canonical` only |
+| exported ζ, a routed opened value, or the randomizer disagrees with the machine's cell / word (F2b-2b-ii) | `opened_out` only, on its row |
 
 The honest test also cross-checks the replay against the native p3 challenger. It
 checks the same α and ζ, and that D2's first draw is the verifier's fri_alpha, which
@@ -437,3 +439,219 @@ Unverified, most likely to break first:
 4. A seed-dependent assumption in a negative: β_0's window must hold at least five
    accepted draws (it fails with probability about 3·10⁻⁷, and deterministically for the fixed seed).
 
+## F2b-2b-ii: input openings
+
+F2b-2b-ii checks, for each FRI query, the three input batches the verifier opens at
+the query index, in circuit. That covers the salted leaves, the Merkle paths up to the
+committed caps, and the reduced opening the query hands to the first fold. Folding and
+the final polynomial are 2b-iii. Like 2a and 2b-i, it is a test-only component
+(`crates/qlab-bench/src/f2/ood/open.rs`), scanned row by row and never proved. It adds
+no inner-proof claim of its own: every value it authenticates is either a public
+input exported by 2a or 2b-i, or a word it hashes into one of those caps.
+
+### Native facts, checked against source
+
+All line numbers are p3 0.6.1 unless stated otherwise.
+
+- **Batch order and points.** uni-stark `verifier.rs:453-510` hands the PCS three
+  claims, in order: the randomizer (one matrix, 4 columns, opened at ζ), the trace
+  (one matrix, w columns, opened at ζ and at ζ·g_N, where g_N generates the
+  *original* N-row domain), and the quotient (8 chunk matrices, 4 columns each,
+  opened at ζ). `open_input` walks them in that order (`verifier.rs:640-753`).
+- **One height.** The hiding PCS commits every input at 2N rows. `hiding_pcs.rs`
+  `commit` (lines 105-131) interleaves the trace with random rows, `get_quotient_ldes`
+  (lines 168-256) extends each size-N chunk by `log_blowup + 1`, and the randomizer
+  is drawn on the 2N domain (lines 438-458). All matrices therefore sit at
+  2^lde rows, with lde = log N + 1 + log_blowup (11 for the toy, 22/23/21 for S/P/R).
+  The reduced index is the query index itself (`verifier.rs:687-691`), and there is
+  a single reduced opening per query.
+- **Leaf serialization.** `hiding_mmcs.rs:169-176` appends each matrix row's
+  4-element salt. `mmcs/batch.rs:200-206` hashes every same-height row as one stream,
+  row ‖ salt per matrix in matrix order (`hash_iter_slices` flattens,
+  `hasher.rs:24-30`). The hasher is `SerializingHasher` over
+  `PaddingFreeSponge<KeccakF, 25, 17, 4>` (`qlab-consensus` `lib.rs:58-61`). Field
+  elements become their Monty words, packed two per u64 with the low word first,
+  and an odd last word stands alone (`p3-field integers.rs:494-507`). The sponge
+  **overwrites** the 17 rate lanes of each block. It does not xor them, which is
+  unlike the challenger's pad10*1 Keccak. A short final block keeps the previous
+  output in its tail lanes, and the digest is lanes 0..3 (`sponge.rs:172-204`).
+- **Path.** `CompressionFunctionFromHasher<_, 2, 4>` is one fresh sponge
+  permutation over left ‖ right (8 u64) (`compression.rs`). Level t reads bit t of
+  the index, current digest on the left when the bit is 0 (`mmcs/batch.rs:210-235`).
+  The schedule is binary, and the top `CAP_HEIGHT` = 3 levels are stripped into the
+  cap (`mmcs/mod.rs:262-297`). The cap entry is `index >> path`, with
+  path = lde − 3.
+- **Reduced opening** (`verifier.rs:706-753`). x = GENERATOR ·
+  ω_lde^{rev_lde(index)} (bit-reversed index, domain shift = the field generator).
+  For each matrix, each point and each column,
+  ro += α^k · (p(z) − p(x)) / (z − x), with k a single running counter across all
+  three batches (one height, so one counter). z = x is an error (`try_inverse`);
+  here it is an unsatisfiable inverse.
+
+### What is bound
+
+- **Sponge, overwrite mode.** The same stock Keccak lane. The M bits of a
+  permutation's step-0 row **are** its rate preimage. There are no S bits, since
+  nothing is xored in. The capacity carries into an interior leaf block and is zero
+  into every other permutation. Leaf words are of four kinds: row values (canonical
+  Monty words, `R⁻¹ · word` accumulated), salts (free witness words, hashed and
+  nothing else), zeros, and carried tail lanes (equal to the previous output).
+- **Path.** On the row that feeds level t, the digest just produced must sit in the
+  left child half when the query's index bit t is 0, and in the right half when it
+  is 1. The other half is the sibling and is free. The final digest equals the cap
+  entry that a one-hot of the top three index bits selects. The caps are 2a's cap
+  public values, limb for limb.
+- **Reduced opening.** Two running sums over the query's leaf rows collect
+  α^k · v, one for the ζ terms (Ax) and one for the ζ·g_N terms (Bx). At the
+  segment's last row, ro = (Az − Ax)·inv_A + (Bz − Bx)·inv_B, with
+  (ζ − x)·inv_A = 1 and (ζ·g_N − x)·inv_B = 1 as extension products. Az and Bz
+  (Σ α^k z_k) and the α powers are computed once per instance in held cells. x is a
+  chain of constant factors, one per index bit: bit t multiplies by ω^{2^{lde−1−t}},
+  which is exactly the bit-reversal. Every constraint has degree ≤ 3.
+- **Outputs.** The per-query reduced openings are held cells (constant over all
+  rows) and public outputs, for 2b-iii.
+
+**Uniform layout.** Every query runs the same segment of permutations: randomizer
+leaf, randomizer path, trace leaf, trace path, quotient leaf, quotient path. The
+per-query values (index bits, cap one-hot, x chain, inverses, ro) are per-row
+registers, bound to that query's public index by a segment selector. Periodic
+columns therefore scale with leaf roles, levels and queries, not with permutations
+(22 for the toy; 96 for S at 43 queries).
+
+### Composition with 2a and 2b-i
+
+The F2b pieces are separate AIRs joined by public values, the same seam 2a's D2
+already uses. For this slice, **2a gains one group, `opened_out`**. It exports ζ and
+every opened value as public outputs, **from the machine's own cells**. A value the
+machine reads leaves from the held input column the machine reads (first row; held
+constant). The randomizer opening, which the machine never reads, leaves from its
+transcript word (`R⁻¹ · word` on its step-0 row). 2b-i already exports fri_alpha and
+the indices. Here those values are public **inputs**, tied to held cells on row 0
+(`opened_in`) and to the per-row index bits (`index`). The z-values FRI reads are
+therefore the machine's, by an equality on each side of one public value. No second
+copy exists that could disagree:
+
+- a z-value handed to FRI that differs from 2a's export: `opened_in`, row 0 (here);
+- an export that differs from the machine's cell or word: `opened_out`, on its row
+  (in 2a).
+
+The seam test compares the three components' public values slice by slice: caps,
+ζ and z-values against 2a's exports of the same proof at log 8, and fri_alpha and
+the covered indices against 2b-i's.
+
+### Constraint groups and tests
+
+Twenty named groups: `keccak`, `bits`, `absorb`, `capacity`, `bind_zero`,
+`bind_carry`, `bind_child`, `cap`, `canonical`, `accumulate`, `opened_in`, `index`,
+`cap_select`, `x_point`, `inverse`, `alpha_pow`, `z_sum`, `reduce`, `hold`,
+`ro_out`. The fixture is 2b-i's: the same seeded log-8 toy proof, built once per
+test binary, with its indices and fri_alpha. The instance covers two queries whose
+cap entries differ. Every negative scans **all** rows and asserts the exact set of
+(row, group) violations:
+
+| negative | refused at |
+|---|---|
+| a salt changed | `cap` only, that batch's cap row |
+| a row value changed, a fresh salt chosen, ro re-derived consistently | `cap` only (the leaf is canonical and self-consistent, so nothing refuses it earlier, and nothing lets it through) |
+| two siblings swapped | `cap` only |
+| child placed on the wrong side, index bit untouched | `bind_child` at that level's feed row, plus `cap` |
+| an index bit flipped, placement, x and ro following it | `index` on every row of the segment, plus `cap` on all three batches |
+| wrong cap entry selected | `cap_select` on the query's register rows, plus `cap` on all three batches |
+| a z-value handed to FRI ≠ 2a's export, Az/ro re-derived (a trace value the machine reads, and the randomizer) | `opened_in` only, row 0 |
+| fri_alpha ≠ 2b-i's export, α powers, Az/Bz and ro re-derived | `opened_in` only, row 0 |
+| x from the index **without** bit reversal, inverses and ro re-derived | `x_point` only, on the query's register rows |
+| a reduced opening poked (held cell and output agreeing) | `reduce` only, the segment's last row |
+
+In 2a, the new negative pokes the exported ζ, a routed opened value and a
+randomizer value. Each is refused by `opened_out` alone, on its row. The ζ-digest
+row and the terminal row stay clean.
+
+**Native cross-checks** (honest test), for **all 43** queries, not only the two
+covered:
+
+- p3's own hiding MMCS (`verify_batch`) accepts each batch's opening at the
+  full index;
+- the lab's native replay of leaf hashing and path reaches the same cap entry;
+- a sequential replica of `open_input`, fed from the proof's opened values in
+  uni-stark's order, equals the grouped (Az − Ax)/(ζ − x) + … form the circuit
+  computes;
+- that value **is** what FRI folds: inserted at `index % 16` among round 0's
+  sibling values, p3's commit-phase MMCS accepts the row. This pins the reduced
+  opening to the committed codeword, independently of both replicas.
+
+The honest test also runs a SAT scan and checks that the held and public reduced
+openings equal the native ones, that the maximum constraint degree is ≤ 3
+**[P, guarded in CI]**, and that the toy layout matches `price::input_openings`
+(width, height, periodic and public-value counts).
+
+### Dimensions **[P, source-derived]**
+
+Toy (w = 2, log 8, lde 11, path 8, 40 opened terms, 2 queries): per query,
+1 + 1 + 2 leaf permutations (8, 6 and 64 elements) + 3 × 8 compressions = 28, giving
+56 permutations, 1,344 rows, height 2,048. Width 4,187 = 2,633 (Keccak) + 1,088 (M) +
+68 (canonicity) + 8 (accumulators) + 46 (registers, 2·lde + 24) + 344 (held,
+16 + 8·40 + 4·2). There are 22 periodic columns and 562 public values.
+
+`f2price` now reports `input_openings` per shape at 43 queries (`price::input_openings`,
+pinned by `input_openings_split_the_census`):
+
+| shape | leaf / compress per query | perms per query | leaf / compress × 43 | lane rows (padded) | opened terms | columns | periodic | PVs |
+|---|---|---|---|---|---|---|---|---|
+| S (w 721, lde 22) | 25 / 57 | 82 | 1,075 / 2,451 | 84,624 (2^17) | 1,478 | 15,877 | 96 | 6,519 |
+| P (w 798, lde 23) | 27 / 60 | 87 | 1,161 / 2,580 | 89,784 (2^17) | 1,632 | 17,111 | 99 | 7,135 |
+| R (w 734, lde 21) | 25 / 54 | 79 | 1,075 / 2,322 | 81,528 (2^17) | 1,504 | 16,083 | 95 | 6,623 |
+
+**Census cross-check.** Add the FRI commit-phase share (S: 8 leaf and 36 path
+permutations per query) to the input share, and S at 43 queries gives
+1,075 + 344 = **1,419** leaf and 2,451 + 1,548 = **3,999** path permutations. These
+are the census's measured numbers. The test asserts the same split against the census
+geometry for all three shapes.
+
+**Reduced-opening arithmetic.** Per query: one extension-by-base product per opened
+term (1,478 at S), lde base products for x, two inverse checks and two extension
+products. Per instance: terms − 1 extension products for the α powers, and terms for
+Az/Bz.
+
+**A layout finding, not a fix.** At L2 widths the dense held tables (α powers and
+z-values, 8·terms columns) dominate the width: 11.8k of S's 15.9k columns. A
+production layout would keep those tables in rows and index them with a periodic
+column, instead of spreading them across width. The count is stated so the lever is
+visible; it is not implemented here.
+
+### Not yet bound (2b-iii)
+
+The commit-phase openings (sibling values, FRI Merkle paths), the folds with β, and
+the final-polynomial evaluation. The reduced openings are exposed for that component.
+`pcs_input_bindings_complete` stays **false** until 2b-iii consumes them, and so do
+`complete_verifier_layout` and `memory_gate_pass`.
+
+### Validation
+
+No local tests, proofs or benchmarks were run. The local preflight was
+`cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: five
+in `open.rs`, one in `bind.rs` and one in `price.rs`, seven in all. **[P, pending
+CI]**: against 2b-i's pending total of 2,775, that is 2,782 passed, 0 failed,
+15 ignored.
+
+Expected new-test runtime **[P]** is 10–40 s on the Graviton lane. The proof is
+shared with 2b-i's fixture (one per test binary). The rest is 2a's export replay at
+log 8, native MMCS and fold checks for 43 queries, about twelve 2,048 × 4,187
+traces, one parallel SAT scan, about eleven parallel full-trace violation scans, and
+one symbolic degree pass.
+
+Unverified, most likely to break first:
+
+1. The leaf serialization and overwrite semantics, as reproduced in the lab's
+   native `Walk` (odd-word packing, the carried tail lanes of the quotient leaf's
+   second block). The honest test's root-equals-cap assertion and p3's
+   `verify_batch` catch a mismatch.
+2. The reduced-opening grouping and term order against the sequential native form,
+   and both against the fold. The round-0 commit-phase check is the independent
+   anchor.
+3. Exact (row, group) sets in the negatives. A negative that trips an extra group
+   (for example a padding-row register, or `hold` on a poked held cell) fails loudly
+   rather than passing silently; the fix would be to name the extra row, not to
+   weaken the assertion.
+4. The hand-derived S/P/R counts in the table: `input_openings_split_the_census`
+   pins them, so an arithmetic slip fails CI.

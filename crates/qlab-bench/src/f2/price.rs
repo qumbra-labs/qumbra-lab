@@ -6,6 +6,7 @@ use p3_air::symbolic::{
     get_symbolic_constraints, AirLayout, SymbolicAirBuilder, SymbolicExpression,
 };
 use p3_air::Air;
+use p3_keccak_air::NUM_KECCAK_COLS;
 use p3_uni_stark::get_log_num_quotient_chunks;
 use qlab_consensus::{FriCfg, Val, CAP_HEIGHT, IS_ZK, SALT_ELEMS};
 use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
@@ -205,6 +206,71 @@ pub(super) fn rom_encoding(rom_width: usize, rom_log_height: usize) -> Value {
         "layout_decided": false})
 }
 
+/// [P] F2b-2b-ii's input-opening component (`ood/open.rs`) at `queries`
+/// covered queries, on the L2 lane: the lane perms each query costs, the
+/// reduced-opening arithmetic, and the component's dense width, height,
+/// periodic and public-value counts. `open.rs`'s tests pin this formula to
+/// the toy instance they build; `input_openings_split_the_census` pins its
+/// perm counts to the census geometry.
+///
+/// - Leaf perms per batch: row ‖ salt (`SALT_ELEMS`) per matrix, two words
+///   per u64, 17 u64 per overwrite-sponge block. A multi-block leaf whose
+///   last block is short carries tail lanes (one periodic role column).
+/// - Compressions: `lde - CAP_HEIGHT` per batch, three batches.
+/// - Reduced opening, per query: one `alpha^k * p(x)` extension-by-base
+///   product per opened term, `lde` base products for x, two inverse checks
+///   and two extension products for ro; per instance: the alpha powers and
+///   the z-sums (`terms - 1` and `terms` extension products).
+/// - Columns: Keccak, 1,088 message bits (no S bits: the sponge
+///   overwrites), 68 canonicity, 8 accumulator, the query registers
+///   (2 lde + 24) and the held cells (16 + 8 terms + 4 queries). The held
+///   alpha-power and z-value tables are 8 terms wide and dominate at L2
+///   widths.
+pub(super) fn input_openings(
+    width: usize,
+    log_height: usize,
+    chunks: usize,
+    queries: usize,
+) -> Value {
+    let lde = lde_log(log_height);
+    let path = lde - CAP_HEIGHT;
+    let (mut leaf, mut roles, mut carries) = (vec![], 0, 0);
+    for (mats, cols) in [(1, 4), (1, width), (chunks, 4)] {
+        let u64s = (mats * (cols + SALT_ELEMS)).div_ceil(2);
+        let blocks = u64s.div_ceil(17);
+        leaf.push(blocks);
+        roles += blocks;
+        if blocks > 1 && !u64s.is_multiple_of(17) {
+            carries += 1;
+        }
+    }
+    let leaf_total: usize = leaf.iter().sum();
+    let per_query = leaf_total + 3 * path;
+    let terms = 4 + 2 * width + 4 * chunks;
+    let rows = queries * per_query * 24;
+    let (ctx, held) = (2 * lde + 24, 16 + 8 * terms + 4 * queries);
+    let columns = NUM_KECCAK_COLS + 64 * 17 + 2 * 34 + 8 + ctx + held;
+    let cap_words = (1usize << CAP_HEIGHT) * 8;
+    json!({"evidence": "P", "source": "F2b-2b-ii layout (ood/open.rs), source-derived; toy pinned by its tests",
+        "queries": queries, "lde_log_height": lde, "path_levels": path,
+        "leaf_permutations_per_query": {"randomizer": leaf[0], "trace": leaf[1], "quotient": leaf[2]},
+        "leaf_permutations_per_query_total": leaf_total,
+        "path_compressions_per_query": 3 * path,
+        "permutations_per_query": per_query,
+        "leaf_permutations_total": leaf_total * queries,
+        "path_compressions_total": 3 * path * queries,
+        "lane_rows": rows, "padded_rows": rows.next_power_of_two(),
+        "reduced_opening_per_query": {"opened_terms": terms, "ext_by_base_mul": terms,
+            "x_chain_base_mul": lde, "ext_inverse_checks": 2, "ext_mul": 4},
+        "reduced_opening_per_instance": {"alpha_power_ext_mul": terms - 1, "z_sum_ext_mul": terms},
+        "component_columns": columns,
+        "column_split": {"keccak": NUM_KECCAK_COLS, "message_bits": 64 * 17, "canonical": 2 * 34,
+            "accumulator": 8, "query_registers": ctx, "held": held},
+        "periodic_columns": 4 + roles + carries + path + 3 + queries,
+        "public_values": 6 * cap_words + 4 + 4 * terms + 4 + queries + 4 * queries,
+        "complete_verifier_layout": false, "memory_gate_pass": false})
+}
+
 impl Geometry {
     pub(super) fn report(&self, shape: Shape) -> Value {
         let cfg = L2_CFG_PROVISIONAL;
@@ -253,6 +319,43 @@ mod tests {
             assert_eq!(g.fri_paths, paths);
             assert_eq!(g.report(shape)["m4_style_lane_permutations_floor"], lane);
         }
+    }
+
+    #[test]
+    fn input_openings_split_the_census() {
+        // The input-batch share plus the FRI commit-phase share is the
+        // census geometry's per-query count, for every shape; at S, 43
+        // queries, that is the measured 1,419 leaf / 3,999 path perms.
+        let cfg = L2_CFG_PROVISIONAL;
+        for (shape, leaf, comp, columns, periodic, pvs) in [
+            (Shape::S, 25, 57, 15_877, 96, 6_519),
+            (Shape::P, 27, 60, 17_111, 99, 7_135),
+            (Shape::R, 25, 54, 16_083, 95, 6_623),
+        ] {
+            let g = geometry(shape, 8);
+            let r = input_openings(shape.width(), shape.log_height(), 8, cfg.num_queries);
+            let fri_leaf: usize = g
+                .log_arities
+                .iter()
+                .map(|a| leaf_perms(4 * (1usize << a)))
+                .sum();
+            let fri_comp: usize = g.fri_paths.iter().sum();
+            assert_eq!(r["leaf_permutations_per_query_total"], leaf);
+            assert_eq!(r["path_compressions_per_query"], comp);
+            assert_eq!(leaf + fri_leaf, g.leaf_per_query);
+            assert_eq!(comp + fri_comp, g.compress_per_query);
+            assert_eq!(r["component_columns"], columns);
+            assert_eq!(r["periodic_columns"], periodic);
+            assert_eq!(r["public_values"], pvs);
+            assert_eq!(r["padded_rows"], 1 << 17);
+            assert_eq!(r["reduced_opening_per_query"]["opened_terms"], g.ood);
+        }
+        let s = input_openings(Shape::S.width(), Shape::S.log_height(), 8, 43);
+        assert_eq!(s["leaf_permutations_total"], 1075);
+        assert_eq!(s["path_compressions_total"], 2451);
+        assert_eq!(1075 + 43 * 8, 1419);
+        assert_eq!(2451 + 43 * 36, 3999);
+        assert_eq!(s["lane_rows"], 84_624);
     }
 
     #[test]
