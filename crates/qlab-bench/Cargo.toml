@@ -57,6 +57,8 @@ bincode = "1"
 # Serialize trait bound for per-component proof accounting (breakdown mode);
 # already in the dependency tree via the p3 crates.
 serde = "1"
+# F2 census reports; already pinned in the workspace lockfile.
+serde_json = "1"
 
 # lab #742 (A5 lever 4a): `zkpeak --phases` — a counting global allocator plus
 # a `tracing` layer on Plonky3's own prover spans. A BENCH build only
