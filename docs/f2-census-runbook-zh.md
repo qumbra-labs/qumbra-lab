@@ -58,9 +58,31 @@ rc0 仍然必须保留 randomizer 承诺和盐值。
 也不是寄存器或行布局；它不分配 trace、不 prove。
 工具始终明确输出 `complete_verifier_layout: false` 和 `memory_gate_pass: false`。
 
-下一检查点须补齐 periodic 求值、quotient 重组与恒等式、randomizer/salt 绑定、
-寄存器生命周期、shape/config 身份、各 shape 的费用和状态转换，以及 issue #78
-剩余工作。由实现重新计算宽度和 padded height，不能把 stage-zero 宽度预算直接
+### 可执行 OOD 算术模型
+
+`f2price` 新增 `ood_arithmetic`，以显式扩展域算术 DAG 表达 periodic 求值、
+AIR selector/约束、alpha fold、quotient 重组和最终 OOD 恒等式。
+其计数标为 **P**，尚未做结构公共子表达式消除、常量折叠或寄存器分配。
+输入读取和常量单独计数，inverse 是显式操作。这是可执行算术模型，**不是 AIR**。
+`symbolic_air.not_lowered` 仍列出递归 AIR 中尚未实现的部分。
+
+`f2census` 在原生 proof 验证成功后，重放包括 randomizer 承诺的 uni-stark
+challenger 前缀，以真实 opening 执行 DAG，并将 periodic 值、selector、next-row
+point、quotient 和 AIR fold 与原生实现比较。`ood_algebra.residual_zero` 必须为
+true；任何差异均令 census 失败。不额外生成 proof。
+
+AIR selector、periodic 列和 next-row point 使用原始 **N** 域，trace 承诺使用
+**2N** 域。编译时对公开 AIR 常量做 IDFT 得到 periodic 系数，再以显式 Horner
+操作在 `zeta^(N/period)` 求值。First/last selector 保留原生非归一化约定。
+每个 quotient chunk 的四个 opening 本身是**扩展域元素**，与扩展域基常量相乘
+后，再应用原生 split-domain 插值权重。随机化后的 PCS chunk commitment 域
+不是重组域。原始 trace 域内的 zeta 被 inverse-of-zero 检查拒绝；输入维度错误
+在索引之前被拒绝。不支持的 symbolic source 报错，不以零代替。
+
+下一检查点须在递归 AIR 中约束这些操作，包括每个 inverse（`x * inv = 1`）、
+输入读取、写入和寄存器 hold；还须补齐 randomizer/salt 绑定、shape/config 身份、
+各 shape 的费用和状态转换，以及 issue #78 剩余工作。
+由实现重新计算宽度和 padded height，不能把 stage-zero 宽度预算直接
 当作已验证的分配尺寸。
 
 ## 验证与限制
@@ -70,3 +92,9 @@ CI 回归测试会串行生成真实 S3/P3/R proof，检查两个原生 verifier
 轻量测试固定纸面几何、当前 AIR 元数据，拒绝不兼容参数及 fixture 元数据。
 测试代码存在不表示 CI 已通过，应以 PR 对应提交的 CI 结果为证据。
 完整递归 soundness、最终宽高、混合 shape 聚合和内存门槛仍未由这些工具验证。
+
+OOD 回归检查以确定性的扩展域输入对拍三个 shape，覆盖每个 quotient chunk 的
+每个基系数，区分 N 与 2N，拒绝域内 zeta、错误维度和不支持的 source。
+既有真实 proof 测试也检查诚实输入的零 residual，并篡改 quotient 系数、local/next
+opening、被消费的公共值、alpha 和 zeta。这些是算术组件检查：原生 PCS 拒绝不能
+代替对拍，通过也不代表完整递归验证已实现。

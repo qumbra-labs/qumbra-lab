@@ -73,9 +73,35 @@ measurement, a structural-CSE optimum, or a lowered register/row layout. It does
 allocate a trace or prove. Both modes report `complete_verifier_layout: false` and
 `memory_gate_pass: false` until a separate completed circuit can justify either claim.
 
-The next implementation checkpoint must account for periodic evaluation, quotient
-recombination/identity, randomizer and salt bindings, register lifetimes, shape/config
-identity and shape-specific fee/state transitions, plus the unresolved issue #78 work.
+### Executable OOD algebra
+
+`f2price` additionally reports `ood_arithmetic`: an explicit extension-field arithmetic
+DAG for periodic evaluation, AIR selectors/constraints, alpha folding, quotient
+recomposition and the final OOD identity. Its counts are **P**, without structural CSE,
+constant folding or register allocation. Input reads and constants are counted separately;
+inverse operations are explicit. This is executable algebra, **not an AIR**. The
+`symbolic_air.not_lowered` list continues to name work missing from the recursive AIR.
+
+`f2census`, after successful native proof verification, replays the uni-stark challenger
+prefix including the randomizer commitment, evaluates that DAG on the actual openings,
+and compares its periodic values, selectors, next-row point, quotient and folded AIR
+constraints against the native routines. `ood_algebra.residual_zero` must be true.
+Any disagreement fails the census. No extra proof is generated.
+
+AIR selectors, periodic columns and the next-row point use the original **N** domain;
+the trace commitment uses **2N**. Periodic coefficients are computed from public AIR
+constants by IDFT during compilation, followed by explicit Horner operations at
+`zeta^(N/period)`. First/last selectors retain the native unnormalized convention.
+Each quotient chunk combines four **extension-valued** openings with extension-basis
+constants, then applies the native split-domain interpolation weights. The randomized
+PCS chunk commitment domains are not the recomposition domains. A zeta in the original
+trace domain fails an explicit inverse-of-zero check; dimension mismatches fail before
+input indexing. Unsupported symbolic sources are errors rather than zero-filled inputs.
+
+The next implementation checkpoint must constrain these operations in a recursive AIR,
+including every inverse (`x * inv = 1`), input read, write and register hold. It must also
+account for randomizer and salt bindings, shape/config identity and shape-specific
+fee/state transitions, plus the unresolved issue #78 work.
 Recompute width and padded height from that implementation; do not copy the stage-zero
 width budgets into an allocation as if they were verified dimensions.
 
@@ -88,3 +114,11 @@ geometry and live AIR metadata and reject incompatible command/fixture inputs.
 These test definitions are not a claim that CI has passed; the PR's exact-head CI result
 is the evidence. Full recursive soundness, lowered width/height, mixed-shape aggregation,
 and the memory gate remain unverified by these tools.
+
+OOD regressions compare all three shapes against native algebra on deterministic
+extension-field inputs, exercise every quotient chunk/basis coefficient, distinguish
+N from 2N, and reject on-domain zeta, wrong dimensions and unsupported sources.
+The existing real-proof test also checks the honest zero residual and mutations of
+quotient coefficients, local/next openings, consumed public values, alpha and zeta.
+These are algebra-only probes: native PCS rejection is not a substitute for their
+comparisons, and passing them is not a claim of full recursive verification.
