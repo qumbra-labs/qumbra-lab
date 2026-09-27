@@ -162,15 +162,89 @@ impl Schedule {
         })
     }
 
-    fn height(&self) -> usize {
+    pub(super) fn height(&self) -> usize {
         // Always a terminal row after the last write. No last-row carry escape.
         (self.steps.len() + 1).next_power_of_two()
     }
-    fn width(&self) -> usize {
+    pub(super) fn width(&self) -> usize {
         12 + 4 * self.registers
     }
-    fn rom_width(&self) -> usize {
+    pub(super) fn rom_width(&self) -> usize {
         12 + 3 * self.registers + self.inputs.len()
+    }
+    /// Logical input sources in first-use order: input `i` of the machine is
+    /// `inputs()[i]`, and its DAG node supplies the honest value.
+    #[cfg(test)]
+    pub(super) fn inputs(&self) -> &[(Id, Input)] {
+        &self.inputs
+    }
+    /// Register slot holding each exported root on the terminal row.
+    #[cfg(test)]
+    pub(super) fn outputs(&self) -> &[usize] {
+        &self.outputs
+    }
+
+    /// Full-period ROM at `height` rows (`height >= self.height()`): opcode,
+    /// constant limbs, one-hot A/B/destination and input selectors; padding
+    /// rows carry only the padding opcode.
+    #[cfg(test)]
+    pub(super) fn rom(&self, height: usize) -> Result<Vec<Vec<Val>>> {
+        require(
+            height >= self.height() && height.is_power_of_two(),
+            "machine ROM height",
+        )?;
+        let mut rom = vec![vec![Val::ZERO; height]; self.rom_width()];
+        let r = self.registers;
+        for (row, step) in self.steps.iter().enumerate() {
+            rom[step.kind.opcode()][row] = Val::ONE;
+            if let Kind::Constant(c) = step.kind {
+                for (k, &limb) in c.as_basis_coefficients_slice().iter().enumerate() {
+                    rom[8 + k][row] = limb;
+                }
+            }
+            if let Some(a) = step.a {
+                rom[12 + a][row] = Val::ONE;
+            }
+            if let Some(b) = step.b {
+                rom[12 + r + b][row] = Val::ONE;
+            }
+            rom[12 + 2 * r + step.dst][row] = Val::ONE;
+            if let Kind::Input(i) = step.kind {
+                rom[12 + 3 * r + i][row] = Val::ONE;
+            }
+        }
+        rom[7][self.steps.len()..].fill(Val::ONE);
+        Ok(rom)
+    }
+
+    /// Row-major machine columns (`self.width()` per row) at `height` rows.
+    #[cfg(test)]
+    pub(super) fn trace_values(&self, inputs: &[E], height: usize) -> Result<Vec<Val>> {
+        require(
+            inputs.len() == self.inputs.len(),
+            "machine input dimensions",
+        )?;
+        require(
+            height >= self.height() && height.is_power_of_two(),
+            "machine trace height",
+        )?;
+        let width = self.width();
+        let mut values = vec![Val::ZERO; height * width];
+        let mut registers = vec![E::ZERO; self.registers];
+        for row in 0..height {
+            let cells = &mut values[row * width..(row + 1) * width];
+            for (i, v) in registers.iter().enumerate() {
+                cells[12 + 4 * i..16 + 4 * i].copy_from_slice(v.as_basis_coefficients_slice());
+            }
+            if let Some(step) = self.steps.get(row) {
+                let (a, b, c) = self.eval_step(step, &registers, inputs)?;
+                for (i, v) in [a, b, c].iter().enumerate() {
+                    cells[4 * i..4 * i + 4].copy_from_slice(v.as_basis_coefficients_slice());
+                }
+                registers[step.dst] = c;
+            }
+        }
+        Ok(values)
     }
 
     fn eval_step(&self, step: &Step, registers: &[E], inputs: &[E]) -> Result<(E, E, E)> {
@@ -231,9 +305,11 @@ impl Schedule {
 }
 
 /// Fully constrained reference component. Inputs and expected outputs are public
-/// extension limbs; they are NOT yet authenticated PCS/FS wires. Full-period ROM
-/// binds opcode, addresses, constants and public input index for every row.
-/// Dense materialization is bounded by the caller before any allocation.
+/// extension limbs; they are NOT authenticated PCS/FS wires here — `bind.rs`
+/// (F2b-2a) runs the same `eval_machine` core on transcript-bound inputs.
+/// Full-period ROM binds opcode, addresses, constants and public input index
+/// for every row. Dense materialization is bounded by the caller before any
+/// allocation.
 #[cfg(test)]
 #[derive(Clone)]
 struct RegisterAir {
@@ -252,52 +328,16 @@ impl RegisterAir {
             cells <= max_cells,
             "reference machine exceeds materialization budget",
         )?;
-        let mut rom = vec![vec![Val::ZERO; height]; schedule.rom_width()];
-        let r = schedule.registers;
-        for (row, step) in schedule.steps.iter().enumerate() {
-            rom[step.kind.opcode()][row] = Val::ONE;
-            if let Kind::Constant(c) = step.kind {
-                for (k, &limb) in c.as_basis_coefficients_slice().iter().enumerate() {
-                    rom[8 + k][row] = limb;
-                }
-            }
-            if let Some(a) = step.a {
-                rom[12 + a][row] = Val::ONE;
-            }
-            if let Some(b) = step.b {
-                rom[12 + r + b][row] = Val::ONE;
-            }
-            rom[12 + 2 * r + step.dst][row] = Val::ONE;
-            if let Kind::Input(i) = step.kind {
-                rom[12 + 3 * r + i][row] = Val::ONE;
-            }
-        }
-        rom[7][schedule.steps.len()..].fill(Val::ONE);
+        let rom = schedule.rom(height)?;
         Ok(Self { schedule, rom })
     }
 
     fn trace(&self, inputs: &[E]) -> Result<RowMajorMatrix<Val>> {
-        require(
-            inputs.len() == self.schedule.inputs.len(),
-            "machine input dimensions",
-        )?;
         let s = &self.schedule;
-        let mut values = vec![Val::ZERO; s.height() * s.width()];
-        let mut registers = vec![E::ZERO; s.registers];
-        for row in 0..s.height() {
-            let cells = &mut values[row * s.width()..(row + 1) * s.width()];
-            for (i, v) in registers.iter().enumerate() {
-                cells[12 + 4 * i..16 + 4 * i].copy_from_slice(v.as_basis_coefficients_slice());
-            }
-            if let Some(step) = s.steps.get(row) {
-                let (a, b, c) = s.eval_step(step, &registers, inputs)?;
-                for (i, v) in [a, b, c].iter().enumerate() {
-                    cells[4 * i..4 * i + 4].copy_from_slice(v.as_basis_coefficients_slice());
-                }
-                registers[step.dst] = c;
-            }
-        }
-        Ok(RowMajorMatrix::new(values, s.width()))
+        Ok(RowMajorMatrix::new(
+            s.trace_values(inputs, s.height())?,
+            s.width(),
+        ))
     }
 
     fn public_values(&self, inputs: &[E], expected: &[E]) -> Result<Vec<Val>> {
@@ -333,11 +373,6 @@ impl BaseAir<Val> for RegisterAir {
 #[cfg(test)]
 impl<AB: AirBuilder<F = Val>> Air<AB> for RegisterAir {
     fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let cur = main.current_slice();
-        let next = main.next_slice();
-        let cv = |i: usize| -> AB::Expr { cur[i].into() };
-        let nv = |i: usize| -> AB::Expr { next[i].into() };
         let rom: Vec<AB::Expr> = builder
             .periodic_values()
             .iter()
@@ -348,56 +383,86 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for RegisterAir {
             .iter()
             .map(|v| (*v).into())
             .collect();
-        let r = self.schedule.registers;
-        // Multiplication in KoalaBear's extension E = F[X]/(X^4 - 3), as in M4.
-        let product = |a: usize, b: usize, limb: usize| {
-            let mut acc = AB::Expr::ZERO;
-            for i in 0..4 {
-                for j in 0..4 {
-                    if (i + j) % 4 == limb {
-                        let factor = if i + j >= 4 {
-                            Val::from_u32(3)
-                        } else {
-                            Val::ONE
-                        };
-                        acc += cv(a + i) * cv(b + j) * factor;
-                    }
+        let s = &self.schedule;
+        let inputs: Vec<[AB::Expr; 4]> = (0..s.inputs.len())
+            .map(|i| core::array::from_fn(|k| pv[4 * i + k].clone()))
+            .collect();
+        eval_machine(builder, s, 0, &rom, &inputs);
+        let main = builder.main();
+        let cur = main.current_slice();
+        for k in 0..4 {
+            for (i, &slot) in s.outputs.iter().enumerate() {
+                builder.when_last_row().assert_eq(
+                    cur[12 + 4 * slot + k].into(),
+                    pv[4 * (s.inputs.len() + i) + k].clone(),
+                );
+            }
+        }
+    }
+}
+
+/// The machine's instruction, read and register-file constraints, shared by
+/// the public-input reference AIR and F2b-2a's transcript-bound component.
+/// Machine columns start at `off`; `rom` is the machine's ROM slice; input `i`
+/// limb `k` is `inputs[i][k]` (public limbs here, held input columns there).
+/// Output bindings are the caller's: which roots are pinned, and to what, is
+/// exactly what differs between the two components.
+#[cfg(test)]
+pub(super) fn eval_machine<AB: AirBuilder<F = Val>>(
+    builder: &mut AB,
+    s: &Schedule,
+    off: usize,
+    rom: &[AB::Expr],
+    inputs: &[[AB::Expr; 4]],
+) {
+    let main = builder.main();
+    let cur = main.current_slice();
+    let next = main.next_slice();
+    let cv = |i: usize| -> AB::Expr { cur[off + i].into() };
+    let nv = |i: usize| -> AB::Expr { next[off + i].into() };
+    let r = s.registers;
+    // Multiplication in KoalaBear's extension E = F[X]/(X^4 - 3), as in M4.
+    let product = |a: usize, b: usize, limb: usize| {
+        let mut acc = AB::Expr::ZERO;
+        for i in 0..4 {
+            for j in 0..4 {
+                if (i + j) % 4 == limb {
+                    let factor = if i + j >= 4 {
+                        Val::from_u32(3)
+                    } else {
+                        Val::ONE
+                    };
+                    acc += cv(a + i) * cv(b + j) * factor;
                 }
             }
-            acc
+        }
+        acc
+    };
+    for k in 0..4 {
+        let read = |base: usize| {
+            (0..r)
+                .map(|i| rom[base + i].clone() * cv(12 + 4 * i + k))
+                .fold(AB::Expr::ZERO, |a, b| a + b)
         };
-        for k in 0..4 {
-            let read = |base: usize| {
-                (0..r)
-                    .map(|i| rom[base + i].clone() * cv(12 + 4 * i + k))
-                    .fold(AB::Expr::ZERO, |a, b| a + b)
-            };
-            builder.assert_eq(cv(k), read(12));
-            builder.assert_eq(cv(4 + k), read(12 + r));
-            let public = (0..self.schedule.inputs.len())
-                .map(|i| rom[12 + 3 * r + i].clone() * pv[4 * i + k].clone())
-                .fold(AB::Expr::ZERO, |a, b| a + b);
-            builder.assert_zero(rom[0].clone() * (cv(8 + k) - public));
-            builder.assert_zero(rom[1].clone() * (cv(8 + k) - rom[8 + k].clone()));
-            builder.assert_zero(rom[2].clone() * (cv(8 + k) - cv(k) - cv(4 + k)));
-            builder.assert_zero(rom[3].clone() * (cv(8 + k) - cv(k) + cv(4 + k)));
-            builder.assert_zero(rom[4].clone() * (cv(8 + k) + cv(k)));
-            builder.assert_zero(rom[5].clone() * (cv(8 + k) - product(0, 4, k)));
-            builder.assert_zero(rom[6].clone() * (product(0, 8, k) - Val::from_bool(k == 0)));
-            builder.assert_zero(rom[7].clone() * cv(8 + k));
-            for i in 0..r {
-                let col = 12 + 4 * i + k;
-                builder.when_first_row().assert_zero(cv(col));
-                builder.when_transition().assert_zero(
-                    nv(col) - cv(col) - rom[12 + 2 * r + i].clone() * (cv(8 + k) - cv(col)),
-                );
-            }
-            for (i, &slot) in self.schedule.outputs.iter().enumerate() {
-                builder.when_last_row().assert_eq(
-                    cv(12 + 4 * slot + k),
-                    pv[4 * (self.schedule.inputs.len() + i) + k].clone(),
-                );
-            }
+        builder.assert_eq(cv(k), read(12));
+        builder.assert_eq(cv(4 + k), read(12 + r));
+        let input = (0..s.inputs.len())
+            .map(|i| rom[12 + 3 * r + i].clone() * inputs[i][k].clone())
+            .fold(AB::Expr::ZERO, |a, b| a + b);
+        builder.assert_zero(rom[0].clone() * (cv(8 + k) - input));
+        builder.assert_zero(rom[1].clone() * (cv(8 + k) - rom[8 + k].clone()));
+        builder.assert_zero(rom[2].clone() * (cv(8 + k) - cv(k) - cv(4 + k)));
+        builder.assert_zero(rom[3].clone() * (cv(8 + k) - cv(k) + cv(4 + k)));
+        builder.assert_zero(rom[4].clone() * (cv(8 + k) + cv(k)));
+        builder.assert_zero(rom[5].clone() * (cv(8 + k) - product(0, 4, k)));
+        builder.assert_zero(rom[6].clone() * (product(0, 8, k) - Val::from_bool(k == 0)));
+        builder.assert_zero(rom[7].clone() * cv(8 + k));
+        for i in 0..r {
+            let col = 12 + 4 * i + k;
+            builder.when_first_row().assert_zero(cv(col));
+            builder.when_transition().assert_zero(
+                nv(col) - cv(col) - rom[12 + 2 * r + i].clone() * (cv(8 + k) - cv(col)),
+            );
         }
     }
 }

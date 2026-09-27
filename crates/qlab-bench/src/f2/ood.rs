@@ -1,5 +1,8 @@
 //! Executable algebraic OOD relation, not a recursive verifier AIR.
 //! All variable arithmetic is explicit; constants/IDFT are compile-time work.
+// F2b-2a: the machine's inputs bound to a replayed hiding transcript (test-only AIR).
+#[cfg(test)]
+mod bind;
 mod machine;
 
 use std::collections::HashMap;
@@ -124,6 +127,26 @@ impl Dag {
     }
 }
 
+/// The AIR dimensions the DAG is compiled for. The L2 shapes supply them from
+/// [`Shape`]; F2b-2a's toy AIR supplies its own, so the transcript binding can
+/// be exercised on a real hiding proof that CI can afford to generate.
+#[derive(Clone, Copy, Debug)]
+struct Dims {
+    width: usize,
+    pv_len: usize,
+    log_height: usize,
+}
+
+impl From<Shape> for Dims {
+    fn from(shape: Shape) -> Self {
+        Self {
+            width: shape.width(),
+            pv_len: shape.pv_len(),
+            log_height: shape.log_height(),
+        }
+    }
+}
+
 struct Leaves {
     local: Vec<Id>,
     next: Vec<Id>,
@@ -157,23 +180,26 @@ struct Inputs {
 
 impl Program {
     fn compile<A: Air<SymbolicAirBuilder<Val>>>(shape: Shape, air: &A) -> Result<Self> {
+        Self::compile_dims(shape.into(), air)
+    }
+
+    fn compile_dims<A: Air<SymbolicAirBuilder<Val>>>(dims: Dims, air: &A) -> Result<Self> {
         let layout = AirLayout::from_air::<Val>(air);
-        require(layout.main_width == shape.width(), "OOD AIR width mismatch")?;
+        require(layout.main_width == dims.width, "OOD AIR width mismatch")?;
         require(
-            layout.num_public_values == shape.pv_len(),
+            layout.num_public_values == dims.pv_len,
             "OOD AIR PV mismatch",
         )?;
         require(
             layout.preprocessed_width == 0,
             "preprocessed OOD AIR unsupported",
         )?;
-        let original = Domain::new(Val::ONE, shape.log_height()).ok_or("original domain")?;
-        let committed =
-            Domain::new(Val::ONE, shape.log_height() + IS_ZK).ok_or("committed domain")?;
+        let original = Domain::new(Val::ONE, dims.log_height).ok_or("original domain")?;
+        let committed = Domain::new(Val::ONE, dims.log_height + IS_ZK).ok_or("committed domain")?;
         let log_q = get_log_num_quotient_chunks::<Val, _>(air, layout, IS_ZK);
         require(log_q + IS_ZK == 3, "expected eight hiding quotient chunks")?;
         let chunk_domains = committed
-            .create_disjoint_domain(1 << (shape.log_height() + IS_ZK + log_q))
+            .create_disjoint_domain(1 << (dims.log_height + IS_ZK + log_q))
             .split_domains(1 << (log_q + IS_ZK));
         let periodic = air.periodic_columns();
         check_periodic_column_lengths(&periodic, original.size())
@@ -183,13 +209,13 @@ impl Program {
             "periodic count mismatch",
         )?;
         let mut dag = Dag::default();
-        let local = (0..shape.width())
+        let local = (0..dims.width)
             .map(|i| dag.push(Op::Input(Input::Local(i))))
             .collect();
-        let next = (0..shape.width())
+        let next = (0..dims.width)
             .map(|i| dag.push(Op::Input(Input::Next(i))))
             .collect();
-        let public = (0..shape.pv_len())
+        let public = (0..dims.pv_len)
             .map(|i| dag.push(Op::Input(Input::Public(i))))
             .collect();
         let alpha = dag.push(Op::Input(Input::Alpha));
@@ -213,7 +239,7 @@ impl Program {
             let log_period = col.len().trailing_zeros() as usize;
             let point = *period_points
                 .entry(log_period)
-                .or_insert_with(|| dag.pow2(zeta, shape.log_height() - log_period));
+                .or_insert_with(|| dag.pow2(zeta, dims.log_height - log_period));
             // Original domain has shift one. Coefficients are public AIR
             // constants; IDFT happens during compilation, never in the witness.
             let coefficients = Dft::default().idft(col);
@@ -337,6 +363,8 @@ impl Program {
             "input_reads": counts[0], "constants": counts[1], "add": counts[2],
             "sub": counts[3], "neg": counts[4], "mul": counts[5], "inverse": counts[6],
             "register_schedule": self.schedule.report(),
+            "rom_encoding": super::price::rom_encoding(self.schedule.rom_width(),
+                self.schedule.height().trailing_zeros() as usize),
             "nodes": self.dag.ops.len(), "original_log_height": self.original.log_size(),
             "quotient_chunks": self.chunk_domains.len(), "periodic_columns": self.leaves.periodic.len(),
             "complete_verifier_layout": false, "memory_gate_pass": false})
@@ -400,8 +428,12 @@ where
 }
 
 fn proof_inputs(shape: Shape, proof: &Proof<Config>, pvs: &[Val]) -> Result<Inputs> {
+    proof_inputs_dims(shape.into(), proof, pvs)
+}
+
+fn proof_inputs_dims(dims: Dims, proof: &Proof<Config>, pvs: &[Val]) -> Result<Inputs> {
     require(
-        proof.degree_bits == shape.log_height() + IS_ZK,
+        proof.degree_bits == dims.log_height + IS_ZK,
         "OOD proof degree",
     )?;
     require(
@@ -413,7 +445,7 @@ fn proof_inputs(shape: Shape, proof: &Proof<Config>, pvs: &[Val]) -> Result<Inpu
     let mut challenger = config.initialise_challenger();
     // uni-stark 0.6.1 prefix: committed degree, original degree, prep width.
     challenger.observe(Val::from_usize(proof.degree_bits));
-    challenger.observe(Val::from_usize(shape.log_height()));
+    challenger.observe(Val::from_usize(dims.log_height));
     challenger.observe(Val::ZERO);
     challenger.observe(proof.commitments.trace.clone());
     challenger.observe_slice(pvs);

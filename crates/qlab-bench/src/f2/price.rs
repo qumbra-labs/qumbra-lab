@@ -97,9 +97,20 @@ pub(super) struct Geometry {
     pub duplicate: usize,
 }
 
+/// LDE height of a hiding commitment to a `log_height` trace on the L2 lane.
+fn lde_log(log_height: usize) -> usize {
+    log_height + IS_ZK + L2_CFG_PROVISIONAL.log_blowup
+}
+
+/// Leaf absorb perms for one salted matrix row of `width` base values:
+/// 17 u64 lanes = 34 base values per Keccak-f.
+fn leaf_perms(width: usize) -> usize {
+    (width + SALT_ELEMS).div_ceil(34)
+}
+
 pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
     let cfg = L2_CFG_PROVISIONAL;
-    let lde_log = shape.log_height() + IS_ZK + cfg.log_blowup;
+    let lde_log = lde_log(shape.log_height());
     let mut remaining = lde_log - cfg.log_blowup - cfg.log_final_poly_len;
     let mut domain_log = lde_log;
     let mut log_arities = vec![];
@@ -112,12 +123,12 @@ pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
         fri_paths.push(domain_log - CAP_HEIGHT);
     }
     let input_path = lde_log - CAP_HEIGHT;
-    let leaf_per_query = (shape.width() + SALT_ELEMS).div_ceil(34)
-        + (4 + SALT_ELEMS).div_ceil(34)
+    let leaf_per_query = leaf_perms(shape.width())
+        + leaf_perms(4)
         + (chunks * (4 + SALT_ELEMS)).div_ceil(34)
         + log_arities
             .iter()
-            .map(|a| (4 * (1usize << a) + SALT_ELEMS).div_ceil(34))
+            .map(|a| leaf_perms(4 * (1usize << a)))
             .sum::<usize>();
     let compress_per_query = 3 * input_path + fri_paths.iter().sum::<usize>();
     let ood = 2 * shape.width() + 4 + 4 * chunks;
@@ -144,6 +155,40 @@ pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
         fs_floor,
         duplicate,
     }
+}
+
+/// [P] The register machine's ROM priced two ways, for whoever verifies the
+/// proof that carries it (F2b-2a census hook; no layout is chosen here).
+///
+/// - **Periodic**: the verifier interpolates nothing at run time but must
+///   evaluate each full-period column at zeta — Horner over `rom_rows`
+///   coefficients, one extension mul + add each. No PCS cost: the columns are
+///   AIR constants, never committed or opened.
+/// - **Committed preprocessed**: one more hiding commitment on the L2 lane.
+///   Its cap joins F0 (uni-stark observes the preprocessed commitment there),
+///   each column is opened at zeta (one extension value, 16 transcript bytes
+///   in F2), each query opens one salted leaf row of it plus one more input
+///   path, the reduced opening gains one fri_alpha term per column, and the
+///   OOD DAG reads each opened value as an input instead of evaluating it.
+///
+/// Both are stated; which one F2 uses is a layout decision, not made in code.
+pub(super) fn rom_encoding(rom_width: usize, rom_log_height: usize) -> Value {
+    let cfg = L2_CFG_PROVISIONAL;
+    let rows = 1usize << rom_log_height;
+    let path = lde_log(rom_log_height) - CAP_HEIGHT;
+    let leaf = leaf_perms(rom_width);
+    json!({"evidence": "P", "source": "reference ROM width/height; L2-lane hiding PCS geometry (price::geometry formulas)",
+        "rom_columns": rom_width, "rom_rows": rows,
+        "periodic": {"ood_extension_mul": rom_width * rows, "ood_extension_add": rom_width * rows,
+            "pcs_cost": 0},
+        "committed_preprocessed": {"f0_cap_bytes": (1usize << CAP_HEIGHT) * 32,
+            "f2_opened_bytes": 16 * rom_width,
+            "leaf_permutations_per_query": leaf, "input_paths_per_query": 1,
+            "path_compressions_per_query": path, "query_count": cfg.num_queries,
+            "leaf_permutations_total": leaf * cfg.num_queries,
+            "path_compressions_total": path * cfg.num_queries,
+            "fri_alpha_terms": rom_width, "dag_input_reads": rom_width},
+        "layout_decided": false})
 }
 
 impl Geometry {
@@ -194,6 +239,31 @@ mod tests {
             assert_eq!(g.fri_paths, paths);
             assert_eq!(g.report(shape)["m4_style_lane_permutations_floor"], lane);
         }
+    }
+
+    #[test]
+    fn rom_encoding_states_both_costs_from_one_geometry() {
+        // 100 columns x 2^10 rows: lde 2^13 on the b4 hiding lane, cap 2^3.
+        let r = rom_encoding(100, 10);
+        assert_eq!(r["rom_rows"], 1024);
+        assert_eq!(r["periodic"]["ood_extension_mul"], 102_400);
+        assert_eq!(r["periodic"]["pcs_cost"], 0);
+        let c = &r["committed_preprocessed"];
+        assert_eq!(c["f2_opened_bytes"], 1600);
+        assert_eq!(c["f0_cap_bytes"], 256);
+        assert_eq!(c["leaf_permutations_per_query"], 4); // (100 + 4) / 34, rounded up
+        assert_eq!(c["path_compressions_per_query"], 10);
+        assert_eq!(c["leaf_permutations_total"], 4 * 43);
+        assert_eq!(c["dag_input_reads"], 100);
+        assert_eq!(r["layout_decided"], false);
+        // Same formula as the shape geometry: a shape-height ROM has the
+        // shape's input path.
+        let g = geometry(Shape::S, 8);
+        assert_eq!(
+            rom_encoding(1, Shape::S.log_height())["committed_preprocessed"]
+                ["path_compressions_per_query"],
+            g.input_path
+        );
     }
 
     #[test]
