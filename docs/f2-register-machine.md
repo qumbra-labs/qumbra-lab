@@ -45,7 +45,7 @@ add, subtract, negate, multiply and inverse; padding has its own fixed selector.
   constraints.
 
 Inputs here are **component public values**, not authenticated PCS/Fiat–Shamir
-wires (F2b-2a below binds them for a test component; the FRI half is still open). This component proves execution of its fixed program on declared inputs.
+wires (F2b-2a below binds them for a test component; F2b-2b-i continues the transcript through the FRI challenges; the Merkle and query checks are still open). This component proves execution of its fixed program on declared inputs.
 It does not establish that those inputs came from a proof, that a source tagged
 `Public` has been mapped to the original transaction PV, or that a challenge was
 derived from the transcript. Those integration bindings remain required.
@@ -258,4 +258,182 @@ most likely to fail first: the replay's cross-check against the native challenge
 (the byte order of the draws, cap serialization); a count mismatch between the
 symbolic and debug builders in phase numbering; the tiny toy height (log 4) on the
 hiding PCS.
+
+## F2b-2b-i: FRI transcript
+
+F2b-2b-i continues the **same** Fiat–Shamir transcript past F2, through every FRI
+challenge the native verifier draws: fri_alpha, one β per commit round, the
+query proof-of-work and every query index. It is Fiat–Shamir only. No Merkle
+path, reduced opening, fold or final-polynomial evaluation is checked here; those
+are 2b-ii/iii. Like 2a, it is a test-only component
+(`crates/qlab-bench/src/f2/ood/fri_fs.rs`), scanned row by row and never proved.
+
+### Native order, checked against source
+
+The challenger is `SerializingChallenger32<KoalaBear, HashChallenger<u8, Keccak256, 32>>`
+with the pinned hiding config (`qlab-consensus` `make_config_from`; L2 lane
+`L2_CFG_PROVISIONAL` = b4/q43/g22/fp16/a16, `CAP_HEIGHT` 3, rc = 0). In p3-fri 0.6.1:
+
+1. `two_adic_pcs.rs:696-701` observes the opened values (F2), then
+   `verifier.rs:195` draws fri_alpha. That flush's digest is D2, which 2a
+   already outputs. D2 is this component's public **input**.
+2. `verifier.rs:302-311`, per round: `observe(commit)`, then
+   `check_witness(commit_proof_of_work_bits, w)`, then β. The lab pins
+   `commit_proof_of_work_bits = 0`, and `check_witness` returns before observing
+   anything at 0 bits (p3-challenger `grinding_challenger.rs:41-47`). The commit
+   witnesses therefore never enter the transcript. Flush G_r = D_{r−1} ‖ cap_r.
+3. `verifier.rs:323` observes the final polynomial (16 coefficients × 4 basis
+   limbs), `verifier.rs:334-336` every round's log-arity as a base element, and
+   `verifier.rs:339` calls `check_witness(22, w)` = observe(w), then
+   `sample_bits(22) == 0`. There is no sample between these observations, so they
+   form **one** flush: H = D_{R−1} ‖ final poly ‖ arities ‖ w.
+4. `verifier.rs:352-353` draws each of the 43 queries with
+   `sample_bits(log_global_max_height)`. `TwoAdicFriFolding` adds zero extra bits
+   (`two_adic_pcs.rs:106`).
+
+**`sample_bits` is not the field draw.** It pops four bytes (little-endian, the same
+positions as a field draw) and keeps the low `bits` bits, with no 31-bit mask and
+no rejection. Two consequences follow. The PoW condition is on the **low** 22 bits
+of draw 0 of H's digest; the brief's "leading-zero bits" is corrected here to
+trailing. And every query index sits at a fixed (digest, draw) position: query i
+is draw i + 1 of the stream that starts at H's digest, so the query phase needs no
+selection gadget. When a digest's eight draws are spent, the challenger re-flushes
+its input buffer, which then holds exactly the last digest (`hash_challenger.rs`
+`flush`). Each refill is Q_w = hash(D_{w−1}), one permutation.
+
+**PoW bits.** Query PoW is 22 bits (nonzero), so the gadget is tested at the
+native difficulty. Commit-phase PoW is 0 bits in the pinned config, so there is
+nothing to constrain there.
+
+### What is bound
+
+- **Sponge.** The same lane and gadgets as 2a, now shared in `lane.rs` (see below).
+  The first flush's chaining prefix is pinned to the D2 public limbs (`seed`, row 0,
+  where S = 0); every later prefix is pinned by `flush_chain`.
+- **Words.** Padding and the log-arities are limb-exact constants. Caps are outer
+  public limbs. Final-polynomial limbs are canonical and equal `R⁻¹ · word` in
+  held cells, since the Montgomery trap applies to them as it did to the opened
+  values. The PoW witness is canonical.
+- **Draws.** fri_alpha (from the D2 window, read on G_0's first block) and each β
+  use 2a's reject + one-hot selection. PoW is enforced as 22 zero bits. Each index
+  bit equals the corresponding draw bit on the window's digest row.
+- **Outputs.** Held cells, constant over all rows, carry fri_alpha, every β, the
+  final polynomial and every query-index bit, ready for 2b-ii/iii's path
+  selection in the same row space. The same values are also public outputs (tied
+  on row 0), so a separate component can consume them by public-value equality.
+  That is this slice's equivalent of 2a's D2 output: nothing in the native verifier
+  observes anything after the query draws, so no later digest is exposed.
+
+**The fold schedule is a shape constant.** p3's verifier accepts any per-round
+log-arity in 1..=max whose sum matches the input height. The layout fixes the
+schedule the p3 prover commits to (`price::fri_log_arities`, factored out of the
+census so both use one function). A proof folded on another legal schedule is
+refused. That is a completeness restriction, never a false accept, and the honest
+prover never produces such a proof. The honest test asserts the real proof's
+arities equal the layout's.
+
+### Reuse
+
+The sponge lane moved from `bind.rs` into `lane.rs`: pad10*1, the absorb loop, the
+draw order, `accepted`/`challenge`, the Keccak column map, the periodic sponge
+selectors, the phase-range counter, and the constraint gadgets `bits`, `absorb`,
+`chain_state`, `flush_chain`, the `< p` comparator, `fs_reject` and `fs_select`.
+Each gadget emits the same constraints in the same order as before, so 2a's
+group-by-index negatives are unchanged. 2a's tests are untouched except that the
+toy AIR, its proof and the native challenger replay through F2 now come from
+`lane::toy` (the same code, shared). What each component binds its words to stays
+in the component.
+
+### Constraint groups and tests
+
+Seventeen named groups: `keccak`, `bits`, `absorb`, `chain_state`, `flush_chain`,
+`seed`, `bind_const`, `bind_cap`, `canonical`, `fs_reject`, `fs_select`, `fs_bind`,
+`bind_final`, `pow`, `fs_index`, `hold`, `cells_out`. The fixture is the same toy AIR
+at log height 8 (seeded hiding proof on the L2 lane). At 2a's log 4, the LDE of 2^7
+folds only once; at log 8, 2^11 folds by 16 and then by 2, which gives two commit
+rounds for the swap negative. D2 comes from 2a's own `Replay` of the same proof,
+which exercises the seam between the two components.
+
+Every negative scans **all** rows and asserts that every violation is in the named
+group, on the named rows (stricter than 2a's single-row check):
+
+| negative | refused at |
+|---|---|
+| wrong fri_alpha limb, exposed consistently | `fs_bind` only, D2 row |
+| β_0 takes the fifth accepted draw (skip) | `fs_select` only, G_0 digest row |
+| round caps absorbed in swapped order; betas, PoW (re-ground by the p3 challenger) and indices all consistent | `bind_cap` only, G_0/G_1 rows |
+| transcript absorbs a forged final-poly coefficient, the query phase gets the honest one; PoW re-ground, indices replayed | `bind_final` only |
+| final-poly word encoded as `word + p` | `canonical` on its row, plus `pow` on the window row (not re-ground: the native challenger cannot absorb a non-canonical word) |
+| PoW witness failing the 22-bit condition, indices replayed from it | `pow` only (the p3 `check_witness` refuses it too) |
+| one query-index bit flipped, cells and public index consistent | `fs_index` only |
+| a query takes another query's index, transcript untouched | `fs_index` only |
+| queries 7.. each take the next draw (skip) | `fs_index` only |
+
+**Scope boundary, asserted.** A final polynomial that the transcript absorbs and
+exposes consistently, with PoW re-ground, is **accepted** by this component. Nothing
+in Fiat–Shamir can refuse it; 2b-iii's final-polynomial evaluation must. The test
+asserts this, so the boundary cannot silently move.
+
+The honest test cross-checks the replay against the native p3 challenger, driven
+through the verifier's own observation order. It checks fri_alpha (from 2a's D2),
+both betas, and that the proof's PoW witness passes `check_witness(22)` at that
+point. A wrong message order through H would pass only by a 2⁻²² coincidence, so
+this anchors the order independently of the replay. It also checks all 43 query
+indices, the shape (arities [4, 1], two commits and witnesses, 16 coefficients,
+43 queries, 11 index bits, six windows), a full SAT scan, and maximum constraint
+degree ≤ 3 **[P, guarded in CI]**.
+
+### Dimensions
+
+**[P, source-derived]** For the toy (log 8, R = 2): the flushes are G_0, G_1 (3
+permutations each: 8 + 64 words), H (3: 8 + 64 + 2 + 1), and six refills of one
+permutation each, 15 permutations in all (360 rows → height 512). Width = 2,633
+(Keccak) + 2 × 1,088 (M, S) + 68 (canonicity) + 72 (field draws) + held cells
+4(R+1) + 64 + 43 · 11 = 549, giving 5,498. Public values: 16 (D2) + 128R (caps) +
+4(R+1) + 64 + 43 = 391.
+
+At shape P (log 20, LDE 2^23): arities [4, 4, 4, 4, 1], so R = 5, 23 index bits,
+and 5 × 3 + 3 + 6 = 24 permutations. This matches the census `fs_floor` FRI terms
+(R × blocks(32 + cap) + blocks(final ‖ arities ‖ witness) + 5 refills), plus one
+permutation. The extra one is the tail refill whose first block carries the last
+window's digest bits: a layout cost of reading draws off a successor's M bits, not
+a transcript cost. Held cells: 24 + 64 + 43 · 23 = 1,077.
+
+### Not yet bound (2b-ii/iii)
+
+Input and commit-phase Merkle paths, salted leaves, the reduced opening, the folds
+(sibling values, β powers) and the final-polynomial evaluation at each query. A
+fri_alpha or β window that needs a refill (more than eight field draws, about 1e-9
+per challenge) is unsatisfiable. As in 2a, that is a completeness gap and never a
+false accept. `pcs_input_bindings_complete`, `full_ood_air_checked`,
+`complete_verifier_layout` and `memory_gate_pass` stay **false**.
+
+### Validation
+
+No local tests, proofs or benchmarks were run. The local preflight was
+`cargo check --workspace --all-targets`, Clippy on `qlab-bench` (no findings in
+`f2/`) and rustfmt; `verify-graviton` CI is the acceptance gate. The slice adds six
+tests in `fri_fs.rs` and no others. **[P, pending CI]**: 2769 + 6 = 2775 passed,
+0 failed, 15 ignored, reconciled against 2a's acceptance run 36325459774 (main has
+not moved since).
+
+Expected new-test runtime **[P]** is 15–40 s on the Graviton lane. It is dominated
+by one toy hiding proof at log 8 (including its own 22-bit grind) and two native
+22-bit re-grinds (expected 2²² Keccak-256 absorbs each, rayon-parallel). The rest
+is about ten 512 × 5,498 traces, one parallel SAT scan, about nine full-trace
+violation scans (512 rows each) and one symbolic degree pass. 2a's six tests now
+share the lane code and should not change in cost.
+
+Unverified, most likely to break first:
+
+1. The native cross-check itself: the replay's H message order and the refill
+   semantics against the p3 challenger (caught by the honest test's `check_witness`
+   and index assertions).
+2. The fixture's fold schedule: `[4, 1]` assumes every hiding input is committed
+   at 2N rows. If a quotient chunk committed lower, the p3 prover would fold to it
+   first and the arity assertion fails.
+3. The refactor of 2a's gadgets into `lane.rs`: constraint order within a group is
+   preserved by construction, but 2a's negatives are the only check.
+4. A seed-dependent assumption in a negative: β_0's window must hold at least five
+   accepted draws (it fails with probability about 3·10⁻⁷, and deterministically for the fixed seed).
 

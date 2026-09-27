@@ -55,37 +55,26 @@
 //! **NOT bound here (F2b-2b):** fri_alpha, the FRI betas and commit caps,
 //! PoW, query indices, the reduced opening, salted input-Merkle leaves and
 //! paths, and the final polynomial. Nothing here ties the opened values to
-//! the committed caps — D2 is where that half starts. The randomizer opening
+//! the committed caps — D2 is where that half starts: `fri_fs` (F2b-2b-i)
+//! takes D2 as its public input and continues the transcript through the
+//! query indices. The sponge gadgets both use live in `lane`. The randomizer opening
 //! is hashed but never routed: it does not enter the OOD identity. A draw
 //! window needing more than eight draws (a refill, probability ~1e-9 per
 //! challenge) is unsatisfiable, a completeness gap, never a false accept.
-use std::borrow::Borrow;
-use std::ops::Range;
-
-use p3_air::symbolic::{AirLayout, SymbolicAirBuilder};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField32};
-use p3_keccak_air::{generate_trace_rows, KeccakAir, KeccakCols, NUM_KECCAK_COLS, NUM_ROUNDS};
+use p3_keccak_air::NUM_ROUNDS;
 use p3_matrix::dense::RowMajorMatrix;
-use p3_matrix::Matrix;
 use p3_uni_stark::Proof;
-use qlab_consensus::{Config, CAP_HEIGHT, IS_ZK};
+use qlab_consensus::{Config, IS_ZK};
 
+use super::lane::{
+    absorb, accepted, challenge, digest_limbs, draw_values, monty, pad, sponge_selectors, Lane,
+    Phased, CAP_WORDS, DRAWS, DRAW_COLS, P, RATE_WORDS,
+};
 use super::machine::{eval_machine, Schedule};
 use super::{require, Dims, Input, Inputs, Program, Result, Val, E};
-use crate::m4gaterec::{digest_of, keccakf};
-use crate::m4skel::LaneBuilder;
-
-const RATE_LANES: usize = 17;
-const RATE_WORDS: usize = 2 * RATE_LANES;
-const RATE_BITS: usize = 64 * RATE_LANES;
-/// Words of one observed cap: 2^CAP_HEIGHT digests x 4 u64 x 2 words.
-const CAP_WORDS: usize = (1 << CAP_HEIGHT) * 8;
-/// Draws one 32-byte digest provides before a refill.
-const DRAWS: usize = 8;
-/// Columns per draw: inv_hi, hi, inv_lo, nz, acc, then four slot selectors.
-const DRAW_COLS: usize = 9;
-const P: u32 = Val::ORDER_U32;
+use crate::m4gaterec::keccakf;
 
 /// Constraint groups, in evaluation order. A negative names the group its
 /// violation must land in; `BoundAir::phase_of` maps an index to its name.
@@ -145,7 +134,7 @@ impl Word {
 /// Static transcript layout: which word sits in which lane perm and slot.
 /// Derived from the dimensions alone — the AIR never reads the proof.
 #[derive(Clone)]
-struct Layout {
+pub(super) struct Layout {
     dims: Dims,
     /// Padded word stream per flush F0..F2, a whole number of rate blocks.
     flushes: [Vec<Word>; 3],
@@ -154,12 +143,8 @@ struct Layout {
     perms: usize,
 }
 
-fn monty(v: Val) -> u32 {
-    v.to_unique_u32()
-}
-
 impl Layout {
-    fn new(dims: Dims, chunks: usize) -> Self {
+    pub(super) fn new(dims: Dims, chunks: usize) -> Self {
         let w = dims.width;
         let mut f0 = vec![
             Word::Const(monty(Val::from_usize(dims.log_height + IS_ZK))),
@@ -181,7 +166,7 @@ impl Layout {
         for o in opened {
             f2.extend((0..4).map(|k| Word::Opened(o, k)));
         }
-        let flushes = [Self::pad(f0), Self::pad(f1), Self::pad(f2)];
+        let flushes = [f0, f1, f2].map(|f| pad(f, Word::Const));
         let blocks: Vec<usize> = flushes.iter().map(|f| f.len() / RATE_WORDS).collect();
         Self {
             dims,
@@ -189,24 +174,6 @@ impl Layout {
             perms: blocks.iter().sum(),
             flushes,
         }
-    }
-
-    /// Keccak pad10*1 (domain byte 0x01) on a 4-byte-aligned message: the
-    /// 0x01 lands at a word's low byte and 0x80 at the block's last byte.
-    fn pad(mut words: Vec<Word>) -> Vec<Word> {
-        let n = words.len();
-        let total = (n / RATE_WORDS + 1) * RATE_WORDS;
-        for i in n..total {
-            let mut v = 0;
-            if i == n {
-                v |= 1;
-            }
-            if i == total - 1 {
-                v |= 0x8000_0000;
-            }
-            words.push(Word::Const(v));
-        }
-        words
     }
 
     fn flush_of(&self, perm: usize) -> usize {
@@ -243,7 +210,7 @@ impl Layout {
 /// Everything the transcript absorbs, as the outer prover claims it. The
 /// honest value comes from the proof; forgeries edit it and replay.
 #[derive(Clone)]
-struct Data {
+pub(super) struct Data {
     inner_pvs: Vec<Val>,
     /// Trace, quotient, randomizer caps.
     caps: [Vec<[u64; 4]>; 3],
@@ -260,7 +227,7 @@ struct Data {
 }
 
 impl Data {
-    fn from_proof(proof: &Proof<Config>, pvs: &[Val]) -> Result<Self> {
+    pub(super) fn from_proof(proof: &Proof<Config>, pvs: &[Val]) -> Result<Self> {
         let o = &proof.opened_values;
         Ok(Self {
             inner_pvs: pvs.to_vec(),
@@ -306,37 +273,16 @@ impl Data {
 /// The native replay of one claimed transcript: sponge inputs in lane order,
 /// padded word streams, digests and the natively drawn challenges.
 #[derive(Clone)]
-struct Replay {
+pub(super) struct Replay {
     words: [Vec<u32>; 3],
     perms: Vec<[u64; 25]>,
-    digests: [[u8; 32]; 3],
+    pub(super) digests: [[u8; 32]; 3],
     alpha: E,
     zeta: E,
 }
 
-/// The eight masked draws of one digest, in challenger order.
-fn draw_values(d: &[u8; 32]) -> [u32; DRAWS] {
-    core::array::from_fn(|j| {
-        u32::from_le_bytes([d[31 - 4 * j], d[30 - 4 * j], d[29 - 4 * j], d[28 - 4 * j]])
-            & 0x7fff_ffff
-    })
-}
-
-/// Indices of the first four accepted draws — native `sample_algebra_element`.
-fn accepted(d: &[u8; 32]) -> Result<[usize; 4]> {
-    let v = draw_values(d);
-    let idx: Vec<usize> = (0..DRAWS).filter(|&j| v[j] < P).take(4).collect();
-    require(idx.len() == 4, "draw window needs a refill (unsupported)")?;
-    Ok([idx[0], idx[1], idx[2], idx[3]])
-}
-
-fn challenge(d: &[u8; 32], pick: [usize; 4]) -> E {
-    let v = draw_values(d);
-    E::from_basis_coefficients_fn(|k| Val::from_u32(v[pick[k]]))
-}
-
 impl Replay {
-    fn new(layout: &Layout, data: &Data) -> Result<Self> {
+    pub(super) fn new(layout: &Layout, data: &Data) -> Result<Self> {
         let mut words: [Vec<u32>; 3] = Default::default();
         let mut perms = Vec::with_capacity(layout.perms);
         let mut digests = [[0u8; 32]; 3];
@@ -373,16 +319,7 @@ impl Replay {
                     stream[pi] = v;
                 }
             }
-            let mut state = [0u64; 25];
-            for block in stream.chunks(RATE_WORDS) {
-                for lane in 0..RATE_LANES {
-                    state[lane] ^=
-                        u64::from(block[2 * lane]) | (u64::from(block[2 * lane + 1]) << 32);
-                }
-                perms.push(state);
-                state = keccakf(&state);
-            }
-            digests[f] = digest_of(&state);
+            digests[f] = absorb(&stream, &mut perms);
             words[f] = stream;
         }
         Ok(Self {
@@ -392,28 +329,6 @@ impl Replay {
             perms,
             digests,
         })
-    }
-}
-
-/// Keccak lane column indices used by the binding (standard lane = x + 5y).
-#[derive(Clone)]
-struct KeccakIdx {
-    step0: usize,
-    fin: usize,
-    pre: [[usize; 4]; 25],
-    out: [[usize; 4]; 25],
-}
-
-fn keccak_idx() -> KeccakIdx {
-    let idx: Vec<usize> = (0..NUM_KECCAK_COLS).collect();
-    let map: &KeccakCols<usize> = idx[..].borrow();
-    KeccakIdx {
-        step0: map.step_flags[0],
-        fin: map.step_flags[NUM_ROUNDS - 1],
-        pre: core::array::from_fn(|lane| map.preimage[lane / 5][lane % 5]),
-        out: core::array::from_fn(|lane| {
-            core::array::from_fn(|l| map.a_prime_prime_prime(lane / 5, lane % 5, l))
-        }),
     }
 }
 
@@ -437,10 +352,9 @@ struct BoundAir {
     routes: Vec<Route>,
     zeta_input: usize,
     height: usize,
-    kc: KeccakIdx,
-    // Main-trace column offsets after the Keccak lane.
-    m_col: usize,
-    s_col: usize,
+    /// Keccak lane at 0, then M and S bits.
+    lane: Lane,
+    // Main-trace column offsets after the lane.
     canon_col: usize,
     draw_col: usize,
     in_col: usize,
@@ -454,7 +368,6 @@ struct BoundAir {
     periodic: Vec<Vec<Val>>,
     rinv: Val,
     g_n: Val,
-    pow2: Vec<Val>,
 }
 
 impl BoundAir {
@@ -500,9 +413,8 @@ impl BoundAir {
         let zeta_input = zeta_input.ok_or("machine never reads zeta")?;
         let rounds = layout.perms * NUM_ROUNDS;
         let height = schedule.height().max(rounds.next_power_of_two());
-        let m_col = NUM_KECCAK_COLS;
-        let s_col = m_col + RATE_BITS;
-        let canon_col = s_col + RATE_BITS;
+        let lane = Lane::new();
+        let canon_col = lane.end();
         let draw_col = canon_col + 2 * RATE_WORDS;
         let in_col = draw_col + DRAWS * DRAW_COLS;
         let mach_col = in_col + 4 * routes.len();
@@ -520,21 +432,11 @@ impl BoundAir {
             "bound machine exceeds materialization budget",
         )?;
         let mut periodic = schedule.rom(height)?;
-        periodic.resize(digest_per + 1, vec![]);
-        for col in &mut periodic[step0_per..] {
-            *col = vec![Val::ZERO; height];
-        }
-        let last = |perm: usize| NUM_ROUNDS * perm + NUM_ROUNDS - 1;
-        for perm in 0..layout.perms {
-            periodic[step0_per + perm][NUM_ROUNDS * perm] = Val::ONE;
-            if layout.is_interior(perm + 1) {
-                periodic[interior_per][last(perm)] = Val::ONE;
-            }
-        }
-        for f in 1..3 {
-            periodic[chain_per][last(layout.first[f] - 1)] = Val::ONE;
-        }
-        periodic[digest_per][last(layout.perms - 1)] = Val::ONE;
+        require(periodic.len() == rom_width, "machine ROM width")?;
+        periodic.extend(sponge_selectors(&layout.first, layout.perms, height));
+        let mut digest = vec![Val::ZERO; height];
+        digest[NUM_ROUNDS * layout.perms - 1] = Val::ONE;
+        periodic.push(digest);
         let r = Val::from_u32(Val::ONE.to_unique_u32());
         Ok(Self {
             layout,
@@ -542,9 +444,7 @@ impl BoundAir {
             routes,
             zeta_input,
             height,
-            kc: keccak_idx(),
-            m_col,
-            s_col,
+            lane,
             canon_col,
             draw_col,
             in_col,
@@ -557,7 +457,6 @@ impl BoundAir {
             periodic,
             rinv: r.inverse(),
             g_n: program.original.subgroup_generator(),
-            pow2: (0..32).map(|t| Val::TWO.exp_u64(t)).collect(),
         })
     }
 
@@ -567,106 +466,126 @@ impl BoundAir {
         self.layout.first[f + 1]
     }
 
-    /// Message bit `b` (0..32) of rate word `slot`.
-    fn word_bit(&self, slot: usize, b: usize) -> usize {
-        self.m_col + 64 * (slot / 2) + 32 * (slot % 2) + b
+    /// Build the whole trace for a replayed transcript and machine inputs.
+    /// `pick` overrides the draw selection on the alpha/zeta rows (forgeries).
+    fn trace(
+        &self,
+        rep: &Replay,
+        inputs: &[E],
+        pick: [Option<[usize; 4]>; 2],
+    ) -> Result<RowMajorMatrix<Val>> {
+        require(rep.perms.len() == self.layout.perms, "replay perm count")?;
+        require(inputs.len() == self.routes.len(), "bound machine inputs")?;
+        let (h, w) = (self.height, self.width);
+        let mut values = self.lane.trace(&rep.perms, h, w)?;
+        for (perm, input) in rep.perms.iter().enumerate() {
+            let row = NUM_ROUNDS * perm * w;
+            let prev = if self.layout.is_interior(perm) {
+                keccakf(&rep.perms[perm - 1])
+            } else {
+                [0; 25]
+            };
+            self.lane.fill_block(&mut values, row, input, &prev);
+            let flush = self.layout.flush_of(perm);
+            let first_word = (perm - self.layout.first[flush]) * RATE_WORDS;
+            for slot in 0..RATE_WORDS {
+                let word = self.layout.flushes[flush][first_word + slot];
+                if word.is_field() {
+                    let v = rep.words[flush][first_word + slot];
+                    Lane::fill_canonical(&mut values, row + self.canon_col + 2 * slot, v);
+                }
+            }
+        }
+        for f in 0..2 {
+            let d = &rep.digests[f];
+            let pick = match pick[f] {
+                Some(p) => p,
+                None => accepted(d)?,
+            };
+            let row = NUM_ROUNDS * self.draw_perm(f) * w + self.draw_col;
+            Lane::fill_draws(&mut values[row..row + DRAWS * DRAW_COLS], d, pick);
+        }
+        let machine = self.schedule.trace_values(inputs, h)?;
+        let mw = self.schedule.width();
+        for row in 0..h {
+            let cells = &mut values[row * w..(row + 1) * w];
+            for (i, v) in inputs.iter().enumerate() {
+                cells[self.in_col + 4 * i..self.in_col + 4 * i + 4]
+                    .copy_from_slice(v.as_basis_coefficients_slice());
+            }
+            cells[self.mach_col..].copy_from_slice(&machine[row * mw..(row + 1) * mw]);
+        }
+        Ok(RowMajorMatrix::new(values, w))
     }
 
-    /// Bit `t` of masked draw `j`: draw bytes 31-4j..28-4j, little-endian.
-    fn draw_bit(&self, j: usize, t: usize) -> usize {
-        let byte = 31 - 4 * j - t / 8;
-        self.m_col + 64 * (byte / 8) + 8 * (byte % 8) + t % 8
+    /// Outer public values: inner PVs, the three caps as 16-bit limbs in the
+    /// canonical order, then the claimed F2 digest as 16-bit limbs.
+    fn public_values(&self, data: &Data, digest: &[u8; 32]) -> Vec<Val> {
+        let mut pv = data.inner_pvs.clone();
+        for n in 0..3 * CAP_WORDS {
+            let w = data.cap_word(n);
+            pv.extend([Val::from_u32(w & 0xffff), Val::from_u32(w >> 16)]);
+        }
+        pv.extend(digest_limbs(digest));
+        pv
+    }
+}
+
+impl Phased for BoundAir {
+    fn phases(&self) -> &'static [&'static str] {
+        &PHASES
     }
 
     fn eval_phase<AB: AirBuilder<F = Val>>(&self, phase: usize, builder: &mut AB) {
-        if PHASES[phase] == "keccak" {
-            let mut lane = LaneBuilder {
-                inner: builder,
-                off: 0,
-                width: NUM_KECCAK_COLS,
-            };
-            KeccakAir {}.eval(&mut lane);
-            return;
+        let lane = &self.lane;
+        let per: Vec<AB::Expr> = builder
+            .periodic_values()
+            .iter()
+            .map(|v| (*v).into())
+            .collect();
+        let step0 = |perm: usize| per[self.step0_per + perm].clone();
+        // The field-draw rows: alpha's (F0 digest) and zeta's (F1 digest).
+        let dr = || step0(self.draw_perm(0)) + step0(self.draw_perm(1));
+        match PHASES[phase] {
+            "keccak" => return lane.eval_keccak(builder),
+            "bits" => return lane.eval_bits(builder),
+            "absorb" => return lane.eval_absorb(builder),
+            "chain_state" => return lane.eval_chain_state(builder, per[self.interior_per].clone()),
+            "flush_chain" => return lane.eval_flush_chain(builder, per[self.chain_per].clone()),
+            "canonical" => {
+                for slot in 0..RATE_WORDS {
+                    let perms: Vec<usize> = self
+                        .layout
+                        .words()
+                        .filter(|&(_, s, w)| s == slot && w.is_field())
+                        .map(|(p, _, _)| p)
+                        .collect();
+                    if perms.is_empty() {
+                        continue;
+                    }
+                    let gate = perms.iter().fold(AB::Expr::ZERO, |acc, &p| acc + step0(p));
+                    lane.eval_canonical(builder, slot, gate, self.canon_col);
+                }
+                return;
+            }
+            "fs_reject" => return lane.eval_fs_reject(builder, dr(), self.draw_col),
+            "fs_select" => return lane.eval_fs_select(builder, dr(), self.draw_col),
+            _ => {}
         }
         let main = builder.main();
         let cur = main.current_slice();
         let next = main.next_slice();
         let c = |i: usize| -> AB::Expr { cur[i].into() };
         let n = |i: usize| -> AB::Expr { next[i].into() };
-        let per: Vec<AB::Expr> = builder
-            .periodic_values()
-            .iter()
-            .map(|v| (*v).into())
-            .collect();
         let pv: Vec<AB::Expr> = builder
             .public_values()
             .iter()
             .map(|v| (*v).into())
             .collect();
-        let k = &self.kc;
-        let two = |t: usize| self.pow2[t];
-        let sum = |cols: &mut dyn Iterator<Item = (usize, usize)>,
-                   at: &dyn Fn(usize) -> AB::Expr| {
-            cols.fold(AB::Expr::ZERO, |acc, (col, t)| acc + at(col) * two(t))
-        };
-        // 16-bit half `h` of rate word `slot`, from the current row's M bits.
-        let half = |slot: usize, h: usize| {
-            sum(
-                &mut (0..16).map(|t| (self.word_bit(slot, 16 * h + t), t)),
-                &c,
-            )
-        };
-        let full = |slot: usize| half(slot, 0) + half(slot, 1) * two(16);
-        let xor = |a: AB::Expr, b: AB::Expr| a.clone() + b.clone() - a * b * Val::TWO;
-        let step0 = |perm: usize| per[self.step0_per + perm].clone();
-        let seven = Val::from_u32(7);
+        let k = &lane.kc;
+        let half = |slot: usize, h: usize| lane.half::<AB>(cur, slot, h);
+        let full = |slot: usize| lane.full::<AB>(cur, slot);
         match PHASES[phase] {
-            "bits" => {
-                for i in 0..RATE_BITS {
-                    builder.assert_bool(c(self.m_col + i));
-                    builder.assert_bool(c(self.s_col + i));
-                }
-            }
-            "absorb" => {
-                for lane in 0..RATE_LANES {
-                    for l in 0..4 {
-                        let bits = (0..16).fold(AB::Expr::ZERO, |acc, t| {
-                            let b = 64 * lane + 16 * l + t;
-                            acc + xor(c(self.m_col + b), c(self.s_col + b)) * two(t)
-                        });
-                        builder.assert_zero(c(k.step0) * (c(k.pre[lane][l]) - bits));
-                    }
-                }
-            }
-            "chain_state" => {
-                let inter = per[self.interior_per].clone();
-                for lane in 0..25 {
-                    for l in 0..4 {
-                        let (prev_rate, first_rate) = if lane < RATE_LANES {
-                            let cols = |t: usize| (self.s_col + 64 * lane + 16 * l + t, t);
-                            (
-                                sum(&mut (0..16).map(cols), &n),
-                                sum(&mut (0..16).map(cols), &c),
-                            )
-                        } else {
-                            (n(k.pre[lane][l]), c(k.pre[lane][l]))
-                        };
-                        builder.when_transition().assert_zero(
-                            c(k.fin) * (prev_rate - inter.clone() * c(k.out[lane][l])),
-                        );
-                        builder.when_first_row().assert_zero(first_rate);
-                    }
-                }
-            }
-            "flush_chain" => {
-                for lane in 0..4 {
-                    for l in 0..4 {
-                        builder.assert_zero(
-                            per[self.chain_per].clone() * (n(k.pre[lane][l]) - c(k.out[lane][l])),
-                        );
-                    }
-                }
-            }
             "bind_const" | "bind_cap" | "bind_inner_pv" => {
                 for (perm, slot, word) in self.layout.words() {
                     let sel = step0(perm);
@@ -689,36 +608,6 @@ impl BoundAir {
                     }
                 }
             }
-            "canonical" => {
-                // word < p  <=>  bit31 = 0 and not(bits24..30 all set and
-                // bits0..23 nonzero). hi = [popcount(bits24..30) == 7] is a
-                // determined zero test (inverse witness), so hi * low24 = 0.
-                for slot in 0..RATE_WORDS {
-                    let perms: Vec<usize> = self
-                        .layout
-                        .words()
-                        .filter(|&(_, s, w)| s == slot && w.is_field())
-                        .map(|(p, _, _)| p)
-                        .collect();
-                    if perms.is_empty() {
-                        continue;
-                    }
-                    let gate = perms.iter().fold(AB::Expr::ZERO, |acc, &p| acc + step0(p));
-                    let bit = |b: usize| c(self.word_bit(slot, b));
-                    let top = (24..31).fold(AB::Expr::ZERO, |acc, b| acc + bit(b)) - seven;
-                    let low = sum(&mut (0..24).map(|t| (self.word_bit(slot, t), t)), &c);
-                    let (inv, hi) = (
-                        c(self.canon_col + 2 * slot),
-                        c(self.canon_col + 2 * slot + 1),
-                    );
-                    builder.assert_zero(
-                        gate.clone() * (top.clone() * inv - AB::Expr::ONE + hi.clone()),
-                    );
-                    builder.assert_zero(gate.clone() * top * hi.clone());
-                    builder.assert_zero(gate.clone() * hi * low);
-                    builder.assert_zero(gate * bit(31));
-                }
-            }
             "digest_out" => {
                 let base = self.layout.digest_base();
                 for lane in 0..4 {
@@ -730,66 +619,13 @@ impl BoundAir {
                     }
                 }
             }
-            "fs_reject" | "fs_select" | "fs_bind" => {
-                let dr = step0(self.draw_perm(0)) + step0(self.draw_perm(1));
-                let col = |j: usize, q: usize| c(self.draw_col + DRAW_COLS * j + q);
-                let value = |j: usize| sum(&mut (0..31).map(|t| (self.draw_bit(j, t), t)), &c);
-                match PHASES[phase] {
-                    "fs_reject" => {
-                        for j in 0..DRAWS {
-                            let top = (24..31)
-                                .fold(AB::Expr::ZERO, |acc, t| acc + c(self.draw_bit(j, t)))
-                                - seven;
-                            let low = sum(&mut (0..24).map(|t| (self.draw_bit(j, t), t)), &c);
-                            let (inv_hi, hi, inv_lo, nz, acc) =
-                                (col(j, 0), col(j, 1), col(j, 2), col(j, 3), col(j, 4));
-                            builder.assert_zero(
-                                dr.clone() * (top.clone() * inv_hi - AB::Expr::ONE + hi.clone()),
-                            );
-                            builder.assert_zero(dr.clone() * top * hi.clone());
-                            builder.assert_zero(dr.clone() * (low.clone() * inv_lo - nz.clone()));
-                            builder.assert_zero(dr.clone() * low * (AB::Expr::ONE - nz.clone()));
-                            builder.assert_zero(dr.clone() * (acc - AB::Expr::ONE + hi * nz));
-                        }
-                    }
-                    "fs_select" => {
-                        // Slot k takes exactly one draw, which must be accepted
-                        // and preceded by exactly k accepted draws.
-                        let mut before = AB::Expr::ZERO;
-                        for j in 0..DRAWS {
-                            for slot in 0..4 {
-                                let sel = col(j, 5 + slot);
-                                builder.assert_zero(
-                                    dr.clone() * sel.clone() * (sel.clone() - AB::Expr::ONE),
-                                );
-                                builder.assert_zero(
-                                    dr.clone() * sel.clone() * (AB::Expr::ONE - col(j, 4)),
-                                );
-                                builder.assert_zero(
-                                    dr.clone() * sel * (before.clone() - Val::from_usize(slot)),
-                                );
-                            }
-                            before += col(j, 4);
-                        }
-                        for slot in 0..4 {
-                            let taken =
-                                (0..DRAWS).fold(AB::Expr::ZERO, |acc, j| acc + col(j, 5 + slot));
-                            builder.assert_zero(dr.clone() * (taken - AB::Expr::ONE));
-                        }
-                    }
-                    _ => {
-                        for (i, route) in self.routes.iter().enumerate() {
-                            let Route::Draw(f) = *route else { continue };
-                            let sel = step0(self.draw_perm(f));
-                            for slot in 0..4 {
-                                let drawn = (0..DRAWS).fold(AB::Expr::ZERO, |acc, j| {
-                                    acc + col(j, 5 + slot) * value(j)
-                                });
-                                builder.assert_zero(
-                                    sel.clone() * (drawn - c(self.in_col + 4 * i + slot)),
-                                );
-                            }
-                        }
+            "fs_bind" => {
+                for (i, route) in self.routes.iter().enumerate() {
+                    let Route::Draw(f) = *route else { continue };
+                    let sel = step0(self.draw_perm(f));
+                    for slot in 0..4 {
+                        let drawn = lane.selected::<AB>(cur, self.draw_col, slot);
+                        builder.assert_zero(sel.clone() * (drawn - c(self.in_col + 4 * i + slot)));
                     }
                 }
             }
@@ -850,132 +686,6 @@ impl BoundAir {
             other => unreachable!("unknown phase {other}"),
         }
     }
-
-    /// Constraint-index range of every phase, counted on the symbolic
-    /// builder (which numbers constraints exactly as the debug scanner does).
-    fn phase_ranges(&self) -> Vec<Range<usize>> {
-        let layout = AirLayout::from_air::<Val>(self);
-        let mut start = 0;
-        (0..PHASES.len())
-            .map(|phase| {
-                let mut builder = SymbolicAirBuilder::<Val>::new(layout);
-                self.eval_phase(phase, &mut builder);
-                let end = start + builder.base_constraints().len();
-                let range = start..end;
-                start = end;
-                range
-            })
-            .collect()
-    }
-
-    /// Build the whole trace for a replayed transcript and machine inputs.
-    /// `pick` overrides the draw selection on the alpha/zeta rows (forgeries).
-    fn trace(
-        &self,
-        rep: &Replay,
-        inputs: &[E],
-        pick: [Option<[usize; 4]>; 2],
-    ) -> Result<RowMajorMatrix<Val>> {
-        require(rep.perms.len() == self.layout.perms, "replay perm count")?;
-        require(inputs.len() == self.routes.len(), "bound machine inputs")?;
-        let (h, w) = (self.height, self.width);
-        let mut lane_inputs = rep.perms.clone();
-        lane_inputs.resize(h / NUM_ROUNDS, [0; 25]);
-        let lane = generate_trace_rows::<Val>(lane_inputs, 0);
-        require(lane.height() == h, "keccak lane height")?;
-        let mut values = vec![Val::ZERO; h * w];
-        for row in 0..h {
-            values[row * w..row * w + NUM_KECCAK_COLS]
-                .copy_from_slice(&lane.values[row * NUM_KECCAK_COLS..(row + 1) * NUM_KECCAK_COLS]);
-        }
-        let set_bits = |values: &mut [Val], base: usize, v: u64| {
-            for b in 0..64 {
-                values[base + b] = Val::from_u64((v >> b) & 1);
-            }
-        };
-        for (perm, input) in rep.perms.iter().enumerate() {
-            let row = NUM_ROUNDS * perm * w;
-            let prev = if self.layout.is_interior(perm) {
-                keccakf(&rep.perms[perm - 1])
-            } else {
-                [0; 25]
-            };
-            for l in 0..RATE_LANES {
-                set_bits(&mut values, row + self.m_col + 64 * l, input[l] ^ prev[l]);
-                set_bits(&mut values, row + self.s_col + 64 * l, prev[l]);
-            }
-            let flush = self.layout.flush_of(perm);
-            let first_word = (perm - self.layout.first[flush]) * RATE_WORDS;
-            for slot in 0..RATE_WORDS {
-                let word = self.layout.flushes[flush][first_word + slot];
-                if !word.is_field() {
-                    continue;
-                }
-                let v = rep.words[flush][first_word + slot];
-                let top = Val::from_u32(((v >> 24) & 0x7f).count_ones()) - Val::from_u32(7);
-                let at = row + self.canon_col + 2 * slot;
-                if top == Val::ZERO {
-                    values[at + 1] = Val::ONE;
-                } else {
-                    values[at] = top.inverse();
-                }
-            }
-        }
-        for f in 0..2 {
-            let d = &rep.digests[f];
-            let v = draw_values(d);
-            let pick = match pick[f] {
-                Some(p) => p,
-                None => accepted(d)?,
-            };
-            let row = NUM_ROUNDS * self.draw_perm(f) * w + self.draw_col;
-            for j in 0..DRAWS {
-                let cells = &mut values[row + DRAW_COLS * j..row + DRAW_COLS * (j + 1)];
-                let top = Val::from_u32(((v[j] >> 24) & 0x7f).count_ones()) - Val::from_u32(7);
-                let low = Val::from_u32(v[j] & 0x00ff_ffff);
-                let hi = top == Val::ZERO;
-                let nz = low != Val::ZERO;
-                if !hi {
-                    cells[0] = top.inverse();
-                }
-                cells[1] = Val::from_bool(hi);
-                if nz {
-                    cells[2] = low.inverse();
-                }
-                cells[3] = Val::from_bool(nz);
-                cells[4] = Val::from_bool(!(hi && nz));
-                for (slot, &j_picked) in pick.iter().enumerate() {
-                    cells[5 + slot] = Val::from_bool(j_picked == j);
-                }
-            }
-        }
-        let machine = self.schedule.trace_values(inputs, h)?;
-        let mw = self.schedule.width();
-        for row in 0..h {
-            let cells = &mut values[row * w..(row + 1) * w];
-            for (i, v) in inputs.iter().enumerate() {
-                cells[self.in_col + 4 * i..self.in_col + 4 * i + 4]
-                    .copy_from_slice(v.as_basis_coefficients_slice());
-            }
-            cells[self.mach_col..].copy_from_slice(&machine[row * mw..(row + 1) * mw]);
-        }
-        Ok(RowMajorMatrix::new(values, w))
-    }
-
-    /// Outer public values: inner PVs, the three caps as 16-bit limbs in the
-    /// canonical order, then the claimed F2 digest as 16-bit limbs.
-    fn public_values(&self, data: &Data, digest: &[u8; 32]) -> Vec<Val> {
-        let mut pv = data.inner_pvs.clone();
-        for n in 0..3 * CAP_WORDS {
-            let w = data.cap_word(n);
-            pv.extend([Val::from_u32(w & 0xffff), Val::from_u32(w >> 16)]);
-        }
-        for lane in 0..4 {
-            let v = u64::from_le_bytes(digest[8 * lane..8 * lane + 8].try_into().unwrap());
-            pv.extend((0..4).map(|l| Val::from_u64((v >> (16 * l)) & 0xffff)));
-        }
-        pv
-    }
 }
 
 impl BaseAir<Val> for BoundAir {
@@ -1016,50 +726,18 @@ fn machine_inputs(program: &Program, inputs: &Inputs) -> Result<Vec<E>> {
 mod tests {
     use std::sync::OnceLock;
 
-    use p3_air::symbolic::get_symbolic_constraints;
-    use p3_challenger::{CanObserve, FieldChallenger};
-    use p3_uni_stark::{prove, verify, StarkGenericConfig};
-    use qlab_air::l2test::{satisfied, violations_at};
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use std::ops::Range;
 
+    use p3_air::symbolic::{get_symbolic_constraints, AirLayout};
+    use p3_challenger::FieldChallenger;
+    use qlab_air::l2test::{satisfied, violations_at};
+
+    use super::super::lane::phase_ranges;
+    use super::super::lane::toy::{native_through_f2, toy_proof, Toy};
     use super::super::{compare_native, proof_inputs_dims};
     use super::*;
 
-    /// Two columns, two PVs, one next-row read, degree 3: the smallest AIR
-    /// that feeds every DAG input class and gets the L2 lane's eight hiding
-    /// quotient chunks (degree 3 + ZK -> log_q 2, x2 hiding split).
-    struct Toy;
     const TOY_LOG_HEIGHT: usize = 4;
-
-    impl BaseAir<Val> for Toy {
-        fn width(&self) -> usize {
-            2
-        }
-        fn num_public_values(&self) -> usize {
-            2
-        }
-    }
-
-    impl<AB: AirBuilder<F = Val>> Air<AB> for Toy {
-        fn eval(&self, builder: &mut AB) {
-            let main = builder.main();
-            let x: AB::Expr = main.current_slice()[0].into();
-            let y: AB::Expr = main.current_slice()[1].into();
-            let nx: AB::Expr = main.next_slice()[0].into();
-            let ny: AB::Expr = main.next_slice()[1].into();
-            let pv: Vec<AB::Expr> = builder
-                .public_values()
-                .iter()
-                .map(|v| (*v).into())
-                .collect();
-            builder.when_first_row().assert_eq(x.clone(), pv[0].clone());
-            builder.when_transition().assert_eq(nx, y.clone());
-            builder
-                .when_transition()
-                .assert_eq(ny, x.clone() * y.clone() * y.clone() + x);
-            builder.when_last_row().assert_eq(y, pv[1].clone());
-        }
-    }
 
     struct Fixture {
         program: Program,
@@ -1083,16 +761,7 @@ mod tests {
     fn fixture() -> &'static Fixture {
         static FIXTURE: OnceLock<Fixture> = OnceLock::new();
         FIXTURE.get_or_init(|| {
-            let (mut x, mut y) = (Val::from_u32(3), Val::from_u32(5));
-            let mut rows = Vec::new();
-            for _ in 0..1 << TOY_LOG_HEIGHT {
-                rows.extend([x, y]);
-                (x, y) = (y, x * y * y + x);
-            }
-            let pvs = vec![rows[0], rows[rows.len() - 1]];
-            let config = qlab_consensus::make_config_seeded(&L2_CFG_PROVISIONAL, 0xf2b2a);
-            let proof = prove(&config, &Toy, RowMajorMatrix::new(rows, 2), &pvs);
-            verify(&config, &Toy, &proof, &pvs).expect("toy hiding proof verifies");
+            let (proof, pvs) = toy_proof(TOY_LOG_HEIGHT, 0xf2b2a);
             let program = Program::compile_dims(dims(), &Toy).unwrap();
             let inputs = proof_inputs_dims(dims(), &proof, &pvs).unwrap();
             let values = compare_native(&program, &Toy, &inputs).unwrap();
@@ -1104,22 +773,7 @@ mod tests {
             // challenger, and F2's digest yields the verifier's fri_alpha.
             assert_eq!(honest.alpha, inputs.alpha, "replayed alpha");
             assert_eq!(honest.zeta, inputs.zeta, "replayed zeta");
-            let mut ch = qlab_l2::make_config_l2().initialise_challenger();
-            ch.observe(Val::from_usize(proof.degree_bits));
-            ch.observe(Val::from_usize(TOY_LOG_HEIGHT));
-            ch.observe(Val::ZERO);
-            ch.observe(proof.commitments.trace.clone());
-            ch.observe_slice(&pvs);
-            let _: E = ch.sample_algebra_element();
-            ch.observe(proof.commitments.quotient_chunks.clone());
-            ch.observe(proof.commitments.random.clone().unwrap());
-            let _: E = ch.sample_algebra_element();
-            ch.observe_algebra_slice(&data.random);
-            ch.observe_algebra_slice(&data.local);
-            ch.observe_algebra_slice(&data.next);
-            for chunk in &data.chunks {
-                ch.observe_algebra_slice(chunk);
-            }
+            let mut ch = native_through_f2(&proof, &pvs, TOY_LOG_HEIGHT);
             let fri_alpha: E = ch.sample_algebra_element();
             let d2 = &honest.digests[2];
             assert_eq!(
@@ -1127,7 +781,7 @@ mod tests {
                 fri_alpha,
                 "F2 message order"
             );
-            let ranges = air.phase_ranges();
+            let ranges = phase_ranges(&air);
             Fixture {
                 program,
                 air,

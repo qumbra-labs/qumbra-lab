@@ -3,6 +3,12 @@
 // F2b-2a: the machine's inputs bound to a replayed hiding transcript (test-only AIR).
 #[cfg(test)]
 mod bind;
+// F2b-2b-i: the FRI Fiat–Shamir continuation from D2 (test-only AIR).
+#[cfg(test)]
+mod fri_fs;
+// The Keccak sponge lane both transcript components share.
+#[cfg(test)]
+mod lane;
 mod machine;
 
 use std::collections::HashMap;

@@ -7,7 +7,7 @@ use p3_air::symbolic::{
 };
 use p3_air::Air;
 use p3_uni_stark::get_log_num_quotient_chunks;
-use qlab_consensus::{Val, CAP_HEIGHT, IS_ZK, SALT_ELEMS};
+use qlab_consensus::{FriCfg, Val, CAP_HEIGHT, IS_ZK, SALT_ELEMS};
 use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
 use serde_json::{json, Value};
 
@@ -98,7 +98,7 @@ pub(super) struct Geometry {
 }
 
 /// LDE height of a hiding commitment to a `log_height` trace on the L2 lane.
-fn lde_log(log_height: usize) -> usize {
+pub(super) fn lde_log(log_height: usize) -> usize {
     log_height + IS_ZK + L2_CFG_PROVISIONAL.log_blowup
 }
 
@@ -108,18 +108,32 @@ fn leaf_perms(width: usize) -> usize {
     (width + SALT_ELEMS).div_ceil(34)
 }
 
-pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
-    let cfg = L2_CFG_PROVISIONAL;
-    let lde_log = lde_log(shape.log_height());
+/// The FRI fold schedule p3-fri 0.6.1's prover commits to when every input
+/// sits at one LDE height (`prover.rs` `commit_phase` via
+/// `compute_log_arity_for_round` with no smaller input left): fold by the
+/// maximum arity until the final height `log_blowup + log_final_poly_len`.
+/// Hiding uni-stark commits the trace, the quotient chunks and the randomizer
+/// all at 2N rows, so this is the L2 lane's schedule. F2b-2b-i's transcript
+/// layout takes its rounds from here and cross-checks a real proof's.
+pub(super) fn fri_log_arities(lde_log: usize, cfg: &FriCfg) -> Vec<usize> {
     let mut remaining = lde_log - cfg.log_blowup - cfg.log_final_poly_len;
-    let mut domain_log = lde_log;
     let mut log_arities = vec![];
-    let mut fri_paths = vec![];
     while remaining > 0 {
         let arity = remaining.min(cfg.max_log_arity);
         remaining -= arity;
-        domain_log -= arity;
         log_arities.push(arity);
+    }
+    log_arities
+}
+
+pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
+    let cfg = L2_CFG_PROVISIONAL;
+    let lde_log = lde_log(shape.log_height());
+    let log_arities = fri_log_arities(lde_log, &cfg);
+    let mut domain_log = lde_log;
+    let mut fri_paths = vec![];
+    for &arity in &log_arities {
+        domain_log -= arity;
         fri_paths.push(domain_log - CAP_HEIGHT);
     }
     let input_path = lde_log - CAP_HEIGHT;
