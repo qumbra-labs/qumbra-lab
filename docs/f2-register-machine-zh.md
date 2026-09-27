@@ -174,6 +174,9 @@ M4 gate 矩形本身：它写死在旧的非 hiding 配置上（固定 2^16 行�
 | 改一个 quotient limb，执行器重算（residual 非零） | `machine_out` |
 | 按 R 缩放接入（漏了 R⁻¹） | `bind_opened` |
 | 把 opened value 编码为 `word + p` | 只有 `canonical` |
+| 伪造 F0 元数据字（log_h），完整自洽的重放 | 只有 `bind_const`；α/ζ 行和最后一行干净 |
+| 吸收的内层 PV 与声明的不同，完整自洽的重放 | 只有 `bind_inner_pv` |
+| 把内层 PV 编码为 `word + p` | 只有 `canonical` |
 
 诚实用例还把重放结果和原生 p3 challenger 交叉核对：α、ζ 必须一致，D2 的第一次抽样
 必须等于 verifier 的 fri_alpha，这就把 F2 消息的顺序钉死了。随后做一次全量 SAT 扫描，
@@ -208,8 +211,8 @@ values 和已提交的 cap 联系起来**，那一半从 D2 开始。若某个�
 ### 验证
 
 本地没有运行测试、生成 proof 或跑 benchmark。本地预检只有 `cargo check`、限定范围的
-Clippy 和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`bind.rs` 三个、
-`price.rs` 一个，相对基线分支共四个 **[P，待 CI]**。预计新测试在 Graviton lane 上总耗时
+Clippy 和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`bind.rs` 六个、
+`price.rs` 一个，相对基线分支共七个 **[P，待 CI]**。预计新测试在 Graviton lane 上总耗时
 不超过 30 秒 **[P]**：一次玩具 hiding proof，约十一个稠密 trace（约 512–1,024 行 ×
 5.4k 列），一次全量扫描，每个负例只扫单行。尚未验证、按最可能先出问题排序：重放与原生
 challenger 的交叉核对（抽样字节序、cap 序列化）；symbolic 与 debug 两种 builder 的

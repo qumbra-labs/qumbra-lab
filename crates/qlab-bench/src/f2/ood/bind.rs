@@ -255,6 +255,8 @@ struct Data {
     swap_f1_caps: bool,
     /// Forgery knob: replace word (flush, index) by its alias word + p.
     alias: Option<(usize, usize)>,
+    /// Forgery knob: replace word (flush, index) by an arbitrary value.
+    poke: Option<(usize, usize, u32)>,
 }
 
 impl Data {
@@ -279,6 +281,7 @@ impl Data {
             chunks: o.quotient_chunks.clone(),
             swap_f1_caps: false,
             alias: None,
+            poke: None,
         })
     }
 
@@ -363,6 +366,11 @@ impl Replay {
                     stream[ai] = stream[ai]
                         .checked_add(P)
                         .ok_or("alias word overflows 32 bits")?;
+                }
+            }
+            if let Some((pf, pi, v)) = data.poke {
+                if pf == f {
+                    stream[pi] = v;
                 }
             }
             let mut state = [0u64; 25];
@@ -1400,5 +1408,94 @@ mod tests {
             !f.is_empty() && f.iter().all(|&p| p == "canonical"),
             "{f:?}"
         );
+    }
+
+    /// A fully consistent forger for an F0 edit: alpha and zeta re-drawn from
+    /// the edited transcript, the quotient re-solved for a zero residual
+    /// there, F2/D2 rebuilt. Returns the claim and the rows that must stay
+    /// clean (both digest rows and the terminal row).
+    fn consistent_f0_forgery(fx: &Fixture, data: &Data) -> (Claim, [usize; 3]) {
+        let edited = Replay::new(&fx.air.layout, data).unwrap();
+        assert_ne!(edited.alpha, fx.inputs.alpha, "F0 edit must move alpha");
+        let mut inputs = fx.inputs.clone();
+        inputs.alpha = edited.alpha;
+        inputs.zeta = edited.zeta;
+        zero_residual(fx, &mut inputs);
+        let data = with_openings(data, &inputs);
+        let c = claim(
+            fx,
+            &data,
+            &machine_inputs(&fx.program, &inputs).unwrap(),
+            [None, None],
+        );
+        assert_eq!((c.rep.alpha, c.rep.zeta), (edited.alpha, edited.zeta));
+        let clean = [
+            step0_row(fx.air.draw_perm(0)),
+            step0_row(fx.air.draw_perm(1)),
+            fx.air.height - 1,
+        ];
+        (c, clean)
+    }
+
+    fn refused_only_by(fx: &Fixture, c: &Claim, row: usize, clean: [usize; 3], phase: &str) {
+        let f = failing(fx, c, row);
+        assert!(
+            !f.is_empty() && f.iter().all(|&p| p == phase),
+            "{phase}: {f:?}"
+        );
+        for r in clean {
+            assert!(
+                failing(fx, c, r).is_empty(),
+                "{phase}: row {r} must be clean"
+            );
+        }
+    }
+
+    fn inner_pv_word(fx: &Fixture) -> (usize, usize) {
+        let index = fx.air.layout.flushes[0]
+            .iter()
+            .position(|&w| w == Word::InnerPv(0))
+            .unwrap();
+        (index, fx.air.layout.first[0] + index / RATE_WORDS)
+    }
+
+    #[test]
+    fn bound_machine_rejects_forged_f0_metadata() {
+        // Claim a different original degree (word 1 = log_h) in F0.
+        let fx = fixture();
+        assert_eq!(
+            fx.air.layout.flushes[0][1],
+            Word::Const(monty(Val::from_usize(TOY_LOG_HEIGHT)))
+        );
+        let mut data = fx.data.clone();
+        data.poke = Some((0, 1, monty(Val::from_usize(TOY_LOG_HEIGHT + 1))));
+        let (c, clean) = consistent_f0_forgery(fx, &data);
+        refused_only_by(fx, &c, step0_row(0), clean, "bind_const");
+    }
+
+    #[test]
+    fn bound_machine_rejects_forged_inner_public_value() {
+        // The transcript absorbs a different inner PV than the declared one;
+        // the machine's Public input stays on the declared outer PV.
+        let fx = fixture();
+        let (_, perm) = inner_pv_word(fx);
+        let mut data = fx.data.clone();
+        data.inner_pvs[0] += Val::ONE;
+        let (c, clean) = consistent_f0_forgery(fx, &data);
+        assert_eq!(c.pvs[0], fx.data.inner_pvs[0], "declared PV stays honest");
+        refused_only_by(fx, &c, step0_row(perm), clean, "bind_inner_pv");
+    }
+
+    #[test]
+    fn bound_machine_rejects_inner_public_value_alias() {
+        // The same inner PV encoded as word + p: R^-1 * word is unchanged, so
+        // only the canonicity comparator sees it.
+        let fx = fixture();
+        let (index, perm) = inner_pv_word(fx);
+        let mut data = fx.data.clone();
+        data.alias = Some((0, index));
+        let (c, clean) = consistent_f0_forgery(fx, &data);
+        assert_eq!(c.rep.words[0][index], fx.honest.words[0][index] + P);
+        refused_only_by(fx, &c, step0_row(perm), clean, "canonical");
     }
 }

@@ -208,6 +208,9 @@ the group its violation lands in, on the row where that group lives:
 | quotient limb poked, machine recomputed (nonzero residual) | `machine_out` |
 | R-scaled routing (R⁻¹ missing) | `bind_opened` |
 | opened value encoded as `word + p` | `canonical` only |
+| F0 metadata word (log_h) forged, consistent replay | `bind_const` only; α/ζ rows and terminal row clean |
+| inner PV absorbed ≠ declared PV, consistent replay | `bind_inner_pv` only |
+| inner PV encoded as `word + p` | `canonical` only |
 
 The honest test also cross-checks the replay against the native p3 challenger. It
 checks the same α and ζ, and that D2's first draw is the verifier's fri_alpha, which
@@ -247,7 +250,7 @@ do `complete_verifier_layout` and `memory_gate_pass`.
 
 No local tests, proofs or benchmarks were run. `cargo check`, scoped Clippy and
 rustfmt are the local preflight; `verify-graviton` CI is the acceptance gate. New
-tests: three in `bind.rs` and one in `price.rs`, four over the base branch
+tests: six in `bind.rs` and one in `price.rs`, seven over the base branch
 **[P, pending CI]**. Expected new-test runtime is under 30 s on the Graviton lane
 **[P]**: one toy hiding proof, about eleven dense traces of roughly 512–1,024 rows ×
 5.4k columns, one full scan, and single-row scans for every negative. Unverified,
