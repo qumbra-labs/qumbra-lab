@@ -172,6 +172,11 @@ impl Schedule {
     pub(super) fn rom_width(&self) -> usize {
         12 + 3 * self.registers + self.inputs.len()
     }
+    /// Machine inputs (extension values): one held input cell each in F2b-2a
+    /// and C1.
+    pub(super) fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
     /// Logical input sources in first-use order: input `i` of the machine is
     /// `inputs()[i]`, and its DAG node supplies the honest value.
     #[cfg(test)]

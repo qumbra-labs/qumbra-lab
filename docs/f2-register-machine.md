@@ -864,3 +864,209 @@ Unverified, most likely to break first:
    p3's `verify_batch` and the root-equals-cap assertion catch a mismatch.
 4. The hand-derived S/P/R column, periodic and PV counts: the census-split test pins
    them.
+
+## F2b composition C1: transcript, machine and FRI transcript on one lane
+
+Slice 1 of the composition the coordinator recorded on issue #750 ("F2b composition:
+two proofs per leaf"). p3 0.6.1 proves a single table, so the four F2b components
+become two proofs per leaf. **C1** is 2a (the uni-stark transcript and the register
+machine) plus 2b-i (the FRI transcript) as one AIR on one duplex Keccak lane, with
+lever **L1**. C2 (2b-ii + 2b-iii) is the next slice. C1 is a test-only component
+(`crates/qlab-bench/src/f2/ood/c1.rs`), scanned row by row and never proved. The four
+merged components and their tests are unchanged; they remain the regression baseline.
+
+### One lane, one transcript
+
+The flushes run back to back: F0 → α, F1 → ζ, F2 (the opened values) → fri_alpha, then
+per commit round G_r → β_r, then H (final polynomial, arities, PoW witness) → PoW and
+the query windows, then the refills. Every word order is the one 2a and 2b-i already
+pinned against p3 source. **D2 is now internal**: F2's last permutation hands its
+digest to G_0's first block through the same `flush_chain` equality every other flush
+uses. Nothing about D2 is public, and the 2a→2b-i seam disappears. The honest test
+asserts that the lane's F2 digest equals 2a's replay and that fri_alpha, every β and
+every index equal 2b-i's outputs for the same proof.
+
+The machine is 2a's, unchanged: held input cells, bound to their transcript words, to
+the inner PVs and to the α/ζ draws. The residual is pinned to 0 and the next point to
+g_N·ζ on the last row.
+
+### Scheduling: no full-period selectors in the transcript
+
+2a and 2b-i gated every binding with one full-period periodic column per permutation,
+plus two sponge columns. The next recursion level evaluates each periodic column at
+ζ, so it pays columns × period for them. C1 schedules from the main trace instead, as
+m4gate does:
+
+- **Keccak's `step_flags`**, the period-24 ring p3-keccak-air already constrains, give
+  each permutation's step-0 row and last row.
+- A **perm ring**: one main column per lane permutation, 1 on all 24 rows of the
+  permutation it names. The first row holds perm 0, and each permutation's last row
+  hands the token on (`ring`). After the last permutation the ring is empty. The ring
+  is fully determined by the Keccak flags.
+
+A binding gated by ring cell P_p holds on all 24 rows of permutation p, so the prover
+**replicates** that permutation's message and state bits, canonicity witnesses and
+draw witnesses on those rows. This keeps every gate at degree 1, the degree the
+periodic selectors had. It is sound for the same reason as before: the replicated rows
+include the step-0 row, where `absorb` ties the bits to the permutation input. The
+chain gates multiply by Keccak's last-row flag. **The only periodic columns left are
+the machine ROM's.** They are still full-period: lever L5, not done here, is what would
+remove them. Their price is below.
+
+### L1: Az and Bz on the absorb rows
+
+Native `open_input` (p3-fri `verifier.rs:706-753`) weights opened value k by
+fri_alpha^k. One counter runs across the randomizer, the trace at ζ and then ζ·g_N,
+and the quotient chunks, and that is exactly F2's absorb order (2b-ii's `Geom::term`
+and its test pin it). So Az = Σ α^k z_k over the ζ-point terms and Bz, the same sum over
+the ζ·g_N terms, are running sums over F2's blocks:
+
+- A block's 34 words cover at most nine terms (j = 0..8). F2 opens with eight chain
+  words and 34 ≡ 2 (mod 4), so **even** blocks start on a term boundary (slot s → term
+  j = s/4, limb s mod 4). **Odd** blocks start on limb 2 of the term the previous block
+  cut: j = (s+2)/4, limb (s+2) mod 4. Two slot maps cover every block. Block 0 is the
+  even map with term −2 at j = 0; D1's words sit there, and the masks drop them. The
+  maps are checked against the layout when the AIR is built, not trusted.
+- Per row, q_j = α^{k0+j}: nine extension cells with q_{j+1} = q_j·α and T = q_8·α.
+  q_0 steps on each F2 permutation's last row: to q_8 after an even block (the next
+  block resumes the cut term) and to T after an odd one. The anchor q_2 = 1 on F2's
+  first block fixes k0 = −2 there (`alpha_chain`).
+- pA_j and pB_j are q_j masked by the static point of term k0 + j. They are zero for
+  D1's words, for padding and for the other point. The masks are ring sums, so each
+  cell is a degree-2 equality (`mask`).
+- On each F2 step-0 row, Az += Σ_s pA_{j(s)}·e_{l(s)}·(R⁻¹·word_s), and Bz accumulates
+  the same way from pB. Two materialized gates, step-0 ∧ even block and step-0 ∧ odd
+  block, keep the update at degree 3 (`gate`, `accumulate`).
+
+This removes C2's 5,912-column α-power and z-value table (S3). The C1→C2 seam carries
+Az and Bz (8 values) instead of the 1,478 opened values.
+
+**Why accumulating before fri_alpha is drawn is sound.** fri_alpha is drawn from D2,
+**after** the opened values are absorbed, but the sums on F2's rows need it. α lives in
+a **held** cell: one value on every row (`hold`), equal to the draw on G_0's first block
+(`fs_bind`). Holding makes the α used on F2's rows and the α drawn from D2 the same
+cell, so the sums computed on earlier rows use the drawn value. Nothing is circular.
+The trace is a static witness, and every constraint is an equality between cells the
+prover fixes at once. The draw is a function of D2, D2 is a function of the absorbed
+words, and Az and Bz are functions of those same words and that same α. A prover who
+puts α′ on F2's rows and the drawn α on the draw row breaks `hold` at the one row
+where the cell changes. The negative below shows exactly that.
+
+### The seam C1 exports
+
+`Seam` in `c1.rs` is the C1→C2 seam as values, and `Seam::read` is the
+`check_seams`-ready accessor over C1's public values. The inputs are the inner PVs and
+every cap (trace, quotient, randomizer, then each commit round), which bind the
+absorbed words. The outputs are ζ (from the machine's held cell), fri_alpha (the held
+cell), Az and Bz (the accumulators on the last row), every β, the final polynomial and
+the 43 query indices. Each is bound on its own draw row or word row, with no held copy.
+That is 16 + 4R + 64 + 43 values: 139 at S3. The opened values are **not** exported,
+because C2 needs only ro = (Az − Ax)/(ζ − x) + (Bz − Bx)/(ζ·g_N − x). The honest test
+checks exactly that split for **all 43 queries** against 2b-ii's sequential
+`open_input` replica.
+
+### Constraint groups and tests
+
+Twenty-seven named groups: `keccak`, `bits`, `absorb`, `ring`, `chain_state`,
+`flush_chain`, `bind_const`, `bind_cap`, `bind_inner_pv`, `canonical`, `fs_reject`,
+`fs_select`, `fs_bind`, `bind_final`, `pow`, `fs_index`, `bind_opened`, `in_public`,
+`hold`, `machine`, `machine_out`, `alpha_chain`, `mask`, `gate`, `accumulate`,
+`cells_out`, `az_out`. Every constraint has degree ≤ 3; the honest test checks this on
+the symbolic builder. The fixture is 2b-i's seeded log-8 toy proof (two FRI rounds),
+shared with 2b-ii and 2b-iii. Every negative scans **all** rows and asserts the exact
+(row, group) set. "Perm rows" means all 24 rows of that permutation.
+
+| negative | refused at |
+|---|---|
+| wrong ζ limb, machine recomputed on it | `fs_bind` on ζ's draw perm rows + `machine_out` on the last row |
+| wrong α limb, machine recomputed on it | `fs_bind` on α's draw perm rows + `machine_out` on the last row |
+| wrong fri_alpha, held on every row, exported, sums recomputed with it | `fs_bind` on G_0's first perm rows only |
+| **held fri_alpha split**: α′ on F2's rows and in the export, the drawn α from the draw row on | `hold` only, on the one row where the cell changes |
+| β_0 takes a skipped accepted draw, exported consistently | `fs_select` on its draw perm rows |
+| F1 caps swapped, consistent replay (own ζ, quotient re-solved, F2/D2 rebuilt, own fri_alpha and β, PoW re-ground by p3's challenger, own indices and sums) | `bind_cap` only, on the F1 perms whose cap words moved |
+| FRI round caps swapped, consistent replay (own β, PoW re-ground) | `bind_cap` only, on the G_0/G_1 perms whose cap words moved |
+| an opened value (trace-local 0) poked in the transcript, machine untouched, everything after F2 replayed and re-ground | `bind_opened` only, on that value's perm rows |
+| **that value poked in the Az accumulation only** (transcript and machine honest; Az and the export moved by fri_alpha⁴) | `accumulate` only, on that value's step-0 row |
+| **a trace-next term put under the ζ mask** (both sums recomputed and exported) | `mask` only, on that block's perm rows |
+| an opened word encoded as word + p | `canonical` on its perm rows + `pow` on window 0's perm rows (D2 moves, PoW not re-ground) |
+| PoW witness failing the grind, the rest replayed | `pow` on window 0's perm rows |
+| an index bit flipped in the export | `fs_index` on its window's perm rows |
+| **Az / Bz output poked** | `az_out` on the last row |
+| ζ / fri_alpha output poked | `cells_out` on row 0 |
+| a β output poked | `fs_bind` on its draw perm rows |
+
+**Native cross-checks** (honest test): every challenge (α, ζ, fri_alpha, both β) from
+p3's own challenger; p3's `check_witness` accepts the PoW; every index equals p3's
+`sample_bits`; the lane's F2 digest is 2a's D2; fri_alpha, β and the indices equal 2b-i's
+outputs. `Seam::read` of the public values equals the native seam. Az and Bz come from a
+source-order `open_input` sum written from the proof's structure, independently of the
+layout. For all 43 queries, 2b-ii's native reduced opening equals
+(Az − Ax)/(ζ − x) + (Bz − Bx)/(ζ·g_N − x). The test also runs a SAT scan, checks degree
+≤ 3, and pins the toy layout to `price::composed_c1_layout`.
+
+### Dimensions **[P, source-derived]**
+
+`price::composed_c1(shape)` is pinned by `composed_c1_pins_the_census`. The lane is
+the whole challenger transcript plus one final refill whose first block carries the
+last window's digest bits. At S3 that is the census's **206** challenger permutations
++ 1 = 207.
+
+| shape | lane perms (challenger + 1) | lane rows | padded rows | columns | periodic (ROM, full period) | PVs | seam outputs |
+|---|---|---|---|---|---|---|---|
+| S | 207 (206 + 1) | 4,968 | 2^15 | 11,746 | 2,227 | 1,151 | 139 |
+| P | 228 (227 + 1) | 5,472 | 2^15 | 12,655 | 2,593 | 1,295 | 143 |
+| R | 209 (208 + 1) | 5,016 | 2^15 | 12,040 | 2,364 | 1,136 | 139 |
+
+The S column split: Keccak 2,633, message and state bits 2,176, canonicity 68, draws
+72, perm ring 207, L1 122, held fri_alpha 4, machine inputs 5,248 (1,312 × 4), machine
+1,216. The rows are the machine's: the lane fills 4,968 of the 2^15 rows.
+
+**Against the plan** (≈ 12.4k columns × 2^15 at S3): 11,746 × 2^15. C1 does not carry
+2b-i's held index bits (43 × 22 = 946 columns at S3). Each index is bound straight from
+its draw bits to its output, and C2 re-decomposes it. The ring (207) and L1 (122) are
+the additions.
+
+**The ROM's price (L5, deferred).** The verifier of C1 evaluates each full-period ROM
+column at ζ: rom columns × 2^15 extension multiplies, **73.0M at S3** (2,227 × 2^15),
+85.0M at P3 and 77.5M at R. The sponge selectors the ring replaced would have added
+(perms + 2) × 2^15 = 6.85M at S3. The coordinator's "≈ 79M for C1" is the sum of the
+two (79.8M). What remains is the ROM alone.
+
+### What C1 does not do
+
+- **C2** (2b-ii + 2b-iii as per-query segments, levers L2 and L3) is the next slice.
+  Nothing yet reads C1's `Seam` from C2's public values, so no seam is enforced across
+  the two proofs yet. `Seam::read` is the accessor that `check_seams` will use.
+- **The machine ROM** stays full-period periodic (L5).
+- **Query coverage and full size.** The toy has two FRI rounds and a small machine. C1
+  at the full S3 size (2^15 rows) has never been built.
+
+`pcs_input_bindings_complete`, `full_ood_air_checked`, `complete_verifier_layout` and
+`memory_gate_pass` stay **false**.
+
+### Validation
+
+No local tests, proofs or benchmarks were run. The local preflight was
+`cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: six in
+`c1.rs` and one in `price.rs`, seven in all. **[P, pending CI]**: against 2b-iii's
+2,791, that is 2,798 passed, 0 failed, 15 ignored.
+
+Expected new-test runtime **[P]** is 10–45 s on the Graviton lane. It adds **no prove**:
+the proof is 2b-i's, shared per test binary. The work is three 22-bit grinds by p3's
+parallel `grind` (the two cap swaps and the opened-value poke), eighteen parallel
+full-trace violation scans and one SAT scan over a 2^10-row, roughly 5.5k-column trace,
+43 native reduced openings, one symbolic degree pass, and the three shape programs
+compiled once for the price test.
+
+Unverified, most likely to break first:
+
+1. Exact (row, group) sets under replication. Every perm-gated violation is expected on
+   all 24 rows of its permutation. An extra group fails loudly; the fix is to name it,
+   not to weaken the assertion.
+2. The L1 slot maps and the q_0 step across the cut term. Construction checks the maps
+   against the layout, and the 43-query split check exercises the sums end to end, but
+   only on the toy's five F2 blocks. S3's F2 (175 blocks) is priced by formula only;
+   `Layout::new`'s map check has never run on it.
+3. The hand-derived S/P/R pins: machine dimensions from F2b-0's census table, lane
+   permutations from the census geometry.

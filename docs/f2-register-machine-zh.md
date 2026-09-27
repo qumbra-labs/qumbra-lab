@@ -728,3 +728,182 @@ prove。
 3. commit 阶段叶子的序列化（扩域 limb 按基底顺序，然后是盐）。p3 的 `verify_batch` 和
    “根等于 cap”的断言会暴露不一致。
 4. 手算的 S/P/R 列数、periodic 数和 PV 数：census 拆分测试把它们钉住。
+
+## F2b 组合 C1：transcript、执行器和 FRI transcript 共用一条 lane
+
+这是协调者在 issue #750 上记下的组合方案（“F2b composition: two proofs per leaf”）的第一片。
+p3 0.6.1 只能证明单张表，所以四个 F2b 组件被合成每个叶子两份 proof。**C1** 把 2a（uni-stark
+transcript 加寄存器执行器）和 2b-i（FRI transcript）放进同一个 AIR、同一条 duplex Keccak lane，
+并带上杠杆 **L1**。C2（2b-ii + 2b-iii）是下一片。C1 是仅用于测试的组件
+（`crates/qlab-bench/src/f2/ood/c1.rs`），逐行扫描，从不 prove。已合并的四个组件及其测试
+原样保留，继续作为回归基线。
+
+### 一条 lane，一份 transcript
+
+各次 flush 首尾相接：F0 → α，F1 → ζ，F2（opened value）→ fri_alpha，然后每个 commit 轮
+G_r → β_r，再是 H（final polynomial、arity、PoW witness）→ PoW 和各个 query 窗口，最后是
+refill。字的顺序全部沿用 2a、2b-i 已经对照 p3 源码钉住的顺序。**D2 变成了内部值**：F2 的
+最后一个置换把 digest 交给 G_0 的第一块，用的就是其余每次 flush 都在用的 `flush_chain` 等式。
+D2 不再有任何公开部分，2a→2b-i 这道接缝随之消失。honest 测试断言：lane 上 F2 的 digest 等于
+2a 的重放结果，fri_alpha、每个 β、每个下标都等于 2b-i 对同一个 proof 的输出。
+
+执行器就是 2a 的那个，没有改动：输入放在保持单元里，分别绑定到 transcript 中对应的字、
+内层 PV 和 α/ζ 的抽样；最后一行上残差钉为 0，下一点钉为 g_N·ζ。
+
+### 调度：transcript 部分不再用全周期 selector
+
+2a 和 2b-i 给每个置换配一列全周期 periodic 列来做绑定的门控，另外还有两列 sponge 列。
+下一层递归要在 ζ 处对每一列 periodic 列求值，代价是列数 × 周期。C1 改用主 trace 来调度，
+做法与 m4gate 相同：
+
+- **Keccak 自带的 `step_flags`**：p3-keccak-air 本来就约束了这个周期 24 的环，由它给出每个
+  置换的 step-0 行和最后一行。
+- **置换环（perm ring）**：每个 lane 置换一列主列，在它所指置换的全部 24 行上取 1。第一行指向
+  置换 0，每个置换的最后一行把令牌交给下一个（`ring`）。最后一个置换之后环就空了。这个环
+  完全由 Keccak 标志决定。
+
+由环单元 P_p 门控的绑定在置换 p 的全部 24 行上成立，因此 prover 要把该置换的消息位、状态位、
+规范性 witness 和抽样 witness **在这些行上复制一遍**。这样每个门控的 degree 都保持为 1，
+与原来的 periodic selector 相同。可靠性的理由也和以前一样：复制的行里包含 step-0 行，
+`absorb` 就在那一行把这些位绑到置换的输入上。链接类的门控再乘上 Keccak 的末行标志。
+**剩下的 periodic 列只有执行器的 ROM**，仍是全周期的；去掉它们要靠杠杆 L5，本片没有做，
+代价见下文。
+
+### L1：在吸收行上累加 Az 和 Bz
+
+原生的 `open_input`（p3-fri `verifier.rs:706-753`）给第 k 个 opened value 乘上 fri_alpha^k。
+计数器只有一个，依次走过随机化器、trace 在 ζ 处和 ζ·g_N 处的值、quotient 各块，而这恰好就是
+F2 的吸收顺序（2b-ii 的 `Geom::term` 及其测试已经钉住）。所以 Az（ζ 点各项的 Σ α^k z_k）和
+Bz（ζ·g_N 点各项的同一求和）可以按 F2 的块依次累加：
+
+- 一块 34 个字，最多碰到九项（j = 0..8）。F2 开头是 8 个链接字，而 34 ≡ 2 (mod 4)，所以
+  **偶数块**从项的边界开始（槽 s → 项 j = s/4，limb s mod 4）；**奇数块**从上一块截断的那一项
+  的 limb 2 开始：j = (s+2)/4，limb (s+2) mod 4。两套槽映射覆盖所有块。第 0 块按偶数块处理，
+  j = 0 处对应项号 −2；那里是 D1 的字，由掩码滤掉。构造 AIR 时会用布局核对这两套映射，
+  而不是想当然。
+- 每行有 q_j = α^{k0+j}：九个扩域单元，q_{j+1} = q_j·α，T = q_8·α。q_0 在每个 F2 置换的最后
+  一行更新：偶数块之后变成 q_8（下一块接着那个被截断的项），奇数块之后变成 T。F2 第一块上的
+  锚点 q_2 = 1 把那里的 k0 定为 −2（`alpha_chain`）。
+- pA_j、pB_j 是 q_j 按第 k0 + j 项的（静态）求值点做掩码的结果；D1 的字、padding 和另一个
+  求值点上都为零。掩码是环单元之和，所以每个单元都是一个 degree 2 的等式（`mask`）。
+- 在每个 F2 的 step-0 行上，Az += Σ_s pA_{j(s)}·e_{l(s)}·(R⁻¹·word_s)，Bz 用 pB 以同样方式
+  累加。两个物化的门控（step-0 ∧ 偶数块、step-0 ∧ 奇数块）让这次更新保持在 degree 3
+  （`gate`、`accumulate`）。
+
+这样 C2 就不再需要那张 5,912 列的 α 幂次与 z 值表（S3）。C1→C2 的接缝传的是 Az、Bz 这 8 个
+值，而不是 1,478 个 opened value。
+
+**为什么在抽出 fri_alpha 之前累加是可靠的。** fri_alpha 从 D2 抽出，而 D2 是在 opened value
+吸收**之后**才有的；但 F2 各行上的累加又要用到它。α 放在一个**保持**单元里：每一行都是同一个
+值（`hold`），并且等于 G_0 第一块上的抽样（`fs_bind`）。有了保持，“F2 各行上用的 α”和
+“从 D2 抽出的 α”就是同一个单元，前面那些行算出的累加和用的正是抽出来的值。这里没有循环：
+trace 是一次性给定的静态 witness，每条约束都只是 prover 同时定下的若干单元之间的等式。
+抽样是 D2 的函数，D2 是被吸收的字的函数，Az、Bz 则是同一批字和同一个 α 的函数。若 prover
+在 F2 各行放 α′、在抽样行放抽出的 α，`hold` 就会在单元变化的那一行被打破；下面的负例测的
+正是这个。
+
+### C1 导出的接缝
+
+`c1.rs` 里的 `Seam` 把 C1→C2 的接缝表示成值，`Seam::read` 是从 C1 公共值读出它的、可直接
+供 `check_seams` 使用的访问器。输入是内层 PV 和每一个 cap（trace、quotient、随机化器，然后是
+各 commit 轮），它们约束被吸收的字。输出是 ζ（取自执行器的保持单元）、fri_alpha（保持单元）、
+Az 和 Bz（最后一行上的累加器）、每个 β、final polynomial 以及 43 个 query 下标；每一项都在
+自己的抽样行或字所在行上直接绑定，不另设保持副本。合计 16 + 4R + 64 + 43 个值，S3 为 139 个。
+opened value **不导出**，因为 C2 只需要 ro = (Az − Ax)/(ζ − x) + (Bz − Bx)/(ζ·g_N − x)。
+honest 测试针对**全部 43 个 query**，把这个拆分与 2b-ii 的顺序版 `open_input` 复刻逐一比对。
+
+### 约束分组与测试
+
+共 27 个命名分组：`keccak`、`bits`、`absorb`、`ring`、`chain_state`、`flush_chain`、
+`bind_const`、`bind_cap`、`bind_inner_pv`、`canonical`、`fs_reject`、`fs_select`、`fs_bind`、
+`bind_final`、`pow`、`fs_index`、`bind_opened`、`in_public`、`hold`、`machine`、`machine_out`、
+`alpha_chain`、`mask`、`gate`、`accumulate`、`cells_out`、`az_out`。所有约束的 degree 都 ≤ 3，
+由 honest 测试在 symbolic builder 上检查。fixture 是 2b-i 那个带种子的 log-8 玩具 proof（两轮
+FRI），与 2b-ii、2b-iii 共用。每个负例都扫描**全部**行，并断言精确的（行，分组）集合。
+下表中“置换各行”指该置换的全部 24 行。
+
+| 负例 | 在哪里被拒 |
+|---|---|
+| ζ 的一个 limb 错了，执行器按错值重算 | ζ 抽样置换各行上的 `fs_bind`，加最后一行的 `machine_out` |
+| α 的一个 limb 错了，执行器按错值重算 | α 抽样置换各行上的 `fs_bind`，加最后一行的 `machine_out` |
+| fri_alpha 错了，但在每行保持、一致导出、累加和也按它重算 | 只有 G_0 第一个置换各行上的 `fs_bind` |
+| **保持的 fri_alpha 前后不一**：F2 各行和导出用 α′，从抽样行起用抽出的 α | 只有 `hold`，就在单元变化的那一行 |
+| β_0 取了一个被跳过的合格抽样，并一致导出 | 其抽样置换各行上的 `fs_select` |
+| F1 的两个 cap 互换，整条 transcript 一致重放（自己的 ζ、重解 quotient、重建 F2/D2、自己的 fri_alpha 和 β、用 p3 的 challenger 重新 grind PoW、自己的下标和累加和） | 只有 `bind_cap`，在 cap 字变了的那些 F1 置换上 |
+| FRI 两轮的 cap 互换，一致重放（自己的 β、重新 grind PoW） | 只有 `bind_cap`，在 cap 字变了的那些 G_0/G_1 置换上 |
+| transcript 里改一个 opened value（trace local 第 0 列），执行器不动，F2 之后全部重放并重新 grind | 只有 `bind_opened`，在该值所在置换各行上 |
+| **同一个值只在 Az 累加里改**（transcript 和执行器都诚实；Az 及其导出偏移 fri_alpha⁴） | 只有 `accumulate`，在该值的 step-0 行上 |
+| **把一个 trace-next 项放到 ζ 的掩码下**（两个累加和都重算并导出） | 只有 `mask`，在该块置换各行上 |
+| 一个 opened 字写成 word + p | 其置换各行上的 `canonical`，加窗口 0 置换各行上的 `pow`（D2 变了，PoW 未重新 grind） |
+| PoW witness 过不了 grind，其余部分重放 | 窗口 0 置换各行上的 `pow` |
+| 导出的某个下标翻转一位 | 其窗口置换各行上的 `fs_index` |
+| **改动导出的 Az / Bz** | 最后一行的 `az_out` |
+| 改动导出的 ζ / fri_alpha | 第 0 行的 `cells_out` |
+| 改动导出的某个 β | 其抽样置换各行上的 `fs_bind` |
+
+**原生交叉核对**（honest 测试）：每个挑战（α、ζ、fri_alpha、两个 β）都来自 p3 自己的
+challenger；p3 的 `check_witness` 接受 PoW；每个下标都等于 p3 的 `sample_bits`；lane 上 F2 的
+digest 就是 2a 的 D2；fri_alpha、β 和下标等于 2b-i 的输出。从公共值读出的 `Seam` 等于原生算出
+的接缝。Az、Bz 来自按源码顺序写的 `open_input` 求和，直接从 proof 的结构写出，不依赖布局。
+对全部 43 个 query，2b-ii 的原生 reduced opening 都等于
+(Az − Ax)/(ζ − x) + (Bz − Bx)/(ζ·g_N − x)。测试还跑一次 SAT 扫描、检查 degree ≤ 3，并把玩具
+布局钉到 `price::composed_c1_layout`。
+
+### 尺寸 **[P，源码推导]**
+
+`price::composed_c1(shape)` 由 `composed_c1_pins_the_census` 钉住。lane 是整条 challenger
+transcript，再加最后一次 refill，它的第一块携带最后一个窗口的 digest 位。S3 上就是 census 的
+**206** 个 challenger 置换 + 1 = 207。
+
+| shape | lane 置换（challenger + 1） | lane 行数 | 补齐后行数 | 列数 | periodic（ROM，全周期） | PV | 接缝输出 |
+|---|---|---|---|---|---|---|---|
+| S | 207（206 + 1） | 4,968 | 2^15 | 11,746 | 2,227 | 1,151 | 139 |
+| P | 228（227 + 1） | 5,472 | 2^15 | 12,655 | 2,593 | 1,295 | 143 |
+| R | 209（208 + 1） | 5,016 | 2^15 | 12,040 | 2,364 | 1,136 | 139 |
+
+S 的列构成：Keccak 2,633，消息位和状态位 2,176，规范性 68，抽样 72，置换环 207，L1 122，
+保持的 fri_alpha 4，执行器输入 5,248（1,312 × 4），执行器 1,216。行数由执行器决定：lane 只占
+2^15 行中的 4,968 行。
+
+**与计划对比**（S3 约 12.4k 列 × 2^15）：实际 11,746 × 2^15。C1 不再保留 2b-i 的下标位保持列
+（S3 上 43 × 22 = 946 列）：每个下标直接从抽样位绑定到输出，由 C2 自己再拆位。新增的是置换环
+（207）和 L1（122）。
+
+**ROM 的代价（L5，暂缓）。** C1 的 verifier 要在 ζ 处对每一列全周期 ROM 求值：ROM 列数 × 2^15
+次扩域乘法，**S3 为 7,300 万次**（2,227 × 2^15），P3 为 8,500 万次，R 为 7,750 万次。被置换环
+取代的 sponge selector 原本还要再加 (置换数 + 2) × 2^15，S3 上是 685 万次。协调者说的
+“C1 约 7,900 万次”正是两者之和（7,980 万次）；现在只剩 ROM 这一部分。
+
+### C1 还没做的事
+
+- **C2**（把 2b-ii + 2b-iii 做成按 query 分段，含杠杆 L2、L3）是下一片。目前还没有任何东西
+  从 C2 的公共值里读出 C1 的 `Seam`，所以两份 proof 之间的接缝尚未被强制。`Seam::read` 就是
+  将来 `check_seams` 要用的访问器。
+- **执行器 ROM** 仍是全周期 periodic（L5）。
+- **query 覆盖与完整尺寸。** 玩具只有两轮 FRI 和一个很小的执行器；完整 S3 尺寸（2^15 行）的
+  C1 还从来没有构建过。
+
+`pcs_input_bindings_complete`、`full_ood_air_checked`、`complete_verifier_layout` 和
+`memory_gate_pass` 仍然是 **false**。
+
+### 验证
+
+本地没有跑任何测试、proof 或 benchmark。本地预检为
+`cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
+和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`c1.rs` 六个、`price.rs` 一个，共七个。
+**[P，待 CI]**：以 2b-iii 的 2,791 为基线，应为 2,798 项通过、0 失败、15 项忽略。
+
+新测试在 Graviton lane 上预计耗时 10–45 秒 **[P]**，**不新增 prove**：proof 用的是 2b-i 的，
+每个测试二进制共用一份。工作量包括：用 p3 的并行 `grind` 做三次 22 位 grind（两次 cap 互换和
+一次 opened value 改动）、十八次并行的全表违反扫描和一次 SAT 扫描（trace 为 2^10 行、约
+5.5k 列）、43 次原生 reduced opening、一次 symbolic degree 计算，以及 price 测试里三个 shape
+的程序各编译一次。
+
+尚未验证，按最可能先出问题排序：
+
+1. 复制之后（行，分组）集合是否精确。凡是由置换门控的违反，预期都出现在该置换的全部 24 行上。
+   多出一个分组会明确失败；正确的修法是把它写进预期，而不是放宽断言。
+2. L1 的槽映射，以及 q_0 跨越被截断项时的更新。构造时会用布局核对映射，43 个 query 的拆分核对
+   也把累加和从头到尾走了一遍，但都只在玩具的五个 F2 块上。S3 的 F2（175 块）只有公式定价，
+   `Layout::new` 的映射核对从没在它上面跑过。
+3. 手算的 S/P/R 钉值：执行器尺寸取自 F2b-0 的 census 表，lane 置换数取自 census 的几何推导。
