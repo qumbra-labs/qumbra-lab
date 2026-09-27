@@ -120,30 +120,30 @@ const CHILD_WORDS: usize = 16;
 /// Query-phase geometry: shape constants and the constant tables derived
 /// from them. Nothing here is read from a proof.
 #[derive(Clone, Debug)]
-struct Geom {
+pub(super) struct Geom {
     /// Query index bits = log2 of the LDE height.
-    lde: usize,
+    pub(super) lde: usize,
     /// Per-round log-arity: the fixed schedule 2b-i binds.
-    arities: Vec<usize>,
+    pub(super) arities: Vec<usize>,
     /// Index bits shifted off before round r (`shift[R]` = all rounds).
-    shift: Vec<usize>,
+    pub(super) shift: Vec<usize>,
     /// Folded log-height after round r.
-    folded: Vec<usize>,
+    pub(super) folded: Vec<usize>,
     /// Merkle levels below the cap in round r.
-    path: Vec<usize>,
+    pub(super) path: Vec<usize>,
     /// log2 of the final domain: `log_blowup + log_final_poly_len`.
-    final_bits: usize,
-    final_len: usize,
+    pub(super) final_bits: usize,
+    pub(super) final_len: usize,
     /// idft[r][k][i] = n^-1 * w_n^{-rev_a(i) * k}.
-    idft: Vec<Vec<Vec<Val>>>,
+    pub(super) idft: Vec<Vec<Vec<Val>>>,
     /// Round r's s^-1 factor for bit t of the shifted index.
-    sinv_f: Vec<Vec<Val>>,
+    pub(super) sinv_f: Vec<Vec<Val>>,
     /// The final x's factor for bit t of `index >> S_R`.
-    final_f: Vec<Val>,
+    pub(super) final_f: Vec<Val>,
 }
 
 impl Geom {
-    fn new(log_height: usize, cfg: &FriCfg) -> Result<Self> {
+    pub(super) fn new(log_height: usize, cfg: &FriCfg) -> Result<Self> {
         let lde = log_height + IS_ZK + cfg.log_blowup;
         require(lde <= 30, "query index wider than 30 bits")?;
         require(CAP_HEIGHT == 3, "the cap mux is written for 2^3 entries")?;
@@ -203,17 +203,17 @@ impl Geom {
         })
     }
 
-    fn rounds(&self) -> usize {
+    pub(super) fn rounds(&self) -> usize {
         self.arities.len()
     }
-    fn arity(&self, r: usize) -> usize {
+    pub(super) fn arity(&self, r: usize) -> usize {
         1 << self.arities[r]
     }
 }
 
 /// One perm of a query segment.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Step {
+pub(super) enum Step {
     /// Block `k` of round `r`'s leaf sponge.
     Leaf(usize, usize),
     /// Path level `t` of round `r`.
@@ -222,20 +222,20 @@ enum Step {
 
 /// Static layout: one segment of perms per covered query.
 #[derive(Clone)]
-struct Layout {
-    geom: Geom,
+pub(super) struct Layout {
+    pub(super) geom: Geom,
     /// Leaf words of every round: 4n extension limbs ‖ salt.
-    leaves: Vec<Vec<Word>>,
+    pub(super) leaves: Vec<Vec<Word>>,
     /// (round, block) of every leaf-block role.
-    roles: Vec<(usize, usize)>,
+    pub(super) roles: Vec<(usize, usize)>,
     /// Roles whose block carries tail lanes from the previous output.
-    carry_roles: Vec<usize>,
-    segment: Vec<Step>,
-    queries: usize,
+    pub(super) carry_roles: Vec<usize>,
+    pub(super) segment: Vec<Step>,
+    pub(super) queries: usize,
 }
 
 impl Layout {
-    fn new(geom: Geom, queries: usize) -> Self {
+    pub(super) fn new(geom: Geom, queries: usize) -> Self {
         let leaves: Vec<Vec<Word>> = (0..geom.rounds())
             .map(|r| leaf_words(1, D * geom.arity(r)))
             .collect();
@@ -267,11 +267,11 @@ impl Layout {
     fn role(&self, r: usize, k: usize) -> usize {
         self.roles.iter().position(|&x| x == (r, k)).unwrap()
     }
-    fn role_words(&self, ro: usize) -> &[Word] {
+    pub(super) fn role_words(&self, ro: usize) -> &[Word] {
         let (r, k) = self.roles[ro];
         &self.leaves[r][RATE_WORDS * k..RATE_WORDS * (k + 1)]
     }
-    fn carry_lanes(&self, ro: usize) -> Vec<usize> {
+    pub(super) fn carry_lanes(&self, ro: usize) -> Vec<usize> {
         let words = self.role_words(ro);
         (0..RATE_LANES)
             .filter(|&ln| words[2 * ln] == Word::Carry)
@@ -319,15 +319,15 @@ impl Layout {
 
 /// One query's commit-phase openings, as the proof carries them.
 #[derive(Clone)]
-struct QOpening {
+pub(super) struct QOpening {
     /// Per round: the n - 1 sibling values, the leaf salt, the Merkle path.
-    sibs: Vec<Vec<E>>,
-    salts: Vec<Vec<Val>>,
-    paths: Vec<Vec<[u64; 4]>>,
+    pub(super) sibs: Vec<Vec<E>>,
+    pub(super) salts: Vec<Vec<Val>>,
+    pub(super) paths: Vec<Vec<[u64; 4]>>,
 }
 
 impl QOpening {
-    fn from_proof(proof: &Proof<Config>, query: usize, g: &Geom) -> Result<Self> {
+    pub(super) fn from_proof(proof: &Proof<Config>, query: usize, g: &Geom) -> Result<Self> {
         let qp = proof
             .opening_proof
             .1
@@ -387,25 +387,25 @@ struct Inbound {
 
 /// Held cells: constant over every row.
 #[derive(Clone)]
-struct Held {
-    betas: Vec<E>,
-    final_poly: Vec<E>,
+pub(super) struct Held {
+    pub(super) betas: Vec<E>,
+    pub(super) final_poly: Vec<E>,
 }
 
 /// Forgery knobs of one query's chain; `honest` is the native verifier.
 #[derive(Clone)]
-struct Knobs {
+pub(super) struct Knobs {
     /// The round whose beta round r's fold uses.
-    beta_of: Vec<usize>,
+    pub(super) beta_of: Vec<usize>,
     /// Bits shifted off before round r's position; its path and s^-1 use
     /// this plus the round's arity.
-    shift: Vec<usize>,
+    pub(super) shift: Vec<usize>,
     /// Round after whose fold `beta^arity * ro` is rolled in again.
-    roll_in: Option<usize>,
+    pub(super) roll_in: Option<usize>,
 }
 
 impl Knobs {
-    fn honest(g: &Geom) -> Self {
+    pub(super) fn honest(g: &Geom) -> Self {
         Self {
             beta_of: (0..g.rounds()).collect(),
             shift: g.shift[..g.rounds()].to_vec(),
@@ -416,32 +416,32 @@ impl Knobs {
 
 /// One covered query's registers, repeated on every row of its segment.
 #[derive(Clone)]
-struct Ctx {
-    bits: Vec<Val>,
-    u: [Val; 4],
-    e: [Val; 8],
+pub(super) struct Ctx {
+    pub(super) bits: Vec<Val>,
+    pub(super) u: [Val; 4],
+    pub(super) e: [Val; 8],
     /// Per round: the n evals (the committed group).
-    groups: Vec<Vec<E>>,
+    pub(super) groups: Vec<Vec<E>>,
     /// Per round: the position one-hot, levels 1..=a concatenated.
-    pos: Vec<Vec<Val>>,
+    pub(super) pos: Vec<Vec<Val>>,
     /// The value entering round r; f[R] is the last fold.
-    f: Vec<E>,
+    pub(super) f: Vec<E>,
     /// Per round: the s^-1 chain.
-    sinv: Vec<Vec<Val>>,
+    pub(super) sinv: Vec<Vec<Val>>,
     /// Per round: u^1..u^{n-1}, u = beta * s^-1.
-    t: Vec<Vec<E>>,
+    pub(super) t: Vec<Vec<E>>,
     /// The final x chain.
-    xf: Vec<Val>,
+    pub(super) xf: Vec<Val>,
     /// Horner cells h_0..h_{L-1}.
-    horner: Vec<E>,
+    pub(super) horner: Vec<E>,
 }
 
 /// The native Merkle replay of one query's commit-phase openings: every
 /// perm's preimage in segment order, and each round's root.
 #[derive(Clone)]
-struct Walk {
-    perms: Vec<[u64; 25]>,
-    roots: Vec<[u64; 4]>,
+pub(super) struct Walk {
+    pub(super) perms: Vec<[u64; 25]>,
+    pub(super) roots: Vec<[u64; 4]>,
 }
 
 /// The fold of one group at beta with s^-1 given, in the inverse-DFT form
@@ -461,7 +461,7 @@ fn fold_idft(idft: &[Vec<Val>], evals: &[E], t: &[E]) -> E {
 /// Registers and Merkle replay of one query: the chain a verifier with
 /// `kn` computes from the openings, the claimed index, the reduced opening
 /// and the held betas / final polynomial.
-fn derive(
+pub(super) fn derive(
     layout: &Layout,
     op: &QOpening,
     index: usize,
@@ -1354,7 +1354,7 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for FoldAir {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::f2::ood) mod tests {
     use std::collections::BTreeSet;
     use std::marker::PhantomData;
     use std::ops::Range;
@@ -1564,7 +1564,7 @@ mod tests {
         )
     }
 
-    fn native_query_of(
+    pub(in crate::f2::ood) fn native_query_of(
         proof: &Proof<Config>,
         lde: usize,
         q: usize,

@@ -1070,3 +1070,241 @@ Unverified, most likely to break first:
    `Layout::new`'s map check has never run on it.
 3. The hand-derived S/P/R pins: machine dimensions from F2b-0's census table, lane
    permutations from the census geometry.
+
+## F2b composition C2 and the seam
+
+Slice 2 of the composition recorded on issue #750. **C2** is 2b-ii (the input-batch
+openings and the reduced opening) plus 2b-iii (the commit-phase openings, the folds and
+the final polynomial) as one AIR on one overwrite-mode Keccak lane (L4), **one segment
+per query**, with levers **L2** and **L3**. It consumes C1's exports through a named
+seam. C2 is a test-only component (`crates/qlab-bench/src/f2/ood/c2.rs`, with the seam
+in `ood/seam.rs`), scanned row by row and never proved. The four merged components, C1,
+and all their tests are unchanged in behaviour. Their layout types are now `pub(super)`
+so C2 reuses them instead of copying them.
+
+### Segment and scheduling
+
+Per covered query, the segment is 2b-ii's permutations exactly as `open.rs` lays them
+out (randomizer, trace and quotient leaf sponges, three input paths), immediately
+followed by 2b-iii's (per round: leaf, then path). Then comes the next query. At S3
+that is 82 + 44 = 126 permutations per query, and 43 queries fill 130,032 of 2^17 rows.
+
+**C2 has no periodic column at all.** Keccak's own period-24 `step_flags` give each
+permutation's step-0 and last rows. A one-hot **position ring**, one main column per
+segment position, is 1 on all 24 rows of the permutation at that position. It
+advances on each permutation's last row and wraps to position 0 at a segment end,
+unless that segment was the last query's, in which case it empties. A one-hot **query
+ring**, one column per covered query, advances at each segment end. Both rings are
+fully determined by the Keccak flags. As in C1, a binding gated by a position cell
+holds on all 24 rows, so the prover replicates the permutation's message bits and
+canonicity witnesses there. The bindings that compare one permutation's output with
+the next permutation's input (child placement, capacity and tail-lane carry) and the
+cap checks need the last row alone. Their gates (last-row flag × position cell) are
+materialized cells, one per index bit that a path level reads and one per cap check,
+which keeps those bindings at degree 3 (`gate`).
+
+### Consuming C1's seam
+
+No z-value and no opened value appears in C2. **C2's public values are the seam**
+(`seam::Seam`): every cap (trace, quotient, randomizer, each commit round), ζ,
+fri_alpha, Az, Bz, every β, the final polynomial and the covered queries' indices.
+ζ, fri_alpha, Az, Bz, the betas and the final polynomial are held cells bound on row 0
+(`seam_in`). The caps are read by the cap checks, and the indices pin the index bits
+through the query ring (`index`). Per query,
+
+  ro = (Az − Ax)/(ζ − x) + (Bz − Bx)/(ζ·g_N − x),
+
+where Ax and Bx are accumulated from the Merkle-authenticated row values in native
+`open_input` order. That is the order C1 absorbed the opened values in and weighted
+Az and Bz by. Both AIRs read it from **one list, `seam::open_order`**: C1's F2 layout is
+built from it, and C2's `Layout::new` checks every input block against it. Each block's
+row values must be consecutive terms, a trace column's ζ·g_N term must be its ζ term + w,
+and consecutive blocks must step term by term, except across the w ζ·g_N terms after
+the trace. So the two sums cannot be taken in different orders.
+
+### L2: incremental fri_alpha powers
+
+2b-ii held one fri_alpha power per opened term, 5,912 columns at S3; L1 had already
+removed the matching z-value table. C2 keeps:
+
+- a **held table α^1..α^34**: a leaf block's 34 words carry at most 34 row values;
+- a **held α^w**, with w the trace width;
+- per row, a **running power p = α^{k0}**, where k0 is the term of the current input
+  block's first row value.
+
+The block's row values are consecutive terms, so blk = Σ_i α^i v_i uses the table
+(`blk`), Ax += p·blk, and on trace blocks Bx += pw·blk with pw = p·α^w (`accumulate`),
+because trace column c's ζ·g_N term is D + w + c. All of it is gated by the step-0 flag.
+The rules for p (`alpha_pow`):
+
+- **anchor**: p = 1 on every segment's first block;
+- **step**: over a block of n row values, p steps by α^n. After the last trace block it
+  steps by α^w·α^n (from pw), which skips the w ζ·g_N terms;
+- **hold and reset**: p holds across path permutations and resets to 1 at the segment
+  end;
+- **α^w pin**: α^w is fixed where the trace terms end, by p·α^n = α^D·α^w on the last
+  trace block. The table itself is a first-row chain from fri_alpha.
+
+At S3 the powers cost 136 + 4 held columns and 16 running columns, replacing 5,912.
+
+### L3: the hand-off
+
+The index bits and ro are **one set of register cells**, held over the whole segment
+(`handoff`). The same bit cells drive x, the three input paths, the cap one-hot (shared
+by every batch and round), the commit-phase paths (bit S_{r+1} + t at round r, level t),
+the fold positions, s^-1 and the final x. Input and commit-phase levels that read the
+same bit share one gate cell. The reduced opening is computed on the opening part
+(`reduce`, on the last input permutation's 24 rows, where Ax and Bx are complete), and
+it is the cell the fold chain starts from (`select`, round 0). Nothing is duplicated
+between the two parts: 2b-iii's own index bits and cap one-hot (lde + 12 columns) are
+gone.
+
+### The seam and `check_seams`
+
+`Seam` is the exact C1→C2 value set, and `SeamShape` gives its one encoding. C1's
+public values are its inner PVs followed by this slice, and C2's public values are
+exactly the slice, carrying the indices of the query slots it covers. `Seam::read` (C1)
+and `Seam::decode` (C2) read it back. **`check_seams(c1, c2) -> Result`** is the
+group-by-group equality the next recursion level will state in-circuit, and an error
+names the first group that differs. C2's covered slots are a static property of its
+layout. **`check_coverage`** asks separately whether C2 covers every query C1 drew. The
+production instance covers all 43; the toy instance covers two, and the honest test
+asserts that `check_coverage` refuses it.
+
+| group | S3 values | carried as |
+|---|---:|---|
+| caps (trace, quotient, randomizer, 4 commit rounds) | 7 × 8 digests = 896 limbs | 16-bit limbs |
+| ζ | 4 | extension limbs |
+| fri_alpha | 4 | extension limbs |
+| Az, Bz | 8 | extension limbs |
+| β (one per round) | 16 | extension limbs |
+| final polynomial | 64 | extension limbs |
+| query indices | 43 | one field element each |
+| **total** | **1,035** | = C1's 1,151 PVs − 116 inner PVs |
+
+Without the caps, the seam is 139 values at S3, matching C1's seam-output count. The
+caps are C1's declared inputs, and C2 reads them from the same encoding.
+
+### Constraint groups and tests
+
+Thirty-two named groups: `keccak`, `bits`, `absorb`, `ring`, `gate`, `capacity`,
+`bind_zero`, `bind_carry`, `bind_child`, `cap`, `canonical`, `leaf_bind`, `index`,
+`cap_select`, `x_point`, `inverse`, `alpha_pow`, `blk`, `accumulate`, `reduce`,
+`position`, `select`, `s_inv`, `fold_pow`, `fold`, `final_x`, `horner`, `final`,
+`seam_in`, `hold`, `handoff`, `ctx_hold`. Every constraint has degree ≤ 3, checked on
+the symbolic builder for the toy and for S3. The fixture is 2b-i's seeded log-8 toy
+proof, with C1's honest seam built from the same proof and a C2 instance covering two
+queries whose cap entries differ (2b-ii's choice). Every negative scans **all** rows and
+asserts the exact (row, group) set.
+
+"Consequences" means exactly what a consistently re-derived claim cannot hide, computed
+from the native replay alone. Every root that misses the seam cap entry its index
+selects is refused by `cap` on that check's row. Every query whose last fold misses the
+final polynomial is refused by `final` on its register rows.
+
+| negative | refused at |
+|---|---|
+| input salt changed | `cap` on that batch's cap row |
+| input row value changed + fresh salt; Ax, ro and the fold chain re-derived | consequences: the input cap, both commit caps, `final` |
+| input siblings swapped | `cap` on that batch's cap row |
+| input child on the wrong side, bit untouched | `bind_child` on the feeding row + `cap` |
+| index bit 3 flipped for the whole segment, everything following it | `index` on the segment's rows + consequences (all three input caps among them) |
+| wrong cap one-hot | `cap_select` on the query's rows + all five cap checks |
+| x without bit reversal; inverses, ro and fold chain re-derived | `x_point` on the query's rows + consequences |
+| ro poked for the whole segment | `reduce` on the last input perm's rows + `select` on the query's rows |
+| commit-phase salt changed | `cap` on round 1's cap row |
+| two round-0 siblings moved so the fold is unchanged | `cap` on round 0's cap row only |
+| round-0 siblings swapped, chain re-derived | consequences |
+| round 1 folded with β_0 | `fold_pow` on the query's rows + `final` |
+| the value between rounds poked | `fold` + `select` on the query's rows |
+| final polynomial forged (public and held, consistent) | `final` on every row |
+| a final-x chain cell poked | `final_x` on the query's rows |
+| **Az public value that the held cell does not carry** | `seam_in` on row 0 |
+| **Az from C1 differs, C2 consistent on it** (held, public, ro and folds re-derived) | `check_seams` names `az`; in C2, consequences (the forged ro misses the commit-phase leaves) |
+| **each seam group tampered on C1's side, then on C2's** | `check_seams` names that group, for all eight groups |
+| **a running power duplicated** (query 1's last quotient block reuses the previous block's power; Ax, ro, folds consistent) | `alpha_pow` on the row where p should have stepped + consequences |
+| **a running power skipped** (query 0's trace block one power too far, every later block following) | `alpha_pow` on the step into it and on its 24 rows (the α^w pin) + consequences |
+| **ro poked between the parts** (the opening part reduces to the honest ro, the fold part starts from ro + 1) | `handoff` on the boundary row + `select` on the fold rows |
+| **the fold part's index bit S_R differs from the opening part's** | `handoff` on the boundary row; on the fold rows `index`, `x_point`, `s_inv`, `final_x`; `bind_child` on the two commit-phase levels that read that bit |
+
+**Native cross-checks** (honest tests):
+
+- For **all 43 queries**, C2's block-form Ax/Bx (running powers from the held table)
+  equals C1's source-order `open_input` sum, and the split with C1's Az/Bz equals 2b-ii's
+  sequential reduced opening.
+- The running powers are α^{k0} for the shared term order.
+- For the covered queries, the fold chain and final check are p3's (commit-phase MMCS,
+  `fold_row`), and every root is the seam's cap entry.
+- Beyond those, the honest tests check SAT, degree ≤ 3 and zero periodic columns,
+  `check_seams(C1, C2)` passing on the honest pair built from the same proof, and the
+  toy layout pinned to `price::composed_c2_layout`.
+- **A real S3 production schedule** (25 input leaf perms and 3 × 19 input levels, then
+  four arity-16 rounds with paths 15/11/7/3) runs for two queries on the shared census
+  proof. The seam comes from p3's challenger and a source-order sum, and ro, Ax/Bx and
+  the folds are checked against native code. The test covers SAT, degree ≤ 3 and the
+  price pin.
+
+### Dimensions **[P, source-derived]**
+
+`price::composed_c2(shape)` is pinned by `composed_c2_pins_the_census_and_the_plan`. At
+43 queries, C2's lane is **every leaf and path permutation of the census geometry**; C1
+carries the challenger's. At S3: 43 × (25 + 8) = **1,419** leaf and 43 × (57 + 36) =
+**3,999** path permutations.
+
+| shape | perms / query (input + commit) | lane rows | padded rows | columns | periodic | PVs (= seam) |
+|---|---|---|---|---|---|---|
+| S | 126 (82 + 44) | 130,032 | 2^17 | 5,058 | 0 | 1,035 |
+| P | 139 (87 + 52) | 143,448 | 2^18 | 5,107 | 0 | 1,167 |
+| R | 120 (79 + 41) | 123,840 | 2^17 | 4,966 | 0 | 1,035 |
+
+The S column split: Keccak 2,633, message bits 1,088, canonicity 68, position and query
+rings 169 (126 + 43), last-row gates 26, query registers 818 (26 of them the hand-off),
+running cells 24, held seam values 232.
+
+**Against the plan** (≈ 5.0k columns × 2^17 at S3; P3 → 2^18): 5,058 × 2^17 at S3, and
+P3 at 2^18. The levers account for the gap to 2b-ii + 2b-iii: L1 and L2 each remove a
+5,912-column table, and L3 removes 2b-iii's second index-bit and one-hot set (34
+columns). The rings, gates and the 140 held power columns are the additions. With no
+periodic column, the next level pays nothing per row for C2's scheduling.
+
+### What C2 does not do
+
+- **In-circuit seam.** `check_seams` is native. The next recursion level states the
+  same equalities in-circuit.
+- **Full size.** C2 at 43 queries (2^17 rows) has never been built. The S3 test builds
+  two queries (2^13 rows).
+- **The plan's slice 3 (the selector conversion) and C1's full-period ROM (L5)** are
+  not part of this slice. C2 itself already has no periodic column.
+
+`complete_verifier_layout` and `memory_gate_pass` stay **false**.
+
+### Validation
+
+No local tests, proofs or benchmarks were run. The local preflight was
+`cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: seven in
+`c2.rs` and one in `price.rs`, eight in all. **[P, pending CI]**: against C1's 2,798,
+that is 2,806 passed, 0 failed, 15 ignored.
+
+Expected new-test runtime **[P]** is 20–60 s on the Graviton lane. It adds **no
+prove**. The toy proof is 2b-i's and the S3 proof is the census test's, each shared per
+test binary; if C2's S3 test runs first, it pays that test's existing ≈ 26 s S3 prove.
+The work:
+
+- C1's honest trace, built once;
+- twenty-one parallel full-trace violation scans and one SAT scan over a 2^11-row,
+  4,395-column trace;
+- 43 × 2 native reduced openings and block sums;
+- one SAT scan over a 2^13-row, roughly 5.0k-column S3 trace;
+- two symbolic degree passes.
+
+Unverified, most likely to break first:
+
+1. Exact (row, group) sets under replication, in particular the "consequences" sets
+   derived from the native replay, and the `alpha_pow` row choice (the last row
+   before the forged block).
+2. The L2 bookkeeping on S3's 22 trace blocks, which has run only in the two-query S3
+   test (SAT), never under a negative.
+3. The S/P/R pins, which assume the census geometry and the formula mirrors the
+   column allocation exactly. The toy and the two-query S3 instance pin the formula to
+   the AIR; P and R are formula-only.

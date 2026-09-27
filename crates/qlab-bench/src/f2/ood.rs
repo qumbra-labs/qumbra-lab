@@ -15,10 +15,16 @@ mod c1;
 // The Keccak sponge lane both transcript components share.
 #[cfg(test)]
 mod lane;
+// F2b composition C2: 2b-ii + 2b-iii as per-query segments on one lane (test-only AIR).
+#[cfg(test)]
+mod c2;
 // F2b-2b-ii: the input-batch openings and reduced opening per query (test-only AIR).
 mod machine;
 #[cfg(test)]
 mod open;
+// The C1 -> C2 seam and the shared opened-term order.
+#[cfg(test)]
+mod seam;
 
 use std::collections::HashMap;
 use std::sync::Arc;
