@@ -284,7 +284,7 @@ macro_rules! lane_body {
     }};
 }
 
-fn bench_lane<A>(
+pub(crate) fn bench_lane<A>(
     air: &A,
     pvs: &[Val],
     cfg: &FriCfg,
