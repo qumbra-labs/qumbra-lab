@@ -365,3 +365,8 @@ fn shape_p_two_proofs_of_one_witness_differ_and_both_verify() {
 fn shape_r_two_proofs_of_one_witness_differ_and_both_verify() {
     hiding_smoke!(qlab_air::l2r::L2ShapeRAir::chain_only(12), qlab_air::l2r::L2ShapeRAir);
 }
+
+#[test]
+fn claim_two_proofs_of_one_witness_differ_and_both_verify() {
+    hiding_smoke!(qlab_air::claim::ClaimAir::chain_only(12), qlab_air::claim::ClaimAir);
+}
