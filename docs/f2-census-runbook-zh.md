@@ -85,6 +85,11 @@ AIR selector、periodic 列和 next-row point 使用原始 **N** 域，trace 承
 由实现重新计算宽度和 padded height，不能把 stage-zero 宽度预算直接
 当作已验证的分配尺寸。
 
+`ood_arithmetic.register_schedule` 现在计入按最后使用位置复用寄存器的调度；
+census 也将稀疏执行逐条与可达 DAG 节点比较。
+[寄存器执行器说明](f2-register-machine-zh.md) 解释有界、仅用于测试的参考 AIR
+及其显式 ROM 成本。这不改变完整布局/内存验收标志。
+
 ## 验证与限制
 
 CI 回归测试会串行生成真实 S3/P3/R proof，检查两个原生 verifier、几何与计数一致性，

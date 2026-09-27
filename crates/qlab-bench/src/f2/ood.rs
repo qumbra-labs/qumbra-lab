@@ -1,5 +1,7 @@
 //! Executable algebraic OOD relation, not a recursive verifier AIR.
 //! All variable arithmetic is explicit; constants/IDFT are compile-time work.
+mod machine;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -132,6 +134,7 @@ struct Leaves {
 }
 
 struct Program {
+    schedule: machine::Schedule,
     dag: Dag,
     leaves: Leaves,
     original: Domain,
@@ -271,7 +274,9 @@ impl Program {
         let residual = dag.push(Op::Sub(lhs, quotient));
         // Arc addresses only identify this compilation's symbolic graph.
         dag.shared.clear();
+        let schedule = machine::Schedule::compile(&dag.ops, &[residual, next_point])?;
         Ok(Self {
+            schedule,
             dag,
             leaves,
             original,
@@ -331,6 +336,7 @@ impl Program {
         json!({"evidence": "P", "source": "executable extension-field OOD DAG; pointer sharing only",
             "input_reads": counts[0], "constants": counts[1], "add": counts[2],
             "sub": counts[3], "neg": counts[4], "mul": counts[5], "inverse": counts[6],
+            "register_schedule": self.schedule.report(),
             "nodes": self.dag.ops.len(), "original_log_height": self.original.log_size(),
             "quotient_chunks": self.chunk_domains.len(), "periodic_columns": self.leaves.periodic.len(),
             "complete_verifier_layout": false, "memory_gate_pass": false})
@@ -343,6 +349,7 @@ where
     A: for<'a> Air<VerifierConstraintFolder<'a, Config>>,
 {
     let values = program.evaluate(inputs)?;
+    program.schedule.check_values(&values)?;
     let periodic: Vec<E> = air
         .periodic_columns()
         .iter()

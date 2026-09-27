@@ -105,6 +105,11 @@ fee/state transitions, plus the unresolved issue #78 work.
 Recompute width and padded height from that implementation; do not copy the stage-zero
 width budgets into an allocation as if they were verified dimensions.
 
+`ood_arithmetic.register_schedule` now prices a last-use register schedule; census
+also checks its sparse execution against every reachable DAG node. The separate
+[register-machine reference](f2-register-machine.md) explains the bounded test-only
+AIR and its explicit ROM cost. This does not change the full-layout/memory flags.
+
 ## Validation and limits
 
 The CI regression suite includes sequential real S3/P3/R proof generation, both native
