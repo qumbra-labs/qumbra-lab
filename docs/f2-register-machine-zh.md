@@ -636,6 +636,8 @@ query。每个负例都扫描**全部**行，并断言违反的（行，分组�
 | 链条不从 2b-ii 的 reduced opening 出发 | 只有 `ro_in`，该 query 那一段 |
 | 第 0 轮之后再注入一次 ro（原生代码对第二个高度才会这么做） | 该 query 各行的 `fold` 和 `final`，外加第 1 轮的 `cap` |
 | 一致地伪造一个 final polynomial 系数（2b-i 接受的那种伪造） | 只有 `final`，所有行 |
+| 改终点 x 链中间的一个单元，下标不动 | 只有 `final_x`，该 query 各行 |
+| 只在寄存器里翻转下标第 S_R 位（终点 x 的第一位） | 该段的 `index`；该 query 各行的 `final_x` 和 `s_inv`（两轮的 s⁻¹ 都读这一位）；读这一位的两层上的 `bind_child` |
 
 下标右移那个负例的预期集合，是按该 query 自己的下标位算出来的；测试会断言这次错位至少
 改变了一位。根是否改变，以原生重放为准。
@@ -647,6 +649,14 @@ query。每个负例都扫描**全部**行，并断言违反的（行，分组�
 中间值、相同的 Horner 结果和相同的 cap 表项。玩具 proof 在生成时已经通过了
 `p3_uni_stark::verify`。诚实用例还做一次 SAT 扫描、检查 degree ≤ 3，并把玩具布局钉到
 `price::query_phase` 上。
+
+**真实 S3 proof 上的生产折叠方案。** 玩具按 `[4, 1]` 折叠（两轮）。另有一个测试在真实
+hiding S3 proof 的方案上跑这个 AIR：四轮、每轮 arity 16，路径 15/11/7/3 层，4,096 行，覆盖
+43 个 query 中的 2 个。它用的是 census 测试那份 S3 proof（`f2::s3_fixture`，现在是两个测试
+共用的 `OnceLock`，所以 CI 每个测试二进制仍只 prove 一次 S3），用 p3 自己的 challenger 重放
+FRI，用 2b-ii 的逐项实现重算 reduced opening，把 p3 的 commit 阶段 MMCS、`fold_row` 链和终点
+检查与电路复现逐一比对，做一次 SAT 扫描，并断言改动两轮之间的当前值时恰好只触发该 query
+各行的 `fold` 和 `select`。
 
 ### 尺寸 **[P，源码推导]**
 
@@ -694,18 +704,25 @@ census 实测的 FRI 份额（1,419 − 1,075 和 3,999 − 2,451）。测试对
 
 本地没有跑任何测试、proof 或 benchmark。本地预检为
 `cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
-和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`fold.rs` 六个、`price.rs` 一个，
-共七个。**[P，待 CI]**：以 2b-ii 待定的 2,782 为基线，应为 2,789 项通过、0 失败、15 项忽略。
+和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`fold.rs` 八个、`price.rs` 一个，
+共九个。**[P，待 CI]**：以 2b-ii 待定的 2,782 为基线，应为 2,791 项通过、0 失败、15 项忽略。
 
-新测试在 Graviton lane 上的预计耗时为 5–30 秒 **[P]**。proof 和 2a 的导出与 2b-i、2b-ii 的
-fixture 共用（每个测试二进制一份）。其余是 43 条原生 query 链（每条两次 MMCS 核对、两次
-`fold_row`）、约十个 512 × 4,147 的 trace、一次 SAT 扫描、约十次并行的全表违反扫描，以及
-一次 symbolic degree 计算。
+玩具相关的新测试在 Graviton lane 上预计耗时 5–30 秒 **[P]**。proof 和 2a 的导出与 2b-i、
+2b-ii 的 fixture 共用（每个测试二进制一份）。其余是 43 条原生 query 链（每条两次 MMCS 核对、
+两次 `fold_row`）、约十二个 512 × 4,147 的 trace、一次 SAT 扫描、约十二次并行的全表违反扫描，
+以及一次 symbolic degree 计算。S3 测试**不新增 prove**：S3 proof（在 rig 上约 26 秒、峰值约
+14 GiB，Graviton 上耗时约 2.7 倍）本来就由 census 测试生成一次，现在两者共用。它自己的工作是
+一次 FS 重放、两个 reduced opening、两个 4,096 × 4,657 的 trace（各约 76 MB）、一次 SAT 扫描和
+一次违反扫描：**约 5–20 秒，在共用 proof 之外不到 1 GiB [P]**。两个测试谁先跑，谁承担那次
+prove。
 
 尚未验证，按最可能先出问题排序：
 
-1. 逆 DFT 形式的折叠与 `fold_row` 是否一致，尤其是兄弟值的位反转顺序和 s⁻¹ 的指数。诚实用例
-   对全部 43 个 query 比对两者。
+1. 逆 DFT 形式的折叠与 `fold_row` 是否一致，尤其是兄弟值的位反转顺序和 s⁻¹ 的指数。玩具
+   测试对全部 43 个 query 比对两者，但只在玩具的 `[4, 1]` 方案上。在生产方案（四轮 arity 16）
+   上，比对、满足性检查和一个负例只覆盖**一个 S3 proof 的 43 个 query 中的 2 个**；P3 第五轮的
+   arity 2、R 最后一轮的 arity 8（唯一带尾部 lane 的叶子）只经过 `price::query_phase` 的计数，
+   从未经过这个 AIR。
 2. 负例里（行，分组）集合是否精确，尤其是会连锁触发的那几个（交换兄弟值、下标错位、重复注入）。
    多触发一个分组会明确失败；正确的修法是把多出来的行写进预期，而不是放宽断言。
 3. commit 阶段叶子的序列化（扩域 limb 按基底顺序，然后是盐）。p3 的 `verify_batch` 和

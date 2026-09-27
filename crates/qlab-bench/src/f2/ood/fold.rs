@@ -1370,7 +1370,10 @@ mod tests {
 
     use super::super::fri_fs::tests::{shared, Shared};
     use super::super::lane::phase_ranges;
-    use super::super::open::tests::{handoff, native_mmcs, Handoff, NativeMmcs};
+    use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
+
+    use super::super::lane::toy::native_through_f2;
+    use super::super::open::tests::{handoff, native_mmcs, reduced_opening, Handoff, NativeMmcs};
     use super::*;
 
     struct Fixture {
@@ -1436,12 +1439,31 @@ mod tests {
         })
     }
 
+    fn phase_in(ranges: &[Range<usize>], constraint: usize) -> &'static str {
+        PHASES[ranges.iter().position(|r| r.contains(&constraint)).unwrap()]
+    }
+
     fn phase_of(fx: &Fixture, constraint: usize) -> &'static str {
-        PHASES[fx
-            .ranges
-            .iter()
-            .position(|r| r.contains(&constraint))
-            .unwrap()]
+        phase_in(&fx.ranges, constraint)
+    }
+
+    /// Every (row, group) violated anywhere in `trace`.
+    fn scan(
+        air: &FoldAir,
+        ranges: &[Range<usize>],
+        trace: &RowMajorMatrix<Val>,
+        pvs: &[Val],
+    ) -> BTreeSet<(usize, &'static str)> {
+        (0..air.height)
+            .into_par_iter()
+            .flat_map_iter(|row| {
+                violations_at(air, trace, pvs, row)
+                    .into_iter()
+                    .map(move |v| (row, phase_in(ranges, v.constraint)))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect()
     }
 
     struct Claim {
@@ -1478,16 +1500,7 @@ mod tests {
 
     /// Every (row, group) violated anywhere in the trace.
     fn violations(fx: &Fixture, c: &Claim) -> BTreeSet<(usize, &'static str)> {
-        (0..fx.air.height)
-            .into_par_iter()
-            .flat_map_iter(|row| {
-                violations_at(&fx.air, &c.trace, &c.pvs, row)
-                    .into_iter()
-                    .map(move |v| (row, phase_of(fx, v.constraint)))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect()
+        scan(&fx.air, &fx.ranges, &c.trace, &c.pvs)
     }
 
     /// Refused, and exactly by `expected` (row, group) pairs.
@@ -1541,11 +1554,28 @@ mod tests {
     /// round, then the final polynomial at the final x. Panics where p3
     /// would return an error.
     fn native_query(fx: &Fixture, q: usize, ro: E) -> (Vec<E>, E) {
-        let fri = &fx.sh.proof.opening_proof.1;
-        let lde = fx.air.layout.geom.lde;
+        native_query_of(
+            fx.sh.proof,
+            fx.air.layout.geom.lde,
+            q,
+            fx.sh.indices[q],
+            ro,
+            &fx.sh.betas,
+        )
+    }
+
+    fn native_query_of(
+        proof: &Proof<Config>,
+        lde: usize,
+        q: usize,
+        index: usize,
+        ro: E,
+        betas: &[E],
+    ) -> (Vec<E>, E) {
+        let fri = &proof.opening_proof.1;
         let mmcs = ExtensionMmcs::<Val, E, NativeMmcs>::new(native_mmcs());
         let folding = TwoAdicFriFolding::<(), ()>(PhantomData);
-        let (mut idx, mut h, mut folded) = (fx.sh.indices[q], lde, ro);
+        let (mut idx, mut h, mut folded) = (index, lde, ro);
         let mut chain = vec![ro];
         for (r, step) in fri.query_proofs[q].commit_phase_openings.iter().enumerate() {
             let a = step.log_arity as usize;
@@ -1569,7 +1599,7 @@ mod tests {
                 idx,
                 h,
                 a,
-                fx.sh.betas[r],
+                betas[r],
                 evals.into_iter(),
             );
             chain.push(folded);
@@ -1843,5 +1873,145 @@ mod tests {
             assert_ne!(c.build.ctx[q].horner[0], fx.honest.ctx[q].horner[0]);
         }
         refused_exactly(fx, &c, &rows(0..fx.air.height, "final"));
+    }
+
+    #[test]
+    fn fri_folds_reject_final_point_forgeries() {
+        let fx = fixture();
+        let g = &fx.air.layout.geom;
+        let last = fx.air.layout.queries - 1;
+        // The toy's bit roles: round 0 positions on bits 0..3, round 1 on
+        // bit 4; the final x reads bits 5..10.
+        assert_eq!(g.shift, vec![0, 4, 5]);
+        // A middle cell of the final-x chain poked, the index untouched: its
+        // own step and the next one refuse; Horner still reads the honest
+        // last cell, so nothing else moves.
+        let c = claim(fx, |_| {}, |b| b.ctx[last].xf[2] += Val::ONE);
+        refused_exactly(fx, &c, &rows(ctx_rows(fx, last), "final_x"));
+        // Bit S_R (= 5, the final x's first bit) flipped in query 0's
+        // registers alone, independently of the public index: the index pin
+        // refuses on the segment, and every other reader of that cell sees
+        // the flip — the final-x chain, both rounds' s^-1 chains (round 0
+        // reads it as its bit 1, round 1 as its bit 0) and the two path
+        // levels that read bit 5 (round 0 level 1, round 1 level 0).
+        let b5 = g.shift[g.rounds()];
+        let c = claim(
+            fx,
+            |_| {},
+            |b| b.ctx[0].bits[b5] = Val::ONE - b.ctx[0].bits[b5],
+        );
+        let mut expected = rows(seg(fx, 0), "index");
+        expected.extend(rows(ctx_rows(fx, 0), "final_x"));
+        expected.extend(rows(ctx_rows(fx, 0), "s_inv"));
+        expected.insert((feed_row(fx, 0, 0, b5 - g.shift[1]), "bind_child"));
+        expected.insert((feed_row(fx, 0, 1, b5 - g.shift[2]), "bind_child"));
+        refused_exactly(fx, &c, &expected);
+    }
+
+    /// The production schedule on a real hiding S3 proof — four rounds of
+    /// arity 16, paths 15/11/7/3 — for two queries. The proof is the census
+    /// test's (`crate::f2::s3_fixture`, one S3 prove per test binary); the
+    /// FRI transcript is replayed by p3's own challenger and the reduced
+    /// openings by 2b-ii's sequential `open_input` replica.
+    #[test]
+    fn fri_folds_accept_a_real_s3_schedule() {
+        let (proof, pvs) = crate::f2::s3_proof();
+        let shape = qlab_l2::Shape::S;
+        let cfg = L2_CFG_PROVISIONAL;
+        let geom = Geom::new(shape.log_height(), &cfg).unwrap();
+        assert_eq!(
+            (geom.lde, geom.arities.clone(), geom.path.clone()),
+            (22, vec![4, 4, 4, 4], vec![15, 11, 7, 3])
+        );
+        // p3's challenger through FRI: fri_alpha, every beta (commit PoW
+        // bits are 0), final polynomial, arities, the query PoW, indices.
+        let fri = &proof.opening_proof.1;
+        let mut ch = native_through_f2(&proof, &pvs, shape.log_height());
+        let fri_alpha: E = ch.sample_algebra_element();
+        let mut betas = vec![];
+        for (c, &w) in fri
+            .commit_phase_commits
+            .iter()
+            .zip(&fri.commit_pow_witnesses)
+        {
+            ch.observe(c.clone());
+            assert!(ch.check_witness(0, w));
+            betas.push(ch.sample_algebra_element());
+        }
+        ch.observe_algebra_slice(&fri.final_poly);
+        for &a in &geom.arities {
+            ch.observe(Val::from_usize(a));
+        }
+        assert!(ch.check_witness(cfg.grind_bits, fri.query_pow_witness));
+        let indices: Vec<usize> = (0..cfg.num_queries)
+            .map(|_| ch.sample_bits(geom.lde))
+            .collect();
+        let covered = [0usize, 1];
+        let ro: Vec<E> = covered
+            .iter()
+            .map(|&q| {
+                reduced_opening(
+                    &proof,
+                    &pvs,
+                    shape.width(),
+                    shape.log_height(),
+                    q,
+                    indices[q],
+                    fri_alpha,
+                )
+            })
+            .collect();
+        let inb = Inbound {
+            caps: fri
+                .commit_phase_commits
+                .iter()
+                .map(|c| c.roots().to_vec())
+                .collect(),
+            betas: betas.clone(),
+            final_poly: fri.final_poly.clone(),
+            indices: covered.iter().map(|&q| indices[q]).collect(),
+            ro: ro.clone(),
+        };
+        let ops: Vec<QOpening> = covered
+            .iter()
+            .map(|&q| QOpening::from_proof(&proof, q, &geom).unwrap())
+            .collect();
+        let air = FoldAir::new(Layout::new(geom, covered.len()), 64 << 20).unwrap();
+        let (layout, g) = (&air.layout, &air.layout.geom);
+        let honest = Build::honest(layout, &inb, ops).unwrap();
+        // p3's chain (commit-phase MMCS every round, `fold_row`, final
+        // check) accepts, and the circuit replica matches it.
+        for (i, &q) in covered.iter().enumerate() {
+            let (chain, eval) = native_query_of(&proof, g.lde, q, indices[q], ro[i], &betas);
+            assert_eq!(eval, chain[chain.len() - 1], "p3's final check, query {q}");
+            assert_eq!(honest.ctx[i].f, chain, "folds, query {q}");
+            assert_eq!(honest.ctx[i].horner[0], eval, "final evaluation, query {q}");
+            for r in 0..g.rounds() {
+                assert_eq!(
+                    honest.walks[i].roots[r],
+                    inb.caps[r][indices[q] >> (g.lde - CAP_HEIGHT)],
+                    "query {q} round {r}"
+                );
+            }
+        }
+        let ranges = phase_ranges(&air);
+        let pv = air.public_values(&inb);
+        let trace = air.trace(&honest).unwrap();
+        satisfied(&air, &trace, &pv).unwrap_or_else(|v| {
+            panic!(
+                "honest S3 query phase refused: {v} in {}",
+                phase_in(&ranges, v.constraint)
+            )
+        });
+        // The value between rounds 0 and 1 of the last query poked: round
+        // 0's fold and round 1's select refuse, on the query's rows
+        // (its segment and the padding after it).
+        let mut forged = honest.clone();
+        forged.ctx[1].f[1] += E::ONE;
+        let trace = air.trace(&forged).unwrap();
+        let from = layout.seg_rows();
+        let mut expected = rows(from..air.height, "fold");
+        expected.extend(rows(from..air.height, "select"));
+        assert_eq!(scan(&air, &ranges, &trace, &pv), expected);
     }
 }

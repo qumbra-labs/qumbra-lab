@@ -1452,6 +1452,30 @@ pub(in crate::f2::ood) mod tests {
         }
     }
 
+    /// The native reduced opening of `query` of any hiding proof on the L2
+    /// lane (the sequential `open_input` replica), for 2b-iii's production-
+    /// schedule test on a real S3 proof.
+    pub(in crate::f2::ood) fn reduced_opening(
+        proof: &Proof<Config>,
+        pvs: &[Val],
+        width: usize,
+        log_height: usize,
+        query: usize,
+        index: usize,
+        fri_alpha: E,
+    ) -> E {
+        let dims = Dims {
+            width,
+            pv_len: pvs.len(),
+            log_height,
+        };
+        let chunks = proof.opened_values.quotient_chunks.len();
+        let geom = Geom::new(dims, chunks, &L2_CFG_PROVISIONAL).unwrap();
+        let zeta = proof_inputs_dims(dims, proof, pvs).unwrap().zeta;
+        let op = Opening::from_proof(proof, query, &geom).unwrap();
+        native_reduced(&geom, proof, &op, index, zeta, fri_alpha).unwrap()
+    }
+
     fn phase_of(fx: &Fixture, constraint: usize) -> &'static str {
         PHASES[fx
             .ranges

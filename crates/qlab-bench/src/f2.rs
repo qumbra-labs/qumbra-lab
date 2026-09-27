@@ -469,6 +469,26 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
     Ok(())
 }
 
+/// One real hiding S3 fixture per test binary. The census test and F2b-2b-iii's
+/// production-schedule test (`ood/fold.rs`) share it, so CI proves S3 once
+/// (≈ 26 s, ≈ 14 GiB peak on the rig, the census test's existing cost).
+#[cfg(test)]
+fn s3_fixture() -> &'static Fixture {
+    static S3: std::sync::OnceLock<Fixture> = std::sync::OnceLock::new();
+    S3.get_or_init(|| prove_fixture(Shape::S, &"a".repeat(40)).unwrap())
+}
+
+/// The shared S3 fixture's proof and public values, decoded.
+#[cfg(test)]
+fn s3_proof() -> (Proof<Config>, Vec<Val>) {
+    let f = s3_fixture();
+    let proof = codec().deserialize(&f.proof).unwrap();
+    (
+        proof,
+        f.public_values.iter().copied().map(Val::from_u32).collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,7 +542,10 @@ mod tests {
     #[test]
     fn real_hiding_proofs_cross_verify_count_and_reject_mutations() {
         for shape in [Shape::S, Shape::P, Shape::R] {
-            let fixture = prove_fixture(shape, &"a".repeat(40)).unwrap();
+            let fixture = match shape {
+                Shape::S => s3_fixture().clone(),
+                _ => prove_fixture(shape, &"a".repeat(40)).unwrap(),
+            };
             let report = census(shape, &fixture).unwrap();
             assert_eq!(report["native_verified"], true);
             assert_eq!(report["counting_native_verified"], true);

@@ -757,6 +757,8 @@ rows and asserts the exact (row, group) set:
 | the chain not started from 2b-ii's reduced opening | `ro_in` only, the query's segment |
 | ro rolled in again after round 0 (native's second-height injection) | `fold` and `final` on the query's rows, plus round 1's `cap` |
 | a final-polynomial coefficient forged consistently (the forgery 2b-i accepts) | `final` only, every row |
+| a middle cell of the final-x chain poked, index untouched | `final_x` only, the query's rows |
+| index bit S_R (the final x's first bit) flipped in the registers alone | `index` on the segment; `final_x` and `s_inv` on the query's rows (both rounds' s⁻¹ read that bit); `bind_child` at the two levels that read it |
 
 For the index-shift negative the expected set is computed from the query's own index
 bits, and the test asserts the shift moves at least one bit; the root check uses the
@@ -770,6 +772,16 @@ replica (inverse-DFT folds, constant-chain s⁻¹ and x, the lab's Merkle replay
 reaches the same values, the same Horner result and the same cap entries. The toy
 proof itself passed `p3_uni_stark::verify` when it was built. The honest test also
 runs a SAT scan, checks degree ≤ 3 and pins the toy layout to `price::query_phase`.
+
+**The production schedule on a real S3 proof.** The toy folds on `[4, 1]` (two
+rounds). A second test runs the AIR on the real hiding S3 proof's schedule — four
+rounds of arity 16, paths 15/11/7/3, 4,096 rows — for 2 of its 43 queries. It takes
+the census test's S3 proof (`f2::s3_fixture`, now a `OnceLock` both tests share, so
+CI still proves S3 once per test binary), replays FRI with p3's own challenger and the
+reduced openings with 2b-ii's sequential replica, checks p3's commit-phase MMCS,
+`fold_row` chain and final check against the circuit replica, runs a SAT scan, and
+refuses a value poked between rounds with exactly `fold` + `select` on the query's
+rows.
 
 ### Dimensions **[P, source-derived]**
 
@@ -821,20 +833,30 @@ the code, because nothing yet forces the seams.
 
 No local tests, proofs or benchmarks were run. The local preflight was
 `cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
-in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: six in
-`fold.rs` and one in `price.rs`, seven in all. **[P, pending CI]**: against 2b-ii's
-pending total of 2,782, that is 2,789 passed, 0 failed, 15 ignored.
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: eight
+in `fold.rs` and one in `price.rs`, nine in all. **[P, pending CI]**: against 2b-ii's
+pending total of 2,782, that is 2,791 passed, 0 failed, 15 ignored.
 
-Expected new-test runtime **[P]** is 5–30 s on the Graviton lane. The proof and the
-2a export are shared with 2b-i's and 2b-ii's fixtures (one per test binary). The
-rest is 43 native query chains (two MMCS checks and two `fold_row` each), about ten
-512 × 4,147 traces, one SAT scan, about ten parallel full-trace violation scans, and
-one symbolic degree pass.
+Expected new-test runtime **[P]** is 5–30 s on the Graviton lane for the toy tests.
+The proof and the 2a export are shared with 2b-i's and 2b-ii's fixtures (one per test
+binary). The rest is 43 native query chains (two MMCS checks and two `fold_row` each),
+about twelve 512 × 4,147 traces, one SAT scan, about twelve parallel full-trace
+violation scans, and one symbolic degree pass. The S3 test adds **no prove**: the S3
+proof (≈ 26 s, ≈ 14 GiB peak on the rig, ≈ 2.7× the time on Graviton) was already
+built once by the census test and is now shared. Its own work is an FS replay, two
+reduced openings, two 4,096 × 4,657 traces (~76 MB each), one SAT scan and one
+violation scan: **≈ 5–20 s, < 1 GiB above the shared proof [P]**. Whichever of the two
+tests runs first pays for the prove.
 
 Unverified, most likely to break first:
 
 1. The inverse-DFT fold against `fold_row`, in particular the bit-reversed sibling
-   order and the s⁻¹ exponent. The honest test compares both for all 43 queries.
+   order and the s⁻¹ exponent. The toy test compares both for all 43 queries, but
+   only on the toy's `[4, 1]` schedule. On the production schedule (four rounds of
+   arity 16) the comparison, the satisfaction check and one negative cover **2 of the
+   43 queries of one S3 proof**; P3's arity-2 fifth round and R's arity-8 last round
+   (the only carry-lane leaf) are exercised only through `price::query_phase`'s
+   counts, never through the AIR.
 2. Exact (row, group) sets, above all the cascading ones (sibling swap, index shift,
    roll-in). An extra group fails loudly; the fix is to name the extra row, not to
    weaken the assertion.
