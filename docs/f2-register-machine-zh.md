@@ -35,7 +35,8 @@ input、constant、add、subtract、negate、multiply、inverse；padding 有独
 - Padding 强制 A/B/C 为零并保持寄存器。最后一条指令之后必有终止行，
   因此最终写入不会逃过 transition 约束。
 
-这里的输入是**组件公共值**，尚不是经认证的 PCS/Fiat–Shamir 连线。
+这里的输入是**组件公共值**，尚不是经认证的 PCS/Fiat–Shamir 连线
+（下文 F2b-2a 在测试组件里补上了这层绑定，FRI 那一半仍未做）。
 该组件证明固定程序在声明输入上的执行，不证明输入来自某个 proof、不证明标为
 `Public` 的源已经接到原交易 PV，也不证明 challenge 来自 transcript。
 这些接入绑定仍然需要实现。
@@ -78,3 +79,142 @@ degree、每个结果 limb、操作数读取、写入目标、不读不写的存
 组合及目标机器内存。`full_ood_air_checked`、`pcs_input_bindings_complete`、
 `complete_verifier_layout`、`memory_gate_pass` 均保持 false。
 不修改 transaction AIR、共识参数、proof fixture、lockfile 或部署。
+
+## F2b-2a：输入绑定到 transcript
+
+F2b-2a 把参考执行器的公共 limb 输入，换成在电路内绑定到一份**重放的**
+Fiat–Shamir transcript 上的输入。这份 transcript 来自一个真实的 **hiding**
+uni-stark proof，绑定范围一直到 opened values 被吸收为止。它仍然是只用于测试的组件
+（`crates/qlab-bench/src/f2/ood/bind.rs`），和参考 AIR 一样逐行扫描，不做 prove。
+fixture 是一个两列、degree 3 的玩具 AIR，在测试里用 L2 lane 加固定种子的 hiding
+config 现场生成 proof，所以 CI 每次重放的都是同一份 transcript。仓库里不提交 fixture 文件。
+
+### 绑定了什么
+
+同一组行上放了三样东西：Keccak lane（原版 p3-keccak-air，经 m4skel 的
+`LaneBuilder` 接入，每个置换 24 行）、sponge 与 Fiat–Shamir 绑定，以及寄存器执行器。
+
+- **Sponge。** 每个置换的第 0 步那一行带着本块的消息位 `M` 和上一个输出的 rate
+  位 `S`，preimage 逐 limb 等于 `M xor S`。块在 flush 内部时 `S` 取上一置换的输出，
+  flush 的第一块则 `S` 为零；capacity 或者沿用，或者从零开始。哪个置换开启一次 flush，
+  由周期选择列定死，证明者没有选择余地。
+- **Transcript 顺序**（已对照 p3-uni-stark 0.6.1 `verifier.rs` 和 p3-fri
+  `two_adic_pcs.rs` 核对）：F0 = committed degree bits ‖ original degree bits ‖
+  preprocessed 宽度 0 ‖ trace cap ‖ PVs，随后抽 α；F1 = D0 ‖ quotient cap ‖
+  randomizer cap，随后抽 ζ；F2 = D1 ‖ randomizer opening（4 个扩展域值）‖ trace local ‖
+  trace next ‖ quotient chunks。randomizer opening 参与哈希，但不接入执行器，
+  因为它不出现在 OOD 等式里。`zeta_next` 用的是原始域 N（trace 提交在 2N 上），
+  执行器的 next-point 输出固定为 `g_N · ζ`。
+- **每个块的每个 rate 字都有绑定**：元数据和填充对常量，cap 按 16 位 limb 对外层
+  公共值，内层 PV 对外层 PV，opened value 对执行器输入，链接前缀在 flush 接缝处用
+  状态相等来约束。
+- **Fiat–Shamir 抽样。** 第 j 次抽样读 digest 的第 31−4j … 28−4j 字节（challenger
+  从输出缓冲区尾部往前弹），截成 31 位，≥ p 就拒绝。拒绝位由逆元见证的判零约束
+  唯一确定；再用 one-hot 选择把第 k 个**被接受**的抽样值放进第 k 个 limb。
+  被拒的抽样不推进任何东西，和原生的重抽行为一致。执行器的 `Alpha`、`Zeta`
+  输入分别等于两个 digest 行上选出的抽样值。
+- **执行器输入。** `Public(i)` 等于外层 PV i，外层 PV i 又等于其 F0 字乘 R⁻¹；
+  `Alpha`/`Zeta` 来自抽样；`Local`/`Next`/`Quotient` 等于各自 F2 字乘 R⁻¹。
+  最后一行把 residual 固定为零，把 next-point 固定为 `g_N · ζ`。
+- **输出。** F2 的 digest D2 以 16 个公共 limb 的形式公开。fri_alpha 由它导出，
+  F2b-2b 从这里接手。
+
+### 两个陷阱
+
+1. **Montgomery 字。** challenger 序列化用的是 `to_unique_u32`，也就是 Monty
+   内部表示 `R·v mod p`。M4 之所以可以全程带着 R 因子，是因为它算的每个等式对
+   opened values 都是线性的。OOD 等式不是（玩具 AIR 的 `x·y·y + x` 对 R 不齐次），
+   所以每个 opened value 和内层 PV 都以 `R⁻¹ · word` 接入。challenge 由
+   `from_canonical_unchecked` 产生，**不带** R 因子（已在 `serializing_challenger.rs`
+   核对）。对应的负例把带 R 的值接进执行器，在 `bind_opened` 处被拒；同时断言
+   这组带 R 输入下 DAG 的 residual 不为零。
+2. **不能用随机线性组合做等式。** 如果用随机线性组合把执行器输入绑到字流上，
+   就需要一个外层证明者事先猜不到的 challenge。内层 proof 的 challenge 在外层 trace
+   选定之前就已知；p3-uni-stark 0.6.1 又是单阶段的，没有外层 challenge 可用。所以这里
+   每条绑定都是确定性的同行相等：保持列在所有行上取同一个值，在承载该字的第 0 步
+   行上等于 `R⁻¹ · word`，执行器的 input 指令读的也是这些保持列。
+
+**规范性。** 一个字有 32 位，而域元素小于 p，所以 `v` 和 `v + p` 都满足
+`R⁻¹ · word = v`。每个域元素字（内层 PV 和全部 opened values）都带一个 `< p`
+比较器：第 31 位为零，并且不能同时满足"第 24..30 位全为 1"和"第 0..23 位非零"。
+cap、digest 和常量按 16 位 limb 比较，本身就是精确的。别名负例把一个 opened value
+编码成 `word + p`，只有这个比较器能拦住它。
+
+### 复用了什么，没复用什么
+
+复用：通过 `m4skel::LaneBuilder` 接入的 p3-keccak-air，`m4gaterec::keccakf`/`digest_of`，
+以及参考执行器的约束核心（`machine::eval_machine`，现在两个组件共用）。没有复用的是
+M4 gate 矩形本身：它写死在旧的非 hiding 配置上（固定 2^16 行、`N_CAPS`/`FLUSH_BYTES`
+常量、三组 opened values、没有 randomizer cap），它的抽样 gadget 和规范性比较器也都
+接在那套布局的列上。F2b-2a 按同样的判定条件写了窄版实现。规范性判定用的是
+"第 24..30 位 popcount = 7"的判零，不是 M4 那种分级 7 位 AND。
+
+**与任务书的偏差：用保持列，不用序言。** 任务书建议把输入读取重排成按 transcript
+顺序的序言，再用同行相等绑定。这一版改为把每个执行器输入放在四列里，这四列在所有
+行上取同一个值。绑定同样是确定性的，而且不用改调度。代价是每个输入 4 列（玩具 AIR
+为 160 列）。这**不代表**对生产布局的任何判断。
+
+### 约束分组与测试
+
+约束按 18 个具名分组依次求值（`keccak`、`bits`、`absorb`、`chain_state`、
+`flush_chain`、`bind_const`、`bind_cap`、`bind_inner_pv`、`canonical`、`digest_out`、
+`fs_reject`、`fs_select`、`fs_bind`、`bind_opened`、`in_public`、`in_hold`、`machine`、
+`machine_out`）。测试在 symbolic builder 上计数，把每个约束编号映射到分组；每个负例都在
+该分组所在的行上断言违反落在哪个分组：
+
+| 负例 | 拒绝位置 |
+|---|---|
+| ζ 的某个 limb 错（执行器重算） | `fs_bind`，ζ 的 digest 行 |
+| α 错（执行器重算） | `fs_bind`，α 的 digest 行 |
+| 换一个 ζ，重解 quotient 使 residual 为零，重建 F2/D2 | 只有 `fs_bind`；最后一行干净 |
+| 跳过一个被接受的抽样 | `fs_select`，不是 `fs_bind` |
+| 先吸收 randomizer cap 再吸收 quotient cap，完整自洽的重放 | 只有 `bind_cap`，F1 第一块；ζ 行和最后一行都干净 |
+| 只改 transcript 里的一个 opened value，执行器不动 | `bind_opened` |
+| 改一个 trace-next 值，执行器重算 | `machine_out`（residual 固定为零）；F2 各行干净 |
+| 改一个 quotient limb，执行器重算（residual 非零） | `machine_out` |
+| 按 R 缩放接入（漏了 R⁻¹） | `bind_opened` |
+| 把 opened value 编码为 `word + p` | 只有 `canonical` |
+| 伪造 F0 元数据字（log_h），完整自洽的重放 | 只有 `bind_const`；α/ζ 行和最后一行干净 |
+| 吸收的内层 PV 与声明的不同，完整自洽的重放 | 只有 `bind_inner_pv` |
+| 把内层 PV 编码为 `word + p` | 只有 `canonical` |
+
+诚实用例还把重放结果和原生 p3 challenger 交叉核对：α、ζ 必须一致，D2 的第一次抽样
+必须等于 verifier 的 fri_alpha，这就把 F2 消息的顺序钉死了。随后做一次全量 SAT 扫描，
+并检查最大约束 degree ≤ 3 **[P，由 CI 检查]**。
+
+### 尺寸
+
+玩具 transcript 的尺寸 **[P，源码推导]**：F0/F1/F2 共 3 + 5 + 5 = 13 个 lane 置换
+（312 行）。宽度 = 2,633（Keccak lane）+ 2 × 1,088（M 位和 S 位）+ 68（规范性）
++ 72（八次抽样）+ 4I（保持的输入，玩具 AIR 的 I = 40）+ 12 + 4R（执行器）。
+高度 = max(next_power_of_two(24 × 置换数), next_power_of_two(K + 1))。
+
+### ROM 编码成本
+
+Price 模式下 `ood_arithmetic.rom_encoding` 紧挨着 `register_schedule`，给出执行器 ROM
+（W_rom 列 × H 行）两种编码的成本 **[P]**，代码里不做取舍：
+
+- **周期列**：在 ζ 处求值需要 W_rom·H 次扩展域乘加，没有 PCS 成本；
+- **提交的 preprocessed 列**：F0 多一个 256 字节的 cap，F2 多 16·W_rom 字节的 opening，
+  每个 query 多 ceil((W_rom + 4)/34) 次叶子置换和一条 input path（分别给出每 query 值和
+  × 43 的总值），外加 W_rom 个 fri_alpha 项和 W_rom 次 DAG 输入读取。
+
+### 尚未绑定（F2b-2b）
+
+fri_alpha、FRI 的各个 beta 和 commit 阶段的 cap、PoW、query 下标、reduced opening、
+加盐的 input-Merkle 叶子和路径，以及 final polynomial。**F2b-2a 没有任何约束把 opened
+values 和已提交的 cap 联系起来**，那一半从 D2 开始。若某个抽样窗口需要补充（超过八次
+抽样，每个 challenge 的概率约 1e-9），则无法满足；这是完备性缺口，不会导致误接受。
+`pcs_input_bindings_complete`、`full_ood_air_checked`、`complete_verifier_layout`、
+`memory_gate_pass` 均保持 **false**。
+
+### 验证
+
+本地没有运行测试、生成 proof 或跑 benchmark。本地预检只有 `cargo check`、限定范围的
+Clippy 和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`bind.rs` 六个、
+`price.rs` 一个，相对基线分支共七个 **[P，待 CI]**。预计新测试在 Graviton lane 上总耗时
+不超过 30 秒 **[P]**：一次玩具 hiding proof，约十一个稠密 trace（约 512–1,024 行 ×
+5.4k 列），一次全量扫描，每个负例只扫单行。尚未验证、按最可能先出问题排序：重放与原生
+challenger 的交叉核对（抽样字节序、cap 序列化）；symbolic 与 debug 两种 builder 的
+约束编号计数不一致；玩具 AIR 高度很小（log 4）时 hiding PCS 的表现。
+
