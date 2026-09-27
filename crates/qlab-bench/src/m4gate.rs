@@ -11,7 +11,7 @@
 //! until 2026-07-31.** Issue #78's class-(2) audit found four columns that
 //! constraints *read* but nothing *determines*; three were confirmed by
 //! execution (`i78_*`/`gate_neg_asm_*` tests below). SCR now has explicit
-//! capture-or-hold constraints; finding 4 remains open.
+//! capture-or-hold constraints; consumed words now have sponge bindings.
 //! **A determined column is not a bound value** — read finding 1's and
 //! finding 4's rows together before concluding anything about the value
 //! pipeline:
@@ -19,9 +19,9 @@
 //! | column | state |
 //! |---|---|
 //! | `FSFULL` (2924) | **FIXED** (issue #78 finding 3): bool + per-perm hold + pinned to `FSGATE@row15`, `:3114`. Was a free witness; `cfull ≡ 0` was reachable and the refill guard vacuous. |
-//! | `ASM0`/`ASM1` (3318/3319) | **DETERMINED** (issue #78 finding 1): capture-row pin + pending-row hold, 4 constraints, `:3389`. Was limbs 0–1 of *every* consumed value with no pin, no carry, not even a boolean. `gate_neg_asm_free_witness` (was SAT, now UNSAT) and `gate_neg_asm_gap8_hole` hold the evidence. **This did not close the value pipeline** — see the `W0C`/`W1C` row: the consumed value is now identically four transcript word cells, and on the dup chain none of the four is sponge-bound. |
-//! | `SCR` (3443…) | **Capture-or-hold constrained** (finding 2): each slot carries outside its leaf-fold, higher-fold, or reduced-opening write rows. `gate_neg_scr_no_hold` inverts the historical SAT witness; wide/interior negatives cover the same gap. This is not a claim that finding 4 or full recursive soundness is closed. |
-//! | `W0C`/`W1C` (2657/2658) | **OPEN** (finding 4), and **it is now the whole gap**: pinned to the sponge on F0 perms only — see the scope note at `:2646`. Since finding 1's fix routes limbs 0–1 through the capture row's `W0C`/`W1C`, **all four** limbs of every consumed dup value are these columns, and on the dup chain / final-poly flush / query leaf absorbs nothing pins them. So a prover still chooses every consumed value; what changed is that closing finding 4 would now close all four limbs instead of two. |
+//! | `ASM0`/`ASM1` (3318/3319) | **DETERMINED** (issue #78 finding 1): capture-row pin + pending-row hold, 4 constraints, `:3389`. Was limbs 0–1 of *every* consumed value with no pin, no carry, not even a boolean. `gate_neg_asm_free_witness` (was SAT, now UNSAT) and `gate_neg_asm_gap8_hole` hold the evidence. The consumed value is identically four transcript word cells; finding 4 now binds those cells to the sponge. |
+//! | `SCR` (3443…) | **Capture-or-hold constrained** (finding 2): each slot carries outside its leaf-fold, higher-fold, or reduced-opening write rows. `gate_neg_scr_no_hold` inverts the historical SAT witness; wide/interior negatives cover the same gap. This is not a claim of full recursive soundness. |
+//! | `W0C`/`W1C` (2657/2658) | **Sponge-bound on value-bearing perms** (finding 4): direct recovery on first observation blocks, refills, first duplicate block and query leaf absorbs; XOR recovery on subsequent observation blocks (except original F2) and duplicate blocks. Original F2 interior words are unused; the duplicate chain is digest-compared to F2. Component regression tests distinguish this binding from downstream counter-pressure. Full quotient/AIR verification is still absent. |
 //!
 //! A reader who greps this header for reassurance should stop at the table.
 //!
@@ -1923,6 +1923,92 @@ impl VerifierGateAir {
         Self { n_children: 2, log_height: 19, ..Self::new_with_shape(GateShape::wide()) }
     }
 
+    /// Word-source gates for every value-bearing sponge permutation. All terms
+    /// are linear: xsel is already constrained to phd*(1-cmpc) + obs_xor.
+    /// Subtracting it makes dup block 0 linear without another witness column.
+    fn word_recovery_gates<AB: AirBuilder>(
+        &self,
+        cv: impl Fn(usize) -> AB::Expr,
+    ) -> (AB::Expr, AB::Expr) {
+        let fb = &self.consts.flush_blocks;
+        let mut obs_direct = AB::Expr::ZERO;
+        let mut obs_xor = AB::Expr::ZERO;
+        for (f, &blocks) in fb.iter().enumerate() {
+            obs_direct += cv(self.layout.shsel + shsel_index(fb, f, 0));
+            // F2's original interior blocks have no routed words: its duplicate
+            // chain recovers those values and is digest-compared to the original.
+            if f != 2 {
+                for b in 1..blocks {
+                    obs_xor += cv(self.layout.shsel + shsel_index(fb, f, b));
+                }
+            }
+        }
+        let query_absorb = (R_ABS_F34..=R_ABS_C30)
+            .map(|r| cv(self.layout.rsel + r as usize))
+            .fold(AB::Expr::ZERO, |a, e| a + e);
+        let gxor = cv(self.layout.xsel);
+        let gdir = obs_direct + cv(self.layout.refsel) + cv(self.layout.phd) - gxor.clone()
+            + obs_xor
+            + query_absorb;
+        (gdir, gxor)
+    }
+
+    /// The same 140 recovery constraints formerly gated on F0 alone. Kept as
+    /// one component so regression tests can isolate this binding from the
+    /// downstream accumulator/ASM constraints that already reject lone pokes.
+    fn eval_word_recovery<AB: AirBuilder>(&self, builder: &mut AB, gdir: AB::Expr, gxor: AB::Expr)
+    where
+        AB::F: Field,
+    {
+        let main = builder.main();
+        let cur = main.current_slice();
+        let cv = |i: usize| -> AB::Expr { cur[i].into() };
+        let sf = |r: usize| cv(r);
+        let c = |x: u32| AB::Expr::from(AB::F::from_u32(x));
+        // 17 rows x 4 u16 limbs cover the whole 68-limb keccak rate; row r
+        // hosts limbs 4r..4r+4 = u32 words 2r (limbs 0,1) and 2r+1 (2,3).
+        const RATE_ROWS: usize = 17;
+        let rowmux = |base: usize, j: usize| -> AB::Expr {
+            (0..RATE_ROWS)
+                .map(|r| sf(r) * cv(base + 4 * r + j))
+                .fold(AB::Expr::ZERO, |a, e| a + e)
+        };
+        let pmux = |j: usize| rowmux(pcol(0), j);
+        let omux = |j: usize| rowmux(self.layout.oreg, j);
+        let recomp = |base: usize, j: usize| -> AB::Expr {
+            (0..16)
+                .map(|i| cv(base + 16 * j + i) * c(1 << i))
+                .fold(AB::Expr::ZERO, |a, e| a + e)
+        };
+        // XOR-recovered message limb (deg 2): Σ (p + o − 2·p·o)·2^i.
+        let xor_limb = |j: usize| -> AB::Expr {
+            (0..16)
+                .map(|i| {
+                    let p = cv(self.layout.pbit + 16 * j + i);
+                    let o = cv(self.layout.obit + 16 * j + i);
+                    (p.clone() + o.clone() - p * o * c(2)) * c(1 << i)
+                })
+                .fold(AB::Expr::ZERO, |a, e| a + e)
+        };
+        for j in 0..4 {
+            // Unconditional booleans: off the XOR rows the fill leaves these
+            // columns zero (trap 3 — new/at-last-constrained columns must be
+            // zeroed outside their region), so these hold trivially there.
+            for i in 0..16 {
+                builder.assert_bool(cv(self.layout.pbit + 16 * j + i));
+                builder.assert_bool(cv(self.layout.obit + 16 * j + i));
+            }
+            builder.assert_zero(gxor.clone() * (pmux(j) - recomp(self.layout.pbit, j)));
+            builder.assert_zero(gxor.clone() * (omux(j) - recomp(self.layout.obit, j)));
+        }
+        for (wc, lo) in [(self.layout.w0c, 0usize), (self.layout.w1c, 2usize)] {
+            builder.assert_zero(
+                gxor.clone() * (cv(wc) - xor_limb(lo) - xor_limb(lo + 1) * c(1 << 16)),
+            );
+            builder.assert_zero(gdir.clone() * (cv(wc) - pmux(lo) - pmux(lo + 1) * c(1 << 16)));
+        }
+    }
+
     /// Build a verifier gate for an arbitrary inner-proof `shape`, deriving the
     /// column layout, query program, and field constants from it (slice 1b-2:
     /// all three are now shape-parametrized, so `new_with_shape(wide())` is
@@ -2706,77 +2792,11 @@ where
             let fb = &self.consts.flush_blocks;
             let n_f0 = fb[0];
             let f0sel = |b: usize| cv(self.layout.shsel + shsel_index(fb, 0, b));
-            // 🔴 SCOPE — READ THIS BEFORE TRUSTING `w0c`/`w1c` ANYWHERE ELSE.
-            //
-            // The two gates below are F0's `shsel` columns and NOTHING ELSE, so
-            // the word-recovery constraints in this block pin `w0c`/`w1c` on
-            // F0's absorbing perms ONLY. On every other absorbing perm those
-            // columns remain exactly as they were before D3 — READ by the asm
-            // pipeline (e.g. `pzacc += preg·w0c`) but pinned to the sponge input
-            // by nothing:
-            //   * the F2 duplicate chain (the zeta openings the fold pipeline
-            //     consumes),
-            //   * the final-poly flush,
-            //   * the per-query leaf absorb blocks.
-            //
-            // This is deliberate (D3's spec is the F0 binding; issue #24) and it
-            // is the trap that comes with a partial fix: after D3 a reader greps
-            // `w0c`, finds constraints, and concludes it is pinned — generally.
-            // It is not. Unconstrained-everywhere is a gap; constrained-in-one-
-            // place-and-looking-general is worse, because the reader stops
-            // looking.
-            //
-            // The gap is issue #78's class (2) ("referenced but under-
-            // determined"), including the verified gate-widening correspondence
-            // and the counter-pressure that makes single-word tampering already
-            // UNSAT. Whether a COORDINATED tamper is caught is open and
-            // deliberately unclaimed here — that is #78's reachability triage.
-            let gdir = f0sel(0);
-            let gxor = (1..n_f0).map(&f0sel).fold(AB::Expr::ZERO, |a, e| a + e);
-            // 17 rows x 4 u16 limbs cover the whole 68-limb keccak rate; row r
-            // hosts limbs 4r..4r+4 = u32 words 2r (limbs 0,1) and 2r+1 (2,3).
-            const RATE_ROWS: usize = 17;
-            let rowmux = |base: usize, j: usize| -> AB::Expr {
-                (0..RATE_ROWS)
-                    .map(|r| sf(r) * cv(base + 4 * r + j))
-                    .fold(AB::Expr::ZERO, |a, e| a + e)
-            };
-            let pmux = |j: usize| rowmux(pcol(0), j);
-            let omux = |j: usize| rowmux(self.layout.oreg, j);
-            let recomp = |base: usize, j: usize| -> AB::Expr {
-                (0..16)
-                    .map(|i| cv(base + 16 * j + i) * c(1 << i))
-                    .fold(AB::Expr::ZERO, |a, e| a + e)
-            };
-            // XOR-recovered message limb (deg 2): Σ (p + o − 2·p·o)·2^i.
-            let xor_limb = |j: usize| -> AB::Expr {
-                (0..16)
-                    .map(|i| {
-                        let p = cv(self.layout.pbit + 16 * j + i);
-                        let o = cv(self.layout.obit + 16 * j + i);
-                        (p.clone() + o.clone() - p * o * c(2)) * c(1 << i)
-                    })
-                    .fold(AB::Expr::ZERO, |a, e| a + e)
-            };
-            for j in 0..4 {
-                // Unconditional booleans: off the XOR rows the fill leaves these
-                // columns zero (trap 3 — new/at-last-constrained columns must be
-                // zeroed outside their region), so these hold trivially there.
-                for i in 0..16 {
-                    builder.assert_bool(cv(self.layout.pbit + 16 * j + i));
-                    builder.assert_bool(cv(self.layout.obit + 16 * j + i));
-                }
-                builder.assert_zero(gxor.clone() * (pmux(j) - recomp(self.layout.pbit, j)));
-                builder.assert_zero(gxor.clone() * (omux(j) - recomp(self.layout.obit, j)));
-            }
-            for (wc, lo) in [(self.layout.w0c, 0usize), (self.layout.w1c, 2usize)] {
-                builder.assert_zero(
-                    gxor.clone() * (cv(wc) - xor_limb(lo) - xor_limb(lo + 1) * c(1 << 16)),
-                );
-                builder.assert_zero(
-                    gdir.clone() * (cv(wc) - pmux(lo) - pmux(lo + 1) * c(1 << 16)),
-                );
-            }
+            // Issue #78 finding 4: recover all consumed sponge words, including
+            // the duplicate chain, final-poly flush and query leaf absorbs.
+            // The linear gates preserve the degree-3 budget (rowmux is degree 2).
+            let (gdir, gxor) = self.word_recovery_gates::<AB>(&cv);
+            self.eval_word_recovery(builder, gdir, gxor);
             // Per-child pv half select for the interior (`chi` = 0 across child
             // L's rows, 1 across child R's — the same running selector the cap
             // comparison uses). Inert (unread) for narrow / single-wide.
@@ -3460,15 +3480,11 @@ where
             // Both are `when_transition`; a pending capture on the last row
             // would escape, and the structure test asserts there is none.
             //
-            // 🔴 WHAT THIS DOES NOT DO. The consumed value is now IDENTICALLY
-            // the four transcript word cells of its two rows —
-            // (w0c,w1c)@capture as limbs 0-1, (w0c,w1c)@consume as limbs 2-3 —
-            // and on the dup chain NONE of those four is pinned to the sponge
-            // (finding 4, `:2666`; D3 binds `w0c`/`w1c` on F0 perms only). So
-            // this block removes a degree of freedom from the WITNESS and
-            // changes nothing about which VALUES a prover may claim. What it
-            // buys is that finding 4's fix becomes sufficient for all four
-            // limbs; before it, pinning the words would have closed only two.
+            // The consumed value is identically the four transcript word cells
+            // of its two rows: (w0c,w1c)@capture are limbs 0-1 and
+            // (w0c,w1c)@consume are limbs 2-3. Finding 4's word recovery now
+            // binds both rows to the sponge. The hold here remains necessary:
+            // recovery alone would not carry limbs 0-1 across pending rows.
             // -----------------------------------------------------------------
             {
                 let mut t = builder.when_transition();
@@ -7034,6 +7050,11 @@ mod tests {
             ("narrow", VerifierGateAir::new()),
             ("interior", VerifierGateAir::new_interior()),
         ] {
+            let recovery = WordRecovery { air: &air, f0_only: false };
+            let recovery_cs = get_symbolic_constraints::<Val, _>(
+                &recovery, AirLayout::from_air::<Val>(&recovery),
+            );
+            assert_eq!(recovery_cs.len(), 140, "word recovery adds no constraints");
             let layout = AirLayout::from_air::<Val>(&air);
             let cs = get_symbolic_constraints::<Val, _>(&air, layout);
             let max = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
@@ -7624,6 +7645,156 @@ mod tests {
         eprintln!("GATE_WIDTH total: {GATE_WIDTH}");
     }
 
+    /// Isolate the recovery component: a lone word poke is already UNSAT in
+    /// the full historical AIR because its arithmetic consumers push back.
+    /// The F0-only reference below distinguishes the newly added sponge bind.
+    struct WordRecovery<'a> {
+        air: &'a VerifierGateAir,
+        f0_only: bool,
+    }
+
+    impl<F: Field> BaseAir<F> for WordRecovery<'_> {
+        fn width(&self) -> usize {
+            self.air.layout.gate_width
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for WordRecovery<'_>
+    where
+        AB::F: Field,
+    {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let cur = main.current_slice();
+            let cv = |i: usize| -> AB::Expr { cur[i].into() };
+            let (gdir, gxor) = if self.f0_only {
+                let fb = &self.air.consts.flush_blocks;
+                let sel = |b| cv(self.air.layout.shsel + shsel_index(fb, 0, b));
+                (
+                    sel(0),
+                    (1..fb[0]).map(sel).fold(AB::Expr::ZERO, |a, e| a + e),
+                )
+            } else {
+                self.air.word_recovery_gates::<AB>(cv)
+            };
+            self.air.eval_word_recovery(builder, gdir, gxor);
+        }
+    }
+
+    /// Reuse the real traces already allocated by the SAT tests. Check the
+    /// gate classification for every child perm and exercise the component on
+    /// every distinct observation/direct/XOR/query-role-and-batch class. Only
+    /// two rows are copied per probe; no extra wide trace or prove is needed.
+    fn check_word_recovery(
+        air: &VerifierGateAir,
+        trace: &RowMajorMatrix<Val>,
+        schedules: &[&Schedule],
+    ) {
+        let w = air.layout.gate_width;
+        let fixed = WordRecovery {
+            air,
+            f0_only: false,
+        };
+        let old = WordRecovery { air, f0_only: true };
+        let mut offset = 0;
+        for (child, sched) in schedules.iter().enumerate() {
+            let (_, infos) = lane_plan(sched, &air.shape);
+            let mut representatives = std::collections::BTreeMap::new();
+            for (pi, info) in infos.iter().enumerate() {
+                // This classification follows the recorder's permutation role,
+                // independently of the AIR's materialized selector algebra.
+                let (key, direct, xor, f0) = match info {
+                    PInfo::Obs { flush, block } => (
+                        (0, *flush, usize::from(*block > 0)),
+                        *block == 0,
+                        *block > 0 && *flush != 2,
+                        *flush == 0,
+                    ),
+                    PInfo::Refill => ((1, 0, 0), true, false, false),
+                    PInfo::Dup { block } => (
+                        (2, usize::from(*block > 0), 0),
+                        *block == 0,
+                        *block > 0,
+                        false,
+                    ),
+                    PInfo::Query { slot, .. } => {
+                        let desc = air.program[*slot];
+                        let role = desc & 0xf;
+                        (
+                            (3, role as usize, ((desc >> 4) & 0x3f) as usize),
+                            (R_ABS_F34..=R_ABS_C30).contains(&role),
+                            false,
+                            false,
+                        )
+                    }
+                };
+                let row = offset + 24 * pi;
+                for r in [0, 23] {
+                    let cv = |col| trace.values[(row + r) * w + col];
+                    let gates = air.word_recovery_gates::<DebugConstraintBuilder<'_, Val>>(cv);
+                    assert_eq!(
+                        gates,
+                        (Val::from_bool(direct), Val::from_bool(xor)),
+                        "child {child} perm {pi} row {r}: {info:?}"
+                    );
+                }
+                representatives.entry(key).or_insert((row, direct, xor, f0));
+            }
+            // The duplicate and final-poly classes must actually be exercised.
+            assert!(representatives.contains_key(&(2, 0, 0)));
+            assert!(representatives.contains_key(&(2, 1, 0)));
+            assert!(representatives.contains_key(&(0, air.consts.flush_blocks.len() - 1, 1)));
+            for (key, (row, direct, xor, f0)) in representatives {
+                // First/last rate rows and first/last non-rate rows: catch rate
+                // indexing and ensure off-rate word cells stay zero when gated.
+                for r in [0, 16, 17, 23] {
+                    let source = &trace.values[(row + r) * w..(row + r + 1) * w];
+                    let mut pair = RowMajorMatrix::new(source.repeat(2), w);
+                    assert!(
+                        !unsat_under(&fixed, &pair, &[]),
+                        "honest recovery child {child}, class {key:?}, row {r}"
+                    );
+                    for col in [air.layout.w0c, air.layout.w1c] {
+                        pair.values[col] += Val::ONE;
+                        assert_eq!(
+                            unsat_under(&fixed, &pair, &[]),
+                            direct || xor,
+                            "word binding child {child}, class {key:?}, row {r}, col {col}"
+                        );
+                        assert_eq!(
+                            unsat_under(&old, &pair, &[]),
+                            f0,
+                            "historical F0-only component control"
+                        );
+                        pair.values[col] -= Val::ONE;
+                    }
+                    if xor {
+                        for col in [air.layout.pbit, air.layout.obit + 63] {
+                            let before = pair.values[col];
+                            pair.values[col] = Val::ONE - before;
+                            assert!(
+                                unsat_under(&fixed, &pair, &[]),
+                                "XOR decomposition must bind"
+                            );
+                            assert_eq!(unsat_under(&old, &pair, &[]), f0);
+                            pair.values[col] = before;
+                        }
+                    }
+                }
+            }
+            offset += 24 * infos.len();
+        }
+        // Padding and the interior merge lane are not word-consuming regions.
+        for row in offset..trace.height() {
+            let cv = |col| trace.values[row * w + col];
+            assert_eq!(
+                air.word_recovery_gates::<DebugConstraintBuilder<'_, Val>>(cv),
+                (Val::ZERO, Val::ZERO),
+                "off-program word gate at row {row}"
+            );
+        }
+    }
+
     /// Positive: the rectangle accepts the genuine M3 consensus proof.
     #[test]
     fn gate_rectangle_satisfies() {
@@ -7631,6 +7802,7 @@ mod tests {
         let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
+        check_word_recovery(&VerifierGateAir::new(), &trace, &[sched]);
     }
 
     /// Whether the narrow gate refuses `trace` (see [`unsat_under`]).
@@ -8094,6 +8266,9 @@ mod tests {
             &trace,
             &meta.opvs,
         );
+        check_word_recovery(
+            &VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &[sched],
+        );
     }
 
     /// Slice 1b-5: the shape-tied tamper negatives, re-derived for the WIDE
@@ -8226,6 +8401,7 @@ mod tests {
         let (sl, sr, ol, or) = wide_shared_distinct();
         let (trace, meta) = build_interior_trace(sl, sr, ol, or, &GateShape::wide(), 0);
         check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+        check_word_recovery(&VerifierGateAir::new_interior(), &trace, &[sl, sr]);
     }
 
     /// 2d-4 (PR-gate): per-child + distinct tamper negatives. Build ONE interior
@@ -8712,19 +8888,11 @@ mod tests {
     /// consumed limb did not move with it (**SAT**); now the pin ties them and
     /// it is UNSAT.
     ///
-    /// ⚠️ **READ THIS BEFORE CITING THAT UNSAT FOR ANYTHING.** It is NOT
-    /// evidence that `W0C` became bound. As PR #144's P5, this check's SAT was
-    /// the resident proof that `W0C` on the dup chain is free (#78 finding 4);
-    /// the pin makes an inconsistent `W0C`/`ASM` pair detectable, so the same
-    /// tamper now fails for a different reason and **that evidence is no longer
-    /// resident anywhere** — it lives in PR #144's body and in the module
-    /// header's finding-4 row. The tamper that WOULD still witness the freedom
-    /// (move `W0C` at the capture row *and* `ASM` along the pending chain
-    /// consistently) cannot be run: it changes the consumed value, which feeds
-    /// `pzacc += preg·v`, and `fill_derived` has no register repropagate — so
-    /// it is UNSAT on the `pzacc` recurrence regardless of whether the value is
-    /// bound. That is PR #144's P6 trap met from the other side. A resident
-    /// freedom witness for finding 4 needs the register repropagate first.
+    /// This remains an ASM regression, not discriminating evidence for the
+    /// sponge binding: downstream `pzacc += preg*v` already rejects a lone
+    /// word poke even with the old F0-only recovery gates. `check_word_recovery`
+    /// now isolates finding 4 and compares the old and expanded gates on real
+    /// rows. Neither test claims to construct a complete forged proof.
     #[test]
     fn gate_neg_asm_free_witness() {
         let _g = heavy_lock();
