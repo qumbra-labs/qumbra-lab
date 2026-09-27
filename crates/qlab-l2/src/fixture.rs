@@ -1,4 +1,5 @@
-//! The deterministic shape-S, shape-P and shape-R instances — one source.
+//! The deterministic shape-S, shape-P and shape-R instances and the claim —
+//! one source.
 //!
 //! These are the instances W3 measured (`qlab-bench l2shape`, lab #700,
 //! `docs/w3-run{1..4}.md`), moved here unchanged so the bench, this crate's
@@ -17,6 +18,7 @@ use qlab_air::l2::{
 use qlab_air::l2::{RegistryLeaf, MODE_HYBRID};
 use qlab_air::l2p::{build_bucket_l2p, issuer_key_of, L2PBucketInstance, PolicyAsset, VPublic};
 use qlab_air::l2p::{build_bucket_l2p_with_witnesses, derive_rkm_l2};
+use qlab_air::claim::{build_claim, rkm_burn, BurnNote, ClaimCredit, ClaimInstance};
 use qlab_air::l2r::{build_shape_r, registry_opening, L2ShapeRInstance, RegistryWrite, SeedOutput};
 
 /// The fixtures' xorshift64 stream (the bench's, verbatim).
@@ -208,4 +210,23 @@ pub fn shape_r_at(log_height: usize) -> L2ShapeRInstance {
 /// Shape R at its own height (2^18).
 pub fn shape_r() -> L2ShapeRInstance {
     shape_r_at(crate::LOG_HEIGHT_R)
+}
+
+/// The L2 id every claim fixture deposits into.
+pub const CLAIM_L2_ID: u64 = 1;
+
+/// The claim (F1, lab #756) at `log_height`: a 250,000-unit burn into L2
+/// [`CLAIM_L2_ID`], against a fabricated tree holding it alone, credited as
+/// 250,000 − fee in asset 0, fee [`crate::claim::FEE_TIER_CLAIM_PLACEHOLDER`].
+pub fn claim_at(log_height: usize) -> ClaimInstance {
+    let mut r = Rnd(SEED ^ 0xc1);
+    let note = BurnNote { value: 250_000, rkm: rkm_burn(CLAIM_L2_ID), rho: r.d4(), rseed: r.d4() };
+    let r_v = r.d4();
+    let credit = ClaimCredit { rkm: r.d4(), rseed: r.d4() };
+    build_claim(log_height, CLAIM_L2_ID, &note, &r_v, &credit, crate::claim::FEE_TIER_CLAIM_PLACEHOLDER)
+}
+
+/// The claim at its own height (2^17).
+pub fn claim() -> ClaimInstance {
+    claim_at(crate::claim::LOG_HEIGHT_CLAIM)
 }

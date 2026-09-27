@@ -15,6 +15,7 @@
 // query). Raise it so the gate rectangle compiles.
 #![recursion_limit = "512"]
 
+mod claimshape;
 mod disclosure;
 mod geometry;
 mod l2shape;
@@ -941,10 +942,28 @@ fn main() {
             l2shape::run_l2shape(&power, shape, only, pcs);
             return;
         }
+        "claimshape" => {
+            // F1 (lab #756): `--layout` and/or `--lane b4|b16 [--pcs hiding|nonhiding]`.
+            let lane = args.iter().position(|a| a == "--lane").and_then(|i| args.get(i + 1)).map(String::as_str);
+            let pcs = match args.iter().position(|a| a == "--pcs").and_then(|i| args.get(i + 1)).map(String::as_str) {
+                None => l2shape::PcsKind::Hiding,
+                Some(p) => l2shape::PcsKind::parse(p).unwrap_or_else(|| {
+                    eprintln!("claimshape: unknown --pcs `{p}`; expected hiding|nonhiding");
+                    std::process::exit(2);
+                }),
+            };
+            let layout = args.iter().any(|a| a == "--layout");
+            if !layout && lane.is_none() {
+                eprintln!("claimshape: `--layout` and/or `--lane b4|b16` is required");
+                std::process::exit(2);
+            }
+            claimshape::run_claimshape(&power, layout, lane, pcs);
+            return;
+        }
         "zkpeak" => {
             let case_pos = args.iter().position(|a| a == "--case");
             let Some(case) = case_pos.and_then(|i| args.get(i + 1)) else {
-                eprintln!("zkpeak: `--case l1|p19|p [--phases] [--rc N]` is required");
+                eprintln!("zkpeak: `--case l1|p19|p|claim [--phases] [--rc N]` is required");
                 std::process::exit(2);
             };
             let rc = args

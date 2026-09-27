@@ -6,6 +6,7 @@
 //! /usr/bin/time -l qlab-bench zkpeak --case l1   # the 2×2 bucket at CONSENSUS_CFG
 //! /usr/bin/time -l qlab-bench zkpeak --case p19  # CANARY: shape P's AIR chain-only at 2^19
 //! /usr/bin/time -l qlab-bench zkpeak --case p    # shape P (fixture) at the L2 lane, b4
+//! /usr/bin/time -l qlab-bench zkpeak --case claim # the F1 claim (fixture) at the L2 lane, b4
 //! ```
 //!
 //! **Order l1 → p19 → p.** The W3 canary rule: start `p` (2^20) only if the
@@ -101,6 +102,17 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let bytes = bincode::serialize(&proof).expect("bincode").len();
             (format!("shape P @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, bytes)
         }
+        ("claim", None) => {
+            // F1 (lab #756): the claim at the L2 lane (b4, 2^17).
+            let inst = qlab_l2::fixture::claim();
+            let t = Instant::now();
+            let (pvs, proof) = qlab_l2::claim::prove_claim(&inst);
+            let secs = t.elapsed().as_secs_f64();
+            let tier = qlab_l2::claim::FEE_TIER_CLAIM_PLACEHOLDER;
+            let ok = qlab_l2::claim::verify_claim(&pvs, &proof, qlab_l2::fixture::CLAIM_L2_ID, tier).is_ok();
+            let bytes = bincode::serialize(&proof).expect("bincode").len();
+            (format!("claim @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::claim::LOG_HEIGHT_CLAIM), secs, ok, bytes)
+        }
         ("p19", None) => {
             use p3_air::BaseAir;
             use qlab_air::l2p::L2ShapePAir;
@@ -121,7 +133,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             )
         }
         (other, None) => {
-            eprintln!("zkpeak: unknown --case `{other}`; expected l1|p19|p");
+            eprintln!("zkpeak: unknown --case `{other}`; expected l1|p19|p|claim");
             std::process::exit(2);
         }
     };

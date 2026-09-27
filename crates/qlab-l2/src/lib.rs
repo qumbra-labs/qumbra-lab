@@ -17,6 +17,9 @@
 //!   struct field, `program`, so the verifier's AIR is a pure function of the
 //!   shape ([`verifier_air_s`], [`verifier_air_p`], [`verifier_air_r`]; lab
 //!   #704 P13, locked by `l2_verifier_air_is_instance_independent`).
+//! - **the claim** — the bridge's claim proof (F1, lab #756): [`claim`]'s
+//!   `prove_claim` / `verify_claim`, the verifier's burn-address and tariff
+//!   checks. Not a [`Shape`].
 //! - **fixtures** — the deterministic instances W3 measured ([`fixture`]).
 //!
 //! Workspace dependencies are exactly `qlab-air` + `qlab-consensus`
@@ -43,6 +46,7 @@ pub use qlab_air::l2r::{
     PV_CM_SEED as PV_R_CM_SEED, PV_NEW_ROOT as PV_R_NEW_ROOT, PV_OLD_ROOT as PV_R_OLD_ROOT,
 };
 
+pub mod claim;
 pub mod digest;
 pub mod fixture;
 
