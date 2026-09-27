@@ -3,6 +3,9 @@
 // F2b-2a: the machine's inputs bound to a replayed hiding transcript (test-only AIR).
 #[cfg(test)]
 mod bind;
+// F2b-2b-iii: the FRI query phase — commit-phase leaves, folds, final polynomial (test-only AIR).
+#[cfg(test)]
+mod fold;
 // F2b-2b-i: the FRI Fiat–Shamir continuation from D2 (test-only AIR).
 #[cfg(test)]
 mod fri_fs;

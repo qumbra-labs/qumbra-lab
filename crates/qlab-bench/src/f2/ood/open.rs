@@ -63,9 +63,9 @@
 //! bound to the query's public index by a segment selector, so periodic
 //! columns grow with roles, levels and queries, never with perms.
 //!
-//! **NOT bound here (2b-iii):** the commit-phase openings, the folds and the
-//! final-polynomial evaluation. The reduced openings are held cells and
-//! public outputs for that component.
+//! **NOT bound here:** the commit-phase openings, the folds and the
+//! final-polynomial evaluation — 2b-iii's `fold.rs`, which takes the reduced
+//! openings (held cells and public outputs here) as its public inputs.
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField32, TwoAdicField};
 use p3_keccak_air::NUM_ROUNDS;
@@ -180,7 +180,7 @@ impl Geom {
 
 /// One 32-bit word of a leaf sponge's rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Word {
+pub(super) enum Word {
     /// Column `c` of matrix `m`: a canonical Monty word, `R^-1 * word`
     /// accumulated into the reduced opening.
     Row(usize, usize),
@@ -195,7 +195,7 @@ enum Word {
 
 /// Leaf words of one batch: row ‖ salt per matrix, packed two words per
 /// u64, padded to whole blocks of `RATE_WORDS`.
-fn leaf_words(mats: usize, cols: usize) -> Vec<Word> {
+pub(super) fn leaf_words(mats: usize, cols: usize) -> Vec<Word> {
     let mut words = Vec::new();
     for m in 0..mats {
         words.extend((0..cols).map(|c| Word::Row(m, c)));
@@ -1288,7 +1288,7 @@ fn native_reduced(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::f2::ood) mod tests {
     use std::collections::BTreeSet;
     use std::ops::Range;
     use std::sync::OnceLock;
@@ -1313,7 +1313,8 @@ mod tests {
     type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
     /// The consensus input MMCS, rebuilt from the same parts
     /// (`qlab-consensus` `ValMmcs`); verification never draws from the RNG.
-    type NativeMmcs = MerkleTreeHidingMmcs<
+    /// The commit-phase MMCS is `ExtensionMmcs` over this same hiding type.
+    pub(in crate::f2::ood) type NativeMmcs = MerkleTreeHidingMmcs<
         [Val; p3_keccak::VECTOR_LEN],
         [u64; p3_keccak::VECTOR_LEN],
         SerializingHasher<U64Hash>,
@@ -1324,7 +1325,7 @@ mod tests {
         SALT_ELEMS,
     >;
 
-    fn native_mmcs() -> NativeMmcs {
+    pub(in crate::f2::ood) fn native_mmcs() -> NativeMmcs {
         let h = U64Hash::new(KeccakF {});
         NativeMmcs::new(
             SerializingHasher::new(h),
@@ -1411,6 +1412,68 @@ mod tests {
                 honest,
             }
         })
+    }
+
+    /// What F2b-2b-iii's tests take from this fixture: the covered query
+    /// slots, this component's honest public values and the positions of its
+    /// reduced-opening outputs (the seam 2b-iii's inputs are compared
+    /// against), those outputs, and the native reduced opening of every one
+    /// of the 43 queries (sequential `open_input` replica).
+    pub(in crate::f2::ood) struct Handoff {
+        pub(in crate::f2::ood) covered: Vec<usize>,
+        pub(in crate::f2::ood) ro: Vec<E>,
+        pub(in crate::f2::ood) ro_all: Vec<E>,
+        pub(in crate::f2::ood) public: Vec<Val>,
+        pub(in crate::f2::ood) ro_at: Vec<usize>,
+    }
+
+    pub(in crate::f2::ood) fn handoff() -> Handoff {
+        let fx = fixture();
+        let (l, g) = (&fx.air.layout, &fx.air.layout.geom);
+        let ro_all = (0..fx.all.len())
+            .map(|q| {
+                native_reduced(
+                    g,
+                    fx.sh.proof,
+                    &fx.all[q],
+                    fx.full.indices[q],
+                    fx.full.zeta,
+                    fx.full.fri_alpha,
+                )
+                .unwrap()
+            })
+            .collect();
+        Handoff {
+            covered: fx.covered.clone(),
+            ro: fx.honest.held.ro.clone(),
+            ro_all,
+            public: fx.air.public_values(&fx.inb, &fx.honest.held.ro),
+            ro_at: (0..l.queries).map(|q| l.ro_pv(q)).collect(),
+        }
+    }
+
+    /// The native reduced opening of `query` of any hiding proof on the L2
+    /// lane (the sequential `open_input` replica), for 2b-iii's production-
+    /// schedule test on a real S3 proof.
+    pub(in crate::f2::ood) fn reduced_opening(
+        proof: &Proof<Config>,
+        pvs: &[Val],
+        width: usize,
+        log_height: usize,
+        query: usize,
+        index: usize,
+        fri_alpha: E,
+    ) -> E {
+        let dims = Dims {
+            width,
+            pv_len: pvs.len(),
+            log_height,
+        };
+        let chunks = proof.opened_values.quotient_chunks.len();
+        let geom = Geom::new(dims, chunks, &L2_CFG_PROVISIONAL).unwrap();
+        let zeta = proof_inputs_dims(dims, proof, pvs).unwrap().zeta;
+        let op = Opening::from_proof(proof, query, &geom).unwrap();
+        native_reduced(&geom, proof, &op, index, zeta, fri_alpha).unwrap()
     }
 
     fn phase_of(fx: &Fixture, constraint: usize) -> &'static str {

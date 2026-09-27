@@ -525,9 +525,8 @@ Az/Bz 共 terms 次。
 ### 尚未绑定（2b-iii）
 
 commit 阶段的打开（兄弟值、FRI 的 Merkle 路径）、用 β 做的折叠，以及 final polynomial 的
-求值。reduced opening 已经为那个组件导出。在 2b-iii 用上它们之前，
-`pcs_input_bindings_complete` 保持 **false**，`complete_verifier_layout` 和
-`memory_gate_pass` 也一样。
+求值。reduced opening 已经为那个组件导出。*（这三项现在由下面的 2b-iii 绑定；它补齐了什么、
+还缺什么，见那一节的“还缺什么”。）*
 
 ### 验证
 
@@ -552,3 +551,180 @@ commit 阶段的打开（兄弟值、FRI 的 Merkle 路径）、用 β 做的折
    或者被改动的保持列触发 `hold`），会明确失败而不是悄悄通过；正确的修法是把多出来的行写进
    预期，而不是放宽断言。
 4. 表里手算的 S/P/R 数字：`input_openings_split_the_census` 把它们钉住，算错会让 CI 失败。
+
+## F2b-2b-iii：FRI 折叠
+
+F2b-2b-iii 把 FRI 的 query 阶段搬进电路。对实例覆盖的每个 query，它逐轮用该轮的 cap
+认证加盐的叶子，检查当前值就是该 query 所在位置上那个已提交的值，用这一轮的 β 折叠整组，
+最后要求 final polynomial 在终点处的取值等于最后一次折叠的结果。和前几片一样，这是仅用于
+测试的组件（`crates/qlab-bench/src/f2/ood/fold.rs`），逐行扫描，从不 prove。它的公共输入
+全都是别的组件的公共输出：commit 阶段的 cap、每一轮的 β、final polynomial 和下标来自 2b-i，
+reduced opening 来自 2b-ii。
+
+### 原生事实（已对照源码）
+
+除非另行注明，行号均指 p3 0.6.1 的 `p3-fri`。
+
+- **单个 query 的顺序**（`verifier.rs:448-584`，`verify_query`）。链条从全局最大高度上的
+  reduced opening 出发（`verifier.rs:470-480`）。每一轮：在已被前几轮右移过的下标上取
+  `index_in_group = index % arity`（`508`）；把当前值插到这个位置，其余位置按顺序填入兄弟值，
+  得到 evals（`509-517`）；下标右移本轮的 log-arity（`529`）；commit 阶段的 MMCS 在右移后的
+  下标处核对 evals（`531-541`）；然后 `fold_row`（`543-549`）。换成电路的说法：第 r 轮用
+  query 下标的第 S_r..S_r+a 位定位置，用第 S_{r+1} 位往上定路径和折叠点，S_r 是前几轮 arity
+  之和。
+- **reduced opening 的注入**（`verifier.rs:554-565`）。折叠之后，如果有输入**恰好提交在折叠后
+  的高度**，原生代码会加上 β^arity · ro。hiding 配置把三个批次都提交在同一个高度上（见 2b-ii），
+  所以唯一的 reduced opening 就是起点那一个，之后没有任何注入；每个 query 只有一个 `ro`，
+  从结构上就排除了第二个高度。
+- **折叠公式**（`two_adic_pcs.rs:110-133`，`lagrange_interpolate_at` `221-258`）。arity 为 n
+  的一组值在 xs[i] = s · ω_n^{rev_a(i)}（按位反转）上的插值多项式在 β 处的取值，
+  s = ω_{h+a}^{rev_h(index′)}，index′ 是右移后的下标，h 是折叠后的 log 高度。原生用重心公式，
+  并在 β 恰好等于某个 x 时提前返回；插值多项式在那一点的值也正是它，所以两者处处一致。
+- **终点**（`verifier.rs:394-410`）。x = ω_lde^{rev_lde(index >> S_R)}，**没有陪集平移**
+  （输入那边的 x 是 GENERATOR · …，这里不是）。按 Horner 从最高次系数算起，结果必须等于
+  最后一次折叠的值。
+- **commit 阶段的叶子也加盐。** `ChallengeMmcs = ExtensionMmcs<Val, E, ValMmcs>`
+  （qlab-consensus `lib.rs:90`），而 `ValMmcs` 就是 hiding MMCS。`ExtensionMmcs` 把 n 个值按
+  基底顺序拆成 4n 个基域 limb（`extension_mmcs.rs:77-82`），`hiding_mmcs.rs:175` 再接上
+  `SALT_ELEMS` = 4 个盐。sponge、打包和路径与输入 MMCS 完全相同（见 2b-ii）。arity 16 时叶子是
+  68 个字，正好两个覆盖块；arity 2 时是 12 个字，一块装下；R 的最后一轮（arity 8）是 36 个字，
+  第二块要带上一块输出的尾部 lane。
+
+### 绑定了什么
+
+- **叶子和路径**，直接复用 2b-ii 的 gadget 和叶子字布局。叶子里的行字是规范的 Monty 字，
+  等于 R 乘以本轮组寄存器 G 的值（`leaf_bind`）；盐字自由。每一层子节点放左边还是右边，由
+  下标绑定所钉住的**同一组**下标位单元决定。cap 表项总是下标最高三位
+  （S_{r+1} + path_r = lde − 3），所以 cap 的 one-hot 与 2b-ii 同形。每一轮的根等于**这一轮**
+  commit 阶段 cap 里被选中的那一项，cap 取自 2b-i 吸收过的公共值。
+- **位置。** 对第 S_r..S_r+a 位逐位搭一层 one-hot（每个单元 degree 2）。选中的那一项必须等于
+  当前值（`select`）。
+- **折叠，写成逆 DFT。** p(β) = Σ_k d_k u^k，其中 d_k = n⁻¹ Σ_i ω_n^{−rev_a(i)·k} G[i]
+  （基域常数，对 G 是线性的），u = β · s⁻¹。s⁻¹ 是一串由下标位挑选的**常数**因子
+  ω_{h+a}^{−2^{h−1−t}} 的连乘，所以**这个组件里没有任何求逆 witness**：1/n 是常数，s⁻¹ 是
+  常数因子链。u 的各次幂放在单元里，u^{k+1} = u^k · u。
+- **final polynomial。** x 是第 S_R..lde−1 位上的常数因子链；Horner 单元
+  h_k = h_{k+1} · x + c_k 作用在保持列里的 final polynomial 上；h_0 等于最后一次折叠的值
+  （`final`）。
+- **寄存器。** 每个 query 的寄存器在它那一段里保持不变（`ctx_hold`），所以叶子 step-0 行上
+  绑定的那组值，就是每一行拿去折叠的那组值。所有约束的 degree 都 ≤ 3 **[P，由 CI 检查]**。
+
+### 与 2b-i、2b-ii 的衔接
+
+β 和 final polynomial 放在保持列里，在第 0 行绑定到各自的公共输入（`inbound`）。下标位和链条
+的起点在该 query 那一段的每一行上钉住（`index`、`ro_in`）。2b-i 的
+`fri_transcript_rejects_final_poly_forgeries` 表明：一个被一致地吸收并导出的 final polynomial
+在 transcript 层面是合法的；拒绝它的地方就在本组件。接缝测试逐段比对公共值：cap、β、
+final polynomial 和下标对照 2b-i 对同一个 proof 的公共值，reduced opening 对照 2b-ii 的输出。
+
+### 约束分组与测试
+
+共 24 个具名分组：`keccak`、`bits`、`absorb`、`capacity`、`bind_zero`、`bind_carry`、
+`bind_child`、`cap`、`canonical`、`leaf_bind`、`index`、`cap_select`、`position`、`ro_in`、
+`select`、`s_inv`、`fold_pow`、`fold`、`final_x`、`horner`、`final`、`inbound`、`hold`、
+`ctx_hold`。fixture 沿用 2b-i 和 2b-ii 的：同一个固定种子的 log 8 玩具 proof，同样覆盖两个
+query。每个负例都扫描**全部**行，并断言违反的（行，分组）集合与预期完全相同：
+
+| 负例 | 拒绝位置 |
+|---|---|
+| 改 commit 阶段的一个盐 | 只有 `cap`，该轮的 cap 行 |
+| 改两个兄弟值，使折叠结果**不变**（w_i·δ_i + w_j·δ_j = 0，p3 的 `fold_row` 也确认），另选新盐 | 只有 `cap`，第 0 轮的 cap 行 |
+| 交换两个兄弟值，链条重算 | 第 0、1 轮的 `cap`，外加该 query 各行的 `final` |
+| 第 1 轮沿用第 0 轮的下标右移量（位置、路径、s⁻¹ 和折叠都随之重算） | 错位的位确实不同时的 `position` / `s_inv`，放置方向变了的那几层的 `bind_child`，根变了时的 `cap`，以及 `final` |
+| 第 1 轮用第 0 轮的 β 折叠，各次幂和折叠结果与之自洽 | 该 query 各行的 `fold_pow` 和 `final` |
+| 改动两轮之间的当前值 | 该 query 各行的 `fold` 和 `select` |
+| 链条不从 2b-ii 的 reduced opening 出发 | 只有 `ro_in`，该 query 那一段 |
+| 第 0 轮之后再注入一次 ro（原生代码对第二个高度才会这么做） | 该 query 各行的 `fold` 和 `final`，外加第 1 轮的 `cap` |
+| 一致地伪造一个 final polynomial 系数（2b-i 接受的那种伪造） | 只有 `final`，所有行 |
+| 改终点 x 链中间的一个单元，下标不动 | 只有 `final_x`，该 query 各行 |
+| 只在寄存器里翻转下标第 S_R 位（终点 x 的第一位） | 该段的 `index`；该 query 各行的 `final_x` 和 `s_inv`（两轮的 s⁻¹ 都读这一位）；读这一位的两层上的 `bind_child` |
+
+下标右移那个负例的预期集合，是按该 query 自己的下标位算出来的；测试会断言这次错位至少
+改变了一位。根是否改变，以原生重放为准。
+
+**原生交叉核对**（诚实用例），覆盖**全部 43 个** query：p3 的 commit 阶段 MMCS
+（`verify_batch`）在右移后的下标处接受每一轮的那组值；从 2b-ii 的原生 reduced opening 出发、
+用 p3 自己的 `fold_row` 走完的链条，终点等于 final polynomial 在终点处的取值（也就是 `verify`
+做的那项检查）；电路的复现（逆 DFT 折叠、常数链的 s⁻¹ 和 x、lab 的 Merkle 重放）得到相同的
+中间值、相同的 Horner 结果和相同的 cap 表项。玩具 proof 在生成时已经通过了
+`p3_uni_stark::verify`。诚实用例还做一次 SAT 扫描、检查 degree ≤ 3，并把玩具布局钉到
+`price::query_phase` 上。
+
+**真实 S3 proof 上的生产折叠方案。** 玩具按 `[4, 1]` 折叠（两轮）。另有一个测试在真实
+hiding S3 proof 的方案上跑这个 AIR：四轮、每轮 arity 16，路径 15/11/7/3 层，4,096 行，覆盖
+43 个 query 中的 2 个。它用的是 census 测试那份 S3 proof（`f2::s3_fixture`，现在是两个测试
+共用的 `OnceLock`，所以 CI 每个测试二进制仍只 prove 一次 S3），用 p3 自己的 challenger 重放
+FRI，用 2b-ii 的逐项实现重算 reduced opening，把 p3 的 commit 阶段 MMCS、`fold_row` 链和终点
+检查与电路复现逐一比对，做一次 SAT 扫描，并断言改动两轮之间的当前值时恰好只触发该 query
+各行的 `fold` 和 `select`。
+
+### 尺寸 **[P，源码推导]**
+
+玩具（lde 11，arity 先 16 后 2，路径 4 层和 3 层，终点域 2^6，16 个系数，2 个 query）：每个
+query 2 + 4 + 1 + 3 = 10 个置换，共 20 个、480 行，高度 512。宽度 4,147 = 2,633（Keccak）+
+1,088（M）+ 68（规范性）+ 286（寄存器）+ 72（保持列：2 个 β 加 16 个系数）。periodic 列
+15 个，公共值 338 个。
+
+`f2price` 现在按形状给出 43 个 query 下的 `query_phase`（`price::query_phase`，由
+`query_phase_splits_the_census` 钉住）：
+
+| 形状 | arity | 每 query 叶子 / 压缩 | 叶子 / 压缩 × 43 | lane 行数（补齐后） | 列数 | periodic | PV |
+|---|---|---|---|---|---|---|---|
+| S（lde 22） | 16, 16, 16, 16 | 8 / 36 | 344 / 1,548 | 45,408（2^16） | 4,657 | 74 | 807 |
+| P（lde 23） | 16, 16, 16, 16, 2 | 9 / 43 | 387 / 1,849 | 53,664（2^16） | 4,690 | 77 | 939 |
+| R（lde 21） | 16, 16, 16, 8 | 8 / 33 | 344 / 1,419 | 42,312（2^16） | 4,573 | 74 | 807 |
+
+**与 census 对账。** S 在 43 个 query 时给出 **344** 个叶子置换和 **1,548** 个路径置换，正是
+census 实测的 FRI 份额（1,419 − 1,075 和 3,999 − 2,451）。测试对三种形状都断言：输入份额加上
+这一份，等于 census 几何给出的每 query 总数。
+
+**每个 query 的折叠算术量**（arity 16）：29 次扩域乘法（u² … u¹⁵ 以及 Σ d_k u^k）、17 次扩域
+乘基域（u 和位置选择）、逆 DFT 的线性组合（常数系数）、s⁻¹ 上 h 次基域乘法；之后 x 用 6 次基域
+乘法，Horner 15 步。没有求逆 witness。
+
+### 还缺什么
+
+2a + 2b-i + 2b-ii + 2b-iii 现在覆盖了原生 hiding PCS verifier 对单个叶子 proof 所做的每一项
+检查，但**各自在自己的 AIR 里**，还不是一个 verifier：
+
+1. **组合。** 四个组件只通过公共值相连，它们之间的等式（D2；cap、ζ、z 值；fri_alpha、β、
+   final polynomial、下标；reduced opening）目前由测试框架核对，而不是由电路强制。完整的单叶子
+   verifier 需要二选一：把四个组件放进同一个电路，或者加一个显式的接缝核对组件，用约束强制
+   这些等式。
+2. **query 覆盖。** 各实例只覆盖 43 个 query 中的 2 个。在完整 S3 尺寸下带上全部 43 个 query
+   的约束满足性，是 F2b-4 的验收项。
+3. **quotient 恒等式与 periodic 求值**（`full_ood_air_checked`）以及 R-PV，属于 F2b-3，本片
+   没有涉及。
+
+因此 `pcs_input_bindings_complete`、`full_ood_air_checked`、`complete_verifier_layout` 和
+`memory_gate_pass` 都保持 **false**：接缝还没有被任何约束强制，这几个标志在代码层面没有一个
+真正成立。
+
+### 验证
+
+本地没有跑任何测试、proof 或 benchmark。本地预检为
+`cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
+和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`fold.rs` 八个、`price.rs` 一个，
+共九个。**[P，待 CI]**：以 2b-ii 待定的 2,782 为基线，应为 2,791 项通过、0 失败、15 项忽略。
+
+玩具相关的新测试在 Graviton lane 上预计耗时 5–30 秒 **[P]**。proof 和 2a 的导出与 2b-i、
+2b-ii 的 fixture 共用（每个测试二进制一份）。其余是 43 条原生 query 链（每条两次 MMCS 核对、
+两次 `fold_row`）、约十二个 512 × 4,147 的 trace、一次 SAT 扫描、约十二次并行的全表违反扫描，
+以及一次 symbolic degree 计算。S3 测试**不新增 prove**：S3 proof（在 rig 上约 26 秒、峰值约
+14 GiB，Graviton 上耗时约 2.7 倍）本来就由 census 测试生成一次，现在两者共用。它自己的工作是
+一次 FS 重放、两个 reduced opening、两个 4,096 × 4,657 的 trace（各约 76 MB）、一次 SAT 扫描和
+一次违反扫描：**约 5–20 秒，在共用 proof 之外不到 1 GiB [P]**。两个测试谁先跑，谁承担那次
+prove。
+
+尚未验证，按最可能先出问题排序：
+
+1. 逆 DFT 形式的折叠与 `fold_row` 是否一致，尤其是兄弟值的位反转顺序和 s⁻¹ 的指数。玩具
+   测试对全部 43 个 query 比对两者，但只在玩具的 `[4, 1]` 方案上。在生产方案（四轮 arity 16）
+   上，比对、满足性检查和一个负例只覆盖**一个 S3 proof 的 43 个 query 中的 2 个**；P3 第五轮的
+   arity 2、R 最后一轮的 arity 8（唯一带尾部 lane 的叶子）只经过 `price::query_phase` 的计数，
+   从未经过这个 AIR。
+2. 负例里（行，分组）集合是否精确，尤其是会连锁触发的那几个（交换兄弟值、下标错位、重复注入）。
+   多触发一个分组会明确失败；正确的修法是把多出来的行写进预期，而不是放宽断言。
+3. commit 阶段叶子的序列化（扩域 limb 按基底顺序，然后是盐）。p3 的 `verify_batch` 和
+   “根等于 cap”的断言会暴露不一致。
+4. 手算的 S/P/R 列数、periodic 数和 PV 数：census 拆分测试把它们钉住。
