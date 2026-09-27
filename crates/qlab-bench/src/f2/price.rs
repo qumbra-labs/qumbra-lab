@@ -271,6 +271,87 @@ pub(super) fn input_openings(
         "complete_verifier_layout": false, "memory_gate_pass": false})
 }
 
+/// [P] F2b-2b-iii's query-phase component (`ood/fold.rs`) at `queries`
+/// covered queries, on the L2 lane: per round, the commit-phase leaf perms
+/// and path compressions each query costs, the fold arithmetic, and the
+/// component's dense width, height, periodic and public-value counts.
+/// `fold.rs`'s honest test pins this formula to the toy instance it builds;
+/// `query_phase_splits_the_census` pins the perm counts to the census's FRI
+/// share.
+///
+/// - Leaf perms per round: the arity-n group as 4n base limbs ‖ salt
+///   (`SALT_ELEMS`), two words per u64, 17 u64 per overwrite block (a
+///   multi-block leaf with a short last block carries tail lanes: one
+///   periodic role column).
+/// - Compressions: folded log-height − `CAP_HEIGHT` per round.
+/// - Fold, per round: u = beta * s^-1 (one ext-by-base product), n − 2
+///   extension products for u^2..u^{n-1}, n − 1 for sum d_k u^k, the
+///   inverse-DFT combinations d_k (n^2 ext-by-constant terms, linear), n
+///   ext-by-base products for the position select, and one base product per
+///   s^-1 chain bit. NO inverse witness: 1/n and s^-1 are constants or
+///   constant-factor chains driven by the index bits.
+/// - Final: `log_blowup + log_final_poly_len` base products for x, and
+///   `final_len − 1` Horner steps (ext-by-base product + add).
+/// - Columns: Keccak, 1,088 message bits, 68 canonicity, the query
+///   registers (index bits, 12 cap one-hot, per round 4n group + 2n − 2
+///   position + h s^-1 + 4(n − 1) powers; 4(R + 1) running values; the
+///   final x chain; 4·final_len Horner cells) and the held betas and final
+///   polynomial.
+pub(super) fn query_phase(log_height: usize, queries: usize) -> Value {
+    let cfg = L2_CFG_PROVISIONAL;
+    let lde = lde_log(log_height);
+    let arities = fri_log_arities(lde, &cfg);
+    let final_bits = cfg.log_blowup + cfg.log_final_poly_len;
+    let final_len = 1usize << cfg.log_final_poly_len;
+    let (mut leaf, mut comp, mut carries, mut regs) = (0, 0, 0, 0);
+    let (mut ext_mul, mut ext_by_base, mut chain_mul) = (0, 0, 0);
+    let mut rounds = vec![];
+    let mut height = lde;
+    for &a in &arities {
+        let n = 1usize << a;
+        let folded = height - a;
+        let path = folded - CAP_HEIGHT;
+        let u64s = (4 * n + SALT_ELEMS).div_ceil(2);
+        let blocks = u64s.div_ceil(17);
+        if blocks > 1 && !u64s.is_multiple_of(17) {
+            carries += 1;
+        }
+        leaf += blocks;
+        comp += path;
+        regs += 4 * n + (2 * n - 2) + folded + 4 * (n - 1);
+        ext_mul += (n - 2) + (n - 1);
+        ext_by_base += 1 + n;
+        chain_mul += folded;
+        rounds.push(json!({"log_arity": a, "folded_log_height": folded,
+            "leaf_permutations": blocks, "path_compressions": path}));
+        height = folded;
+    }
+    let r = arities.len();
+    regs += lde + 12 + 4 * (r + 1) + final_bits + 4 * final_len;
+    let held = 4 * r + 4 * final_len;
+    let per_query = leaf + comp;
+    let lane_rows = queries * per_query * 24;
+    let columns = NUM_KECCAK_COLS + 64 * 17 + 2 * 34 + regs + held;
+    let path0 = lde - arities[0] - CAP_HEIGHT;
+    let cap_words = (1usize << CAP_HEIGHT) * 8;
+    json!({"evidence": "P", "source": "F2b-2b-iii layout (ood/fold.rs), source-derived; toy pinned by its tests",
+        "queries": queries, "lde_log_height": lde, "fri_log_arities": arities, "rounds": rounds,
+        "final_log_height": final_bits, "final_poly_len": final_len,
+        "leaf_permutations_per_query": leaf, "path_compressions_per_query": comp,
+        "permutations_per_query": per_query,
+        "leaf_permutations_total": leaf * queries, "path_compressions_total": comp * queries,
+        "lane_rows": lane_rows, "padded_rows": lane_rows.next_power_of_two(),
+        "fold_per_query": {"ext_mul": ext_mul, "ext_by_base_mul": ext_by_base,
+            "s_inverse_chain_base_mul": chain_mul, "final_x_base_mul": final_bits,
+            "horner_ext_by_base_mul": final_len - 1, "inverse_witnesses": 0},
+        "component_columns": columns,
+        "column_split": {"keccak": NUM_KECCAK_COLS, "message_bits": 64 * 17, "canonical": 2 * 34,
+            "query_registers": regs, "held": held},
+        "periodic_columns": 4 + leaf + carries + path0 + r + queries,
+        "public_values": 2 * cap_words * r + 4 * r + 4 * final_len + queries + 4 * queries,
+        "complete_verifier_layout": false, "memory_gate_pass": false})
+}
+
 impl Geometry {
     pub(super) fn report(&self, shape: Shape) -> Value {
         let cfg = L2_CFG_PROVISIONAL;
@@ -356,6 +437,48 @@ mod tests {
         assert_eq!(1075 + 43 * 8, 1419);
         assert_eq!(2451 + 43 * 36, 3999);
         assert_eq!(s["lane_rows"], 84_624);
+    }
+
+    #[test]
+    fn query_phase_splits_the_census() {
+        // The query phase's perms are the census geometry's FRI commit-phase
+        // share, for every shape; with the input share they are the whole
+        // per-query count. At S, 43 queries: the measured 344 leaf / 1,548
+        // path perms (1,419 − 1,075 and 3,999 − 2,451).
+        let cfg = L2_CFG_PROVISIONAL;
+        for (shape, leaf, comp, columns, periodic, pvs) in [
+            (Shape::S, 8, 36, 4_657, 74, 807),
+            (Shape::P, 9, 43, 4_690, 77, 939),
+            (Shape::R, 8, 33, 4_573, 74, 807),
+        ] {
+            let g = geometry(shape, 8);
+            let i = input_openings(shape.width(), shape.log_height(), 8, cfg.num_queries);
+            let q = query_phase(shape.log_height(), cfg.num_queries);
+            assert_eq!(q["fri_log_arities"], json!(g.log_arities));
+            assert_eq!(q["leaf_permutations_per_query"], leaf);
+            assert_eq!(q["path_compressions_per_query"], comp);
+            assert_eq!(comp, g.fri_paths.iter().sum::<usize>());
+            let input = |k: &str| i[k].as_u64().unwrap() as usize;
+            assert_eq!(
+                input("leaf_permutations_per_query_total") + leaf,
+                g.leaf_per_query
+            );
+            assert_eq!(
+                input("path_compressions_per_query") + comp,
+                g.compress_per_query
+            );
+            assert_eq!(q["component_columns"], columns);
+            assert_eq!(q["periodic_columns"], periodic);
+            assert_eq!(q["public_values"], pvs);
+            assert_eq!(q["padded_rows"], 1 << 16);
+            assert_eq!(q["fold_per_query"]["inverse_witnesses"], 0);
+        }
+        let s = query_phase(Shape::S.log_height(), 43);
+        assert_eq!(s["leaf_permutations_total"], 344);
+        assert_eq!(s["path_compressions_total"], 1548);
+        assert_eq!(1075 + 344, 1419);
+        assert_eq!(2451 + 1548, 3999);
+        assert_eq!(s["lane_rows"], 45_408);
     }
 
     #[test]

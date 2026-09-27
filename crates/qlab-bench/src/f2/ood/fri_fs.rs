@@ -53,12 +53,13 @@
 //! folded on another legal schedule is refused: a completeness restriction,
 //! never a false accept, and the honest prover never produces one.
 //!
-//! **NOT bound here (2b-ii/iii):** the input and commit-phase Merkle paths,
-//! salted leaves, the reduced opening, the folds and the final-polynomial
-//! evaluation. A final polynomial the transcript absorbs AND exposes
-//! consistently is accepted by this component — only the query phase can
-//! refuse it (`fri_transcript_rejects_final_poly_forgeries` pins that
-//! boundary). A draw window needing a refill for fri_alpha or a beta (more
+//! **NOT bound here (2b-ii `open.rs`, 2b-iii `fold.rs`):** the input and
+//! commit-phase Merkle paths, salted leaves, the reduced opening, the folds
+//! and the final-polynomial evaluation. A final polynomial the transcript
+//! absorbs AND exposes consistently is accepted by this component — only the
+//! query phase can refuse it (`fri_transcript_rejects_final_poly_forgeries`
+//! pins that boundary; `fri_folds_refuse_the_final_poly_forgery_2b_i_accepts`
+//! is the other side). A draw window needing a refill for fri_alpha or a beta (more
 //! than eight field draws, ~1e-9 per challenge) is unsatisfiable, as in 2a.
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField32};
@@ -804,7 +805,7 @@ pub(in crate::f2::ood) mod tests {
         })
     }
 
-    /// What F2b-2b-ii's tests take from this fixture: the same seeded proof
+    /// What F2b-2b-ii's (and 2b-iii's) tests take from this fixture: the same seeded proof
     /// (one proof and one 22-bit grind per test binary, not two), the query
     /// phase's inputs as this component derives them, and this component's
     /// honest public values with the positions of its fri_alpha and index
@@ -818,6 +819,14 @@ pub(in crate::f2::ood) mod tests {
         pub(in crate::f2::ood) public: Vec<Val>,
         pub(in crate::f2::ood) fri_alpha_at: usize,
         pub(in crate::f2::ood) index_at: Vec<usize>,
+        /// For 2b-iii: every beta and the final polynomial as exported, and
+        /// where the commit-phase caps (inputs), the betas and the final
+        /// polynomial (outputs) sit in `public`.
+        pub(in crate::f2::ood) betas: Vec<E>,
+        pub(in crate::f2::ood) final_poly: Vec<E>,
+        pub(in crate::f2::ood) caps_at: Range<usize>,
+        pub(in crate::f2::ood) betas_at: usize,
+        pub(in crate::f2::ood) final_at: usize,
     }
 
     pub(in crate::f2::ood) fn shared() -> Shared {
@@ -835,6 +844,11 @@ pub(in crate::f2::ood) mod tests {
             public: fx.air.public_values(&fx.data, &cells),
             fri_alpha_at: layout.out_base(),
             index_at: (0..s.queries).map(|i| indices_at + i).collect(),
+            betas: cells.challenges[1..].to_vec(),
+            final_poly: cells.final_poly.clone(),
+            caps_at: layout.cap_base()..layout.out_base(),
+            betas_at: layout.out_base() + D,
+            final_at: layout.out_base() + D * (s.rounds() + 1),
         }
     }
 

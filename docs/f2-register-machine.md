@@ -622,8 +622,8 @@ visible; it is not implemented here.
 
 The commit-phase openings (sibling values, FRI Merkle paths), the folds with β, and
 the final-polynomial evaluation. The reduced openings are exposed for that component.
-`pcs_input_bindings_complete` stays **false** until 2b-iii consumes them, and so do
-`complete_verifier_layout` and `memory_gate_pass`.
+*(2b-iii, below, now binds all three; what that does and does not make complete is
+stated in its "What remains" paragraph.)*
 
 ### Validation
 
@@ -655,3 +655,190 @@ Unverified, most likely to break first:
    weaken the assertion.
 4. The hand-derived S/P/R counts in the table: `input_openings_split_the_census`
    pins them, so an arithmetic slip fails CI.
+
+## F2b-2b-iii: FRI folding
+
+F2b-2b-iii is the FRI query phase, in circuit. For each covered query it
+authenticates every commit round's salted leaf against that round's cap, checks
+that the running value is the committed entry at the query's position, folds the
+group at the round's β, and finally requires the final polynomial, evaluated at the
+final point, to equal the last folded value. Like the earlier slices, it is a
+test-only component (`crates/qlab-bench/src/f2/ood/fold.rs`), scanned row by row and
+never proved. Its public inputs are other components' public outputs: the
+commit-phase caps, every β, the final polynomial and the indices from 2b-i, and the
+reduced openings from 2b-ii.
+
+### Native facts, checked against source
+
+p3 0.6.1, `p3-fri` unless stated otherwise.
+
+- **Order of one query** (`verifier.rs:448-584`, `verify_query`). The chain starts
+  from the reduced opening at the global max height (`verifier.rs:470-480`). For
+  each round: `index_in_group = index % arity` on the index already shifted by the
+  earlier rounds (`508`); evals = the siblings with the running value inserted at
+  that position, siblings filling the other slots in order (`509-517`); the index
+  shifts by the round's log-arity (`529`); the commit-phase MMCS checks evals at the
+  shifted index (`531-541`); then `fold_row` (`543-549`). In circuit terms: round r
+  reads query-index bits S_r..S_r+a for the position and bits S_{r+1}.. for the path
+  and the fold point, with S_r the sum of the earlier arities.
+- **Reduced-opening injection** (`verifier.rs:554-565`). After a fold, native adds
+  β^arity · ro for an input committed **at the folded height**. The hiding config
+  commits all three batches at one height (2b-ii), so the only reduced opening is
+  the starting one: nothing is rolled in later, and the component asserts no
+  other height exists by construction (one `ro` per query).
+- **Fold formula** (`two_adic_pcs.rs:110-133`, `lagrange_interpolate_at`
+  `221-258`). The interpolant at β of the arity-n group at
+  xs[i] = s · ω_n^{rev_a(i)} (bit-reversed), s = ω_{h+a}^{rev_h(index′)}, where
+  index′ is the shifted index and h the folded log-height. Barycentric, with an early
+  return when β equals an x; the interpolant has that value there too, so the two
+  agree everywhere.
+- **Final point** (`verifier.rs:394-410`). x = ω_lde^{rev_lde(index >> S_R)}, **no
+  coset shift** (unlike the input point x = GENERATOR · …). Horner over the final
+  polynomial, highest coefficient first, must equal the last folded value.
+- **Commit-phase leaves are salted.** `ChallengeMmcs = ExtensionMmcs<Val, E, ValMmcs>`
+  (qlab-consensus `lib.rs:90`), and `ValMmcs` is the hiding MMCS. `ExtensionMmcs`
+  flattens the n evals to 4n base limbs in basis order (`extension_mmcs.rs:77-82`),
+  and `hiding_mmcs.rs:175` appends `SALT_ELEMS` = 4 salt. Sponge, packing and path
+  are exactly the input MMCS's (2b-ii). For arity 16 the leaf is 68 words, which is
+  exactly two overwrite blocks; for arity 2 it is 12 words in one block; for R's
+  last round (arity 8) it is 36 words, so its second block carries tail lanes.
+
+### What is bound
+
+- **Leaves and paths**, reusing 2b-ii's gadgets and leaf-word layout. A leaf's row
+  words are canonical Monty words equal to R · G for the round's group registers G
+  (`leaf_bind`); salt words are free. Each level's child sits left or right by the
+  **same** index-bit cells the index binding pins; the cap entry is always the top
+  three index bits (S_{r+1} + path_r = lde − 3), so the cap one-hot is shared with
+  2b-ii's form. Each round's root equals the selected entry of **that round's**
+  commit-phase cap, taken from the public caps 2b-i absorbs.
+- **Position.** A one-hot over bits S_r..S_r+a, built one level per bit (degree 2
+  per cell). The selected group entry equals the running value (`select`).
+- **Fold, as an inverse DFT.** p(β) = Σ_k d_k u^k, where
+  d_k = n⁻¹ Σ_i ω_n^{−rev_a(i)·k} G[i] (base constants, linear in G) and
+  u = β · s⁻¹. s⁻¹ is a product of **constant** factors ω_{h+a}^{−2^{h−1−t}}
+  selected by the index bits, so **there is no inverse witness anywhere in this
+  component**: 1/n is a constant and s⁻¹ is a constant-factor chain. The powers
+  u^k are cells, each u^{k+1} = u^k · u.
+- **Final polynomial.** x is a constant-factor chain on bits S_R..lde−1; Horner
+  cells h_k = h_{k+1} · x + c_k over the held final polynomial; h_0 equals the last
+  folded value (`final`).
+- **Registers.** Each query's registers are constant over its segment
+  (`ctx_hold`), so the group bound on a leaf's step-0 rows is the group every row
+  folds. Every constraint has degree ≤ 3 **[P, guarded in CI]**.
+
+### Composition with 2b-i and 2b-ii
+
+β and the final polynomial are held cells bound to their public inputs on row 0
+(`inbound`). The index bits and the chain's starting value are pinned on every row
+of the query's segment (`index`, `ro_in`). 2b-i's `fri_transcript_rejects_final_poly_forgeries`
+shows that a final polynomial absorbed and exported consistently is transcript-valid;
+this component is where it is refused. The seam test compares the public values slice
+by slice: caps, β, final polynomial and indices against 2b-i's public values of the
+same proof, the reduced openings against 2b-ii's outputs.
+
+### Constraint groups and tests
+
+Twenty-four named groups: `keccak`, `bits`, `absorb`, `capacity`, `bind_zero`,
+`bind_carry`, `bind_child`, `cap`, `canonical`, `leaf_bind`, `index`, `cap_select`,
+`position`, `ro_in`, `select`, `s_inv`, `fold_pow`, `fold`, `final_x`, `horner`,
+`final`, `inbound`, `hold`, `ctx_hold`. The fixture is 2b-i's and 2b-ii's: the same
+seeded log-8 toy proof, the same two covered queries. Every negative scans **all**
+rows and asserts the exact (row, group) set:
+
+| negative | refused at |
+|---|---|
+| a commit-phase salt changed | `cap` only, that round's cap row |
+| two sibling entries poked so the fold is **unchanged** (w_i·δ_i + w_j·δ_j = 0; p3's `fold_row` agrees), a fresh salt | `cap` only, round 0's cap row |
+| two siblings swapped, chain re-derived | `cap` on rounds 0 and 1, plus `final` on the query's rows |
+| round 1 read with round 0's index shift (position, path, s⁻¹ and fold re-derived) | `position` / `s_inv` where the mis-shifted bits differ, `bind_child` at each level whose side moves, `cap` if the root moves, `final` |
+| round 1 folded with round 0's β, powers and fold consistent | `fold_pow` and `final`, on the query's rows |
+| the value between rounds poked | `fold` and `select`, on the query's rows |
+| the chain not started from 2b-ii's reduced opening | `ro_in` only, the query's segment |
+| ro rolled in again after round 0 (native's second-height injection) | `fold` and `final` on the query's rows, plus round 1's `cap` |
+| a final-polynomial coefficient forged consistently (the forgery 2b-i accepts) | `final` only, every row |
+
+For the index-shift negative the expected set is computed from the query's own index
+bits, and the test asserts the shift moves at least one bit; the root check uses the
+native replay.
+
+**Native cross-checks** (honest test), for **all 43** queries: p3's commit-phase
+MMCS (`verify_batch`) accepts every round's group at the shifted index; p3's own
+`fold_row` chain, started from 2b-ii's native reduced opening, ends at the value of
+the final polynomial at the final point (the check `verify` performs); the circuit's
+replica (inverse-DFT folds, constant-chain s⁻¹ and x, the lab's Merkle replay)
+reaches the same values, the same Horner result and the same cap entries. The toy
+proof itself passed `p3_uni_stark::verify` when it was built. The honest test also
+runs a SAT scan, checks degree ≤ 3 and pins the toy layout to `price::query_phase`.
+
+### Dimensions **[P, source-derived]**
+
+Toy (lde 11, arities 16 then 2, paths 4 and 3, final domain 2^6, 16 coefficients,
+2 queries): per query 2 + 4 + 1 + 3 = 10 permutations, 20 in all, 480 rows, height
+512. Width 4,147 = 2,633 (Keccak) + 1,088 (M) + 68 (canonicity) + 286 (registers) +
+72 (held: 2 β + 16 coefficients). There are 15 periodic columns and 338 public
+values.
+
+`f2price` now reports `query_phase` per shape at 43 queries (`price::query_phase`,
+pinned by `query_phase_splits_the_census`):
+
+| shape | arities | leaf / compress per query | leaf / compress × 43 | lane rows (padded) | columns | periodic | PVs |
+|---|---|---|---|---|---|---|---|
+| S (lde 22) | 16, 16, 16, 16 | 8 / 36 | 344 / 1,548 | 45,408 (2^16) | 4,657 | 74 | 807 |
+| P (lde 23) | 16, 16, 16, 16, 2 | 9 / 43 | 387 / 1,849 | 53,664 (2^16) | 4,690 | 77 | 939 |
+| R (lde 21) | 16, 16, 16, 8 | 8 / 33 | 344 / 1,419 | 42,312 (2^16) | 4,573 | 74 | 807 |
+
+**Census cross-check.** S at 43 queries gives **344** leaf and **1,548** path
+permutations, the census's measured FRI share (1,419 − 1,075 and 3,999 − 2,451). The
+test asserts, for all three shapes, that the input share plus this share is the
+census geometry's per-query count.
+
+**Fold arithmetic per query** at arity 16: 29 extension products (u² … u¹⁵ and
+Σ d_k u^k), 17 extension-by-base products (u and the position select), the
+inverse-DFT combinations (linear, constant coefficients), h base products for s⁻¹;
+then 6 base products for x and 15 Horner steps. No inverse witness.
+
+### What remains
+
+2a + 2b-i + 2b-ii + 2b-iii now cover every check the native hiding PCS verifier
+makes for one leaf proof, **each in its own AIR**, but they are not yet one verifier:
+
+1. **Composition.** The four components meet only through public values, and the
+   equalities between them (D2; caps, ζ, z-values; fri_alpha, β, final polynomial,
+   indices; reduced openings) are checked by the test harness, not by a circuit.
+   A complete single-leaf verifier needs either one circuit containing all four
+   or an explicit seam-check component whose constraints force those equalities.
+2. **Query coverage.** The instances cover 2 of 43 queries. Constraint satisfaction
+   with all 43 queries at the full S3 size is an F2b-4 acceptance item.
+3. **The quotient identity and periodic evaluation** (`full_ood_air_checked`) and
+   R-PV are F2b-3 items, untouched here.
+
+`pcs_input_bindings_complete`, `full_ood_air_checked`, `complete_verifier_layout`
+and `memory_gate_pass` therefore stay **false**: none of them is literally true of
+the code, because nothing yet forces the seams.
+
+### Validation
+
+No local tests, proofs or benchmarks were run. The local preflight was
+`cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: six in
+`fold.rs` and one in `price.rs`, seven in all. **[P, pending CI]**: against 2b-ii's
+pending total of 2,782, that is 2,789 passed, 0 failed, 15 ignored.
+
+Expected new-test runtime **[P]** is 5–30 s on the Graviton lane. The proof and the
+2a export are shared with 2b-i's and 2b-ii's fixtures (one per test binary). The
+rest is 43 native query chains (two MMCS checks and two `fold_row` each), about ten
+512 × 4,147 traces, one SAT scan, about ten parallel full-trace violation scans, and
+one symbolic degree pass.
+
+Unverified, most likely to break first:
+
+1. The inverse-DFT fold against `fold_row`, in particular the bit-reversed sibling
+   order and the s⁻¹ exponent. The honest test compares both for all 43 queries.
+2. Exact (row, group) sets, above all the cascading ones (sibling swap, index shift,
+   roll-in). An extra group fails loudly; the fix is to name the extra row, not to
+   weaken the assertion.
+3. The commit-phase leaf serialization (extension limbs in basis order, then salt).
+   p3's `verify_batch` and the root-equals-cap assertion catch a mismatch.
+4. The hand-derived S/P/R column, periodic and PV counts: the census-split test pins
+   them.
