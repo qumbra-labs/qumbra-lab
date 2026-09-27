@@ -1243,6 +1243,10 @@ pub(in crate::f2::ood) mod tests {
         assert!(fx.air.open_route[routed].is_some(), "trace local is routed");
         assert!(fx.air.open_route[random].is_none(), "randomizer is not");
         let (random_perm, _) = layout.find(Word::Opened(Open::Random(2), 1)).unwrap();
+        // F2 opens with the randomizer, so its words sit on F2's first block
+        // — the zeta digest row. That row is the export row here, not a
+        // clean row.
+        assert_eq!(random_perm, fx.air.draw_perm(1));
         for (at, row) in [
             (layout.zeta_base() + 3, 0),
             (layout.opened_base() + 4 * routed + 1, 0),
@@ -1264,7 +1268,9 @@ pub(in crate::f2::ood) mod tests {
                 "{at}: {f:?}"
             );
             for r in [step0_row(fx.air.draw_perm(1)), fx.air.height - 1] {
-                assert!(failing(fx, &bad, r).is_empty(), "{at}: row {r}");
+                if r != row {
+                    assert!(failing(fx, &bad, r).is_empty(), "{at}: row {r}");
+                }
             }
         }
     }
