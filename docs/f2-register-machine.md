@@ -558,6 +558,7 @@ cap entries differ. Every negative scans **all** rows and asserts the exact set 
 | an index bit flipped, placement, x and ro following it | `index` on every row of the segment, plus `cap` on all three batches |
 | wrong cap entry selected | `cap_select` on the query's register rows, plus `cap` on all three batches |
 | a z-value handed to FRI ≠ 2a's export, Az/ro re-derived (a trace value the machine reads, and the randomizer) | `opened_in` only, row 0 |
+| fri_alpha ≠ 2b-i's export, α powers, Az/Bz and ro re-derived | `opened_in` only, row 0 |
 | x from the index **without** bit reversal, inverses and ro re-derived | `x_point` only, on the query's register rows |
 | a reduced opening poked (held cell and output agreeing) | `reduce` only, the segment's last row |
 

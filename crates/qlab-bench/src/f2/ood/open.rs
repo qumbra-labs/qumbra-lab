@@ -1737,6 +1737,17 @@ mod tests {
         );
         assert_ne!(c.build.held.ro[1], fx.honest.held.ro[1]);
         refused_exactly(fx, &c, &rows(ctx_rows(fx, 1), "x_point"));
+        // A different fri_alpha than 2b-i exports, the alpha powers, Az/Bz
+        // and every reduced opening re-derived from it: only the equality to
+        // the export refuses it.
+        let c = claim(
+            fx,
+            |b| b.held.fri_alpha += <E as BasedVectorSpace<Val>>::ith_basis_element(2).unwrap(),
+            |_| {},
+        );
+        assert_ne!(c.build.held.apow[1], fx.honest.held.apow[1]);
+        assert_ne!(c.build.held.ro[0], fx.honest.held.ro[0]);
+        refused_exactly(fx, &c, &[(0, "opened_in")].into());
         // A reduced opening poked, held cell and public output agreeing.
         let end = seg(fx, 0).end - 1;
         let c = claim(fx, |_| {}, |b| b.held.ro[0] += E::ONE);

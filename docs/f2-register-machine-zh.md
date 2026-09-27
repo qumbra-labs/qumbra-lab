@@ -470,6 +470,7 @@ fri_alpha。实例覆盖两个 cap 表项不同的 query。每个负例都扫描
 | 翻转一个下标位，放置方向、x 和 ro 都随之改变 | 该段每一行的 `index`，外加三个批次的 `cap` |
 | 选错 cap 表项 | 该 query 寄存器所在各行的 `cap_select`，外加三个批次的 `cap` |
 | 交给 FRI 的 z 值 ≠ 2a 的导出，Az 和 ro 重算（一个执行器读取的 trace 值，以及 randomizer） | 只有 `opened_in`，第 0 行 |
+| fri_alpha ≠ 2b-i 的导出，α 的各次幂、Az/Bz 和 ro 重算 | 只有 `opened_in`，第 0 行 |
 | 用**未经**位反转的下标算 x，逆元和 ro 重算 | 只有 `x_point`，在该 query 寄存器所在各行 |
 | 改一个 reduced opening（保持列和公共输出一致） | 只有 `reduce`，该段最后一行 |
 
