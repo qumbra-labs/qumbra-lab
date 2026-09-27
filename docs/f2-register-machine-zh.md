@@ -36,7 +36,7 @@ input、constant、add、subtract、negate、multiply、inverse；padding 有独
   因此最终写入不会逃过 transition 约束。
 
 这里的输入是**组件公共值**，尚不是经认证的 PCS/Fiat–Shamir 连线
-（下文 F2b-2a 在测试组件里补上了这层绑定，FRI 那一半仍未做）。
+（下文 F2b-2a 在测试组件里补上了这层绑定，F2b-2b-i 把 transcript 接着推过了 FRI 的全部 challenge；Merkle 和 query 检查仍未做）。
 该组件证明固定程序在声明输入上的执行，不证明输入来自某个 proof、不证明标为
 `Public` 的源已经接到原交易 PV，也不证明 challenge 来自 transcript。
 这些接入绑定仍然需要实现。
@@ -217,4 +217,154 @@ Clippy 和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`bin
 5.4k 列），一次全量扫描，每个负例只扫单行。尚未验证、按最可能先出问题排序：重放与原生
 challenger 的交叉核对（抽样字节序、cap 序列化）；symbolic 与 debug 两种 builder 的
 约束编号计数不一致；玩具 AIR 高度很小（log 4）时 hiding PCS 的表现。
+
+## F2b-2b-i：FRI transcript
+
+F2b-2b-i 把**同一份** Fiat–Shamir transcript 从 F2 往后接着推，覆盖原生 verifier
+抽取的每个 FRI challenge：fri_alpha、每轮 commit 一个 β、query 阶段的 proof-of-work，
+以及每个 query 下标。这一片只管 Fiat–Shamir，不检查 Merkle 路径、reduced opening、
+折叠或 final polynomial 求值，那些归 2b-ii/iii。它和 2a 一样是只用于测试的组件
+（`crates/qlab-bench/src/f2/ood/fri_fs.rs`），逐行扫描，不做 prove。
+
+### 原生顺序（已对照源码）
+
+challenger 是 `SerializingChallenger32<KoalaBear, HashChallenger<u8, Keccak256, 32>>`，
+配置为仓库钉住的 hiding 配置（`qlab-consensus` 的 `make_config_from`；L2 lane
+`L2_CFG_PROVISIONAL` = b4/q43/g22/fp16/a16，`CAP_HEIGHT` 3，rc = 0）。p3-fri 0.6.1 中：
+
+1. `two_adic_pcs.rs:696-701` 吸收 opened values（F2），随后 `verifier.rs:195` 抽
+   fri_alpha。这次 flush 的 digest 就是 D2，2a 已经把它作为输出公开；在本组件里，
+   D2 是公共**输入**。
+2. `verifier.rs:302-311`，每一轮依次是：`observe(commit)`、
+   `check_witness(commit_proof_of_work_bits, w)`、抽 β。仓库把
+   `commit_proof_of_work_bits` 定为 0，而 `check_witness` 在 0 位时什么都不吸收就直接
+   返回（p3-challenger `grinding_challenger.rs:41-47`），所以 commit 阶段的 witness
+   根本不进 transcript。第 r 轮的 flush 为 G_r = D_{r−1} ‖ cap_r。
+3. `verifier.rs:323` 吸收 final polynomial（16 个系数，每个 4 个基 limb），
+   `verifier.rs:334-336` 把每轮的 log-arity 作为基域元素吸收，`verifier.rs:339` 调用
+   `check_witness(22, w)`，即先吸收 w，再要求 `sample_bits(22) == 0`。这几次吸收之间
+   没有任何抽样，所以合起来是**一次** flush：H = D_{R−1} ‖ final poly ‖ arities ‖ w。
+4. `verifier.rs:352-353` 为 43 个 query 各调用一次 `sample_bits(log_global_max_height)`。
+   `TwoAdicFriFolding` 不额外加位（`two_adic_pcs.rs:106`）。
+
+**`sample_bits` 和域元素抽样不是一回事。** 它同样弹出四个字节（小端，位置与域元素
+抽样相同），但只保留低 `bits` 位：不截 31 位，也不拒绝。由此有两个结论。第一，PoW
+条件落在 H 的 digest 第 0 次抽样的**低** 22 位上；任务书写的"前导零位"在此更正为末尾零位。
+第二，每个 query 下标都在固定的（digest, 抽样）位置上：query i 是从 H 的 digest 开始的
+抽样流里的第 i + 1 次，所以 query 阶段不需要选择 gadget。一个 digest 的八次抽样用完后，
+challenger 会重新 flush 它的输入缓冲区，而这时缓冲区里恰好只有上一个 digest
+（`hash_challenger.rs` 的 `flush`）。每次补充为 Q_w = hash(D_{w−1})，一个置换。
+
+**PoW 位数。** query 阶段的 PoW 是 22 位（非零），所以直接按原生难度测这个 gadget。
+commit 阶段的 PoW 在钉住的配置里是 0 位，那里没有可约束的东西。
+
+### 绑定了什么
+
+- **Sponge。** lane 和各个 gadget 与 2a 相同，现在集中放在 `lane.rs`（见下）。第一次
+  flush 的链接前缀固定为 D2 的公共 limb（`seed`，第 0 行，那里 S = 0）；之后每次 flush
+  的前缀由 `flush_chain` 固定。
+- **字。** 填充和各轮 log-arity 是逐 limb 精确的常量。cap 对外层公共 limb。
+  final polynomial 的 limb 必须规范，并且在保持列里等于 `R⁻¹ · word`：Montgomery 陷阱
+  对它们和对 opened values 一样成立。PoW witness 必须规范。
+- **抽样。** fri_alpha（取自 D2 的窗口，在 G_0 第一块上读出）和每个 β 都用 2a 的拒绝加
+  one-hot 选择。PoW 约束为 22 个零位。每个下标位等于该窗口 digest 行上对应的抽样位。
+- **输出。** 保持列在所有行上取同一个值，里面放着 fri_alpha、每个 β、final polynomial
+  和每个 query 下标的各个位，供 2b-ii/iii 在同一行空间里做路径选择。同样这些值也作为
+  公共输出公开（在第 0 行绑定），这样独立的组件可以靠公共值相等来接收。这相当于 2a 的
+  D2 输出：原生 verifier 在 query 抽样之后不再吸收任何东西，所以不再公开更后面的 digest。
+
+**折叠方案是形状常量。** p3 的 verifier 接受任意一组每轮 log-arity，只要每个在
+1..=max 之间、总和与输入高度一致。这里的布局把它固定为 p3 prover 实际采用的方案
+（`price::fri_log_arities`，从 census 里提出来，两处共用一个函数）。用别的合法方案折叠的
+proof 会被拒；这是完备性上的限制，不会导致误接受，诚实的 prover 也不会生成这样的 proof。
+诚实用例断言真实 proof 的 arity 与布局一致。
+
+### 复用
+
+sponge lane 从 `bind.rs` 搬到了 `lane.rs`：pad10*1、吸收循环、抽样顺序、
+`accepted`/`challenge`、Keccak 列映射、周期性 sponge 选择列、分组区间计数，以及约束
+gadget `bits`、`absorb`、`chain_state`、`flush_chain`、`< p` 比较器、`fs_reject` 和
+`fs_select`。每个 gadget 产生的约束与原来相同、顺序也相同，所以 2a 那些按编号定位分组的
+负例不受影响。2a 的测试没有改动，只是玩具 AIR、它的 proof，以及原生 challenger 重放到
+F2 的那段代码，现在都来自 `lane::toy`（同一份代码，两边共用）。每个组件把自己的字绑到
+什么上，仍然留在组件自己里面。
+
+### 约束分组与测试
+
+共 17 个具名分组：`keccak`、`bits`、`absorb`、`chain_state`、`flush_chain`、`seed`、
+`bind_const`、`bind_cap`、`canonical`、`fs_reject`、`fs_select`、`fs_bind`、
+`bind_final`、`pow`、`fs_index`、`hold`、`cells_out`。fixture 仍是那个玩具 AIR，高度取
+log 8（L2 lane 上加固定种子的 hiding proof）。按 2a 的 log 4，LDE 为 2^7，只折叠一次；
+log 8 时 2^11 先按 16 折、再按 2 折，有两轮 commit，交换负例才有意义。D2 取自 2a 自己的
+`Replay` 对同一个 proof 的重放，顺带检验两个组件之间的接缝。
+
+每个负例都扫描**全部**行，并断言所有违反都落在指定分组、指定行上（比 2a 的单行检查更严）：
+
+| 负例 | 拒绝位置 |
+|---|---|
+| fri_alpha 的某个 limb 错，输出一致 | 只有 `fs_bind`，D2 行 |
+| β_0 取了第五个被接受的抽样（跳过） | 只有 `fs_select`，G_0 digest 行 |
+| 两轮的 cap 按相反顺序吸收；β、PoW（由 p3 challenger 重新 grind）和下标全部自洽 | 只有 `bind_cap`，G_0/G_1 各行 |
+| transcript 吸收伪造的 final-poly 系数，query 阶段拿到的是诚实值；PoW 重新 grind，下标按新 transcript 重放 | 只有 `bind_final` |
+| 把 final-poly 的一个字编码为 `word + p` | 该行的 `canonical`，外加窗口行的 `pow`（没有重新 grind：原生 challenger 吸收不了非规范字） |
+| PoW witness 不满足 22 位条件，下标按它重放 | 只有 `pow`（p3 的 `check_witness` 同样拒绝） |
+| 翻转一个 query 下标位，保持列和公共下标一致 | 只有 `fs_index` |
+| 某个 query 用了另一个 query 的下标，transcript 不动 | 只有 `fs_index` |
+| query 7 及之后每个都取下一次抽样（跳过） | 只有 `fs_index` |
+
+**范围边界（有断言）。** 如果 transcript 吸收的 final polynomial 和对外给出的一致，
+PoW 也重新 grind 过，本组件会**接受**。Fiat–Shamir 这一层没有任何东西能拒绝它，
+必须由 2b-iii 的 final polynomial 求值来拒绝。测试把这一点写成断言，边界不会悄悄移动。
+
+诚实用例把重放结果和原生 p3 challenger 交叉核对，challenger 按 verifier 自己的吸收顺序
+驱动。核对内容：fri_alpha（取自 2a 的 D2）、两个 β，以及 proof 里的 PoW witness 在这个
+位置能通过 `check_witness(22)`。若经过 H 的消息顺序有误，只有 2⁻²² 的巧合才能通过，
+所以这一步独立于重放本身把顺序钉死。此外还核对全部 43 个 query 下标、形状（arity [4, 1]、
+两个 commit 和两个 witness、16 个系数、43 个 query、11 个下标位、六个窗口）、一次全量
+SAT 扫描，以及最大约束 degree ≤ 3 **[P，由 CI 检查]**。
+
+### 尺寸
+
+**[P，源码推导]** 玩具 AIR（log 8，R = 2）：flush 依次为 G_0、G_1（各 3 个置换：8 + 64 个字）、
+H（3 个：8 + 64 + 2 + 1），以及六次补充，各一个置换，共 15 个置换（360 行 → 高度 512）。
+宽度 = 2,633（Keccak）+ 2 × 1,088（M、S）+ 68（规范性）+ 72（域元素抽样）+ 保持列
+4(R+1) + 64 + 43 · 11 = 549，合计 5,498。公共值：16（D2）+ 128R（cap）+ 4(R+1) + 64 + 43 = 391。
+
+按 shape P（log 20，LDE 2^23）：arity 为 [4, 4, 4, 4, 1]，R = 5，下标 23 位，置换数
+5 × 3 + 3 + 6 = 24。这与 census `fs_floor` 里 FRI 那几项
+（R × blocks(32 + cap) + blocks(final ‖ arities ‖ witness) + 5 次补充）一致，只多一个置换：
+末尾那次补充的第一块用来承载最后一个窗口的 digest 位。这是"从后继块的 M 位读抽样"
+这种布局的代价，不是 transcript 的代价。保持列：24 + 64 + 43 · 23 = 1,077。
+
+### 尚未绑定（2b-ii/iii）
+
+input 与 commit 阶段的 Merkle 路径、加盐叶子、reduced opening、折叠（兄弟值、β 的幂），
+以及每个 query 上的 final polynomial 求值。若 fri_alpha 或某个 β 的抽样窗口需要补充
+（超过八次域元素抽样，每个 challenge 的概率约 1e-9），则无法满足；和 2a 一样，这是完备性
+缺口，不会导致误接受。`pcs_input_bindings_complete`、`full_ood_air_checked`、
+`complete_verifier_layout`、`memory_gate_pass` 均保持 **false**。
+
+### 验证
+
+本地没有运行测试、生成 proof 或跑 benchmark。本地预检为
+`cargo check --workspace --all-targets`、`qlab-bench` 的 Clippy（`f2/` 下无告警）和
+rustfmt；验收以 `verify-graviton` CI 为准。本片在 `fri_fs.rs` 新增六个测试，别处没有新增。
+**[P，待 CI]**：2769 + 6 = 2775 项通过、0 失败、15 项忽略，以 2a 的验收运行 36325459774
+为基线核算（此后 main 没有变动）。
+
+新测试在 Graviton lane 上的预计耗时为 15–40 秒 **[P]**。大头是一次 log 8 的玩具 hiding
+proof（含它自己的 22 位 grind）和两次原生 22 位重新 grind（每次期望 2²² 次 Keccak-256
+吸收，rayon 并行）。其余是约十个 512 × 5,498 的 trace、一次并行 SAT 扫描、约九次全表违反
+扫描（每次 512 行）和一次 symbolic degree 计算。2a 的六个测试现在共用 lane 代码，耗时应当不变。
+
+尚未验证，按最可能先出问题排序：
+
+1. 原生交叉核对本身：重放里 H 的消息顺序和补充语义是否与 p3 challenger 一致（诚实用例的
+   `check_witness` 和下标断言会暴露问题）。
+2. fixture 的折叠方案：`[4, 1]` 假定 hiding 的每个输入都提交在 2N 行上。若某个 quotient
+   chunk 提交得更低，p3 prover 会先折到它的高度，arity 断言就会失败。
+3. 把 2a 的 gadget 挪进 `lane.rs` 的重构：分组内的约束顺序按构造保持不变，但能检验这一点的
+   只有 2a 的负例。
+4. 某个负例依赖种子：β_0 的窗口里至少要有五个被接受的抽样（不满足的概率约 3·10⁻⁷，
+   对固定种子而言结果是确定的）。
 
