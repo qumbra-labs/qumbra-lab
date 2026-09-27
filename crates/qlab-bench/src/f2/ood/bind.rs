@@ -52,13 +52,23 @@
 //! all opened values) therefore carries a < p comparator; caps, digests and
 //! constants are compared as 16-bit limbs, which are exact.
 //!
+//! **Exported for F2b-2b-ii** (`opened_out`): zeta and every opened value
+//! are public OUTPUTS, so the input-opening component reads the very values
+//! the machine read. A value the machine reads is exported from its held
+//! input cell (first row); the randomizer opening, which the machine never
+//! reads, from its transcript word (`R^-1 * word` on its step-0 row). Either
+//! way the export is an equality to what this component already binds —
+//! there is no second copy a forger could make disagree with the machine.
+//!
 //! **NOT bound here (F2b-2b):** fri_alpha, the FRI betas and commit caps,
 //! PoW, query indices, the reduced opening, salted input-Merkle leaves and
 //! paths, and the final polynomial. Nothing here ties the opened values to
 //! the committed caps — D2 is where that half starts: `fri_fs` (F2b-2b-i)
 //! takes D2 as its public input and continues the transcript through the
-//! query indices. The sponge gadgets both use live in `lane`. The randomizer opening
-//! is hashed but never routed: it does not enter the OOD identity. A draw
+//! query indices, and `open` (F2b-2b-ii) authenticates the queried rows
+//! against the caps. The sponge gadgets both use live in `lane`. The
+//! randomizer opening is hashed but never routed: it does not enter the OOD
+//! identity. A draw
 //! window needing more than eight draws (a refill, probability ~1e-9 per
 //! challenge) is unsatisfiable, a completeness gap, never a false accept.
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -78,7 +88,7 @@ use crate::m4gaterec::keccakf;
 
 /// Constraint groups, in evaluation order. A negative names the group its
 /// violation must land in; `BoundAir::phase_of` maps an index to its name.
-const PHASES: [&str; 18] = [
+const PHASES: [&str; 19] = [
     "keccak",
     "bits",
     "absorb",
@@ -97,6 +107,7 @@ const PHASES: [&str; 18] = [
     "in_hold",
     "machine",
     "machine_out",
+    "opened_out",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,6 +147,8 @@ impl Word {
 #[derive(Clone)]
 pub(super) struct Layout {
     dims: Dims,
+    /// Every opened value in F2 order, which is also the export order.
+    opened: Vec<Open>,
     /// Padded word stream per flush F0..F2, a whole number of rate blocks.
     flushes: [Vec<Word>; 3],
     /// First lane perm of each flush.
@@ -158,18 +171,20 @@ impl Layout {
         let mut f2: Vec<Word> = (0..8).map(Word::Chain).collect();
         // Hiding PCS round order: randomizer, trace (zeta then zeta_next),
         // quotient chunks; each extension value as four basis limbs.
-        let opened = (0..4)
+        let opened: Vec<Open> = (0..4)
             .map(Open::Random)
             .chain((0..w).map(Open::Local))
             .chain((0..w).map(Open::Next))
-            .chain((0..chunks).flat_map(|c| (0..4).map(move |e| Open::Quotient(c, e))));
-        for o in opened {
+            .chain((0..chunks).flat_map(|c| (0..4).map(move |e| Open::Quotient(c, e))))
+            .collect();
+        for &o in &opened {
             f2.extend((0..4).map(|k| Word::Opened(o, k)));
         }
         let flushes = [f0, f1, f2].map(|f| pad(f, Word::Const));
         let blocks: Vec<usize> = flushes.iter().map(|f| f.len() / RATE_WORDS).collect();
         Self {
             dims,
+            opened,
             first: [0, blocks[0], blocks[0] + blocks[1]],
             perms: blocks.iter().sum(),
             flushes,
@@ -202,8 +217,15 @@ impl Layout {
     fn digest_base(&self) -> usize {
         self.dims.pv_len + 6 * CAP_WORDS
     }
-    fn num_public_values(&self) -> usize {
+    /// Exported zeta (four limbs), then every opened value in F2 order.
+    fn zeta_base(&self) -> usize {
         self.digest_base() + 16
+    }
+    fn opened_base(&self) -> usize {
+        self.zeta_base() + 4
+    }
+    fn num_public_values(&self) -> usize {
+        self.opened_base() + 4 * self.opened.len()
     }
 }
 
@@ -350,6 +372,8 @@ struct BoundAir {
     layout: Layout,
     schedule: Schedule,
     routes: Vec<Route>,
+    /// Per opened value (layout order): the machine input that reads it.
+    open_route: Vec<Option<usize>>,
     zeta_input: usize,
     height: usize,
     /// Keccak lane at 0, then M and S bits.
@@ -384,6 +408,7 @@ impl BoundAir {
             "expected residual and next-point roots",
         )?;
         let mut routes = Vec::new();
+        let mut open_route = vec![None; layout.opened.len()];
         let mut zeta_input = None;
         for (i, &(_, input)) in schedule.inputs().iter().enumerate() {
             routes.push(match input {
@@ -400,6 +425,12 @@ impl BoundAir {
                         Input::Quotient(_, e) => Open::Quotient(c, e),
                         _ => unreachable!("matched above"),
                     };
+                    let o = layout
+                        .opened
+                        .iter()
+                        .position(|&x| x == open)
+                        .ok_or("machine input missing from the opened values")?;
+                    open_route[o] = Some(routes.len());
                     let mut at = [(0, 0); 4];
                     for (k, slot) in at.iter_mut().enumerate() {
                         *slot = layout
@@ -442,6 +473,7 @@ impl BoundAir {
             layout,
             schedule,
             routes,
+            open_route,
             zeta_input,
             height,
             lane,
@@ -519,14 +551,19 @@ impl BoundAir {
     }
 
     /// Outer public values: inner PVs, the three caps as 16-bit limbs in the
-    /// canonical order, then the claimed F2 digest as 16-bit limbs.
-    fn public_values(&self, data: &Data, digest: &[u8; 32]) -> Vec<Val> {
-        let mut pv = data.inner_pvs.clone();
+    /// canonical order (both from the declared instance), then the claim's
+    /// outputs: the F2 digest as 16-bit limbs, zeta, every opened value.
+    fn public_values(&self, declared: &Data, claimed: &Data, rep: &Replay) -> Vec<Val> {
+        let mut pv = declared.inner_pvs.clone();
         for n in 0..3 * CAP_WORDS {
-            let w = data.cap_word(n);
+            let w = declared.cap_word(n);
             pv.extend([Val::from_u32(w & 0xffff), Val::from_u32(w >> 16)]);
         }
-        pv.extend(digest_limbs(digest));
+        pv.extend(digest_limbs(&rep.digests[2]));
+        pv.extend_from_slice(rep.zeta.as_basis_coefficients_slice());
+        for &o in &self.layout.opened {
+            pv.extend_from_slice(claimed.opened(o).as_basis_coefficients_slice());
+        }
         pv
     }
 }
@@ -683,6 +720,36 @@ impl Phased for BoundAir {
                     );
                 }
             }
+            "opened_out" => {
+                // The exports are the machine's own cells: zeta and every
+                // routed opened value leave from the held input column the
+                // machine reads (held constant, so row 0 is every row). The
+                // randomizer has no machine cell; it leaves from its word.
+                let zeta = self.layout.zeta_base();
+                for limb in 0..4 {
+                    builder.when_first_row().assert_zero(
+                        c(self.in_col + 4 * self.zeta_input + limb) - pv[zeta + limb].clone(),
+                    );
+                }
+                for (i, &o) in self.layout.opened.iter().enumerate() {
+                    let at = self.layout.opened_base() + 4 * i;
+                    for limb in 0..4 {
+                        if let Some(r) = self.open_route[i] {
+                            builder
+                                .when_first_row()
+                                .assert_zero(c(self.in_col + 4 * r + limb) - pv[at + limb].clone());
+                        } else {
+                            let (perm, slot) = self
+                                .layout
+                                .find(Word::Opened(o, limb))
+                                .expect("every opened limb is a transcript word");
+                            builder.assert_zero(
+                                step0(perm) * (full(slot) * self.rinv - pv[at + limb].clone()),
+                            );
+                        }
+                    }
+                }
+            }
             other => unreachable!("unknown phase {other}"),
         }
     }
@@ -723,7 +790,7 @@ fn machine_inputs(program: &Program, inputs: &Inputs) -> Result<Vec<E>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::f2::ood) mod tests {
     use std::sync::OnceLock;
 
     use std::ops::Range;
@@ -813,7 +880,7 @@ mod tests {
     fn claim(fx: &Fixture, data: &Data, inputs: &[E], pick: [Option<[usize; 4]>; 2]) -> Claim {
         let rep = Replay::new(&fx.air.layout, data).unwrap();
         let trace = fx.air.trace(&rep, inputs, pick).unwrap();
-        let pvs = fx.air.public_values(&fx.data, &rep.digests[2]);
+        let pvs = fx.air.public_values(&fx.data, data, &rep);
         Claim { rep, trace, pvs }
     }
 
@@ -1151,5 +1218,88 @@ mod tests {
         let (c, clean) = consistent_f0_forgery(fx, &data);
         assert_eq!(c.rep.words[0][index], fx.honest.words[0][index] + P);
         refused_only_by(fx, &c, step0_row(perm), clean, "canonical");
+    }
+
+    #[test]
+    fn bound_machine_exports_exactly_the_values_the_machine_read() {
+        // F2b-2b-ii reads zeta and the opened values from these outputs. An
+        // export that disagrees with the machine's own cells — the one thing
+        // that would let the machine and FRI see different z-values — is
+        // refused by `opened_out` alone, on the row the export is tied on.
+        let fx = fixture();
+        let honest = machine_inputs(&fx.program, &fx.inputs).unwrap();
+        let c = claim(fx, &fx.data, &honest, [None, None]);
+        let layout = &fx.air.layout;
+        let routed = layout
+            .opened
+            .iter()
+            .position(|&o| o == Open::Local(0))
+            .unwrap();
+        let random = layout
+            .opened
+            .iter()
+            .position(|&o| o == Open::Random(2))
+            .unwrap();
+        assert!(fx.air.open_route[routed].is_some(), "trace local is routed");
+        assert!(fx.air.open_route[random].is_none(), "randomizer is not");
+        let (random_perm, _) = layout.find(Word::Opened(Open::Random(2), 1)).unwrap();
+        for (at, row) in [
+            (layout.zeta_base() + 3, 0),
+            (layout.opened_base() + 4 * routed + 1, 0),
+            (
+                layout.opened_base() + 4 * random + 1,
+                step0_row(random_perm),
+            ),
+        ] {
+            let mut pvs = c.pvs.clone();
+            pvs[at] += Val::ONE;
+            let bad = Claim {
+                rep: c.rep.clone(),
+                trace: c.trace.clone(),
+                pvs,
+            };
+            let f = failing(fx, &bad, row);
+            assert!(
+                !f.is_empty() && f.iter().all(|&p| p == "opened_out"),
+                "{at}: {f:?}"
+            );
+            for r in [step0_row(fx.air.draw_perm(1)), fx.air.height - 1] {
+                assert!(failing(fx, &bad, r).is_empty(), "{at}: row {r}");
+            }
+        }
+    }
+
+    /// 2a's honest public values for another proof of the toy at
+    /// `log_height`, and where its exports sit in them: the three caps (2a's
+    /// trace, quotient, randomizer order), zeta, and the opened values. The
+    /// seam F2b-2b-ii's tests compare their public inputs against.
+    pub(in crate::f2::ood) struct Exported {
+        pub(in crate::f2::ood) pvs: Vec<Val>,
+        pub(in crate::f2::ood) caps: Range<usize>,
+        pub(in crate::f2::ood) zeta: Range<usize>,
+        pub(in crate::f2::ood) opened: Range<usize>,
+    }
+
+    pub(in crate::f2::ood) fn exported(
+        proof: &Proof<Config>,
+        pvs: &[Val],
+        log_height: usize,
+    ) -> Exported {
+        let dims = Dims {
+            width: 2,
+            pv_len: 2,
+            log_height,
+        };
+        let program = Program::compile_dims(dims, &Toy).unwrap();
+        let air = BoundAir::new(&program, 64 << 20).unwrap();
+        let data = Data::from_proof(proof, pvs).unwrap();
+        let rep = Replay::new(&air.layout, &data).unwrap();
+        let l = &air.layout;
+        Exported {
+            pvs: air.public_values(&data, &data, &rep),
+            caps: l.cap_base()..l.cap_base() + 6 * CAP_WORDS,
+            zeta: l.zeta_base()..l.opened_base(),
+            opened: l.opened_base()..l.num_public_values(),
+        }
     }
 }

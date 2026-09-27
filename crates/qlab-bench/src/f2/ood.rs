@@ -9,7 +9,10 @@ mod fri_fs;
 // The Keccak sponge lane both transcript components share.
 #[cfg(test)]
 mod lane;
+// F2b-2b-ii: the input-batch openings and reduced opening per query (test-only AIR).
 mod machine;
+#[cfg(test)]
+mod open;
 
 use std::collections::HashMap;
 use std::sync::Arc;

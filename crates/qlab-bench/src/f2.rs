@@ -445,6 +445,8 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
                 .as_u64()
                 .ok_or("missing quotient census")? as usize;
             json!({"symbolic_air": air, "projected_opening_schedule": price::geometry(shape, chunks).report(shape),
+                "input_openings": price::input_openings(shape.width(), shape.log_height(), chunks,
+                    L2_CFG_PROVISIONAL.num_queries),
                 "ood_arithmetic": ood::price(shape)?,
                 "complete_verifier_layout": false, "memory_gate_pass": false})
         }

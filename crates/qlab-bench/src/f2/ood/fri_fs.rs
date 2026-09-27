@@ -741,7 +741,7 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for FriFsAir {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::f2::ood) mod tests {
     use std::collections::BTreeSet;
     use std::ops::Range;
     use std::sync::OnceLock;
@@ -802,6 +802,40 @@ mod tests {
                 honest,
             }
         })
+    }
+
+    /// What F2b-2b-ii's tests take from this fixture: the same seeded proof
+    /// (one proof and one 22-bit grind per test binary, not two), the query
+    /// phase's inputs as this component derives them, and this component's
+    /// honest public values with the positions of its fri_alpha and index
+    /// outputs — the seam 2b-ii's public inputs are compared against.
+    pub(in crate::f2::ood) struct Shared {
+        pub(in crate::f2::ood) proof: &'static Proof<Config>,
+        pub(in crate::f2::ood) pvs: &'static [Val],
+        pub(in crate::f2::ood) log_height: usize,
+        pub(in crate::f2::ood) fri_alpha: E,
+        pub(in crate::f2::ood) indices: Vec<usize>,
+        pub(in crate::f2::ood) public: Vec<Val>,
+        pub(in crate::f2::ood) fri_alpha_at: usize,
+        pub(in crate::f2::ood) index_at: Vec<usize>,
+    }
+
+    pub(in crate::f2::ood) fn shared() -> Shared {
+        let fx = fixture();
+        let layout = &fx.air.layout;
+        let s = &layout.shape;
+        let cells = Cells::of(&fx.honest, &fx.data);
+        let indices_at = layout.out_base() + D * (s.rounds() + 1) + D * s.final_len;
+        Shared {
+            proof: &fx.proof,
+            pvs: &fx.pvs,
+            log_height: LOG_HEIGHT,
+            fri_alpha: fx.honest.fri_alpha,
+            indices: fx.honest.indices.clone(),
+            public: fx.air.public_values(&fx.data, &cells),
+            fri_alpha_at: layout.out_base(),
+            index_at: (0..s.queries).map(|i| indices_at + i).collect(),
+        }
     }
 
     fn phase_of(fx: &Fixture, constraint: usize) -> &'static str {
