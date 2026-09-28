@@ -105,30 +105,30 @@ const PHASES: [&str; 20] = [
 /// Extension limbs.
 const D: usize = 4;
 /// Native batch order (`coms_to_verify`): randomizer, trace, quotient.
-const RANDOM: usize = 0;
-const TRACE: usize = 1;
-const QUOTIENT: usize = 2;
-const BATCHES: usize = 3;
+pub(super) const RANDOM: usize = 0;
+pub(super) const TRACE: usize = 1;
+pub(super) const QUOTIENT: usize = 2;
+pub(super) const BATCHES: usize = 3;
 /// Rate words a compression's two children occupy (2 x 4 u64).
 const CHILD_WORDS: usize = 16;
 
 /// Opening geometry: shape constants only, nothing read from a proof.
 #[derive(Clone, Debug)]
-struct Geom {
-    width: usize,
-    chunks: usize,
+pub(super) struct Geom {
+    pub(super) width: usize,
+    pub(super) chunks: usize,
     /// log2 of every input matrix's LDE height (= query index bits).
-    lde: usize,
+    pub(super) lde: usize,
     /// Merkle levels below the cap.
-    path: usize,
+    pub(super) path: usize,
     /// (point, column) terms = opened extension values = fri_alpha powers.
-    terms: usize,
+    pub(super) terms: usize,
     /// Generator of the ORIGINAL trace domain: zeta_next = zeta * g_n.
-    g_n: Val,
+    pub(super) g_n: Val,
 }
 
 impl Geom {
-    fn new(dims: Dims, chunks: usize, cfg: &FriCfg) -> Result<Self> {
+    pub(super) fn new(dims: Dims, chunks: usize, cfg: &FriCfg) -> Result<Self> {
         let lde = dims.log_height + IS_ZK + cfg.log_blowup;
         require(lde <= 30, "query index wider than 30 bits")?;
         require(CAP_HEIGHT == 3, "the cap mux is written for 2^3 entries")?;
@@ -144,7 +144,7 @@ impl Geom {
     }
 
     /// (matrices, columns) of batch `b`.
-    fn mats(&self, b: usize) -> (usize, usize) {
+    pub(super) fn mats(&self, b: usize) -> (usize, usize) {
         match b {
             RANDOM => (1, D),
             TRACE => (1, self.width),
@@ -169,7 +169,7 @@ impl Geom {
     }
 
     /// 2a exports the caps as trace, quotient, randomizer.
-    fn cap_block(b: usize) -> usize {
+    pub(super) fn cap_block(b: usize) -> usize {
         match b {
             TRACE => 0,
             QUOTIENT => 1,
@@ -212,7 +212,7 @@ pub(super) fn leaf_words(mats: usize, cols: usize) -> Vec<Word> {
 
 /// One perm of a query segment.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Step {
+pub(super) enum Step {
     /// Block `k` of batch `b`'s leaf sponge.
     Leaf(usize, usize),
     /// Path level `t` of batch `b`.
@@ -221,19 +221,19 @@ enum Step {
 
 /// Static layout: one segment of perms per covered query.
 #[derive(Clone)]
-struct Layout {
-    geom: Geom,
-    leaves: [Vec<Word>; BATCHES],
+pub(super) struct Layout {
+    pub(super) geom: Geom,
+    pub(super) leaves: [Vec<Word>; BATCHES],
     /// (batch, block) of every leaf-block role.
-    roles: Vec<(usize, usize)>,
+    pub(super) roles: Vec<(usize, usize)>,
     /// Roles whose block carries tail lanes from the previous output.
-    carry_roles: Vec<usize>,
-    segment: Vec<Step>,
-    queries: usize,
+    pub(super) carry_roles: Vec<usize>,
+    pub(super) segment: Vec<Step>,
+    pub(super) queries: usize,
 }
 
 impl Layout {
-    fn new(geom: Geom, queries: usize) -> Self {
+    pub(super) fn new(geom: Geom, queries: usize) -> Self {
         let leaves: [Vec<Word>; BATCHES] = core::array::from_fn(|b| {
             let (mats, cols) = geom.mats(b);
             leaf_words(mats, cols)
@@ -266,12 +266,12 @@ impl Layout {
     fn role(&self, b: usize, k: usize) -> usize {
         self.roles.iter().position(|&x| x == (b, k)).unwrap()
     }
-    fn role_words(&self, r: usize) -> &[Word] {
+    pub(super) fn role_words(&self, r: usize) -> &[Word] {
         let (b, k) = self.roles[r];
         &self.leaves[b][RATE_WORDS * k..RATE_WORDS * (k + 1)]
     }
     /// Rate lanes of role `r` that carry the previous output.
-    fn carry_lanes(&self, r: usize) -> Vec<usize> {
+    pub(super) fn carry_lanes(&self, r: usize) -> Vec<usize> {
         let words = self.role_words(r);
         (0..RATE_LANES)
             .filter(|&ln| words[2 * ln] == Word::Carry)
@@ -318,14 +318,14 @@ impl Layout {
 
 /// One query's claimed input opening, as the proof carries it.
 #[derive(Clone)]
-struct Opening {
-    rows: [Vec<Vec<Val>>; BATCHES],
-    salts: [Vec<Vec<Val>>; BATCHES],
-    siblings: [Vec<[u64; 4]>; BATCHES],
+pub(super) struct Opening {
+    pub(super) rows: [Vec<Vec<Val>>; BATCHES],
+    pub(super) salts: [Vec<Vec<Val>>; BATCHES],
+    pub(super) siblings: [Vec<[u64; 4]>; BATCHES],
 }
 
 impl Opening {
-    fn from_proof(proof: &Proof<Config>, query: usize, geom: &Geom) -> Result<Self> {
+    pub(super) fn from_proof(proof: &Proof<Config>, query: usize, geom: &Geom) -> Result<Self> {
         let qp = proof
             .opening_proof
             .1
@@ -373,15 +373,20 @@ impl Opening {
 /// The native Merkle replay of one opening: every perm's preimage, in
 /// segment order, and each batch's root.
 #[derive(Clone)]
-struct Walk {
-    perms: Vec<[u64; 25]>,
-    roots: [[u64; 4]; BATCHES],
+pub(super) struct Walk {
+    pub(super) perms: Vec<[u64; 25]>,
+    pub(super) roots: [[u64; 4]; BATCHES],
 }
 
 impl Walk {
     /// `flip` puts the child on the wrong side at (batch, level) while the
     /// index bit stays: a forgery knob.
-    fn new(layout: &Layout, op: &Opening, index: usize, flip: Option<(usize, usize)>) -> Self {
+    pub(super) fn new(
+        layout: &Layout,
+        op: &Opening,
+        index: usize,
+        flip: Option<(usize, usize)>,
+    ) -> Self {
         let mut perms = Vec::with_capacity(layout.segment.len());
         let mut roots = [[0u64; 4]; BATCHES];
         for (b, leaf) in layout.leaves.iter().enumerate() {
@@ -429,31 +434,31 @@ struct Inbound {
 
 /// Held cells: constant over every row.
 #[derive(Clone)]
-struct Held {
-    zeta: E,
-    zvals: Vec<E>,
-    fri_alpha: E,
-    apow: Vec<E>,
-    az: E,
-    bz: E,
-    ro: Vec<E>,
+pub(super) struct Held {
+    pub(super) zeta: E,
+    pub(super) zvals: Vec<E>,
+    pub(super) fri_alpha: E,
+    pub(super) apow: Vec<E>,
+    pub(super) az: E,
+    pub(super) bz: E,
+    pub(super) ro: Vec<E>,
 }
 
 /// One covered query's registers, repeated on every row of its segment.
 #[derive(Clone)]
-struct Ctx {
-    bits: Vec<Val>,
-    u: [Val; 4],
-    e: [Val; 8],
-    xs: Vec<Val>,
-    inv_a: E,
-    inv_b: E,
-    ro: E,
+pub(super) struct Ctx {
+    pub(super) bits: Vec<Val>,
+    pub(super) u: [Val; 4],
+    pub(super) e: [Val; 8],
+    pub(super) xs: Vec<Val>,
+    pub(super) inv_a: E,
+    pub(super) inv_b: E,
+    pub(super) ro: E,
 }
 
 /// The x-chain factors: bit t of the index moves x by omega^{2^{lde-1-t}},
 /// which is the bit-reversal `open_input` applies to the index.
-fn x_factors(geom: &Geom) -> Vec<Val> {
+pub(super) fn x_factors(geom: &Geom) -> Vec<Val> {
     let w = Val::two_adic_generator(geom.lde);
     (0..geom.lde)
         .map(|t| w.exp_power_of_2(geom.lde - 1 - t))
@@ -463,7 +468,13 @@ fn x_factors(geom: &Geom) -> Vec<Val> {
 impl Ctx {
     /// Registers for bits of `index` and an x chain walked on `x_index`'s
     /// bits (the same index for an honest query).
-    fn new(geom: &Geom, index: usize, x_index: usize, held: &Held, ab: (E, E)) -> Result<Self> {
+    pub(super) fn new(
+        geom: &Geom,
+        index: usize,
+        x_index: usize,
+        held: &Held,
+        ab: (E, E),
+    ) -> Result<Self> {
         let bit = |i: usize, t: usize| Val::from_usize((i >> t) & 1);
         let bits: Vec<Val> = (0..geom.lde).map(|t| bit(index, t)).collect();
         let f = |set: bool, p: Val| if set { p } else { Val::ONE - p };

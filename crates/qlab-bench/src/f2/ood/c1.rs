@@ -96,6 +96,7 @@ use super::lane::{
     P, RATE_WORDS,
 };
 use super::machine::{eval_machine, Schedule};
+use super::seam::{open_order, Open, Point, Seam, SeamShape};
 use super::{require, Dims, Input, Inputs, Program, Result, Val, E};
 use crate::f2::price::fri_log_arities;
 use crate::m4gaterec::keccakf;
@@ -143,30 +144,6 @@ const L1_COLUMNS: usize = D * TERMS_PER_BLOCK * 3 + D + 2 + 2 * D;
 /// Flush indices: F0, F1, F2, then G_r = FIRST_G + r, H, the refills.
 const F2: usize = 2;
 const FIRST_G: usize = 3;
-
-/// The point a term is opened at.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Point {
-    Zeta,
-    Next,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Open {
-    Random(usize),
-    Local(usize),
-    Next(usize),
-    Quotient(usize, usize),
-}
-
-impl Open {
-    fn point(self) -> Point {
-        match self {
-            Self::Next(_) => Point::Next,
-            _ => Point::Zeta,
-        }
-    }
-}
 
 /// Where a transcript word comes from, which decides how it is bound.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -272,12 +249,9 @@ impl Layout {
         let mut f1 = chain();
         f1.extend((0..CAP_WORDS).map(|n| Word::Cap(1, n)));
         f1.extend((0..CAP_WORDS).map(|n| Word::Cap(2, n)));
-        let opened: Vec<Open> = (0..D)
-            .map(Open::Random)
-            .chain((0..w).map(Open::Local))
-            .chain((0..w).map(Open::Next))
-            .chain((0..chunks).flat_map(|c| (0..D).map(move |e| Open::Quotient(c, e))))
-            .collect();
+        // The shared term order (`seam::open_order`): C2 weights its row
+        // values in the same list, so the two sums cannot diverge.
+        let opened: Vec<Open> = open_order(w, chunks);
         let mut f2 = chain();
         for k in 0..opened.len() {
             f2.extend((0..D).map(|l| Word::Opened(k, l)));
@@ -1286,63 +1260,26 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for C1Air {
     }
 }
 
-/// The C1 → C2 seam: what C1's public values say, as values. C2's public
-/// inputs are read into the same struct, and `check_seams(c1, c2)` (native,
-/// and in-circuit at the next level) is field-by-field equality of the two.
-#[derive(Clone, Debug, PartialEq)]
-struct Seam {
-    inner_pvs: Vec<Val>,
-    /// Trace, quotient, randomizer, then every commit round's cap.
-    caps: Vec<Vec<[u64; 4]>>,
-    zeta: E,
-    fri_alpha: E,
-    az: E,
-    bz: E,
-    betas: Vec<E>,
-    final_poly: Vec<E>,
-    indices: Vec<usize>,
+impl Layout {
+    /// Where the seam groups sit after the inner PVs (`seam::SeamShape`).
+    fn seam_shape(&self) -> SeamShape {
+        SeamShape {
+            rounds: self.rounds(),
+            final_len: self.fri.final_len,
+        }
+    }
 }
 
 impl Seam {
-    /// The `check_seams`-ready accessor: C1's public values as a [`Seam`].
+    /// The `check_seams`-ready accessor: C1's public values after the inner
+    /// PVs, read as the C1 → C2 seam (every query slot).
     fn read(layout: &Layout, pvs: &[Val]) -> Result<Self> {
         require(
             pvs.len() == layout.num_public_values(),
             "C1 public value count",
         )?;
-        let ext = |at: usize| E::from_basis_coefficients_fn(|i| pvs[at + i]);
-        let limb = |at: usize| -> Result<u64> {
-            let v = pvs[at].as_canonical_u32();
-            require(v < 1 << 16, "cap limb wider than 16 bits")?;
-            Ok(u64::from(v))
-        };
-        let mut caps = Vec::with_capacity(3 + layout.rounds());
-        for b in 0..3 + layout.rounds() {
-            let mut cap = vec![[0u64; 4]; 1 << CAP_HEIGHT];
-            for n in 0..CAP_WORDS {
-                let at = layout.cap_pv(b, n);
-                let word = limb(at)? | (limb(at + 1)? << 16);
-                cap[n / 8][(n % 8) / 2] |= word << (32 * (n % 2));
-            }
-            caps.push(cap);
-        }
-        Ok(Self {
-            inner_pvs: pvs[..layout.dims.pv_len].to_vec(),
-            caps,
-            zeta: ext(layout.zeta_pv()),
-            fri_alpha: ext(layout.fri_alpha_pv()),
-            az: ext(layout.az_pv()),
-            bz: ext(layout.bz_pv()),
-            betas: (0..layout.rounds())
-                .map(|r| ext(layout.beta_pv(r)))
-                .collect(),
-            final_poly: (0..layout.fri.final_len)
-                .map(|c| ext(layout.final_pv(c)))
-                .collect(),
-            indices: (0..layout.fri.queries)
-                .map(|i| pvs[layout.index_pv(i)].as_canonical_u32() as usize)
-                .collect(),
-        })
+        let slots: Vec<usize> = (0..layout.fri.queries).collect();
+        Seam::decode(layout.seam_shape(), &slots, &pvs[layout.dims.pv_len..])
     }
 }
 
@@ -1358,7 +1295,7 @@ fn machine_inputs(program: &Program, inputs: &Inputs) -> Result<Vec<E>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::f2::ood) mod tests {
     use std::collections::BTreeSet;
     use std::ops::Range;
     use std::sync::OnceLock;
@@ -1499,7 +1436,11 @@ mod tests {
     /// Per batch, per matrix: (at zeta_next?, the values at that point).
     type Claims<'a> = [Vec<Vec<(bool, &'a Vec<E>)>>; 3];
 
-    fn native_sums(proof: &Proof<Config>, fri_alpha: E, query: Option<usize>) -> (E, E) {
+    pub(in crate::f2::ood) fn native_sums(
+        proof: &Proof<Config>,
+        fri_alpha: E,
+        query: Option<usize>,
+    ) -> (E, E) {
         let o = &proof.opened_values;
         let random = o.random.as_ref().unwrap();
         let next = o.trace_next.as_ref().unwrap();
@@ -1559,6 +1500,15 @@ mod tests {
 
     fn honest(fx: &Fixture) -> Claim {
         claim(fx, &fx.data, &fx.inputs, |_, _| {})
+    }
+
+    /// C2's tests take C1's honest public values for the shared toy proof,
+    /// and the seam read from them, as the other side of `check_seams`.
+    pub(in crate::f2::ood) fn honest_seam() -> (Vec<Val>, Seam) {
+        let fx = fixture();
+        let c = honest(fx);
+        let seam = Seam::read(&fx.air.layout, &c.pvs).unwrap();
+        (c.pvs, seam)
     }
 
     type Groups = BTreeSet<(usize, &'static str)>;
@@ -1710,10 +1660,10 @@ mod tests {
         assert_eq!(residual(fx, &fx.inputs), E::ZERO);
         let (az, bz) = native_sums(proof, rep.fri_alpha(), None);
         let seam = Seam::read(l, &c.pvs).unwrap();
+        assert_eq!(&c.pvs[..l.dims.pv_len], fx.pvs, "inner PVs");
         assert_eq!(
             seam,
             Seam {
-                inner_pvs: fx.pvs.to_vec(),
                 caps: fx.data.caps.clone(),
                 zeta: fx.inputs.zeta,
                 fri_alpha: rep.fri_alpha(),
@@ -1721,14 +1671,14 @@ mod tests {
                 bz,
                 betas: rep.betas().to_vec(),
                 final_poly: fri.final_poly.clone(),
-                indices: native,
+                indices: native.iter().copied().enumerate().collect(),
             }
         );
         // The split is the one C2 needs: for every query, 2b-ii's sequential
         // `open_input` replica equals (Az - Ax)/(ζ - x) + (Bz - Bx)/(ζ·g_N - x).
         let lde = l.fri.index_bits;
         let g_n = Val::two_adic_generator(LOG_HEIGHT);
-        for (q, &index) in seam.indices.iter().enumerate() {
+        for &(q, index) in &seam.indices {
             let ro = reduced_opening(proof, fx.pvs, 2, LOG_HEIGHT, q, index, seam.fri_alpha);
             let x = E::from(
                 Val::GENERATOR

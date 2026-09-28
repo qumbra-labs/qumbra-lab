@@ -450,6 +450,7 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
                 "query_phase": price::query_phase(shape.log_height(), L2_CFG_PROVISIONAL.num_queries),
                 "ood_arithmetic": ood::price(shape)?,
                 "composed_c1": price::composed_c1(shape)?,
+                "composed_c2": price::composed_c2(shape),
                 "complete_verifier_layout": false, "memory_gate_pass": false})
         }
         "f2census" => census(shape, &read_fixture(Path::new(get("--proof-in")?))?)?,

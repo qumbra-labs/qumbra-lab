@@ -907,3 +907,206 @@ S 的列构成：Keccak 2,633，消息位和状态位 2,176，规范性 68，抽
    也把累加和从头到尾走了一遍，但都只在玩具的五个 F2 块上。S3 的 F2（175 块）只有公式定价，
    `Layout::new` 的映射核对从没在它上面跑过。
 3. 手算的 S/P/R 钉值：执行器尺寸取自 F2b-0 的 census 表，lane 置换数取自 census 的几何推导。
+
+## F2b 组合 C2 与接缝
+
+这是 issue #750 上记下的组合方案的第二片。**C2** 把 2b-ii（输入批次的 opening 和 reduced
+opening）与 2b-iii（commit 阶段的 opening、折叠和 final polynomial）放进同一个 AIR、同一条
+覆写模式的 Keccak lane（L4），**每个 query 一段**，并带上杠杆 **L2** 和 **L3**。C1 的导出值
+通过一道有名字的接缝交给 C2。C2 是仅用于测试的组件（`crates/qlab-bench/src/f2/ood/c2.rs`，
+接缝在 `ood/seam.rs`），逐行扫描，从不 prove。已合并的四个组件、C1 以及它们的测试，行为
+都没有变；只是把布局类型改成了 `pub(super)`，让 C2 直接复用，不必另抄一份。
+
+### 分段与调度
+
+每个被覆盖的 query 占一段：先是 2b-ii 的置换，排法与 `open.rs` 完全相同（随机化器、trace、
+quotient 三个叶子 sponge，加三条输入路径），紧接着是 2b-iii 的置换（每轮先叶子、后路径），
+然后才轮到下一个 query。S3 上每个 query 是 82 + 44 = 126 个置换，43 个 query 占满 2^17 行中的
+130,032 行。
+
+**C2 完全没有 periodic 列。** Keccak 自带的周期 24 的 `step_flags` 给出每个置换的 step-0 行和
+最后一行。**位置环**是 one-hot 的，每个段内位置一列主列，在该位置的置换的全部 24 行上取 1；它在
+每个置换的最后一行前移，到段尾绕回位置 0，但若这一段属于最后一个 query，环就清空。**query 环**
+也是 one-hot 的，每个被覆盖的 query 一列，在每个段尾前移。两个环都完全由 Keccak 标志决定。和 C1
+一样，由位置单元门控的绑定在全部 24 行上成立，所以 prover 要把该置换的消息位和规范性 witness
+在这些行上复制一遍。有些绑定只需要最后一行：把一个置换的输出与下一个置换的输入相比较的那些
+（子节点左右位置、capacity 和尾部 lane 的延续），以及 cap 检查。它们的门控（末行标志 × 位置
+单元）做成物化单元：路径层每读一个下标位配一个，每个 cap 检查配一个。这样这些绑定都保持在
+degree 3（`gate`）。
+
+### 使用 C1 的接缝
+
+C2 里不出现任何 z 值，也不出现任何 opened value。**C2 的公共值就是接缝**（`seam::Seam`）：
+每一个 cap（trace、quotient、随机化器、各 commit 轮）、ζ、fri_alpha、Az、Bz、每个 β、
+final polynomial，以及被覆盖的 query 的下标。ζ、fri_alpha、Az、Bz、各 β 和 final polynomial
+放在保持单元里，在第 0 行绑定到公共值（`seam_in`）；cap 由 cap 检查直接读取；下标经 query
+环钉住下标位（`index`）。每个 query 上，
+
+  ro = (Az − Ax)/(ζ − x) + (Bz − Bx)/(ζ·g_N − x)，
+
+其中 Ax、Bx 由经过 Merkle 认证的行值、按原生 `open_input` 的顺序累加而来。C1 吸收 opened value、
+给 Az 和 Bz 加权，用的正是这个顺序。两个 AIR 都从**同一张表 `seam::open_order`** 读取它：C1 的
+F2 布局由它生成，C2 的 `Layout::new` 则拿它逐块核对输入块。每块的行值必须是连续的项；trace
+第 c 列在 ζ·g_N 处的项号必须等于它在 ζ 处的项号 + w；相邻两块必须逐项衔接，唯一的例外是 trace
+之后要跨过那 w 个 ζ·g_N 项。所以两边不可能按不同的顺序求和。
+
+### L2：fri_alpha 幂次逐步推进
+
+2b-ii 给每个 opened 项保存一个 fri_alpha 幂次，S3 上是 5,912 列；与之配套的 z 值表已经被 L1
+去掉了。C2 只保留：
+
+- **保持的幂次表 α^1..α^34**：一个叶子块 34 个字，最多装 34 个行值；
+- **保持的 α^w**，w 是 trace 宽度；
+- 每行一个**滚动幂次 p = α^{k0}**，k0 是当前输入块第一个行值的项号。
+
+块内行值是连续的项，所以 blk = Σ_i α^i v_i 直接查表（`blk`）。Ax += p·blk；在 trace 块上还有
+Bx += pw·blk，pw = p·α^w（`accumulate`），因为 trace 第 c 列在 ζ·g_N 处的项号是 D + w + c。
+这些累加都由 step-0 标志门控。p 的规则（`alpha_pow`）：
+
+- **锚点**：每段第一块上 p = 1；
+- **推进**：经过一个含 n 个行值的块，p 乘上 α^n。最后一个 trace 块之后乘 α^w·α^n（经由 pw），
+  借此跳过那 w 个 ζ·g_N 项；
+- **保持与复位**：p 在路径置换上保持不变，到段尾复位为 1；
+- **钉住 α^w**：在 trace 项结束的地方，由最后一个 trace 块上的 p·α^n = α^D·α^w 定下 α^w。幂次表
+  本身是从 fri_alpha 出发、在第一行上逐项相乘的一条链。
+
+S3 上这套幂次只占 136 + 4 个保持列和 16 个滚动列，替换掉原来的 5,912 列。
+
+### L3：交接
+
+下标位和 ro 是**同一组寄存器单元**，在整段上保持不变（`handoff`）。同一组位单元驱动 x、三条
+输入路径、cap 的 one-hot（所有批次和轮次共用）、commit 阶段的路径（第 r 轮第 t 层读第
+S_{r+1} + t 位）、各轮折叠位置、s^-1 以及最终的 x。读同一个位的输入层和 commit 层共用一个门控
+单元。reduced opening 在 opening 部分算出（`reduce`，放在最后一个输入置换的 24 行上，那里 Ax、
+Bx 已经累加完），折叠链的起点就是这个单元（`select`，第 0 轮）。两部分之间没有任何重复：2b-iii
+自己的那套下标位和 cap one-hot（lde + 12 列）已经不存在了。
+
+### 接缝与 `check_seams`
+
+`Seam` 就是 C1→C2 的精确取值集合，`SeamShape` 给出它唯一的编码方式。C1 的公共值是内层 PV
+后面接上这一段；C2 的公共值恰好就是这一段，下标只带它覆盖的那几个 query 槽位。`Seam::read`
+（C1）和 `Seam::decode`（C2）负责把它读回来。**`check_seams(c1, c2) -> Result`** 按分组逐项
+比较，下一层递归要在电路里写的就是这些等式；出错时报出第一个不相等的分组名。C2 覆盖哪些槽位
+是它布局的静态属性。C2 是否覆盖了 C1 抽出的每一个 query，另由 **`check_coverage`** 回答：
+生产实例覆盖全部 43 个；玩具实例只覆盖 2 个，honest 测试断言 `check_coverage` 会拒绝它。
+
+| 分组 | S3 上的个数 | 编码 |
+|---|---:|---|
+| cap（trace、quotient、随机化器、4 个 commit 轮） | 7 × 8 个 digest = 896 个 limb | 16 位 limb |
+| ζ | 4 | 扩域 limb |
+| fri_alpha | 4 | 扩域 limb |
+| Az、Bz | 8 | 扩域 limb |
+| β（每轮一个） | 16 | 扩域 limb |
+| final polynomial | 64 | 扩域 limb |
+| query 下标 | 43 | 每个一个域元素 |
+| **合计** | **1,035** | = C1 的 1,151 个 PV − 116 个内层 PV |
+
+不算 cap，S3 上的接缝是 139 个值，与 C1 的接缝输出数一致。cap 是 C1 声明的输入，C2 按同一种
+编码读取。
+
+### 约束分组与测试
+
+共 32 个命名分组：`keccak`、`bits`、`absorb`、`ring`、`gate`、`capacity`、`bind_zero`、
+`bind_carry`、`bind_child`、`cap`、`canonical`、`leaf_bind`、`index`、`cap_select`、
+`x_point`、`inverse`、`alpha_pow`、`blk`、`accumulate`、`reduce`、`position`、`select`、
+`s_inv`、`fold_pow`、`fold`、`final_x`、`horner`、`final`、`seam_in`、`hold`、`handoff`、
+`ctx_hold`。所有约束的 degree 都 ≤ 3，玩具和 S3 两个实例都在 symbolic builder 上检查过。fixture
+是 2b-i 那个带种子的 log-8 玩具 proof；C1 的 honest 接缝由同一个 proof 构建；C2 实例覆盖两个
+cap 条目不同的 query（沿用 2b-ii 的选法）。每个负例都扫描**全部**行，并断言精确的（行，分组）
+集合。
+
+下表中的“连带后果”专指一个一致重推的伪造无法掩盖的东西，完全由原生重放算出：凡是根与其下标
+所选的接缝 cap 条目不符的，在该检查所在行由 `cap` 拒绝；凡是最后一次折叠与 final polynomial
+不符的 query，在它的寄存器各行由 `final` 拒绝。
+
+| 负例 | 在哪里被拒 |
+|---|---|
+| 改输入叶子的 salt | 该批次 cap 行上的 `cap` |
+| 改一个输入行值并换新 salt，Ax、ro 和折叠链随之重推 | 连带后果：输入 cap、两个 commit cap、`final` |
+| 输入路径上两个 sibling 互换 | 该批次 cap 行上的 `cap` |
+| 输入子节点放错边，下标位不动 | 送入那一层的行上的 `bind_child`，加 `cap` |
+| 整段翻转下标第 3 位，其余一切随之改动 | 该段各行上的 `index`，加连带后果（其中包括全部三个输入 cap） |
+| cap 的 one-hot 选错 | 该 query 各行上的 `cap_select`，加全部五个 cap 检查 |
+| x 不做位反转，逆元、ro 和折叠链随之重推 | 该 query 各行上的 `x_point`，加连带后果 |
+| 整段改动 ro | 最后一个输入置换各行上的 `reduce`，加该 query 各行上的 `select` |
+| 改 commit 阶段的 salt | 第 1 轮 cap 行上的 `cap` |
+| 改动第 0 轮两个 sibling，使折叠结果不变 | 只有第 0 轮 cap 行上的 `cap` |
+| 第 0 轮 sibling 互换，链条重推 | 连带后果 |
+| 第 1 轮用 β_0 折叠 | 该 query 各行上的 `fold_pow`，加 `final` |
+| 改动两轮之间的值 | 该 query 各行上的 `fold` 和 `select` |
+| 伪造 final polynomial（公共值与保持单元一致） | 每一行上的 `final` |
+| 改动最终 x 链中的一个单元 | 该 query 各行上的 `final_x` |
+| **公共值里的 Az 与保持单元不一致** | 第 0 行的 `seam_in` |
+| **C1 给的 Az 不同，C2 按它一致重推**（保持单元、公共值、ro 和折叠全部重推） | `check_seams` 报出 `az`；在 C2 内部是连带后果（伪造的 ro 对不上 commit 阶段的叶子） |
+| **八个接缝分组逐一在 C1 一侧、再在 C2 一侧篡改** | `check_seams` 报出对应的分组名，八组全部如此 |
+| **重复使用一个滚动幂次**（query 1 最后一个 quotient 块沿用前一块的幂次，Ax、ro、折叠一致） | p 本该推进的那一行上的 `alpha_pow`，加连带后果 |
+| **跳过一个滚动幂次**（query 0 的 trace 块多乘一次，后面各块跟着偏移） | 进入该块那一步的 `alpha_pow`，以及该块 24 行上的 `alpha_pow`（α^w 钉），加连带后果 |
+| **ro 在两部分之间被改**（opening 部分算出诚实的 ro，折叠部分从 ro + 1 开始） | 交界行上的 `handoff`，加折叠部分各行上的 `select` |
+| **折叠部分的下标第 S_R 位与 opening 部分不同** | 交界行上的 `handoff`；折叠部分各行上的 `index`、`x_point`、`s_inv`、`final_x`；读该位的两层 commit 路径上的 `bind_child` |
+
+**原生交叉核对**（honest 测试）：
+
+- 对**全部 43 个 query**，C2 按块计算的 Ax/Bx（用保持表里的滚动幂次）等于 C1 那个按源码顺序
+  写的 `open_input` 求和；与 C1 的 Az/Bz 组合后，等于 2b-ii 顺序版的 reduced opening。
+- 滚动幂次在共用的项序下正是 α^{k0}。
+- 对被覆盖的 query，折叠链和最终检查与 p3 一致（commit 阶段的 MMCS、`fold_row`），每个根都是
+  接缝里对应的 cap 条目。
+- 此外还检查：SAT、degree ≤ 3、periodic 列为零；用同一个 proof 构建的 honest 组合上
+  `check_seams(C1, C2)` 通过；玩具布局钉到 `price::composed_c2_layout`。
+- **真实的 S3 生产调度**（25 个输入叶子置换和 3 × 19 个输入路径层，然后是四轮 arity 16、路径
+  长 15/11/7/3 的折叠）在共享的 census proof 上跑两个 query。接缝由 p3 的 challenger 和按源码
+  顺序的求和算出，ro、Ax/Bx 和各次折叠都与原生代码对拍。测试覆盖 SAT、degree ≤ 3 和价格钉值。
+
+### 尺寸 **[P，源码推导]**
+
+`price::composed_c2(shape)` 由 `composed_c2_pins_the_census_and_the_plan` 钉住。在 43 个
+query 下，C2 的 lane 恰好是 **census 几何里全部的叶子置换和路径置换**，challenger 的置换归
+C1。S3 上是 43 × (25 + 8) = **1,419** 个叶子置换，43 × (57 + 36) = **3,999** 个路径置换。
+
+| shape | 每 query 置换（输入 + commit） | lane 行数 | 补齐后行数 | 列数 | periodic | PV（= 接缝） |
+|---|---|---|---|---|---|---|
+| S | 126（82 + 44） | 130,032 | 2^17 | 5,058 | 0 | 1,035 |
+| P | 139（87 + 52） | 143,448 | 2^18 | 5,107 | 0 | 1,167 |
+| R | 120（79 + 41） | 123,840 | 2^17 | 4,966 | 0 | 1,035 |
+
+S 的列构成：Keccak 2,633，消息位 1,088，规范性 68，位置环与 query 环 169（126 + 43），末行门控
+26，query 寄存器 818（其中 26 列是交接部分），滚动单元 24，保持的接缝值 232。
+
+**与计划对比**（S3 约 5.0k 列 × 2^17；P3 → 2^18）：S3 实际 5,058 × 2^17，P3 为 2^18。与 2b-ii +
+2b-iii 相比的差额来自三根杠杆：L1 和 L2 各去掉一张 5,912 列的表，L3 去掉 2b-iii 那套重复的
+下标位和 one-hot（34 列）。新增的是两个环、门控单元和 140 个保持的幂次列。由于没有 periodic
+列，下一层不必为 C2 的调度付出任何按行计的代价。
+
+### C2 还没做的事
+
+- **电路内的接缝。** `check_seams` 目前是原生的；下一层递归要在电路里写出同样的等式。
+- **完整尺寸。** 43 个 query 的 C2（2^17 行）从没构建过；S3 测试只构建两个 query（2^13 行）。
+- **计划中的第 3 片（selector 转换）和 C1 的全周期 ROM（L5）** 不在本片范围内。C2 本身已经
+  没有 periodic 列。
+
+`complete_verifier_layout` 和 `memory_gate_pass` 仍然是 **false**。
+
+### 验证
+
+本地没有跑任何测试、proof 或 benchmark。本地预检为
+`cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
+和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`c2.rs` 八个、`price.rs` 一个，共九个。
+**[P，待 CI]**：以 C1 的 2,798 为基线，应为 2,807 项通过、0 失败、15 项忽略。
+
+新测试在 Graviton lane 上预计耗时 20–60 秒 **[P]**，**不新增 prove**：玩具 proof 用 2b-i 的，
+S3 proof 用 census 测试的，每个测试二进制各共用一份；如果 C2 的 S3 测试先跑，就由它承担那次
+原本就有的约 26 秒 S3 prove。工作量：
+
+- 构建一次 C1 的 honest trace；
+- 在 2^11 行、4,395 列的 trace 上做二十一次并行全表违反扫描和一次 SAT 扫描；
+- 43 × 2 次原生 reduced opening 和块求和；
+- 在 2^13 行、约 5.0k 列的 S3 trace 上做一次 SAT 扫描；
+- 两次 symbolic degree 计算。
+
+尚未验证，按最可能先出问题排序：
+
+1. 复制之后（行，分组）集合是否精确，特别是由原生重放推出的“连带后果”集合，以及 `alpha_pow`
+   所在行的取法（伪造块之前的最后一行）。
+2. L2 在 S3 的 22 个 trace 块上的项号记账：只在两 query 的 S3 测试（SAT）里跑过，从没经过负例。
+3. S/P/R 的钉值：假定 census 几何成立，且公式与列分配完全对应。玩具和两 query 的 S3 实例把公式
+   钉到了 AIR 上；P 和 R 只有公式。

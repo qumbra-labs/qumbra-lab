@@ -454,6 +454,106 @@ pub(super) fn composed_c1(shape: Shape) -> Result<Value, String> {
     ))
 }
 
+/// Held fri_alpha powers C2's lever L2 keeps (`ood/c2.rs`): α^1..α^34, one
+/// per rate word, since a leaf block carries at most 34 row values.
+const C2_POWER_TABLE: usize = 34;
+
+/// [P] F2b composition slice C2 (`ood/c2.rs`): 2b-ii's input openings and
+/// 2b-iii's query phase as per-query segments on ONE overwrite-mode Keccak
+/// lane, with levers L2 (incremental fri_alpha powers) and L3 (ro and the
+/// index bits handed off as registers). Source-derived; C2's honest tests
+/// pin this formula to the toy instance and to a two-query S3 instance, and
+/// `composed_c2_pins_the_census_and_the_plan` pins the lane to the census.
+///
+/// - Lane perms per query: 2b-ii's input leaves and 3 x (lde - CAP_HEIGHT)
+///   input levels, then 2b-iii's commit-phase leaves and paths. At 43 queries
+///   these are ALL of the census's leaf and path perms; C1 carries the
+///   challenger's.
+/// - Columns: Keccak, 1,088 message bits (no S bits), 68 canonicity, the
+///   position ring (one per segment perm) and the query ring (one per query),
+///   materialized last-row gates (one per index bit a path level reads, one
+///   per cap check), the query registers (index bits and ro — the hand-off —,
+///   12 cap one-hot, the x chain, two inverses, per round 4n group + 2n - 2
+///   position + h s^-1 + 4(n - 1) powers, 4R running values, the final x
+///   chain, 4·final_len Horner cells), six running extension cells (p, pn,
+///   pw, blk, Ax, Bx) and the held seam values (ζ, α^1..α^34, α^w, Az, Bz,
+///   every β, the final polynomial).
+/// - Periodic: none. Scheduling is Keccak's step flags and the two rings.
+/// - Public values: the seam (every cap, ζ, fri_alpha, Az, Bz, every β, the
+///   final polynomial, the covered indices).
+pub(super) fn composed_c2_layout(
+    width: usize,
+    log_height: usize,
+    chunks: usize,
+    queries: usize,
+) -> Value {
+    let cfg = L2_CFG_PROVISIONAL;
+    let lde = lde_log(log_height);
+    let path = lde - CAP_HEIGHT;
+    let blocks = |u64s: usize| u64s.div_ceil(17);
+    let in_leaf: usize = [(1, 4), (1, width), (chunks, 4)]
+        .iter()
+        .map(|&(mats, cols)| blocks((mats * (cols + SALT_ELEMS)).div_ceil(2)))
+        .sum();
+    let in_comp = 3 * path;
+    let arities = fri_log_arities(lde, &cfg);
+    let rounds = arities.len();
+    let final_bits = cfg.log_blowup + cfg.log_final_poly_len;
+    let final_len = 1usize << cfg.log_final_poly_len;
+    let (mut fri_leaf, mut fri_comp, mut round_regs) = (0, 0, 0);
+    let mut height = lde;
+    for &a in &arities {
+        let n = 1usize << a;
+        let folded = height - a;
+        fri_leaf += blocks((4 * n + SALT_ELEMS).div_ceil(2));
+        fri_comp += folded - CAP_HEIGHT;
+        round_regs += 4 * n + (2 * n - 2) + folded + 4 * (n - 1);
+        height = folded;
+    }
+    let per_query = in_leaf + in_comp + fri_leaf + fri_comp;
+    let lane_rows = queries * per_query * 24;
+    let rings = per_query + queries;
+    let gates = path + 3 + rounds;
+    let handoff = lde + 4;
+    let registers = handoff + 12 + lde + 8 + round_regs + 4 * rounds + final_bits + 4 * final_len;
+    let running = 6 * 4;
+    let held = 4 + 4 * C2_POWER_TABLE + 4 + 8 + 4 * rounds + 4 * final_len;
+    let lane = NUM_KECCAK_COLS + 64 * 17 + 2 * 34;
+    let columns = lane + rings + gates + registers + running + held;
+    let terms = 4 + 2 * width + 4 * chunks;
+    let cap_words = (1usize << CAP_HEIGHT) * 8;
+    json!({"evidence": "P", "source": "F2b composition C2 layout (ood/c2.rs), source-derived; toy and two-query S3 pinned by its tests",
+        "queries": queries, "lde_log_height": lde, "fri_log_arities": arities,
+        "permutations_per_query": per_query,
+        "per_query": {"input_leaf": in_leaf, "input_path": in_comp,
+            "commit_leaf": fri_leaf, "commit_path": fri_comp},
+        "leaf_permutations_total": (in_leaf + fri_leaf) * queries,
+        "path_compressions_total": (in_comp + fri_comp) * queries,
+        "lane_rows": lane_rows, "padded_rows": lane_rows.next_power_of_two(),
+        "component_columns": columns,
+        "column_split": {"keccak": NUM_KECCAK_COLS, "message_bits": 64 * 17, "canonical": 2 * 34,
+            "position_and_query_rings": rings, "last_row_gates": gates,
+            "query_registers": registers, "hand_off_registers": handoff,
+            "running": running, "held": held},
+        "periodic_columns": 0,
+        "public_values": 2 * cap_words * (3 + rounds) + 16 + 4 * rounds + 4 * final_len + queries,
+        "opened_terms": terms,
+        "levers": {"l1_z_value_table_removed": 4 * terms, "l2_alpha_power_table_removed": 4 * terms,
+            "l2_power_cells_added": 4 * C2_POWER_TABLE + 4 + 4 * 4,
+            "l3_duplicate_index_and_one_hot_avoided": lde + 12},
+        "complete_verifier_layout": false, "memory_gate_pass": false})
+}
+
+/// [P] `composed_c2_layout` for a shape, covering all queries.
+pub(super) fn composed_c2(shape: Shape) -> Value {
+    composed_c2_layout(
+        shape.width(),
+        shape.log_height(),
+        8,
+        L2_CFG_PROVISIONAL.num_queries,
+    )
+}
+
 impl Geometry {
     pub(super) fn report(&self, shape: Shape) -> Value {
         let cfg = L2_CFG_PROVISIONAL;
@@ -609,6 +709,46 @@ mod tests {
         assert_eq!(s["lane_rows"], 207 * 24);
         assert_eq!(s["rom_ood_extension_mul"], 2_227 << 15);
         assert_eq!(s["replaced_sponge_selectors_ood_extension_mul"], 209 << 15);
+    }
+
+    #[test]
+    fn composed_c2_pins_the_census_and_the_plan() {
+        // C2's lane is every leaf and path perm of the census geometry (C1
+        // carries the challenger's): at S3, 43 x (25 + 8) = 1,419 leaf and
+        // 43 x (57 + 36) = 3,999 path perms. The plan: about 5.0k columns x
+        // 2^17 at S3, 2^18 at P3; no periodic column.
+        for (shape, per_query, columns, rows, pvs) in [
+            (Shape::S, 126, 5_058, 1 << 17, 1_035),
+            (Shape::P, 139, 5_107, 1 << 18, 1_167),
+            (Shape::R, 120, 4_966, 1 << 17, 1_035),
+        ] {
+            let g = geometry(shape, 8);
+            let c = composed_c2(shape);
+            assert_eq!(
+                c["leaf_permutations_total"],
+                43 * g.leaf_per_query,
+                "{shape:?}"
+            );
+            assert_eq!(c["path_compressions_total"], 43 * g.compress_per_query);
+            assert_eq!(c["permutations_per_query"], per_query);
+            assert_eq!(c["component_columns"], columns);
+            assert_eq!(c["padded_rows"], rows);
+            assert_eq!(c["periodic_columns"], 0);
+            assert_eq!(c["public_values"], pvs);
+            assert_eq!(c["opened_terms"], g.ood);
+            // The seam is C1's export after its inner PVs.
+            let c1 = composed_c1(shape).unwrap();
+            assert_eq!(
+                c1["public_values"].as_u64().unwrap() as usize - shape.pv_len(),
+                pvs
+            );
+        }
+        let s = composed_c2(Shape::S);
+        assert_eq!(s["leaf_permutations_total"], 1_419);
+        assert_eq!(s["path_compressions_total"], 3_999);
+        assert_eq!(s["lane_rows"], 130_032);
+        assert_eq!(s["levers"]["l2_alpha_power_table_removed"], 5_912);
+        assert_eq!(s["levers"]["l1_z_value_table_removed"], 5_912);
     }
 
     #[test]
