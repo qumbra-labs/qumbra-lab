@@ -506,11 +506,18 @@ pub(super) fn digest_limbs(d: &[u8; 32]) -> Vec<Val> {
 /// Test fixtures shared by both transcript components.
 #[cfg(test)]
 pub(super) mod toy {
-    use p3_challenger::{CanObserve, FieldChallenger};
+    use std::collections::BTreeSet;
+
+    use p3_air::DebugConstraintBuilder;
+    use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
     use p3_matrix::dense::RowMajorMatrix;
+    use p3_maybe_rayon::prelude::*;
     use p3_uni_stark::{prove, verify, Proof, StarkGenericConfig};
-    use qlab_consensus::Config;
+    use qlab_air::l2test::violations_at;
+    use qlab_consensus::{Config, IS_ZK};
     use qlab_l2::L2_CFG_PROVISIONAL;
+
+    use crate::f2::price::fri_log_arities;
 
     /// The verifier's own challenger type.
     pub(in crate::f2::ood) type Native = <Config as StarkGenericConfig>::Challenger;
@@ -552,9 +559,8 @@ pub(super) mod toy {
         }
     }
 
-    /// One real hiding proof of the toy at `log_height` on the L2 lane,
-    /// seeded so CI replays the same transcript every run.
-    pub(in crate::f2::ood) fn toy_proof(log_height: usize, seed: u64) -> (Proof<Config>, Vec<Val>) {
+    /// The toy's recurrence trace at `log_height` and its two PVs.
+    fn toy_trace(log_height: usize) -> (RowMajorMatrix<Val>, Vec<Val>) {
         let (mut x, mut y) = (Val::from_u32(3), Val::from_u32(5));
         let mut rows = Vec::new();
         for _ in 0..1 << log_height {
@@ -562,10 +568,121 @@ pub(super) mod toy {
             (x, y) = (y, x * y * y + x);
         }
         let pvs = vec![rows[0], rows[rows.len() - 1]];
+        (RowMajorMatrix::new(rows, 2), pvs)
+    }
+
+    /// One real hiding proof of the toy at `log_height` on the L2 lane,
+    /// seeded so CI replays the same transcript every run.
+    pub(in crate::f2::ood) fn toy_proof(log_height: usize, seed: u64) -> (Proof<Config>, Vec<Val>) {
+        let (trace, pvs) = toy_trace(log_height);
         let config = qlab_consensus::make_config_seeded(&L2_CFG_PROVISIONAL, seed);
-        let proof = prove(&config, &Toy, RowMajorMatrix::new(rows, 2), &pvs);
+        let proof = prove(&config, &Toy, trace, &pvs);
         verify(&config, &Toy, &proof, &pvs).expect("toy hiding proof verifies");
         (proof, pvs)
+    }
+
+    /// F2b-5 (issue #750): the toy plus one period-4 periodic column
+    /// s = (1, 0, 0, 0) and the constraint s · (x' − y) = 0 on transitions,
+    /// which the toy's own x' = y implies. It changes nothing about the
+    /// trace, but the OOD identity now reads s(ζ): the smallest real hiding
+    /// proof on which a wrong periodic evaluation can be refused. Degree 3
+    /// still, so eight hiding quotient chunks, as the toy.
+    pub(in crate::f2::ood) struct ToyPeriodic;
+
+    impl BaseAir<Val> for ToyPeriodic {
+        fn width(&self) -> usize {
+            2
+        }
+        fn num_public_values(&self) -> usize {
+            2
+        }
+        fn num_periodic_columns(&self) -> usize {
+            1
+        }
+        fn periodic_columns(&self) -> Vec<Vec<Val>> {
+            vec![vec![Val::ONE, Val::ZERO, Val::ZERO, Val::ZERO]]
+        }
+    }
+
+    impl<AB: AirBuilder<F = Val>> Air<AB> for ToyPeriodic {
+        fn eval(&self, builder: &mut AB) {
+            Toy.eval(builder);
+            let main = builder.main();
+            let y: AB::Expr = main.current_slice()[1].into();
+            let nx: AB::Expr = main.next_slice()[0].into();
+            let s: AB::Expr = builder.periodic_values()[0].into();
+            builder.when_transition().assert_zero(s * (nx - y));
+        }
+    }
+
+    /// One real hiding proof of [`ToyPeriodic`] (the toy's trace), seeded.
+    pub(in crate::f2::ood) fn toy_periodic_proof(
+        log_height: usize,
+        seed: u64,
+    ) -> (Proof<Config>, Vec<Val>) {
+        let (trace, pvs) = toy_trace(log_height);
+        let config = qlab_consensus::make_config_seeded(&L2_CFG_PROVISIONAL, seed);
+        let proof = prove(&config, &ToyPeriodic, trace, &pvs);
+        verify(&config, &ToyPeriodic, &proof, &pvs).expect("periodic toy proof verifies");
+        (proof, pvs)
+    }
+
+    /// A deep copy of a proof (p3's `Proof` is not `Clone`): what a forger
+    /// edits.
+    pub(in crate::f2::ood) fn copy(proof: &Proof<Config>) -> Proof<Config> {
+        let bytes = bincode::serialize(proof).expect("serialize a proof");
+        bincode::deserialize(&bytes).expect("deserialize a proof")
+    }
+
+    /// Re-grind the query PoW of a hiding proof of height `log_height` for
+    /// the transcript it now carries under `pvs`. A tampered opened value,
+    /// cap or PV moves every later challenge, so the old witness fails; a
+    /// forger grinds a new one (p3's challenger through F2, fri_alpha, each
+    /// commit round and β, the final polynomial and the arity schedule,
+    /// p3-fri `verifier.rs:298-339`), leaving only the tampering itself to
+    /// be refused.
+    pub(in crate::f2::ood) fn regrind(proof: &mut Proof<Config>, pvs: &[Val], log_height: usize) {
+        let cfg = L2_CFG_PROVISIONAL;
+        let mut ch = native_through_f2(proof, pvs, log_height);
+        let _fri_alpha: E = ch.sample_algebra_element();
+        let fri = &proof.opening_proof.1;
+        for (cm, &w) in fri
+            .commit_phase_commits
+            .iter()
+            .zip(&fri.commit_pow_witnesses)
+        {
+            ch.observe(cm.clone());
+            assert!(ch.check_witness(0, w), "commit PoW bits are 0");
+            let _beta: E = ch.sample_algebra_element();
+        }
+        ch.observe_algebra_slice(&fri.final_poly);
+        for a in fri_log_arities(log_height + IS_ZK + cfg.log_blowup, &cfg) {
+            ch.observe(Val::from_usize(a));
+        }
+        proof.opening_proof.1.query_pow_witness = ch.grind(cfg.grind_bits);
+    }
+
+    /// Every (row, group) a component's trace violates, over ALL rows.
+    pub(in crate::f2::ood) fn violation_set<A>(
+        air: &A,
+        trace: &RowMajorMatrix<Val>,
+        pvs: &[Val],
+    ) -> BTreeSet<(usize, &'static str)>
+    where
+        A: Phased + Sync + for<'b> Air<DebugConstraintBuilder<'b, Val>>,
+    {
+        let ranges = phase_ranges(air);
+        let group = |c: usize| air.phases()[ranges.iter().position(|r| r.contains(&c)).unwrap()];
+        (0..trace.height())
+            .into_par_iter()
+            .flat_map_iter(|row| {
+                violations_at(air, trace, pvs, row)
+                    .into_iter()
+                    .map(move |v| (row, group(v.constraint)))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// The p3 challenger driven through uni-stark 0.6.1's hiding order up to

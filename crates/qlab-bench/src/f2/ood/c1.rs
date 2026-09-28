@@ -1368,10 +1368,12 @@ pub(in crate::f2::ood) mod tests {
 
     use super::super::bind;
     use super::super::fri_fs::tests::shared;
-    use super::super::lane::toy::{Native, Toy};
+    use super::super::lane::toy::{
+        copy, regrind, toy_periodic_proof, violation_set, Native, Toy, ToyPeriodic,
+    };
     use super::super::lane::{draw_values, phase_ranges};
     use super::super::open::tests::reduced_opening;
-    use super::super::{compare_native, proof_inputs_dims};
+    use super::super::{compare_native, proof_inputs_dims, Domains};
     use super::*;
     use crate::f2::price::{composed_c1_layout, MachineDims};
 
@@ -2017,5 +2019,99 @@ pub(in crate::f2::ood) mod tests {
         };
         bad.pvs[l.beta_pv(1) + 2] += Val::ONE;
         refused_exactly(fx, &bad, &perm_rows(l.draw_perm(4), "fs_bind"));
+    }
+
+    /// F2b-5 (issue #750; the kickoff's "tampered opened value" and
+    /// "tampered quotient chunk", stage-0's "wrong quotient/AIR
+    /// satisfaction"): a REAL leaf proof with one opened value altered — a
+    /// quotient chunk limb, the trace at ζ, the trace at ζ·g_N — run through
+    /// the builder `f2wrap` uses ([`super::honest`]), not a poked trace cell. p3's
+    /// verifier refuses it. The builder refuses it natively by name while
+    /// the proof carries its old query PoW (the absorbed values moved every
+    /// later draw). Re-ground for the moved transcript, the C1 trace built
+    /// from it is consistent everywhere — transcript, Az/Bz, the machine's
+    /// bound inputs — except the OOD identity: its residual is not zero, and
+    /// `machine_out` on the last row is the only refusal.
+    #[test]
+    fn c1_refuses_real_proofs_with_an_altered_opened_value() {
+        let fx = fixture();
+        let cfg = L2_CFG_PROVISIONAL;
+        for which in [
+            "quotient chunk 3 limb 2",
+            "trace at zeta",
+            "trace at zeta g_N",
+        ] {
+            let mut proof = copy(fx.proof);
+            let o = &mut proof.opened_values;
+            match which {
+                "quotient chunk 3 limb 2" => o.quotient_chunks[3][2] += E::ONE,
+                "trace at zeta" => o.trace_local[1] += E::ONE,
+                _ => o.trace_next.as_mut().unwrap()[0] += E::ONE,
+            }
+            assert!(
+                p3_uni_stark::verify(&qlab_l2::make_config_l2(), &Toy, &proof, fx.pvs).is_err(),
+                "{which}: p3 accepted it"
+            );
+            let inputs = proof_inputs_dims(dims(), &proof, fx.pvs).unwrap();
+            assert_ne!(residual(fx, &inputs), E::ZERO, "{which}");
+            let err = super::honest(&fx.program, &inputs, &proof, fx.pvs, &cfg, 64 << 20)
+                .err()
+                .unwrap();
+            assert!(
+                err.contains("query PoW sample is not zero"),
+                "{which}: {err}"
+            );
+            regrind(&mut proof, fx.pvs, LOG_HEIGHT);
+            let h = super::honest(&fx.program, &inputs, &proof, fx.pvs, &cfg, 64 << 20).unwrap();
+            assert_ne!(h.seam.fri_alpha, fx.honest.fri_alpha(), "{which}: moved");
+            assert_eq!(
+                violation_set(&h.air, &h.trace, &h.pvs),
+                [(last(fx), "machine_out")].into(),
+                "{which}"
+            );
+        }
+    }
+
+    /// F2b-5 (stage-0's "periodic evaluation" and "g_N versus the
+    /// doubled-domain shift", C1's side): a verifier program compiled on the
+    /// committed 2N-point domain instead of the trace domain. The native
+    /// comparison `wrap` runs before building (`compare_native`) refuses
+    /// each by name. Built anyway on an honest proof, the machine is
+    /// consistent with its own (wrong) ROM, and C1 still refuses on the
+    /// last row: ζ·g_2N misses C1's own pin of the next point to ζ·g_N, and
+    /// a periodic column evaluated at ζ^{2N/4} instead of ζ^{N/4} leaves a
+    /// nonzero residual. The periodic case needs a leaf AIR with a periodic
+    /// column: [`ToyPeriodic`], one more seeded log-8 proof.
+    #[test]
+    fn c1_refuses_verifier_programs_on_the_doubled_domain() {
+        let fx = fixture();
+        let cfg = L2_CFG_PROVISIONAL;
+        // The next point on g_2N: the residual does not read it.
+        let wrong = Program::compile_on(dims(), &Toy, Domains::NextOn2N).unwrap();
+        let err = compare_native(&wrong, &Toy, &fx.inputs).unwrap_err();
+        assert!(err.contains("next-point DAG/native mismatch"), "{err}");
+        assert_eq!(wrong.evaluate(&fx.inputs).unwrap()[wrong.residual], E::ZERO);
+        let h = super::honest(&wrong, &fx.inputs, fx.proof, fx.pvs, &cfg, 64 << 20).unwrap();
+        assert_eq!(
+            violation_set(&h.air, &h.trace, &h.pvs),
+            [(last(fx), "machine_out")].into()
+        );
+        // A periodic column interpolated over 2N points.
+        let (proof, pvs) = toy_periodic_proof(LOG_HEIGHT, 0xf2b5);
+        let inputs = proof_inputs_dims(dims(), &proof, &pvs).unwrap();
+        let right = Program::compile_dims(dims(), &ToyPeriodic).unwrap();
+        let values = compare_native(&right, &ToyPeriodic, &inputs).unwrap();
+        assert_eq!(values[right.residual], E::ZERO);
+        let h = super::honest(&right, &inputs, &proof, &pvs, &cfg, 64 << 20).unwrap();
+        assert!(violation_set(&h.air, &h.trace, &h.pvs).is_empty(), "honest");
+        let wrong = Program::compile_on(dims(), &ToyPeriodic, Domains::PeriodicOn2N).unwrap();
+        let err = compare_native(&wrong, &ToyPeriodic, &inputs).unwrap_err();
+        assert!(err.contains("periodic DAG/native mismatch"), "{err}");
+        assert_ne!(wrong.evaluate(&inputs).unwrap()[wrong.residual], E::ZERO);
+        let h = super::honest(&wrong, &inputs, &proof, &pvs, &cfg, 64 << 20).unwrap();
+        assert_eq!(
+            violation_set(&h.air, &h.trace, &h.pvs),
+            [(h.air.height - 1, "machine_out")].into()
+        );
     }
 }

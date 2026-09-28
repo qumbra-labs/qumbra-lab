@@ -203,11 +203,11 @@ pub(super) struct Leaf<'a> {
 
 /// The OOD program of a verifier AIR, and the native identity on the
 /// proof's openings (residual zero), before anything is built on it.
-fn compiled<A>(shape: Shape, air: &A, inputs: &Inputs) -> Result<Program>
+fn compiled<A>(dims: Dims, air: &A, inputs: &Inputs) -> Result<Program>
 where
     A: Air<SymbolicAirBuilder<Val>> + for<'a> Air<VerifierConstraintFolder<'a, Config>>,
 {
-    let program = Program::compile(shape, air)?;
+    let program = Program::compile_dims(dims, air)?;
     let values = compare_native(&program, air, inputs)?;
     require(
         values[program.residual] == E::ZERO,
@@ -221,9 +221,9 @@ impl<'a> Leaf<'a> {
     pub(super) fn of(shape: Shape, proof: &'a Proof<Config>, pvs: &'a [Val]) -> Result<Self> {
         let inputs = proof_inputs(shape, proof, pvs)?;
         let program = match shape {
-            Shape::S => compiled(shape, &qlab_l2::verifier_air_s(), &inputs)?,
-            Shape::P => compiled(shape, &qlab_l2::verifier_air_p(), &inputs)?,
-            Shape::R => compiled(shape, &qlab_l2::verifier_air_r(), &inputs)?,
+            Shape::S => compiled(shape.into(), &qlab_l2::verifier_air_s(), &inputs)?,
+            Shape::P => compiled(shape.into(), &qlab_l2::verifier_air_p(), &inputs)?,
+            Shape::R => compiled(shape.into(), &qlab_l2::verifier_air_r(), &inputs)?,
         };
         Ok(Self {
             dims: shape.into(),
@@ -552,8 +552,8 @@ pub(in crate::f2) fn run(
 #[cfg(test)]
 mod tests {
     use super::super::fri_fs::tests::shared;
-    use super::super::lane::toy::Toy;
-    use super::super::open;
+    use super::super::lane::toy::{copy, regrind, violation_set, Toy};
+    use super::super::open::{self, QUOTIENT, RANDOM, TRACE};
     use super::super::proof_inputs_dims;
     use super::super::seam::{check_pv_widths, PvWidth};
     use super::*;
@@ -652,5 +652,299 @@ mod tests {
         assert_eq!(r["expected_peak_gib"]["c2"]["b4"], 10.823);
         assert_eq!(r["expected_peak_gib"]["c2"]["b2"], 6.718);
         assert_eq!(r["expected_peak_gib"]["c1_main_columns"]["b4"], 6.284);
+    }
+
+    /// C2's two-slot toy instance (the C2 tests'): slot 0 and the first slot
+    /// whose cap entry differs.
+    fn toy_slots(leaf: &Leaf<'_>) -> Vec<usize> {
+        let path = open::Geom::new(leaf.dims, leaf.chunks, &leaf.cfg)
+            .unwrap()
+            .path;
+        let idx = &shared().indices;
+        let other = (1..idx.len())
+            .find(|&i| idx[i] >> path != idx[0] >> path)
+            .unwrap();
+        vec![0, other]
+    }
+
+    /// F2b-5 (stage-0's "missing/altered randomizer" and "salt/path/point
+    /// lengths"): a toy leaf proof missing a piece, or with a length the
+    /// builders read changed, is refused by name by the builders
+    /// `check_leaf` calls: C1's (`c1::honest`), C2's (`c2::honest`, on the
+    /// covered slot 0) and the leaf's native OOD compile (`compiled`, which
+    /// `Leaf::of` runs). For an L2 shape `f2wrap` runs `validate_geometry`
+    /// and the native verifier before any of these; the census test names
+    /// those refusals.
+    #[test]
+    fn f2wrap_builders_refuse_missing_or_misshapen_proofs_by_name() {
+        type Edit = fn(&mut Proof<Config>);
+        let leaf = toy_leaf();
+        let sh = shared();
+        let (cfg, max) = (L2_CFG_PROVISIONAL, 64 << 20);
+        let edited = |edit: Edit| {
+            let mut p = copy(sh.proof);
+            edit(&mut p);
+            p
+        };
+        let c1_side: [(Edit, &str); 3] = [
+            (
+                |p| p.commitments.random = None,
+                "missing randomizer commitment",
+            ),
+            (
+                |p| p.opened_values.random = None,
+                "missing randomizer opening",
+            ),
+            (
+                |p| p.opened_values.trace_next = None,
+                "missing next-row opening",
+            ),
+        ];
+        for (edit, name) in c1_side {
+            let p = edited(edit);
+            let err = c1::honest(&leaf.program, &leaf.inputs, &p, sh.pvs, &cfg, max)
+                .err()
+                .unwrap();
+            assert_eq!(err, name);
+        }
+        let point: [Edit; 2] = [
+            |p| p.opened_values.trace_local.push(E::ZERO),
+            |p| p.opened_values.quotient_chunks[5].push(E::ZERO),
+        ];
+        for edit in point {
+            let p = edited(edit);
+            let inputs = proof_inputs_dims(leaf.dims, &p, sh.pvs).unwrap();
+            let err = compiled(leaf.dims, &Toy, &inputs).err().unwrap();
+            assert_eq!(err, "OOD input dimensions");
+        }
+        let seam = c1::honest(&leaf.program, &leaf.inputs, sh.proof, sh.pvs, &cfg, max)
+            .unwrap()
+            .seam;
+        let slots = toy_slots(&leaf);
+        let c2_side: [(Edit, &str); 9] = [
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].input_proof.pop();
+                },
+                "input batch count",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].input_proof[RANDOM].opened_values[0]
+                        .push(Val::ZERO)
+                },
+                "opened row shape",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].input_proof[TRACE]
+                        .opening_proof
+                        .0[0]
+                        .pop();
+                },
+                "salt shape",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].input_proof[QUOTIENT]
+                        .opening_proof
+                        .1
+                        .pop();
+                },
+                "input path length",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0]
+                        .commit_phase_openings
+                        .pop();
+                },
+                "commit round count",
+            ),
+            (
+                |p| p.opening_proof.1.query_proofs[0].commit_phase_openings[1].log_arity ^= 1,
+                "log arity differs from the fixed schedule",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].commit_phase_openings[0]
+                        .sibling_values
+                        .pop();
+                },
+                "sibling count",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].commit_phase_openings[0]
+                        .opening_proof
+                        .0[0]
+                        .pop();
+                },
+                "commit-phase salt shape",
+            ),
+            (
+                |p| {
+                    p.opening_proof.1.query_proofs[0].commit_phase_openings[1]
+                        .opening_proof
+                        .1
+                        .pop();
+                },
+                "commit-phase path length",
+            ),
+        ];
+        for (edit, name) in c2_side {
+            let p = edited(edit);
+            let err = c2::honest(leaf.dims, leaf.chunks, &cfg, &seam, slots.clone(), &p, max)
+                .err()
+                .unwrap();
+            assert_eq!(err, name);
+        }
+    }
+
+    /// F2b-5 (the kickoff's "legacy verifier fed a hiding proof"; stage-0:
+    /// "never feed a hiding proof to the legacy verifier"). The legacy,
+    /// non-hiding p3 verifier (the outer lane here, and the M4 modules)
+    /// takes `Proof<LegacyNonHidingConfig>`, so a hiding `Proof<Config>`
+    /// reaches it only re-typed. The most generous re-typing keeps every
+    /// commitment, opened value and FRI value and drops only the Merkle
+    /// salts, which the legacy MMCS has no slot for. It is refused by name
+    /// before any transcript work: the randomizer the hiding PCS adds
+    /// (`RandomizationError`); with the randomizer dropped too, the eight
+    /// hiding quotient chunks where the non-hiding verifier expects two
+    /// (`OpenedValuesDimensionMismatch`). The hiding verifier accepts the
+    /// same proof. So the legacy verifier cannot stand in for C1's
+    /// hiding-aware transcript.
+    #[test]
+    fn the_legacy_verifier_refuses_a_hiding_leaf_proof() {
+        use p3_commit::BatchOpening;
+        use p3_fri::{CommitPhaseProofStep, FriProof, QueryProof};
+        use p3_uni_stark::{Commitments, OpenedValues, VerificationError};
+        let sh = shared();
+        let retype = |p: &Proof<Config>, randomizer: bool| -> Proof<OuterConfig> {
+            let (c, o, fri) = (&p.commitments, &p.opened_values, &p.opening_proof.1);
+            let query_proofs = fri
+                .query_proofs
+                .iter()
+                .map(|q| QueryProof {
+                    input_proof: q
+                        .input_proof
+                        .iter()
+                        .map(|b| BatchOpening {
+                            opened_values: b.opened_values.clone(),
+                            opening_proof: b.opening_proof.1.clone(),
+                        })
+                        .collect(),
+                    commit_phase_openings: q
+                        .commit_phase_openings
+                        .iter()
+                        .map(|s| CommitPhaseProofStep {
+                            log_arity: s.log_arity,
+                            sibling_values: s.sibling_values.clone(),
+                            opening_proof: s.opening_proof.1.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            Proof {
+                commitments: Commitments {
+                    trace: c.trace.clone(),
+                    quotient_chunks: c.quotient_chunks.clone(),
+                    random: c.random.clone().filter(|_| randomizer),
+                },
+                opened_values: OpenedValues {
+                    trace_local: o.trace_local.clone(),
+                    trace_next: o.trace_next.clone(),
+                    preprocessed_local: o.preprocessed_local.clone(),
+                    preprocessed_next: o.preprocessed_next.clone(),
+                    quotient_chunks: o.quotient_chunks.clone(),
+                    random: o.random.clone().filter(|_| randomizer),
+                },
+                opening_proof: FriProof {
+                    commit_phase_commits: fri.commit_phase_commits.clone(),
+                    commit_pow_witnesses: fri.commit_pow_witnesses.clone(),
+                    query_proofs,
+                    final_poly: fri.final_poly.clone(),
+                    query_pow_witness: fri.query_pow_witness,
+                },
+                degree_bits: p.degree_bits,
+            }
+        };
+        verify(&qlab_l2::make_config_l2(), &Toy, sh.proof, sh.pvs).unwrap();
+        let legacy = make_legacy_config_with(&L2_CFG_PROVISIONAL);
+        let err = verify(&legacy, &Toy, &retype(sh.proof, true), sh.pvs).unwrap_err();
+        assert!(
+            matches!(err, VerificationError::RandomizationError),
+            "{err:?}"
+        );
+        let err = verify(&legacy, &Toy, &retype(sh.proof, false), sh.pvs).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("OpenedValuesDimensionMismatch"),
+            "{err:?}"
+        );
+    }
+
+    /// F2b-5 (stage-0's "shape-specific public-state/fee routing"), toy:
+    /// the leaf's two PVs swapped — each routed to the other's offset —
+    /// under the honest proof. p3's verifier refuses it. The leaf's native
+    /// compile (`compiled`) refuses it by name: the PVs are absorbed before
+    /// α and read by the AIR, so the OOD identity fails. C1's builder
+    /// refuses it while the PoW is the proof's own; re-ground, C1 exposes
+    /// the swapped PVs unchanged and refuses on the last row alone
+    /// (`machine_out`).
+    #[test]
+    fn f2wrap_refuses_toy_pvs_routed_to_the_wrong_offset() {
+        let leaf = toy_leaf();
+        let sh = shared();
+        let cfg = L2_CFG_PROVISIONAL;
+        let swapped = [sh.pvs[1], sh.pvs[0]];
+        let mut proof = copy(sh.proof);
+        assert!(verify(&qlab_l2::make_config_l2(), &Toy, &proof, &swapped).is_err());
+        let inputs = proof_inputs_dims(leaf.dims, &proof, &swapped).unwrap();
+        let err = compiled(leaf.dims, &Toy, &inputs).err().unwrap();
+        assert_eq!(err, "native OOD identity fails on the leaf's openings");
+        let err = c1::honest(&leaf.program, &inputs, &proof, &swapped, &cfg, 64 << 20)
+            .err()
+            .unwrap();
+        assert_eq!(err, "query PoW sample is not zero");
+        regrind(&mut proof, &swapped, leaf.dims.log_height);
+        let h = c1::honest(&leaf.program, &inputs, &proof, &swapped, &cfg, 64 << 20).unwrap();
+        assert_eq!(h.pvs[..2], swapped);
+        assert_eq!(
+            violation_set(&h.air, &h.trace, &h.pvs),
+            [(h.trace.height() - 1, "machine_out")].into()
+        );
+    }
+
+    /// F2b-5 (shape-specific routing on the real S3 leaf, the census test's
+    /// shared proof): S3's PVs laid out as P3's (the vPublic block inserted
+    /// before nf3) are refused by the S3 leaf's native compile by name, and
+    /// S3's fee chunks routed to R's fee offset (where S carries cm1) make
+    /// the OOD identity fail. The native S verifier refuses both. A
+    /// full-size S3 C1 is beyond a CI test's budget; the toy test above
+    /// shows the same routing refused in-circuit.
+    #[test]
+    fn f2wrap_refuses_s3_pvs_in_another_shapes_layout() {
+        use qlab_air::{l2, l2p, l2r};
+        let (proof, pvs) = crate::f2::s3_proof();
+        assert!(Leaf::of(Shape::S, &proof, &pvs).is_ok());
+        let mut as_p = pvs[..l2p::PV_VP1].to_vec();
+        as_p.extend([Val::ZERO; l2p::PV_NF3 - l2p::PV_VP1]);
+        as_p.extend_from_slice(&pvs[l2::PV_NF3..]);
+        assert_eq!(as_p.len(), Shape::P.pv_len());
+        let mut fee_at_r = pvs.clone();
+        for i in 0..4 {
+            fee_at_r.swap(l2::PV_FEE + i, l2r::PV_FEE + i);
+        }
+        assert_ne!(fee_at_r, pvs);
+        for (bad, name) in [
+            (&as_p, "OOD input dimensions"),
+            (
+                &fee_at_r,
+                "native OOD identity fails on the leaf's openings",
+            ),
+        ] {
+            assert!(!qlab_l2::verify_s(bad, &proof), "{name}");
+            assert_eq!(Leaf::of(Shape::S, &proof, bad).err().unwrap(), name);
+        }
     }
 }

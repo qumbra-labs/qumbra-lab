@@ -181,6 +181,23 @@ struct Leaves {
     selectors: [Id; 4],
 }
 
+/// The domain a verifier program evaluates periodic columns and the next
+/// point on. [`Domains::Trace`] is the only correct one: the ORIGINAL trace
+/// domain of size N (uni-stark evaluates periodic columns and ζ·g_N on
+/// it). The other two are stage-0's "g_N versus the doubled-domain shift"
+/// confusions with the committed domain of size 2N, compiled on purpose so
+/// F2b-5's negatives can show both the native comparison and C1 refusing
+/// them (issue #750).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Domains {
+    Trace,
+    /// Periodic columns interpolated over the 2N-point committed domain.
+    PeriodicOn2N,
+    /// The next point ζ·g_2N.
+    NextOn2N,
+}
+
 struct Program {
     schedule: machine::Schedule,
     dag: Dag,
@@ -209,6 +226,14 @@ impl Program {
     }
 
     fn compile_dims<A: Air<SymbolicAirBuilder<Val>>>(dims: Dims, air: &A) -> Result<Self> {
+        Self::compile_on(dims, air, Domains::Trace)
+    }
+
+    fn compile_on<A: Air<SymbolicAirBuilder<Val>>>(
+        dims: Dims,
+        air: &A,
+        domains: Domains,
+    ) -> Result<Self> {
         let layout = AirLayout::from_air::<Val>(air);
         require(layout.main_width == dims.width, "OOD AIR width mismatch")?;
         require(
@@ -256,15 +281,22 @@ impl Program {
         let transition = dag.push(Op::Sub(zeta, last_point));
         let last_inv = dag.push(Op::Inverse(transition));
         let last = dag.push(Op::Mul(vanishing, last_inv));
-        let gen = dag.constant(original.subgroup_generator());
+        let gen = dag.constant(match domains {
+            Domains::NextOn2N => committed.subgroup_generator(),
+            _ => original.subgroup_generator(),
+        });
         let next_point = dag.push(Op::Mul(zeta, gen));
         let mut periodic_ids = Vec::new();
         let mut period_points = HashMap::new();
+        let log_domain = match domains {
+            Domains::PeriodicOn2N => committed.log_size(),
+            _ => dims.log_height,
+        };
         for col in periodic {
             let log_period = col.len().trailing_zeros() as usize;
             let point = *period_points
                 .entry(log_period)
-                .or_insert_with(|| dag.pow2(zeta, dims.log_height - log_period));
+                .or_insert_with(|| dag.pow2(zeta, log_domain - log_period));
             // Original domain has shift one. Coefficients are public AIR
             // constants; IDFT happens during compilation, never in the witness.
             let coefficients = Dft::default().idft(col);
@@ -594,6 +626,13 @@ pub(super) fn check_real_mutations(shape: Shape, proof: &Proof<Config>, pvs: &[V
         Shape::P => check(shape, &qlab_l2::verifier_air_p(), inputs),
         Shape::R => check(shape, &qlab_l2::verifier_air_r(), inputs),
     }
+}
+
+/// F2b-5's P3 negatives (`c2::tests::p3_last_round_negatives`), on the P3
+/// proof the census test already holds.
+#[cfg(test)]
+pub(super) fn check_p3_last_round(proof: &Proof<Config>, pvs: &[Val]) {
+    c2::tests::p3_last_round_negatives(proof, pvs);
 }
 
 #[cfg(test)]

@@ -1308,3 +1308,125 @@ Unverified, most likely to break first:
 3. The S/P/R pins, which assume the census geometry and the formula mirrors the
    column allocation exactly. The toy and the two-query S3 instance pin the formula to
    the AIR; P and R are formula-only.
+
+## F2b-5: end-to-end negatives
+
+Stage-0 step 5 of issue #750 lists the rejection cases the single-leaf verifier must
+cover: wrong quotient/AIR satisfaction, periodic evaluation, g_N versus the
+doubled-domain shift, a missing or altered randomizer, salt/path/point lengths, P3's
+additional fold, value/SCR hold bindings, and shape-specific public-state/fee routing.
+The F2b kickoff adds a tampered opened value, a wrong ζ, a tampered quotient chunk and
+the legacy verifier fed a hiding proof, and R-PV adds a leaf PV ≥ 2^16. F2b-5 takes each
+case **through the composed pipeline**: a tampered inner hiding proof, or tampered
+leaf PVs, go into the builders `f2wrap` uses (`c1::honest`, `c2::honest`, the leaf's
+native compile), and the honest C1/C2 traces built from them are scanned on **every**
+row. Each refusal is an exact (row, group) set, or a native check refused by name.
+
+A tampered proof moves every later Fiat–Shamir draw, so its old query PoW fails. That
+is itself a refusal: C1's builder stops at `query PoW sample is not zero`. To leave
+only the tampering to be refused, the tests then do what a forger would: re-grind the
+PoW for the moved transcript with p3's own challenger (`lane::toy::regrind`). Every
+in-circuit case below is refused after that re-grind.
+
+### Coverage
+
+"Consequences" is C2's term from its own tests: every Merkle root that misses the seam
+cap entry its index selects (`cap` on that check's row), and every query whose last fold
+misses the final polynomial (`final` on its register rows), computed natively from the
+forged claim. **New** marks a test this slice adds; the rest are existing tests, cited
+rather than duplicated.
+
+| stage-0 / kickoff item | test | refused at |
+|---|---|---|
+| wrong quotient / AIR satisfaction; tampered quotient chunk | **New** `c1_refuses_real_proofs_with_an_altered_opened_value` (a real proof, quotient chunk 3 limb 2 + 1) | p3's verifier; the builder, `query PoW sample is not zero`; re-ground, C1 `machine_out` on the last row only |
+| | existing `check_real_mutations` (census test, S/P/R) | every chunk limb moves the native residual |
+| tampered opened value | **New**, same test: the trace at ζ, the trace at ζ·g_N | as above: C1 `machine_out` on the last row only |
+| | existing `c1_rejects_opened_value_forgeries` | a transcript-only poke: `bind_opened`; Az only: `accumulate`; a point flip: `mask`; word + p: `canonical` + `pow` |
+| wrong ζ | existing `c1_rejects_challenge_forgeries` | `fs_bind` on ζ's draw perm + `machine_out` |
+| periodic evaluation | **New** `c1_refuses_verifier_programs_on_the_doubled_domain`, on `ToyPeriodic` (the toy plus a period-4 column) | periodic column interpolated over 2N points: `compare_native` refuses (`periodic DAG/native mismatch`); built anyway, C1 `machine_out` on the last row only |
+| | existing `all_shape_dags_match_native_ood_algebra_on_synthetic_inputs` | N/2N periodic confusion at the DAG level, S/P/R |
+| g_N versus the doubled-domain shift | **New**, same C1 test: the next point ζ·g_2N | `next-point DAG/native mismatch`; built anyway, C1 `machine_out` on the last row only |
+| | **New** `c2_refuses_the_next_point_on_the_doubled_domain` (query 1's ro with ζ·g_2N, inverses and folds consistent) | `inverse` on every row carrying query 1's registers + consequences |
+| missing randomizer | **New** `f2wrap_builders_refuse_missing_or_misshapen_proofs_by_name` | `missing randomizer commitment`, `missing randomizer opening` |
+| | existing census test | `validate_geometry` refuses a removed randomizer commitment |
+| altered randomizer opening | **New** `c2_refuses_a_randomizer_opening_altered_in_the_proof` (a real proof, re-ground) | p3's verifier. C1 is **SAT**: the machine never reads the randomizer, which enters only the transcript and Az. C2, on that C1's seam (`check_seams` passes): consequences, including round 0's `cap` |
+| altered randomizer cap | existing `c1_rejects_swapped_caps_on_a_consistent_replay` | the randomizer cap absorbed out of order, everything re-derived: `bind_cap` on the moved F1 perms |
+| | existing `c2_rejects_input_opening_forgeries`, `c2_meets_c1_at_the_seam` | randomizer siblings swapped: `cap` on its cap row; a cap group differing between C1 and C2: `check_seams` names `caps` |
+| salt lengths | **New**, builders test | `salt shape`, `commit-phase salt shape` |
+| | **New** in the census test (S/P/R) | `FRI salt shape mismatch`; the input salt is the existing case |
+| path lengths | **New**, builders test | `input path length`, `commit-phase path length` |
+| | **New** in the census test (S/P/R) | `input Merkle path length mismatch`, `FRI path length mismatch` |
+| point lengths | **New**, builders test | an extra trace value or quotient limb: `OOD input dimensions`; no ζ·g_N opening: `missing next-row opening`; `opened row shape`, `input batch count`, `commit round count`, `sibling count`, `log arity differs from the fixed schedule` |
+| | **New** in the census test (S/P/R) | `trace opening shape mismatch`, `missing or malformed randomizer OOD opening`, `quotient opening shape mismatch`, `FRI fold shape mismatch`; rc0 nesting is the existing case |
+| P3's additional fold | **New** `p3_last_round_negatives`, run by the census test on the P3 proof it already proves | honest two-query C2 on P3's schedule (arities 16, 16, 16, 16, **2**) SAT, with ro and the folds equal to p3's; the fifth round's salt changed: `cap` on that round's cap row only; its one sibling moved, fold re-derived: that `cap` + `final` on query 0's rows, rounds 0–3 unchanged |
+| | existing census test | P3 with its fifth round removed: `validate_geometry` refuses |
+| value/SCR hold bindings | existing `c1_rejects_challenge_forgeries` | fri_alpha' on F2's rows: `hold` where the cell changes |
+| | existing `c2_rejects_hand_off_forgeries`, `c2_meets_c1_at_the_seam` | ro or an index bit changed between C2's parts: `handoff` + the readers; a public Az the held cell lacks: `seam_in` |
+| | existing `reference_register_air_rejects_result_read_write_hold_and_tail_tampers` | the machine's register holds |
+| shape-specific public-state/fee routing | **New** `f2wrap_refuses_toy_pvs_routed_to_the_wrong_offset` (the two toy PVs swapped) | p3's verifier; the leaf compile, `native OOD identity fails on the leaf's openings`; the builder, `query PoW sample is not zero`; re-ground, C1 exposes the swapped PVs and refuses at `machine_out` on the last row only |
+| | **New** `f2wrap_refuses_s3_pvs_in_another_shapes_layout` (the real S3 proof) | S3's PVs in P3's layout: `OOD input dimensions`; S3's fee chunks at R's fee offset: `native OOD identity fails on the leaf's openings`; the native S verifier refuses both |
+| | existing `check_leaf_pvs_refuses_out_of_range_leaf_pvs_by_name`, `fixture_metadata_binds_shape_config_and_canonical_public_values` | the fee named at each shape's own offset; a fixture's shape, AIR digest and PV count |
+| R-PV: a leaf PV ≥ 2^16 | existing `check_leaf_pvs_refuses_out_of_range_leaf_pvs_by_name` | a 16-bit chunk at 2^16 and at p − 1 refused by name (S/P/R); P's sign at 2 refused as 1-bit |
+| | existing `c1_accepts_an_out_of_range_leaf_pv`, `f2wrap_check_stage_on_the_toy_leaf` | C1 is SAT on it (why option (c)); `check_leaf_pvs` names `toy_y[0]` |
+| legacy verifier fed a hiding proof | **New** `the_legacy_verifier_refuses_a_hiding_leaf_proof` | re-typed with only the salts dropped: `RandomizationError`; with the randomizer dropped too: `OpenedValuesDimensionMismatch` (eight hiding chunks, two expected). The hiding verifier accepts the same proof. Without re-typing it is impossible: the legacy verifier takes `Proof<LegacyNonHidingConfig>` |
+
+### What changed in code
+
+- `ood::Domains` and `Program::compile_on`: a program compiled on the committed 2N
+  domain on purpose, for either periodic columns or the next point. `compile_dims` is
+  `compile_on(.., Domains::Trace)`, unchanged.
+- `wrap::compiled` takes `Dims` instead of `Shape` (`Leaf::of` passes `shape.into()`),
+  so the toy leaf goes through the same native compile.
+- Test support in `lane::toy`: `ToyPeriodic` and its seeded proof, `copy` (p3's
+  `Proof` is not `Clone`), `regrind` and `violation_set` (the exact (row, group) scan for
+  any phased AIR).
+- In C2's tests, the row helpers and `consequences` take the AIR (`*_in`), and
+  `native_seam` is factored out of the real-S3 test so the P3 negatives reuse it.
+
+### Out of scope
+
+- **In-circuit seam checks.** `check_seams`, `check_coverage` and `check_leaf_pvs` stay
+  native. The next recursion level states them in-circuit, and binds each leaf's shape
+  and AIR identity (which C1/C2 verifying key), not inferred from a PV count.
+- **Issue #78's interior**: wrapper and interior negatives there, and M4's value/SCR
+  holds.
+- **Full-size negatives.** S3 and P3 C1 at full size are beyond a CI test's budget. The
+  S3 routing case stops at the leaf's native compile; its in-circuit refusal is shown
+  on the toy.
+- **Opened-value lengths inside the builders.** C1's builder reads the layout's count
+  of opened values and does not re-check a longer vector (for example a randomizer
+  opening with a fifth limb). `f2wrap` never reaches it with one: `validate_geometry`
+  refuses it by name first (tested above). In-circuit, these lengths are the static
+  layout.
+
+### Validation
+
+No local tests, proofs or benchmarks were run. The local preflight was
+`cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate.
+
+New tests: two in `c1.rs`, two in `c2.rs` and four in `wrap.rs`, eight in all. The P3
+negatives and the named `validate_geometry` cases run inside the existing census test.
+**[P, pending CI]**: eight more passes than PR #765's head, 0 failed.
+
+Expected added runtime **[P]** is 20–60 s on the Graviton lane, with **no new
+full-size prove**:
+
+- one seeded log-8 `ToyPeriodic` proof (with its own 22-bit grind);
+- five 22-bit PoW re-grinds;
+- about sixteen toy C1 builds (seven stop at a named refusal) and eight full-trace toy C1
+  scans;
+- two toy C2 scans;
+- three two-query P3 C2 scans at 2^13 rows;
+- three S3 native compiles on the shared S3 proof;
+- twenty-one `validate_geometry` calls.
+
+Unverified, most likely to break first:
+
+1. The P3 exact sets. P3's two-query C2 has not run in CI before; only the rig's
+   full-size scan (F2b-4) has.
+2. The builder's `query PoW sample is not zero` before each re-grind assumes the moved
+   transcript neither passes the 22-bit PoW by chance (2^-22) nor hits an unsupported
+   draw refill.
+3. The consequences sets where the moved transcript also moves the query indices
+   (the randomizer case).
