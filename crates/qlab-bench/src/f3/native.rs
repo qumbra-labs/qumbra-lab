@@ -10,6 +10,13 @@
 //!   `lo < K < hi` **strictly**, rewrites it to `(lo, K)` and appends
 //!   `(K, hi)` at the next index. A key already present, or either sentinel,
 //!   has no strictly bracketing leaf — refused by construction.
+//!   **The sentinels (ruling (c)):** a nullifier is a Keccak-f output, so
+//!   `K = 0` and `K = 2^256 − 1` each occur with probability 2^-256 — and
+//!   neither is insertable regardless: no leaf has `lo < 0` (the genesis and
+//!   every later low end are ≥ 0) and none has `MAX < hi`, so the strict
+//!   comparisons never bracket them (the `2^256 − 1` end is the freeze tree's
+//!   `KEY_MAX` note in `qlab_air::l2p`; the `0` end is this). Test:
+//!   `f3_sentinels_and_duplicates_have_no_gap`.
 //! - **`C`, the note-commitment tree**: the node's append-only depth-32 tree
 //!   ([`qlab_cbserver::tree::CommitmentTree`]); an append opens the empty
 //!   slot at the next index and writes the commitment through the same path.
@@ -341,9 +348,12 @@ pub(crate) enum StError {
     Surface,
     /// An S/P transaction's `registry_root` is not the running `R`.
     RegistryRead,
-    /// A shape-R write: old root not the running `R`, a leaf not at the PV's
-    /// slot, asset 0, or a new root the leaf does not fold to.
+    /// A shape-R write: a leaf not at the PV's slot, asset 0, or a new root
+    /// the leaf does not fold to.
     RegistryWrite,
+    /// A shape-R write proven against a root that is not the running `R`
+    /// (the PV's `old_root`, or the opened path — a stale or forged opening).
+    RegistryRoot,
     /// A second shape-R write in one leaf (v1 allows one, ruling Q6).
     SecondWrite,
     /// The witnesses do not match the transactions (counts, shapes).
@@ -531,13 +541,13 @@ pub(crate) fn check_leaf(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> 
                 use qlab_air::l2r::{PV_ASSET, PV_NEW_ROOT, PV_OLD_ROOT};
                 let asset = tx.pvs[PV_ASSET] as u64;
                 let bits = bits_of(asset, qlab_air::l2::REGISTRY_DEPTH);
-                if asset == 0
-                    || rw.leaf.asset != asset
-                    || rw.path.path_bits.to_vec() != bits
-                    || tx.digest_at(PV_OLD_ROOT)? != s.r
-                    || rw.path.fold_root(&rw.old_digest) != s.r
-                    || rw.path.fold_root(&rw.leaf.hash()) != tx.digest_at(PV_NEW_ROOT)?
-                {
+                if asset == 0 || rw.leaf.asset != asset || rw.path.path_bits.to_vec() != bits {
+                    return Err(StError::RegistryWrite);
+                }
+                if tx.digest_at(PV_OLD_ROOT)? != s.r || rw.path.fold_root(&rw.old_digest) != s.r {
+                    return Err(StError::RegistryRoot);
+                }
+                if rw.path.fold_root(&rw.leaf.hash()) != tx.digest_at(PV_NEW_ROOT)? {
                     return Err(StError::RegistryWrite);
                 }
                 s.r = tx.digest_at(PV_NEW_ROOT)?;
@@ -794,6 +804,61 @@ mod tests {
         t.pvs[qlab_air::l2r::PV_ASSET] = leaf.asset as u32;
         t.write = Some(leaf);
         t
+    }
+
+    /// Review of PR #768 — negative (1) across two leaves: leaf 1 inserts
+    /// `K`, leaf 2 re-inserts it on the same state. No gap brackets `K`.
+    #[test]
+    fn f3_neg_double_insert_across_leaves() {
+        let (mut s, mut rng) = fresh();
+        let rr = s.r.root();
+        let t1 = synth_tx(&mut rng, L2ShapeTag::S, &rr);
+        let (_, w1, rmid) = s.apply_leaf(std::slice::from_ref(&t1)).unwrap();
+        let mut t2 = synth_tx(&mut rng, L2ShapeTag::P, &rr);
+        t2.pvs[16..32].copy_from_slice(&t1.pvs[16..32]);
+        assert_eq!(s.apply_leaf(std::slice::from_ref(&t2)).unwrap_err(), StError::Nf(NfError::NotInGap));
+        // Replaying leaf 1's insert witness for K in leaf 2 is refused too.
+        let mut other = s.clone();
+        let mut t3 = synth_tx(&mut rng, L2ShapeTag::S, &rr);
+        let (_, mut w3, _) = other.apply_leaf(std::slice::from_ref(&t3)).unwrap();
+        t3.pvs[16..32].copy_from_slice(&t1.pvs[16..32]);
+        w3[0].inserts[0] = w1[0].inserts[0];
+        assert!(check_leaf(&rmid, &[t3], &w3).is_err(), "leaf 1's witness for K does not re-insert K");
+    }
+
+    /// Review of PR #768 — negative (4) for C and R: the right index, a
+    /// superseded root.
+    #[test]
+    fn f3_neg_stale_root_c_and_r() {
+        // C: b's append at index 1, proven in a tree whose index 0 holds x, not a.
+        let mut rng = Rng(11);
+        let (a, b, x) = (rng.digest(), rng.digest(), rng.digest());
+        let mut c = CommitmentTree::new();
+        append(&mut c, &a);
+        let r1 = c.root();
+        let mut alt = CommitmentTree::new();
+        append(&mut alt, &x);
+        let wb_alt = append(&mut alt, &b);
+        assert_eq!(wb_alt.index, 1, "the right index");
+        assert_eq!(apply_append(&r1, 1, &b, &wb_alt), Err(AppendError::RootMismatch));
+        // R: a write proven against the registry before an earlier write. N and
+        // C witnesses come from the current state, so only R is stale.
+        let (mut s, mut rng) = fresh();
+        let stale = s.clone();
+        let w7 = synth_write(&mut rng, &s, RegistryLeaf::cloaked(7));
+        let (_, _, rin) = s.apply_leaf(std::slice::from_ref(&w7)).unwrap();
+        let leaf8 = RegistryLeaf::cloaked(8);
+        let mut w8 = synth_write(&mut rng, &stale, leaf8);
+        let mut cur = s.clone();
+        let inserts = w8.nullifiers().unwrap().iter().map(|nf| cur.n.insert(nf).unwrap()).collect();
+        let appends = w8.commitments().unwrap().iter().map(|cm| append(&mut cur.c, cm)).collect();
+        let stale_write = RegistryWrite { leaf: leaf8, old_digest: EMPTY, path: stale.r.opening_at(8) };
+        let wit = TxWitness { inserts, appends, write: Some(stale_write) };
+        // (i) the surface's own old_root is the superseded one.
+        assert_eq!(check_leaf(&rin, std::slice::from_ref(&w8), std::slice::from_ref(&wit)), Err(StError::RegistryRoot));
+        // (ii) old_root patched to the running R, the opening still the stale tree's.
+        w8.pvs[qlab_air::l2r::PV_OLD_ROOT..qlab_air::l2r::PV_OLD_ROOT + 16].copy_from_slice(&pv_chunks(&s.r.root()));
+        assert_eq!(check_leaf(&rin, std::slice::from_ref(&w8), std::slice::from_ref(&wit)), Err(StError::RegistryRoot));
     }
 
     #[test]
