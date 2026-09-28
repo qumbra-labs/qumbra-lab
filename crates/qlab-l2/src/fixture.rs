@@ -74,15 +74,23 @@ pub const ISK_7: [u64; 4] = [0x15c7_0001, 0x15c7_0002, 0x15c7_0003, 0x15c7_0004]
 /// (asset 0) + 30,000 (asset 7) out, fee 1,000, no vPublic. Every gadget is
 /// in the trace (fixed shape); the allowlist rides the dummy path.
 pub fn shape_p_at(log_height: usize) -> L2PBucketInstance {
+    shape_p_asset7_at(log_height, 30_000, 30_000, VPublic::NONE)
+}
+
+/// [`shape_p_at`] with asset 7's row carrying `vp` (the issuer key is the
+/// asset's own, so a closed redeem and a mint both prove): `in7` of asset 7
+/// in, `out7` out. Lab #758's mint/redeem fixtures — the balance with a
+/// nonzero `vPublic`, both signs.
+pub fn shape_p_asset7_at(log_height: usize, in7: u64, out7: u64, vp: VPublic) -> L2PBucketInstance {
     let mut r = Rnd(SEED);
-    let inputs = [r.input(50_000, 0), r.input(30_000, 7)];
-    let outputs = [r.output(49_000, 0), r.output(30_000, 7)];
+    let inputs = [r.input(50_000, 0), r.input(in7, 7)];
+    let outputs = [r.output(49_000, 0), r.output(out7, 7)];
     let frozen = [r.d4(), r.d4(), r.d4()];
     let assets = [
         PolicyAsset::cloaked(0),
         PolicyAsset::hybrid(7, ISK_7, false, &frozen),
     ];
-    build_bucket_l2p(log_height, &inputs, &outputs, 1_000, &assets, [VPublic::NONE; 2])
+    build_bucket_l2p(log_height, &inputs, &outputs, 1_000, &assets, [VPublic::NONE, vp])
 }
 
 /// Shape P at its own height (2^20).
@@ -131,7 +139,16 @@ pub fn shape_s3_merge_at(log_height: usize) -> L2BucketInstance {
 /// Shape P3 at `log_height`: [`merge_notes`] with asset 7 Hybrid (issuer
 /// [`ISK_7`], three frozen keys, redeem closed), no vPublic.
 pub fn shape_p3_merge_at(log_height: usize) -> L2PBucketInstance {
-    let (inputs, outputs, fee_note) = merge_notes();
+    shape_p3_merge_vp_at(log_height, 50_000, VPublic::NONE)
+}
+
+/// [`shape_p3_merge_at`] with row 1 carrying `vp` and output 0 worth
+/// `out0` (the merge's 50,000 ± the term): the `q = 1` summed chain with a
+/// nonzero `vPublic₁` (lab #758). Asset 7's issuer key is the fixture's, so a
+/// mint and a closed redeem both prove.
+pub fn shape_p3_merge_vp_at(log_height: usize, out0: u64, vp: VPublic) -> L2PBucketInstance {
+    let (inputs, mut outputs, fee_note) = merge_notes();
+    outputs[0].value = out0;
     let cms = [&inputs[0], &inputs[1], &fee_note].map(|i| derive_input_l2(i).2);
     let (w, anchor) = fabricated_tree3([&cms[0], &cms[1], &cms[2]]);
     let mut r = Rnd(SEED_MERGE ^ 0xf0f0);
@@ -153,7 +170,7 @@ pub fn shape_p3_merge_at(log_height: usize) -> L2PBucketInstance {
         anchor,
         &policy,
         root,
-        [VPublic::NONE; 2],
+        [vp, VPublic::NONE],
         &FeeSlot::Exact { input: fee_note, witness: w[2] },
     )
 }

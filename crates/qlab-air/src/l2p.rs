@@ -117,95 +117,95 @@ const PH_OFF: usize = PB_OFF + 24; // 426
 const PR_LIMBS: usize = 63;
 const PR_OFF: usize = PH_OFF + 4; // 430
 const ROLE_BITS: usize = 5;
-const D_OFF: usize = PR_OFF + PR_LIMBS; // 483
-const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 503
-const LO_OFF: usize = RB_OFF + ROLE_BITS; // 508
+const D_OFF: usize = PR_OFF + PR_LIMBS; // 493
+const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 513
+const LO_OFF: usize = RB_OFF + ROLE_BITS; // 518
 /// Shape S's 16 role selectors + AISS, AFRZ, ACRED, BALLOW, ARKM2, AFKEY,
 /// and (A4) BNF3, ACMF.
 const NSEL: usize = 24;
-const SEL_OFF: usize = LO_OFF + 4; // 512
+const SEL_OFF: usize = LO_OFF + 4; // 522
 /// [mrk+nf, ank, arkm+arkm2, acm, acmout, arho, areg, aiss, afrz, acred, afkey, acmf]
 const NINJ: usize = 12;
-const INJ_OFF: usize = SEL_OFF + NSEL; // 533
-const G4_COL: usize = INJ_OFF + NINJ; // 543
-const PBIT_COL: usize = G4_COL + 1; // 544
+const INJ_OFF: usize = SEL_OFF + NSEL; // 546
+const G4_COL: usize = INJ_OFF + NINJ; // 558
+const PBIT_COL: usize = G4_COL + 1; // 559
 const NW: usize = 15;
-const W_OFF: usize = PBIT_COL + 1; // 545
-const EQ_OFF: usize = W_OFF + NW; // 560
-const EG_OFF: usize = EQ_OFF + 32; // 592
-const EP_COL: usize = EG_OFF + 6; // 598
-const GWRAP_COL: usize = EP_COL + 1; // 599
+const W_OFF: usize = PBIT_COL + 1; // 560
+const EQ_OFF: usize = W_OFF + NW; // 575
+const EG_OFF: usize = EQ_OFF + 32; // 607
+const EP_COL: usize = EG_OFF + 6; // 613
+const GWRAP_COL: usize = EP_COL + 1; // 614
 const NSE: usize = 8;
-const SE_OFF: usize = GWRAP_COL + 1; // 600
+const SE_OFF: usize = GWRAP_COL + 1; // 615
 const SE_RHO: usize = 6;
 const SE_AREG: usize = 7;
-const BQ_OFF: usize = SE_OFF + NSE; // 608
-const BGCAP_COL: usize = BQ_OFF + 16; // 624
-const BGRST_COL: usize = BGCAP_COL + 1; // 625
+const BQ_OFF: usize = SE_OFF + NSE; // 623
+const BGCAP_COL: usize = BQ_OFF + 16; // 639
+const BGRST_COL: usize = BGCAP_COL + 1; // 640
 /// [banchor, bnf1, bnf2, bcm1, bcm2, breg, bnf3 (A4)]
 const NBGC: usize = 7;
 const BGC_OFF: usize = BGRST_COL + 1;
-const BL_OFF: usize = BGC_OFF + NBGC; // 632
-const BLC_OFF: usize = BL_OFF + 4; // 636
-const BLCLOSE_COL: usize = BLC_OFF + 9; // 645
-const INJ3E_COL: usize = BLCLOSE_COL + 1; // 646
-const INJ4E_COL: usize = INJ3E_COL + 1; // 647
-const EFF_OFF: usize = INJ4E_COL + 1; // 648
-const LATCH_COL: usize = EFF_OFF + 25; // 673
-const DV_COL: usize = LATCH_COL + 1; // 674
-const LDV_COL: usize = DV_COL + 1; // 675
-const OM_COL: usize = LDV_COL + 1; // 676
-const EQ3_OFF: usize = OM_COL + 1; // 677
-const EG3_OFF: usize = EQ3_OFF + 16; // 693
+const BL_OFF: usize = BGC_OFF + NBGC; // 648
+const BLC_OFF: usize = BL_OFF + 4; // 652
+const BLCLOSE_COL: usize = BLC_OFF + 9; // 661
+const INJ3E_COL: usize = BLCLOSE_COL + 1; // 662
+const INJ4E_COL: usize = INJ3E_COL + 1; // 663
+const EFF_OFF: usize = INJ4E_COL + 1; // 664
+const LATCH_COL: usize = EFF_OFF + 25; // 689
+const DV_COL: usize = LATCH_COL + 1; // 690
+const LDV_COL: usize = DV_COL + 1; // 691
+const OM_COL: usize = LDV_COL + 1; // 692
+const EQ3_OFF: usize = OM_COL + 1; // 693
+const EG3_OFF: usize = EQ3_OFF + 16; // 709
 // --- shape S additions (verbatim) ---
-const INJRE_COL: usize = EG3_OFF + 3; // 696
-const AG_OFF: usize = INJRE_COL + 1; // 697
+const INJRE_COL: usize = EG3_OFF + 3; // 712
+const AG_OFF: usize = INJRE_COL + 1; // 713
 const AG_IN1: usize = 0;
 const AG_IN2: usize = 1;
 const AG_O1: usize = 2;
 const AG_O2: usize = 3;
 const AG_R1: usize = 4;
 const AG_R2: usize = 5;
-const AC_OFF: usize = AG_OFF + 6; // 703
-const SEL2_OFF: usize = AC_OFF + 6; // 709
+const AC_OFF: usize = AG_OFF + 6; // 719
+const SEL2_OFF: usize = AC_OFF + 6; // 725
 const S2_O1A: usize = 0;
 const S2_O2A: usize = 1;
 const S2_F1: usize = 2;
 const S2_Q: usize = 3;
-const QINV_COL: usize = SEL2_OFF + 4; // 713
-const CQ_OFF: usize = QINV_COL + 1; // 714
-const SG_OFF: usize = CQ_OFF + 2; // 716
-const BL2_OFF: usize = SG_OFF + 2; // 718
-const BLC2_OFF: usize = BL2_OFF + 4; // 722
+const QINV_COL: usize = SEL2_OFF + 4; // 729
+const CQ_OFF: usize = QINV_COL + 1; // 730
+const SG_OFF: usize = CQ_OFF + 2; // 732
+const BL2_OFF: usize = SG_OFF + 2; // 734
+const BLC2_OFF: usize = BL2_OFF + 4; // 738
 /// Shape S's width, reproduced here with the ring/selector/injection growth:
 /// 702 + 22 + 6 + 4 = 734.
-const S_END: usize = BLC2_OFF + 9; // 731
+const S_END: usize = BLC2_OFF + 9; // 747
 // --- shape P additions ---
 /// `inj(afrz) · ep` — the comparison's assertion gate (the chained digest on
 /// `AFRZ`'s boundary is the freeze key `H(rkm ‖ D_FRZ)`, lab #704 Q1).
-const INJ_AFRZE_COL: usize = S_END; // 731
+const INJ_AFRZE_COL: usize = S_END; // 747
 /// `inj(acred) · ep` — the third bank's `−rkm′` leg and the bind bank's `+rkm′`.
-const INJ_ACREDE_COL: usize = INJ_AFRZE_COL + 1; // 732
+const INJ_ACREDE_COL: usize = INJ_AFRZE_COL + 1; // 748
 /// `gperm · sel(acred) · ep` — closes and resets the third bank's rkm window.
-const CLOSE_CRED_COL: usize = INJ_ACREDE_COL + 1; // 733
+const CLOSE_CRED_COL: usize = INJ_ACREDE_COL + 1; // 749
 /// `bnd · sel(ballow) · ep` — bank 1's `+allow_fold` leg (gated by `ALW`).
-const EGB_COL: usize = CLOSE_CRED_COL + 1; // 734
+const EGB_COL: usize = CLOSE_CRED_COL + 1; // 750
 /// `gperm · sel(ballow) · ep` — bank 1's allowlist close.
-const EGBC_COL: usize = EGB_COL + 1; // 735
+const EGBC_COL: usize = EGB_COL + 1; // 751
 /// `gperm · SE[areg]` — resets the bind bank after the AISS window.
-const AREGE_COL: usize = EGBC_COL + 1; // 736
+const AREGE_COL: usize = EGBC_COL + 1; // 752
 /// `AREGE · RQ` — the AISS window's gated close.
-const CRQ_COL: usize = AREGE_COL + 1; // 737
+const CRQ_COL: usize = AREGE_COL + 1; // 753
 /// `inj(afkey) · ep` — the third bank's `+rkm` leg: `rkm` is the chained
 /// digest on `AFKEY`'s boundary (lab #704 Q1 moved the leg here from `AFRZ`,
 /// whose boundary now carries the hashed key).
-const INJ_AFKEYE_COL: usize = CRQ_COL + 1; // 738
+const INJ_AFKEYE_COL: usize = CRQ_COL + 1; // 754
 /// Two 256-bit comparisons, bit-serial: `key_lo < K` (block 0) and
 /// `K < key_hi` (block 1), `K = H(rkm ‖ D_FRZ)` the freeze key. Per block: 4 running `LT` flags, 4 running `EQ`
 /// flags (one per lane, LSB → MSB over z), and 3 materialized lane-combines
 /// `C1 = LT1 + EQ1·LT0`, `C2 = LT2 + EQ2·C1`, `C3 = LT3 + EQ3·C2` — `C3` at
 /// z = 63 is the 256-bit verdict.
-const CMP_OFF: usize = INJ_AFKEYE_COL + 1; // 739
+const CMP_OFF: usize = INJ_AFKEYE_COL + 1; // 755
 const CMP_BLOCK: usize = 11;
 const CMP_LT: usize = 0;
 const CMP_EQ: usize = 4;
@@ -214,7 +214,7 @@ const CMP_C: usize = 8;
 /// in-circuit: `hy`, `rg`, `ropen` (to the leaf's lanes), `nz` (to `Σm`),
 /// `vpinv` (field, the nonzero-inverse for `nz`), `REQ = nz·(1 − s·ropen)`;
 /// then the two "current input" muxes `RQ` and `ALW`.
-const POL_OFF: usize = CMP_OFF + 2 * CMP_BLOCK; // 760
+const POL_OFF: usize = CMP_OFF + 2 * CMP_BLOCK; // 777
 const POL_HY: usize = 0;
 const POL_RG: usize = 2;
 const POL_ROPEN: usize = 4;
@@ -3296,6 +3296,17 @@ mod tests {
     /// The complete shape P — a Cloaked and a Hybrid input, every gadget in
     /// the trace, no vPublic — satisfies the AIR with the real public values
     /// at 2^20 (the module fixture's full scan).
+    /// The named column offsets, pinned (lab #758): the `// NNN` comments on
+    /// the constant chain had drifted after A4 and misled two readers of the
+    /// audit. This fails if the chain moves without its comments.
+    #[test]
+    fn l2p_named_offsets_are_the_constant_chain() {
+        assert_eq!(
+            (W_OFF, EQ_OFF, EG_OFF, EQ3_OFF, SEL2_OFF, CMP_OFF, POL_OFF, L2P_WIDTH),
+            (560, 575, 607, 693, 725, 755, 777, 798)
+        );
+    }
+
     #[test]
     fn l2p_shape_p_satisfies_constraints() {
         let fx = honest_fixture();
@@ -3858,6 +3869,66 @@ mod tests {
         assert_unsat(&bad, "ARKM with a different nk");
     }
 
+    /// 🔴 Lab #758 — the bank-bound copies the determination census could
+    /// not reach forward on P, tampered directly, each asserted refused **at
+    /// its binding** (a row where that window closes, or the anchor's bind),
+    /// not merely somewhere: `ρ` at `ACM` / `ACMF` — bank 2 against `NF`'s
+    /// capture (the anchor moves too: the naive tamper, so the claim is only
+    /// that bank 2's close is among the refusals); `nk` at the fee chain's
+    /// `ARKM` — bank 1; `nf1` at `ARHO` — the third bank (output 1's `cm`
+    /// rides `ACMOUT`'s own copy, so the published `cm2` still matches); and
+    /// the note path's first step under input 0 (sibling, path bit) — the
+    /// anchor's bind at `BANCHOR`.
+    #[test]
+    fn l2p_neg_bank_bound_copies() {
+        let fx = honest_fixture();
+        let w = fx.trace.width();
+        let rpp = crate::l2::ROWS_PER_PERM;
+        // Rows where `col` is nonzero on the honest trace (a window's close).
+        let gate_rows = |col: usize| -> Vec<usize> { (0..fx.trace.height()).filter(|r| fx.trace.values[r * w + col] != F::ZERO).collect() };
+        // Refused on one of `rows`: every constraint on each row, honest
+        // rows first clean (else the probe measures nothing).
+        let refused_on = |bad: &L2PBucketInstance, rows: &[usize], what: &str| {
+            assert!(!rows.is_empty(), "{what}: no binding rows (probe measures nothing)");
+            for r in rows {
+                assert!(l2test::violations_at(&fx.inst.air, &fx.trace, &fx.pvs, *r).is_empty(), "{what}: honest trace violated at row {r}");
+            }
+            let pvs = pvs_of(bad);
+            let t = bad.air.generate_trace::<F>(0);
+            assert!(rows.iter().any(|r| !l2test::violations_at(&bad.air, &t, &pvs, *r).is_empty()), "{what} VERIFIED at its binding");
+        };
+        let bank1 = gate_rows(EG_OFF + 2);
+        let bank2 = gate_rows(EG_OFF + 5);
+        let bank3 = gate_rows(EG3_OFF + 2);
+        for (role, name) in [(ROLE_ACM, "ρ@ACM"), (ROLE_ACMF, "ρ@ACMF")] {
+            let mut bad = fx.inst.clone();
+            let s = slot_of(&bad.air.program, role, 0);
+            bad.air.slot_witness[s].w[5] ^= 0x5eed;
+            refused_on(&bad, &bank2, &format!("{name} not NF's ρ (bank 2)"));
+        }
+        // The fee chain's ARKM: the third ARKM slot.
+        let mut bad = fx.inst.clone();
+        let s = slot_of(&bad.air.program, ROLE_ARKM, 2);
+        bad.air.slot_witness[s].w[0] ^= 0x5eed;
+        refused_on(&bad, &bank1, "nk@ARKM (fee chain) not NF's (bank 1)");
+        let mut bad = fx.inst.clone();
+        let s = slot_of(&bad.air.program, ROLE_ARHO, 0);
+        bad.air.slot_witness[s].w[5] ^= 0x5eed;
+        refused_on(&bad, &bank3, "nf1@ARHO not nf₀, cm2 unchanged (third bank)");
+        // Input 0's note path starts after 20 + 16 + 20 policy steps; its
+        // anchor binds at input 0's BANCHOR.
+        let step = FREEZE_DEPTH + REGISTRY_DEPTH + ALLOW_DEPTH;
+        let banchor = slot_of(&fx.inst.air.program, ROLE_BANCHOR, 0);
+        let anchor_rows: Vec<usize> = (banchor * rpp..(banchor + 1) * rpp).collect();
+        let s = slot_of(&fx.inst.air.program, ROLE_MERKLE, step);
+        let mut bad = fx.inst.clone();
+        bad.air.slot_witness[s].w[0] ^= 0x5eed;
+        refused_on(&bad, &anchor_rows, "a wrong note-path sibling (anchor bind)");
+        let mut bad = fx.inst.clone();
+        bad.air.slot_witness[s].pbit = !bad.air.slot_witness[s].pbit;
+        refused_on(&bad, &anchor_rows, "a flipped note-path bit (anchor bind)");
+    }
+
     /// 🔴 **The public `vPublic` surface**: `vpa` not the row's asset; a term
     /// on row 2 under `q`; a non-bool sign; a lied `nz`.
     #[test]
@@ -3867,9 +3938,11 @@ mod tests {
         let mut vpa = mint.inst.clone();
         vpa.pvs[pv_vp_asset(1)] = 3;
         assert_unsat(&vpa, "a mint revealing the wrong asset");
-        // `q` is reachable only with both inputs in asset 0 (a bucket needs an
-        // asset-0 note), where the Cloaked rule already refuses any term; the
-        // `close_q · vPublic₂ = 0` leg is exercised here on top of it.
+        // Here `q` is on two asset-0 inputs, where the Cloaked rule already
+        // refuses any term; the `close_q · vPublic₂ = 0` leg is exercised on
+        // top of it. (Since A4's fee slot, `q` is also reachable on a policy
+        // asset — the merge — where vPublic₁ is legal on the summed chain:
+        // lab #758's merge-mint/merge-redeem fixtures.)
         let q2 = same_asset();
         q2.assert_sat("precondition: same-asset spend");
         let q2b = bucket(0x0a11_0777, 60, 0, 40, 0, 70, 0, 35, 0, 5, [VPublic::NONE, VPublic::mint(10)]);
@@ -4278,4 +4351,224 @@ mod canonical_tree_tests {
         assert!(allow.witness_for(&cred_of(&[6; 4])).is_none());
         assert_eq!(policy_zeros()[POLICY_DEPTH], CanonicalAllowTree::from_creds(&[]).root, "an empty allowlist is the zero chain's top");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The witness manifest (lab #758), read against
+// `build_bucket_l2p_with_witnesses`'s program/lane writes.
+// ---------------------------------------------------------------------------
+
+/// Shape P3's witness manifest: S3's, plus the policy blocks (`isk`, the
+/// freeze non-membership keys, the allowlist path). `hy`/`rg`/`ropen` are
+/// bound to the leaf in-circuit and are not inputs.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::{ManifestEntry as M, ANY_ROLE};
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    let mut m = vec![
+        M::input(ROLE_ANK, w(0..4), "input.sk"),
+        M::input(ROLE_NF, w(0..4), "input.rho"),
+        M::input(ROLE_AISS, w(0..4), "policy.isk"),
+        M::copy(ROLE_ARKM, w(0..4), "input.nk"),
+        M::input(ROLE_ARKM, w(5..7), "input.d"),
+        M::copy(ROLE_ARKM2, w(0..4), "input.nk"),
+        M::input(ROLE_ARKM2, w(5..7), "input.d"),
+        M::input(ROLE_AFRZ, w(0..4), "freeze.key_lo"),
+        M::input(ROLE_AFRZ, w(5..9), "freeze.key_hi"),
+        M::input(ROLE_AREG, w(0..15), "registry.leaf"),
+        M::input(ROLE_MERKLE, w(0..4), "path.sibling"),
+        M::input(ROLE_MERKLE, vec![PBIT_COL], "path.bit"),
+        M::copy(ROLE_ARHO, w(5..9), "nf1"),
+        M::input(ROLE_ACMOUT, w(0..4), "output.rkm"),
+        M::input(ROLE_ACMOUT, w(4..5), "output.value"),
+        M::copy(ROLE_ACMOUT, w(5..9), "output.rho"),
+        M::input(ROLE_ACMOUT, w(9..13), "output.rseed"),
+        M::input(ROLE_ACMOUT, w(13..14), "output.asset"),
+        M::input(ANY_ROLE, vec![DV_COL], "dv"),
+        M::input(ANY_ROLE, vec![D3_COL], "d3"),
+    ];
+    for role in [ROLE_ACM, ROLE_ACMF] {
+        m.push(M::input(role, w(4..5), "input.value"));
+        m.push(M::copy(role, w(5..9), "input.rho"));
+        m.push(M::input(role, w(9..13), "input.rseed"));
+        m.push(M::input(role, w(13..14), "input.asset"));
+    }
+    m
+}
+
+/// Shape P3's program as the census reads it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_program(air: &L2ShapePAir) -> crate::detaudit::Program {
+    crate::detaudit::Program { rows_per_perm: crate::l2::ROWS_PER_PERM, roles: air.program.to_vec() }
+}
+
+/// The census's public-value range premise (lab #758), per [`pv_vec_l2p`]:
+/// digests and the fee and each `vPublic` amount as 16-bit chunks, each
+/// row's `redeem` a bool (`as u32` of a bool), each row's `vpa` a `u32` cast
+/// of the asset. The node builds them with it (`qumbra-node` `verifier.rs`,
+/// `qlab_l2::pv_vec_p`); `qlab_l2::verify_p` refuses a vector outside them.
+pub fn audit_pv_bits() -> Vec<u32> {
+    let mut b = vec![16; PV_LEN];
+    for base in [PV_VP1, PV_VP2] {
+        b[base] = 1; // redeem
+        b[base + 5] = 32; // vpa
+    }
+    b
+}
+
+/// Column regions by name (lab #758): every `*_OFF`/`*_COL` constant of this
+/// module, so census output names columns from the source of truth rather
+/// than from comments. A column belongs to the region with the greatest
+/// start ≤ it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("A_OFF", A_OFF),
+        ("C_OFF", C_OFF),
+        ("US_OFF", US_OFF),
+        ("AP_OFF", AP_OFF),
+        ("X00_COL", X00_COL),
+        ("S_OFF", S_OFF),
+        ("V_OFF", V_OFF),
+        ("UV_OFF", UV_OFF),
+        ("U_OFF", U_OFF),
+        ("UU_OFF", UU_OFF),
+        ("R_OFF", R_OFF),
+        ("B_OFF", B_OFF),
+        ("PB_OFF", PB_OFF),
+        ("PH_OFF", PH_OFF),
+        ("PR_OFF", PR_OFF),
+        ("D_OFF", D_OFF),
+        ("RB_OFF", RB_OFF),
+        ("LO_OFF", LO_OFF),
+        ("SEL_OFF", SEL_OFF),
+        ("INJ_OFF", INJ_OFF),
+        ("G4_COL", G4_COL),
+        ("PBIT_COL", PBIT_COL),
+        ("W_OFF", W_OFF),
+        ("EQ_OFF", EQ_OFF),
+        ("EG_OFF", EG_OFF),
+        ("EP_COL", EP_COL),
+        ("GWRAP_COL", GWRAP_COL),
+        ("SE_OFF", SE_OFF),
+        ("BQ_OFF", BQ_OFF),
+        ("BGCAP_COL", BGCAP_COL),
+        ("BGRST_COL", BGRST_COL),
+        ("BGC_OFF", BGC_OFF),
+        ("BL_OFF", BL_OFF),
+        ("BLC_OFF", BLC_OFF),
+        ("BLCLOSE_COL", BLCLOSE_COL),
+        ("INJ3E_COL", INJ3E_COL),
+        ("INJ4E_COL", INJ4E_COL),
+        ("EFF_OFF", EFF_OFF),
+        ("LATCH_COL", LATCH_COL),
+        ("DV_COL", DV_COL),
+        ("LDV_COL", LDV_COL),
+        ("OM_COL", OM_COL),
+        ("EQ3_OFF", EQ3_OFF),
+        ("EG3_OFF", EG3_OFF),
+        ("INJRE_COL", INJRE_COL),
+        ("AG_OFF", AG_OFF),
+        ("AC_OFF", AC_OFF),
+        ("SEL2_OFF", SEL2_OFF),
+        ("QINV_COL", QINV_COL),
+        ("CQ_OFF", CQ_OFF),
+        ("SG_OFF", SG_OFF),
+        ("BL2_OFF", BL2_OFF),
+        ("BLC2_OFF", BLC2_OFF),
+        ("INJ_AFRZE_COL", INJ_AFRZE_COL),
+        ("INJ_ACREDE_COL", INJ_ACREDE_COL),
+        ("CLOSE_CRED_COL", CLOSE_CRED_COL),
+        ("EGB_COL", EGB_COL),
+        ("EGBC_COL", EGBC_COL),
+        ("AREGE_COL", AREGE_COL),
+        ("CRQ_COL", CRQ_COL),
+        ("INJ_AFKEYE_COL", INJ_AFKEYE_COL),
+        ("CMP_OFF", CMP_OFF),
+        ("POL_OFF", POL_OFF),
+        ("FB_OFF", FB_OFF),
+        ("L3_COL", L3_COL),
+        ("D3_COL", D3_COL),
+        ("L3D3_COL", L3D3_COL),
+    ];
+    v.sort_by_key(|(_, c)| *c);
+    v
+}
+
+/// The census's verifier-supplied public values (lab #758): **only** a
+/// `vPublic` row's `redeem` and `vpa` when that row's amount is zero. There
+/// the AIR reads them only through `Σm·(vpa − asset)`, `s·m` and
+/// `nz·s·ropen` — all zero — so they are free in the AIR, and it is the
+/// surface codec that pins them: `qlab-devnet` `annulet.rs` refuses a
+/// zero-amount term with `redeem` set or `asset ≠ 0`
+/// (`L2SurfaceError::NonCanonicalZeroTerm`) before any proof is checked.
+/// The amount's chunks are never declared: they must come out of the witness
+/// through the balance (a nonzero row's `redeem`/`vpa` too).
+/// A **diagnostic** premise, never a verdict's (lab #758 R12): the
+/// bit-serial compare's cells (both blocks) declared as sources on every
+/// row. They reach the statement only through the verdict at `AFRZ`'s
+/// z = 63; declaring them separates "the compare's free T-row cells block
+/// the census's elimination" from "a bank tie is missing".
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_cmp_cells() -> crate::detaudit::ManifestEntry {
+    crate::detaudit::ManifestEntry::input(crate::detaudit::ANY_ROLE, (CMP_OFF..CMP_OFF + 2 * CMP_BLOCK).collect(), "cmp (diagnostic premise)")
+}
+
+/// The census's **collision-resistance premise** (lab #758 R14), declared
+/// sources: the one copy whose only tie runs through a digest's *output*.
+/// `ARKM′`/`ARKM″` (`ROLE_ARKM2`) take `nk` as a free input, with no bank-1
+/// legs; what binds it is the output: `rkm@AFKEY − rkm′@ACRED` on the third
+/// bank, closed at `ACRED`'s end, and `rkm′@ACRED − rkm″@ACM` on the bind
+/// bank, closed at `ACM`'s end (module doc, "Why three ARKMs"). A different
+/// `nk` reaching the same `rkm` is a Keccak preimage/collision — out of the
+/// census's algebraic scope, so the census cannot determine these cells
+/// forward and everything downstream of the first `ARKM′` reads free. Every
+/// other copy is tied by a bank to a value computed forward (nk@ARKM by bank
+/// 1 from NF's capture; ρ@ACM/ACMF by bank 2 from NF's; nf1@ARHO and the
+/// outputs' ρ by the third bank): those are NOT under this premise.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_cr_premise() -> Vec<crate::detaudit::ManifestEntry> {
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    vec![crate::detaudit::ManifestEntry::input(ROLE_ARKM2, w(0..4), "input.nk @ ARKM′/″ (CR premise)")]
+}
+
+/// A **diagnostic** premise (lab #758 R15): the output-row selectors
+/// `o1a`/`o2a` declared sources. Under `q` (one distinct asset) they are the
+/// designed accounting freedom — the balance closes on `BL + BL2`, so which
+/// row an output is counted on moves no public value (confirmed SAT with no
+/// PV moved). Declared, the per-row accumulators `BL`/`BL2` become
+/// determinable and the enumeration can reach row 1's amount; the amount
+/// reads only their sum, which no assignment of `o1a`/`o2a` changes.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_sel2_accounting() -> crate::detaudit::ManifestEntry {
+    crate::detaudit::ManifestEntry::input(crate::detaudit::ANY_ROLE, vec![SEL2_OFF + S2_O1A, SEL2_OFF + S2_O2A], "o1a, o2a (diagnostic premise)")
+}
+
+/// Where each witness copy is actually read (lab #758 R11): its field,
+/// the injection column that is 1 on the rows whose message absorbs it, and
+/// its lanes. [`witness_manifest`] declares a copy on every row of its role;
+/// off the injection rows the lanes are read only by the bit-serial compare
+/// (xy block 0 reads `W0..3`, block 1 `W5..8`, on every M row), so a census
+/// component there names the copy without touching the value the hash reads.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_copy_reads() -> Vec<(&'static str, usize, Vec<usize>)> {
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    vec![
+        ("input.nk (ARKM + ARKM2 absorb)", INJ_OFF + 2, w(0..4)),
+        ("input.rho (ACM absorb)", INJ_OFF + 3, w(5..9)),
+        ("input.rho (ACMF absorb)", INJ_OFF + INJ_ACMF, w(5..9)),
+        ("output.rho (ACMOUT absorb)", INJ_OFF + 4, w(5..9)),
+        ("nf1 (ARHO absorb)", INJ_OFF + 5, w(5..9)),
+    ]
+}
+
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_pv_inputs(pvs: &[u32]) -> Vec<usize> {
+    let mut v = Vec::new();
+    for base in [PV_VP1, PV_VP2] {
+        if pvs[base + 1..base + 5].iter().all(|m| *m == 0) {
+            v.extend([base, base + 5]);
+        }
+    }
+    v
 }

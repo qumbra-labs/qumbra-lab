@@ -119,54 +119,54 @@ const PR_LIMBS: usize = 40;
 const PR_OFF: usize = PH_OFF + 4; // 430: 32: program ring, 4 slots x 5 bits/limb
 /// Role-code width in bits.
 const ROLE_BITS: usize = 5;
-const D_OFF: usize = PR_OFF + PR_LIMBS; // 462: 20: bit-decomposition of PR[0]
-const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 482: 5: current perm's role bits
+const D_OFF: usize = PR_OFF + PR_LIMBS; // 470: 20: bit-decomposition of PR[0]
+const RB_OFF: usize = D_OFF + 4 * ROLE_BITS; // 490: 5: current perm's role bits
 /// The four materialized low half-selectors `pair(r0, r1, j)`, so a 5-bit
 /// selector `lo · pair(r2, r3) · bit(r4)` stays at degree 4 — the ceiling the
 /// 13 L1 selectors already set. Without them the selector would be degree 5.
-const LO_OFF: usize = RB_OFF + ROLE_BITS; // 487: 4
+const LO_OFF: usize = RB_OFF + ROLE_BITS; // 495: 4
 const NSEL: usize = 18; // materialized role selectors, order = SEL_CODES
-const SEL_OFF: usize = LO_OFF + 4; // 491
+const SEL_OFF: usize = LO_OFF + 4; // 499
 const NINJ: usize = 8; // injection flags [mrk+nf, ank, arkm, acm, acmout, arho, areg, acmf]
-const INJ_OFF: usize = SEL_OFF + NSEL; // 507
-const G4_COL: usize = INJ_OFF + NINJ; // 514: program-ring rotation gate
-const PBIT_COL: usize = G4_COL + 1; // 515: merkle path bit (constant per perm)
+const INJ_OFF: usize = SEL_OFF + NSEL; // 517
+const G4_COL: usize = INJ_OFF + NINJ; // 525: program-ring rotation gate
+const PBIT_COL: usize = G4_COL + 1; // 526: merkle path bit (constant per perm)
 /// Witness lanes: the L1's 13 plus `W13 = asset` and `W14 = flags`.
 const NW: usize = 15;
-const W_OFF: usize = PBIT_COL + 1; // 516: 15 witness lanes (role-multiplexed)
-const EQ_OFF: usize = W_OFF + NW; // 531: 32: two equality banks, 4 lanes x 4 chunks
-const EG_OFF: usize = EQ_OFF + 32; // 563: 6: eq gates
-const EP_COL: usize = EG_OFF + 6; // 569: epoch flag
-const GWRAP_COL: usize = EP_COL + 1; // 570: epoch-kill gate (gperm * sel_end)
+const W_OFF: usize = PBIT_COL + 1; // 527: 15 witness lanes (role-multiplexed)
+const EQ_OFF: usize = W_OFF + NW; // 542: 32: two equality banks, 4 lanes x 4 chunks
+const EG_OFF: usize = EQ_OFF + 32; // 574: 6: eq gates
+const EP_COL: usize = EG_OFF + 6; // 580: epoch flag
+const GWRAP_COL: usize = EP_COL + 1; // 581: epoch-kill gate (gperm * sel_end)
 /// 8 ep-gated selectors [nf, arkm, acm, acmout, bindsum, bal, arho+acmout, areg].
 const NSE: usize = 8;
-const SE_OFF: usize = GWRAP_COL + 1; // 571
+const SE_OFF: usize = GWRAP_COL + 1; // 582
 const SE_RHO: usize = 6;
 const SE_AREG: usize = 7;
-const BQ_OFF: usize = SE_OFF + NSE; // 579: 16: bind bank
-const BGCAP_COL: usize = BQ_OFF + 16; // 595: bind capture gate
-const BGRST_COL: usize = BGCAP_COL + 1; // 596: bind reset gate
+const BQ_OFF: usize = SE_OFF + NSE; // 590: 16: bind bank
+const BGCAP_COL: usize = BQ_OFF + 16; // 606: bind capture gate
+const BGRST_COL: usize = BGCAP_COL + 1; // 607: bind reset gate
 /// 7 bind close gates [banchor, bnf1, bnf2, bcm1, bcm2, breg, bnf3].
 const NBGC: usize = 7;
-const BGC_OFF: usize = BGRST_COL + 1; // 597
-const BL_OFF: usize = BGC_OFF + NBGC; // 603: 4: balance row 1 accumulators
-const BLC_OFF: usize = BL_OFF + 4; // 607: 9: row-1 carry encodings
-const BLCLOSE_COL: usize = BLC_OFF + 9; // 616: balance close gate
-const INJ3E_COL: usize = BLCLOSE_COL + 1; // 617: inj(acm) * ep
-const INJ4E_COL: usize = INJ3E_COL + 1; // 618: inj(acmout) * ep
-const EFF_OFF: usize = INJ4E_COL + 1; // 619: 25: effective round input
-const LATCH_COL: usize = EFF_OFF + 25; // 644: the #219 latch L
-const DV_COL: usize = LATCH_COL + 1; // 645: dv
-const LDV_COL: usize = DV_COL + 1; // 646: L·dv
-const OM_COL: usize = LDV_COL + 1; // 647: the #215 output-1 span marker
-const EQ3_OFF: usize = OM_COL + 1; // 648: 16: the third bank
-const EG3_OFF: usize = EQ3_OFF + 16; // 664: 3: [pos, neg, close]
+const BGC_OFF: usize = BGRST_COL + 1; // 608
+const BL_OFF: usize = BGC_OFF + NBGC; // 615: 4: balance row 1 accumulators
+const BLC_OFF: usize = BL_OFF + 4; // 619: 9: row-1 carry encodings
+const BLCLOSE_COL: usize = BLC_OFF + 9; // 628: balance close gate
+const INJ3E_COL: usize = BLCLOSE_COL + 1; // 629: inj(acm) * ep
+const INJ4E_COL: usize = INJ3E_COL + 1; // 630: inj(acmout) * ep
+const EFF_OFF: usize = INJ4E_COL + 1; // 631: 25: effective round input
+const LATCH_COL: usize = EFF_OFF + 25; // 656: the #219 latch L
+const DV_COL: usize = LATCH_COL + 1; // 657: dv
+const LDV_COL: usize = DV_COL + 1; // 658: L·dv
+const OM_COL: usize = LDV_COL + 1; // 659: the #215 output-1 span marker
+const EQ3_OFF: usize = OM_COL + 1; // 660: 16: the third bank
+const EG3_OFF: usize = EQ3_OFF + 16; // 676: 3: [pos, neg, close]
 // --- L2 additions ---
 /// `inj(areg) · ep` — materialized like `INJ3E`/`INJ4E`.
-const INJRE_COL: usize = EG3_OFF + 3; // 667
+const INJRE_COL: usize = EG3_OFF + 3; // 679
 /// Six materialized capture gates [in1, in2, o1, o2, r1, r2]:
 /// `INJ3E·(1−L)`, `INJ3E·L`, `INJ4E·(1−M)`, `INJ4E·M`, `INJRE·(1−L)`, `INJRE·L`.
-const AG_OFF: usize = INJRE_COL + 1; // 668
+const AG_OFF: usize = INJRE_COL + 1; // 680
 const AG_IN1: usize = 0;
 const AG_IN2: usize = 1;
 const AG_O1: usize = 2;
@@ -175,21 +175,21 @@ const AG_R1: usize = 4;
 const AG_R2: usize = 5;
 /// Six capture-and-hold asset accumulators (16-bit chunk 0 of `W13`), same
 /// order as the gates: `A₁, A₂, O₁, O₂, R₁, R₂`.
-const AC_OFF: usize = AG_OFF + 6; // 674
+const AC_OFF: usize = AG_OFF + 6; // 686
 /// The four balance selectors [o1a, o2a, f1, q] — bool, constant for the trace.
-const SEL2_OFF: usize = AC_OFF + 6; // 680
+const SEL2_OFF: usize = AC_OFF + 6; // 692
 const S2_O1A: usize = 0;
 const S2_O2A: usize = 1;
 const S2_F1: usize = 2;
 const S2_Q: usize = 3;
 /// `qinv` — the nonzero-inverse witness for `¬q ⇒ A₁ ≠ A₂`; constant.
-const QINV_COL: usize = SEL2_OFF + 4; // 684
+const QINV_COL: usize = SEL2_OFF + 4; // 696
 /// `close·q`, `close·(1 − q)` — materialized so the gated chains stay degree 3.
-const CQ_OFF: usize = QINV_COL + 1; // 685
+const CQ_OFF: usize = QINV_COL + 1; // 697
 /// `AG[o1]·o1a`, `AG[o2]·o2a` — materialized so the row legs stay degree 3.
-const SG_OFF: usize = CQ_OFF + 2; // 687
-const BL2_OFF: usize = SG_OFF + 2; // 689: 4: balance row 2 accumulators
-const BLC2_OFF: usize = BL2_OFF + 4; // 693+: 9: row-2 carry encodings
+const SG_OFF: usize = CQ_OFF + 2; // 699
+const BL2_OFF: usize = SG_OFF + 2; // 701: 4: balance row 2 accumulators
+const BLC2_OFF: usize = BL2_OFF + 4; // 705+: 9: row-2 carry encodings
 // --- Shape S3 (A4): the dedicated fee input ---
 /// The fee bank: the fee input's value (W4 at `ACMF`), four 16-bit chunks,
 /// closed at `BAL` against `(1 − d3) · fee`.
@@ -2562,6 +2562,12 @@ mod tests {
         bucket(100, 0, 50, 7, 90, 0, 50, 7, 10)
     }
 
+    /// The named column offsets, pinned (lab #758; see `l2p`'s twin).
+    #[test]
+    fn l2_named_offsets_are_the_constant_chain() {
+        assert_eq!((W_OFF, EQ_OFF, EQ3_OFF, SEL2_OFF, L2_WIDTH), (527, 542, 660, 692, 721));
+    }
+
     #[test]
     fn l2_chain_only_satisfies_constraints() {
         let air = L2ShapeSAir::chain_only(10);
@@ -3425,4 +3431,131 @@ mod tests {
             "a merge minting 1 (30 + 20 → 51 + 0)",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The witness manifest (lab #758), read against
+// `build_bucket_l2_with_witnesses`'s program/lane writes.
+// ---------------------------------------------------------------------------
+
+/// Shape S3's witness manifest. The per-trace declarations `dv` and `d3`
+/// are statement choices (inputs); the balance selectors, `q`, `qinv` and
+/// the latches are not — the census must find them determined.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::{ManifestEntry as M, ANY_ROLE};
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    let note = |role: u32, who: &'static str| {
+        let _ = who;
+        vec![
+            M::input(role, w(4..5), "input.value"),
+            M::copy(role, w(5..9), "input.rho"),
+            M::input(role, w(9..13), "input.rseed"),
+            M::input(role, w(13..14), "input.asset"),
+        ]
+    };
+    let mut m = vec![
+        M::input(ROLE_ANK, w(0..4), "input.sk"),
+        M::input(ROLE_NF, w(0..4), "input.rho"),
+        M::input(ROLE_AREG, w(0..15), "registry.leaf"),
+        M::input(ROLE_MERKLE, w(0..4), "path.sibling"),
+        M::input(ROLE_MERKLE, vec![PBIT_COL], "path.bit"),
+        M::copy(ROLE_ARKM, w(0..4), "input.nk"),
+        M::input(ROLE_ARKM, w(5..7), "input.d"),
+        M::copy(ROLE_ARHO, w(5..9), "nf1"),
+        M::input(ROLE_ACMOUT, w(0..4), "output.rkm"),
+        M::input(ROLE_ACMOUT, w(4..5), "output.value"),
+        M::copy(ROLE_ACMOUT, w(5..9), "output.rho"),
+        M::input(ROLE_ACMOUT, w(9..13), "output.rseed"),
+        M::input(ROLE_ACMOUT, w(13..14), "output.asset"),
+        M::input(ANY_ROLE, vec![DV_COL], "dv"),
+        M::input(ANY_ROLE, vec![D3_COL], "d3"),
+    ];
+    m.extend(note(ROLE_ACM, "input"));
+    m.extend(note(ROLE_ACMF, "fee"));
+    m
+}
+
+/// Shape S3's program as the census reads it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_program(air: &L2ShapeSAir) -> crate::detaudit::Program {
+    crate::detaudit::Program { rows_per_perm: ROWS_PER_PERM, roles: air.program.to_vec() }
+}
+
+/// The census's public-value range premise (lab #758): every shape-S3 public
+/// value is a 16-bit chunk ([`pv_vec_l2`]: digests through `pv_chunks`, the
+/// fee as `& 0xffff` chunks); the node builds them with it (`qumbra-node`
+/// `verifier.rs`, `qlab_l2::pv_vec_s`), and `qlab_l2::verify_s` refuses a
+/// vector outside these ranges.
+pub fn audit_pv_bits() -> Vec<u32> {
+    vec![16; PV_LEN]
+}
+
+/// Column regions by name (lab #758): every `*_OFF`/`*_COL` constant of this
+/// module, so census output names columns from the source of truth rather
+/// than from comments. A column belongs to the region with the greatest
+/// start ≤ it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("A_OFF", A_OFF),
+        ("C_OFF", C_OFF),
+        ("US_OFF", US_OFF),
+        ("AP_OFF", AP_OFF),
+        ("X00_COL", X00_COL),
+        ("S_OFF", S_OFF),
+        ("V_OFF", V_OFF),
+        ("UV_OFF", UV_OFF),
+        ("U_OFF", U_OFF),
+        ("UU_OFF", UU_OFF),
+        ("R_OFF", R_OFF),
+        ("B_OFF", B_OFF),
+        ("PB_OFF", PB_OFF),
+        ("PH_OFF", PH_OFF),
+        ("PR_OFF", PR_OFF),
+        ("D_OFF", D_OFF),
+        ("RB_OFF", RB_OFF),
+        ("LO_OFF", LO_OFF),
+        ("SEL_OFF", SEL_OFF),
+        ("INJ_OFF", INJ_OFF),
+        ("G4_COL", G4_COL),
+        ("PBIT_COL", PBIT_COL),
+        ("W_OFF", W_OFF),
+        ("EQ_OFF", EQ_OFF),
+        ("EG_OFF", EG_OFF),
+        ("EP_COL", EP_COL),
+        ("GWRAP_COL", GWRAP_COL),
+        ("SE_OFF", SE_OFF),
+        ("BQ_OFF", BQ_OFF),
+        ("BGCAP_COL", BGCAP_COL),
+        ("BGRST_COL", BGRST_COL),
+        ("BGC_OFF", BGC_OFF),
+        ("BL_OFF", BL_OFF),
+        ("BLC_OFF", BLC_OFF),
+        ("BLCLOSE_COL", BLCLOSE_COL),
+        ("INJ3E_COL", INJ3E_COL),
+        ("INJ4E_COL", INJ4E_COL),
+        ("EFF_OFF", EFF_OFF),
+        ("LATCH_COL", LATCH_COL),
+        ("DV_COL", DV_COL),
+        ("LDV_COL", LDV_COL),
+        ("OM_COL", OM_COL),
+        ("EQ3_OFF", EQ3_OFF),
+        ("EG3_OFF", EG3_OFF),
+        ("INJRE_COL", INJRE_COL),
+        ("AG_OFF", AG_OFF),
+        ("AC_OFF", AC_OFF),
+        ("SEL2_OFF", SEL2_OFF),
+        ("QINV_COL", QINV_COL),
+        ("CQ_OFF", CQ_OFF),
+        ("SG_OFF", SG_OFF),
+        ("BL2_OFF", BL2_OFF),
+        ("BLC2_OFF", BLC2_OFF),
+        ("FB_OFF", FB_OFF),
+        ("L3_COL", L3_COL),
+        ("D3_COL", D3_COL),
+        ("L3D3_COL", L3D3_COL),
+    ];
+    v.sort_by_key(|(_, c)| *c);
+    v
 }

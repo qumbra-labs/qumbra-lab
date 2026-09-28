@@ -1438,3 +1438,105 @@ impl ClaimAir {
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// The witness manifest (lab #758): the statement's inputs, per role, as the
+// builder lays them. Everything else in the trace must be determined by them.
+// ---------------------------------------------------------------------------
+
+/// The claim's witness manifest — read against [`build_claim_with_witness`]'s
+/// `put` calls. W13 at ACMOUT (the credit's asset) is deliberately absent:
+/// the circuit fixes it to 0, so the census must find it determined.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::ManifestEntry as M;
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    vec![
+        M::input(ROLE_ACM_BURN, w(0..4), "burn.rkm"),
+        M::input(ROLE_ACM_BURN, w(4..5), "burn.v"),
+        M::input(ROLE_ACM_BURN, w(5..9), "burn.rho"),
+        M::input(ROLE_ACM_BURN, w(9..13), "burn.rseed"),
+        M::copy(ROLE_ACNF, w(0..4), "burn.rseed"),
+        M::input(ROLE_MW1, w(0..4), "path.sibling"),
+        M::copy(ROLE_MW1, w(4..8), "burn.cm"),
+        M::input(ROLE_MW1, vec![PBIT_COL], "path.bit"),
+        M::input(ROLE_MERKLE, w(0..4), "path.sibling"),
+        M::input(ROLE_MERKLE, vec![PBIT_COL], "path.bit"),
+        M::input(ROLE_AVC, w(0..4), "r_v"),
+        M::copy(ROLE_AVC, w(4..5), "burn.v"),
+        M::input(ROLE_ACMOUT, w(0..4), "credit.rkm"),
+        M::input(ROLE_ACMOUT, w(4..5), "credit.value"),
+        M::copy(ROLE_ACMOUT, w(5..9), "cnf"),
+        M::input(ROLE_ACMOUT, w(9..13), "credit.rseed"),
+    ]
+}
+
+/// The claim program as the census reads it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_program(air: &ClaimAir) -> crate::detaudit::Program {
+    crate::detaudit::Program { rows_per_perm: ROWS_PER_PERM, roles: air.program.to_vec() }
+}
+
+/// The row-0 warm-up allowance (the narrow engine's, issue #143): the claim
+/// runs the same engine, so its leading dummy perm's input is prover-chosen
+/// and must die before ACM_BURN's full override, reaching no public value.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_allowances() -> Vec<crate::detaudit::Allowance> {
+    vec![crate::detaudit::Allowance { name: "row-0 warm-up (#143)", root_rows: 0..1, max_row: ROWS_PER_PERM + 128 }]
+}
+
+/// The census's public-value range premise (lab #758): every claim public
+/// value is a 16-bit chunk ([`pv_vec_claim`]: five digests through
+/// `pv_chunks`, the fee as `& 0xffff` chunks). `qlab_l2::claim::verify_claim`
+/// pins `rkm_burn` and the fee to its own `pv_vec_claim` and refuses any
+/// public value ≥ 2^16 by name.
+pub fn audit_pv_bits() -> Vec<u32> {
+    vec![16; PV_LEN]
+}
+
+/// Column regions by name (lab #758): every `*_OFF`/`*_COL` constant of this
+/// module, so census output names columns from the source of truth rather
+/// than from comments. A column belongs to the region with the greatest
+/// start ≤ it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("A_OFF", A_OFF),
+        ("C_OFF", C_OFF),
+        ("US_OFF", US_OFF),
+        ("AP_OFF", AP_OFF),
+        ("X00_COL", X00_COL),
+        ("S_OFF", S_OFF),
+        ("V_OFF", V_OFF),
+        ("UV_OFF", UV_OFF),
+        ("U_OFF", U_OFF),
+        ("UU_OFF", UU_OFF),
+        ("R_OFF", R_OFF),
+        ("B_OFF", B_OFF),
+        ("PB_OFF", PB_OFF),
+        ("PH_OFF", PH_OFF),
+        ("PR_OFF", PR_OFF),
+        ("D_OFF", D_OFF),
+        ("RB_OFF", RB_OFF),
+        ("LO_OFF", LO_OFF),
+        ("SEL_OFF", SEL_OFF),
+        ("INJ_OFF", INJ_OFF),
+        ("G4_COL", G4_COL),
+        ("PBIT_COL", PBIT_COL),
+        ("W_OFF", W_OFF),
+        ("CL_OFF", CL_OFF),
+        ("BGCAP_COL", BGCAP_COL),
+        ("BGC_OFF", BGC_OFF),
+        ("BQ_OFF", BQ_OFF),
+        ("RK_OFF", RK_OFF),
+        ("RS_OFF", RS_OFF),
+        ("CM_OFF", CM_OFF),
+        ("RH_OFF", RH_OFF),
+        ("VA_OFF", VA_OFF),
+        ("VB_OFF", VB_OFF),
+        ("BLC_OFF", BLC_OFF),
+        ("EFF_OFF", EFF_OFF),
+    ];
+    v.sort_by_key(|(_, c)| *c);
+    v
+}

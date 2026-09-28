@@ -13,6 +13,8 @@
 //! new AIR type beside `narrow`, never an edit to it.
 
 pub mod claim;
+#[cfg(any(test, feature = "audit"))]
+pub mod detaudit;
 pub mod l2;
 pub mod l2p;
 pub mod l2r;

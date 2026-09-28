@@ -3667,3 +3667,130 @@ mod tests {
         assert!(!report.is_ok(), "a swapped-NF second nullifier VERIFIED");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The witness manifest (lab #758): the statement's inputs, per role, as
+// `build_bucket_with_witnesses` lays them. Everything else in the trace must
+// be determined by them (the row-0 warm-up is the one named allowance).
+// ---------------------------------------------------------------------------
+
+/// The 2×2 bucket's witness manifest.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::{ManifestEntry as M, ANY_ROLE};
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    vec![
+        M::input(ROLE_ANK, w(0..4), "input.sk"),
+        M::input(ROLE_NF, w(0..4), "input.rho"),
+        M::copy(ROLE_ARKM, w(0..4), "input.nk"),
+        M::input(ROLE_ARKM, w(5..7), "input.d"),
+        M::input(ROLE_ACM, w(4..5), "input.value"),
+        M::copy(ROLE_ACM, w(5..9), "input.rho"),
+        M::input(ROLE_ACM, w(9..13), "input.rseed"),
+        M::input(ROLE_MERKLE, w(0..4), "path.sibling"),
+        M::input(ROLE_MERKLE, vec![PBIT_COL], "path.bit"),
+        M::copy(ROLE_ARHO, w(5..9), "nf1"),
+        M::input(ROLE_ACMOUT, w(0..4), "output.rkm"),
+        M::input(ROLE_ACMOUT, w(4..5), "output.value"),
+        M::copy(ROLE_ACMOUT, w(5..9), "output.rho"),
+        M::input(ROLE_ACMOUT, w(9..13), "output.rseed"),
+        M::input(ANY_ROLE, vec![DV_COL], "dv"),
+    ]
+}
+
+/// The bucket program as the census reads it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_program(air: &NarrowKeccakAir) -> crate::detaudit::Program {
+    crate::detaudit::Program { rows_per_perm: ROWS_PER_PERM, roles: air.program.to_vec() }
+}
+
+/// The row-0 warm-up allowance (issue #143): the first perm's input state is
+/// prover-chosen and fully overridden at the first injecting perm; it must
+/// reach no public value and die inside the leading dummy perm and the next
+/// perm's first block.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_allowances() -> Vec<crate::detaudit::Allowance> {
+    vec![crate::detaudit::Allowance { name: "row-0 warm-up (#143)", root_rows: 0..1, max_row: ROWS_PER_PERM + 128 }]
+}
+
+/// The census's public-value range premise (lab #758): every bucket public
+/// value is a 16-bit chunk — digests through [`pv_chunks`], the fee as four
+/// `& 0xffff` chunks — because the only verify path builds them with
+/// [`pv_vec`] from the declared surface (`qumbra-node` `verifier.rs`,
+/// `pvs_u32_from_public` → `pv_vec`). A path taking raw field elements would
+/// void the premise for itself.
+pub fn audit_pv_bits() -> Vec<u32> {
+    vec![16; PV_LEN]
+}
+
+/// The #219 dummy-slot value pin `INJ3E·LDV·W4` (the columns it reads) —
+/// the census's `--vacuous` control (lab #758): vacuous on a `dv = 0`
+/// trace, live on a `dv = 1` one.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_dv_value_pin_reads() -> [usize; 3] {
+    [INJ3E_COL, LDV_COL, W_OFF + 4]
+}
+
+/// The #737 NF path-bit pin `sel(NF)·PBIT` (the columns it reads) — the
+/// census's `--vacuous` regression control (lab #758): load-bearing on every
+/// trace.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_nf_pbit_pin_reads() -> [usize; 2] {
+    [SEL_OFF + 1, PBIT_COL]
+}
+
+/// Column regions by name (lab #758): every `*_OFF`/`*_COL` constant of this
+/// module, so census output names columns from the source of truth rather
+/// than from comments. A column belongs to the region with the greatest
+/// start ≤ it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("A_OFF", A_OFF),
+        ("C_OFF", C_OFF),
+        ("US_OFF", US_OFF),
+        ("AP_OFF", AP_OFF),
+        ("X00_COL", X00_COL),
+        ("S_OFF", S_OFF),
+        ("V_OFF", V_OFF),
+        ("UV_OFF", UV_OFF),
+        ("U_OFF", U_OFF),
+        ("UU_OFF", UU_OFF),
+        ("R_OFF", R_OFF),
+        ("B_OFF", B_OFF),
+        ("PB_OFF", PB_OFF),
+        ("PH_OFF", PH_OFF),
+        ("PR_OFF", PR_OFF),
+        ("D_OFF", D_OFF),
+        ("RB_OFF", RB_OFF),
+        ("SEL_OFF", SEL_OFF),
+        ("INJ_OFF", INJ_OFF),
+        ("G4_COL", G4_COL),
+        ("PBIT_COL", PBIT_COL),
+        ("W_OFF", W_OFF),
+        ("SIB_OFF", SIB_OFF),
+        ("EQ_OFF", EQ_OFF),
+        ("EG_OFF", EG_OFF),
+        ("EP_COL", EP_COL),
+        ("GWRAP_COL", GWRAP_COL),
+        ("SE_OFF", SE_OFF),
+        ("BQ_OFF", BQ_OFF),
+        ("BGCAP_COL", BGCAP_COL),
+        ("BGRST_COL", BGRST_COL),
+        ("BGC_OFF", BGC_OFF),
+        ("BL_OFF", BL_OFF),
+        ("BLC_OFF", BLC_OFF),
+        ("BLCLOSE_COL", BLCLOSE_COL),
+        ("INJ3E_COL", INJ3E_COL),
+        ("INJ4E_COL", INJ4E_COL),
+        ("EFF_OFF", EFF_OFF),
+        ("LATCH_COL", LATCH_COL),
+        ("DV_COL", DV_COL),
+        ("LDV_COL", LDV_COL),
+        ("OM_COL", OM_COL),
+        ("EQ3_OFF", EQ3_OFF),
+        ("EG3_OFF", EG3_OFF),
+    ];
+    v.sort_by_key(|(_, c)| *c);
+    v
+}

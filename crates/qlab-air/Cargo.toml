@@ -17,6 +17,9 @@ p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"], optional = true 
 # tests (lab #742: qlab-bench's M4 gate block enables it as a dev-dependency).
 # Never a runtime feature: nothing outside a test may depend on it.
 test-support = ["dep:p3-maybe-rayon"]
+# `detaudit` — the determination census (lab #758) and the per-AIR witness
+# manifests. Bench-only (`qlab-bench detaudit`); no consensus path enables it.
+audit = []
 
 [dev-dependencies]
 # Published Keccak-f used as the authority the reference implementation

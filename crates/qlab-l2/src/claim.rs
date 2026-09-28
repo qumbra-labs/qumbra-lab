@@ -40,6 +40,9 @@ pub const FEE_TIER_CLAIM_PLACEHOLDER: u64 = 4;
 pub enum ClaimRefusal {
     /// The public-value vector is not a claim's length.
     PvLength,
+    /// A public value outside its declared range (lab #758: every claim
+    /// public value is a 16-bit chunk).
+    PvRange,
     /// The claimed burn is to another chain's burn address (or none).
     RkmBurnNotThisChain,
     /// The fee is not this chain's claim tariff.
@@ -78,6 +81,9 @@ pub fn prove_claim(inst: &ClaimInstance) -> (Vec<Val>, Proof<Config>) {
 pub fn check_claim_surface(pvs: &[Val], l2_id: u64, fee_tier: u64) -> Result<(), ClaimRefusal> {
     if pvs.len() != PV_LEN {
         return Err(ClaimRefusal::PvLength);
+    }
+    if !crate::pv_in_range(pvs, &qlab_air::claim::audit_pv_bits()) {
+        return Err(ClaimRefusal::PvRange);
     }
     let burn = public_values(&pv_vec_claim(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &rkm_burn(l2_id), fee_tier));
     if pvs[PV_RKM_BURN..PV_RKM_BURN + 16] != burn[PV_RKM_BURN..PV_RKM_BURN + 16] {
@@ -146,6 +152,10 @@ mod tests {
         let mut bad = pvs.clone();
         bad[PV_RKM_BURN + 15] += Val::ONE;
         assert_eq!(check_claim_surface(&bad, CLAIM_L2_ID, tier), Err(ClaimRefusal::RkmBurnNotThisChain));
+        // Lab #758: a chunk ≥ 2^16 anywhere is refused by name.
+        let mut bad = pvs.clone();
+        bad[PV_CV + 2] += Val::from_u32(1 << 16);
+        assert_eq!(check_claim_surface(&bad, CLAIM_L2_ID, tier), Err(ClaimRefusal::PvRange));
     }
 
     /// The claim through the real prover under the L2 lane, verified by the
