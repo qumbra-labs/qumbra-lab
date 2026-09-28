@@ -85,6 +85,7 @@ pub(crate) fn shapes_arg(args: &[String]) -> Result<Vec<L2ShapeTag>, String> {
     let get = |key: &str| args.iter().position(|a| a == key).and_then(|i| args.get(i + 1));
     match (get("--shapes"), get("--k")) {
         (Some(_), Some(_)) => Err("give --shapes or --k, not both".into()),
+        (Some(s), None) if s.is_empty() => Err("--shapes needs at least one shape".into()),
         (Some(s), None) => s
             .chars()
             .map(|c| match c {
@@ -94,7 +95,11 @@ pub(crate) fn shapes_arg(args: &[String]) -> Result<Vec<L2ShapeTag>, String> {
                 other => Err(format!("unknown shape {other}")),
             })
             .collect(),
-        (None, Some(k)) => Ok(default_shapes(k.parse().map_err(|_| "--k takes a count")?)),
+        (None, Some(k)) => match k.parse::<usize>() {
+            Ok(0) => Err("--k must be at least 1".into()),
+            Ok(k) => Ok(default_shapes(k)),
+            Err(_) => Err("--k takes a count".into()),
+        },
         (None, None) => Ok(vec![L2ShapeTag::P]),
     }
 }
@@ -368,6 +373,17 @@ mod tests {
             assert_eq!(2 * (ch + q * pq), both);
             assert_eq!((24 * q * pq).next_power_of_two(), rows);
         }
+    }
+
+    /// `--k 0` and an empty `--shapes` are refused as arguments, before any
+    /// leaf is built (`LeafAir::new` asserts k ≥ 1).
+    #[test]
+    fn f3bench_refuses_an_empty_leaf() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(shapes_arg(&args(&["--k", "0"])), Err("--k must be at least 1".into()));
+        assert_eq!(shapes_arg(&args(&["--shapes", ""])), Err("--shapes needs at least one shape".into()));
+        assert!(shapes_arg(&args(&["--k", "x"])).is_err());
+        assert_eq!(shapes_arg(&args(&["--k", "2"])).map(|v| v.len()), Ok(2));
     }
 
     /// One real round trip on the lane: a one-transaction leaf proven on the

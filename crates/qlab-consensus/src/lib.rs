@@ -301,13 +301,19 @@ fn make_config_from(cfg: &FriCfg, rc: usize, mut rng: impl FnMut() -> ProverRng)
     Config::new(pcs, challenger)
 }
 
-/// **Legacy, non-hiding** — the pre-re-mint `TwoAdicFriPcs` stack, kept for
-/// exactly one consumer: the M4 aggregation bench (`qlab-bench` `m4*`), whose
-/// in-circuit recorder and gate AIR verify the non-hiding FRI proof shape.
-/// Rung-1 aggregation is **re-gated** by the re-mint: it measures aggregating
-/// proofs the network no longer produces, until it is extended to the hiding
-/// shape (a named post-re-mint milestone). Nothing that proves or verifies a
-/// transaction may use this module.
+/// **Legacy, non-hiding** — the pre-re-mint `TwoAdicFriPcs` stack. Its
+/// consumers are all bench-only, in `qlab-bench`:
+///
+/// - the M4 aggregation bench (`m4*`), whose in-circuit recorder and gate AIR
+///   verify the non-hiding FRI proof shape. Rung-1 aggregation is
+///   **re-gated** by the re-mint: it measures aggregating proofs the network
+///   no longer produces, until it is extended to the hiding shape (a named
+///   post-re-mint milestone);
+/// - the non-hiding outer lanes that prove over public values only: F2's
+///   `f2wrap` (lab #750), F3's state-transition leaf `f3leaf --prove` (lab
+///   #767), and `l2shape`'s non-hiding comparison lane.
+///
+/// Nothing that proves or verifies a transaction may use this module.
 pub mod legacy {
     use super::*;
     use p3_fri::TwoAdicFriPcs;

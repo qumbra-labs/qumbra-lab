@@ -16,6 +16,17 @@
 //! negatives ([`neg`]: `qlab-bench f3leaf --check`, `f3neg`, `f3vec`). F3-2c
 //! adds `f3leaf --prove` and the interior census, `f3census --interior`
 //! ([`bench`]).
+//!
+//! **Where F3 closed (lab #767, 2026-09-28).** The coordinator's box (EC2
+//! r7g.2xlarge, two passes per cell, every proof verified natively, degree 3,
+//! two quotient chunks) put the worst b2 leaf — k = 16, 2^18 rows — at
+//! 6.45 GiB peak (b4: 12.89 GiB), so **the 32 GB-class b2 gate passes** at
+//! every roadmap k with room to spare; F2's k-model over-predicts by 7–25 %.
+//! **The interior stays census-only:** one C2-class query component per leaf
+//! models at 21–26 GiB [P] (the OOD register machine not counted), so an
+//! in-circuit interior at this leaf width sits at the 32 GB edge; F4 decides
+//! between it and native chain checks (a leaf verifies in 0.02–0.03 s).
+//! Measured table and census: issue #767.
 
 pub(crate) mod bench;
 pub(crate) mod census;
