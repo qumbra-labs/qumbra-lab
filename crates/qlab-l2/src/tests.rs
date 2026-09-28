@@ -370,3 +370,26 @@ fn shape_r_two_proofs_of_one_witness_differ_and_both_verify() {
 fn claim_two_proofs_of_one_witness_differ_and_both_verify() {
     hiding_smoke!(qlab_air::claim::ClaimAir::chain_only(12), qlab_air::claim::ClaimAir);
 }
+
+/// Lab #758's public-value range premise, at the L2 verifiers: the fixtures'
+/// honest vectors sit inside every declared range, and one chunk pushed to
+/// 2^16 (or a `redeem` to 2) is outside — `verify_s/p/r` refuse such a
+/// vector before reading the proof.
+#[test]
+fn l2_pv_range_premise_holds_and_is_enforced() {
+    let s = public_values(&fixture::shape_s().pvs);
+    let p = public_values(&fixture::shape_p().pvs);
+    let r = public_values(&fixture::shape_r().pvs);
+    let (bs, bp, br) = (qlab_air::l2::audit_pv_bits(), qlab_air::l2p::audit_pv_bits(), qlab_air::l2r::audit_pv_bits());
+    assert!(pv_in_range(&s, &bs) && pv_in_range(&p, &bp) && pv_in_range(&r, &br), "the honest vectors");
+    let mut bad = s.clone();
+    bad[PV_FEE] += Val::from_u32(1 << 16);
+    assert!(!pv_in_range(&bad, &bs), "a fee chunk ≥ 2^16");
+    let mut bad = p.clone();
+    bad[PV_VP1] = Val::TWO;
+    assert!(!pv_in_range(&bad, &bp), "a redeem flag of 2");
+    let mut bad = r.clone();
+    bad[PV_R_NEW_ROOT + 7] += Val::from_u32(1 << 16);
+    assert!(!pv_in_range(&bad, &br), "a root chunk ≥ 2^16");
+    assert!(!pv_in_range(&s[..10], &bs), "a wrong length");
+}

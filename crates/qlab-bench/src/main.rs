@@ -16,6 +16,7 @@
 #![recursion_limit = "512"]
 
 mod claimshape;
+mod detaudit;
 mod disclosure;
 mod geometry;
 mod l2shape;
@@ -750,6 +751,12 @@ fn main() {
         .map(|(_, a)| a.as_str())
         .unwrap_or("matrix")
         .to_string();
+
+    if mode == "detaudit" {
+        // Lab #758: the determination census (local output only).
+        detaudit::run_detaudit(&args[1..]);
+        return;
+    }
 
     if mode == "f3census" {
         // Lab #767: the state-transition leaf's symbolic census.

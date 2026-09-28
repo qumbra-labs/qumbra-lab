@@ -212,6 +212,14 @@ pub fn verifier_air_r() -> L2ShapeRAir {
 // Prove / verify
 // ---------------------------------------------------------------------------
 
+/// Every public value inside the range its AIR declares
+/// (`qlab_air::*::audit_pv_bits`) — lab #758's premise, enforced at the
+/// verifier so a raw field element cannot carry a non-canonical chunk.
+pub fn pv_in_range(pvs: &[Val], bits: &[u32]) -> bool {
+    use p3_field::PrimeField32;
+    pvs.len() == bits.len() && pvs.iter().zip(bits).all(|(v, b)| *b >= 32 || v.as_canonical_u32() < 1 << b)
+}
+
 /// A public-value vector as field elements.
 pub fn public_values(pvs: &[u32]) -> Vec<Val> {
     pvs.iter().map(|v| Val::from_u32(*v)).collect()
@@ -231,6 +239,7 @@ pub fn prove_s(inst: &L2BucketInstance) -> (Vec<Val>, Proof<Config>) {
 /// A wrong-length `pvs` is refused before verification.
 pub fn verify_s(pvs: &[Val], proof: &Proof<Config>) -> bool {
     pvs.len() == Shape::S.pv_len()
+        && pv_in_range(pvs, &qlab_air::l2::audit_pv_bits())
         && verify(&make_config_l2(), &verifier_air_s(), proof, pvs).is_ok()
 }
 
@@ -246,6 +255,7 @@ pub fn prove_p(inst: &L2PBucketInstance) -> (Vec<Val>, Proof<Config>) {
 /// `true` iff `proof` is a valid shape-P proof for `pvs` under the L2 lane.
 pub fn verify_p(pvs: &[Val], proof: &Proof<Config>) -> bool {
     pvs.len() == Shape::P.pv_len()
+        && pv_in_range(pvs, &qlab_air::l2p::audit_pv_bits())
         && verify(&make_config_l2(), &verifier_air_p(), proof, pvs).is_ok()
 }
 
@@ -261,6 +271,7 @@ pub fn prove_r(inst: &L2ShapeRInstance) -> (Vec<Val>, Proof<Config>) {
 /// `true` iff `proof` is a valid shape-R proof for `pvs` under the L2 lane.
 pub fn verify_r(pvs: &[Val], proof: &Proof<Config>) -> bool {
     pvs.len() == Shape::R.pv_len()
+        && pv_in_range(pvs, &qlab_air::l2r::audit_pv_bits())
         && verify(&make_config_l2(), &verifier_air_r(), proof, pvs).is_ok()
 }
 

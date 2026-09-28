@@ -386,6 +386,37 @@ mod tests {
         o
     }
 
+    /// Lab #758's public-value range premise, on the L1 verify path: whatever
+    /// surface a transaction declares — any digests, any u64 fee — the public
+    /// values this path hands `verify_proof` are 16-bit chunks, as
+    /// `qlab_air::narrow::audit_pv_bits` declares.
+    #[test]
+    fn l1_verify_path_builds_only_16_bit_public_values() {
+        let bits = qlab_air::narrow::audit_pv_bits();
+        let mut x = 0x0758_1600_dead_beefu64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for fee in [0u64, 1, 0xffff, 0x1_0000, u64::MAX, rnd()] {
+            let d = |r: &mut dyn FnMut() -> u64| h32(&[r(), r(), r(), r()]);
+            let p = TxPublic {
+                anchor: d(&mut rnd),
+                nullifiers: vec![d(&mut rnd), d(&mut rnd)],
+                commitments: vec![d(&mut rnd), d(&mut rnd)],
+                bucket: ArityBucket::TwoByTwo,
+                fee,
+            };
+            let pvs = pvs_u32_from_public(&p).expect("a 2×2 surface");
+            assert_eq!(pvs.len(), bits.len());
+            for (i, (v, b)) in pvs.iter().zip(bits.iter()).enumerate() {
+                assert!((*v as u64) < 1u64 << b, "public value {i} = {v} exceeds its declared {b} bits (fee {fee})");
+            }
+        }
+    }
+
     /// A balanced 2-in/2-out bucket (50k+30k = 60k+19k + 1k fee) — the
     /// qlab-consensus reference instance.
     fn balanced_bucket() -> BucketInstance {

@@ -2483,3 +2483,130 @@ mod tests {
         assert_refused_at(&inst, slot, "a swapped-NF second nullifier");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The witness manifest (lab #758), read against
+// `build_shape_r_with_witnesses`'s `put` calls.
+// ---------------------------------------------------------------------------
+
+/// Shape R's witness manifest. `REG` (registration vs update) is a
+/// statement choice; `DC`/`DR`/`MINV`/`RINV`/`AINV` are derived and must
+/// come out determined. BREG_OLD's path bit is level 16's, carried to MN_16.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::{ManifestEntry as M, ANY_ROLE};
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    vec![
+        M::input(ROLE_ANK, w(0..4), "fee.sk"),
+        M::input(ROLE_NF, w(0..4), "fee.rho"),
+        M::copy(ROLE_ARKM, w(0..4), "fee.nk"),
+        M::input(ROLE_ARKM, w(5..7), "fee.d"),
+        M::input(ROLE_ACM, w(4..5), "fee.value"),
+        M::copy(ROLE_ACM, w(5..9), "fee.rho"),
+        M::input(ROLE_ACM, w(9..13), "fee.rseed"),
+        M::input(ROLE_ACM, w(13..14), "fee.asset"),
+        M::input(ROLE_MERKLE, w(0..4), "path.sibling"),
+        M::input(ROLE_MERKLE, vec![PBIT_COL], "path.bit"),
+        M::input(ROLE_ACMOUT, w(0..4), "out.rkm"),
+        M::input(ROLE_ACMOUT, w(4..5), "out.value"),
+        M::copy(ROLE_ACMOUT, w(5..9), "nf"),
+        M::input(ROLE_ACMOUT, w(9..13), "out.rseed"),
+        M::input(ROLE_ACMOUT, w(13..14), "out.asset"),
+        M::copy(ROLE_ARHO, w(0..4), "nf"),
+        M::input(ROLE_ACMOUT2, w(0..4), "seed.rkm"),
+        M::input(ROLE_ACMOUT2, w(9..13), "seed.rseed"),
+        M::input(ROLE_ACMOUT2, w(13..14), "seed.asset"),
+        M::input(ROLE_AISS, w(0..4), "isk"),
+        M::input(ROLE_AREG_OLD, w(0..15), "old_leaf"),
+        M::input(ROLE_AREG_NEW, w(0..15), "new_leaf"),
+        M::input(ROLE_MO, w(0..4), "registry.sibling"),
+        M::copy(ROLE_MO, w(4..8), "old.digest"),
+        M::input(ROLE_MO, vec![PBIT_COL], "registry.bit"),
+        M::copy(ROLE_MN, w(0..4), "registry.sibling"),
+        M::copy(ROLE_MN, w(4..8), "new.digest"),
+        M::copy(ROLE_MN, vec![PBIT_COL], "registry.bit"),
+        M::copy(ROLE_BREG_OLD, vec![PBIT_COL], "registry.bit"),
+        M::input(ANY_ROLE, vec![REG_COL], "reg"),
+    ]
+}
+
+/// Shape R's program as the census reads it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_program(air: &L2ShapeRAir) -> crate::detaudit::Program {
+    crate::detaudit::Program { rows_per_perm: ROWS_PER_PERM, roles: air.program.to_vec() }
+}
+
+/// The census's public-value range premise (lab #758), per [`pv_vec_r`]:
+/// every public value a 16-bit chunk except `PV_ASSET`, the declared asset
+/// cast `as u32`. The node builds them with it (`qumbra-node` `verifier.rs`,
+/// `qlab_l2::pv_vec_r`); `qlab_l2::verify_r` refuses a vector outside them.
+pub fn audit_pv_bits() -> Vec<u32> {
+    let mut b = vec![16; PV_LEN];
+    b[PV_ASSET] = 32;
+    b
+}
+
+/// Column regions by name (lab #758): every `*_OFF`/`*_COL` constant of this
+/// module, so census output names columns from the source of truth rather
+/// than from comments. A column belongs to the region with the greatest
+/// start ≤ it.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
+    let mut v = vec![
+        ("A_OFF", A_OFF),
+        ("C_OFF", C_OFF),
+        ("US_OFF", US_OFF),
+        ("AP_OFF", AP_OFF),
+        ("X00_COL", X00_COL),
+        ("S_OFF", S_OFF),
+        ("V_OFF", V_OFF),
+        ("UV_OFF", UV_OFF),
+        ("U_OFF", U_OFF),
+        ("UU_OFF", UU_OFF),
+        ("R_OFF", R_OFF),
+        ("B_OFF", B_OFF),
+        ("PB_OFF", PB_OFF),
+        ("PH_OFF", PH_OFF),
+        ("PR_OFF", PR_OFF),
+        ("D_OFF", D_OFF),
+        ("RB_OFF", RB_OFF),
+        ("LO_OFF", LO_OFF),
+        ("SEL_OFF", SEL_OFF),
+        ("INJ_OFF", INJ_OFF),
+        ("INJOLD_COL", INJOLD_COL),
+        ("INJNEW_COL", INJNEW_COL),
+        ("MOB_COL", MOB_COL),
+        ("MNB_COL", MNB_COL),
+        ("G4_COL", G4_COL),
+        ("PBIT_COL", PBIT_COL),
+        ("W_OFF", W_OFF),
+        ("NFB_COL", NFB_COL),
+        ("CL_OFF", CL_OFF),
+        ("BGCAP_COL", BGCAP_COL),
+        ("BGC_OFF", BGC_OFF),
+        ("BQ_OFF", BQ_OFF),
+        ("EQ_OFF", EQ_OFF),
+        ("EQ3_OFF", EQ3_OFF),
+        ("BL_OFF", BL_OFF),
+        ("BLC_OFF", BLC_OFF),
+        ("EFF_OFF", EFF_OFF),
+        ("CO_OFF", CO_OFF),
+        ("CN_OFF", CN_OFF),
+        ("SB_OFF", SB_OFF),
+        ("IS_OFF", IS_OFF),
+        ("POW_COL", POW_COL),
+        ("PACC_COL", PACC_COL),
+        ("AC_OLD_COL", AC_OLD_COL),
+        ("AC_NEW_COL", AC_NEW_COL),
+        ("MC_COL", MC_COL),
+        ("AC_SEED_COL", AC_SEED_COL),
+        ("REG_COL", REG_COL),
+        ("DC_COL", DC_COL),
+        ("DR_COL", DR_COL),
+        ("MINV_COL", MINV_COL),
+        ("RINV_COL", RINV_COL),
+        ("AINV_COL", AINV_COL),
+    ];
+    v.sort_by_key(|(_, c)| *c);
+    v
+}

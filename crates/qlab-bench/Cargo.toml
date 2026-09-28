@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-qlab-air = { path = "../qlab-air" }
+qlab-air = { path = "../qlab-air", features = ["audit"] }
 # Single source of truth for the consensus StarkConfig + CONSENSUS_CFG + wrappers
 # (issue #38). The plumbing formerly defined here is re-exported from it so the
 # bench modules' `crate::{Val, Config, FriCfg, make_config_with}` still resolve.
