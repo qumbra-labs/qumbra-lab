@@ -1110,3 +1110,109 @@ S3 proof 用 census 测试的，每个测试二进制各共用一份；如果 C2
 2. L2 在 S3 的 22 个 trace 块上的项号记账：只在两 query 的 S3 测试（SAT）里跑过，从没经过负例。
 3. S/P/R 的钉值：假定 census 几何成立，且公式与列分配完全对应。玩具和两 query 的 S3 实例把公式
    钉到了 AIR 上；P 和 R 只有公式。
+
+## F2b-5：端到端负例
+
+issue #750 stage-0 第 5 步列出了单叶验证器必须拒绝的情形：商/AIR 满足性错误、periodic 求值、
+g_N 与倍长域 shift 的混淆、randomizer 缺失或被改、salt/路径/点的长度、P3 多出的一轮折叠、
+value/SCR 保持绑定，以及按 shape 区分的公共状态/手续费路由。F2b 启动表另加了改过的打开值、
+错误的 ζ、改过的商块、把 hiding proof 喂给 legacy 验证器；R-PV 另加一条：叶子 PV ≥ 2^16。
+F2b-5 让每一条都**走完组合后的流水线**：改过的内层 hiding proof（或改过的叶子 PV）送进
+`f2wrap` 用的构建器（`c1::honest`、`c2::honest`、叶子的原生编译），再对由它构建出的 honest
+C1/C2 trace **逐行全扫**。每条拒绝要么是精确的（行，分组）集合，要么是按名字拒绝的原生检查。
+
+proof 一改，其后的每个 Fiat–Shamir 抽样都会跟着变，原来的 query PoW 也就过不了。这本身就是
+一次拒绝：C1 的构建器停在 `query PoW sample is not zero`。为了让被拒绝的只剩篡改本身，测试
+接着照伪造者的做法，用 p3 自己的 challenger 为变动后的 transcript 重新磨 PoW
+（`lane::toy::regrind`）。下文所有电路内的拒绝都发生在重磨之后。
+
+### 覆盖表
+
+“连带后果”沿用 C2 测试里的说法：凡是没对上接缝中按下标选出的 cap 条目的 Merkle 根
+（在该检查所在行由 `cap` 拒绝），凡是最后一次折叠对不上 final polynomial 的 query（在其寄存器
+行由 `final` 拒绝），都由原生重放从伪造的声明算出。标 **新增** 的是本片加的测试，其余是已有
+测试，只引用、不重复。
+
+| stage-0 / 启动表条目 | 测试 | 拒绝位置 |
+|---|---|---|
+| 商/AIR 满足性错误；改过的商块 | **新增** `c1_refuses_real_proofs_with_an_altered_opened_value`（真实 proof，商块 3 第 2 limb 加 1） | p3 验证器；构建器报 `query PoW sample is not zero`；重磨后只剩最后一行的 C1 `machine_out` |
+| | 已有 `check_real_mutations`（census 测试，S/P/R） | 每个商块 limb 都会改变原生残差 |
+| 改过的打开值 | **新增**，同一测试：ζ 处的 trace、ζ·g_N 处的 trace | 同上：只剩最后一行的 C1 `machine_out` |
+| | 已有 `c1_rejects_opened_value_forgeries` | 只改 transcript：`bind_opened`；只改 Az：`accumulate`；点翻转：`mask`；word + p：`canonical` + `pow` |
+| 错误的 ζ | 已有 `c1_rejects_challenge_forgeries` | ζ 抽样置换上的 `fs_bind` + `machine_out` |
+| periodic 求值 | **新增** `c1_refuses_verifier_programs_on_the_doubled_domain`，用 `ToyPeriodic`（玩具加一列周期 4 的 periodic 列） | periodic 列按 2N 个点插值：`compare_native` 拒绝（`periodic DAG/native mismatch`）；硬要构建，也只剩最后一行的 C1 `machine_out` |
+| | 已有 `all_shape_dags_match_native_ood_algebra_on_synthetic_inputs` | DAG 层面的 N/2N periodic 混淆，S/P/R |
+| g_N 与倍长域 shift | **新增**，同一 C1 测试：下一行点取 ζ·g_2N | `next-point DAG/native mismatch`；硬要构建，也只剩最后一行的 C1 `machine_out` |
+| | **新增** `c2_refuses_the_next_point_on_the_doubled_domain`（query 1 的 ro 用 ζ·g_2N 算，逆元与折叠都自洽） | query 1 寄存器所在每一行的 `inverse` + 连带后果 |
+| randomizer 缺失 | **新增** `f2wrap_builders_refuse_missing_or_misshapen_proofs_by_name` | `missing randomizer commitment`、`missing randomizer opening` |
+| | 已有 census 测试 | 去掉 randomizer 承诺后 `validate_geometry` 拒绝 |
+| randomizer 打开值被改 | **新增** `c2_refuses_a_randomizer_opening_altered_in_the_proof`（真实 proof，已重磨） | p3 验证器。C1 **满足**：寄存器机从不读 randomizer，它只进 transcript 和 Az。基于这个 C1 接缝的 C2（`check_seams` 通过）：连带后果，其中含第 0 轮的 `cap` |
+| randomizer cap 被改 | 已有 `c1_rejects_swapped_caps_on_a_consistent_replay` | randomizer cap 吸收顺序被换、其余全部重推：被移动的 F1 置换上的 `bind_cap` |
+| | 已有 `c2_rejects_input_opening_forgeries`、`c2_meets_c1_at_the_seam` | randomizer 兄弟节点互换：其 cap 行的 `cap`；C1 与 C2 的 cap 组不一致：`check_seams` 点名 `caps` |
+| salt 长度 | **新增**，构建器测试 | `salt shape`、`commit-phase salt shape` |
+| | **新增**，census 测试内（S/P/R） | `FRI salt shape mismatch`；输入 salt 是已有情形 |
+| 路径长度 | **新增**，构建器测试 | `input path length`、`commit-phase path length` |
+| | **新增**，census 测试内（S/P/R） | `input Merkle path length mismatch`、`FRI path length mismatch` |
+| 点的长度 | **新增**，构建器测试 | 多一个 trace 值或商 limb：`OOD input dimensions`；缺 ζ·g_N 打开值：`missing next-row opening`；`opened row shape`、`input batch count`、`commit round count`、`sibling count`、`log arity differs from the fixed schedule` |
+| | **新增**，census 测试内（S/P/R） | `trace opening shape mismatch`、`missing or malformed randomizer OOD opening`、`quotient opening shape mismatch`、`FRI fold shape mismatch`；rc0 嵌套是已有情形 |
+| P3 多出的一轮折叠 | **新增** `p3_last_round_negatives`，由 census 测试在它本来就要证明的 P3 proof 上调用 | P3 调度（arity 16、16、16、16、**2**）下两个 query 的 honest C2 满足，ro 与各次折叠等于 p3 的；第五轮 salt 被改：只剩该轮 cap 行的 `cap`；第五轮唯一的兄弟值被改、折叠重推：该 `cap` + query 0 各行的 `final`，第 0–3 轮不变 |
+| | 已有 census 测试 | 删掉第五轮的 P3：`validate_geometry` 拒绝 |
+| value/SCR 保持绑定 | 已有 `c1_rejects_challenge_forgeries` | F2 行上用 fri_alpha'：该单元变化处的 `hold` |
+| | 已有 `c2_rejects_hand_off_forgeries`、`c2_meets_c1_at_the_seam` | C2 两部分之间 ro 或某个下标位不一致：`handoff` + 读取方；公开的 Az 与保持单元不符：`seam_in` |
+| | 已有 `reference_register_air_rejects_result_read_write_hold_and_tail_tampers` | 寄存器机的寄存器保持 |
+| 按 shape 区分的公共状态/手续费路由 | **新增** `f2wrap_refuses_toy_pvs_routed_to_the_wrong_offset`（玩具的两个 PV 互换） | p3 验证器；叶子编译报 `native OOD identity fails on the leaf's openings`；构建器报 `query PoW sample is not zero`；重磨后 C1 原样暴露互换后的 PV，只在最后一行由 `machine_out` 拒绝 |
+| | **新增** `f2wrap_refuses_s3_pvs_in_another_shapes_layout`（真实 S3 proof） | S3 的 PV 按 P3 布局排：`OOD input dimensions`；S3 的手续费块放到 R 的手续费偏移：`native OOD identity fails on the leaf's openings`；原生 S 验证器两者都拒绝 |
+| | 已有 `check_leaf_pvs_refuses_out_of_range_leaf_pvs_by_name`、`fixture_metadata_binds_shape_config_and_canonical_public_values` | 手续费按各 shape 自己的偏移点名；fixture 的 shape、AIR 摘要和 PV 个数 |
+| R-PV：叶子 PV ≥ 2^16 | 已有 `check_leaf_pvs_refuses_out_of_range_leaf_pvs_by_name` | 16 位块取 2^16 和 p − 1 时按名字拒绝（S/P/R）；P 的符号位取 2 时按 1 位拒绝 |
+| | 已有 `c1_accepts_an_out_of_range_leaf_pv`、`f2wrap_check_stage_on_the_toy_leaf` | C1 对它满足（这正是要选项 (c) 的原因）；`check_leaf_pvs` 点名 `toy_y[0]` |
+| 把 hiding proof 喂给 legacy 验证器 | **新增** `the_legacy_verifier_refuses_a_hiding_leaf_proof` | 只去掉 salt 后改成 legacy 类型：`RandomizationError`；再去掉 randomizer：`OpenedValuesDimensionMismatch`（有 8 个 hiding 商块，只预期 2 个）。hiding 验证器接受同一个 proof。不改类型则根本喂不进去：legacy 验证器只收 `Proof<LegacyNonHidingConfig>` |
+
+### 代码改动
+
+- `ood::Domains` 与 `Program::compile_on`：故意在 2N 大小的承诺域上编译程序，可分别作用于
+  periodic 列或下一行点。`compile_dims` 就是 `compile_on(.., Domains::Trace)`，行为不变。
+- `wrap::compiled` 改收 `Dims` 而不是 `Shape`（`Leaf::of` 传 `shape.into()`），玩具叶子因此走
+  同一个原生编译。
+- `lane::toy` 里的测试辅助：`ToyPeriodic` 及其带种子的 proof，`copy`（p3 的 `Proof` 不是
+  `Clone`），`regrind`，以及 `violation_set`（对任何分组 AIR 做精确的（行，分组）扫描）。
+- C2 测试里，行号辅助函数和 `consequences` 改为接收 AIR（`*_in`），`native_seam` 从真实 S3 测试
+  里提出来，供 P3 负例复用。
+
+### 不在范围内
+
+- **电路内的接缝检查。** `check_seams`、`check_coverage`、`check_leaf_pvs` 仍是原生的。下一层
+  递归要在电路里写出它们，并绑定每个叶子的 shape 和 AIR 身份（用哪一对 C1/C2 验证密钥），
+  不能从 PV 个数推断。
+- **issue #78 的 interior**：那边的 wrapper 与 interior 负例，以及 M4 的 value/SCR 保持。
+- **完整尺寸的负例。** 完整尺寸的 S3、P3 C1 超出 CI 测试的预算。S3 的路由负例停在叶子的原生
+  编译；它在电路内被拒绝的情形用玩具演示。
+- **构建器内部的打开值长度。** C1 的构建器按布局里的个数读打开值，不会再检查更长的向量（例如
+  带第 5 个 limb 的 randomizer 打开值）。`f2wrap` 不会带着这样的 proof 走到那里：
+  `validate_geometry` 先按名字拒绝（上面已测）。在电路里，这些长度就是静态布局。
+
+### 验证
+
+本地没有跑任何测试、proof 或 benchmark。本地预检为
+`cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
+和 rustfmt；验收以 `verify-graviton` CI 为准。
+
+新增测试：`c1.rs` 两个、`c2.rs` 两个、`wrap.rs` 四个，共八个。P3 负例和按名字的
+`validate_geometry` 情形跑在已有的 census 测试里。**[P，待 CI]**：比 PR #765 头部多八项通过、
+0 失败。
+
+在 Graviton lane 上预计多出 20–60 秒 **[P]**，**不新增完整尺寸的 prove**：
+
+- 一个带种子的 log-8 `ToyPeriodic` proof（含它自己的 22 位磨 PoW）；
+- 五次 22 位 PoW 重磨；
+- 约十六次玩具 C1 构建（其中七次停在按名字的拒绝）和八次玩具 C1 全表扫描；
+- 两次玩具 C2 扫描；
+- 三次两 query、2^13 行的 P3 C2 扫描；
+- 在共享 S3 proof 上做三次 S3 原生编译；
+- 二十一次 `validate_geometry` 调用。
+
+尚未验证，按最可能先出问题排序：
+
+1. P3 的精确集合。两 query 的 P3 C2 以前从没在 CI 里跑过，只在 rig 上做过完整尺寸扫描（F2b-4）。
+2. 每次重磨前构建器报 `query PoW sample is not zero`，前提是变动后的 transcript 既没有碰巧通过
+   22 位 PoW（概率 2^-22），也没有碰到不支持的抽样补充。
+3. transcript 变动同时移动了 query 下标时（randomizer 那条）的连带后果集合。

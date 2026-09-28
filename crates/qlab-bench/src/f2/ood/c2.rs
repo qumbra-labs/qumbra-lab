@@ -1547,7 +1547,7 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for C2Air {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeSet;
     use std::ops::Range;
     use std::sync::OnceLock;
@@ -1558,17 +1558,17 @@ mod tests {
     use p3_maybe_rayon::prelude::*;
     use p3_util::reverse_bits_len;
     use qlab_air::l2test::{satisfied, violations_at};
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
 
     use super::super::c1::tests::{honest_seam, native_sums};
     use super::super::fold::tests::native_query_of;
     use super::super::fri_fs::tests::{shared, Shared};
     use super::super::lane::phase_ranges;
-    use super::super::lane::toy::native_through_f2;
+    use super::super::lane::toy::{copy, native_through_f2, regrind, violation_set, Toy};
     use super::super::open::tests::reduced_opening;
     use super::super::open::BATCHES;
-    use super::super::proof_inputs_dims;
     use super::super::seam::{check_coverage, check_seams, GROUPS};
+    use super::super::{proof_inputs_dims, Program};
     use super::*;
     use crate::f2::price::composed_c2_layout;
 
@@ -1695,16 +1695,22 @@ mod tests {
     }
 
     fn seg(fx: &Fixture, q: usize) -> Range<usize> {
-        let s = NUM_ROUNDS * fx.air.layout.len();
+        seg_in(&fx.air, q)
+    }
+    fn seg_in(air: &C2Air, q: usize) -> Range<usize> {
+        let s = NUM_ROUNDS * air.layout.len();
         q * s..(q + 1) * s
     }
 
     /// Rows carrying query `q`'s registers: its segment, and for the last
     /// query the padding rows after it.
     fn ctx_rows(fx: &Fixture, q: usize) -> Range<usize> {
-        let r = seg(fx, q);
-        if q + 1 == fx.air.layout.queries() {
-            r.start..fx.air.height
+        ctx_rows_in(&fx.air, q)
+    }
+    fn ctx_rows_in(air: &C2Air, q: usize) -> Range<usize> {
+        let r = seg_in(air, q);
+        if q + 1 == air.layout.queries() {
+            r.start..air.height
         } else {
             r
         }
@@ -1717,7 +1723,10 @@ mod tests {
     }
 
     fn last_row(fx: &Fixture, q: usize, pos: usize) -> usize {
-        NUM_ROUNDS * (q * fx.air.layout.len() + pos) + NUM_ROUNDS - 1
+        last_row_in(&fx.air, q, pos)
+    }
+    fn last_row_in(air: &C2Air, q: usize, pos: usize) -> usize {
+        NUM_ROUNDS * (q * air.layout.len() + pos) + NUM_ROUNDS - 1
     }
 
     fn perm_rows(fx: &Fixture, q: usize, pos: usize, group: &'static str) -> Groups {
@@ -1726,18 +1735,24 @@ mod tests {
     }
 
     fn in_cap_row(fx: &Fixture, q: usize, b: usize) -> usize {
-        let l = &fx.air.layout;
-        last_row(
-            fx,
+        in_cap_row_in(&fx.air, q, b)
+    }
+    fn in_cap_row_in(air: &C2Air, q: usize, b: usize) -> usize {
+        let l = &air.layout;
+        last_row_in(
+            air,
             q,
             l.at(Step::In(open::Step::Node(b, l.ig.geom.path - 1))),
         )
     }
 
     fn fri_cap_row(fx: &Fixture, q: usize, r: usize) -> usize {
-        let l = &fx.air.layout;
-        last_row(
-            fx,
+        fri_cap_row_in(&fx.air, q, r)
+    }
+    fn fri_cap_row_in(air: &C2Air, q: usize, r: usize) -> usize {
+        let l = &air.layout;
+        last_row_in(
+            air,
             q,
             l.at(Step::Fri(fold::Step::Node(r, l.fg.geom.path[r] - 1))),
         )
@@ -1757,24 +1772,27 @@ mod tests {
     /// selects (`cap` on that check's row), and every query whose last
     /// fold misses the final polynomial (`final` on its register rows).
     fn consequences(fx: &Fixture, b: &Build) -> Groups {
-        let l = &fx.air.layout;
+        consequences_in(&fx.air, &fx.seam.caps, b)
+    }
+    fn consequences_in(air: &C2Air, caps: &[Vec<[u64; 4]>], b: &Build) -> Groups {
+        let l = &air.layout;
         let top = |q: usize| b.index[q] >> (l.lde() - CAP_HEIGHT);
         let mut out = Groups::new();
         for q in 0..l.queries() {
             for bt in 0..BATCHES {
-                let cap = &fx.seam.caps[open::Geom::cap_block(bt)];
+                let cap = &caps[open::Geom::cap_block(bt)];
                 if b.in_walks[q].roots[bt] != cap[top(q)] {
-                    out.insert((in_cap_row(fx, q, bt), "cap"));
+                    out.insert((in_cap_row_in(air, q, bt), "cap"));
                 }
             }
             for r in 0..l.fg.geom.rounds() {
-                if b.fri_walks[q].roots[r] != fx.seam.caps[3 + r][top(q)] {
-                    out.insert((fri_cap_row(fx, q, r), "cap"));
+                if b.fri_walks[q].roots[r] != caps[3 + r][top(q)] {
+                    out.insert((fri_cap_row_in(air, q, r), "cap"));
                 }
             }
             let f = &b.fctx[q];
             if f.f[f.f.len() - 1] != f.horner[0] {
-                out.extend(rows(ctx_rows(fx, q), "final"));
+                out.extend(rows(ctx_rows_in(air, q), "final"));
             }
         }
         out
@@ -2284,20 +2302,14 @@ mod tests {
         refused_exactly(fx, &c, &expected);
     }
 
-    /// The production schedule on a real hiding S3 proof — 25 input leaf
-    /// perms and 3 x 19 input levels, then four arity-16 rounds with paths
-    /// 15/11/7/3 — for two queries. The proof is the census test's (shared
-    /// per test binary); the seam is computed natively (p3's challenger, a
-    /// source-order `open_input` sum), and the reduced openings and folds are
-    /// checked against 2b-ii's and p3's native verifier code.
-    #[test]
-    fn c2_accepts_a_real_s3_production_schedule() {
-        let (proof, pvs) = crate::f2::s3_proof();
-        let shape = qlab_l2::Shape::S;
+    /// C1's seam for a real leaf of `shape`, computed natively: p3's
+    /// challenger through the query PoW (checked) and the query draws, and a
+    /// source-order `open_input` sum. It carries the indices of `layout`'s
+    /// covered slots, which must be the first ones.
+    fn native_seam(proof: &Proof<Config>, pvs: &[Val], shape: Shape, layout: &Layout) -> Seam {
         let cfg = L2_CFG_PROVISIONAL;
-        let dims = Dims::from(shape);
         let fri = &proof.opening_proof.1;
-        let mut ch = native_through_f2(&proof, &pvs, shape.log_height());
+        let mut ch = native_through_f2(proof, pvs, shape.log_height());
         let fri_alpha: E = ch.sample_algebra_element();
         let mut betas = vec![];
         for (cm, &wit) in fri
@@ -2310,14 +2322,14 @@ mod tests {
             betas.push(ch.sample_algebra_element());
         }
         ch.observe_algebra_slice(&fri.final_poly);
-        let layout = Layout::new(dims, 8, &cfg, vec![0, 1]).unwrap();
         for &a in &layout.fg.geom.arities {
             ch.observe(Val::from_usize(a));
         }
         assert!(ch.check_witness(cfg.grind_bits, fri.query_pow_witness));
-        let lde = layout.lde();
-        let indices: Vec<usize> = (0..2).map(|_| ch.sample_bits(lde)).collect();
-        let (az, bz) = native_sums(&proof, fri_alpha, None);
+        let n = layout.queries();
+        assert_eq!(layout.slots, (0..n).collect::<Vec<_>>(), "the first slots");
+        let indices = (0..n).map(|q| (q, ch.sample_bits(layout.lde()))).collect();
+        let (az, bz) = native_sums(proof, fri_alpha, None);
         let c = &proof.commitments;
         let mut caps = vec![
             c.trace.roots().to_vec(),
@@ -2325,16 +2337,37 @@ mod tests {
             c.random.as_ref().unwrap().roots().to_vec(),
         ];
         caps.extend(fri.commit_phase_commits.iter().map(|x| x.roots().to_vec()));
-        let seam = Seam {
+        Seam {
             caps,
-            zeta: proof_inputs_dims(dims, &proof, &pvs).unwrap().zeta,
+            zeta: proof_inputs_dims(Dims::from(shape), proof, pvs)
+                .unwrap()
+                .zeta,
             fri_alpha,
             az,
             bz,
-            betas: betas.clone(),
+            betas,
             final_poly: fri.final_poly.clone(),
-            indices: indices.iter().copied().enumerate().collect(),
-        };
+            indices,
+        }
+    }
+
+    /// The production schedule on a real hiding S3 proof — 25 input leaf
+    /// perms and 3 x 19 input levels, then four arity-16 rounds with paths
+    /// 15/11/7/3 — for two queries. The proof is the census test's (shared
+    /// per test binary); the seam is computed natively (p3's challenger, a
+    /// source-order `open_input` sum), and the reduced openings and folds are
+    /// checked against 2b-ii's and p3's native verifier code.
+    #[test]
+    fn c2_accepts_a_real_s3_production_schedule() {
+        let (proof, pvs) = crate::f2::s3_proof();
+        let shape = Shape::S;
+        let cfg = L2_CFG_PROVISIONAL;
+        let dims = Dims::from(shape);
+        let layout = Layout::new(dims, 8, &cfg, vec![0, 1]).unwrap();
+        let seam = native_seam(&proof, &pvs, shape, &layout);
+        let (fri_alpha, betas) = (seam.fri_alpha, seam.betas.clone());
+        let indices: Vec<usize> = seam.indices.iter().map(|&(_, i)| i).collect();
+        let lde = layout.lde();
         assert_eq!(
             (lde, layout.open_last + 1, layout.len(), layout.blocks.len()),
             (22, 82, 126, 25)
@@ -2381,6 +2414,158 @@ mod tests {
         let price = composed_c2_layout(dims.width, dims.log_height, 8, 2);
         assert_eq!(price["component_columns"], air.width);
         assert_eq!(price["padded_rows"], air.height);
+    }
+
+    /// F2b-5 (stage-0's "g_N versus the doubled-domain shift", C2's side):
+    /// query 1's reduced opening taken with ζ·g_2N — the committed
+    /// domain's generator — in the (Bz − Bx) term. The forger's inv_b, ro and
+    /// fold chain are all consistent with it; C2's `inverse` pins
+    /// inv_b·(ζ·g_N − x) = 1 with g_N a constant, so it refuses on every
+    /// row carrying query 1's registers, and the forged ro misses the
+    /// commit-phase leaves and the final polynomial (consequences).
+    #[test]
+    fn c2_refuses_the_next_point_on_the_doubled_domain() {
+        let fx = fixture();
+        let l = &fx.air.layout;
+        let mut doubled = l.ig.geom.clone();
+        doubled.g_n = Val::two_adic_generator(fx.dims.log_height + qlab_consensus::IS_ZK);
+        assert_ne!(doubled.g_n, l.ig.geom.g_n);
+        let c = claim(
+            fx,
+            |_| {},
+            |b| {
+                let held = open::Held {
+                    zeta: b.held.zeta,
+                    zvals: vec![],
+                    fri_alpha: b.held.fri_alpha,
+                    apow: vec![],
+                    az: b.held.az,
+                    bz: b.held.bz,
+                    ro: vec![],
+                };
+                b.ictx[1] =
+                    open::Ctx::new(&doubled, b.index[1], b.index[1], &held, b.ab[1]).unwrap();
+                b.refold(l, 1).unwrap();
+            },
+        );
+        assert_eq!(c.build.ictx[1].inv_a, fx.honest.ictx[1].inv_a);
+        assert_ne!(c.build.ictx[1].ro, fx.honest.ictx[1].ro);
+        let mut expected = rows(ctx_rows(fx, 1), "inverse");
+        expected.extend(consequences(fx, &c.build));
+        refused_exactly(fx, &c, &expected);
+    }
+
+    /// F2b-5 (stage-0's "missing/altered randomizer"): a REAL leaf proof
+    /// whose randomizer opening at ζ is altered, the query PoW re-ground for
+    /// the moved transcript. p3's verifier refuses it. C1, built from it by
+    /// `f2wrap`'s builder, is SAT: the machine never reads the randomizer,
+    /// which enters only the transcript and Az — so C1 alone cannot see it.
+    /// C2, built on that C1's seam (and so passing `check_seams`), refuses
+    /// it: its Ax comes from the Merkle-authenticated randomizer rows, the
+    /// split ro no longer matches the commit-phase leaves, and the moved
+    /// query indices no longer match the openings' paths (consequences).
+    #[test]
+    fn c2_refuses_a_randomizer_opening_altered_in_the_proof() {
+        let fx = fixture();
+        let l = &fx.air.layout;
+        let cfg = L2_CFG_PROVISIONAL;
+        let (pvs, dims) = (fx.sh.pvs, fx.dims);
+        let mut proof = copy(fx.sh.proof);
+        proof.opened_values.random.as_mut().unwrap()[2] += basis(1);
+        regrind(&mut proof, pvs, dims.log_height);
+        assert!(p3_uni_stark::verify(&qlab_l2::make_config_l2(), &Toy, &proof, pvs).is_err());
+        let program = Program::compile_dims(dims, &Toy).unwrap();
+        let inputs = proof_inputs_dims(dims, &proof, pvs).unwrap();
+        let c1 = super::super::c1::honest(&program, &inputs, &proof, pvs, &cfg, 64 << 20).unwrap();
+        assert!(
+            violation_set(&c1.air, &c1.trace, &c1.pvs).is_empty(),
+            "C1 is SAT"
+        );
+        assert_ne!(c1.seam.az, fx.c1.az);
+        let seam = Seam {
+            indices: l.slots.iter().map(|&s| c1.seam.indices[s]).collect(),
+            ..c1.seam.clone()
+        };
+        let build = Build::honest(l, &seam, &proof).unwrap();
+        let c = Claim {
+            trace: fx.air.trace(&build).unwrap(),
+            pvs: fx.air.public_values(&seam).unwrap(),
+            build,
+        };
+        check_seams(&c1.seam, &Seam::decode(l.seam, &l.slots, &c.pvs).unwrap()).unwrap();
+        let expected = consequences(fx, &c.build);
+        assert!(
+            expected.contains(&(fri_cap_row(fx, 0, 0), "cap")),
+            "{expected:?}"
+        );
+        refused_exactly(fx, &c, &expected);
+    }
+
+    /// F2b-5 (stage-0's "P3's additional fold"), called by the census test
+    /// on the P3 proof it already proves, so no new prove: C2 for two
+    /// queries on P3's production schedule — four arity-16 rounds, then the
+    /// fifth, arity-2 round no shape but P3 has. Honest: the reduced
+    /// openings and the fold chain are p3's, and the trace is SAT. Then two
+    /// negatives on query 0's fifth round, each refused exactly: its salt
+    /// changed (only that round's cap check), and its one sibling moved with
+    /// the fold re-derived (that cap check, and the final polynomial on the
+    /// query's register rows; rounds 0-3 unchanged).
+    pub(in crate::f2::ood) fn p3_last_round_negatives(proof: &Proof<Config>, pvs: &[Val]) {
+        let shape = Shape::P;
+        let cfg = L2_CFG_PROVISIONAL;
+        let layout = Layout::new(Dims::from(shape), 8, &cfg, vec![0, 1]).unwrap();
+        assert_eq!(layout.fg.geom.arities, vec![4, 4, 4, 4, 1], "P3's schedule");
+        let rounds = layout.fg.geom.rounds();
+        let last = rounds - 1;
+        let seam = native_seam(proof, pvs, shape, &layout);
+        let air = C2Air::new(layout, 64 << 20).unwrap();
+        let (l, ranges) = (&air.layout, phase_ranges(&air));
+        let honest = Build::honest(l, &seam, proof).unwrap();
+        for (q, &(_, index)) in seam.indices.iter().enumerate() {
+            let ro = reduced_opening(
+                proof,
+                pvs,
+                shape.width(),
+                shape.log_height(),
+                q,
+                index,
+                seam.fri_alpha,
+            );
+            assert_eq!(honest.ictx[q].ro, ro, "ro, query {q}");
+            let (chain, eval) = native_query_of(proof, l.lde(), q, index, ro, &seam.betas);
+            assert_eq!(eval, chain[chain.len() - 1], "p3's final check, query {q}");
+            assert_eq!(honest.fctx[q].f, chain, "folds, query {q}");
+        }
+        assert!(consequences_in(&air, &seam.caps, &honest).is_empty());
+        let pv = air.public_values(&seam).unwrap();
+        let trace = air.trace(&honest).unwrap();
+        satisfied(&air, &trace, &pv).unwrap_or_else(|v| {
+            panic!(
+                "honest P3 C2 refused: {v} in {}",
+                phase_in(&ranges, v.constraint)
+            )
+        });
+        let forged = |edit: &dyn Fn(&mut Build)| -> (Build, Groups) {
+            let mut b = honest.clone();
+            edit(&mut b);
+            b.settle(l).unwrap();
+            let v = scan(&air, &ranges, &air.trace(&b).unwrap(), &pv);
+            (b, v)
+        };
+        let cap = fri_cap_row_in(&air, 0, last);
+        let (b, v) = forged(&|b| b.fri_ops[0].salts[last][2] += Val::ONE);
+        assert_eq!(b.fctx[0].f, honest.fctx[0].f, "a salt does not fold");
+        let expected: Groups = [(cap, "cap")].into();
+        assert_eq!(consequences_in(&air, &seam.caps, &b), expected);
+        assert_eq!(v, expected, "fifth-round salt");
+        assert_eq!(b.fri_ops[0].sibs[last].len(), 1, "arity 2: one sibling");
+        let (b, v) = forged(&|b| b.fri_ops[0].sibs[last][0] += basis(1));
+        assert_eq!(b.fctx[0].f[..rounds], honest.fctx[0].f[..rounds]);
+        assert_ne!(b.fctx[0].f[rounds], honest.fctx[0].f[rounds]);
+        let mut expected: Groups = [(cap, "cap")].into();
+        expected.extend(rows(seg_in(&air, 0), "final"));
+        assert_eq!(consequences_in(&air, &seam.caps, &b), expected);
+        assert_eq!(v, expected, "fifth-round sibling");
     }
 
     const SALT: usize = qlab_consensus::SALT_ELEMS;

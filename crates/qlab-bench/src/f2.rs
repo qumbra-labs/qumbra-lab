@@ -737,6 +737,77 @@ mod tests {
                 .map(Val::from_u32)
                 .collect();
             ood::check_real_mutations(shape, &proof, &pvs);
+            if shape == Shape::P {
+                // F2b-5: P3's fifth, arity-2 fold round under C2, on this proof.
+                ood::check_p3_last_round(&proof, &pvs);
+            }
+            // F2b-5: the path, point and fold-shape lengths `f2wrap` relies on
+            // `validate_geometry` for, each refused by name (the salt, rc0
+            // and randomizer cases follow below).
+            type Edit = fn(&mut Proof<Config>);
+            let named: [(Edit, &str); 7] = [
+                (
+                    |p| {
+                        p.opened_values
+                            .trace_local
+                            .push(qlab_consensus::Challenge::ZERO)
+                    },
+                    "trace opening shape mismatch",
+                ),
+                (
+                    |p| {
+                        p.opened_values
+                            .random
+                            .as_mut()
+                            .unwrap()
+                            .push(qlab_consensus::Challenge::ZERO)
+                    },
+                    "missing or malformed randomizer OOD opening",
+                ),
+                (
+                    |p| p.opened_values.quotient_chunks[0].push(qlab_consensus::Challenge::ZERO),
+                    "quotient opening shape mismatch",
+                ),
+                (
+                    |p| {
+                        p.opening_proof.1.query_proofs[0].input_proof[2]
+                            .opening_proof
+                            .1
+                            .pop();
+                    },
+                    "input Merkle path length mismatch",
+                ),
+                (
+                    |p| {
+                        p.opening_proof.1.query_proofs[0].commit_phase_openings[0]
+                            .opening_proof
+                            .1
+                            .pop();
+                    },
+                    "FRI path length mismatch",
+                ),
+                (
+                    |p| {
+                        p.opening_proof.1.query_proofs[0].commit_phase_openings[1]
+                            .opening_proof
+                            .0[0]
+                            .pop();
+                    },
+                    "FRI salt shape mismatch",
+                ),
+                (
+                    |p| {
+                        let q = &mut p.opening_proof.1.query_proofs[0];
+                        q.commit_phase_openings.last_mut().unwrap().log_arity ^= 1;
+                    },
+                    "FRI fold shape mismatch",
+                ),
+            ];
+            for (edit, name) in named {
+                let mut bad: Proof<Config> = codec().deserialize(&fixture.proof).unwrap();
+                edit(&mut bad);
+                assert_eq!(validate_geometry(shape, &bad, &g).unwrap_err(), name);
+            }
             let random = proof.commitments.random.take();
             assert!(validate_geometry(shape, &proof, &g).is_err());
             proof.commitments.random = random;
