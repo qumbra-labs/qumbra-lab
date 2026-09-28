@@ -2089,31 +2089,46 @@ mod tests {
         }
         refused_exactly(fx, &c, &expected);
         // x WITHOUT bit reversal (a verifier forgetting `reverse_bits_len`),
-        // inverses, ro and the fold chain re-derived from it.
-        let c = claim(
-            fx,
-            |_| {},
-            |b| {
-                let index = b.index[1];
-                let rev = reverse_bits_len(index, g.lde);
-                assert_ne!(rev, index, "a palindromic index hides the reversal");
-                let held = open::Held {
-                    zeta: b.held.zeta,
-                    zvals: vec![],
-                    fri_alpha: b.held.fri_alpha,
-                    apow: vec![],
-                    az: b.held.az,
-                    bz: b.held.bz,
-                    ro: vec![],
-                };
-                b.ictx[1] = open::Ctx::new(g, index, rev, &held, b.ab[1]).unwrap();
-                b.refold(l, 1).unwrap();
-            },
-        );
-        assert_ne!(c.build.ictx[1].ro, fx.honest.ictx[1].ro);
-        let mut expected = rows(ctx_rows(fx, 1), "x_point");
-        expected.extend(consequences(fx, &c.build));
-        refused_exactly(fx, &c, &expected);
+        // inverses, ro and the fold chain re-derived from it. The query
+        // indices follow the proof's PoW witness (a parallel grind, not
+        // seeded), so the slot is the first covered one whose index is not a
+        // bit-reversal palindrome — on a palindrome the forgery is the honest
+        // claim. All covered indices palindromic: this sub-case is skipped,
+        // loudly.
+        let indices = &fx.honest.index;
+        match (0..l.queries()).find(|&q| reverse_bits_len(indices[q], g.lde) != indices[q]) {
+            Some(q) => {
+                let c = claim(
+                    fx,
+                    |_| {},
+                    |b| {
+                        let index = b.index[q];
+                        let rev = reverse_bits_len(index, g.lde);
+                        assert_ne!(rev, index, "a palindromic index hides the reversal");
+                        let held = open::Held {
+                            zeta: b.held.zeta,
+                            zvals: vec![],
+                            fri_alpha: b.held.fri_alpha,
+                            apow: vec![],
+                            az: b.held.az,
+                            bz: b.held.bz,
+                            ro: vec![],
+                        };
+                        b.ictx[q] = open::Ctx::new(g, index, rev, &held, b.ab[q]).unwrap();
+                        b.refold(l, q).unwrap();
+                    },
+                );
+                assert_ne!(c.build.ictx[q].ro, fx.honest.ictx[q].ro);
+                let mut expected = rows(ctx_rows(fx, q), "x_point");
+                expected.extend(consequences(fx, &c.build));
+                refused_exactly(fx, &c, &expected);
+            }
+            None => eprintln!(
+                "SKIP no-reversal forgery: every covered index {indices:?} is a {}-bit \
+                 bit-reversal palindrome",
+                g.lde
+            ),
+        }
         // A reduced opening poked for the whole segment: `reduce` on the
         // last input perm, and round 0's select on every register row.
         let c = claim(fx, |_| {}, |b| b.ictx[0].ro += E::ONE);

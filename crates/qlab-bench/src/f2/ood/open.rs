@@ -1796,21 +1796,36 @@ pub(in crate::f2::ood) mod tests {
             refused_exactly(fx, &c, &[(0, "opened_in")].into());
         }
         // x from the index WITHOUT bit reversal (what a verifier forgetting
-        // `reverse_bits_len` would use), inverses and ro re-derived.
-        let c = claim(
-            fx,
-            |_| {},
-            |b| {
-                let index = b.index[1];
-                let rev = p3_util::reverse_bits_len(index, g.lde);
-                assert_ne!(rev, index, "a palindromic index hides the reversal");
-                let ab = Build::sums(l, &b.ops[1], &b.held.apow);
-                b.ctx[1] = Ctx::new(g, index, rev, &b.held, ab).unwrap();
-                b.held.ro[1] = b.ctx[1].ro;
-            },
-        );
-        assert_ne!(c.build.held.ro[1], fx.honest.held.ro[1]);
-        refused_exactly(fx, &c, &rows(ctx_rows(fx, 1), "x_point"));
+        // `reverse_bits_len` would use), inverses and ro re-derived. The
+        // query indices follow the proof's PoW witness (a parallel grind, not
+        // seeded), so the slot is the first covered one whose index is not a
+        // bit-reversal palindrome — on a palindrome the forgery is the honest
+        // claim. All covered indices palindromic: this sub-case is skipped,
+        // loudly.
+        let indices = &fx.honest.index;
+        match (0..l.queries).find(|&q| p3_util::reverse_bits_len(indices[q], g.lde) != indices[q]) {
+            Some(q) => {
+                let c = claim(
+                    fx,
+                    |_| {},
+                    |b| {
+                        let index = b.index[q];
+                        let rev = p3_util::reverse_bits_len(index, g.lde);
+                        assert_ne!(rev, index, "a palindromic index hides the reversal");
+                        let ab = Build::sums(l, &b.ops[q], &b.held.apow);
+                        b.ctx[q] = Ctx::new(g, index, rev, &b.held, ab).unwrap();
+                        b.held.ro[q] = b.ctx[q].ro;
+                    },
+                );
+                assert_ne!(c.build.held.ro[q], fx.honest.held.ro[q]);
+                refused_exactly(fx, &c, &rows(ctx_rows(fx, q), "x_point"));
+            }
+            None => eprintln!(
+                "SKIP no-reversal forgery: every covered index {indices:?} is a {}-bit \
+                 bit-reversal palindrome",
+                g.lde
+            ),
+        }
         // A different fri_alpha than 2b-i exports, the alpha powers, Az/Bz
         // and every reduced opening re-derived from it: only the equality to
         // the export refuses it.
