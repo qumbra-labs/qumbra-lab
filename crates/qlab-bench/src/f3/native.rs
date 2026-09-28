@@ -24,8 +24,16 @@
 //!   ([`qlab_cbserver::registry::RegistryTree`]); a shape-R write replaces the
 //!   leaf at its slot (asset 0 never writable, as the node rules).
 //! - **`SD`, the surface digest** (ruling (a)): per transaction
-//!   `SD_i = H("qumbra:l2-sd:v1" ‖ SD_{i−1} ‖ tag ‖ pv_len ‖ pvs)`, over the
-//!   transaction's **full** public-value vector exactly as C1 exports it.
+//!   `SD_i = H(SD_{i−1}; tag ‖ pv_len ‖ pvs)` under the domain
+//!   `"qumbra:l2-sd:v1"`, over the transaction's **full** public-value vector
+//!   exactly as C1 exports it — a Merkle–Damgård chain of single-permutation
+//!   compressions ([`sd_chain`], F3-2b), which the batch side (F4) must
+//!   compute with exactly this construction.
+//! - **The index cap (F3-2b, a protocol limit):** both append trees stop at
+//!   [`INDEX_CAP`] = 2^30 leaves — the leaf AIR accumulates an index as one
+//!   KoalaBear element (p ≈ 2^31), so it forces path bits 30 and 31 to zero.
+//!   A liveness limit, not a soundness one: the nullifier tree fills first,
+//!   at ≈ 357 M L2 transactions (3 inserts each); F4/F5 must surface it.
 //!
 //! Every tree hash is the consensus Keccak node hash, so the roots are the
 //! node's roots bit for bit.
@@ -47,6 +55,8 @@ pub(crate) type Digest = [u64; 4];
 pub(crate) const N_DEPTH: usize = MERKLE_DEPTH;
 /// An unused slot (both append trees): the zero digest, the node's convention.
 pub(crate) const EMPTY: Digest = [0; 4];
+/// Both append trees' leaf-count limit: indices stay below 2^30 < p.
+pub(crate) const INDEX_CAP: u64 = 1 << 30;
 
 /// The nullifier-tree leaf `H(lo ‖ hi)`: one Keccak-f block, domain marker at
 /// lane 8 bit 4 — distinct from the node hash's pad (bit 0) and the freeze
@@ -85,7 +95,7 @@ pub(crate) enum NfError {
     PathIndex,
     /// The append is not at the running next index.
     AppendIndex,
-    /// The tree is full.
+    /// The tree is at [`INDEX_CAP`].
     Full,
 }
 
@@ -121,6 +131,11 @@ impl IndexedTree {
         self.get(N_DEPTH, 0)
     }
 
+    /// The leaves, by index.
+    pub fn leaves(&self) -> &[(Digest, Digest)] {
+        &self.leaves
+    }
+
     /// The next free leaf index.
     pub fn next_index(&self) -> u64 {
         self.leaves.len() as u64
@@ -130,7 +145,7 @@ impl IndexedTree {
         *self.levels[lvl].get(&i).unwrap_or(&self.zeros[lvl])
     }
 
-    fn put(&mut self, idx: u64, leaf: (Digest, Digest)) {
+    pub(crate) fn put(&mut self, idx: u64, leaf: (Digest, Digest)) {
         if idx as usize == self.leaves.len() {
             self.leaves.push(leaf);
         } else {
@@ -147,7 +162,7 @@ impl IndexedTree {
         }
     }
 
-    fn path(&self, idx: u64) -> MerkleWitness {
+    pub(crate) fn path(&self, idx: u64) -> MerkleWitness {
         let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
         let mut path_bits = [false; MERKLE_DEPTH];
         for lvl in 0..N_DEPTH {
@@ -166,7 +181,7 @@ impl IndexedTree {
     /// Insert `key`, returning the witness [`apply_insert`] checks.
     pub fn insert(&mut self, key: &Digest) -> Result<InsertWitness, NfError> {
         let j = self.low_leaf_of(key).ok_or(NfError::NotInGap)?;
-        if self.next_index() >= 1u64 << N_DEPTH {
+        if self.next_index() >= INDEX_CAP {
             return Err(NfError::Full);
         }
         let low = self.leaves[j as usize];
@@ -181,6 +196,9 @@ impl IndexedTree {
 
 /// The insert as the leaf proves it: from `(root, next)` to the new pair.
 pub(crate) fn apply_insert(root: &Digest, next: u64, w: &InsertWitness) -> Result<(Digest, u64), NfError> {
+    if next >= INDEX_CAP {
+        return Err(NfError::Full);
+    }
     if w.low_path.path_bits.to_vec() != bits_of(w.low_index, N_DEPTH) || w.new_path.path_bits.to_vec() != bits_of(w.new_index, N_DEPTH) {
         return Err(NfError::PathIndex);
     }
@@ -221,6 +239,8 @@ pub(crate) enum AppendError {
     PathIndex,
     /// The slot is not empty under the running root, or the root is stale.
     RootMismatch,
+    /// The tree is at [`INDEX_CAP`].
+    Full,
 }
 
 /// Append `cm` to `tree`, returning its witness.
@@ -231,6 +251,9 @@ pub(crate) fn append(tree: &mut CommitmentTree, cm: &Digest) -> AppendWitness {
 
 /// The append as the leaf proves it.
 pub(crate) fn apply_append(root: &Digest, next: u64, cm: &Digest, w: &AppendWitness) -> Result<(Digest, u64), AppendError> {
+    if next >= INDEX_CAP {
+        return Err(AppendError::Full);
+    }
     if w.index != next {
         return Err(AppendError::Index);
     }
@@ -277,52 +300,87 @@ impl std::fmt::Debug for RegistryWrite {
 // SD — the surface digest
 // ---------------------------------------------------------------------------
 
-/// The chain's domain (ruling (a)), as the leading 16 bytes of every step.
+/// The chain's domain (ruling (a)): capacity lanes 17–18 of every block.
 pub(crate) const SD_DOMAIN: &[u8; 16] = b"qumbra:l2-sd:v1\0";
-/// Keccak's rate in bytes.
-const RATE: usize = 136;
+/// Message words per block: rate lanes 4..17, two little-endian `u32` words
+/// per lane (lanes 0..4 carry the chaining value).
+pub(crate) const SD_BLOCK_WORDS: usize = 26;
+/// The first message lane.
+pub(crate) const SD_LANE_MSG: usize = 4;
+/// Capacity lanes: the domain (17, 18), the block index (19), the final flag (20).
+pub(crate) const SD_LANE_DOMAIN: usize = 17;
+pub(crate) const SD_LANE_INDEX: usize = 19;
+pub(crate) const SD_LANE_FINAL: usize = 20;
 
-/// One step's word stream: domain ‖ `prev` (8 words, lane low half first) ‖
-/// tag ‖ `pv_len` ‖ the PVs, each a little-endian `u32`.
-pub(crate) fn sd_words(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
-    let mut w: Vec<u32> = SD_DOMAIN.chunks(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect();
-    for lane in prev {
-        w.push(*lane as u32);
-        w.push((*lane >> 32) as u32);
-    }
-    w.push(tag.byte() as u32);
-    w.push(pvs.len() as u32);
+/// The domain as the two capacity lanes it occupies.
+pub(crate) fn sd_domain_lanes() -> [u64; 2] {
+    [
+        u64::from_le_bytes(SD_DOMAIN[..8].try_into().expect("8 bytes")),
+        u64::from_le_bytes(SD_DOMAIN[8..].try_into().expect("8 bytes")),
+    ]
+}
+
+/// One step's message: `tag ‖ pv_len ‖ pvs`, each a `u32` word.
+pub(crate) fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
+    let mut w = vec![u32::from(tag.byte()), pvs.len() as u32];
     w.extend_from_slice(pvs);
     w
 }
 
-/// Keccak (rate 136, pad10*1 with domain byte 0x01) over a word stream,
-/// the first four output lanes.
-pub(crate) fn sponge(words: &[u32]) -> Digest {
-    let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    bytes.push(0x01);
-    while !bytes.len().is_multiple_of(RATE) {
-        bytes.push(0);
-    }
-    *bytes.last_mut().expect("nonempty") |= 0x80;
-    let mut st = [0u64; 25];
-    for block in bytes.chunks(RATE) {
-        for (i, lane) in block.chunks(8).enumerate() {
-            st[i] ^= u64::from_le_bytes(lane.try_into().expect("8 bytes"));
+/// **One chain step, block by block** (F3-2b; the #767 ruling's approval of
+/// the construction): a Merkle–Damgård chain of single-permutation
+/// compressions, the node hash's construction widened.
+///
+/// Block `b`'s Keccak-f input is: rate lanes 0..4 the chaining value
+/// (`prev` for `b = 0`, else block `b − 1`'s first four output lanes); rate
+/// lanes 4..17 the message's words `26b … 26b + 25`, zero past the end;
+/// capacity lanes 17–18 the domain, 19 the block index, 20 the final flag
+/// (1 on the last block), 21..25 zero. The step's digest is the last block's
+/// first four output lanes.
+///
+/// **Why it is collision resistant.** The capacity (lanes 17..25, 512 bits)
+/// is fixed by `(b, final)` and never message-controlled, so each block is a
+/// truncated single-block sponge call: finding two inputs with the same
+/// 256-bit output costs ~2^128 (the birthday bound on the output; the
+/// capacity's 2^256 inversion bound is higher). Merkle–Damgård then carries
+/// the compression's collision resistance to the chain, strengthened by the
+/// tag, `pv_len`, the block index and the final flag: two streams that agree
+/// in their message words but not in length or shape differ in a capacity
+/// lane or in word 0/1. A nonzero capacity also separates every block from
+/// the node, nullifier-leaf and registry-leaf hashes, whose capacity is zero.
+///
+/// Returns the blocks' Keccak-f inputs (what the leaf AIR hashes) and the digest.
+pub(crate) fn sd_chain(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> (Vec<[u64; 25]>, Digest) {
+    let words = sd_words(tag, pvs);
+    let n = words.len().div_ceil(SD_BLOCK_WORDS);
+    let dom = sd_domain_lanes();
+    let mut h = *prev;
+    let mut blocks = Vec::with_capacity(n);
+    for b in 0..n {
+        let mut st = [0u64; 25];
+        st[..4].copy_from_slice(&h);
+        for w in 0..SD_BLOCK_WORDS {
+            let v = u64::from(words.get(SD_BLOCK_WORDS * b + w).copied().unwrap_or(0));
+            st[SD_LANE_MSG + w / 2] |= v << (32 * (w % 2));
         }
-        st = keccak_f(&st);
+        st[SD_LANE_DOMAIN] = dom[0];
+        st[SD_LANE_DOMAIN + 1] = dom[1];
+        st[SD_LANE_INDEX] = b as u64;
+        st[SD_LANE_FINAL] = u64::from(b + 1 == n);
+        blocks.push(st);
+        h = keccak_f(&st)[..4].try_into().expect("four lanes");
     }
-    st[..4].try_into().expect("four lanes")
+    (blocks, h)
 }
 
-/// One chain step.
+/// One chain step's digest.
 pub(crate) fn sd_step(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> Digest {
-    sponge(&sd_words(prev, tag, pvs))
+    sd_chain(prev, tag, pvs).1
 }
 
-/// Permutations one step costs: its padded blocks.
+/// Permutations one step costs: its blocks.
 pub(crate) const fn sd_perms(pv_len: usize) -> usize {
-    (4 * (4 + 8 + 1 + 1 + pv_len) + 1).div_ceil(RATE)
+    (2 + pv_len).div_ceil(SD_BLOCK_WORDS)
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +678,7 @@ mod tests {
     //! §5 plus ruling (d)) at the reference level; the AIR repeats them at
     //! its binding rows. Every tree here is small: these run on the lane.
     use super::*;
+    use p3_field::PrimeField32;
 
     fn fresh() -> (L2State, Rng) {
         (L2State::genesis(&[RegistryLeaf::cloaked(0)]), Rng(0x767_f3f3_0001))
@@ -872,9 +931,69 @@ mod tests {
         assert_eq!(big.digest_at(0), Err(StError::Surface), "a chunk ≥ 2^16 is refused");
         // The domain and the chain position both enter.
         assert_ne!(sd_step(&EMPTY, L2ShapeTag::R, &t.pvs), sd_step(&d, L2ShapeTag::R, &t.pvs));
-        assert_eq!(sd_words(&EMPTY, L2ShapeTag::S, &[]).len(), 14);
-        // Permutations per step (padded blocks): S 4, P 5, R 4.
-        assert_eq!((sd_perms(qlab_air::l2::PV_LEN), sd_perms(qlab_air::l2p::PV_LEN), sd_perms(qlab_air::l2r::PV_LEN)), (4, 5, 4));
-        assert_eq!(sd_words(&EMPTY, L2ShapeTag::P, &vec![0; qlab_air::l2p::PV_LEN]).len() * 4 / RATE + 1, sd_perms(qlab_air::l2p::PV_LEN));
+        assert_eq!(sd_words(L2ShapeTag::S, &[]), vec![1, 0], "tag, pv_len");
+        // Permutations per step (26 message words per block): S 5, P 5, R 4.
+        assert_eq!((sd_perms(qlab_air::l2::PV_LEN), sd_perms(qlab_air::l2p::PV_LEN), sd_perms(qlab_air::l2r::PV_LEN)), (5, 5, 4));
+        for (tag, len) in [(L2ShapeTag::S, qlab_air::l2::PV_LEN), (L2ShapeTag::P, qlab_air::l2p::PV_LEN), (L2ShapeTag::R, qlab_air::l2r::PV_LEN)] {
+            let (blocks, h) = sd_chain(&d, tag, &vec![7; len]);
+            assert_eq!(blocks.len(), sd_perms(len));
+            assert_eq!(blocks[0][..4], d, "block 0 chains SD_prev");
+            for (b, st) in blocks.iter().enumerate() {
+                assert_eq!(st[SD_LANE_DOMAIN..SD_LANE_DOMAIN + 2], sd_domain_lanes());
+                assert_eq!((st[SD_LANE_INDEX], st[SD_LANE_FINAL]), (b as u64, u64::from(b + 1 == blocks.len())));
+                assert!(st[21..].iter().all(|l| *l == 0));
+                if b > 0 {
+                    assert_eq!(st[..4], keccak_f(&blocks[b - 1])[..4], "block {b} chains block {}", b - 1);
+                }
+            }
+            assert_eq!(h[..], keccak_f(blocks.last().unwrap())[..4]);
+        }
+    }
+
+    /// Approval condition 1(b): streams that agree in every message word but
+    /// the length — a moved zero-pad boundary — do not collide. `x` and
+    /// `x ‖ 0^12` pad to the same five blocks of words except word 1
+    /// (`pv_len`); `x ‖ 0^38` adds a sixth block, so block 4's final flag
+    /// differs as well; the same words under another tag differ in word 0.
+    #[test]
+    fn f3_neg_sd_moved_pad_boundary() {
+        let mut rng = Rng(0x5d);
+        let x: Vec<u32> = (0..qlab_air::l2::PV_LEN).map(|_| (rng.next() & 0xffff) as u32).collect();
+        let (bx, hx) = sd_chain(&EMPTY, L2ShapeTag::S, &x);
+        let y: Vec<u32> = x.iter().copied().chain([0; 12]).collect();
+        let (by, hy) = sd_chain(&EMPTY, L2ShapeTag::S, &y);
+        assert_eq!(bx.len(), by.len());
+        let mut diff: Vec<(usize, usize)> = Vec::new();
+        for b in 0..bx.len() {
+            for l in 0..25 {
+                if (b == 0 || l >= SD_LANE_MSG) && bx[b][l] != by[b][l] {
+                    diff.push((b, l));
+                }
+            }
+        }
+        assert_eq!(diff, vec![(0, SD_LANE_MSG)], "only word 1 (pv_len) differs");
+        assert_ne!(hx, hy);
+        let z: Vec<u32> = x.iter().copied().chain([0; 38]).collect();
+        let (bz, hz) = sd_chain(&EMPTY, L2ShapeTag::S, &z);
+        assert_eq!((bx.len(), bz.len()), (5, 6));
+        assert_eq!((bx[4][SD_LANE_FINAL], bz[4][SD_LANE_FINAL]), (1, 0), "the final flag moves");
+        assert_ne!(hx, hz);
+        assert_ne!(hx, sd_step(&EMPTY, L2ShapeTag::P, &x), "the tag is word 0");
+    }
+
+    /// The index cap: at 2^30 leaves both trees refuse before reading the witness.
+    #[test]
+    fn f3_index_cap_refuses() {
+        let (mut s, mut rng) = fresh();
+        let (root, next) = (s.n.root(), s.n.next_index());
+        let w = s.n.insert(&rng.digest()).unwrap();
+        assert!(apply_insert(&root, next, &w).is_ok());
+        assert_eq!(apply_insert(&root, INDEX_CAP, &w), Err(NfError::Full));
+        let mut c = CommitmentTree::new();
+        let r0 = c.root();
+        let cm = rng.digest();
+        let wa = append(&mut c, &cm);
+        assert_eq!(apply_append(&r0, INDEX_CAP, &cm, &wa), Err(AppendError::Full));
+        assert!(INDEX_CAP < u64::from(qlab_consensus::Val::ORDER_U32), "an index is one field element");
     }
 }
