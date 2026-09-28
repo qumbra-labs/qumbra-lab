@@ -822,7 +822,10 @@ impl C2Air {
             .map(|s| (s + 1 < len).then(|| l.reads_bit(s + 1)).flatten())
             .collect();
         let (mut carried, mut ax, mut bx) = (E::ONE, E::ZERO, E::ZERO);
-        for perm in 0..h / NUM_ROUNDS {
+        // The height is a power of two, not a multiple of 24: the last perm
+        // is partial (8 rows at 2^11 and 2^13), and its rows must carry the
+        // held, register and running cells like every other padding row.
+        for perm in 0..h.div_ceil(NUM_ROUNDS) {
             let real = perm < perms.len();
             let (q, pos) = (perm / len, perm % len);
             let pre = if real { perms[perm] } else { [0; 25] };
@@ -842,6 +845,9 @@ impl C2Air {
             let words = if real { l.leaf_words(pos) } else { None };
             for round in 0..NUM_ROUNDS {
                 let row = NUM_ROUNDS * perm + round;
+                if row == h {
+                    break;
+                }
                 let cells = &mut values[row * w..(row + 1) * w];
                 let mut set = |col: usize, v: &E| {
                     cells[col..col + D].copy_from_slice(v.as_basis_coefficients_slice())
@@ -1741,6 +1747,78 @@ mod tests {
             Val::GENERATOR
                 * Val::two_adic_generator(lde).exp_u64(reverse_bits_len(index, lde) as u64),
         )
+    }
+
+    #[test]
+    fn c2_releases_at_the_segment_end_and_fills_the_trace_tail() {
+        // Two places where a per-segment hold must change hands, pinned on
+        // the honest trace. (1) The segment end: the last row of query 0's
+        // last perm is the one row where the last-row flag meets the last
+        // position cell, so the register holds release there and nowhere
+        // else; query 1's registers differ from query 0's across it.
+        // (2) The trace tail: 2^11 is not a multiple of 24, so the last perm
+        // is partial (8 rows); those rows carry the held, register and
+        // running cells of the padding like every row before them (a tail
+        // left at zero broke `hold`, `handoff`, `ctx_hold` and `alpha_pow`
+        // on the last full row, run 36358638145).
+        let fx = fixture();
+        let (air, l) = (&fx.air, &fx.air.layout);
+        let (h, w) = (air.height, air.width);
+        assert_eq!(h % NUM_ROUNDS, 8, "a partial last perm");
+        let c = claim(fx, |_| {}, |_| {});
+        let v = &c.trace.values;
+        let cell = |row: usize, col: usize| v[row * w + col];
+        let end = seg(fx, 0).end - 1;
+        let fin = air.lane.kc.fin;
+        let ring_last = air.ring_col + l.len() - 1;
+        for row in 0..h {
+            let release = cell(row, fin) * cell(row, ring_last);
+            assert_eq!(
+                release,
+                Val::from_bool(row == end || row == seg(fx, 1).end - 1),
+                "segment end at row {row}"
+            );
+        }
+        let regs = air.bits_col..air.reg_end;
+        assert_ne!(
+            v[end * w..][regs.clone()],
+            v[(end + 1) * w..][regs.clone()],
+            "the two queries' registers differ across the release row"
+        );
+        // Query 0's registers hold on every row of its segment, query 1's on
+        // every later row (its segment and the padding, tail included).
+        for row in 0..h {
+            let q = usize::from(row > end);
+            let first = if q == 0 { 0 } else { end + 1 };
+            assert_eq!(
+                v[row * w..][regs.clone()],
+                v[first * w..][regs.clone()],
+                "registers at row {row}"
+            );
+            assert_eq!(
+                v[row * w..][air.held_col..w],
+                v[..w][air.held_col..w],
+                "held cells at row {row}"
+            );
+        }
+        // The running power: 1 on each segment's first block and on every
+        // padding row, tail included.
+        let one = E::ONE;
+        let p = |row: usize| E::from_basis_coefficients_fn(|i| cell(row, air.p_col + i));
+        assert_eq!(p(0), one);
+        assert_eq!(p(end + 1), one);
+        for row in seg(fx, 1).end..h {
+            assert_eq!(p(row), one, "padding p at row {row}");
+        }
+        // No constraint is violated around either place.
+        for row in [end - 1, end, end + 1, h - 10, h - 9, h - 8, h - 2, h - 1] {
+            let bad = violations_at(air, &c.trace, &c.pvs, row);
+            assert!(
+                bad.is_empty(),
+                "row {row}: {}",
+                phase_in(&fx.ranges, bad[0].constraint)
+            );
+        }
     }
 
     #[test]

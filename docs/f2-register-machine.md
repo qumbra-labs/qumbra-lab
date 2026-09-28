@@ -1282,9 +1282,9 @@ periodic column, the next level pays nothing per row for C2's scheduling.
 
 No local tests, proofs or benchmarks were run. The local preflight was
 `cargo check --workspace --all-targets --locked`, Clippy on `qlab-bench` (no findings
-in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: seven in
-`c2.rs` and one in `price.rs`, eight in all. **[P, pending CI]**: against C1's 2,798,
-that is 2,806 passed, 0 failed, 15 ignored.
+in `f2/`) and rustfmt. `verify-graviton` CI is the acceptance gate. New tests: eight in
+`c2.rs` and one in `price.rs`, nine in all. **[P, pending CI]**: against C1's 2,798,
+that is 2,807 passed, 0 failed, 15 ignored.
 
 Expected new-test runtime **[P]** is 20–60 s on the Graviton lane. It adds **no
 prove**. The toy proof is 2b-i's and the S3 proof is the census test's, each shared per

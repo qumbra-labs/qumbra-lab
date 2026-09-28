@@ -1090,8 +1090,8 @@ S 的列构成：Keccak 2,633，消息位 1,088，规范性 68，位置环与 qu
 
 本地没有跑任何测试、proof 或 benchmark。本地预检为
 `cargo check --workspace --all-targets --locked`、`qlab-bench` 上的 Clippy（`f2/` 下无告警）
-和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`c2.rs` 七个、`price.rs` 一个，共八个。
-**[P，待 CI]**：以 C1 的 2,798 为基线，应为 2,806 项通过、0 失败、15 项忽略。
+和 rustfmt；验收以 `verify-graviton` CI 为准。新增测试：`c2.rs` 八个、`price.rs` 一个，共九个。
+**[P，待 CI]**：以 C1 的 2,798 为基线，应为 2,807 项通过、0 失败、15 项忽略。
 
 新测试在 Graviton lane 上预计耗时 20–60 秒 **[P]**，**不新增 prove**：玩具 proof 用 2b-i 的，
 S3 proof 用 census 测试的，每个测试二进制各共用一份；如果 C2 的 S3 测试先跑，就由它承担那次
