@@ -322,7 +322,12 @@ pub(crate) fn sd_domain_lanes() -> [u64; 2] {
 
 /// One step's message: `tag ‖ pv_len ‖ pvs`, each a `u32` word.
 pub(crate) fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
-    let mut w = vec![u32::from(tag.byte()), pvs.len() as u32];
+    sd_words_byte(tag.byte(), pvs)
+}
+
+/// [`sd_words`] for any slot tag byte (F4's claim slot is `0x04`).
+pub(crate) fn sd_words_byte(tag: u8, pvs: &[u32]) -> Vec<u32> {
+    let mut w = vec![u32::from(tag), pvs.len() as u32];
     w.extend_from_slice(pvs);
     w
 }
@@ -351,7 +356,12 @@ pub(crate) fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
 ///
 /// Returns the blocks' Keccak-f inputs (what the leaf AIR hashes) and the digest.
 pub(crate) fn sd_chain(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> (Vec<[u64; 25]>, Digest) {
-    let words = sd_words(tag, pvs);
+    sd_chain_byte(prev, tag.byte(), pvs)
+}
+
+/// [`sd_chain`] for any slot tag byte — the one construction F4 extends.
+pub(crate) fn sd_chain_byte(prev: &Digest, tag: u8, pvs: &[u32]) -> (Vec<[u64; 25]>, Digest) {
+    let words = sd_words_byte(tag, pvs);
     let n = words.len().div_ceil(SD_BLOCK_WORDS);
     let dom = sd_domain_lanes();
     let mut h = *prev;

@@ -23,6 +23,7 @@ mod l2shape;
 mod zkpeak;
 mod f2;
 mod f3;
+mod f4;
 #[cfg(feature = "phasemem")]
 mod phasemem;
 
@@ -755,6 +756,15 @@ fn main() {
     if mode == "detaudit" {
         // Lab #758: the determination census (local output only).
         detaudit::run_detaudit(&args[1..]);
+        return;
+    }
+
+    if matches!(mode.as_str(), "f4leaf" | "f4neg") {
+        // Lab #775: the wrapper leaf W.
+        if let Err(error) = f4::run(&mode, &args[1..]) {
+            eprintln!("{mode}: {error}");
+            std::process::exit(2);
+        }
         return;
     }
 
