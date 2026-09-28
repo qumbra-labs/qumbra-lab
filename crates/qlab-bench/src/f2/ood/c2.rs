@@ -3,7 +3,9 @@
 //! overwrite-mode Keccak lane (L4), one segment per query, with levers L2
 //! (incremental fri_alpha powers) and L3 (the reduced opening and the index
 //! bits handed from the opening part to the fold part as registers).
-//! Test-only component, scanned row by row, never proved.
+//! Scanned row by row by its tests (toy leaf, two-query S3); built at full
+//! size for all queries of a real leaf, then scanned or proved under a
+//! non-hiding outer config, by F2b-4's `qlab-bench f2wrap` ([`honest`]).
 //!
 //! **Segment.** Per covered query: the input-batch leaf sponges and Merkle
 //! paths exactly as `open.rs` lays them out (randomizer, trace, quotient),
@@ -70,7 +72,7 @@ use qlab_consensus::{Config, FriCfg, CAP_HEIGHT};
 
 use super::fold;
 use super::lane::{Lane, Phased, RATE_BITS, RATE_LANES, RATE_WORDS};
-use super::open::{self, Word, BATCHES, QUOTIENT, RANDOM, TRACE};
+use super::open::{self, Word, QUOTIENT, RANDOM, TRACE};
 use super::seam::{open_order, Open, Seam, SeamShape};
 use super::{require, Dims, Result, Val, E};
 
@@ -301,6 +303,7 @@ impl Layout {
     fn path_bits(&self) -> usize {
         self.ig.geom.path
     }
+    #[cfg(test)]
     fn at(&self, step: Step) -> usize {
         self.segment.iter().position(|&s| s == step).unwrap()
     }
@@ -530,6 +533,7 @@ impl Build {
 
     /// Re-derive query `q`'s fold part from its (edited) reduced opening:
     /// a forger whose fold chain starts from the forged ro.
+    #[cfg(test)]
     fn refold(&mut self, layout: &Layout, q: usize) -> Result<()> {
         let fold_held = fold::Held {
             betas: self.held.betas.clone(),
@@ -552,7 +556,7 @@ impl Build {
 /// C2: one overwrite-mode Keccak lane, per query the input openings and the
 /// reduced opening, then the commit-phase openings, folds and final check.
 #[derive(Clone)]
-struct C2Air {
+pub(super) struct C2Air {
     layout: Layout,
     lane: Lane,
     height: usize,
@@ -747,6 +751,7 @@ impl C2Air {
     fn final_c(&self, c: usize) -> usize {
         self.final_col + D * c
     }
+    #[cfg(test)]
     fn fri_rows(&self) -> usize {
         NUM_ROUNDS * (self.layout.open_last + 1)
     }
@@ -927,6 +932,50 @@ impl C2Air {
             acc
         })
     }
+}
+
+/// An honest C2 for a real leaf proof: the trace, its public values (C1's
+/// seam, with the covered slots' indices) and the seam read back from them.
+pub(super) struct Honest {
+    pub(super) air: C2Air,
+    pub(super) trace: RowMajorMatrix<Val>,
+    pub(super) pvs: Vec<Val>,
+    pub(super) seam: Seam,
+}
+
+/// Build [`Honest`] from C1's seam for the same proof, covering `slots`
+/// (ascending). F2b-4's `f2wrap` covers every one of the `cfg.num_queries`
+/// slots, so `check_coverage` can hold; a test may cover fewer. `max_cells`
+/// bounds the materialization before the trace is allocated (`C2Air::new`).
+pub(super) fn honest(
+    dims: Dims,
+    chunks: usize,
+    cfg: &FriCfg,
+    c1_seam: &Seam,
+    slots: Vec<usize>,
+    proof: &Proof<Config>,
+    max_cells: usize,
+) -> Result<Honest> {
+    require(
+        slots.iter().all(|&s| s < c1_seam.indices.len()),
+        "a covered slot C1 did not draw",
+    )?;
+    let seam = Seam {
+        indices: slots.iter().map(|&s| c1_seam.indices[s]).collect(),
+        ..c1_seam.clone()
+    };
+    let layout = Layout::new(dims, chunks, cfg, slots)?;
+    let air = C2Air::new(layout, max_cells)?;
+    let build = Build::honest(&air.layout, &seam, proof)?;
+    let trace = air.trace(&build)?;
+    let pvs = air.public_values(&seam)?;
+    let seam = Seam::decode(air.layout.seam, &air.layout.slots, &pvs)?;
+    Ok(Honest {
+        air,
+        trace,
+        pvs,
+        seam,
+    })
 }
 
 impl Phased for C2Air {
@@ -1517,6 +1566,7 @@ mod tests {
     use super::super::lane::phase_ranges;
     use super::super::lane::toy::native_through_f2;
     use super::super::open::tests::reduced_opening;
+    use super::super::open::BATCHES;
     use super::super::proof_inputs_dims;
     use super::super::seam::{check_coverage, check_seams, GROUPS};
     use super::*;

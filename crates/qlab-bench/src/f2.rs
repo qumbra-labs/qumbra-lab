@@ -1,5 +1,7 @@
-//! Issue #750: F2's native hiding-proof census and symbolic pricing tools.
-//! These modes do not implement an aggregation circuit or declare a memory pass.
+//! Issue #750: F2's native hiding-proof census and symbolic pricing tools,
+//! and F2b-4's `f2wrap` (the full-size C1/C2 of one real leaf: check, or
+//! prove under the non-hiding outer lane). No mode declares a memory pass:
+//! peak memory is the operator's `/usr/bin/time -v` reading.
 mod counting;
 mod ood;
 mod price;
@@ -22,6 +24,10 @@ type Result<T> = std::result::Result<T, String>;
 // Bench fixture cap, not a transaction wire limit. Check before decoding.
 const MAX_FIXTURE_BYTES: u64 = 8 * 1024 * 1024;
 const FIXTURE_VERSION: u32 = 1;
+/// f2wrap's default materialization budget, in field cells: above the
+/// largest planned component (P3's C2, 5,107 x 2^18 = 1,338,769,408 cells
+/// [P], `price::composed_c2`), about 6 GB of trace values.
+const DEFAULT_MAX_CELLS: usize = 1_500_000_000;
 
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
@@ -386,11 +392,16 @@ fn options<'a>(mode: &str, args: &'a [String]) -> Result<BTreeMap<&'a str, &'a s
                 key,
                 "--shape" | "--revision" | "--power" | "--report" | "--input-pcs" | "--rc"
             ) || (mode == "f2fixture" && key == "--out")
-                || (mode == "f2census" && key == "--proof-in")
-                || (mode == "f2price" && key == "--symbolic-only"),
+                || (matches!(mode, "f2census" | "f2wrap") && key == "--proof-in")
+                || (mode == "f2price" && key == "--symbolic-only")
+                || (mode == "f2wrap"
+                    && matches!(
+                        key,
+                        "--check" | "--prove" | "--outer" | "--component" | "--max-cells"
+                    )),
             &format!("unknown argument {key}"),
         )?;
-        if key == "--symbolic-only" {
+        if matches!(key, "--symbolic-only" | "--check" | "--prove") {
             require(result.insert(key, "true").is_none(), "duplicate argument")?;
             i += 1;
             continue;
@@ -438,6 +449,23 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
         valid_revision(revision),
         "--revision must be the full build commit (40 hex characters)",
     )?;
+    if mode == "f2wrap" {
+        // Refused before the fixture is read or anything is allocated.
+        let (wrap_mode, max_cells) = wrap_options(&opts)?;
+        let plan = ood::wrap::Plan::of(shape)?;
+        plan.admit(max_cells)?;
+        let fixture = read_fixture(Path::new(get("--proof-in")?))?;
+        let (proof, pvs) = verified_leaf(shape, &fixture)?;
+        let report = ood::wrap::run(shape, &proof, &pvs, plan, wrap_mode, max_cells)?;
+        let pass = report["all_pass"] == true;
+        let report = json!({"plan": plan.report(), "max_cells": max_cells,
+            "fixture_producer_revision": fixture.producer_revision,
+            "memory_gate_pass": false,
+            "memory_gate_note": "decided from the operator's /usr/bin/time -v peak RSS (GiB = KiB / 1024^2) against 60 GiB, and separately 32 GiB; never in-process",
+            "result": report});
+        print_envelope(mode, shape, revision, power, report)?;
+        return require(pass, "f2wrap: one or more checks failed (see the report)");
+    }
     let report = match mode {
         "f2price" => {
             let air = price::symbolic(shape);
@@ -457,6 +485,78 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
         "f2fixture" => create_fixture(shape, revision, Path::new(get("--out")?))?,
         _ => return Err("unknown F2 mode".into()),
     };
+    print_envelope(mode, shape, revision, power, report)
+}
+
+/// The f2wrap stage and budget: exactly one of `--check` / `--prove`;
+/// `--outer b2|b4` with `--prove` only; `--component` (default both) with
+/// `--prove` only; `--max-cells` a positive cell count (default
+/// [`DEFAULT_MAX_CELLS`]).
+fn wrap_options(opts: &BTreeMap<&str, &str>) -> Result<(ood::wrap::Mode, usize)> {
+    let (check, prove) = (opts.contains_key("--check"), opts.contains_key("--prove"));
+    require(
+        check != prove,
+        "f2wrap needs exactly one of --check / --prove",
+    )?;
+    require(
+        opts.contains_key("--proof-in"),
+        "--proof-in is required (an f2fixture envelope)",
+    )?;
+    let max_cells = match opts.get("--max-cells") {
+        None => DEFAULT_MAX_CELLS,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or("--max-cells must be a positive integer")?,
+    };
+    let mode = if check {
+        require(
+            !opts.contains_key("--outer") && !opts.contains_key("--component"),
+            "--outer / --component apply to --prove only",
+        )?;
+        ood::wrap::Mode::Check
+    } else {
+        let outer =
+            ood::wrap::Outer::parse(opts.get("--outer").ok_or("--prove needs --outer b2|b4")?)?;
+        let component = opts
+            .get("--component")
+            .map_or(Ok(ood::wrap::Component::Both), |c| {
+                ood::wrap::Component::parse(c)
+            })?;
+        ood::wrap::Mode::Prove(outer, component)
+    };
+    Ok((mode, max_cells))
+}
+
+/// A fixture's leaf, decoded and natively verified exactly as `f2census`
+/// admits it (metadata, geometry, the live L2 verifier).
+fn verified_leaf(shape: Shape, fixture: &Fixture) -> Result<(Proof<Config>, Vec<Val>)> {
+    fixture.check_metadata(shape)?;
+    let proof: Proof<Config> = codec()
+        .deserialize(&fixture.proof)
+        .map_err(|e| format!("proof decode: {e}"))?;
+    let chunks = price::symbolic(shape)["hiding_quotient_chunks"]
+        .as_u64()
+        .ok_or("missing quotient census")? as usize;
+    validate_geometry(shape, &proof, &price::geometry(shape, chunks))?;
+    let pvs: Vec<Val> = fixture
+        .public_values
+        .iter()
+        .copied()
+        .map(Val::from_u32)
+        .collect();
+    native_verify(shape, &pvs, &proof)?;
+    Ok((proof, pvs))
+}
+
+fn print_envelope(
+    mode: &str,
+    shape: Shape,
+    revision: &str,
+    power: &str,
+    report: Value,
+) -> Result<()> {
     let output = json!({"schema": "qumbra-f2-census-v1", "mode": mode, "shape": shape_name(shape),
         "build_revision_declared_by_operator": revision,
         "shape_digest": qlab_l2::digest::shape_digest(shape), "config_words": config_words(),
@@ -513,6 +613,81 @@ mod tests {
         }
         assert!(parse_shape("s").is_err());
         assert!(!valid_revision("main"));
+    }
+
+    fn words(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn wrap(suffix: &str) -> Result<(ood::wrap::Mode, usize)> {
+        let args = words(&format!("f2wrap --shape s3 {suffix}"));
+        wrap_options(&options("f2wrap", &args)?)
+    }
+
+    #[test]
+    fn f2wrap_options_take_exactly_one_stage_and_a_positive_budget() {
+        use ood::wrap::{Component, Mode, Outer};
+        assert_eq!(
+            wrap("--proof-in f --check").unwrap(),
+            (Mode::Check, DEFAULT_MAX_CELLS)
+        );
+        assert_eq!(
+            wrap("--proof-in f --prove --outer b2").unwrap(),
+            (Mode::Prove(Outer::B2, Component::Both), DEFAULT_MAX_CELLS)
+        );
+        assert_eq!(
+            wrap("--proof-in f --prove --outer b4 --component c2 --max-cells 7").unwrap(),
+            (Mode::Prove(Outer::B4, Component::C2), 7)
+        );
+        for suffix in [
+            "--proof-in f",
+            "--proof-in f --check --prove --outer b2",
+            "--check",
+            "--proof-in f --check --outer b2",
+            "--proof-in f --check --component c1",
+            "--proof-in f --prove",
+            "--proof-in f --prove --outer b8",
+            "--proof-in f --prove --outer b2 --component c3",
+            "--proof-in f --check --max-cells 0",
+            "--proof-in f --check --max-cells -5",
+            "--proof-in f --check --max-cells lots",
+            "--proof-in f --check --max-cells",
+            "--proof-in f --check --check",
+            "--proof-in f --check --out x",
+            "--proof-in f --check --symbolic-only",
+            "--proof-in f --check --input-pcs plain",
+            "--proof-in f --check --rc 4",
+        ] {
+            assert!(wrap(suffix).is_err(), "{suffix}");
+        }
+        // The stage flags belong to f2wrap alone.
+        for mode in ["f2census", "f2fixture", "f2price"] {
+            let args = words(&format!("{mode} --shape s3 --check"));
+            assert!(options(mode, &args).is_err(), "{mode}");
+        }
+    }
+
+    /// An over-budget plan is refused before the fixture is even opened (the
+    /// path does not exist); at the default budget the same command gets as
+    /// far as reading it.
+    #[test]
+    fn f2wrap_refuses_an_over_budget_plan_before_reading_the_fixture() {
+        let rev = "a".repeat(40);
+        let base = format!(
+            "f2wrap --shape s3 --revision {rev} --proof-in /nonexistent/f2wrap-fixture --check"
+        );
+        let err = run(
+            "f2wrap",
+            &words(&format!("{base} --max-cells 1000")),
+            "test",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("exceeds --max-cells 1000") && err.contains("nothing allocated"),
+            "{err}"
+        );
+        let err = run("f2wrap", &words(&base), "test").unwrap_err();
+        assert!(!err.contains("exceeds"), "{err}");
     }
 
     #[test]

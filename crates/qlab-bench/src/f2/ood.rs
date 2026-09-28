@@ -3,28 +3,32 @@
 // F2b-2a: the machine's inputs bound to a replayed hiding transcript (test-only AIR).
 #[cfg(test)]
 mod bind;
-// F2b-2b-iii: the FRI query phase — commit-phase leaves, folds, final polynomial (test-only AIR).
-#[cfg(test)]
+// F2b-2b-iii: the FRI query phase — commit-phase leaves, folds, final
+// polynomial. Its layout, walks and constraint gadgets are C2's (F2b-4's
+// `f2wrap` builds C2 at full size); its own component AIR is exercised only
+// by its tests.
+#[cfg_attr(not(test), allow(dead_code))]
 mod fold;
 // F2b-2b-i: the FRI Fiat–Shamir continuation from D2 (test-only AIR).
 #[cfg(test)]
 mod fri_fs;
-// F2b composition C1: 2a + 2b-i on one lane, plus the L1 Az/Bz sums (test-only AIR).
-#[cfg(test)]
+// F2b composition C1: 2a + 2b-i on one lane, plus the L1 Az/Bz sums.
 mod c1;
 // The Keccak sponge lane both transcript components share.
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 mod lane;
-// F2b composition C2: 2b-ii + 2b-iii as per-query segments on one lane (test-only AIR).
-#[cfg(test)]
+// F2b composition C2: 2b-ii + 2b-iii as per-query segments on one lane.
 mod c2;
-// F2b-2b-ii: the input-batch openings and reduced opening per query (test-only AIR).
+// F2b-2b-ii's register machine (the OOD identity) and its reference AIR (test-only).
 mod machine;
-#[cfg(test)]
+// F2b-2b-ii: the input-batch openings and reduced opening per query. As
+// with `fold`, C2 consumes its layout, walks and gadgets.
+#[cfg_attr(not(test), allow(dead_code))]
 mod open;
-// The C1 -> C2 seam and the shared opened-term order.
-#[cfg(test)]
+// The C1 -> C2 seam, the shared opened-term order, and R-PV's leaf PV widths.
 mod seam;
+// F2b-4: the full-size C1 and C2 of one real leaf proof (`qlab-bench f2wrap`).
+pub(super) mod wrap;
 
 use std::collections::HashMap;
 use std::sync::Arc;

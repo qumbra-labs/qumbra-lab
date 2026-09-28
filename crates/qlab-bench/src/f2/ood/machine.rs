@@ -1,15 +1,14 @@
 //! Reference register machine for the OOD DAG. Full-period ROM is deliberately
 //! priced, not hidden: this is a correctness model, not the final F2 layout.
 #[cfg(test)]
-use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-#[cfg(test)]
+use p3_air::{Air, BaseAir};
+use p3_air::{AirBuilder, WindowAccess};
 use p3_field::BasedVectorSpace;
 use p3_field::{Field, PrimeCharacteristicRing};
 #[cfg(test)]
 use p3_matrix::dense::RowMajorMatrix;
 use serde_json::{json, Value};
 
-#[cfg(test)]
 use super::Val;
 use super::{require, Id, Input, Op, Result, E};
 
@@ -25,7 +24,6 @@ enum Kind {
 }
 
 impl Kind {
-    #[cfg(test)]
     fn opcode(self) -> usize {
         match self {
             Self::Input(_) => 0,
@@ -179,12 +177,10 @@ impl Schedule {
     }
     /// Logical input sources in first-use order: input `i` of the machine is
     /// `inputs()[i]`, and its DAG node supplies the honest value.
-    #[cfg(test)]
     pub(super) fn inputs(&self) -> &[(Id, Input)] {
         &self.inputs
     }
     /// Register slot holding each exported root on the terminal row.
-    #[cfg(test)]
     pub(super) fn outputs(&self) -> &[usize] {
         &self.outputs
     }
@@ -192,7 +188,6 @@ impl Schedule {
     /// Full-period ROM at `height` rows (`height >= self.height()`): opcode,
     /// constant limbs, one-hot A/B/destination and input selectors; padding
     /// rows carry only the padding opcode.
-    #[cfg(test)]
     pub(super) fn rom(&self, height: usize) -> Result<Vec<Vec<Val>>> {
         require(
             height >= self.height() && height.is_power_of_two(),
@@ -223,7 +218,6 @@ impl Schedule {
     }
 
     /// Row-major machine columns (`self.width()` per row) at `height` rows.
-    #[cfg(test)]
     pub(super) fn trace_values(&self, inputs: &[E], height: usize) -> Result<Vec<Val>> {
         require(
             inputs.len() == self.inputs.len(),
@@ -412,7 +406,6 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for RegisterAir {
 /// limb `k` is `inputs[i][k]` (public limbs here, held input columns there).
 /// Output bindings are the caller's: which roots are pinned, and to what, is
 /// exactly what differs between the two components.
-#[cfg(test)]
 pub(super) fn eval_machine<AB: AirBuilder<F = Val>>(
     builder: &mut AB,
     s: &Schedule,
