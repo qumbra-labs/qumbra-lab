@@ -1,8 +1,10 @@
 //! F2b composition, slice C1 (issue #750, "two proofs per leaf"): F2b-2a's
 //! transcript-bound register machine and F2b-2b-i's FRI transcript as ONE
 //! AIR on ONE duplex Keccak lane, plus lever L1 — the α-weighted opened-value
-//! sums Az and Bz accumulated on the opened-value absorb rows. Test-only
-//! component, scanned row by row, never proved.
+//! sums Az and Bz accumulated on the opened-value absorb rows. Scanned row
+//! by row by its tests (toy leaf); built at full size for a real leaf, then
+//! scanned or proved under a non-hiding outer config, by F2b-4's
+//! `qlab-bench f2wrap` ([`honest`]).
 //!
 //! **One lane, one transcript.** The flushes run back to back: F0 (metadata,
 //! trace cap, inner PVs) → α; F1 (D0, quotient cap, randomizer cap) → ζ; F2
@@ -618,7 +620,7 @@ impl Claimed {
 /// C1: one Keccak lane replaying the whole hiding transcript, the register
 /// machine, and the L1 accumulators, in one row space.
 #[derive(Clone)]
-struct C1Air {
+pub(super) struct C1Air {
     layout: Layout,
     schedule: Schedule,
     routes: Vec<Route>,
@@ -1250,6 +1252,11 @@ impl BaseAir<Val> for C1Air {
     fn periodic_columns(&self) -> Vec<Vec<Val>> {
         self.periodic.clone()
     }
+    /// One row of the ROM, without cloning every column first (the default
+    /// clones the whole table per row: 2,227 x 2^15 values at S3).
+    fn periodic_values(&self, row: usize) -> Vec<Val> {
+        self.periodic.iter().map(|c| c[row % c.len()]).collect()
+    }
 }
 
 impl<AB: AirBuilder<F = Val>> Air<AB> for C1Air {
@@ -1281,6 +1288,57 @@ impl Seam {
         let slots: Vec<usize> = (0..layout.fri.queries).collect();
         Seam::decode(layout.seam_shape(), &slots, &pvs[layout.dims.pv_len..])
     }
+}
+
+impl C1Air {
+    /// Inner PVs C1 re-exposes unchanged at the front of its public values.
+    pub(super) fn inner_pv_len(&self) -> usize {
+        self.layout.dims.pv_len
+    }
+}
+
+/// A full-size honest C1 for one real leaf proof: the transcript replayed
+/// from the proof, the machine on the proof's openings, the trace and C1's
+/// public values (inner PVs, every cap, the seam outputs), and the seam read
+/// back from them.
+pub(super) struct Honest {
+    pub(super) air: C1Air,
+    pub(super) trace: RowMajorMatrix<Val>,
+    pub(super) pvs: Vec<Val>,
+    pub(super) seam: Seam,
+}
+
+/// Build [`Honest`] for `proof` (inner PVs `pvs`) under the inner lane
+/// `cfg`. `inputs` are the DAG inputs `proof_inputs` replayed with p3's own
+/// challenger; the lane replay must agree with them (α, ζ) and pass the
+/// query PoW. `max_cells` bounds the materialization before the ROM or the
+/// trace is allocated (`C1Air::new`).
+pub(super) fn honest(
+    program: &Program,
+    inputs: &Inputs,
+    proof: &Proof<Config>,
+    pvs: &[Val],
+    cfg: &FriCfg,
+    max_cells: usize,
+) -> Result<Honest> {
+    let air = C1Air::new(program, cfg, max_cells)?;
+    let data = Data::from_proof(proof, pvs)?;
+    let rep = Replay::new(&air.layout, &data)?;
+    require(
+        rep.challenges[0] == inputs.alpha && rep.zeta() == inputs.zeta,
+        "C1's lane replay disagrees with the native challenger",
+    )?;
+    require(rep.pow_sample == 0, "query PoW sample is not zero")?;
+    let cl = Claimed::of(&rep, &data, machine_inputs(program, inputs)?);
+    let (trace, az, bz) = air.trace(&rep, &cl)?;
+    let pvs = air.public_values(&data, &cl, az, bz);
+    let seam = Seam::read(&air.layout, &pvs)?;
+    Ok(Honest {
+        air,
+        trace,
+        pvs,
+        seam,
+    })
 }
 
 /// The machine's honest inputs for a DAG input assignment, in schedule order.
@@ -1698,6 +1756,42 @@ pub(in crate::f2::ood) mod tests {
             .max()
             .unwrap();
         assert!(max <= 3, "C1 degree {max} > 3");
+    }
+
+    /// R-PV (issue #750): why option (c) is needed. The toy's PV 1 is its
+    /// recurrence's last value, far above 2^16, under a valid hiding proof;
+    /// C1 is SAT on it and exposes it unchanged. C1 has no range gate on an
+    /// inner PV — only `bind_inner_pv` (R⁻¹ · the absorbed word, canonical
+    /// `< p`) and `in_public` (the machine's input cells) read it — so the
+    /// leaf's width table, applied natively by the consumer
+    /// (`seam::check_leaf_pvs`), is what refuses it, by name. Read with a
+    /// 16-bit table for both toy PVs.
+    #[test]
+    fn c1_accepts_an_out_of_range_leaf_pv() {
+        use super::super::seam::{check_pv_widths, PvWidth};
+        let fx = fixture();
+        let y = fx.pvs[1].as_canonical_u32();
+        assert!(y >= 1 << 16, "toy PV 1 = {y}");
+        let c = honest(fx);
+        satisfied(&fx.air, &c.trace, &c.pvs).unwrap_or_else(|v| {
+            panic!(
+                "C1 refused the honest toy: {v} in {}",
+                phase_of(fx, v.constraint)
+            )
+        });
+        assert_eq!(&c.pvs[..fx.air.inner_pv_len()], fx.pvs, "exposed unchanged");
+        let widths = ["toy_x", "toy_y"].map(|group| PvWidth {
+            group,
+            index: 0,
+            bits: 16,
+        });
+        let err = check_pv_widths(&widths, &c.pvs).unwrap_err();
+        assert!(
+            err.contains("`toy_y[0]`") && err.contains("16-bit"),
+            "{err}"
+        );
+        // PV 0 (= 3) is inside 16 bits: the refusal is PV 1's alone.
+        check_pv_widths(&widths[..1], &c.pvs).unwrap();
     }
 
     #[test]

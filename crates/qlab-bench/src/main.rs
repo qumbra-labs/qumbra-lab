@@ -750,7 +750,10 @@ fn main() {
         .unwrap_or("matrix")
         .to_string();
 
-    if matches!(mode.as_str(), "f2fixture" | "f2census" | "f2price") {
+    if matches!(
+        mode.as_str(),
+        "f2fixture" | "f2census" | "f2price" | "f2wrap"
+    ) {
         if let Err(error) = f2::run(&mode, &args[1..], &power) {
             eprintln!("{mode}: {error}");
             std::process::exit(2);

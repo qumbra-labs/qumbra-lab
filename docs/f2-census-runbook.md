@@ -127,3 +127,121 @@ The existing real-proof test also checks the honest zero residual and mutations 
 quotient coefficients, local/next openings, consumed public values, alpha and zeta.
 These are algebra-only probes: native PCS rejection is not a substitute for their
 comparisons, and passing them is not a claim of full recursive verification.
+
+## R-PV (F2b-3): option (c) on every leaf PV group
+
+Ruled on issue #750 (R-PV and its addendum). **C1 exposes every inner leaf PV unchanged**
+as its own public values `[0, pv_len)`: 116 for S3, 128 for P3, 101 for R. No group is
+compressed. No inner PV is hashed, summed or folded into another value. So option (c)
+covers every group:
+
+| shape | exposed groups (all of them) | compressed |
+|---|---|---|
+| S3 | anchor, nf1, nf2, cm1, cm2, fee, registry_root, nf3 | none |
+| P3 | S3's first seven, vp1/vp2 (sign, amount, asset), nf3 | none |
+| R | anchor, nf, cm, fee, old_root, new_root, asset, cm_seed | none |
+
+C1 does **not** range-check them. Only two constraint groups read an inner-PV cell:
+`bind_inner_pv` (PV = R⁻¹ · the absorbed word, and `canonical` keeps the word `< p`)
+and `in_public` (the machine's input cells). The test `c1_accepts_an_out_of_range_leaf_pv`
+shows it: the toy leaf's PV 1 is far above 2^16, and C1 is SAT on it. The consumer of the
+aggregation proof must therefore apply `seam::check_leaf_pvs(shape, c1_pvs)` before it
+accepts. That check refuses a PV outside its width and names it by group and index
+(e.g. `` `fee[0]` ``).
+
+The widths are **not restated**. `seam::leaf_pv_widths` reads them from the leaf AIRs' own
+PV builders (`qlab_air::l2::pv_vec_l2`, `l2p::pv_vec_l2p`, `l2r::pv_vec_r`, re-exported by
+`qlab-l2`) as the bit length of each slot at saturated typed inputs:
+
+- **16 bits** for every `& 0xffff` chunk (digests, fee, vPublic amounts);
+- **1 bit** for P3's two vPublic signs (`redeem as u32`);
+- **32 bits** for the asset ids P3's vPublic and R expose (`as u32`). This is vacuous as a
+  native check, since KoalaBear's p < 2^31 and every PV is canonical. In-AIR, each of these
+  slots is equated to an asset accumulator cell.
+
+`audit_pv_bits()` (lab issue #758) is not on main. When it lands, pin it equal to this table.
+
+## F2b-4: the wrapper runs (`f2wrap`)
+
+`f2wrap` loads an `f2fixture` envelope and admits it exactly as `f2census` does
+(metadata, geometry, the live L2 verifier). It then builds the **full-size** C1 and C2 of
+that one leaf, with C2 covering all 43 query slots:
+
+- `--check` scans every row of both traces with p3-air's constraint evaluator. This is the
+  row loop of `p3_air::check_constraints`; `qlab_air::l2test` wraps the same loop, but it is
+  test-only by its Cargo contract. It then runs `check_seams`, `check_coverage` and
+  `check_leaf_pvs`, and checks that each AIR has degree ≤ 3 and that the built dimensions
+  equal the `price::composed_*` plan. No proving.
+- `--prove --outer b2|b4` proves C1 and C2 under the **non-hiding** outer config (stage-0
+  ruling 1: `qlab_consensus::legacy`). The lanes are the M4 interior's own, now named
+  constants `m4interior::INTERIOR_B2_CFG` (b2/q86/g22/fp16/a16) and `INTERIOR_B4_CFG`
+  (b4/q43/g22/fp16/a16). It verifies both proofs natively and reports widths, heights,
+  constraint counts, degree, proof bytes, and prove and verify wall time.
+  `--component c1|c2` proves one component only (the default is both). C1 is always
+  built, because its seam feeds C2.
+- **Budget:** `--max-cells` (default 1,500,000,000) is checked against the plan
+  **before the fixture is read or any trace or ROM exists**. The C1/C2 constructors check
+  it again before they allocate. Components are built one at a time, and each trace is
+  dropped before the next is built. A process's peak is therefore its larger component's.
+- **Output:** JSON on stdout, same envelope as `f2census`, with `--revision`. The mode writes
+  no files. A run with a failed check still prints its report, then exits 2.
+
+**[P] plan for S3** (`price::composed_*`, the #750 stage-0 k-model
+`peak_GiB ≈ k × width × 2^(h−18)`, k_b2 = 0.00265645, k_b4 = 0.00427969). The report
+prints the same numbers under `plan.expected_peak_gib`:
+
+| component | columns × rows [P] | k-model b2 [P] | k-model b4 [P] |
+|---|---|---:|---:|
+| C1 | 11,746 (+2,227 periodic ROM) × 2^15 | 3.900 GiB (4.640 with ROM) | 6.284 GiB (7.475 with ROM) |
+| C2 | 5,058 × 2^17 | 6.718 GiB | 10.823 GiB |
+
+The k-model was fitted on the legacy M4 interior. It is a planning model, not a bound, and
+has never been calibrated on these AIRs.
+
+### Box commands (coordinator, memory-qualified rig)
+
+Run sequentially and alone: no CI, no other benchmark. Record commit, `Cargo.lock`,
+`rustc -Vv`, hardware, `MemTotal` and power state, as above. `noclobber` makes the shell
+refuse to overwrite a report. Fixtures refuse to overwrite anyway.
+
+```sh
+set -o noclobber
+cargo build --release --locked -p qlab-bench
+rev=$(git rev-parse HEAD); bin=target/release/qlab-bench
+power='AC; record hardware/thermal state separately'
+mkdir -p f2b4
+for pass in 1 2; do
+  /usr/bin/time -v $bin f2fixture --shape s3 --out f2b4/s3-$pass.proof --revision "$rev" --power "$power" \
+    > f2b4/s3-fixture-$pass.json 2> f2b4/s3-fixture-$pass.time
+  /usr/bin/time -v $bin f2wrap --shape s3 --proof-in f2b4/s3-$pass.proof --check --revision "$rev" --power "$power" \
+    > f2b4/s3-check-$pass.json 2> f2b4/s3-check-$pass.time || break
+  /usr/bin/time -v $bin f2wrap --shape s3 --proof-in f2b4/s3-$pass.proof --prove --outer b2 --revision "$rev" --power "$power" \
+    > f2b4/s3-prove-b2-$pass.json 2> f2b4/s3-prove-b2-$pass.time
+  /usr/bin/time -v $bin f2wrap --shape s3 --proof-in f2b4/s3-$pass.proof --prove --outer b4 --revision "$rev" --power "$power" \
+    > f2b4/s3-prove-b4-$pass.json 2> f2b4/s3-prove-b4-$pass.time
+done
+```
+
+If `--check` exits non-zero, **stop**. `report.result.checks` names the failed check, and
+`sat_scan.first_violations` names the row and constraint group. Post that before any
+prove run. To attribute a peak to a component, add `--component c1` or `--component c2` in
+separate processes.
+
+**Reading the memory gate.** Peak RSS is `Maximum resident set size (kbytes)` in each
+`.time` file: GiB = kbytes / 1024². The JSON never contains a measured peak.
+
+- **Memory gate pass** means: every `f2wrap --prove` process, at both outer lanes and in
+  both passes, peaks at **≤ 60 GiB** [M] (stage-0 ruling 2: rigs are r7g.2xlarge with 61 GiB
+  usable), and its report shows `native_verified: true` for each proved component.
+- **Separately**, report whether each peak is **≤ 32 GiB**, the named 32 GiB class. This is
+  a second verdict, not the gate.
+- The `f2fixture` producer (the hiding **transaction** prover, 13.727 GiB at S3 per F2b-0)
+  and the `--check` process are **not** aggregation memory. Record them, but do not gate on
+  them. A serialized pipeline's peak is the maximum of its processes, not their sum.
+- Also record against F2b-4's acceptance: `c1.built.max_degree` and `c2.built.max_degree`
+  ≤ 3, and `proof_bytes`, `prove_seconds` and `verify_seconds` per component. Two passes
+  must agree before any number is published.
+
+**Not established by this change:** no full-size trace has been built, scanned or proved.
+Local runs are forbidden, and CI runs only the toy and 2-query instances. The plan-equals-
+built check, the SAT scans at 43 queries and every prove number are the box run's to measure.

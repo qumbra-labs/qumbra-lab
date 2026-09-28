@@ -167,6 +167,26 @@ enum Shape {
     Two,
 }
 
+/// The interior's optional/fallback outer lane, **b4/q43/g22/fp16/a16**
+/// (non-hiding, `qlab_consensus::legacy`). Also F2b-4's `f2wrap --outer b4`.
+pub(crate) const INTERIOR_B4_CFG: crate::FriCfg = crate::FriCfg {
+    log_blowup: 2,
+    num_queries: 43, // q43 (B″, issue #41 — was q40)
+    grind_bits: 22,
+    log_final_poly_len: 4,
+    max_log_arity: 4,
+};
+
+/// The DECIDED interior outer lane, **b2/q86/g22/fp16/a16** (non-hiding,
+/// `qlab_consensus::legacy`). Also F2b-4's `f2wrap --outer b2`.
+pub(crate) const INTERIOR_B2_CFG: crate::FriCfg = crate::FriCfg {
+    log_blowup: 1,
+    num_queries: 86, // q86 (B″, issue #41 — was q80; the decided interior lane)
+    grind_bits: 22,
+    log_final_poly_len: 4,
+    max_log_arity: 4,
+};
+
 /// `m4interior` bench mode (M4 step 1 stage 3): the interior peak-RSS gate.
 ///
 /// Proves ONE interior rectangle per invocation (filtered by `--only <name>`),
@@ -227,20 +247,7 @@ pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
     // ~100 bits conjectured (make_config_with asserts the capacity proxy: 43·2+22 =
     // 86·1+22 = 108, post-B″/B′) AND the 2197-corrected ceiling (b2/q86 → 100.2,
     // b4/q43 → 101.6). fp16/a16 match the leaf/consensus lane; grind g22 per B′.
-    let b4 = FriCfg {
-        log_blowup: 2,
-        num_queries: 43, // q43 (B″, issue #41 — was q40)
-        grind_bits: 22,
-        log_final_poly_len: 4,
-        max_log_arity: 4,
-    };
-    let b2 = FriCfg {
-        log_blowup: 1,
-        num_queries: 86, // q86 (B″, issue #41 — was q80; the decided interior lane)
-        grind_bits: 22,
-        log_final_poly_len: 4,
-        max_log_arity: 4,
-    };
+    let (b4, b2) = (INTERIOR_B4_CFG, INTERIOR_B2_CFG);
     // b2 rows first (the decided primary lane); b4 rows kept as the optional fallback.
     let rows: [(&str, Shape, FriCfg); 4] = [
         ("single-child/b2/q86/g22/fp16/a16", Shape::Single, b2),
