@@ -76,6 +76,10 @@ pub(crate) fn row(k: usize) -> Row {
 }
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "--interior") {
+        println!("{}", serde_json::to_string_pretty(&super::bench::interior_report()).expect("json"));
+        return Ok(());
+    }
     let ks: Vec<usize> = match args.iter().position(|a| a == "--k") {
         Some(i) => vec![args.get(i + 1).and_then(|v| v.parse().ok()).ok_or("--k takes a count")?],
         None => vec![4, 8, 16, 32],

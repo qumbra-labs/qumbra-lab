@@ -159,7 +159,7 @@ fn each_perm(plan: &mut Plan, from_perm: usize, f: impl Fn(&mut PermPlan)) {
 const P: L2ShapeTag = L2ShapeTag::P;
 const R: L2ShapeTag = L2ShapeTag::R;
 const S: L2ShapeTag = L2ShapeTag::S;
-const SEED: u64 = 0x767_f3b0;
+pub(crate) const SEED: u64 = 0x767_f3b0;
 
 /// One negative, run on demand.
 pub(crate) type Case = (&'static str, fn() -> Neg);
@@ -201,6 +201,8 @@ pub(crate) fn cases() -> Vec<Case> {
         ("key register limb out of range", neg_key_range),
         ("pv: N in", neg_pv_in),
         ("pv: SD out", neg_pv_out),
+        ("boundary: declared k != slots", neg_k_mismatch),
+        ("boundary: ends before PAD", neg_ends_early),
     ]
 }
 
@@ -465,6 +467,33 @@ fn neg_pv_out() -> Neg {
     judge("pv: SD out", &fx, |_, pvs| pvs[PV_SIDE + PV_SD] += Val::ONE, |_| {}, leaf_height(2) - 1, "last")
 }
 
+/// Boundary (a), F3-2b review: a two-slot trace checked as a three-slot
+/// leaf. The AIR seeds `LEFT = k − 1` on the first row; the trace's is 1.
+fn neg_k_mismatch() -> Neg {
+    let fx = fixture(&[P, R], SEED + 23);
+    let plan = build_plan(&fx.rin, &fx.txs, &fx.wits);
+    let trace = render(&plan);
+    let pvs = leaf_pvs(&fx.rin, &fx.rout);
+    let got = first_violation(&LeafAir::new(3), &trace, &pvs);
+    Neg { name: "boundary: declared k != slots", row: 0, phase: "first", got }
+}
+
+/// Boundary (b), F3-2b review: a two-slot leaf whose trace stops at 2^14
+/// rows, inside slot 2 — every earlier row consistent, the last row neither
+/// PAD nor the declared surface out.
+fn neg_ends_early() -> Neg {
+    let fx = fixture(&[P, R], SEED + 24);
+    let short = 1 << 14;
+    judge(
+        "boundary: ends before PAD",
+        &fx,
+        |_, _| {},
+        move |t| t.values.truncate(short * LEAF_WIDTH),
+        short - 1,
+        "last",
+    )
+}
+
 /// `qlab-bench f3neg [--only a-b]`: the negatives (1-based, inclusive
 /// range), one line each; an error on any miss.
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
@@ -493,19 +522,11 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `qlab-bench f3leaf --check [--shapes PSR…]`: an honest leaf over the
-/// given shapes (default `P`), scanned in full.
+/// `qlab-bench f3leaf --check [--shapes PSR… | --k N]`: an honest leaf over
+/// the given shapes (default `P`), scanned in full.
 pub(crate) fn check(args: &[String]) -> Result<(), String> {
-    let spec = args.iter().position(|a| a == "--shapes").and_then(|i| args.get(i + 1)).map_or("P", String::as_str);
-    let shapes: Vec<L2ShapeTag> = spec
-        .chars()
-        .map(|c| match c {
-            'S' => Ok(S),
-            'P' => Ok(P),
-            'R' => Ok(R),
-            other => Err(format!("unknown shape {other}")),
-        })
-        .collect::<Result<_, _>>()?;
+    let shapes = super::bench::shapes_arg(args)?;
+    let spec: String = shapes.iter().map(|t| format!("{t:?}")).collect();
     let k = shapes.len();
     let fx = fixture(&shapes, SEED);
     let t = std::time::Instant::now();
@@ -639,7 +660,7 @@ mod tests {
     #[test]
     fn f3leaf_negatives_refuse_at_their_binding_rows() {
         let cases = cases();
-        assert_eq!(cases.len(), 25);
+        assert_eq!(cases.len(), 27);
         let missed: Vec<String> = cases
             .iter()
             .map(|(_, f)| f())

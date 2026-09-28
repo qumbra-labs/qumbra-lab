@@ -13,8 +13,11 @@
 //! (`qlab-bench f3census`, [`census`]). F3-2a adds the leaf's 256-bit strict
 //! comparator, a 16-limb subtract-with-borrow gadget ([`cmp`]). F3-2b adds
 //! the leaf AIR and its trace generator ([`leaf`]), and its fixtures and
-//! negatives ([`neg`]: `qlab-bench f3leaf --check`, `f3neg`, `f3vec`).
+//! negatives ([`neg`]: `qlab-bench f3leaf --check`, `f3neg`, `f3vec`). F3-2c
+//! adds `f3leaf --prove` and the interior census, `f3census --interior`
+//! ([`bench`]).
 
+pub(crate) mod bench;
 pub(crate) mod census;
 pub(crate) mod cmp;
 pub(crate) mod leaf;
@@ -25,6 +28,7 @@ pub(crate) mod native;
 pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
     match mode {
         "f3census" => census::run(args),
+        "f3leaf" if args.iter().any(|a| a == "--prove") => bench::prove_run(args),
         "f3leaf" => neg::check(args),
         "f3neg" => neg::run(args),
         "f3vec" => neg::vec_run(args),
