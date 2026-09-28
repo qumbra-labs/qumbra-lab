@@ -8,11 +8,13 @@
 //! computes independently from the same leaf PVs; the wrapper checks the two
 //! agree. F3 verifies no proof in-circuit.
 //!
-//! This first slice is the **native reference** the AIR is built against and
+//! The first slice is the **native reference** the AIR is built against and
 //! the negatives are written from ([`native`]), and the symbolic census
-//! (`qlab-bench f3census`, [`census`]). No AIR yet.
+//! (`qlab-bench f3census`, [`census`]). F3-2a adds the leaf's 256-bit strict
+//! comparator, a 16-limb subtract-with-borrow gadget ([`cmp`]). No leaf AIR yet.
 
 pub(crate) mod census;
+pub(crate) mod cmp;
 pub(crate) mod native;
 
 /// `qlab-bench f3census …` — see [`census::run`].

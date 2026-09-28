@@ -3,7 +3,8 @@
 //! (a)'s surface digest. No allocation: this prices, it does not build.
 //!
 //! Every figure is **[P]**. The width is a stage-0 estimate until the AIR
-//! exists (then it is read off the AIR); the memory is F2's k-model
+//! exists (then it is read off the AIR) — except the comparator's share,
+//! read off the F3-2a gadget; the memory is F2's k-model
 //! (`peak_GiB ≈ K × width × 2^(h − 18)`, fitted on the legacy M4 interior —
 //! a planning model, not a bound).
 use qlab_devnet::annulet::L2ShapeTag;
@@ -14,9 +15,9 @@ use super::native::{sd_perms, N_DEPTH};
 pub(crate) const ROWS_PER_PERM: usize = 24;
 /// The wide lane's Keccak columns (p3-keccak-air 0.6.1).
 pub(crate) const KECCAK_COLS: usize = 2_633;
-/// [P] the 256-bit comparator's columns on its rows (two blocks of bits plus
-/// the degree-3 aux products) — stage-0 estimate.
-pub(crate) const CMP_COLS_P: usize = 800;
+/// The two 256-bit strict comparisons of an insert (`lo < K`, `K < hi`):
+/// two [`super::cmp`] gadgets on separate columns (F3-2a, 2 × 271).
+pub(crate) const CMP_COLS: usize = 2 * super::cmp::LT_WIDTH;
 /// [P] mux, path, running-root, index and selector columns — stage-0 estimate.
 pub(crate) const CONTROL_COLS_P: usize = 300;
 /// F2's k-model constants (`qlab-bench` `f2::ood::wrap`), GiB per col·2^18 rows.
@@ -66,7 +67,7 @@ pub(crate) fn row(k: usize) -> Row {
     let perms = k * tx_perms(L2ShapeTag::P);
     let rows = perms * ROWS_PER_PERM;
     let log_h = rows.next_power_of_two().trailing_zeros();
-    let width = KECCAK_COLS + CMP_COLS_P + CONTROL_COLS_P;
+    let width = KECCAK_COLS + CMP_COLS + CONTROL_COLS_P;
     let scale = width as f64 * 2f64.powi(log_h as i32 - 18);
     Row { k, perms, rows, log_h, width, gib_b2: K_B2 * scale, gib_b4: K_B4 * scale }
 }
@@ -76,7 +77,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         Some(i) => vec![args.get(i + 1).and_then(|v| v.parse().ok()).ok_or("--k takes a count")?],
         None => vec![4, 8, 16, 32],
     };
-    println!("# f3census (lab #767) — every figure [P]; width = {} keccak + {} cmp [P] + {} control [P]", KECCAK_COLS, CMP_COLS_P, CONTROL_COLS_P);
+    println!("# f3census (lab #767) — every figure [P]; width = {} keccak + {} cmp (2 × gadget) + {} control [P]", KECCAK_COLS, CMP_COLS, CONTROL_COLS_P);
     println!(
         "# per tx: S {} / P {} / R {} perms (insert {}, append {}, replace {}, SD S/P/R {}/{}/{})",
         tx_perms(L2ShapeTag::S),
@@ -102,14 +103,16 @@ mod tests {
     use super::*;
 
     /// The stage-0 model, pinned: a P transaction is 3 inserts, 2 appends and
-    /// ruling (a)'s 5-permutation digest step; every roadmap k fits the 32 GB
-    /// class at b2 and b4 [P].
+    /// ruling (a)'s 5-permutation digest step; the width carries the F3-2a
+    /// comparators (2 × 271); every roadmap k fits the 32 GB class at b2 and
+    /// b4 [P].
     #[test]
     fn f3_census_model() {
         assert_eq!((insert_perms(), append_perms(), replace_perms()), (131, 64, 34));
         assert_eq!(tx_perms(L2ShapeTag::P), 3 * 131 + 2 * 64 + 5);
         assert_eq!(tx_perms(L2ShapeTag::S), 3 * 131 + 2 * 64 + 4);
         assert_eq!(tx_perms(L2ShapeTag::R), 131 + 2 * 64 + 34 + 4);
+        assert_eq!(row(4).width, 2_633 + 542 + 300);
         for (k, log_h) in [(4, 16), (8, 17), (16, 18)] {
             let r = row(k);
             assert_eq!(r.log_h, log_h, "k = {k}");
