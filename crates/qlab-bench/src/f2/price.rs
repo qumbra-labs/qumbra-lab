@@ -352,6 +352,108 @@ pub(super) fn query_phase(log_height: usize, queries: usize) -> Value {
         "complete_verifier_layout": false, "memory_gate_pass": false})
 }
 
+/// The register machine's dimensions (`ood::machine_dims` for a shape, the
+/// toy's own in C1's honest test).
+pub(super) struct MachineDims {
+    /// Main columns: 12 + 4 · registers.
+    pub(super) width: usize,
+    /// Full-period ROM columns: 12 + 3 · registers + inputs.
+    pub(super) rom_width: usize,
+    /// Input extension values (one held 4-limb cell each).
+    pub(super) inputs: usize,
+    /// Padded rows of the schedule.
+    pub(super) height: usize,
+}
+
+/// Main columns C1's lever L1 adds (`ood/c1.rs`): nine running powers q_j,
+/// T = q_8 · fri_alpha, the point-masked copies pA_j and pB_j (4 limbs each),
+/// two step-0 parity gates, and the Az and Bz accumulators.
+const C1_L1_COLUMNS: usize = 4 * 9 * 3 + 4 + 2 + 2 * 4;
+
+/// [P] F2b composition slice C1 (`ood/c1.rs`): 2a's transcript-bound
+/// machine and 2b-i's FRI transcript on ONE duplex Keccak lane, with the
+/// Az/Bz accumulation (L1). Source-derived; C1's honest test pins this
+/// formula to the toy instance it builds, and `composed_c1_pins_the_census`
+/// pins the lane to the census's challenger count.
+///
+/// - Lane perms: every challenger flush of the hiding transcript (F0, F1, F2,
+///   one G per commit round, H, and a refill per query window after the
+///   first), plus one final refill whose first block carries the last
+///   window's digest bits: the census's `challenger_permutations_floor` + 1.
+/// - Columns: Keccak, M and S bits (duplex), 68 canonicity, 72 draw, one
+///   perm-ring column per lane perm (the scheduling that replaces 2a/2b-i's
+///   full-period step-0 selectors), L1, the held fri_alpha, 4 per machine
+///   input, the machine's registers.
+/// - Periodic: the machine ROM only, full period (L5 deferred). Its cost to
+///   the verifier of this proof is one Horner evaluation per column at ζ,
+///   `rom_columns × padded_rows` extension multiplies; the sponge selectors
+///   the ring replaced would have added `(perms + 2) × padded_rows`.
+/// - Public values: the inner PVs and every cap (trace, quotient,
+///   randomizer, commit rounds; 16-bit limbs), then the seam outputs ζ,
+///   fri_alpha, Az, Bz, every β, the final polynomial and the query indices.
+pub(super) fn composed_c1_layout(
+    width: usize,
+    pv_len: usize,
+    log_height: usize,
+    chunks: usize,
+    m: &MachineDims,
+) -> Value {
+    let cfg = L2_CFG_PROVISIONAL;
+    let lde = lde_log(log_height);
+    let arities = fri_log_arities(lde, &cfg);
+    let rounds = arities.len();
+    let final_len = 1usize << cfg.log_final_poly_len;
+    let cap_words = (1usize << CAP_HEIGHT) * 8;
+    let terms = 4 + 2 * width + 4 * chunks;
+    // pad10*1 always adds at least one byte: words / 34 + 1 blocks.
+    let blocks = |words: usize| words / 34 + 1;
+    let windows = (cfg.num_queries + 1).div_ceil(8);
+    let (f0, f1, f2) = (
+        blocks(3 + cap_words + pv_len),
+        blocks(8 + 2 * cap_words),
+        blocks(8 + 4 * terms),
+    );
+    let (g, h) = (
+        rounds * blocks(8 + cap_words),
+        blocks(8 + 4 * final_len + rounds + 1),
+    );
+    let perms = f0 + f1 + f2 + g + h + windows;
+    let lane_rows = 24 * perms;
+    let rows = lane_rows.next_power_of_two().max(m.height);
+    let lane = NUM_KECCAK_COLS + 2 * 64 * 17 + 2 * 34 + 8 * 9;
+    let columns = lane + perms + C1_L1_COLUMNS + 4 + 4 * m.inputs + m.width;
+    let outputs = 16 + 4 * rounds + 4 * final_len + cfg.num_queries;
+    json!({"evidence": "P", "source": "F2b composition C1 layout (ood/c1.rs), source-derived; toy pinned by its tests",
+        "lane_permutations": perms, "challenger_permutations": perms - 1,
+        "flush_blocks": {"f0": f0, "f1": f1, "f2_opened_values": f2, "commit_rounds": g,
+            "final_poly_arities_pow": h, "query_windows": windows},
+        "opened_terms": terms, "lane_rows": lane_rows, "machine_rows": m.height,
+        "padded_rows": rows,
+        "component_columns": columns,
+        "column_split": {"keccak": NUM_KECCAK_COLS, "message_and_state_bits": 2 * 64 * 17,
+            "canonical": 2 * 34, "draw": 8 * 9, "perm_ring": perms, "l1_accumulation": C1_L1_COLUMNS,
+            "held_fri_alpha": 4, "machine_inputs": 4 * m.inputs, "machine": m.width},
+        "periodic_columns": m.rom_width, "periodic_column_length": rows,
+        "rom_ood_extension_mul": m.rom_width * rows,
+        "replaced_sponge_selectors_ood_extension_mul": (perms + 2) * rows,
+        "public_values": pv_len + (3 + rounds) * 2 * cap_words + outputs,
+        "seam_outputs": outputs,
+        "complete_verifier_layout": false, "memory_gate_pass": false})
+}
+
+/// [P] `composed_c1_layout` for a shape, its machine compiled from the
+/// shape's live OOD DAG.
+pub(super) fn composed_c1(shape: Shape) -> Result<Value, String> {
+    let m = super::ood::machine_dims(shape)?;
+    Ok(composed_c1_layout(
+        shape.width(),
+        shape.pv_len(),
+        shape.log_height(),
+        8,
+        &m,
+    ))
+}
+
 impl Geometry {
     pub(super) fn report(&self, shape: Shape) -> Value {
         let cfg = L2_CFG_PROVISIONAL;
@@ -479,6 +581,34 @@ mod tests {
         assert_eq!(1075 + 344, 1419);
         assert_eq!(2451 + 1548, 3999);
         assert_eq!(s["lane_rows"], 45_408);
+    }
+
+    #[test]
+    fn composed_c1_pins_the_census() {
+        // C1's lane is the whole challenger transcript plus one carrier
+        // refill: at S3, the census's 206 challenger perms + 1. The machine
+        // dimensions are F2b-0's (S3 1,216 x 2^15, ROM 2,227, 1,312 inputs).
+        for (shape, perms, columns, rom, pvs) in [
+            (Shape::S, 207, 11_746, 2_227, 1_151),
+            (Shape::P, 228, 12_655, 2_593, 1_295),
+            (Shape::R, 209, 12_040, 2_364, 1_136),
+        ] {
+            let g = geometry(shape, 8);
+            let c = composed_c1(shape).unwrap();
+            assert_eq!(c["challenger_permutations"], g.fs_floor);
+            assert_eq!(c["lane_permutations"], perms);
+            assert_eq!(c["component_columns"], columns);
+            assert_eq!(c["periodic_columns"], rom);
+            assert_eq!(c["public_values"], pvs);
+            assert_eq!(c["padded_rows"], 1 << 15);
+            assert_eq!(c["opened_terms"], g.ood);
+            assert_eq!(c["seam_outputs"], 16 + 4 * g.log_arities.len() + 64 + 43);
+        }
+        let s = composed_c1(Shape::S).unwrap();
+        assert_eq!(s["challenger_permutations"], 206);
+        assert_eq!(s["lane_rows"], 207 * 24);
+        assert_eq!(s["rom_ood_extension_mul"], 2_227 << 15);
+        assert_eq!(s["replaced_sponge_selectors_ood_extension_mul"], 209 << 15);
     }
 
     #[test]

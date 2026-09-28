@@ -9,6 +9,9 @@ mod fold;
 // F2b-2b-i: the FRI Fiat–Shamir continuation from D2 (test-only AIR).
 #[cfg(test)]
 mod fri_fs;
+// F2b composition C1: 2a + 2b-i on one lane, plus the L1 Az/Bz sums (test-only AIR).
+#[cfg(test)]
+mod c1;
 // The Keccak sponge lane both transcript components share.
 #[cfg(test)]
 mod lane;
@@ -502,6 +505,23 @@ pub(super) fn verify_relation(shape: Shape, proof: &Proof<Config>, pvs: &[Val]) 
         Shape::P => check(shape, &qlab_l2::verifier_air_p(), &inputs),
         Shape::R => check(shape, &qlab_l2::verifier_air_r(), &inputs),
     }
+}
+
+/// [P] The register machine's dimensions for `shape` — what
+/// `price::composed_c1` needs from the compiled OOD program.
+pub(super) fn machine_dims(shape: Shape) -> Result<super::price::MachineDims> {
+    let program = match shape {
+        Shape::S => Program::compile(shape, &qlab_l2::verifier_air_s())?,
+        Shape::P => Program::compile(shape, &qlab_l2::verifier_air_p())?,
+        Shape::R => Program::compile(shape, &qlab_l2::verifier_air_r())?,
+    };
+    let s = &program.schedule;
+    Ok(super::price::MachineDims {
+        width: s.width(),
+        rom_width: s.rom_width(),
+        inputs: s.input_count(),
+        height: s.height(),
+    })
 }
 
 pub(super) fn price(shape: Shape) -> Result<Value> {
