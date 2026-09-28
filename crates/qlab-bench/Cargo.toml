@@ -13,6 +13,9 @@ qlab-consensus = { path = "../qlab-consensus" }
 # The L2 consensus crate (lab #704): `l2shape` reads the L2 lane and the
 # measured fixtures from it — one source, never a local copy.
 qlab-l2 = { path = "../qlab-l2" }
+# The node's commitment and registry trees (lab #767): F3's native reference
+# builds on them so its roots are the node's roots bit for bit.
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 # M5 note-encryption prototype library (additive; see crates/qlab-note).
 qlab-note = { path = "../qlab-note" }
 # M6 consensus/network devnet library (additive; see crates/qlab-devnet). The

@@ -1542,6 +1542,7 @@ dependencies = [
  "p3-util",
  "postcard",
  "qlab-air",
+ "qlab-cbserver",
  "qlab-consensus",
  "qlab-devnet",
  "qlab-disclosure",
