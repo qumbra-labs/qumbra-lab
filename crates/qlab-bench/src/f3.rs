@@ -11,16 +11,23 @@
 //! The first slice is the **native reference** the AIR is built against and
 //! the negatives are written from ([`native`]), and the symbolic census
 //! (`qlab-bench f3census`, [`census`]). F3-2a adds the leaf's 256-bit strict
-//! comparator, a 16-limb subtract-with-borrow gadget ([`cmp`]). No leaf AIR yet.
+//! comparator, a 16-limb subtract-with-borrow gadget ([`cmp`]). F3-2b adds
+//! the leaf AIR and its trace generator ([`leaf`]), and its fixtures and
+//! negatives ([`neg`]: `qlab-bench f3leaf --check`, `f3neg`, `f3vec`).
 
 pub(crate) mod census;
 pub(crate) mod cmp;
+pub(crate) mod leaf;
+pub(crate) mod neg;
 pub(crate) mod native;
 
-/// `qlab-bench f3census …` — see [`census::run`].
+/// `qlab-bench f3census | f3leaf | f3neg | f3vec …`.
 pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
     match mode {
         "f3census" => census::run(args),
+        "f3leaf" => neg::check(args),
+        "f3neg" => neg::run(args),
+        "f3vec" => neg::vec_run(args),
         other => Err(format!("unknown f3 mode `{other}`")),
     }
 }

@@ -31,7 +31,8 @@
 //! 4. verifies against a **canonical, witness-free AIR**. The AIR's constraints
 //!    read only the structural program ring + trace + public values — never
 //!    `slot_witness` or `self.fee` — so any 2×2 bucket instance yields the exact
-//!    AIR the prover used; we overwrite its `.pvs` with the declared surface.
+//!    AIR the prover used; the declared surface is passed to `verify_proof`
+//!    as the public values (the instance's own `.pvs` are never read).
 //!
 //! Verification cost is ms-class (M4 census: 2,336 keccak-f/proof native).
 
@@ -354,8 +355,8 @@ pub const L1_CONSTRAINTS_DIGEST: Option<&str> =
 /// A canonical 2×2-bucket instance whose `.air` is exactly the AIR the prover
 /// used. The AIR's constraints read only the structural program ring, trace, and
 /// public values — never `slot_witness` or `self.fee` — so the specific witness
-/// values (and the balance) are irrelevant to verification; the caller overwrites
-/// `.pvs` with the tx's declared surface.
+/// values (and the balance) are irrelevant to verification; the caller passes
+/// the tx's declared surface to `verify_proof` as the public values.
 fn canonical_bucket_instance() -> BucketInstance {
     let inputs = [
         TxInput { sk: [1, 2, 3, 4], value: 3, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12], d: [0, 0] },

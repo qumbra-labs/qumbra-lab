@@ -758,7 +758,7 @@ fn main() {
         return;
     }
 
-    if mode == "f3census" {
+    if matches!(mode.as_str(), "f3census" | "f3leaf" | "f3neg" | "f3vec") {
         // Lab #767: the state-transition leaf's symbolic census.
         if let Err(error) = f3::run(&mode, &args[1..]) {
             eprintln!("{mode}: {error}");

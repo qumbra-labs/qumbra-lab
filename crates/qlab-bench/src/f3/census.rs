@@ -2,9 +2,8 @@
 //! symbolic census on the wide lane, from the stage-0 cost model plus ruling
 //! (a)'s surface digest. No allocation: this prices, it does not build.
 //!
-//! Every figure is **[P]**. The width is a stage-0 estimate until the AIR
-//! exists (then it is read off the AIR) — except the comparator's share,
-//! read off the F3-2a gadget; the memory is F2's k-model
+//! Every figure is **[P]**. The width and the per-transaction slot are read
+//! off the F3-2b leaf AIR ([`super::leaf`]); the memory is F2's k-model
 //! (`peak_GiB ≈ K × width × 2^(h − 18)`, fitted on the legacy M4 interior —
 //! a planning model, not a bound).
 use qlab_devnet::annulet::L2ShapeTag;
@@ -15,11 +14,6 @@ use super::native::{sd_perms, N_DEPTH};
 pub(crate) const ROWS_PER_PERM: usize = 24;
 /// The wide lane's Keccak columns (p3-keccak-air 0.6.1).
 pub(crate) const KECCAK_COLS: usize = 2_633;
-/// The two 256-bit strict comparisons of an insert (`lo < K`, `K < hi`):
-/// two [`super::cmp`] gadgets on separate columns (F3-2a, 2 × 271).
-pub(crate) const CMP_COLS: usize = 2 * super::cmp::LT_WIDTH;
-/// [P] mux, path, running-root, index and selector columns — stage-0 estimate.
-pub(crate) const CONTROL_COLS_P: usize = 300;
 /// F2's k-model constants (`qlab-bench` `f2::ood::wrap`), GiB per col·2^18 rows.
 pub(crate) const K_B2: f64 = 0.002_656_45;
 pub(crate) const K_B4: f64 = 0.004_279_69;
@@ -35,12 +29,13 @@ pub(crate) const fn insert_perms() -> usize {
 pub(crate) const fn append_perms() -> usize {
     2 * N_DEPTH
 }
-/// One shape-R replacement: two leaf hashes and two depth-16 folds.
+/// One shape-R replacement: the new leaf's hash and two depth-16 folds (the
+/// old leaf opens from its digest).
 pub(crate) const fn replace_perms() -> usize {
-    2 * R_DEPTH + 2
+    2 * R_DEPTH + 1
 }
 
-/// Permutations one transaction of `tag` costs in the leaf.
+/// Permutations a transaction of `tag` uses in its slot.
 pub(crate) fn tx_perms(tag: L2ShapeTag) -> usize {
     let (nfs, cms, pv_len, write) = match tag {
         L2ShapeTag::S => (3, 2, qlab_air::l2::PV_LEN, 0),
@@ -49,6 +44,14 @@ pub(crate) fn tx_perms(tag: L2ShapeTag) -> usize {
     };
     nfs * insert_perms() + cms * append_perms() + write + sd_perms(pv_len)
 }
+
+/// The slot every transaction occupies (approved deviation 4): the most of
+/// each segment any shape uses — 5 SD blocks, 3 inserts, 2 appends, one
+/// registry replacement.
+pub(crate) fn slot_perms() -> usize {
+    SD_SLOT + 3 * insert_perms() + 2 * append_perms() + replace_perms()
+}
+const SD_SLOT: usize = 5;
 
 /// One leaf's census row.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,12 +65,12 @@ pub(crate) struct Row {
     pub gib_b4: f64,
 }
 
-/// The worst-case leaf of `k` transactions: every one shape P (the costliest).
+/// A leaf of `k` transactions: `k` fixed slots, whatever the shapes.
 pub(crate) fn row(k: usize) -> Row {
-    let perms = k * tx_perms(L2ShapeTag::P);
+    let perms = k * slot_perms();
     let rows = perms * ROWS_PER_PERM;
     let log_h = rows.next_power_of_two().trailing_zeros();
-    let width = KECCAK_COLS + CMP_COLS + CONTROL_COLS_P;
+    let width = super::leaf::LEAF_WIDTH;
     let scale = width as f64 * 2f64.powi(log_h as i32 - 18);
     Row { k, perms, rows, log_h, width, gib_b2: K_B2 * scale, gib_b4: K_B4 * scale }
 }
@@ -77,9 +80,15 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         Some(i) => vec![args.get(i + 1).and_then(|v| v.parse().ok()).ok_or("--k takes a count")?],
         None => vec![4, 8, 16, 32],
     };
-    println!("# f3census (lab #767) — every figure [P]; width = {} keccak + {} cmp (2 × gadget) + {} control [P]", KECCAK_COLS, CMP_COLS, CONTROL_COLS_P);
     println!(
-        "# per tx: S {} / P {} / R {} perms (insert {}, append {}, replace {}, SD S/P/R {}/{}/{})",
+        "# f3census (lab #767) — memory [P]; width {} = {} keccak + {} leaf columns (the F3-2b AIR); slot {} perms",
+        super::leaf::LEAF_WIDTH,
+        KECCAK_COLS,
+        super::leaf::LEAF_WIDTH - KECCAK_COLS,
+        slot_perms()
+    );
+    println!(
+        "# per tx used: S {} / P {} / R {} perms (insert {}, append {}, replace {}, SD S/P/R {}/{}/{})",
         tx_perms(L2ShapeTag::S),
         tx_perms(L2ShapeTag::P),
         tx_perms(L2ShapeTag::R),
@@ -102,17 +111,17 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The stage-0 model, pinned: a P transaction is 3 inserts, 2 appends and
-    /// ruling (a)'s 5-permutation digest step; the width carries the F3-2a
-    /// comparators (2 × 271); every roadmap k fits the 32 GB class at b2 and
-    /// b4 [P].
+    /// The model, pinned to the F3-2b AIR: a slot is 5 SD blocks, 3 inserts,
+    /// 2 appends and one replacement — 559 perms, the leaf program's own
+    /// count — and every roadmap k fits the 32 GB class at b2 and b4 [P].
     #[test]
     fn f3_census_model() {
-        assert_eq!((insert_perms(), append_perms(), replace_perms()), (131, 64, 34));
+        assert_eq!((insert_perms(), append_perms(), replace_perms()), (131, 64, 33));
         assert_eq!(tx_perms(L2ShapeTag::P), 3 * 131 + 2 * 64 + 5);
-        assert_eq!(tx_perms(L2ShapeTag::S), 3 * 131 + 2 * 64 + 4);
-        assert_eq!(tx_perms(L2ShapeTag::R), 131 + 2 * 64 + 34 + 4);
-        assert_eq!(row(4).width, 2_633 + 542 + 300);
+        assert_eq!(tx_perms(L2ShapeTag::S), 3 * 131 + 2 * 64 + 5);
+        assert_eq!(tx_perms(L2ShapeTag::R), 131 + 2 * 64 + 33 + 4);
+        assert_eq!(slot_perms(), super::super::leaf::SLOT_PERMS);
+        assert_eq!(row(4).width, super::super::leaf::LEAF_WIDTH);
         for (k, log_h) in [(4, 16), (8, 17), (16, 18)] {
             let r = row(k);
             assert_eq!(r.log_h, log_h, "k = {k}");
