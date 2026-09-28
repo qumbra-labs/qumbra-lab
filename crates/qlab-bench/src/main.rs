@@ -21,6 +21,7 @@ mod geometry;
 mod l2shape;
 mod zkpeak;
 mod f2;
+mod f3;
 #[cfg(feature = "phasemem")]
 mod phasemem;
 
@@ -749,6 +750,15 @@ fn main() {
         .map(|(_, a)| a.as_str())
         .unwrap_or("matrix")
         .to_string();
+
+    if mode == "f3census" {
+        // Lab #767: the state-transition leaf's symbolic census.
+        if let Err(error) = f3::run(&mode, &args[1..]) {
+            eprintln!("{mode}: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
 
     if matches!(
         mode.as_str(),
