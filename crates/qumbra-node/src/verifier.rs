@@ -36,7 +36,7 @@
 //! Verification cost is ms-class (M4 census: 2,336 keccak-f/proof native).
 
 use qlab_air::narrow::{build_bucket, pv_vec, BucketInstance, TxInput, TxOutput};
-use qlab_consensus::{public_values, verify_proof, Config, Proof, LOG_HEIGHT};
+use qlab_consensus::{verify_proof, Config, Proof, LOG_HEIGHT};
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
 use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::header::Hash32;
@@ -71,10 +71,8 @@ impl TxVerifier for ConsensusVerifier {
             Err(_) => return false,
         };
         // (4) Verify against the canonical witness-free AIR with the declared PVs.
-        let mut inst = canonical_bucket_instance();
-        inst.pvs = pvs_u32;
-        let pvs = public_values(&inst);
-        verify_proof(&inst, &pvs, &proof)
+        let inst = canonical_bucket_instance();
+        verify_proof(&inst, &pvs_u32, &proof)
     }
 }
 

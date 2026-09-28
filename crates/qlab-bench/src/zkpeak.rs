@@ -87,9 +87,9 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
         ("l1", None) => {
             let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
             let t = Instant::now();
-            let (pvs, proof) = qlab_consensus::prove_bucket(&inst);
+            let (_, proof) = qlab_consensus::prove_bucket(&inst);
             let secs = t.elapsed().as_secs_f64();
-            let ok = qlab_consensus::verify_proof(&inst, &pvs, &proof);
+            let ok = qlab_consensus::verify_proof(&inst, &inst.pvs, &proof);
             let bytes = bincode::serialize(&proof).expect("bincode").len();
             (format!("L1 2×2 bucket @ {} (2^{})", qlab_consensus::CONSENSUS_CFG.label(), qlab_consensus::LOG_HEIGHT), secs, ok, bytes)
         }

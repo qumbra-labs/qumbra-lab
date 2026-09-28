@@ -368,8 +368,24 @@ pub fn prove_bucket(inst: &BucketInstance) -> (Vec<Val>, Proof<Config>) {
 }
 
 /// Node-side verification: `true` iff `proof` is a valid consensus proof for
-/// `inst` under `pvs`.
-pub fn verify_proof(inst: &BucketInstance, pvs: &[Val], proof: &Proof<Config>) -> bool {
+/// `inst` under the public values `pvs`, given **as the verifier builds them**
+/// — the bucket's 84 chunks of 16 bits (`qlab_air::narrow::pv_vec` from the
+/// declared surface). A vector of the wrong length, or with any chunk outside
+/// `qlab_air::narrow::audit_pv_bits()`, is refused before any proof work
+/// (lab #758's range premise: the L1 counterpart of `qlab_l2::pv_in_range`).
+/// The field-element entry is crate-private, so no caller can hand the
+/// verifier a public value no honest node constructs.
+pub fn verify_proof(inst: &BucketInstance, pvs: &[u32], proof: &Proof<Config>) -> bool {
+    let bits = qlab_air::narrow::audit_pv_bits();
+    if pvs.len() != bits.len() || pvs.iter().zip(&bits).any(|(v, b)| *b < 32 && *v >= 1 << b) {
+        return false;
+    }
+    let vals: Vec<Val> = pvs.iter().map(|v| Val::from_u32(*v)).collect();
+    verify_proof_vals(inst, &vals, proof)
+}
+
+/// [`verify_proof`] over field elements, unchecked: crate-private (lab #758).
+pub(crate) fn verify_proof_vals(inst: &BucketInstance, pvs: &[Val], proof: &Proof<Config>) -> bool {
     let config = make_config();
     verify(&config, &inst.air, proof, pvs).is_ok()
 }
@@ -408,8 +424,15 @@ mod tests {
     #[test]
     fn real_m3_proof_roundtrips() {
         let inst = balanced_bucket();
-        let (pvs, proof) = prove_bucket(&inst);
-        assert!(verify_proof(&inst, &pvs, &proof), "real M3 proof must verify");
+        let (_, proof) = prove_bucket(&inst);
+        assert!(verify_proof(&inst, &inst.pvs, &proof), "real M3 proof must verify");
+        // Lab #758: the typed entry refuses what no honest node builds — a
+        // chunk outside 16 bits, or a vector of the wrong length — before
+        // any proof work; the same proof under the honest vector verifies.
+        let mut wide = inst.pvs.clone();
+        wide[0] = 1 << 16;
+        assert!(!verify_proof(&inst, &wide, &proof), "a 17-bit chunk is refused");
+        assert!(!verify_proof(&inst, &inst.pvs[1..], &proof), "a short vector is refused");
     }
 
     /// The minted consensus proof size. **One source of truth**: both the wire
@@ -464,8 +487,8 @@ mod tests {
     #[test]
     fn consensus_wire_is_pinned() {
         let inst = balanced_bucket();
-        let (pvs, proof) = prove_bucket(&inst);
-        assert!(verify_proof(&inst, &pvs, &proof));
+        let (_, proof) = prove_bucket(&inst);
+        assert!(verify_proof(&inst, &inst.pvs, &proof));
         let bytes = bincode::serialize(&proof)
             .expect("bincode serialization failed")
             .len();
@@ -526,14 +549,14 @@ mod tests {
     #[test]
     fn q69_dummy_proof_verifies_and_is_size_indistinguishable() {
         let real = balanced_bucket();
-        let (real_pvs, real_proof) = prove_bucket(&real);
-        assert!(verify_proof(&real, &real_pvs, &real_proof), "real 2×2 must verify");
+        let (_, real_proof) = prove_bucket(&real);
+        assert!(verify_proof(&real, &real.pvs, &real_proof), "real 2×2 must verify");
 
         let dummy = dummy1_bucket();
         assert!(dummy.air.dv, "precondition: slot 1 is declared dummy");
-        let (d_pvs, d_proof) = prove_bucket(&dummy);
+        let (_, d_proof) = prove_bucket(&dummy);
         assert!(
-            verify_proof(&dummy, &d_pvs, &d_proof),
+            verify_proof(&dummy, &dummy.pvs, &d_proof),
             "the dummy-slot proof must be accepted by p3_uni_stark::verify at \
              the frozen config, not merely by check_constraints"
         );
@@ -556,10 +579,10 @@ mod tests {
     fn q69_dummy_proof_is_bound_to_its_declared_nullifier() {
         use qlab_air::narrow::PV_NF2;
         let dummy = dummy1_bucket();
-        let (pvs, proof) = prove_bucket(&dummy);
-        assert!(verify_proof(&dummy, &pvs, &proof));
-        let mut tampered = pvs.clone();
-        tampered[PV_NF2 + 5] += Val::ONE;
+        let (_, proof) = prove_bucket(&dummy);
+        assert!(verify_proof(&dummy, &dummy.pvs, &proof));
+        let mut tampered = dummy.pvs.clone();
+        tampered[PV_NF2 + 5] ^= 1;
         assert!(
             !verify_proof(&dummy, &tampered, &proof),
             "a rewritten dummy nullifier must be refused by the real verifier"

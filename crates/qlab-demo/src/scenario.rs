@@ -45,7 +45,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::ledger::{NullifierSet, SupplyTracker};
-use crate::prover::{live_witness, prove_bucket, verify_proof, Config, Val, LOG_HEIGHT};
+use crate::prover::{live_witness, prove_bucket, verify_proof, Config, LOG_HEIGHT};
 
 /// Demo anchor-age window (blocks). Compressed from the real
 /// `MAX_ANCHOR_AGE_BLOCKS` (24 h @ 60 s = 1440) so the accelerated sim can
@@ -63,16 +63,16 @@ fn h32(x: &[u64; 4]) -> Hash32 {
 }
 
 /// The real M3 verifier injected into `validate_body`: it holds proved
-/// instances/pvs/proofs and runs `crate::prover::verify_proof`. The TxEntry's
+/// instances and proofs and runs `crate::prover::verify_proof` on each instance's own public values. The TxEntry's
 /// proof bytes encode the pool index (little-endian u64), the m6devnet pattern.
 struct PoolVerifier {
-    pool: Vec<(BucketInstance, Vec<Val>, Proof<Config>)>,
+    pool: Vec<(BucketInstance, Proof<Config>)>,
 }
 impl TxVerifier for PoolVerifier {
     fn verify_tx(&self, entry: &TxEntry) -> bool {
         let idx = usize::from_le_bytes(entry.proof[..8].try_into().expect("8-byte index"));
-        let (inst, pvs, proof) = &self.pool[idx];
-        verify_proof(inst, pvs, proof)
+        let (inst, proof) = &self.pool[idx];
+        verify_proof(inst, &inst.pvs, proof)
     }
 }
 
@@ -276,7 +276,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     );
 
     let t = Instant::now();
-    let (send_pvs, send_proof) = prove_bucket(&send_inst);
+    let (_, send_proof) = prove_bucket(&send_inst);
     prove_secs.push(t.elapsed().as_secs_f64());
     say!("Real M3 proof #1 (send): {:.2} s", prove_secs[0]);
 
@@ -288,7 +288,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     let send_body = BlockBody::from_single_payee(vec![send_entry], 0, [0; 4]);
     // cm_out surfaces bound into the send proof; keep them for the tree append.
     let send_out_cms = send_inst.cm_out;
-    let verifier = PoolVerifier { pool: vec![(send_inst, send_pvs, send_proof)] };
+    let verifier = PoolVerifier { pool: vec![(send_inst, send_proof)] };
     let send_header = header_committing_to(&send_body);
     validate_body(&send_header, &send_body, &verifier, |r: &Hash32| {
         node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
@@ -363,11 +363,11 @@ pub fn run_loop(seed: u64) -> LoopReport {
     let spend_entry = tx_entry(&spend_inst);
 
     let t = Instant::now();
-    let (spend_pvs, spend_proof) = prove_bucket(&spend_inst);
+    let (_, spend_proof) = prove_bucket(&spend_inst);
     prove_secs.push(t.elapsed().as_secs_f64());
     say!("Real M3 proof #2 (spend, anchored to finalized R1): {:.2} s", prove_secs[1]);
 
-    let verifier2 = PoolVerifier { pool: vec![(spend_inst, spend_pvs, spend_proof)] };
+    let verifier2 = PoolVerifier { pool: vec![(spend_inst, spend_proof)] };
     let spend_body = BlockBody::from_single_payee(vec![spend_entry.clone()], 0, [0; 4]);
     validate_body(&header_committing_to(&spend_body), &spend_body, &verifier2, |r: &Hash32| {
         node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)

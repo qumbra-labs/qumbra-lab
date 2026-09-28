@@ -95,7 +95,7 @@ mod tests {
 
         let inst = build_bucket_with_witnesses(LOG_HEIGHT, &inputs, &outputs, 1_000, &[w0, w1], anchor);
         assert_eq!(inst.anchor, anchor, "proof anchors to the live-tree root");
-        let (pvs, proof) = prove_bucket(&inst);
-        assert!(verify_proof(&inst, &pvs, &proof), "real proof against live tree must verify");
+        let (_, proof) = prove_bucket(&inst);
+        assert!(verify_proof(&inst, &inst.pvs, &proof), "real proof against live tree must verify");
     }
 }
