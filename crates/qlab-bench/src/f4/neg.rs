@@ -32,6 +32,9 @@ pub(crate) struct WFixture {
     pub pre_claim: Member,
     /// What built it: the honest [`base`] a negative on it is judged against.
     pub key: FxKey,
+    /// The wrapper's claims' openings, in slot order (their deposit sum is
+    /// `inp.d_batch`).
+    pub deps: Vec<super::dep::DepEntry>,
 }
 
 /// A fixture's `(kinds, seed, P rows)`.
@@ -60,7 +63,7 @@ fn memo<T>(store: &Memo<T>, key: &FxKey, f: impl FnOnce() -> T) -> Arc<OnceLock<
 /// Every fixture claim pays this fee (a claim's fee is the chain's tariff):
 /// `0x1_FFFF` — ≥ 2^16, and two of them carry out of limb 0 (condition (i)).
 pub(crate) const CLAIM_FEE: u64 = 0x1_ffff;
-/// The prefill's deposit total, and each fixture wrapper's.
+/// The prefill's deposit total (a fixture wrapper's is its claims' sum).
 pub(crate) const PRE_D: u64 = 1_000_000;
 /// The prefill mints this much of asset [`ASSET`].
 pub(crate) const PRE_MINT: u64 = 1000;
@@ -95,14 +98,19 @@ fn build_fixture(key: FxKey) -> WFixture {
     ];
     s.apply(&pre_inp, &pre_members).expect("the prefill wrapper");
     let pre = s.clone();
-    let inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: PRE_D };
+    let mut inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: 0 };
     let c_in = s.l2.c.root();
     let mut work = s.l2.clone();
     let mut members = Vec::new();
+    let mut deps = Vec::new();
     let mut asset = 7;
     for (i, k) in kinds.iter().enumerate() {
         let m = match k {
-            WTag::C => synth_claim(&mut rng, &inp.absorbed[i % M_ABS], CLAIM_FEE),
+            WTag::C => {
+                let (m, open) = synth_claim_open(&mut rng, &inp.absorbed[i % M_ABS], CLAIM_FEE);
+                deps.push(open);
+                m
+            }
             WTag::R => {
                 asset += 1;
                 let t = synth_write(&mut rng, &work, RegistryLeaf::cloaked(asset - 1));
@@ -117,9 +125,11 @@ fn build_fixture(key: FxKey) -> WFixture {
         };
         members.push(m);
     }
+    // D_batch is the claims' deposit sum (what the deposit proof binds).
+    inp.d_batch = deps.iter().map(|d| d.v).sum();
     let (rin, wit, rout) = s.apply(&inp, &members).expect("the fixture wrapper");
     let exit_cmt = check_wrapper_leaf(&rin, &inp, &members, &wit).expect("its check").1;
-    WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim, key }
+    WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim, key, deps }
 }
 
 /// [`wfixture_rows`] with the default P rows.
@@ -321,7 +331,7 @@ pub(crate) fn cases() -> Vec<Case> {
         ("w6 fee note value != sum of fees", neg_fee_value),
         ("w7 fee note nonzero with no claims", neg_fee_no_claims),
         ("w8 a claim fee not accumulated", neg_fee_acc),
-        ("w9 absorbed root at a skipped index", neg_absorb_skip),
+        ("w9 absorbed subtree at a skipped slot", neg_absorb_skip),
         ("w10 K threading gap", neg_k_gap),
         ("w11 a claim declared a transaction", neg_claim_as_tx),
         ("w12 activate a claim's gated-off insert", neg_claim_insert1),
@@ -353,6 +363,14 @@ pub(crate) fn cases() -> Vec<Case> {
         ("R6 KAN off for a claim", neg_kan_off),
         ("R6 KFE off for a claim", neg_kfe_off),
         ("R6 registry on for a claim", neg_registry_on_claim),
+        ("r absorb old side != zeros[2]", neg_abs_old_side),
+        ("r absorb at aa_next = 1 mod 4", neg_abs_misaligned),
+        ("r absorbed roots reordered in the subtree", neg_abs_reordered),
+        ("S2 exit rkm not the chain's", neg_exit_rkm),
+        ("S4 D overflow", neg_d_overflow),
+        ("S5 asset-0 redeem moves the supply leaf", neg_asset0_moves_supply),
+        ("S5 an exit left out of the chain", neg_exit_skipped),
+        ("S5 an asset-0 redeem not flagged an exit", neg_exit_unflagged),
     ]
 }
 
@@ -453,12 +471,70 @@ fn neg_supply_underflow() -> Neg {
     witness("l supply underflow", fx, s0(0, Seg::SupNew(1), 0), "supply")
 }
 
-/// (l): two asset-0 redeems whose sum passes 2^64: E_out has no u64 form.
+/// (l): two asset-0 redeems whose sum passes 2^64, with `E_out` the
+/// wrapped sum (review S4): every limb but the top one balances, so only
+/// "no carry out" refuses.
 fn neg_e_overflow() -> Neg {
     let mut fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
     set_row(&mut fx.members[0], 0, 1, u64::MAX, 0);
     set_row(&mut fx.members[0], 1, 1, 5, 0);
+    fx.rout.e_cum = fx.rin.e_cum.wrapping_add(u64::MAX).wrapping_add(5);
     witness("l E overflow", fx, s0(0, Seg::FeeRseed, 0), "de")
+}
+
+/// S4: `D_in + D_batch` past 2^64 − 1, `D_out` the wrapped sum.
+fn neg_d_overflow() -> Neg {
+    let mut fx = wfixture(&[C], SEED);
+    fx.rin.d_cum = u64::MAX - 3;
+    fx.rout.d_cum = fx.rin.d_cum.wrapping_add(fx.inp.d_batch);
+    witness("S4 D overflow", fx, s0(0, Seg::FeeRho, 0), "de")
+}
+
+/// S2: an exit's `rkm` other than the one the chain was taken over — a free
+/// witness, but bound through `exit_cmt`.
+fn neg_exit_rkm() -> Neg {
+    let mut fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
+    fx.wit.extra[0].vp[0].exit_rkm[0] ^= 1;
+    witness("S2 exit rkm not the chain's", fx, w_height(1) - 1, "last")
+}
+
+/// S5: an asset-0 redeem that moves the supply leaf.
+fn neg_asset0_moves_supply() -> Neg {
+    let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
+    judge(
+        "S5 asset-0 redeem moves the supply leaf",
+        &fx,
+        |plan, _| {
+            let p = &mut plan.perms[perm_at(0, Seg::SupNew(0), 0)];
+            p.pre[1] = p.pre[1].wrapping_sub(40);
+        },
+        s0(0, Seg::SupNew(0), 0),
+        "supply",
+    )
+}
+
+/// S5: an asset-0 redeem whose exit step is switched off.
+fn neg_exit_skipped() -> Neg {
+    let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
+    judge(
+        "S5 an exit left out of the chain",
+        &fx,
+        |plan, _| plan.perms[perm_at(0, Seg::Exit(0), 0)].set(KX_OFF, Val::ZERO),
+        s0(0, Seg::Exit(0), 0),
+        "flags",
+    )
+}
+
+/// S5: `vpa = 0, sign = 1, m > 0` not flagged an exit.
+fn neg_exit_unflagged() -> Neg {
+    let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
+    judge(
+        "S5 an asset-0 redeem not flagged an exit",
+        &fx,
+        |plan, _| each_perm(plan, 0, |p| p.set(XF_OFF, Val::ZERO)),
+        0,
+        "flags",
+    )
 }
 
 /// (m): an exit step hashing an amount that is not the row's.
@@ -610,14 +686,65 @@ fn neg_fee_acc() -> Neg {
     )
 }
 
-/// w9: absorbed root 1 appended into the slot after the running index.
+fn abs_last() -> Seg {
+    Seg::Pair(PathId::Abs, Part::LastB)
+}
+
+/// w9 (F4-3: the subtree absorb): the absorbed roots' subtree placed at the
+/// next aligned slot after the running index, with a genuine path there.
 fn neg_absorb_skip() -> Neg {
     let mut fx = wfixture(&[S], SEED);
     let n = fx.rin.aa_next;
-    let mut aa = fx.pre.aa.clone();
-    aa.append(fx.inp.absorbed[0]);
-    fx.wit.absorbs[1] = AppendWitness { index: n + 2, path: empty_slot_path(&aa, n + 2) };
-    witness("w9 absorbed root at a skipped index", fx, s0(0, Seg::Pair(PathId::Abs(1), Part::LastB), 0), "root_aa")
+    fx.wit.absorbs[0] = AppendWitness { index: n + 4, path: empty_slot_path(&fx.pre.aa, n + 4) };
+    witness("w9 absorbed subtree at a skipped slot", fx, s0(0, abs_last(), 0), "root_aa")
+}
+
+/// (r): the absorb's old side is not the empty subtree `zeros[2]`.
+fn neg_abs_old_side() -> Neg {
+    let fx = wfixture(&[S], SEED);
+    judge(
+        "r absorb old side != zeros[2]",
+        &fx,
+        |plan, _| {
+            let p = &mut plan.perms[perm_at(0, Seg::Pair(PathId::Abs, Part::Bulk), 0)];
+            p.set(NA_OFF, p.get(NA_OFF) + Val::ONE);
+        },
+        s23(0, Seg::AbsNode(2), 0),
+        "path_regs",
+    )
+}
+
+/// (r): an `aa_next` ≢ 0 (mod 4), threaded consistently everywhere else.
+fn neg_abs_misaligned() -> Neg {
+    let fx = wfixture(&[S], SEED);
+    judge(
+        "r absorb at aa_next = 1 mod 4",
+        &fx,
+        |plan, pvs| {
+            each_perm(plan, 0, |p| p.set(AAN, p.get(AAN) + Val::ONE));
+            pvs[PV_AAN] += Val::ONE;
+            pvs[PV_SIDE + PV_AAN] += Val::ONE;
+        },
+        s0(0, abs_last(), 0),
+        "root_aa",
+    )
+}
+
+/// (r): the first two absorbed roots swapped inside the subtree.
+fn neg_abs_reordered() -> Neg {
+    let fx = wfixture(&[S], SEED);
+    judge(
+        "r absorbed roots reordered in the subtree",
+        &fx,
+        |plan, _| {
+            let p = &mut plan.perms[perm_at(0, Seg::AbsNode(0), 0)];
+            for l in 0..4 {
+                p.pre.swap(l, 4 + l);
+            }
+        },
+        s0(0, Seg::AbsNode(0), 0),
+        "abs_sub",
+    )
 }
 
 /// w10: slot 2 starts from a K that slot 1 did not end on.
@@ -869,10 +996,10 @@ mod tests {
     use super::*;
 
     /// W's width, read off the named `f4leaf --check` runs.
-    const W_WIDTH_PIN: usize = 3_479;
+    const W_WIDTH_PIN: usize = 3_470;
 
-    /// The program: 20 prologue, 65 slot and 7 epilogue segments in ring
-    /// order; 320 + 661 + 67 perms; width pinned from the named runs;
+    /// The program: 11 prologue, 65 slot and 7 epilogue segments in ring
+    /// order; 127 + 661 + 67 perms; width pinned from the named runs;
     /// degree 3; every constraint group non-empty; the carries cover
     /// `MAX_CLAIMS`.
     #[test]
@@ -888,6 +1015,15 @@ mod tests {
         assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 3);
         assert!(phase_ranges(&air).iter().all(|r| !r.is_empty()), "every group emits");
         assert_eq!((w_height(1), w_height(2)), (1 << 15, 1 << 16));
+    }
+
+    /// Condition (n): the heights the ruled K cells prove at — K = 16 back
+    /// under 2^18 (the absorb as one subtree: prologue 320 → 127 perms).
+    #[test]
+    fn f4w_heights_by_k() {
+        let rows = |k: usize| (PRO_PERMS + k * SLOT_PERMS + EPI_PERMS) * 24;
+        assert_eq!([1, 2, 4, 8, 16].map(rows), [20_520, 36_384, 68_112, 131_568, 258_480]);
+        assert_eq!([1, 2, 4, 8, 16].map(w_height), [1 << 15, 1 << 16, 1 << 17, 1 << 18, 1 << 18]);
     }
 
     /// Honest wrappers hold: every kind alone, and the two-slot mixes that
@@ -913,7 +1049,7 @@ mod tests {
     #[test]
     fn f4w_negatives_refuse_at_their_binding_rows() {
         let cases = cases();
-        assert_eq!(cases.len(), 40);
+        assert_eq!(cases.len(), 48);
         let missed: Vec<String> = cases
             .iter()
             .map(|(_, f)| f())

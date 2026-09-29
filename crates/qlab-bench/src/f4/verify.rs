@@ -20,6 +20,10 @@
 //! | V6 | `W.prev` is the predecessor's surface commitment | stays verifier-side (reading B) |
 //! | V7 | every absorbed root is a genuine recent finalized L1 root | F5's L1 rule; stubbed here as a caller predicate |
 //! | V8 | `E_cum ≤ D_cum` on W's out | stays public arithmetic on the surface (F5's L1 rule) |
+//! | V9 | the deposit-sum proof ([`super::dep`]): its `u32` PVs are 16-bit words (before conversion), it verifies under the hiding L2 config, its `n` is the bundle's claim count, its `dig` the chain over the claims' `Cv` PVs in bundle order, its `D_batch` W's `PV_DB` | **in-circuit**: the deposit proof's verification (a hiding member proof, V2's class) and `dig`'s recomputation over the claims' `Cv` PVs where the members are aggregated (V4's place); `n` and `D_batch` become equalities between that proof's PVs and the aggregated count / W's own PV. **Nothing of V9 stays verifier-side** |
+//!
+//! V8 is meaningful only with V9: W takes `D_batch` as a public value, and
+//! V9 is what ties it to the claims' deposits (review S3).
 //!
 //! Member proofs pass through the typed entries only, never a raw
 //! field-element path (ruling condition (b): the L2 entries take `u32` PVs
@@ -30,9 +34,10 @@ use qlab_consensus::legacy::{make_legacy_config_with, LegacyNonHidingConfig};
 use qlab_consensus::{Config, Val};
 use qlab_l2::public_values;
 
+use super::dep::{claim_cvs, dep_chain, verify_dep_u32, DPV_D, DPV_DIG, DPV_N};
 use super::native::{WRoots, WTag, CLAIM_TAG, M_ABS};
 use super::wleaf::{
-    WAir, PV_AA, PV_AAN, PV_ABS, PV_C, PV_CH, PV_CHN, PV_CN, PV_D, PV_E, PV_EXC, PV_K, PV_KN, PV_N, PV_NN, PV_PREV, PV_R, PV_SD, PV_SIDE, PV_SUP,
+    WAir, PV_AA, PV_AAN, PV_ABS, PV_C, PV_CH, PV_CHN, PV_CN, PV_D, PV_DB, PV_E, PV_EXC, PV_K, PV_KN, PV_N, PV_NN, PV_PREV, PV_R, PV_SD, PV_SIDE, PV_SUP,
     W_PV_LEN,
 };
 use crate::f3::bench::Outer;
@@ -42,12 +47,19 @@ use crate::f3::native::{sd_chain_byte, Digest, Roots};
 /// Version 1 is ruling Q1's K = 16 on the decided b2 lane; `0x8000 | k` are
 /// devnet/test versions of smaller `k`.
 pub(crate) fn version(id: u32) -> Option<(usize, Outer)> {
-    match id {
-        1 => Some((16, Outer::B2)),
-        0x8001 | 0x8002 | 0x8004 | 0x8008 => Some(((id & 0xff) as usize, Outer::B2)),
-        _ => None,
-    }
+    VERSIONS.iter().find(|(v, _)| *v == id).map(|(_, k)| (*k, Outer::B2))
 }
+
+/// `(version, k)`, every one on the b2 lane.
+pub(crate) const VERSIONS: [(u32, usize); 5] = [(1, 16), (0x8001, 1), (0x8002, 2), (0x8004, 4), (0x8008, 8)];
+const _: () = {
+    let mut i = 0;
+    while i < VERSIONS.len() {
+        assert!(VERSIONS[i].1 <= super::wleaf::MAX_K);
+        assert!(VERSIONS[i].1 <= super::dep::DEP_CAP);
+        i += 1;
+    }
+};
 
 /// The surface commitment's tag in the MD chain (distinct from every slot tag).
 pub(crate) const SURFACE_TAG: u8 = 0x10;
@@ -130,6 +142,9 @@ pub(crate) struct Bundle<'a, P> {
     pub w_pvs: Vec<u32>,
     pub w_proof: &'a Proof<LegacyNonHidingConfig>,
     pub members: Vec<BundleMember<P>>,
+    /// The deposit-sum proof and its PVs (V9).
+    pub dep_pvs: Vec<u32>,
+    pub dep_proof: &'a Proof<Config>,
 }
 
 /// How member proofs are checked — the real one is [`TypedMembers`]. The
@@ -192,6 +207,23 @@ pub(crate) enum VError {
     Anchor(usize),
     /// V8: `E_cum > D_cum`.
     EAboveD,
+    /// V9: the deposit-sum proof, named by check.
+    Dep(DepCheck),
+}
+
+/// V9's checks, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DepCheck {
+    /// A PV word not 16-bit, or the wrong count — before any conversion.
+    PvRange,
+    /// The proof does not verify.
+    Proof,
+    /// `n` is not the bundle's claim count.
+    Count,
+    /// `dig` is not the chain over the claims' `Cv` PVs in order.
+    Digest,
+    /// `D_batch` is not W's.
+    DBatch,
 }
 
 fn digest_at(w: &[u32], off: usize) -> Digest {
@@ -266,6 +298,28 @@ pub(crate) fn verify_wrapper<P>(
         }
         members.verify(m, prev.l2_id).map_err(|e| VError::Member(i, e))?;
     }
+    // V9 — F4b: the deposit proof verified in-circuit (V2's class) and `dig`
+    // recomputed over the aggregated claims' Cv PVs (V4's place). The words
+    // first (condition (p)), then the proof, then its three bindings.
+    {
+        let d = &b.dep_pvs;
+        if d.len() != super::dep::DEP_PV_LEN || d.iter().any(|x| *x >= 1 << 16) {
+            return Err(VError::Dep(DepCheck::PvRange));
+        }
+        if !verify_dep_u32(d, b.dep_proof) {
+            return Err(VError::Dep(DepCheck::Proof));
+        }
+        let cvs = claim_cvs(b.members.iter().filter(|m| m.tag == WTag::C).map(|m| m.pvs.as_slice()));
+        if d[DPV_N] as usize != cvs.len() {
+            return Err(VError::Dep(DepCheck::Count));
+        }
+        if digest_at(d, DPV_DIG) != dep_chain(&cvs) {
+            return Err(VError::Dep(DepCheck::Digest));
+        }
+        if u64_at(d, DPV_D) != u64_at(&b.w_pvs, PV_DB) {
+            return Err(VError::Dep(DepCheck::DBatch));
+        }
+    }
     // V3 — F4b: the wrapper root proof.
     let w_vals: Vec<Val> = public_values(&b.w_pvs);
     verify(&make_legacy_config_with(&outer.cfg()), &WAir::new(k), b.w_proof, &w_vals).map_err(|_| VError::WProof)?;
@@ -332,6 +386,7 @@ mod tests {
 
     use p3_uni_stark::prove;
 
+    use super::super::dep::{prove_dep, DepEntry};
     use super::super::native::{Member, WInputs};
     use super::super::neg::{honest, wfixture, SEED};
     use super::*;
@@ -355,6 +410,8 @@ mod tests {
         proof: Proof<LegacyNonHidingConfig>,
         members: Vec<Member>,
         prev: Surface,
+        deps: Vec<DepEntry>,
+        dep: (Vec<u32>, Proof<Config>),
     }
 
     const TEST_VERSION: u32 = 0x8002;
@@ -378,7 +435,8 @@ mod tests {
                 use p3_field::PrimeField32;
                 v.as_canonical_u32()
             }).collect();
-            Case { bundle_pvs, proof, members: fx.members.clone(), prev: pre }
+            let dep = prove_dep(&fx.deps).expect("the claims' openings fit");
+            Case { bundle_pvs, proof, members: fx.members.clone(), prev: pre, deps: fx.deps.clone(), dep }
         })
     }
 
@@ -388,6 +446,8 @@ mod tests {
             w_pvs: c.bundle_pvs.clone(),
             w_proof: &c.proof,
             members: c.members.iter().map(|m| BundleMember { tag: m.tag, pvs: m.pvs.clone(), proof: m.pvs.clone() }).collect(),
+            dep_pvs: c.dep.0.clone(),
+            dep_proof: &c.dep.1,
         }
     }
 
@@ -487,6 +547,68 @@ mod tests {
         let absorbed0 = digest_at(&c.bundle_pvs, PV_ABS);
         let not_first: &dyn Fn(&Digest) -> bool = &move |a| *a != absorbed0;
         assert_eq!(verify_wrapper(&bundle(c), &c.prev, &Stub, not_first).unwrap_err(), VError::Anchor(0));
+    }
+
+    /// V9, the deposit-sum proof (review S3; conditions (o), (p)). Every
+    /// refusal lands before V3, so the synthetic two-claim bundles below
+    /// need no W proof of their own.
+    #[test]
+    fn f4_verify_wrapper_deposit_negatives() {
+        let c = case();
+        let run = |b: &Bundle<'_, Vec<u32>>| verify_wrapper(b, &c.prev, &Stub, ANY);
+
+        // (p): a 17-bit word, refused before conversion; p + n likewise.
+        let mut b = bundle(c);
+        b.dep_pvs[DPV_DIG] += 1 << 16;
+        assert_eq!(run(&b).unwrap_err(), VError::Dep(DepCheck::PvRange), "(p) a 17-bit word");
+        use p3_field::PrimeField32;
+        let mut b = bundle(c);
+        b.dep_pvs[DPV_N] += Val::ORDER_U32;
+        assert_eq!(run(&b).unwrap_err(), VError::Dep(DepCheck::PvRange), "(p) p + n");
+        // A PV the proof does not carry.
+        let mut b = bundle(c);
+        b.dep_pvs[DPV_D] ^= 1;
+        assert_eq!(run(&b).unwrap_err(), VError::Dep(DepCheck::Proof), "D_batch moved under the proof");
+        // D_batch not W's.
+        let mut b = bundle(c);
+        b.w_pvs[PV_DB] ^= 1;
+        assert_eq!(run(&b).unwrap_err(), VError::Dep(DepCheck::DBatch), "W's D_batch not the deposits'");
+        // (o): n above the claim count — a real proof over one more entry.
+        let extra = [c.deps.clone(), vec![DepEntry { v: 9, r_v: [7; 4] }]].concat();
+        let (pvs, proof) = prove_dep(&extra).unwrap();
+        let mut b = bundle(c);
+        (b.dep_pvs, b.dep_proof) = (pvs, &proof);
+        assert_eq!(run(&b).unwrap_err(), VError::Dep(DepCheck::Count), "(o) n > the claim count");
+        // A proof over another Cv list of the right length.
+        let (pvs, proof) = prove_dep(&[DepEntry { v: c.deps[0].v, r_v: [3; 4] }]).unwrap();
+        let mut b = bundle(c);
+        (b.dep_pvs, b.dep_proof) = (pvs, &proof);
+        assert_eq!(run(&b).unwrap_err(), VError::Dep(DepCheck::Digest), "another Cv list");
+
+        // Two claims: honest V9 passes (the refusal is V3's, a proof this
+        // synthetic bundle lacks); reordered, or the last dropped, it refuses.
+        let fx = wfixture(&[WTag::C, WTag::C], SEED);
+        let two = |order: [usize; 2], deps: &[DepEntry]| -> Result<Surface, VError> {
+            let (dep_pvs, dep_proof) = prove_dep(deps).unwrap();
+            let mut b = bundle(c);
+            b.members = order
+                .iter()
+                .map(|i| {
+                    let m = &fx.members[*i];
+                    BundleMember { tag: m.tag, pvs: m.pvs.clone(), proof: m.pvs.clone() }
+                })
+                .collect();
+            let d: u64 = deps.iter().map(|e| e.v).sum();
+            for j in 0..4 {
+                b.w_pvs[PV_DB + j] = ((d >> (16 * j)) & 0xffff) as u32;
+            }
+            b.dep_pvs = dep_pvs;
+            b.dep_proof = &dep_proof;
+            run(&b)
+        };
+        assert_eq!(two([0, 1], &fx.deps).unwrap_err(), VError::WProof, "V9 holds for the two claims in order");
+        assert_eq!(two([1, 0], &fx.deps).unwrap_err(), VError::Dep(DepCheck::Digest), "claims reordered against the Cv chain");
+        assert_eq!(two([0, 1], &fx.deps[..1]).unwrap_err(), VError::Dep(DepCheck::Count), "the last Cv dropped");
     }
 
     /// The versions: 1 is K = 16 at b2; devnet versions carry their k.

@@ -759,7 +759,7 @@ fn main() {
         return;
     }
 
-    if matches!(mode.as_str(), "f4leaf" | "f4neg") {
+    if matches!(mode.as_str(), "f4leaf" | "f4neg" | "f4dep") {
         // Lab #775: the wrapper leaf W.
         if let Err(error) = f4::run(&mode, &args[1..]) {
             eprintln!("{mode}: {error}");

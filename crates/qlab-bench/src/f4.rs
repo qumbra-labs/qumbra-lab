@@ -4,8 +4,10 @@
 //!
 //! F4-1: the wrapper leaf's native reference ([`native`]), W, the wrapper
 //! leaf AIR ([`wleaf`]), its negatives ([`neg`]), and `verify_wrapper`, the
-//! native reference verifier ([`verify`]).
+//! native reference verifier ([`verify`]). F4-3: the deposit-sum proof
+//! ([`dep`]) and `verify_wrapper`'s V9.
 
+pub(crate) mod dep;
 pub(crate) mod native;
 pub(crate) mod neg;
 pub(crate) mod verify;
@@ -16,6 +18,7 @@ pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
     match mode {
         "f4leaf" => neg::check(args),
         "f4neg" => neg::run(args),
+        "f4dep" => dep::check(args),
         other => Err(format!("unknown f4 mode `{other}`")),
     }
 }
