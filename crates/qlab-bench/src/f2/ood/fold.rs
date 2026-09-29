@@ -143,6 +143,8 @@ pub(super) struct Geom {
 }
 
 impl Geom {
+    /// Hiding only: the LDE is `log_height + IS_ZK + log_blowup`. It takes
+    /// no `Dims`, so its callers check `zk` (`c2::Layout::new`, lab #782 X4).
     pub(super) fn new(log_height: usize, cfg: &FriCfg) -> Result<Self> {
         let lde = log_height + IS_ZK + cfg.log_blowup;
         require(lde <= 30, "query index wider than 30 bits")?;

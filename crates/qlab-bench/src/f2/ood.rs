@@ -160,6 +160,10 @@ struct Dims {
     width: usize,
     pv_len: usize,
     log_height: usize,
+    /// 1 for a hiding child (`HidingFriPcs`: trace committed at 2N, a
+    /// randomizer, chunks doubled), 0 for a non-hiding one
+    /// (`qlab_consensus::legacy`, F4b-2's W and gate children).
+    zk: usize,
 }
 
 impl From<Shape> for Dims {
@@ -168,6 +172,7 @@ impl From<Shape> for Dims {
             width: shape.width(),
             pv_len: shape.pv_len(),
             log_height: shape.log_height(),
+            zk: IS_ZK,
         }
     }
 }
@@ -199,6 +204,8 @@ enum Domains {
 }
 
 struct Program {
+    /// The child's hiding flag (`Dims::zk`).
+    zk: usize,
     schedule: machine::Schedule,
     dag: Dag,
     leaves: Leaves,
@@ -245,12 +252,16 @@ impl Program {
             "preprocessed OOD AIR unsupported",
         )?;
         let original = Domain::new(Val::ONE, dims.log_height).ok_or("original domain")?;
-        let committed = Domain::new(Val::ONE, dims.log_height + IS_ZK).ok_or("committed domain")?;
-        let log_q = get_log_num_quotient_chunks::<Val, _>(air, layout, IS_ZK);
-        require(log_q + IS_ZK == 3, "expected eight hiding quotient chunks")?;
+        let zk = dims.zk;
+        require(zk <= 1, "zk is 0 or 1")?;
+        let committed = Domain::new(Val::ONE, dims.log_height + zk).ok_or("committed domain")?;
+        let log_q = get_log_num_quotient_chunks::<Val, _>(air, layout, zk);
+        if zk == IS_ZK {
+            require(log_q + IS_ZK == 3, "expected eight hiding quotient chunks")?;
+        }
         let chunk_domains = committed
-            .create_disjoint_domain(1 << (dims.log_height + IS_ZK + log_q))
-            .split_domains(1 << (log_q + IS_ZK));
+            .create_disjoint_domain(1 << (dims.log_height + zk + log_q))
+            .split_domains(1 << (log_q + zk));
         let periodic = air.periodic_columns();
         check_periodic_column_lengths(&periodic, original.size())
             .map_err(|e| format!("periodic columns: {e:?}"))?;
@@ -359,6 +370,7 @@ impl Program {
         dag.shared.clear();
         let schedule = machine::Schedule::compile(&dag.ops, &[residual, next_point])?;
         Ok(Self {
+            zk,
             schedule,
             dag,
             leaves,
@@ -433,6 +445,17 @@ fn compare_native<A>(program: &Program, air: &A, inputs: &Inputs) -> Result<Vec<
 where
     A: for<'a> Air<VerifierConstraintFolder<'a, Config>>,
 {
+    compare_native_on::<Config, A>(program, air, inputs)
+}
+
+/// [`compare_native`] under any config on this field and PCS domain — the
+/// non-hiding (`qlab_consensus::legacy`) children of F4b-2 (lab #782).
+fn compare_native_on<SC, A>(program: &Program, air: &A, inputs: &Inputs) -> Result<Vec<E>>
+where
+    SC: p3_uni_stark::StarkGenericConfig<Challenge = E>,
+    SC::Pcs: p3_commit::Pcs<E, SC::Challenger, Domain = Domain>,
+    A: for<'a> Air<VerifierConstraintFolder<'a, SC>>,
+{
     let values = program.evaluate(inputs)?;
     program.schedule.check_values(&values)?;
     let periodic: Vec<E> = air
@@ -456,7 +479,7 @@ where
         Some(values[program.next_point]) == program.original.next_point(inputs.zeta),
         "next-point DAG/native mismatch",
     )?;
-    let quotient = recompose_quotient_from_chunks::<Config>(
+    let quotient = recompose_quotient_from_chunks::<SC>(
         &program.chunk_domains,
         &inputs.chunks,
         inputs.zeta,
@@ -467,7 +490,7 @@ where
     )?;
     // Ask the native folder to verify against the DAG's computed left side.
     // This checks folding even for synthetic inputs with a nonzero residual.
-    verify_constraints::<Config, _, ()>(
+    verify_constraints::<SC, _, ()>(
         air,
         &inputs.local,
         &inputs.next,
@@ -528,6 +551,278 @@ fn proof_inputs_dims(dims: Dims, proof: &Proof<Config>, pvs: &[Val]) -> Result<I
         alpha,
         zeta,
     })
+}
+
+/// [`proof_inputs_dims`] for a **non-hiding** child (`qlab_consensus::legacy`,
+/// lane `cfg`): the trace committed at N, no randomizer commitment before ζ
+/// (p3-uni-stark 0.6.1's verifier with `is_zk = 0`). F4b-2 (lab #782).
+fn proof_inputs_legacy(
+    dims: Dims,
+    proof: &Proof<qlab_consensus::legacy::LegacyNonHidingConfig>,
+    pvs: &[Val],
+    cfg: &qlab_consensus::FriCfg,
+) -> Result<Inputs> {
+    use p3_uni_stark::StarkGenericConfig;
+    require(dims.zk == 0, "a legacy proof is non-hiding")?;
+    require(proof.degree_bits == dims.log_height, "OOD proof degree")?;
+    require(
+        proof.opened_values.preprocessed_local.is_none()
+            && proof.opened_values.preprocessed_next.is_none()
+            && proof.opened_values.random.is_none()
+            && proof.commitments.random.is_none(),
+        "unexpected preprocessed or randomizer values on a non-hiding proof",
+    )?;
+    let config = qlab_consensus::legacy::make_legacy_config_with(cfg);
+    let mut challenger = config.initialise_challenger();
+    challenger.observe(Val::from_usize(proof.degree_bits));
+    challenger.observe(Val::from_usize(dims.log_height));
+    challenger.observe(Val::ZERO);
+    challenger.observe(proof.commitments.trace.clone());
+    challenger.observe_slice(pvs);
+    let alpha = challenger.sample_algebra_element();
+    challenger.observe(proof.commitments.quotient_chunks.clone());
+    let zeta = challenger.sample_algebra_element();
+    Ok(Inputs {
+        local: proof.opened_values.trace_local.clone(),
+        next: proof
+            .opened_values
+            .trace_next
+            .clone()
+            .ok_or("missing next-row opening")?,
+        public: pvs.to_vec(),
+        chunks: proof.opened_values.quotient_chunks.clone(),
+        alpha,
+        zeta,
+    })
+}
+
+/// [P] F4b-2's census of a NON-hiding child's OOD component (a `zk = 0`
+/// C1 on lane `cfg`) for any AIR: the DAG, the register machine and C1's
+/// size, compiled from the AIR's symbolic constraints; no proof, no trace.
+pub(crate) fn ood_census<A: Air<SymbolicAirBuilder<Val>>>(
+    width: usize,
+    pv_len: usize,
+    log_height: usize,
+    air: &A,
+    cfg: &qlab_consensus::FriCfg,
+) -> Result<Value> {
+    let program = Program::compile_dims(Dims { width, pv_len, log_height, zk: 0 }, air)?;
+    let (perms, rows, cols, rom, c1_pvs) = c1::c1_dims(&program, cfg)?;
+    let s = &program.schedule;
+    // The child's transcript order for the ζ openings (p3's PCS observes
+    // trace local, trace next, then each quotient chunk); PVs, α and ζ are
+    // known before flush 2.
+    let arrival = |i: Input| -> u64 {
+        match i {
+            Input::Public(_) | Input::Alpha | Input::Zeta => 0,
+            Input::Local(c) => 1 + c as u64,
+            Input::Next(c) => (1 << 24) + c as u64,
+            Input::Quotient(k, j) => (2 << 24) + ((k as u64) << 12) + j as u64,
+        }
+    };
+    let regs = machine::lever_registers(&program.dag.ops, &[program.residual, program.next_point], &arrival);
+    require(regs.current == s.registers(), "lever count must reproduce the compiled register count")?;
+    let mut dag = program.report();
+    // The DAG report's ROM-encoding block prices F2's HIDING L2-lane PCS
+    // geometry; it does not describe a zk = 0 child.
+    dag["rom_encoding"] = json!({"omitted": "F2's block prices the hiding L2-lane PCS geometry; not applicable to a zk = 0 child"});
+    if let Some(r) = dag.get_mut("register_schedule").and_then(Value::as_object_mut) {
+        r.remove("input_sources");
+    }
+    Ok(json!({"evidence": "P", "zk": 0, "child": {"width": width, "public_values": pv_len, "log_height": log_height},
+        "quotient_chunks": program.chunk_domains.len(), "dag": dag,
+        "machine": {"registers_width": s.width(), "rom_width": rom, "inputs": s.inputs().len(), "height": s.height(),
+            "extension_registers": s.registers()},
+        "c1": {"lane_perms": perms, "rows": rows, "columns": cols, "rom_columns": rom, "public_values": c1_pvs},
+        "lever_registers": {"current": regs.current, "held_operands": regs.held_operands, "streamed": regs.streamed}}))
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// One FNV-1a step over a 64-bit word, byte by byte.
+fn fnv(mut h: u64, word: u64) -> u64 {
+    for b in word.to_le_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// A structural hash of an AIR's symbolic constraints: every node's kind,
+/// operands, variable entry and index, constants' canonical values, in
+/// constraint order; shared subtrees are hashed once (memoized on the
+/// node), iteratively so a deep sum cannot overflow a test thread's stack.
+fn constraint_hash(constraints: &[p3_air::symbolic::SymbolicExpression<Val>]) -> u64 {
+    use p3_air::symbolic::{BaseEntry, BaseLeaf, SymbolicExpr, SymbolicExpression};
+    use p3_field::PrimeField32;
+    type Node = SymbolicExpression<Val>;
+    let mut memo: HashMap<*const Node, u64> = HashMap::new();
+    let kids = |e: &Node| -> Vec<*const Node> {
+        match e {
+            SymbolicExpr::Leaf(_) => vec![],
+            SymbolicExpr::Add { x, y, .. } | SymbolicExpr::Sub { x, y, .. } | SymbolicExpr::Mul { x, y, .. } => {
+                vec![Arc::as_ptr(x), Arc::as_ptr(y)]
+            }
+            SymbolicExpr::Neg { x, .. } => vec![Arc::as_ptr(x)],
+        }
+    };
+    let mut total = FNV_OFFSET;
+    for c in constraints {
+        let root: *const Node = c;
+        let mut stack = vec![(root, false)];
+        while let Some((p, exit)) = stack.pop() {
+            if memo.contains_key(&p) {
+                continue;
+            }
+            // SAFETY: every pointer is `root` or an `Arc` child reached from
+            // it; `constraints` owns them all for this whole function.
+            let e = unsafe { &*p };
+            let ks = kids(e);
+            if !exit {
+                stack.push((p, true));
+                stack.extend(ks.iter().map(|&k| (k, false)));
+                continue;
+            }
+            let (tag, sub) = match e {
+                SymbolicExpr::Leaf(l) => match l {
+                    BaseLeaf::Variable(v) => {
+                        let entry = match v.entry {
+                            BaseEntry::Preprocessed { offset } => (1u64 << 32) | offset as u64,
+                            BaseEntry::Main { offset } => (2u64 << 32) | offset as u64,
+                            BaseEntry::Periodic => 3u64 << 32,
+                            BaseEntry::Public => 4u64 << 32,
+                        };
+                        (1, vec![entry, v.index as u64])
+                    }
+                    BaseLeaf::IsFirstRow => (2, vec![]),
+                    BaseLeaf::IsLastRow => (3, vec![]),
+                    BaseLeaf::IsTransition => (4, vec![]),
+                    BaseLeaf::Constant(v) => (5, vec![u64::from(v.as_canonical_u32())]),
+                },
+                SymbolicExpr::Add { .. } => (6, vec![]),
+                SymbolicExpr::Sub { .. } => (7, vec![]),
+                SymbolicExpr::Neg { .. } => (8, vec![]),
+                SymbolicExpr::Mul { .. } => (9, vec![]),
+            };
+            let mut h = fnv(FNV_OFFSET, tag);
+            for w in sub.into_iter().chain(ks.iter().map(|k| memo[k])) {
+                h = fnv(h, w);
+            }
+            memo.insert(p, h);
+        }
+        total = fnv(total, memo[&root]);
+    }
+    total
+}
+
+/// Lab #782 condition (4): the hiding C1's layout fingerprint for a real L2
+/// shape on the L2 lane — width, public values, ROM columns, constraint
+/// count and degree, a structural hash of every constraint and a hash of
+/// the ROM. The same function on `main` and on F4b-2's tree must print the
+/// same object: `zk` must leave F2's hiding path byte-for-byte.
+pub(crate) fn hiding_c1_fingerprint(shape: Shape) -> Result<Value> {
+    use p3_air::BaseAir;
+    fn go<A: Air<SymbolicAirBuilder<Val>>>(shape: Shape, air: &A) -> Result<Value> {
+        let program = Program::compile(shape, air)?;
+        let c1 = c1::C1Air::new(&program, &qlab_l2::L2_CFG_PROVISIONAL, 8 << 30)?;
+        let cs = p3_air::symbolic::get_symbolic_constraints::<Val, _>(&c1, p3_air::symbolic::AirLayout::from_air::<Val>(&c1));
+        let degree = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
+        Ok(json!({"shape": format!("{shape:?}"), "width": c1.width(), "public_values": c1.num_public_values(),
+            "rom_columns": c1.num_periodic_columns(), "constraints": cs.len(), "max_degree": degree,
+            "constraint_hash": format!("{:016x}", constraint_hash(&cs)), "rom_hash": format!("{:016x}", c1.rom_hash())}))
+    }
+    match shape {
+        Shape::S => go(shape, &qlab_l2::verifier_air_s()),
+        Shape::P => go(shape, &qlab_l2::verifier_air_p()),
+        Shape::R => go(shape, &qlab_l2::verifier_air_r()),
+    }
+}
+
+/// F4b-2 (lab #782): one real non-hiding child's OOD component, built.
+pub(crate) struct LegacyOod {
+    /// Compile, native agreement, build, scan and prove records.
+    pub(crate) report: Value,
+    /// C1's exported ζ-openings flush digest (16 u16 limbs).
+    pub(crate) f2dig: Vec<Val>,
+    /// Every cap C1 re-exposes, as u16 limbs in cap order.
+    pub(crate) caps: Vec<Val>,
+    /// The inner PVs C1 re-exposes.
+    pub(crate) inner_pvs: Vec<Val>,
+    /// Every requested stage held (native agreement, scan, prove + verify).
+    pub(crate) ok: bool,
+}
+
+/// F4b-2 (lab #782): the OOD component of one real **non-hiding** child —
+/// the `zk = 0` C1 for `proof` (child lane `child_cfg`). The compiled DAG is
+/// first checked against p3's own verifier fold at ζ (residual zero), then
+/// C1 is built from the proof; `check` scans every row, `outer` proves and
+/// natively verifies it on that lane (non-hiding, as F2's components).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn legacy_ood<A>(
+    (width, pv_len, log_height): (usize, usize, usize),
+    air: &A,
+    proof: &Proof<qlab_consensus::legacy::LegacyNonHidingConfig>,
+    pvs: &[Val],
+    child_cfg: &qlab_consensus::FriCfg,
+    check: bool,
+    outer: Option<&qlab_consensus::FriCfg>,
+    max_cells: usize,
+) -> Result<LegacyOod>
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<VerifierConstraintFolder<'a, qlab_consensus::legacy::LegacyNonHidingConfig>>,
+{
+    let dims = Dims { width, pv_len, log_height, zk: 0 };
+    let t = std::time::Instant::now();
+    let program = Program::compile_dims(dims, air)?;
+    let inputs = proof_inputs_legacy(dims, proof, pvs, child_cfg)?;
+    let values = compare_native_on::<qlab_consensus::legacy::LegacyNonHidingConfig, A>(&program, air, &inputs)?;
+    require(values[program.residual] == E::ZERO, "OOD relation mismatch on an honest child")?;
+    let compile_s = t.elapsed().as_secs_f64();
+    let (perms, rows, cols, rom, _) = c1::c1_dims(&program, child_cfg)?;
+    let t = std::time::Instant::now();
+    // X1 (lab #782 review): a trace that will be proved reserves the outer
+    // lane's blowup up front, as `m4gate::build_gate_trace` does; a late
+    // reserve copies the trace and inflates the peak.
+    let reserve = outer.map_or(0, |o| o.log_blowup);
+    let c1::Honest { air: c1_air, trace, pvs: c1_pvs, .. } =
+        c1::honest_legacy(&program, &inputs, proof, pvs, child_cfg, max_cells, reserve)?;
+    let build_s = t.elapsed().as_secs_f64();
+    let planned = (cols, rows, rom);
+    let f2dig = c1_air.f2dig_limbs(&c1_pvs).ok_or("a zk = 0 C1 exports its F2 digest")?.to_vec();
+    let caps = c1_air.cap_limbs(&c1_pvs).to_vec();
+    let inner_pvs = c1_pvs[..c1_air.inner_pv_len()].to_vec();
+    let mut ok = true;
+    let mut report = json!({"evidence": "M", "zk": 0, "dag": program.report(),
+        "native_fold_agrees_residual_zero": true, "compile_and_native_seconds": compile_s,
+        "c1_p": {"lane_perms": perms, "rows": rows, "columns": cols, "rom_columns": rom},
+        "build_seconds": build_s, "extra_capacity_bits": reserve,
+        "exposes_every_inner_pv": inner_pvs == pvs});
+    ok &= inner_pvs == pvs;
+    if check {
+        let scan = wrap::scan(&c1_air, &trace, &c1_pvs);
+        ok &= scan["pass"] == true;
+        report["scan"] = scan;
+        // Condition (1)'s one-side negative on C1's side: one exported limb
+        // moved, the same trace must no longer satisfy C1.
+        let mut moved = c1_pvs.clone();
+        let o = c1_air.f2dig_offset().ok_or("a zk = 0 C1 exports its F2 digest")?;
+        moved[o + 5] += Val::ONE;
+        let neg = wrap::scan(&c1_air, &trace, &moved);
+        ok &= neg["pass"] == false;
+        report["f2dig_perturbed"] = json!({"limb": 5, "rejected": neg["pass"] == false,
+            "violating_rows": neg["violating_rows"], "first_violations": neg["first_violations"]});
+    }
+    report["component"] = match outer {
+        Some(o) => {
+            let config = qlab_consensus::legacy::make_legacy_config_with(o);
+            let r = wrap::prove_component(&c1_air, trace, &c1_pvs, &config, planned);
+            ok &= r["native_verified"] == true;
+            r
+        }
+        None => wrap::built(&c1_air, &trace, planned).0,
+    };
+    Ok(LegacyOod { report, f2dig, caps, inner_pvs, ok })
 }
 
 pub(super) fn verify_relation(shape: Shape, proof: &Proof<Config>, pvs: &[Val]) -> Result<Value> {
@@ -659,6 +954,85 @@ mod tests {
             alpha: extension(seed + 7),
             zeta: extension(seed + 13),
         }
+    }
+
+    /// Lab #782 F4b-2: the `zk = 0` compile of W's AIR and of `m4gate`'s own
+    /// AIR (verifying a K = 16 b4 W) agrees with p3's NON-hiding verifier
+    /// algebra at ζ (commit at N, two quotient chunks, no randomizer), on
+    /// synthetic inputs; moving every opening moves the residual.
+    #[test]
+    fn non_hiding_w_and_gate_dags_match_native_ood_algebra() {
+        type L = qlab_consensus::legacy::LegacyNonHidingConfig;
+        fn check<A>(dims: Dims, air: &A)
+        where
+            A: Air<SymbolicAirBuilder<Val>> + for<'a> Air<VerifierConstraintFolder<'a, L>>,
+        {
+            let p = Program::compile_dims(dims, air).unwrap();
+            assert_eq!((p.zk, p.chunk_domains.len()), (0, 2));
+            for seed in [3, 71] {
+                let inputs = Inputs {
+                    local: (0..dims.width).map(|i| extension(i + seed)).collect(),
+                    next: (0..dims.width).map(|i| extension(i + seed + 5000)).collect(),
+                    public: (0..dims.pv_len).map(|i| Val::from_usize(i + seed)).collect(),
+                    chunks: (0..2).map(|i| (0..4).map(|j| extension(seed + 4 * i + j)).collect()).collect(),
+                    alpha: extension(seed + 7),
+                    zeta: extension(seed + 13),
+                };
+                let values = compare_native_on::<L, A>(&p, air, &inputs).unwrap();
+                let mut moved = inputs.clone();
+                for v in moved.local.iter_mut().chain(moved.next.iter_mut()) {
+                    *v += extension(41);
+                }
+                let got = compare_native_on::<L, A>(&p, air, &moved).unwrap();
+                assert_ne!(got[p.residual], values[p.residual]);
+            }
+        }
+        use crate::f4::wleaf::{WAir, W_PV_LEN, W_WIDTH};
+        check(Dims { width: W_WIDTH, pv_len: W_PV_LEN, log_height: 15, zk: 0 }, &WAir::new(1));
+        let shape = crate::f4::gate::w_gate_shape(18, crate::f3::bench::Outer::B4);
+        let width = crate::m4gate::GateLayout::from_shape(&shape).gate_width;
+        let (pv_len, air) = (shape.n_opvs(), crate::m4gate::VerifierGateAir::new_with_shape(shape));
+        check(Dims { width, pv_len, log_height: 18, zk: 0 }, &air);
+    }
+
+    /// Lab #782 F4b-2, the smallest real zk = 0 child end to end: a
+    /// non-hiding proof of the toy (log 8, L2 lane parameters) → the DAG
+    /// agrees with p3's own fold at ζ (residual zero) → C1 built from the
+    /// proof satisfies every row, refuses one moved F2-digest limb, proves
+    /// and verifies; its exported F2 digest and caps are byte-identical to
+    /// the `m4gate` walk's flush 2 and caps (condition (1) at toy scale; the
+    /// real W is the box's `f4ood --node`).
+    #[test]
+    fn legacy_toy_ood_component_holds_and_matches_the_query_walk() {
+        use super::lane::toy::{toy_legacy_proof, Toy};
+        let cfg = qlab_l2::L2_CFG_PROVISIONAL;
+        let (proof, pvs) = toy_legacy_proof(8);
+        let ood = legacy_ood((2, 2, 8), &Toy, &proof, &pvs, &cfg, true, Some(&cfg), 64 << 20).unwrap();
+        assert!(ood.ok, "{}", ood.report);
+        assert_eq!(ood.report["scan"]["pass"], true);
+        assert_eq!(ood.report["f2dig_perturbed"]["rejected"], true);
+        assert_eq!(ood.report["component"]["native_verified"], true);
+        let limbs = |d: &[u8]| -> Vec<Val> { d.chunks(2).map(|c| Val::from_u32(u32::from(u16::from_le_bytes([c[0], c[1]])))).collect() };
+        let sched = crate::m4gaterec::walk_with_cfg(&proof, &pvs, &cfg);
+        assert_eq!(ood.f2dig, limbs(&sched.flushes[2].digest), "C1's F2 digest vs the query walk's flush 2");
+        let caps: Vec<Val> = sched.caps.iter().flatten().flat_map(|d| (0..16).map(move |j| Val::from_u32(((d[j / 4] >> (16 * (j % 4))) & 0xffff) as u32))).collect();
+        assert_eq!(ood.caps, caps, "C1's caps vs the query walk's, limb for limb");
+        assert_eq!(ood.inner_pvs, pvs);
+    }
+
+    /// Lab #782 condition (4): the hiding C1 of shape S is main's, byte for
+    /// byte. The object below was printed by `f4ood --fingerprint s` on
+    /// main aaa5753 (a scratch tree carrying only this helper) and on
+    /// F4b-2's tree, and the two outputs were identical (PR body).
+    #[test]
+    fn c1_hiding_layout_fingerprint_is_mains() {
+        let fp = hiding_c1_fingerprint(Shape::S).unwrap();
+        assert_eq!(
+            fp,
+            json!({"constraint_hash": "e9f3034b4eec9370", "constraints": 21385, "max_degree": 3,
+                "public_values": 1151, "rom_columns": 2227, "rom_hash": "b893fee1ac3e506c",
+                "shape": "S", "width": 11746})
+        );
     }
 
     #[test]

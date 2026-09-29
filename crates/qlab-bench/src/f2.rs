@@ -3,7 +3,7 @@
 //! prove under the non-hiding outer lane). No mode declares a memory pass:
 //! peak memory is the operator's `/usr/bin/time -v` reading.
 mod counting;
-mod ood;
+pub(crate) mod ood;
 pub(crate) mod price;
 
 use std::collections::BTreeMap;

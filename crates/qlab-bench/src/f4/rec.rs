@@ -424,7 +424,7 @@ pub(crate) fn m4_layout_json(k: usize, child: crate::f3::bench::Outer) -> Value 
     let rows = (24 * perms).next_power_of_two();
     let cols = crate::m4gate::GateLayout::from_shape(&shape).gate_width;
     json!({"k": k, "child_lane": child.label(), "evidence": "P", "layout": "m4gate VerifierGateAir, one child",
-        "note": "undetermined against F3's layout until measured: the k-model overstates F2's measured C2 by 26–30 % at b2 (F3's layout at F2's empirical slope ≈ 20.4 GiB)",
+        "note": "resolved by F4b-1's box (issue #782): the k-model overstated these cells by ≈ 33 % at outer b2 and ≈ 7 % at outer b4; measured ≈ 7.6 GiB per 2^18 rows at outer b2, ≈ 15.1 at outer b4",
         "queries": shape.nq, "qslots": shape.qslots(), "lane_perms": perms, "rows": rows, "columns": cols,
         "k_model_gib": {"outer_b2": (gib(Lane::B2, cols, rows) * 10.0).round() / 10.0,
             "outer_b4": (gib(Lane::B4, cols, rows) * 10.0).round() / 10.0}})
@@ -485,6 +485,7 @@ pub(crate) fn run(_args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::f3::bench::{leaf_verify, Outer};
+    use p3_field::PrimeCharacteristicRing;
 
     /// Condition (a): F3's pinned census rows, reproduced by the general
     /// formula at the F3 leaf's width.
@@ -576,9 +577,100 @@ mod tests {
     #[test]
     fn f4census_perms_p_matches_the_boxs_lane_counts() {
         use crate::f3::bench::Outer;
-        for (log_h, child, lane) in [(15, Outer::B4, 8_380), (18, Outer::B4, 9_200), (18, Outer::B2, 16_214)] {
-            assert_eq!(super::super::gate::perms_p(&super::super::gate::w_gate_shape(log_h, child)), lane, "{log_h} {child:?}");
+        for (log_h, child, lane, cols) in
+            [(15, Outer::B4, 8_380, 3_792), (18, Outer::B4, 9_200, 3_832), (18, Outer::B2, 16_214, 3_954)]
+        {
+            let shape = super::super::gate::w_gate_shape(log_h, child);
+            assert_eq!(super::super::gate::perms_p(&shape), lane, "{log_h} {child:?}");
+            // PR #783 review W3: the box's columns too.
+            assert_eq!(crate::m4gate::GateLayout::from_shape(&shape).gate_width, cols, "{log_h} {child:?}");
         }
+    }
+
+    /// Lab #782 F4b-2 condition (2): the F2-digest export is opt-in. Narrow,
+    /// wide and the plain W shapes leave it off, so their PVs and layouts are
+    /// unchanged; turning it on keeps every column and every existing PV
+    /// offset, and adds exactly 16 PVs after the inner PVs and 16 constraints.
+    #[test]
+    fn f2dig_export_is_opt_in_and_adds_only_its_pvs_and_constraints() {
+        use crate::m4gate::{GateLayout, GateShape, VerifierGateAir, N_OPVS};
+        use p3_air::symbolic::{get_symbolic_constraints, AirLayout};
+        assert!(!GateShape::narrow().export_f2dig && !GateShape::wide().export_f2dig);
+        assert_eq!(GateShape::narrow().n_opvs(), N_OPVS, "narrow's outer PVs unchanged");
+        let constraints = |s: &GateShape| {
+            let air = VerifierGateAir::new_with_shape(s.clone());
+            get_symbolic_constraints::<Val, _>(&air, AirLayout::from_air::<Val>(&air)).len()
+        };
+        for (log_h, child) in [(15, Outer::B4), (18, Outer::B2)] {
+            let off = super::super::gate::w_gate_shape(log_h, child);
+            assert!(!off.export_f2dig, "{log_h} {child:?}");
+            let on = GateShape { export_f2dig: true, ..off.clone() };
+            assert_eq!(GateLayout::from_shape(&on).gate_width, GateLayout::from_shape(&off).gate_width);
+            assert_eq!((on.opv_f0dig(), on.opv_pvs(), on.opv_f2dig()), (off.opv_f0dig(), off.opv_pvs(), off.n_opvs()));
+            assert_eq!(on.n_opvs(), off.n_opvs() + 16);
+            assert_eq!(constraints(&on), constraints(&off) + 16, "{log_h} {child:?}");
+        }
+        // X3: a merge-lane shape refuses the export at layout time.
+        let wide = GateShape { export_f2dig: true, ..GateShape::wide() };
+        let refused = std::panic::catch_unwind(|| GateLayout::from_shape(&wide)).is_err();
+        assert!(refused, "a merge-lane shape must refuse export_f2dig");
+        GateShape::wide().check();
+    }
+
+    /// Every constraint a single synthetic row pair violates (row 1 of a
+    /// long trace: not first, not last).
+    fn row_failures(air: &crate::m4gate::VerifierGateAir, local: &[Val], next: &[Val], pvs: &[Val]) -> std::collections::BTreeSet<usize> {
+        use p3_matrix::dense::RowMajorMatrixView;
+        use p3_matrix::stack::ViewPair;
+        let main = ViewPair::new(RowMajorMatrixView::new_row(local), RowMajorMatrixView::new_row(next));
+        let prep = ViewPair::new(RowMajorMatrixView::new(&[], 0), RowMajorMatrixView::new(&[], 0));
+        let mut b = p3_air::DebugConstraintBuilder::new(1, main, prep, pvs, Val::ZERO, Val::ZERO, Val::ONE, &[]);
+        p3_air::Air::eval(air, &mut b);
+        b.into_failures().into_iter().map(|f| f.constraint).collect()
+    }
+
+    /// PR #783 review W1: the `r_ff` role's own constraints, on a synthetic
+    /// row (no trace, no proof). (i) A nonzero preimage limb at or past
+    /// `2·ff` fails a constraint that needs BOTH the role and the limb (not
+    /// in the role-only row, not in the limb-only row). (ii) On a last-fold-round row at
+    /// step 10, the carry selector `cf` must follow `r_ff`'s range (`ff = 32`
+    /// fresh words: word-0 rows 0..=15) and not `R_ABS_F16`'s (`qw = 8`:
+    /// rows 0..=3): `cf = 0` (the shortened range) fails, `cf = 1` does not.
+    #[test]
+    fn r_ff_role_refuses_limbs_past_its_words_and_a_shortened_carry_range() {
+        use crate::f3::bench::Outer;
+        use crate::m4gate::{GateLayout, VerifierGateAir};
+        let s = super::super::gate::w_gate_shape(15, Outer::B4);
+        let (ff, rff) = (s.ff_words().expect("K = 1 b4 has a short last round"), s.r_ff().unwrap() as usize);
+        assert_eq!((ff, s.qw), (32, 8));
+        let l = GateLayout::from_shape(&s);
+        let air = VerifierGateAir::new_with_shape(s.clone());
+        let pvs = vec![Val::ZERO; s.n_opvs()];
+        let zero = vec![Val::ZERO; l.gate_width];
+        // Preimage limb i is column 25 + i (m4gate's `pcol`).
+        let with = |cells: &[(usize, u32)]| {
+            let mut r = zero.clone();
+            for &(c, v) in cells {
+                r[c] = Val::from_u32(v);
+            }
+            r
+        };
+        let role = with(&[(l.rsel + rff, 1)]);
+        let role_only = row_failures(&air, &role, &zero, &pvs);
+        let specific = |i: usize| {
+            let both = row_failures(&air, &with(&[(l.rsel + rff, 1), (25 + i, 1)]), &zero, &pvs);
+            let limb_only = row_failures(&air, &with(&[(25 + i, 1)]), &zero, &pvs);
+            both.difference(&role_only).filter(|c| !limb_only.contains(c)).count()
+        };
+        for i in [2 * ff, 2 * ff + 1, 67, 99] {
+            assert!(specific(i) > 0, "limb {i} past r_ff's {ff} words is not refused by the role");
+        }
+        // (ii) the carry range: last fold round, keccak step 10.
+        let fold = l.drnd + 2 + (s.n_fri_rounds() - 1);
+        let base = [(l.rsel + rff, 1), (fold, 1), (10, 1)];
+        let honest = row_failures(&air, &with(&[base[0], base[1], base[2], (l.cf, 1)]), &zero, &pvs);
+        let short = row_failures(&air, &with(&base), &zero, &pvs);
+        assert!(short.difference(&honest).count() > 0, "cf = 0 at step 10 (R_ABS_F16's range) is not refused");
     }
 
     /// The tree counts and the security table's arithmetic.

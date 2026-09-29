@@ -71,10 +71,11 @@ impl Open {
 }
 
 /// Every opened term in native `open_input` order: term k is weighted by
-/// fri_alpha^k. Randomizer (4 columns), trace at ζ (w), trace at ζ·g_N (w),
-/// quotient chunk c column e (4 per chunk).
-pub(super) fn open_order(width: usize, chunks: usize) -> Vec<Open> {
-    (0..D)
+/// fri_alpha^k. Randomizer (4 columns, a hiding child only: `zk` = 1),
+/// trace at ζ (w), trace at ζ·g_N (w), quotient chunk c column e (4 per
+/// chunk).
+pub(super) fn open_order(width: usize, chunks: usize, zk: usize) -> Vec<Open> {
+    (0..D * zk)
         .map(Open::Random)
         .chain((0..width).map(Open::Local))
         .chain((0..width).map(Open::Next))
@@ -87,12 +88,15 @@ pub(super) fn open_order(width: usize, chunks: usize) -> Vec<Open> {
 pub(super) struct SeamShape {
     pub(super) rounds: usize,
     pub(super) final_len: usize,
+    /// 1: the child is hiding (a randomizer cap block); 0: it is not.
+    pub(super) zk: usize,
 }
 
 impl SeamShape {
-    /// Cap blocks: trace, quotient, randomizer, then each commit round.
+    /// Cap blocks: trace, quotient, the randomizer (hiding only), then each
+    /// commit round.
     pub(super) fn cap_blocks(&self) -> usize {
-        3 + self.rounds
+        2 + self.zk + self.rounds
     }
     /// Low limb of cap word `n` (entry n / 8, u64 lane (n % 8) / 2, half n % 2).
     pub(super) fn cap_word(&self, block: usize, n: usize) -> usize {
@@ -162,6 +166,7 @@ impl Seam {
         SeamShape {
             rounds: self.betas.len(),
             final_len: self.final_poly.len(),
+            zk: self.caps.len() - 2 - self.betas.len(),
         }
     }
 

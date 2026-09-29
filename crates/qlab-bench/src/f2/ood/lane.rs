@@ -425,11 +425,26 @@ impl Lane {
         height: usize,
         width: usize,
     ) -> Result<Vec<Val>> {
+        self.trace_reserved(perms, height, width, 0)
+    }
+
+    /// [`Self::trace`] with capacity for `extra_capacity_bits` more of
+    /// height reserved up front: the prover's LDE extends in place, so a
+    /// trace allocated for proving reserves `log_blowup` (lab #782 X1, as
+    /// `m4gate::build_gate_trace`; a late reserve copies the trace).
+    pub(super) fn trace_reserved(
+        &self,
+        perms: &[[u64; 25]],
+        height: usize,
+        width: usize,
+        extra_capacity_bits: usize,
+    ) -> Result<Vec<Val>> {
         let mut lane_inputs = perms.to_vec();
         lane_inputs.resize(height / NUM_ROUNDS, [0; 25]);
         let lane = generate_trace_rows::<Val>(lane_inputs, 0);
         require(lane.height() == height, "keccak lane height")?;
-        let mut values = vec![Val::ZERO; height * width];
+        let mut values = Vec::with_capacity((height << extra_capacity_bits) * width);
+        values.resize(height * width, Val::ZERO);
         for row in 0..height {
             values[row * width..row * width + NUM_KECCAK_COLS]
                 .copy_from_slice(&lane.values[row * NUM_KECCAK_COLS..(row + 1) * NUM_KECCAK_COLS]);
@@ -578,6 +593,22 @@ pub(super) mod toy {
         let config = qlab_consensus::make_config_seeded(&L2_CFG_PROVISIONAL, seed);
         let proof = prove(&config, &Toy, trace, &pvs);
         verify(&config, &Toy, &proof, &pvs).expect("toy hiding proof verifies");
+        (proof, pvs)
+    }
+
+    /// One real NON-hiding proof of the toy at `log_height` on the L2 lane's
+    /// FRI parameters (`qlab_consensus::legacy`): F4b-2's smallest zk = 0
+    /// child (lab #782). Deterministic (no hiding randomness).
+    pub(in crate::f2::ood) fn toy_legacy_proof(
+        log_height: usize,
+    ) -> (
+        Proof<qlab_consensus::legacy::LegacyNonHidingConfig>,
+        Vec<Val>,
+    ) {
+        let (trace, pvs) = toy_trace(log_height);
+        let config = qlab_consensus::legacy::make_legacy_config_with(&L2_CFG_PROVISIONAL);
+        let proof = prove(&config, &Toy, trace, &pvs);
+        verify(&config, &Toy, &proof, &pvs).expect("toy non-hiding proof verifies");
         (proof, pvs)
     }
 

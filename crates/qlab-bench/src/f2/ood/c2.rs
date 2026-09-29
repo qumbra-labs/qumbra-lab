@@ -175,6 +175,12 @@ impl Layout {
             slots.windows(2).all(|w| w[0] < w[1]) && slots.iter().all(|&s| s < cfg.num_queries),
             "covered slots must ascend inside the query count",
         )?;
+        // Hiding only (lab #782 X4): `fold::Geom` takes the height alone and
+        // commits at 2N, so the check sits here, where `Dims` is known.
+        require(
+            dims.zk == qlab_consensus::IS_ZK,
+            "C2 is hiding-only; a zk = 0 child has no C2",
+        )?;
         let ig = open::Layout::new(open::Geom::new(dims, chunks, cfg)?, 1);
         let fg = fold::Layout::new(fold::Geom::new(dims.log_height, cfg)?, 1);
         require(ig.geom.lde == fg.geom.lde, "one LDE height")?;
@@ -185,7 +191,7 @@ impl Layout {
         // it: a block's row values are consecutive terms, a trace column's
         // ζ·g_N term is its ζ term + w, and blocks follow each other term
         // by term except across the w ζ·g_N terms after the trace.
-        let order = open_order(dims.width, chunks);
+        let order = open_order(dims.width, chunks, dims.zk);
         let term = |o: Open| -> Result<usize> {
             order
                 .iter()
@@ -272,6 +278,7 @@ impl Layout {
         let seam = SeamShape {
             rounds: fg.geom.rounds(),
             final_len: fg.geom.final_len,
+            zk: dims.zk,
         };
         Ok(Self {
             ig,
@@ -1599,6 +1606,7 @@ pub(super) mod tests {
                 width: 2,
                 pv_len: 2,
                 log_height: sh.log_height,
+                zk: qlab_consensus::IS_ZK,
             };
             let chunks = sh.proof.opened_values.quotient_chunks.len();
             let cfg = L2_CFG_PROVISIONAL;

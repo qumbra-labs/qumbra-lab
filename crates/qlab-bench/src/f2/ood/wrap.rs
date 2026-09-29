@@ -280,7 +280,7 @@ where
 
 /// The SAT scan: EVERY row evaluated (in parallel), violations named by the
 /// component's constraint group.
-fn scan<A>(air: &A, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Value
+pub(super) fn scan<A>(air: &A, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Value
 where
     A: Phased + Sync + for<'b> Air<DebugConstraintBuilder<'b, Val>>,
 {
@@ -318,7 +318,11 @@ fn symbolic<A: Air<SymbolicAirBuilder<Val>>>(air: &A) -> (usize, usize) {
 }
 
 /// What was built, against the plan, and its maximum constraint degree.
-fn built<A>(air: &A, trace: &RowMajorMatrix<Val>, planned: (usize, usize, usize)) -> (Value, usize)
+pub(super) fn built<A>(
+    air: &A,
+    trace: &RowMajorMatrix<Val>,
+    planned: (usize, usize, usize),
+) -> (Value, usize)
 where
     A: BaseAir<Val> + Air<SymbolicAirBuilder<Val>>,
 {
@@ -422,7 +426,7 @@ pub(super) fn check_leaf(
 }
 
 /// Prove and natively verify one component under the outer config.
-fn prove_component<A>(
+pub(super) fn prove_component<A>(
     air: &A,
     trace: RowMajorMatrix<Val>,
     pvs: &[Val],
@@ -567,6 +571,7 @@ mod tests {
             width: 2,
             pv_len: 2,
             log_height: sh.log_height,
+            zk: qlab_consensus::IS_ZK,
         };
         let inputs = proof_inputs_dims(dims, sh.proof, sh.pvs).unwrap();
         let program = Program::compile_dims(dims, &Toy).unwrap();

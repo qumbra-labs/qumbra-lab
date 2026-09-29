@@ -158,6 +158,8 @@ pub(super) struct Layout {
 
 impl Layout {
     pub(super) fn new(dims: Dims, chunks: usize) -> Self {
+        // Hiding only: F0's degree bits below are log_height + IS_ZK (lab #782 X4).
+        assert_eq!(dims.zk, IS_ZK, "the binding component is hiding-only");
         let w = dims.width;
         let mut f0 = vec![
             Word::Const(monty(Val::from_usize(dims.log_height + IS_ZK))),
@@ -400,6 +402,7 @@ impl BoundAir {
             width: program.leaves.local.len(),
             pv_len: program.leaves.public.len(),
             log_height: program.original.log_size(),
+            zk: program.zk,
         };
         let layout = Layout::new(dims, program.chunk_domains.len());
         let schedule = program.schedule.clone();
@@ -820,6 +823,7 @@ pub(in crate::f2::ood) mod tests {
             width: 2,
             pv_len: 2,
             log_height: TOY_LOG_HEIGHT,
+            zk: qlab_consensus::IS_ZK,
         }
     }
 
@@ -1295,6 +1299,7 @@ pub(in crate::f2::ood) mod tests {
             width: 2,
             pv_len: 2,
             log_height,
+            zk: qlab_consensus::IS_ZK,
         };
         let program = Program::compile_dims(dims, &Toy).unwrap();
         let air = BoundAir::new(&program, 64 << 20).unwrap();

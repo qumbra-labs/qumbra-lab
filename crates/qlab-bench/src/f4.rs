@@ -20,6 +20,7 @@ pub(crate) mod gate;
 pub(crate) mod native;
 pub(crate) mod rec;
 pub(crate) mod neg;
+pub(crate) mod ood;
 pub(crate) mod verify;
 pub(crate) mod wleaf;
 
@@ -32,6 +33,7 @@ pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
         "f4dep" => dep::check(args),
         "f4census" => rec::run(args),
         "f4gate" => gate::run(args),
+        "f4ood" => ood::run(args),
         other => Err(format!("unknown f4 mode `{other}`")),
     }
 }
