@@ -393,3 +393,20 @@ fn l2_pv_range_premise_holds_and_is_enforced() {
     assert!(!pv_in_range(&bad, &br), "a root chunk ≥ 2^16");
     assert!(!pv_in_range(&s[..10], &bs), "a wrong length");
 }
+
+/// Lab #775 review R1: the typed entries' range check sees the `u32`, not
+/// its mod-p reduction — `p + x` is refused where [`pv_in_range`] would
+/// accept it as `x`, and a 32-bit position refuses `v ≥ p`.
+#[test]
+fn l2_u32_entries_refuse_words_above_their_width_before_reduction() {
+    use p3_field::PrimeField32;
+    let p = Val::ORDER_U32;
+    let bits = [16, 32, 1];
+    assert!(pv_u32_in_range(&[0xffff, p - 1, 1], &bits));
+    assert!(!pv_u32_in_range(&[p + 3, 0, 0], &bits), "p + x at a 16-bit position");
+    assert!(pv_in_range(&public_values(&[p + 3, 0, 0]), &bits), "the reduced check accepts it as x");
+    assert!(!pv_u32_in_range(&[0, p, 0], &bits), "a 32-bit position at p");
+    assert!(!pv_u32_in_range(&[0, u32::MAX, 0], &bits));
+    assert!(!pv_u32_in_range(&[0, 0, 2], &bits), "a 1-bit position at 2");
+    assert!(!pv_u32_in_range(&[0, 0], &bits), "the length");
+}

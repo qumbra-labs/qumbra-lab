@@ -70,6 +70,11 @@ pub(crate) fn nf_leaf_hash(lo: &Digest, hi: &Digest) -> Digest {
     keccak_f(&st)[..4].try_into().expect("four lanes")
 }
 
+/// The consensus node hash (for F4's supply tree).
+pub(crate) fn node_pub(l: &Digest, r: &Digest) -> Digest {
+    node(l, r)
+}
+
 fn node(l: &Digest, r: &Digest) -> Digest {
     merkle_node_state(l, r)[..4].try_into().expect("four lanes")
 }

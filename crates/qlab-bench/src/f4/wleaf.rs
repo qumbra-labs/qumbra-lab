@@ -62,6 +62,10 @@ pub(crate) enum PathId {
     R,
     /// An absorbed L1 root appended to AA.
     Abs(usize),
+    /// `C_in` appended to CH.
+    Hist,
+    /// A `vPublic` row's supply-leaf replacement (old, new).
+    Sup(usize),
     /// The fee note appended to C.
     Fee,
 }
@@ -69,7 +73,7 @@ pub(crate) enum PathId {
 impl PathId {
     pub(crate) const fn depth(self) -> usize {
         match self {
-            PathId::R => R_DEPTH,
+            PathId::R | PathId::Sup(_) => R_DEPTH,
             _ => N_DEPTH,
         }
     }
@@ -99,6 +103,11 @@ pub(crate) enum Seg {
     LeafNew(usize),
     Pair(PathId, Part),
     RegLeaf,
+    /// A `vPublic` row's old and new supply leaves.
+    SupOld(usize),
+    SupNew(usize),
+    /// A `vPublic` row's exit-chain step.
+    Exit(usize),
     Anch(APart),
     FeeRho,
     FeeRseed,
@@ -106,8 +115,8 @@ pub(crate) enum Seg {
     Pad,
 }
 
-pub(crate) const PRO: usize = 4 * M_ABS;
-pub(crate) const SLOT_SEGS: usize = 53;
+pub(crate) const PRO: usize = 4 * M_ABS + 4;
+pub(crate) const SLOT_SEGS: usize = 65;
 pub(crate) const SLOT_BASE: usize = PRO;
 pub(crate) const EPI_BASE: usize = SLOT_BASE + SLOT_SEGS;
 pub(crate) const EPI: usize = 7;
@@ -130,6 +139,7 @@ impl Seg {
         let b = SLOT_BASE;
         match self {
             Seg::Pair(PathId::Abs(i), p) => 4 * i + part_off(p),
+            Seg::Pair(PathId::Hist, p) => 4 * M_ABS + part_off(p),
             Seg::Sd(k) => b + k,
             Seg::LeafOld(i) => b + 5 + 11 * i,
             Seg::LeafMid(i) => b + 5 + 11 * i + 1,
@@ -141,9 +151,15 @@ impl Seg {
             Seg::Pair(PathId::R, Part::Bulk) => b + 47,
             Seg::Pair(PathId::R, Part::LastA) => b + 48,
             Seg::Pair(PathId::R, _) => b + 49,
-            Seg::Anch(APart::Low) => b + 50,
-            Seg::Anch(APart::L30) => b + 51,
-            Seg::Anch(APart::Last) => b + 52,
+            Seg::SupOld(k) => b + 50 + 5 * k,
+            Seg::SupNew(k) => b + 51 + 5 * k,
+            Seg::Pair(PathId::Sup(k), Part::Bulk) => b + 52 + 5 * k,
+            Seg::Pair(PathId::Sup(k), Part::LastA) => b + 53 + 5 * k,
+            Seg::Pair(PathId::Sup(k), _) => b + 54 + 5 * k,
+            Seg::Exit(k) => b + 60 + k,
+            Seg::Anch(APart::Low) => b + 62,
+            Seg::Anch(APart::L30) => b + 63,
+            Seg::Anch(APart::Last) => b + 64,
             Seg::FeeRho => EPI_BASE,
             Seg::FeeRseed => EPI_BASE + 1,
             Seg::FeeNote => EPI_BASE + 2,
@@ -154,7 +170,7 @@ impl Seg {
 
     pub(crate) const fn len(self) -> usize {
         match self {
-            Seg::Pair(PathId::R, Part::Bulk) => 30,
+            Seg::Pair(PathId::R | PathId::Sup(_), Part::Bulk) => 30,
             Seg::Pair(_, Part::Bulk) => 60,
             Seg::Pair(_, Part::L30) => 2,
             Seg::Anch(APart::Low) => 30,
@@ -173,8 +189,9 @@ impl Seg {
             }
             Seg::Pair(PathId::C(j), _) => j == 0 || !c,
             Seg::RegLeaf | Seg::Pair(PathId::R, _) => r,
-            Seg::Anch(_) => c,
-            Seg::Pair(PathId::Abs(_) | PathId::Fee, _) | Seg::FeeRho | Seg::FeeRseed | Seg::FeeNote => true,
+            Seg::SupOld(_) | Seg::SupNew(_) | Seg::Exit(_) | Seg::Pair(PathId::Sup(_), _) => t == WTag::P,
+            Seg::Anch(_) => true,
+            Seg::Pair(PathId::Abs(_) | PathId::Hist | PathId::Fee, _) | Seg::FeeRho | Seg::FeeRseed | Seg::FeeNote => true,
             Seg::Pad => false,
         }
     }
@@ -197,6 +214,7 @@ pub(crate) fn program() -> Vec<Seg> {
     for i in 0..M_ABS {
         v.extend(PARTS.map(|p| Seg::Pair(PathId::Abs(i), p)));
     }
+    v.extend(PARTS.map(|p| Seg::Pair(PathId::Hist, p)));
     v.extend((0..SD_BLOCKS).map(Seg::Sd));
     for i in 0..INSERTS {
         v.push(Seg::LeafOld(i));
@@ -210,6 +228,12 @@ pub(crate) fn program() -> Vec<Seg> {
     }
     v.push(Seg::RegLeaf);
     v.extend([Part::Bulk, Part::LastA, Part::LastB].map(|p| Seg::Pair(PathId::R, p)));
+    for k in 0..2 {
+        v.push(Seg::SupOld(k));
+        v.push(Seg::SupNew(k));
+        v.extend([Part::Bulk, Part::LastA, Part::LastB].map(|p| Seg::Pair(PathId::Sup(k), p)));
+    }
+    v.extend([Seg::Exit(0), Seg::Exit(1)]);
     v.extend([APart::Low, APart::L30, APart::Last].map(Seg::Anch));
     v.extend([Seg::FeeRho, Seg::FeeRseed, Seg::FeeNote]);
     v.extend(PARTS.map(|p| Seg::Pair(PathId::Fee, p)));
@@ -222,8 +246,8 @@ pub(crate) fn slot_program() -> Vec<Seg> {
     program()[SLOT_BASE..EPI_BASE].to_vec()
 }
 
-pub(crate) const PRO_PERMS: usize = 256;
-pub(crate) const SLOT_PERMS: usize = 591;
+pub(crate) const PRO_PERMS: usize = 320;
+pub(crate) const SLOT_PERMS: usize = 661;
 pub(crate) const EPI_PERMS: usize = 67;
 
 /// The perm index of segment `seg`'s `i`-th perm (`slot` ignored outside a slot).
@@ -250,6 +274,7 @@ pub(crate) fn w_height(k: usize) -> usize {
 
 /// Tag column order.
 pub(crate) const TAGS: [WTag; 4] = WTag::ALL;
+const T_P: usize = 1;
 const T_R: usize = 2;
 const T_C: usize = 3;
 
@@ -272,7 +297,13 @@ fn captures() -> Vec<Capture> {
         (RT_OFF, 16, vec![(s, l2::PV_REGROOT), (p, l2::PV_REGROOT), (r, l2r::PV_OLD_ROOT)]),
         (NRT_OFF, 16, vec![(r, l2r::PV_NEW_ROOT)]),
         (ASSET, 1, vec![(r, l2r::PV_ASSET)]),
-        (ANC_OFF, 16, vec![(c, claim::PV_A)]),
+        (ANC_OFF, 16, vec![(s, l2::PV_ANCHOR), (p, l2::PV_ANCHOR), (r, l2r::PV_ANCHOR), (c, claim::PV_A)]),
+        (VS_OFF, 1, vec![(p, l2p::PV_VP1)]),
+        (VS_OFF + 1, 1, vec![(p, l2p::PV_VP2)]),
+        (VM_OFF, 4, vec![(p, l2p::PV_VP1 + 1)]),
+        (VM_OFF + 4, 4, vec![(p, l2p::PV_VP2 + 1)]),
+        (VA_OFF, 1, vec![(p, l2p::PV_VP1 + 5)]),
+        (VA_OFF + 1, 1, vec![(p, l2p::PV_VP2 + 5)]),
     ]
 }
 
@@ -330,7 +361,26 @@ pub(crate) const RHO_OFF: usize = FE_OFF + 4;
 pub(crate) const RSD_OFF: usize = RHO_OFF + 16;
 /// The value's three carries, five bits each.
 pub(crate) const FCB_OFF: usize = RSD_OFF + 16;
-pub(crate) const ON: usize = FCB_OFF + 15;
+/// CH (the C-root history) and its next index; the supply tree's root.
+pub(crate) const CH_OFF: usize = FCB_OFF + 15;
+pub(crate) const CHN: usize = CH_OFF + 16;
+pub(crate) const SUP_OFF: usize = CHN + 1;
+/// A P slot's two `vPublic` rows (captured): sign, amount (4 chunks), asset.
+pub(crate) const VS_OFF: usize = SUP_OFF + 16;
+pub(crate) const VM_OFF: usize = VS_OFF + 2;
+pub(crate) const VA_OFF: usize = VM_OFF + 8;
+/// `[asset == 0]` per row and its inverse witness.
+pub(crate) const ZV_OFF: usize = VA_OFF + 2;
+pub(crate) const ZVINV_OFF: usize = ZV_OFF + 2;
+/// The old outstanding (SupOld → SupNew) and the supply addition's carries.
+pub(crate) const OLDV_OFF: usize = ZVINV_OFF + 2;
+pub(crate) const SCB_OFF: usize = OLDV_OFF + 4;
+/// The exit accumulator (unnormalized chunk sums) and the exit chain.
+pub(crate) const EA_OFF: usize = SCB_OFF + 3;
+pub(crate) const EXC_OFF: usize = EA_OFF + 4;
+/// D/E normalization carries (six bits each; D on FeeRho, E on FeeRseed).
+pub(crate) const ECB_OFF: usize = EXC_OFF + 16;
+pub(crate) const ON: usize = ECB_OFF + 18;
 pub(crate) const KPA: usize = ON + 1;
 pub(crate) const KPB: usize = KPA + 1;
 pub(crate) const KCMP: usize = KPB + 1;
@@ -345,7 +395,15 @@ pub(crate) const KFE: usize = KAN + 1;
 pub(crate) const W: usize = KFE + 1;
 pub(crate) const SDC: usize = W + 1;
 pub(crate) const SDF: usize = SDC + 1;
-pub(crate) const W_WIDTH: usize = SDF + 1;
+/// Transaction-anchor (CH) check; per-row exit flag, exit perm, supply
+/// SupNew and LastB flags, asset-0 mint flag.
+pub(crate) const KCH: usize = SDF + 1;
+pub(crate) const XF_OFF: usize = KCH + 1;
+pub(crate) const KX_OFF: usize = XF_OFF + 2;
+pub(crate) const KSN_OFF: usize = KX_OFF + 2;
+pub(crate) const KSU_OFF: usize = KSN_OFF + 2;
+pub(crate) const MZ_OFF: usize = KSU_OFF + 2;
+pub(crate) const W_WIDTH: usize = MZ_OFF + 2;
 const PLAN_BASE: usize = SEG_OFF;
 const PLAN_WIDTH: usize = W_WIDTH - PLAN_BASE;
 
@@ -365,20 +423,29 @@ pub(crate) const PV_K: usize = 68;
 pub(crate) const PV_KN: usize = 84;
 pub(crate) const PV_AA: usize = 86;
 pub(crate) const PV_AAN: usize = 102;
-pub(crate) const PV_SIDE: usize = 104;
+/// F4-2: `CH` 16, `ch_next` 2, the supply root 16, `D_cum` 4, `E_cum` 4.
+pub(crate) const PV_CH: usize = 104;
+pub(crate) const PV_CHN: usize = 120;
+pub(crate) const PV_SUP: usize = 122;
+pub(crate) const PV_D: usize = 138;
+pub(crate) const PV_E: usize = 142;
+pub(crate) const PV_SIDE: usize = 146;
 /// After in and out: `prev` 16, `rkm_seq` 16, the absorbed roots 4 × 16, the
-/// fee note's value 4.
+/// fee note's value 4, `D_batch` 4, the batch's `exit_cmt` 16.
 pub(crate) const PV_PREV: usize = 2 * PV_SIDE;
 pub(crate) const PV_RKMS: usize = PV_PREV + 16;
 pub(crate) const PV_ABS: usize = PV_RKMS + 16;
 pub(crate) const PV_FEE: usize = PV_ABS + 16 * M_ABS;
-pub(crate) const W_PV_LEN: usize = PV_FEE + 4;
+pub(crate) const PV_DB: usize = PV_FEE + 4;
+pub(crate) const PV_EXC: usize = PV_DB + 4;
+pub(crate) const W_PV_LEN: usize = PV_EXC + 16;
 
 /// W's public values.
-pub(crate) fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64) -> Vec<Val> {
+pub(crate) fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64, exit_cmt: &Digest) -> Vec<Val> {
     let mut v = Vec::with_capacity(W_PV_LEN);
     let d = |v: &mut Vec<Val>, x: &Digest| v.extend(limbs(x).iter().map(|l| Val::from_u32(*l)));
     let i = |v: &mut Vec<Val>, x: u64| v.extend([Val::from_u32((x & 0xffff) as u32), Val::from_u32((x >> 16) as u32)]);
+    let u = |v: &mut Vec<Val>, x: u64| v.extend((0..4).map(|j| Val::from_u32(((x >> (16 * j)) & 0xffff) as u32)));
     for r in [rin, rout] {
         d(&mut v, &r.f3.n);
         i(&mut v, r.f3.n_next);
@@ -390,13 +457,20 @@ pub(crate) fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64) -> Vec
         i(&mut v, r.k_next);
         d(&mut v, &r.aa);
         i(&mut v, r.aa_next);
+        d(&mut v, &r.ch);
+        i(&mut v, r.ch_next);
+        d(&mut v, &r.sup);
+        u(&mut v, r.d_cum);
+        u(&mut v, r.e_cum);
     }
     d(&mut v, &inp.prev);
     d(&mut v, &inp.rkm_seq);
     for a in &inp.absorbed {
         d(&mut v, a);
     }
-    v.extend((0..4).map(|j| Val::from_u32(((fee >> (16 * j)) & 0xffff) as u32)));
+    u(&mut v, fee);
+    u(&mut v, inp.d_batch);
+    d(&mut v, exit_cmt);
     debug_assert_eq!(v.len(), W_PV_LEN);
     v
 }
@@ -452,6 +526,12 @@ pub(crate) const PHASES: &[&str] = &[
     "fee_acc",
     "fee_seed",
     "fee_note",
+    "root_ch",
+    "vp",
+    "supply",
+    "root_sup",
+    "exits",
+    "de",
 ];
 
 impl BaseAir<Val> for WAir {
@@ -563,7 +643,12 @@ impl WAir {
         let to_c1 = Seg::Pair(PathId::C(0), Part::LastB);
         let r_last = Seg::Pair(PathId::R, Part::LastB);
         let abs_last = |i: usize| Seg::Pair(PathId::Abs(i), Part::LastB);
-        let to_abs: Vec<Seg> = (0..M_ABS - 1).map(abs_last).collect();
+        let all_abs: Vec<Seg> = (0..M_ABS).map(abs_last).collect();
+        let to_hist = abs_last(M_ABS - 1);
+        let hist_last = Seg::Pair(PathId::Hist, Part::LastB);
+        let sup_old = [Seg::SupOld(0), Seg::SupOld(1)];
+        let sup_new = [Seg::SupNew(0), Seg::SupNew(1)];
+        let sup_last = |k: usize| Seg::Pair(PathId::Sup(k), Part::LastB);
         let pv_abs = |i: usize, j: usize| pvs[PV_ABS + 16 * i + j].clone();
 
         match PHASES[phase] {
@@ -639,25 +724,32 @@ impl WAir {
                 }
                 for j in 0..4 {
                     f.assert_zero(c(FE_OFF + j));
+                    f.assert_zero(c(EA_OFF + j));
                 }
-                for (col, at) in [(N_OFF, PV_N), (C_OFF, PV_C), (R_OFF, PV_R), (SD_OFF, PV_SD), (K_OFF, PV_K), (AA_OFF, PV_AA)] {
+                for j in 0..16 {
+                    f.assert_zero(c(EXC_OFF + j));
+                }
+                for (col, at) in [(N_OFF, PV_N), (C_OFF, PV_C), (R_OFF, PV_R), (SD_OFF, PV_SD), (K_OFF, PV_K), (AA_OFF, PV_AA), (CH_OFF, PV_CH), (SUP_OFF, PV_SUP)] {
                     for j in 0..16 {
                         f.assert_zero(c(col + j) - pvs[at + j].clone());
                     }
                 }
-                for (col, at) in [(NN, PV_NN), (CN, PV_CN), (KN, PV_KN), (AAN, PV_AAN)] {
+                for (col, at) in [(NN, PV_NN), (CN, PV_CN), (KN, PV_KN), (AAN, PV_AAN), (CHN, PV_CHN)] {
                     f.assert_zero(c(col) - pvs[at].clone() - pvs[at + 1].clone() * radix);
                 }
             }
             "last" => {
                 let mut l = builder.when_last_row();
                 l.assert_one(c(SEG_OFF + PAD));
-                for (col, at) in [(N_OFF, PV_N), (C_OFF, PV_C), (R_OFF, PV_R), (SD_OFF, PV_SD), (K_OFF, PV_K), (AA_OFF, PV_AA)] {
+                for (col, at) in [(N_OFF, PV_N), (C_OFF, PV_C), (R_OFF, PV_R), (SD_OFF, PV_SD), (K_OFF, PV_K), (AA_OFF, PV_AA), (CH_OFF, PV_CH), (SUP_OFF, PV_SUP)] {
                     for j in 0..16 {
                         l.assert_zero(c(col + j) - pvs[PV_SIDE + at + j].clone());
                     }
                 }
-                for (col, at) in [(NN, PV_NN), (CN, PV_CN), (KN, PV_KN), (AAN, PV_AAN)] {
+                for j in 0..16 {
+                    l.assert_zero(c(EXC_OFF + j) - pvs[PV_EXC + j].clone());
+                }
+                for (col, at) in [(NN, PV_NN), (CN, PV_CN), (KN, PV_KN), (AAN, PV_AAN), (CHN, PV_CHN)] {
                     l.assert_zero(c(col) - pvs[PV_SIDE + at].clone() - pvs[PV_SIDE + at + 1].clone() * radix);
                 }
             }
@@ -703,6 +795,14 @@ impl WAir {
                 });
                 builder.assert_zero(c(SDF) - sdf);
                 builder.assert_zero(c(BP) - c(BIT) * c(PW));
+                builder.assert_zero(c(KCH) - seg(Seg::Anch(APart::Last)) * (tag(0) + tag(1) + tag(2)));
+                for k in 0..2 {
+                    builder.assert_zero(c(XF_OFF + k) - tag(T_P) * c(ZV_OFF + k) * c(VS_OFF + k));
+                    builder.assert_zero(c(KX_OFF + k) - seg(Seg::Exit(k)) * c(XF_OFF + k));
+                    builder.assert_zero(c(KSN_OFF + k) - seg(Seg::SupNew(k)) * tag(T_P));
+                    builder.assert_zero(c(KSU_OFF + k) - seg(sup_last(k)) * tag(T_P));
+                    builder.assert_zero(c(MZ_OFF + k) - c(ZV_OFF + k) * (one.clone() - c(VS_OFF + k)));
+                }
             }
             "sd" => {
                 for l in 0..4 {
@@ -770,7 +870,7 @@ impl WAir {
             "surface_hold" => {
                 let free = fin.clone() * c(W);
                 let mut t = builder.when_transition();
-                for col in (NF_OFF..=ASSET).chain(ANC_OFF..ANC_OFF + 16) {
+                for col in (NF_OFF..=ASSET).chain(ANC_OFF..ANC_OFF + 16).chain(VS_OFF..VA_OFF + 2) {
                     t.assert_zero((one.clone() - free.clone()) * (n(col) - c(col)));
                 }
             }
@@ -844,15 +944,16 @@ impl WAir {
             }
             "path_regs" => {
                 builder.assert_bool(cur[BIT]);
-                let fao = ka() + segs(&leaf_old) + segs(&anch);
-                let faz = segs(&leaf_new) + seg(to_c0) + seg(to_c1) + segs(&to_abs) + seg(Seg::FeeNote);
-                let fanc = seg(r_last);
+                let fao = ka() + segs(&leaf_old) + segs(&anch) + segs(&sup_old);
+                let faz = segs(&leaf_new) + seg(to_c0) + seg(to_c1) + segs(&all_abs) + seg(Seg::FeeNote);
+                let fanc = seg(Seg::Exit(1));
                 let free = seg(Seg::RegLeaf);
-                let fbo = kb() - seg(to_c0) - seg(to_c1) - segs(&to_abs)
+                let fbo = kb() - seg(to_c0) - seg(to_c1) - segs(&all_abs)
                     + segs(&leaf_mid)
                     + segs(&leaf_new)
                     + seg(Seg::RegLeaf)
-                    + seg(Seg::FeeNote);
+                    + seg(Seg::FeeNote)
+                    + segs(&sup_new);
                 let hold_ab = one.clone() - fin.clone() + fin.clone() * ka();
                 let mut t = builder.when_transition();
                 for j in 0..16 {
@@ -866,7 +967,8 @@ impl WAir {
                                     + free.clone() * (na - a)),
                     );
                     let (b, nb) = (c(NB_OFF + j), n(NB_OFF + j));
-                    let abs_next = (0..M_ABS - 1).fold(AB::Expr::ZERO, |acc, i| acc + seg(abs_last(i)) * (pv_abs(i + 1, j) - b.clone()));
+                    let abs_next = (0..M_ABS - 1).fold(AB::Expr::ZERO, |acc, i| acc + seg(abs_last(i)) * (pv_abs(i + 1, j) - b.clone()))
+                        + seg(to_hist) * (c(C_OFF + j) - b.clone());
                     t.assert_zero(
                         nb - b.clone()
                             - fin.clone()
@@ -883,14 +985,14 @@ impl WAir {
                 let capped = prog
                     .iter()
                     .filter(|s| {
-                        matches!(s, Seg::Pair(p, Part::L30 | Part::LastA | Part::LastB) if *p != PathId::R)
+                        matches!(s, Seg::Pair(p, Part::L30 | Part::LastA | Part::LastB) if !matches!(p, PathId::R | PathId::Sup(_)))
                             || matches!(s, Seg::Anch(APart::L30 | APart::Last))
                     })
                     .fold(AB::Expr::ZERO, |a, s| a + seg(*s));
                 builder.assert_zero(capped * c(BIT));
             }
             "index" => {
-                let fi = segs(&leaf_mid) + segs(&leaf_new) + seg(to_c0) + seg(to_c1) + seg(Seg::RegLeaf) + segs(&to_abs) + seg(Seg::FeeNote);
+                let fi = segs(&leaf_mid) + segs(&leaf_new) + seg(to_c0) + seg(to_c1) + seg(Seg::RegLeaf) + segs(&all_abs) + seg(Seg::FeeNote) + segs(&sup_new);
                 let mut t = builder.when_transition();
                 t.assert_zero(n(ACC) - c(ACC) - fin.clone() * (c(KPB) * c(BP) - fi.clone() * c(ACC)));
                 t.assert_zero(n(PW) - c(PW) - fin * (fi * (one.clone() - c(PW)) + c(KPB) * c(PW)));
@@ -980,12 +1082,14 @@ impl WAir {
             }
             "anchor" => {
                 // A claim's anchor opens in AA: the path's last output is AA's root.
+                // …and a transaction's anchor opens in CH (post-prologue).
                 for j in 0..16 {
                     builder.assert_zero(fin.clone() * c(KAN) * (out(j / 4, j % 4) - c(AA_OFF + j)));
+                    builder.assert_zero(fin.clone() * c(KCH) * (out(j / 4, j % 4) - c(CH_OFF + j)));
                 }
                 // A ≠ 0: its limbs' sum (< 2^20) has an inverse.
                 let sum = (0..16).fold(AB::Expr::ZERO, |a, j| a + c(ANC_OFF + j));
-                builder.assert_zero(c(KAN) * (sum * c(ANINV) - one.clone()));
+                builder.assert_zero((c(KAN) + c(KCH)) * (sum * c(ANINV) - one.clone()));
             }
             "fee_acc" => {
                 let mut t = builder.when_transition();
@@ -1055,6 +1159,147 @@ impl WAir {
                     }
                 }
             }
+            "root_ch" => {
+                let kh = seg(hist_last);
+                for j in 0..16 {
+                    builder.assert_zero(kh.clone() * (c(NA_OFF + j) - c(CH_OFF + j)));
+                }
+                builder.assert_zero(kh.clone() * (c(ACC) + c(BP) - c(CHN)));
+                let mut t = builder.when_transition();
+                for j in 0..16 {
+                    t.assert_zero(n(CH_OFF + j) - c(CH_OFF + j) - fin.clone() * kh.clone() * (out(j / 4, j % 4) - c(CH_OFF + j)));
+                }
+                t.assert_zero(n(CHN) - c(CHN) - fin * kh);
+            }
+            "vp" => {
+                let dom = super::native::supply_domain_lanes();
+                for k in 0..2 {
+                    builder.assert_bool(cur[VS_OFF + k]);
+                    builder.assert_bool(cur[ZV_OFF + k]);
+                    builder.assert_zero(c(VA_OFF + k) * c(ZVINV_OFF + k) - (one.clone() - c(ZV_OFF + k)));
+                    builder.assert_zero(c(VA_OFF + k) * c(ZV_OFF + k));
+                    // The old and new supply leaves H(asset ‖ outstanding).
+                    for s in [Seg::SupOld(k), Seg::SupNew(k)] {
+                        let g = seg(s) * tag(T_P);
+                        for l in 0..25 {
+                            if l == 1 {
+                                continue;
+                            }
+                            for m in 0..4 {
+                                let e: AB::Expr = match (l, m) {
+                                    (0, 0) => c(VA_OFF + k),
+                                    (8, 0) => AB::Expr::ONE,
+                                    (16, 3) => konst(0x8000),
+                                    (21..=23, m) => konst(((dom[l - 21] >> (16 * m)) & 0xffff) as u32),
+                                    _ => AB::Expr::ZERO,
+                                };
+                                builder.assert_zero(g.clone() * (pre(l, m) - e));
+                            }
+                        }
+                    }
+                    for j in 0..4 {
+                        builder.assert_zero(seg(Seg::SupOld(k)) * tag(T_P) * (c(OLDV_OFF + j) - pre(1, j)));
+                    }
+                }
+                // OLDV holds from each SupOld to its SupNew; free entering a SupOld.
+                let fold = seg(r_last) + seg(sup_last(0));
+                let mut t = builder.when_transition();
+                for j in 0..4 {
+                    t.assert_zero((one.clone() - fin.clone() * fold.clone()) * (n(OLDV_OFF + j) - c(OLDV_OFF + j)));
+                }
+            }
+            "supply" => {
+                for b in 0..3 {
+                    builder.assert_bool(cur[SCB_OFF + b]);
+                }
+                let carry = |j: usize| -> AB::Expr {
+                    if j == 0 || j == 4 {
+                        AB::Expr::ZERO
+                    } else {
+                        c(SCB_OFF + j - 1)
+                    }
+                };
+                for k in 0..2 {
+                    let g = c(KSN_OFF + k);
+                    let (sg, zv) = (c(VS_OFF + k), c(ZV_OFF + k));
+                    for j in 0..4 {
+                        // mint (s = 0): old + m = new; redeem (s = 1): new + m = old;
+                        // asset 0 moves nothing (m counts as 0).
+                        let (old, new) = (c(OLDV_OFF + j), pre(1, j));
+                        let a = old.clone() + sg.clone() * (new.clone() - old.clone());
+                        let r = new.clone() + sg.clone() * (old - new);
+                        let mm = (one.clone() - zv.clone()) * c(VM_OFF + 4 * k + j);
+                        builder.assert_zero(g.clone() * (a + mm + carry(j) - r - carry(j + 1) * radix));
+                        // No vPublic mint on asset 0.
+                        builder.assert_zero(g.clone() * c(MZ_OFF + k) * c(VM_OFF + 4 * k + j));
+                    }
+                }
+            }
+            "root_sup" => {
+                for k in 0..2 {
+                    let g = c(KSU_OFF + k);
+                    for j in 0..16 {
+                        builder.assert_zero(g.clone() * (c(NA_OFF + j) - c(SUP_OFF + j)));
+                    }
+                    builder.assert_zero(g * (c(ACC) + c(BP) - c(VA_OFF + k)));
+                }
+                let ks = c(KSU_OFF) + c(KSU_OFF + 1);
+                let mut t = builder.when_transition();
+                for j in 0..16 {
+                    t.assert_zero(n(SUP_OFF + j) - c(SUP_OFF + j) - fin.clone() * ks.clone() * (out(j / 4, j % 4) - c(SUP_OFF + j)));
+                }
+            }
+            "exits" => {
+                let dom = super::native::exit_domain_lanes();
+                let kx = c(KX_OFF) + c(KX_OFF + 1);
+                for l in 0..25 {
+                    if (4..8).contains(&l) {
+                        continue; // rkm: a stub until Q3's field (lab #775)
+                    }
+                    for m in 0..4 {
+                        let e: AB::Expr = match (l, m) {
+                            (0..=3, m) => c(EXC_OFF + 4 * l + m),
+                            (8, m) => c(KX_OFF) * c(VM_OFF + m) + c(KX_OFF + 1) * c(VM_OFF + 4 + m),
+                            (9, 0) => AB::Expr::ONE,
+                            (16, 3) => konst(0x8000),
+                            (21..=23, m) => konst(((dom[l - 21] >> (16 * m)) & 0xffff) as u32),
+                            _ => AB::Expr::ZERO,
+                        };
+                        if l == 8 {
+                            builder.assert_zero(kx.clone() * pre(l, m) - e);
+                        } else {
+                            builder.assert_zero(kx.clone() * (pre(l, m) - e));
+                        }
+                    }
+                }
+                let mut t = builder.when_transition();
+                for j in 0..16 {
+                    t.assert_zero(n(EXC_OFF + j) - c(EXC_OFF + j) - fin.clone() * kx.clone() * (out(j / 4, j % 4) - c(EXC_OFF + j)));
+                }
+                for j in 0..4 {
+                    t.assert_zero(n(EA_OFF + j) - c(EA_OFF + j) - fin.clone() * (c(KX_OFF) * c(VM_OFF + j) + c(KX_OFF + 1) * c(VM_OFF + 4 + j)));
+                }
+            }
+            "de" => {
+                for b in 0..18 {
+                    builder.assert_bool(cur[ECB_OFF + b]);
+                }
+                let carry = |j: usize| -> AB::Expr {
+                    if j == 0 || j == 4 {
+                        AB::Expr::ZERO
+                    } else {
+                        (0..6).fold(AB::Expr::ZERO, |a, i| a + c(ECB_OFF + 6 * (j - 1) + i) * Val::from_u32(1 << i))
+                    }
+                };
+                for j in 0..4 {
+                    // D_out = D_in + D_batch (FeeRho); E_out = E_in + Σ exits (FeeRseed).
+                    let rest = carry(j) - carry(j + 1) * radix;
+                    builder.assert_zero(
+                        seg(Seg::FeeRho) * (pvs[PV_SIDE + PV_D + j].clone() - pvs[PV_D + j].clone() - pvs[PV_DB + j].clone() - rest.clone()),
+                    );
+                    builder.assert_zero(seg(Seg::FeeRseed) * (pvs[PV_SIDE + PV_E + j].clone() - pvs[PV_E + j].clone() - c(EA_OFF + j) - rest));
+                }
+            }
             other => unreachable!("phase {other}"),
         }
     }
@@ -1117,6 +1362,20 @@ struct Regs {
     rho: Digest,
     rsd: Digest,
     fcb: [u32; 3],
+    ch: Digest,
+    chn: u64,
+    sup: Digest,
+    vs: [u32; 2],
+    vm: [u64; 2],
+    va: [u32; 2],
+    oldv: u64,
+    scb: [u32; 3],
+    ea: [u64; 4],
+    exc: Digest,
+    ecb: [u32; 3],
+    d_in: u64,
+    e_in: u64,
+    d_batch: u64,
 }
 
 fn put_digest(cols: &mut [Val], at: usize, d: &Digest) {
@@ -1132,13 +1391,34 @@ struct SlotView<'a> {
     appends: Vec<crate::f3::native::AppendWitness>,
     write: Option<crate::f3::native::RegistryWrite>,
     anchor: Option<qlab_air::narrow::MerkleWitness>,
+    vp: [super::native::VpWitness; 2],
 }
 
-fn slot_view<'a>(m: &'a Member, w: &'a SlotWitness) -> SlotView<'a> {
+fn slot_view<'a>(m: &'a Member, w: &'a SlotWitness, ex: &'a super::native::SlotExtra) -> SlotView<'a> {
     match w {
-        SlotWitness::Tx(t) => SlotView { member: m, inserts: t.inserts.clone(), appends: t.appends.clone(), write: t.write, anchor: None },
-        SlotWitness::Claim(c) => SlotView { member: m, inserts: vec![c.insert], appends: vec![c.append], write: None, anchor: Some(c.anchor_path) },
+        SlotWitness::Tx(t) => {
+            SlotView { member: m, inserts: t.inserts.clone(), appends: t.appends.clone(), write: t.write, anchor: Some(ex.anchor_path), vp: ex.vp }
+        }
+        SlotWitness::Claim(c) => {
+            SlotView { member: m, inserts: vec![c.insert], appends: vec![c.append], write: None, anchor: Some(c.anchor_path), vp: ex.vp }
+        }
     }
+}
+
+/// A `vPublic` row's new outstanding, as the witness implies (wrapping: a
+/// malicious witness still renders; the AIR refuses it).
+fn vp_new(old: u64, s: u32, m: u64, va: u32) -> u64 {
+    if va == 0 {
+        old
+    } else if s == 0 {
+        old.wrapping_add(m)
+    } else {
+        old.wrapping_sub(m)
+    }
+}
+
+fn limb(x: u64, j: usize) -> u64 {
+    (x >> (16 * j)) & 0xffff
 }
 
 /// Build W's plan from a witness, without validating it.
@@ -1177,9 +1457,23 @@ pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WW
         rho: EMPTY,
         rsd: EMPTY,
         fcb: [0; 3],
+        ch: rin.ch,
+        chn: rin.ch_next,
+        sup: rin.sup,
+        vs: [0; 2],
+        vm: [0; 2],
+        va: [0; 2],
+        oldv: 0,
+        scb: [0; 3],
+        ea: [0; 4],
+        exc: EMPTY,
+        ecb: [0; 3],
+        d_in: rin.d_cum,
+        e_in: rin.e_cum,
+        d_batch: inp.d_batch,
     };
     let mut perms: Vec<PermPlan> = Vec::new();
-    let views: Vec<SlotView> = members.iter().zip(&w.slots).map(|(m, s)| slot_view(m, s)).collect();
+    let views: Vec<SlotView> = members.iter().zip(&w.slots).zip(&w.extra).map(|((m, s), e)| slot_view(m, s, e)).collect();
     let run = |s: Seg, g: &mut Regs, view: Option<&SlotView>, blocks: &[[u64; 25]], perms: &mut Vec<PermPlan>| {
         for i in 0..s.len() {
             let side = if s.is_pair_bulk() { i % 2 } else { 0 };
@@ -1190,6 +1484,34 @@ pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WW
                     g.sib = sib;
                     g.bit = bit;
                 }
+            }
+            match s {
+                Seg::SupOld(k) => g.oldv = view.map_or(0, |v| v.vp[k].old_out),
+                Seg::SupNew(k) => {
+                    // The addition a + mm = r's carries (mint: old + m = new;
+                    // redeem: new + m = old; asset 0: m counts as 0).
+                    let new = vp_new(g.oldv, g.vs[k], g.vm[k], g.va[k]);
+                    let a = if g.vs[k] == 1 { new } else { g.oldv };
+                    let mm = if g.va[k] == 0 { 0 } else { g.vm[k] };
+                    let mut c = 0u64;
+                    for j in 0..3 {
+                        c = (limb(a, j) + limb(mm, j) + c) >> 16;
+                        g.scb[j] = c as u32;
+                    }
+                }
+                Seg::FeeRho | Seg::FeeRseed => {
+                    let (x, y): (Vec<u64>, Vec<u64>) = if s == Seg::FeeRho {
+                        ((0..4).map(|j| limb(g.d_in, j)).collect(), (0..4).map(|j| limb(g.d_batch, j)).collect())
+                    } else {
+                        ((0..4).map(|j| limb(g.e_in, j)).collect(), g.ea.to_vec())
+                    };
+                    let mut c = 0u64;
+                    for j in 0..3 {
+                        c = (x[j] + y[j] + c) >> 16;
+                        g.ecb[j] = c as u32;
+                    }
+                }
+                _ => {}
             }
             if let Seg::FeeNote = s {
                 // Normalize the accumulator into the value limbs; the carries.
@@ -1207,7 +1529,7 @@ pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WW
             let rem = s.len() - 1 - i;
             perms.push(PermPlan { pre, cols: snapshot(s, rem, side, g) });
             let out = out4(&pre);
-            step(s, side, out, g, inp, &pre);
+            step(s, side, out, g, inp, &pre, view);
         }
     };
     // Slot 0's surface registers hold from the first row (they change only
@@ -1243,7 +1565,16 @@ fn set_surface(g: &mut Regs, m: &Member) {
         g.rt = EMPTY;
         g.nrt = EMPTY;
         g.asset = 0;
-        g.anc = EMPTY;
+        g.anc = pv_digest(pvs, 0);
+        g.vs = [0; 2];
+        g.vm = [0; 2];
+        g.va = [0; 2];
+        if m.tag == WTag::P {
+            for k in 0..2 {
+                let (sg, amt, vpa) = super::native::vp_row(pvs, k);
+                (g.vs[k], g.vm[k], g.va[k]) = (sg, amt, vpa);
+            }
+        }
         match m.tag {
             WTag::R => {
                 g.nf[0] = pv_digest(pvs, l2r::PV_NF);
@@ -1255,7 +1586,6 @@ fn set_surface(g: &mut Regs, m: &Member) {
             WTag::C => {
                 g.nf[0] = pv_digest(pvs, claim::PV_CNF);
                 g.cm[0] = pv_digest(pvs, claim::PV_CM2);
-                g.anc = pv_digest(pvs, claim::PV_A);
                 g.rt = g.r;
             }
             t => {
@@ -1289,6 +1619,8 @@ fn path_at(s: Seg, view: Option<&SlotView>, w: &WWitness, lvl: usize) -> (Digest
         Seg::Pair(PathId::C(j), _) => view.and_then(|v| v.appends.get(j)).map(|x| get(&x.path)),
         Seg::Pair(PathId::R, _) => view.and_then(|v| v.write.as_ref()).map(|x| (x.path.siblings[lvl], x.path.path_bits[lvl])),
         Seg::Pair(PathId::Abs(i), _) => Some(get(&w.absorbs[i].path)),
+        Seg::Pair(PathId::Hist, _) => Some(get(&w.hist.path)),
+        Seg::Pair(PathId::Sup(k), _) => view.map(|v| (v.vp[k].path.siblings[lvl], v.vp[k].path.path_bits[lvl])),
         Seg::Pair(PathId::Fee, _) => Some(get(&w.fee.path)),
         Seg::Anch(_) => view.and_then(|v| v.anchor.as_ref()).map(get),
         _ => None,
@@ -1327,6 +1659,10 @@ fn perm_input(s: Seg, i: usize, g: &Regs, view: Option<&SlotView>, blocks: &[[u6
             (Some(rw), WTag::R) => rw.leaf.state(),
             _ => [0; 25],
         },
+        Seg::SupOld(k) if on => super::native::supply_leaf_state(u64::from(g.va[k]), g.oldv),
+        Seg::SupNew(k) if on => super::native::supply_leaf_state(u64::from(g.va[k]), vp_new(g.oldv, g.vs[k], g.vm[k], g.va[k])),
+        Seg::Exit(k) if on && xf(g, k) => super::native::exit_state(&g.exc, &view.map_or(EMPTY, |v| v.vp[k].exit_rkm), g.vm[k]),
+        Seg::SupOld(_) | Seg::SupNew(_) | Seg::Exit(_) => [0; 25],
         Seg::FeeRho => fee_seed_state(&inp.prev, 1),
         Seg::FeeRseed => fee_seed_state(&inp.prev, 2),
         Seg::FeeNote => {
@@ -1342,6 +1678,11 @@ fn perm_input(s: Seg, i: usize, g: &Regs, view: Option<&SlotView>, blocks: &[[u6
         }
         Seg::Pad => [0; 25],
     }
+}
+
+/// Row `k` is an exit: a P slot's `vPublic` redeem on asset 0.
+fn xf(g: &Regs, k: usize) -> bool {
+    g.tag == WTag::P && g.va[k] == 0 && g.vs[k] == 1
 }
 
 /// The accumulator as a u64 (the normalized value; wraps past 2^64 — the AIR refuses that).
@@ -1409,6 +1750,42 @@ fn snapshot(s: Seg, rem: usize, side: usize, g: &Regs) -> Vec<Val> {
             }
         }
     }
+    put_digest(&mut cols, CH_OFF, &g.ch);
+    put(&mut cols, CHN, Val::from_u32(g.chn as u32));
+    put_digest(&mut cols, SUP_OFF, &g.sup);
+    for k in 0..2 {
+        put(&mut cols, VS_OFF + k, Val::from_u32(g.vs[k]));
+        for j in 0..4 {
+            put(&mut cols, VM_OFF + 4 * k + j, Val::from_u32(limb(g.vm[k], j) as u32));
+        }
+        let va = Val::from_u32(g.va[k]);
+        put(&mut cols, VA_OFF + k, va);
+        put(&mut cols, ZV_OFF + k, Val::from_bool(g.va[k] == 0));
+        put(&mut cols, ZVINV_OFF + k, inv_or_zero(va));
+        put(&mut cols, XF_OFF + k, Val::from_bool(xf(g, k)));
+        put(&mut cols, KX_OFF + k, Val::from_bool(s == Seg::Exit(k) && xf(g, k)));
+        put(&mut cols, KSN_OFF + k, Val::from_bool(s == Seg::SupNew(k) && g.tag == WTag::P));
+        put(&mut cols, KSU_OFF + k, Val::from_bool(s == Seg::Pair(PathId::Sup(k), Part::LastB) && g.tag == WTag::P));
+        put(&mut cols, MZ_OFF + k, Val::from_bool(g.va[k] == 0 && g.vs[k] == 0));
+    }
+    for j in 0..4 {
+        put(&mut cols, OLDV_OFF + j, Val::from_u32(limb(g.oldv, j) as u32));
+        put(&mut cols, EA_OFF + j, Val::from_u32(g.ea[j] as u32));
+    }
+    if matches!(s, Seg::SupNew(_)) {
+        for j in 0..3 {
+            put(&mut cols, SCB_OFF + j, Val::from_u32(g.scb[j]));
+        }
+    }
+    if matches!(s, Seg::FeeRho | Seg::FeeRseed) {
+        for j in 0..3 {
+            for b in 0..6 {
+                put(&mut cols, ECB_OFF + 6 * j + b, Val::from_u32((g.ecb[j] >> b) & 1));
+            }
+        }
+    }
+    put_digest(&mut cols, EXC_OFF, &g.exc);
+    put(&mut cols, KCH, Val::from_bool(g.tag != WTag::C && s == Seg::Anch(APart::Last)));
     let on = s.active(g.tag);
     let tx = matches!(g.tag, WTag::S | WTag::P | WTag::R);
     let cl = g.tag == WTag::C;
@@ -1433,7 +1810,8 @@ fn snapshot(s: Seg, rem: usize, side: usize, g: &Regs) -> Vec<Val> {
 }
 
 /// The perm's last-row transition.
-fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u64; 25]) {
+fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u64; 25], view: Option<&SlotView>) {
+    let _ = view;
     let on = s.active(g.tag);
     let tx = matches!(g.tag, WTag::S | WTag::P | WTag::R);
     let to_c0 = Seg::Pair(PathId::New(INSERTS - 1), Part::LastB);
@@ -1471,7 +1849,7 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
                 Part::LastA => true,
                 Part::LastB => false,
             };
-            let to_abs = matches!(p, PathId::Abs(i) if i + 1 < M_ABS) && part == Part::LastB;
+            let to_abs = matches!(p, PathId::Abs(_)) && part == Part::LastB;
             if a {
                 g.na = out;
             } else if s != to_c0 && s != to_c1 && !to_abs {
@@ -1507,6 +1885,11 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
                         g.aa = out;
                         g.aan += 1;
                     }
+                    PathId::Hist => {
+                        g.ch = out;
+                        g.chn += 1;
+                    }
+                    PathId::Sup(_) if g.tag == WTag::P => g.sup = out,
                     PathId::R if g.tag == WTag::R => g.r = out,
                     _ => {}
                 }
@@ -1521,15 +1904,10 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
                     reset(g);
                 }
                 if let PathId::Abs(i) = p {
-                    if i + 1 < M_ABS {
-                        g.na = EMPTY;
-                        g.nb = inp.absorbed[i + 1];
-                        reset(g);
-                    }
-                }
-                if p == PathId::R {
-                    // The slot boundary; the anchor path starts from A.
-                    g.na = g.anc;
+                    g.na = EMPTY;
+                    // The next absorbed root, or (after the last) C_in into CH.
+                    g.nb = if i + 1 < M_ABS { inp.absorbed[i + 1] } else { g.c };
+                    reset(g);
                 }
             }
         }
@@ -1537,6 +1915,23 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
             g.nb = out;
             g.na = EMPTY;
             reset(g);
+        }
+        Seg::SupOld(_) => g.na = out,
+        Seg::SupNew(_) => {
+            g.nb = out;
+            reset(g);
+        }
+        Seg::Exit(k) => {
+            if xf(g, k) {
+                g.exc = out;
+                for j in 0..4 {
+                    g.ea[j] += limb(g.vm[k], j);
+                }
+            }
+            if k == 1 {
+                // The anchor path starts from the slot's anchor.
+                g.na = g.anc;
+            }
         }
         Seg::FeeRho => g.rho = out,
         Seg::FeeRseed => g.rsd = out,
