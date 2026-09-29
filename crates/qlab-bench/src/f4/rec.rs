@@ -550,6 +550,27 @@ mod tests {
         assert!(leaf + compress + challenger > 0);
     }
 
+    /// The box's first W gate cells refused at "fold output": a one-block
+    /// last fold leaf (4·2^la words) went through `R_ABS_F16`, whose fresh
+    /// count is the quotient's `qw`. W's short last rounds now take their own
+    /// role; narrow (16 = qw) and wide (all multi-block) keep none, so their
+    /// programs and layouts are unchanged.
+    #[test]
+    fn f4gate_short_last_fold_round_has_its_own_role() {
+        use crate::f3::bench::Outer;
+        use crate::m4gate::{qprogram_from_shape, GateShape};
+        assert_eq!((GateShape::narrow().ff_words(), GateShape::wide().ff_words()), (None, None));
+        assert_eq!((GateShape::narrow().n_roles(), GateShape::wide().n_roles()), (13, 12));
+        for (log_h, child, la, ff) in [(15, Outer::B4, 3, 32), (18, Outer::B4, 2, 16), (18, Outer::B2, 2, 16)] {
+            let s = super::super::gate::w_gate_shape(log_h, child);
+            assert_eq!((*s.log_arities.last().unwrap(), s.ff_words()), (la, Some(ff)), "{log_h} {child:?}");
+            let rff = s.r_ff().unwrap();
+            assert_eq!((rff as usize, s.n_roles()), (9 + s.n_fri_rounds(), 10 + s.n_fri_rounds()));
+            let prog = qprogram_from_shape(&s);
+            assert_eq!(prog.iter().filter(|d| **d & 0xf == rff).count(), 1, "one short fold leaf a query");
+        }
+    }
+
     /// The tree counts and the security table's arithmetic.
     #[test]
     fn f4census_trees() {
