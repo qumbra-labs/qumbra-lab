@@ -73,50 +73,32 @@
 //! [`INDEX_CAP`] = 2^30 (inherited, Larry 2026-09-29).
 // The W AIR is this module's non-test consumer.
 #![cfg_attr(not(test), allow(dead_code))]
-use qlab_air::l2::{l2_cm, RegistryLeaf, RegistryWitness};
+use qlab_air::l2::{RegistryLeaf, RegistryWitness};
 use qlab_air::narrow::{pv_chunks, MerkleWitness, MERKLE_DEPTH};
-use qlab_air::reference::keccak_f;
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::annulet::L2ShapeTag;
 
 use crate::f3::native::{
     append, apply_append, apply_insert, sd_chain_byte, AppendError, AppendWitness, Digest, IndexedTree, InsertWitness,
-    L2State, NfError, Roots, StError, TxSurface, TxWitness, EMPTY, INDEX_CAP,
+    L2State, NfError, StError, TxSurface, TxWitness, EMPTY, INDEX_CAP,
 };
 
-/// A deposit claim's slot tag (SD's word 0).
-pub(crate) const CLAIM_TAG: u8 = 0x04;
-/// L1 roots absorbed per wrapper (ruling Q8: a devnet placeholder).
-pub(crate) const M_ABS: usize = 4;
+// Lab #785 F5-1: the wrapper-state types and domain-tagged states moved to qlab-wrapper.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use qlab_wrapper::hash::{
+    exit_state, fee_domain_lanes, fee_note_cm, fee_rho, fee_rseed, fee_seed_state, h4,
+    supply_leaf_state, WRoots, WTag, CLAIM_TAG, M_ABS, SUPPLY_DEPTH,
+};
 
-/// A slot's kind: an L2 transaction shape or a claim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WTag {
-    S,
-    P,
-    R,
-    C,
+/// The `WTag` ↔ `L2ShapeTag` conversion, kept on this side so qlab-wrapper
+/// carries no qlab-devnet edge (lab #785 review Y1). `WTag::byte` writes the
+/// shape bytes out; `wtag_bytes_are_the_shape_tags` pins them equal.
+pub(crate) trait WTagShape {
+    fn shape(self) -> Option<L2ShapeTag>;
 }
 
-impl WTag {
-    pub(crate) const ALL: [WTag; 4] = [WTag::S, WTag::P, WTag::R, WTag::C];
-    pub(crate) fn byte(self) -> u8 {
-        match self {
-            WTag::S => L2ShapeTag::S.byte(),
-            WTag::P => L2ShapeTag::P.byte(),
-            WTag::R => L2ShapeTag::R.byte(),
-            WTag::C => CLAIM_TAG,
-        }
-    }
-    pub(crate) fn pv_len(self) -> usize {
-        match self {
-            WTag::S => qlab_air::l2::PV_LEN,
-            WTag::P => qlab_air::l2p::PV_LEN,
-            WTag::R => qlab_air::l2r::PV_LEN,
-            WTag::C => qlab_air::claim::PV_LEN,
-        }
-    }
-    pub(crate) fn shape(self) -> Option<L2ShapeTag> {
+impl WTagShape for WTag {
+    fn shape(self) -> Option<L2ShapeTag> {
         match self {
             WTag::S => Some(L2ShapeTag::S),
             WTag::P => Some(L2ShapeTag::P),
@@ -124,12 +106,14 @@ impl WTag {
             WTag::C => None,
         }
     }
-    pub(crate) fn of(tag: L2ShapeTag) -> Self {
-        match tag {
-            L2ShapeTag::S => WTag::S,
-            L2ShapeTag::P => WTag::P,
-            L2ShapeTag::R => WTag::R,
-        }
+}
+
+/// [`WTag`] of an L2 transaction shape (was `WTag::of`).
+pub(crate) fn wtag_of(tag: L2ShapeTag) -> WTag {
+    match tag {
+        L2ShapeTag::S => WTag::S,
+        L2ShapeTag::P => WTag::P,
+        L2ShapeTag::R => WTag::R,
     }
 }
 
@@ -144,7 +128,7 @@ pub(crate) struct Member {
 
 impl Member {
     pub(crate) fn tx(t: &TxSurface) -> Self {
-        Member { tag: WTag::of(t.tag), pvs: t.pvs.clone(), write: t.write }
+        Member { tag: wtag_of(t.tag), pvs: t.pvs.clone(), write: t.write }
     }
     fn as_tx(&self) -> Option<TxSurface> {
         self.tag.shape().map(|tag| TxSurface { tag, pvs: self.pvs.clone(), write: self.write })
@@ -197,23 +181,6 @@ pub(crate) enum WError {
     /// `aa_next` not a multiple of [`M_ABS`]: the absorbed roots are one
     /// aligned subtree of `AA` (F4-3's absorb).
     AbsAlign,
-}
-
-/// The running state a wrapper leaf threads: F3's six plus `K` (the claim
-/// nullifiers, `cnf_root`), `AA` (the L1-anchor accumulator), `CH` (the
-/// C-root history), the supply tree's root and `D_cum`/`E_cum`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WRoots {
-    pub f3: Roots,
-    pub k: Digest,
-    pub k_next: u64,
-    pub aa: Digest,
-    pub aa_next: u64,
-    pub ch: Digest,
-    pub ch_next: u64,
-    pub sup: Digest,
-    pub d_cum: u64,
-    pub e_cum: u64,
 }
 
 /// A claim slot's witnesses.
@@ -286,87 +253,6 @@ pub(crate) struct WWitness {
     pub slots: Vec<SlotWitness>,
     pub extra: Vec<SlotExtra>,
     pub fee: AppendWitness,
-}
-
-/// The fee note's `ρ` and `rseed`: one domain-tagged Keccak-f each over
-/// `prev` — `prev` in lanes 0..4, the kind in lane 4 (1 = ρ, 2 = rseed),
-/// the domain `"qumbra:l2-claimfee:v1"` in capacity lanes 21..24, which no
-/// node, leaf, registry or SD block sets.
-pub(crate) fn fee_seed_state(prev: &Digest, kind: u64) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(prev);
-    st[4] = kind;
-    st[8] = 1;
-    st[16] = 1 << 63;
-    let dom = fee_domain_lanes();
-    st[21..24].copy_from_slice(&dom);
-    st
-}
-
-/// `"qumbra:l2-claimfee:v1"` as three little-endian lanes (zero-padded).
-pub(crate) fn fee_domain_lanes() -> [u64; 3] {
-    let mut b = [0u8; 24];
-    b[..21].copy_from_slice(b"qumbra:l2-claimfee:v1");
-    core::array::from_fn(|i| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes")))
-}
-
-pub(crate) fn fee_rho(prev: &Digest) -> Digest {
-    keccak_f(&fee_seed_state(prev, 1))[..4].try_into().expect("four lanes")
-}
-pub(crate) fn fee_rseed(prev: &Digest) -> Digest {
-    keccak_f(&fee_seed_state(prev, 2))[..4].try_into().expect("four lanes")
-}
-
-/// The fee note's commitment: an asset-0 L2 note (`qlab_air::l2::l2_cm`).
-pub(crate) fn fee_note_cm(value: u64, rkm_seq: &Digest, prev: &Digest) -> Digest {
-    l2_cm(value, 0, rkm_seq, &fee_rho(prev), &fee_rseed(prev))
-}
-
-/// The supply tree's depth — asset ids < 2^16 (a devnet placeholder).
-pub(crate) const SUPPLY_DEPTH: usize = qlab_air::l2::REGISTRY_DEPTH;
-
-pub(crate) fn domain3(s: &[u8]) -> [u64; 3] {
-    let mut b = [0u8; 24];
-    b[..s.len()].copy_from_slice(s);
-    core::array::from_fn(|i| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes")))
-}
-
-/// `"qumbra:l2-supply:v1"` in capacity lanes 21..24.
-pub(crate) fn supply_domain_lanes() -> [u64; 3] {
-    domain3(b"qumbra:l2-supply:v1")
-}
-/// `"qumbra:l2-exits:v1"` in capacity lanes 21..24.
-pub(crate) fn exit_domain_lanes() -> [u64; 3] {
-    domain3(b"qumbra:l2-exits:v1")
-}
-
-/// A supply leaf `H(asset ‖ outstanding)`: lanes 0/1, the node pad (lanes
-/// 8, 16), the domain in capacity lanes 21..24.
-pub(crate) fn supply_leaf_state(asset: u64, out: u64) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[0] = asset;
-    st[1] = out;
-    st[8] = 1;
-    st[16] = 1 << 63;
-    st[21..24].copy_from_slice(&supply_domain_lanes());
-    st
-}
-
-fn h4(st: &[u64; 25]) -> Digest {
-    keccak_f(st)[..4].try_into().expect("four lanes")
-}
-
-/// One exit-chain step `H(prev ‖ rkm ‖ v)`: lanes 0..4, 4..8, 8; pad lanes
-/// 9, 16; the domain in capacity lanes 21..24.
-pub(crate) fn exit_state(prev: &Digest, rkm: &Digest, v: u64) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(prev);
-    st[4..8].copy_from_slice(rkm);
-    st[8] = v;
-    st[9] = 1;
-    st[16] = 1 << 63;
-    st[21..24].copy_from_slice(&exit_domain_lanes());
-    st
 }
 
 /// The supply tree: every asset's outstanding, every level materialized.
@@ -750,6 +636,23 @@ mod tests {
         let mut rng = Rng(0x775_f4f4_0001);
         let inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: 0 };
         (WState::genesis(&[RegistryLeaf::cloaked(0)]), rng, inp)
+    }
+
+    /// Lab #785 review Y1: qlab-wrapper's `WTag::byte` writes the shape
+    /// bytes out rather than reading qlab-devnet's `L2ShapeTag`; they must
+    /// stay the same bytes, the conversion must round-trip, and the claim
+    /// tag must be none of them.
+    #[test]
+    fn wtag_bytes_are_the_shape_tags() {
+        for tag in [L2ShapeTag::S, L2ShapeTag::P, L2ShapeTag::R] {
+            let w = wtag_of(tag);
+            assert_eq!(w.byte(), tag.byte(), "{tag:?}");
+            assert_eq!(w.shape(), Some(tag));
+            assert_eq!(L2ShapeTag::from_byte(w.byte()), Some(tag));
+        }
+        assert_eq!(WTag::C.shape(), None);
+        assert_eq!(L2ShapeTag::from_byte(WTag::C.byte()), None, "the claim tag is no shape's byte");
+        assert_eq!(WTag::ALL.map(WTag::byte), [0x01, 0x02, 0x03, CLAIM_TAG]);
     }
 
     /// A mixed sequence threads, and the fee note carries Σ fee.

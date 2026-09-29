@@ -1552,6 +1552,7 @@ dependencies = [
  "qlab-p2p",
  "qlab-pow",
  "qlab-wallet",
+ "qlab-wrapper",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -1803,6 +1804,20 @@ dependencies = [
  "qlab-air",
  "qlab-note",
  "rand 0.10.2",
+]
+
+[[package]]
+name = "qlab-wrapper"
+version = "0.0.0"
+dependencies = [
+ "p3-air",
+ "p3-field",
+ "p3-keccak-air",
+ "p3-matrix",
+ "p3-uni-stark",
+ "qlab-air",
+ "qlab-consensus",
+ "qlab-l2",
 ]
 
 [[package]]

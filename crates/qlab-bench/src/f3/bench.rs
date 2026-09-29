@@ -31,40 +31,16 @@ use serde_json::{json, Value};
 use super::census::{row, K_B2, K_B4};
 use super::leaf::{first_violation, LeafAir, LEAF_PV_LEN, LEAF_WIDTH};
 use super::neg::{fixture, honest, SEED};
-use crate::m4interior::{INTERIOR_B2_CFG, INTERIOR_B4_CFG};
 
-/// The outer lane a leaf is proven on.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Outer {
-    B2,
-    B4,
-}
+// Lab #785 F5-1: the outer-lane enum moved to qlab-wrapper; its k-model
+// constant stays a bench fact.
+pub(crate) use qlab_wrapper::config::Outer;
 
-impl Outer {
-    pub(crate) fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "b2" => Ok(Self::B2),
-            "b4" => Ok(Self::B4),
-            _ => Err("--outer must be b2|b4".into()),
-        }
-    }
-    pub(crate) fn cfg(self) -> FriCfg {
-        match self {
-            Self::B2 => INTERIOR_B2_CFG,
-            Self::B4 => INTERIOR_B4_CFG,
-        }
-    }
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::B2 => "b2/q86/g22/fp16/a16",
-            Self::B4 => "b4/q43/g22/fp16/a16",
-        }
-    }
-    pub(crate) fn k_model(self) -> f64 {
-        match self {
-            Self::B2 => K_B2,
-            Self::B4 => K_B4,
-        }
+/// The k-model memory constant for `outer` (was `Outer::k_model`).
+pub(crate) fn k_model(outer: Outer) -> f64 {
+    match outer {
+        Outer::B2 => K_B2,
+        Outer::B4 => K_B4,
     }
 }
 
@@ -154,7 +130,7 @@ pub(crate) fn prove_run(args: &[String]) -> Result<(), String> {
         "native_verified": verified.is_ok(),
         "verify_error": verified.err().map(|e| format!("{e:?}")),
         "expected_peak_gib": {"evidence": "P", "source": "F2's k-model, peak ≈ K × width × 2^(h−18), a planning model",
-            "value": (outer.k_model() * scale * 100.0).round() / 100.0},
+            "value": (k_model(outer) * scale * 100.0).round() / 100.0},
         "peak_rss": {"evidence": "M", "value": null, "operator_records": "maximum resident set size from /usr/bin/time wrapping this process"},
     });
     println!("{}", serde_json::to_string_pretty(&report).expect("json"));
@@ -307,7 +283,7 @@ pub(crate) fn interior_report() -> Value {
             let perms = 2 * (v.challenger_perms + v.queries * v.per_query_perms);
             let q_rows = (24 * v.queries * v.per_query_perms).next_power_of_two();
             let gib = |cols: usize, rows: usize| {
-                (outer.k_model() * cols as f64 * 2f64.powi(rows.trailing_zeros() as i32 - 18) * 10.0).round() / 10.0
+                (k_model(outer) * cols as f64 * 2f64.powi(rows.trailing_zeros() as i32 - 18) * 10.0).round() / 10.0
             };
             rows.push(json!({
                 "outer": outer.label(), "k": k, "leaf_log_height": lh, "leaf_lde": v.lde,

@@ -58,15 +58,13 @@
 //! [`INDEX_CAP`] = 2^30, the path bits 30 and 31 forced to zero.
 // The bench modes (F3-2c) are this module's non-test consumer.
 #![cfg_attr(not(test), allow(dead_code))]
-use std::borrow::Borrow;
 use std::ops::Range;
 
 use p3_air::symbolic::{AirLayout, SymbolicAirBuilder};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
-use p3_field::{Field, PrimeCharacteristicRing};
-use p3_keccak_air::{generate_trace_rows, KeccakAir, KeccakCols, NUM_KECCAK_COLS, NUM_ROUNDS};
+use p3_field::PrimeCharacteristicRing;
+use p3_keccak_air::{generate_trace_rows, KeccakAir, NUM_KECCAK_COLS, NUM_ROUNDS};
 use p3_matrix::dense::RowMajorMatrix;
-use qlab_air::reference::keccak_f;
 use qlab_consensus::Val;
 use qlab_devnet::annulet::L2ShapeTag;
 
@@ -76,6 +74,9 @@ use super::native::{
     SD_BLOCK_WORDS, SD_LANE_DOMAIN, SD_LANE_FINAL, SD_LANE_INDEX, SD_LANE_MSG,
 };
 use crate::m4skel::LaneBuilder;
+
+// Lab #785 F5-1: the Keccak-lane helpers moved to qlab-wrapper.
+pub(crate) use qlab_wrapper::hash::{inv_or_zero, keccak_idx, mux, nf_leaf_state, node_state, out4, pv_digest, KeccakIdx};
 
 // ---------------------------------------------------------------------------
 // The slot program
@@ -377,26 +378,6 @@ pub(crate) fn leaf_pvs(rin: &Roots, rout: &Roots) -> Vec<Val> {
 // ---------------------------------------------------------------------------
 // The AIR
 // ---------------------------------------------------------------------------
-
-/// Keccak lane column indices (standard lane = x + 5y).
-#[derive(Clone)]
-pub(crate) struct KeccakIdx {
-    pub(crate) step0: usize,
-    pub(crate) fin: usize,
-    pub(crate) pre: [[usize; 4]; 25],
-    pub(crate) out: [[usize; 4]; 25],
-}
-
-pub(crate) fn keccak_idx() -> KeccakIdx {
-    let idx: Vec<usize> = (0..NUM_KECCAK_COLS).collect();
-    let map: &KeccakCols<usize> = idx[..].borrow();
-    KeccakIdx {
-        step0: map.step_flags[0],
-        fin: map.step_flags[NUM_ROUNDS - 1],
-        pre: core::array::from_fn(|lane| map.preimage[lane / 5][lane % 5]),
-        out: core::array::from_fn(|lane| core::array::from_fn(|l| map.a_prime_prime_prime(lane / 5, lane % 5, l))),
-    }
-}
 
 /// The leaf for `k` transactions.
 pub(crate) struct LeafAir {
@@ -972,37 +953,6 @@ struct Regs {
     left: i64,
 }
 
-pub(crate) fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(lo);
-    st[4..8].copy_from_slice(hi);
-    st[8] = 1 << 4;
-    st[16] = 1 << 63;
-    st
-}
-
-pub(crate) fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(l);
-    st[4..8].copy_from_slice(r);
-    st[8] = 1;
-    st[16] = 1 << 63;
-    st
-}
-
-pub(crate) fn out4(st: &[u64; 25]) -> Digest {
-    keccak_f(st)[..4].try_into().expect("four lanes")
-}
-
-/// A PV digest, chunk by chunk (masked: the plan never validates; the AIR does).
-pub(crate) fn pv_digest(pvs: &[u32], off: usize) -> Digest {
-    core::array::from_fn(|l| (0..4).map(|j| (u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0)) & 0xffff) << (16 * j)).sum())
-}
-
-pub(crate) fn inv_or_zero(v: Val) -> Val {
-    v.try_inverse().unwrap_or(Val::ZERO)
-}
-
 fn put_digest(cols: &mut [Val], at: usize, d: &Digest) {
     for (j, l) in limbs(d).iter().enumerate() {
         cols[at - PLAN_BASE + j] = Val::from_u32(*l);
@@ -1113,14 +1063,6 @@ fn path_at(s: Seg, w: &TxWitness, lvl: usize) -> (Digest, bool) {
         PathId::R => w.write.as_ref().map(|x| (x.path.siblings[lvl], x.path.path_bits[lvl])),
     };
     mw.unwrap_or((EMPTY, false))
-}
-
-pub(crate) fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
-    if bit {
-        (*sib, *x)
-    } else {
-        (*x, *sib)
-    }
 }
 
 /// The perm's Keccak-f input.
