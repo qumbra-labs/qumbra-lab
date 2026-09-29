@@ -394,7 +394,7 @@ pub(crate) fn verify_wrapper<P>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! One real two-slot W proof (b2), shared; the member proofs are stubs
     //! (their real check is `qlab_l2`'s own suite). Every native negative
     //! mutates the bundle or the predecessor and names the refusing check.
@@ -454,6 +454,13 @@ mod tests {
             let dep = prove_dep(&fx.deps).expect("the claims' openings fit");
             Case { bundle_pvs, proof, members: fx.members.clone(), prev: pre, deps: fx.deps.clone(), dep }
         })
+    }
+
+    /// The shared case's W proof (K = 2, b2) and its PVs — F4b-1's gate
+    /// census walks it rather than proving a second W.
+    pub(crate) fn case_w_proof() -> (&'static Proof<LegacyNonHidingConfig>, Vec<Val>) {
+        let c = case();
+        (&c.proof, public_values(&c.bundle_pvs))
     }
 
     fn bundle(c: &Case) -> Bundle<'_, Vec<u32>> {

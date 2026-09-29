@@ -545,7 +545,7 @@ pub(super) fn composed_c2_layout(
 }
 
 /// [P] `composed_c2_layout` for a shape, covering all queries.
-pub(super) fn composed_c2(shape: Shape) -> Value {
+pub(crate) fn composed_c2(shape: Shape) -> Value {
     composed_c2_layout(
         shape.width(),
         shape.log_height(),

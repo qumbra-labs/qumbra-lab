@@ -6,7 +6,8 @@
 //! leaf AIR ([`wleaf`]), its negatives ([`neg`]), and `verify_wrapper`, the
 //! native reference verifier ([`verify`]). F4-3: the deposit-sum proof
 //! ([`dep`]) and `verify_wrapper`'s V9. F4-4: the measured cell
-//! (`f4leaf --prove`, [`bench`]).
+//! (`f4leaf --prove`, [`bench`]). F4b-1 (lab #782): the recursion census
+//! (`f4census`, [`rec`]).
 //!
 //! **Measured:** the F4-4 box run of all thirteen cells (K ∈ {4, 8, 16} ×
 //! {b2, b4}, two passes, plus the per-shape member proofs) is lab issue
@@ -15,7 +16,9 @@
 
 pub(crate) mod bench;
 pub(crate) mod dep;
+pub(crate) mod gate;
 pub(crate) mod native;
+pub(crate) mod rec;
 pub(crate) mod neg;
 pub(crate) mod verify;
 pub(crate) mod wleaf;
@@ -27,6 +30,8 @@ pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
         "f4leaf" => neg::check(args),
         "f4neg" => neg::run(args),
         "f4dep" => dep::check(args),
+        "f4census" => rec::run(args),
+        "f4gate" => gate::run(args),
         other => Err(format!("unknown f4 mode `{other}`")),
     }
 }
