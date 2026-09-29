@@ -1817,7 +1817,6 @@ dependencies = [
  "p3-uni-stark",
  "qlab-air",
  "qlab-consensus",
- "qlab-devnet",
  "qlab-l2",
 ]
 

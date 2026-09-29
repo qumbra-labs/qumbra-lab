@@ -76,7 +76,6 @@
 use qlab_air::l2::{RegistryLeaf, RegistryWitness};
 use qlab_air::narrow::{pv_chunks, MerkleWitness, MERKLE_DEPTH};
 use qlab_cbserver::tree::CommitmentTree;
-#[cfg_attr(not(test), allow(unused_imports))]
 use qlab_devnet::annulet::L2ShapeTag;
 
 use crate::f3::native::{
@@ -91,6 +90,33 @@ pub(crate) use qlab_wrapper::hash::{
     supply_leaf_state, WRoots, WTag, CLAIM_TAG, M_ABS, SUPPLY_DEPTH,
 };
 
+/// The `WTag` ↔ `L2ShapeTag` conversion, kept on this side so qlab-wrapper
+/// carries no qlab-devnet edge (lab #785 review Y1). `WTag::byte` writes the
+/// shape bytes out; `wtag_bytes_are_the_shape_tags` pins them equal.
+pub(crate) trait WTagShape {
+    fn shape(self) -> Option<L2ShapeTag>;
+}
+
+impl WTagShape for WTag {
+    fn shape(self) -> Option<L2ShapeTag> {
+        match self {
+            WTag::S => Some(L2ShapeTag::S),
+            WTag::P => Some(L2ShapeTag::P),
+            WTag::R => Some(L2ShapeTag::R),
+            WTag::C => None,
+        }
+    }
+}
+
+/// [`WTag`] of an L2 transaction shape (was `WTag::of`).
+pub(crate) fn wtag_of(tag: L2ShapeTag) -> WTag {
+    match tag {
+        L2ShapeTag::S => WTag::S,
+        L2ShapeTag::P => WTag::P,
+        L2ShapeTag::R => WTag::R,
+    }
+}
+
 /// One member of the sequence: its tag and full public-value vector (and an
 /// R write's leaf, as F3).
 #[derive(Clone, Debug)]
@@ -102,7 +128,7 @@ pub(crate) struct Member {
 
 impl Member {
     pub(crate) fn tx(t: &TxSurface) -> Self {
-        Member { tag: WTag::of(t.tag), pvs: t.pvs.clone(), write: t.write }
+        Member { tag: wtag_of(t.tag), pvs: t.pvs.clone(), write: t.write }
     }
     fn as_tx(&self) -> Option<TxSurface> {
         self.tag.shape().map(|tag| TxSurface { tag, pvs: self.pvs.clone(), write: self.write })
@@ -610,6 +636,23 @@ mod tests {
         let mut rng = Rng(0x775_f4f4_0001);
         let inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: 0 };
         (WState::genesis(&[RegistryLeaf::cloaked(0)]), rng, inp)
+    }
+
+    /// Lab #785 review Y1: qlab-wrapper's `WTag::byte` writes the shape
+    /// bytes out rather than reading qlab-devnet's `L2ShapeTag`; they must
+    /// stay the same bytes, the conversion must round-trip, and the claim
+    /// tag must be none of them.
+    #[test]
+    fn wtag_bytes_are_the_shape_tags() {
+        for tag in [L2ShapeTag::S, L2ShapeTag::P, L2ShapeTag::R] {
+            let w = wtag_of(tag);
+            assert_eq!(w.byte(), tag.byte(), "{tag:?}");
+            assert_eq!(w.shape(), Some(tag));
+            assert_eq!(L2ShapeTag::from_byte(w.byte()), Some(tag));
+        }
+        assert_eq!(WTag::C.shape(), None);
+        assert_eq!(L2ShapeTag::from_byte(WTag::C.byte()), None, "the claim tag is no shape's byte");
+        assert_eq!(WTag::ALL.map(WTag::byte), [0x01, 0x02, 0x03, CLAIM_TAG]);
     }
 
     /// A mixed sequence threads, and the fee note carries Σ fee.

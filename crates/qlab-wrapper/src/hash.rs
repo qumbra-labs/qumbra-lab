@@ -11,7 +11,6 @@ use qlab_air::l2::l2_cm;
 use qlab_air::narrow::MERKLE_DEPTH;
 use qlab_air::reference::{keccak_f, merkle_node_state};
 use qlab_consensus::Val;
-use qlab_devnet::annulet::L2ShapeTag;
 
 // f3/native
 pub type Digest = [u64; 4];
@@ -196,11 +195,16 @@ pub enum WTag {
 
 impl WTag {
     pub const ALL: [WTag; 4] = [WTag::S, WTag::P, WTag::R, WTag::C];
+    /// SD's word 0. The three shape bytes are the L2 shape tags' wire bytes
+    /// (qlab-devnet's `L2ShapeTag::byte`), written out here so this crate has
+    /// no qlab-devnet edge (lab #785 review Y1; the precedent is qlab-devnet
+    /// keeping its own shape tag, lab #706 P7). qlab-bench pins the two
+    /// mappings equal byte for byte.
     pub fn byte(self) -> u8 {
         match self {
-            WTag::S => L2ShapeTag::S.byte(),
-            WTag::P => L2ShapeTag::P.byte(),
-            WTag::R => L2ShapeTag::R.byte(),
+            WTag::S => 0x01,
+            WTag::P => 0x02,
+            WTag::R => 0x03,
             WTag::C => CLAIM_TAG,
         }
     }
@@ -210,21 +214,6 @@ impl WTag {
             WTag::P => qlab_air::l2p::PV_LEN,
             WTag::R => qlab_air::l2r::PV_LEN,
             WTag::C => qlab_air::claim::PV_LEN,
-        }
-    }
-    pub fn shape(self) -> Option<L2ShapeTag> {
-        match self {
-            WTag::S => Some(L2ShapeTag::S),
-            WTag::P => Some(L2ShapeTag::P),
-            WTag::R => Some(L2ShapeTag::R),
-            WTag::C => None,
-        }
-    }
-    pub fn of(tag: L2ShapeTag) -> Self {
-        match tag {
-            L2ShapeTag::S => WTag::S,
-            L2ShapeTag::P => WTag::P,
-            L2ShapeTag::R => WTag::R,
         }
     }
 }
