@@ -3,6 +3,8 @@
 //! or plan, generated as an honest one would be ([`build_plan`] never
 //! validates), is scanned in full, and its **lowest** violated row is the
 //! named binding row, refused there by the named constraint group.
+use std::sync::{Arc, Mutex, OnceLock};
+
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
@@ -28,6 +30,31 @@ pub(crate) struct WFixture {
     pub pre: WState,
     /// The prefill's claim (its `cnf` is in `K`).
     pub pre_claim: Member,
+    /// What built it: the honest [`base`] a negative on it is judged against.
+    pub key: FxKey,
+}
+
+/// A fixture's `(kinds, seed, P rows)`.
+pub(crate) type FxKey = (Vec<WTag>, u64, [(u32, u64, u32); 2]);
+
+type Memo<T> = Mutex<Vec<(FxKey, Arc<OnceLock<T>>)>>;
+
+/// `f(key)`, computed once per process per key (condition (c): the fixtures
+/// and their honest scans are shared, not rebuilt per negative).
+fn memo<T>(store: &Memo<T>, key: &FxKey, f: impl FnOnce() -> T) -> Arc<OnceLock<T>> {
+    let cell = {
+        let mut v = store.lock().expect("the memo");
+        match v.iter().find(|(k, _)| k == key) {
+            Some((_, c)) => c.clone(),
+            None => {
+                let c = Arc::new(OnceLock::new());
+                v.push((key.clone(), c.clone()));
+                c
+            }
+        }
+    };
+    cell.get_or_init(f);
+    cell
 }
 
 /// Every fixture claim pays this fee (a claim's fee is the chain's tariff):
@@ -40,6 +67,8 @@ pub(crate) const PRE_MINT: u64 = 1000;
 pub(crate) const ASSET: u32 = 5;
 /// A P member's default `vPublic` rows: a mint and a redeem of [`ASSET`].
 pub(crate) const P_ROWS: [(u32, u64, u32); 2] = [(0, 250, ASSET), (1, 100, ASSET)];
+/// An asset-0 redeem of 40 (an exit) and an idle row.
+pub(crate) const EXIT_ROWS: [(u32, u64, u32); 2] = [(1, 40, 0), (0, 0, 0)];
 
 /// A wrapper over `kinds`, on a state that already holds one prefill wrapper
 /// (an S and a P transaction and a claim: every tree past its genesis,
@@ -47,6 +76,13 @@ pub(crate) const P_ROWS: [(u32, u64, u32); 2] = [(0, 250, ASSET), (1, 100, ASSET
 /// anchor at this wrapper's `C_in` (in `CH` after its prologue); claims at
 /// its absorbed roots; P members carry `p_rows`.
 pub(crate) fn wfixture_rows(kinds: &[WTag], seed: u64, p_rows: [(u32, u64, u32); 2]) -> WFixture {
+    static FX: Memo<WFixture> = Mutex::new(Vec::new());
+    let key = (kinds.to_vec(), seed, p_rows);
+    memo(&FX, &key, || build_fixture(key.clone())).get().expect("built").clone()
+}
+
+fn build_fixture(key: FxKey) -> WFixture {
+    let (kinds, seed, p_rows) = (&key.0, key.1, key.2);
     let mut rng = Rng(seed);
     let mut s = WState::genesis(&[RegistryLeaf::cloaked(0)]);
     let pre_inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: PRE_D };
@@ -83,7 +119,7 @@ pub(crate) fn wfixture_rows(kinds: &[WTag], seed: u64, p_rows: [(u32, u64, u32);
     }
     let (rin, wit, rout) = s.apply(&inp, &members).expect("the fixture wrapper");
     let exit_cmt = check_wrapper_leaf(&rin, &inp, &members, &wit).expect("its check").1;
-    WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim }
+    WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim, key }
 }
 
 /// [`wfixture_rows`] with the default P rows.
@@ -123,25 +159,94 @@ pub(crate) fn s23(slot: usize, seg: Seg, i: usize) -> usize {
     row_of(perm_at(slot, seg, i), 23)
 }
 
-fn judge(
-    name: &'static str,
-    fx: &WFixture,
-    tamper: impl FnOnce(&mut Plan, &mut Vec<Val>),
-    retouch: impl FnOnce(&mut RowMajorMatrix<Val>),
-    row: usize,
-    phase: &'static str,
-) -> Neg {
+/// An honest shape, scanned in full in this process (every row holds) before
+/// any negative is judged against it; the trace itself is not kept.
+pub(crate) struct Base {
+    plan: Plan,
+    pvs: Vec<Val>,
+}
+
+/// The honest [`Base`] for `key`: rendered and scanned in full on first use,
+/// panicking if any row fails.
+pub(crate) fn base(key: &FxKey) -> Arc<OnceLock<Base>> {
+    static BASES: Memo<Base> = Mutex::new(Vec::new());
+    memo(&BASES, key, || {
+        let fx = wfixture_rows(&key.0, key.1, key.2);
+        let (air, trace, pvs) = honest(&fx);
+        assert_eq!(first_violation(&air, &trace, &pvs), None, "the honest wrapper {key:?}");
+        Base { plan: build_plan(&fx.rin, &fx.inp, &fx.members, &fx.wit), pvs }
+    })
+}
+
+fn same_perm(a: &PermPlan, b: &PermPlan) -> bool {
+    a.pre == b.pre && a.cols == b.cols
+}
+
+/// The rows a tampered plan can fail at, ascending, or `None` for "every
+/// row". [`render`] fills row `r` from perm `r / 24` alone (its Keccak input
+/// and its plan columns; the padding perm past the end), so rows of an
+/// unchanged perm are the honest base's rows; a row reads itself and its
+/// successor, so a changed perm `i` exposes rows `24i − 1 ..= 24i + 23`. With
+/// the PVs or the padding perm changed, every row is exposed.
+fn exposed_rows(plan: &Plan, pvs: &[Val], b: &Base, height: usize) -> Option<Vec<usize>> {
+    if pvs != b.pvs.as_slice() || plan.perms.len() != b.plan.perms.len() || !same_perm(&plan.pad, &b.plan.pad) {
+        return None;
+    }
+    let mut rows = std::collections::BTreeSet::new();
+    for i in (0..plan.perms.len()).filter(|&i| !same_perm(&plan.perms[i], &b.plan.perms[i])) {
+        rows.insert((row_of(i, 0) + height - 1) % height);
+        rows.extend(row_of(i, 0)..row_of(i, 0) + 24);
+    }
+    Some(rows.into_iter().collect())
+}
+
+/// [`first_violation`] over `rows` (ascending): the lowest of them that fails.
+fn first_violation_in(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], rows: &[usize]) -> Option<(usize, Vec<&'static str>)> {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use p3_maybe_rayon::prelude::*;
+    let best = AtomicUsize::new(usize::MAX);
+    rows.par_chunks(1024).for_each(|ch| {
+        for &row in ch {
+            if row >= best.load(Ordering::Relaxed) {
+                return;
+            }
+            if !failures_at(air, trace, pvs, row).is_empty() {
+                best.fetch_min(row, Ordering::Relaxed);
+                return;
+            }
+        }
+    });
+    let row = best.into_inner();
+    (row != usize::MAX).then(|| (row, phases_at(air, trace, pvs, row, &phase_ranges(air))))
+}
+
+/// A tampered plan and PVs judged against the fixture's honest base: every
+/// row outside [`exposed_rows`] is the base's and holds, so the lowest
+/// failing exposed row is the lowest failing row.
+fn judge(name: &'static str, fx: &WFixture, tamper: impl FnOnce(&mut Plan, &mut Vec<Val>), row: usize, phase: &'static str) -> Neg {
+    let cell = base(&fx.key);
+    let b = cell.get().expect("scanned");
     let mut plan = build_plan(&fx.rin, &fx.inp, &fx.members, &fx.wit);
     let mut pvs = fx_pvs(fx);
     tamper(&mut plan, &mut pvs);
-    let mut trace = render(&plan);
-    retouch(&mut trace);
-    let got = first_violation(&WAir::new(fx.members.len()), &trace, &pvs);
+    let trace = render(&plan);
+    let air = WAir::new(fx.members.len());
+    let got = match exposed_rows(&plan, &pvs, b, trace.height()) {
+        Some(rows) => first_violation_in(&air, &trace, &pvs, &rows),
+        None => first_violation(&air, &trace, &pvs),
+    };
     Neg { name, row, phase, got }
 }
 
+/// [`judge`] with the rendered trace edited after the fact: scanned in full.
+fn judge_trace(name: &'static str, fx: &WFixture, retouch: impl FnOnce(&mut RowMajorMatrix<Val>), row: usize, phase: &'static str) -> Neg {
+    let (air, mut trace, pvs) = honest(fx);
+    retouch(&mut trace);
+    Neg { name, row, phase, got: first_violation(&air, &trace, &pvs) }
+}
+
 fn witness(name: &'static str, fx: WFixture, row: usize, phase: &'static str) -> Neg {
-    judge(name, &fx, |_, _| {}, |_| {}, row, phase)
+    judge(name, &fx, |_, _| {}, row, phase)
 }
 
 fn forge_insert(tree: &IndexedTree, key: &Digest, low_index: u64, low: Option<(Digest, Digest)>) -> InsertWitness {
@@ -258,7 +363,7 @@ fn anch_last() -> Seg {
 /// (j): a `vPublic` asset id ≥ 2^16 — its word's high limb is nonzero, so
 /// the capture refuses it where SD absorbs it.
 fn neg_asset_id_wide() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 30);
+    let mut fx = wfixture(&[P], SEED);
     fx.members[0].pvs[qlab_air::l2p::PV_VP1 + 5] = (1 << 16) | ASSET;
     let b = (2 + qlab_air::l2p::PV_VP1 + 5) / 26;
     witness("j asset id >= 2^16", fx, s0(0, Seg::Sd(b), 0), "sd_capture")
@@ -267,7 +372,7 @@ fn neg_asset_id_wide() -> Neg {
 /// (k): a transaction anchored at this wrapper's own `C_out`, which is not
 /// in CH until the next wrapper's prologue.
 fn neg_anchor_c_out() -> Neg {
-    let mut fx = wfixture(&[S], SEED + 31);
+    let mut fx = wfixture(&[S], SEED);
     let c_out = fx.rout.f3.c;
     set_digest_pvs(&mut fx.members[0].pvs, 0, &c_out);
     witness("k tx anchor = this wrapper's C_out", fx, s23(0, anch_last(), 0), "anchor")
@@ -275,7 +380,7 @@ fn neg_anchor_c_out() -> Neg {
 
 /// (k): a transaction anchored at an absorbed L1 root, opened in AA.
 fn neg_tx_anchor_in_aa() -> Neg {
-    let mut fx = wfixture(&[S], SEED + 32);
+    let mut fx = wfixture(&[S], SEED);
     let a = fx.inp.absorbed[0];
     set_digest_pvs(&mut fx.members[0].pvs, 0, &a);
     let mut aa = fx.pre.aa.clone();
@@ -290,7 +395,7 @@ fn neg_tx_anchor_in_aa() -> Neg {
 
 /// (k): a claim anchored at `C_in`, opened in CH.
 fn neg_claim_anchor_in_ch() -> Neg {
-    let mut fx = wfixture(&[C], SEED + 33);
+    let mut fx = wfixture(&[C], SEED);
     let c_in = fx.rin.f3.c;
     set_digest_pvs(&mut fx.members[0].pvs, qlab_air::claim::PV_A, &c_in);
     let mut ch = fx.pre.ch.clone();
@@ -303,7 +408,7 @@ fn neg_claim_anchor_in_ch() -> Neg {
 
 /// (k): the transaction's CH check swapped for the claim's AA check.
 fn neg_kch_kan_swap() -> Neg {
-    let fx = wfixture(&[S], SEED + 34);
+    let fx = wfixture(&[S], SEED);
     judge(
         "k KCH/KAN swapped on a tx",
         &fx,
@@ -312,7 +417,6 @@ fn neg_kch_kan_swap() -> Neg {
             p.set(KCH, Val::ZERO);
             p.set(KAN, Val::ONE);
         },
-        |_| {},
         s0(0, anch_last(), 0),
         "flags",
     )
@@ -320,7 +424,7 @@ fn neg_kch_kan_swap() -> Neg {
 
 /// (l): a `vPublic` mint on asset 0.
 fn neg_asset0_mint() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 35);
+    let mut fx = wfixture(&[P], SEED);
     let base = qlab_air::l2p::PV_VP1;
     (fx.members[0].pvs[base], fx.members[0].pvs[base + 1], fx.members[0].pvs[base + 5]) = (0, 7, 0);
     witness("l vPublic mint on asset 0", fx, s0(0, Seg::SupNew(0), 0), "supply")
@@ -337,21 +441,21 @@ fn set_row(m: &mut Member, k: usize, sgn: u32, amt: u64, vpa: u32) {
 
 /// (l): a mint past 2^64 − 1 outstanding.
 fn neg_supply_overflow() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 36);
+    let mut fx = wfixture(&[P], SEED);
     set_row(&mut fx.members[0], 0, 0, u64::MAX, ASSET);
     witness("l supply overflow", fx, s0(0, Seg::SupNew(0), 0), "supply")
 }
 
 /// (l): a redeem of more than is outstanding.
 fn neg_supply_underflow() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 37);
+    let mut fx = wfixture(&[P], SEED);
     set_row(&mut fx.members[0], 1, 1, 1 << 40, ASSET);
     witness("l supply underflow", fx, s0(0, Seg::SupNew(1), 0), "supply")
 }
 
 /// (l): two asset-0 redeems whose sum passes 2^64: E_out has no u64 form.
 fn neg_e_overflow() -> Neg {
-    let mut fx = wfixture_rows(&[P], SEED + 38, [(1, 40, 0), (0, 0, 0)]);
+    let mut fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
     set_row(&mut fx.members[0], 0, 1, u64::MAX, 0);
     set_row(&mut fx.members[0], 1, 1, 5, 0);
     witness("l E overflow", fx, s0(0, Seg::FeeRseed, 0), "de")
@@ -359,12 +463,11 @@ fn neg_e_overflow() -> Neg {
 
 /// (m): an exit step hashing an amount that is not the row's.
 fn neg_exit_v() -> Neg {
-    let fx = wfixture_rows(&[P], SEED + 39, [(1, 40, 0), (0, 0, 0)]);
+    let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
     judge(
         "m exit v not the row's amount",
         &fx,
         |plan, _| plan.perms[perm_at(0, Seg::Exit(0), 0)].pre[8] += 1,
-        |_| {},
         s0(0, Seg::Exit(0), 0),
         "exits",
     )
@@ -372,13 +475,13 @@ fn neg_exit_v() -> Neg {
 
 /// (m): an `exit_cmt` PV that is not the chain over the synthetic list.
 fn neg_exit_cmt_pv() -> Neg {
-    let fx = wfixture_rows(&[P], SEED + 40, [(1, 40, 0), (0, 0, 0)]);
-    judge("m exit_cmt PV not the chain", &fx, |_, pvs| pvs[PV_EXC] += Val::ONE, |_| {}, w_height(1) - 1, "last")
+    let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
+    judge("m exit_cmt PV not the chain", &fx, |_, pvs| pvs[PV_EXC] += Val::ONE, w_height(1) - 1, "last")
 }
 
 /// (i): two claims whose fees carry out of limb 0; the carry bit withheld.
 fn neg_wrong_carry() -> Neg {
-    let fx = wfixture(&[C, C], SEED + 41);
+    let fx = wfixture(&[C, C], SEED);
     judge(
         "i wrong fee carry",
         &fx,
@@ -387,7 +490,6 @@ fn neg_wrong_carry() -> Neg {
             let b = p.get(FCB_OFF);
             p.set(FCB_OFF, Val::ONE - b);
         },
-        |_| {},
         s0(1, Seg::FeeNote, 0),
         "fee_note",
     )
@@ -395,20 +497,20 @@ fn neg_wrong_carry() -> Neg {
 
 /// R6: a claim's AA check switched off.
 fn neg_kan_off() -> Neg {
-    let fx = wfixture(&[C], SEED + 42);
-    judge("R6 KAN off for a claim", &fx, |plan, _| plan.perms[perm_at(0, anch_last(), 0)].set(KAN, Val::ZERO), |_| {}, s0(0, anch_last(), 0), "flags")
+    let fx = wfixture(&[C], SEED);
+    judge("R6 KAN off for a claim", &fx, |plan, _| plan.perms[perm_at(0, anch_last(), 0)].set(KAN, Val::ZERO), s0(0, anch_last(), 0), "flags")
 }
 
 /// R6: a claim's fee accumulation switched off.
 fn neg_kfe_off() -> Neg {
-    let fx = wfixture(&[C], SEED + 43);
-    judge("R6 KFE off for a claim", &fx, |plan, _| plan.perms[perm_at(0, Seg::Sd(3), 0)].set(KFE, Val::ZERO), |_| {}, s0(0, Seg::Sd(3), 0), "flags")
+    let fx = wfixture(&[C], SEED);
+    judge("R6 KFE off for a claim", &fx, |plan, _| plan.perms[perm_at(0, Seg::Sd(3), 0)].set(KFE, Val::ZERO), s0(0, Seg::Sd(3), 0), "flags")
 }
 
 /// R6: the registry segment switched on for a claim.
 fn neg_registry_on_claim() -> Neg {
-    let fx = wfixture(&[C], SEED + 44);
-    judge("R6 registry on for a claim", &fx, |plan, _| plan.perms[perm_at(0, Seg::RegLeaf, 0)].set(ON, Val::ONE), |_| {}, s0(0, Seg::RegLeaf, 0), "flags")
+    let fx = wfixture(&[C], SEED);
+    judge("R6 registry on for a claim", &fx, |plan, _| plan.perms[perm_at(0, Seg::RegLeaf, 0)].set(ON, Val::ONE), s0(0, Seg::RegLeaf, 0), "flags")
 }
 
 /// w1: a claim whose `cnf` is already in K (the prefill's): the prover opens
@@ -425,7 +527,7 @@ fn neg_double_claim() -> Neg {
 
 /// w2: the same `cnf` in both claims of one wrapper.
 fn neg_claim_dup() -> Neg {
-    let mut fx = wfixture(&[C, C], SEED + 1);
+    let mut fx = wfixture(&[C, C], SEED);
     let cnf = pv_digest_of(&fx.members[0].pvs, qlab_air::claim::PV_CNF);
     set_digest_pvs(&mut fx.members[1].pvs, qlab_air::claim::PV_CNF, &cnf);
     let mut k = fx.pre.k.clone();
@@ -436,7 +538,7 @@ fn neg_claim_dup() -> Neg {
 
 /// w3: a claim anchored at a root never absorbed, opened with a genuine path.
 fn neg_anchor_forged() -> Neg {
-    let mut fx = wfixture(&[C], SEED + 2);
+    let mut fx = wfixture(&[C], SEED);
     let stray = Rng(99).digest();
     set_digest_pvs(&mut fx.members[0].pvs, qlab_air::claim::PV_A, &stray);
     witness("w3 claim anchor not in AA", fx, s23(0, Seg::Anch(APart::Last), 0), "anchor")
@@ -445,7 +547,7 @@ fn neg_anchor_forged() -> Neg {
 /// w4: a zero anchor opened at an empty slot of AA — its fold IS AA's root;
 /// only `A ≠ 0` refuses it.
 fn neg_anchor_zero() -> Neg {
-    let mut fx = wfixture(&[C], SEED + 3);
+    let mut fx = wfixture(&[C], SEED);
     set_digest_pvs(&mut fx.members[0].pvs, qlab_air::claim::PV_A, &EMPTY);
     let mut aa = fx.pre.aa.clone();
     for r in &fx.inp.absorbed {
@@ -460,7 +562,7 @@ fn neg_anchor_zero() -> Neg {
 
 /// w5: a claim's `cm2` appended into the empty slot after the running index.
 fn neg_cm2_skip() -> Neg {
-    let mut fx = wfixture(&[C], SEED + 4);
+    let mut fx = wfixture(&[C], SEED);
     let c = fx.rin.f3.c_next;
     let tree = fx.pre.l2.c.clone();
     claim_mut(&mut fx, 0).append = AppendWitness { index: c + 1, path: empty_slot_path(&tree, c + 1) };
@@ -469,14 +571,14 @@ fn neg_cm2_skip() -> Neg {
 
 /// w6: the fee note's value one more than Σ fee (PV kept honest).
 fn neg_fee_value() -> Neg {
-    let fx = wfixture(&[C], SEED + 5);
+    let fx = wfixture(&[C], SEED);
     let k = fx.members.len() - 1;
-    judge("w6 fee note value != sum of fees", &fx, move |plan, _| plan.perms[perm_at(k, Seg::FeeNote, 0)].pre[0] += 1, |_| {}, s0(k, Seg::FeeNote, 0), "fee_note")
+    judge("w6 fee note value != sum of fees", &fx, move |plan, _| plan.perms[perm_at(k, Seg::FeeNote, 0)].pre[0] += 1, s0(k, Seg::FeeNote, 0), "fee_note")
 }
 
 /// w7: a wrapper with no claims whose fee note (and fee PV) says 1.
 fn neg_fee_no_claims() -> Neg {
-    let fx = wfixture(&[S], SEED + 6);
+    let fx = wfixture(&[S], SEED);
     judge(
         "w7 fee note nonzero with no claims",
         &fx,
@@ -484,7 +586,6 @@ fn neg_fee_no_claims() -> Neg {
             plan.perms[perm_at(0, Seg::FeeNote, 0)].pre[0] = 1;
             pvs[PV_FEE] = Val::ONE;
         },
-        |_| {},
         s0(0, Seg::FeeNote, 0),
         "fee_note",
     )
@@ -492,7 +593,7 @@ fn neg_fee_no_claims() -> Neg {
 
 /// w8: a claim's fee chunks left out of the accumulator.
 fn neg_fee_acc() -> Neg {
-    let fx = wfixture(&[C], SEED + 7);
+    let fx = wfixture(&[C], SEED);
     let from = perm_at(0, Seg::Sd(3), 0) + 1;
     judge(
         "w8 a claim fee not accumulated",
@@ -504,7 +605,6 @@ fn neg_fee_acc() -> Neg {
                 }
             })
         },
-        |_| {},
         s23(0, Seg::Sd(3), 0),
         "fee_acc",
     )
@@ -512,7 +612,7 @@ fn neg_fee_acc() -> Neg {
 
 /// w9: absorbed root 1 appended into the slot after the running index.
 fn neg_absorb_skip() -> Neg {
-    let mut fx = wfixture(&[S], SEED + 8);
+    let mut fx = wfixture(&[S], SEED);
     let n = fx.rin.aa_next;
     let mut aa = fx.pre.aa.clone();
     aa.append(fx.inp.absorbed[0]);
@@ -522,7 +622,7 @@ fn neg_absorb_skip() -> Neg {
 
 /// w10: slot 2 starts from a K that slot 1 did not end on.
 fn neg_k_gap() -> Neg {
-    let fx = wfixture(&[C, C], SEED + 9);
+    let fx = wfixture(&[C, C], SEED);
     let old = fx.rin.k;
     let from = perm_at(1, Seg::Sd(0), 0);
     judge(
@@ -535,7 +635,6 @@ fn neg_k_gap() -> Neg {
                 }
             })
         },
-        |_| {},
         s23(0, Seg::Anch(APart::Last), 0),
         "root_k",
     )
@@ -543,19 +642,18 @@ fn neg_k_gap() -> Neg {
 
 /// w11: a claim's PV vector declared a shape-S transaction.
 fn neg_claim_as_tx() -> Neg {
-    let mut fx = wfixture(&[C], SEED + 10);
+    let mut fx = wfixture(&[C], SEED);
     fx.members[0].tag = S;
     witness("w11 a claim declared a transaction", fx, s0(0, Seg::Sd(0), 0), "sd")
 }
 
 /// w12: insert 1 switched on in a claim slot.
 fn neg_claim_insert1() -> Neg {
-    let fx = wfixture(&[C], SEED + 11);
+    let fx = wfixture(&[C], SEED);
     judge(
         "w12 activate a claim's gated-off insert",
         &fx,
         |plan, _| plan.perms[perm_at(0, Seg::LeafOld(1), 0)].set(ON, Val::ONE),
-        |_| {},
         s0(0, Seg::LeafOld(1), 0),
         "flags",
     )
@@ -563,7 +661,7 @@ fn neg_claim_insert1() -> Neg {
 
 /// w13: a claim's cnf committed to N instead of K (the commit flag moved).
 fn neg_cnf_into_n() -> Neg {
-    let fx = wfixture(&[C], SEED + 12);
+    let fx = wfixture(&[C], SEED);
     judge(
         "w13 claim cnf into N, not K",
         &fx,
@@ -572,7 +670,6 @@ fn neg_cnf_into_n() -> Neg {
             p.set(KNC, Val::ONE);
             p.set(KKC, Val::ZERO);
         },
-        |_| {},
         s0(0, ml(0), 0),
         "flags",
     )
@@ -580,13 +677,12 @@ fn neg_cnf_into_n() -> Neg {
 
 /// w14: the fee note's ρ not `H(prev)` (a replayed ρ from another `prev`).
 fn neg_fee_rho() -> Neg {
-    let fx = wfixture(&[C], SEED + 13);
+    let fx = wfixture(&[C], SEED);
     let k = fx.members.len() - 1;
     judge(
         "w14 fee note rho not H(prev)",
         &fx,
         move |plan, _| plan.perms[perm_at(k, Seg::FeeRho, 0)].pre[0] ^= 1,
-        |_| {},
         s0(k, Seg::FeeRho, 0),
         "fee_seed",
     )
@@ -594,7 +690,7 @@ fn neg_fee_rho() -> Neg {
 
 /// F3 (1) on W: a transaction nullifier already in N.
 fn neg_tx_double_insert() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 14);
+    let mut fx = wfixture(&[P], SEED);
     let n = fx.pre.l2.n.clone();
     let key = n.leaves()[1].0;
     set_digest_pvs(&mut fx.members[0].pvs, qlab_air::l2::PV_NF1, &key);
@@ -604,7 +700,7 @@ fn neg_tx_double_insert() -> Neg {
 
 /// F3 (3b) on W.
 fn neg_tx_forged_leaf() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 15);
+    let mut fx = wfixture(&[P], SEED);
     let n = fx.pre.l2.n.clone();
     let key = pv_digest_of(&fx.members[0].pvs, qlab_air::l2::PV_NF1);
     let right = tx_mut(&mut fx, 0).inserts[0].low_index;
@@ -614,7 +710,7 @@ fn neg_tx_forged_leaf() -> Neg {
 
 /// F3 (5) on W.
 fn neg_tx_append_skip() -> Neg {
-    let mut fx = wfixture(&[S], SEED + 16);
+    let mut fx = wfixture(&[S], SEED);
     let c = fx.rin.f3.c_next;
     let tree = fx.pre.l2.c.clone();
     tx_mut(&mut fx, 0).appends[0] = AppendWitness { index: c + 1, path: empty_slot_path(&tree, c + 1) };
@@ -623,21 +719,21 @@ fn neg_tx_append_skip() -> Neg {
 
 /// F3 (8) on W.
 fn neg_tx_key() -> Neg {
-    let mut fx = wfixture(&[S], SEED + 17);
+    let mut fx = wfixture(&[S], SEED);
     tx_mut(&mut fx, 0).inserts[0].key[0] ^= 1;
     witness("f3/8 tx key not the surface's", fx, s0(0, Seg::LeafMid(0), 0), "leaf_key")
 }
 
 /// F3 (9) on W.
 fn neg_tx_tag_swap() -> Neg {
-    let mut fx = wfixture(&[P], SEED + 18);
+    let mut fx = wfixture(&[P], SEED);
     fx.members[0].tag = S;
     witness("f3/9 tx shape-tag swap", fx, s0(0, Seg::Sd(0), 0), "sd")
 }
 
 /// F3 (10) on W.
 fn neg_tx_n_gap() -> Neg {
-    let fx = wfixture(&[S, S], SEED + 19);
+    let fx = wfixture(&[S, S], SEED);
     let old = fx.rin.f3.n;
     let from = perm_at(1, Seg::Sd(0), 0);
     judge(
@@ -650,7 +746,6 @@ fn neg_tx_n_gap() -> Neg {
                 }
             })
         },
-        |_| {},
         s23(0, Seg::Anch(APart::Last), 0),
         "root_n",
     )
@@ -658,19 +753,18 @@ fn neg_tx_n_gap() -> Neg {
 
 /// F3's index cap on W.
 fn neg_tx_bit30() -> Neg {
-    let mut fx = wfixture(&[S], SEED + 20);
+    let mut fx = wfixture(&[S], SEED);
     tx_mut(&mut fx, 0).inserts[0].low_path.path_bits[30] = true;
     witness("f3/cap path bit 30", fx, s0(0, Seg::Pair(PathId::Mid(0), Part::L30), 0), "bit_cap")
 }
 
 /// F3's approval-3 negative on W.
 fn neg_tx_free_hi() -> Neg {
-    let fx = wfixture(&[S], SEED + 21);
+    let fx = wfixture(&[S], SEED);
     judge(
         "f3/3 free hi at NEW",
         &fx,
         |plan, _| plan.perms[perm_at(0, Seg::LeafNew(0), 0)].pre[4] ^= 1,
-        |_| {},
         s0(0, Seg::LeafNew(0), 0),
         "leaf_hi",
     )
@@ -678,21 +772,21 @@ fn neg_tx_free_hi() -> Neg {
 
 /// F3's obligation-1 negative on W.
 fn neg_idle_cmp() -> Neg {
-    let fx = wfixture(&[S], SEED + 22);
+    let fx = wfixture(&[S], SEED);
     let row = 1;
-    judge("f3/idle comparator cell non-boolean", &fx, |_, _| {}, move |t| t.values[row * W_WIDTH + CMP_OFF] = Val::TWO, row, "cmp")
+    judge_trace("f3/idle comparator cell non-boolean", &fx, move |t| t.values[row * W_WIDTH + CMP_OFF] = Val::TWO, row, "cmp")
 }
 
 fn neg_pv_k_in() -> Neg {
-    let fx = wfixture(&[C], SEED + 23);
-    judge("pv: K in", &fx, |_, pvs| pvs[PV_K] += Val::ONE, |_| {}, 0, "first")
+    let fx = wfixture(&[C], SEED);
+    judge("pv: K in", &fx, |_, pvs| pvs[PV_K] += Val::ONE, 0, "first")
 }
 
 /// The fee PV one off the fee note's value.
 fn neg_pv_fee() -> Neg {
-    let fx = wfixture(&[C], SEED + 24);
+    let fx = wfixture(&[C], SEED);
     let k = fx.members.len() - 1;
-    judge("pv: fee", &fx, |_, pvs| pvs[PV_FEE] += Val::ONE, |_| {}, s0(k, Seg::FeeNote, 0), "fee_note")
+    judge("pv: fee", &fx, |_, pvs| pvs[PV_FEE] += Val::ONE, s0(k, Seg::FeeNote, 0), "fee_note")
 }
 
 fn pv_digest_of(pvs: &[u32], off: usize) -> Digest {
@@ -712,11 +806,13 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     };
     let (mut bad, mut ran) = (0, 0);
     for (i, (_, f)) in all.iter().enumerate().filter(|(i, _)| (a..=b).contains(&(i + 1))) {
+        let t = std::time::Instant::now();
         let n = f();
+        let dt = t.elapsed();
         let ok = n.holds();
         ran += 1;
         bad += usize::from(!ok);
-        println!("{} {:2} {:42} want row {:6} {:12} got {:?}", if ok { "ok  " } else { "MISS" }, i + 1, n.name, n.row, n.phase, n.got);
+        println!("{} {:2} {:42} want row {:6} {:12} got {:?} ({dt:.2?})", if ok { "ok  " } else { "MISS" }, i + 1, n.name, n.row, n.phase, n.got);
     }
     println!("# f4neg {a}-{b}: {}/{ran} refused at their binding row", ran - bad);
     if bad > 0 {
@@ -741,17 +837,22 @@ pub(crate) fn check(args: &[String]) -> Result<(), String> {
     if kinds.is_empty() {
         return Err("--kinds needs at least one".into());
     }
-    let fx = wfixture(&kinds, SEED);
     let t = std::time::Instant::now();
-    let (air, trace, pvs) = honest(&fx);
-    let gen = t.elapsed();
+    let fx = wfixture(&kinds, SEED);
+    let t_fx = t.elapsed();
+    let plan = build_plan(&fx.rin, &fx.inp, &fx.members, &fx.wit);
+    let t_plan = t.elapsed();
+    let (air, trace, pvs) = (WAir::new(fx.members.len()), render(&plan), fx_pvs(&fx));
+    let t_render = t.elapsed();
     let v = first_violation(&air, &trace, &pvs);
     println!(
-        "# f4leaf --check kinds={spec}: {} rows x {} cols; gen {:.2?}, scan {:.2?}; {}",
+        "# f4leaf --check kinds={spec}: {} rows x {} cols; fixture {:.2?}, plan {:.2?}, render {:.2?}, scan {:.2?}; {}",
         trace.height(),
         trace.width(),
-        gen,
-        t.elapsed() - gen,
+        t_fx,
+        t_plan - t_fx,
+        t_render - t_plan,
+        t.elapsed() - t_render,
         match &v {
             None => "every row holds".to_string(),
             Some((r, ph)) => format!("VIOLATED at row {r} (perm {}, round {}): {ph:?}", r / 24, r % 24),
@@ -790,19 +891,18 @@ mod tests {
     }
 
     /// Honest wrappers hold: every kind alone, and the two-slot mixes that
-    /// thread K and C across a slot boundary.
+    /// thread K and C across a slot boundary. Each is scanned in full once
+    /// ([`base`] panics on a failing row) and is then the base the negatives
+    /// of its shape are judged against.
     #[test]
     fn f4w_honest_wrappers_hold() {
         for kinds in [&[C][..], &[S], &[P], &[WTag::R], &[S, C], &[C, C], &[P, C]] {
-            let fx = wfixture(kinds, SEED);
-            let (air, trace, pvs) = honest(&fx);
-            assert_eq!(first_violation(&air, &trace, &pvs), None, "{kinds:?}");
+            base(&(kinds.to_vec(), SEED, P_ROWS));
         }
         // An asset-0 redeem: an exit into E and the exit list; the supply
         // root does not move for it (condition (l)).
-        let fx = wfixture_rows(&[P], SEED, [(1, 40, 0), (0, 0, 0)]);
-        let (air, trace, pvs) = honest(&fx);
-        assert_eq!(first_violation(&air, &trace, &pvs), None, "the exit wrapper");
+        base(&(vec![P], SEED, EXIT_ROWS));
+        let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
         assert_eq!((fx.rout.e_cum, fx.rout.sup), (fx.rin.e_cum + 40, fx.rin.sup));
         assert_ne!(fx.exit_cmt, EMPTY);
         // (i): the two claims' fees carry out of limb 0.
