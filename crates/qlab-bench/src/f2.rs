@@ -4,7 +4,7 @@
 //! peak memory is the operator's `/usr/bin/time -v` reading.
 mod counting;
 mod ood;
-mod price;
+pub(crate) mod price;
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

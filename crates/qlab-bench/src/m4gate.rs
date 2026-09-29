@@ -434,7 +434,29 @@ impl GateShape {
     /// Query-program role selectors (`N_ROLES` = 9 + n_fri_rounds, from the
     /// per-round R_PLAST_F* vocabulary).
     pub(crate) fn n_roles(&self) -> usize {
-        9 + self.n_fri_rounds()
+        9 + self.n_fri_rounds() + usize::from(self.r_ff().is_some())
+    }
+
+    /// Fresh words of a single-block LAST fold leaf that `R_ABS_F16` cannot
+    /// absorb (lab #782 F4b-1): `R_ABS_F16`'s fresh count is `qw`, so a
+    /// one-block fold leaf of `4·2^la ≠ qw` words needs its own role. Narrow
+    /// (la = 2 → 16 = qw) and wide (every round multi-block) have none, so
+    /// their programs and layouts are unchanged. Only the last round can be
+    /// short: every earlier round folds by the maximum arity.
+    pub(crate) fn ff_words(&self) -> Option<usize> {
+        let la = *self.log_arities.last()?;
+        let w = 4 * (1usize << la);
+        (w <= 34 && w != self.qw).then_some(w)
+    }
+
+    /// The single-block fold-leaf role code, after the plast roles.
+    pub(crate) fn r_ff(&self) -> Option<u32> {
+        self.ff_words().map(|_| (9 + self.n_fri_rounds()) as u32)
+    }
+
+    /// Whether a query role absorbs leaf words (`R_ABS_*`, and `r_ff`).
+    pub(crate) fn is_absorb_role(&self, role: u32) -> bool {
+        (R_ABS_F34..=R_ABS_C30).contains(&role) || Some(role) == self.r_ff()
     }
 
     /// Micro-code selectors (`N_MICROS` = 6 + 3·n_fri_rounds, from the per-round
@@ -1689,8 +1711,13 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
     let emit_leaf = |p: &mut Vec<u32>, nw: usize, dp: u32, last_role: u32| {
         let nb = ceil34(nw);
         if nb <= 1 {
-            // Single (first+last) block.
-            p.push(desc(R_ABS_F16, dp, M_NONE));
+            // Single (first+last) block: R_ABS_F16 absorbs `qw` fresh words;
+            // a fold leaf of another size takes `r_ff` (F4b-1).
+            let single = match (dp >= D_F[0], s.ff_words(), s.r_ff()) {
+                (true, Some(w), Some(rff)) if w == nw => rff,
+                _ => R_ABS_F16,
+            };
+            p.push(desc(single, dp, M_NONE));
         } else {
             p.push(desc(R_ABS_F34, dp, M_NONE));
             for _ in 0..nb - 2 {
@@ -1944,6 +1971,7 @@ impl VerifierGateAir {
             }
         }
         let query_absorb = (R_ABS_F34..=R_ABS_C30)
+            .chain(self.shape.r_ff())
             .map(|r| cv(self.layout.rsel + r as usize))
             .fold(AB::Expr::ZERO, |a, e| a + e);
         let gxor = cv(self.layout.xsel);
@@ -2257,7 +2285,8 @@ where
             + cv(self.layout.rsel + R_ABS_F16 as usize)
             + cv(self.layout.rsel + R_ABS_C34 as usize)
             + cv(self.layout.rsel + R_ABS_C5 as usize)
-            + cv(self.layout.rsel + R_ABS_C30 as usize);
+            + cv(self.layout.rsel + R_ABS_C30 as usize)
+            + self.shape.r_ff().map_or(AB::Expr::ZERO, |r| cv(self.layout.rsel + r as usize));
         // DRND_j = absany * self.layout.dlo[j]  (self.layout.dlo[j] is the same 3-bit product; deg 2).
         // Loop bound = drnd_width (narrow 6, wide 5 = 2 + n_fri_rounds); j=6 on
         // wide would write drnd+5 = dbit (OOB), corrupting dbit's own constraint.
@@ -2267,7 +2296,9 @@ where
         // Leaf-start selector.
         builder.assert_eq(
             cv(self.layout.lfs),
-            cv(self.layout.rsel + R_ABS_F34 as usize) + cv(self.layout.rsel + R_ABS_F16 as usize),
+            cv(self.layout.rsel + R_ABS_F34 as usize)
+                + cv(self.layout.rsel + R_ABS_F16 as usize)
+                + self.shape.r_ff().map_or(AB::Expr::ZERO, |r| cv(self.layout.rsel + r as usize)),
         );
 
         // =====================================================================
@@ -2394,6 +2425,12 @@ where
         // → 16..100.
         for i in (2 * self.shape.qw)..100 {
             builder.assert_zero(cv(self.layout.rsel + R_ABS_F16 as usize) * cv(pcol(i)));
+        }
+        // The single-block fold leaf of another size (F4b-1): `ff` fresh words.
+        if let (Some(ff), Some(rff)) = (self.shape.ff_words(), self.shape.r_ff()) {
+            for i in (2 * ff)..100 {
+                builder.assert_zero(cv(self.layout.rsel + rff as usize) * cv(pcol(i)));
+            }
         }
         // Compression preimages: lanes 8..25 zero.
         for i in 32..100 {
@@ -3398,6 +3435,10 @@ where
                     + rsel(R_ABS_C5) * rle(wf(tlf))
                     + rsel(R_ABS_C30) * rle(wf(30))
                     + rsel(R_ABS_F16) * rle(wf(qw))
+                    + match (self.shape.ff_words(), self.shape.r_ff()) {
+                        (Some(ff), Some(rff)) => rsel(rff) * rle(wf(ff)),
+                        _ => AB::Expr::ZERO,
+                    }
             };
             let m0 = role_range(m0w);
             let m1 = role_range(m1w);
@@ -4548,7 +4589,7 @@ pub(crate) fn lane_plan(sched: &Schedule, shape: &GateShape) -> (Vec<[u64; 25]>,
             let p = &sched.perms[ptr];
             ptr += 1;
             match role {
-                1..=5 => {
+                r if shape.is_absorb_role(r) => {
                     let Role::Absorb { leaf, .. } = &p.role else {
                         panic!("q{q} slot {slot}: expected absorb, got another role");
                     };
@@ -4569,7 +4610,7 @@ pub(crate) fn lane_plan(sched: &Schedule, shape: &GateShape) -> (Vec<[u64; 25]>,
                     };
                     assert_eq!(got, expect_round, "q{q} slot {slot} absorb round");
                 }
-                6..=12 => {
+                r if (R_PATH..=shape.r_plast_f(shape.n_fri_rounds() - 1)).contains(&r) => {
                     let Role::Compress {
                         tag: CompressTag::Path { q: pq, cap_ext: false, .. },
                     } = &p.role
@@ -4779,11 +4820,11 @@ fn write_row(
         wb(v, layout.rsel + role as usize, true);
         wb(v, layout.mlo + (micro & 7) as usize, true);
         wb(v, layout.msel + micro as usize, true);
-        let absany = (1..=5).contains(&role);
+        let absany = shape.is_absorb_role(role);
         if absany {
             wb(v, layout.drnd + dparam as usize, true);
         }
-        wb(v, layout.lfs, role == R_ABS_F34 || role == R_ABS_F16);
+        wb(v, layout.lfs, role == R_ABS_F34 || role == R_ABS_F16 || Some(role) == shape.r_ff());
     }
     // layout.mhi/layout.dlo/layout.dhi are pure bit products (no phase gate).
     wb(v, layout.mhi + ((micro >> 3) & 3) as usize, true);
@@ -5151,7 +5192,7 @@ fn emit_child(
             PInfo::Dup { block } => (*block > 0, *block == 0),
             PInfo::Query { slot, .. } => {
                 let role = program[*slot] & 0xf;
-                (false, (1..=5).contains(&role))
+                (false, shape.is_absorb_role(role))
             }
         };
         let (q_role, q_dparam, q_micro, q_q) = match info {
@@ -5169,7 +5210,7 @@ fn emit_child(
             }
         }
         // Fold round of an absorb slot (dparam 2..6), if any.
-        let fold_r = if (1..=5).contains(&q_role) && q_dparam >= 2 {
+        let fold_r = if shape.is_absorb_role(q_role) && q_dparam >= 2 {
             Some((q_dparam - 2) as usize)
         } else {
             None
@@ -5253,7 +5294,7 @@ fn emit_child(
                             _ => r <= 1,
                         };
                     }
-                    PInfo::Query { .. } if (1..=5).contains(&q_role) => {
+                    PInfo::Query { .. } if shape.is_absorb_role(q_role) => {
                         // word-0 fills ceil(f/2) rows (r <= ceil(f/2)-1), word-1
                         // fills floor(f/2) rows (r <= floor(f/2)-1). Mirrors the
                         // eval-side `role_range`. Narrow: F34/C34 f=34→(16,16),
@@ -5265,6 +5306,7 @@ fn emit_child(
                             R_ABS_C5 => shape.trace_last_fresh(),
                             R_ABS_C30 => 30,
                             R_ABS_F16 => shape.qw,
+                            r if Some(r) == shape.r_ff() => shape.ff_words().unwrap_or(0),
                             _ => 0,
                         };
                         let (m0, m1) = if f == 0 {
@@ -5575,6 +5617,40 @@ fn emit_child(
                             let outv = (lo + hi) * ext_base(consts.half)
                                 + regs.breg[l] * ext_base(consts.kf[rf][l][i]) * (lo - hi);
                             if r == pairs.len() - 1 {
+                                if outv != scale(qr.folds[rf].folded) {
+                                    // Lab #782 F4b-1 diagnostic: which input of the fold
+                                    // disagrees with the recorded (native) walk.
+                                    let fold = &qr.folds[rf];
+                                    eprintln!("FOLD-DIAG q_first_row={row} rf={rf} la={la} n_rounds={n_rounds} log_arities={:?} cum={:?} lf={:?} index_in_group={} evals={}",
+                                        shape.log_arities, cum, shape.lf(), fold.index_in_group, fold.evals.len());
+                                    eprintln!("FOLD-DIAG beta: circuit chal={:?} walk={:?} equal={}", regs.chal[G_BETA0 + rf], fold.beta, regs.chal[G_BETA0 + rf] == fold.beta);
+                                    eprintln!("FOLD-DIAG all circuit betas={:?}", (0..n_rounds).map(|x| regs.chal[G_BETA0 + x]).collect::<Vec<_>>());
+                                    eprintln!("FOLD-DIAG all walk betas={:?}", sched.betas);
+                                    let mut s_l = fold.s;
+                                    for lvl in 0..la {
+                                        let want = fold.beta.exp_power_of_2(lvl) * (s_l * Ext::from(Val::from_u32(2))).inverse();
+                                        eprintln!("FOLD-DIAG breg[{lvl}] circuit={:?} want={:?} equal={}", regs.breg[lvl], want, regs.breg[lvl] == want);
+                                        s_l = s_l * s_l;
+                                    }
+                                    // Native re-fold of the scaled evals with the walk's beta.
+                                    let mut cur: Vec<Ext> = fold.evals.iter().map(|e| scale(*e)).collect();
+                                    let mut beta_l = fold.beta;
+                                    let mut s_l = fold.s;
+                                    for lvl in 0..la {
+                                        let g_l = Val::two_adic_generator(la).exp_power_of_2(lvl);
+                                        let half_n = cur.len() / 2;
+                                        let nxt: Vec<Ext> = (0..half_n).map(|i2| {
+                                            let (lo, hi) = (cur[2 * i2], cur[2 * i2 + 1]);
+                                            let y = s_l * Ext::from(g_l.exp_u64(rev_bits(i2, la - lvl - 1) as u64));
+                                            (lo + hi) * ext_base(consts.half) + beta_l * (lo - hi) * (y * Ext::from(Val::from_u32(2))).inverse()
+                                        }).collect();
+                                        eprintln!("FOLD-DIAG native level {lvl}: {} values, first={:?}", nxt.len(), nxt.first());
+                                        cur = nxt;
+                                        beta_l = beta_l * beta_l;
+                                        s_l = s_l * s_l;
+                                    }
+                                    eprintln!("FOLD-DIAG native final={:?} walk final(scaled)={:?} circuit={:?}", cur.first(), scale(fold.folded), outv);
+                                }
                                 assert_eq!(outv, scale(qr.folds[rf].folded), "fold output");
                                 regs.runev = outv;
                             } else {
@@ -5699,7 +5775,7 @@ fn emit_child(
                 }
                 if let Some(PInfo::Query { slot, .. }) = next {
                     let role = program[*slot] & 0xf;
-                    if role == R_ABS_F34 || role == R_ABS_F16 {
+                    if role == R_ABS_F34 || role == R_ABS_F16 || Some(role) == shape.r_ff() {
                         regs.pzacc = Ext::ZERO;
                         regs.preg = Ext::ONE;
                         regs.vc = 0;
