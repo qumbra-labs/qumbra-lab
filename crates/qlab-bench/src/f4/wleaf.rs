@@ -1,27 +1,39 @@
-//! Lab #775 F4-1 — **W, the wrapper leaf AIR**: F3's state leaf
+//! Lab #775 F4 — **W, the wrapper leaf AIR**: F3's state leaf
 //! (`crate::f3::leaf`), extended with the claim slot, the L1-anchor
-//! accumulator and the sequencer fee note. It proves
-//! [`super::native::check_wrapper_leaf`].
+//! accumulator, CH, the supply tree, the exit list and the sequencer fee
+//! note. It proves [`super::native::check_wrapper_leaf`].
 //!
 //! **The program.** A prologue, `k` slots, an epilogue, then `PAD`:
 //!
 //! ```text
-//!   prologue:  4 × absorb (an F3 append of one absorbed L1 root to AA, 64 perms)
-//!   slot ×k:   F3's 559-perm slot (SD 5 | inserts 3 × 131 | appends 2 × 64 | registry 33)
-//!              + an anchor path (32 perms: a claim's anchor A opened in AA)
-//!   epilogue:  ρ(prev), rseed(prev), the fee note's commitment, its append to C (67 perms)
+//!   prologue (127 perms):
+//!     absorb   H(a0,a1), H(a2,a3), their parent; one pair path over AA's
+//!              levels 2..31 (60): the four roots as one aligned subtree,
+//!              its old side the empty subtree zeros[2] (aa_next ≡ 0 mod 4)
+//!     history  C_in appended to CH (64)
+//!   slot ×k (661 perms):
+//!     F3's slot    SD 5 | inserts 3 × 131 | appends 2 × 64 | registry 33
+//!     vPublic ×2   old leaf, new leaf, supply pair path (34 each; P only)
+//!     exits ×2     the exit chain's steps (P redeems on asset 0)
+//!     anchor       32: a transaction's anchor opened in CH, a claim's in AA
+//!   epilogue (67 perms): ρ(prev), rseed(prev), the fee note, its append to C
 //! ```
 //!
 //! **The claim slot** (tag `C`, SD word 0 = `0x04`): insert 0 is its `cnf`,
-//! committed to `K` (not `N`); append 0 is its `cm2`; the anchor path opens
-//! its `A` against `AA` (`A ≠ 0`); its fee chunks add into the fee
-//! accumulator. Inserts 1–2, append 1, SD block 4 and the registry segment
-//! are off for a claim, as for R; the anchor path is on only for a claim.
+//! committed to `K` (not `N`); append 0 is its `cm2`; its anchor opens in
+//! `AA` (`A ≠ 0`); its fee chunks add into the fee accumulator. Inserts 1–2,
+//! append 1, SD block 4, the registry and the `vPublic` segments are off for
+//! a claim.
 //!
 //! **The fee note** is appended in every wrapper (value 0 with no claims):
 //! `cm = H(value ‖ 0 ‖ rkm_seq ‖ ρ ‖ rseed)` with `value` the accumulator
 //! normalized to four 16-bit limbs (carries ≤ 5 bits: at most 31 claims per
 //! leaf), `ρ`/`rseed` the two domain-tagged perms over the `prev` PV.
+//!
+//! **D/E**: `D_out = D_in + D_batch` (FeeRho row) and `E_out = E_in + Σ
+//! exits` (FeeRseed row), u64 limbs with 6-bit carries and no carry out.
+//! `D_batch` is a W public value; the deposit-sum proof ([`super::dep`])
+//! binds it to the claims' `Cv`s at the verifier (V9).
 //!
 //! Degree 3 throughout, by the same device as F3: every flag a data
 //! constraint needs is a materialized column.
@@ -53,6 +65,14 @@ pub(crate) const R_DEPTH: usize = qlab_air::l2::REGISTRY_DEPTH;
 /// `MAX_CLAIMS` 16-bit chunks plus a carry-in keeps its carry-out < 2^5.
 pub(crate) const MAX_CLAIMS: usize = 31;
 const _: () = assert!(MAX_CLAIMS * 0xffff + 31 < 32 << 16);
+/// The widest `k` any wrapper version proves (`verify::VERSIONS`).
+pub(crate) const MAX_K: usize = 16;
+const _: () = assert!(MAX_K <= MAX_CLAIMS);
+/// E's 6-bit carries: a limb of `E_in`, two exit chunks per slot and a
+/// carry-in keep the carry-out < 2^6 for every `k ≤ MAX_K` (sound to k = 31;
+/// past that the honest wrapper is unsatisfiable, never unsound). D adds one
+/// chunk per limb.
+const _: () = assert!((1 + 2 * MAX_K) * 0xffff + 63 < 64 << 16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PathId {
@@ -60,8 +80,8 @@ pub(crate) enum PathId {
     New(usize),
     C(usize),
     R,
-    /// An absorbed L1 root appended to AA.
-    Abs(usize),
+    /// The absorbed L1 roots' depth-2 subtree appended to AA (levels 2..31).
+    Abs,
     /// `C_in` appended to CH.
     Hist,
     /// A `vPublic` row's supply-leaf replacement (old, new).
@@ -97,6 +117,8 @@ pub(crate) enum APart {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Seg {
+    /// The absorbed roots' subtree: `H(a0, a1)`, `H(a2, a3)`, their parent.
+    AbsNode(usize),
     Sd(usize),
     LeafOld(usize),
     LeafMid(usize),
@@ -115,7 +137,11 @@ pub(crate) enum Seg {
     Pad,
 }
 
-pub(crate) const PRO: usize = 4 * M_ABS + 4;
+/// The prologue: the subtree's 3 nodes, its pair path (4 parts), CH's (4 parts).
+pub(crate) const PRO: usize = 3 + 4 + 4;
+/// The absorbed roots form one aligned depth-2 subtree of AA.
+pub(crate) const ABS_LEVELS: usize = 2;
+const _: () = assert!(M_ABS == 1 << ABS_LEVELS);
 pub(crate) const SLOT_SEGS: usize = 65;
 pub(crate) const SLOT_BASE: usize = PRO;
 pub(crate) const EPI_BASE: usize = SLOT_BASE + SLOT_SEGS;
@@ -138,8 +164,9 @@ impl Seg {
     pub(crate) const fn idx(self) -> usize {
         let b = SLOT_BASE;
         match self {
-            Seg::Pair(PathId::Abs(i), p) => 4 * i + part_off(p),
-            Seg::Pair(PathId::Hist, p) => 4 * M_ABS + part_off(p),
+            Seg::AbsNode(j) => j,
+            Seg::Pair(PathId::Abs, p) => 3 + part_off(p),
+            Seg::Pair(PathId::Hist, p) => 7 + part_off(p),
             Seg::Sd(k) => b + k,
             Seg::LeafOld(i) => b + 5 + 11 * i,
             Seg::LeafMid(i) => b + 5 + 11 * i + 1,
@@ -171,6 +198,7 @@ impl Seg {
     pub(crate) const fn len(self) -> usize {
         match self {
             Seg::Pair(PathId::R | PathId::Sup(_), Part::Bulk) => 30,
+            Seg::Pair(PathId::Abs, Part::Bulk) => 2 * (30 - ABS_LEVELS),
             Seg::Pair(_, Part::Bulk) => 60,
             Seg::Pair(_, Part::L30) => 2,
             Seg::Anch(APart::Low) => 30,
@@ -191,7 +219,7 @@ impl Seg {
             Seg::RegLeaf | Seg::Pair(PathId::R, _) => r,
             Seg::SupOld(_) | Seg::SupNew(_) | Seg::Exit(_) | Seg::Pair(PathId::Sup(_), _) => t == WTag::P,
             Seg::Anch(_) => true,
-            Seg::Pair(PathId::Abs(_) | PathId::Hist | PathId::Fee, _) | Seg::FeeRho | Seg::FeeRseed | Seg::FeeNote => true,
+            Seg::AbsNode(_) | Seg::Pair(PathId::Abs | PathId::Hist | PathId::Fee, _) | Seg::FeeRho | Seg::FeeRseed | Seg::FeeNote => true,
             Seg::Pad => false,
         }
     }
@@ -210,10 +238,8 @@ const PARTS: [Part; 4] = [Part::Bulk, Part::L30, Part::LastA, Part::LastB];
 
 /// Every segment in ring order (without `PAD`).
 pub(crate) fn program() -> Vec<Seg> {
-    let mut v = Vec::new();
-    for i in 0..M_ABS {
-        v.extend(PARTS.map(|p| Seg::Pair(PathId::Abs(i), p)));
-    }
+    let mut v: Vec<Seg> = (0..3).map(Seg::AbsNode).collect();
+    v.extend(PARTS.map(|p| Seg::Pair(PathId::Abs, p)));
     v.extend(PARTS.map(|p| Seg::Pair(PathId::Hist, p)));
     v.extend((0..SD_BLOCKS).map(Seg::Sd));
     for i in 0..INSERTS {
@@ -246,7 +272,7 @@ pub(crate) fn slot_program() -> Vec<Seg> {
     program()[SLOT_BASE..EPI_BASE].to_vec()
 }
 
-pub(crate) const PRO_PERMS: usize = 320;
+pub(crate) const PRO_PERMS: usize = 127;
 pub(crate) const SLOT_PERMS: usize = 661;
 pub(crate) const EPI_PERMS: usize = 67;
 
@@ -518,6 +544,7 @@ pub(crate) const PHASES: &[&str] = &[
     "root_k",
     "root_c",
     "root_aa",
+    "abs_sub",
     "root_r",
     "reg_read",
     "rleaf",
@@ -642,9 +669,10 @@ impl WAir {
         let to_c0 = Seg::Pair(PathId::New(INSERTS - 1), Part::LastB);
         let to_c1 = Seg::Pair(PathId::C(0), Part::LastB);
         let r_last = Seg::Pair(PathId::R, Part::LastB);
-        let abs_last = |i: usize| Seg::Pair(PathId::Abs(i), Part::LastB);
-        let all_abs: Vec<Seg> = (0..M_ABS).map(abs_last).collect();
-        let to_hist = abs_last(M_ABS - 1);
+        let abs_last = Seg::Pair(PathId::Abs, Part::LastB);
+        let an = |j: usize| seg(Seg::AbsNode(j));
+        let z2l = limbs(&abs_old_side());
+        let z2 = |j: usize| konst(z2l[j]);
         let hist_last = Seg::Pair(PathId::Hist, Part::LastB);
         let sup_old = [Seg::SupOld(0), Seg::SupOld(1)];
         let sup_new = [Seg::SupNew(0), Seg::SupNew(1)];
@@ -720,7 +748,6 @@ impl WAir {
                 f.assert_one(c(PW));
                 for j in 0..16 {
                     f.assert_zero(c(NA_OFF + j));
-                    f.assert_zero(c(NB_OFF + j) - pv_abs(0, j));
                 }
                 for j in 0..4 {
                     f.assert_zero(c(FE_OFF + j));
@@ -944,11 +971,13 @@ impl WAir {
             }
             "path_regs" => {
                 builder.assert_bool(cur[BIT]);
-                let fao = ka() + segs(&leaf_old) + segs(&anch) + segs(&sup_old);
-                let faz = segs(&leaf_new) + seg(to_c0) + seg(to_c1) + segs(&all_abs) + seg(Seg::FeeNote);
+                let fao = ka() + segs(&leaf_old) + segs(&anch) + segs(&sup_old) + an(1);
+                let faz = segs(&leaf_new) + seg(to_c0) + seg(to_c1) + seg(abs_last) + seg(Seg::FeeNote);
                 let fanc = seg(Seg::Exit(1));
                 let free = seg(Seg::RegLeaf);
-                let fbo = kb() - seg(to_c0) - seg(to_c1) - segs(&all_abs)
+                let fbo = kb() - seg(to_c0) - seg(to_c1) - seg(abs_last)
+                    + an(0)
+                    + an(2)
                     + segs(&leaf_mid)
                     + segs(&leaf_new)
                     + seg(Seg::RegLeaf)
@@ -964,11 +993,11 @@ impl WAir {
                             - fin.clone()
                                 * (fao.clone() * (out(l, m) - a.clone()) - faz.clone() * a.clone()
                                     + fanc.clone() * (c(ANC_OFF + j) - a.clone())
+                                    + an(2) * (z2(j) - a.clone())
                                     + free.clone() * (na - a)),
                     );
                     let (b, nb) = (c(NB_OFF + j), n(NB_OFF + j));
-                    let abs_next = (0..M_ABS - 1).fold(AB::Expr::ZERO, |acc, i| acc + seg(abs_last(i)) * (pv_abs(i + 1, j) - b.clone()))
-                        + seg(to_hist) * (c(C_OFF + j) - b.clone());
+                    let abs_next = seg(abs_last) * (c(C_OFF + j) - b.clone());
                     t.assert_zero(
                         nb - b.clone()
                             - fin.clone()
@@ -992,7 +1021,7 @@ impl WAir {
                 builder.assert_zero(capped * c(BIT));
             }
             "index" => {
-                let fi = segs(&leaf_mid) + segs(&leaf_new) + seg(to_c0) + seg(to_c1) + seg(Seg::RegLeaf) + segs(&all_abs) + seg(Seg::FeeNote) + segs(&sup_new);
+                let fi = segs(&leaf_mid) + segs(&leaf_new) + seg(to_c0) + seg(to_c1) + seg(Seg::RegLeaf) + seg(abs_last) + seg(Seg::FeeNote) + segs(&sup_new);
                 let mut t = builder.when_transition();
                 t.assert_zero(n(ACC) - c(ACC) - fin.clone() * (c(KPB) * c(BP) - fi.clone() * c(ACC)));
                 t.assert_zero(n(PW) - c(PW) - fin * (fi * (one.clone() - c(PW)) + c(KPB) * c(PW)));
@@ -1031,16 +1060,46 @@ impl WAir {
                 t.assert_zero(n(CN) - c(CN) - fin * c(KCC));
             }
             "root_aa" => {
-                let kab = (0..M_ABS).fold(AB::Expr::ZERO, |a, i| a + seg(abs_last(i)));
+                // The subtree's slot: its path index counts from level 2, so
+                // AA's next index is 4 × it (aa_next ≡ 0 mod 4 is forced).
+                let kab = seg(abs_last);
+                let m = konst(M_ABS as u32);
                 for j in 0..16 {
                     builder.assert_zero(kab.clone() * (c(NA_OFF + j) - c(AA_OFF + j)));
                 }
-                builder.assert_zero(kab.clone() * (c(ACC) + c(BP) - c(AAN)));
+                builder.assert_zero(kab.clone() * ((c(ACC) + c(BP)) * m.clone() - c(AAN)));
                 let mut t = builder.when_transition();
                 for j in 0..16 {
                     t.assert_zero(n(AA_OFF + j) - c(AA_OFF + j) - fin.clone() * kab.clone() * (out(j / 4, j % 4) - c(AA_OFF + j)));
                 }
-                t.assert_zero(n(AAN) - c(AAN) - fin * kab);
+                t.assert_zero(n(AAN) - c(AAN) - fin * kab * m);
+            }
+            "abs_sub" => {
+                // H(a0, a1), H(a2, a3) from the absorbed-root PVs; their parent
+                // from the two registers (NB, NA) they were left in.
+                for (jn, (x, y)) in [(0usize, (0usize, 1usize)), (1, (2, 3))] {
+                    for j in 0..16 {
+                        let (l, mm) = (j / 4, j % 4);
+                        builder.assert_zero(an(jn) * (pre(l, mm) - pv_abs(x, j)));
+                        builder.assert_zero(an(jn) * (pre(4 + l, mm) - pv_abs(y, j)));
+                    }
+                }
+                for j in 0..16 {
+                    let (l, mm) = (j / 4, j % 4);
+                    builder.assert_zero(an(2) * (pre(l, mm) - c(NB_OFF + j)));
+                    builder.assert_zero(an(2) * (pre(4 + l, mm) - c(NA_OFF + j)));
+                }
+                let kn = an(0) + an(1) + an(2);
+                for l in 8..25 {
+                    for mm in 0..4 {
+                        let v = match (l, mm) {
+                            (8, 0) => 1,
+                            (16, 3) => 0x8000,
+                            _ => 0,
+                        };
+                        builder.assert_zero(kn.clone() * (pre(l, mm) - konst(v)));
+                    }
+                }
             }
             "root_r" => {
                 for j in 0..16 {
@@ -1254,7 +1313,7 @@ impl WAir {
                 let kx = c(KX_OFF) + c(KX_OFF + 1);
                 for l in 0..25 {
                     if (4..8).contains(&l) {
-                        continue; // rkm: a stub until Q3's field (lab #775)
+                        continue; // rkm: a free witness, bound only through the chain (Q3 = (c))
                     }
                     for m in 0..4 {
                         let e: AB::Expr = match (l, m) {
@@ -1445,7 +1504,7 @@ pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WW
         anc: EMPTY,
         hi: EMPTY,
         na: EMPTY,
-        nb: inp.absorbed[0],
+        nb: EMPTY,
         sib: EMPTY,
         bit: false,
         acc: Val::ZERO,
@@ -1529,7 +1588,7 @@ pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WW
             let rem = s.len() - 1 - i;
             perms.push(PermPlan { pre, cols: snapshot(s, rem, side, g) });
             let out = out4(&pre);
-            step(s, side, out, g, inp, &pre, view);
+            step(s, side, out, g, &pre, view);
         }
     };
     // Slot 0's surface registers hold from the first row (they change only
@@ -1600,6 +1659,7 @@ fn set_surface(g: &mut Regs, m: &Member) {
 
 fn pair_level(s: Seg, i: usize) -> (Option<usize>, bool) {
     match s {
+        Seg::Pair(PathId::Abs, Part::Bulk) => (Some(ABS_LEVELS + i / 2), i.is_multiple_of(2)),
         Seg::Pair(_, Part::Bulk) => (Some(i / 2), i.is_multiple_of(2)),
         Seg::Pair(_, Part::L30) => (Some(30 + i / 2), i.is_multiple_of(2)),
         Seg::Pair(p, Part::LastA) => (Some(p.depth() - 1), true),
@@ -1618,7 +1678,8 @@ fn path_at(s: Seg, view: Option<&SlotView>, w: &WWitness, lvl: usize) -> (Digest
         Seg::Pair(PathId::New(i), _) => view.and_then(|v| v.inserts.get(i)).map(|x| get(&x.new_path)),
         Seg::Pair(PathId::C(j), _) => view.and_then(|v| v.appends.get(j)).map(|x| get(&x.path)),
         Seg::Pair(PathId::R, _) => view.and_then(|v| v.write.as_ref()).map(|x| (x.path.siblings[lvl], x.path.path_bits[lvl])),
-        Seg::Pair(PathId::Abs(i), _) => Some(get(&w.absorbs[i].path)),
+        // Levels ≥ 2 of the first root's path are the subtree's.
+        Seg::Pair(PathId::Abs, _) => Some(get(&w.absorbs[0].path)),
         Seg::Pair(PathId::Hist, _) => Some(get(&w.hist.path)),
         Seg::Pair(PathId::Sup(k), _) => view.map(|v| (v.vp[k].path.siblings[lvl], v.vp[k].path.path_bits[lvl])),
         Seg::Pair(PathId::Fee, _) => Some(get(&w.fee.path)),
@@ -1632,6 +1693,14 @@ fn perm_input(s: Seg, i: usize, g: &Regs, view: Option<&SlotView>, blocks: &[[u6
     let on = s.active(g.tag);
     let ins = |i: usize| view.and_then(|v| v.inserts.get(i)).filter(|_| on);
     match s {
+        Seg::AbsNode(j) => {
+            let a = &inp.absorbed;
+            match j {
+                0 => node_state(&a[0], &a[1]),
+                1 => node_state(&a[2], &a[3]),
+                _ => node_state(&g.nb, &g.na),
+            }
+        }
         Seg::Sd(b) => {
             if on {
                 blocks.get(b).copied().unwrap_or([0; 25])
@@ -1678,6 +1747,12 @@ fn perm_input(s: Seg, i: usize, g: &Regs, view: Option<&SlotView>, blocks: &[[u6
         }
         Seg::Pad => [0; 25],
     }
+}
+
+/// The empty depth-2 subtree (`zeros[2]`): the old side of the absorb.
+pub(crate) fn abs_old_side() -> Digest {
+    let z1 = crate::f3::native::node_pub(&EMPTY, &EMPTY);
+    crate::f3::native::node_pub(&z1, &z1)
 }
 
 /// Row `k` is an exit: a P slot's `vPublic` redeem on asset 0.
@@ -1810,7 +1885,7 @@ fn snapshot(s: Seg, rem: usize, side: usize, g: &Regs) -> Vec<Val> {
 }
 
 /// The perm's last-row transition.
-fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u64; 25], view: Option<&SlotView>) {
+fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, pre: &[u64; 25], view: Option<&SlotView>) {
     let _ = view;
     let on = s.active(g.tag);
     let tx = matches!(g.tag, WTag::S | WTag::P | WTag::R);
@@ -1843,13 +1918,21 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
             reset(g);
         }
         Seg::Anch(_) => g.na = out,
+        Seg::AbsNode(0) => g.nb = out,
+        Seg::AbsNode(1) => g.na = out,
+        Seg::AbsNode(_) => {
+            // The subtree's root on the B side; the A side opens the empty
+            // subtree the four slots were.
+            g.nb = out;
+            g.na = abs_old_side();
+        }
         Seg::Pair(p, part) => {
             let a = match part {
                 Part::Bulk | Part::L30 => side == 0,
                 Part::LastA => true,
                 Part::LastB => false,
             };
-            let to_abs = matches!(p, PathId::Abs(_)) && part == Part::LastB;
+            let to_abs = p == PathId::Abs && part == Part::LastB;
             if a {
                 g.na = out;
             } else if s != to_c0 && s != to_c1 && !to_abs {
@@ -1881,9 +1964,9 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
                         g.c = out;
                         g.cn += 1;
                     }
-                    PathId::Abs(_) => {
+                    PathId::Abs => {
                         g.aa = out;
-                        g.aan += 1;
+                        g.aan += M_ABS as u64;
                     }
                     PathId::Hist => {
                         g.ch = out;
@@ -1903,10 +1986,10 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, inp: &WInputs, pre: &[u6
                     g.nb = g.cm[1];
                     reset(g);
                 }
-                if let PathId::Abs(i) = p {
+                if p == PathId::Abs {
+                    // Then C_in into CH.
                     g.na = EMPTY;
-                    // The next absorbed root, or (after the last) C_in into CH.
-                    g.nb = if i + 1 < M_ABS { inp.absorbed[i + 1] } else { g.c };
+                    g.nb = g.c;
                     reset(g);
                 }
             }

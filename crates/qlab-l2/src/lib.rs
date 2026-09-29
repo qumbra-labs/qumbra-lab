@@ -221,11 +221,14 @@ pub fn pv_in_range(pvs: &[Val], bits: &[u32]) -> bool {
 }
 
 /// Every **`u32`** public value inside the range its AIR declares, checked
-/// BEFORE the mod-p conversion (`qlab_consensus::verify_proof`'s rule, lab
-/// PR #770): a width `b < 32` requires `v < 2^b`; a 32-bit position requires
-/// `v < p`, so no word is reduced mod p on its way into the verifier. (Lab
-/// #775 review R1: [`pv_in_range`] sees the reduced value, so `p + x` passes
-/// it as `x`.)
+/// BEFORE the mod-p conversion: a width `b < 32` requires `v < 2^b`, as
+/// `qlab_consensus::verify_proof` (lab PR #770) does; **stricter than L1**, a
+/// 32-bit position also requires `v < p`, so no word is reduced mod p on its
+/// way into the verifier. (Lab #775 review R1: [`pv_in_range`] sees the
+/// reduced value, so `p + x` passes it as `x`.) The `Val`-typed `verify_*`
+/// entries stay public for callers that build their own PVs as field
+/// elements (`qlab-bench`'s F2 and zkpeak paths, the node's verifier); a
+/// verifier handed `u32` words by someone else uses the `_u32` entries.
 pub fn pv_u32_in_range(pvs: &[u32], bits: &[u32]) -> bool {
     use p3_field::PrimeField32;
     pvs.len() == bits.len() && pvs.iter().zip(bits).all(|(v, b)| if *b < 32 { *v < 1 << b } else { *v < Val::ORDER_U32 })

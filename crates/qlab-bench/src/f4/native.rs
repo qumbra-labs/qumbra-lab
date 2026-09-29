@@ -13,7 +13,8 @@
 //!
 //! **Anchor absorption.** Before its slots, every wrapper appends exactly
 //! [`M_ABS`] absorbed L1 roots to `AA` (the count a devnet placeholder, ruling
-//! Q8). That they are genuine recent finalized L1 roots is the enshrined
+//! Q8). `AA` grows only by these, so `aa_next ≡ 0 (mod 4)` always: the four
+//! are one aligned depth-2 subtree, which W proves with a single path. That they are genuine recent finalized L1 roots is the enshrined
 //! rule's check (F5), stubbed in [`super::verify`].
 //!
 //! **The sequencer fee note (ruling condition (e), option 1).** After its
@@ -193,6 +194,9 @@ pub(crate) enum WError {
     AssetZeroMint,
     /// `D_cum` or `E_cum` overflows u64.
     Counter,
+    /// `aa_next` not a multiple of [`M_ABS`]: the absorbed roots are one
+    /// aligned subtree of `AA` (F4-3's absorb).
+    AbsAlign,
 }
 
 /// The running state a wrapper leaf threads: F3's six plus `K` (the claim
@@ -321,7 +325,7 @@ pub(crate) fn fee_note_cm(value: u64, rkm_seq: &Digest, prev: &Digest) -> Digest
 /// The supply tree's depth — asset ids < 2^16 (a devnet placeholder).
 pub(crate) const SUPPLY_DEPTH: usize = qlab_air::l2::REGISTRY_DEPTH;
 
-fn domain3(s: &[u8]) -> [u64; 3] {
+pub(crate) fn domain3(s: &[u8]) -> [u64; 3] {
     let mut b = [0u8; 24];
     b[..s.len()].copy_from_slice(s);
     core::array::from_fn(|i| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes")))
@@ -418,11 +422,14 @@ impl SupplyTree {
     }
 }
 
-/// A P row's `(s, m, vpa)`.
+/// A P row's `(s, m, vpa)`. Total: a word past a short vector reads 0 (the
+/// native checks refuse a P member of the wrong length first; the plan
+/// generator renders whatever it is given).
 pub(crate) fn vp_row(pvs: &[u32], k: usize) -> (u32, u64, u32) {
     let base = qlab_air::l2p::PV_VP1 + 6 * k;
-    let m = (0..4).map(|j| u64::from(pvs[base + 1 + j] & 0xffff) << (16 * j)).sum();
-    (pvs[base], m, pvs[base + 5])
+    let at = |i: usize| pvs.get(i).copied().unwrap_or(0);
+    let m = (0..4).map(|j| u64::from(at(base + 1 + j) & 0xffff) << (16 * j)).sum();
+    (at(base), m, at(base + 5))
 }
 
 /// The wrapper's L2 state: F3's three trees and SD, plus `K`, `AA`, `CH`, the
@@ -469,9 +476,17 @@ impl WState {
     /// Apply one wrapper leaf: absorb, the slots in order, the fee note.
     /// Returns `(roots in, witnesses, roots out)`; on error the state is
     /// left as it was.
+    ///
+    /// **The sequencer prefilters with this** (review S8): a member whose own
+    /// proof verifies can still make W unsatisfiable — a P row with `m = 0`
+    /// and `vpa ≥ 2^16`, or a `vPublic` mint on asset 0 — and this refuses
+    /// exactly those, so a batch it accepts is one W can prove.
     pub(crate) fn apply(&mut self, inp: &WInputs, members: &[Member]) -> Result<(WRoots, WWitness, WRoots), WError> {
         if members.iter().filter(|m| m.tag == WTag::R).count() > 1 {
             return Err(WError::Capacity);
+        }
+        if !self.aa.len().is_multiple_of(M_ABS as u64) {
+            return Err(WError::AbsAlign);
         }
         let before = self.clone();
         let rin = self.roots();
@@ -494,6 +509,9 @@ impl WState {
                     ex.anchor_path = self.ch.auth_path(ex.anchor_index, self.ch.len());
                 }
                 if m.tag == WTag::P {
+                    if m.pvs.len() != WTag::P.pv_len() {
+                        return Err(WError::Surface);
+                    }
                     for k in 0..2 {
                         let (sgn, amt, vpa) = vp_row(&m.pvs, k);
                         if sgn > 1 || vpa >= 1 << SUPPLY_DEPTH {
@@ -563,9 +581,12 @@ fn bits_ok(path: &MerkleWitness, index: u64) -> bool {
     index < INDEX_CAP && (0..MERKLE_DEPTH).all(|i| path.path_bits[i] == ((index >> i) & 1 == 1))
 }
 
-/// The exit list's stub `rkm` for row `k` of a transaction (Q3 = (c)): a
-/// deterministic placeholder — the member's `cm1` chunks — until the shape
-/// freeze gives L2 transactions an L1 recipient field. Bound only by the chain.
+/// The **test fixtures'** exit `rkm` for row `k` (Q3 = (c)): an arbitrary
+/// deterministic value (the member's `cm1` chunks), nothing a verifier can
+/// recompute. In W, `rkm` is a **free witness**: its lanes are unconstrained
+/// and it is bound only through the exit chain's hash, so `exit_cmt` commits
+/// to whatever `(rkm, v)` the sequencer wrote — until the shape freeze gives
+/// L2 transactions an L1 recipient field.
 pub(crate) fn exit_rkm_stub(pvs: &[u32], k: usize) -> Digest {
     let off = qlab_air::l2::PV_CM1;
     core::array::from_fn(|l| (0..4).map(|j| u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0) & 0xffff) << (16 * j)).sum::<u64>() ^ (k as u64))
@@ -588,6 +609,9 @@ pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member]
         return Err(WError::Capacity);
     }
     let mut s = *rin;
+    if !s.aa_next.is_multiple_of(M_ABS as u64) {
+        return Err(WError::AbsAlign);
+    }
     for (root, a) in inp.absorbed.iter().zip(&w.absorbs) {
         (s.aa, s.aa_next) = apply_append(&s.aa, s.aa_next, root, a).map_err(WError::Append)?;
     }
@@ -601,6 +625,9 @@ pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member]
             }
         }
         if m.tag == WTag::P {
+            if m.pvs.len() != WTag::P.pv_len() {
+                return Err(WError::Surface);
+            }
             for (k, vw) in ex.vp.iter().enumerate() {
                 let (sgn, amt, vpa) = vp_row(&m.pvs, k);
                 if sgn > 1 || vpa >= 1 << SUPPLY_DEPTH {
@@ -670,15 +697,26 @@ pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member]
 /// burn address, and `fee` (four chunks). Range, not semantics, is what W
 /// reads; a real claim proof binds these (F1).
 pub(crate) fn synth_claim(rng: &mut crate::f3::native::Rng, a: &Digest, fee: u64) -> Member {
+    synth_claim_open(rng, a, fee).0
+}
+
+/// [`synth_claim`] with its value commitment's opening: `Cv` is
+/// `claim_cv(v, r_v)` for a 40-bit `v ≥ fee` (so a deposit proof over the
+/// fixture's claims exists).
+pub(crate) fn synth_claim_open(rng: &mut crate::f3::native::Rng, a: &Digest, fee: u64) -> (Member, super::dep::DepEntry) {
     use qlab_air::claim::{PV_A, PV_CM2, PV_CNF, PV_CV, PV_FEE, PV_LEN, PV_RKM_BURN};
     let mut pvs = vec![0u32; PV_LEN];
-    for (off, d) in [(PV_A, *a), (PV_CNF, rng.digest()), (PV_CV, rng.digest()), (PV_CM2, rng.digest()), (PV_RKM_BURN, rng.digest())] {
+    let cnf = rng.digest();
+    let r_v = rng.digest();
+    let open = super::dep::DepEntry { v: fee + (r_v[0] >> 24), r_v };
+    let cv = qlab_air::claim::claim_cv(open.v, &r_v);
+    for (off, d) in [(PV_A, *a), (PV_CNF, cnf), (PV_CV, cv), (PV_CM2, rng.digest()), (PV_RKM_BURN, rng.digest())] {
         pvs[off..off + 16].copy_from_slice(&pv_chunks(&d));
     }
     for j in 0..4 {
         pvs[PV_FEE + j] = ((fee >> (16 * j)) & 0xffff) as u32;
     }
-    Member { tag: WTag::C, pvs, write: None }
+    (Member { tag: WTag::C, pvs, write: None }, open)
 }
 
 /// A transaction member valid against a wrapper whose `C_in` is `c_in`: its
