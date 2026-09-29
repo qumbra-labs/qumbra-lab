@@ -5575,6 +5575,40 @@ fn emit_child(
                             let outv = (lo + hi) * ext_base(consts.half)
                                 + regs.breg[l] * ext_base(consts.kf[rf][l][i]) * (lo - hi);
                             if r == pairs.len() - 1 {
+                                if outv != scale(qr.folds[rf].folded) {
+                                    // Lab #782 F4b-1 diagnostic: which input of the fold
+                                    // disagrees with the recorded (native) walk.
+                                    let fold = &qr.folds[rf];
+                                    eprintln!("FOLD-DIAG q_first_row={row} rf={rf} la={la} n_rounds={n_rounds} log_arities={:?} cum={:?} lf={:?} index_in_group={} evals={}",
+                                        shape.log_arities, cum, shape.lf(), fold.index_in_group, fold.evals.len());
+                                    eprintln!("FOLD-DIAG beta: circuit chal={:?} walk={:?} equal={}", regs.chal[G_BETA0 + rf], fold.beta, regs.chal[G_BETA0 + rf] == fold.beta);
+                                    eprintln!("FOLD-DIAG all circuit betas={:?}", (0..n_rounds).map(|x| regs.chal[G_BETA0 + x]).collect::<Vec<_>>());
+                                    eprintln!("FOLD-DIAG all walk betas={:?}", sched.betas);
+                                    let mut s_l = fold.s;
+                                    for lvl in 0..la {
+                                        let want = fold.beta.exp_power_of_2(lvl) * (s_l * Ext::from(Val::from_u32(2))).inverse();
+                                        eprintln!("FOLD-DIAG breg[{lvl}] circuit={:?} want={:?} equal={}", regs.breg[lvl], want, regs.breg[lvl] == want);
+                                        s_l = s_l * s_l;
+                                    }
+                                    // Native re-fold of the scaled evals with the walk's beta.
+                                    let mut cur: Vec<Ext> = fold.evals.iter().map(|e| scale(*e)).collect();
+                                    let mut beta_l = fold.beta;
+                                    let mut s_l = fold.s;
+                                    for lvl in 0..la {
+                                        let g_l = Val::two_adic_generator(la).exp_power_of_2(lvl);
+                                        let half_n = cur.len() / 2;
+                                        let nxt: Vec<Ext> = (0..half_n).map(|i2| {
+                                            let (lo, hi) = (cur[2 * i2], cur[2 * i2 + 1]);
+                                            let y = s_l * Ext::from(g_l.exp_u64(rev_bits(i2, la - lvl - 1) as u64));
+                                            (lo + hi) * ext_base(consts.half) + beta_l * (lo - hi) * (y * Ext::from(Val::from_u32(2))).inverse()
+                                        }).collect();
+                                        eprintln!("FOLD-DIAG native level {lvl}: {} values, first={:?}", nxt.len(), nxt.first());
+                                        cur = nxt;
+                                        beta_l = beta_l * beta_l;
+                                        s_l = s_l * s_l;
+                                    }
+                                    eprintln!("FOLD-DIAG native final={:?} walk final(scaled)={:?} circuit={:?}", cur.first(), scale(fold.folded), outv);
+                                }
                                 assert_eq!(outv, scale(qr.folds[rf].folded), "fold output");
                                 regs.runev = outv;
                             } else {
