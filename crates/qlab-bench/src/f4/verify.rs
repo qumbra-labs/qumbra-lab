@@ -45,13 +45,29 @@ use crate::f3::native::{sd_chain_byte, Digest, Roots};
 
 /// The wrapper statement versions this verifier knows: `(k, outer lane)`.
 /// Version 1 is ruling Q1's K = 16 on the decided b2 lane; `0x8000 | k` are
-/// devnet/test versions of smaller `k`.
+/// devnet/test versions of smaller `k`; `0x8100 | k` are the F4-4 bench's
+/// b4 cells — **measurement only, never a chain version**.
 pub(crate) fn version(id: u32) -> Option<(usize, Outer)> {
-    VERSIONS.iter().find(|(v, _)| *v == id).map(|(_, k)| (*k, Outer::B2))
+    VERSIONS.iter().find(|(v, _, _)| *v == id).map(|(_, k, o)| (*k, *o))
 }
 
-/// `(version, k)`, every one on the b2 lane.
-pub(crate) const VERSIONS: [(u32, usize); 5] = [(1, 16), (0x8001, 1), (0x8002, 2), (0x8004, 4), (0x8008, 8)];
+/// The version a `(k, lane)` bench cell runs under.
+pub(crate) fn version_for(k: usize, outer: Outer) -> Option<u32> {
+    VERSIONS.iter().find(|(_, kk, o)| *kk == k && *o == outer).map(|(v, _, _)| *v)
+}
+
+/// `(version, k, outer lane)`.
+pub(crate) const VERSIONS: [(u32, usize, Outer); 8] = [
+    (1, 16, Outer::B2),
+    (0x8001, 1, Outer::B2),
+    (0x8002, 2, Outer::B2),
+    (0x8004, 4, Outer::B2),
+    (0x8008, 8, Outer::B2),
+    // Measurement only, never a chain version (F4-4's b4 cells).
+    (0x8104, 4, Outer::B4),
+    (0x8108, 8, Outer::B4),
+    (0x8110, 16, Outer::B4),
+];
 const _: () = {
     let mut i = 0;
     while i < VERSIONS.len() {
@@ -588,8 +604,11 @@ mod tests {
         // Two claims: honest V9 passes (the refusal is V3's, a proof this
         // synthetic bundle lacks); reordered, or the last dropped, it refuses.
         let fx = wfixture(&[WTag::C, WTag::C], SEED);
-        let two = |order: [usize; 2], deps: &[DepEntry]| -> Result<Surface, VError> {
-            let (dep_pvs, dep_proof) = prove_dep(deps).unwrap();
+        // One deposit proof per statement (review T2): the in-order and the
+        // reordered bundles share the full list's.
+        let full = prove_dep(&fx.deps).unwrap();
+        let first = prove_dep(&fx.deps[..1]).unwrap();
+        let two = |order: [usize; 2], deps: &[DepEntry], dep: &(Vec<u32>, Proof<Config>)| -> Result<Surface, VError> {
             let mut b = bundle(c);
             b.members = order
                 .iter()
@@ -602,13 +621,13 @@ mod tests {
             for j in 0..4 {
                 b.w_pvs[PV_DB + j] = ((d >> (16 * j)) & 0xffff) as u32;
             }
-            b.dep_pvs = dep_pvs;
-            b.dep_proof = &dep_proof;
+            b.dep_pvs = dep.0.clone();
+            b.dep_proof = &dep.1;
             run(&b)
         };
-        assert_eq!(two([0, 1], &fx.deps).unwrap_err(), VError::WProof, "V9 holds for the two claims in order");
-        assert_eq!(two([1, 0], &fx.deps).unwrap_err(), VError::Dep(DepCheck::Digest), "claims reordered against the Cv chain");
-        assert_eq!(two([0, 1], &fx.deps[..1]).unwrap_err(), VError::Dep(DepCheck::Count), "the last Cv dropped");
+        assert_eq!(two([0, 1], &fx.deps, &full).unwrap_err(), VError::WProof, "V9 holds for the two claims in order");
+        assert_eq!(two([1, 0], &fx.deps, &full).unwrap_err(), VError::Dep(DepCheck::Digest), "claims reordered against the Cv chain");
+        assert_eq!(two([0, 1], &fx.deps[..1], &first).unwrap_err(), VError::Dep(DepCheck::Count), "the last Cv dropped");
     }
 
     /// The versions: 1 is K = 16 at b2; devnet versions carry their k.
@@ -617,5 +636,12 @@ mod tests {
         assert_eq!(version(1).map(|v| v.0), Some(16));
         assert_eq!(version(0x8002).map(|v| v.0), Some(2));
         assert_eq!(version(2), None);
+        assert_eq!(version(0x8110).map(|v| v.1), Some(Outer::B4));
+        assert_eq!(version_for(16, Outer::B2), Some(1));
+        assert_eq!(version_for(16, Outer::B4), Some(0x8110));
+        // One version per (k, lane).
+        for (i, a) in VERSIONS.iter().enumerate() {
+            assert!(VERSIONS[i + 1..].iter().all(|b| (a.1, a.2) != (b.1, b.2) && a.0 != b.0));
+        }
     }
 }

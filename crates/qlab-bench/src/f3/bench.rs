@@ -60,7 +60,7 @@ impl Outer {
             Self::B4 => "b4/q43/g22/fp16/a16",
         }
     }
-    fn k_model(self) -> f64 {
+    pub(crate) fn k_model(self) -> f64 {
         match self {
             Self::B2 => K_B2,
             Self::B4 => K_B4,

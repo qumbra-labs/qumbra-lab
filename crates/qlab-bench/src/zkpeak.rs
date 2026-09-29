@@ -54,7 +54,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
     // closing `· between (to its end)` row.
     #[cfg(feature = "phasemem")]
     let root = phases.then(|| tracing::info_span!("zkpeak case (prove, then verify)").entered());
-    let (label, prove_s, verify_ok, bytes) = match (case, rc) {
+    let (label, prove_s, verify_ok, verify_s, bytes) = match (case, rc) {
         ("l1", Some(rc)) => {
             let (inst, _) = crate::m4gaterec::bucket_instance_seeded(0xfeed_face_cafe_beef);
             let cfg = qlab_consensus::CONSENSUS_CFG;
@@ -63,9 +63,11 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let t = Instant::now();
             let proof = p3_uni_stark::prove(&qlab_consensus::make_config_with_rc(&cfg, rc), &inst.air, trace, &pvs);
             let secs = t.elapsed().as_secs_f64();
+            let tv = Instant::now();
             let ok = p3_uni_stark::verify(&qlab_consensus::make_config_with_rc(&cfg, rc), &inst.air, &proof, &pvs).is_ok();
+            let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("L1 2×2 bucket @ {} (2^{}), rc = {rc}", cfg.label(), qlab_consensus::LOG_HEIGHT), secs, ok, bytes)
+            (format!("L1 2×2 bucket @ {} (2^{}), rc = {rc}", cfg.label(), qlab_consensus::LOG_HEIGHT), secs, ok, verify_s, bytes)
         }
         ("p", Some(rc)) => {
             let inst = qlab_l2::fixture::shape_p();
@@ -75,10 +77,12 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let t = Instant::now();
             let proof = p3_uni_stark::prove(&qlab_consensus::make_config_with_rc(&cfg, rc), &inst.air, trace, &pvs);
             let secs = t.elapsed().as_secs_f64();
+            let tv = Instant::now();
             let ok = p3_uni_stark::verify(&qlab_consensus::make_config_with_rc(&cfg, rc), &qlab_l2::verifier_air_p(), &proof, &pvs)
                 .is_ok();
+            let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("shape P @ {} (2^{}), rc = {rc}", cfg.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, bytes)
+            (format!("shape P @ {} (2^{}), rc = {rc}", cfg.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, verify_s, bytes)
         }
         (_, Some(_)) => {
             eprintln!("zkpeak: `--rc` is implemented for `--case l1|p` only");
@@ -89,18 +93,22 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let t = Instant::now();
             let (_, proof) = qlab_consensus::prove_bucket(&inst);
             let secs = t.elapsed().as_secs_f64();
+            let tv = Instant::now();
             let ok = qlab_consensus::verify_proof(&inst, &inst.pvs, &proof);
+            let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("L1 2×2 bucket @ {} (2^{})", qlab_consensus::CONSENSUS_CFG.label(), qlab_consensus::LOG_HEIGHT), secs, ok, bytes)
+            (format!("L1 2×2 bucket @ {} (2^{})", qlab_consensus::CONSENSUS_CFG.label(), qlab_consensus::LOG_HEIGHT), secs, ok, verify_s, bytes)
         }
         ("p", None) => {
             let inst = qlab_l2::fixture::shape_p();
             let t = Instant::now();
             let (pvs, proof) = qlab_l2::prove_p(&inst);
             let secs = t.elapsed().as_secs_f64();
+            let tv = Instant::now();
             let ok = qlab_l2::verify_p(&pvs, &proof);
+            let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("shape P @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, bytes)
+            (format!("shape P @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, verify_s, bytes)
         }
         ("claim", None) => {
             // F1 (lab #756): the claim at the L2 lane (b4, 2^17).
@@ -109,9 +117,11 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let (pvs, proof) = qlab_l2::claim::prove_claim(&inst);
             let secs = t.elapsed().as_secs_f64();
             let tier = qlab_l2::claim::FEE_TIER_CLAIM_PLACEHOLDER;
+            let tv = Instant::now();
             let ok = qlab_l2::claim::verify_claim(&pvs, &proof, qlab_l2::fixture::CLAIM_L2_ID, tier).is_ok();
+            let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("claim @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::claim::LOG_HEIGHT_CLAIM), secs, ok, bytes)
+            (format!("claim @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::claim::LOG_HEIGHT_CLAIM), secs, ok, verify_s, bytes)
         }
         ("p19", None) => {
             use p3_air::BaseAir;
@@ -123,12 +133,15 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let t = Instant::now();
             let proof = p3_uni_stark::prove(&config, &air, trace, &pvs);
             let secs = t.elapsed().as_secs_f64();
+            let tv = Instant::now();
             let ok = p3_uni_stark::verify(&qlab_l2::make_config_l2(), &air, &proof, &pvs).is_ok();
+            let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
             (
                 format!("CANARY: shape-P AIR chain-only @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P - 1),
                 secs,
                 ok,
+                verify_s,
                 bytes,
             )
         }
@@ -147,9 +160,9 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
         println!("_Timings from a `phasemem` build are not publishable: every allocation pays two atomics._");
         println!();
     }
-    println!("| case | prove s | verifies | wire bytes (bincode fixint) |");
-    println!("|---|---|---|---|");
-    println!("| {label} | {prove_s:.2} | {verify_ok} | {bytes} |");
+    println!("| case | prove s | verifies | verify s | wire bytes (bincode fixint) |");
+    println!("|---|---|---|---|---|");
+    println!("| {label} | {prove_s:.2} | {verify_ok} | {verify_s:.4} | {bytes} |");
     println!();
     println!("Peak footprint: read `peak memory footprint` from the wrapping `/usr/bin/time -l`.");
     assert!(verify_ok, "the ZK proof must verify");
