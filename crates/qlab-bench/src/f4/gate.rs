@@ -81,11 +81,19 @@ pub(crate) fn child_gate_shape(width: usize, pv_len: usize, log_height: usize, c
     }
 }
 
-/// [P] a child's lane perms on this layout without a proof: the challenger's
-/// flush blocks plus every query's program (`qslots`). The report checks it
-/// against the measured `lane_plan` count for W.
+/// [P] a child's lane perms on this layout without a proof, counted as
+/// `m4gate::lane_plan` lays them out: every observation flush's blocks, the
+/// index refills, the trailer, flush 2's duplicate, then every query's
+/// program (`qslots`). The refills assume no rejected field draw (each costs
+/// one more perm, p ≈ 2^-7 a draw). F4b-1's box measured the lane at
+/// 8,380 / 9,200 / 16,214 perms (W at K = 1 b4, K = 16 b4, K = 16 b2); the
+/// first census missed the refills, trailer and duplicate (824–829 perms).
 pub(crate) fn perms_p(shape: &GateShape) -> usize {
-    shape.flush_blocks().iter().sum::<usize>() + shape.nq * shape.qslots()
+    let blocks = shape.flush_blocks();
+    // After the last observation: one draw for the query PoW and one per
+    // query index, eight u32 draws a digest, the first from that flush.
+    let refills = (shape.nq + 1).div_ceil(8) - 1;
+    blocks.iter().sum::<usize>() + refills + 1 + blocks[2] + shape.nq * shape.qslots()
 }
 
 /// Every row's constraints, in parallel; the lowest failing row.

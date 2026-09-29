@@ -571,6 +571,16 @@ mod tests {
         }
     }
 
+    /// F4b-1's box: the lane perms `lane_plan` produced for real W children
+    /// (issue #782's measurement), reproduced by the census exactly.
+    #[test]
+    fn f4census_perms_p_matches_the_boxs_lane_counts() {
+        use crate::f3::bench::Outer;
+        for (log_h, child, lane) in [(15, Outer::B4, 8_380), (18, Outer::B4, 9_200), (18, Outer::B2, 16_214)] {
+            assert_eq!(super::super::gate::perms_p(&super::super::gate::w_gate_shape(log_h, child)), lane, "{log_h} {child:?}");
+        }
+    }
+
     /// The tree counts and the security table's arithmetic.
     #[test]
     fn f4census_trees() {
