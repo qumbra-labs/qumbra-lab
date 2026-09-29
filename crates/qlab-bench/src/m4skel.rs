@@ -24,7 +24,6 @@
 //! Fiat–Shamir challenges, or bind public values. The skeleton's numbers
 //! are the floor the full build must not drift far from.
 
-use std::borrow::Borrow;
 use std::time::Instant;
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -41,64 +40,12 @@ use crate::{keccak_inputs, pc_len, FriCfg, Val, RUNS};
 // Re-gated by the re-mint: M4 runs on the legacy non-hiding config.
 use qlab_consensus::legacy::make_legacy_config_with as make_config_with;
 
+// Lab #785 F5-1: the column-offset builder moved to qlab-wrapper.
+pub(crate) use qlab_wrapper::lane::LaneBuilder;
+
 // ---------------------------------------------------------------------------
 // Lane composition: evaluate a foreign AIR at a column offset
 // ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub(crate) struct LaneWindow<W> {
-    inner: W,
-    off: usize,
-    width: usize,
-}
-
-impl<T, W: WindowAccess<T>> WindowAccess<T> for LaneWindow<W> {
-    fn current_slice(&self) -> &[T] {
-        &self.inner.current_slice()[self.off..self.off + self.width]
-    }
-    fn next_slice(&self) -> &[T] {
-        &self.inner.next_slice()[self.off..self.off + self.width]
-    }
-}
-
-pub(crate) struct LaneBuilder<'a, AB: AirBuilder> {
-    pub(crate) inner: &'a mut AB,
-    pub(crate) off: usize,
-    pub(crate) width: usize,
-}
-
-impl<'a, AB: AirBuilder> AirBuilder for LaneBuilder<'a, AB> {
-    type F = AB::F;
-    type Expr = AB::Expr;
-    type Var = AB::Var;
-    type PublicVar = AB::PublicVar;
-    type PeriodicVar = AB::PeriodicVar;
-    type PreprocessedWindow = AB::PreprocessedWindow;
-    type MainWindow = LaneWindow<AB::MainWindow>;
-
-    fn main(&self) -> Self::MainWindow {
-        LaneWindow {
-            inner: self.inner.main(),
-            off: self.off,
-            width: self.width,
-        }
-    }
-    fn preprocessed(&self) -> &Self::PreprocessedWindow {
-        self.inner.preprocessed()
-    }
-    fn is_first_row(&self) -> Self::Expr {
-        self.inner.is_first_row()
-    }
-    fn is_last_row(&self) -> Self::Expr {
-        self.inner.is_last_row()
-    }
-    fn is_transition(&self) -> Self::Expr {
-        self.inner.is_transition()
-    }
-    fn assert_zero<I: Into<Self::Expr>>(&mut self, x: I) {
-        self.inner.assert_zero(x);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The skeleton AIR

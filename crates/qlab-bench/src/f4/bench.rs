@@ -229,7 +229,7 @@ pub(crate) fn cell(kinds: &[WTag], outer: Outer, member_bytes: Option<[u64; 4]>,
                 "member_bytes_by_shape": member_bytes.map(|mb| json!({"S": mb[0], "P": mb[1], "R": mb[2], "C": mb[3]})),
                 "member_source": member_source}},
         "expected_peak_gib": {"evidence": "P", "source": "F2's k-model, peak ≈ K × width × 2^(h−18), a prediction only",
-            "value": (outer.k_model() * scale * 100.0).round() / 100.0},
+            "value": (crate::f3::bench::k_model(outer) * scale * 100.0).round() / 100.0},
         "peak_rss": {"evidence": "M", "value": null, "operator_records": "maximum resident set size from /usr/bin/time -v wrapping this process"},
     });
     Ok((report, ok))

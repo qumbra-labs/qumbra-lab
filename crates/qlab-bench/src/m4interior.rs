@@ -169,23 +169,11 @@ enum Shape {
 
 /// The interior's optional/fallback outer lane, **b4/q43/g22/fp16/a16**
 /// (non-hiding, `qlab_consensus::legacy`). Also F2b-4's `f2wrap --outer b4`.
-pub(crate) const INTERIOR_B4_CFG: crate::FriCfg = crate::FriCfg {
-    log_blowup: 2,
-    num_queries: 43, // q43 (B″, issue #41 — was q40)
-    grind_bits: 22,
-    log_final_poly_len: 4,
-    max_log_arity: 4,
-};
+pub(crate) const INTERIOR_B4_CFG: crate::FriCfg = qlab_wrapper::config::B4_CFG;
 
 /// The DECIDED interior outer lane, **b2/q86/g22/fp16/a16** (non-hiding,
 /// `qlab_consensus::legacy`). Also F2b-4's `f2wrap --outer b2`.
-pub(crate) const INTERIOR_B2_CFG: crate::FriCfg = crate::FriCfg {
-    log_blowup: 1,
-    num_queries: 86, // q86 (B″, issue #41 — was q80; the decided interior lane)
-    grind_bits: 22,
-    log_final_poly_len: 4,
-    max_log_arity: 4,
-};
+pub(crate) const INTERIOR_B2_CFG: crate::FriCfg = qlab_wrapper::config::B2_CFG;
 
 /// `m4interior` bench mode (M4 step 1 stage 3): the interior peak-RSS gate.
 ///

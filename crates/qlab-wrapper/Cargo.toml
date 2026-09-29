@@ -1,0 +1,20 @@
+[package]
+name = "qlab-wrapper"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The verification half of the L2 wrapper (lab #785, F5-1): what the L1 needs
+# to run `verify_wrapper` as consensus. No prover, no fixtures, no IO —
+# qlab-bench keeps those and re-exports this crate.
+[dependencies]
+qlab-air = { path = "../qlab-air" }
+qlab-consensus = { path = "../qlab-consensus" }
+qlab-devnet = { path = "../qlab-devnet" }
+qlab-l2 = { path = "../qlab-l2" }
+p3-air = "=0.6.1"
+p3-field = "=0.6.1"
+p3-keccak-air = "=0.6.1"
+p3-matrix = "=0.6.1"
+p3-uni-stark = "=0.6.1"

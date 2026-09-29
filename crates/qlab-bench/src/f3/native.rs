@@ -44,40 +44,17 @@ use std::collections::HashMap;
 use qlab_air::l2::{RegistryLeaf, RegistryWitness};
 use qlab_air::l2p::{key_lt, KEY_MAX};
 use qlab_air::narrow::{pv_chunks, MerkleWitness, MERKLE_DEPTH};
-use qlab_air::reference::{keccak_f, merkle_node_state};
+#[cfg_attr(not(test), allow(unused_imports))]
+use qlab_air::reference::keccak_f;
 use qlab_cbserver::registry::RegistryTree;
 use qlab_cbserver::tree::{zeros, CommitmentTree};
 use qlab_devnet::annulet::L2ShapeTag;
 
-pub(crate) type Digest = [u64; 4];
-
-/// The nullifier tree's depth (ruling Q2): the commitment tree's.
-pub(crate) const N_DEPTH: usize = MERKLE_DEPTH;
-/// An unused slot (both append trees): the zero digest, the node's convention.
-pub(crate) const EMPTY: Digest = [0; 4];
-/// Both append trees' leaf-count limit: indices stay below 2^30 < p.
-pub(crate) const INDEX_CAP: u64 = 1 << 30;
-
-/// The nullifier-tree leaf `H(lo ‖ hi)`: one Keccak-f block, domain marker at
-/// lane 8 bit 4 — distinct from the node hash's pad (bit 0) and the freeze
-/// leaf's marker (bit 3), so no nullifier leaf is ever a node or a freeze leaf.
-pub(crate) fn nf_leaf_hash(lo: &Digest, hi: &Digest) -> Digest {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(lo);
-    st[4..8].copy_from_slice(hi);
-    st[8] = 1 << 4;
-    st[16] = 1 << 63;
-    keccak_f(&st)[..4].try_into().expect("four lanes")
-}
-
-/// The consensus node hash (for F4's supply tree).
-pub(crate) fn node_pub(l: &Digest, r: &Digest) -> Digest {
-    node(l, r)
-}
-
-fn node(l: &Digest, r: &Digest) -> Digest {
-    merkle_node_state(l, r)[..4].try_into().expect("four lanes")
-}
+// Lab #785 F5-1: the hash-level items moved to qlab-wrapper.
+pub(crate) use qlab_wrapper::hash::{
+    nf_leaf_hash, node_pub, sd_chain_byte, sd_domain_lanes, sd_perms, sd_words_byte, Digest, Roots, EMPTY, INDEX_CAP, N_DEPTH, SD_BLOCK_WORDS, SD_LANE_DOMAIN, SD_LANE_FINAL, SD_LANE_INDEX, SD_LANE_MSG,
+};
+use qlab_wrapper::hash::node;
 
 fn bits_of(index: u64, depth: usize) -> Vec<bool> {
     (0..depth).map(|i| (index >> i) & 1 == 1).collect()
@@ -305,36 +282,9 @@ impl std::fmt::Debug for RegistryWrite {
 // SD — the surface digest
 // ---------------------------------------------------------------------------
 
-/// The chain's domain (ruling (a)): capacity lanes 17–18 of every block.
-pub(crate) const SD_DOMAIN: &[u8; 16] = b"qumbra:l2-sd:v1\0";
-/// Message words per block: rate lanes 4..17, two little-endian `u32` words
-/// per lane (lanes 0..4 carry the chaining value).
-pub(crate) const SD_BLOCK_WORDS: usize = 26;
-/// The first message lane.
-pub(crate) const SD_LANE_MSG: usize = 4;
-/// Capacity lanes: the domain (17, 18), the block index (19), the final flag (20).
-pub(crate) const SD_LANE_DOMAIN: usize = 17;
-pub(crate) const SD_LANE_INDEX: usize = 19;
-pub(crate) const SD_LANE_FINAL: usize = 20;
-
-/// The domain as the two capacity lanes it occupies.
-pub(crate) fn sd_domain_lanes() -> [u64; 2] {
-    [
-        u64::from_le_bytes(SD_DOMAIN[..8].try_into().expect("8 bytes")),
-        u64::from_le_bytes(SD_DOMAIN[8..].try_into().expect("8 bytes")),
-    ]
-}
-
 /// One step's message: `tag ‖ pv_len ‖ pvs`, each a `u32` word.
 pub(crate) fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
     sd_words_byte(tag.byte(), pvs)
-}
-
-/// [`sd_words`] for any slot tag byte (F4's claim slot is `0x04`).
-pub(crate) fn sd_words_byte(tag: u8, pvs: &[u32]) -> Vec<u32> {
-    let mut w = vec![u32::from(tag), pvs.len() as u32];
-    w.extend_from_slice(pvs);
-    w
 }
 
 /// **One chain step, block by block** (F3-2b; the #767 ruling's approval of
@@ -364,38 +314,9 @@ pub(crate) fn sd_chain(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> (Vec<[u64
     sd_chain_byte(prev, tag.byte(), pvs)
 }
 
-/// [`sd_chain`] for any slot tag byte — the one construction F4 extends.
-pub(crate) fn sd_chain_byte(prev: &Digest, tag: u8, pvs: &[u32]) -> (Vec<[u64; 25]>, Digest) {
-    let words = sd_words_byte(tag, pvs);
-    let n = words.len().div_ceil(SD_BLOCK_WORDS);
-    let dom = sd_domain_lanes();
-    let mut h = *prev;
-    let mut blocks = Vec::with_capacity(n);
-    for b in 0..n {
-        let mut st = [0u64; 25];
-        st[..4].copy_from_slice(&h);
-        for w in 0..SD_BLOCK_WORDS {
-            let v = u64::from(words.get(SD_BLOCK_WORDS * b + w).copied().unwrap_or(0));
-            st[SD_LANE_MSG + w / 2] |= v << (32 * (w % 2));
-        }
-        st[SD_LANE_DOMAIN] = dom[0];
-        st[SD_LANE_DOMAIN + 1] = dom[1];
-        st[SD_LANE_INDEX] = b as u64;
-        st[SD_LANE_FINAL] = u64::from(b + 1 == n);
-        blocks.push(st);
-        h = keccak_f(&st)[..4].try_into().expect("four lanes");
-    }
-    (blocks, h)
-}
-
 /// One chain step's digest.
 pub(crate) fn sd_step(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> Digest {
     sd_chain(prev, tag, pvs).1
-}
-
-/// Permutations one step costs: its blocks.
-pub(crate) const fn sd_perms(pv_len: usize) -> usize {
-    (2 + pv_len).div_ceil(SD_BLOCK_WORDS)
 }
 
 // ---------------------------------------------------------------------------
@@ -475,17 +396,6 @@ impl TxSurface {
             L2ShapeTag::R => Ok(vec![self.digest_at(qlab_air::l2r::PV_CM)?, self.digest_at(qlab_air::l2r::PV_CM_SEED)?]),
         }
     }
-}
-
-/// The running state a leaf threads: every root, both next indices, `SD`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Roots {
-    pub n: Digest,
-    pub n_next: u64,
-    pub c: Digest,
-    pub c_next: u64,
-    pub r: Digest,
-    pub sd: Digest,
 }
 
 /// One transaction's witnesses, in the order [`check_leaf`] consumes them.
