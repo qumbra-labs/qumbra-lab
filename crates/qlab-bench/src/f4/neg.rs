@@ -85,6 +85,16 @@ pub(crate) fn wfixture_rows(kinds: &[WTag], seed: u64, p_rows: [(u32, u64, u32);
 }
 
 fn build_fixture(key: FxKey) -> WFixture {
+    try_build_fixture(key).expect("the fixture")
+}
+
+/// [`wfixture_rows`], not memoized, with the builder's refusals as `Err`
+/// (the bench's CLI path: a kinds list W refuses, e.g. a second R).
+pub(crate) fn try_wfixture_rows(kinds: &[WTag], seed: u64, p_rows: [(u32, u64, u32); 2]) -> Result<WFixture, String> {
+    try_build_fixture((kinds.to_vec(), seed, p_rows))
+}
+
+fn try_build_fixture(key: FxKey) -> Result<WFixture, String> {
     let (kinds, seed, p_rows) = (&key.0, key.1, key.2);
     let mut rng = Rng(seed);
     let mut s = WState::genesis(&[RegistryLeaf::cloaked(0)]);
@@ -96,7 +106,7 @@ fn build_fixture(key: FxKey) -> WFixture {
         tx_member(&synth_tx(&mut rng, L2ShapeTag::P, &rr), &c0, [(0, PRE_MINT, ASSET), (0, 0, 0)]),
         pre_claim.clone(),
     ];
-    s.apply(&pre_inp, &pre_members).expect("the prefill wrapper");
+    s.apply(&pre_inp, &pre_members).map_err(|e| format!("the prefill wrapper: {e:?}"))?;
     let pre = s.clone();
     let mut inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: 0 };
     let c_in = s.l2.c.root();
@@ -114,12 +124,12 @@ fn build_fixture(key: FxKey) -> WFixture {
             WTag::R => {
                 asset += 1;
                 let t = synth_write(&mut rng, &work, RegistryLeaf::cloaked(asset - 1));
-                work.apply_tx(&t).expect("a valid write");
+                work.apply_tx(&t).map_err(|e| format!("slot {i}'s write: {e:?}"))?;
                 tx_member(&t, &c_in, NO_VP)
             }
             t => {
                 let tx = synth_tx(&mut rng, t.shape().unwrap(), &work.r.root());
-                work.apply_tx(&tx).expect("a valid transaction");
+                work.apply_tx(&tx).map_err(|e| format!("slot {i}'s transaction: {e:?}"))?;
                 tx_member(&tx, &c_in, p_rows)
             }
         };
@@ -127,9 +137,9 @@ fn build_fixture(key: FxKey) -> WFixture {
     }
     // D_batch is the claims' deposit sum (what the deposit proof binds).
     inp.d_batch = deps.iter().map(|d| d.v).sum();
-    let (rin, wit, rout) = s.apply(&inp, &members).expect("the fixture wrapper");
-    let exit_cmt = check_wrapper_leaf(&rin, &inp, &members, &wit).expect("its check").1;
-    WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim, key, deps }
+    let (rin, wit, rout) = s.apply(&inp, &members).map_err(|e| format!("the fixture wrapper: {e:?}"))?;
+    let exit_cmt = check_wrapper_leaf(&rin, &inp, &members, &wit).map_err(|e| format!("its check: {e:?}"))?.1;
+    Ok(WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim, key, deps })
 }
 
 /// [`wfixture_rows`] with the default P rows.

@@ -7,6 +7,11 @@
 //! native reference verifier ([`verify`]). F4-3: the deposit-sum proof
 //! ([`dep`]) and `verify_wrapper`'s V9. F4-4: the measured cell
 //! (`f4leaf --prove`, [`bench`]).
+//!
+//! **Measured:** the F4-4 box run of all thirteen cells (K ∈ {4, 8, 16} ×
+//! {b2, b4}, two passes, plus the per-shape member proofs) is lab issue
+//! #775's measurement comment,
+//! <https://github.com/qumbra-labs/qumbra-lab/issues/775#issuecomment-5886951895>.
 
 pub(crate) mod bench;
 pub(crate) mod dep;
