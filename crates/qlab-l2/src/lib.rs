@@ -220,6 +220,32 @@ pub fn pv_in_range(pvs: &[Val], bits: &[u32]) -> bool {
     pvs.len() == bits.len() && pvs.iter().zip(bits).all(|(v, b)| *b >= 32 || v.as_canonical_u32() < 1 << b)
 }
 
+/// Every **`u32`** public value inside the range its AIR declares, checked
+/// BEFORE the mod-p conversion (`qlab_consensus::verify_proof`'s rule, lab
+/// PR #770): a width `b < 32` requires `v < 2^b`; a 32-bit position requires
+/// `v < p`, so no word is reduced mod p on its way into the verifier. (Lab
+/// #775 review R1: [`pv_in_range`] sees the reduced value, so `p + x` passes
+/// it as `x`.)
+pub fn pv_u32_in_range(pvs: &[u32], bits: &[u32]) -> bool {
+    use p3_field::PrimeField32;
+    pvs.len() == bits.len() && pvs.iter().zip(bits).all(|(v, b)| if *b < 32 { *v < 1 << b } else { *v < Val::ORDER_U32 })
+}
+
+/// The typed shape-S entry: `u32` PVs, range-checked before conversion.
+pub fn verify_s_u32(pvs: &[u32], proof: &Proof<Config>) -> bool {
+    pv_u32_in_range(pvs, &qlab_air::l2::audit_pv_bits()) && verify_s(&public_values(pvs), proof)
+}
+
+/// The typed shape-P entry.
+pub fn verify_p_u32(pvs: &[u32], proof: &Proof<Config>) -> bool {
+    pv_u32_in_range(pvs, &qlab_air::l2p::audit_pv_bits()) && verify_p(&public_values(pvs), proof)
+}
+
+/// The typed shape-R entry.
+pub fn verify_r_u32(pvs: &[u32], proof: &Proof<Config>) -> bool {
+    pv_u32_in_range(pvs, &qlab_air::l2r::audit_pv_bits()) && verify_r(&public_values(pvs), proof)
+}
+
 /// A public-value vector as field elements.
 pub fn public_values(pvs: &[u32]) -> Vec<Val> {
     pvs.iter().map(|v| Val::from_u32(*v)).collect()

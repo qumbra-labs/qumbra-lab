@@ -102,6 +102,18 @@ pub fn verify_claim(pvs: &[Val], proof: &Proof<Config>, l2_id: u64, fee_tier: u6
     verify(&make_config_l2(), &verifier_air_claim(), proof, pvs).map_err(|_| ClaimRefusal::Proof)
 }
 
+/// The typed claim entry: `u32` PVs, length- and range-checked before the
+/// mod-p conversion ([`crate::pv_u32_in_range`]), then [`verify_claim`].
+pub fn verify_claim_u32(pvs: &[u32], proof: &Proof<Config>, l2_id: u64, fee_tier: u64) -> Result<(), ClaimRefusal> {
+    if pvs.len() != PV_LEN {
+        return Err(ClaimRefusal::PvLength);
+    }
+    if !crate::pv_u32_in_range(pvs, &qlab_air::claim::audit_pv_bits()) {
+        return Err(ClaimRefusal::PvRange);
+    }
+    verify_claim(&public_values(pvs), proof, l2_id, fee_tier)
+}
+
 #[cfg(test)]
 mod tests {
     use p3_air::symbolic::{get_max_constraint_degree, AirLayout};

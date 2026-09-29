@@ -24,52 +24,82 @@ pub(crate) struct WFixture {
     pub members: Vec<Member>,
     pub wit: WWitness,
     pub rout: WRoots,
+    pub exit_cmt: Digest,
     pub pre: WState,
     /// The prefill's claim (its `cnf` is in `K`).
     pub pre_claim: Member,
 }
 
+/// Every fixture claim pays this fee (a claim's fee is the chain's tariff):
+/// `0x1_FFFF` — ≥ 2^16, and two of them carry out of limb 0 (condition (i)).
+pub(crate) const CLAIM_FEE: u64 = 0x1_ffff;
+/// The prefill's deposit total, and each fixture wrapper's.
+pub(crate) const PRE_D: u64 = 1_000_000;
+/// The prefill mints this much of asset [`ASSET`].
+pub(crate) const PRE_MINT: u64 = 1000;
+pub(crate) const ASSET: u32 = 5;
+/// A P member's default `vPublic` rows: a mint and a redeem of [`ASSET`].
+pub(crate) const P_ROWS: [(u32, u64, u32); 2] = [(0, 250, ASSET), (1, 100, ASSET)];
+
 /// A wrapper over `kinds`, on a state that already holds one prefill wrapper
-/// (an S transaction and a claim), so every tree is past its genesis.
-/// Claims anchor at this wrapper's absorbed roots, with small fees.
-pub(crate) fn wfixture(kinds: &[WTag], seed: u64) -> WFixture {
+/// (an S and a P transaction and a claim: every tree past its genesis,
+/// [`PRE_MINT`] of [`ASSET`] outstanding, `D_cum` = [`PRE_D`]). Transactions
+/// anchor at this wrapper's `C_in` (in `CH` after its prologue); claims at
+/// its absorbed roots; P members carry `p_rows`.
+pub(crate) fn wfixture_rows(kinds: &[WTag], seed: u64, p_rows: [(u32, u64, u32); 2]) -> WFixture {
     let mut rng = Rng(seed);
     let mut s = WState::genesis(&[RegistryLeaf::cloaked(0)]);
-    let pre_inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()) };
-    let rr = s.l2.r.root();
-    let pre_claim = synth_claim(&mut rng, &pre_inp.absorbed[0], 3);
-    s.apply(&pre_inp, &[Member::tx(&synth_tx(&mut rng, L2ShapeTag::S, &rr)), pre_claim.clone()]).expect("the prefill wrapper");
+    let pre_inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: PRE_D };
+    let (rr, c0) = (s.l2.r.root(), s.l2.c.root());
+    let pre_claim = synth_claim(&mut rng, &pre_inp.absorbed[0], CLAIM_FEE);
+    let pre_members = [
+        tx_member(&synth_tx(&mut rng, L2ShapeTag::S, &rr), &c0, NO_VP),
+        tx_member(&synth_tx(&mut rng, L2ShapeTag::P, &rr), &c0, [(0, PRE_MINT, ASSET), (0, 0, 0)]),
+        pre_claim.clone(),
+    ];
+    s.apply(&pre_inp, &pre_members).expect("the prefill wrapper");
     let pre = s.clone();
-    let inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()) };
+    let inp = WInputs { prev: rng.digest(), rkm_seq: rng.digest(), absorbed: core::array::from_fn(|_| rng.digest()), d_batch: PRE_D };
+    let c_in = s.l2.c.root();
     let mut work = s.l2.clone();
     let mut members = Vec::new();
     let mut asset = 7;
     for (i, k) in kinds.iter().enumerate() {
         let m = match k {
-            WTag::C => synth_claim(&mut rng, &inp.absorbed[i % M_ABS], 1000 + i as u64),
+            WTag::C => synth_claim(&mut rng, &inp.absorbed[i % M_ABS], CLAIM_FEE),
             WTag::R => {
                 asset += 1;
                 let t = synth_write(&mut rng, &work, RegistryLeaf::cloaked(asset - 1));
                 work.apply_tx(&t).expect("a valid write");
-                Member::tx(&t)
+                tx_member(&t, &c_in, NO_VP)
             }
             t => {
                 let tx = synth_tx(&mut rng, t.shape().unwrap(), &work.r.root());
                 work.apply_tx(&tx).expect("a valid transaction");
-                Member::tx(&tx)
+                tx_member(&tx, &c_in, p_rows)
             }
         };
         members.push(m);
     }
     let (rin, wit, rout) = s.apply(&inp, &members).expect("the fixture wrapper");
-    WFixture { rin, inp, members, wit, rout, pre, pre_claim }
+    let exit_cmt = check_wrapper_leaf(&rin, &inp, &members, &wit).expect("its check").1;
+    WFixture { rin, inp, members, wit, rout, exit_cmt, pre, pre_claim }
+}
+
+/// [`wfixture_rows`] with the default P rows.
+pub(crate) fn wfixture(kinds: &[WTag], seed: u64) -> WFixture {
+    wfixture_rows(kinds, seed, P_ROWS)
+}
+
+/// The fixture's public values.
+pub(crate) fn fx_pvs(fx: &WFixture) -> Vec<Val> {
+    w_pvs(&fx.rin, &fx.rout, &fx.inp, fee_of(&fx.members), &fx.exit_cmt)
 }
 
 /// The honest trace and PVs.
 pub(crate) fn honest(fx: &WFixture) -> (WAir, RowMajorMatrix<Val>, Vec<Val>) {
     let plan = build_plan(&fx.rin, &fx.inp, &fx.members, &fx.wit);
-    let pvs = w_pvs(&fx.rin, &fx.rout, &fx.inp, fee_of(&fx.members));
-    (WAir::new(fx.members.len()), render(&plan), pvs)
+    (WAir::new(fx.members.len()), render(&plan), fx_pvs(fx))
 }
 
 #[derive(Debug)]
@@ -102,7 +132,7 @@ fn judge(
     phase: &'static str,
 ) -> Neg {
     let mut plan = build_plan(&fx.rin, &fx.inp, &fx.members, &fx.wit);
-    let mut pvs = w_pvs(&fx.rin, &fx.rout, &fx.inp, fee_of(&fx.members));
+    let mut pvs = fx_pvs(fx);
     tamper(&mut plan, &mut pvs);
     let mut trace = render(&plan);
     retouch(&mut trace);
@@ -203,7 +233,182 @@ pub(crate) fn cases() -> Vec<Case> {
         ("f3/idle comparator cell non-boolean", neg_idle_cmp),
         ("pv: K in", neg_pv_k_in),
         ("pv: fee", neg_pv_fee),
+        ("j asset id >= 2^16", neg_asset_id_wide),
+        ("k tx anchor = this wrapper's C_out", neg_anchor_c_out),
+        ("k tx anchor opened against AA", neg_tx_anchor_in_aa),
+        ("k claim anchor opened against CH", neg_claim_anchor_in_ch),
+        ("k KCH/KAN swapped on a tx", neg_kch_kan_swap),
+        ("l vPublic mint on asset 0", neg_asset0_mint),
+        ("l supply overflow", neg_supply_overflow),
+        ("l supply underflow", neg_supply_underflow),
+        ("l E overflow", neg_e_overflow),
+        ("m exit v not the row's amount", neg_exit_v),
+        ("m exit_cmt PV not the chain", neg_exit_cmt_pv),
+        ("i wrong fee carry", neg_wrong_carry),
+        ("R6 KAN off for a claim", neg_kan_off),
+        ("R6 KFE off for a claim", neg_kfe_off),
+        ("R6 registry on for a claim", neg_registry_on_claim),
     ]
+}
+
+fn anch_last() -> Seg {
+    Seg::Anch(APart::Last)
+}
+
+/// (j): a `vPublic` asset id ≥ 2^16 — its word's high limb is nonzero, so
+/// the capture refuses it where SD absorbs it.
+fn neg_asset_id_wide() -> Neg {
+    let mut fx = wfixture(&[P], SEED + 30);
+    fx.members[0].pvs[qlab_air::l2p::PV_VP1 + 5] = (1 << 16) | ASSET;
+    let b = (2 + qlab_air::l2p::PV_VP1 + 5) / 26;
+    witness("j asset id >= 2^16", fx, s0(0, Seg::Sd(b), 0), "sd_capture")
+}
+
+/// (k): a transaction anchored at this wrapper's own `C_out`, which is not
+/// in CH until the next wrapper's prologue.
+fn neg_anchor_c_out() -> Neg {
+    let mut fx = wfixture(&[S], SEED + 31);
+    let c_out = fx.rout.f3.c;
+    set_digest_pvs(&mut fx.members[0].pvs, 0, &c_out);
+    witness("k tx anchor = this wrapper's C_out", fx, s23(0, anch_last(), 0), "anchor")
+}
+
+/// (k): a transaction anchored at an absorbed L1 root, opened in AA.
+fn neg_tx_anchor_in_aa() -> Neg {
+    let mut fx = wfixture(&[S], SEED + 32);
+    let a = fx.inp.absorbed[0];
+    set_digest_pvs(&mut fx.members[0].pvs, 0, &a);
+    let mut aa = fx.pre.aa.clone();
+    let idx = aa.len();
+    for r in &fx.inp.absorbed {
+        aa.append(*r);
+    }
+    fx.wit.extra[0].anchor_index = idx;
+    fx.wit.extra[0].anchor_path = aa.auth_path(idx, aa.len());
+    witness("k tx anchor opened against AA", fx, s23(0, anch_last(), 0), "anchor")
+}
+
+/// (k): a claim anchored at `C_in`, opened in CH.
+fn neg_claim_anchor_in_ch() -> Neg {
+    let mut fx = wfixture(&[C], SEED + 33);
+    let c_in = fx.rin.f3.c;
+    set_digest_pvs(&mut fx.members[0].pvs, qlab_air::claim::PV_A, &c_in);
+    let mut ch = fx.pre.ch.clone();
+    let idx = ch.append(c_in);
+    let cw = claim_mut(&mut fx, 0);
+    cw.anchor_index = idx;
+    cw.anchor_path = ch.auth_path(idx, ch.len());
+    witness("k claim anchor opened against CH", fx, s23(0, anch_last(), 0), "anchor")
+}
+
+/// (k): the transaction's CH check swapped for the claim's AA check.
+fn neg_kch_kan_swap() -> Neg {
+    let fx = wfixture(&[S], SEED + 34);
+    judge(
+        "k KCH/KAN swapped on a tx",
+        &fx,
+        |plan, _| {
+            let p = &mut plan.perms[perm_at(0, anch_last(), 0)];
+            p.set(KCH, Val::ZERO);
+            p.set(KAN, Val::ONE);
+        },
+        |_| {},
+        s0(0, anch_last(), 0),
+        "flags",
+    )
+}
+
+/// (l): a `vPublic` mint on asset 0.
+fn neg_asset0_mint() -> Neg {
+    let mut fx = wfixture(&[P], SEED + 35);
+    let base = qlab_air::l2p::PV_VP1;
+    (fx.members[0].pvs[base], fx.members[0].pvs[base + 1], fx.members[0].pvs[base + 5]) = (0, 7, 0);
+    witness("l vPublic mint on asset 0", fx, s0(0, Seg::SupNew(0), 0), "supply")
+}
+
+fn set_row(m: &mut Member, k: usize, sgn: u32, amt: u64, vpa: u32) {
+    let base = qlab_air::l2p::PV_VP1 + 6 * k;
+    m.pvs[base] = sgn;
+    for j in 0..4 {
+        m.pvs[base + 1 + j] = ((amt >> (16 * j)) & 0xffff) as u32;
+    }
+    m.pvs[base + 5] = vpa;
+}
+
+/// (l): a mint past 2^64 − 1 outstanding.
+fn neg_supply_overflow() -> Neg {
+    let mut fx = wfixture(&[P], SEED + 36);
+    set_row(&mut fx.members[0], 0, 0, u64::MAX, ASSET);
+    witness("l supply overflow", fx, s0(0, Seg::SupNew(0), 0), "supply")
+}
+
+/// (l): a redeem of more than is outstanding.
+fn neg_supply_underflow() -> Neg {
+    let mut fx = wfixture(&[P], SEED + 37);
+    set_row(&mut fx.members[0], 1, 1, 1 << 40, ASSET);
+    witness("l supply underflow", fx, s0(0, Seg::SupNew(1), 0), "supply")
+}
+
+/// (l): two asset-0 redeems whose sum passes 2^64: E_out has no u64 form.
+fn neg_e_overflow() -> Neg {
+    let mut fx = wfixture_rows(&[P], SEED + 38, [(1, 40, 0), (0, 0, 0)]);
+    set_row(&mut fx.members[0], 0, 1, u64::MAX, 0);
+    set_row(&mut fx.members[0], 1, 1, 5, 0);
+    witness("l E overflow", fx, s0(0, Seg::FeeRseed, 0), "de")
+}
+
+/// (m): an exit step hashing an amount that is not the row's.
+fn neg_exit_v() -> Neg {
+    let fx = wfixture_rows(&[P], SEED + 39, [(1, 40, 0), (0, 0, 0)]);
+    judge(
+        "m exit v not the row's amount",
+        &fx,
+        |plan, _| plan.perms[perm_at(0, Seg::Exit(0), 0)].pre[8] += 1,
+        |_| {},
+        s0(0, Seg::Exit(0), 0),
+        "exits",
+    )
+}
+
+/// (m): an `exit_cmt` PV that is not the chain over the synthetic list.
+fn neg_exit_cmt_pv() -> Neg {
+    let fx = wfixture_rows(&[P], SEED + 40, [(1, 40, 0), (0, 0, 0)]);
+    judge("m exit_cmt PV not the chain", &fx, |_, pvs| pvs[PV_EXC] += Val::ONE, |_| {}, w_height(1) - 1, "last")
+}
+
+/// (i): two claims whose fees carry out of limb 0; the carry bit withheld.
+fn neg_wrong_carry() -> Neg {
+    let fx = wfixture(&[C, C], SEED + 41);
+    judge(
+        "i wrong fee carry",
+        &fx,
+        |plan, _| {
+            let p = &mut plan.perms[perm_at(1, Seg::FeeNote, 0)];
+            let b = p.get(FCB_OFF);
+            p.set(FCB_OFF, Val::ONE - b);
+        },
+        |_| {},
+        s0(1, Seg::FeeNote, 0),
+        "fee_note",
+    )
+}
+
+/// R6: a claim's AA check switched off.
+fn neg_kan_off() -> Neg {
+    let fx = wfixture(&[C], SEED + 42);
+    judge("R6 KAN off for a claim", &fx, |plan, _| plan.perms[perm_at(0, anch_last(), 0)].set(KAN, Val::ZERO), |_| {}, s0(0, anch_last(), 0), "flags")
+}
+
+/// R6: a claim's fee accumulation switched off.
+fn neg_kfe_off() -> Neg {
+    let fx = wfixture(&[C], SEED + 43);
+    judge("R6 KFE off for a claim", &fx, |plan, _| plan.perms[perm_at(0, Seg::Sd(3), 0)].set(KFE, Val::ZERO), |_| {}, s0(0, Seg::Sd(3), 0), "flags")
+}
+
+/// R6: the registry segment switched on for a claim.
+fn neg_registry_on_claim() -> Neg {
+    let fx = wfixture(&[C], SEED + 44);
+    judge("R6 registry on for a claim", &fx, |plan, _| plan.perms[perm_at(0, Seg::RegLeaf, 0)].set(ON, Val::ONE), |_| {}, s0(0, Seg::RegLeaf, 0), "flags")
 }
 
 /// w1: a claim whose `cnf` is already in K (the prefill's): the prover opens
@@ -562,8 +767,11 @@ mod tests {
 
     use super::*;
 
-    /// The program: 16 prologue, 53 slot and 7 epilogue segments in ring
-    /// order; 256 + 591 + 67 perms; width 3,358 (the named runs' reading);
+    /// W's width, read off the named `f4leaf --check` runs.
+    const W_WIDTH_PIN: usize = 3_479;
+
+    /// The program: 20 prologue, 65 slot and 7 epilogue segments in ring
+    /// order; 320 + 661 + 67 perms; width pinned from the named runs;
     /// degree 3; every constraint group non-empty; the carries cover
     /// `MAX_CLAIMS`.
     #[test]
@@ -574,7 +782,7 @@ mod tests {
         let sum = |r: std::ops::Range<usize>| prog[r].iter().map(|s| s.len()).sum::<usize>();
         assert_eq!((sum(0..SLOT_BASE), sum(SLOT_BASE..EPI_BASE), sum(EPI_BASE..PAD)), (PRO_PERMS, SLOT_PERMS, EPI_PERMS));
         assert_eq!(slot_program().len(), SLOT_SEGS);
-        assert_eq!(W_WIDTH, 3_358);
+        assert_eq!(W_WIDTH, W_WIDTH_PIN);
         let air = WAir::new(2);
         assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 3);
         assert!(phase_ranges(&air).iter().all(|r| !r.is_empty()), "every group emits");
@@ -585,18 +793,27 @@ mod tests {
     /// thread K and C across a slot boundary.
     #[test]
     fn f4w_honest_wrappers_hold() {
-        for kinds in [&[C][..], &[S], &[P], &[WTag::R], &[S, C], &[C, C]] {
+        for kinds in [&[C][..], &[S], &[P], &[WTag::R], &[S, C], &[C, C], &[P, C]] {
             let fx = wfixture(kinds, SEED);
             let (air, trace, pvs) = honest(&fx);
             assert_eq!(first_violation(&air, &trace, &pvs), None, "{kinds:?}");
         }
+        // An asset-0 redeem: an exit into E and the exit list; the supply
+        // root does not move for it (condition (l)).
+        let fx = wfixture_rows(&[P], SEED, [(1, 40, 0), (0, 0, 0)]);
+        let (air, trace, pvs) = honest(&fx);
+        assert_eq!(first_violation(&air, &trace, &pvs), None, "the exit wrapper");
+        assert_eq!((fx.rout.e_cum, fx.rout.sup), (fx.rin.e_cum + 40, fx.rin.sup));
+        assert_ne!(fx.exit_cmt, EMPTY);
+        // (i): the two claims' fees carry out of limb 0.
+        const { assert!(2 * (CLAIM_FEE & 0xffff) >= 1 << 16) };
     }
 
-    /// Every negative, including the three two-slot ones (2, 10, 20).
+    /// Every negative, including the four two-slot ones (2, 10, 20, 37).
     #[test]
     fn f4w_negatives_refuse_at_their_binding_rows() {
         let cases = cases();
-        assert_eq!(cases.len(), 25);
+        assert_eq!(cases.len(), 40);
         let missed: Vec<String> = cases
             .iter()
             .map(|(_, f)| f())
