@@ -175,6 +175,12 @@ impl Layout {
             slots.windows(2).all(|w| w[0] < w[1]) && slots.iter().all(|&s| s < cfg.num_queries),
             "covered slots must ascend inside the query count",
         )?;
+        // Hiding only (lab #782 X4): `fold::Geom` takes the height alone and
+        // commits at 2N, so the check sits here, where `Dims` is known.
+        require(
+            dims.zk == qlab_consensus::IS_ZK,
+            "C2 is hiding-only; a zk = 0 child has no C2",
+        )?;
         let ig = open::Layout::new(open::Geom::new(dims, chunks, cfg)?, 1);
         let fg = fold::Layout::new(fold::Geom::new(dims.log_height, cfg)?, 1);
         require(ig.geom.lde == fg.geom.lde, "one LDE height")?;
@@ -272,7 +278,7 @@ impl Layout {
         let seam = SeamShape {
             rounds: fg.geom.rounds(),
             final_len: fg.geom.final_len,
-            zk: qlab_consensus::IS_ZK,
+            zk: dims.zk,
         };
         Ok(Self {
             ig,

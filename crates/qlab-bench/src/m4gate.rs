@@ -573,6 +573,17 @@ impl GateShape {
         self.opv_pvs() + self.n_pvs
     }
 
+    /// Refuse shapes the layout cannot host (lab #782 review X3): the
+    /// interior's per-child PV routing indexes child R's PVs at `n_opvs`,
+    /// so an exported F2 digest would shift them — `export_f2dig` is
+    /// single-child only. Checked where every layout and PV vector is made.
+    pub(crate) fn check(&self) {
+        assert!(
+            !(self.export_f2dig && self.merge_lane),
+            "export_f2dig is single-child only: a merge-lane shape cannot export the F2 digest"
+        );
+    }
+
     /// Observation flush count = `4 + n_fri_rounds` (alpha, zeta, fri_alpha,
     /// one per FRI-round cap, and the final-poly/PoW flush). Narrow 8, wide 7.
     pub(crate) fn n_obs_flushes(&self) -> usize {
@@ -1392,6 +1403,7 @@ impl GateLayout {
     /// `const` chain (lines ~382–584) exactly; `from_shape(&GateShape::narrow())`
     /// == every const above.
     pub(crate) fn from_shape(s: &GateShape) -> GateLayout {
+        s.check();
         let nq = s.nq;
         let log_max = s.log_max;
         let n_fhg = s.n_fhg();
@@ -4512,6 +4524,7 @@ pub(crate) struct GateMeta {
 /// the D3 F0 digest + the inner public values (slice 1b-2: shape-driven;
 /// narrow = 6x8x16 + 16 + 84).
 pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) -> Vec<Val> {
+    shape.check();
     let mut opvs = Vec::with_capacity(shape.n_opvs());
     assert_eq!(sched.caps.len(), shape.n_caps());
     for cap in &sched.caps {

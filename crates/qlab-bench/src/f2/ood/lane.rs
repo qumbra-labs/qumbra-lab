@@ -425,11 +425,26 @@ impl Lane {
         height: usize,
         width: usize,
     ) -> Result<Vec<Val>> {
+        self.trace_reserved(perms, height, width, 0)
+    }
+
+    /// [`Self::trace`] with capacity for `extra_capacity_bits` more of
+    /// height reserved up front: the prover's LDE extends in place, so a
+    /// trace allocated for proving reserves `log_blowup` (lab #782 X1, as
+    /// `m4gate::build_gate_trace`; a late reserve copies the trace).
+    pub(super) fn trace_reserved(
+        &self,
+        perms: &[[u64; 25]],
+        height: usize,
+        width: usize,
+        extra_capacity_bits: usize,
+    ) -> Result<Vec<Val>> {
         let mut lane_inputs = perms.to_vec();
         lane_inputs.resize(height / NUM_ROUNDS, [0; 25]);
         let lane = generate_trace_rows::<Val>(lane_inputs, 0);
         require(lane.height() == height, "keccak lane height")?;
-        let mut values = vec![Val::ZERO; height * width];
+        let mut values = Vec::with_capacity((height << extra_capacity_bits) * width);
+        values.resize(height * width, Val::ZERO);
         for row in 0..height {
             values[row * width..row * width + NUM_KECCAK_COLS]
                 .copy_from_slice(&lane.values[row * NUM_KECCAK_COLS..(row + 1) * NUM_KECCAK_COLS]);

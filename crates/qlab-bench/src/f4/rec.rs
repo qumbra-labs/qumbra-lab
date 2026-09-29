@@ -610,6 +610,11 @@ mod tests {
             assert_eq!(on.n_opvs(), off.n_opvs() + 16);
             assert_eq!(constraints(&on), constraints(&off) + 16, "{log_h} {child:?}");
         }
+        // X3: a merge-lane shape refuses the export at layout time.
+        let wide = GateShape { export_f2dig: true, ..GateShape::wide() };
+        let refused = std::panic::catch_unwind(|| GateLayout::from_shape(&wide)).is_err();
+        assert!(refused, "a merge-lane shape must refuse export_f2dig");
+        GateShape::wide().check();
     }
 
     /// Every constraint a single synthetic row pair violates (row 1 of a

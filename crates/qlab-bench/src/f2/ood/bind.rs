@@ -158,6 +158,8 @@ pub(super) struct Layout {
 
 impl Layout {
     pub(super) fn new(dims: Dims, chunks: usize) -> Self {
+        // Hiding only: F0's degree bits below are log_height + IS_ZK (lab #782 X4).
+        assert_eq!(dims.zk, IS_ZK, "the binding component is hiding-only");
         let w = dims.width;
         let mut f0 = vec![
             Word::Const(monty(Val::from_usize(dims.log_height + IS_ZK))),

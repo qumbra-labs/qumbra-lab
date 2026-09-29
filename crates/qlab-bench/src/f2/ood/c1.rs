@@ -817,12 +817,25 @@ impl C1Air {
     /// Build the trace for a replayed transcript and a claim. Returns the
     /// matrix and the accumulators' final values (Az, Bz).
     fn trace(&self, rep: &Replay, cl: &Claimed) -> Result<(RowMajorMatrix<Val>, E, E)> {
+        self.trace_reserved(rep, cl, 0)
+    }
+
+    /// [`Self::trace`] allocated with `extra_capacity_bits` of height
+    /// reserved for the prover's LDE (lab #782 X1).
+    fn trace_reserved(
+        &self,
+        rep: &Replay,
+        cl: &Claimed,
+        extra_capacity_bits: usize,
+    ) -> Result<(RowMajorMatrix<Val>, E, E)> {
         let l = &self.layout;
         let (h, w) = (self.height, self.width);
         require(rep.perms.len() == l.perms, "replay perm count")?;
         require(cl.inputs.len() == self.routes.len(), "machine inputs")?;
         require(cl.picks.len() == l.challenges(), "draw selections")?;
-        let mut values = self.lane.trace(&rep.perms, h, w)?;
+        let mut values = self
+            .lane
+            .trace_reserved(&rep.perms, h, w, extra_capacity_bits)?;
         // Lane, ring and canonicity witnesses, replicated on all 24 rows.
         for (perm, input) in rep.perms.iter().enumerate() {
             let prev = if l.is_interior(perm) {
@@ -1440,11 +1453,14 @@ pub(super) fn honest(
         Data::from_proof(proof, pvs)?,
         cfg,
         max_cells,
+        0,
     )
 }
 
 /// [`honest`] for a non-hiding child (`qlab_consensus::legacy`, `program`
-/// compiled with `zk = 0`): F4b-2's W and gate children (lab #782).
+/// compiled with `zk = 0`): F4b-2's W and gate children (lab #782). The
+/// trace reserves `extra_capacity_bits` of height for the prover's LDE
+/// (the outer lane's `log_blowup` when it will be proved; 0 otherwise).
 pub(super) fn honest_legacy(
     program: &Program,
     inputs: &Inputs,
@@ -1452,6 +1468,7 @@ pub(super) fn honest_legacy(
     pvs: &[Val],
     cfg: &FriCfg,
     max_cells: usize,
+    extra_capacity_bits: usize,
 ) -> Result<Honest> {
     require(program.zk == 0, "a legacy child needs a zk = 0 program")?;
     honest_data(
@@ -1460,6 +1477,7 @@ pub(super) fn honest_legacy(
         Data::from_legacy_proof(proof, pvs)?,
         cfg,
         max_cells,
+        extra_capacity_bits,
     )
 }
 
@@ -1469,6 +1487,7 @@ fn honest_data(
     data: Data,
     cfg: &FriCfg,
     max_cells: usize,
+    extra_capacity_bits: usize,
 ) -> Result<Honest> {
     let air = C1Air::new(program, cfg, max_cells)?;
     let rep = Replay::new(&air.layout, &data)?;
@@ -1478,7 +1497,7 @@ fn honest_data(
     )?;
     require(rep.pow_sample == 0, "query PoW sample is not zero")?;
     let cl = Claimed::of(&rep, &data, machine_inputs(program, inputs)?);
-    let (trace, az, bz) = air.trace(&rep, &cl)?;
+    let (trace, az, bz) = air.trace_reserved(&rep, &cl, extra_capacity_bits)?;
     let pvs = air.public_values(&data, &cl, az, bz, &rep.digests[F2]);
     let seam = Seam::read(&air.layout, &pvs)?;
     Ok(Honest {

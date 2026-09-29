@@ -129,6 +129,11 @@ pub(super) struct Geom {
 
 impl Geom {
     pub(super) fn new(dims: Dims, chunks: usize, cfg: &FriCfg) -> Result<Self> {
+        // Hiding only: the geometry below commits at 2N (lab #782 X4).
+        require(
+            dims.zk == IS_ZK,
+            "the opening component is hiding-only; a zk = 0 child has no C2",
+        )?;
         let lde = dims.log_height + IS_ZK + cfg.log_blowup;
         require(lde <= 30, "query index wider than 30 bits")?;
         require(CAP_HEIGHT == 3, "the cap mux is written for 2^3 entries")?;

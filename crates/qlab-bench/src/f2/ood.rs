@@ -781,8 +781,12 @@ where
     let compile_s = t.elapsed().as_secs_f64();
     let (perms, rows, cols, rom, _) = c1::c1_dims(&program, child_cfg)?;
     let t = std::time::Instant::now();
+    // X1 (lab #782 review): a trace that will be proved reserves the outer
+    // lane's blowup up front, as `m4gate::build_gate_trace` does; a late
+    // reserve copies the trace and inflates the peak.
+    let reserve = outer.map_or(0, |o| o.log_blowup);
     let c1::Honest { air: c1_air, trace, pvs: c1_pvs, .. } =
-        c1::honest_legacy(&program, &inputs, proof, pvs, child_cfg, max_cells)?;
+        c1::honest_legacy(&program, &inputs, proof, pvs, child_cfg, max_cells, reserve)?;
     let build_s = t.elapsed().as_secs_f64();
     let planned = (cols, rows, rom);
     let f2dig = c1_air.f2dig_limbs(&c1_pvs).ok_or("a zk = 0 C1 exports its F2 digest")?.to_vec();
@@ -792,7 +796,7 @@ where
     let mut report = json!({"evidence": "M", "zk": 0, "dag": program.report(),
         "native_fold_agrees_residual_zero": true, "compile_and_native_seconds": compile_s,
         "c1_p": {"lane_perms": perms, "rows": rows, "columns": cols, "rom_columns": rom},
-        "build_seconds": build_s,
+        "build_seconds": build_s, "extra_capacity_bits": reserve,
         "exposes_every_inner_pv": inner_pvs == pvs});
     ok &= inner_pvs == pvs;
     if check {

@@ -115,7 +115,8 @@ struct Shape {
 impl Shape {
     /// The hiding config commits every input at 2N rows, so the LDE height
     /// is log_height + IS_ZK + log_blowup and the query index takes that many
-    /// bits (= sum of arities + log_blowup + log_final_poly_len).
+    /// bits (= sum of arities + log_blowup + log_final_poly_len). Hiding
+    /// only; it takes no `Dims` (lab #782 X4).
     fn new(log_height: usize, cfg: &FriCfg) -> Result<Self> {
         let lde = log_height + IS_ZK + cfg.log_blowup;
         let arities = fri_log_arities(lde, cfg);

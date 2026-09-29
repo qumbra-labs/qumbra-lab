@@ -46,9 +46,9 @@ use crate::m4gaterec::walk_with_cfg;
 /// (the coordinator's ruling on the first census: they disagree by ≈ 3×, so
 /// every [P] GiB carries both).
 /// - `gate`: F4b-1's W-gate cells (issue #782's box), GiB per 3,800 columns
-///   × 2^18 rows at an outer b2 / b4 lane (≈ 7.6 B per cell at b2).
+///   × 2^18 rows at an outer b2 / b4 lane (≈ 8.2 bytes of peak per main-column cell at b2).
 /// - `f2_c1`: F2's measured C1 (P, 12,655 main columns × 2^15, ROM included
-///   in the peak but not in the cells) at outer b2, ≈ 25 B per cell; its b4
+///   in the peak but not in the cells) at outer b2, ≈ 27 bytes of peak per main-column cell; its b4
 ///   figure doubles the b2 one, as the gate cells did.
 const GATE_B2: f64 = 7.6 / (3_800.0 * 262_144.0);
 const GATE_B4: f64 = 15.1 / (3_800.0 * 262_144.0);
@@ -237,49 +237,77 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let ood = crate::f2::ood::legacy_ood((W_WIDTH, W_PV_LEN, log_h), &w_air, &w_proof, &w_pvs, &child.cfg(), check,
         do_prove.then(|| outer.cfg()).as_ref(), max_cells)?;
     report["ood_component"] = ood.report.clone();
+    // X6: the component's scaled memory [P], beside the measured peak the
+    // operator records.
+    let c1p = |k: &str| ood.report["c1_p"][k].as_u64().unwrap_or(0) as usize;
+    report["ood_component"]["memory_gib"] = gib(c1p("columns"), c1p("rows"));
     let mut ok = w_ok && ood.ok;
+    // X2: the OOD stage's JSON is on stdout before the node stage runs, so a
+    // failure there cannot lose it (a second, final object follows).
+    report["stage"] = json!("ood");
+    println!("{}", serde_json::to_string_pretty(&report).expect("json"));
+    report["stage"] = json!("final");
 
     if node {
-        // The query component with the F2 digest exported, and the seam.
-        let sched = walk_with_cfg(&w_proof, &w_pvs, &child.cfg());
-        let shape = GateShape { export_f2dig: true, ..w_gate_shape(log_h, child) };
-        let mut q = json!({"columns": GateLayout::from_shape(&shape).gate_width, "public_values": shape.n_opvs()});
-        let mut opvs = outer_pvs(&sched, &w_pvs, &shape);
-        if check || do_prove {
-            let reserve = if do_prove { outer.cfg().log_blowup } else { 0 };
-            let t = Instant::now();
-            let (trace, meta) = build_gate_trace(&sched, &w_pvs, &shape, reserve);
-            q["build_seconds"] = json!(t.elapsed().as_secs_f64());
-            q["trace"] = json!([trace.height(), trace.width()]);
-            ok &= meta.opvs == opvs;
-            opvs = meta.opvs;
-            let air = VerifierGateAir::new_with_shape(shape.clone());
-            if check {
+        let node_run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (Value, Value, bool) {
+            let mut ok = true;
+            // The query component with the F2 digest exported, and the seam.
+            let sched = walk_with_cfg(&w_proof, &w_pvs, &child.cfg());
+            let shape = GateShape { export_f2dig: true, ..w_gate_shape(log_h, child) };
+            let mut q = json!({"columns": GateLayout::from_shape(&shape).gate_width, "public_values": shape.n_opvs()});
+            let mut opvs = outer_pvs(&sched, &w_pvs, &shape);
+            if check || do_prove {
+                let reserve = if do_prove { outer.cfg().log_blowup } else { 0 };
                 let t = Instant::now();
-                let bad = scan(&air, &trace, &opvs);
-                // Condition (1)'s other side: one exported limb moved.
-                let mut moved = opvs.clone();
-                moved[shape.opv_f2dig() + 5] += Val::ONE;
-                let neg = scan(&air, &trace, &moved);
-                q["scan"] = json!({"every_row_holds": bad.is_none(), "first_failing_row": bad, "seconds": t.elapsed().as_secs_f64()});
-                q["f2dig_perturbed"] = json!({"limb": 5, "rejected": neg.is_some(), "first_failing_row": neg});
-                ok &= bad.is_none() && neg.is_some();
+                let (trace, meta) = build_gate_trace(&sched, &w_pvs, &shape, reserve);
+                q["build_seconds"] = json!(t.elapsed().as_secs_f64());
+                q["trace"] = json!([trace.height(), trace.width()]);
+                ok &= meta.opvs == opvs;
+                opvs = meta.opvs;
+                let air = VerifierGateAir::new_with_shape(shape.clone());
+                if check {
+                    let t = Instant::now();
+                    let bad = scan(&air, &trace, &opvs);
+                    // Condition (1)'s other side: one exported limb moved.
+                    let mut moved = opvs.clone();
+                    moved[shape.opv_f2dig() + 5] += Val::ONE;
+                    let neg = scan(&air, &trace, &moved);
+                    q["scan"] = json!({"every_row_holds": bad.is_none(), "first_failing_row": bad, "seconds": t.elapsed().as_secs_f64()});
+                    q["f2dig_perturbed"] = json!({"limb": 5, "rejected": neg.is_some(), "first_failing_row": neg});
+                    ok &= bad.is_none() && neg.is_some();
+                }
+                if do_prove {
+                    let cfg = make_legacy_config_with(&outer.cfg());
+                    let t = Instant::now();
+                    let proof = prove(&cfg, &air, trace, &opvs);
+                    let prove_s = t.elapsed().as_secs_f64();
+                    let v = verify(&cfg, &air, &proof, &opvs);
+                    ok &= v.is_ok();
+                    q["prove"] = json!({"evidence": "M", "prove_seconds": prove_s, "verified": v.is_ok(),
+                        "error": v.err().map(|e| format!("{e:?}")), "proof_bytes": bincode::serialize(&proof).map(|b| b.len()).ok()});
+                }
             }
-            if do_prove {
-                let cfg = make_legacy_config_with(&outer.cfg());
-                let t = Instant::now();
-                let proof = prove(&cfg, &air, trace, &opvs);
-                let prove_s = t.elapsed().as_secs_f64();
-                let v = verify(&cfg, &air, &proof, &opvs);
-                ok &= v.is_ok();
-                q["prove"] = json!({"evidence": "M", "prove_seconds": prove_s, "verified": v.is_ok(),
-                    "error": v.err().map(|e| format!("{e:?}")), "proof_bytes": bincode::serialize(&proof).map(|b| b.len()).ok()});
+            let seam = seam(&shape, &opvs, &ood);
+            ok &= seam["holds"] == true;
+            (q, seam, ok)
+        }));
+        match node_run {
+            Ok((q, seam, node_ok)) => {
+                ok &= node_ok;
+                report["query_component"] = q;
+                report["seam"] = seam;
+            }
+            Err(e) => {
+                // As f4gate: a panic in the M4 machinery is reported, not a crash.
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                report["query_component"] = json!({"error": {"stage": "node", "panic": msg}});
+                ok = false;
             }
         }
-        let seam = seam(&shape, &opvs, &ood);
-        ok &= seam["holds"] == true;
-        report["query_component"] = q;
-        report["seam"] = seam;
     }
     println!("{}", serde_json::to_string_pretty(&report).expect("json"));
     if !ok {
