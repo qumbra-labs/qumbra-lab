@@ -20,3 +20,9 @@ ctrlc = { version = "3.4", features = ["termination"] }
 
 # Plonky3 deps intentionally NOT pinned yet — M1 starts by selecting and
 # pinning exact revs (bench numbers are meaningless against a moving prover).
+
+# Lab #775 F4-2, condition (c): W's AIR scans in the debug test build run
+# about 10x faster with qlab-bench optimized. Build profile only:
+# debug-assertions and overflow-checks keep their dev defaults.
+[profile.dev.package.qlab-bench]
+opt-level = 2
