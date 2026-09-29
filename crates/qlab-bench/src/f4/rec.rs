@@ -424,6 +424,7 @@ pub(crate) fn m4_layout_json(k: usize, child: crate::f3::bench::Outer) -> Value 
     let rows = (24 * perms).next_power_of_two();
     let cols = crate::m4gate::GateLayout::from_shape(&shape).gate_width;
     json!({"k": k, "child_lane": child.label(), "evidence": "P", "layout": "m4gate VerifierGateAir, one child",
+        "note": "undetermined against F3's layout until measured: the k-model overstates F2's measured C2 by 26–30 % at b2 (F3's layout at F2's empirical slope ≈ 20.4 GiB)",
         "queries": shape.nq, "qslots": shape.qslots(), "lane_perms": perms, "rows": rows, "columns": cols,
         "k_model_gib": {"outer_b2": (gib(Lane::B2, cols, rows) * 10.0).round() / 10.0,
             "outer_b4": (gib(Lane::B4, cols, rows) * 10.0).round() / 10.0}})

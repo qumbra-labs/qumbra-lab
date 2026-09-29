@@ -151,11 +151,21 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let w_ok = verify(&child_cfg, &w_air, &w_proof, &w_pvs).is_ok();
     let w_bytes = bincode::serialize(&w_proof).map(|b| b.len()).ok();
 
-    // Its verification, recorded; the gate's shape and layout.
+    // Its verification, recorded; the gate's shape and layout. A panic in
+    // the M4 machinery on this new child shape is reported, not a crash
+    // (review V2).
     let t = Instant::now();
     let sched = walk_with_cfg(&w_proof, &w_pvs, &child.cfg());
     let shape = w_gate_shape(log_h, child);
-    let perms = lane_plan(&sched, &shape).0.len();
+    let fail = |stage: &str, e: Box<dyn std::any::Any + Send>| -> String {
+        let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+        let skeleton = json!({"mode": "f4gate", "issue": 782, "k": k, "child_lane": child.label(), "outer_lane": outer.label(),
+            "child": {"verified": w_ok, "proof_bytes": w_bytes}, "error": {"stage": stage, "panic": msg}});
+        println!("{}", serde_json::to_string_pretty(&skeleton).expect("json"));
+        format!("{stage} panicked: {msg}")
+    };
+    let perms = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane_plan(&sched, &shape).0.len()))
+        .map_err(|e| fail("lane_plan", e))?;
     let rows = (perms * 24).next_power_of_two();
     let width = GateLayout::from_shape(&shape).gate_width;
     let walk_s = t.elapsed().as_secs_f64();
@@ -179,16 +189,20 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let mut report = json!({
         "mode": "f4gate", "issue": 782, "k": k, "child_lane": child.label(), "outer_lane": outer.label(),
         "child": {"evidence": "M", "log_height": log_h, "width": W_WIDTH, "public_values": W_PV_LEN,
-            "prove_seconds": child_prove_s, "verified": w_ok, "proof_bytes": w_bytes},
+            "fixture_and_prove_seconds": child_prove_s, "verified": w_ok, "proof_bytes": w_bytes},
         "gate_shape": {"tw": shape.tw, "qw": shape.qw, "n_pvs": shape.n_pvs, "nq": shape.nq, "log_max": shape.log_max,
             "log_arities": shape.log_arities, "qslots": shape.qslots()},
         "component": {"evidence": "M (built from the recorded walk)", "lane_perms": perms, "rows": rows, "columns": width,
             "queries_covered": shape.nq, "components_to_cover_all_queries": 1,
             "perms_p_check": perms_p(&shape),
+            "perms_match": perms.abs_diff(perms_p(&shape)) * 20 <= perms,
+            "perms_match_tolerance": "±5 %",
             "native_keccak_f": {"leaf": leaf, "compress": compress, "challenger": challenger},
             "walk_and_plan_seconds": walk_s,
             "k_model_gib": {"evidence": "P", "outer": gib(outer, width, rows)}},
-        "two_child_node_p": {"evidence": "P", "children": "this W + one rung-1 C2 of shape P (F2's widest)",
+        "two_child_node_p": {"evidence": "P, rough", "children": "this W + one rung-1 C2 of shape P (F2's widest)",
+            "caveat": "heterogeneous children: the C2 child's perms are perms_p from its shape (no proof, no walk), the columns are the wider child's plus the merge lane, and m4gate's two-child interior was only ever built for two children of ONE shape",
+            "layout_note": "the M4-vs-F3 layout comparison is undetermined until measured: the k-model overstates F2's measured C2 by 26–30 % at b2 (F3's layout at F2's empirical slope ≈ 20.4 GiB)",
             "c2_child": {"columns": c2_cols, "rows": c2_rows, "lane_perms_p": perms_p(&c2_shape)},
             "lane_perms": two_perms, "rows": two_rows, "columns_at_least": two_width,
             "k_model_gib": gib(outer, two_width, two_rows)},
@@ -197,11 +211,16 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     });
 
     if check || do_prove {
+        // The prover's LDE reserve, allocated with the trace (review V1: a
+        // late reserve costs ~3× RSS; m4interior passes log_blowup too).
+        let reserve = if do_prove { outer.cfg().log_blowup } else { 0 };
         let t = Instant::now();
-        let (trace, meta) = build_gate_trace(&sched, &w_pvs, &shape, 0);
+        let (trace, meta) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_gate_trace(&sched, &w_pvs, &shape, reserve)))
+            .map_err(|e| fail("build_gate_trace", e))?;
         let build_s = t.elapsed().as_secs_f64();
         let air = VerifierGateAir::new_with_shape(shape.clone());
         report["component"]["trace_build_seconds"] = json!(build_s);
+        report["component"]["extra_capacity_bits"] = json!(reserve);
         report["component"]["trace"] = json!([trace.height(), trace.width()]);
         if check {
             let t = Instant::now();
