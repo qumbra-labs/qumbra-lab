@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 
 use super::dep::{prove_dep, verify_dep_u32, DEP_HEIGHT, DEP_WIDTH};
 use super::native::{check_wrapper_leaf, WInputs, WTag};
-use super::neg::{fx_pvs, honest, wfixture_rows, P_ROWS, SEED};
+use super::neg::{fx_pvs, honest, try_wfixture_rows, P_ROWS, SEED};
 use super::verify::{verify_wrapper, version_for, Bundle, BundleMember, MemberVerifier, Surface};
 use super::wleaf::{first_violation, W_PV_LEN};
 use crate::f3::bench::Outer;
@@ -99,6 +99,9 @@ pub(crate) fn parse_member_bytes(spec: &str) -> Result<[u64; 4], String> {
             "C" => 3,
             o => return Err(format!("unknown shape {o}")),
         };
+        if out[i].is_some() {
+            return Err(format!("--member-bytes gives {k} twice"));
+        }
         out[i] = Some(v.parse::<u64>().map_err(|e| e.to_string())?);
     }
     let all: Option<Vec<u64>> = out.iter().copied().collect();
@@ -119,15 +122,18 @@ pub(crate) fn cell(kinds: &[WTag], outer: Outer, member_bytes: Option<[u64; 4]>,
     let k = kinds.len();
     let version = version_for(k, outer).ok_or_else(|| format!("no wrapper version for k = {k} on {}", outer.label()))?;
 
-    // The fixture, its `prev` the genesis surface's commitment.
+    // The fixture, its `prev` the genesis surface's commitment (review U1:
+    // timed apart from the trace).
     let t = Instant::now();
-    let mut fx = wfixture_rows(kinds, SEED, P_ROWS);
+    let mut fx = try_wfixture_rows(kinds, SEED, P_ROWS)?;
     let genesis = Surface::genesis(version, BENCH_L2_ID, fx.rin);
     fx.inp = WInputs { prev: genesis.commitment, ..fx.inp.clone() };
     let mut st = fx.pre.clone();
     let (rin, wit, rout) = st.apply(&fx.inp, &fx.members).map_err(|e| format!("the fixture wrapper: {e:?}"))?;
     fx.exit_cmt = check_wrapper_leaf(&rin, &fx.inp, &fx.members, &wit).map_err(|e| format!("its check: {e:?}"))?.1;
     (fx.rin, fx.wit, fx.rout) = (rin, wit, rout);
+    let fixture_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
     let (air, trace, pvs) = honest(&fx);
     let gen_s = t.elapsed().as_secs_f64();
     let (width, height) = (trace.width(), trace.height());
@@ -200,15 +206,21 @@ pub(crate) fn cell(kinds: &[WTag], outer: Outer, member_bytes: Option<[u64; 4]>,
         "built": {"evidence": "M", "width": width, "height": height, "log_height": height.trailing_zeros(),
             "public_values": W_PV_LEN, "constraints": constraints, "max_degree": degree, "quotient_chunks": chunks},
         "honest_scan": {"evidence": "M", "every_row_holds": true, "seconds": scan_s},
-        "trace_gen_seconds": {"evidence": "M", "value": gen_s},
-        "prove_seconds": {"evidence": "M", "value": prove_s},
-        "verify_seconds": {"evidence": "M", "value": verify_s},
+        "fixture_seconds": {"evidence": "M", "value": fixture_s,
+            "contains": "the k-slot fixture's synthesis, the genesis surface, the rebuild on its commitment (apply + check_wrapper_leaf)"},
+        "trace_gen_seconds": {"evidence": "M", "value": gen_s, "contains": "W's plan and render only"},
+        "prove_seconds": {"evidence": "M", "value": prove_s, "contains": "exactly p3 prove(); excludes trace generation"},
+        "verify_seconds": {"evidence": "M", "value": verify_s, "contains": "exactly p3 verify() of W; the config is built outside"},
+        "timers_note": "the timers overlap and must not be summed: verify_wrapper.seconds re-runs V3 (W verify) and V9 (deposit verify); the full verifier = verify_wrapper.seconds + Σ member verify, nothing else added",
         "w_proof_bytes": {"evidence": "M", "source": "bincode::serialize", "value": w_bytes},
         "native_verified": w_ok.is_ok(),
         "verify_error": w_ok.err().map(|e| format!("{e:?}")),
         "dep": {"evidence": "M", "n": fx.deps.len(), "rows": DEP_HEIGHT, "width": DEP_WIDTH, "pcs": "hiding (qlab_l2::make_config_l2)",
-            "prove_seconds": dep_prove_s, "verify_seconds": dep_verify_s, "proof_bytes": dep_bytes, "verified": dep_ok},
+            "prove_seconds": dep_prove_s, "verify_seconds": dep_verify_s, "proof_bytes": dep_bytes, "verified": dep_ok,
+            "contains": "prove_seconds: its PVs, plan, render and prove; verify_seconds: the u32 gate, config and AIR construction, and verify"},
         "verify_wrapper": {"evidence": "M", "label": "stub members", "seconds": vw_s, "ok": vw.is_ok(),
+            "contains": "V0–V9 in full: W's verify (V3) and the deposit proof's (V9), their configs and AIRs built inside; stub member checks (V2)",
+            "anchor_ok": "stub: every absorbed root accepted (V7 is F5's L1 rule)",
             "error": vw.err().map(|e| format!("{e:?}")), "members": "stub",
             "members_reason": "one L2 member prove is 7–30 GiB (P ≈ 31 GiB at b4, hiding PCS): k real members do not fit one process; the full verifier = this path + Σ each member's own verify, measured per shape"},
         "bundle_bytes": {"value": bundle_total,
@@ -227,12 +239,20 @@ pub(crate) fn cell(kinds: &[WTag], outer: Outer, member_bytes: Option<[u64; 4]>,
 pub(crate) fn prove_run(args: &[String]) -> Result<(), String> {
     let get = |key: &str| args.iter().position(|a| a == key).and_then(|i| args.get(i + 1));
     let outer = Outer::parse(get("--outer").ok_or("--prove needs --outer b2|b4")?)?;
+    // k is checked against the versions before anything is built (review U3).
+    let has_version = |k: usize| version_for(k, outer).map(|_| ()).ok_or_else(|| format!("no wrapper version for k = {k} on {}", outer.label()));
     let kinds = match (get("--kinds"), get("--k")) {
         (Some(_), Some(_)) => return Err("give --kinds or --k, not both".into()),
-        (Some(s), None) => parse_kinds(s)?,
+        (Some(s), None) => {
+            has_version(s.chars().count())?;
+            parse_kinds(s)?
+        }
         (None, Some(k)) => match k.parse::<usize>() {
             Ok(0) => return Err("--k must be at least 1".into()),
-            Ok(k) => default_kinds(k),
+            Ok(k) => {
+                has_version(k)?;
+                default_kinds(k)
+            }
             Err(_) => return Err("--k takes a count".into()),
         },
         (None, None) => return Err("--prove needs --k N or --kinds SPRC…".into()),
@@ -263,6 +283,9 @@ mod tests {
         assert_eq!([count(4), count(8), count(16)], [[0, 2, 1, 1], [1, 4, 1, 2], [3, 8, 1, 4]]);
         assert_eq!(parse_member_bytes("S=1,P=2,R=3,C=4"), Ok([1, 2, 3, 4]));
         assert!(parse_member_bytes("S=1,P=2,R=3").is_err());
+        assert!(parse_member_bytes("S=1,P=2,R=3,C=4,S=5").is_err(), "a duplicate key");
+        // A kinds list W refuses (a second R) is an Err, never a panic.
+        assert!(cell(&[WTag::R, WTag::R], Outer::B2, None, None).is_err());
         assert!(parse_kinds("SX").is_err());
         for k in [4, 8, 16] {
             assert!(version_for(k, Outer::B2).is_some() && version_for(k, Outer::B4).is_some(), "k = {k}");
@@ -293,6 +316,8 @@ mod tests {
             assert!(r.pointer(key).is_some_and(|v| !v.is_null()), "{key} missing in {r:#}");
         }
         assert_eq!(r["verify_wrapper"]["label"], "stub members");
+        assert!(r["verify_wrapper"]["anchor_ok"].as_str().is_some_and(|s| s.starts_with("stub")));
+        assert!(r.pointer("/fixture_seconds/value").is_some_and(|v| !v.is_null()));
         assert_eq!(r["dep"]["n"], 1);
         assert_eq!(r["bundle_bytes"]["parts"]["members"], 4, "one claim at 4 B");
     }
