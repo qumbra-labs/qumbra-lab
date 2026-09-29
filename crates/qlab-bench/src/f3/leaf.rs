@@ -380,14 +380,14 @@ pub(crate) fn leaf_pvs(rin: &Roots, rout: &Roots) -> Vec<Val> {
 
 /// Keccak lane column indices (standard lane = x + 5y).
 #[derive(Clone)]
-struct KeccakIdx {
-    step0: usize,
-    fin: usize,
-    pre: [[usize; 4]; 25],
-    out: [[usize; 4]; 25],
+pub(crate) struct KeccakIdx {
+    pub(crate) step0: usize,
+    pub(crate) fin: usize,
+    pub(crate) pre: [[usize; 4]; 25],
+    pub(crate) out: [[usize; 4]; 25],
 }
 
-fn keccak_idx() -> KeccakIdx {
+pub(crate) fn keccak_idx() -> KeccakIdx {
     let idx: Vec<usize> = (0..NUM_KECCAK_COLS).collect();
     let map: &KeccakCols<usize> = idx[..].borrow();
     KeccakIdx {
@@ -972,7 +972,7 @@ struct Regs {
     left: i64,
 }
 
-fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
+pub(crate) fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
     let mut st = [0u64; 25];
     st[..4].copy_from_slice(lo);
     st[4..8].copy_from_slice(hi);
@@ -981,7 +981,7 @@ fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
     st
 }
 
-fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
+pub(crate) fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
     let mut st = [0u64; 25];
     st[..4].copy_from_slice(l);
     st[4..8].copy_from_slice(r);
@@ -990,16 +990,16 @@ fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
     st
 }
 
-fn out4(st: &[u64; 25]) -> Digest {
+pub(crate) fn out4(st: &[u64; 25]) -> Digest {
     keccak_f(st)[..4].try_into().expect("four lanes")
 }
 
 /// A PV digest, chunk by chunk (masked: the plan never validates; the AIR does).
-fn pv_digest(pvs: &[u32], off: usize) -> Digest {
+pub(crate) fn pv_digest(pvs: &[u32], off: usize) -> Digest {
     core::array::from_fn(|l| (0..4).map(|j| (u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0)) & 0xffff) << (16 * j)).sum())
 }
 
-fn inv_or_zero(v: Val) -> Val {
+pub(crate) fn inv_or_zero(v: Val) -> Val {
     v.try_inverse().unwrap_or(Val::ZERO)
 }
 
@@ -1115,7 +1115,7 @@ fn path_at(s: Seg, w: &TxWitness, lvl: usize) -> (Digest, bool) {
     mw.unwrap_or((EMPTY, false))
 }
 
-fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
+pub(crate) fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
     if bit {
         (*sib, *x)
     } else {
