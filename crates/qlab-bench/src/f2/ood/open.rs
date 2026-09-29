@@ -1372,6 +1372,7 @@ pub(in crate::f2::ood) mod tests {
                 width: 2,
                 pv_len: 2,
                 log_height: sh.log_height,
+                zk: qlab_consensus::IS_ZK,
             };
             let chunks = proof.opened_values.quotient_chunks.len();
             let geom = Geom::new(dims, chunks, &L2_CFG_PROVISIONAL).unwrap();
@@ -1479,6 +1480,7 @@ pub(in crate::f2::ood) mod tests {
             width,
             pv_len: pvs.len(),
             log_height,
+            zk: qlab_consensus::IS_ZK,
         };
         let chunks = proof.opened_values.quotient_chunks.len();
         let geom = Geom::new(dims, chunks, &L2_CFG_PROVISIONAL).unwrap();

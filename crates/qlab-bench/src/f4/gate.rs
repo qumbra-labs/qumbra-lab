@@ -60,6 +60,7 @@ pub(crate) fn w_gate_shape(log_height: usize, child: Outer) -> GateShape {
         cap_len: 1 << qlab_consensus::CAP_HEIGHT,
         log_blowup: cfg.log_blowup,
         merge_lane: false,
+        export_f2dig: false,
     }
 }
 
@@ -78,14 +79,18 @@ pub(crate) fn child_gate_shape(width: usize, pv_len: usize, log_height: usize, c
         cap_len: 1 << qlab_consensus::CAP_HEIGHT,
         log_blowup: cfg.log_blowup,
         merge_lane: false,
+        export_f2dig: false,
     }
 }
 
 /// [P] a child's lane perms on this layout without a proof, counted as
 /// `m4gate::lane_plan` lays them out: every observation flush's blocks, the
 /// index refills, the trailer, flush 2's duplicate, then every query's
-/// program (`qslots`). The refills assume no rejected field draw (each costs
-/// one more perm, p ≈ 2^-7 a draw). F4b-1's box measured the lane at
+/// program (`qslots`). The refills are exact for the last phase, which
+/// samples bits (the query PoW and the indices), never by rejection. A
+/// rejected field draw earlier (p ≈ 2^-7 a draw) costs one more u32 word,
+/// and one more perm only when it crosses an 8-word digest boundary
+/// (PR #783 review W5). F4b-1's box measured the lane at
 /// 8,380 / 9,200 / 16,214 perms (W at K = 1 b4, K = 16 b4, K = 16 b2); the
 /// first census missed the refills, trailer and duplicate (824–829 perms).
 pub(crate) fn perms_p(shape: &GateShape) -> usize {
@@ -97,7 +102,7 @@ pub(crate) fn perms_p(shape: &GateShape) -> usize {
 }
 
 /// Every row's constraints, in parallel; the lowest failing row.
-fn scan<A>(air: &A, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Option<usize>
+pub(super) fn scan<A>(air: &A, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Option<usize>
 where
     A: for<'a> Air<DebugConstraintBuilder<'a, Val>> + BaseAir<Val> + Sync,
 {
@@ -210,7 +215,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             "k_model_gib": {"evidence": "P", "outer": gib(outer, width, rows)}},
         "two_child_node_p": {"evidence": "P, rough", "children": "this W + one rung-1 C2 of shape P (F2's widest)",
             "caveat": "heterogeneous children: the C2 child's perms are perms_p from its shape (no proof, no walk), the columns are the wider child's plus the merge lane, and m4gate's two-child interior was only ever built for two children of ONE shape",
-            "layout_note": "the M4-vs-F3 layout comparison is undetermined until measured: the k-model overstates F2's measured C2 by 26–30 % at b2 (F3's layout at F2's empirical slope ≈ 20.4 GiB)",
+            "layout_note": "resolved by F4b-1's box (issue #782): the k-model overstated the one-child gate cells by ≈ 33 % at outer b2 and ≈ 7 % at outer b4; the measured slope is ≈ 7.6 GiB per 2^18 rows at outer b2 and ≈ 15.1 at outer b4",
             "c2_child": {"columns": c2_cols, "rows": c2_rows, "lane_perms_p": perms_p(&c2_shape)},
             "lane_perms": two_perms, "rows": two_rows, "columns_at_least": two_width,
             "k_model_gib": gib(outer, two_width, two_rows)},

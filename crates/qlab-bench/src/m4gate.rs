@@ -301,6 +301,14 @@ pub(crate) struct GateShape {
     /// shipped leaf `narrow()` never merges, so its layout omits them entirely →
     /// narrow gate_width unchanged → byte-identical.
     pub(crate) merge_lane: bool,
+    /// Lab #782 F4b-2: expose the zeta-openings flush (F2) digest as 16 u16
+    /// limbs appended AFTER the inner public values, pinned to flush 2's last
+    /// block output — the query component's half of the native seam with a
+    /// non-hiding C1 (which exports the same digest). Opt-in: narrow, wide and
+    /// every shipped shape leave it off, so their layouts and PVs are unchanged.
+    /// Not combinable with `merge_lane` (the interior's per-child PV routing
+    /// indexes by `n_opvs`).
+    pub(crate) export_f2dig: bool,
 }
 
 impl GateShape {
@@ -318,6 +326,7 @@ impl GateShape {
             cap_len: 8,
             log_blowup: 4, // b16
             merge_lane: false,
+            export_f2dig: false,
         }
     }
 
@@ -343,6 +352,7 @@ impl GateShape {
             cap_len: 8,
             log_blowup: 2, // b4 (AGG_CFG)
             merge_lane: true,
+            export_f2dig: false,
         }
     }
 
@@ -444,7 +454,15 @@ impl GateShape {
     /// their programs and layouts are unchanged. Only the last round can be
     /// short: every earlier round folds by the maximum arity.
     pub(crate) fn ff_words(&self) -> Option<usize> {
-        let la = *self.log_arities.last()?;
+        let (&la, earlier) = self.log_arities.split_last()?;
+        // Only the last round is read (PR #783 review W6): an earlier short
+        // single-block leaf would fall back to `R_ABS_F16` silently, so
+        // refuse the shape instead. `fri_log_arities` is greedy, so none is.
+        assert!(
+            earlier.iter().all(|&e| 4 * (1usize << e) > 34 || 4 * (1usize << e) == self.qw),
+            "only the last FRI round may fold by a short single-block leaf: {:?}",
+            self.log_arities
+        );
         let w = 4 * (1usize << la);
         (w <= 34 && w != self.qw).then_some(w)
     }
@@ -546,6 +564,12 @@ impl GateShape {
     /// `F0DIG_LIMBS` F0 digest (D3) + `n_pvs` inner public values
     /// (`N_OPVS` for narrow = 768 + 16 + 84 = 868).
     pub(crate) fn n_opvs(&self) -> usize {
+        self.opv_f2dig() + if self.export_f2dig { F2DIG_LIMBS } else { 0 }
+    }
+
+    /// Outer-PV offset of the exported F2 digest (lab #782): right after the
+    /// inner public values, so every existing offset is untouched.
+    pub(crate) fn opv_f2dig(&self) -> usize {
         self.opv_pvs() + self.n_pvs
     }
 
@@ -719,6 +743,8 @@ pub(crate) enum Shape {
 /// values (issue #21's R2) and is non-hollow only because D3 also binds F0's
 /// absorbed INPUT words to those same public values (see `eval`).
 pub(crate) const F0DIG_LIMBS: usize = 16;
+/// u16 limbs of the opt-in exported F2 digest (`GateShape::export_f2dig`).
+pub(crate) const F2DIG_LIMBS: usize = 16;
 
 /// Outer public value layout: 6 caps x 8 digests x 16 limbs, the 16-limb F0
 /// digest (D3), then the 84 inner public values.
@@ -2874,6 +2900,16 @@ where
                         * (cv(ocol(m)) - half(self.shape.opv_f0dig() + m)),
                 );
             }
+            // Lab #782 F4b-2 (opt-in): the F2 (zeta-openings) digest is flush
+            // 2's last block's output rate limbs 0..16 — the same limbs the
+            // `f2dig` register captures — exposed for the native seam.
+            if self.shape.export_f2dig {
+                assert!(!route, "export_f2dig is single-child only");
+                let f2last = cv(self.layout.shsel + shsel_index(fb, 2, fb[2] - 1));
+                for m in 0..F2DIG_LIMBS {
+                    builder.assert_zero(sf(23) * f2last.clone() * (cv(ocol(m)) - pv(self.shape.opv_f2dig() + m)));
+                }
+            }
         }
         // =====================================================================
         // Shape selectors: fully determined by the flush automaton (no
@@ -4501,6 +4537,12 @@ pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) 
     // encoding (Monty words), matching the absorbed bytes.
     let rr = monty_rr();
     opvs.extend(inner_pvs.iter().map(|v| *v * rr));
+    if shape.export_f2dig {
+        // Lab #782: the F2 digest, same limb encoding as F0's.
+        for c in sched.flushes[2].digest.chunks(2) {
+            opvs.push(Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32));
+        }
+    }
     assert_eq!(opvs.len(), shape.n_opvs());
     opvs
 }
@@ -5617,9 +5659,11 @@ fn emit_child(
                             let outv = (lo + hi) * ext_base(consts.half)
                                 + regs.breg[l] * ext_base(consts.kf[rf][l][i]) * (lo - hi);
                             if r == pairs.len() - 1 {
-                                if outv != scale(qr.folds[rf].folded) {
+                                if outv != scale(qr.folds[rf].folded) && std::env::var_os("QLAB_FOLD_DIAG").is_some() {
                                     // Lab #782 F4b-1 diagnostic: which input of the fold
-                                    // disagrees with the recorded (native) walk.
+                                    // disagrees with the recorded (native) walk. Off
+                                    // unless QLAB_FOLD_DIAG is set (PR #783 review W7);
+                                    // the assert below fires either way.
                                     let fold = &qr.folds[rf];
                                     eprintln!("FOLD-DIAG q_first_row={row} rf={rf} la={la} n_rounds={n_rounds} log_arities={:?} cum={:?} lf={:?} index_in_group={} evals={}",
                                         shape.log_arities, cum, shape.lf(), fold.index_in_group, fold.evals.len());

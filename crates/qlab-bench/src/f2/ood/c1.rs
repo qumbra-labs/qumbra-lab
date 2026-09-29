@@ -91,7 +91,7 @@ use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, PrimeField32};
 use p3_keccak_air::NUM_ROUNDS;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::Proof;
-use qlab_consensus::{Config, FriCfg, CAP_HEIGHT, IS_ZK};
+use qlab_consensus::{Config, FriCfg, CAP_HEIGHT};
 
 use super::lane::{
     absorb, accepted, challenge, draw_words, monty, pad, Lane, Phased, CAP_WORDS, DRAWS, DRAW_COLS,
@@ -105,7 +105,7 @@ use crate::m4gaterec::keccakf;
 
 /// Constraint groups, in evaluation order. A negative names the group(s) its
 /// violation must land in, on named rows.
-const PHASES: [&str; 27] = [
+const PHASES: [&str; 28] = [
     "keccak",
     "bits",
     "absorb",
@@ -133,6 +133,7 @@ const PHASES: [&str; 27] = [
     "accumulate",
     "cells_out",
     "az_out",
+    "f2dig_out",
 ];
 
 /// Extension limbs.
@@ -187,8 +188,8 @@ struct Fri {
 }
 
 impl Fri {
-    fn new(log_height: usize, cfg: &FriCfg) -> Result<Self> {
-        let lde = log_height + IS_ZK + cfg.log_blowup;
+    fn new(log_height: usize, cfg: &FriCfg, zk: usize) -> Result<Self> {
+        let lde = log_height + zk + cfg.log_blowup;
         let arities = fri_log_arities(lde, cfg);
         let index_bits = arities.iter().sum::<usize>() + cfg.log_blowup + cfg.log_final_poly_len;
         require(index_bits == lde, "fold schedule does not reach the LDE")?;
@@ -242,7 +243,7 @@ impl Layout {
         let w = dims.width;
         let chain = || (0..8).map(Word::Chain).collect::<Vec<Word>>();
         let mut f0 = vec![
-            Word::Const(monty(Val::from_usize(dims.log_height + IS_ZK))),
+            Word::Const(monty(Val::from_usize(dims.log_height + dims.zk))),
             Word::Const(monty(Val::from_usize(dims.log_height))),
             Word::Const(monty(Val::ZERO)),
         ];
@@ -250,10 +251,13 @@ impl Layout {
         f0.extend((0..dims.pv_len).map(Word::InnerPv));
         let mut f1 = chain();
         f1.extend((0..CAP_WORDS).map(|n| Word::Cap(1, n)));
-        f1.extend((0..CAP_WORDS).map(|n| Word::Cap(2, n)));
+        if dims.zk == 1 {
+            // The randomizer's cap (hiding only).
+            f1.extend((0..CAP_WORDS).map(|n| Word::Cap(2, n)));
+        }
         // The shared term order (`seam::open_order`): C2 weights its row
         // values in the same list, so the two sums cannot diverge.
-        let opened: Vec<Open> = open_order(w, chunks);
+        let opened: Vec<Open> = open_order(w, chunks, dims.zk);
         let mut f2 = chain();
         for k in 0..opened.len() {
             f2.extend((0..D).map(|l| Word::Opened(k, l)));
@@ -261,7 +265,7 @@ impl Layout {
         let mut flushes = vec![f0, f1, f2];
         for r in 0..fri.rounds() {
             let mut g = chain();
-            g.extend((0..CAP_WORDS).map(|n| Word::Cap(3 + r, n)));
+            g.extend((0..CAP_WORDS).map(|n| Word::Cap(2 + dims.zk + r, n)));
             flushes.push(g);
         }
         let mut h = chain();
@@ -386,7 +390,7 @@ impl Layout {
         self.dims.pv_len + 2 * (CAP_WORDS * b + n)
     }
     fn zeta_pv(&self) -> usize {
-        self.cap_pv(3 + self.rounds(), 0)
+        self.cap_pv(2 + self.dims.zk + self.rounds(), 0)
     }
     fn fri_alpha_pv(&self) -> usize {
         self.zeta_pv() + D
@@ -406,8 +410,14 @@ impl Layout {
     fn index_pv(&self, i: usize) -> usize {
         self.final_pv(self.fri.final_len) + i
     }
-    fn num_public_values(&self) -> usize {
+    /// A non-hiding child's ζ-openings flush digest (16 u16 limbs), after
+    /// the indices: the seam to `m4gate`'s own export of it (F4b-2, lab
+    /// #782 answer A). Absent for a hiding child, so F2's layout is unchanged.
+    fn f2dig_pv(&self) -> usize {
         self.index_pv(self.fri.queries)
+    }
+    fn num_public_values(&self) -> usize {
+        self.index_pv(self.fri.queries) + if self.dims.zk == 0 { 16 } else { 0 }
     }
 }
 
@@ -454,6 +464,40 @@ impl Data {
             inner_pvs: pvs.to_vec(),
             caps,
             random: o.random.clone().ok_or("missing randomizer opening")?,
+            local: o.trace_local.clone(),
+            next: o.trace_next.clone().ok_or("missing next-row opening")?,
+            chunks: o.quotient_chunks.clone(),
+            final_poly: fri.final_poly.clone(),
+            witness: fri.query_pow_witness,
+            swap_f1_caps: false,
+            swap_rounds: false,
+            alias: None,
+        })
+    }
+
+    /// [`Data::from_proof`] for a non-hiding (`qlab_consensus::legacy`) child:
+    /// no randomizer cap or opening (F4b-2, lab #782).
+    fn from_legacy_proof(
+        proof: &Proof<qlab_consensus::legacy::LegacyNonHidingConfig>,
+        pvs: &[Val],
+    ) -> Result<Self> {
+        let o = &proof.opened_values;
+        let fri = &proof.opening_proof;
+        let c = &proof.commitments;
+        require(
+            c.random.is_none() && o.random.is_none(),
+            "a non-hiding proof has no randomizer",
+        )?;
+        let mut caps = vec![c.trace.roots().to_vec(), c.quotient_chunks.roots().to_vec()];
+        caps.extend(fri.commit_phase_commits.iter().map(|x| x.roots().to_vec()));
+        require(
+            caps.iter().all(|x| x.len() == 1 << CAP_HEIGHT),
+            "cap height",
+        )?;
+        Ok(Self {
+            inner_pvs: pvs.to_vec(),
+            caps,
+            random: vec![],
             local: o.trace_local.clone(),
             next: o.trace_next.clone().ok_or("missing next-row opening")?,
             chunks: o.quotient_chunks.clone(),
@@ -655,13 +699,14 @@ fn basis(i: usize) -> E {
 }
 
 impl C1Air {
-    fn new(program: &Program, cfg: &FriCfg, max_cells: usize) -> Result<Self> {
+    pub(super) fn new(program: &Program, cfg: &FriCfg, max_cells: usize) -> Result<Self> {
         let dims = Dims {
             width: program.leaves.local.len(),
             pv_len: program.leaves.public.len(),
             log_height: program.original.log_size(),
+            zk: program.zk,
         };
-        let fri = Fri::new(dims.log_height, cfg)?;
+        let fri = Fri::new(dims.log_height, cfg, dims.zk)?;
         let layout = Layout::new(dims, program.chunk_domains.len(), fri)?;
         let schedule = program.schedule.clone();
         require(
@@ -893,10 +938,17 @@ impl C1Air {
 
     /// Outer public values: the declared instance (inner PVs, every cap as
     /// 16-bit limbs), then the claim's seam outputs.
-    fn public_values(&self, declared: &Data, cl: &Claimed, az: E, bz: E) -> Vec<Val> {
+    fn public_values(
+        &self,
+        declared: &Data,
+        cl: &Claimed,
+        az: E,
+        bz: E,
+        f2dig: &[u8; 32],
+    ) -> Vec<Val> {
         let l = &self.layout;
         let mut pv = declared.inner_pvs.clone();
-        for b in 0..3 + l.rounds() {
+        for b in 0..2 + l.dims.zk + l.rounds() {
             for n in 0..CAP_WORDS {
                 let w = declared.cap_word(b, n);
                 pv.extend([Val::from_u32(w & 0xffff), Val::from_u32(w >> 16)]);
@@ -907,6 +959,13 @@ impl C1Air {
             pv.extend_from_slice(v.as_basis_coefficients_slice());
         }
         pv.extend(cl.indices.iter().map(|&i| Val::from_usize(i)));
+        if l.dims.zk == 0 {
+            pv.extend(
+                f2dig
+                    .chunks(2)
+                    .map(|h| Val::from_u32(u32::from(u16::from_le_bytes([h[0], h[1]])))),
+            );
+        }
         pv
     }
 
@@ -1224,6 +1283,22 @@ impl Phased for C1Air {
                     );
                 }
             }
+            "f2dig_out" => {
+                // The ζ-openings flush digest is the chaining value G_0's
+                // first perm absorbs in slots 0..7 (`flush_chain` binds it to
+                // F2's last output); its halves are the exported limbs.
+                if l.dims.zk == 0 {
+                    let sel = ring(l.first[FIRST_G]);
+                    for slot in 0..8 {
+                        for h in 0..2 {
+                            builder.assert_zero(
+                                sel.clone()
+                                    * (half(slot, h) - pv[l.f2dig_pv() + 2 * slot + h].clone()),
+                            );
+                        }
+                    }
+                }
+            }
             "az_out" => {
                 for limb in 0..D {
                     builder
@@ -1273,6 +1348,7 @@ impl Layout {
         SeamShape {
             rounds: self.rounds(),
             final_len: self.fri.final_len,
+            zk: self.dims.zk,
         }
     }
 }
@@ -1286,7 +1362,11 @@ impl Seam {
             "C1 public value count",
         )?;
         let slots: Vec<usize> = (0..layout.fri.queries).collect();
-        Seam::decode(layout.seam_shape(), &slots, &pvs[layout.dims.pv_len..])
+        Seam::decode(
+            layout.seam_shape(),
+            &slots,
+            &pvs[layout.dims.pv_len..layout.index_pv(layout.fri.queries)],
+        )
     }
 }
 
@@ -1294,6 +1374,39 @@ impl C1Air {
     /// Inner PVs C1 re-exposes unchanged at the front of its public values.
     pub(super) fn inner_pv_len(&self) -> usize {
         self.layout.dims.pv_len
+    }
+
+    /// FNV-1a over the ROM (every periodic column, in order), without
+    /// cloning it: the ROM half of the hiding-layout fingerprint (lab #782
+    /// condition (4)).
+    pub(super) fn rom_hash(&self) -> u64 {
+        use p3_field::PrimeField32;
+        let mut h = super::FNV_OFFSET;
+        for col in &self.periodic {
+            h = super::fnv(h, col.len() as u64);
+            for v in col {
+                h = super::fnv(h, u64::from(v.as_canonical_u32()));
+            }
+        }
+        h
+    }
+
+    /// Every cap C1 re-exposes (trace, quotient, [randomizer,] FRI rounds),
+    /// as u16 limbs in cap order: the query component's half of the seam.
+    pub(super) fn cap_limbs<'a>(&self, pvs: &'a [Val]) -> &'a [Val] {
+        let l = &self.layout;
+        &pvs[l.cap_pv(0, 0)..l.zeta_pv()]
+    }
+
+    /// The exported ζ-openings flush digest (16 u16 limbs) of a non-hiding
+    /// C1 (lab #782); `None` for a hiding one, which exports none.
+    pub(super) fn f2dig_limbs<'a>(&self, pvs: &'a [Val]) -> Option<&'a [Val]> {
+        self.f2dig_offset().map(|o| &pvs[o..o + 16])
+    }
+
+    /// Where [`Self::f2dig_limbs`] sit in C1's public values.
+    pub(super) fn f2dig_offset(&self) -> Option<usize> {
+        (self.layout.dims.zk == 0).then(|| self.layout.f2dig_pv())
     }
 }
 
@@ -1321,8 +1434,43 @@ pub(super) fn honest(
     cfg: &FriCfg,
     max_cells: usize,
 ) -> Result<Honest> {
+    honest_data(
+        program,
+        inputs,
+        Data::from_proof(proof, pvs)?,
+        cfg,
+        max_cells,
+    )
+}
+
+/// [`honest`] for a non-hiding child (`qlab_consensus::legacy`, `program`
+/// compiled with `zk = 0`): F4b-2's W and gate children (lab #782).
+pub(super) fn honest_legacy(
+    program: &Program,
+    inputs: &Inputs,
+    proof: &Proof<qlab_consensus::legacy::LegacyNonHidingConfig>,
+    pvs: &[Val],
+    cfg: &FriCfg,
+    max_cells: usize,
+) -> Result<Honest> {
+    require(program.zk == 0, "a legacy child needs a zk = 0 program")?;
+    honest_data(
+        program,
+        inputs,
+        Data::from_legacy_proof(proof, pvs)?,
+        cfg,
+        max_cells,
+    )
+}
+
+fn honest_data(
+    program: &Program,
+    inputs: &Inputs,
+    data: Data,
+    cfg: &FriCfg,
+    max_cells: usize,
+) -> Result<Honest> {
     let air = C1Air::new(program, cfg, max_cells)?;
-    let data = Data::from_proof(proof, pvs)?;
     let rep = Replay::new(&air.layout, &data)?;
     require(
         rep.challenges[0] == inputs.alpha && rep.zeta() == inputs.zeta,
@@ -1331,7 +1479,7 @@ pub(super) fn honest(
     require(rep.pow_sample == 0, "query PoW sample is not zero")?;
     let cl = Claimed::of(&rep, &data, machine_inputs(program, inputs)?);
     let (trace, az, bz) = air.trace(&rep, &cl)?;
-    let pvs = air.public_values(&data, &cl, az, bz);
+    let pvs = air.public_values(&data, &cl, az, bz, &rep.digests[F2]);
     let seam = Seam::read(&air.layout, &pvs)?;
     Ok(Honest {
         air,
@@ -1339,6 +1487,36 @@ pub(super) fn honest(
         pvs,
         seam,
     })
+}
+
+/// [P] C1's size for `program` on lane `cfg`, without allocating the ROM
+/// or a trace (F4b-2's census, lab #782): lane perms, padded rows, main
+/// columns (the `C1Air::new` column chain), ROM columns and public values.
+pub(super) fn c1_dims(
+    program: &Program,
+    cfg: &FriCfg,
+) -> Result<(usize, usize, usize, usize, usize)> {
+    let dims = Dims {
+        width: program.leaves.local.len(),
+        pv_len: program.leaves.public.len(),
+        log_height: program.original.log_size(),
+        zk: program.zk,
+    };
+    let fri = Fri::new(dims.log_height, cfg, dims.zk)?;
+    let layout = Layout::new(dims, program.chunk_domains.len(), fri)?;
+    let s = &program.schedule;
+    let height = s
+        .height()
+        .max((layout.perms * NUM_ROUNDS).next_power_of_two());
+    let ring_col = Lane::new().end() + 2 * RATE_WORDS + DRAWS * DRAW_COLS;
+    let width = ring_col + layout.perms + L1_COLUMNS + D + D * s.inputs().len() + s.width();
+    Ok((
+        layout.perms,
+        height,
+        width,
+        s.rom_width(),
+        layout.num_public_values(),
+    ))
 }
 
 /// The machine's honest inputs for a DAG input assignment, in schedule order.
@@ -1396,6 +1574,7 @@ pub(in crate::f2::ood) mod tests {
             width: 2,
             pv_len: 2,
             log_height: LOG_HEIGHT,
+            zk: qlab_consensus::IS_ZK,
         }
     }
 
@@ -1554,7 +1733,9 @@ pub(in crate::f2::ood) mod tests {
         let mut cl = Claimed::of(&rep, data, machine_inputs(&fx.program, inputs).unwrap());
         edit(&rep, &mut cl);
         let (trace, az, bz) = fx.air.trace(&rep, &cl).unwrap();
-        let pvs = fx.air.public_values(&fx.data, &cl, az, bz);
+        let pvs = fx
+            .air
+            .public_values(&fx.data, &cl, az, bz, &rep.digests[F2]);
         Claim { rep, trace, pvs }
     }
 

@@ -400,6 +400,7 @@ impl BoundAir {
             width: program.leaves.local.len(),
             pv_len: program.leaves.public.len(),
             log_height: program.original.log_size(),
+            zk: program.zk,
         };
         let layout = Layout::new(dims, program.chunk_domains.len());
         let schedule = program.schedule.clone();
@@ -820,6 +821,7 @@ pub(in crate::f2::ood) mod tests {
             width: 2,
             pv_len: 2,
             log_height: TOY_LOG_HEIGHT,
+            zk: qlab_consensus::IS_ZK,
         }
     }
 
@@ -1295,6 +1297,7 @@ pub(in crate::f2::ood) mod tests {
             width: 2,
             pv_len: 2,
             log_height,
+            zk: qlab_consensus::IS_ZK,
         };
         let program = Program::compile_dims(dims, &Toy).unwrap();
         let air = BoundAir::new(&program, 64 << 20).unwrap();

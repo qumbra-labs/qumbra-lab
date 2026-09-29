@@ -185,7 +185,7 @@ impl Layout {
         // it: a block's row values are consecutive terms, a trace column's
         // ζ·g_N term is its ζ term + w, and blocks follow each other term
         // by term except across the w ζ·g_N terms after the trace.
-        let order = open_order(dims.width, chunks);
+        let order = open_order(dims.width, chunks, dims.zk);
         let term = |o: Open| -> Result<usize> {
             order
                 .iter()
@@ -272,6 +272,7 @@ impl Layout {
         let seam = SeamShape {
             rounds: fg.geom.rounds(),
             final_len: fg.geom.final_len,
+            zk: qlab_consensus::IS_ZK,
         };
         Ok(Self {
             ig,
@@ -1599,6 +1600,7 @@ pub(super) mod tests {
                 width: 2,
                 pv_len: 2,
                 log_height: sh.log_height,
+                zk: qlab_consensus::IS_ZK,
             };
             let chunks = sh.proof.opened_values.quotient_chunks.len();
             let cfg = L2_CFG_PROVISIONAL;

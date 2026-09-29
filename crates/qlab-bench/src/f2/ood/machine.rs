@@ -167,6 +167,10 @@ impl Schedule {
     pub(super) fn width(&self) -> usize {
         12 + 4 * self.registers
     }
+    /// Extension registers the schedule allocates.
+    pub(super) fn registers(&self) -> usize {
+        self.registers
+    }
     pub(super) fn rom_width(&self) -> usize {
         12 + 3 * self.registers + self.inputs.len()
     }
@@ -465,6 +469,173 @@ pub(super) fn eval_machine<AB: AirBuilder<F = Val>>(
     }
 }
 
+/// [P] F4b-2 lever pricing (lab #782), count-only: the DAG's peak live
+/// registers under the current discipline and two others, with nothing built.
+///
+/// - `current`: [`Schedule::compile`]'s depth-first order, every input
+///   loaded into a register (reproduces `Schedule::registers`).
+/// - `held_operands`: the same order, but an input is read straight from its
+///   held column as an operand and never takes a register.
+/// - `streamed`: nothing held; inputs arrive one at a time in `arrival`
+///   order (the child's transcript order) and every node runs as soon as its
+///   operands exist, constants loading at their first consumer. A greedy
+///   schedule, so a better scheduler can only lower it.
+pub(super) struct LeverRegisters {
+    pub(super) current: usize,
+    pub(super) held_operands: usize,
+    pub(super) streamed: usize,
+}
+
+fn postorder(ops: &[Op], roots: &[Id]) -> Vec<Id> {
+    let mut done = vec![false; ops.len()];
+    let mut order = Vec::new();
+    let mut stack: Vec<_> = roots.iter().rev().map(|&id| (id, false)).collect();
+    while let Some((id, exit)) = stack.pop() {
+        if done[id] {
+            continue;
+        }
+        if exit {
+            done[id] = true;
+            order.push(id);
+        } else {
+            stack.push((id, true));
+            stack.extend(sources(ops[id]).into_iter().rev().map(|src| (src, false)));
+        }
+    }
+    order
+}
+
+/// Peak registers of the depth-first order; `inputs_take_registers` false
+/// is the held-operand discipline.
+fn depth_first_peak(ops: &[Op], roots: &[Id], inputs_take_registers: bool) -> usize {
+    let order = postorder(ops, roots);
+    let mut last_use = vec![0; ops.len()];
+    for (row, &id) in order.iter().enumerate() {
+        for src in sources(ops[id]) {
+            last_use[src] = row;
+        }
+    }
+    for &id in roots {
+        last_use[id] = order.len();
+    }
+    let takes = |id: Id| inputs_take_registers || !matches!(ops[id], Op::Input(_));
+    let (mut live, mut peak) = (0usize, 0usize);
+    for (row, &id) in order.iter().enumerate() {
+        let src = sources(ops[id]);
+        for (j, &i) in src.iter().enumerate() {
+            if last_use[i] == row && !src[..j].contains(&i) && takes(i) {
+                live -= 1;
+            }
+        }
+        if takes(id) {
+            live += 1;
+            peak = peak.max(live);
+        }
+    }
+    peak
+}
+
+/// Peak registers of the greedy streamed schedule.
+fn streamed_peak(ops: &[Op], roots: &[Id], arrival: &dyn Fn(Input) -> u64) -> usize {
+    let order = postorder(ops, roots);
+    let n = ops.len();
+    let mut reach = vec![false; n];
+    for &id in &order {
+        reach[id] = true;
+    }
+    let distinct = |id: Id| {
+        let mut s = sources(ops[id]);
+        s.dedup();
+        s
+    };
+    let is_const = |id: Id| matches!(ops[id], Op::Constant(_));
+    let mut consumers: Vec<Vec<Id>> = vec![vec![]; n];
+    let mut pending = vec![0usize; n];
+    let mut uses = vec![0usize; n];
+    for &id in &order {
+        for s in distinct(id) {
+            consumers[s].push(id);
+            uses[s] += 1;
+            if !is_const(s) {
+                pending[id] += 1;
+            }
+        }
+    }
+    for &id in roots {
+        uses[id] = usize::MAX;
+    }
+    let (mut live, mut peak) = (0usize, 0usize);
+    let mut loaded = vec![false; n];
+    let mut ready: std::collections::VecDeque<Id> = order
+        .iter()
+        .copied()
+        .filter(|&id| pending[id] == 0 && !matches!(ops[id], Op::Input(_) | Op::Constant(_)))
+        .collect();
+    let mut inputs: Vec<Id> = order
+        .iter()
+        .copied()
+        .filter(|&id| matches!(ops[id], Op::Input(_)))
+        .collect();
+    inputs.sort_by_key(|&id| match ops[id] {
+        Op::Input(i) => (arrival(i), id),
+        _ => unreachable!(),
+    });
+    let mut next_input = 0;
+    loop {
+        // Run everything ready before the next arrival.
+        while let Some(id) = ready.pop_front() {
+            let src = distinct(id);
+            for &s in &src {
+                if is_const(s) && !loaded[s] {
+                    loaded[s] = true;
+                    live += 1;
+                }
+            }
+            peak = peak.max(live);
+            for &s in &src {
+                uses[s] = uses[s].saturating_sub(1);
+                if uses[s] == 0 {
+                    live -= 1;
+                }
+            }
+            live += 1;
+            peak = peak.max(live);
+            for &c in &consumers[id] {
+                pending[c] -= 1;
+                if pending[c] == 0 {
+                    ready.push_back(c);
+                }
+            }
+        }
+        let Some(&id) = inputs.get(next_input) else {
+            break;
+        };
+        next_input += 1;
+        live += 1;
+        peak = peak.max(live);
+        for &c in &consumers[id] {
+            pending[c] -= 1;
+            if pending[c] == 0 {
+                ready.push_back(c);
+            }
+        }
+    }
+    peak
+}
+
+/// The three disciplines' peak registers for `ops` (outputs `roots`).
+pub(super) fn lever_registers(
+    ops: &[Op],
+    roots: &[Id],
+    arrival: &dyn Fn(Input) -> u64,
+) -> LeverRegisters {
+    LeverRegisters {
+        current: depth_first_peak(ops, roots, true),
+        held_operands: depth_first_peak(ops, roots, false),
+        streamed: streamed_peak(ops, roots, arrival),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +692,38 @@ mod tests {
 
     fn sat(air: &RegisterAir, trace: &RowMajorMatrix<Val>, pv: &[Val]) -> bool {
         qlab_air::l2test::scan(air, trace, pv, None).is_none()
+    }
+
+    /// Lab #782 F4b-2's lever counts, on a DAG small enough to schedule by
+    /// hand: `t = a·b; u = t + n; r = u·a` with `a, b` local inputs and `n`
+    /// a next-row input (arriving after every local one). Depth-first order
+    /// a, b, t, n, u, r: three live at n's load (a, t, n) with inputs in
+    /// registers; one (t, then u, then r) with inputs as held operands;
+    /// streamed, a and b arrive, t runs, then n arrives beside a and t: three.
+    #[test]
+    fn lever_register_counts_match_a_hand_schedule() {
+        let ops = vec![
+            Op::Input(Input::Local(0)),
+            Op::Input(Input::Local(1)),
+            Op::Input(Input::Next(0)),
+            Op::Mul(0, 1),
+            Op::Add(3, 2),
+            Op::Mul(4, 0),
+        ];
+        let arrival = |i: Input| match i {
+            Input::Local(c) => 1 + c as u64,
+            Input::Next(c) => 100 + c as u64,
+            _ => 0,
+        };
+        let r = lever_registers(&ops, &[5], &arrival);
+        assert_eq!((r.current, r.held_operands, r.streamed), (3, 1, 3));
+        assert_eq!(
+            r.current,
+            Schedule::compile(&ops, &[5]).unwrap().registers()
+        );
+        // The reference fixture: `current` is the compiled register file.
+        let (air, ..) = fixture(5);
+        assert!(air.schedule.registers() > 0);
     }
 
     #[test]

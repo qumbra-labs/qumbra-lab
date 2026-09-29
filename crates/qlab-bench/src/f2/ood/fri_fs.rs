@@ -782,6 +782,7 @@ pub(in crate::f2::ood) mod tests {
                 width: 2,
                 pv_len: 2,
                 log_height: LOG_HEIGHT,
+                zk: qlab_consensus::IS_ZK,
             };
             let chunks = proof.opened_values.quotient_chunks.len();
             let f2 = bind::Replay::new(

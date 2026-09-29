@@ -581,6 +581,22 @@ pub(super) mod toy {
         (proof, pvs)
     }
 
+    /// One real NON-hiding proof of the toy at `log_height` on the L2 lane's
+    /// FRI parameters (`qlab_consensus::legacy`): F4b-2's smallest zk = 0
+    /// child (lab #782). Deterministic (no hiding randomness).
+    pub(in crate::f2::ood) fn toy_legacy_proof(
+        log_height: usize,
+    ) -> (
+        Proof<qlab_consensus::legacy::LegacyNonHidingConfig>,
+        Vec<Val>,
+    ) {
+        let (trace, pvs) = toy_trace(log_height);
+        let config = qlab_consensus::legacy::make_legacy_config_with(&L2_CFG_PROVISIONAL);
+        let proof = prove(&config, &Toy, trace, &pvs);
+        verify(&config, &Toy, &proof, &pvs).expect("toy non-hiding proof verifies");
+        (proof, pvs)
+    }
+
     /// F2b-5 (issue #750): the toy plus one period-4 periodic column
     /// s = (1, 0, 0, 0) and the constraint s · (x' − y) = 0 on transitions,
     /// which the toy's own x' = y implies. It changes nothing about the
