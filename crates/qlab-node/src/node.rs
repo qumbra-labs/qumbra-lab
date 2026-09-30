@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use qlab_devnet::forms::GenesisForm;
+use qlab_devnet::forms::{BodySections, GenesisForm};
 use qlab_devnet::body::{validate_body_with_names, BlockBody, BodyError, TxVerifier};
 use qlab_devnet::chain::{FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::committee::Checkpoint;
@@ -741,20 +741,33 @@ fn hex8(h: &Hash32) -> String {
 /// binary above the boundary (v2 bytes at a v3 height) is refused here —
 /// loudly, naming the height — rather than silently starting fresh.
 fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
-    check_stored_binding_for(GenesisForm::V4, block)
+    check_stored_binding_for(GenesisForm::V4, BodySections::None, block)
 }
 
 /// [`check_stored_binding`] under an explicit genesis form (lab #470 4a): the
 /// v4 arm is the height-keyed v2/v3 rule exactly as before; the v5 arm binds
 /// under the height-keyed cap assertion in `commitment_v5_at` (the bytes stay
 /// the same across that boundary).
-fn check_stored_binding_for(form: GenesisForm, block: &StoredBlock) -> Result<(), NodeError> {
-    let got = match form {
-        GenesisForm::V4 => block.body().commitment_at(block.header.height),
-        GenesisForm::V5 => block.body().commitment_v5_at(block.header.height),
+///
+/// The section axis (lab #785): on a V6 net every block binds under
+/// `commitment_v6`, and on any other net a block carrying sections is refused
+/// here — the V4/V5 commitments do not cover them.
+fn check_stored_binding_for(
+    form: GenesisForm,
+    sections: BodySections,
+    block: &StoredBlock,
+) -> Result<(), NodeError> {
+    if sections == BodySections::None && block.sections.is_some() {
+        return Err(NodeError::Body(qlab_devnet::body::BodyError::SectionOnForm { section: "finality/bundle" }));
+    }
+    let got = match (form, sections) {
+        (GenesisForm::V5, BodySections::V6) => block.body().commitment_v6(),
+        (_, BodySections::V6) => unreachable!("BodySections::V6 exists only beside GenesisForm::V5 (forms.rs)"),
+        (GenesisForm::V4, _) => block.body().commitment_at(block.header.height),
+        (GenesisForm::V5, _) => block.body().commitment_v5_at(block.header.height),
         // Lab #708: the Annulet body commitment (B1). Genesis never passes this
         // funnel (it is bound at construction, over its genesis notes).
-        GenesisForm::Annulet => qlab_devnet::annulet::body_commitment_annulet(&block.body()),
+        (GenesisForm::Annulet, _) => qlab_devnet::annulet::body_commitment_annulet(&block.body()),
     };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
@@ -864,6 +877,21 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// (`open_for` / `in_memory_for`), BEFORE any record is replayed; there is
     /// no later setter (the install-before-run invariant, extended here).
     form: GenesisForm,
+    /// The body-section axis (lab #785 F5-3b): [`BodySections::V6`] exactly on
+    /// a V6 net (always beside [`GenesisForm::V5`]). Set at construction with
+    /// `form`, before any record is replayed, and never re-keyed.
+    sections: BodySections,
+    /// Genesis committee₀ (lab #785 ruling Q1): the roster a V6 finality
+    /// record's signatures are checked against. `Some` exactly on a V6 node;
+    /// installed by [`MemNode::in_memory_v6`] / [`MemNode::open_v6`] before the
+    /// first live block and carried across rewinds.
+    committee0: Option<qlab_devnet::committee::Committee>,
+    /// **Recorded finality** (lab #785 Q-L5): `block height → record height`
+    /// for every applied main-chain block carrying a finality record. Derived
+    /// state, folded in `apply_state` (so every replay and rewind rebuilds it)
+    /// and re-derived from the held chain on the snapshot paths, which skip
+    /// `apply_state` for the prefix. `CR(tip)` is its last value.
+    recorded: BTreeMap<u64, u64>,
     /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node.
     annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
     /// The asset registry (lab #710): `Some` exactly on an Annulet node,
@@ -908,12 +936,32 @@ impl MemNode {
     /// An in-memory node from a genesis block, with no disk durability.
     /// **v4 identities** — a v5 net starts via [`MemNode::in_memory_for`].
     pub fn in_memory(genesis: StoredBlock) -> Self {
-        Self::from_genesis(GenesisForm::V4, genesis, None)
+        Self::from_genesis(GenesisForm::V4, BodySections::None, genesis, None)
     }
 
     /// [`MemNode::in_memory`] under an explicit genesis form (lab #470 4a).
     pub fn in_memory_for(form: GenesisForm, genesis: StoredBlock) -> Self {
-        Self::from_genesis(form, genesis, None)
+        Self::from_genesis(form, BodySections::None, genesis, None)
+    }
+
+    /// An in-memory **V6** node (lab #785 F5-3b): `GenesisForm::V5` with the
+    /// V6 body sections, record signatures checked against `committee0`.
+    pub fn in_memory_v6(genesis: StoredBlock, committee0: qlab_devnet::committee::Committee) -> Self {
+        let mut node = Self::from_genesis(GenesisForm::V5, BodySections::V6, genesis, None);
+        node.committee0 = Some(committee0);
+        node
+    }
+
+    /// Open (or create) a disk-backed **V6** node — [`Self::open_for`]'s
+    /// resume machinery unchanged, keyed `(V5, V6)` before any record is read.
+    pub fn open_v6(
+        dir: impl AsRef<Path>,
+        genesis: StoredBlock,
+        committee0: qlab_devnet::committee::Committee,
+    ) -> Result<Self, NodeError> {
+        let mut node = Self::open_inner(GenesisForm::V5, BodySections::V6, dir.as_ref(), genesis, None)?;
+        node.committee0 = Some(committee0);
+        Ok(node)
     }
 
     /// Open (or create) a disk-backed node at `dir`, resuming restart-safely:
@@ -933,7 +981,7 @@ impl MemNode {
         genesis: StoredBlock,
     ) -> Result<Self, NodeError> {
         match form {
-            GenesisForm::V4 | GenesisForm::V5 => Self::open_inner(form, dir.as_ref(), genesis, None),
+            GenesisForm::V4 | GenesisForm::V5 => Self::open_inner(form, BodySections::None, dir.as_ref(), genesis, None),
             // Lab #708: an Annulet genesis binds its notes and carries a fee
             // table, neither of which this signature has.
             GenesisForm::Annulet => Err(NodeError::FormNotServed { form, owner: "MemNode::open_annulet" }),
@@ -960,7 +1008,7 @@ impl MemNode {
         let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
-        let node = Self::open_inner(GenesisForm::Annulet, dir, genesis, Some(setup))?;
+        let node = Self::open_inner(GenesisForm::Annulet, BodySections::None, dir, genesis, Some(setup))?;
         // Lab #710, #728: the registry is chain state — every resume path
         // derives it from the log (replay through `apply_state`, a snapshot
         // through `recompute_annulet_state`). The sidecar is checked against
@@ -985,6 +1033,7 @@ impl MemNode {
 
     fn open_inner(
         form: GenesisForm,
+        sections: BodySections,
         dir: &Path,
         genesis: StoredBlock,
         annulet: Option<AnnuletSetup>,
@@ -1045,7 +1094,7 @@ impl MemNode {
         // and issue #225 a third — see [`Self::resume_from_snapshot`]. The reason
         // is carried into the [`RecoveryReport`] rather than dropped.
         if let Some(snap) = snapshot.as_ref() {
-            match Self::resume_from_snapshot(form, &dir, &genesis, annulet.clone(), snap, &records)? {
+            match Self::resume_from_snapshot(form, sections, &dir, &genesis, annulet.clone(), snap, &records)? {
                 SnapshotResume::Resumed(node) => return Ok(node),
                 SnapshotResume::Rejected(why) => {
                     // Lab #408: before conceding the genesis fold, try the
@@ -1053,7 +1102,7 @@ impl MemNode {
                     // when the log itself proves its tip is on the finalized
                     // main chain. Any failure inside the attempt falls back to
                     // the full replay, which stays the correctness anchor.
-                    if let Some(node) = Self::resume_near_tip(form, &dir, &genesis, annulet.clone(), snap, &records, &why)
+                    if let Some(node) = Self::resume_near_tip(form, sections, &dir, &genesis, annulet.clone(), snap, &records, &why)
                     {
                         return Ok(node);
                     }
@@ -1061,7 +1110,7 @@ impl MemNode {
                 }
             }
         }
-        Self::resume_by_replay(form, &dir, genesis, annulet, &records, snapshot_rejected)
+        Self::resume_by_replay(form, sections, &dir, genesis, annulet, &records, snapshot_rejected)
     }
 
     /// The snapshot-assisted resume. `Rejected` = this snapshot cannot be
@@ -1096,13 +1145,14 @@ impl MemNode {
     /// with its own reason.
     fn resume_from_snapshot(
         form: GenesisForm,
+        sections: BodySections,
         dir: &Path,
         genesis: &StoredBlock,
         annulet: Option<AnnuletSetup>,
         snap: &Snapshot,
         records: &[LogRecord],
     ) -> Result<SnapshotResume, NodeError> {
-        let mut node = Self::from_genesis_with(form, genesis.clone(), Some(dir.to_path_buf()), annulet);
+        let mut node = Self::from_genesis_with(form, sections, genesis.clone(), Some(dir.to_path_buf()), annulet);
         node.restore_from_snapshot(snap);
         // Lab #367: the registry sidecar rides the snapshot. Any problem with
         // a PRESENT sidecar is a fall-through to the full replay (which
@@ -1142,7 +1192,7 @@ impl MemNode {
                     // one way a corrupted log record enters unchecked. It stays
                     // FIRST: a tampered record is refused outright, and must not
                     // be mistaken for the rewind below.
-                    check_stored_binding_for(node.form, b)?;
+                    check_stored_binding_for(node.form, node.sections, b)?;
                     // Issue #162: the log is append-only but the applied chain is
                     // no longer append-only, so a prefix record whose parent is not
                     // the running tip is the live node's rewind, replayed here at
@@ -1237,6 +1287,7 @@ impl MemNode {
         // Annulet chain state the tail's `apply_state` reads is re-derived
         // here, before the first tail block needs it.
         node.recompute_annulet_state()?;
+        node.recompute_recorded()?;
         let mut progress = ReplayProgress::start(
             tail_blocks,
             &format!("past snapshot at height {}", snap.applied_height),
@@ -1319,8 +1370,10 @@ impl MemNode {
     /// [`SnapshotRejection::NamesSidecarDisagreement`] is excluded by
     /// construction: the registry at `applied_height` is derived state this
     /// path cannot re-derive without the very fold it exists to skip.
+    #[allow(clippy::too_many_arguments)]
     fn resume_near_tip(
         form: GenesisForm,
+        sections: BodySections,
         dir: &Path,
         genesis: &StoredBlock,
         annulet: Option<AnnuletSetup>,
@@ -1366,7 +1419,7 @@ impl MemNode {
 
         // (2) Derived state from the snapshot; the registry sidecar under the
         // same rule the honoured path applies (absent = pre-#367 = empty).
-        let mut node = Self::from_genesis_with(form, genesis.clone(), Some(dir.to_path_buf()), annulet);
+        let mut node = Self::from_genesis_with(form, sections, genesis.clone(), Some(dir.to_path_buf()), annulet);
         node.restore_from_snapshot(snap);
         match crate::name_registry::load_names_at(dir) {
             Ok(None) => {}
@@ -1396,7 +1449,7 @@ impl MemNode {
             // The binding is still checked (issue #77): this path skips
             // `apply_state`, so it would otherwise be the one door a corrupted
             // log record enters by.
-            check_stored_binding_for(node.form, block).ok()?;
+            check_stored_binding_for(node.form, node.sections, block).ok()?;
             node.chain.put_block((*block).clone()).ok()?;
         }
         if node.chain.tip_hash() != snap.tip {
@@ -1431,6 +1484,7 @@ impl MemNode {
         // Lab #712, #728: as on the honoured path — the prefix skipped
         // `apply_state`, so the Annulet chain state is re-derived first.
         node.recompute_annulet_state().ok()?;
+        node.recompute_recorded().ok()?;
         let mut progress = ReplayProgress::start(
             tail_blocks,
             &format!("near-tip catch-up past rejected snapshot at height {}", snap.applied_height),
@@ -1479,13 +1533,14 @@ impl MemNode {
     /// and "the snapshot was unusable" are different things to tell an operator.
     fn resume_by_replay(
         form: GenesisForm,
+        sections: BodySections,
         dir: &Path,
         genesis: StoredBlock,
         annulet: Option<AnnuletSetup>,
         records: &[LogRecord],
         snapshot_rejected: Option<SnapshotRejection>,
     ) -> Result<Self, NodeError> {
-        let mut node = Self::from_genesis_with(form, genesis, Some(dir.to_path_buf()), annulet);
+        let mut node = Self::from_genesis_with(form, sections, genesis, Some(dir.to_path_buf()), annulet);
         // Lab #287: every record is applied, so walk total == final replayed_records.
         // `records` is already in memory from `open`; the total is free.
         let mut progress = ReplayProgress::start(records.len(), "from genesis");
@@ -1525,7 +1580,7 @@ impl MemNode {
         genesis: StoredBlock,
     ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
-        let mut node = Self::from_genesis(form, genesis, Some(dir.clone()));
+        let mut node = Self::from_genesis(form, BodySections::None, genesis, Some(dir.clone()));
         for rec in persist::read_records(&dir).map_err(NodeError::Io)? {
             match rec {
                 LogRecord::Block(b) => {
@@ -1646,7 +1701,8 @@ impl MemNode {
 
         // Built beside the live state and swapped in only on success, so a failure
         // anywhere in the re-fold leaves the node exactly as it was.
-        let mut rebuilt = Self::from_genesis_with(self.form, kept[0].clone(), self.dir.clone(), self.annulet_setup());
+        let mut rebuilt = Self::from_genesis_with(self.form, self.sections, kept[0].clone(), self.dir.clone(), self.annulet_setup());
+        rebuilt.committee0 = self.committee0.clone();
         for block in &kept[1..] {
             rebuilt.apply_state(block)?;
         }
@@ -1680,20 +1736,22 @@ impl MemNode {
         Ok(report)
     }
 
-    fn from_genesis(form: GenesisForm, genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
+    fn from_genesis(form: GenesisForm, sections: BodySections, genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
         assert_eq!(genesis.header.height, 0, "genesis height must be 0");
         // Issue #115: genesis is bound to its body like every other block, and
         // this is the one seam a genesis enters by without passing
         // `check_stored_binding` (it is put straight into the chain store).
         // Panicking matches the height assertion above — the genesis block is
         // locally built or operator-supplied, never network input.
-        let expected_binding = match form {
-            GenesisForm::V4 => genesis.body().commitment(),
-            GenesisForm::V5 => genesis.body().commitment_v5(),
+        let expected_binding = match (form, sections) {
+            (GenesisForm::V5, BodySections::V6) => genesis.body().commitment_v6(),
+            (_, BodySections::V6) => panic!("BodySections::V6 exists only beside GenesisForm::V5"),
+            (GenesisForm::V4, _) => genesis.body().commitment(),
+            (GenesisForm::V5, _) => genesis.body().commitment_v5(),
             // Locally-built input, same class as the height assertion above:
             // an Annulet genesis binds its genesis notes, which this signature
             // does not carry.
-            GenesisForm::Annulet => panic!(
+            (GenesisForm::Annulet, _) => panic!(
                 "an Annulet genesis is opened with MemNode::in_memory_annulet (lab #708)"
             ),
         };
@@ -1701,7 +1759,7 @@ impl MemNode {
             genesis.header.tx_body_commitment, expected_binding,
             "genesis must bind its own body (under the net's form)"
         );
-        Self::from_bound_genesis(form, genesis, dir)
+        Self::from_bound_genesis(form, sections, genesis, dir)
     }
 
     /// [`Self::from_genesis`] for every internal (re)build: on Annulet the
@@ -1710,14 +1768,15 @@ impl MemNode {
     /// fee table is carried, and genesis is final on acceptance (Q4).
     fn from_genesis_with(
         form: GenesisForm,
+        sections: BodySections,
         genesis: StoredBlock,
         dir: Option<PathBuf>,
         annulet: Option<AnnuletSetup>,
     ) -> Self {
         match (form, annulet) {
-            (GenesisForm::V4 | GenesisForm::V5, None) => Self::from_genesis(form, genesis, dir),
+            (GenesisForm::V4 | GenesisForm::V5, None) => Self::from_genesis(form, sections, genesis, dir),
             (GenesisForm::Annulet, Some(setup)) => {
-                let mut node = Self::from_bound_genesis(form, genesis, dir);
+                let mut node = Self::from_bound_genesis(form, sections, genesis, dir);
                 node.annulet_fees = Some(setup.fees);
                 node.registry_genesis = Some(setup.registry.clone());
                 node.registry = Some(setup.registry);
@@ -1750,7 +1809,7 @@ impl MemNode {
 
     /// [`Self::from_genesis`] after the genesis binding has been checked by
     /// the caller (the L1 arms above; the Annulet constructor over its notes).
-    fn from_bound_genesis(form: GenesisForm, genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
+    fn from_bound_genesis(form: GenesisForm, sections: BodySections, genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
         let commitments = MemCommitmentStore::default();
         let chain = MemChainStore::new_for(form, genesis);
         let mut roots_by_height = BTreeMap::new();
@@ -1773,6 +1832,9 @@ impl MemNode {
             recovery: RecoveryReport::default(),
             names: crate::name_registry::NameRegistry::default(),
             form,
+            sections,
+            committee0: None,
+            recorded: BTreeMap::new(),
             annulet_fees: None,
             registry: None,
             registry_genesis: None,
@@ -1806,7 +1868,7 @@ impl MemNode {
         let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)
             .unwrap_or_else(|e| panic!("the Annulet genesis must bind its registry (lab #710): {e}"));
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
-        MemNode::from_genesis_with(GenesisForm::Annulet, genesis, None, Some(setup))
+        MemNode::from_genesis_with(GenesisForm::Annulet, BodySections::None, genesis, None, Some(setup))
     }
 
     /// The genesis form this node's identities are keyed under (lab #470).
@@ -1846,7 +1908,9 @@ impl MemNode {
         );
         let rebuilt =
             genesis_block_for(form, genesis.header.difficulty, genesis.header.timestamp);
-        *self = Self::from_genesis(form, rebuilt, self.dir.clone());
+        let committee0 = self.committee0.take();
+        *self = Self::from_genesis(form, self.sections, rebuilt, self.dir.clone());
+        self.committee0 = committee0;
     }
 
     fn restore_from_snapshot(&mut self, snap: &Snapshot) {
@@ -1968,6 +2032,30 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // Read-only body validation (anchor closure borrows self immutably). The
         // header goes in too (issue #77): the body must be the one this header
         // committed to, checked before any other body work.
+        //
+        // Lab #785 F5-3b: on a V6 net the gate is not consulted at all. The V6
+        // funnel reads only the block's own ancestry (`V6View`), so live
+        // application and settled-history replay are the same function by
+        // construction — the #402 split, and #786's race, do not exist here.
+        if self.sections == BodySections::V6 {
+            let _ = gate;
+            let view = V6View { node: &*self, block_height: header.height };
+            qlab_devnet::body::validate_body_v6(
+                &header,
+                &body,
+                verifier,
+                &view,
+                &qlab_devnet::body::RefuseAllBundles,
+                &self.names,
+            )
+            .map_err(NodeError::Body)?;
+            let block = StoredBlock::from_parts(&header, &body);
+            let hash = self.apply_state(&block)?;
+            if let Some(dir) = &self.dir {
+                persist::append_record(dir, &LogRecord::Block(block)).map_err(NodeError::Io)?;
+            }
+            return Ok(hash);
+        }
         match gate {
             AnchorGate::Live => {
                 let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
@@ -2206,6 +2294,53 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         Ok(())
     }
 
+    /// The finality-record height a block carries, or `None` (no record, or
+    /// not a V6 net — where `check_stored_binding_for` has already refused a
+    /// section).
+    fn record_height_of(&self, block: &StoredBlock) -> Result<Option<u64>, NodeError> {
+        let Some(sections) = &block.sections else { return Ok(None) };
+        if sections.finality.is_empty() {
+            return Ok(None);
+        }
+        qlab_devnet::finality_record::FinalityRecord::decode(&sections.finality)
+            .map(|r| Some(r.cp.height))
+            .map_err(|err| NodeError::Body(BodyError::FinalityRecord { err }))
+    }
+
+    /// Re-derive [`Self::recorded`] from the held main chain — the snapshot
+    /// paths put the prefix in by `put_block` alone (the
+    /// [`Self::recompute_annulet_state`] pattern). A no-op off V6.
+    fn recompute_recorded(&mut self) -> Result<(), NodeError> {
+        self.recorded.clear();
+        if self.sections != BodySections::V6 {
+            return Ok(());
+        }
+        let mut found = Vec::new();
+        let mut cursor = self.chain.tip_hash();
+        while let Some(block) = self.chain.block(&cursor) {
+            if block.header.height == 0 {
+                break;
+            }
+            if let Some(h) = self.record_height_of(block)? {
+                found.push((block.header.height, h));
+            }
+            cursor = block.header.prev;
+        }
+        self.recorded.extend(found);
+        Ok(())
+    }
+
+    /// `CR(tip)`: the latest recorded finality height on the applied main
+    /// chain (lab #785 Q-L5). `None` off V6, or before the first record.
+    pub fn recorded_finality(&self) -> Option<u64> {
+        self.recorded.values().next_back().copied()
+    }
+
+    /// The body-section axis this node runs (lab #785).
+    pub fn sections(&self) -> BodySections {
+        self.sections
+    }
+
     /// The ancestor at exactly `height` of the block whose parent hash is `from`,
     /// found by walking `prev` through the chain store. `None` if the walk leaves
     /// the store or `height` is above `from`'s own height.
@@ -2250,7 +2385,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // The funnel guard (issue #77): every state mutation — fresh application
         // and disk-log replay alike — passes through here, so the header/body
         // binding is re-established before anything is folded into state.
-        check_stored_binding_for(self.form, block)?;
+        check_stored_binding_for(self.form, self.sections, block)?;
+        // Lab #785: a V6 block's record height, decoded before any mutation. A
+        // live block was validated in full before reaching here; a logged one
+        // that no longer decodes is a corrupt log, named rather than skipped.
+        let record_height = self.record_height_of(block)?;
         // Lab #712: the outstanding-supply rule, checked before any mutation.
         let supply_delta = match self.form {
             GenesisForm::V4 | GenesisForm::V5 => BTreeMap::new(),
@@ -2348,6 +2487,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             .apply_block_riders(block.header.height, block.txs.iter().map(|t| t.rider.as_slice()))
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
         self.record_root_at(block.header.height);
+        if let Some(h) = record_height {
+            self.recorded.insert(block.header.height, h);
+        }
         if let Some(next) = registry_after {
             self.registry = Some(next);
         }
@@ -2653,6 +2795,51 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
     }
 }
 
+/// What the V6 funnel reads (lab #785 F5-3b): the node's applied main chain,
+/// which is exactly the ancestry of a block extending its tip. Every answer is
+/// taken as of that block — `CR(parent)` is `CR(tip)`, ancestors are walked
+/// from the tip, anchor heights are the tip's index — never the node's local
+/// finality.
+struct V6View<'a, C: ChainStore, N: NullifierStore, T: CommitmentStore> {
+    node: &'a Node<C, N, T>,
+    block_height: u64,
+}
+
+impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> qlab_devnet::body::V6ChainView for V6View<'_, C, N, T> {
+    fn recorded_finality(&self) -> Option<u64> {
+        self.node.recorded_finality()
+    }
+
+    fn ancestor_at(&self, height: u64) -> Option<Hash32> {
+        if height >= self.block_height {
+            return None;
+        }
+        let tip = self.node.chain.tip_hash();
+        self.node
+            .ancestor_at(&tip, height)
+            .map(|b| b.header().header_hash_for(self.node.form))
+    }
+
+    fn committee0(&self) -> &qlab_devnet::committee::Committee {
+        self.node
+            .committee0
+            .as_ref()
+            .expect("a V6 node is constructed with committee0 (in_memory_v6 / open_v6)")
+    }
+
+    fn root_heights(&self, root: &Hash32) -> &[u64] {
+        self.node.anchor_heights_by_root.get(root).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The **V6** genesis block (lab #785 F5-3b): the v5 genesis header over the
+/// empty body, bound under `commitment_v6` (`0e32092e…ad1d`).
+pub fn genesis_block_v6(difficulty: u64, timestamp: u64) -> StoredBlock {
+    let mut header = BlockHeader::genesis_for(GenesisForm::V5, difficulty, timestamp);
+    header.tx_body_commitment = BlockBody::default().commitment_v6();
+    StoredBlock::from_parts(&header, &BlockBody::default())
+}
+
 /// Build the genesis [`StoredBlock`] (empty body) at the given difficulty and
 /// timestamp — the base every node starts from.
 pub fn genesis_block(difficulty: u64, timestamp: u64) -> StoredBlock {
@@ -2834,7 +3021,7 @@ mod tests {
         let honest = BlockBody::from_single_payee(vec![tx([9u8; 32], 4)], 0, [0; 4]);
         let header = child_committing_to(&g_header, &honest);
         // …but whose persisted body is not that body.
-        let tampered = StoredBlock { annulet: None,
+        let tampered = StoredBlock { annulet: None, sections: None,
             header: StoredHeader::from(&header),
             txs: Vec::new(),
             coinbase: 0,
@@ -2903,7 +3090,7 @@ mod tests {
         let honest2 = BlockBody::from_single_payee(vec![tx(root, 6)], 0, [0; 4]);
         let h2 = child_committing_to(&g_header, &honest2);
         let tampered =
-            StoredBlock { annulet: None,
+            StoredBlock { annulet: None, sections: None,
                 header: StoredHeader::from(&h2),
                 txs: Vec::new(),
                 coinbase: 0,
@@ -2948,7 +3135,7 @@ mod tests {
         // takes it — whose stored body is not the body its header commits to.
         let honest2 = BlockBody::from_single_payee(vec![tx(root, 8)], 0, [0; 4]);
         let h2 = child_committing_to(&h1, &honest2);
-        let tampered = StoredBlock { annulet: None,
+        let tampered = StoredBlock { annulet: None, sections: None,
             header: StoredHeader::from(&h2),
             txs: Vec::new(),
             coinbase: 0,
@@ -3167,7 +3354,7 @@ mod tests {
         let mk = |parent: &BlockHeader, nf: u8| {
             let body = BlockBody::from_single_payee(vec![tx([9u8; 32], nf)], 0, [0; 4]);
             let header = child_committing_to(parent, &body);
-            let stored = StoredBlock { annulet: None,
+            let stored = StoredBlock { annulet: None, sections: None,
                 header: StoredHeader::from(&header),
                 txs: body.txs.iter().map(|t| t.into()).collect(),
                 coinbase: 0,
@@ -3540,4 +3727,136 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    // --- lab #785 F5-3b: the V6 apply path ------------------------------------
+
+    /// Twenty-one rehearsal committee₀ keys (built once) — ML-DSA, ms-class.
+    fn v6_validators() -> &'static (qlab_devnet::committee::Committee, Vec<qlab_devnet::committee::Validator>) {
+        use qlab_devnet::committee::{Committee, Validator};
+        static F: std::sync::OnceLock<(Committee, Vec<Validator>)> = std::sync::OnceLock::new();
+        F.get_or_init(|| {
+            let vs: Vec<Validator> = (0..21)
+                .map(|i| {
+                    let mut seed = [0u8; 32];
+                    seed[..8].copy_from_slice(b"f5-3b-nd");
+                    seed[8] = i as u8;
+                    Validator::from_seed(i, seed)
+                })
+                .collect();
+            (Committee::from_keys(vs.iter().map(Validator::verifying_key).collect()), vs)
+        })
+    }
+
+    fn v6_block(parent: &BlockHeader, txs: Vec<TxEntry>, finality: Vec<u8>) -> (BlockHeader, BlockBody) {
+        let height = parent.height + 1;
+        let mut body =
+            BlockBody::from_single_payee(txs, qlab_devnet::emission_exact::coinbase_exact(height), [height; 4]);
+        body.finality = finality;
+        let header =
+            BlockHeader::child_of_for(GenesisForm::V5, parent, parent.timestamp + 75, 8, body.commitment_v6());
+        (header, body)
+    }
+
+    /// The V6 script both gates and both disk paths replay: blocks 1–8 empty;
+    /// a tx anchored at the empty-tree root at 9 **without** a record (refused:
+    /// no recorded finality, no anchor); block 9 carrying the quorum record
+    /// for checkpoint 8; block 10 spending against the root now under it.
+    fn v6_script(node: &mut MemNode, gate: AnchorGate) -> Vec<Result<Hash32, String>> {
+        let (_, vs) = v6_validators();
+        let mut out = Vec::new();
+        let root = node.commitment_root();
+        let mut parent = node.chain.block(&node.tip_hash()).unwrap().header();
+        for _ in 1..=8 {
+            let (h, b) = v6_block(&parent, vec![], vec![]);
+            out.push(node.apply_block_gated(h, b, &MockVerifier, gate).map_err(|e| format!("{e:?}")));
+            parent = h;
+        }
+        let (h9_bad, b9_bad) = v6_block(&parent, vec![tx(root, 0x51)], vec![]);
+        out.push(node.apply_block_gated(h9_bad, b9_bad, &MockVerifier, gate).map_err(|e| format!("{e:?}")));
+        let cp8 = qlab_devnet::committee::Checkpoint::new(8, node.tip_hash(), node.tip_hash());
+        let record = qlab_devnet::finality_record::FinalityRecord {
+            cp: cp8,
+            votes: (0..15).map(|i| vs[i].sign_checkpoint(&cp8)).collect(),
+        }
+        .encode();
+        let (h9, b9) = v6_block(&parent, vec![], record);
+        out.push(node.apply_block_gated(h9, b9, &MockVerifier, gate).map_err(|e| format!("{e:?}")));
+        let (h10, b10) = v6_block(&h9, vec![tx(root, 0x52)], vec![]);
+        out.push(node.apply_block_gated(h10, b10, &MockVerifier, gate).map_err(|e| format!("{e:?}")));
+        out
+    }
+
+    /// 🔒 **F5-3b merge condition — replay equals live.** On a V6 net the
+    /// anchor verdict reads only the block's ancestry, so the Live and
+    /// SettledHistory gates return the same verdict for every block —
+    /// including the refusal — and a reopened node (full replay, then the
+    /// snapshot path) re-derives the same recorded finality and tip.
+    #[test]
+    fn v6_live_and_settled_history_agree_and_replay_rederives_the_record() {
+        let (c0, _) = v6_validators();
+        let genesis = genesis_block_v6(8, 0);
+        let mut live = MemNode::in_memory_v6(genesis.clone(), c0.clone());
+        let mut settled = MemNode::in_memory_v6(genesis.clone(), c0.clone());
+        let a = v6_script(&mut live, AnchorGate::Live);
+        let b = v6_script(&mut settled, AnchorGate::SettledHistory);
+        assert_eq!(a, b, "one verdict per block whichever gate the caller names");
+        assert!(a[..8].iter().all(Result::is_ok));
+        assert!(a[8].as_ref().unwrap_err().contains("AnchorOutsideRecord"), "{:?}", a[8]);
+        assert!(a[9].is_ok() && a[10].is_ok(), "{a:?}");
+        assert_eq!(live.recorded_finality(), Some(8));
+        assert_eq!(live.tip_hash(), settled.tip_hash());
+
+        let dir = temp_dir("v6-replay");
+        let tip = {
+            let mut disk = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).unwrap();
+            assert_eq!(v6_script(&mut disk, AnchorGate::Live), a);
+            disk.tip_hash()
+        };
+        let replayed = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).expect("full replay");
+        assert_eq!((replayed.tip_hash(), replayed.recorded_finality()), (tip, Some(8)));
+        replayed.save_snapshot().unwrap();
+        let resumed = MemNode::open_v6(&dir, genesis, c0.clone()).expect("snapshot resume");
+        assert_eq!(
+            persist::snapshot_on_disk(&dir).unwrap(),
+            persist::SnapshotOnDisk::At { applied_height: 10 }
+        );
+        assert_eq!((resumed.tip_hash(), resumed.recorded_finality()), (tip, Some(8)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewind below the carrying block drops the recorded finality with it,
+    /// and re-applying restores it (the derived state follows the fold).
+    #[test]
+    fn v6_recorded_finality_follows_a_rewind() {
+        let (c0, _) = v6_validators();
+        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), c0.clone());
+        let r = v6_script(&mut node, AnchorGate::Live);
+        assert!(r[9].is_ok());
+        let at8 = node.ancestor_at(&node.tip_hash(), 8).unwrap().header().header_hash_for(GenesisForm::V5);
+        node.rewind_to(at8).unwrap();
+        assert_eq!(node.recorded_finality(), None);
+        assert_eq!(node.sections(), BodySections::V6);
+    }
+
+    /// A V6 genesis binds `commitment_v6`, and a V5 node refuses a V6
+    /// datadir record through the stored binding (sections on a V5 net).
+    #[test]
+    fn v6_sections_are_refused_on_a_v5_node() {
+        let (c0, vs) = v6_validators();
+        let _ = c0;
+        let genesis5 = genesis_block_for(GenesisForm::V5, 8, 0);
+        let mut node = MemNode::in_memory_for(GenesisForm::V5, genesis5.clone());
+        let cp = qlab_devnet::committee::Checkpoint::new(8, [1; 32], [1; 32]);
+        let mut body = BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(1), [1; 4]);
+        body.finality = qlab_devnet::finality_record::FinalityRecord {
+            cp,
+            votes: (0..15).map(|i| vs[i].sign_checkpoint(&cp)).collect(),
+        }
+        .encode();
+        let header =
+            BlockHeader::child_of_for(GenesisForm::V5, &genesis5.header(), 75, 8, body.commitment_v5());
+        let err = node.apply_block(header, body, &MockVerifier).unwrap_err();
+        assert!(format!("{err:?}").contains("SectionOnForm"), "{err:?}");
+        assert_ne!(genesis_block_v6(8, 0).header.tx_body_commitment, genesis5.header.tx_body_commitment);
+    }
 }

@@ -212,6 +212,21 @@ pub struct StoredBlock {
     /// (B2b) writes it explicitly.
     #[serde(skip)]
     pub annulet: Option<AnnuletStoredSeal>,
+    /// The V6 body sections (lab #785 F5-3b) — **in-memory only**
+    /// (`serde(skip)`), exactly like `annulet`: no pre-V6 layout writes them,
+    /// and the V6 log record (`persist` variant 4) writes them explicitly.
+    /// `None` is both sections absent.
+    #[serde(skip)]
+    pub sections: Option<StoredSections>,
+}
+
+/// A V6 block's two body sections, as committed (lab #785 F5-3b).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoredSections {
+    /// The finality record's canonical bytes; empty when absent.
+    pub finality: Vec<u8>,
+    /// The wrapper bundle's canonical bytes; empty when absent.
+    pub bundle: Vec<u8>,
 }
 
 impl StoredBlock {
@@ -224,6 +239,10 @@ impl StoredBlock {
             txs: body.txs.iter().map(StoredTx::from).collect(),
             coinbase,
             coinbase_rkm,
+            sections: body.has_v6_sections().then(|| StoredSections {
+                finality: body.finality.clone(),
+                bundle: body.bundle.clone(),
+            }),
         }
     }
 
@@ -272,6 +291,7 @@ impl StoredBlock {
             coinbase: 0,
             coinbase_rkm: [0; 4],
             annulet: Some(AnnuletStoredSeal { ext, sig }),
+            sections: None,
         }
     }
 
@@ -284,7 +304,13 @@ impl StoredBlock {
 
     /// The live devnet body this block round-trips to.
     pub fn body(&self) -> BlockBody {
-        BlockBody::from_single_payee(self.txs.iter().map(TxEntry::from).collect(), self.coinbase, self.coinbase_rkm)
+        let mut body =
+            BlockBody::from_single_payee(self.txs.iter().map(TxEntry::from).collect(), self.coinbase, self.coinbase_rkm);
+        if let Some(s) = &self.sections {
+            body.finality = s.finality.clone();
+            body.bundle = s.bundle.clone();
+        }
+        body
     }
 }
 

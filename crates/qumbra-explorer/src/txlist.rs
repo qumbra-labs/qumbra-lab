@@ -642,7 +642,7 @@ mod tests {
     }
 
     fn stored_block(height: u64, txs: Vec<StoredTx>) -> StoredBlock {
-        StoredBlock { annulet: None,
+        StoredBlock { annulet: None, sections: None,
             header: qlab_node::StoredHeader {
                 prev: h32(height.saturating_sub(1) as u8),
                 height,

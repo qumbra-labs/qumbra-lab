@@ -199,16 +199,50 @@ impl FinalityRecord {
         Ok(rec)
     }
 
-    /// Rules 1–4 (module doc). `prior` is `CR(parent)`: the height of the
-    /// latest record in the parent's ancestry, if any. `ancestor_at(h)` is the
-    /// hash of this block's ancestor at height `h` (`None` at or above its own
-    /// height). `committee0` is the genesis committee, by genesis index.
+    /// The canonical-form rules a record must satisfy however it was built
+    /// (lab #785 PR #789 review K1): `QUORUM ≤ n ≤ N`, signers strictly
+    /// ascending and `< N`, `root == block_hash`. [`Self::decode`] enforces
+    /// them on the way in; [`Self::check`] re-asserts them, so a record built
+    /// by hand (the fields are public) cannot pass rule 4 with one signature
+    /// repeated.
+    pub fn structural(&self) -> Result<(), RecordError> {
+        let n = self.votes.len();
+        if !(FROZEN_QUORUM..=FROZEN_COMMITTEE_SIZE).contains(&n) {
+            return Err(RecordError::VoteCount { got: n });
+        }
+        let mut last: Option<usize> = None;
+        for v in &self.votes {
+            if v.signer >= FROZEN_COMMITTEE_SIZE {
+                return Err(RecordError::SignerRange { signer: v.signer });
+            }
+            if last.is_some_and(|l| v.signer <= l) {
+                return Err(RecordError::SignerOrder);
+            }
+            last = Some(v.signer);
+        }
+        if self.cp.root != self.cp.block_hash {
+            return Err(RecordError::Root);
+        }
+        Ok(())
+    }
+
+    /// Rules 1–4 (module doc), after [`Self::structural`]. `prior` is
+    /// `CR(parent)`: the height of the latest record in the parent's ancestry,
+    /// if any. `ancestor_at(h)` is the hash of this block's ancestor at height
+    /// `h` (`None` at or above its own height). `committee0` is the genesis
+    /// committee, by genesis index.
+    ///
+    /// **This does not verify `ancestor_at`'s contract.** Rule 3 is only as
+    /// good as the caller's ancestry lookup: it must answer from the chain
+    /// this block extends (never the node's current tip) and return `None`
+    /// at or above the block's own height.
     pub fn check(
         &self,
         prior: Option<u64>,
         ancestor_at: impl Fn(u64) -> Option<Hash32>,
         committee0: &Committee,
     ) -> Result<(), RecordError> {
+        self.structural()?;
         let h = self.cp.height;
         if !is_checkpoint_height(h, CHECKPOINT_CADENCE_BLOCKS) {
             return Err(RecordError::NotCadence { height: h });
@@ -224,13 +258,8 @@ impl FinalityRecord {
         if ancestor_at(h) != Some(self.cp.block_hash) {
             return Err(RecordError::NotAncestor { height: h });
         }
-        // Rule 4: the decoder already bounded the count to [QUORUM, N] and the
+        // Rule 4: `structural` bounded the count to [QUORUM, N] and the
         // signers to distinct indices < N; every carried signature must verify.
-        if self.votes.len() < FROZEN_QUORUM {
-            return Err(RecordError::VoteCount {
-                got: self.votes.len(),
-            });
-        }
         for v in &self.votes {
             if !committee0.verify_vote(&self.cp, v) {
                 return Err(RecordError::BadSignature { signer: v.signer });
@@ -242,6 +271,11 @@ impl FinalityRecord {
 
 /// The recorded finality after a block: its own record's height if it carries
 /// one, else the parent's.
+///
+/// Taking the own record's height unconditionally relies on **rule 2**
+/// (monotone): only a record that passed [`FinalityRecord::check`] against
+/// `prior` may be passed as `own`, so its height is strictly above `prior`
+/// and recorded finality never moves backwards (review K4).
 pub fn recorded_after(prior: Option<u64>, own: Option<&FinalityRecord>) -> Option<u64> {
     own.map(|r| r.cp.height).or(prior)
 }
@@ -249,6 +283,11 @@ pub fn recorded_after(prior: Option<u64>, own: Option<&FinalityRecord>) -> Optio
 /// **The anchor rule** (module doc): a root first reached at height `root_h`
 /// is a valid anchor in a block at `block_h` whose recorded finality (its own
 /// record included) is `recorded`.
+///
+/// `root_h < block_h` is implied whenever the caller passes a finality its
+/// rules produced (a record names an ancestor, so `recorded < block_h`); the
+/// guard is kept so the function is correct on any input and the
+/// subtraction below cannot underflow (review K4).
 pub fn anchor_ok(root_h: u64, block_h: u64, recorded: Option<u64>) -> bool {
     recorded.is_some_and(|f| root_h <= f)
         && root_h < block_h
@@ -256,7 +295,7 @@ pub fn anchor_ok(root_h: u64, block_h: u64, recorded: Option<u64>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::OnceLock;
 
     use super::*;
@@ -269,14 +308,14 @@ mod tests {
         s
     }
 
-    struct Fx {
-        committee: Committee,
-        validators: Vec<Validator>,
-        cp: Checkpoint,
+    pub(crate) struct Fx {
+        pub(crate) committee: Committee,
+        pub(crate) validators: Vec<Validator>,
+        pub(crate) cp: Checkpoint,
     }
 
     /// Twenty-one rehearsal committee keys and one checkpoint (built once).
-    fn fx() -> &'static Fx {
+    pub(crate) fn fx() -> &'static Fx {
         static F: OnceLock<Fx> = OnceLock::new();
         F.get_or_init(|| {
             let validators: Vec<Validator> = (0..FROZEN_COMMITTEE_SIZE)
@@ -293,7 +332,7 @@ mod tests {
         })
     }
 
-    fn record(signers: &[usize]) -> FinalityRecord {
+    pub(crate) fn record(signers: &[usize]) -> FinalityRecord {
         let f = fx();
         FinalityRecord {
             cp: f.cp,
@@ -304,7 +343,7 @@ mod tests {
         }
     }
 
-    fn quorum() -> Vec<usize> {
+    pub(crate) fn quorum() -> Vec<usize> {
         (0..FROZEN_QUORUM).collect()
     }
 
@@ -315,15 +354,19 @@ mod tests {
 
     #[test]
     fn record_round_trips_at_the_pinned_size_and_checks() {
+        // Size, computed (review K2): 72 checkpoint bytes, a 1-byte count, and
+        // per vote a 1-byte signer, the 2-byte length varint and the signature.
+        let size = |n: usize| 72 + 1 + n * (1 + 2 + SIG_LEN);
         let r = record(&quorum());
         let b = r.encode();
-        assert_eq!(b.len(), 49_753, "15 votes: 72 + 1 + 15 × (1 + 2 + 3309)");
+        assert_eq!(b.len(), size(15));
+        assert_eq!(size(15), 49_753, "the figure the F5-3 plan quotes");
         let d = FinalityRecord::decode(&b).unwrap();
         assert_eq!(d.encode(), b);
         assert_eq!(d.check(None, chain, &fx().committee), Ok(()));
         assert_eq!(d.check(Some(8), chain, &fx().committee), Ok(()));
         let all = record(&(0..FROZEN_COMMITTEE_SIZE).collect::<Vec<_>>()).encode();
-        assert_eq!(all.len(), 69_625, "21 votes");
+        assert_eq!(all.len(), size(21));
         assert!(FinalityRecord::decode(&all).is_ok());
     }
 
@@ -388,6 +431,69 @@ mod tests {
             FinalityRecord::decode(&sr).unwrap_err(),
             RecordError::SignerRange { signer: 21 }
         );
+    }
+
+    /// Review K1: `check` stands on its own — a record built by hand, not
+    /// decoded, with one member's signature repeated fifteen times would pass
+    /// a "15 valid signatures" count; `structural` refuses it first.
+    #[test]
+    fn a_hand_built_record_repeating_one_signature_is_refused() {
+        let f = fx();
+        let one = f.validators[0].sign_checkpoint(&f.cp);
+        let rec = FinalityRecord { cp: f.cp, votes: (0..FROZEN_QUORUM).map(|_| one.clone()).collect() };
+        assert_eq!(rec.check(None, chain, &f.committee), Err(RecordError::SignerOrder));
+        let mut high = record(&quorum());
+        high.votes[14].signer = FROZEN_COMMITTEE_SIZE;
+        assert_eq!(high.check(None, chain, &f.committee), Err(RecordError::SignerRange { signer: 21 }));
+        let mut root = record(&quorum());
+        root.cp.root = [0xcd; 32];
+        assert_eq!(root.check(None, chain, &f.committee), Err(RecordError::Root));
+        let big = FinalityRecord { cp: f.cp, votes: (0..22).map(|i| f.validators[i % 21].sign_checkpoint(&f.cp)).collect() };
+        assert_eq!(big.check(None, chain, &f.committee), Err(RecordError::VoteCount { got: 22 }));
+    }
+
+    /// Review K3: more than 21 votes, a signature length above 3309, and the
+    /// re-encode guard.
+    #[test]
+    fn record_decode_refuses_more_votes_and_longer_signatures() {
+        let f = fx();
+        let mut votes: Vec<Vote> = (0..FROZEN_COMMITTEE_SIZE).map(|i| f.validators[i].sign_checkpoint(&f.cp)).collect();
+        votes.push(Vote { signer: 21, signature: votes[0].signature.clone() });
+        let over = FinalityRecord { cp: f.cp, votes }.encode();
+        assert_eq!(FinalityRecord::decode(&over).unwrap_err(), RecordError::VoteCount { got: 22 });
+        // The first vote's length varint 3309 = 0xed 0x19 → 3310 = 0xee 0x19,
+        // with one extra byte so the declared length is present.
+        let good = record(&quorum()).encode();
+        let mut long = good[..74].to_vec();
+        long.extend([0xee, 0x19]);
+        long.extend_from_slice(&good[76..76 + SIG_LEN]);
+        long.push(0);
+        long.extend_from_slice(&good[76 + SIG_LEN..]);
+        assert_eq!(FinalityRecord::decode(&long).unwrap_err(), RecordError::SigLen { got: 3310 });
+    }
+
+    /// Review K3, `NotCanonical`: the guard is re-encode-and-compare, and no
+    /// decodable non-canonical input is known (ML-DSA's decoder refuses
+    /// malformed hints, the varints are canonical-only). So the guarantee is
+    /// stated as a property instead: across a sweep of single-byte mutations
+    /// of a valid record, every mutation either fails to decode or decodes to
+    /// a record whose encoding is exactly the mutated bytes. A decoder that
+    /// silently normalised would fail here.
+    #[test]
+    fn every_decodable_mutation_re_encodes_to_itself() {
+        let good = record(&quorum()).encode();
+        let mut decoded = 0;
+        for pos in (0..good.len()).step_by(97).chain(76..76 + 64) {
+            for delta in [0x01u8, 0x80] {
+                let mut m = good.clone();
+                m[pos] ^= delta;
+                if let Ok(r) = FinalityRecord::decode(&m) {
+                    decoded += 1;
+                    assert_eq!(r.encode(), m, "byte {pos} ^ {delta:#x} decoded to a different encoding");
+                }
+            }
+        }
+        assert!(decoded > 0, "the sweep must reach bytes the decoder accepts (signature bodies)");
     }
 
     #[test]

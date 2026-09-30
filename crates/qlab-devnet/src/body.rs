@@ -86,6 +86,22 @@ pub const BODY_PREIMAGE_DOMAIN_V3: &[u8] = b"qumbra:body:v3";
 /// golden is locked then, not before.
 pub const BODY_PREIMAGE_DOMAIN_V5: &[u8] = b"qumbra:body:v5";
 
+/// Domain tag for **body format v6** — the V6 net's body (genesis format 10,
+/// lab #785 F5-3b): the v5 body followed by two length-prefixed sections,
+/// `finality_len (8 LE) ‖ finality ‖ bundle_len (8 LE) ‖ bundle`, where a
+/// zero length is absence (a canonical record or bundle is never empty).
+/// The new tag keeps a v6 body from ever binding under v5 and the reverse.
+pub const BODY_PREIMAGE_DOMAIN_V6: &[u8] = b"qumbra:body:v6";
+
+/// The V6 net's coinbase payee cap, native at every height (lab #785 F5-3b
+/// ruling (b)): [`COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT`] is not consulted on
+/// V6 (it stays for V5, untouched).
+///
+/// **One, not eight**, because the node cannot yet apply more: the log
+/// record, the coinbase note and the matured leaf are single-payee (lab
+/// #790). N-payee apply is its own baton, and that baton raises this cap.
+pub const COINBASE_PAYEE_CAP_V6: usize = 1;
+
 /// The maximum v5 coinbase payee count after the cap rule activates.
 ///
 /// Eight is the ruled pool split: large enough to reduce payout variance for a
@@ -145,6 +161,7 @@ enum BodyPreimageForm {
     V2,
     V3,
     V5,
+    V6,
 }
 
 /// One coinbase payee in the v5 body form: a raw `rkm` and the amount it is
@@ -321,12 +338,26 @@ pub struct BlockBody {
     /// The block's coinbase payouts. Representation is independent of the
     /// height-keyed validity cap (lab #593 / QUM-161, then QUM-160).
     pub coinbase_payees: Vec<CoinbasePayee>,
+    /// **V6 only** (lab #785 F5-3b): the finality record's canonical bytes
+    /// (`crate::finality_record`), empty when absent. Every other body form
+    /// refuses a non-empty section ([`BodyError::SectionOnForm`]).
+    pub finality: Vec<u8>,
+    /// **V6 only**: the wrapper bundle's canonical bytes, empty when absent.
+    /// Until F5-4 wires `verify_wrapper` as the rule, every bundle is refused
+    /// ([`RefuseAllBundles`]).
+    pub bundle: Vec<u8>,
 }
 
 impl BlockBody {
-    /// Construct a body from its list-shaped coinbase source of truth.
+    /// Construct a body from its list-shaped coinbase source of truth (no
+    /// V6 sections).
     pub fn new(txs: Vec<TxEntry>, coinbase_payees: Vec<CoinbasePayee>) -> Self {
-        Self { txs, coinbase_payees }
+        Self { txs, coinbase_payees, finality: Vec::new(), bundle: Vec::new() }
+    }
+
+    /// Whether either V6 section is present.
+    pub fn has_v6_sections(&self) -> bool {
+        !self.finality.is_empty() || !self.bundle.is_empty()
     }
 
     /// Preserve the old flat pair's exact states while callers migrate to the
@@ -444,9 +475,11 @@ impl BlockBody {
             BodyPreimageForm::V2 => BODY_PREIMAGE_DOMAIN,
             BodyPreimageForm::V3 => BODY_PREIMAGE_DOMAIN_V3,
             BodyPreimageForm::V5 => BODY_PREIMAGE_DOMAIN_V5,
+            BodyPreimageForm::V6 => BODY_PREIMAGE_DOMAIN_V6,
         });
         let rider_tail = !matches!(form, BodyPreimageForm::V2);
-        let v5 = matches!(form, BodyPreimageForm::V5);
+        // V6 is the v5 body plus its section tail: every v5 byte rule applies.
+        let v5 = matches!(form, BodyPreimageForm::V5 | BodyPreimageForm::V6);
         for tx in &self.txs {
             buf.extend_from_slice(&tx.public.anchor);
             if v5 {
@@ -496,7 +529,7 @@ impl BlockBody {
                     buf.extend_from_slice(&lane.to_le_bytes());
                 }
             }
-            BodyPreimageForm::V5 => {
+            BodyPreimageForm::V5 | BodyPreimageForm::V6 => {
                 // The payee-list tail: count ‖ [rkm ‖ amount]×N. The total is
                 // Σ amounts and travels nowhere else — a redundant total that
                 // could disagree with its own list is unrepresentable.
@@ -522,7 +555,22 @@ impl BlockBody {
                 }
             }
         }
+        if matches!(form, BodyPreimageForm::V6) {
+            // The V6 section tail. A zero length is absence; both sections
+            // are always written, so the encoding is unambiguous.
+            buf.extend_from_slice(&(self.finality.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&self.finality);
+            buf.extend_from_slice(&(self.bundle.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&self.bundle);
+        }
         buf
+    }
+
+    /// The **v6** body commitment (lab #785 F5-3b): the v5 bytes under the
+    /// v6 tag, plus the two section tail. The V6 payee cap is native
+    /// ([`COINBASE_PAYEE_CAP_V6`]).
+    pub fn commitment_v6(&self) -> Hash32 {
+        keccak256(&self.preimage_form(BodyPreimageForm::V6, COINBASE_PAYEE_CAP_V6))
     }
 
     /// The **v5** body commitment (lab #470). Stage-2 state: not yet
@@ -751,6 +799,29 @@ pub enum BodyError {
     /// A registry write whose `new_root` is not the block header's
     /// `registry_root` — the block contradicts itself (lab #728).
     L2RegistryWriteRootMismatch { index: usize },
+
+    // --- lab #785 F5-3b: the V6 body form ------------------------------------
+    /// A V6 section (`"finality"` or `"bundle"`) is present on a body form
+    /// that has none. The V4/V5 preimages do not cover the sections, so
+    /// without this refusal a peer could attach bytes no header committed to.
+    SectionOnForm { section: &'static str },
+    /// The body's finality record fails the record rules
+    /// ([`crate::finality_record::FinalityRecord::check`]); `err` is the
+    /// record's own verdict, kept rather than flattened.
+    FinalityRecord { err: crate::finality_record::RecordError },
+    /// The body's wrapper bundle was refused by the bundle rule. Until F5-4
+    /// wires `verify_wrapper`, every bundle is refused ([`RefuseAllBundles`]).
+    BundleRefused,
+    /// **V6's anchor rule**: the tx at `index` names a root that is not a
+    /// commitment root at some ancestor height `h` with `h ≤` the block's
+    /// recorded finality and `H − h ≤ MAX_ANCHOR_AGE_BLOCKS`.
+    ///
+    /// A separate variant from [`BodyError::AnchorNotFinal`] on purpose: this
+    /// verdict is a pure function of the chain, so it is **intrinsic** — every
+    /// node reaches it identically, live or replaying — while `AnchorNotFinal`
+    /// reads the node's local finality and is positional (the #134 amnesty).
+    /// A scorer must be able to tell them apart without knowing the form.
+    AnchorOutsideRecord { index: usize },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
@@ -835,6 +906,16 @@ pub fn check_scheduled_coinbase_payees_above(
     payees: &[CoinbasePayee],
 ) -> Result<(), BodyError> {
     let cap = coinbase_payee_cap_v5_above(boundary, height);
+    check_payees_capped_and_scheduled(cap, height, payees)
+}
+
+/// The payee-list Σ rule under an explicit cap — shared by the V5 form
+/// (height-keyed cap) and V6 ([`COINBASE_PAYEE_CAP_V6`], native).
+fn check_payees_capped_and_scheduled(
+    cap: usize,
+    height: u64,
+    payees: &[CoinbasePayee],
+) -> Result<(), BodyError> {
     if payees.len() > cap {
         return Err(BodyError::TooManyCoinbasePayees {
             got: payees.len(),
@@ -1020,10 +1101,120 @@ where
     validate_body_form(BodyRuleForm::V4 { name_boundary: boundary }, header, body, verifier, is_anchor_final, name_view)
 }
 
+/// What the V6 funnel reads from the chain **as of the block being
+/// validated** — every answer is a function of that block's ancestry, never
+/// of the node's tip or its local finality, which is what makes the V6
+/// verdict identical live and in replay (lab #785 Q-L5).
+pub trait V6ChainView {
+    /// `CR(parent)`: the latest recorded finality height in the block's
+    /// ancestry (the parent included), or `None` if no ancestor carries a
+    /// record.
+    fn recorded_finality(&self) -> Option<u64>;
+    /// The hash of the block's ancestor at `height`; `None` for any height at
+    /// or above the block's own.
+    fn ancestor_at(&self, height: u64) -> Option<Hash32>;
+    /// Genesis committee₀, by genesis index (ruling Q1).
+    fn committee0(&self) -> &crate::committee::Committee;
+    /// The ascending ancestor heights (all below the block's own) after which
+    /// `root` was the commitment root. Empty for a root this ancestry never had.
+    fn root_heights(&self, root: &Hash32) -> &[u64];
+}
+
+/// The bundle rule's seam. F5-3b ships [`RefuseAllBundles`] only; F5-4 wires
+/// `verify_wrapper` V0–V9 behind this trait.
+pub trait BundleVerifier {
+    /// `true` iff `bundle` is valid in the block `header` heads.
+    fn verify_bundle(&self, header: &BlockHeader, bundle: &[u8]) -> bool;
+}
+
+/// Refuses every bundle — so no bundle can land unverified between the form
+/// (F5-3b) and the rule (F5-4).
+pub struct RefuseAllBundles;
+
+impl BundleVerifier for RefuseAllBundles {
+    fn verify_bundle(&self, _header: &BlockHeader, _bundle: &[u8]) -> bool {
+        false
+    }
+}
+
+/// The finality record a V6 body carries, decoded — `None` when the section
+/// is absent. Decoding alone is not validity: see [`validate_body_v6`].
+pub fn finality_record_of(
+    body: &BlockBody,
+) -> Result<Option<crate::finality_record::FinalityRecord>, crate::finality_record::RecordError> {
+    if body.finality.is_empty() {
+        return Ok(None);
+    }
+    crate::finality_record::FinalityRecord::decode(&body.finality).map(Some)
+}
+
+/// V6's anchor rule over a chain view: `root` is valid in a block at
+/// `block_h` whose recorded finality is `recorded` iff some ancestor height
+/// `h` carrying it satisfies [`crate::finality_record::anchor_ok`]. The
+/// newest qualifying height is the only candidate worth testing — the rule
+/// is `h ≤ min(recorded, block_h − 1)` and `block_h − h ≤ window`, so if the
+/// newest such `h` is outside the window every older one is too.
+pub fn v6_anchor_ok(heights: &[u64], block_h: u64, recorded: Option<u64>) -> bool {
+    let Some(f) = recorded else { return false };
+    let ceiling = f.min(block_h.saturating_sub(1));
+    let upto = heights.partition_point(|h| *h <= ceiling);
+    upto > 0 && crate::finality_record::anchor_ok(heights[upto - 1], block_h, recorded)
+}
+
+/// The V6 header/body binding: the payee cap first (so the preimage's cap
+/// assert is unreachable from a peer), then [`BlockBody::commitment_v6`].
+pub fn check_body_binding_v6(header: &BlockHeader, body: &BlockBody) -> Result<(), BodyError> {
+    if body.coinbase_payees.len() > COINBASE_PAYEE_CAP_V6 {
+        return Err(BodyError::TooManyCoinbasePayees {
+            got: body.coinbase_payees.len(),
+            cap: COINBASE_PAYEE_CAP_V6,
+        });
+    }
+    let got = body.commitment_v6();
+    if header.tx_body_commitment != got {
+        return Err(BodyError::CommitmentMismatch { expected: header.tx_body_commitment, got });
+    }
+    Ok(())
+}
+
+/// **The V6 rule funnel** (lab #785 F5-3b): the v5 rules under the v6
+/// binding and native payee cap, then the two sections —
+///
+/// 1. the **finality record**, if present, checked against the chain view
+///    (cadence, monotone over `CR(parent)`, ancestor, committee₀ signatures);
+/// 2. the **bundle**, if present, through `bundles` (every bundle refused
+///    until F5-4);
+/// 3. every tx anchor under the **record** rule ([`v6_anchor_ok`]) with the
+///    block's own record counted — [`BodyError::AnchorOutsideRecord`].
+///
+/// There is no finality predicate argument: V6 anchors never read the node's
+/// local finality (the #402 Live/SettledHistory split does not exist here).
+pub fn validate_body_v6<V, N>(
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    chain: &dyn V6ChainView,
+    bundles: &dyn BundleVerifier,
+    name_view: &N,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    N: names::NameView,
+{
+    validate_body_form(
+        BodyRuleForm::V6 { chain, bundles },
+        header,
+        body,
+        verifier,
+        |_: &Hash32| false,
+        name_view,
+    )
+}
+
 /// The body rule form [`validate_body_form`] runs under — the funnel's arm of
 /// the lab #470 keying. Internal: public callers are the v4 wrappers above and
-/// [`validate_body_v5`].
-enum BodyRuleForm {
+/// [`validate_body_v5`] / [`validate_body_v6`].
+enum BodyRuleForm<'a> {
     /// v4-genesis nets: the v2/v3 body forms keyed at `name_boundary` (binding
     /// AND rider gate — a drill that armed one without the other would
     /// validate a chain no real binary runs), the boundary-grandfathered
@@ -1034,6 +1225,11 @@ enum BodyRuleForm {
     /// grandfathering. Composes with (never edits) the v4 machinery: the v4
     /// consts are simply never consulted on this arm.
     V5 { payee_boundary: Option<u64> },
+    /// V6-genesis nets (lab #785): the v5 rules under the v6 binding, the
+    /// native payee cap [`COINBASE_PAYEE_CAP_V6`], the two sections, and the
+    /// **record-based** anchor rule read from `chain` instead of the caller's
+    /// finality predicate.
+    V6 { chain: &'a dyn V6ChainView, bundles: &'a dyn BundleVerifier },
 }
 
 /// **The v5 rule funnel** (lab #470 stage 3, C4): [`validate_body_above`]'s
@@ -1108,7 +1304,19 @@ where
         BodyRuleForm::V5 { payee_boundary } => {
             coinbase_payee_cap_v5_above(*payee_boundary, header.height)
         }
+        BodyRuleForm::V6 { .. } => COINBASE_PAYEE_CAP_V6,
     };
+    // Sections exist only on V6: the V4/V5 preimages do not cover them, so a
+    // section there is bytes no header committed to. Refused before binding
+    // because binding would *pass* with them silently ignored.
+    if !matches!(form, BodyRuleForm::V6 { .. }) {
+        if !body.finality.is_empty() {
+            return Err(BodyError::SectionOnForm { section: "finality" });
+        }
+        if !body.bundle.is_empty() {
+            return Err(BodyError::SectionOnForm { section: "bundle" });
+        }
+    }
     if body.coinbase_payees.len() > payee_cap {
         return Err(BodyError::TooManyCoinbasePayees {
             got: body.coinbase_payees.len(),
@@ -1122,6 +1330,7 @@ where
         BodyRuleForm::V5 { payee_boundary } => {
             check_body_binding_v5_above(*payee_boundary, header, body)?
         }
+        BodyRuleForm::V6 { .. } => check_body_binding_v6(header, body)?,
     }
     // A minting block must name a payee (issue #101). Second-cheapest check
     // after the binding, and it guards the block's whole issuance.
@@ -1139,14 +1348,47 @@ where
             header.height,
             &body.coinbase_payees,
         )?,
+        BodyRuleForm::V6 { .. } => check_payees_capped_and_scheduled(
+            COINBASE_PAYEE_CAP_V6,
+            header.height,
+            &body.coinbase_payees,
+        )?,
     }
+    // V6 sections, after the binding (the body is the header's) and the
+    // integer coinbase checks, before any tx work: the record fixes the
+    // finality every anchor below is judged against.
+    let v6_recorded = match &form {
+        BodyRuleForm::V6 { chain, bundles } => {
+            let prior = chain.recorded_finality();
+            let record = finality_record_of(body).map_err(|err| BodyError::FinalityRecord { err })?;
+            if let Some(r) = &record {
+                r.check(prior, |h| chain.ancestor_at(h), chain.committee0())
+                    .map_err(|err| BodyError::FinalityRecord { err })?;
+            }
+            if !body.bundle.is_empty() && !bundles.verify_bundle(header, &body.bundle) {
+                return Err(BodyError::BundleRefused);
+            }
+            crate::finality_record::recorded_after(prior, record.as_ref())
+        }
+        _ => None,
+    };
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
     // Names revealed earlier in this block — the same-block tie rule: earliest
     // tx order wins (brief §1 step 4).
     let mut pending_names: HashSet<Vec<u8>> = HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
-        if !is_anchor_final(&tx.public.anchor) {
-            return Err(BodyError::AnchorNotFinal { index: i });
+        match &form {
+            BodyRuleForm::V6 { chain, .. } => {
+                let heights = chain.root_heights(&tx.public.anchor);
+                if !v6_anchor_ok(heights, header.height, v6_recorded) {
+                    return Err(BodyError::AnchorOutsideRecord { index: i });
+                }
+            }
+            _ => {
+                if !is_anchor_final(&tx.public.anchor) {
+                    return Err(BodyError::AnchorNotFinal { index: i });
+                }
+            }
         }
         // The rider decodes before the fee check because the fee rule depends
         // on the op (the split: relay tier + burned name fee).
@@ -1157,8 +1399,9 @@ where
                 crate::names::riders_active_above(*name_boundary, header.height)
             }
             // C4: names native from height ≥ 1 on a v5 net — same strictly-
-            // above-genesis shape as `riders_active_above(Some(0), h)`.
-            BodyRuleForm::V5 { .. } => header.height > 0,
+            // above-genesis shape as `riders_active_above(Some(0), h)`. V6
+            // inherits it.
+            BodyRuleForm::V5 { .. } | BodyRuleForm::V6 { .. } => header.height > 0,
         };
         if op.is_some() && !riders_active {
             return Err(BodyError::RiderBeforeBoundary { index: i });
@@ -1327,6 +1570,7 @@ pub fn repeated_nullifier_in_tx(p: &TxPublic) -> Option<Hash32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
     use qlab_note::kem::CT_LEN;
     use qlab_note::wire::{ClueSlot, CompactEntry};
 
@@ -2900,5 +3144,224 @@ mod tests {
                 cap: COINBASE_PAYEE_CAP_V5,
             })
         );
+    }
+
+    // --- lab #785 F5-3b: the V6 body form ------------------------------------
+
+    /// A chain view over fixed answers: the fixture checkpoint (height 16,
+    /// `[0xab; 32]`, from `finality_record`'s tests) is the only ancestor it
+    /// knows, and `FINAL_ANCHOR` was the root after `anchor_heights`.
+    struct Cv {
+        recorded: Option<u64>,
+        anchor_heights: Vec<u64>,
+    }
+
+    impl V6ChainView for Cv {
+        fn recorded_finality(&self) -> Option<u64> {
+            self.recorded
+        }
+        fn ancestor_at(&self, height: u64) -> Option<Hash32> {
+            (height == 16).then_some([0xab; 32])
+        }
+        fn committee0(&self) -> &crate::committee::Committee {
+            &crate::finality_record::tests::fx().committee
+        }
+        fn root_heights(&self, root: &Hash32) -> &[u64] {
+            if *root == FINAL_ANCHOR { &self.anchor_heights } else { &[] }
+        }
+    }
+
+    fn header_v6(height: u64, body: &BlockBody) -> BlockHeader {
+        BlockHeader {
+            height,
+            ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, body.commitment_v6())
+        }
+    }
+
+    fn v6(height: u64, body: &BlockBody, cv: &Cv) -> Result<(), BodyError> {
+        validate_body_v6(&header_v6(height, body), body, &MockVerifier, cv, &RefuseAllBundles, &names::EmptyNameView)
+    }
+
+    fn quorum_record_bytes() -> Vec<u8> {
+        use crate::finality_record::tests::{quorum, record};
+        record(&quorum()).encode()
+    }
+
+    /// 🔒 Absent sections are **eight zero bytes each** (the accepted
+    /// deviation from the plan's presence byte: `len u64 LE ‖ bytes`, the
+    /// file's proof/discovery/rider idiom), so an absent-section V6 preimage is
+    /// the v5 preimage under the v6 tag plus sixteen zero bytes. The empty-body
+    /// golden was computed independently of this crate (Python Keccak-256 over
+    /// `"qumbra:body:v6" ‖ 0x00 ‖ 0x00×16`, the same method reproducing the v5
+    /// empty golden `82c2707b…`).
+    #[test]
+    fn v6_absent_sections_are_eight_zero_bytes_each() {
+        for body in [BlockBody::default(), golden_body()] {
+            let v5 = body.preimage_form(BodyPreimageForm::V5, COINBASE_PAYEE_CAP_V5);
+            let v6 = body.preimage_form(BodyPreimageForm::V6, COINBASE_PAYEE_CAP_V6);
+            let mut expect = BODY_PREIMAGE_DOMAIN_V6.to_vec();
+            expect.extend_from_slice(&v5[BODY_PREIMAGE_DOMAIN_V5.len()..]);
+            expect.extend_from_slice(&[0u8; 16]);
+            assert_eq!(v6, expect);
+        }
+        assert_eq!(
+            hex_of(&BlockBody::default().commitment_v6()),
+            "0e32092e64d751a28f72c34625b36e32cf0589a2993e608c86b8fe15f50cad1d",
+        );
+    }
+
+    /// The v6 commitment covers each section, and the two length prefixes
+    /// keep bytes from sliding between them.
+    #[test]
+    fn v6_commitment_covers_both_sections_and_their_boundary() {
+        let base = BlockBody::default().commitment_v6();
+        let with = |f: &[u8], b: &[u8]| {
+            BlockBody { finality: f.to_vec(), bundle: b.to_vec(), ..Default::default() }.commitment_v6()
+        };
+        let f = with(&[1, 2], &[]);
+        let b = with(&[], &[1, 2]);
+        let split = with(&[1], &[2]);
+        for c in [f, b, split] {
+            assert_ne!(c, base);
+        }
+        assert_ne!(f, b);
+        assert_ne!(f, split);
+        assert_ne!(b, split);
+    }
+
+    /// V4/V5 bodies carry no sections: their preimages do not cover them, so a
+    /// section there is refused by name before the binding could pass it.
+    #[test]
+    fn a_section_on_a_v4_or_v5_body_is_refused() {
+        for (section, which) in [("finality", 0), ("bundle", 1)] {
+            let mut body = BlockBody::from_single_payee(vec![], coinbase_exact(5), MINER_RKM);
+            if which == 0 { body.finality = vec![7] } else { body.bundle = vec![7] }
+            let want = Err(BodyError::SectionOnForm { section });
+            let h5 = BlockHeader { height: 5, ..header_for(&body) };
+            let mut hv5 = h5;
+            hv5.tx_body_commitment = body.commitment_v5();
+            assert_eq!(validate_body_v5(&hv5, &body, &MockVerifier, is_final, &names::EmptyNameView), want);
+            assert_eq!(validate_body(&header_at(5, &body), &body, &MockVerifier, is_final), want);
+        }
+    }
+
+    /// The bindings refuse each other both ways: a V5-bound header under the
+    /// V6 funnel and a V6-bound header under the V5 funnel.
+    #[test]
+    fn v5_and_v6_bindings_refuse_each_other() {
+        let body = BlockBody::from_single_payee(vec![], coinbase_exact(5), MINER_RKM);
+        let cv = Cv { recorded: None, anchor_heights: vec![] };
+        let mut v5_bound = header_v6(5, &body);
+        v5_bound.tx_body_commitment = body.commitment_v5();
+        assert!(matches!(
+            validate_body_v6(&v5_bound, &body, &MockVerifier, &cv, &RefuseAllBundles, &names::EmptyNameView),
+            Err(BodyError::CommitmentMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_body_v5(&header_v6(5, &body), &body, &MockVerifier, is_final, &names::EmptyNameView),
+            Err(BodyError::CommitmentMismatch { .. })
+        ));
+        assert_eq!(v6(5, &body, &cv), Ok(()));
+    }
+
+    /// Ruling (b): V6's payee cap is **1 at every height** — the V5 boundary
+    /// (11,520) is not consulted — until N-payee apply lands (lab #790).
+    #[test]
+    fn v6_payee_cap_is_one_at_every_height() {
+        assert_eq!(COINBASE_PAYEE_CAP_V6, 1);
+        let two = |h: u64| {
+            let total = coinbase_exact(h.max(1));
+            BlockBody::new(
+                vec![],
+                vec![
+                    CoinbasePayee { rkm: [1; 4], amount: total / 2 },
+                    CoinbasePayee { rkm: [2; 4], amount: total - total / 2 },
+                ],
+            )
+        };
+        let cv = Cv { recorded: None, anchor_heights: vec![] };
+        for h in [0, 1, 11_520, 11_521] {
+            let body = two(h);
+            let want = Err(BodyError::TooManyCoinbasePayees { got: 2, cap: 1 });
+            assert_eq!(v6(h, &body, &cv), want, "height {h}");
+            // The binding alone refuses too, before hashing an over-cap list.
+            assert_eq!(check_body_binding_v6(&header_v6(h, &BlockBody::default()), &body), want);
+        }
+        // One payee at the exact schedule is fine on both sides of 11,520.
+        for h in [11_520, 11_521] {
+            let one = BlockBody::from_single_payee(vec![], coinbase_exact(h), MINER_RKM);
+            assert_eq!(v6(h, &one, &cv), Ok(()), "height {h}");
+        }
+    }
+
+    /// 🔒 Every bundle is refused until F5-4 wires `verify_wrapper` — the
+    /// section is committed and decoded nowhere else, so this is the one gate.
+    #[test]
+    fn every_v6_bundle_is_refused_until_f5_4() {
+        let cv = Cv { recorded: None, anchor_heights: vec![] };
+        for bytes in [vec![0u8], vec![0xff; 4096]] {
+            let mut body = BlockBody::from_single_payee(vec![], coinbase_exact(20), MINER_RKM);
+            body.bundle = bytes;
+            assert_eq!(v6(20, &body, &cv), Err(BodyError::BundleRefused));
+        }
+        assert!(!RefuseAllBundles.verify_bundle(&BlockHeader::genesis(1, 0), &[]));
+    }
+
+    /// A bad record is refused with the record's own verdict: bytes that do
+    /// not decode, and a valid record that is not above `CR(parent)`.
+    #[test]
+    fn v6_record_refusals_keep_the_records_verdict() {
+        use crate::finality_record::RecordError;
+        let mut body = BlockBody::from_single_payee(vec![], coinbase_exact(20), MINER_RKM);
+        body.finality = vec![1, 2, 3];
+        let none = Cv { recorded: None, anchor_heights: vec![] };
+        assert!(matches!(
+            v6(20, &body, &none),
+            Err(BodyError::FinalityRecord { err: RecordError::Malformed(_) })
+        ));
+        body.finality = quorum_record_bytes();
+        assert_eq!(v6(20, &body, &none), Ok(()));
+        let later = Cv { recorded: Some(16), anchor_heights: vec![] };
+        assert_eq!(
+            v6(20, &body, &later),
+            Err(BodyError::FinalityRecord { err: RecordError::NotMonotone { height: 16, prior: 16 } })
+        );
+    }
+
+    /// V6's anchor rule is the **record's**: no record in the ancestry means
+    /// no anchor; the block's own record counts; the window runs from the
+    /// block's own height; and the verdict is `AnchorOutsideRecord`, never the
+    /// positional `AnchorNotFinal`.
+    #[test]
+    fn v6_anchors_are_judged_against_the_recorded_finality() {
+        let tx_body = |h: u64| BlockBody::from_single_payee(vec![good_tx(0x31)], coinbase_exact(h), MINER_RKM);
+        let root_at_16 = Cv { recorded: None, anchor_heights: vec![3, 16] };
+        let body = tx_body(20);
+        assert_eq!(v6(20, &body, &root_at_16), Err(BodyError::AnchorOutsideRecord { index: 0 }));
+        // The same block carrying the record for 16: the record itself makes
+        // the anchor valid.
+        let mut carrying = tx_body(20);
+        carrying.finality = quorum_record_bytes();
+        assert_eq!(v6(20, &carrying, &root_at_16), Ok(()));
+        // A record in the ancestry does the same.
+        let recorded = Cv { recorded: Some(16), anchor_heights: vec![3, 16] };
+        assert_eq!(v6(20, &body, &recorded), Ok(()));
+        // Window from the block's own height: 16 + 1,152 is the last block
+        // that may name it.
+        let edge = 16 + MAX_ANCHOR_AGE_BLOCKS;
+        assert_eq!(v6(edge, &tx_body(edge), &recorded), Ok(()));
+        assert_eq!(v6(edge + 1, &tx_body(edge + 1), &recorded), Err(BodyError::AnchorOutsideRecord { index: 0 }));
+    }
+
+    #[test]
+    fn v6_anchor_ok_picks_the_newest_height_under_the_record() {
+        // Root seen at 3 and 40; record at 16. 40 is above the record, 3 is
+        // under it: valid while 3 is in the window.
+        assert!(v6_anchor_ok(&[3, 40], 50, Some(16)));
+        assert!(!v6_anchor_ok(&[3, 40], 3 + MAX_ANCHOR_AGE_BLOCKS + 1, Some(16)));
+        assert!(!v6_anchor_ok(&[40], 50, Some(16)), "only above the record");
+        assert!(!v6_anchor_ok(&[3], 50, None), "no record, no anchor");
+        assert!(!v6_anchor_ok(&[], 50, Some(16)));
+        assert!(!v6_anchor_ok(&[16], 16, Some(16)), "an anchor is below its block");
     }
 }

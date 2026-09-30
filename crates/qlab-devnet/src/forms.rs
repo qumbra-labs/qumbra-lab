@@ -63,6 +63,35 @@ pub enum GenesisForm {
     Annulet,
 }
 
+/// The block-body **section** axis beside [`GenesisForm`] (lab #785 F5-3b,
+/// ruling (B)). V6 — genesis format 10, the wrapper-bundle net — is
+/// [`GenesisForm::V5`] in every header, coinbase, pool, wallet and emission
+/// respect, and differs only in its body: two optional sections (the
+/// finality record and the wrapper bundle) in the `qumbra:body:v6` preimage,
+/// and the record-based anchor rule. So V6 is **V5 plus this axis**, read
+/// only where bodies are committed, validated, stored, carried or mined —
+/// never a fourth form every V5 arm would have to learn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BodySections {
+    /// No sections: V4 and V5 bodies, and every Annulet body.
+    #[default]
+    None,
+    /// The V6 sections (finality record, wrapper bundle), V5 form only.
+    V6,
+}
+
+/// Genesis format **10**: the V6 net (lab #785 F5-3), `(V5, BodySections::V6)`.
+pub const V6_GENESIS_FORMAT_VERSION: u32 = 10;
+
+/// The form set **and** body-section axis a genesis `format_version` selects:
+/// every served version, with format 10 the only one carrying sections.
+pub fn forms_of_genesis_format_version(v: u32) -> Option<(GenesisForm, BodySections)> {
+    if v == V6_GENESIS_FORMAT_VERSION {
+        return Some((GenesisForm::V5, BodySections::V6));
+    }
+    GenesisForm::from_genesis_format_version(v).map(|f| (f, BodySections::None))
+}
+
 impl GenesisForm {
     /// The committed discovery payload width on this form (lab #714) — the
     /// one selection point: the L1's 120-B `PAYLOAD_LEN` (104-B note + tag),
