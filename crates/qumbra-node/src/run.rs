@@ -430,6 +430,9 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
 struct CachedMineTemplate {
     tip: qlab_devnet::header::Hash32,
     mempool_len: usize,
+    /// PR #792 review F2: a V6 template carries a record (and filters its txs
+    /// by it), so a finalization since the cache was filled makes it stale.
+    record_height: Option<u64>,
     payees: Vec<qlab_devnet::body::CoinbasePayee>,
     wire: MineTemplateWire,
 }
@@ -720,6 +723,9 @@ pub struct PreparedNode<'a, P: PowEngine, V: TxVerifier + Clone> {
 /// or an Annulet one with the sequencer key when this node is the producer.
 enum PreparedGenesis<'a> {
     L1(&'a GenesisFile),
+    /// Lab #785 F5-3c: the V6 net — the L1 shape (committee, halt gates,
+    /// PoW) over format 10, opened with the V6 body sections.
+    V6(&'a crate::genesis_v6::GenesisFileV6),
     Annulet {
         file: &'a crate::annulet_genesis::AnnuletGenesisFile,
         sequencer: Option<qlab_devnet::annulet::SequencerKey>,
@@ -753,6 +759,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         verifier: V,
     ) -> Result<Self, RunError> {
         Self::start_with_release(config, genesis, pow, verifier, RELEASE)
+    }
+
+    /// [`Self::start`] for a **V6** genesis (lab #785 F5-3c): prepare, then open.
+    pub fn start_v6(
+        config: &NodeConfig,
+        genesis: &crate::genesis_v6::GenesisFileV6,
+        pow: P,
+        verifier: V,
+    ) -> Result<Self, RunError> {
+        Self::prepare_v6(config, genesis, pow, verifier)?.open()
     }
 
     /// [`Self::start`] against an explicit [`Release`] (issue #74).
@@ -792,6 +808,48 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn prepare_with_release<'a>(
         config: &'a NodeConfig,
         genesis: &'a GenesisFile,
+        pow: P,
+        verifier: V,
+        release: Release,
+    ) -> Result<PreparedNode<'a, P, V>, RunError> {
+        Self::prepare_l1_family(
+            config,
+            genesis,
+            PreparedGenesis::L1(genesis),
+            || genesis.verify_startup(config.expected_genesis_hash.as_deref()),
+            pow,
+            verifier,
+            release,
+        )
+    }
+
+    /// [`Self::prepare`] for a **V6** genesis (lab #785 F5-3c): the same
+    /// halt gates, committee₀, key cross-checks and sim parameters, read from
+    /// the V6 file's base — with the V6 startup gate (format 10, this
+    /// binary's wrapper constants, the V6 hash pin) in place of the L1 one.
+    /// committee₀ comes from this file and nowhere else.
+    pub fn prepare_v6<'a>(
+        config: &'a NodeConfig,
+        genesis: &'a crate::genesis_v6::GenesisFileV6,
+        pow: P,
+        verifier: V,
+    ) -> Result<PreparedNode<'a, P, V>, RunError> {
+        Self::prepare_l1_family(
+            config,
+            &genesis.base,
+            PreparedGenesis::V6(genesis),
+            || genesis.verify_startup(config.expected_genesis_hash.as_deref()),
+            pow,
+            verifier,
+            RELEASE,
+        )
+    }
+
+    fn prepare_l1_family<'a>(
+        config: &'a NodeConfig,
+        genesis: &'a GenesisFile,
+        which: PreparedGenesis<'a>,
+        verify_startup: impl FnOnce() -> Result<(), crate::genesis::GenesisError>,
         pow: P,
         verifier: V,
         release: Release,
@@ -838,7 +896,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
 
         // (1) Byte-verify the genesis file + optional hash pin BEFORE any state.
-        genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
+        verify_startup()?;
 
         // (2) committee₀ from the baked verifying keys; bond = the frozen
         //     steady-state self-bond in bessel (the epoch ramp is a genesis-recorded
@@ -874,7 +932,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 
         Ok(PreparedNode {
             config,
-            genesis: PreparedGenesis::L1(genesis),
+            genesis: which,
             pow,
             verifier,
             release,
@@ -943,6 +1001,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 // + marker (#74/#81). No runtime path to either (H1).
                 adapter.set_chain_rules(ChainRules { form: genesis.form()?, halt: rules });
                 (adapter, genesis.hash(), Duration::from_secs(genesis.frozen.block_time_secs), None)
+            }
+            // Lab #785 F5-3c: the V6 net — V5 headers and coinbase, the V6
+            // body sections, committee₀ from the V6 genesis (the adapter's
+            // record roster), and the V6 genesis hash as the net identity.
+            PreparedGenesis::V6(genesis) => {
+                let mut adapter = NodeAdapter::open_v6(&config.data_dir, committee, pow, verifier, sim)?;
+                qlab_devnet::jprintln!("{}", adapter.punishment_restore().summary_line());
+                adapter.set_chain_rules(ChainRules { form: genesis.forms().0, halt: rules });
+                (adapter, genesis.hash(), Duration::from_secs(genesis.base.frozen.block_time_secs), None)
             }
             // Lab #708: the sequencer net — its own open path (persist variant
             // 3, final = tip), no committee, no punishment ledger, no halt.
@@ -2462,8 +2529,13 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         }
         let tip = self.p2p.node().tip_hash();
         let mempool_len = self.p2p.node().mempool().len();
+        let record_height = self.p2p.node().record_material_height();
         if let Some(cached) = &self.cached_mine_template {
-            if cached.tip == tip && cached.mempool_len == mempool_len && cached.payees == payees {
+            if cached.tip == tip
+                && cached.mempool_len == mempool_len
+                && cached.record_height == record_height
+                && cached.payees == payees
+            {
                 return Ok(cached.wire.clone());
             }
         }
@@ -2476,6 +2548,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         self.cached_mine_template = Some(CachedMineTemplate {
             tip,
             mempool_len,
+            record_height,
             payees: payees.to_vec(),
             wire: wire.clone(),
         });
@@ -3813,6 +3886,46 @@ mod tests {
         );
         let progress = node.p2p.node().grind_progress().expect("kept parked through the refusal");
         assert_eq!(progress, (parent, n1), "the parked cursor is untouched: not advanced, not dropped");
+    }
+
+    /// Lab #785 F5-3c: the V6 net through the REAL run path — `prepare_v6`
+    /// over a format-10 genesis file, committee₀ from that file, the node's
+    /// own miner and committee. Finalizing checkpoint 8 makes the next mined
+    /// block carry the finality record, the node's recorded finality becomes
+    /// 8, and all of it survives a restart on the same data dir.
+    ///
+    /// Slot 8 is signed only once the tip is `CHECKPOINT_SIGN_HYSTERESIS_BLOCKS`
+    /// past it (issue #269), so the node mines to `8 + H` first.
+    #[test]
+    fn a_v6_node_mines_a_record_and_keeps_it_across_restart() {
+        let (mut config, _, base) = rig("v6", true);
+        let genesis = crate::genesis_v6::GenesisFileV6::new_rehearsal();
+        std::fs::write(&config.genesis_file, genesis.to_bytes()).unwrap();
+        config.expected_genesis_hash = Some(genesis.hash_hex());
+        let mut node = RunningNode::start_v6(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        assert_eq!(node.p2p.node().sections(), qlab_devnet::forms::BodySections::V6);
+        let signed_at = 8 + qlab_devnet::params_devnet::CHECKPOINT_SIGN_HYSTERESIS_BLOCKS;
+        node.try_checkpoint();
+        for _ in 0..signed_at {
+            assert!(node.try_mine(), "KeccakPow mines at the rehearsal difficulty");
+            node.try_checkpoint();
+        }
+        assert_eq!(node.finalized_height(), Some(8), "the committee finalized checkpoint 8");
+        assert_eq!(node.p2p.node().state().recorded_finality(), None, "no record mined yet");
+        assert!(node.try_mine(), "the block after finalization");
+        assert_eq!(node.tip_height(), signed_at + 1);
+        assert_eq!(
+            node.p2p.node().state().recorded_finality(),
+            Some(8),
+            "the node's own next block carries the record for 8"
+        );
+        node.save_snapshot().unwrap();
+        drop(node);
+        let reopened = RunningNode::start_v6(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(reopened.tip_height(), signed_at + 1);
+        assert_eq!(reopened.p2p.node().state().recorded_finality(), Some(8), "re-derived on reopen");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

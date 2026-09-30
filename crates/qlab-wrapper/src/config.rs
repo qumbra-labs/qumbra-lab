@@ -1,6 +1,7 @@
 //! The outer lanes a wrapper leaf W is proven on (non-hiding,
 //! `qlab_consensus::legacy`). Moved from qlab-bench's `m4interior` /
-//! `f3::bench` (lab #785, F5-1), unchanged: version 1 proves W on [`B2_CFG`].
+//! `f3::bench` (lab #785, F5-1). Version 1 proves W on [`W_V1_CFG`] (b2/q91,
+//! F5-2); [`B2_CFG`] stays the interior lane and the measurement versions'.
 use qlab_consensus::FriCfg;
 
 /// **b4/q43/g22/fp16/a16** — the interior's fallback outer lane (qlab-bench

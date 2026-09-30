@@ -2,7 +2,7 @@
 
 > [中文版](l2-shape-v1-zh.md) · tracker: lab issue #704 (l2-roadmap A1) · circuits: lab PR #701 / issue #700 (W3) · crate: `crates/qlab-l2`
 
-**Status (2026-09-23):** the two L2 transaction shapes, **S** and **P**, are frozen as v1. Their program, geometry, public-value layout, note block, in-circuit domains and constraint set are pinned by name in `qlab-l2` and `qlab-note`. The **lane is not frozen**: `L2_CFG` stays provisional while a coordinator-side review of the lane's PCS configuration is open. That review can change the proof wire without touching the AIRs, so **no proof-byte count is pinned**.
+**Status (2026-09-23):** the two L2 transaction shapes, **S** and **P**, are frozen as v1. Their program, geometry, public-value layout, note block, in-circuit domains and constraint set are pinned by name in `qlab-l2` and `qlab-note`. *(Superseded 2026-09-30 by the Update below: the lane is frozen at q45.)* The **lane is not frozen**: `L2_CFG` stays provisional while a coordinator-side review of the lane's PCS configuration is open. That review can change the proof wire without touching the AIRs, so **no proof-byte count is pinned**.
 
 **Update (2026-09-30, lab issue #785, F5-2): the lane is frozen at b4/q45/g22/fp16/a16.**
 - **Why q45.** The v1 enshrined object is the wrapper bundle (Q2 = B), 18 proofs at K = 16, so each needs 100 + log₂ 18 = 104.17 conjectured bits. q43 gave 101.68; q45 gives 105.39 (Larry's Q-L2). W's own lane moves to b2/q91 in the same step (`qlab-wrapper`'s `W_V1_CFG`).

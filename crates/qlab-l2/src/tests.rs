@@ -185,11 +185,12 @@ fn l2_verifier_air_is_instance_independent() {
     }
 }
 
-/// Shape S through the real prover under the provisional lane, verified by
+/// Shape S through the real prover under the L2 lane (q45, frozen by lab #785
+/// F5-2), verified by
 /// the canonical (witness-free) AIR — the B4 API; the matrix width is read
 /// off the trace `prove` is handed. A tampered public value is refused, and a
 /// shape-P-length PV vector is refused before verification. **No byte pin**
-/// (#704 ruling: the lane and the wire are provisional).
+/// here: the q45 bytes are the F5-2 box pass's measurements, not this test's.
 #[test]
 fn l2_prove_verify_roundtrip_s() {
     let inst = fixture::shape_s();
@@ -207,7 +208,7 @@ fn l2_prove_verify_roundtrip_s() {
     assert!(!verify_p(&long, &proof), "an S proof is not a P proof");
 }
 
-/// Shape P through the real prover under the provisional lane (~15 GB,
+/// Shape P through the real prover under the L2 lane (~15 GB,
 /// the heaviest test this crate carries), verified by the canonical AIR;
 /// a tampered `vPublic` amount is refused.
 #[test]
@@ -221,7 +222,7 @@ fn l2_prove_verify_roundtrip_p() {
     assert!(!verify_s(&pvs[..Shape::S.pv_len()], &proof), "a P proof is not an S proof");
 }
 
-/// Shape R through the real prover under the provisional lane — the
+/// Shape R through the real prover under the L2 lane — the
 /// fixture's update of asset 7 — verified by the canonical AIR. A moved new
 /// root and a moved asset id are refused; an R proof is not an S proof.
 #[test]

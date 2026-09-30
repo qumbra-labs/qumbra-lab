@@ -22,7 +22,7 @@
 //!
 //! The genesis BLOCK is fully determined by (form, difficulty, timestamp):
 //! committee keys live in the genesis FILE, not the block
-//! (`qumbra_node::genesis::t2_from_committee_keys` builds the block via
+//! (`qumbra_node::genesis::t2_v5_from_committee_keys` builds the block via
 //! `qlab_node::genesis_block_for(V5, difficulty, 0)` regardless of keys). The
 //! launch difficulty is recovered from the fixtures' own bytes: the v5 genesis
 //! header preimage at difficulty 256 (the `T0_GENESIS_DIFFICULTY` placeholder —

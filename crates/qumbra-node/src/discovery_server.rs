@@ -242,12 +242,13 @@ pub const MAX_TX_WIRE_BYTES: usize = 256 * 1024;
 /// The most bytes `POST /v1/tx` will read on an **Annulet** node (lab #716).
 ///
 /// Basis: an L2 transaction carries an L2-lane proof — shape S ≈ 285.6 KB and
-/// shape P ≈ 312.7 KB at the provisional lane (W3's measured sizes) — plus
+/// shape P ≈ 312.7 KB at q43 (W3's measured sizes; ≈ 328 KB for P at the q45
+/// lane frozen by lab #785 F5-2) — plus
 /// the surface and a 128-B-payload discovery group, so ≈ 288–317 KB. The L1
 /// cap above refused every one of them (the B6 journey's first lane run: an
 /// S grant of 288,332 B answered `body-too-large`). 512 KiB covers P with
-/// slack. `[devnet-placeholder]` — moves with the L2 lane, which is
-/// provisional.
+/// slack. `[devnet-placeholder]` — sized for the L2 lane, frozen at q45 since
+/// lab #785 F5-2 (512 KiB still covers a q45 P).
 pub const MAX_TX_WIRE_BYTES_ANNULET: usize = 512 * 1024;
 
 /// The `POST /v1/tx` body cap for `form`.

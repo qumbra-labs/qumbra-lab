@@ -99,7 +99,7 @@ fn rig_t2(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
     let base = std::env::temp_dir().join(format!("qmb_mine_rpc_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    let genesis = GenesisFile::new_t2();
+    let genesis = GenesisFile::new_t2_v5();
     let gpath = base.join("genesis.qmb");
     genesis.write(&gpath).unwrap();
     let keys = genesis.write_committee_key_files(base.join("keys")).unwrap();

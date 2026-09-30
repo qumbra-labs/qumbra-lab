@@ -244,8 +244,11 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// ruling Q3): the raw material a V6 miner's finality record is built
     /// from. Memory only, one entry, replaced at each finalization — a
     /// restart mines without a record until the next one (≤ one cadence).
-    /// Every verified vote is kept, jailed signers included: a record is
-    /// judged against committee₀ (ruling Q1), not the local roster.
+    /// It holds the tally's accumulated set, which is **active-filtered**
+    /// (jailed and tombstoned signers never enter the tally) — so a record is
+    /// built from locally-active signers only, although ruling Q1 judges it
+    /// against committee₀. The direction is safe: a set shrunk below 15 fails
+    /// `VoteCount` at the miner's own check and is omitted, never included.
     last_finalized_votes: Option<(Checkpoint, Vec<Vote>)>,
     /// Counters that attribute ingest refusals to a layer (issue #74 drill
     /// evidence). Surfaced in the binary's telemetry line so the docker drill can
@@ -2067,15 +2070,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         self.assemble_on_parent(parent_hash, self.miner_rkm, None)
     }
 
-    /// Form and height of the candidate [`Self::assemble_block`] would build,
-    /// without assembling a body or advancing the mining clock. The pool uses
-    /// this once at startup so its first template request carries a real payee
-    /// list; there is no payee-free compatibility request.
     /// The body-section axis this adapter was built with (lab #785).
     pub fn sections(&self) -> BodySections {
         self.sections
     }
 
+    /// The checkpoint height of the retained record material (lab #785
+    /// ruling Q3), `None` before any local finalization. A V6 template's
+    /// content depends on it, so the template cache keys on it (PR #792
+    /// review F2).
+    pub fn record_material_height(&self) -> Option<u64> {
+        self.last_finalized_votes.as_ref().map(|(cp, _)| cp.height)
+    }
+
+    /// Form and height of the candidate [`Self::assemble_block`] would build,
+    /// without assembling a body or advancing the mining clock. The pool uses
+    /// this once at startup so its first template request carries a real payee
+    /// list; there is no payee-free compatibility request.
     pub fn mine_template_context(&mut self) -> Option<(GenesisForm, u64)> {
         let parent_hash = self.mining_parent_hash()?;
         let parent = self.chain.header(&parent_hash)?;
@@ -2327,9 +2338,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         self.grind.as_ref().map(|g| (g.parent_hash, g.next_nonce))
     }
 
-    /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
-    /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
-    /// path as a self-mined block. A fork here is a consensus-adjacent fork.
     /// The finality record a V6 block on `parent_hash` carries (lab #785
     /// ruling Q3), or `None`.
     ///
@@ -2363,6 +2371,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         Some(record.encode())
     }
 
+    /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
+    /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
+    /// path as a self-mined block. A fork here is a consensus-adjacent fork.
     fn assemble_on_parent(
         &mut self,
         parent_hash: Hash32,
@@ -3068,6 +3079,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         //   If the branch later wins, the body is refetched (#130 (c)) and
         //   arrives as a main-chain block under the first bullet. One refetch
         //   on a sibling reorg is the price.
+        // PR #792 review F1: the off-tip V6 arm below submits the header itself
+        // to learn whether its branch has won. Its outcome is THE header
+        // outcome — a second submit in step 2 would answer `Duplicate` for a
+        // header this call just accepted, and the P2P layer caches and relays
+        // only on `Accepted`.
+        let mut v6_submitted: Option<IngestOutcome> = None;
         let validate_result = if self.sections == BodySections::V6 {
             if header.prev == self.state.tip_hash() {
                 self.state.validate_block_v6(&header, &body, &self.verifier)
@@ -3082,6 +3099,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
                     IngestOutcome::Accepted | IngestOutcome::Duplicate
                         if self.chain.main_chain_hash_at(header.height) == Some(hash) =>
                     {
+                        v6_submitted = Some(submitted);
                         Ok(())
                     }
                     IngestOutcome::Accepted | IngestOutcome::Duplicate => {
@@ -3174,8 +3192,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
                 }
             },
         }
-        // 2. Header into the consensus chain (PoW / fork-choice).
-        let outcome = self.submit_header(header);
+        // 2. Header into the consensus chain (PoW / fork-choice) — unless the
+        //    V6 off-tip arm already did (F1 above).
+        let outcome = match v6_submitted {
+            Some(outcome) => outcome,
+            None => self.submit_header(header),
+        };
         // 3. Application is gated on **whether we hold this header**, never on
         //    whether the header was NEW (issue #130 (a)).
         //
@@ -3428,8 +3450,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
             match self.finality.try_finalize(cp, &active_now, &committee) {
                 Ok(()) => {
                     self.seen_checkpoints.insert(id);
-                    // Lab #785 Q3: every verified vote for this checkpoint,
-                    // ascending by signer — a V6 miner's record material.
+                    // Lab #785 Q3: the tally's accumulated (active-filtered,
+                    // verified) set for this checkpoint, ascending by signer —
+                    // a V6 miner's record material.
                     let mut votes = added.accumulated.clone();
                     votes.sort_by_key(|v| v.signer);
                     self.last_finalized_votes = Some((*cp, votes));
@@ -8306,9 +8329,9 @@ mod tests {
         assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5));
 
         // 4' makes the branch heavier: its body is a main-chain block now, buffered.
-        // (The header was submitted once to decide the branch, so the second
-        // submission inside ingest answers Duplicate.)
-        assert!(matches!(a.ingest_block(h4x, b4x), IngestOutcome::Accepted | IngestOutcome::Duplicate));
+        // Review F1 on PR #792: a NEW main-chain header answers Accepted, so the
+        // P2P layer caches and relays the block.
+        assert_eq!(a.ingest_block(h4x, b4x), IngestOutcome::Accepted);
         assert_eq!(a.pending_bodies.len(), 1, "4' is a main-chain block: buffered");
         assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5), "3' is still missing");
 

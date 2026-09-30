@@ -138,6 +138,9 @@ qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 qlab-l2 = { path = "../qlab-l2" }
 
 [dev-dependencies]
+# Lab #785 F5-3c: the WrapperParams lane labels are cross-locked to the
+# wrapper crate's own FRI config (test-only; the node takes no wrapper code).
+qlab-wrapper = { path = "../qlab-wrapper" }
 # Issue #101 acceptance (`tests/coinbase_spend.rs`): the miner's key hierarchy —
 # `Wallet::rkm(d)` is what a block's `coinbase_rkm` carries, and `spend_input` is
 # the only spend-witness constructor, so this is what proves the minted note is

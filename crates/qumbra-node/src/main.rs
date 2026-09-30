@@ -272,6 +272,14 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
     if let Some(from) = &plan.remint_from {
         let expect = plan.remint_expect.as_deref().expect("parse pairs --remint-from with --remint-expect");
         let old = GenesisFile::from_bytes(&std::fs::read(from)?)?;
+        // Lab #785 F5-3c: a format-9 T2 genesis re-mints into V6 — the relaunch
+        // ceremony's path, with the ceremony's sequencer key.
+        if old.format_version == qumbra_node::genesis::REMINT_TO_V6_FROM_FORMAT {
+            return genesis_remint_v6(&plan, &old, expect);
+        }
+        if plan.sequencer_key.is_some() {
+            return Err("`--sequencer-key` applies only to a format-9 → V6 re-mint".into());
+        }
         let gf = GenesisFile::remint_t2_from(&old, expect)?;
         let gpath = plan.out.join("genesis.qmb");
         gf.write(&gpath)?;
@@ -293,11 +301,16 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  self-verify:    OK");
         return Ok(());
     }
+    // Lab #785 F5-3c: `--t2` mints the V6 rehearsal genesis (format 10);
+    // `--t2 --form v5` the V5 rehearsal genesis it minted before.
+    if plan.t2 && !plan.launch && !plan.v5_rehearsal {
+        return genesis_init_v6(&plan);
+    }
     let (gf, launch_seeds) = if plan.launch {
         let (gf, seeds) = GenesisFile::new_t2_launch(plan.difficulty);
         (gf, Some(seeds))
     } else if plan.t2 {
-        (GenesisFile::new_t2(), None)
+        (GenesisFile::new_t2_v5(), None)
     } else {
         (GenesisFile::new_devnet_t0(), None)
     };
@@ -338,6 +351,94 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  genesis file:   {}", gpath.display());
     println!("  key files:      {} in {}", keys.len(), key_dir.display());
     println!("  GENESIS HASH:   {hash}");
+    println!("  self-verify:    OK");
+    Ok(())
+}
+
+/// The V6 digests a V6 genesis prints beside its hash (lab #785 F5-3c).
+fn print_v6_identity(gf: &qumbra_node::genesis_v6::GenesisFileV6, hash: &str) {
+    println!("  forms:          V5 header/coinbase, V6 body sections (format 10)");
+    println!("  l2 lane:        {}", gf.wrapper.l2_lane);
+    println!("  wrapper lane:   {}", gf.wrapper.wrapper_lane);
+    println!("  K_exit:         {}", gf.wrapper.k_exit);
+    println!("  bundle spacing: {} blocks", gf.wrapper.wrapper_spacing_blocks);
+    println!("  record version: {}", gf.wrapper.finality_record_version);
+    println!("  l2_id:          {}", gf.wrapper.l2_id);
+    println!("  genesis surface:{:?}", gf.wrapper.genesis_surface);
+    println!("  sequencer key:  {} B{}", gf.wrapper.sequencer_key.len(),
+        if gf.wrapper.has_rehearsal_sequencer_key() { " (in-code rehearsal key)" } else { "" });
+    println!("  WRAPPER PARAMS: {}", gf.wrapper.digest_hex());
+    match qumbra_node::release::RELEASE.revision {
+        Some(r) => println!(
+            "  V6 REVISION:    {} ({} ⊕ WrapperParams)",
+            qumbra_node::genesis::hex_encode(&qumbra_node::revision::revision_digest_v6(
+                r.id,
+                r.frozen_digest_hex,
+                &gf.wrapper,
+            )),
+            r.id
+        ),
+        None => println!("  V6 REVISION:    none — this release carries no revision"),
+    }
+    println!("  GENESIS HASH:   {hash}");
+}
+
+/// `genesis init --t2`: the V6 rehearsal genesis + the 21 rehearsal key files.
+fn genesis_init_v6(plan: &qumbra_node::genesis::GenesisInitPlan) -> Result<(), Box<dyn Error>> {
+    use qumbra_node::genesis_v6::GenesisFileV6;
+    let gf = GenesisFileV6::new_rehearsal();
+    let gpath = plan.out.join("genesis.qmb");
+    std::fs::write(&gpath, gf.to_bytes())?;
+    let keys = gf.base.write_committee_key_files(plan.out.join("keys"))?;
+    let loaded = GenesisFileV6::from_bytes(&std::fs::read(&gpath)?)?;
+    let hash = loaded.hash_hex();
+    loaded.verify_startup(Some(&hash))?;
+    println!("qumbra-node genesis init");
+    println!("  network:        {}", gf.base.network);
+    println!("  format version: {} (V6)", gf.base.format_version);
+    println!("  mode:           {}", qumbra_node::genesis::mode_banner(false));
+    println!("  committee:      N={} quorum={}", gf.base.frozen.committee_size, gf.base.frozen.quorum);
+    println!("  consensus FRI:  {}", gf.base.frozen.consensus_fri);
+    println!("  genesis file:   {}", gpath.display());
+    println!("  key files:      {} in {}", keys.len(), plan.out.join("keys").display());
+    print_v6_identity(&gf, &hash);
+    println!("  self-verify:    OK");
+    Ok(())
+}
+
+/// `genesis init --t2 --remint-from FORMAT9 --remint-expect H --sequencer-key F`:
+/// the relaunch ceremony's V6 re-mint. No key files are written.
+fn genesis_remint_v6(
+    plan: &qumbra_node::genesis::GenesisInitPlan,
+    old: &GenesisFile,
+    expect: &str,
+) -> Result<(), Box<dyn Error>> {
+    use qumbra_node::genesis_v6::{GenesisFileV6, REHEARSAL_GENESIS_SURFACE, REHEARSAL_L2_ID};
+    let key_path = plan
+        .sequencer_key
+        .as_ref()
+        .ok_or("a format-9 → V6 re-mint requires `--sequencer-key FILE` (the ceremony's verifying key, hex)")?;
+    let key = qumbra_node::genesis::hex_decode(std::fs::read_to_string(key_path)?.trim())
+        .ok_or("--sequencer-key: the file is not hex")?;
+    // `REHEARSAL_L2_ID` and `REHEARSAL_GENESIS_SURFACE` are the right values for
+    // a launch re-mint too: v1 has ONE l2_id (Q-L3), and the genesis surface is
+    // the empty-registry W state's commitment for that l2_id — it does not
+    // depend on the sequencer key or the committee (review R4 on PR #794).
+    let gf = GenesisFileV6::remint_from_v5(old, expect, key, REHEARSAL_L2_ID, REHEARSAL_GENESIS_SURFACE)?;
+    let gpath = plan.out.join("genesis.qmb");
+    std::fs::write(&gpath, gf.to_bytes())?;
+    let loaded = GenesisFileV6::from_bytes(&std::fs::read(&gpath)?)?;
+    let hash = loaded.hash_hex();
+    loaded.verify_startup(Some(&hash))?;
+    println!("qumbra-node genesis init");
+    println!("  network:        {}", gf.base.network);
+    println!("  format version: {} (V6 re-mint; input format {})", gf.base.format_version, old.format_version);
+    println!("  input genesis:  {} (matches --remint-expect)", old.hash_hex());
+    println!("  committee:      N={} quorum={} (carried)", gf.base.frozen.committee_size, gf.base.frozen.quorum);
+    println!("  difficulty:     {} (carried)", gf.base.genesis_difficulty);
+    println!("  genesis file:   {}", gpath.display());
+    println!("  key files:      none written (the hosts keep theirs)");
+    print_v6_identity(&gf, &hash);
     println!("  self-verify:    OK");
     Ok(())
 }
@@ -421,6 +522,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // Annulet genesis (B2's rehearsal-only interim is retired).
     let form = match &genesis {
         qumbra_node::annulet_genesis::AnyGenesis::L1(g) => g.form()?,
+        qumbra_node::annulet_genesis::AnyGenesis::V6(g) => g.forms().0,
         qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => g.form()?,
     };
     let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form);
@@ -443,6 +545,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     qlab_devnet::jprintln!("STARTUP node prepare begin (halt gates, genesis byte-verify, committee keys)");
     let prepared = match &genesis {
         qumbra_node::annulet_genesis::AnyGenesis::L1(g) => RunningNode::prepare(&config, g, pow, verifier)?,
+        qumbra_node::annulet_genesis::AnyGenesis::V6(g) => RunningNode::prepare_v6(&config, g, pow, verifier)?,
         qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => RunningNode::prepare_annulet(&config, g, pow, verifier)?,
     };
     qlab_devnet::jprintln!("STARTUP node prepare done");
@@ -652,6 +755,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         "  genesis hash: {}",
         match &genesis {
             qumbra_node::annulet_genesis::AnyGenesis::L1(g) => g.hash_hex(),
+            qumbra_node::annulet_genesis::AnyGenesis::V6(g) => g.hash_hex(),
             qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => g.hash_hex(),
         }
     );

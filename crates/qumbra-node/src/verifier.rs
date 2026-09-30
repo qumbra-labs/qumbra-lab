@@ -82,8 +82,9 @@ impl TxVerifier for ConsensusVerifier {
 /// as [`ConsensusVerifier`] does for the L1 — under `qlab_l2`'s canonical
 /// witness-free AIRs and its one config site, `make_config_l2()`.
 ///
-/// **No wire-byte literal.** The lane is provisional (lab #704), so the proof
-/// is judged by what the config implies: a strict decode (fixint,
+/// **No wire-byte literal.** The lane was provisional when this was written
+/// (lab #704) and is frozen at b4/q45 since lab #785 F5-2; the proof is still
+/// judged by what the config implies, so the lane keeps one source: a strict decode (fixint,
 /// reject-trailing, bounded by the input), then its structure — trace height
 /// `LOG_HEIGHT_{S,P}`, `num_queries` query proofs, a `2^log_final_poly_len`
 /// final polynomial — each read from `qlab_l2`. That structure is also what
@@ -284,7 +285,7 @@ pub fn select_verifier(rehearsal: bool, form: qlab_devnet::forms::GenesisForm) -
                 return (
                     NodeVerifier::L2(L2Verifier),
                     "verifier: real L2 verifier active (qlab_l2::verify_s / verify_p under make_config_l2, \
-                     the provisional L2 lane)."
+                     the L2 lane, b4/q45)."
                         .to_string(),
                 );
             }

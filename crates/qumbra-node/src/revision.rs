@@ -352,6 +352,32 @@ pub fn revision_digest(id: &str, frozen_digest_hex: &str) -> Hash32 {
     keccak256(&buf)
 }
 
+/// Domain tag for [`revision_digest_v6`] (lab #785 F5-3c).
+pub const REVISION_TAG_V6: &[u8] = b"qumbra:revision:v6";
+
+/// The **V6 revision digest**: the ordinary revision digest with the V6 net's
+/// frozen wrapper constants folded in —
+/// `keccak("qumbra:revision:v6" ‖ revision_digest(id, frozen_hex) ‖ keccak(WrapperParams))`.
+///
+/// **Status (F5-3c):** computed, pinned (`genesis_v6` tests) and printed by
+/// `genesis init --t2` — **not yet** used as any net's rule domain or marker
+/// identity; a V6 node runs the release's ordinary [`Revision::digest`] today.
+/// Making it the V6 rule schedule's domain and marker identity is F5-4
+/// condition C1 (review of PR #794). It is a new function beside
+/// [`revision_digest`], not a change to it: T1's and V5's revision digests,
+/// rule domains and halt markers are byte-identical either way.
+pub fn revision_digest_v6(
+    id: &str,
+    frozen_digest_hex: &str,
+    wrapper: &crate::genesis_v6::WrapperParams,
+) -> Hash32 {
+    let mut buf = Vec::with_capacity(REVISION_TAG_V6.len() + 64);
+    buf.extend_from_slice(REVISION_TAG_V6);
+    buf.extend_from_slice(&revision_digest(id, frozen_digest_hex));
+    buf.extend_from_slice(&wrapper.digest());
+    keccak256(&buf)
+}
+
 impl Revision {
     /// The **revision digest**: this revision's identity as a 32-byte value,
     /// binding *both* the identifier and the frozen-parameter digest it claims.
