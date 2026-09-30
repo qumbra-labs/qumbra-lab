@@ -26,11 +26,20 @@ pub fn not_v6() -> String {
     )
 }
 
-/// The bridge document: `view` is the node's bridge ledger (`None` off V6),
-/// `t` its telemetry (for the emission and burn the attestation needs).
-pub fn bridge_document(view: Option<&BridgeView>, t: &Telemetry) -> String {
-    let Some(v) = view else { return not_v6() };
-    let circulating = matches!(t.supply_coverage(), SupplyCoverage::Complete)
+/// The bridge document: `view` is the node's bridge ledger (`None` off V6;
+/// `Some(Err(why))` when the ledger refused — said as itself, review S3), `t`
+/// its telemetry (for the emission and burn the attestation needs).
+/// `circulating` needs the supply rows to cover the tip AND the bridge rows to
+/// cover the same tip (review S2); otherwise the token.
+pub fn bridge_document(view: Option<Result<&BridgeView, String>>, t: &Telemetry) -> String {
+    let v = match view {
+        None => return not_v6(),
+        Some(Err(why)) => {
+            return format!("{{\"v\":1,\"available\":false,\"why\":\"the bridge ledger refused: {}\"}}", crate::json::esc(&why))
+        }
+        Some(Ok(v)) => v,
+    };
+    let circulating = (matches!(t.supply_coverage(), SupplyCoverage::Complete) && v.covered_height == t.tip_height)
         .then(|| {
             let emission = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.measured_coinbase))?;
             let burned = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.burned))?;
@@ -90,6 +99,10 @@ mod tests {
     fn off_v6_the_bridge_document_is_not_available() {
         let v: serde_json::Value = serde_json::from_str(&bridge_document(None, &covered())).unwrap();
         assert_eq!(v["available"], false);
+        // A refusing ledger says so, as itself.
+        let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(Err("CounterDecrease { height: 7 }".into())), &covered())).unwrap();
+        assert!(v["why"].as_str().unwrap().contains("CounterDecrease"), "{v}");
+        assert_eq!(v["available"], false);
         assert!(v.get("d_cum").is_none() && v.get("epochs").is_none(), "{v}");
     }
 
@@ -97,12 +110,16 @@ mod tests {
     /// supply rows not covering the tip, `circulating` is the token.
     #[test]
     fn on_v6_the_bridge_document_carries_rows_and_the_attestation() {
-        let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(&view()), &covered())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(Ok(&view())), &covered())).unwrap();
         assert_eq!((v["available"].clone(), v["d_cum"].clone(), v["e_cum"].clone()), (true.into(), 1000.into(), 40.into()));
         assert_eq!(v["circulating"], 10_000 - 100 - 1_000 + 40);
         assert_eq!(v["epochs"][0]["bridged_out"], 40);
         let lagging = Telemetry::assemble(20, Some(8), Some(75), 0, 3, 1, qlab_devnet::params_devnet::DEGRADED_MODE_LAG_BLOCKS).with_supply(covered().supply);
-        let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(&view()), &lagging)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(Ok(&view())), &lagging)).unwrap();
+        assert_eq!(v["circulating"], crate::json::UNAVAILABLE);
+        // Review S2: supply covered, but the bridge rows cover another height.
+        let behind = BridgeView { covered_height: 13, ..view() };
+        let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(Ok(&behind)), &covered())).unwrap();
         assert_eq!(v["circulating"], crate::json::UNAVAILABLE);
     }
 }

@@ -131,10 +131,13 @@ impl BridgeView {
         Ok(BridgeView { covered_height, d_cum, e_cum, rows })
     }
 
-    /// `circulating = emission − burned − D_cum + E_cum`, checked; `None` on
-    /// any overflow or underflow (a reader shows it as unavailable).
+    /// `circulating = emission − burned + E_cum − D_cum`, checked; `None` on
+    /// any overflow or underflow (a reader shows it as unavailable). `E_cum`
+    /// is added before `D_cum` is subtracted: both are cumulative, so after
+    /// deposit → exit → deposit `D_cum` alone can exceed what is left of
+    /// emission on a healthy bridge (review S1).
     pub fn circulating(&self, emission: u64, burned: u64) -> Option<u64> {
-        emission.checked_sub(burned)?.checked_sub(self.d_cum)?.checked_add(self.e_cum)
+        emission.checked_sub(burned)?.checked_add(self.e_cum)?.checked_sub(self.d_cum)
     }
 }
 
@@ -195,5 +198,9 @@ mod tests {
         assert_eq!(v.circulating(100, 200), None, "burned above emission");
         let big = BridgeView { e_cum: u64::MAX, ..view() };
         assert_eq!(big.circulating(u64::MAX, 0), None, "overflow");
+        // Review S1: deposit 100, exit 100, deposit 100 on emission 100 — D_cum
+        // 200 exceeds emission, and the true figure is 0, not unavailable.
+        let cycled = BridgeView { d_cum: 200, e_cum: 100, ..view() };
+        assert_eq!(cycled.circulating(100, 0), Some(0));
     }
 }

@@ -177,6 +177,9 @@ pub enum BridgeReading {
     NotServed(String),
     /// Answered with bytes this build cannot decode.
     Undecodable(String),
+    /// Answered, but not with a bridge and not with a 404 — e.g. the node's
+    /// ledger refusing (503, its reason in the status): unavailable, with why.
+    Failed(String),
 }
 
 /// One endpoint's reading, with the caliper on it.
@@ -244,7 +247,8 @@ pub fn poll_one(endpoint: &Endpoint, opts: PollOptions) -> NodeReading {
     // Lab #785 F5-4c-1: the bridge route, only where the node answered at all.
     let bridge = if reading.is_reachable() {
         match fetch(&endpoint.base_url, qlab_node::bridge_wire::BRIDGE_PATH, opts.timeout) {
-            Err(e) => BridgeReading::NotServed(e),
+            Err(e) if e.contains(" 404") => BridgeReading::NotServed(e),
+            Err(e) => BridgeReading::Failed(e),
             Ok(body) => match qlab_node::bridge_wire::BridgeView::from_bytes(&body) {
                 Ok(v) => BridgeReading::Served(v),
                 Err(e) => BridgeReading::Undecodable(format!("{e:?}")),

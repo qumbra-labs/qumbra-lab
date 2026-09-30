@@ -476,17 +476,27 @@ pub fn bridge(readings: &[NodeReading]) -> String {
             BridgeReading::Undecodable(why) => {
                 out.push_str(&format!("{:<label_w$}  UNAVAILABLE — bridge payload not readable: {why}\n", r.endpoint.label));
             }
+            BridgeReading::Failed(why) => {
+                out.push_str(&format!("{:<label_w$}  UNAVAILABLE — bridge not served: {why}\n", r.endpoint.label));
+            }
             BridgeReading::Served(v) => {
-                let circulating = r
-                    .reading
-                    .telemetry()
-                    .filter(|t| matches!(t.supply_coverage(), qlab_node::telemetry::SupplyCoverage::Complete))
-                    .and_then(|t| {
-                        let emission = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.measured_coinbase))?;
-                        let burned = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.burned))?;
-                        v.circulating(emission, burned)
-                    })
-                    .map_or_else(|| "UNAVAILABLE".to_string(), |c| c.to_string());
+                // Two fetches, two heights (review S2): the attestation mixes
+                // them only when the bridge covers exactly the telemetry tip.
+                let circulating = match r.reading.telemetry() {
+                    None => "UNAVAILABLE".to_string(),
+                    Some(t) if t.tip_height != v.covered_height => format!(
+                        "UNAVAILABLE (bridge covers {}, telemetry tip {})",
+                        v.covered_height, t.tip_height
+                    ),
+                    Some(t) => matches!(t.supply_coverage(), qlab_node::telemetry::SupplyCoverage::Complete)
+                        .then(|| {
+                            let emission = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.measured_coinbase))?;
+                            let burned = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.burned))?;
+                            v.circulating(emission, burned)
+                        })
+                        .flatten()
+                        .map_or_else(|| "UNAVAILABLE".to_string(), |c| c.to_string()),
+                };
                 out.push_str(&format!(
                     "{:<label_w$}  covered to {}  D_cum {}  E_cum {}  circulating {}\n",
                     r.endpoint.label, v.covered_height, v.d_cum, v.e_cum, circulating
@@ -831,8 +841,16 @@ mod tests {
             rows: vec![BridgeRow { epoch: 0, start_height: 0, end_height: 400, bridged_in: 1000, bridged_out: 40 }],
         });
         let down = down("node1");
-        let text = bridge(&[v6, down]);
+        let text = bridge(&[v6.clone(), down]);
         assert!(text.contains("D_cum 1000  E_cum 40"), "{text}");
+        // Review S2: the bridge covers 400, the telemetry tip is 3800.
+        assert!(text.contains("circulating UNAVAILABLE (bridge covers 400, telemetry tip 3800)"), "{text}");
+        // A refusing node reads as itself, and the view is not "no node serves".
+        let mut refusing = v6;
+        refusing.bridge = BridgeReading::Failed("non-200 response: HTTP/1.1 503".into());
+        let text = bridge(&[refusing]);
+        assert!(text.contains("bridge not served: non-200 response: HTTP/1.1 503"), "{text}");
+        assert!(!text.contains("not a V6 net"), "{text}");
         assert!(text.contains("in                 1000"), "{text}");
         assert!(text.contains("node1  UNAVAILABLE"), "{text}");
     }

@@ -142,7 +142,7 @@ pub struct TelemetryServer {
     /// The `/v1/supply/bridge` payload (lab #785 F5-4c-1): `Some` only on a
     /// V6 node once it has rendered one; `None` ⇒ 404, which readers show as
     /// unavailable — never as zero.
-    bridge: Arc<Mutex<Option<Vec<u8>>>>,
+    bridge: Arc<Mutex<Option<Result<Vec<u8>, String>>>>,
     /// `false` from bind until [`Self::mark_ready`]: `/v1/ready` says
     /// `starting` and `/v1/telemetry` 404s. Never cleared — a node is not
     /// un-opened.
@@ -167,7 +167,7 @@ impl TelemetryServer {
             .ok_or_else(|| io::Error::other("telemetry listener has no ip address"))?;
         let served = Arc::new(AtomicU64::new(0));
         let snapshot: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let bridge: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let bridge: Arc<Mutex<Option<Result<Vec<u8>, String>>>> = Arc::new(Mutex::new(None));
         let ready = Arc::new(AtomicBool::new(false));
 
         let worker = Arc::clone(&server);
@@ -214,7 +214,12 @@ impl TelemetryServer {
                         None
                     };
                     let _ = match body {
-                        Some(body) => {
+                        // The ledger's own refusal (review S3): said as itself,
+                        // never as "not a V6 net".
+                        Some(Err(why)) => request.respond(
+                            tiny_http::Response::from_string(format!("bridge ledger refused: {why}")).with_status_code(503),
+                        ),
+                        Some(Ok(body)) => {
                             let header = tiny_http::Header::from_bytes(CONTENT_TYPE_HEADER, CONTENT_TYPE_VALUE)
                                 .expect("static content type parses");
                             request.respond(tiny_http::Response::from_data(body).with_header(header))
@@ -270,7 +275,7 @@ impl TelemetryServer {
 
     /// The `/v1/supply/bridge` slot (lab #785 F5-4c-1), adopted like
     /// [`Self::snapshot`]; a V6 node fills it, every other node leaves `None`.
-    pub(crate) fn bridge(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
+    pub(crate) fn bridge(&self) -> Arc<Mutex<Option<Result<Vec<u8>, String>>>> {
         Arc::clone(&self.bridge)
     }
 
@@ -487,13 +492,18 @@ mod tests {
             e_cum: 2,
             rows: vec![BridgeRow { epoch: 3, start_height: 3456, end_height: 3800, bridged_in: 7, bridged_out: 2 }],
         };
-        *srv.bridge().lock().unwrap() = Some(view.to_bytes());
+        *srv.bridge().lock().unwrap() = Some(Ok(view.to_bytes()));
         let (status, body) = get(addr, BRIDGE_PATH);
         assert!(status.contains(" 200"), "{status}");
         assert_eq!(BridgeView::from_bytes(&body), Ok(view));
         let (status, body) = get(addr, TELEMETRY_PATH);
         assert!(status.contains(" 200"), "{status}");
         assert_eq!(Telemetry::from_bytes(&body).unwrap(), t, "the telemetry wire is unchanged beside it");
+        // Review S3: a refusing ledger answers with its own reason, not a 404.
+        *srv.bridge().lock().unwrap() = Some(Err("CounterDecrease { height: 7 }".into()));
+        let (status, body) = get(addr, BRIDGE_PATH);
+        assert!(status.contains(" 503"), "{status}");
+        assert!(String::from_utf8_lossy(&body).contains("CounterDecrease"));
         srv.shutdown();
     }
 

@@ -119,6 +119,13 @@ fn rebuild_supply_ledger<C: ChainStore>(
     )
 }
 
+/// The bridge ledger, or the refusal it last hit and the tip it hit it at
+/// (lab #785 F5-4c-1, review S3).
+enum BridgeState {
+    Ledger(crate::bridge::BridgeLedger),
+    Refused { at_tip: qlab_devnet::header::Hash32, error: crate::bridge::BridgeError },
+}
+
 /// A stored block's bundle bytes (empty when it carries none).
 fn bundle_bytes(block: &qlab_node::StoredBlock) -> &[u8] {
     block.sections.as_ref().map_or(&[][..], |s| s.bundle.as_slice())
@@ -515,8 +522,9 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// poller can never contend with the consensus loop for node state.
     telemetry_snapshot: Arc<Mutex<Vec<u8>>>,
     /// The `/v1/supply/bridge` slot (lab #785 F5-4c-1), adopted from the
-    /// telemetry server; filled only on a V6 node.
-    bridge_snapshot: Arc<Mutex<Option<Vec<u8>>>>,
+    /// telemetry server; filled only on a V6 node (`Err` = the ledger's own
+    /// refusal, served with its reason).
+    bridge_snapshot: Arc<Mutex<Option<Result<Vec<u8>, String>>>>,
     /// When the telemetry snapshot was last encoded.
     last_telemetry_render: Instant,
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
@@ -576,10 +584,8 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
     supply_ledger: Mutex<SupplyLedger>,
-    /// The bridge ledger (lab #785 F5-4c-1): `Some` exactly on a V6 node. An
-    /// `Err` inside is a broken invariant, logged once and served as nothing
-    /// (a 404 reads unavailable) until a rebuild succeeds.
-    bridge_ledger: Option<Mutex<Result<crate::bridge::BridgeLedger, crate::bridge::BridgeError>>>,
+    /// The bridge ledger (lab #785 F5-4c-1): `Some` exactly on a V6 node.
+    bridge_ledger: Option<Mutex<BridgeState>>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -1148,7 +1154,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // Lab #785 F5-4c-1: a V6 node also keeps the bridge ledger.
         let bridge_ledger = (p2p.node().sections() == qlab_devnet::forms::BodySections::V6).then(|| {
             let state_chain = p2p.node().state().chain();
-            Mutex::new(rebuild_bridge_ledger(state_chain, &state_chain.chain().main_chain()))
+            Mutex::new(match rebuild_bridge_ledger(state_chain, &state_chain.chain().main_chain()) {
+                Ok(l) => BridgeState::Ledger(l),
+                Err(error) => {
+                    qlab_devnet::jeprintln!(ERROR, "BRIDGE ledger refused at startup: {error:?}");
+                    BridgeState::Refused { at_tip: state_chain.tip_hash(), error }
+                }
+            })
         });
 
         Ok(RunningNode {
@@ -2248,7 +2260,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         if let Ok(mut slot) = self.telemetry_snapshot.lock() {
             *slot = bytes;
         }
-        let bridge = self.bridge_view().map(|v| v.to_bytes());
+        let bridge = self.bridge_view().map(|r| r.map(|v| v.to_bytes()).map_err(|e| format!("{e:?}")));
         if let Ok(mut slot) = self.bridge_snapshot.lock() {
             *slot = bridge;
         }
@@ -2256,36 +2268,48 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
 
     /// The bridge rows over the applied main chain (lab #785 F5-4c-1), brought
     /// up to the tip — rebuilt on a reorg below the ledger, as the supply
-    /// ledger is. `None` off V6, and while the ledger holds a refusal.
-    pub fn bridge_view(&self) -> Option<qlab_node::bridge_wire::BridgeView> {
+    /// ledger is. `None` off V6. A refusal is kept, with the tip it happened
+    /// at, and answered as itself (`Err`) until the tip moves — then one
+    /// rebuild is tried, and a repeat refusal is logged again once (review S3).
+    pub fn bridge_view(
+        &self,
+    ) -> Option<Result<qlab_node::bridge_wire::BridgeView, crate::bridge::BridgeError>> {
         let slot = self.bridge_ledger.as_ref()?;
         let mut guard = slot.lock().expect("the bridge ledger mutex is not poisoned");
         let node = self.p2p.node();
         let state_chain = node.state().chain();
+        let tip = state_chain.tip_hash();
         let main_chain = state_chain.chain().main_chain();
-        let in_sync = guard.as_ref().is_ok_and(|l| l.is_in_sync_with(&main_chain));
-        if !in_sync {
-            *guard = rebuild_bridge_ledger(state_chain, &main_chain);
-        }
-        if let Ok(ledger) = guard.as_mut() {
-            for height in ledger.next_height()..=state_chain.tip_height() {
-                let pushed = usize::try_from(height)
-                    .ok()
-                    .and_then(|i| main_chain.get(i))
-                    .and_then(|hash| state_chain.block(hash).map(|b| (*hash, b)))
-                    .map(|(hash, b)| ledger.push(height, hash, b.header.prev, bundle_bytes(b)));
-                match pushed {
-                    Some(Ok(())) => {}
-                    Some(Err(e)) => {
-                        qlab_devnet::jeprintln!(ERROR, "BRIDGE ledger refused height {height}: {e:?}");
-                        *guard = Err(e);
-                        break;
-                    }
-                    None => break,
-                }
+        let refuse = |guard: &mut BridgeState, error: crate::bridge::BridgeError| {
+            qlab_devnet::jeprintln!(ERROR, "BRIDGE ledger refused: {error:?}");
+            *guard = BridgeState::Refused { at_tip: tip, error: error.clone() };
+            Some(Err(error))
+        };
+        let needs_rebuild = match &*guard {
+            BridgeState::Refused { at_tip, error } if *at_tip == tip => return Some(Err(error.clone())),
+            BridgeState::Refused { .. } => true,
+            BridgeState::Ledger(l) => !l.is_in_sync_with(&main_chain),
+        };
+        if needs_rebuild {
+            match rebuild_bridge_ledger(state_chain, &main_chain) {
+                Ok(l) => *guard = BridgeState::Ledger(l),
+                Err(e) => return refuse(&mut guard, e),
             }
         }
-        guard.as_ref().ok().map(crate::bridge::BridgeLedger::view)
+        let BridgeState::Ledger(ledger) = &mut *guard else { unreachable!("rebuilt above") };
+        for height in ledger.next_height()..=state_chain.tip_height() {
+            let Some((hash, block)) = usize::try_from(height)
+                .ok()
+                .and_then(|i| main_chain.get(i))
+                .and_then(|hash| state_chain.block(hash).map(|b| (*hash, b)))
+            else {
+                break;
+            };
+            if let Err(e) = ledger.push(height, hash, block.header.prev, bundle_bytes(block)) {
+                return refuse(&mut guard, e);
+            }
+        }
+        Some(Ok(ledger.view()))
     }
 
     /// Bind the `/v1/compact` note-discovery endpoint (issue #188 baton 2).
@@ -4002,7 +4026,7 @@ mod tests {
         assert_eq!(reopened.p2p.node().state().recorded_finality(), Some(8), "re-derived on reopen");
         // Lab #785 F5-4c-1: a V6 node keeps the bridge ledger — nothing
         // bridged on a chain with no bundle, rows covering its tip.
-        let v = reopened.bridge_view().expect("a V6 node serves the bridge");
+        let v = reopened.bridge_view().expect("a V6 node serves the bridge").expect("no refusal");
         assert_eq!((v.covered_height, v.d_cum, v.e_cum), (signed_at + 1, 0, 0));
         assert!(v.rows.iter().all(|r| r.bridged_in == 0 && r.bridged_out == 0));
         let _ = std::fs::remove_dir_all(&base);

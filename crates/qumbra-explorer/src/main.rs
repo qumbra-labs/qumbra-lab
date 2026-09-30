@@ -244,7 +244,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // Lab #785 F5-4c-1: the bridge document (V6 only; "not available" elsewhere),
     // re-projected with the attestation when the tip moves.
     let bridge_page = Arc::new(RwLock::new(qumbra_explorer::bridge::bridge_document(
-        node.bridge_view().as_ref(),
+        node.bridge_view().as_ref().map(|r| r.as_ref().map_err(|e| format!("{e:?}"))),
         &node.telemetry(),
     )));
 
@@ -439,7 +439,10 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
             if http::publish(&assets_page, attest::registry_document(n.state())) {
                 note_poisoned(attest::REGISTRY_PATH, &degraded);
             }
-            let doc = qumbra_explorer::bridge::bridge_document(n.bridge_view().as_ref(), &n.telemetry());
+            let doc = qumbra_explorer::bridge::bridge_document(
+                n.bridge_view().as_ref().map(|r| r.as_ref().map_err(|e| format!("{e:?}"))),
+                &n.telemetry(),
+            );
             if http::publish(&bridge_page, doc) {
                 note_poisoned(qumbra_explorer::bridge::BRIDGE_PATH, &degraded);
             }
