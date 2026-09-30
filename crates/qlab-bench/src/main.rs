@@ -953,7 +953,8 @@ fn main() {
             // Cloaked leaf and nothing else (F5-4a, finding F-A: over an EMPTY
             // registry no S/P/R input could open asset 0's leaf, so no L2
             // transaction would ever be provable) — the value the V6
-            // rehearsal genesis pins. Printed once, lanes in order.
+            // rehearsal genesis pins; F5-4a's `qlab_wrapper::genesis` port is
+            // asserted equal here. Printed once, lanes in order.
             let l2_id = args
                 .iter()
                 .position(|a| a == "--l2-id")
@@ -962,6 +963,9 @@ fn main() {
                 .unwrap_or(1);
             let roots = f4::native::WState::genesis(&[qlab_air::l2::RegistryLeaf::cloaked(0)]).roots();
             let surface = qlab_wrapper::verify::Surface::genesis(1, l2_id, roots);
+            // F5-4a: the consensus port computes the same surface.
+            let reg = qlab_cbserver::registry::RegistryTree::from_leaves(&[qlab_air::l2::RegistryLeaf::cloaked(0)]).expect("asset 0's leaf").root();
+            assert_eq!(qlab_wrapper::genesis::genesis_surface(l2_id, &reg), surface, "qlab_wrapper::genesis disagrees with the native model");
             println!("wgenesis: version 1, l2_id {l2_id}, registry [cloaked(0)]");
             println!("genesis_surface = {:?}", surface.commitment);
             return;

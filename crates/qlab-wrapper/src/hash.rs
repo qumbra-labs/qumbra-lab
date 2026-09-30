@@ -1,16 +1,14 @@
 //! The wrapper's hash-level primitives: digests, the node and leaf Keccak-f
 //! states, F3's surface-digest (SD) chain, and F4's wrapper-state types and
-//! domain-tagged states (claim-fee note, supply leaf, exit chain). Moved from
+//! domain-tagged states (claim-fee seeds, supply leaf, exit chain). Moved from
 //! qlab-bench's `f3::native`, `f3::leaf` and `f4::native` (lab #785, F5-1),
-//! unchanged.
+//! unchanged; the prover-only trace helpers went back to qlab-bench in F5-4a
+//! (review Y2).
 use std::borrow::Borrow;
 
-use p3_field::{Field, PrimeCharacteristicRing};
 use p3_keccak_air::{KeccakCols, NUM_KECCAK_COLS, NUM_ROUNDS};
-use qlab_air::l2::l2_cm;
 use qlab_air::narrow::MERKLE_DEPTH;
 use qlab_air::reference::{keccak_f, merkle_node_state};
-use qlab_consensus::Val;
 
 // f3/native
 pub type Digest = [u64; 4];
@@ -138,24 +136,6 @@ pub fn keccak_idx() -> KeccakIdx {
     }
 }
 
-pub fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(lo);
-    st[4..8].copy_from_slice(hi);
-    st[8] = 1 << 4;
-    st[16] = 1 << 63;
-    st
-}
-
-pub fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(l);
-    st[4..8].copy_from_slice(r);
-    st[8] = 1;
-    st[16] = 1 << 63;
-    st
-}
-
 pub fn out4(st: &[u64; 25]) -> Digest {
     keccak_f(st)[..4].try_into().expect("four lanes")
 }
@@ -163,18 +143,6 @@ pub fn out4(st: &[u64; 25]) -> Digest {
 /// A PV digest, chunk by chunk (masked: the plan never validates; the AIR does).
 pub fn pv_digest(pvs: &[u32], off: usize) -> Digest {
     core::array::from_fn(|l| (0..4).map(|j| (u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0)) & 0xffff) << (16 * j)).sum())
-}
-
-pub fn inv_or_zero(v: Val) -> Val {
-    v.try_inverse().unwrap_or(Val::ZERO)
-}
-
-pub fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
-    if bit {
-        (*sib, *x)
-    } else {
-        (*x, *sib)
-    }
 }
 
 // f4/native
@@ -263,11 +231,6 @@ pub fn fee_rho(prev: &Digest) -> Digest {
 
 pub fn fee_rseed(prev: &Digest) -> Digest {
     keccak_f(&fee_seed_state(prev, 2))[..4].try_into().expect("four lanes")
-}
-
-/// The fee note's commitment: an asset-0 L2 note (`qlab_air::l2::l2_cm`).
-pub fn fee_note_cm(value: u64, rkm_seq: &Digest, prev: &Digest) -> Digest {
-    l2_cm(value, 0, rkm_seq, &fee_rho(prev), &fee_rseed(prev))
 }
 
 /// The supply tree's depth — asset ids < 2^16 (a devnet placeholder).

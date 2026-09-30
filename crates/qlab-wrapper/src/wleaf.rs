@@ -430,8 +430,6 @@ pub const KSN_OFF: usize = KX_OFF + 2;
 pub const KSU_OFF: usize = KSN_OFF + 2;
 pub const MZ_OFF: usize = KSU_OFF + 2;
 pub const W_WIDTH: usize = MZ_OFF + 2;
-pub const PLAN_BASE: usize = SEG_OFF;
-pub const PLAN_WIDTH: usize = W_WIDTH - PLAN_BASE;
 
 // ---------------------------------------------------------------------------
 // Public values

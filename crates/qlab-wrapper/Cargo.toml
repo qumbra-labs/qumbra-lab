@@ -17,3 +17,7 @@ p3-field = "=0.6.1"
 p3-keccak-air = "=0.6.1"
 p3-matrix = "=0.6.1"
 p3-uni-stark = "=0.6.1"
+# F5-4a: the bundle codec decodes proofs strictly (fixint, reject-trailing,
+# re-encode equality), the same bincode 1 the node's transaction path uses.
+bincode = "1"
+serde = "1"

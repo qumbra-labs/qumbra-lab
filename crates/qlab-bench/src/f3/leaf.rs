@@ -76,7 +76,39 @@ use super::native::{
 use crate::m4skel::LaneBuilder;
 
 // Lab #785 F5-1: the Keccak-lane helpers moved to qlab-wrapper.
-pub(crate) use qlab_wrapper::hash::{inv_or_zero, keccak_idx, mux, nf_leaf_state, node_state, out4, pv_digest, KeccakIdx};
+pub(crate) use qlab_wrapper::hash::{keccak_idx, out4, pv_digest, KeccakIdx};
+
+// Lab #785 F5-4a (review Y2 on PR #787): the prover's trace helpers came
+// back from qlab-wrapper, where nothing used them.
+pub(crate) fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(lo);
+    st[4..8].copy_from_slice(hi);
+    st[8] = 1 << 4;
+    st[16] = 1 << 63;
+    st
+}
+
+pub(crate) fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(l);
+    st[4..8].copy_from_slice(r);
+    st[8] = 1;
+    st[16] = 1 << 63;
+    st
+}
+
+pub(crate) fn inv_or_zero(v: Val) -> Val {
+    p3_field::Field::try_inverse(&v).unwrap_or(Val::ZERO)
+}
+
+pub(crate) fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
+    if bit {
+        (*sib, *x)
+    } else {
+        (*x, *sib)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The slot program
