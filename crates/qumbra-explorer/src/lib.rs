@@ -96,6 +96,7 @@
 
 pub mod attest;
 pub mod blocks;
+pub mod bridge;
 pub mod checkpoints;
 pub mod config;
 pub mod http;

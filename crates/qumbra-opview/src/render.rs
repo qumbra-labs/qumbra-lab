@@ -452,7 +452,72 @@ pub fn verdicts(a: &Agreement) -> String {
 
 /// The whole view: table, then verdicts.
 pub fn view(readings: &[NodeReading], a: &Agreement) -> String {
-    format!("{}{}{}", table(readings), supply(readings), verdicts(a))
+    format!("{}{}{}{}", table(readings), supply(readings), bridge(readings), verdicts(a))
+}
+
+/// **The bridge columns** (lab #785 F5-4c-1): per node, the tip's cumulative
+/// `D_cum` / `E_cum`, `circulating = emission − burned − D_cum + E_cum` (only
+/// when the node's supply rows cover its tip, checked arithmetic), and each
+/// epoch's bridged-in / bridged-out. A net where no node serves a bridge —
+/// every T1/V5 net — prints one line, `bridge: none (not a V6 net)`, never a
+/// zero and never the UNAVAILABLE token: the token means a coverage gap, and
+/// a net with no bridge has none (#785 F5-4c-1 ruling). The token stays for a
+/// node that refuses or cannot be read, and for a covered-height mismatch.
+pub fn bridge(readings: &[NodeReading]) -> String {
+    use crate::poll::BridgeReading;
+    let any = readings.iter().any(|r| !matches!(r.bridge, BridgeReading::NotServed(_)));
+    if !any {
+        return "bridge: none (not a V6 net)\n".to_string();
+    }
+    let label_w = readings.iter().map(|r| r.endpoint.label.len()).max().unwrap_or(4).max(4);
+    let mut out = String::from("bridge (V6: bridged in = ΔD, out = ΔE):\n");
+    for r in readings {
+        match &r.bridge {
+            BridgeReading::NotServed(why) => {
+                out.push_str(&format!("{:<label_w$}  UNAVAILABLE — {why}\n", r.endpoint.label));
+            }
+            BridgeReading::Undecodable(why) => {
+                out.push_str(&format!("{:<label_w$}  UNAVAILABLE — bridge payload not readable: {why}\n", r.endpoint.label));
+            }
+            BridgeReading::Failed(why) => {
+                out.push_str(&format!("{:<label_w$}  UNAVAILABLE — bridge not served: {why}\n", r.endpoint.label));
+            }
+            BridgeReading::Served(v) => {
+                // Two fetches, two heights (review S2): the attestation mixes
+                // them only when the bridge covers exactly the telemetry tip.
+                let circulating = match r.reading.telemetry() {
+                    None => "UNAVAILABLE".to_string(),
+                    Some(t) if t.tip_height != v.covered_height => format!(
+                        "UNAVAILABLE (bridge covers {}, telemetry tip {})",
+                        v.covered_height, t.tip_height
+                    ),
+                    Some(t) => matches!(t.supply_coverage(), qlab_node::telemetry::SupplyCoverage::Complete)
+                        .then(|| {
+                            let emission = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.measured_coinbase))?;
+                            let burned = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.burned))?;
+                            v.circulating(emission, burned)
+                        })
+                        .flatten()
+                        .map_or_else(|| "UNAVAILABLE".to_string(), |c| c.to_string()),
+                };
+                out.push_str(&format!(
+                    "{:<label_w$}  covered to {}  D_cum {}  E_cum {}  circulating {}\n",
+                    r.endpoint.label, v.covered_height, v.d_cum, v.e_cum, circulating
+                ));
+                for row in &v.rows {
+                    out.push_str(&format!(
+                        "{:<label_w$}    epoch {:>5} {:>17}  in {:>20}  out {:>20}\n",
+                        "",
+                        row.epoch,
+                        format!("{}..={}", row.start_height, row.end_height),
+                        row.bridged_in,
+                        row.bridged_out
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -498,6 +563,7 @@ mod tests {
 
     fn ok_at(label: &str, tel: Telemetry, wire_version: u8) -> NodeReading {
         NodeReading {
+            bridge: crate::poll::BridgeReading::NotServed("404".to_string()),
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
             reading: Reading::Ok { telemetry: Box::new(tel), wire_version },
             elapsed: Duration::from_millis(2),
@@ -505,6 +571,7 @@ mod tests {
     }
     fn down(label: &str) -> NodeReading {
         NodeReading {
+            bridge: crate::poll::BridgeReading::NotServed("404".to_string()),
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
             reading: Reading::Unreachable("connect: Connection refused".into()),
             elapsed: Duration::from_millis(1),
@@ -756,6 +823,44 @@ mod tests {
         // distinction.
         assert_eq!(Agreement::of(&lagging).exit_code(), 0);
         assert_eq!(Agreement::of(&healthy).exit_code(), 0);
+    }
+
+    /// Lab #785 F5-4c-1: off V6 every node 404s the bridge route and the view
+    /// says so in one line — never a zero, and not the UNAVAILABLE token (no
+    /// coverage gap: there is no bridge); a V6 node's rows and cumulative pair
+    /// render, with `circulating` from its covered supply rows; a refusing
+    /// node (503) reads as itself, with the token.
+    #[test]
+    fn the_bridge_section_is_unavailable_off_v6_and_renders_on_v6() {
+        use crate::poll::BridgeReading;
+        use qlab_node::bridge_wire::{BridgeRow, BridgeView};
+        let readings = vec![ok("node0", t(Some(384), None, None))];
+        let text = bridge(&readings);
+        assert_eq!(text, "bridge: none (not a V6 net)\n");
+        assert!(!text.contains("UNAVAILABLE"), "no bridge is not a coverage gap:\n{text}");
+        assert!(!text.contains("D_cum 0"), "no bridge is not zero bridged:\n{text}");
+        let mut v6 = ok("node0", t(Some(384), None, None));
+        v6.bridge = BridgeReading::Served(BridgeView {
+            covered_height: 400,
+            d_cum: 1000,
+            e_cum: 40,
+            rows: vec![BridgeRow { epoch: 0, start_height: 0, end_height: 400, bridged_in: 1000, bridged_out: 40 }],
+        });
+        let down = down("node1");
+        let text = bridge(&[v6.clone(), down]);
+        assert!(text.contains("D_cum 1000  E_cum 40"), "{text}");
+        // Review S2: the bridge covers 400, the telemetry tip is 3800.
+        assert!(text.contains("circulating UNAVAILABLE (bridge covers 400, telemetry tip 3800)"), "{text}");
+        assert!(text.contains("in                 1000"), "{text}");
+        assert!(text.contains("node1  UNAVAILABLE"), "{text}");
+        // A refusing node (503) reads as itself, with the token, and the view
+        // is not "not a V6 net".
+        let mut refusing = v6;
+        refusing.bridge = BridgeReading::Failed("non-200 response: HTTP/1.1 503".into());
+        let text = bridge(&[refusing]);
+        assert!(text.contains("bridge not served: non-200 response: HTTP/1.1 503"), "{text}");
+        assert!(!text.contains("not a V6 net"), "{text}");
+        assert!(text.contains("UNAVAILABLE"), "{text}");
     }
 
     /// **Acceptance (#121): the public view has no per-signer participation

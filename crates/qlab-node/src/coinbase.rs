@@ -168,6 +168,35 @@ pub fn coinbase_rseed_v5(height: u64, payee_index: u8, rkm: &[u64; 4]) -> [u64; 
     derive_lanes_v5(COINBASE_RSEED_DOMAIN_V5, height, payee_index, rkm)
 }
 
+/// Domain string for an **exit note**'s ρ (lab #785 F5-4c): the note a V6
+/// block materializes for entry `i` of its bundle's clear exit list. Fresh,
+/// so no exit ρ can ever equal a coinbase ρ.
+pub const EXIT_RHO_DOMAIN: &[u8] = b"qumbra:exit-note-rho:v1";
+
+/// Domain string for an exit note's `rseed`. See [`EXIT_RHO_DOMAIN`].
+pub const EXIT_RSEED_DOMAIN: &[u8] = b"qumbra:exit-note-rseed:v1";
+
+/// **The exit note** (l2-architecture §4.2, "bridge-coinbase outputs"): the
+/// L1 note of `value` to `rkm` for exit `index` of the bundle carried at
+/// `height` — the v5 coinbase shape, `H(domain ‖ height ‖ index ‖ rkm)`,
+/// with the exit index where the payee index goes and a domain of its own.
+/// ρ is unique per `(height, index)`. Deterministic `rseed`, so a recipient
+/// who knows the clear list can rebuild the note — the one derivation the
+/// node and (F5-5) a wallet both call.
+pub fn exit_note(height: u64, index: u8, rkm: [u64; 4], value: u64) -> Note {
+    Note {
+        value,
+        rkm,
+        rho: derive_lanes_v5(EXIT_RHO_DOMAIN, height, index, &rkm),
+        rseed: derive_lanes_v5(EXIT_RSEED_DOMAIN, height, index, &rkm),
+    }
+}
+
+/// The commitment-tree leaf of [`exit_note`], on-wire bytes.
+pub fn exit_note_leaf(height: u64, index: u8, rkm: [u64; 4], value: u64) -> Hash32 {
+    digest_bytes(&exit_note(height, index, rkm, value).commitment())
+}
+
 /// The value the coinbase note carries: the miner's frozen §3 share of the
 /// block's scheduled emission plus the block's fees **minus the burned
 /// name-fee portion** (lab #367). See the module docs for why the

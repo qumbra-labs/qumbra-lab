@@ -227,6 +227,9 @@ fn f5_4b_the_proven_bundle_through_the_node_path() {
     let verified = r.verify_bundle(&h, &fx.wire, &ctx).unwrap();
     assert_eq!(r.fold_bundle(&prior, &fx.wire), Ok(verified.clone()));
     assert_eq!(r.bundle_surface(&fx.wire), Ok(verified.surface.clone()));
+    // F5-4c Q1: the prefix read states the same surface from the first bytes.
+    let prefix = 12 + 4 * qlab_wrapper::wleaf::W_PV_LEN;
+    assert_eq!(qlab_wrapper::codec::stated_surface_prefix(&fx.wire[..prefix]), Ok(Some(stated.clone())));
     assert_eq!((verified.d_batch, verified.e_batch, verified.exits.len()), (stated.out.d_cum, 0, 0));
 }
 
@@ -288,9 +291,10 @@ fn f5_4b_bundle_rule_negatives() {
     // The chain's own surface undecodable: this node's state, named.
     let ctx = BundleContext { surface: &[1, 2, 3], last_bundle_height: None, anchor_ok: &|_| true };
     assert_eq!(r.verify_bundle(&header_at(AT), &fx.wire, &ctx), Err(BundleRefusal::SurfaceState));
-    // Pre-review Q1: any exit is refused until F5-4c, rule and fold alike.
-    assert_eq!(judge(&r, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitsUnsupported { n: 1 }));
-    assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitsUnsupported { n: 1 }));
+    // 9. An exit list that does not chain to W's exit_cmt (EMPTY here) — F5-4c
+    // lifted 4b's blanket exit refusal, so the chain check is what refuses.
+    assert_eq!(judge(&r, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitCommitment));
+    assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitCommitment));
     // The fold refuses the verify path's refusals where it can judge (no proof, no signature).
     assert_eq!(r.fold_bundle(&off, &fx.wire), wrapper("Thread(\"k_next\")"));
     assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.l2_id = 2; false })), Err(BundleRefusal::L2Id { got: 2, want: REHEARSAL_L2_ID }));

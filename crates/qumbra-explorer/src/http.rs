@@ -266,6 +266,9 @@ pub struct Surfaces {
     pub attest: Arc<RwLock<String>>,
     /// `/v1/assets` — the registry, pre-serialized (lab #726; Annulet only).
     pub assets: Arc<RwLock<String>>,
+    /// `/v1/bridge` — the bridge document, pre-serialized (lab #785 F5-4c-1;
+    /// V6 only, "not available" elsewhere).
+    pub bridge: Arc<RwLock<String>>,
     /// Set by the run loop when [`publish`] observed a poisoned lock — a writer
     /// panicked at some point in process history. The projections keep serving
     /// (publish writes through), but `/healthz` answers **503 `degraded`**
@@ -293,6 +296,7 @@ impl Default for Surfaces {
             names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
             attest: Arc::new(RwLock::new("{\"v\":1,\"available\":false}".to_string())),
             assets: Arc::new(RwLock::new("{\"v\":1,\"available\":false}".to_string())),
+            bridge: Arc::new(RwLock::new(crate::bridge::not_v6())),
             degraded: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -344,6 +348,7 @@ impl ExplorerServer {
             names,
             attest,
             assets,
+            bridge,
             degraded,
         } = surfaces;
         let server = tiny_http::Server::http(addr)
@@ -423,6 +428,11 @@ impl ExplorerServer {
                         let body =
                             attest.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
                         (crate::attest::ATTEST_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
+                    }
+                    (tiny_http::Method::Get, crate::bridge::BRIDGE_PATH) => {
+                        let body =
+                            bridge.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
+                        (crate::bridge::BRIDGE_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
                     }
                     (tiny_http::Method::Get, crate::attest::REGISTRY_PATH) => {
                         let body =
@@ -657,6 +667,7 @@ mod tests {
                 names: Arc::clone(&s.names),
                 attest: Arc::clone(&s.attest),
                 assets: Arc::clone(&s.assets),
+                bridge: Arc::clone(&s.bridge),
                 degraded: Arc::clone(&s.degraded),
             },
         )

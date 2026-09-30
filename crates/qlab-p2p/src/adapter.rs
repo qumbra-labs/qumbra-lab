@@ -2634,7 +2634,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 | qlab_devnet::body::BundleRefusal::TooManyExits { .. }
                 | qlab_devnet::body::BundleRefusal::ZeroExitRkm { .. }
                 | qlab_devnet::body::BundleRefusal::ZeroExitValue { .. }
-                | qlab_devnet::body::BundleRefusal::ExitsUnsupported { .. }
                 | qlab_devnet::body::BundleRefusal::NoStatedSurface
                 | qlab_devnet::body::BundleRefusal::Signature
                 | qlab_devnet::body::BundleRefusal::Wrapper(_)
@@ -8380,7 +8379,7 @@ mod tests {
             assert!(matches!(A::body_fault_class(&BodyError::Bundle { refusal: r }), BodyFault::Local(_)));
         }
         assert!(matches!(
-            A::body_fault_class(&BodyError::Bundle { refusal: BundleRefusal::ExitsUnsupported { n: 1 } }),
+            A::body_fault_class(&BodyError::Bundle { refusal: BundleRefusal::ExitCommitment }),
             BodyFault::Intrinsic("bad body")
         ));
     }
