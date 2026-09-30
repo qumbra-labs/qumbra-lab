@@ -77,3 +77,9 @@ phasemem = ["dep:tracing", "dep:tracing-subscriber"]
 [dev-dependencies]
 # lab #742 (A5 lever 4f): the M4 gate tests scan with `qlab_air::l2test`.
 qlab-air = { path = "../qlab-air", features = ["test-support"] }
+# Lab #785 F5-4b: the proven k = 1 bundle fixture runs through the node's real
+# bundle rule (`qumbra_node::bundle::WrapperRule`), whose measurement version
+# and member stub are behind this dev-only feature (ruling 5915423092).
+qumbra-node = { path = "../qumbra-node", features = ["wrapper-test-knobs"] }
+# The fixture's sequencer signature (the rehearsal key's signing half).
+ml-dsa = "=0.1.1"

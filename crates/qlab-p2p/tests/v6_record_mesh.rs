@@ -47,6 +47,7 @@ fn v6_adapter(committee: &qlab_devnet::committee::Committee) -> Adapter {
         KeccakPow,
         MarkerVerifier,
         easy_sim(),
+        None,
     )
 }
 

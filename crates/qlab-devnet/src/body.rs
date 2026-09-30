@@ -343,8 +343,8 @@ pub struct BlockBody {
     /// refuses a non-empty section ([`BodyError::SectionOnForm`]).
     pub finality: Vec<u8>,
     /// **V6 only**: the wrapper bundle's canonical bytes, empty when absent.
-    /// Until F5-4 wires `verify_wrapper` as the rule, every bundle is refused
-    /// ([`RefuseAllBundles`]).
+    /// Judged by the net's [`BundleVerifier`] (lab #785 F5-4b); a node with
+    /// no wrapper rule refuses every bundle ([`RefuseAllBundles`]).
     pub bundle: Vec<u8>,
 }
 
@@ -809,9 +809,10 @@ pub enum BodyError {
     /// ([`crate::finality_record::FinalityRecord::check`]); `err` is the
     /// record's own verdict, kept rather than flattened.
     FinalityRecord { err: crate::finality_record::RecordError },
-    /// The body's wrapper bundle was refused by the bundle rule. Until F5-4
-    /// wires `verify_wrapper`, every bundle is refused ([`RefuseAllBundles`]).
-    BundleRefused,
+    /// The body's wrapper bundle was refused by the bundle rule (lab #785
+    /// F5-4b), named by the step that refused it. A node with no bundle rule
+    /// refuses every bundle with [`BundleRefusal::NoRule`].
+    Bundle { refusal: BundleRefusal },
     /// **V6's anchor rule**: the tx at `index` names a root that is not a
     /// commitment root at some ancestor height `h` with `h ≤` the block's
     /// recorded finality and `H − h ≤ MAX_ANCHOR_AGE_BLOCKS`.
@@ -1129,22 +1130,133 @@ pub trait V6ChainView {
     /// The ascending ancestor heights (all below the block's own) after which
     /// `root` was the commitment root. Empty for a root this ancestry never had.
     fn root_heights(&self, root: &Hash32) -> &[u64];
+    /// The wrapper chain's surface after the parent (lab #785 F5-4b): the
+    /// canonical bytes the bundle rule last returned, or the genesis surface.
+    /// Opaque here — only the rule decodes it.
+    fn wrapper_surface(&self) -> &[u8];
+    /// The height of the latest bundle-carrying block in the ancestry, if any.
+    fn last_bundle_height(&self) -> Option<u64>;
 }
 
-/// The bundle rule's seam. F5-3b ships [`RefuseAllBundles`] only; F5-4 wires
-/// `verify_wrapper` V0–V9 behind this trait.
+/// What the bundle rule reads from the chain as of the block being validated
+/// (lab #785 F5-4b). Every field is a function of the block's ancestry and
+/// its own finality record, so a verdict is the same live and in replay.
+pub struct BundleContext<'a> {
+    /// The predecessor surface's canonical bytes.
+    pub surface: &'a [u8],
+    /// The last bundle's height, for spacing (the first bundle is free).
+    pub last_bundle_height: Option<u64>,
+    /// V7: is `root` (a commitment root, as the node's `Hash32`) a valid
+    /// absorbed L1 root in this block — the record rule, the block's own
+    /// record counted ([`v6_anchor_ok`]).
+    pub anchor_ok: &'a dyn Fn(&Hash32) -> bool,
+}
+
+/// An accepted bundle's effect (lab #785 F5-4b).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleOutcome {
+    /// The successor surface's canonical bytes.
+    pub surface: Vec<u8>,
+    /// The clear exit list `(rkm, v)`, in order (F5-4c turns them into notes).
+    pub exits: Vec<(Hash32, u64)>,
+    /// `D_cum` and `E_cum` moved by this bundle (F5-4c's supply columns).
+    pub d_batch: u64,
+    pub e_batch: u64,
+}
+
+/// Why a bundle was refused, by the step that refused it (lab #785 F5-4b;
+/// the order is the rule's, ruling change A).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BundleRefusal {
+    /// This node has no bundle rule ([`RefuseAllBundles`]).
+    NoRule,
+    /// The bytes are not a canonical bundle; the codec's named error.
+    Codec(String),
+    /// The chain's own surface does not decode — an invariant broken on this
+    /// node, never a property of the bundle.
+    SurfaceState,
+    /// The bundle's `l2_id` is not the chain's.
+    L2Id { got: u64, want: u64 },
+    /// Fewer than the genesis spacing blocks since the last bundle.
+    Spacing { since: u64, need: u64 },
+    /// More exits than `K_exit`.
+    TooManyExits { n: usize, k_exit: usize },
+    /// Exit `index` pays the zero `rkm`.
+    ZeroExitRkm { index: usize },
+    /// Exit `index` carries no value.
+    ZeroExitValue { index: usize },
+    /// A non-empty exit list, refused until F5-4c appends exits to the
+    /// commitment tree (pre-review Q1): a chain that accepted exits without
+    /// their notes would replay to a different tree under F5-4c.
+    ExitsUnsupported { n: usize },
+    /// A W public value is not a 16-bit chunk, so the bundle states no
+    /// surface to sign (V0 would refuse it too; this is the signature path's
+    /// own check, before any proof).
+    NoStatedSurface,
+    /// The sequencer's signature does not verify.
+    Signature,
+    /// `verify_wrapper` refused: its check, named (`VError`'s debug form).
+    Wrapper(String),
+    /// The verified successor surface is not the one the bundle states (and
+    /// the sequencer signed).
+    StatedSurface,
+    /// The clear exit list does not chain to W's `exit_cmt`.
+    ExitCommitment,
+    /// `Σ v` overflows, or is not `E_cum − E_cum_prev`.
+    ExitSum,
+    /// `D_cum` or `E_cum` moved backwards, or a difference overflowed.
+    Counters,
+}
+
+/// The bundle rule's seam (lab #785): `qlab-devnet` stays prover-free, and
+/// the real implementation lives in qumbra-node over `qlab_wrapper`.
 pub trait BundleVerifier {
-    /// `true` iff `bundle` is valid in the block `header` heads.
-    fn verify_bundle(&self, header: &BlockHeader, bundle: &[u8]) -> bool;
+    /// **The rule**: judge `bundle` in the block `header` heads, against the
+    /// chain as `ctx` states it; on acceptance, its effect.
+    fn verify_bundle(&self, header: &BlockHeader, bundle: &[u8], ctx: &BundleContext<'_>) -> Result<BundleOutcome, BundleRefusal>;
+    /// **The fold**: the effect of a bundle already judged valid, from the
+    /// predecessor surface's bytes — decode and read, no proof. The state
+    /// funnel (`apply_state`) runs it on every applied block, live and in
+    /// log replay, so the chain's surface is one function of the applied
+    /// chain; the snapshot paths, which put their prefix in without
+    /// `apply_state`, re-derive it with [`Self::bundle_surface`] instead.
+    fn fold_bundle(&self, surface: &[u8], bundle: &[u8]) -> Result<BundleOutcome, BundleRefusal>;
+    /// The successor surface `bundle` states, from its own bytes alone —
+    /// what [`Self::fold_bundle`] returns as `surface` for it. The snapshot
+    /// paths re-derive the chain's surface from the latest held bundle with
+    /// it (every applied bundle was folded, so its stated surface is the one
+    /// the chain moved to).
+    fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, BundleRefusal>;
 }
 
-/// Refuses every bundle — so no bundle can land unverified between the form
-/// (F5-3b) and the rule (F5-4).
+/// A V6 net's wrapper chain as a node carries it (lab #785 F5-4b): the rule
+/// (built from the genesis's `WrapperParams` by qumbra-node) and the genesis
+/// surface's canonical bytes, the predecessor of the first bundle.
+#[derive(Clone)]
+pub struct WrapperSetup {
+    pub rule: std::sync::Arc<dyn BundleVerifier + Send + Sync>,
+    pub genesis_surface: Vec<u8>,
+}
+
+impl std::fmt::Debug for WrapperSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrapperSetup").field("genesis_surface_len", &self.genesis_surface.len()).finish_non_exhaustive()
+    }
+}
+
+/// Refuses every bundle — the verifier on every path with no wrapper
+/// parameters (ruling condition (b): no accepting stub outside tests).
 pub struct RefuseAllBundles;
 
 impl BundleVerifier for RefuseAllBundles {
-    fn verify_bundle(&self, _header: &BlockHeader, _bundle: &[u8]) -> bool {
-        false
+    fn verify_bundle(&self, _: &BlockHeader, _: &[u8], _: &BundleContext<'_>) -> Result<BundleOutcome, BundleRefusal> {
+        Err(BundleRefusal::NoRule)
+    }
+    fn fold_bundle(&self, _: &[u8], _: &[u8]) -> Result<BundleOutcome, BundleRefusal> {
+        Err(BundleRefusal::NoRule)
+    }
+    fn bundle_surface(&self, _: &[u8]) -> Result<Vec<u8>, BundleRefusal> {
+        Err(BundleRefusal::NoRule)
     }
 }
 
@@ -1193,8 +1305,8 @@ pub fn check_body_binding_v6(header: &BlockHeader, body: &BlockBody) -> Result<(
 ///
 /// 1. the **finality record**, if present, checked against the chain view
 ///    (cadence, monotone over `CR(parent)`, ancestor, committee₀ signatures);
-/// 2. the **bundle**, if present, through `bundles` (every bundle refused
-///    until F5-4);
+/// 2. the **bundle**, if present, through `bundles` — after the record, so
+///    V7's absorbed roots are judged under the block's own record;
 /// 3. every tx anchor under the **record** rule ([`v6_anchor_ok`]) with the
 ///    block's own record counted — [`BodyError::AnchorOutsideRecord`].
 ///
@@ -1376,10 +1488,21 @@ where
                 r.check(prior, |h| chain.ancestor_at(h), chain.committee0())
                     .map_err(|err| BodyError::FinalityRecord { err })?;
             }
-            if !body.bundle.is_empty() && !bundles.verify_bundle(header, &body.bundle) {
-                return Err(BodyError::BundleRefused);
+            let recorded = crate::finality_record::recorded_after(prior, record.as_ref());
+            // The bundle, after the record (V7 reads the block's own record, as
+            // the tx anchors below do) and before any tx work.
+            if !body.bundle.is_empty() {
+                let anchor_ok = |root: &Hash32| v6_anchor_ok(chain.root_heights(root), header.height, recorded);
+                let ctx = BundleContext {
+                    surface: chain.wrapper_surface(),
+                    last_bundle_height: chain.last_bundle_height(),
+                    anchor_ok: &anchor_ok,
+                };
+                bundles
+                    .verify_bundle(header, &body.bundle, &ctx)
+                    .map_err(|refusal| BodyError::Bundle { refusal })?;
             }
-            crate::finality_record::recorded_after(prior, record.as_ref())
+            recorded
         }
         _ => None,
     };
@@ -3180,6 +3303,12 @@ mod tests {
         fn root_heights(&self, root: &Hash32) -> &[u64] {
             if *root == FINAL_ANCHOR { &self.anchor_heights } else { &[] }
         }
+        fn wrapper_surface(&self) -> &[u8] {
+            &[]
+        }
+        fn last_bundle_height(&self) -> Option<u64> {
+            None
+        }
     }
 
     fn header_v6(height: u64, body: &BlockBody) -> BlockHeader {
@@ -3313,17 +3442,76 @@ mod tests {
         }
     }
 
-    /// 🔒 Every bundle is refused until F5-4 wires `verify_wrapper` — the
-    /// section is committed and decoded nowhere else, so this is the one gate.
+    /// 🔒 With no bundle rule every bundle is refused (ruling condition (b)):
+    /// validation and the fold alike, by name.
     #[test]
-    fn every_v6_bundle_is_refused_until_f5_4() {
+    fn with_no_rule_every_v6_bundle_is_refused() {
         let cv = Cv { recorded: None, anchor_heights: vec![] };
         for bytes in [vec![0u8], vec![0xff; 4096]] {
             let mut body = BlockBody::from_single_payee(vec![], coinbase_exact(20), MINER_RKM);
             body.bundle = bytes;
-            assert_eq!(v6(20, &body, &cv), Err(BodyError::BundleRefused));
+            assert_eq!(v6(20, &body, &cv), Err(BodyError::Bundle { refusal: BundleRefusal::NoRule }));
         }
-        assert!(!RefuseAllBundles.verify_bundle(&BlockHeader::genesis(1, 0), &[]));
+        let ctx = BundleContext { surface: &[], last_bundle_height: None, anchor_ok: &|_| true };
+        assert_eq!(RefuseAllBundles.verify_bundle(&BlockHeader::genesis(1, 0), &[], &ctx), Err(BundleRefusal::NoRule));
+        assert_eq!(RefuseAllBundles.fold_bundle(&[], &[1]), Err(BundleRefusal::NoRule));
+        assert_eq!(RefuseAllBundles.bundle_surface(&[1]), Err(BundleRefusal::NoRule));
+    }
+
+    /// Lab #785 F5-4b: the funnel hands the rule the chain's surface, the
+    /// last bundle height and a V7 predicate that counts the block's OWN
+    /// record — a root recorded only by this block's record is valid for
+    /// the bundle, as it is for the block's tx anchors.
+    #[test]
+    fn the_bundle_rule_sees_the_chain_and_the_blocks_own_record() {
+        use std::cell::RefCell;
+        struct Probe {
+            seen: RefCell<Option<(Vec<u8>, Option<u64>, bool, bool)>>,
+        }
+        impl BundleVerifier for Probe {
+            fn verify_bundle(&self, _: &BlockHeader, _: &[u8], ctx: &BundleContext<'_>) -> Result<BundleOutcome, BundleRefusal> {
+                *self.seen.borrow_mut() =
+                    Some((ctx.surface.to_vec(), ctx.last_bundle_height, (ctx.anchor_ok)(&FINAL_ANCHOR), (ctx.anchor_ok)(&[0x77; 32])));
+                Err(BundleRefusal::Signature)
+            }
+            fn fold_bundle(&self, _: &[u8], _: &[u8]) -> Result<BundleOutcome, BundleRefusal> {
+                unreachable!("the funnel never folds")
+            }
+            fn bundle_surface(&self, _: &[u8]) -> Result<Vec<u8>, BundleRefusal> {
+                unreachable!("the funnel never re-derives")
+            }
+        }
+        struct Cv2(Cv);
+        impl V6ChainView for Cv2 {
+            fn recorded_finality(&self) -> Option<u64> {
+                self.0.recorded_finality()
+            }
+            fn ancestor_at(&self, h: u64) -> Option<Hash32> {
+                self.0.ancestor_at(h)
+            }
+            fn committee0(&self) -> &crate::committee::Committee {
+                self.0.committee0()
+            }
+            fn root_heights(&self, root: &Hash32) -> &[u64] {
+                self.0.root_heights(root)
+            }
+            fn wrapper_surface(&self) -> &[u8] {
+                &[9, 9, 9]
+            }
+            fn last_bundle_height(&self) -> Option<u64> {
+                Some(3)
+            }
+        }
+        // FINAL_ANCHOR exists at height 16 only; no prior record, so only the
+        // block's own record (checkpoint 16) makes it valid.
+        let cv = Cv2(Cv { recorded: None, anchor_heights: vec![16] });
+        let mut body = BlockBody::from_single_payee(vec![], coinbase_exact(20), MINER_RKM);
+        body.finality = quorum_record_bytes();
+        body.bundle = vec![1];
+        let probe = Probe { seen: RefCell::new(None) };
+        let got = validate_body_v6(&header_v6(20, &body), &body, &MockVerifier, &cv, &probe, &names::EmptyNameView);
+        assert_eq!(got, Err(BodyError::Bundle { refusal: BundleRefusal::Signature }), "the rule's refusal, named");
+        assert_eq!(probe.seen.into_inner(), Some((vec![9, 9, 9], Some(3), true, false)));
     }
 
     /// A bad record is refused with the record's own verdict: bytes that do
