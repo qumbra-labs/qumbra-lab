@@ -306,7 +306,7 @@ impl GenesisFileV6 {
         // C2 (lab #785 F5-4b): the pinned genesis surface is the one this
         // binary computes for the genesis's l2_id over the empty registry —
         // the surface every node's first bundle threads from.
-        let computed = qlab_wrapper::genesis::genesis_surface(self.wrapper.l2_id, &qlab_wrapper::genesis::empty_registry_root());
+        let computed = qlab_wrapper::genesis::genesis_surface(self.wrapper.l2_id, &v6_genesis_registry_root());
         if self.wrapper.genesis_surface != computed.commitment {
             return Err(GenesisError::V6Refused(format!(
                 "WrapperParams.genesis_surface {:?} is not the empty L2 state's surface for l2_id {} ({:?})",
@@ -453,7 +453,7 @@ mod tests {
         assert!(matches!(other_id.verify_startup(None), Err(GenesisError::V6Refused(m)) if m.contains("genesis_surface")));
         let mut both = base;
         both.wrapper.l2_id = 2;
-        both.wrapper.genesis_surface = qlab_wrapper::genesis::genesis_surface(2, &qlab_wrapper::genesis::empty_registry_root()).commitment;
+        both.wrapper.genesis_surface = qlab_wrapper::genesis::genesis_surface(2, &v6_genesis_registry_root()).commitment;
         assert!(both.verify_startup(None).is_ok(), "a consistent pair passes");
     }
 

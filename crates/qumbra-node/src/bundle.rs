@@ -49,7 +49,7 @@ use qlab_devnet::body::{BundleContext, BundleOutcome, BundleRefusal, BundleVerif
 use qlab_wrapper::codec::{
     check_exit_shape, decode_surface, digest_to_bytes, encode_surface, exit_chain, exit_sum, sign_message, ExitShape, WireBundle,
 };
-use qlab_wrapper::genesis::{empty_registry_root, genesis_surface, CHAIN_VERSION};
+use qlab_wrapper::genesis::{genesis_surface, CHAIN_VERSION};
 use qlab_consensus::{Config, Proof};
 use qlab_wrapper::verify::{roots_at, thread_check, verify_wrapper, BundleMember, MemberVerifier, Surface, TypedMembers, VError};
 
@@ -161,16 +161,16 @@ impl WrapperRule {
     }
 
     /// The genesis surface this net starts from: the empty L2 state for its
-    /// `l2_id` over the empty registry, as canonical bytes.
+    /// `l2_id` over the V6 genesis registry (asset 0's leaf), as canonical bytes.
     pub fn genesis_surface_bytes(l2_id: u64) -> Vec<u8> {
-        encode_surface(&genesis_surface(l2_id, &empty_registry_root())).to_vec()
+        encode_surface(&genesis_surface(l2_id, &crate::genesis_v6::v6_genesis_registry_root())).to_vec()
     }
 
     /// The node-side setup: this rule and the genesis surface at the rule's
     /// version (version 1 outside tests, so exactly
     /// [`Self::genesis_surface_bytes`]).
     pub fn into_setup(self) -> WrapperSetup {
-        let roots = qlab_wrapper::genesis::genesis_roots(&empty_registry_root());
+        let roots = qlab_wrapper::genesis::genesis_roots(&crate::genesis_v6::v6_genesis_registry_root());
         let genesis_surface = encode_surface(&Surface::genesis(self.version, self.l2_id, roots)).to_vec();
         WrapperSetup { rule: Arc::new(self), genesis_surface }
     }

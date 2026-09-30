@@ -26,12 +26,12 @@ use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_node::{genesis_block_v6, ChainStore, MemNode, NodeError, NodeState, V6Setup};
 use qlab_wrapper::codec::{digest_from_bytes, encode_surface, sign_message, Exit, WireBundle, SEQUENCER_SIG_LEN};
 use qlab_wrapper::config::Outer;
-use qlab_wrapper::genesis::{empty_registry_root, genesis_roots};
+use qlab_wrapper::genesis::genesis_roots;
 use qlab_wrapper::hash::{WTag, M_ABS};
 use qlab_wrapper::verify::{BundleMember, MemberVerifier, Surface};
 use qlab_wrapper::wleaf::{PV_C, PV_D, PV_E, PV_EXC, PV_PREV, PV_SIDE};
 use qumbra_node::bundle::WrapperRule;
-use qumbra_node::genesis_v6::{rehearsal_sequencer_seed, WrapperParams, REHEARSAL_L2_ID};
+use qumbra_node::genesis_v6::{rehearsal_sequencer_seed, v6_genesis_registry, v6_genesis_registry_root, WrapperParams, REHEARSAL_L2_ID};
 
 use super::dep::prove_dep;
 use super::native::{check_wrapper_leaf, synth_claim_open, WInputs, WState};
@@ -124,9 +124,9 @@ fn fixture() -> &'static Fixture {
         // The chain's commitment root, absorbed four times: the empty tree's,
         // recorded at every height of `chain_to_8`.
         let root = digest_from_bytes(&chain_to_8().commitment_root());
-        let genesis = Surface::genesis(VERSION, REHEARSAL_L2_ID, genesis_roots(&empty_registry_root()));
+        let genesis = Surface::genesis(VERSION, REHEARSAL_L2_ID, genesis_roots(&v6_genesis_registry_root()));
         let mut rng = Rng(0x785_f54b);
-        let mut s = WState::genesis(&[]);
+        let mut s = WState::genesis(&v6_genesis_registry());
         assert_eq!(s.roots(), genesis.out, "the fixture starts at the chain's genesis state");
         let (claim, open) = synth_claim_open(&mut rng, &root, CLAIM_FEE);
         let inp = WInputs { prev: genesis.commitment, rkm_seq: rng.digest(), absorbed: [root; M_ABS], d_batch: open.v };
@@ -364,4 +364,17 @@ fn f5_4b_the_proven_bundle_survives_replay_and_snapshot_resume() {
     assert_eq!((resumed.recovery_report().snapshot_height, resumed.recovery_report().replayed_records), (Some(9), 0));
     assert_eq!((resumed.tip_hash(), resumed.wrapper_surface().to_vec(), resumed.last_bundle_height()), live);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// F-A (lab #785 F5-4a): the node's V6 genesis registry is the registry
+/// every F3/F4 fixture starts from — asset 0's Cloaked leaf — and the
+/// native model over it is the node's genesis surface.
+#[test]
+fn the_v6_genesis_registry_is_the_fixtures() {
+    use qlab_air::l2::RegistryLeaf;
+    assert_eq!(v6_genesis_registry(), vec![RegistryLeaf::cloaked(0)]);
+    let native = WState::genesis(&v6_genesis_registry()).roots();
+    assert_eq!(native, genesis_roots(&v6_genesis_registry_root()));
+    let surface = WrapperRule::genesis_surface_bytes(REHEARSAL_L2_ID);
+    assert_eq!(surface, encode_surface(&Surface::genesis(1, REHEARSAL_L2_ID, native)).to_vec());
 }
