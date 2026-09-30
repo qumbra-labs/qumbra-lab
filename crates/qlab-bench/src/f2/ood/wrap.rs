@@ -937,6 +937,7 @@ mod tests {
         let mut as_p = pvs[..l2p::PV_VP1].to_vec();
         as_p.extend([Val::ZERO; l2p::PV_NF3 - l2p::PV_VP1]);
         as_p.extend_from_slice(&pvs[l2::PV_NF3..]);
+        as_p.extend([Val::ZERO; 16]); // F5-4d: no exit recipient
         assert_eq!(as_p.len(), Shape::P.pv_len());
         let mut fee_at_r = pvs.clone();
         for i in 0..4 {

@@ -313,6 +313,7 @@ fn pv_groups(shape: Shape) -> Vec<(usize, &'static str)> {
             (l2p::PV_VP2 + 1, "vp2_amount"),
             (l2p::PV_VP2 + 5, "vp2_asset"),
             (l2p::PV_NF3, "nf3"),
+            (l2p::PV_XRKM, "xrkm"),
         ],
         Shape::R => vec![
             (l2r::PV_ANCHOR, "anchor"),

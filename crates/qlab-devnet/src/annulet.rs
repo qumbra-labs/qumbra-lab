@@ -695,12 +695,12 @@ mod tests {
 
     #[test]
     fn surfaces_round_trip_at_their_lengths() {
-        for (s, len) in [(s_surface(), 33usize), (p_surface(), 55)] {
+        for (s, len) in [(s_surface(), 33usize), (p_surface(), 87)] {
             let b = s.encode();
             assert_eq!(b.len(), len);
             assert_eq!(L2Surface::decode(&b), Ok(Some(s)));
         }
-        assert_eq!((L2_SURFACE_LEN_S, L2_SURFACE_LEN_P), (33, 55));
+        assert_eq!((L2_SURFACE_LEN_S, L2_SURFACE_LEN_P), (33, 87), "P: + the exit recipient (F5-4d)");
         assert_eq!(L2Surface::decode(L2_SURFACE_ABSENT), Ok(None));
         assert_eq!((L2ShapeTag::S.byte(), L2ShapeTag::P.byte()), (0x01, 0x02));
     }

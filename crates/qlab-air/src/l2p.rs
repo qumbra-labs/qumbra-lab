@@ -1320,7 +1320,8 @@ where
             }
             // `e_k = s_k · z_k · nz_k`: degree 2 in columns, because `s_k` is a
             // public value (a constant to the AIR). `XE = e_0 ∨ e_1` is the
-            // shape's ONE degree-4 constraint.
+            // exit edge's one degree-4 constraint (`e_0 · e_1`); the shape
+            // already had others, so the maximum stays 4.
             let e = |k: usize| pv(pv_vp_sign(k)) * z(k) * pol(POL_NZ + k);
             builder.assert_eq(xe.clone(), e(0) + e(1) - e(0) * e(1));
             // The recipient: nonzero on an exit (Σ of 16 16-bit limbs is below
@@ -3573,9 +3574,10 @@ mod tests {
         // A4 adds: 2 role selectors; the two row-fee chains' 4 chunk closes
         // each (`close·d3·f1·fee·ep`); the two row-fee asset bindings; and the
         // 16 bind-bank transitions whose AISS leg carries `(1 − L3)`.
+        // F5-4d (lab #785) adds one: `XE`'s definition (`e_0 · e_1`).
         assert_eq!(
             hist.get(&4).copied().unwrap_or(0),
-            24 + 1 + 16 + 16 + 3 + 8 + 2 + 16,
+            24 + 1 + 16 + 16 + 3 + 8 + 2 + 16 + 1,
             "deg-4 constraints"
         );
     }
@@ -3924,7 +3926,7 @@ mod tests {
         assert_unsat(&bad, "a mint on a Cloaked asset with a lied mode");
         // A redeem on a Cloaked asset other than 0 likewise (lab #785 F5-4d:
         // asset 0's redeem is the exit edge, `l2p_asset0_redeem_is_the_exit`).
-        let bad2 = bucket(0xc10a_0002, 100, 0, 50, 5, 100, 0, 40, 5, 10, [VPublic::NONE, VPublic::redeem(10)]);
+        let bad2 = bucket(0xc10a_0002, 100, 0, 50, 5, 90, 0, 40, 5, 10, [VPublic::NONE, VPublic::redeem(10)]);
         assert_unsat(&bad2, "a redeem on a Cloaked asset");
     }
 
