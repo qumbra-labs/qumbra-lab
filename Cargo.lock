@@ -1928,6 +1928,7 @@ dependencies = [
  "qlab-pow",
  "qlab-stratum",
  "qlab-wallet",
+ "qlab-wrapper",
  "qumbra-pool",
  "qumbra-wallet",
  "rand 0.10.2",

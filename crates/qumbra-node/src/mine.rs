@@ -1405,10 +1405,10 @@ mod tests {
     /// mint in this tree**, and it is the entire reason the old guard looked
     /// sound. T2 shows what it was worth: the live T2 genesis was minted at the
     /// launch ceremony from OS-random committee keys (`new_t2_with_committee_
-    /// seeds`, lab #506), so the in-tree rehearsal mint `new_t2()` hashes to a
+    /// seeds`, lab #506), so the in-tree rehearsal mint `new_t2_v5()` hashes to a
     /// third value that tracks neither the live net nor this table.
     ///
-    /// If this test ever fails, someone has re-minted `new_t2()` into agreement
+    /// If this test ever fails, someone has re-minted `new_t2_v5()` into agreement
     /// with the live net — which cannot happen without the ceremony's secret
     /// keys, so the likelier reading is that one of the two values was edited to
     /// make a test pass.
@@ -1421,10 +1421,10 @@ mod tests {
              offline `prepare` tests that use real_genesis_bytes() need a different fixture"
         );
         assert_ne!(
-            GenesisFile::new_t2().hash_hex(),
+            GenesisFile::new_t2_v5().hash_hex(),
             NET_T2.genesis_hash,
             "the in-tree T2 mint is the REHEARSAL mint; the live T2 genesis carries ceremony \
-             keys. A guard pinning mine's T2 constant to new_t2() would be asserting a \
+             keys. A guard pinning mine's T2 constant to new_t2_v5() would be asserting a \
              falsehood — see this test's doc comment and lab #527."
         );
     }

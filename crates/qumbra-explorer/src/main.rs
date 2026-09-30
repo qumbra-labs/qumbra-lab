@@ -111,6 +111,7 @@ fn load(cfg_path: &str) -> Result<(ExplorerConfig, NodeConfig, AnyGenesis), Box<
 fn genesis_hash_hex(g: &AnyGenesis) -> String {
     match g {
         AnyGenesis::L1(g) => g.hash_hex(),
+        AnyGenesis::V6(g) => g.hash_hex(),
         AnyGenesis::Annulet(g) => g.hash_hex(),
     }
 }
@@ -119,6 +120,7 @@ fn genesis_hash_hex(g: &AnyGenesis) -> String {
 fn genesis_network(g: &AnyGenesis) -> &str {
     match g {
         AnyGenesis::L1(g) => &g.network,
+        AnyGenesis::V6(g) => &g.base.network,
         AnyGenesis::Annulet(g) => &g.network,
     }
 }
@@ -127,6 +129,7 @@ fn genesis_network(g: &AnyGenesis) -> &str {
 fn genesis_form(g: &AnyGenesis) -> Result<qlab_devnet::forms::GenesisForm, Box<dyn Error>> {
     Ok(match g {
         AnyGenesis::L1(g) => g.form()?,
+        AnyGenesis::V6(g) => g.forms().0,
         AnyGenesis::Annulet(g) => g.form()?,
     })
 }
@@ -135,7 +138,7 @@ fn genesis_form(g: &AnyGenesis) -> Result<qlab_devnet::forms::GenesisForm, Box<d
 /// genesis's public plaintext notes, each commitment checked; empty on L1.
 fn genesis_issuance(g: &AnyGenesis) -> Result<std::collections::BTreeMap<u16, u128>, Box<dyn Error>> {
     match g {
-        AnyGenesis::L1(_) => Ok(Default::default()),
+        AnyGenesis::L1(_) | AnyGenesis::V6(_) => Ok(Default::default()),
         AnyGenesis::Annulet(g) => Ok(qlab_node::asset_supply::genesis_issuance(&g.notes())?),
     }
 }
@@ -200,6 +203,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis_form(&genesis)?);
     let mut node = match &genesis {
         AnyGenesis::L1(g) => RunningNode::start(&node_cfg, g, RandomXPow::new(), verifier)?,
+        AnyGenesis::V6(g) => RunningNode::start_v6(&node_cfg, g, RandomXPow::new(), verifier)?,
         // An Annulet net has no PoW; the engine parameter is unused on it.
         AnyGenesis::Annulet(g) => RunningNode::start_annulet(&node_cfg, g, RandomXPow::new(), verifier)?,
     };

@@ -209,6 +209,8 @@ impl SequencerKeyFile {
 #[derive(Debug)]
 pub enum AnyGenesis {
     L1(Box<GenesisFile>),
+    /// Lab #785 F5-3c: genesis format 10.
+    V6(Box<crate::genesis_v6::GenesisFileV6>),
     Annulet(Box<AnnuletGenesisFile>),
 }
 
@@ -222,6 +224,9 @@ pub fn load_any(bytes: &[u8]) -> Result<AnyGenesis, GenesisError> {
     let got = leading_format_version(bytes).ok_or_else(|| GenesisError::Decode("genesis file shorter than its format version".into()))?;
     if crate::genesis::PRE_REMINT_FORMAT_VERSIONS.contains(&got) {
         return Err(GenesisError::PreRemintGenesis { got });
+    }
+    if got == qlab_devnet::forms::V6_GENESIS_FORMAT_VERSION {
+        return Ok(AnyGenesis::V6(Box::new(crate::genesis_v6::GenesisFileV6::from_bytes(bytes)?)));
     }
     match GenesisForm::from_genesis_format_version(got) {
         Some(GenesisForm::V4) | Some(GenesisForm::V5) => {
@@ -643,7 +648,7 @@ mod tests {
     fn load_any_dispatches_on_the_leading_format_version() {
         let an = AnnuletGenesisFile::fixture().to_bytes();
         assert!(matches!(load_any(&an), Ok(AnyGenesis::Annulet(_))));
-        for l1 in [GenesisFile::new_devnet_t0(), GenesisFile::new_t2()] {
+        for l1 in [GenesisFile::new_devnet_t0(), GenesisFile::new_t2_v5()] {
             assert!(matches!(load_any(&l1.to_bytes()), Ok(AnyGenesis::L1(_))));
         }
         let mut junk = an.clone();
@@ -674,7 +679,7 @@ mod tests {
         // the refusal by name itself lives in the L1 loader.
         // Read from the constructors' own fields, never literals (lab #747's
         // lesson: a literal version in a test goes stale at every format bump).
-        for l1 in [GenesisFile::new_devnet_t0(), GenesisFile::new_t2()] {
+        for l1 in [GenesisFile::new_devnet_t0(), GenesisFile::new_t2_v5()] {
             let v = l1.format_version;
             assert!(matches!(
                 AnnuletGenesisFile::from_bytes(&l1.to_bytes()),
@@ -682,7 +687,7 @@ mod tests {
             ));
         }
         for v in crate::genesis::PRE_REMINT_FORMAT_VERSIONS {
-            let mut old = GenesisFile::new_t2();
+            let mut old = GenesisFile::new_t2_v5();
             old.format_version = v;
             assert!(matches!(
                 AnnuletGenesisFile::from_bytes(&old.to_bytes()),
@@ -782,7 +787,7 @@ mod tests {
     fn the_l1_genesis_files_are_untouched() {
         let t1 = GenesisFile::new_devnet_t0();
         assert_eq!(GenesisFile::from_bytes(&t1.to_bytes()).unwrap().hash(), t1.hash());
-        let t2 = GenesisFile::new_t2();
+        let t2 = GenesisFile::new_t2_v5();
         assert_eq!(GenesisFile::from_bytes(&t2.to_bytes()).unwrap().hash(), t2.hash());
     }
 }

@@ -492,7 +492,7 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     let listen = flag(args, "--listen").unwrap_or("127.0.0.1:8090");
     let node_cfg = NodeConfig::load(cfg_path)?;
     let genesis = match load_any(&std::fs::read(&node_cfg.genesis_file)?)? {
-        AnyGenesis::L1(_) => {
+        AnyGenesis::L1(_) | AnyGenesis::V6(_) => {
             return Err("the genesis is an L1 form; the Annulet faucet refuses to start on it \
                         (lab #716) — the L1 faucet is `qumbra-faucet run`"
                 .into())

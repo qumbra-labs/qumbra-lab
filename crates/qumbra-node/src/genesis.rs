@@ -114,7 +114,12 @@ pub const PRE_REMINT_FORMAT_VERSIONS: [u32; 4] = [4, 5, 6, 7];
 
 /// The earlier T2 formats `--remint-from` accepts as input: the pre-re-mint 5
 /// and batch 1's 7.
-pub const REMINT_FROM_T2_FORMATS: [u32; 2] = [5, 7];
+pub const REMINT_FROM_T2_FORMATS: [u32; 3] = [5, 7, 9];
+
+/// The T2 format a **V6** re-mint starts from (lab #785 F5-3c): the V5 launch
+/// file (format 9) becomes a format-10 V6 genesis with the ceremony's
+/// sequencer key. 5 and 7 re-mint to V5 as before.
+pub const REMINT_TO_V6_FROM_FORMAT: u32 = GENESIS_FORMAT_VERSION_T2;
 
 /// The FROZEN consensus wire size in bytes (qlab-consensus
 /// `consensus_wire_is_148625_bytes`; consensus-parameters §1). Baked so the
@@ -207,6 +212,14 @@ pub struct GenesisInitPlan {
     pub remint_from: Option<std::path::PathBuf>,
     /// `--remint-expect HEX` — the pinned genesis hash the input must have.
     pub remint_expect: Option<String>,
+    /// `--form v5` (lab #785 F5-3c) — with `--t2` and nothing else, mint the
+    /// **V5** rehearsal genesis (format 9) that `--t2` minted before V6. The
+    /// census's third construction; the running V5 net's shape.
+    pub v5_rehearsal: bool,
+    /// `--sequencer-key FILE` — the ceremony's ML-DSA-65 sequencer verifying
+    /// key (hex), required when re-minting a format-9 T2 genesis into V6 and
+    /// refused anywhere else.
+    pub sequencer_key: Option<std::path::PathBuf>,
 }
 
 impl GenesisInitPlan {
@@ -220,6 +233,8 @@ impl GenesisInitPlan {
         let mut difficulty: Option<u64> = None;
         let mut remint_from: Option<std::path::PathBuf> = None;
         let mut remint_expect: Option<String> = None;
+        let mut v5_rehearsal = false;
+        let mut sequencer_key: Option<std::path::PathBuf> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -244,6 +259,19 @@ impl GenesisInitPlan {
                 "--remint-expect" => {
                     let v = args.get(i + 1).ok_or("--remint-expect requires the pinned genesis hash (hex)")?;
                     remint_expect = Some(v.to_string());
+                    i += 2;
+                }
+                "--form" => {
+                    match args.get(i + 1).map(String::as_str) {
+                        Some("v5") => v5_rehearsal = true,
+                        Some("v6") => {}
+                        other => return Err(format!("--form expects v5 or v6, got {other:?}")),
+                    }
+                    i += 2;
+                }
+                "--sequencer-key" => {
+                    let v = args.get(i + 1).ok_or("--sequencer-key requires a file (hex verifying key)")?;
+                    sequencer_key = Some(std::path::PathBuf::from(v));
                     i += 2;
                 }
                 "--difficulty" => {
@@ -282,6 +310,12 @@ impl GenesisInitPlan {
                 return Err("`--remint-from FILE` and `--remint-expect HASH` go together".into());
             }
         }
+        if v5_rehearsal && (!t2 || launch || remint_from.is_some()) {
+            return Err("`--form v5` is the V5 rehearsal genesis: it takes `--t2` and nothing else".into());
+        }
+        if sequencer_key.is_some() && remint_from.is_none() {
+            return Err("`--sequencer-key` belongs to a V6 re-mint (`--remint-from` a format-9 T2 genesis)".into());
+        }
         Ok(Self {
             out,
             t2,
@@ -289,6 +323,8 @@ impl GenesisInitPlan {
             difficulty: difficulty.unwrap_or(T0_GENESIS_DIFFICULTY),
             remint_from,
             remint_expect,
+            v5_rehearsal,
+            sequencer_key,
         })
     }
 }
@@ -646,6 +682,13 @@ pub enum GenesisError {
     },
     /// `--remint-from`: the input is not what the re-mint may start from.
     RemintInput(String),
+    /// A V6 loader was handed a file whose leading `format_version` is not
+    /// 10 (lab #785 F5-3c; `None`: shorter than four bytes).
+    NotV6Genesis { got: Option<u32> },
+    /// A V6 genesis refused by name (lab #785): its `WrapperParams` do not
+    /// describe this binary's v1 constants, its sequencer key does not decode,
+    /// or a launch genesis carries the rehearsal sequencer key.
+    V6Refused(String),
 }
 
 impl std::fmt::Display for GenesisError {
@@ -693,6 +736,10 @@ impl std::fmt::Display for GenesisError {
                 write!(f, "not an Annulet genesis file: leading format_version {got:?}, want 32")
             }
             GenesisError::BadAnnulet(why) => write!(f, "Annulet genesis: {why}"),
+            GenesisError::NotV6Genesis { got } => {
+                write!(f, "not a V6 genesis file: leading format_version {got:?}, want 10")
+            }
+            GenesisError::V6Refused(why) => write!(f, "V6 genesis refused: {why}"),
         }
     }
 }
@@ -742,7 +789,7 @@ impl GenesisFile {
     /// and the same 21 rehearsal committee keys (C5 explicitly deferred; the
     /// T-ops launch ceremony re-mints with real keys and the launch difficulty
     /// — both `[devnet-placeholder]` here exactly as they were for T0).
-    pub fn new_t2() -> Self {
+    pub fn new_t2_v5() -> Self {
         let n = pd::FROZEN_COMMITTEE_SIZE;
         let committee_keys: Vec<Vec<u8>> = (0..n)
             .map(|i| {
@@ -752,13 +799,13 @@ impl GenesisFile {
                     .to_vec()
             })
             .collect();
-        Self::t2_from_committee_keys(committee_keys, T0_GENESIS_DIFFICULTY)
+        Self::t2_v5_from_committee_keys(committee_keys, T0_GENESIS_DIFFICULTY)
     }
 
     /// Shared T2 shape: format v5, network `qumbra-t2`, FrozenParams v1.0, v5
     /// genesis block. Rehearsal and launch differ **only** in the 21 keys and
     /// the difficulty baked into the file + header.
-    fn t2_from_committee_keys(committee_keys: Vec<Vec<u8>>, difficulty: u64) -> Self {
+    fn t2_v5_from_committee_keys(committee_keys: Vec<Vec<u8>>, difficulty: u64) -> Self {
         GenesisFile {
             format_version: GENESIS_FORMAT_VERSION_T2,
             network: "qumbra-t2".to_string(),
@@ -794,7 +841,7 @@ impl GenesisFile {
                     .to_vec()
             })
             .collect();
-        Self::t2_from_committee_keys(committee_keys, difficulty)
+        Self::t2_v5_from_committee_keys(committee_keys, difficulty)
     }
 
     /// T2 **launch** genesis (lab #506): same v5 shape as [`Self::new_t2`], but
@@ -842,6 +889,11 @@ impl GenesisFile {
                 old.format_version, REMINT_FROM_T2_FORMATS
             )));
         }
+        if old.format_version == REMINT_TO_V6_FROM_FORMAT {
+            return Err(GenesisError::RemintInput(
+                "a format-9 T2 genesis re-mints into V6 (`--sequencer-key`), not into format 9 again".into(),
+            ));
+        }
         let n = pd::FROZEN_COMMITTEE_SIZE;
         if old.committee_keys.len() != n {
             return Err(GenesisError::RemintInput(format!(
@@ -849,7 +901,7 @@ impl GenesisFile {
                 old.committee_keys.len()
             )));
         }
-        let new = Self::t2_from_committee_keys(old.committee_keys.clone(), old.genesis_difficulty);
+        let new = Self::t2_v5_from_committee_keys(old.committee_keys.clone(), old.genesis_difficulty);
         if new.genesis_block != old.genesis_block {
             return Err(GenesisError::RemintInput(
                 "this tree does not rebuild the input's genesis block byte-for-byte (form or difficulty drift)"
@@ -904,6 +956,18 @@ impl GenesisFile {
             == Some(qlab_devnet::forms::ANNULET_GENESIS_FORMAT_VERSION)
         {
             return Err(GenesisError::AnnuletGenesisNotServed);
+        }
+        // Lab #785 F5-3c: a V6 file's leading bytes ARE a `GenesisFile` (its
+        // base), followed by the wrapper section — bincode would decode the
+        // base and never look at the rest. Refused by name instead.
+        if crate::annulet_genesis::leading_format_version(bytes)
+            == Some(qlab_devnet::forms::V6_GENESIS_FORMAT_VERSION)
+        {
+            return Err(GenesisError::V6Refused(
+                "this is a V6 genesis file (format 10): load it as a V6 genesis (`load_any` / `GenesisFileV6`), \
+                 never as its L1 base"
+                    .into(),
+            ));
         }
         bincode::deserialize(bytes).map_err(|e| GenesisError::Decode(e.to_string()))
     }
@@ -962,6 +1026,13 @@ impl GenesisFile {
         // nets; WHICH net is still pinned by `expected_genesis_hash`, so this
         // widening moves no operator decision.
         self.form()?;
+        self.verify_structure(expected_hex)
+    }
+
+    /// The form-independent half of [`Self::verify_startup`] — committee size,
+    /// quorum, every key decoding, and the optional hash pin. Shared with the
+    /// V6 file (lab #785 F5-3c), whose base carries format 10.
+    pub(crate) fn verify_structure(&self, expected_hex: Option<&str>) -> Result<(), GenesisError> {
         let want_n = self.frozen.committee_size;
         if self.committee_keys.len() != want_n as usize {
             return Err(GenesisError::WrongCommitteeSize {
@@ -1456,14 +1527,16 @@ mod tests {
     #[test]
     fn t2_genesis_hash_is_pinned() {
         assert_eq!(
-            GenesisFile::new_t2().hash_hex(),
+            GenesisFile::new_t2_v5().hash_hex(),
             // Re-genesis batch 2 (lab #747): named `genesis init --t2` runs ×2,
             // file sha256 55bc803c…baf1, 41,754 B, byte-identical, format 9;
+            // UNMOVED by lab #785 F5-3c, where `--t2` became the V6 genesis and
+            // this file became `--t2 --form v5` (named runs ×2, same sha256);
             // was f2f8350c… (batch 1), 0e55ccb3… before that.
             "83776614914ed4e36aa4c467d5e82df0a7be9e2e041761489e8f5d84b262b54c",
         );
         assert_ne!(
-            GenesisFile::new_t2().hash_hex(),
+            GenesisFile::new_t2_v5().hash_hex(),
             GenesisFile::new_devnet_t0().hash_hex(),
             "T2 and T1 are different networks"
         );
@@ -1471,8 +1544,8 @@ mod tests {
 
     #[test]
     fn t2_genesis_is_deterministic_and_v5() {
-        let a = GenesisFile::new_t2();
-        let b = GenesisFile::new_t2();
+        let a = GenesisFile::new_t2_v5();
+        let b = GenesisFile::new_t2_v5();
         assert_eq!(a.to_bytes(), b.to_bytes());
         assert_eq!(a.form().unwrap(), GenesisForm::V5);
         assert_eq!(a.format_version, GENESIS_FORMAT_VERSION_T2);
@@ -1483,7 +1556,7 @@ mod tests {
     /// baked T2 genesis header binds the empty body's v5 commitment.
     #[test]
     fn t2_genesis_binds_its_own_v5_body() {
-        let gf = GenesisFile::new_t2();
+        let gf = GenesisFile::new_t2_v5();
         let g = &gf.genesis_block;
         assert_eq!(g.header.height, 0);
         assert_eq!(g.header.tx_body_commitment, g.body().commitment_v5());
@@ -1509,8 +1582,8 @@ mod tests {
     #[test]
     fn verify_startup_accepts_both_formats_and_refuses_the_rest() {
         assert!(GenesisFile::new_devnet_t0().verify_startup(None).is_ok());
-        assert!(GenesisFile::new_t2().verify_startup(None).is_ok());
-        let mut gf = GenesisFile::new_t2();
+        assert!(GenesisFile::new_t2_v5().verify_startup(None).is_ok());
+        let mut gf = GenesisFile::new_t2_v5();
         gf.format_version = u32::MAX;
         assert!(matches!(
             gf.verify_startup(None),
@@ -1598,7 +1671,7 @@ mod tests {
         assert_ne!(a_seeds, b_seeds, "two OsRng draws must not collide");
         assert_ne!(
             a.hash_hex(),
-            GenesisFile::new_t2().hash_hex(),
+            GenesisFile::new_t2_v5().hash_hex(),
             "a launch mint is not the rehearsal pin"
         );
     }
@@ -1648,7 +1721,7 @@ mod tests {
     #[test]
     fn t2_launch_is_v5_and_not_the_rehearsal_committee() {
         let (gf, _) = GenesisFile::new_t2_launch(T0_GENESIS_DIFFICULTY);
-        let rehearsal = GenesisFile::new_t2();
+        let rehearsal = GenesisFile::new_t2_v5();
         assert_eq!(gf.form().unwrap(), GenesisForm::V5);
         assert_ne!(gf.committee_keys, rehearsal.committee_keys);
         for i in 0..gf.committee_keys.len() {
@@ -1672,7 +1745,7 @@ mod tests {
         let gf = GenesisFile::new_t2_with_committee_seeds(7_777, &seeds);
         assert_eq!(gf.genesis_difficulty, 7_777);
         assert_eq!(gf.genesis_block.header.difficulty, 7_777);
-        assert_ne!(gf.hash_hex(), GenesisFile::new_t2().hash_hex());
+        assert_ne!(gf.hash_hex(), GenesisFile::new_t2_v5().hash_hex());
         // Same keys, default difficulty, is a different file from 7777.
         let at_default = GenesisFile::new_t2_with_committee_seeds(T0_GENESIS_DIFFICULTY, &seeds);
         assert_ne!(gf.hash(), at_default.hash());
@@ -1683,7 +1756,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("qmb_t2_launch_mismatch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let gf = GenesisFile::new_t2(); // rehearsal keys
+        let gf = GenesisFile::new_t2_v5(); // rehearsal keys
         let seeds = vec![[0x11u8; 32]; 21];
         assert!(matches!(
             gf.write_committee_key_files_from_seeds(&dir, &seeds, LAUNCH_KEY_NOTE),
@@ -1837,7 +1910,7 @@ mod tests {
     /// genesis open the re-minted one, index for index.
     #[test]
     fn the_hosts_key_files_open_the_re_minted_genesis() {
-        let mut old = GenesisFile::new_t2();
+        let mut old = GenesisFile::new_t2_v5();
         old.format_version = 5;
         old.frozen.consensus_wire_bytes = 148_625;
         old.frozen.consensus_fri = CONSENSUS_CFG.label();
@@ -1848,6 +1921,25 @@ mod tests {
         let vals = new.load_validators(&paths).expect("the carried committee opens the old key files");
         assert_eq!(vals.len(), pd::FROZEN_COMMITTEE_SIZE);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #785 F5-3c: `--form v5` is the V5 rehearsal genesis and takes
+    /// `--t2` alone; `--sequencer-key` belongs to a re-mint only.
+    #[test]
+    fn genesis_init_parse_v6_rules() {
+        let v5 = GenesisInitPlan::parse(&args(&["--t2", "--form", "v5"])).unwrap();
+        assert!(v5.t2 && v5.v5_rehearsal);
+        let v6 = GenesisInitPlan::parse(&args(&["--t2"])).unwrap();
+        assert!(!v6.v5_rehearsal && v6.sequencer_key.is_none());
+        assert!(GenesisInitPlan::parse(&args(&["--form", "v5"])).is_err(), "needs --t2");
+        assert!(GenesisInitPlan::parse(&args(&["--t2", "--launch", "--form", "v5"])).is_err());
+        assert!(GenesisInitPlan::parse(&args(&["--t2", "--form", "v7"])).is_err());
+        assert!(GenesisInitPlan::parse(&args(&["--t2", "--sequencer-key", "k"])).is_err(), "not without a re-mint");
+        let remint = GenesisInitPlan::parse(&args(&[
+            "--t2", "--remint-from", "f", "--remint-expect", "ab", "--sequencer-key", "k",
+        ]))
+        .unwrap();
+        assert_eq!(remint.sequencer_key.as_deref(), Some(std::path::Path::new("k")));
     }
 
     #[test]
