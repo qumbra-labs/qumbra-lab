@@ -117,6 +117,8 @@ pub fn encode_addrs(addrs: &[String]) -> Vec<u8> {
 pub fn decode_addrs(buf: &[u8]) -> Result<Vec<String>, DecodeError> {
     let mut pos = 0usize;
     let n = read_varint(buf, &mut pos)? as usize;
+    // Each address is at least a one-byte length varint: at most one String
+    // (24 B) is reserved per input byte.
     let mut addrs = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
         let len = read_varint(buf, &mut pos)? as usize;
@@ -310,11 +312,11 @@ mod tests {
     fn absurd_addr_count_and_length_are_errors() {
         let mut huge = Vec::new();
         crate::varint::write_varint(&mut huge, u64::MAX);
-        assert!(decode_addrs(&huge).is_err(), "count");
+        assert!(matches!(decode_addrs(&huge), Err(DecodeError::Truncated { what: "varint" })), "count");
         let mut one = Vec::new();
         crate::varint::write_varint(&mut one, 1);
         one.extend_from_slice(&huge);
-        assert!(decode_addrs(&one).is_err(), "length");
+        assert!(matches!(decode_addrs(&one), Err(DecodeError::Truncated { what: "addr" })), "length");
     }
 
     #[test]

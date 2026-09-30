@@ -1195,7 +1195,11 @@ impl AnchorSet {
         let finalized_height = if r.u8()? == 1 { Some(r.u64()?) } else { None };
         let max_age_blocks = r.u64()?;
         let n = r.varint()?;
-        let mut roots = Vec::with_capacity(n as usize);
+        // A served count (the wallet, the FFI and credit-ref read this body):
+        // cap the reservation by the 32-byte roots the bytes could hold, as
+        // `TreeLeaves::from_bytes` does — a claim of 2^60 roots is a
+        // `Truncated` refusal on its first read, never a giant allocation.
+        let mut roots = Vec::with_capacity((n as usize).min(b.len() / 32));
         for _ in 0..n {
             roots.push(r.hash32()?);
         }
@@ -1645,6 +1649,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hardening (review R1 on PR #793): a served `/v1/anchors` body claiming
+    /// 2^64−1 roots is a `Truncated` refusal on the first root — the
+    /// reservation is capped by the bytes, never sized by the claim.
+    #[test]
+    fn an_absurd_anchor_root_count_is_truncated_not_allocated() {
+        let mut b = AnchorSet { tip_height: 5, finalized_height: None, max_age_blocks: 7, roots: vec![] }.to_bytes();
+        b.pop(); // the zero root count
+        write_varint(&mut b, u64::MAX);
+        assert!(matches!(AnchorSet::from_bytes(&b), Err(CodecError::Truncated { what: "hash32" })));
+    }
     use qlab_devnet::fees::posted_fee;
     use crate::node::{genesis_block, genesis_block_for, MemNode};
     use qlab_cbserver::codec::decode_compact_response;

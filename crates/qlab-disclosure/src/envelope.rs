@@ -147,7 +147,9 @@ impl Envelope {
     pub fn from_bytes(buf: &[u8]) -> Result<Envelope, EnvelopeError> {
         let mut pos = 0usize;
         let take = |buf: &[u8], pos: &mut usize, n: usize| -> Result<Vec<u8>, EnvelopeError> {
-            let end = *pos + n;
+            // Checked: `n` can be a raw u64 varint (the proof length), and an
+            // unchecked add near usize::MAX wraps in release.
+            let end = pos.checked_add(n).ok_or(EnvelopeError::Malformed("truncated field"))?;
             let s = buf
                 .get(*pos..end)
                 .ok_or(EnvelopeError::Malformed("truncated field"))?
@@ -213,6 +215,18 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hardening (review R2 on PR #793): a proof length of u64::MAX is the
+    /// named `truncated field` refusal — the offset add is checked, so it can
+    /// neither wrap nor panic.
+    #[test]
+    fn an_absurd_proof_length_is_malformed_not_a_panic() {
+        let mut b = vec![ENVELOPE_VER, CLAIM_SENT_PAYMENT];
+        b.extend_from_slice(&[0u8; 32 + 8 + 32]);
+        b.push(0); // output_index
+        qlab_note::compact::write_varint(&mut b, u64::MAX);
+        assert!(matches!(Envelope::from_bytes(&b), Err(EnvelopeError::Malformed("truncated field"))));
+    }
     use crate::air::build_disclosure;
     use qlab_note::kem::generate_keypair;
     use qlab_wallet::address::{Address, Diversifier};
