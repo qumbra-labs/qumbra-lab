@@ -2541,6 +2541,30 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 Some(rule.fold_bundle(&self.surface, &sec.bundle).map_err(bundle_err)?)
             }
         };
+        // Lab #785 F5-4c: the exit notes' leaves, derived before any mutation.
+        // The exit index is a u8 in the note derivation; an outcome with more
+        // exits than that (a rule is a trait object — never trusted to cap) is
+        // refused by name, not a panic.
+        let exit_leaves: Vec<Hash32> = match &bundle_outcome {
+            None => Vec::new(),
+            Some(outcome) => outcome
+                .exits
+                .iter()
+                .enumerate()
+                .map(|(i, (rkm, v))| {
+                    let index = u8::try_from(i).map_err(|_| {
+                        NodeError::Body(BodyError::Bundle {
+                            refusal: qlab_devnet::body::BundleRefusal::TooManyExits {
+                                n: outcome.exits.len(),
+                                k_exit: usize::from(u8::MAX) + 1,
+                            },
+                        })
+                    })?;
+                    let rkm = qlab_note::hash::digest_from_bytes(rkm);
+                    Ok(crate::coinbase::exit_note_leaf(block.header.height, index, rkm, *v))
+                })
+                .collect::<Result<_, NodeError>>()?,
+        };
         // Lab #712: the outstanding-supply rule, checked before any mutation.
         let supply_delta = match self.form {
             GenesisForm::V4 | GenesisForm::V5 => BTreeMap::new(),
@@ -2633,12 +2657,8 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // outputs and in exit-list order, before the height's root is
         // recorded — so the root at this height covers them, and rewind,
         // replay and the snapshot's leaf list follow through the one append.
-        if let Some(outcome) = &bundle_outcome {
-            for (i, (rkm, v)) in outcome.exits.iter().enumerate() {
-                let index = u8::try_from(i).expect("the bundle codec caps exits at 255");
-                let rkm = qlab_note::hash::digest_from_bytes(rkm);
-                self.append_commitment(crate::coinbase::exit_note_leaf(block.header.height, index, rkm, *v));
-            }
+        for leaf in exit_leaves {
+            self.append_commitment(leaf);
         }
         // Lab #367: fold the block's riders into the name registry — the same
         // funnel as everything above, so `open == replay` and rewind-refold

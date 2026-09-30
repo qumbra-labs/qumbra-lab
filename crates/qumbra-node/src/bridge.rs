@@ -55,25 +55,33 @@ impl BridgeLedger {
         if height != self.next_height || (height > 0 && self.head != Some(prev)) {
             return Err(BridgeError::NotContiguous { height });
         }
-        let (din, dout) = if bundle.is_empty() {
-            (0, 0)
+        // Compute everything first; commit only once nothing can fail, so a
+        // refusal leaves the ledger exactly as it was.
+        let (cum, din, dout) = if bundle.is_empty() {
+            ((self.d_cum, self.e_cum), 0, 0)
         } else {
             let stated = qlab_wrapper::codec::stated_surface_prefix(bundle)
                 .map_err(|e| BridgeError::Undecodable { height, why: format!("{e:?}") })?
                 .ok_or(BridgeError::NoStatedSurface { height })?;
             let din = stated.out.d_cum.checked_sub(self.d_cum).ok_or(BridgeError::CounterDecrease { height })?;
             let dout = stated.out.e_cum.checked_sub(self.e_cum).ok_or(BridgeError::CounterDecrease { height })?;
-            (self.d_cum, self.e_cum) = (stated.out.d_cum, stated.out.e_cum);
-            (din, dout)
+            ((stated.out.d_cum, stated.out.e_cum), din, dout)
         };
         let epoch = height / self.epoch_length;
-        if self.rows.last().is_none_or(|r| r.epoch != epoch) {
-            self.rows.push(BridgeRow { epoch, start_height: height, end_height: height, bridged_in: 0, bridged_out: 0 });
+        let current = self.rows.last().filter(|r| r.epoch == epoch).copied();
+        let base = current.unwrap_or(BridgeRow { epoch, start_height: height, end_height: height, bridged_in: 0, bridged_out: 0 });
+        let row = BridgeRow {
+            end_height: height,
+            bridged_in: base.bridged_in.checked_add(din).ok_or(BridgeError::Overflow { height })?,
+            bridged_out: base.bridged_out.checked_add(dout).ok_or(BridgeError::Overflow { height })?,
+            ..base
+        };
+        if current.is_some() {
+            *self.rows.last_mut().expect("current is the last row") = row;
+        } else {
+            self.rows.push(row);
         }
-        let row = self.rows.last_mut().expect("pushed above");
-        row.end_height = height;
-        row.bridged_in = row.bridged_in.checked_add(din).ok_or(BridgeError::Overflow { height })?;
-        row.bridged_out = row.bridged_out.checked_add(dout).ok_or(BridgeError::Overflow { height })?;
+        (self.d_cum, self.e_cum) = cum;
         self.next_height = height + 1;
         self.head = Some(hash);
         Ok(())
@@ -169,5 +177,11 @@ mod tests {
         l.push(1, h(1), h(0), &bundle(100, 10)).unwrap();
         assert_eq!(l.push(2, h(2), h(1), &bundle(90, 10)), Err(BridgeError::CounterDecrease { height: 2 }));
         assert_eq!(l.push(2, h(2), h(1), &bundle(100, 5)), Err(BridgeError::CounterDecrease { height: 2 }));
+        // A refusal leaves the ledger as it was: the next push still extends it.
+        let before = l.clone();
+        assert!(l.push(2, h(2), h(1), &bundle(90, 10)).is_err());
+        assert_eq!(l, before, "compute first, commit last");
+        l.push(2, h(2), h(1), &bundle(120, 10)).unwrap();
+        assert_eq!((l.view().d_cum, l.view().rows[0].bridged_in), (120, 120));
     }
 }
