@@ -901,6 +901,29 @@ pub fn decode_headers(form: GenesisForm, buf: &[u8]) -> Result<Vec<BlockHeader>,
 mod tests {
     use super::*;
     use qlab_devnet::committee::devnet_committee;
+
+    /// Lab #785 F5-3: the finality record carried in a V6 block body is the
+    /// `Checkpoint` / `CheckpointVotes` gossip body **byte for byte**. The two
+    /// encoders live in two crates (qlab-devnet cannot depend on this one),
+    /// so this pins them together in both directions: equal bytes, each
+    /// decodes the other's.
+    #[test]
+    fn finality_record_is_the_checkpoint_votes_body_byte_for_byte() {
+        use qlab_devnet::finality_record::FinalityRecord;
+        let (_committee, validators) = devnet_committee(21);
+        let hash = [0x5a; 32];
+        let cp = Checkpoint::new(24, hash, hash);
+        let votes: Vec<Vote> = validators.iter().take(15).map(|v| v.sign_checkpoint(&cp)).collect();
+        let gossip = encode_checkpoint_votes(&cp, &votes);
+        let rec = FinalityRecord { cp, votes: votes.clone() };
+        assert_eq!(rec.encode(), gossip);
+        assert_eq!(gossip, encode_checkpoint_msg(&cp, &votes));
+        let back = FinalityRecord::decode(&gossip).expect("a canonical gossip body is a record");
+        assert_eq!(back.cp, cp);
+        let (cp2, votes2) = decode_checkpoint_votes(&rec.encode()).unwrap();
+        assert_eq!(cp2, cp);
+        assert_eq!(votes2.iter().map(|v| v.signer).collect::<Vec<_>>(), (0..15).collect::<Vec<_>>());
+    }
     use qlab_devnet::header::ZERO_HASH;
 
     fn sample_header() -> BlockHeader {

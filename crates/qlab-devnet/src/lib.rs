@@ -36,6 +36,7 @@ pub mod emission_exact;
 pub mod epoch;
 pub mod fees;
 pub mod finality;
+pub mod finality_record;
 pub mod forms;
 pub mod halt;
 pub mod hash;
