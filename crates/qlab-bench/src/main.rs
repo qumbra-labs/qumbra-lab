@@ -947,6 +947,21 @@ fn main() {
             registry_admit::run_registry_admit(&power);
             return;
         }
+        "exitnote" => {
+            // Lab #785 F5-4c: the exit-note derivation's golden, for a named
+            // run — `qlab_node::coinbase::exit_note` at two fixed inputs (index
+            // 0 and 1 of one bundle): ρ, rseed and the commitment leaf.
+            for (h, i, rkm, v) in [(100u64, 0u8, [1u64, 2, 3, 4], 40u64), (100, 1, [5, 6, 7, 8], 2)] {
+                let note = qlab_node::coinbase::exit_note(h, i, rkm, v);
+                let leaf = qlab_node::coinbase::exit_note_leaf(h, i, rkm, v);
+                let hex: String = leaf.iter().map(|b| format!("{b:02x}")).collect();
+                println!("exit_note(height {h}, index {i}, rkm {rkm:?}, v {v}):");
+                println!("  rho   = {:?}", note.rho);
+                println!("  rseed = {:?}", note.rseed);
+                println!("  leaf  = {hex}");
+            }
+            return;
+        }
         "wgenesis" => {
             // Lab #785 F5-3c (Q-S = (b)): the W genesis surface commitment for
             // `--l2-id` (default 1) over the V6 genesis registry — asset 0's

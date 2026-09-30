@@ -1185,10 +1185,6 @@ pub enum BundleRefusal {
     ZeroExitRkm { index: usize },
     /// Exit `index` carries no value.
     ZeroExitValue { index: usize },
-    /// A non-empty exit list, refused until F5-4c appends exits to the
-    /// commitment tree (pre-review Q1): a chain that accepted exits without
-    /// their notes would replay to a different tree under F5-4c.
-    ExitsUnsupported { n: usize },
     /// A W public value is not a 16-bit chunk, so the bundle states no
     /// surface to sign (V0 would refuse it too; this is the signature path's
     /// own check, before any proof).

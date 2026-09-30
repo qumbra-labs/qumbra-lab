@@ -2629,6 +2629,17 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 self.nullifiers_ordered.push(*nf);
             }
         }
+        // Lab #785 F5-4c: the bundle's exit notes, after the block's own
+        // outputs and in exit-list order, before the height's root is
+        // recorded — so the root at this height covers them, and rewind,
+        // replay and the snapshot's leaf list follow through the one append.
+        if let Some(outcome) = &bundle_outcome {
+            for (i, (rkm, v)) in outcome.exits.iter().enumerate() {
+                let index = u8::try_from(i).expect("the bundle codec caps exits at 255");
+                let rkm = qlab_note::hash::digest_from_bytes(rkm);
+                self.append_commitment(crate::coinbase::exit_note_leaf(block.header.height, index, rkm, *v));
+            }
+        }
         // Lab #367: fold the block's riders into the name registry — the same
         // funnel as everything above, so `open == replay` and rewind-refold
         // both hold for names with nothing extra to maintain. A rider that
@@ -4239,5 +4250,177 @@ mod tests {
         let err = MemNode::open_v6(&dir, genesis, no_rule()).err().expect("the snapshot path refuses too");
         assert!(matches!(err, NodeError::Body(BodyError::Bundle { refusal: BundleRefusal::NoRule })), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- lab #785 F5-4c: exit notes ---------------------------------------------
+
+    /// A test-only rule whose bundle is `counter (8 B) ‖ n × (rkm 32 ‖ v 8)`:
+    /// the fold carries the exits, so the node's append path is exercised
+    /// without a proven P member (the exit-bearing proven bundle is F5-6's).
+    struct ExitRule;
+    fn exit_bundle(next: u64, exits: &[([u64; 4], u64)]) -> Vec<u8> {
+        let mut b = next.to_le_bytes().to_vec();
+        for (rkm, v) in exits {
+            b.extend_from_slice(&qlab_note::hash::digest_bytes(rkm));
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+    impl qlab_devnet::body::BundleVerifier for ExitRule {
+        fn verify_bundle(
+            &self,
+            _: &BlockHeader,
+            bundle: &[u8],
+            ctx: &qlab_devnet::body::BundleContext<'_>,
+        ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+            self.fold_bundle(ctx.surface, bundle)
+        }
+        fn fold_bundle(
+            &self,
+            surface: &[u8],
+            bundle: &[u8],
+        ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+            use qlab_devnet::body::BundleRefusal;
+            let prev = counter(surface).ok_or(BundleRefusal::SurfaceState)?;
+            let (head, rest) = bundle.split_at_checked(8).ok_or(BundleRefusal::Codec("short".into()))?;
+            let next = counter(head).ok_or(BundleRefusal::Codec("short".into()))?;
+            if next <= prev || rest.len() % 40 != 0 {
+                return Err(BundleRefusal::Wrapper("Thread".into()));
+            }
+            let exits: Vec<(Hash32, u64)> = rest
+                .chunks_exact(40)
+                .map(|c| (c[..32].try_into().unwrap(), u64::from_le_bytes(c[32..].try_into().unwrap())))
+                .collect();
+            let e_batch = exits.iter().map(|e| e.1).sum();
+            Ok(qlab_devnet::body::BundleOutcome { surface: head.to_vec(), exits, d_batch: 0, e_batch })
+        }
+        fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, qlab_devnet::body::BundleRefusal> {
+            bundle.get(..8).map(<[u8]>::to_vec).ok_or(qlab_devnet::body::BundleRefusal::Codec("short".into()))
+        }
+    }
+
+    fn exit_setup() -> V6Setup {
+        let wrapper = qlab_devnet::body::WrapperSetup {
+            rule: std::sync::Arc::new(ExitRule),
+            genesis_surface: 0u64.to_le_bytes().to_vec(),
+        };
+        V6Setup { committee0: v6_validators().0.clone(), wrapper: Some(wrapper) }
+    }
+
+    fn raw_bundle_block(parent: &BlockHeader, bundle: Vec<u8>) -> (BlockHeader, BlockBody) {
+        let height = parent.height + 1;
+        let mut body =
+            BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(height), [height; 4]);
+        body.bundle = bundle;
+        let header =
+            BlockHeader::child_of_for(GenesisForm::V5, parent, parent.timestamp + 75, 8, body.commitment_v6());
+        (header, body)
+    }
+
+    const EXIT_A: [u64; 4] = [0xa1, 2, 3, 4];
+    const EXIT_B: [u64; 4] = [0xb1, 6, 7, 8];
+
+    /// Blocks 1 (empty) and 2 (a bundle with exits A:40, B:2), then 3 (empty).
+    fn exit_script(node: &mut MemNode) {
+        let mut parent = node.chain.block(&node.tip_hash()).unwrap().header();
+        for bundle in [vec![], exit_bundle(5, &[(EXIT_A, 40), (EXIT_B, 2)]), vec![]] {
+            let (h, b) = raw_bundle_block(&parent, bundle);
+            node.apply_block(h, b, &MockVerifier).unwrap();
+            parent = h;
+        }
+    }
+
+    /// Lab #785 F5-4c: a bundle's exits become notes — after the block's
+    /// outputs, in list order, under [`crate::coinbase::exit_note`] — the
+    /// height's recorded root covers them; a rewind below the block removes
+    /// them and re-applying restores them; replay and snapshot resume reach
+    /// the same tree.
+    #[test]
+    fn v6_exit_notes_append_in_order_and_follow_rewind_and_resume() {
+        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), exit_setup());
+        exit_script(&mut node);
+        assert_eq!(node.commitments.count(), 2, "two exits, no matured coinbase yet");
+        let leaf = |i: u64| qlab_note::hash::digest_bytes(&node.commitments.tree().leaf(i));
+        assert_eq!(leaf(0), crate::coinbase::exit_note_leaf(2, 0, EXIT_A, 40));
+        assert_eq!(leaf(1), crate::coinbase::exit_note_leaf(2, 1, EXIT_B, 2));
+        assert_eq!(node.roots_by_height[&2], node.commitments.root_bytes(), "the root at 2 covers the exits");
+        assert_ne!(node.roots_by_height[&1], node.roots_by_height[&2]);
+        let live_root = node.commitments.root_bytes();
+
+        let at1 = node.ancestor_at(&node.tip_hash(), 1).unwrap().header().header_hash_for(GenesisForm::V5);
+        let kept: Vec<StoredBlock> = [2, 3].iter().map(|h| node.ancestor_at(&node.tip_hash(), *h).unwrap().clone()).collect();
+        node.rewind_to(at1).unwrap();
+        assert_eq!(node.commitments.count(), 0, "the exits left with their block");
+        for b in &kept {
+            node.apply_block(b.header(), b.body(), &MockVerifier).unwrap();
+        }
+        assert_eq!(node.commitments.root_bytes(), live_root, "re-applying restores them");
+
+        let dir = temp_dir("v6-exit-notes");
+        {
+            let mut disk = MemNode::open_v6(&dir, genesis_block_v6(8, 0), exit_setup()).unwrap();
+            exit_script(&mut disk);
+        }
+        let replayed = MemNode::open_v6(&dir, genesis_block_v6(8, 0), exit_setup()).unwrap();
+        assert_eq!(replayed.commitments.root_bytes(), live_root);
+        replayed.save_snapshot().unwrap();
+        let resumed = MemNode::open_v6(&dir, genesis_block_v6(8, 0), exit_setup()).unwrap();
+        assert_eq!(resumed.recovery_report().replayed_records, 0);
+        assert_eq!((resumed.commitments.root_bytes(), resumed.commitments.count()), (live_root, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 4c ruling's condition: a 4b-era chain — bundles, none with exits —
+    /// reaches the same tree under 4c: no exit, no append.
+    #[test]
+    fn a_bundle_without_exits_leaves_the_tree_as_before() {
+        let mut with = MemNode::in_memory_v6(genesis_block_v6(8, 0), exit_setup());
+        let mut without = MemNode::in_memory_v6(genesis_block_v6(8, 0), exit_setup());
+        let (mut pw, mut po) = (
+            with.chain.block(&with.tip_hash()).unwrap().header(),
+            without.chain.block(&without.tip_hash()).unwrap().header(),
+        );
+        for n in 1..=4u64 {
+            let (h, b) = raw_bundle_block(&pw, if n % 2 == 0 { exit_bundle(n, &[]) } else { vec![] });
+            with.apply_block(h, b, &MockVerifier).unwrap();
+            pw = h;
+            let (h, b) = raw_bundle_block(&po, vec![]);
+            without.apply_block(h, b, &MockVerifier).unwrap();
+            po = h;
+        }
+        assert_eq!(with.last_bundle_height(), Some(4));
+        assert_eq!(with.roots_by_height, without.roots_by_height, "every height's root is the no-bundle chain's");
+    }
+
+    /// 🔒 The exit-note golden (lab #785 F5-4c-1): ρ, rseed and the leaf at
+    /// two fixed inputs, copied from the named `qlab-bench exitnote` run's
+    /// output (`logs/f5-4c1-runs/exitnote.log`).
+    #[test]
+    fn the_exit_note_derivation_is_pinned() {
+        use crate::coinbase::{exit_note, exit_note_leaf};
+        let hex = |b: &Hash32| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let a = exit_note(100, 0, [1, 2, 3, 4], 40);
+        assert_eq!(a.rho, [13712170880088095291, 4199033222445404976, 15972117310625030030, 15041945620642184602]);
+        assert_eq!(a.rseed, [9743797210762047376, 5384718611270703694, 1562314213152760210, 4897966456472967529]);
+        assert_eq!(hex(&exit_note_leaf(100, 0, [1, 2, 3, 4], 40)), "ad09e649d6cb186cca8aada010203ad9a273a3f051abc9dce6e49c98ed9e3bc6");
+        let b = exit_note(100, 1, [5, 6, 7, 8], 2);
+        assert_eq!(b.rho, [3022201620843842787, 16721148094731447576, 14861027003635416433, 6589176296354670576]);
+        assert_eq!(b.rseed, [15747039078141673426, 5666021685480660654, 8548220196773582315, 18023207007031546542]);
+        assert_eq!(hex(&exit_note_leaf(100, 1, [5, 6, 7, 8], 2)), "7e067871141533fc2c1f75691bf5831f9bd094f6bd3a1f7ff2f04e0ad8be457c");
+    }
+
+    /// The exit-note derivation: ρ and rseed separate by index, height and
+    /// rkm, and from the coinbase domain.
+    #[test]
+    fn exit_note_derivation_separates_index_height_and_domain() {
+        use crate::coinbase::{coinbase_rho_v5, exit_note};
+        let n = exit_note(10, 0, EXIT_A, 40);
+        assert_eq!((n.value, n.rkm), (40, EXIT_A));
+        assert_ne!(n.rho, exit_note(10, 1, EXIT_A, 40).rho, "index");
+        assert_ne!(n.rho, exit_note(11, 0, EXIT_A, 40).rho, "height");
+        assert_ne!(n.rho, exit_note(10, 0, EXIT_B, 40).rho, "rkm");
+        assert_ne!(n.rho, coinbase_rho_v5(10, 0, &EXIT_A), "not a coinbase ρ");
+        assert_ne!(n.rho, n.rseed);
+        assert_eq!(n.rho, exit_note(10, 0, EXIT_A, 999).rho, "value is not in ρ");
     }
 }

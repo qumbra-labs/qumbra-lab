@@ -10,8 +10,7 @@
 //! 3. **spacing**: at least `wrapper_spacing_blocks` since the last bundle
 //!    (the first bundle is free);
 //! 4. the clear exit list's shape: at most `K_exit`, no zero `rkm`, no zero
-//!    `v` — and, until F5-4c appends exit notes, no exits at all
-//!    ([`BundleRefusal::ExitsUnsupported`], pre-review Q1);
+//!    `v` (each accepted exit becomes an L1 note, F5-4c);
 //! 5. W's public values are 16-bit chunks, so the bundle **states** a
 //!    successor surface ([`WireBundle::stated_surface`]);
 //! 6. the **sequencer's signature** over [`sign_message`] (the net's V6
@@ -108,18 +107,6 @@ fn exit_shape_err(e: ExitShape) -> BundleRefusal {
     }
 }
 
-/// Pre-review Q1: until F5-4c appends exits to the commitment tree, a
-/// bundle with exits is refused — rule and fold alike — so no chain a 4b
-/// binary accepts replays to a different tree under 4c. 4c removes this in
-/// the commit that appends the notes.
-fn exits_supported(wb: &WireBundle) -> Result<(), BundleRefusal> {
-    if wb.exits.is_empty() {
-        Ok(())
-    } else {
-        Err(BundleRefusal::ExitsUnsupported { n: wb.exits.len() })
-    }
-}
-
 impl WrapperRule {
     /// The chain's rule from its genesis: version 1, the genesis's `l2_id`,
     /// spacing, `K_exit` and sequencer key, the V6 genesis hash as net id.
@@ -186,7 +173,6 @@ impl WrapperRule {
             return Err(wrapper_err(VError::Version));
         }
         check_exit_shape(&wb.exits, self.k_exit).map_err(exit_shape_err)?;
-        exits_supported(wb)?;
         let stated = wb.stated_surface().ok_or(BundleRefusal::NoStatedSurface)?;
         // V5 and V6, the verifier-side threading — proof-free, so the fold
         // keeps them: a logged bundle folds only onto its own predecessor.
@@ -235,7 +221,6 @@ impl BundleVerifier for WrapperRule {
             }
         }
         check_exit_shape(&wb.exits, self.k_exit).map_err(exit_shape_err)?;
-        exits_supported(&wb)?;
         let stated = wb.stated_surface().ok_or(BundleRefusal::NoStatedSurface)?;
         // 6: only the sequencer can make a node pay for step 7.
         if !self.signature_ok(&wb, &stated) {
