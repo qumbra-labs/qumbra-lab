@@ -413,8 +413,14 @@ mod tests {
         for bytes in [vec![], vec![0u8; 12], vec![0xff; 4096]] {
             assert!(matches!(rule.verify_bundle(&header, &bytes, &ctx), Err(BundleRefusal::Codec(_))));
             assert!(matches!(rule.fold_bundle(&surface, &bytes), Err(BundleRefusal::Codec(_))));
+        }
+        // `bundle_surface` reads the prefix alone (F5-4c-1): too short to hold
+        // it is the codec's refusal; a whole prefix of 0xff words (each ≥ 2^16)
+        // states no surface.
+        for bytes in [vec![], vec![0u8; 12]] {
             assert!(matches!(rule.bundle_surface(&bytes), Err(BundleRefusal::Codec(_))));
         }
+        assert_eq!(rule.bundle_surface(&[0xff; 4096]), Err(BundleRefusal::NoStatedSurface));
         assert_eq!(rule.fold_bundle(&[1, 2, 3], &[]), Err(BundleRefusal::SurfaceState));
     }
 }

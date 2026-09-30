@@ -172,8 +172,9 @@ impl Reading {
 pub enum BridgeReading {
     /// A V6 node's bridge rows.
     Served(qlab_node::bridge_wire::BridgeView),
-    /// No bridge: a 404 (not a V6 net, or still starting) or no answer. Shown
-    /// as unavailable — never as zero.
+    /// No bridge: a 404 (not a V6 net, or still starting) or no answer. When
+    /// no node serves one the view prints `bridge: none (not a V6 net)`; on a
+    /// net where some node does, this node reads UNAVAILABLE — never zero.
     NotServed(String),
     /// Answered with bytes this build cannot decode.
     Undecodable(String),

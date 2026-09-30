@@ -458,13 +458,16 @@ pub fn view(readings: &[NodeReading], a: &Agreement) -> String {
 /// **The bridge columns** (lab #785 F5-4c-1): per node, the tip's cumulative
 /// `D_cum` / `E_cum`, `circulating = emission − burned − D_cum + E_cum` (only
 /// when the node's supply rows cover its tip, checked arithmetic), and each
-/// epoch's bridged-in / bridged-out. A node that serves no bridge — every
-/// T1/V5 node — reads UNAVAILABLE, never zero.
+/// epoch's bridged-in / bridged-out. A net where no node serves a bridge —
+/// every T1/V5 net — prints one line, `bridge: none (not a V6 net)`, never a
+/// zero and never the UNAVAILABLE token: the token means a coverage gap, and
+/// a net with no bridge has none (#785 F5-4c-1 ruling). The token stays for a
+/// node that refuses or cannot be read, and for a covered-height mismatch.
 pub fn bridge(readings: &[NodeReading]) -> String {
     use crate::poll::BridgeReading;
     let any = readings.iter().any(|r| !matches!(r.bridge, BridgeReading::NotServed(_)));
     if !any {
-        return "bridge: UNAVAILABLE — no node serves /v1/supply/bridge (not a V6 net)\n".to_string();
+        return "bridge: none (not a V6 net)\n".to_string();
     }
     let label_w = readings.iter().map(|r| r.endpoint.label.len()).max().unwrap_or(4).max(4);
     let mut out = String::from("bridge (V6: bridged in = ΔD, out = ΔE):\n");
@@ -823,15 +826,18 @@ mod tests {
     }
 
     /// Lab #785 F5-4c-1: off V6 every node 404s the bridge route and the view
-    /// says UNAVAILABLE — never a zero; a V6 node's rows and cumulative pair
-    /// render, with `circulating` from its covered supply rows.
+    /// says so in one line — never a zero, and not the UNAVAILABLE token (no
+    /// coverage gap: there is no bridge); a V6 node's rows and cumulative pair
+    /// render, with `circulating` from its covered supply rows; a refusing
+    /// node (503) reads as itself, with the token.
     #[test]
     fn the_bridge_section_is_unavailable_off_v6_and_renders_on_v6() {
         use crate::poll::BridgeReading;
         use qlab_node::bridge_wire::{BridgeRow, BridgeView};
         let readings = vec![ok("node0", t(Some(384), None, None))];
         let text = bridge(&readings);
-        assert!(text.contains("UNAVAILABLE"), "{text}");
+        assert_eq!(text, "bridge: none (not a V6 net)\n");
+        assert!(!text.contains("UNAVAILABLE"), "no bridge is not a coverage gap:\n{text}");
         assert!(!text.contains("D_cum 0"), "no bridge is not zero bridged:\n{text}");
         let mut v6 = ok("node0", t(Some(384), None, None));
         v6.bridge = BridgeReading::Served(BridgeView {
@@ -845,14 +851,16 @@ mod tests {
         assert!(text.contains("D_cum 1000  E_cum 40"), "{text}");
         // Review S2: the bridge covers 400, the telemetry tip is 3800.
         assert!(text.contains("circulating UNAVAILABLE (bridge covers 400, telemetry tip 3800)"), "{text}");
-        // A refusing node reads as itself, and the view is not "no node serves".
+        assert!(text.contains("in                 1000"), "{text}");
+        assert!(text.contains("node1  UNAVAILABLE"), "{text}");
+        // A refusing node (503) reads as itself, with the token, and the view
+        // is not "not a V6 net".
         let mut refusing = v6;
         refusing.bridge = BridgeReading::Failed("non-200 response: HTTP/1.1 503".into());
         let text = bridge(&[refusing]);
         assert!(text.contains("bridge not served: non-200 response: HTTP/1.1 503"), "{text}");
         assert!(!text.contains("not a V6 net"), "{text}");
-        assert!(text.contains("in                 1000"), "{text}");
-        assert!(text.contains("node1  UNAVAILABLE"), "{text}");
+        assert!(text.contains("UNAVAILABLE"), "{text}");
     }
 
     /// **Acceptance (#121): the public view has no per-signer participation
