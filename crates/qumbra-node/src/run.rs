@@ -119,6 +119,25 @@ fn rebuild_supply_ledger<C: ChainStore>(
     )
 }
 
+/// A stored block's bundle bytes (empty when it carries none).
+fn bundle_bytes(block: &qlab_node::StoredBlock) -> &[u8] {
+    block.sections.as_ref().map_or(&[][..], |s| s.bundle.as_slice())
+}
+
+/// Build the bridge ledger from the applied main chain (lab #785 F5-4c-1) —
+/// startup and reorg recovery alike, one function as for the supply ledger.
+fn rebuild_bridge_ledger<C: ChainStore>(
+    state_chain: &C,
+    main_chain: &[qlab_devnet::header::Hash32],
+) -> Result<crate::bridge::BridgeLedger, crate::bridge::BridgeError> {
+    let mut ledger = crate::bridge::BridgeLedger::new(EPOCH_LENGTH_BLOCKS);
+    for (height, hash) in (0u64..).zip(main_chain) {
+        let block = state_chain.block(hash).expect("every canonical state-chain hash has its stored body");
+        ledger.push(height, *hash, block.header.prev, bundle_bytes(block))?;
+    }
+    Ok(ledger)
+}
+
 /// The `sid=` value when this node's own held keys are committed to *different*
 /// checkpoints at the same slot (issue #84), and the type carrying it.
 ///
@@ -495,6 +514,9 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// encodes on its own cadence and the server thread serves the bytes, so a
     /// poller can never contend with the consensus loop for node state.
     telemetry_snapshot: Arc<Mutex<Vec<u8>>>,
+    /// The `/v1/supply/bridge` slot (lab #785 F5-4c-1), adopted from the
+    /// telemetry server; filled only on a V6 node.
+    bridge_snapshot: Arc<Mutex<Option<Vec<u8>>>>,
     /// When the telemetry snapshot was last encoded.
     last_telemetry_render: Instant,
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
@@ -554,6 +576,10 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
     supply_ledger: Mutex<SupplyLedger>,
+    /// The bridge ledger (lab #785 F5-4c-1): `Some` exactly on a V6 node. An
+    /// `Err` inside is a broken invariant, logged once and served as nothing
+    /// (a 404 reads unavailable) until a rebuild succeeds.
+    bridge_ledger: Option<Mutex<Result<crate::bridge::BridgeLedger, crate::bridge::BridgeError>>>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -1119,6 +1145,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 &state_chain.chain().main_chain(),
             )?
         };
+        // Lab #785 F5-4c-1: a V6 node also keeps the bridge ledger.
+        let bridge_ledger = (p2p.node().sections() == qlab_devnet::forms::BodySections::V6).then(|| {
+            let state_chain = p2p.node().state().chain();
+            Mutex::new(rebuild_bridge_ledger(state_chain, &state_chain.chain().main_chain()))
+        });
 
         Ok(RunningNode {
             p2p,
@@ -1139,6 +1170,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             last_metrics_render: Instant::now(),
             metrics_server: None,
             telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
+            bridge_snapshot: Arc::new(Mutex::new(None)),
             last_telemetry_render: Instant::now(),
             telemetry_server: None,
             discovery_view: Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
@@ -1157,6 +1189,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             template_serving: config.template_serving,
             cached_mine_template: None,
             supply_ledger: Mutex::new(supply_ledger),
+            bridge_ledger,
             process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
@@ -2201,6 +2234,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
     /// the faucet takes, kept under the new ownership.
     pub fn adopt_telemetry_server(&mut self, srv: TelemetryServer) -> std::net::SocketAddr {
         self.telemetry_snapshot = srv.snapshot();
+        self.bridge_snapshot = srv.bridge();
         self.refresh_telemetry();
         srv.mark_ready();
         let bound = srv.addr();
@@ -2214,6 +2248,44 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         if let Ok(mut slot) = self.telemetry_snapshot.lock() {
             *slot = bytes;
         }
+        let bridge = self.bridge_view().map(|v| v.to_bytes());
+        if let Ok(mut slot) = self.bridge_snapshot.lock() {
+            *slot = bridge;
+        }
+    }
+
+    /// The bridge rows over the applied main chain (lab #785 F5-4c-1), brought
+    /// up to the tip — rebuilt on a reorg below the ledger, as the supply
+    /// ledger is. `None` off V6, and while the ledger holds a refusal.
+    pub fn bridge_view(&self) -> Option<qlab_node::bridge_wire::BridgeView> {
+        let slot = self.bridge_ledger.as_ref()?;
+        let mut guard = slot.lock().expect("the bridge ledger mutex is not poisoned");
+        let node = self.p2p.node();
+        let state_chain = node.state().chain();
+        let main_chain = state_chain.chain().main_chain();
+        let in_sync = guard.as_ref().is_ok_and(|l| l.is_in_sync_with(&main_chain));
+        if !in_sync {
+            *guard = rebuild_bridge_ledger(state_chain, &main_chain);
+        }
+        if let Ok(ledger) = guard.as_mut() {
+            for height in ledger.next_height()..=state_chain.tip_height() {
+                let pushed = usize::try_from(height)
+                    .ok()
+                    .and_then(|i| main_chain.get(i))
+                    .and_then(|hash| state_chain.block(hash).map(|b| (*hash, b)))
+                    .map(|(hash, b)| ledger.push(height, hash, b.header.prev, bundle_bytes(b)));
+                match pushed {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        qlab_devnet::jeprintln!(ERROR, "BRIDGE ledger refused height {height}: {e:?}");
+                        *guard = Err(e);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+        guard.as_ref().ok().map(crate::bridge::BridgeLedger::view)
     }
 
     /// Bind the `/v1/compact` note-discovery endpoint (issue #188 baton 2).
@@ -3928,6 +4000,11 @@ mod tests {
         let reopened = RunningNode::start_v6(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         assert_eq!(reopened.tip_height(), signed_at + 1);
         assert_eq!(reopened.p2p.node().state().recorded_finality(), Some(8), "re-derived on reopen");
+        // Lab #785 F5-4c-1: a V6 node keeps the bridge ledger — nothing
+        // bridged on a chain with no bundle, rows covering its tip.
+        let v = reopened.bridge_view().expect("a V6 node serves the bridge");
+        assert_eq!((v.covered_height, v.d_cum, v.e_cum), (signed_at + 1, 0, 0));
+        assert!(v.rows.iter().all(|r| r.bridged_in == 0 && r.bridged_out == 0));
         let _ = std::fs::remove_dir_all(&base);
     }
 

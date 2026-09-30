@@ -44,6 +44,7 @@
 //! replay.
 
 pub mod asset_supply;
+pub mod bridge_wire;
 pub mod coinbase;
 pub mod emission;
 pub mod mempool;

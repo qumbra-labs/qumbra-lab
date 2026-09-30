@@ -434,6 +434,7 @@ mod tests {
     /// (issue #212).
     fn node_at(label: &str, t: Telemetry, wire_version: u8) -> NodeReading {
         NodeReading {
+            bridge: crate::poll::BridgeReading::NotServed("404".to_string()),
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
             reading: Reading::Ok { telemetry: Box::new(t), wire_version },
             elapsed: Duration::from_millis(1),
@@ -452,6 +453,7 @@ mod tests {
 
     fn down(label: &str, why: &str) -> NodeReading {
         NodeReading {
+            bridge: crate::poll::BridgeReading::NotServed("404".to_string()),
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
             reading: Reading::Unreachable(why.into()),
             elapsed: Duration::from_millis(1),

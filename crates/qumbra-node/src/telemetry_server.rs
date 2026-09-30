@@ -139,6 +139,10 @@ pub struct TelemetryServer {
     /// this server may exist before any node does; the node adopts this `Arc`
     /// at handover and refreshes it from then on.
     snapshot: Arc<Mutex<Vec<u8>>>,
+    /// The `/v1/supply/bridge` payload (lab #785 F5-4c-1): `Some` only on a
+    /// V6 node once it has rendered one; `None` ⇒ 404, which readers show as
+    /// unavailable — never as zero.
+    bridge: Arc<Mutex<Option<Vec<u8>>>>,
     /// `false` from bind until [`Self::mark_ready`]: `/v1/ready` says
     /// `starting` and `/v1/telemetry` 404s. Never cleared — a node is not
     /// un-opened.
@@ -163,11 +167,13 @@ impl TelemetryServer {
             .ok_or_else(|| io::Error::other("telemetry listener has no ip address"))?;
         let served = Arc::new(AtomicU64::new(0));
         let snapshot: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let bridge: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let ready = Arc::new(AtomicBool::new(false));
 
         let worker = Arc::clone(&server);
         let worker_served = Arc::clone(&served);
         let worker_snapshot = Arc::clone(&snapshot);
+        let worker_bridge = Arc::clone(&bridge);
         let worker_ready = Arc::clone(&ready);
         let thread = std::thread::spawn(move || {
             for request in worker.incoming_requests() {
@@ -197,6 +203,27 @@ impl TelemetryServer {
                             .expect("static content type parses");
                     let _ =
                         request.respond(tiny_http::Response::from_string(body).with_header(header));
+                    continue;
+                }
+                if path == qlab_node::bridge_wire::BRIDGE_PATH {
+                    // Lab #785 F5-4c-1: a pure route addition (no RPC_VERSION
+                    // move). 404 until the node is ready and on every non-V6 net.
+                    let body = if worker_ready.load(Ordering::Acquire) {
+                        worker_bridge.lock().ok().and_then(|b| b.clone())
+                    } else {
+                        None
+                    };
+                    let _ = match body {
+                        Some(body) => {
+                            let header = tiny_http::Header::from_bytes(CONTENT_TYPE_HEADER, CONTENT_TYPE_VALUE)
+                                .expect("static content type parses");
+                            request.respond(tiny_http::Response::from_data(body).with_header(header))
+                        }
+                        None => request.respond(
+                            tiny_http::Response::from_string("not found: this node serves no bridge (not a V6 net, or still starting)")
+                                .with_status_code(404),
+                        ),
+                    };
                     continue;
                 }
                 if path != TELEMETRY_PATH {
@@ -232,13 +259,19 @@ impl TelemetryServer {
             }
         });
 
-        Ok(TelemetryServer { addr: bound, server, thread: Some(thread), served, snapshot, ready })
+        Ok(TelemetryServer { addr: bound, server, thread: Some(thread), served, snapshot, bridge, ready })
     }
 
     /// The snapshot slot this server serves — the node adopts this `Arc` at
     /// handover so its refresh cadence writes what this server reads.
     pub(crate) fn snapshot(&self) -> Arc<Mutex<Vec<u8>>> {
         Arc::clone(&self.snapshot)
+    }
+
+    /// The `/v1/supply/bridge` slot (lab #785 F5-4c-1), adopted like
+    /// [`Self::snapshot`]; a V6 node fills it, every other node leaves `None`.
+    pub(crate) fn bridge(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
+        Arc::clone(&self.bridge)
     }
 
     /// Flip the latch: `/v1/ready` answers `ready`, `/v1/telemetry` serves.
@@ -435,6 +468,33 @@ mod tests {
 
             srv.shutdown();
         });
+    }
+
+    /// Lab #785 F5-4c-1: `/v1/supply/bridge` is 404 while the slot is empty
+    /// (every non-V6 node, and before readiness) and serves the slot's bytes
+    /// exactly once a V6 node fills it; `/v1/telemetry` is untouched by it.
+    #[test]
+    fn the_bridge_route_is_404_off_v6_and_serves_the_slot_on_v6() {
+        use qlab_node::bridge_wire::{BridgeRow, BridgeView, BRIDGE_PATH};
+        let t = sample();
+        let (srv, _) = started_ready(&t);
+        let addr = srv.addr();
+        let (status, _) = get(addr, BRIDGE_PATH);
+        assert!(status.contains(" 404"), "no bridge off V6: {status}");
+        let view = BridgeView {
+            covered_height: 3800,
+            d_cum: 7,
+            e_cum: 2,
+            rows: vec![BridgeRow { epoch: 3, start_height: 3456, end_height: 3800, bridged_in: 7, bridged_out: 2 }],
+        };
+        *srv.bridge().lock().unwrap() = Some(view.to_bytes());
+        let (status, body) = get(addr, BRIDGE_PATH);
+        assert!(status.contains(" 200"), "{status}");
+        assert_eq!(BridgeView::from_bytes(&body), Ok(view));
+        let (status, body) = get(addr, TELEMETRY_PATH);
+        assert!(status.contains(" 200"), "{status}");
+        assert_eq!(Telemetry::from_bytes(&body).unwrap(), t, "the telemetry wire is unchanged beside it");
+        srv.shutdown();
     }
 
     /// House rule (ratified PR #315, recorded at `qlab_node::rpc`): a pure route

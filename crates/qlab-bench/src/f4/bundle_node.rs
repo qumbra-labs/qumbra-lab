@@ -227,6 +227,9 @@ fn f5_4b_the_proven_bundle_through_the_node_path() {
     let verified = r.verify_bundle(&h, &fx.wire, &ctx).unwrap();
     assert_eq!(r.fold_bundle(&prior, &fx.wire), Ok(verified.clone()));
     assert_eq!(r.bundle_surface(&fx.wire), Ok(verified.surface.clone()));
+    // F5-4c Q1: the prefix read states the same surface from the first bytes.
+    let prefix = 12 + 4 * qlab_wrapper::wleaf::W_PV_LEN;
+    assert_eq!(qlab_wrapper::codec::stated_surface_prefix(&fx.wire[..prefix]), Ok(Some(stated.clone())));
     assert_eq!((verified.d_batch, verified.e_batch, verified.exits.len()), (stated.out.d_cum, 0, 0));
 }
 

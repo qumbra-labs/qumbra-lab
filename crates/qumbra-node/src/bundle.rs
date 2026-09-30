@@ -46,7 +46,8 @@ use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa65, Signature, Verifier
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::body::{BundleContext, BundleOutcome, BundleRefusal, BundleVerifier, WrapperSetup};
 use qlab_wrapper::codec::{
-    check_exit_shape, decode_surface, digest_to_bytes, encode_surface, exit_chain, exit_sum, sign_message, ExitShape, WireBundle,
+    check_exit_shape, decode_surface, digest_to_bytes, encode_surface, exit_chain, exit_sum, sign_message, stated_surface_prefix, ExitShape,
+    WireBundle,
 };
 use qlab_wrapper::genesis::{genesis_surface, CHAIN_VERSION};
 use qlab_consensus::{Config, Proof};
@@ -247,9 +248,10 @@ impl BundleVerifier for WrapperRule {
         self.fold_checks(&prev, &wb)
     }
 
+    /// The prefix read (F5-4c ruling Q1): kilobytes, no proof decoded — the
+    /// snapshot paths' walk-back reads only what the stated surface needs.
     fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, BundleRefusal> {
-        let wb = WireBundle::decode(bundle).map_err(codec_err)?;
-        let stated = wb.stated_surface().ok_or(BundleRefusal::NoStatedSurface)?;
+        let stated = stated_surface_prefix(bundle).map_err(codec_err)?.ok_or(BundleRefusal::NoStatedSurface)?;
         Ok(encode_surface(&stated).to_vec())
     }
 }

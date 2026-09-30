@@ -452,7 +452,59 @@ pub fn verdicts(a: &Agreement) -> String {
 
 /// The whole view: table, then verdicts.
 pub fn view(readings: &[NodeReading], a: &Agreement) -> String {
-    format!("{}{}{}", table(readings), supply(readings), verdicts(a))
+    format!("{}{}{}{}", table(readings), supply(readings), bridge(readings), verdicts(a))
+}
+
+/// **The bridge columns** (lab #785 F5-4c-1): per node, the tip's cumulative
+/// `D_cum` / `E_cum`, `circulating = emission − burned − D_cum + E_cum` (only
+/// when the node's supply rows cover its tip, checked arithmetic), and each
+/// epoch's bridged-in / bridged-out. A node that serves no bridge — every
+/// T1/V5 node — reads UNAVAILABLE, never zero.
+pub fn bridge(readings: &[NodeReading]) -> String {
+    use crate::poll::BridgeReading;
+    let any = readings.iter().any(|r| !matches!(r.bridge, BridgeReading::NotServed(_)));
+    if !any {
+        return "bridge: UNAVAILABLE — no node serves /v1/supply/bridge (not a V6 net)\n".to_string();
+    }
+    let label_w = readings.iter().map(|r| r.endpoint.label.len()).max().unwrap_or(4).max(4);
+    let mut out = String::from("bridge (V6: bridged in = ΔD, out = ΔE):\n");
+    for r in readings {
+        match &r.bridge {
+            BridgeReading::NotServed(why) => {
+                out.push_str(&format!("{:<label_w$}  UNAVAILABLE — {why}\n", r.endpoint.label));
+            }
+            BridgeReading::Undecodable(why) => {
+                out.push_str(&format!("{:<label_w$}  UNAVAILABLE — bridge payload not readable: {why}\n", r.endpoint.label));
+            }
+            BridgeReading::Served(v) => {
+                let circulating = r
+                    .reading
+                    .telemetry()
+                    .filter(|t| matches!(t.supply_coverage(), qlab_node::telemetry::SupplyCoverage::Complete))
+                    .and_then(|t| {
+                        let emission = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.measured_coinbase))?;
+                        let burned = t.supply.iter().try_fold(0u64, |a, e| a.checked_add(e.burned))?;
+                        v.circulating(emission, burned)
+                    })
+                    .map_or_else(|| "UNAVAILABLE".to_string(), |c| c.to_string());
+                out.push_str(&format!(
+                    "{:<label_w$}  covered to {}  D_cum {}  E_cum {}  circulating {}\n",
+                    r.endpoint.label, v.covered_height, v.d_cum, v.e_cum, circulating
+                ));
+                for row in &v.rows {
+                    out.push_str(&format!(
+                        "{:<label_w$}    epoch {:>5} {:>17}  in {:>20}  out {:>20}\n",
+                        "",
+                        row.epoch,
+                        format!("{}..={}", row.start_height, row.end_height),
+                        row.bridged_in,
+                        row.bridged_out
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -498,6 +550,7 @@ mod tests {
 
     fn ok_at(label: &str, tel: Telemetry, wire_version: u8) -> NodeReading {
         NodeReading {
+            bridge: crate::poll::BridgeReading::NotServed("404".to_string()),
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
             reading: Reading::Ok { telemetry: Box::new(tel), wire_version },
             elapsed: Duration::from_millis(2),
@@ -505,6 +558,7 @@ mod tests {
     }
     fn down(label: &str) -> NodeReading {
         NodeReading {
+            bridge: crate::poll::BridgeReading::NotServed("404".to_string()),
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
             reading: Reading::Unreachable("connect: Connection refused".into()),
             elapsed: Duration::from_millis(1),
@@ -756,6 +810,31 @@ mod tests {
         // distinction.
         assert_eq!(Agreement::of(&lagging).exit_code(), 0);
         assert_eq!(Agreement::of(&healthy).exit_code(), 0);
+    }
+
+    /// Lab #785 F5-4c-1: off V6 every node 404s the bridge route and the view
+    /// says UNAVAILABLE — never a zero; a V6 node's rows and cumulative pair
+    /// render, with `circulating` from its covered supply rows.
+    #[test]
+    fn the_bridge_section_is_unavailable_off_v6_and_renders_on_v6() {
+        use crate::poll::BridgeReading;
+        use qlab_node::bridge_wire::{BridgeRow, BridgeView};
+        let readings = vec![ok("node0", t(Some(384), None, None))];
+        let text = bridge(&readings);
+        assert!(text.contains("UNAVAILABLE"), "{text}");
+        assert!(!text.contains("D_cum 0"), "no bridge is not zero bridged:\n{text}");
+        let mut v6 = ok("node0", t(Some(384), None, None));
+        v6.bridge = BridgeReading::Served(BridgeView {
+            covered_height: 400,
+            d_cum: 1000,
+            e_cum: 40,
+            rows: vec![BridgeRow { epoch: 0, start_height: 0, end_height: 400, bridged_in: 1000, bridged_out: 40 }],
+        });
+        let down = down("node1");
+        let text = bridge(&[v6, down]);
+        assert!(text.contains("D_cum 1000  E_cum 40"), "{text}");
+        assert!(text.contains("in                 1000"), "{text}");
+        assert!(text.contains("node1  UNAVAILABLE"), "{text}");
     }
 
     /// **Acceptance (#121): the public view has no per-signer participation

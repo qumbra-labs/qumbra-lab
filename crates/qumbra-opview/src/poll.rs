@@ -167,11 +167,25 @@ impl Reading {
     }
 }
 
+/// What one node's `/v1/supply/bridge` answered (lab #785 F5-4c-1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BridgeReading {
+    /// A V6 node's bridge rows.
+    Served(qlab_node::bridge_wire::BridgeView),
+    /// No bridge: a 404 (not a V6 net, or still starting) or no answer. Shown
+    /// as unavailable — never as zero.
+    NotServed(String),
+    /// Answered with bytes this build cannot decode.
+    Undecodable(String),
+}
+
 /// One endpoint's reading, with the caliper on it.
 #[derive(Clone, Debug)]
 pub struct NodeReading {
     pub endpoint: Endpoint,
     pub reading: Reading,
+    /// The node's bridge columns (lab #785 F5-4c-1).
+    pub bridge: BridgeReading,
     /// How long this read took, wall clock. Reported so a "3/4 reachable" line can
     /// be read alongside how close to the deadline the other three were.
     pub elapsed: Duration,
@@ -195,6 +209,7 @@ pub fn poll_all(endpoints: &[Endpoint], opts: PollOptions) -> Vec<NodeReading> {
                     // A panicked reader is this tool's fault, not the node's, and
                     // must not be rendered as anything about the node.
                     reading: Reading::Unreachable("poll thread panicked (opview bug)".to_string()),
+                    bridge: BridgeReading::NotServed("poll thread panicked (opview bug)".to_string()),
                     elapsed: Duration::ZERO,
                 })
             })
@@ -226,7 +241,19 @@ pub fn poll_one(endpoint: &Endpoint, opts: PollOptions) -> NodeReading {
             )),
         },
     };
-    NodeReading { endpoint: endpoint.clone(), reading, elapsed: started.elapsed() }
+    // Lab #785 F5-4c-1: the bridge route, only where the node answered at all.
+    let bridge = if reading.is_reachable() {
+        match fetch(&endpoint.base_url, qlab_node::bridge_wire::BRIDGE_PATH, opts.timeout) {
+            Err(e) => BridgeReading::NotServed(e),
+            Ok(body) => match qlab_node::bridge_wire::BridgeView::from_bytes(&body) {
+                Ok(v) => BridgeReading::Served(v),
+                Err(e) => BridgeReading::Undecodable(format!("{e:?}")),
+            },
+        }
+    } else {
+        BridgeReading::NotServed("the node did not answer".to_string())
+    };
+    NodeReading { endpoint: endpoint.clone(), reading, bridge, elapsed: started.elapsed() }
 }
 
 /// A minimal HTTP/1.1 GET with a hard deadline on connect, write and read.

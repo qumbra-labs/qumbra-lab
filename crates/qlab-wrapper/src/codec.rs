@@ -311,6 +311,20 @@ pub fn stated_surface(version: u32, l2_id: u64, w_pvs: &[u32]) -> Option<Surface
     (w_pvs.len() == W_PV_LEN && w_pvs.iter().all(|w| *w < 1 << 16)).then(|| crate::verify::surface_of(version, l2_id, w_pvs))
 }
 
+/// The successor surface a bundle states, read from its **prefix alone** —
+/// `version ‖ l2_id ‖ w_pvs`, the first `12 + 4 · W_PV_LEN` bytes — with no
+/// proof decoded (lab #785 F5-4c ruling Q1: a snapshot resume reads kilobytes
+/// per bundle, not megabytes). `Ok(None)` when a W word is not a 16-bit
+/// chunk (see [`stated_surface`]). Only for bytes a node already accepted:
+/// it checks nothing after the prefix.
+pub fn stated_surface_prefix(b: &[u8]) -> Result<Option<Surface>, CodecError> {
+    let mut r = Reader { b };
+    let version = r.u32("version")?;
+    let l2_id = r.u64("l2_id")?;
+    let w_pvs = r.words(W_PV_LEN, "w_pvs")?;
+    Ok(stated_surface(version, l2_id, &w_pvs))
+}
+
 /// A decoded bundle: owned proofs, the clear exit list and the signature.
 pub struct WireBundle {
     pub version: u32,
@@ -515,6 +529,27 @@ mod tests {
         w[0] = 1 << 16;
         assert_eq!(stated_surface(1, 1, &w), None);
         assert_eq!(stated_surface(1, 1, &vec![0u32; W_PV_LEN - 1]), None);
+    }
+
+    /// The prefix read: truncated inside the prefix is named; a prefix whose
+    /// words are 16-bit chunks states the surface `stated_surface` does, and
+    /// anything after the prefix is not read.
+    #[test]
+    fn the_prefix_read_states_the_surface_from_the_first_bytes() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(stated_surface_prefix(&b), Err(CodecError::Truncated("w_pvs")));
+        let words = vec![3u32; W_PV_LEN];
+        words.iter().for_each(|w| b.extend_from_slice(&w.to_le_bytes()));
+        let want = stated_surface(1, 7, &words);
+        assert!(want.is_some());
+        assert_eq!(stated_surface_prefix(&b), Ok(want.clone()));
+        b.extend_from_slice(&[0xff; 64]);
+        assert_eq!(stated_surface_prefix(&b), Ok(want), "the tail is not read");
+        let mut wide = b.clone();
+        wide[12..16].copy_from_slice(&(1u32 << 16).to_le_bytes());
+        assert_eq!(stated_surface_prefix(&wide), Ok(None));
     }
 
     /// The bundle codec's refusals up to the first proof, from a prefix

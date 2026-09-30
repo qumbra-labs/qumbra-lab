@@ -241,6 +241,12 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let attest_page = Arc::new(RwLock::new(attest::attest_document(node.state(), &issuance)));
     let assets_page = Arc::new(RwLock::new(attest::registry_document(node.state())));
     let mut attest_tip = node.state().chain().tip_hash();
+    // Lab #785 F5-4c-1: the bridge document (V6 only; "not available" elsewhere),
+    // re-projected with the attestation when the tip moves.
+    let bridge_page = Arc::new(RwLock::new(qumbra_explorer::bridge::bridge_document(
+        node.bridge_view().as_ref(),
+        &node.telemetry(),
+    )));
 
     // And project the transaction-existence view once for the same reason: the
     // first `/v1/txlist` read must be answered from the chain this process
@@ -301,6 +307,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
             names: Arc::clone(&names_view),
             attest: Arc::clone(&attest_page),
             assets: Arc::clone(&assets_page),
+            bridge: Arc::clone(&bridge_page),
             degraded: Arc::clone(&degraded),
         },
         Arc::clone(&metrics),
@@ -353,6 +360,11 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         "  registry:       http://{}{}  (every registered asset's leaf, Annulet only)",
         server.addr(),
         attest::REGISTRY_PATH
+    );
+    qlab_devnet::jprintln!(
+        "  bridge:         http://{}{}  (L2 bridge in/out per epoch, V6 only)",
+        server.addr(),
+        qumbra_explorer::bridge::BRIDGE_PATH
     );
     qlab_devnet::jprintln!("  page:           served separately (qumbra-explorer-web) — no / here");
     match &metrics_server {
@@ -426,6 +438,10 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
             }
             if http::publish(&assets_page, attest::registry_document(n.state())) {
                 note_poisoned(attest::REGISTRY_PATH, &degraded);
+            }
+            let doc = qumbra_explorer::bridge::bridge_document(n.bridge_view().as_ref(), &n.telemetry());
+            if http::publish(&bridge_page, doc) {
+                note_poisoned(qumbra_explorer::bridge::BRIDGE_PATH, &degraded);
             }
         }
         names::refresh_shared(&names_view, n.state().chain());
