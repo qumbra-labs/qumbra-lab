@@ -132,8 +132,9 @@ fn usage() {
            [--sample-interval-secs N]           telemetry sampling cadence (default 30; observability only)\n      \
            [--snapshot-interval-secs N]         snapshot write cadence (default 300; durability only, #359)\n  \
          qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
-         qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74),\n      \
-                                            and — with --config — this data dir's snapshot height (#359)\n  \
+         qumbra-node halt-status [--config F] [--genesis G]   print this binary's halt schedule + revision digest (#74),\n      \
+                                            with --config this data dir's snapshot height (#359), with --genesis\n      \
+                                            the rule domain on that net (a V6 file folds its WrapperParams, #785)\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit\n  \
          qumbra-node audit-emission --data-dir DIR [--from H] [--to H]\n      \
          qumbra-node audit-names --data-dir DIR [--from H] [--to H]\n      \
@@ -776,7 +777,10 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // The banner is a multi-line string shared with the one-shot `halt-status`
     // (which stays unstamped, like all one-shot command output); here on the
     // run path each of its lines gets the journal stamp.
-    for line in RELEASE
+    // Lab #785 F5-4c-2 (review T2): the node's OWN release — on a V6 net it
+    // carries the V6 identity, and the logged rule domain must be that one.
+    for line in node
+        .release()
         .banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref())
         .lines()
     {
@@ -860,8 +864,23 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         None => (None, None),
     };
+    // Lab #785 F5-4c-2 (C1): `--genesis <file>` answers for that net — a
+    // format-10 file folds its WrapperParams into the identity; any other
+    // file, and no flag at all, is this binary's L1 identity, whose output is
+    // byte-identical to before.
+    // Review T3: the file must be a genesis (any other bytes refuse), and
+    // `--genesis` with no value is an error, never a silent L1 answer.
+    let release = if has_flag(args, "--genesis") {
+        let path = flag(args, "--genesis").filter(|p| !p.starts_with("--")).ok_or("--genesis needs a genesis file path")?;
+        match qumbra_node::annulet_genesis::load_any(&std::fs::read(path)?)? {
+            qumbra_node::annulet_genesis::AnyGenesis::V6(g) => RELEASE.on_v6(g.wrapper.digest()),
+            qumbra_node::annulet_genesis::AnyGenesis::L1(_) | qumbra_node::annulet_genesis::AnyGenesis::Annulet(_) => RELEASE,
+        }
+    } else {
+        RELEASE
+    };
     println!("qumbra-node halt-status (issue #74)");
-    print!("{}", RELEASE.banner(marker.as_ref()));
+    print!("{}", release.banner(marker.as_ref()));
     // Lab #367: the name-service boundary is a second consensus boundary this
     // binary carries — banner it beside the emission one so arming day reads
     // one command, not two.
@@ -879,7 +898,7 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     println!("  frozen digest (recomputed from THIS binary's constants):");
     println!("    {}", own_frozen_digest_hex());
-    match RELEASE.validate() {
+    match release.validate() {
         Ok(()) => println!("  validate:     OK — this release is startable"),
         Err(e) => {
             println!("  validate:     REFUSES TO START — {e}");
@@ -887,7 +906,7 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
     if let Some(m) = &marker {
-        if let Err(e) = RELEASE.check_against_marker(Some(m)) {
+        if let Err(e) = release.check_against_marker(Some(m)) {
             println!("  resume gate:  REFUSES TO START — {e}");
             return Err(Box::new(e));
         }
@@ -896,13 +915,13 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
         // the release AND of the data dir — a routine release inherits the boundary
         // from the marker. An operator diagnosing a fork needs to see the effective
         // value, not the one this binary declares.
-        match RELEASE.rule_schedule_on(Some(m)) {
+        match release.rule_schedule_on(Some(m)) {
             Ok(s) => match s.post_halt {
                 Some(p) => println!(
                     "  rule domain:  {} above height {} ({})",
                     qumbra_node::genesis::hex_encode(&p.domain),
                     p.from_height,
-                    if RELEASE.resumes_from == Some(p.from_height) {
+                    if release.resumes_from == Some(p.from_height) {
                         "declared by this release"
                     } else {
                         "inherited from the halt marker"
