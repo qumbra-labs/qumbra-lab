@@ -360,7 +360,11 @@ pub(crate) fn security_json(t: &Tree, w_lane: Lane, rung_lane: Lane) -> Value {
         "per_proof_bits_needed": (need * 10.0).round() / 10.0,
         "extra_queries": {"l2_lane_members_deposit": e_l2, "w_lane": e_w, "rung_lane": e_r},
         "query_rows_factor": {"l2_lane": rows(Lane::L2, e_l2), "w_lane": rows(w_lane, e_w), "rung_lane": rows(rung_lane, e_r)},
-        "lanes": {"w": w_lane.label(), "rungs": rung_lane.label()}})
+        "lanes": {"w": w_lane.label(), "rungs": rung_lane.label()},
+        // Lab #785 (review Z1 on PR #788): these figures price F2's measured
+        // lanes (members/deposit at q43, W at q86) — F4b's record, kept as it
+        // was. The enshrined v1 lanes are q45 (L2) and q91 (W), F5-2.
+        "note": "F2's measured lanes (members/deposit q43, W q86); v1 is q45/q91 — lab #785 F5-2"})
 }
 
 // ---------------------------------------------------------------------------

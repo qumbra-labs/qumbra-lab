@@ -41,9 +41,9 @@
 //! capacity proxy and labelled with its 2197-corrected figure:
 //! - `b2/q86/g22/fp16/a16`  — the interior lane's ruled point (`m4interior`),
 //!   100.2 corrected; shape P's second lane by the stage-1 ruling.
-//! - `b4/q43/g22/fp16/a16`  — the L2 lane, read from `qlab_l2::L2_CFG`
-//!   (lab #704: one source; equal in value to the M4 leaf point `AGG_CFG`,
-//!   not tied to it), 101.6 corrected.
+//! - `b4/q43/g22/fp16/a16`  — W3's L2 lane (lab #704; equal in value to the M4
+//!   leaf point `AGG_CFG`), 101.6 corrected. The L2 lane itself is
+//!   `qlab_l2::L2_CFG`, frozen at b4/q45 by lab #785 F5-2 (row below).
 //! - `b8/q29/g22/fp16/a16`  — derived the same way as q43 (see `B8_CFG`).
 //! - `b16/q21/g22/fp16/a16` — the L1 consensus point; shape S only, and only
 //!   if the b8 run projects it under 32 GB (#700's canary rule; the operator
@@ -547,7 +547,8 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: Pcs
     println!();
     println!(
         "Envelope (#700): shape P ≤ 16 GB peak footprint and ≤ 20 s prove, judged at the L2 lane \
-         (b4/q43 or b2/q86, whichever clears with the larger margin — stage-1 ruling). \
+         (W3 judged at b4/q43 or b2/q86, whichever cleared with the larger margin — stage-1 ruling; \
+         the lane is b4/q45 since lab #785 F5-2). \
          Proof bytes and verify time are informational."
     );
 }
@@ -574,7 +575,8 @@ mod tests {
         assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
     }
 
-    /// Shape P through the real prover at the b4/q43 lane (2^20 × 798 — the
+    /// Shape P through the real prover at the L2 lane (`L2_CFG`, b4/q45 since
+    /// lab #785 F5-2; b4/q43 when written) (2^20 × 798 — the
     /// ~15 GB class; the local scoped run skips it by name and it was run
     /// once on its own under the lock, see `docs/w3-run3.md`): the honest
     /// instance proves and verifies, then each of `anchor`, `nf₁`, `fee`,
@@ -668,7 +670,7 @@ mod tests {
 
     /// 🔴 Stage-2 carry-over (lab #700 stage-1 ruling, cargo item 0 (ii)): the
     /// L1's `rejects_a_tampered_public_surface` pair, on L2. The honest shape-S
-    /// instance is proved ONCE at b4/q43 through the real prover; then each of
+    /// instance is proved ONCE at the L2 lane (`L2_CFG`) through the real prover; then each of
     /// `anchor`, `nf₁`, `fee`, `registry_root` is flipped in turn in the public
     /// values handed to `p3_uni_stark::verify`, which must Err — a proof for
     /// one surface must not verify against another. (`l2::l2_public_value_negatives`

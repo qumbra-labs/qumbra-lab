@@ -10,7 +10,7 @@ B4 makes the node verify every Annulet transaction's proof against its **declare
 2. **The bucket** must be 2×2 (`NotTwoByTwo`).
 3. **A strict decode**: bincode fixint (what `bincode::serialize` writes), reject-trailing, and a limit equal to the input length, so a hostile length prefix cannot allocate (`ProofDecode`).
 4. **The structure the config implies** (`ProofShape{what, got, want}`): `degree_bits == LOG_HEIGHT_{S,P}`, `num_queries` query proofs, a `2^log_final_poly_len` final polynomial.
-   - Every number is read from `qlab_l2`. **There is no wire-byte literal:** the lane is provisional (lab #704), so a lane change moves these with no edit here.
+   - Every number is read from `qlab_l2`. **There is no wire-byte literal:** the lane was provisional (lab #704) and is frozen at b4/q45 since lab #785 F5-2; the numbers are still read from the config, so the lane keeps one source.
    - This step is also what separates an L1 proof from an L2 one: both decode as `Proof<Config>`, and only their structure differs.
 5. **`verify_s` / `verify_p`** run against PVs rebuilt from the declared surface (`ProofInvalid`). For shape P, each `VPublicTerm {redeem, amount, asset}` becomes `VPublic{redeem, amount}` plus the revealed asset.
 
