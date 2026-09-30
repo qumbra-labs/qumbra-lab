@@ -50,6 +50,12 @@ pub const K_EXIT_V1: u32 = 8;
 pub const WRAPPER_SPACING_BLOCKS_V1: u64 = 48;
 /// The finality-record format this net runs (`qlab_devnet::finality_record`).
 pub const FINALITY_RECORD_VERSION_V1: u32 = 1;
+/// **The claim fee tier — a named PLACEHOLDER** (lab #785 F5-4d-2, §5): the
+/// fee a claim pays out of its credit, which the rule checks every claim
+/// member against at V2. Bound here so the genesis names it; its value is
+/// Larry's decision (Q-4d-2), needed before any launch re-mint. Until then it
+/// is qlab-l2's labelled placeholder, 4 bessel.
+pub const CLAIM_FEE_TIER_V1: u64 = qlab_l2::claim::FEE_TIER_CLAIM_PLACEHOLDER;
 /// The rehearsal net's one `l2_id` (Q-L3). A `u64`: `qlab_wrapper`'s `Surface`
 /// carries `l2_id` as a `u64`, and the genesis must name the same value the
 /// verifier threads (the plan's `[u8; 32]` would have needed a mapping that
@@ -95,6 +101,8 @@ pub struct WrapperParams {
     pub k_exit: u32,
     pub wrapper_spacing_blocks: u64,
     pub finality_record_version: u32,
+    /// The claim fee tier, [`CLAIM_FEE_TIER_V1`] — a placeholder (Q-4d-2).
+    pub claim_fee_tier: u64,
     pub l2_id: u64,
     /// The sequencer's ML-DSA-65 verifying key (1,952 B): a bundle's
     /// permission (stage-0 §C).
@@ -124,6 +132,7 @@ impl WrapperParams {
             k_exit: K_EXIT_V1,
             wrapper_spacing_blocks: WRAPPER_SPACING_BLOCKS_V1,
             finality_record_version: FINALITY_RECORD_VERSION_V1,
+            claim_fee_tier: CLAIM_FEE_TIER_V1,
             l2_id,
             sequencer_key,
             genesis_surface,
@@ -148,14 +157,16 @@ impl WrapperParams {
 
     /// These parameters describe **this binary's** version-1 constants, and
     /// the sequencer key decodes. A genesis naming another lane, `K_exit`,
-    /// spacing or record version is a net this binary does not run.
+    /// spacing, record version or claim fee tier is a net this binary does
+    /// not run.
     pub fn check_v1(&self) -> Result<(), GenesisError> {
         let want = Self::v1(self.l2_id, self.sequencer_key.clone(), self.genesis_surface);
         if *self != want {
             return Err(GenesisError::V6Refused(format!(
                 "WrapperParams {self:?} are not this binary's v1 constants \
                  (lanes {L2_LANE_V1} / {WRAPPER_LANE_V1}, K_exit {K_EXIT_V1}, spacing \
-                 {WRAPPER_SPACING_BLOCKS_V1}, finality record v{FINALITY_RECORD_VERSION_V1})"
+                 {WRAPPER_SPACING_BLOCKS_V1}, finality record v{FINALITY_RECORD_VERSION_V1}, \
+                 claim fee tier {CLAIM_FEE_TIER_V1} [placeholder])"
             )));
         }
         let enc = ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa65>::try_from(self.sequencer_key.as_slice())
@@ -417,16 +428,20 @@ mod tests {
     }
 
     /// Every v1 constant is checked: a genesis naming another lane, K_exit,
-    /// spacing or record version is not a net this binary runs.
+    /// spacing, record version or claim fee tier (lab #785 F5-4d-2, the
+    /// placeholder 4 until Q-4d-2) is not a net this binary runs.
     #[test]
     fn a_genesis_off_the_v1_constants_is_refused() {
         let base = GenesisFileV6::new_rehearsal();
-        let edits: [fn(&mut WrapperParams); 5] = [
+        assert_eq!(base.wrapper.claim_fee_tier, 4, "the named placeholder");
+        let edits: [fn(&mut WrapperParams); 7] = [
             |w| w.l2_lane = "b4/q43/g22/fp16/a16".into(),
             |w| w.wrapper_lane = "b2/q86/g22/fp16/a16".into(),
             |w| w.k_exit = 9,
             |w| w.wrapper_spacing_blocks = 47,
             |w| w.finality_record_version = 2,
+            |w| w.claim_fee_tier = 5,
+            |w| w.claim_fee_tier = 0,
         ];
         for edit in edits {
             let mut g = base.clone();

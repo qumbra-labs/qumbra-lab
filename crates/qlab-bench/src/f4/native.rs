@@ -232,13 +232,13 @@ pub(crate) struct WInputs {
     pub d_batch: u64,
 }
 
-/// One P `vPublic` row's witness: the asset's outstanding before, its
-/// opening in the supply tree, and — if the row is an exit — the stub `rkm`.
+/// One P `vPublic` row's witness: the asset's outstanding before and its
+/// opening in the supply tree. An exit's `rkm` is no witness (lab #785
+/// F5-4d-2): it is the member's `PV_XRKM`, which W captures.
 #[derive(Clone, Copy)]
 pub(crate) struct VpWitness {
     pub old_out: u64,
     pub path: RegistryWitness,
-    pub exit_rkm: Digest,
 }
 
 /// A slot's F4-2 witnesses: a transaction's anchor opening in `CH` (unused
@@ -391,7 +391,7 @@ impl WState {
             let mut fee = 0u64;
             let mut e_batch = 0u64;
             for m in members {
-                let mut ex = SlotExtra { anchor_index: 0, anchor_path: self.ch.auth_path(0, self.ch.len()), vp: [VpWitness { old_out: 0, path: self.sup.path(0), exit_rkm: [0; 4] }; 2] };
+                let mut ex = SlotExtra { anchor_index: 0, anchor_path: self.ch.auth_path(0, self.ch.len()), vp: [VpWitness { old_out: 0, path: self.sup.path(0) }; 2] };
                 if m.tag != WTag::C {
                     let a = m.digest_at(0)?;
                     if a == EMPTY {
@@ -411,7 +411,7 @@ impl WState {
                         }
                         let a = if vpa == 0 { 0 } else { u64::from(vpa) };
                         let old = self.sup.outstanding(a);
-                        ex.vp[k] = VpWitness { old_out: old, path: self.sup.path(a), exit_rkm: exit_rkm_stub(&m.pvs, k) };
+                        ex.vp[k] = VpWitness { old_out: old, path: self.sup.path(a) };
                         if vpa == 0 {
                             if sgn == 0 && amt != 0 {
                                 return Err(WError::AssetZeroMint);
@@ -473,15 +473,22 @@ fn bits_ok(path: &MerkleWitness, index: u64) -> bool {
     index < INDEX_CAP && (0..MERKLE_DEPTH).all(|i| path.path_bits[i] == ((index >> i) & 1 == 1))
 }
 
-/// The **test fixtures'** exit `rkm` for row `k` (Q3 = (c)): an arbitrary
-/// deterministic value (the member's `cm1` chunks), nothing a verifier can
-/// recompute. In W, `rkm` is a **free witness**: its lanes are unconstrained
-/// and it is bound only through the exit chain's hash, so `exit_cmt` commits
-/// to whatever `(rkm, v)` the sequencer wrote — until the shape freeze gives
-/// L2 transactions an L1 recipient field.
-pub(crate) fn exit_rkm_stub(pvs: &[u32], k: usize) -> Digest {
+/// The **test fixtures'** exit recipient: an arbitrary deterministic nonzero
+/// value (the member's `cm1` chunks, low lane forced odd), written into P's
+/// `PV_XRKM` by [`tx_member`] when a row exits. Since lab #785 F5-4d-2 the
+/// recipient is the P proof's public value, one per transaction, and W binds
+/// its exit steps to it; nothing here is a free witness any more.
+pub(crate) fn fixture_xrkm(pvs: &[u32]) -> Digest {
     let off = qlab_air::l2::PV_CM1;
-    core::array::from_fn(|l| (0..4).map(|j| u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0) & 0xffff) << (16 * j)).sum::<u64>() ^ (k as u64))
+    let mut d: Digest = core::array::from_fn(|l| (0..4).map(|j| u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0) & 0xffff) << (16 * j)).sum::<u64>());
+    d[0] |= 1;
+    d
+}
+
+/// Whether P row `(sgn, amt, vpa)` is an exit: P's `e_k` — a redeem of
+/// asset 0 of a nonzero amount (lab #785 F5-4d).
+pub(crate) fn is_exit(sgn: u32, amt: u64, vpa: u32) -> bool {
+    sgn == 1 && vpa == 0 && amt != 0
 }
 
 /// **The wrapper leaf's statement, natively.** From `rin`: absorb the
@@ -534,9 +541,9 @@ pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member]
                     if sgn == 0 && amt != 0 {
                         return Err(WError::AssetZeroMint);
                     }
-                    if sgn == 1 {
+                    if is_exit(sgn, amt, vpa) {
                         e_batch = e_batch.checked_add(amt).ok_or(WError::Counter)?;
-                        exc = h4(&exit_state(&exc, &vw.exit_rkm, amt));
+                        exc = h4(&exit_state(&exc, &m.digest_at(qlab_air::l2p::PV_XRKM)?, amt));
                     }
                     vw.old_out
                 } else if sgn == 0 {
@@ -626,6 +633,11 @@ pub(crate) fn tx_member(t: &TxSurface, c_in: &Digest, rows: [(u32, u64, u32); 2]
             }
             m.pvs[base + 5] = *vpa;
         }
+        // P's canonical recipient (lab #785 F5-4d): nonzero exactly when a
+        // row exits.
+        let exits = rows.iter().any(|(sgn, amt, vpa)| is_exit(*sgn, *amt, *vpa));
+        let xrkm = if exits { pv_chunks(&fixture_xrkm(&m.pvs)) } else { [0; 16] };
+        m.pvs[qlab_air::l2p::PV_XRKM..qlab_air::l2p::PV_XRKM + 16].copy_from_slice(&xrkm);
     }
     m
 }
@@ -701,10 +713,14 @@ mod tests {
         let members = [a.clone(), b.clone()];
         let (rin, w, rout) = s.apply(&inp, &members).unwrap();
         let exc = check_wrapper_leaf(&rin, &inp, &members, &w).unwrap().1;
+        // One recipient per transaction (lab #785 F5-4d): a's two exits pay
+        // the same `rkm`, two chain entries.
+        let xr = |m: &Member| m.digest_at(qlab_air::l2p::PV_XRKM).unwrap();
+        assert_ne!(xr(&a), xr(&b));
         let list = [
-            Exit { rkm: exit_rkm_stub(&a.pvs, 0), v: 40 },
-            Exit { rkm: exit_rkm_stub(&a.pvs, 1), v: 2 },
-            Exit { rkm: exit_rkm_stub(&b.pvs, 0), v: 7 },
+            Exit { rkm: xr(&a), v: 40 },
+            Exit { rkm: xr(&a), v: 2 },
+            Exit { rkm: xr(&b), v: 7 },
         ];
         assert_eq!(exit_chain(&list), exc);
         assert_eq!(exit_sum(&list), Some(rout.e_cum - rin.e_cum));
@@ -824,7 +840,19 @@ mod tests {
         let (rin, w, rout) = s.apply(&inp, std::slice::from_ref(&m)).unwrap();
         assert_eq!((rout.e_cum, rout.sup), (rin.e_cum + 40, sup0), "an asset-0 redeem is an exit, not a supply move");
         let exc = check_wrapper_leaf(&rin, &inp, std::slice::from_ref(&m), &w).unwrap().1;
-        assert_eq!(exc, h4(&exit_state(&EMPTY, &exit_rkm_stub(&m.pvs, 0), 40)), "the exit list binds (rkm, v)");
+        assert_eq!(exc, h4(&exit_state(&EMPTY, &m.digest_at(qlab_air::l2p::PV_XRKM).unwrap(), 40)), "the exit list binds (rkm, v)");
+        // Lab #785 F5-4d-2: a zero-amount asset-0 redeem is no exit (P's
+        // `e_k`): nothing chains, E does not move, and the fixture's recipient
+        // PV is zero; with an exit beside it, only that one chains.
+        let z = p_member(&mut rng, &s, [(1, 0, 0), (0, 0, 0)]);
+        assert_eq!(z.digest_at(qlab_air::l2p::PV_XRKM).unwrap(), EMPTY);
+        let (rin, w, rout) = s.apply(&inp, std::slice::from_ref(&z)).unwrap();
+        assert_eq!(rout.e_cum, rin.e_cum);
+        assert_eq!(check_wrapper_leaf(&rin, &inp, std::slice::from_ref(&z), &w).unwrap().1, EMPTY, "no exit chained");
+        let z2 = p_member(&mut rng, &s, [(1, 0, 0), (1, 2, 0)]);
+        let (rin, w, _) = s.apply(&inp, std::slice::from_ref(&z2)).unwrap();
+        let xr = z2.digest_at(qlab_air::l2p::PV_XRKM).unwrap();
+        assert_eq!(check_wrapper_leaf(&rin, &inp, std::slice::from_ref(&z2), &w).unwrap().1, h4(&exit_state(&EMPTY, &xr, 2)));
         for (rows, err) in [
             ([(0, 7, 0), (0, 0, 0)], WError::AssetZeroMint),
             ([(1, 301, 9), (0, 0, 0)], WError::Supply),

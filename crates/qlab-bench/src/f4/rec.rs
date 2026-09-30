@@ -528,11 +528,14 @@ mod tests {
     #[test]
     fn f4census_w_and_deposit() {
         let w2 = cost(&w_child(16, Lane::B2));
-        assert_eq!((w2.opened_ext, w2.challenger_perms, w2.per_query_perms, w2.keccak_total()), (6_950, 862, 169, 15_396));
+        assert_eq!((w2.opened_ext, w2.challenger_perms, w2.per_query_perms, w2.keccak_total()), (6_990, 867, 169, 15_401));
         // F5-4d: W +1 column opens 2 more terms (ζ, ζ·g); 27,808 words stay in
         // the same flush block, so the challenger and totals do not move.
         let w4 = cost(&w_child(16, Lane::B4));
-        assert_eq!((w4.challenger_perms, w4.per_query_perms, w4.keccak_total()), (857, 175, 8_382));
+        assert_eq!((w4.challenger_perms, w4.per_query_perms, w4.keccak_total()), (862, 175, 8_387));
+        // Lab #785 F5-4d-2: W +20 columns open 40 more terms, and
+        // 4·terms + 8 = 27,968 words crosses five flush blocks (818 → 823);
+        // the input leaf stays 103 blocks, so per-query cost does not move.
         assert_eq!((w2.query_rows, w4.query_rows), (1 << 19, 1 << 18));
         let d = dep_child();
         // Degree 3 under the hiding PCS: 4 chunks, doubled by IS_ZK (the stage-0 guessed 4).

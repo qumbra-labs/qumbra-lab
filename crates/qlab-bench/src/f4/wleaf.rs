@@ -14,7 +14,8 @@
 //!   slot ×k (662 perms):
 //!     F3's slot    SD 6 | inserts 3 × 131 | appends 2 × 64 | registry 33
 //!     vPublic ×2   old leaf, new leaf, supply pair path (34 each; P only)
-//!     exits ×2     the exit chain's steps (P redeems on asset 0)
+//!     exits ×2     the exit chain's steps (P's nonzero redeems of asset 0,
+//!                  to P's captured recipient)
 //!     anchor       32: a transaction's anchor opened in CH, a claim's in AA
 //!   epilogue (67 perms): ρ(prev), rseed(prev), the fee note, its append to C
 //! ```
@@ -151,6 +152,8 @@ struct Regs {
     vs: [u32; 2],
     vm: [u64; 2],
     va: [u32; 2],
+    /// A P slot's exit recipient (`PV_XRKM`, lab #785 F5-4d-2).
+    xr: Digest,
     oldv: u64,
     scb: [u32; 3],
     ea: [u64; 4],
@@ -246,6 +249,7 @@ pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WW
         vs: [0; 2],
         vm: [0; 2],
         va: [0; 2],
+        xr: EMPTY,
         oldv: 0,
         scb: [0; 3],
         ea: [0; 4],
@@ -352,7 +356,9 @@ fn set_surface(g: &mut Regs, m: &Member) {
         g.vs = [0; 2];
         g.vm = [0; 2];
         g.va = [0; 2];
+        g.xr = EMPTY;
         if m.tag == WTag::P {
+            g.xr = pv_digest(pvs, l2p::PV_XRKM);
             for k in 0..2 {
                 let (sg, amt, vpa) = super::native::vp_row(pvs, k);
                 (g.vs[k], g.vm[k], g.va[k]) = (sg, amt, vpa);
@@ -454,7 +460,7 @@ fn perm_input(s: Seg, i: usize, g: &Regs, view: Option<&SlotView>, blocks: &[[u6
         },
         Seg::SupOld(k) if on => super::native::supply_leaf_state(u64::from(g.va[k]), g.oldv),
         Seg::SupNew(k) if on => super::native::supply_leaf_state(u64::from(g.va[k]), vp_new(g.oldv, g.vs[k], g.vm[k], g.va[k])),
-        Seg::Exit(k) if on && xf(g, k) => super::native::exit_state(&g.exc, &view.map_or(EMPTY, |v| v.vp[k].exit_rkm), g.vm[k]),
+        Seg::Exit(k) if on && xf(g, k) => super::native::exit_state(&g.exc, &g.xr, g.vm[k]),
         Seg::SupOld(_) | Seg::SupNew(_) | Seg::Exit(_) => [0; 25],
         Seg::FeeRho => fee_seed_state(&inp.prev, 1),
         Seg::FeeRseed => fee_seed_state(&inp.prev, 2),
@@ -475,7 +481,7 @@ fn perm_input(s: Seg, i: usize, g: &Regs, view: Option<&SlotView>, blocks: &[[u6
 
 /// Row `k` is an exit: a P slot's `vPublic` redeem on asset 0.
 fn xf(g: &Regs, k: usize) -> bool {
-    g.tag == WTag::P && g.va[k] == 0 && g.vs[k] == 1
+    g.tag == WTag::P && g.va[k] == 0 && g.vs[k] == 1 && g.vm[k] != 0
 }
 
 /// The accumulator as a u64 (the normalized value; wraps past 2^64 — the AIR refuses that).
@@ -560,7 +566,11 @@ fn snapshot(s: Seg, rem: usize, side: usize, g: &Regs) -> Vec<Val> {
         put(&mut cols, KSN_OFF + k, Val::from_bool(s == Seg::SupNew(k) && g.tag == WTag::P));
         put(&mut cols, KSU_OFF + k, Val::from_bool(s == Seg::Pair(PathId::Sup(k), Part::LastB) && g.tag == WTag::P));
         put(&mut cols, MZ_OFF + k, Val::from_bool(g.va[k] == 0 && g.vs[k] == 0));
+        let sm = (0..4).fold(Val::ZERO, |a, j| a + Val::from_u32(limb(g.vm[k], j) as u32));
+        put(&mut cols, NZ_OFF + k, Val::from_bool(g.vm[k] != 0));
+        put(&mut cols, NZINV_OFF + k, inv_or_zero(sm));
     }
+    put_digest(&mut cols, XR_OFF, &g.xr);
     for j in 0..4 {
         put(&mut cols, OLDV_OFF + j, Val::from_u32(limb(g.oldv, j) as u32));
         put(&mut cols, EA_OFF + j, Val::from_u32(g.ea[j] as u32));

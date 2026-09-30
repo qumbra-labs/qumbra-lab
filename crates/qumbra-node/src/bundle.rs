@@ -56,11 +56,6 @@ use qlab_wrapper::verify::{roots_at, thread_check, verify_wrapper, BundleMember,
 use crate::genesis::GenesisError;
 use crate::genesis_v6::{GenesisFileV6, WrapperParams};
 
-/// The claim tariff member verification checks claims against: qlab-l2's
-/// labelled placeholder, the value F4's fixtures and the box pass use. Its
-/// real value is an Annulet-genesis parameter not yet chosen.
-const FEE_TIER_CLAIM: u64 = qlab_l2::claim::FEE_TIER_CLAIM_PLACEHOLDER;
-
 /// How member proofs are checked: the typed L2 entries, or — test builds
 /// only — a caller's verifier.
 enum Members {
@@ -128,7 +123,9 @@ impl WrapperRule {
             k_exit,
             sequencer_key: VerifyingKey::<MlDsa65>::decode(&enc),
             version: CHAIN_VERSION,
-            members: Members::Typed(TypedMembers { fee_tier: FEE_TIER_CLAIM }),
+            // Lab #785 F5-4d-2: the genesis names the claim tariff
+            // (`check_v1` holds it to this binary's placeholder).
+            members: Members::Typed(TypedMembers { fee_tier: params.claim_fee_tier }),
         })
     }
 
@@ -271,6 +268,12 @@ mod tests {
         assert_eq!(CHAIN_VERSION, 1);
         assert!(matches!(rule.members, Members::Typed(TypedMembers { fee_tier }) if fee_tier == qlab_l2::claim::FEE_TIER_CLAIM_PLACEHOLDER));
         assert_eq!((rule.net_id, rule.l2_id, rule.spacing, rule.k_exit), (g.hash(), REHEARSAL_L2_ID, 48, 8));
+        // Lab #785 F5-4d-2: the tariff is the genesis's, not a constant here
+        // (startup's `check_v1` refuses any but the placeholder).
+        let mut other = g.clone();
+        other.wrapper.claim_fee_tier = 9;
+        let rule = WrapperRule::from_genesis(&other).unwrap();
+        assert!(matches!(rule.members, Members::Typed(TypedMembers { fee_tier: 9 })));
     }
 
     /// Ruling 5915423092 (a): no source file but this one names a knob, and
