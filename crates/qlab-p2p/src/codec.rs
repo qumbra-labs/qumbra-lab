@@ -116,12 +116,20 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], DecodeError> {
-        if self.pos + n > self.buf.len() {
-            return Err(DecodeError::Truncated { what });
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        // Checked: `n` is often a peer-supplied length, and an unchecked add
+        // near usize::MAX wraps in release. Every length that does not fit the
+        // remaining bytes is `Truncated` — an error, never a panic.
+        let end = self.pos.checked_add(n).filter(|end| *end <= self.buf.len());
+        let Some(end) = end else { return Err(DecodeError::Truncated { what }) };
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(s)
+    }
+
+    /// The bytes not yet consumed — the bound on any count a decoder is about
+    /// to pre-allocate for (every element takes at least one byte).
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     pub fn u8(&mut self, what: &'static str) -> Result<u8, DecodeError> {

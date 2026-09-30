@@ -116,11 +116,17 @@ pub fn decode_compact_response(b: &[u8]) -> Result<Vec<CompactBlock>, CodecError
         return Err(CodecError::BadVersion { got: ver });
     }
     let n_blocks = read_varint(b, &mut pos)?;
-    let mut blocks = Vec::with_capacity(n_blocks as usize);
+    // Counts are peer/server-supplied: pre-allocate no more than the bytes
+    // left could possibly describe (every element takes at least one byte).
+    // Each block is at least two one-byte varints (height, n_groups): at most
+    // one CompactBlock is reserved per input byte, each a few dozen bytes.
+    let mut blocks = Vec::with_capacity((n_blocks as usize).min(b.len()));
     for _ in 0..n_blocks {
         let height = read_varint(b, &mut pos)?;
         let n_groups = read_varint(b, &mut pos)?;
-        let mut groups = Vec::with_capacity(n_groups as usize);
+        // Each group is at least a tx_index varint and a recipient count: at
+        // most one CompactGroup per input byte.
+        let mut groups = Vec::with_capacity((n_groups as usize).min(b.len()));
         for _ in 0..n_groups {
             groups.push(read_group(b, &mut pos)?);
         }
@@ -176,11 +182,10 @@ pub fn decode_full_response(b: &[u8]) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
         let mut payloads = Vec::with_capacity(n_payloads as usize);
         for _ in 0..n_payloads {
             let len = read_varint(b, &mut pos)? as usize;
-            if b.len() < pos + len {
-                return Err(CodecError::Truncated { what: "payload" });
-            }
-            payloads.push(b[pos..pos + len].to_vec());
-            pos += len;
+            let end = pos.checked_add(len).filter(|end| *end <= b.len());
+            let Some(end) = end else { return Err(CodecError::Truncated { what: "payload" }) };
+            payloads.push(b[pos..end].to_vec());
+            pos = end;
         }
         out.push(payloads);
     }
@@ -455,14 +460,15 @@ impl NamesPage {
         for _ in 0..n_blocks {
             let height = read_varint(b, &mut pos)?;
             let n_tx = read_varint(b, &mut pos)?;
+            // Each rider is at least a one-byte length varint: at most one
+            // Vec (24 B) per input byte.
             let mut riders = Vec::with_capacity((n_tx as usize).min(b.len()));
             for _ in 0..n_tx {
                 let len = read_varint(b, &mut pos)? as usize;
-                if b.len() < pos + len {
-                    return Err(CodecError::Truncated { what: "rider" });
-                }
-                riders.push(b[pos..pos + len].to_vec());
-                pos += len;
+                let end = pos.checked_add(len).filter(|end| *end <= b.len());
+                let Some(end) = end else { return Err(CodecError::Truncated { what: "rider" }) };
+                riders.push(b[pos..end].to_vec());
+                pos = end;
             }
             blocks.push(BlockNames { height, riders });
         }
@@ -693,6 +699,36 @@ impl CoinbasePage {
 mod tests {
     use super::*;
     use qlab_air::reference::keccak_f;
+
+    /// Hardening: the compact-response counts and the payload / rider length
+    /// prefixes are error-returning at `u64::MAX` — no wrapping add, no
+    /// unbounded pre-allocation — because the P2P compact relay hands peer
+    /// bytes to these decoders.
+    #[test]
+    fn absurd_counts_and_lengths_are_errors_not_panics() {
+        let mut huge = Vec::new();
+        write_varint(&mut huge, u64::MAX);
+        let mut blocks = vec![WIRE_VERSION];
+        blocks.extend_from_slice(&huge);
+        // A u64::MAX count, then the first element's first read runs out.
+        let truncated = |r: Result<(), CodecError>| match r {
+            Err(CodecError::Truncated { what }) => what,
+            other => panic!("want Truncated, got {other:?}"),
+        };
+        assert_eq!(truncated(decode_compact_response(&blocks).map(|_| ())), "varint", "n_blocks");
+        let mut groups = vec![WIRE_VERSION, 1, 7];
+        groups.extend_from_slice(&huge);
+        assert_eq!(truncated(decode_compact_response(&groups).map(|_| ())), "varint", "n_groups");
+        // A payload length prefix of u64::MAX: one recipient, one payload.
+        let mut payload = vec![WIRE_VERSION, 1, 1];
+        payload.extend_from_slice(&huge);
+        assert_eq!(truncated(decode_full_response(&payload).map(|_| ())), "payload", "payload length");
+        // A rider length prefix of u64::MAX: from 0, to 1, one block at
+        // height 1 with one rider.
+        let mut rider = vec![WIRE_VERSION, 0, 1, 1, 1, 1];
+        rider.extend_from_slice(&huge);
+        assert_eq!(truncated(NamesPage::from_bytes(&rider).map(|_| ())), "rider", "rider length");
+    }
     use qlab_note::kem::CT_LEN;
     use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
 

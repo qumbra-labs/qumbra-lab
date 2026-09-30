@@ -55,6 +55,14 @@ impl From<GenesisForm> for WireForm {
     }
 }
 
+/// The smallest encoded transaction on either tx wire: it opens with its
+/// 32-byte anchor.
+const MIN_TX_WIRE_BYTES: usize = 32;
+/// The smallest prefilled entry: index varint + length varint + a tx.
+const MIN_PREFILLED_BYTES: usize = 2 + MIN_TX_WIRE_BYTES;
+/// The smallest `BlockTxn` entry: length varint + a tx.
+const MIN_BLOCK_TXN_ENTRY_BYTES: usize = 1 + MIN_TX_WIRE_BYTES;
+
 /// Why an announce could not be encoded (lab #785 F5-3b-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnounceEncodeError {
@@ -361,13 +369,16 @@ fn decode_announce_inner(payee_boundary: Option<u64>, wf: WireForm, buf: &[u8]) 
         (Vec::new(), Vec::new())
     };
     let n_short = r.varint()? as usize;
-    let mut short_ids = Vec::with_capacity(n_short);
+    let mut short_ids = Vec::with_capacity(n_short.min(r.remaining() / SHORTID_LEN));
     for _ in 0..n_short {
         let s = r.rest(SHORTID_LEN, "announce.shortid")?;
         short_ids.push(s.try_into().unwrap());
     }
     let n_pf = r.varint()? as usize;
-    let mut prefilled = Vec::with_capacity(n_pf);
+    // Every prefilled entry is at least an index varint, a length varint and a
+    // tx whose wire opens with its 32-byte anchor (L1 and Annulet alike): the
+    // bound reserves at most remaining / 34 entries, never a count's worth.
+    let mut prefilled = Vec::with_capacity(n_pf.min(r.remaining() / MIN_PREFILLED_BYTES));
     for _ in 0..n_pf {
         let index = r.varint()? as u32;
         let tx_len = r.varint()? as usize;
@@ -396,7 +407,9 @@ pub fn decode_get_block_txn(buf: &[u8]) -> Result<GetBlockTxn, DecodeError> {
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("gbt.block_hash")?;
     let n = r.varint()? as usize;
-    let mut indexes = Vec::with_capacity(n);
+    // Each index is a varint of at least one byte; the reservation is at most
+    // 4 B (a u32) per remaining byte.
+    let mut indexes = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         indexes.push(r.varint()? as u32);
     }
@@ -434,7 +447,9 @@ pub fn decode_block_txn_for(form: GenesisForm, buf: &[u8]) -> Result<BlockTxn, D
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("bt.block_hash")?;
     let n = r.varint()? as usize;
-    let mut txs = Vec::with_capacity(n);
+    // Every entry is at least a length varint and a tx opening with its
+    // 32-byte anchor: at most remaining / 33 entries are reserved.
+    let mut txs = Vec::with_capacity(n.min(r.remaining() / MIN_BLOCK_TXN_ENTRY_BYTES));
     for _ in 0..n {
         let tx_len = r.varint()? as usize;
         let tx_bytes = r.rest(tx_len, "bt.tx")?;
@@ -819,6 +834,75 @@ mod tests {
             assert!(back.seal.is_none());
             assert_eq!(encode_announce(form, &back), *bytes, "{form:?} round trip");
         }
+    }
+
+    /// Hardening: every peer-supplied length and count on the announce frame
+    /// — the prefilled tx length, the short-id and prefilled counts, and the
+    /// V6 section lengths — is an error at any value, `u64::MAX` included,
+    /// never a panic or an unbounded allocation, on V4, V5 and V6.
+    #[test]
+    fn absurd_lengths_and_counts_are_errors_on_every_announce_frame() {
+        let huge = {
+            let mut v = Vec::new();
+            write_varint(&mut v, u64::MAX);
+            v
+        };
+        for (wf, form) in [
+            (WireForm::plain(GenesisForm::V4), GenesisForm::V4),
+            (WireForm::plain(GenesisForm::V5), GenesisForm::V5),
+            (WireForm::V6, GenesisForm::V5),
+        ] {
+            let mut a = golden_l1_announce(form);
+            a.short_ids.clear();
+            a.prefilled.clear();
+            let base = encode_announce_for(wf, &a).unwrap();
+            // The frame ends `… n_short = 0 ‖ n_pf = 0`.
+            let stem = &base[..base.len() - 2];
+            let truncated = |f: &[u8]| match decode_announce_for(wf, f) {
+                Err(DecodeError::Truncated { what }) => what,
+                other => panic!("{wf:?}: want Truncated, got {:?}", other.map(|_| ())),
+            };
+            // (1) One prefilled tx whose length prefix is u64::MAX.
+            let mut f = stem.to_vec();
+            f.extend_from_slice(&[0, 1, 0]);
+            f.extend_from_slice(&huge);
+            assert_eq!(truncated(&f), "announce.prefilled.tx", "{wf:?} tx_len");
+            // (2) An absurd short-id count: the first short id is missing.
+            let mut f = stem.to_vec();
+            f.extend_from_slice(&huge);
+            f.push(0);
+            assert_eq!(truncated(&f), "announce.shortid", "{wf:?} n_short");
+            // (3) An absurd prefilled count, then one entry claiming one byte
+            //     that is not there: the count passed the capacity cap and the
+            //     loop reached its first entry.
+            let mut f = stem.to_vec();
+            f.push(0);
+            f.extend_from_slice(&huge);
+            f.extend_from_slice(&[0, 1]);
+            assert_eq!(truncated(&f), "announce.prefilled.tx", "{wf:?} n_pf");
+        }
+        // (4) V6: a section length of u64::MAX, right after the coinbase section.
+        let a = golden_l1_announce(GenesisForm::V5);
+        let at = header_msg_len(GenesisForm::V5) + 8 + 1 + 40;
+        let v6_truncated = |f: &[u8]| match decode_announce_for(WireForm::V6, f) {
+            Err(DecodeError::Truncated { what }) => what,
+            other => panic!("want Truncated, got {:?}", other.map(|_| ())),
+        };
+        let mut f = encode_announce(GenesisForm::V5, &a)[..at].to_vec();
+        f.extend_from_slice(&huge);
+        assert_eq!(v6_truncated(&f), "announce.finality");
+        let mut f = encode_announce(GenesisForm::V5, &a)[..at].to_vec();
+        f.push(0);
+        f.extend_from_slice(&huge);
+        assert_eq!(v6_truncated(&f), "announce.bundle");
+        // (5) The other two count sites on this wire: a u64::MAX count, then
+        //     the first element's read runs out.
+        let mut g = [0u8; 32].to_vec();
+        g.extend_from_slice(&huge);
+        assert!(matches!(decode_get_block_txn(&g), Err(DecodeError::Truncated { what: "varint" })));
+        let mut t = g.clone();
+        t.push(1);
+        assert!(matches!(decode_block_txn(&t), Err(DecodeError::Truncated { what: "bt.tx" })));
     }
 
     /// Lab #785 F5-3b-2: the V6 frame is the V5 frame with the two section
