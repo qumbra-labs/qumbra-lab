@@ -367,7 +367,7 @@ pub(crate) mod tests {
         let direct = verify_wrapper(&bundle(c), &c.prev, &Stub, ANY).expect("the honest wrapper");
         let decoded = verify_wrapper(&back.bundle(), &c.prev, &AcceptMembers, ANY).expect("the decoded wrapper");
         assert_eq!(decoded, direct);
-        assert_eq!(back.stated_surface(), direct, "the stated surface is the verified one");
+        assert_eq!(back.stated_surface(), Some(direct.clone()), "the stated surface is the verified one");
         assert_eq!(qlab_wrapper::codec::decode_surface(&qlab_wrapper::codec::encode_surface(&direct)), Ok(direct));
     }
 

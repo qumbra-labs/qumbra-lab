@@ -76,6 +76,12 @@ pub enum CodecError {
     /// A proof that does not decode (`what`).
     ProofDecode(&'static str),
     /// A proof whose bytes are not its canonical re-encoding (`what`).
+    /// A belt: with fixint integers, reject-trailing and a length prefix
+    /// per proof, no input is known to reach it (every field of a p3 proof
+    /// is a fixed-width integer, a field element — refused ≥ p by its own
+    /// deserializer — or a length-prefixed sequence). It stays so that a
+    /// future proof type with a non-canonical encoding refuses rather than
+    /// admitting two byte strings for one proof.
     ProofNotCanonical(&'static str),
 }
 
@@ -277,9 +283,11 @@ pub const BUNDLE_SIG_DOMAIN: &[u8] = b"qumbra:l2-bundle:v1";
 
 /// What the sequencer signs (F5-4 ruling, change A): the domain, the net's
 /// id (the V6 genesis hash), `l2_id`, and the successor surface's commitment
-/// as the bundle states it ([`stated_surface`]). `verify_wrapper` then proves
-/// that commitment, so a signature binds exactly the transition it names,
-/// on exactly one net.
+/// as the bundle states it ([`stated_surface`]). A signature binds exactly
+/// the transition it names, on exactly one net, **provided the caller**
+/// refuses a bundle whose wire `l2_id` is not the chain's or whose
+/// `verify_wrapper` surface is not the stated one (4b): `verify_wrapper`
+/// proves the transition from the predecessor's `l2_id`, not the wire's.
 pub fn sign_message(net_id: &[u8; 32], l2_id: u64, commitment: &Digest) -> Vec<u8> {
     let mut m = Vec::with_capacity(BUNDLE_SIG_DOMAIN.len() + 32 + 8 + 32);
     m.extend_from_slice(BUNDLE_SIG_DOMAIN);
@@ -290,10 +298,17 @@ pub fn sign_message(net_id: &[u8; 32], l2_id: u64, commitment: &Digest) -> Vec<u
 }
 
 /// The successor surface a bundle states, read from W's PVs without
-/// verifying anything: [`crate::verify::verify_wrapper`] returns exactly this
-/// value when it accepts. `None` unless there are exactly `W_PV_LEN` words.
+/// verifying anything. `None` unless there are exactly `W_PV_LEN` words and
+/// every one is a 16-bit chunk: the codec does not range-check PVs (V0
+/// does), and a wider word would overflow the limb recomposition — a panic
+/// in a checked build, an aliased commitment in a release one (pre-review
+/// P1). With the same `version` and `l2_id`, it is the value
+/// [`crate::verify::verify_wrapper`] returns on acceptance; `verify_wrapper`
+/// takes `l2_id` from the predecessor surface, so the **caller** must refuse
+/// a bundle whose wire `l2_id` is not the chain's, or whose verified surface
+/// is not the stated one (4b).
 pub fn stated_surface(version: u32, l2_id: u64, w_pvs: &[u32]) -> Option<Surface> {
-    (w_pvs.len() == W_PV_LEN).then(|| crate::verify::surface_of(version, l2_id, w_pvs))
+    (w_pvs.len() == W_PV_LEN && w_pvs.iter().all(|w| *w < 1 << 16)).then(|| crate::verify::surface_of(version, l2_id, w_pvs))
 }
 
 /// A decoded bundle: owned proofs, the clear exit list and the signature.
@@ -396,9 +411,10 @@ impl WireBundle {
         }
     }
 
-    /// The successor surface this bundle states ([`stated_surface`]).
-    pub fn stated_surface(&self) -> Surface {
-        stated_surface(self.version, self.l2_id, &self.w_pvs).expect("decode fixes W_PV_LEN")
+    /// The successor surface this bundle states ([`stated_surface`]):
+    /// `None` when a W PV is not a 16-bit chunk (a bundle V0 refuses).
+    pub fn stated_surface(&self) -> Option<Surface> {
+        stated_surface(self.version, self.l2_id, &self.w_pvs)
     }
 }
 
@@ -483,6 +499,22 @@ mod tests {
         assert_ne!(m, sign_message(&[8u8; 32], 1, &c));
         assert_ne!(m, sign_message(&net, 2, &c));
         assert_ne!(m, sign_message(&net, 1, &[1, 2, 3, 5]));
+    }
+
+    /// Pre-review P1: a W PV word ≥ 2^16 has no stated surface (the limb
+    /// recomposition would overflow u64); only the exact 16-bit vector does.
+    #[test]
+    fn stated_surface_refuses_words_wider_than_a_chunk() {
+        use crate::wleaf::PV_PREV;
+        let mut w = vec![0u32; W_PV_LEN];
+        assert!(stated_surface(1, 1, &w).is_some());
+        w[PV_PREV + 2] = u32::MAX;
+        w[PV_PREV + 3] = u32::MAX;
+        assert_eq!(stated_surface(1, 1, &w), None);
+        let mut w = vec![0u32; W_PV_LEN];
+        w[0] = 1 << 16;
+        assert_eq!(stated_surface(1, 1, &w), None);
+        assert_eq!(stated_surface(1, 1, &vec![0u32; W_PV_LEN - 1]), None);
     }
 
     /// The bundle codec's refusals up to the first proof, from a prefix

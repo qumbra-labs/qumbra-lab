@@ -399,7 +399,11 @@ pub fn verify_wrapper<P>(
 /// The surface W's PVs state: `prev`, the out side, the newest absorbed root
 /// and `exit_cmt`, committed. `verify_wrapper`'s success value, and the
 /// sequencer's signed commitment ([`crate::codec::stated_surface`]) — one
-/// function, so the two cannot drift. `w` is `W_PV_LEN` words.
+/// function, so for the same `l2_id` the two are the same value. They agree
+/// only if the caller ties the wire `l2_id` to the predecessor's (which
+/// `verify_wrapper` uses) and checks the returned surface against the
+/// stated one (4b). `w` is `W_PV_LEN` words, each < 2^16 (V0's check here,
+/// `stated_surface`'s there).
 pub(crate) fn surface_of(version: u32, l2_id: u64, w: &[u32]) -> Surface {
     let prev = digest_at(w, PV_PREV);
     let out = roots_at(w, 1);

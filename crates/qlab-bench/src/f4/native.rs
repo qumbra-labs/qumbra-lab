@@ -688,6 +688,31 @@ mod tests {
         }
     }
 
+    /// Lab #785 F5-4a (pre-review P3): `qlab_wrapper::codec::exit_chain`
+    /// over the clear list is this model's `exit_cmt` — three exits, two
+    /// rows of one P member then one of the next, in slot and row order.
+    #[test]
+    fn exit_chain_is_the_models_exit_cmt() {
+        use qlab_wrapper::codec::{exit_chain, exit_sum, Exit};
+        let (mut s, mut rng, mut inp) = fresh();
+        inp.d_batch = 1000;
+        let a = p_member(&mut rng, &s, [(1, 40, 0), (1, 2, 0)]);
+        let b = p_member(&mut rng, &s, [(1, 7, 0), (0, 0, 0)]);
+        let members = [a.clone(), b.clone()];
+        let (rin, w, rout) = s.apply(&inp, &members).unwrap();
+        let exc = check_wrapper_leaf(&rin, &inp, &members, &w).unwrap().1;
+        let list = [
+            Exit { rkm: exit_rkm_stub(&a.pvs, 0), v: 40 },
+            Exit { rkm: exit_rkm_stub(&a.pvs, 1), v: 2 },
+            Exit { rkm: exit_rkm_stub(&b.pvs, 0), v: 7 },
+        ];
+        assert_eq!(exit_chain(&list), exc);
+        assert_eq!(exit_sum(&list), Some(rout.e_cum - rin.e_cum));
+        let mut swapped = list;
+        swapped.swap(0, 1);
+        assert_ne!(exit_chain(&swapped), exc, "order binds");
+    }
+
     /// A mixed sequence threads, and the fee note carries Σ fee.
     #[test]
     fn f4_wrapper_leaf_threads_claims_and_the_fee_note() {
