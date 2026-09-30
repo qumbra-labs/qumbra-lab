@@ -14,25 +14,29 @@
 | 对象 | v1 值 | 由谁钉住 |
 |---|---|---|
 | shape S 几何 | **721** 列 · **158** 个置换 · 2^19 行 · 最大约束次数 4（4 个商块）· **116** 个公共值（S3，A4，见 §1.2）| `l2_shape_geometry_is_locked`；`qlab-air` 的 `l2_trace_width_is_read_off_the_matrix`、`l2_quotient_degree_matches_the_l1` |
-| shape P 几何 | **798** 列 · **252** 个置换（环 252 槽）· 2^20 行 · 次数 4 · **128** 个公共值（P3，A4）| `l2_shape_geometry_is_locked`；`qlab-air` 的 `l2p_trace_width_is_read_off_the_matrix`、`l2p_quotient_degree_matches_the_l1`、`l2p_program_geometry` |
-| 公共值布局 | `anchor` 0 · `nf₁` 16 · `nf₂` 32 · `cm₁` 48 · `cm₂` 64 · `fee` 80（4 个 16 位块）· `registry_root` 84 · 仅 P：`vPublic₁` 100、`vPublic₂` 106（各为 `redeem`、`amount` 的 4 个 16 位块、`vpa`）· A4：追加 `nf₃`（槽 3，手续费输入）——S 在 100，P 在 112 | `l2_shape_geometry_is_locked`、`l2_golden_pv_vectors` |
+| shape P 几何 | **804** 列 · **252** 个置换（环 252 槽）· 2^20 行 · 次数 4 · **144** 个公共值（P3，A4；F5-4d 见 §1.3）| `l2_shape_geometry_is_locked`；`qlab-air` 的 `l2p_trace_width_is_read_off_the_matrix`、`l2p_quotient_degree_matches_the_l1`、`l2p_program_geometry` |
+| 公共值布局 | `anchor` 0 · `nf₁` 16 · `nf₂` 32 · `cm₁` 48 · `cm₂` 64 · `fee` 80（4 个 16 位块）· `registry_root` 84 · 仅 P：`vPublic₁` 100、`vPublic₂` 106（各为 `redeem`、`amount` 的 4 个 16 位块、`vpa`）· A4：追加 `nf₃`（槽 3，手续费输入）——S 在 100，P 在 112 · F5-4d，仅 P：退出收款人 `xrkm` 在 128（16 块；不退出时为零） | `l2_shape_geometry_is_locked`、`l2_golden_pv_vectors` |
 | program | 每个槽的 5 位角色码；所有构造器产出同一个 program，所以验证者用的 AIR 只取决于 shape | `l2_verifier_air_is_instance_independent`；shape 摘要 |
 | note 块 | `cm = H(value ‖ asset ‖ rkm ‖ ρ ‖ rseed)`；112 字节明文 `value(8 LE) ‖ asset(8 LE) ‖ rkm ‖ ρ ‖ rseed` | `qlab-note` 的 `l2_golden_note_block`（字面值在 Rust 之外独立算出）、`l2_commitment_matches_qlab_air_build_bucket_l2` |
 | 发现载荷 | `L2_PAYLOAD_LEN = 128`（112 字节 note + 16 字节 tag） | `qlab-note` 的 `l2_payload_len_is_128` |
 | 电路内域常量（P） | `D_I` = lane 4 第 7 位（`issuer_key = H(isk ‖ D_I)`）· `D_CRED` = lane 4 第 15 位（`cred = H(rkm ‖ D_CRED)`）· **`D_FRZ` = lane 4 第 31 位**（冻结键 `K = H(rkm ‖ D_FRZ)`） | shape 摘要里的已知答案；`l2p_policy_blocks_match_reference` |
 | 资产 id 空间 | 16 位注册表下标（16..63 位强制为 0）；注册表深度 16 | `l2_asset_id_is_a_16_bit_registry_index`；`l2_shape_geometry_is_locked` |
 | 树深度 | 承诺树 32 · 注册表 16 · 冻结树 20（有序索引树，按 `K` 建键）· 白名单 20 | shape 摘要 |
-| **shape 摘要** | S `0bd458286dc5608d25d17c6f8b1f2652387722a6a9c82a14aa97b7b5d03cf6a2` · P `57a1bc84601dad21c54d84728915ead38d25a48cd9a76cdf344924c51f47f9c0` | `l2_shape_digests_are_pinned` |
+| **shape 摘要** | S `0bd458286dc5608d25d17c6f8b1f2652387722a6a9c82a14aa97b7b5d03cf6a2` · P `a072476c85f42a3f30388e0c3b5372ea230d4347829057f360b05d8924b7999c`（F5-4d；A4 时为 `57a1bc84…f9c0`） | `l2_shape_digests_are_pinned` |
 
 **shape 摘要**（`qlab_l2::digest`）是 `Keccak-256(b"qumbra:l2:shape:v1" ‖ tag ‖ 常量 ‖ 约束)`：
 - **常量**部分：几何、公共值布局、标准 program、各树深度、mode/flag 取值，外加电路所镜像的每个主机侧哈希的已知答案。域常量是哈希块里的 lane/位位置，不是具名常量，所以通过这些输出来钉，而不是再手抄一遍。
-- **约束**部分：对 Plonky3 符号约束集做的结构化内容哈希——S 有 1,113 条约束，P 有 1,328 条（A4）。哪怕一处约束改动没碰任何常量，摘要也会变。
+- **约束**部分：对 Plonky3 符号约束集做的结构化内容哈希——S 有 1,113 条约束，P 有 1,358 条（F5-4d；A4 时 1,328）。哪怕一处约束改动没碰任何常量，摘要也会变。
 - 测试里会把摘要算两遍，以此确认它是确定性的。
 - **Plonky3 升级导致摘要变化，也算一次冻结事件。** 重新钉值必须经协调者同意。
 
 ### 1.2 A4（2026-09-25，随安全重铸合入）：S3/P3，3×2 形状
 
 design #283 裁定 (a)：S 和 P 各加第三个输入，**槽 3 专付手续费**——`ANK → NF → BNF3 → ARKM → ACMF → 32×MERKLE → BANCHOR`，资产强制为 0，它的 nullifier 作为 `nf₃`（`PV_NF3`）公开，接在原有公共值后面（S 在 100，P 在 112）。槽 3 **要么是真票据，要么是占位**（`d3`，见证值）：`d3 = 0` 时花一张面额正好等于手续费的资产 0 票据，余额行不再承担手续费，于是同一资产的两张票据可以合并；`d3 = 1` 时是占位，手续费照旧从资产 0 的那一行出。两种情况都公开三个 nullifier，匿名集不会被切开。S 从 702 列 / 120 个置换变为 721 / 158（仍是 2^19，高度预算还剩 12 个置换）；P 从 778 / 214 变为 798 / 252（仍是 2^20）。非隐藏 b4 实测（Graviton 机器）：S3 6.94 GB，P3 15.17–15.73 GB——P 在 16 GB 这一档已没有余量。摘要和黄金公共值由一次点名的 `l2_goldens` 运行重新钉住，跑两遍，逐字节一致；v1 的公共值前缀没有动。
+
+### 1.3 F5-4d（lab #785）：shape P 的退出边
+
+**资产 0** 的 redeem 就是 L2 → L1 退出：不要发行方密钥，不走冻结和白名单两条腿——`z_k = [叶子资产 = 0]` 通过 `s·z` 放开 Cloaked 门和 REQ。`XE = e0 + e1 − e0·e1`（`e_k = s_k·z_k·nz_k`）表示这笔交易在退出；收款人 `xrkm`（PV 128..144）当且仅当退出时非零，每笔交易一个收款人。P 从 798 列到 804（Z×2、ZINV×2、XE、XINV），PV 128 → 144，约束 1,328 → 1,358；仍是 2^20、4 次（唯一的 4 次约束是 `XE` 的定义；`s` 是公共值，所以 `e_k` 只有 2 次）。v1 的 PV 前缀不动。摘要由点名的 `l2_goldens` 运行重钉，两次逐字节一致；S 与 R 未动。
 
 ### 1.1 相对 W3 的 shape P 唯一的改动：冻结键改为哈希
 

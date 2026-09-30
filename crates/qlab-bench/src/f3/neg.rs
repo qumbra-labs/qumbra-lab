@@ -645,8 +645,8 @@ mod tests {
     #[test]
     fn f3leaf_sd_vectors() {
         const SD_IN: Digest = [0x2e14bf6b332aa7b0, 0x153cf3d726326217, 0x4fd48521c7bae5fb, 0xe7b0935ef4961c3e];
-        const AFTER_P: Digest = [0x4648ef13d0b6e74f, 0xdc1073de28246423, 0x2e083b862b002575, 0xc74bd36d2b5f23d5];
-        const SD_OUT: Digest = [0xc5feb7bf2e2b0a93, 0xc2f4d8cac6a7e75c, 0xfb6455911a040a71, 0x0d5dc862ea5ab067];
+        const AFTER_P: Digest = [0xc20dca281ddbe757, 0x1766688fba25a511, 0xf729d765197769e0, 0x639dd63eac513545];
+        const SD_OUT: Digest = [0x484656deab6c552b, 0x19cdc67e7dca9cfd, 0xb0e078452e6ebd4f, 0x324ec65b434467ec];
         assert_eq!(sd_vectors(), [SD_IN, AFTER_P, SD_OUT], "native");
         let fx = fixture(&[P, R], SEED);
         assert_eq!((fx.rin.sd, fx.rout.sd), (SD_IN, SD_OUT), "the native leaf");

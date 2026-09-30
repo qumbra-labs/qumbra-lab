@@ -781,7 +781,7 @@ mod tests {
     fn live_air_census_pins_hiding_chunks_and_periodic_columns() {
         for (shape, count, periodic) in [
             (Shape::S, 1113, 40),
-            (Shape::P, 1328, 40),
+            (Shape::P, 1358, 40),
             (Shape::R, 1226, 41),
         ] {
             let r = symbolic(shape);
