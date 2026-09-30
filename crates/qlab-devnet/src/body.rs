@@ -3283,9 +3283,17 @@ mod tests {
         for h in [0, 1, 11_520, 11_521] {
             let body = two(h);
             let want = Err(BodyError::TooManyCoinbasePayees { got: 2, cap: 1 });
-            assert_eq!(v6(h, &body, &cv), want, "height {h}");
-            // The binding alone refuses too, before hashing an over-cap list.
-            assert_eq!(check_body_binding_v6(&header_v6(h, &BlockBody::default()), &body), want);
+            // The header is bound to the EMPTY body: an over-cap list cannot be
+            // hashed at all (the preimage asserts the cap, #253 house rule), and
+            // the point of this test is that neither the funnel nor the binding
+            // ever tries — both refuse by name before hashing.
+            let header = header_v6(h, &BlockBody::default());
+            assert_eq!(
+                validate_body_v6(&header, &body, &MockVerifier, &cv, &RefuseAllBundles, &names::EmptyNameView),
+                want,
+                "height {h}"
+            );
+            assert_eq!(check_body_binding_v6(&header, &body), want);
         }
         // One payee at the exact schedule is fine on both sides of 11,520.
         for h in [11_520, 11_521] {
