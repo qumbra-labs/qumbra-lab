@@ -48,14 +48,13 @@
 //!
 //! Conversely an honest `x < y` always has a witness ([`lt_witness`]), and
 //! it is unique (the representation of `D` is). Condition (b)'s evidence is
-//! this module's tests: native equivalence with `key_lt` **and** shape P's
-//! recurrence on boundaries plus random pairs, a test AIR ([`LtTestAir`])
-//! run through p3's `check_constraints` row loop on the same cases, and the
+//! qlab-bench's `f3::cmp` tests: native equivalence with `key_lt` **and**
+//! shape P's recurrence on boundaries plus random pairs, a test AIR
+//! (`LtTestAir`, kept there since it is test-only) run through p3's `check_constraints` row loop on the same cases, and the
 //! malicious-witness negatives, each refused at its named constraint.
 // The leaf AIR (F3-2b) is the gadget's non-test consumer.
-use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
+use p3_air::AirBuilder;
 use p3_field::PrimeCharacteristicRing;
-use p3_matrix::dense::RowMajorMatrix;
 use qlab_consensus::Val;
 
 use crate::hash::Digest;
@@ -177,110 +176,4 @@ pub fn eval_lt<AB: AirBuilder<F = Val>>(
             gate.clone() * (y[j].clone() - x[j].clone() - strict - borrow(j) + borrow(j + 1) * radix - d),
         );
     }
-}
-
-/// **The test AIR** (condition (b)): one comparison `x < y` per row, gated
-/// by `g0 · g1` (a degree-2 gate, as a leaf role selector is), with the
-/// inputs optionally range-bound by 16 bits per limb — the property the leaf
-/// inherits from the Keccak lane. Columns: `g0, g1 | x[16] | y[16] |
-/// gadget[271] | (bound) x bits[256] | y bits[256]`.
-pub struct LtTestAir {
-    pub bind_inputs: bool,
-}
-
-pub const G0: usize = 0;
-pub const X_OFF: usize = 2;
-pub const Y_OFF: usize = X_OFF + LIMBS;
-pub const W_OFF: usize = Y_OFF + LIMBS;
-pub const XB_OFF: usize = W_OFF + LT_WIDTH;
-pub const IN_BITS: usize = LIMBS * LIMB_BITS;
-
-/// The test AIR's constraints by name: the gadget's first, in its own order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TestConstraint {
-    Gadget(LtConstraint),
-    Gate(usize),
-    /// Input bit `(side, j, i)`, side 0 = `x`, 1 = `y` (bound AIR only).
-    InBit(usize, usize, usize),
-    /// Input limb `(side, j)` equals its bits' recomposition (bound AIR only).
-    InLimb(usize, usize),
-}
-
-impl TestConstraint {
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Gadget(c) => c.index(),
-            Self::Gate(k) => LT_CONSTRAINTS + k,
-            Self::InBit(s, j, i) => LT_CONSTRAINTS + 2 + IN_BITS * s + LIMB_BITS * j + i,
-            Self::InLimb(s, j) => LT_CONSTRAINTS + 2 + 2 * IN_BITS + LIMBS * s + j,
-        }
-    }
-}
-
-impl BaseAir<Val> for LtTestAir {
-    fn width(&self) -> usize {
-        XB_OFF + if self.bind_inputs { 2 * IN_BITS } else { 0 }
-    }
-}
-
-impl<AB: AirBuilder<F = Val>> Air<AB> for LtTestAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let cur = main.current_slice();
-        let c = |i: usize| -> AB::Expr { cur[i].into() };
-        let x: [AB::Expr; LIMBS] = core::array::from_fn(|j| c(X_OFF + j));
-        let y: [AB::Expr; LIMBS] = core::array::from_fn(|j| c(Y_OFF + j));
-        eval_lt(builder, c(G0) * c(G0 + 1), &x, &y, &cur[W_OFF..W_OFF + LT_WIDTH]);
-        builder.assert_bool(cur[G0]);
-        builder.assert_bool(cur[G0 + 1]);
-        if self.bind_inputs {
-            for b in &cur[XB_OFF..XB_OFF + 2 * IN_BITS] {
-                builder.assert_bool(*b);
-            }
-            for (side, limbs) in [x, y].into_iter().enumerate() {
-                for (j, limb) in limbs.into_iter().enumerate() {
-                    let off = XB_OFF + IN_BITS * side + LIMB_BITS * j;
-                    let r = (0..LIMB_BITS).rev().fold(AB::Expr::ZERO, |acc, i| acc.double() + c(off + i));
-                    builder.assert_zero(limb - r);
-                }
-            }
-        }
-    }
-}
-
-/// One test-AIR row: comparison `x < y` with gadget witness `w`, active iff
-/// `on`. Input bits are each limb's low 16 bits (what a range-bound source
-/// can carry).
-pub fn test_row(air: &LtTestAir, x: &Limbs, y: &Limbs, w: &LtWitness, on: bool) -> Vec<Val> {
-    let mut row = vec![Val::ZERO; BaseAir::<Val>::width(air)];
-    row[G0] = Val::from_bool(on);
-    row[G0 + 1] = Val::from_bool(on);
-    for j in 0..LIMBS {
-        row[X_OFF + j] = Val::from_u32(x[j]);
-        row[Y_OFF + j] = Val::from_u32(y[j]);
-    }
-    fill(&mut row[W_OFF..W_OFF + LT_WIDTH], w);
-    if air.bind_inputs {
-        for (side, v) in [x, y].into_iter().enumerate() {
-            for j in 0..LIMBS {
-                for i in 0..LIMB_BITS {
-                    row[XB_OFF + IN_BITS * side + LIMB_BITS * j + i] = Val::from_u32((v[j] >> i) & 1);
-                }
-            }
-        }
-    }
-    row
-}
-
-/// Stack rows into a trace, padded with idle (all-zero) rows to a power of two.
-pub fn test_trace(air: &LtTestAir, rows: Vec<Vec<Val>>) -> RowMajorMatrix<Val> {
-    let width = BaseAir::<Val>::width(air);
-    let height = rows.len().max(2).next_power_of_two();
-    let mut values = Vec::with_capacity(height * width);
-    for r in &rows {
-        assert_eq!(r.len(), width);
-        values.extend_from_slice(r);
-    }
-    values.resize(height * width, Val::ZERO);
-    RowMajorMatrix::new(values, width)
 }

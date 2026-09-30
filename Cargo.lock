@@ -1810,6 +1810,7 @@ dependencies = [
 name = "qlab-wrapper"
 version = "0.0.0"
 dependencies = [
+ "bincode",
  "p3-air",
  "p3-field",
  "p3-keccak-air",
@@ -1818,6 +1819,7 @@ dependencies = [
  "qlab-air",
  "qlab-consensus",
  "qlab-l2",
+ "serde",
 ]
 
 [[package]]

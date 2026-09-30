@@ -9,9 +9,16 @@
 //!
 //! Moved, not rewritten: every item is qlab-bench's (lab #775 F4, #767 F3)
 //! with `pub(crate)` widened to `pub`.
+//!
+//! F5-4a adds what consensus needs beyond the verifier: [`genesis`] (the
+//! empty L2 state's roots and the genesis surface) and [`codec`] (the
+//! canonical surface and bundle bytes, the sequencer's signed message, the
+//! exit list's chain).
 pub mod cmp;
+pub mod codec;
 pub mod config;
 pub mod dep;
+pub mod genesis;
 pub mod hash;
 pub mod lane;
 pub mod verify;

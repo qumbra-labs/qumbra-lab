@@ -52,6 +52,11 @@ use crate::f3::leaf::{inv_or_zero, mux, nf_leaf_state, node_state, out4, pv_dige
 use crate::f3::native::{sd_chain_byte, Digest, EMPTY};
 pub(crate) use qlab_wrapper::wleaf::*;
 
+// The trace plan's column span (back from qlab-wrapper in lab #785 F5-4a,
+// review Y2: only the prover's plan uses it).
+pub(crate) const PLAN_BASE: usize = SEG_OFF;
+pub(crate) const PLAN_WIDTH: usize = W_WIDTH - PLAN_BASE;
+
 /// W's public values.
 pub(crate) fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64, exit_cmt: &Digest) -> Vec<Val> {
     let mut v = Vec::with_capacity(W_PV_LEN);

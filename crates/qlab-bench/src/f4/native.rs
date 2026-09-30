@@ -86,9 +86,15 @@ use crate::f3::native::{
 // Lab #785 F5-1: the wrapper-state types and domain-tagged states moved to qlab-wrapper.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use qlab_wrapper::hash::{
-    exit_state, fee_domain_lanes, fee_note_cm, fee_rho, fee_rseed, fee_seed_state, h4,
+    exit_state, fee_domain_lanes, fee_rho, fee_rseed, fee_seed_state, h4,
     supply_leaf_state, WRoots, WTag, CLAIM_TAG, M_ABS, SUPPLY_DEPTH,
 };
+
+/// The fee note's commitment: an asset-0 L2 note (`qlab_air::l2::l2_cm`).
+/// Back from qlab-wrapper (lab #785 F5-4a, review Y2): only the prover uses it.
+pub(crate) fn fee_note_cm(value: u64, rkm_seq: &Digest, prev: &Digest) -> Digest {
+    qlab_air::l2::l2_cm(value, 0, rkm_seq, &fee_rho(prev), &fee_rseed(prev))
+}
 
 /// The `WTag` ↔ `L2ShapeTag` conversion, kept on this side so qlab-wrapper
 /// carries no qlab-devnet edge (lab #785 review Y1). `WTag::byte` writes the
@@ -653,6 +659,33 @@ mod tests {
         assert_eq!(WTag::C.shape(), None);
         assert_eq!(L2ShapeTag::from_byte(WTag::C.byte()), None, "the claim tag is no shape's byte");
         assert_eq!(WTag::ALL.map(WTag::byte), [0x01, 0x02, 0x03, CLAIM_TAG]);
+    }
+
+    /// Lab #785 F5-4a (ruling condition (a)): qlab-wrapper's genesis port
+    /// computes this model's roots, over an empty registry and a non-empty
+    /// one, tree by tree; the zero ladder is the node's; the digest-bytes
+    /// mapping is qlab-note's.
+    #[test]
+    fn wgenesis_roots_are_the_native_models() {
+        use qlab_cbserver::registry::RegistryTree;
+        use qlab_wrapper::genesis as g;
+        use qlab_wrapper::verify::Surface;
+        assert_eq!(g::zeros(), qlab_cbserver::tree::zeros());
+        assert_eq!(g::indexed_genesis_root(), IndexedTree::genesis().root());
+        assert_eq!(g::supply_genesis_root(), SupplyTree::genesis().root());
+        assert_eq!(g::empty_registry_root(), RegistryTree::from_leaves(&[]).unwrap().root());
+        for reg in [vec![], vec![RegistryLeaf::cloaked(0)]] {
+            let model = WState::genesis(&reg).roots();
+            let r = RegistryTree::from_leaves(&reg).unwrap().root();
+            assert_eq!(g::genesis_roots(&r), model, "registry of {}", reg.len());
+            assert_eq!(g::genesis_surface(7, &r), Surface::genesis(g::CHAIN_VERSION, 7, model));
+        }
+        let mut rng = Rng(0x785_f54a);
+        for _ in 0..8 {
+            let d = rng.digest();
+            assert_eq!(qlab_wrapper::codec::digest_to_bytes(&d), qlab_note::hash::digest_bytes(&d));
+            assert_eq!(qlab_wrapper::codec::digest_from_bytes(&qlab_note::hash::digest_bytes(&d)), d);
+        }
     }
 
     /// A mixed sequence threads, and the fee note carries Σ fee.

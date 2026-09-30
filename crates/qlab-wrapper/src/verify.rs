@@ -186,13 +186,16 @@ pub struct TypedMembers {
     pub fee_tier: u64,
 }
 
-impl MemberVerifier<Proof<Config>> for TypedMembers {
-    fn verify(&self, m: &BundleMember<Proof<Config>>, l2_id: u64) -> Result<(), String> {
+/// Owned proofs (the bench) and borrowed ones (a decoded
+/// [`crate::codec::WireBundle`]) alike.
+impl<P: std::borrow::Borrow<Proof<Config>>> MemberVerifier<P> for TypedMembers {
+    fn verify(&self, m: &BundleMember<P>, l2_id: u64) -> Result<(), String> {
+        let proof = m.proof.borrow();
         let ok = match m.tag {
-            WTag::S => qlab_l2::verify_s_u32(&m.pvs, &m.proof),
-            WTag::P => qlab_l2::verify_p_u32(&m.pvs, &m.proof),
-            WTag::R => qlab_l2::verify_r_u32(&m.pvs, &m.proof),
-            WTag::C => return qlab_l2::claim::verify_claim_u32(&m.pvs, &m.proof, l2_id, self.fee_tier).map_err(|e| format!("{e:?}")),
+            WTag::S => qlab_l2::verify_s_u32(&m.pvs, proof),
+            WTag::P => qlab_l2::verify_p_u32(&m.pvs, proof),
+            WTag::R => qlab_l2::verify_r_u32(&m.pvs, proof),
+            WTag::C => return qlab_l2::claim::verify_claim_u32(&m.pvs, proof, l2_id, self.fee_tier).map_err(|e| format!("{e:?}")),
         };
         ok.then_some(()).ok_or_else(|| "the proof does not verify".into())
     }
@@ -390,15 +393,18 @@ pub fn verify_wrapper<P>(
     if let Some(i) = absorbed.iter().position(|a| !anchor_ok(a)) {
         return Err(VError::Anchor(i));
     }
-    let newest = absorbed[M_ABS - 1];
-    let exit_cmt = digest_at(&b.w_pvs, PV_EXC);
-    Ok(Surface {
-        version: b.version,
-        l2_id: prev.l2_id,
-        prev: w_prev,
-        out: wout,
-        newest_anchor: newest,
-        exit_cmt,
-        commitment: Surface::commit(b.version, prev.l2_id, &w_prev, &wout, &newest, &exit_cmt),
-    })
+    Ok(surface_of(b.version, prev.l2_id, &b.w_pvs))
+}
+
+/// The surface W's PVs state: `prev`, the out side, the newest absorbed root
+/// and `exit_cmt`, committed. `verify_wrapper`'s success value, and the
+/// sequencer's signed commitment ([`crate::codec::stated_surface`]) — one
+/// function, so the two cannot drift. `w` is `W_PV_LEN` words.
+pub(crate) fn surface_of(version: u32, l2_id: u64, w: &[u32]) -> Surface {
+    let prev = digest_at(w, PV_PREV);
+    let out = roots_at(w, 1);
+    let newest_anchor = digest_at(w, PV_ABS + 16 * (M_ABS - 1));
+    let exit_cmt = digest_at(w, PV_EXC);
+    let commitment = Surface::commit(version, l2_id, &prev, &out, &newest_anchor, &exit_cmt);
+    Surface { version, l2_id, prev, out, newest_anchor, exit_cmt, commitment }
 }

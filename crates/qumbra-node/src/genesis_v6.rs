@@ -78,7 +78,8 @@ pub fn v6_genesis_registry_root() -> [u64; 4] {
 /// [`v6_genesis_registry`] — `Surface::genesis(1, REHEARSAL_L2_ID,
 /// WState::genesis(&[cloaked(0)]).roots()).commitment`, **copied from the
 /// named `qlab-bench wgenesis` run's output** (Q-S = (b) on issue #785; the
-/// registry per F-A). F5-4a's port recomputes it.
+/// registry per F-A). F5-4a's port recomputes it, and
+/// `the_rehearsal_genesis_surface_is_the_ported_one` holds this pin to it.
 pub const REHEARSAL_GENESIS_SURFACE: [u64; 4] =
     [3351788334638659005, 15912216378482193296, 6060495819875004553, 538790937245016534];
 
@@ -361,6 +362,15 @@ mod tests {
         let root = v6_genesis_registry_root();
         assert_ne!(root, [0; 4]);
         assert_ne!(root, qlab_cbserver::registry::RegistryTree::from_leaves(&[]).unwrap().root(), "not the empty registry");
+    }
+
+    /// Lab #785 F5-4a (ruling condition (a)): the pinned surface, copied
+    /// from qlab-bench's native model, is the value `qlab_wrapper`'s port
+    /// computes for the rehearsal `l2_id` over the V6 genesis registry.
+    #[test]
+    fn the_rehearsal_genesis_surface_is_the_ported_one() {
+        use qlab_wrapper::genesis::genesis_surface;
+        assert_eq!(genesis_surface(REHEARSAL_L2_ID, &v6_genesis_registry_root()).commitment, REHEARSAL_GENESIS_SURFACE);
     }
 
     /// The lanes are the wrapper and L2 crates' own configs, not copies.

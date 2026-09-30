@@ -322,4 +322,97 @@ pub(crate) mod tests {
             assert!(VERSIONS[i + 1..].iter().all(|b| (a.1, a.2) != (b.1, b.2) && a.0 != b.0));
         }
     }
+
+    /// Accepts any member (test-only): the codec tests below judge W's and
+    /// the deposit proof's round trip, not the members'.
+    struct AcceptMembers;
+    impl MemberVerifier<&Proof<Config>> for AcceptMembers {
+        fn verify(&self, _: &BundleMember<&Proof<Config>>, _: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// The shared case as wire bytes: W's and the deposit proof are the real
+    /// ones; each member carries the deposit proof as its (unverified) proof,
+    /// so no new prove is paid.
+    fn wire(c: &Case) -> qlab_wrapper::codec::WireBundle {
+        use qlab_wrapper::codec::{Exit, WireBundle, SEQUENCER_SIG_LEN};
+        let copy = |p: &Proof<Config>| -> Proof<Config> { bincode::deserialize(&bincode::serialize(p).unwrap()).unwrap() };
+        WireBundle {
+            version: TEST_VERSION,
+            l2_id: STUB_L2_ID,
+            w_pvs: c.bundle_pvs.clone(),
+            w_proof: bincode::deserialize(&bincode::serialize(&c.proof).unwrap()).unwrap(),
+            dep_pvs: c.dep.0.clone(),
+            dep_proof: copy(&c.dep.1),
+            members: c.members.iter().map(|m| BundleMember { tag: m.tag, pvs: m.pvs.clone(), proof: copy(&c.dep.1) }).collect(),
+            exits: vec![Exit { rkm: [3, 1, 4, 1], v: 40 }],
+            sig: Box::new([0xa5; SEQUENCER_SIG_LEN]),
+        }
+    }
+
+    /// Lab #785 F5-4a: the bundle codec round-trips the proven case byte for
+    /// byte, the decoded bundle verifies to the same surface as the
+    /// original, and that surface is the one the bundle states (the
+    /// sequencer's signed commitment).
+    #[test]
+    fn f5_4a_bundle_codec_round_trips_the_proven_case() {
+        use qlab_wrapper::codec::WireBundle;
+        let c = case();
+        let w = wire(c);
+        let bytes = w.encode();
+        let back = WireBundle::decode(&bytes).expect("canonical bytes decode");
+        assert_eq!(back.encode(), bytes, "decode ∘ encode is the identity");
+        assert_eq!((back.version, back.l2_id, &back.exits, &back.sig[..]), (w.version, w.l2_id, &w.exits, &w.sig[..]));
+        let direct = verify_wrapper(&bundle(c), &c.prev, &Stub, ANY).expect("the honest wrapper");
+        let decoded = verify_wrapper(&back.bundle(), &c.prev, &AcceptMembers, ANY).expect("the decoded wrapper");
+        assert_eq!(decoded, direct);
+        assert_eq!(back.stated_surface(), direct, "the stated surface is the verified one");
+        assert_eq!(qlab_wrapper::codec::decode_surface(&qlab_wrapper::codec::encode_surface(&direct)), Ok(direct));
+    }
+
+    /// Lab #785 F5-4a (condition (g)): every codec refusal, named, on the
+    /// proven case's bytes.
+    #[test]
+    fn f5_4a_bundle_codec_negatives() {
+        use qlab_wrapper::codec::{CodecError, WireBundle, SEQUENCER_SIG_LEN};
+        let c = case();
+        let bytes = wire(c).encode();
+        let err = |b: &[u8]| WireBundle::decode(b).err().expect("refused");
+        // Truncated anywhere, trailing anything.
+        assert_eq!(err(&bytes[..bytes.len() - 1]), CodecError::Truncated("sequencer_sig"));
+        assert_eq!(err(&bytes[..bytes.len() - SEQUENCER_SIG_LEN - 1]), CodecError::Truncated("exit v"));
+        let mut t = bytes.clone();
+        t.push(0);
+        assert_eq!(err(&t), CodecError::Trailing);
+        // Offsets from the layout.
+        let w_proof_at = 12 + 4 * W_PV_LEN;
+        let w_len = u32::from_le_bytes(bytes[w_proof_at..w_proof_at + 4].try_into().unwrap()) as usize;
+        let dep_len_at = w_proof_at + 4 + w_len + 4 * qlab_wrapper::dep::DEP_PV_LEN;
+        let dep_len = u32::from_le_bytes(bytes[dep_len_at..dep_len_at + 4].try_into().unwrap()) as usize;
+        let n_at = dep_len_at + 4 + dep_len;
+        assert_eq!(bytes[n_at] as usize, c.members.len());
+        // The #793 class: a length prefix of u32::MAX refuses without allocating.
+        let mut t = bytes.clone();
+        t[w_proof_at..w_proof_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(err(&t), CodecError::Truncated("w_proof"));
+        // A proof one byte short of its bytes: bincode runs out inside it.
+        let mut t = bytes.clone();
+        t[w_proof_at..w_proof_at + 4].copy_from_slice(&((w_len - 1) as u32).to_le_bytes());
+        assert_eq!(err(&t), CodecError::ProofDecode("w_proof"));
+        // A proof with a byte appended inside its length: trailing bytes are refused by the decoder.
+        let mut t = bytes[..w_proof_at].to_vec();
+        t.extend_from_slice(&((w_len + 1) as u32).to_le_bytes());
+        t.extend_from_slice(&bytes[w_proof_at + 4..w_proof_at + 4 + w_len]);
+        t.push(0);
+        t.extend_from_slice(&bytes[w_proof_at + 4 + w_len..]);
+        assert_eq!(err(&t), CodecError::ProofDecode("w_proof"));
+        // Member count past MAX_K, and an unknown tag.
+        let mut t = bytes.clone();
+        t[n_at] = (qlab_wrapper::wleaf::MAX_K + 1) as u8;
+        assert_eq!(err(&t), CodecError::TooManyMembers((qlab_wrapper::wleaf::MAX_K + 1) as u8));
+        let mut t = bytes.clone();
+        t[n_at + 1] = 0x09;
+        assert_eq!(err(&t), CodecError::UnknownTag(0x09));
+    }
 }
