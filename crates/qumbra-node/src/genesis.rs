@@ -234,6 +234,7 @@ impl GenesisInitPlan {
         let mut remint_from: Option<std::path::PathBuf> = None;
         let mut remint_expect: Option<String> = None;
         let mut v5_rehearsal = false;
+        let mut form_given = false;
         let mut sequencer_key: Option<std::path::PathBuf> = None;
         let mut i = 0;
         while i < args.len() {
@@ -262,6 +263,7 @@ impl GenesisInitPlan {
                     i += 2;
                 }
                 "--form" => {
+                    form_given = true;
                     match args.get(i + 1).map(String::as_str) {
                         Some("v5") => v5_rehearsal = true,
                         Some("v6") => {}
@@ -310,8 +312,11 @@ impl GenesisInitPlan {
                 return Err("`--remint-from FILE` and `--remint-expect HASH` go together".into());
             }
         }
-        if v5_rehearsal && (!t2 || launch || remint_from.is_some()) {
-            return Err("`--form v5` is the V5 rehearsal genesis: it takes `--t2` and nothing else".into());
+        // Review R2 on PR #794: `--form` (either value) selects the rehearsal
+        // genesis's form, so it takes `--t2` and nothing else — never a silent
+        // no-op on T1, a launch or a re-mint.
+        if form_given && (!t2 || launch || remint_from.is_some()) {
+            return Err("`--form v5|v6` selects the T2 rehearsal genesis's form: it takes `--t2` and nothing else".into());
         }
         if sequencer_key.is_some() && remint_from.is_none() {
             return Err("`--sequencer-key` belongs to a V6 re-mint (`--remint-from` a format-9 T2 genesis)".into());
@@ -844,7 +849,7 @@ impl GenesisFile {
         Self::t2_v5_from_committee_keys(committee_keys, difficulty)
     }
 
-    /// T2 **launch** genesis (lab #506): same v5 shape as [`Self::new_t2`], but
+    /// T2 **launch** genesis (lab #506): same v5 shape as [`Self::new_t2_v5`], but
     /// the 21 committee seeds come from the OS CSPRNG (`rand::rng()`, the house
     /// OsRng-class path) through [`Validator::from_seed`]. Returns the seeds so
     /// the caller can write key files that actually open this genesis — they
@@ -1934,6 +1939,12 @@ mod tests {
         assert!(GenesisInitPlan::parse(&args(&["--form", "v5"])).is_err(), "needs --t2");
         assert!(GenesisInitPlan::parse(&args(&["--t2", "--launch", "--form", "v5"])).is_err());
         assert!(GenesisInitPlan::parse(&args(&["--t2", "--form", "v7"])).is_err());
+        // Review R2 on PR #794: `--form v6` is never silently ignored.
+        assert!(GenesisInitPlan::parse(&args(&["--form", "v6"])).is_err(), "not on T1");
+        assert!(GenesisInitPlan::parse(&args(&["--t2", "--launch", "--form", "v6"])).is_err(), "not on a launch");
+        assert!(GenesisInitPlan::parse(&args(&["--t2", "--remint-from", "f", "--remint-expect", "ab", "--form", "v6"])).is_err());
+        let v6 = GenesisInitPlan::parse(&args(&["--t2", "--form", "v6"])).unwrap();
+        assert!(v6.t2 && !v6.v5_rehearsal);
         assert!(GenesisInitPlan::parse(&args(&["--t2", "--sequencer-key", "k"])).is_err(), "not without a re-mint");
         let remint = GenesisInitPlan::parse(&args(&[
             "--t2", "--remint-from", "f", "--remint-expect", "ab", "--sequencer-key", "k",

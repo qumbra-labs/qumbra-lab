@@ -420,6 +420,10 @@ fn genesis_remint_v6(
         .ok_or("a format-9 → V6 re-mint requires `--sequencer-key FILE` (the ceremony's verifying key, hex)")?;
     let key = qumbra_node::genesis::hex_decode(std::fs::read_to_string(key_path)?.trim())
         .ok_or("--sequencer-key: the file is not hex")?;
+    // `REHEARSAL_L2_ID` and `REHEARSAL_GENESIS_SURFACE` are the right values for
+    // a launch re-mint too: v1 has ONE l2_id (Q-L3), and the genesis surface is
+    // the empty-registry W state's commitment for that l2_id — it does not
+    // depend on the sequencer key or the committee (review R4 on PR #794).
     let gf = GenesisFileV6::remint_from_v5(old, expect, key, REHEARSAL_L2_ID, REHEARSAL_GENESIS_SURFACE)?;
     let gpath = plan.out.join("genesis.qmb");
     std::fs::write(&gpath, gf.to_bytes())?;

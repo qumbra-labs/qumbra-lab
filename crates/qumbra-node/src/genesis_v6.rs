@@ -22,9 +22,12 @@
 //!
 //! [`WrapperParams`] freezes the L2's consensus constants for this net. Their
 //! keccak is folded into the V6 revision digest
-//! ([`crate::revision::revision_digest_v6`]) beside `frozen_digest`, so T1's
-//! and V5's digests stay byte-identical while a V6 net's rule domain binds the
-//! wrapper constants as well.
+//! ([`crate::revision::revision_digest_v6`]) beside `frozen_digest`. In F5-3c
+//! that digest is **computed, pinned and printed** (`genesis init --t2`) — it
+//! is **not yet** a V6 net's rule domain or halt-marker identity: `prepare_v6`
+//! runs the release's ordinary `Revision::digest()`, exactly as T1 and V5 do.
+//! Wiring it in (with T1's and V5's domains byte-identical and a CI pin) is
+//! F5-4 condition C1 (review of PR #794).
 
 use serde::{Deserialize, Serialize};
 
@@ -259,7 +262,14 @@ impl GenesisFileV6 {
             Some(V6_GENESIS_FORMAT_VERSION) => {}
             got => return Err(GenesisError::NotV6Genesis { got }),
         }
-        bincode::deserialize(bytes).map_err(|e| GenesisError::Decode(e.to_string()))
+        let file: Self = bincode::deserialize(bytes).map_err(|e| GenesisError::Decode(e.to_string()))?;
+        // Canonical only (review R3 on PR #794): bincode 1.3's `deserialize`
+        // accepts trailing bytes, so the decode is re-encoded and compared —
+        // one file has one byte string, and its hash names exactly it.
+        if file.to_bytes() != bytes {
+            return Err(GenesisError::Decode("a V6 genesis file must be exactly its canonical bytes (trailing or non-canonical bytes)".into()));
+        }
+        Ok(file)
     }
 
     /// The V6 startup gate: format 10, the base's committee size / quorum /
@@ -341,6 +351,18 @@ mod tests {
         assert!(matches!(GenesisFile::from_bytes(&bytes), Err(GenesisError::V6Refused(_))));
         let t1 = GenesisFile::new_devnet_t0().to_bytes();
         assert!(matches!(GenesisFileV6::from_bytes(&t1), Err(GenesisError::NotV6Genesis { got: Some(8) })));
+    }
+
+    /// Review R3 on PR #794: a V6 file is exactly its canonical bytes — a
+    /// trailing byte and a truncation are both refused.
+    #[test]
+    fn a_v6_file_with_trailing_or_missing_bytes_is_refused() {
+        let bytes = GenesisFileV6::new_rehearsal().to_bytes();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(GenesisFileV6::from_bytes(&trailing), Err(GenesisError::Decode(_))));
+        assert!(matches!(GenesisFileV6::from_bytes(&bytes[..bytes.len() - 1]), Err(GenesisError::Decode(_))));
+        assert!(GenesisFileV6::from_bytes(&bytes).is_ok());
     }
 
     /// Every v1 constant is checked: a genesis naming another lane, K_exit,

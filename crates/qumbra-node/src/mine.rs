@@ -128,7 +128,7 @@ pub const NET_T1: NetProfile = NetProfile {
 /// whole lesson of lab #527.** The live T2 genesis was minted at the launch
 /// ceremony from OS-random committee keys
 /// ([`GenesisFile::new_t2_with_committee_seeds`]), so the in-tree rehearsal mint
-/// [`GenesisFile::new_t2`] hashes to a *different* value — a third number that
+/// [`GenesisFile::new_t2_v5`] hashes to a *different* value — a third number that
 /// tracks neither this constant nor the live net. Any test that pins this to an
 /// in-tree mint is asserting a falsehood; the guard that keeps it honest is
 /// `the_net_table_is_the_release_lanes_net_table`, which compares it to
