@@ -1006,7 +1006,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // body sections, committee₀ from the V6 genesis (the adapter's
             // record roster), and the V6 genesis hash as the net identity.
             PreparedGenesis::V6(genesis) => {
-                let mut adapter = NodeAdapter::open_v6(&config.data_dir, committee, pow, verifier, sim)?;
+                // Lab #785 F5-4b: the bundle rule from the genesis's WrapperParams
+                // (version 1 only, condition (c)), installed before the log replays.
+                let wrapper = crate::bundle::WrapperRule::from_genesis(genesis)?.into_setup();
+                let mut adapter = NodeAdapter::open_v6(&config.data_dir, committee, pow, verifier, sim, Some(wrapper))?;
                 qlab_devnet::jprintln!("{}", adapter.punishment_restore().summary_line());
                 adapter.set_chain_rules(ChainRules { form: genesis.forms().0, halt: rules });
                 (adapter, genesis.hash(), Duration::from_secs(genesis.base.frozen.block_time_secs), None)

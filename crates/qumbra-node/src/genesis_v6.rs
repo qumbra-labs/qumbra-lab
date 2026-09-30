@@ -303,6 +303,16 @@ impl GenesisFileV6 {
             return Err(GenesisError::V6Refused("the genesis block is not the V6 genesis block at this difficulty".into()));
         }
         self.wrapper.check_v1()?;
+        // C2 (lab #785 F5-4b): the pinned genesis surface is the one this
+        // binary computes for the genesis's l2_id over the empty registry —
+        // the surface every node's first bundle threads from.
+        let computed = qlab_wrapper::genesis::genesis_surface(self.wrapper.l2_id, &qlab_wrapper::genesis::empty_registry_root());
+        if self.wrapper.genesis_surface != computed.commitment {
+            return Err(GenesisError::V6Refused(format!(
+                "WrapperParams.genesis_surface {:?} is not the empty L2 state's surface for l2_id {} ({:?})",
+                self.wrapper.genesis_surface, self.wrapper.l2_id, computed.commitment
+            )));
+        }
         if self.wrapper.has_rehearsal_sequencer_key() && !self.is_rehearsal() {
             return Err(GenesisError::V6Refused(
                 "a launch genesis (non-rehearsal committee₀) carries the in-code rehearsal sequencer key".into(),
@@ -426,6 +436,25 @@ mod tests {
         let mut bad_key = base.clone();
         bad_key.wrapper.sequencer_key.pop();
         assert!(matches!(bad_key.verify_startup(None), Err(GenesisError::V6Refused(_))));
+    }
+
+    /// C2 (lab #785 F5-4b): a V6 genesis whose pinned surface is not the
+    /// empty L2 state's for its `l2_id` is refused at startup — a flipped
+    /// lane, and an `l2_id` changed without its surface.
+    #[test]
+    fn a_v6_genesis_with_the_wrong_genesis_surface_is_refused() {
+        let base = GenesisFileV6::new_rehearsal();
+        assert!(base.verify_startup(None).is_ok());
+        let mut flipped = base.clone();
+        flipped.wrapper.genesis_surface[0] ^= 1;
+        assert!(matches!(flipped.verify_startup(None), Err(GenesisError::V6Refused(m)) if m.contains("genesis_surface")));
+        let mut other_id = base.clone();
+        other_id.wrapper.l2_id = 2;
+        assert!(matches!(other_id.verify_startup(None), Err(GenesisError::V6Refused(m)) if m.contains("genesis_surface")));
+        let mut both = base;
+        both.wrapper.l2_id = 2;
+        both.wrapper.genesis_surface = qlab_wrapper::genesis::genesis_surface(2, &qlab_wrapper::genesis::empty_registry_root()).commitment;
+        assert!(both.verify_startup(None).is_ok(), "a consistent pair passes");
     }
 
     /// The rehearsal sequencer key is refused in any genesis whose committee₀

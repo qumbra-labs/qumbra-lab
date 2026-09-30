@@ -362,7 +362,23 @@ pub fn verify_wrapper<P>(
         return Err(VError::Sd);
     }
     // V5 — stays verifier-side (reading B): threading-in = predecessor's out.
-    let p = &prev.out;
+    thread_check(&win, &prev.out)?;
+    // V6 — stays verifier-side (reading B): the chain link.
+    let w_prev = digest_at(&b.w_pvs, PV_PREV);
+    if w_prev != prev.commitment {
+        return Err(VError::Prev);
+    }
+    // V7 — F5's L1 rule (stub): absorbed roots are genuine recent finalized roots.
+    let absorbed: Vec<Digest> = (0..M_ABS).map(|i| digest_at(&b.w_pvs, PV_ABS + 16 * i)).collect();
+    if let Some(i) = absorbed.iter().position(|a| !anchor_ok(a)) {
+        return Err(VError::Anchor(i));
+    }
+    Ok(surface_of(b.version, prev.l2_id, &b.w_pvs))
+}
+
+/// V5: W's threading-in values equal the predecessor's out, the first
+/// mismatch named. Shared with the L1's proof-free fold (lab #785 F5-4b).
+pub fn thread_check(win: &WRoots, p: &WRoots) -> Result<(), VError> {
     let pairs: [(&'static str, bool); 15] = [
         ("N", win.f3.n == p.f3.n),
         ("n_next", win.f3.n_next == p.f3.n_next),
@@ -383,17 +399,7 @@ pub fn verify_wrapper<P>(
     if let Some((name, _)) = pairs.iter().find(|(_, ok)| !ok) {
         return Err(VError::Thread(name));
     }
-    // V6 — stays verifier-side (reading B): the chain link.
-    let w_prev = digest_at(&b.w_pvs, PV_PREV);
-    if w_prev != prev.commitment {
-        return Err(VError::Prev);
-    }
-    // V7 — F5's L1 rule (stub): absorbed roots are genuine recent finalized roots.
-    let absorbed: Vec<Digest> = (0..M_ABS).map(|i| digest_at(&b.w_pvs, PV_ABS + 16 * i)).collect();
-    if let Some(i) = absorbed.iter().position(|a| !anchor_ok(a)) {
-        return Err(VError::Anchor(i));
-    }
-    Ok(surface_of(b.version, prev.l2_id, &b.w_pvs))
+    Ok(())
 }
 
 /// The surface W's PVs state: `prev`, the out side, the newest absorbed root

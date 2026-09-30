@@ -1523,6 +1523,7 @@ name = "qlab-bench"
 version = "0.0.0"
 dependencies = [
  "bincode",
+ "ml-dsa",
  "p3-air",
  "p3-blake3-air",
  "p3-challenger",
@@ -1553,6 +1554,7 @@ dependencies = [
  "qlab-pow",
  "qlab-wallet",
  "qlab-wrapper",
+ "qumbra-node",
  "rand 0.10.2",
  "serde",
  "serde_json",

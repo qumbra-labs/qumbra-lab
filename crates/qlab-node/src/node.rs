@@ -494,6 +494,16 @@ pub enum NodeError {
     SupplyUnderflow { height: u64, asset: u16, outstanding: i128, delta: i128 },
 }
 
+/// What a V6 node carries beyond a V5 one (lab #785): committee₀ (the
+/// roster finality records are judged by) and the wrapper chain's rule and
+/// origin — installed before any record is replayed, carried across every
+/// rebuild. `wrapper: None` refuses every bundle (ruling condition (b)).
+#[derive(Clone)]
+pub struct V6Setup {
+    pub committee0: qlab_devnet::committee::Committee,
+    pub wrapper: Option<qlab_devnet::body::WrapperSetup>,
+}
+
 /// What an Annulet node carries beyond an L1 node (lab #708/#710): the
 /// genesis fee table and the genesis registry, already bound to the genesis
 /// header's `registry_root`.
@@ -892,6 +902,16 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// and re-derived from the held chain on the snapshot paths, which skip
     /// `apply_state` for the prefix. `CR(tip)` is its last value.
     recorded: BTreeMap<u64, u64>,
+    /// The wrapper chain's rule and origin (lab #785 F5-4b) — `Some` on a V6
+    /// node built with `WrapperParams`; installed with committee₀.
+    wrapper: Option<qlab_devnet::body::WrapperSetup>,
+    /// The wrapper chain's surface after the applied tip, canonical bytes
+    /// (opaque: only the rule decodes them). The genesis surface until the
+    /// first bundle; empty on a node with no wrapper. Derived state, folded
+    /// in `apply_state` and re-derived on the snapshot paths.
+    surface: Vec<u8>,
+    /// The height of the latest applied bundle-carrying block (spacing).
+    last_bundle_height: Option<u64>,
     /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node.
     annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
     /// The asset registry (lab #710): `Some` exactly on an Annulet node,
@@ -946,9 +966,9 @@ impl MemNode {
 
     /// An in-memory **V6** node (lab #785 F5-3b): `GenesisForm::V5` with the
     /// V6 body sections, record signatures checked against `committee0`.
-    pub fn in_memory_v6(genesis: StoredBlock, committee0: qlab_devnet::committee::Committee) -> Self {
+    pub fn in_memory_v6(genesis: StoredBlock, v6: V6Setup) -> Self {
         let mut node = Self::from_genesis(GenesisForm::V5, BodySections::V6, genesis, None);
-        node.committee0 = Some(committee0);
+        node.install_v6(Some(v6));
         node
     }
 
@@ -957,11 +977,10 @@ impl MemNode {
     pub fn open_v6(
         dir: impl AsRef<Path>,
         genesis: StoredBlock,
-        committee0: qlab_devnet::committee::Committee,
+        v6: V6Setup,
     ) -> Result<Self, NodeError> {
-        let mut node = Self::open_inner(GenesisForm::V5, BodySections::V6, dir.as_ref(), genesis, None)?;
-        node.committee0 = Some(committee0);
-        Ok(node)
+        // Installed before the log is read: replay folds bundles (F5-4b).
+        Self::open_inner(GenesisForm::V5, BodySections::V6, dir.as_ref(), genesis, None, Some(v6))
     }
 
     /// Open (or create) a disk-backed node at `dir`, resuming restart-safely:
@@ -981,7 +1000,7 @@ impl MemNode {
         genesis: StoredBlock,
     ) -> Result<Self, NodeError> {
         match form {
-            GenesisForm::V4 | GenesisForm::V5 => Self::open_inner(form, BodySections::None, dir.as_ref(), genesis, None),
+            GenesisForm::V4 | GenesisForm::V5 => Self::open_inner(form, BodySections::None, dir.as_ref(), genesis, None, None),
             // Lab #708: an Annulet genesis binds its notes and carries a fee
             // table, neither of which this signature has.
             GenesisForm::Annulet => Err(NodeError::FormNotServed { form, owner: "MemNode::open_annulet" }),
@@ -1008,7 +1027,7 @@ impl MemNode {
         let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
-        let node = Self::open_inner(GenesisForm::Annulet, BodySections::None, dir, genesis, Some(setup))?;
+        let node = Self::open_inner(GenesisForm::Annulet, BodySections::None, dir, genesis, Some(setup), None)?;
         // Lab #710, #728: the registry is chain state — every resume path
         // derives it from the log (replay through `apply_state`, a snapshot
         // through `recompute_annulet_state`). The sidecar is checked against
@@ -1037,6 +1056,7 @@ impl MemNode {
         dir: &Path,
         genesis: StoredBlock,
         annulet: Option<AnnuletSetup>,
+        v6: Option<V6Setup>,
     ) -> Result<Self, NodeError> {
         let dir = dir.to_path_buf();
         std::fs::create_dir_all(&dir).map_err(NodeError::Io)?;
@@ -1094,7 +1114,7 @@ impl MemNode {
         // and issue #225 a third — see [`Self::resume_from_snapshot`]. The reason
         // is carried into the [`RecoveryReport`] rather than dropped.
         if let Some(snap) = snapshot.as_ref() {
-            match Self::resume_from_snapshot(form, sections, &dir, &genesis, annulet.clone(), snap, &records)? {
+            match Self::resume_from_snapshot(form, sections, &dir, &genesis, annulet.clone(), v6.clone(), snap, &records)? {
                 SnapshotResume::Resumed(node) => return Ok(node),
                 SnapshotResume::Rejected(why) => {
                     // Lab #408: before conceding the genesis fold, try the
@@ -1102,7 +1122,7 @@ impl MemNode {
                     // when the log itself proves its tip is on the finalized
                     // main chain. Any failure inside the attempt falls back to
                     // the full replay, which stays the correctness anchor.
-                    if let Some(node) = Self::resume_near_tip(form, sections, &dir, &genesis, annulet.clone(), snap, &records, &why)
+                    if let Some(node) = Self::resume_near_tip(form, sections, &dir, &genesis, annulet.clone(), v6.clone(), snap, &records, &why)
                     {
                         return Ok(node);
                     }
@@ -1110,7 +1130,7 @@ impl MemNode {
                 }
             }
         }
-        Self::resume_by_replay(form, sections, &dir, genesis, annulet, &records, snapshot_rejected)
+        Self::resume_by_replay(form, sections, &dir, genesis, annulet, v6, &records, snapshot_rejected)
     }
 
     /// The snapshot-assisted resume. `Rejected` = this snapshot cannot be
@@ -1149,10 +1169,12 @@ impl MemNode {
         dir: &Path,
         genesis: &StoredBlock,
         annulet: Option<AnnuletSetup>,
+        v6: Option<V6Setup>,
         snap: &Snapshot,
         records: &[LogRecord],
     ) -> Result<SnapshotResume, NodeError> {
         let mut node = Self::from_genesis_with(form, sections, genesis.clone(), Some(dir.to_path_buf()), annulet);
+        node.install_v6(v6);
         node.restore_from_snapshot(snap);
         // Lab #367: the registry sidecar rides the snapshot. Any problem with
         // a PRESENT sidecar is a fall-through to the full replay (which
@@ -1288,6 +1310,7 @@ impl MemNode {
         // here, before the first tail block needs it.
         node.recompute_annulet_state()?;
         node.recompute_recorded()?;
+        node.recompute_wrapper()?;
         let mut progress = ReplayProgress::start(
             tail_blocks,
             &format!("past snapshot at height {}", snap.applied_height),
@@ -1377,6 +1400,7 @@ impl MemNode {
         dir: &Path,
         genesis: &StoredBlock,
         annulet: Option<AnnuletSetup>,
+        v6: Option<V6Setup>,
         snap: &Snapshot,
         records: &[LogRecord],
         why: &SnapshotRejection,
@@ -1420,6 +1444,7 @@ impl MemNode {
         // (2) Derived state from the snapshot; the registry sidecar under the
         // same rule the honoured path applies (absent = pre-#367 = empty).
         let mut node = Self::from_genesis_with(form, sections, genesis.clone(), Some(dir.to_path_buf()), annulet);
+        node.install_v6(v6);
         node.restore_from_snapshot(snap);
         match crate::name_registry::load_names_at(dir) {
             Ok(None) => {}
@@ -1485,6 +1510,7 @@ impl MemNode {
         // `apply_state`, so the Annulet chain state is re-derived first.
         node.recompute_annulet_state().ok()?;
         node.recompute_recorded().ok()?;
+        node.recompute_wrapper().ok()?;
         let mut progress = ReplayProgress::start(
             tail_blocks,
             &format!("near-tip catch-up past rejected snapshot at height {}", snap.applied_height),
@@ -1537,10 +1563,12 @@ impl MemNode {
         dir: &Path,
         genesis: StoredBlock,
         annulet: Option<AnnuletSetup>,
+        v6: Option<V6Setup>,
         records: &[LogRecord],
         snapshot_rejected: Option<SnapshotRejection>,
     ) -> Result<Self, NodeError> {
         let mut node = Self::from_genesis_with(form, sections, genesis, Some(dir.to_path_buf()), annulet);
+        node.install_v6(v6);
         // Lab #287: every record is applied, so walk total == final replayed_records.
         // `records` is already in memory from `open`; the total is free.
         let mut progress = ReplayProgress::start(records.len(), "from genesis");
@@ -1702,7 +1730,7 @@ impl MemNode {
         // Built beside the live state and swapped in only on success, so a failure
         // anywhere in the re-fold leaves the node exactly as it was.
         let mut rebuilt = Self::from_genesis_with(self.form, self.sections, kept[0].clone(), self.dir.clone(), self.annulet_setup());
-        rebuilt.committee0 = self.committee0.clone();
+        rebuilt.install_v6(self.v6_setup());
         for block in &kept[1..] {
             rebuilt.apply_state(block)?;
         }
@@ -1835,6 +1863,9 @@ impl MemNode {
             sections,
             committee0: None,
             recorded: BTreeMap::new(),
+            wrapper: None,
+            surface: Vec::new(),
+            last_bundle_height: None,
             annulet_fees: None,
             registry: None,
             registry_genesis: None,
@@ -1908,9 +1939,9 @@ impl MemNode {
         );
         let rebuilt =
             genesis_block_for(form, genesis.header.difficulty, genesis.header.timestamp);
-        let committee0 = self.committee0.take();
+        let v6 = self.v6_setup();
         *self = Self::from_genesis(form, self.sections, rebuilt, self.dir.clone());
-        self.committee0 = committee0;
+        self.install_v6(v6);
     }
 
     fn restore_from_snapshot(&mut self, snap: &Snapshot) {
@@ -2109,14 +2140,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         assert_eq!(self.sections, BodySections::V6, "validate_block_v6 on a non-V6 node");
         assert_eq!(header.prev, self.chain.tip_hash(), "a V6 verdict is defined only at the tip");
         let view = V6View { node: self, block_height: header.height };
-        qlab_devnet::body::validate_body_v6(
-            header,
-            body,
-            verifier,
-            &view,
-            &qlab_devnet::body::RefuseAllBundles,
-            &self.names,
-        )
+        // Condition (b): with no wrapper rule every bundle is refused.
+        let bundles: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
+            Some(w) => &*w.rule,
+            None => &qlab_devnet::body::RefuseAllBundles,
+        };
+        qlab_devnet::body::validate_body_v6(header, body, verifier, &view, bundles, &self.names)
     }
 
     /// Would `record` pass the V6 record rule in the **next** block on this
@@ -2376,6 +2405,62 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.recorded.values().next_back().copied()
     }
 
+    /// Install a V6 node's setup (lab #785): committee₀, and the wrapper
+    /// chain at its genesis surface. Every constructor and rebuild calls it
+    /// before any block is applied, so replay folds bundles with the rule.
+    fn install_v6(&mut self, v6: Option<V6Setup>) {
+        let Some(v6) = v6 else { return };
+        self.committee0 = Some(v6.committee0);
+        self.surface = v6.wrapper.as_ref().map(|w| w.genesis_surface.clone()).unwrap_or_default();
+        self.last_bundle_height = None;
+        self.wrapper = v6.wrapper;
+    }
+
+    /// This node's V6 setup, for a rebuild; `None` off V6.
+    fn v6_setup(&self) -> Option<V6Setup> {
+        self.committee0.clone().map(|committee0| V6Setup { committee0, wrapper: self.wrapper.clone() })
+    }
+
+    /// Re-derive the wrapper surface and the last bundle height from the held
+    /// main chain (lab #785 F5-4b) — the snapshot paths put the prefix in by
+    /// `put_block` alone. Walks back from the tip to the latest bundle block
+    /// (the [`Self::recompute_recorded`] pattern; the log is already in
+    /// memory) and takes that bundle's stated surface, which is the surface
+    /// its fold moved the chain to. No bundle held: the genesis surface.
+    fn recompute_wrapper(&mut self) -> Result<(), NodeError> {
+        self.surface = self.wrapper.as_ref().map(|w| w.genesis_surface.clone()).unwrap_or_default();
+        self.last_bundle_height = None;
+        if self.sections != BodySections::V6 {
+            return Ok(());
+        }
+        let mut cursor = self.chain.tip_hash();
+        while let Some(block) = self.chain.block(&cursor) {
+            if block.header.height == 0 {
+                break;
+            }
+            if let Some(sec) = block.sections.as_ref().filter(|s| !s.bundle.is_empty()) {
+                let bundle_err = |refusal| NodeError::Body(BodyError::Bundle { refusal });
+                let rule = &self.wrapper.as_ref().ok_or(bundle_err(qlab_devnet::body::BundleRefusal::NoRule))?.rule;
+                self.surface = rule.bundle_surface(&sec.bundle).map_err(bundle_err)?;
+                self.last_bundle_height = Some(block.header.height);
+                break;
+            }
+            cursor = block.header.prev;
+        }
+        Ok(())
+    }
+
+    /// The wrapper chain's surface after the applied tip, canonical bytes
+    /// (lab #785 F5-4b); empty on a node with no wrapper.
+    pub fn wrapper_surface(&self) -> &[u8] {
+        &self.surface
+    }
+
+    /// The latest applied bundle's height (lab #785 F5-4b).
+    pub fn last_bundle_height(&self) -> Option<u64> {
+        self.last_bundle_height
+    }
+
     /// The body-section axis this node runs (lab #785).
     pub fn sections(&self) -> BodySections {
         self.sections
@@ -2430,6 +2515,18 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // live block was validated in full before reaching here; a logged one
         // that no longer decodes is a corrupt log, named rather than skipped.
         let record_height = self.record_height_of(block)?;
+        // Lab #785 F5-4b: a V6 block's bundle, folded before any mutation — the
+        // proof-free half of the rule, over the surface the parent left. A live
+        // block passed the whole rule first; a logged bundle that no longer
+        // folds (or a node with no rule) stops here by name, never a skip.
+        let bundle_outcome = match block.sections.as_ref().filter(|s| !s.bundle.is_empty()) {
+            None => None,
+            Some(sec) => {
+                let bundle_err = |refusal| NodeError::Body(BodyError::Bundle { refusal });
+                let rule = &self.wrapper.as_ref().ok_or(bundle_err(qlab_devnet::body::BundleRefusal::NoRule))?.rule;
+                Some(rule.fold_bundle(&self.surface, &sec.bundle).map_err(bundle_err)?)
+            }
+        };
         // Lab #712: the outstanding-supply rule, checked before any mutation.
         let supply_delta = match self.form {
             GenesisForm::V4 | GenesisForm::V5 => BTreeMap::new(),
@@ -2529,6 +2626,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.record_root_at(block.header.height);
         if let Some(h) = record_height {
             self.recorded.insert(block.header.height, h);
+        }
+        if let Some(outcome) = bundle_outcome {
+            self.surface = outcome.surface;
+            self.last_bundle_height = Some(block.header.height);
         }
         if let Some(next) = registry_after {
             self.registry = Some(next);
@@ -2869,6 +2970,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> qlab_devnet::body::V6
 
     fn root_heights(&self, root: &Hash32) -> &[u64] {
         self.node.anchor_heights_by_root.get(root).map_or(&[], Vec::as_slice)
+    }
+
+    fn wrapper_surface(&self) -> &[u8] {
+        &self.node.surface
+    }
+
+    fn last_bundle_height(&self) -> Option<u64> {
+        self.node.last_bundle_height
     }
 }
 
@@ -3835,8 +3944,8 @@ mod tests {
     fn v6_live_and_settled_history_agree_and_replay_rederives_the_record() {
         let (c0, _) = v6_validators();
         let genesis = genesis_block_v6(8, 0);
-        let mut live = MemNode::in_memory_v6(genesis.clone(), c0.clone());
-        let mut settled = MemNode::in_memory_v6(genesis.clone(), c0.clone());
+        let mut live = MemNode::in_memory_v6(genesis.clone(), V6Setup { committee0: c0.clone(), wrapper: None });
+        let mut settled = MemNode::in_memory_v6(genesis.clone(), V6Setup { committee0: c0.clone(), wrapper: None });
         let a = v6_script(&mut live, AnchorGate::Live);
         let b = v6_script(&mut settled, AnchorGate::SettledHistory);
         assert_eq!(a, b, "one verdict per block whichever gate the caller names");
@@ -3848,15 +3957,15 @@ mod tests {
 
         let dir = temp_dir("v6-replay");
         let tip = {
-            let mut disk = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).unwrap();
+            let mut disk = MemNode::open_v6(&dir, genesis.clone(), V6Setup { committee0: c0.clone(), wrapper: None }).unwrap();
             assert_eq!(v6_script(&mut disk, AnchorGate::Live), a);
             disk.tip_hash()
         };
-        let replayed = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).expect("full replay");
+        let replayed = MemNode::open_v6(&dir, genesis.clone(), V6Setup { committee0: c0.clone(), wrapper: None }).expect("full replay");
         assert_eq!((replayed.tip_hash(), replayed.recorded_finality()), (tip, Some(8)));
         assert_eq!(replayed.recovery_report().snapshot_height, None, "no snapshot yet: a full replay");
         replayed.save_snapshot().unwrap();
-        let mut resumed = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).expect("snapshot resume");
+        let mut resumed = MemNode::open_v6(&dir, genesis.clone(), V6Setup { committee0: c0.clone(), wrapper: None }).expect("snapshot resume");
         assert_eq!(
             persist::snapshot_on_disk(&dir).unwrap(),
             persist::SnapshotOnDisk::At { applied_height: 10 }
@@ -3868,7 +3977,7 @@ mod tests {
         assert_eq!((resumed.tip_hash(), resumed.recorded_finality()), (tip, Some(8)));
         // …and the re-derived record is load-bearing: a post-resume block
         // spending against the empty root (valid only under the record) applies.
-        let empty_root = MemNode::in_memory_v6(genesis, c0.clone()).commitment_root();
+        let empty_root = MemNode::in_memory_v6(genesis, V6Setup { committee0: c0.clone(), wrapper: None }).commitment_root();
         let parent = resumed.chain.block(&tip).unwrap().header();
         let (h11, b11) = v6_block(&parent, vec![tx(empty_root, 0x54)], vec![]);
         resumed.apply_block(h11, b11, &MockVerifier).expect("anchored under the resumed record");
@@ -3881,7 +3990,7 @@ mod tests {
     #[test]
     fn v6_recorded_finality_follows_a_rewind() {
         let (c0, _) = v6_validators();
-        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), c0.clone());
+        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), V6Setup { committee0: c0.clone(), wrapper: None });
         let r = v6_script(&mut node, AnchorGate::Live);
         assert!(r[9].is_ok());
         let at8 = node.ancestor_at(&node.tip_hash(), 8).unwrap().header().header_hash_for(GenesisForm::V5);
@@ -3935,5 +4044,180 @@ mod tests {
         let err = node.apply_block(header, body, &MockVerifier).unwrap_err();
         assert!(format!("{err:?}").contains("SectionOnForm"), "{err:?}");
         assert_ne!(genesis_block_v6(8, 0).header.tx_body_commitment, genesis5.header.tx_body_commitment);
+    }
+
+    // --- lab #785 F5-4b: the bundle state on the funnel -------------------------
+
+    /// A test-only bundle rule (ruling condition (b): no accepting stub outside
+    /// tests). The surface is an 8-byte counter; a bundle states its successor
+    /// counter, which must be above the predecessor's (the "threading");
+    /// spacing is 3. It exercises the node's state, not `verify_wrapper`.
+    struct CounterRule;
+    const COUNTER_SPACING: u64 = 3;
+    fn counter(b: &[u8]) -> Option<u64> {
+        Some(u64::from_le_bytes(b.try_into().ok()?))
+    }
+    impl qlab_devnet::body::BundleVerifier for CounterRule {
+        fn verify_bundle(
+            &self,
+            header: &BlockHeader,
+            bundle: &[u8],
+            ctx: &qlab_devnet::body::BundleContext<'_>,
+        ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+            if let Some(last) = ctx.last_bundle_height {
+                let since = header.height - last;
+                if since < COUNTER_SPACING {
+                    return Err(qlab_devnet::body::BundleRefusal::Spacing { since, need: COUNTER_SPACING });
+                }
+            }
+            self.fold_bundle(ctx.surface, bundle)
+        }
+        fn fold_bundle(
+            &self,
+            surface: &[u8],
+            bundle: &[u8],
+        ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+            use qlab_devnet::body::BundleRefusal;
+            let prev = counter(surface).ok_or(BundleRefusal::SurfaceState)?;
+            let next = counter(bundle).ok_or(BundleRefusal::Codec("not 8 bytes".into()))?;
+            if next <= prev {
+                return Err(BundleRefusal::Wrapper("Thread".into()));
+            }
+            Ok(qlab_devnet::body::BundleOutcome { surface: bundle.to_vec(), exits: vec![], d_batch: 0, e_batch: 0 })
+        }
+        fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, qlab_devnet::body::BundleRefusal> {
+            counter(bundle).map(|_| bundle.to_vec()).ok_or(qlab_devnet::body::BundleRefusal::Codec("not 8 bytes".into()))
+        }
+    }
+
+    fn counter_setup() -> V6Setup {
+        let wrapper = qlab_devnet::body::WrapperSetup {
+            rule: std::sync::Arc::new(CounterRule),
+            genesis_surface: 0u64.to_le_bytes().to_vec(),
+        };
+        V6Setup { committee0: v6_validators().0.clone(), wrapper: Some(wrapper) }
+    }
+
+    fn bundle_block(parent: &BlockHeader, bundle: Option<u64>) -> (BlockHeader, BlockBody) {
+        let height = parent.height + 1;
+        let mut body =
+            BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(height), [height; 4]);
+        body.bundle = bundle.map(|c| c.to_le_bytes().to_vec()).unwrap_or_default();
+        let header =
+            BlockHeader::child_of_for(GenesisForm::V5, parent, parent.timestamp + 75, 8, body.commitment_v6());
+        (header, body)
+    }
+
+    /// Blocks 1–5: a bundle at 1 (counter 5), one at 2 refused on spacing,
+    /// empty 2 and 3, a bundle at 4 (counter 9), empty 5. The verdicts, then
+    /// the node's `(surface counter, last bundle height)`.
+    /// The script's verdicts and the node's `(surface counter, last bundle height)`.
+    type BundleRun = (Vec<Result<Hash32, String>>, (Option<u64>, Option<u64>));
+
+    fn bundle_script(node: &mut MemNode) -> BundleRun {
+        let mut out = Vec::new();
+        let mut parent = node.chain.block(&node.tip_hash()).unwrap().header();
+        for (i, b) in [Some(5), None, None, Some(9), None].into_iter().enumerate() {
+            if i == 1 {
+                let (h, bd) = bundle_block(&parent, Some(6));
+                out.push(node.apply_block(h, bd, &MockVerifier).map_err(|e| format!("{e:?}")));
+            }
+            let (h, bd) = bundle_block(&parent, b);
+            out.push(node.apply_block(h, bd, &MockVerifier).map_err(|e| format!("{e:?}")));
+            parent = h;
+        }
+        (out, (counter(node.wrapper_surface()), node.last_bundle_height()))
+    }
+
+    /// Lab #785 F5-4b: the surface and last bundle height fold in
+    /// `apply_state`; the rule sees them as its context (a second bundle one
+    /// block later is refused on spacing, by name); a rewind below a bundle
+    /// restores the previous surface and re-applying restores both.
+    #[test]
+    fn v6_bundle_state_folds_and_follows_a_rewind() {
+        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), counter_setup());
+        assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(0), None), "the genesis surface");
+        let (verdicts, state) = bundle_script(&mut node);
+        assert!(verdicts[0].is_ok(), "{verdicts:?}");
+        assert!(verdicts[1].as_ref().unwrap_err().contains("Spacing { since: 1, need: 3 }"), "{:?}", verdicts[1]);
+        assert!(verdicts[2..].iter().all(Result::is_ok), "{verdicts:?}");
+        assert_eq!(state, (Some(9), Some(4)));
+
+        let at3 = node.ancestor_at(&node.tip_hash(), 3).unwrap().header().header_hash_for(GenesisForm::V5);
+        let block4 = node.ancestor_at(&node.tip_hash(), 4).unwrap().clone();
+        node.rewind_to(at3).unwrap();
+        assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(5), Some(1)), "back to bundle 1's surface");
+        node.apply_block(block4.header(), block4.body(), &MockVerifier).expect("block 4 re-applies");
+        assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(9), Some(4)));
+
+        // A bundle whose counter does not advance fails the fold, by name.
+        let parent = node.chain.block(&node.tip_hash()).unwrap().header();
+        let (h, b) = bundle_block(&parent, Some(9));
+        let err = node.apply_block(h, b, &MockVerifier).unwrap_err();
+        assert!(format!("{err:?}").contains("Wrapper(\"Thread\")"), "{err:?}");
+    }
+
+    /// Lab #785 F5-4b (the 4b ruling's (2)): replay and both snapshot paths
+    /// re-derive the surface and the last bundle height — the snapshot path
+    /// by walking back to the latest held bundle, with nothing replayed — and
+    /// the re-derived spacing is load-bearing after resume.
+    #[test]
+    fn v6_bundle_state_snapshot_resume_equals_replay() {
+        let genesis = genesis_block_v6(8, 0);
+        let dir = temp_dir("v6-bundle-resume");
+        let (live_tip, live_state) = {
+            let mut disk = MemNode::open_v6(&dir, genesis.clone(), counter_setup()).unwrap();
+            let (_, state) = bundle_script(&mut disk);
+            (disk.tip_hash(), state)
+        };
+        assert_eq!(live_state, (Some(9), Some(4)));
+        let replayed = MemNode::open_v6(&dir, genesis.clone(), counter_setup()).expect("full replay");
+        assert_eq!(replayed.recovery_report().snapshot_height, None);
+        assert_eq!((replayed.tip_hash(), counter(replayed.wrapper_surface()), replayed.last_bundle_height()), (live_tip, Some(9), Some(4)));
+        replayed.save_snapshot().unwrap();
+        let mut resumed = MemNode::open_v6(&dir, genesis.clone(), counter_setup()).expect("snapshot resume");
+        assert_eq!(resumed.recovery_report().snapshot_height, Some(5));
+        assert_eq!(resumed.recovery_report().replayed_records, 0, "the snapshot path, nothing folded");
+        assert_eq!((resumed.tip_hash(), counter(resumed.wrapper_surface()), resumed.last_bundle_height()), (live_tip, Some(9), Some(4)));
+        // Spacing from the re-derived height: a bundle at 6 is 2 after 4.
+        let parent = resumed.chain.block(&live_tip).unwrap().header();
+        let (h6, b6) = bundle_block(&parent, Some(11));
+        let err = resumed.apply_block(h6, b6, &MockVerifier).unwrap_err();
+        assert!(format!("{err:?}").contains("Spacing { since: 2, need: 3 }"), "{err:?}");
+        let (h6, b6) = bundle_block(&parent, None);
+        resumed.apply_block(h6, b6, &MockVerifier).unwrap();
+        let (h7, b7) = bundle_block(&h6, Some(11));
+        resumed.apply_block(h7, b7, &MockVerifier).expect("3 after 4");
+        assert_eq!((counter(resumed.wrapper_surface()), resumed.last_bundle_height()), (Some(11), Some(7)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ruling condition (b), node side: with no rule a V6 node refuses a bundle
+    /// on validation, and a datadir holding one does not open — refused by
+    /// name on both the replay and the snapshot path, never skipped.
+    #[test]
+    fn v6_a_node_with_no_rule_refuses_bundles_live_and_logged() {
+        use qlab_devnet::body::BundleRefusal;
+        let genesis = genesis_block_v6(8, 0);
+        let no_rule = || V6Setup { committee0: v6_validators().0.clone(), wrapper: None };
+        let mut bare = MemNode::in_memory_v6(genesis.clone(), no_rule());
+        let (h, b) = bundle_block(&genesis.header(), Some(1));
+        assert!(matches!(
+            bare.apply_block(h, b, &MockVerifier),
+            Err(NodeError::Body(BodyError::Bundle { refusal: BundleRefusal::NoRule }))
+        ));
+        assert_eq!(bare.wrapper_surface(), &[] as &[u8]);
+
+        let dir = temp_dir("v6-bundle-norule");
+        {
+            let mut disk = MemNode::open_v6(&dir, genesis.clone(), counter_setup()).unwrap();
+            bundle_script(&mut disk);
+        }
+        let err = MemNode::open_v6(&dir, genesis.clone(), no_rule()).err().expect("replay refuses");
+        assert!(matches!(err, NodeError::Body(BodyError::Bundle { refusal: BundleRefusal::NoRule })), "{err:?}");
+        MemNode::open_v6(&dir, genesis.clone(), counter_setup()).unwrap().save_snapshot().unwrap();
+        let err = MemNode::open_v6(&dir, genesis, no_rule()).err().expect("the snapshot path refuses too");
+        assert!(matches!(err, NodeError::Body(BodyError::Bundle { refusal: BundleRefusal::NoRule })), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

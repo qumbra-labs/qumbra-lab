@@ -54,6 +54,11 @@ drill-cancel = []
 # `RULE_BOUNDARY_HEIGHT` under the exact-decimal schedule. See `release::RELEASE`
 # for why arming is the default and resuming is the flag.
 rule-boundary-resume = []
+# Lab #785 F5-4b: the bundle rule's two test constructors
+# (`WrapperRule::for_version`, `with_members`) for qlab-bench's proven k = 1
+# fixture — enabled ONLY by qlab-bench's dev-dependency. `prepare_v6` calls
+# neither, and `bundle::tests` pins both facts (ruling 5915423092 (a)).
+wrapper-test-knobs = []
 
 [dependencies]
 # The N7 full-node composition: NodeAdapter (real chain/PoW/state/mempool/
@@ -136,11 +141,13 @@ qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 # qumbra-ffi does not depend on this crate, so the wasm/iOS graph stays
 # prover-free (qlab-devnet keeps its own shape tag, lab #706 P7).
 qlab-l2 = { path = "../qlab-l2" }
+# The bundle rule (lab #785 F5-4b): `verify_wrapper`, the bundle and surface
+# codecs, the genesis surface. The verification half only — no new weight
+# beyond qlab-l2's (qlab-air, qlab-consensus) — and, as with qlab-l2, only
+# this binary crate takes it: qlab-devnet and qlab-node keep opaque bytes.
+qlab-wrapper = { path = "../qlab-wrapper" }
 
 [dev-dependencies]
-# Lab #785 F5-3c: the WrapperParams lane labels are cross-locked to the
-# wrapper crate's own FRI config (test-only; the node takes no wrapper code).
-qlab-wrapper = { path = "../qlab-wrapper" }
 # Issue #101 acceptance (`tests/coinbase_spend.rs`): the miner's key hierarchy —
 # `Wallet::rkm(d)` is what a block's `coinbase_rkm` carries, and `spend_input` is
 # the only spend-witness constructor, so this is what proves the minted note is

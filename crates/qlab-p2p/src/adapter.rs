@@ -713,9 +713,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// New in-memory **V6** adapter (lab #785 F5-3b-2): `GenesisForm::V5`
     /// with the V6 body sections, over the V6 genesis block. The genesis
     /// committee is committee₀, the roster finality records are judged by.
-    pub fn new_v6(committee: CommitteeState, pow: P, verifier: V, sim: SimConfig) -> Self {
+    ///
+    /// `wrapper` is the net's bundle rule and genesis surface (lab #785
+    /// F5-4b); `None` refuses every bundle.
+    pub fn new_v6(
+        committee: CommitteeState,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+        wrapper: Option<qlab_devnet::body::WrapperSetup>,
+    ) -> Self {
         let genesis = genesis_block_v6(sim.genesis_difficulty, 0);
-        let state = MemNode::in_memory_v6(genesis.clone(), committee.committee().clone());
+        let v6 = qlab_node::V6Setup { committee0: committee.committee().clone(), wrapper };
+        let state = MemNode::in_memory_v6(genesis.clone(), v6);
         let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
         let mut me = Self::assemble_on(GenesisForm::V5, genesis.header(), ec, pow, verifier, sim, state);
         me.sections = BodySections::V6;
@@ -731,10 +741,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         pow: P,
         verifier: V,
         sim: SimConfig,
+        wrapper: Option<qlab_devnet::body::WrapperSetup>,
     ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
         let genesis = genesis_block_v6(sim.genesis_difficulty, 0);
-        let state = MemNode::open_v6(&dir, genesis.clone(), committee.committee().clone())?;
+        let v6 = qlab_node::V6Setup { committee0: committee.committee().clone(), wrapper };
+        let state = MemNode::open_v6(&dir, genesis.clone(), v6)?;
         let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
         let mut me = Self::assemble_on(GenesisForm::V5, genesis.header(), ec, pow, verifier, sim, state);
         me.sections = BodySections::V6;
@@ -2587,8 +2599,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::L2RegistryWriteRootMismatch { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
             | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
-            // Lab #785 F5-3b, the V6 form. A section on the wrong form and the
-            // bundle stub read the pair alone. The finality record and the V6
+            // Lab #785 F5-3b, the V6 form. A section on the wrong form reads
+            // the pair alone. The finality record and the V6
             // anchor rule read the block's OWN ancestry (CR(parent), ancestor
             // hashes, roots by height, committee₀) — never this node's tip or
             // local finality — so every node that holds the parent reaches the
@@ -2596,9 +2608,32 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // and it is what takes AnchorOutsideRecord out of #134's amnesty
             // where AnchorNotFinal stays in it.
             BodyError::SectionOnForm { .. }
-            | BodyError::BundleRefused
             | BodyError::FinalityRecord { .. }
             | BodyError::AnchorOutsideRecord { .. } => BodyFault::Intrinsic("bad body"),
+            // Lab #785 F5-4b, the bundle rule: every step reads the bundle's
+            // bytes and the block's own ancestry (the predecessor surface and
+            // last bundle height are folded from it; V7 is the record rule
+            // above) — intrinsic. Two refusals are this node's own state, not
+            // the block's: no rule installed, and a surface that does not
+            // decode. Neither may cost the peer.
+            BodyError::Bundle { refusal } => match refusal {
+                qlab_devnet::body::BundleRefusal::NoRule | qlab_devnet::body::BundleRefusal::SurfaceState => {
+                    BodyFault::Positional("bad body")
+                }
+                qlab_devnet::body::BundleRefusal::Codec(_)
+                | qlab_devnet::body::BundleRefusal::L2Id { .. }
+                | qlab_devnet::body::BundleRefusal::Spacing { .. }
+                | qlab_devnet::body::BundleRefusal::TooManyExits { .. }
+                | qlab_devnet::body::BundleRefusal::ZeroExitRkm { .. }
+                | qlab_devnet::body::BundleRefusal::ZeroExitValue { .. }
+                | qlab_devnet::body::BundleRefusal::NoStatedSurface
+                | qlab_devnet::body::BundleRefusal::Signature
+                | qlab_devnet::body::BundleRefusal::Wrapper(_)
+                | qlab_devnet::body::BundleRefusal::StatedSurface
+                | qlab_devnet::body::BundleRefusal::ExitCommitment
+                | qlab_devnet::body::BundleRefusal::ExitSum
+                | qlab_devnet::body::BundleRefusal::Counters => BodyFault::Intrinsic("bad body"),
+            },
             // Lab #367, the rule half — split by what the verdict reads:
             BodyError::RiderRule { err, .. } => match err {
                 // Grammar, record kind and record size read only the revealed
@@ -8241,7 +8276,7 @@ mod tests {
     fn v6_at_8() -> (NodeAdapter<KeccakPow, MockVerifier>, Vec<Validator>) {
         let (committee, validators) = devnet_committee(qlab_devnet::params_devnet::FROZEN_COMMITTEE_SIZE);
         let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
-        let mut a = NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg);
+        let mut a = NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg, None);
         for _ in 0..8 {
             let (h, b) = a.mine_block().expect("mine");
             assert_eq!(a.ingest_block(h, b), IngestOutcome::Accepted);
@@ -8289,7 +8324,7 @@ mod tests {
     fn v6_adapter() -> NodeAdapter<KeccakPow, MockVerifier> {
         let (committee, _) = devnet_committee(qlab_devnet::params_devnet::FROZEN_COMMITTEE_SIZE);
         let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
-        NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg)
+        NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg, None)
     }
 
     /// Ruling J1 on issue #785: a live side-branch V6 body is judged by its

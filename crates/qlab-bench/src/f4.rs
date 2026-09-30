@@ -15,6 +15,8 @@
 //! <https://github.com/qumbra-labs/qumbra-lab/issues/775#issuecomment-5886951895>.
 
 pub(crate) mod bench;
+#[cfg(test)]
+mod bundle_node;
 pub(crate) mod dep;
 pub(crate) mod gate;
 pub(crate) mod native;
