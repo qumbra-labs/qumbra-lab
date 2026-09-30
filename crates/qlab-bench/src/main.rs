@@ -949,18 +949,20 @@ fn main() {
         }
         "wgenesis" => {
             // Lab #785 F5-3c (Q-S = (b)): the W genesis surface commitment for
-            // `--l2-id` (default 1) over the EMPTY registry — the value the V6
-            // rehearsal genesis pins. F5-4 recomputes it from qlab-wrapper and
-            // asserts equality. Printed once, lanes in order.
+            // `--l2-id` (default 1) over the V6 genesis registry — asset 0's
+            // Cloaked leaf and nothing else (F5-4a, finding F-A: over an EMPTY
+            // registry no S/P/R input could open asset 0's leaf, so no L2
+            // transaction would ever be provable) — the value the V6
+            // rehearsal genesis pins. Printed once, lanes in order.
             let l2_id = args
                 .iter()
                 .position(|a| a == "--l2-id")
                 .and_then(|i| args.get(i + 1))
                 .map(|v| v.parse::<u64>().expect("--l2-id is a u64"))
                 .unwrap_or(1);
-            let roots = f4::native::WState::genesis(&[]).roots();
+            let roots = f4::native::WState::genesis(&[qlab_air::l2::RegistryLeaf::cloaked(0)]).roots();
             let surface = qlab_wrapper::verify::Surface::genesis(1, l2_id, roots);
-            println!("wgenesis: version 1, l2_id {l2_id}, empty registry");
+            println!("wgenesis: version 1, l2_id {l2_id}, registry [cloaked(0)]");
             println!("genesis_surface = {:?}", surface.commitment);
             return;
         }

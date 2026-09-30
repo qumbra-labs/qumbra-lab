@@ -56,14 +56,31 @@ pub const FINALITY_RECORD_VERSION_V1: u32 = 1;
 /// nothing else defines).
 pub const REHEARSAL_L2_ID: u64 = 1;
 
-/// The W genesis surface commitment for the rehearsal `l2_id` over the empty
-/// registry — `qlab_wrapper::verify::Surface::genesis(1, REHEARSAL_L2_ID,
-/// WState::genesis(&[]).roots()).commitment`, **copied from the named
-/// qlab-bench run's output** (Q-S = (b) on issue #785). F5-4 ports the
-/// empty-state roots into `qlab-wrapper` and recomputes this value; its
-/// equality with the one pinned here is an F5-4 merge condition.
+/// **The V6 genesis registry** (lab #785 F5-4a, finding F-A): asset 0's
+/// pinned Cloaked leaf and nothing else — the Annulet genesis's asset-0
+/// record, and the registry every F3/F4 fixture starts from. It cannot be
+/// empty: shapes S and P open each input's asset leaf under R (dummy input
+/// slots carry asset 0), a leaf digest is a Keccak output and never the zero
+/// digest, and asset 0's slot is never writable afterwards (lab #724) — so
+/// over an empty registry no L2 transaction would ever be provable.
+pub fn v6_genesis_registry() -> Vec<qlab_air::l2::RegistryLeaf> {
+    vec![qlab_air::l2::RegistryLeaf::cloaked(0)]
+}
+
+/// The root of [`v6_genesis_registry`] — the node's registry tree over it.
+pub fn v6_genesis_registry_root() -> [u64; 4] {
+    qlab_cbserver::registry::RegistryTree::from_leaves(&v6_genesis_registry())
+        .expect("asset 0's leaf is a valid registry")
+        .root()
+}
+
+/// The W genesis surface commitment for the rehearsal `l2_id` over
+/// [`v6_genesis_registry`] — `Surface::genesis(1, REHEARSAL_L2_ID,
+/// WState::genesis(&[cloaked(0)]).roots()).commitment`, **copied from the
+/// named `qlab-bench wgenesis` run's output** (Q-S = (b) on issue #785; the
+/// registry per F-A). F5-4a's port recomputes it.
 pub const REHEARSAL_GENESIS_SURFACE: [u64; 4] =
-    [8656162996667631829, 9674717420235390145, 12079470267801080854, 14563979253050795826];
+    [3351788334638659005, 15912216378482193296, 6060495819875004553, 538790937245016534];
 
 /// The domain the rehearsal sequencer key's seed is derived under.
 pub const REHEARSAL_SEQUENCER_DOMAIN: &[u8] = b"qumbra:rehearsal-sequencer:v1";
@@ -305,16 +322,17 @@ mod tests {
     use super::*;
 
     /// 🔒 The V6 rehearsal genesis, from the named `genesis init --t2` runs ×2
-    /// (byte-identical files; lab #785 F5-3c). The V5 rehearsal genesis
+    /// (byte-identical files; lab #785 F5-3c, re-pinned in F5-4a over the
+    /// asset-0 genesis registry, finding F-A). The V5 rehearsal genesis
     /// (`83776614…`) and T1 (`740ba41c…`) keep their own pins in `genesis.rs`.
     #[test]
     fn the_v6_rehearsal_genesis_is_pinned() {
         let a = GenesisFileV6::new_rehearsal();
         assert_eq!(a, GenesisFileV6::new_rehearsal(), "deterministic");
-        assert_eq!(a.hash_hex(), "9d93869ee8a394f09e9ee710f0a61bbf0ce94b225e93766cb5e9e2546d3fd15d");
+        assert_eq!(a.hash_hex(), "68594df44b53151dd5bccfc23832c5a527831f717784d16124640b29f84d0093");
         assert_eq!(
             a.wrapper.digest_hex(),
-            "33847ac6ca7d069eb77c3ca4dd627e1a879ab2a8ea809b5c0c73416a87e5bbd8"
+            "7567956821dce68d5f1b4021fb18290c57edae0732bb0ee2c5df7445c3e31224"
         );
         assert_eq!(
             hex_encode(&crate::revision::revision_digest_v6(
@@ -322,7 +340,7 @@ mod tests {
                 crate::release::REVISION_V1_0.frozen_digest_hex,
                 &a.wrapper,
             )),
-            "143be08542c1fd3eddea7425b898ef64334709860a368474f2b7c6bd503ccfbb"
+            "89e36dac55fcae4d1e4f3975e74df689ae4984b997272f3f65b44c4d77e2ffe4"
         );
         assert_eq!(a.base.format_version, 10);
         assert_eq!(a.forms(), (GenesisForm::V5, BodySections::V6));
@@ -330,6 +348,19 @@ mod tests {
         let back = GenesisFileV6::from_bytes(&a.to_bytes()).unwrap();
         assert_eq!(back, a);
         assert_eq!(back.hash(), a.hash());
+    }
+
+    /// F-A (lab #785 F5-4a): the V6 genesis registry is exactly the Annulet
+    /// genesis's pinned asset-0 record — Cloaked, no issuer, both roots 0 —
+    /// and its root is the node registry tree's over it.
+    #[test]
+    fn the_v6_genesis_registry_is_asset_zeros_pinned_leaf() {
+        let reg = v6_genesis_registry();
+        assert_eq!(reg, vec![crate::annulet_genesis::RegistryLeafRecord::asset_zero().leaf()]);
+        assert_eq!(reg[0].mode, qlab_air::l2::MODE_CLOAKED, "shape S admits only a Cloaked leaf");
+        let root = v6_genesis_registry_root();
+        assert_ne!(root, [0; 4]);
+        assert_ne!(root, qlab_cbserver::registry::RegistryTree::from_leaves(&[]).unwrap().root(), "not the empty registry");
     }
 
     /// The lanes are the wrapper and L2 crates' own configs, not copies.
