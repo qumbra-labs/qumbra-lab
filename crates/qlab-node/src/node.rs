@@ -4164,8 +4164,14 @@ mod tests {
         node.apply_block(block4.header(), block4.body(), &MockVerifier).expect("block 4 re-applies");
         assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(9), Some(4)));
 
-        // A bundle whose counter does not advance fails the fold, by name.
-        let parent = node.chain.block(&node.tip_hash()).unwrap().header();
+        // A bundle whose counter does not advance fails the fold, by name —
+        // at height 7, spacing (3) after bundle 4, so the fold is what refuses.
+        let mut parent = node.chain.block(&node.tip_hash()).unwrap().header();
+        for _ in 0..2 {
+            let (h, b) = bundle_block(&parent, None);
+            node.apply_block(h, b, &MockVerifier).expect("an empty block");
+            parent = h;
+        }
         let (h, b) = bundle_block(&parent, Some(9));
         let err = node.apply_block(h, b, &MockVerifier).unwrap_err();
         assert!(format!("{err:?}").contains("Wrapper(\"Thread\")"), "{err:?}");
