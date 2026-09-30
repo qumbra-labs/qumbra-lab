@@ -2,11 +2,11 @@
 
 > [中文版](l2-shape-v1-zh.md) · tracker: lab issue #704 (l2-roadmap A1) · circuits: lab PR #701 / issue #700 (W3) · crate: `crates/qlab-l2`
 
-**Status (2026-09-23):** the two L2 transaction shapes, **S** and **P**, are frozen as v1. Their program, geometry, public-value layout, note block, in-circuit domains and constraint set are pinned by name in `qlab-l2` and `qlab-note`. The **lane is not frozen**: `L2_CFG_PROVISIONAL` stays provisional while a coordinator-side review of the lane's PCS configuration is open. That review can change the proof wire without touching the AIRs, so **no proof-byte count is pinned**.
+**Status (2026-09-23):** the two L2 transaction shapes, **S** and **P**, are frozen as v1. Their program, geometry, public-value layout, note block, in-circuit domains and constraint set are pinned by name in `qlab-l2` and `qlab-note`. The **lane is not frozen**: `L2_CFG` stays provisional while a coordinator-side review of the lane's PCS configuration is open. That review can change the proof wire without touching the AIRs, so **no proof-byte count is pinned**.
 
 **Update (2026-09-30, lab issue #785, F5-2): the lane is frozen at b4/q45/g22/fp16/a16.**
 - **Why q45.** The v1 enshrined object is the wrapper bundle (Q2 = B), 18 proofs at K = 16, so each needs 100 + log₂ 18 = 104.17 conjectured bits. q43 gave 101.68; q45 gives 105.39 (Larry's Q-L2). W's own lane moves to b2/q91 in the same step (`qlab-wrapper`'s `W_V1_CFG`).
-- **Where it is pinned.** `l2_cfg_provisional_is_value_locked` pins the new value. The lane enters the L1 frozen parameters with F5's re-genesis (F5-3).
+- **Where it is pinned.** `l2_cfg_is_value_locked` pins the new value. The lane enters the L1 frozen parameters with F5's re-genesis (F5-3).
 - **§3's bytes are q43 measurements, superseded.** The q45 bytes come from the post-merge box pass.
 
 ## 1. What is frozen
@@ -51,7 +51,7 @@ The mutation check is `l2p_neg_raw_rkm_keyed_witness`: a genuine leaf that brack
 
 | object | status |
 |---|---|
-| the lane `L2_CFG_PROVISIONAL` = **b4/q45/g22/fp16/a16** | **frozen** (lab #785 F5-2, 2026-09-30; was provisional at q43). It is built at exactly one site, `qlab_l2::make_config_l2()`, and pinned by `l2_cfg_provisional_is_value_locked`. Why b4: both shapes are degree 4 (4 quotient chunks), and b2 does not verify a 4-chunk AIR in Plonky3 0.6.1 (`l2shape_b2_is_not_a_lane_for_a_degree_4_air`). q45/g22 = 105.39 bits under the 2197-corrected accounting, against the bundle's 104.17 per proof (q43 gave 101.6). |
+| the lane `L2_CFG` = **b4/q45/g22/fp16/a16** | **frozen** (lab #785 F5-2, 2026-09-30; was provisional at q43). It is built at exactly one site, `qlab_l2::make_config_l2()`, and pinned by `l2_cfg_is_value_locked`. Why b4: both shapes are degree 4 (4 quotient chunks), and b2 does not verify a 4-chunk AIR in Plonky3 0.6.1 (`l2shape_b2_is_not_a_lane_for_a_degree_4_air`). q45/g22 = 105.39 bits under the 2197-corrected accounting, against the bundle's 104.17 per proof (q43 gave 101.6). |
 | the proof wire | **not pinned.** No `WIRE_BYTES_S/P` constant and no byte test; the numbers below are measurements. |
 | proof bytes of a fixed instance | never pinned, by design. Plonky3's grind witness is found by a parallel `find_any` and every query index is drawn after it, so the same instance can yield different proofs across thread schedules. The PV vector and the note block are pinned instead. |
 
@@ -69,7 +69,7 @@ Apple M5 Max / 36 GiB, release binary directly under `/usr/bin/time -l` inside `
 
 ## 4. Tests added by A1
 
-`qlab-l2`: `l2_cfg_provisional_is_value_locked`, `l2_crate_deps_are_exactly_air_and_consensus`, `l2_shape_geometry_is_locked`, `l2_verifier_air_is_instance_independent`, `l2_prove_verify_roundtrip_s`, `l2_prove_verify_roundtrip_p`, `l2_shape_digests_are_pinned`, `l2_golden_pv_vectors`. `qlab-note`: `l2_payload_len_is_128`, `l2_golden_note_block`. `qlab-air`: `l2p_neg_raw_rkm_keyed_witness`. Existing tests were updated for P v1; none were removed.
+`qlab-l2`: `l2_cfg_is_value_locked`, `l2_crate_deps_are_exactly_air_and_consensus`, `l2_shape_geometry_is_locked`, `l2_verifier_air_is_instance_independent`, `l2_prove_verify_roundtrip_s`, `l2_prove_verify_roundtrip_p`, `l2_shape_digests_are_pinned`, `l2_golden_pv_vectors`. `qlab-note`: `l2_payload_len_is_128`, `l2_golden_note_block`. `qlab-air`: `l2p_neg_raw_rkm_keyed_witness`. Existing tests were updated for P v1; none were removed.
 
 ## 5. Shape R — registry writes (A2, lab #724)
 

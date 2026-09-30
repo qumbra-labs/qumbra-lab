@@ -41,7 +41,7 @@
 //! capacity proxy and labelled with its 2197-corrected figure:
 //! - `b2/q86/g22/fp16/a16`  — the interior lane's ruled point (`m4interior`),
 //!   100.2 corrected; shape P's second lane by the stage-1 ruling.
-//! - `b4/q43/g22/fp16/a16`  — the L2 lane, read from `qlab_l2::L2_CFG_PROVISIONAL`
+//! - `b4/q43/g22/fp16/a16`  — the L2 lane, read from `qlab_l2::L2_CFG`
 //!   (lab #704: one source; equal in value to the M4 leaf point `AGG_CFG`,
 //!   not tied to it), 101.6 corrected.
 //! - `b8/q29/g22/fp16/a16`  — derived the same way as q43 (see `B8_CFG`).
@@ -64,7 +64,7 @@ use qlab_air::l2::{
 use qlab_air::l2p::{L2ShapePAir, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
 use qlab_air::l2r::{L2ShapeRAir, SHAPE_R_PERMS};
 use qlab_consensus::CONSENSUS_CFG;
-use qlab_l2::L2_CFG_PROVISIONAL as L2_CFG;
+use qlab_l2::L2_CFG;
 
 use qlab_consensus::legacy::{make_legacy_config_with, LegacyNonHidingConfig};
 

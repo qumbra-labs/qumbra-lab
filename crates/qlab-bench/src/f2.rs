@@ -664,7 +664,7 @@ mod tests {
     /// explicit and cannot drift: the two differ in the query count only.
     #[test]
     fn f2_lane_is_the_measured_lane_not_the_frozen_one() {
-        let l2 = qlab_l2::L2_CFG_PROVISIONAL;
+        let l2 = qlab_l2::L2_CFG;
         assert_eq!(F2_LANE.label(), "b4/q43/g22/fp16/a16", "F2's measured lane");
         assert_eq!(l2.label(), "b4/q45/g22/fp16/a16", "the frozen L2 lane");
         assert_eq!(

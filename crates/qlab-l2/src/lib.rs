@@ -4,7 +4,7 @@
 //!
 //! It owns:
 //!
-//! - **the L2 lane** — [`L2_CFG_PROVISIONAL`] and [`make_config_l2`], the one
+//! - **the L2 lane** — [`L2_CFG`] and [`make_config_l2`], the one
 //!   site where the L2's `StarkConfig` is built. **Provisional**: the #704
 //!   ruling parks the lane freeze behind a coordinator-side review of the
 //!   lane's PCS configuration, so no proof-wire byte count is pinned here.
@@ -85,7 +85,7 @@ pub mod fixture;
 ///
 /// Once equal in value to the M4 leaf lane (`qlab-bench`'s `AGG_CFG`, q43)
 /// and deliberately **not** cross-locked to it: the two lanes now differ.
-pub const L2_CFG_PROVISIONAL: FriCfg = FriCfg {
+pub const L2_CFG: FriCfg = FriCfg {
     log_blowup: 2,
     num_queries: 45,
     grind_bits: 22,
@@ -96,7 +96,7 @@ pub const L2_CFG_PROVISIONAL: FriCfg = FriCfg {
 /// The L2 `StarkConfig` — **the one site** where the L2's PCS and FRI
 /// parameters are chosen, so a lane or PCS change is one edit here.
 pub fn make_config_l2() -> Config {
-    qlab_consensus::make_config_with(&L2_CFG_PROVISIONAL)
+    qlab_consensus::make_config_with(&L2_CFG)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,7 @@ pub fn public_values(pvs: &[u32]) -> Vec<Val> {
 pub fn prove_s(inst: &L2BucketInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_S, "shape S proves at 2^{LOG_HEIGHT_S}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }
@@ -286,7 +286,7 @@ pub fn verify_s(pvs: &[Val], proof: &Proof<Config>) -> bool {
 pub fn prove_p(inst: &L2PBucketInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_P, "shape P proves at 2^{LOG_HEIGHT_P}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }
@@ -302,7 +302,7 @@ pub fn verify_p(pvs: &[Val], proof: &Proof<Config>) -> bool {
 pub fn prove_r(inst: &L2ShapeRInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_R, "shape R proves at 2^{LOG_HEIGHT_R}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }

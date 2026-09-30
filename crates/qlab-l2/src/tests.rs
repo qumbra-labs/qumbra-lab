@@ -7,13 +7,13 @@ use p3_matrix::Matrix;
 /// v1). Moving it is a consensus change: the bundle's composed security and
 /// every member proof's bytes follow it.
 #[test]
-fn l2_cfg_provisional_is_value_locked() {
-    assert_eq!(L2_CFG_PROVISIONAL.log_blowup, 2);
-    assert_eq!(L2_CFG_PROVISIONAL.num_queries, 45);
-    assert_eq!(L2_CFG_PROVISIONAL.grind_bits, 22);
-    assert_eq!(L2_CFG_PROVISIONAL.log_final_poly_len, 4);
-    assert_eq!(L2_CFG_PROVISIONAL.max_log_arity, 4);
-    assert_eq!(L2_CFG_PROVISIONAL.label(), "b4/q45/g22/fp16/a16");
+fn l2_cfg_is_value_locked() {
+    assert_eq!(L2_CFG.log_blowup, 2);
+    assert_eq!(L2_CFG.num_queries, 45);
+    assert_eq!(L2_CFG.grind_bits, 22);
+    assert_eq!(L2_CFG.log_final_poly_len, 4);
+    assert_eq!(L2_CFG.max_log_arity, 4);
+    assert_eq!(L2_CFG.label(), "b4/q45/g22/fp16/a16");
     // 2197-corrected: 45 × 1.853 + 22 = 105.39 ≥ 104.17 = 100 + log2(18), the
     // K = 16 bundle's per-proof budget; the capacity proxy (45 × 2 + 22 =
     // 112) is asserted inside make_config_with.
@@ -193,7 +193,7 @@ fn l2_verifier_air_is_instance_independent() {
 #[test]
 fn l2_prove_verify_roundtrip_s() {
     let inst = fixture::shape_s();
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     assert_eq!(trace.width(), Shape::S.width(), "width read off the matrix");
     drop(trace);
     let (pvs, proof) = prove_s(&inst);
@@ -335,7 +335,7 @@ macro_rules! hiding_smoke {
         let air = $air;
         let pvs = vec![Val::ZERO; <$ty as BaseAir<Val>>::num_public_values(&air)];
         let prove_once = || {
-            let trace = air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+            let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
             let proof = prove(&make_config_l2(), &air, trace, &pvs);
             assert!(verify(&make_config_l2(), &air, &proof, &pvs).is_ok(), "a hiding L2 proof verifies");
             for round in &proof.opening_proof.0 {

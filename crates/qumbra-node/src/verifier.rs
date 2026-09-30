@@ -221,7 +221,7 @@ fn decode_proof_strict(bytes: &[u8]) -> Result<Proof<Config>, L2VerifyError> {
 /// The structure the L2 config implies for a proof at `log_height`, each
 /// quantity read from `qlab_l2` (no literal here).
 fn check_proof_shape(proof: &Proof<Config>, log_height: usize) -> Result<(), L2VerifyError> {
-    let cfg = qlab_l2::L2_CFG_PROVISIONAL;
+    let cfg = qlab_l2::L2_CFG;
     let checks = [
         // The hiding PCS commits the trace at twice its height.
         ("degree_bits", proof.degree_bits, log_height + qlab_consensus::IS_ZK),

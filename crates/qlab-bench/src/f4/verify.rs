@@ -139,7 +139,7 @@ pub(crate) mod tests {
         assert_eq!(B2_CFG.label(), "b2/q86/g22/fp16/a16", "M4's interior lane, unchanged");
         assert_eq!(crate::m4interior::INTERIOR_B2_CFG.label(), B2_CFG.label());
         let need = 100.0 + 18f64.log2();
-        let l2 = qlab_l2::L2_CFG_PROVISIONAL.num_queries as f64 * BETA_B4 + GRIND;
+        let l2 = qlab_l2::L2_CFG.num_queries as f64 * BETA_B4 + GRIND;
         let w = W_V1_CFG.num_queries as f64 * BETA_B2 + GRIND;
         assert!(l2 >= need && w >= need, "{l2} {w} vs {need}");
         assert!(B2_CFG.num_queries as f64 * BETA_B2 + GRIND < need, "q86 alone would not clear the bundle's budget");
