@@ -174,7 +174,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             }
             Err(NodeError::Body(e)) => match Self::body_fault_class(&e) {
                 BodyFault::Intrinsic(why) => IngestOutcome::Rejected(why),
-                BodyFault::Positional(why) => IngestOutcome::Ignored(why),
+                BodyFault::Positional(why) | BodyFault::Local(why) => IngestOutcome::Ignored(why),
             },
             Err(NodeError::NotExtendingTip { .. }) => IngestOutcome::Orphan,
             Err(e) => {

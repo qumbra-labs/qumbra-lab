@@ -343,8 +343,8 @@ pub struct BlockBody {
     /// refuses a non-empty section ([`BodyError::SectionOnForm`]).
     pub finality: Vec<u8>,
     /// **V6 only**: the wrapper bundle's canonical bytes, empty when absent.
-    /// Until F5-4 wires `verify_wrapper` as the rule, every bundle is refused
-    /// ([`RefuseAllBundles`]).
+    /// Judged by the net's [`BundleVerifier`] (lab #785 F5-4b); a node with
+    /// no wrapper rule refuses every bundle ([`RefuseAllBundles`]).
     pub bundle: Vec<u8>,
 }
 
@@ -1185,6 +1185,10 @@ pub enum BundleRefusal {
     ZeroExitRkm { index: usize },
     /// Exit `index` carries no value.
     ZeroExitValue { index: usize },
+    /// A non-empty exit list, refused until F5-4c appends exits to the
+    /// commitment tree (pre-review Q1): a chain that accepted exits without
+    /// their notes would replay to a different tree under F5-4c.
+    ExitsUnsupported { n: usize },
     /// A W public value is not a 16-bit chunk, so the bundle states no
     /// surface to sign (V0 would refuse it too; this is the signature path's
     /// own check, before any proof).
@@ -1212,8 +1216,10 @@ pub trait BundleVerifier {
     fn verify_bundle(&self, header: &BlockHeader, bundle: &[u8], ctx: &BundleContext<'_>) -> Result<BundleOutcome, BundleRefusal>;
     /// **The fold**: the effect of a bundle already judged valid, from the
     /// predecessor surface's bytes — decode and read, no proof. The state
-    /// funnel (`apply_state`) runs it on every path, live and replayed, so
-    /// the chain's surface is one function of the applied chain.
+    /// funnel (`apply_state`) runs it on every applied block, live and in
+    /// log replay, so the chain's surface is one function of the applied
+    /// chain; the snapshot paths, which put their prefix in without
+    /// `apply_state`, re-derive it with [`Self::bundle_surface`] instead.
     fn fold_bundle(&self, surface: &[u8], bundle: &[u8]) -> Result<BundleOutcome, BundleRefusal>;
     /// The successor surface `bundle` states, from its own bytes alone —
     /// what [`Self::fold_bundle`] returns as `surface` for it. The snapshot

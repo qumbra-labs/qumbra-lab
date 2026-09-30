@@ -641,7 +641,14 @@ enum BodyFault {
     /// ([`NodeAdapter::anchor_verdict_is_authoritative`]). Carries the reject reason
     /// used when it *is* chargeable.
     Positional(&'static str),
+    /// The verdict is about THIS node's own state, not the block (lab #785
+    /// F5-4b pre-review Q2: no bundle rule installed, or a chain surface that
+    /// does not decode) ⇒ never the sender's fault on any arm: `Ignored`.
+    Local(&'static str),
 }
+
+/// The `Ignored` reason for a body this node's own state cannot judge.
+pub const LOCAL_STATE_REASON: &str = "this node's own state cannot judge the body";
 
 /// The retained body-surface weight shared with the #135 serving cache, so the
 /// two byte budgets stay comparable. Fixed container/map overhead is bounded by
@@ -2615,10 +2622,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // last bundle height are folded from it; V7 is the record rule
             // above) — intrinsic. Two refusals are this node's own state, not
             // the block's: no rule installed, and a surface that does not
-            // decode. Neither may cost the peer.
+            // decode. They are `Local`, which no arm charges (pre-review Q2:
+            // as `Positional` they reached the authoritative arm at the tip).
             BodyError::Bundle { refusal } => match refusal {
                 qlab_devnet::body::BundleRefusal::NoRule | qlab_devnet::body::BundleRefusal::SurfaceState => {
-                    BodyFault::Positional("bad body")
+                    BodyFault::Local(LOCAL_STATE_REASON)
                 }
                 qlab_devnet::body::BundleRefusal::Codec(_)
                 | qlab_devnet::body::BundleRefusal::L2Id { .. }
@@ -2626,6 +2634,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 | qlab_devnet::body::BundleRefusal::TooManyExits { .. }
                 | qlab_devnet::body::BundleRefusal::ZeroExitRkm { .. }
                 | qlab_devnet::body::BundleRefusal::ZeroExitValue { .. }
+                | qlab_devnet::body::BundleRefusal::ExitsUnsupported { .. }
                 | qlab_devnet::body::BundleRefusal::NoStatedSurface
                 | qlab_devnet::body::BundleRefusal::Signature
                 | qlab_devnet::body::BundleRefusal::Wrapper(_)
@@ -3167,6 +3176,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             Ok(()) => {}
             Err(e) => match Self::body_fault_class(&e) {
                 BodyFault::Intrinsic(why) => return IngestOutcome::Rejected(why),
+                // This node's own state cannot judge the body (lab #785 F5-4b):
+                // never charged, on any arm — not a verdict on the block.
+                BodyFault::Local(why) => return IngestOutcome::Ignored(why),
                 // Positional, but the block is SETTLED HISTORY (lab #402): the
                 // main-chain block at its own height under the quorum-verified
                 // finalized pointer. Our positional "no" is then a fact about our
@@ -5294,7 +5306,7 @@ mod tests {
         type A = NodeAdapter<KeccakPow, MockVerifier>;
         let intrinsic = |e: BodyError, want: &str| match A::body_fault_class(&e) {
             BodyFault::Intrinsic(why) => assert_eq!(why, want, "{e:?}"),
-            BodyFault::Positional(_) => panic!("{e:?} is intrinsic"),
+            BodyFault::Positional(_) | BodyFault::Local(_) => panic!("{e:?} is intrinsic"),
         };
         intrinsic(
             BodyError::CommitmentMismatch { expected: [0; 32], got: [1; 32] },
@@ -8319,6 +8331,58 @@ mod tests {
         ];
         let err = a.assemble_block_for_payees(&two).err().expect("refused");
         assert!(err.contains("want 1..=1"), "{err}");
+    }
+
+    /// Lab #785 F5-4b pre-review Q2: a bundle this node's OWN state cannot
+    /// judge (no rule installed; a rule whose chain surface does not decode)
+    /// is `Ignored` at the applied tip — the arm where a positional refusal
+    /// would be charged — while an intrinsic bundle refusal there is
+    /// `Rejected`.
+    #[test]
+    fn a_bundle_this_node_cannot_judge_is_ignored_and_an_intrinsic_one_rejected() {
+        use qlab_devnet::body::{BundleContext, BundleOutcome, BundleRefusal, BundleVerifier, WrapperSetup};
+        struct Refuses(BundleRefusal);
+        impl BundleVerifier for Refuses {
+            fn verify_bundle(&self, _: &BlockHeader, _: &[u8], _: &BundleContext<'_>) -> Result<BundleOutcome, BundleRefusal> {
+                Err(self.0.clone())
+            }
+            fn fold_bundle(&self, _: &[u8], _: &[u8]) -> Result<BundleOutcome, BundleRefusal> {
+                Err(self.0.clone())
+            }
+            fn bundle_surface(&self, _: &[u8]) -> Result<Vec<u8>, BundleRefusal> {
+                Err(self.0.clone())
+            }
+        }
+        let adapter = |refusal: Option<BundleRefusal>| {
+            let (committee, _) = devnet_committee(qlab_devnet::params_devnet::FROZEN_COMMITTEE_SIZE);
+            let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
+            let wrapper =
+                refusal.map(|r| WrapperSetup { rule: std::sync::Arc::new(Refuses(r)), genesis_surface: vec![] });
+            NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg, wrapper)
+        };
+        let at_tip_with_bundle = |a: &mut NodeAdapter<KeccakPow, MockVerifier>| {
+            let c = a.assemble_block().expect("candidate");
+            let (mut h, mut b) = (c.header, c.body);
+            b.bundle = vec![1, 2, 3];
+            h.tx_body_commitment = b.commitment_v6();
+            assert_eq!(h.prev, a.state().tip_hash(), "judged at the applied tip");
+            a.ingest_block(h, b)
+        };
+        for local in [None, Some(BundleRefusal::SurfaceState)] {
+            let mut a = adapter(local.clone());
+            assert_eq!(at_tip_with_bundle(&mut a), IngestOutcome::Ignored(LOCAL_STATE_REASON), "{local:?}");
+        }
+        let mut a = adapter(Some(BundleRefusal::Signature));
+        assert_eq!(at_tip_with_bundle(&mut a), IngestOutcome::Rejected("bad body"));
+        // The classes, directly.
+        type A = NodeAdapter<KeccakPow, MockVerifier>;
+        for r in [BundleRefusal::NoRule, BundleRefusal::SurfaceState] {
+            assert!(matches!(A::body_fault_class(&BodyError::Bundle { refusal: r }), BodyFault::Local(_)));
+        }
+        assert!(matches!(
+            A::body_fault_class(&BodyError::Bundle { refusal: BundleRefusal::ExitsUnsupported { n: 1 } }),
+            BodyFault::Intrinsic("bad body")
+        ));
     }
 
     fn v6_adapter() -> NodeAdapter<KeccakPow, MockVerifier> {

@@ -9,7 +9,9 @@
 //! 2. its `l2_id` is the genesis's;
 //! 3. **spacing**: at least `wrapper_spacing_blocks` since the last bundle
 //!    (the first bundle is free);
-//! 4. the clear exit list's shape: at most `K_exit`, no zero `rkm`, no zero `v`;
+//! 4. the clear exit list's shape: at most `K_exit`, no zero `rkm`, no zero
+//!    `v` — and, until F5-4c appends exit notes, no exits at all
+//!    ([`BundleRefusal::ExitsUnsupported`], pre-review Q1);
 //! 5. W's public values are 16-bit chunks, so the bundle **states** a
 //!    successor surface ([`WireBundle::stated_surface`]);
 //! 6. the **sequencer's signature** over [`sign_message`] (the net's V6
@@ -106,6 +108,18 @@ fn exit_shape_err(e: ExitShape) -> BundleRefusal {
     }
 }
 
+/// Pre-review Q1: until F5-4c appends exits to the commitment tree, a
+/// bundle with exits is refused — rule and fold alike — so no chain a 4b
+/// binary accepts replays to a different tree under 4c. 4c removes this in
+/// the commit that appends the notes.
+fn exits_supported(wb: &WireBundle) -> Result<(), BundleRefusal> {
+    if wb.exits.is_empty() {
+        Ok(())
+    } else {
+        Err(BundleRefusal::ExitsUnsupported { n: wb.exits.len() })
+    }
+}
+
 impl WrapperRule {
     /// The chain's rule from its genesis: version 1, the genesis's `l2_id`,
     /// spacing, `K_exit` and sequencer key, the V6 genesis hash as net id.
@@ -172,6 +186,7 @@ impl WrapperRule {
             return Err(wrapper_err(VError::Version));
         }
         check_exit_shape(&wb.exits, self.k_exit).map_err(exit_shape_err)?;
+        exits_supported(wb)?;
         let stated = wb.stated_surface().ok_or(BundleRefusal::NoStatedSurface)?;
         // V5 and V6, the verifier-side threading — proof-free, so the fold
         // keeps them: a logged bundle folds only onto its own predecessor.
@@ -220,6 +235,7 @@ impl BundleVerifier for WrapperRule {
             }
         }
         check_exit_shape(&wb.exits, self.k_exit).map_err(exit_shape_err)?;
+        exits_supported(&wb)?;
         let stated = wb.stated_surface().ok_or(BundleRefusal::NoStatedSurface)?;
         // 6: only the sequencer can make a node pay for step 7.
         if !self.signature_ok(&wb, &stated) {
@@ -274,8 +290,9 @@ mod tests {
     /// here only behind the feature — so no production path can call one.
     #[test]
     fn no_production_source_calls_a_test_knob() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![dir];
+        // src/, and (pre-review Q6) this crate's tests/ and examples/ too.
+        let krate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut stack: Vec<_> = ["src", "tests", "examples"].iter().map(|d| krate.join(d)).filter(|p| p.exists()).collect();
         let mut seen = 0;
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).unwrap() {
@@ -304,9 +321,43 @@ mod tests {
         }
     }
 
-    /// Ruling 5915423092 (4): no workflow, script or deploy recipe switches
-    /// the knobs on — the release lanes pass explicit features for the drill
-    /// builds, which is where one could be added by hand.
+    /// Pre-review Q6: the feature is named in exactly two manifests — this
+    /// crate's `[features]` and qlab-bench's `[dev-dependencies]` — and no
+    /// other crate's.
+    #[test]
+    fn only_two_manifests_name_the_test_knobs() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let feature = concat!("wrapper-test", "-knobs");
+        let mut found = Vec::new();
+        for e in std::fs::read_dir(&crates).unwrap() {
+            let manifest = e.unwrap().path().join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else { continue };
+            let krate = manifest.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+            let mut section = String::new();
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    section = t.to_string();
+                }
+                if t.starts_with('#') || !t.contains(feature) {
+                    continue;
+                }
+                found.push((krate.clone(), section.clone()));
+            }
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            vec![("qlab-bench".to_string(), "[dev-dependencies]".to_string()), ("qumbra-node".to_string(), "[features]".to_string())]
+        );
+        let root = crates.join("..").join("Cargo.toml");
+        assert!(!std::fs::read_to_string(root).unwrap().contains(feature), "the workspace manifest does not name it");
+    }
+
+    /// Ruling 5915423092 (4) and pre-review Q6: no workflow, script or
+    /// deploy recipe switches the knobs on — by name or by `--all-features`.
+    /// The release lanes pass explicit features for the drill builds, which
+    /// is where one could be added by hand.
     #[test]
     fn no_workflow_or_script_enables_the_test_knobs() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -323,6 +374,7 @@ mod tests {
                 let Ok(text) = std::fs::read_to_string(&p) else { continue };
                 seen += 1;
                 assert!(!text.contains(concat!("wrapper-test", "-knobs")), "{} enables the bundle rule's test knobs", p.display());
+                assert!(!text.contains(concat!("--all", "-features")), "{} builds with every feature", p.display());
             }
         }
         assert!(seen > 5, "the scan read the workflow files ({seen})");

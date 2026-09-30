@@ -444,6 +444,11 @@ pub enum NodeError {
     /// The snapshot claims finality that the authoritative append-only log cannot
     /// reproduce. Accepting it would make `open` disagree with `replay`.
     SnapshotFinalityNotLogged { hash: Hash32, height: u64 },
+    /// Lab #785 F5-4b: re-deriving the wrapper surface on a snapshot path
+    /// met a block above genesis that the chain store does not hold — the
+    /// walk cannot say which bundle is latest, so it refuses rather than
+    /// fall back to the genesis surface.
+    WrapperWalkBroken { missing: Hash32 },
     /// A rewind of the applied chain was refused (issue #162). See
     /// [`RewindError`] — every variant leaves node state untouched.
     Rewind(RewindError),
@@ -587,6 +592,7 @@ impl NodeError {
             | NodeError::Chain(_)
             | NodeError::SnapshotFinality(_)
             | NodeError::SnapshotFinalityNotLogged { .. }
+            | NodeError::WrapperWalkBroken { .. }
             | NodeError::Rewind(_)
             // A form this node cannot serve reaching its funnel is an internal
             // wiring error (`run` refuses an Annulet genesis before a node
@@ -636,6 +642,11 @@ impl std::fmt::Display for NodeError {
                 f,
                 "snapshot finalized head {} at height {height} has no matching finalization in the block log",
                 hex8(hash)
+            ),
+            NodeError::WrapperWalkBroken { missing } => write!(
+                f,
+                "re-deriving the wrapper surface: block {} is not held, so the latest bundle is unknown",
+                hex8(missing)
             ),
             NodeError::Rewind(e) => write!(f, "rewind refused: {e}"),
             NodeError::Io(e) => write!(f, "persistence error: {e}"),
@@ -2434,7 +2445,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             return Ok(());
         }
         let mut cursor = self.chain.tip_hash();
-        while let Some(block) = self.chain.block(&cursor) {
+        loop {
+            // Pre-review Q5: a hole in the held chain is named, never read as
+            // "no bundle" (which would silently restore the genesis surface).
+            let block = self.chain.block(&cursor).ok_or(NodeError::WrapperWalkBroken { missing: cursor })?;
             if block.header.height == 0 {
                 break;
             }

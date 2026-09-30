@@ -29,7 +29,7 @@ use qlab_wrapper::config::Outer;
 use qlab_wrapper::genesis::{empty_registry_root, genesis_roots};
 use qlab_wrapper::hash::{WTag, M_ABS};
 use qlab_wrapper::verify::{BundleMember, MemberVerifier, Surface};
-use qlab_wrapper::wleaf::{PV_C, PV_E, PV_SIDE};
+use qlab_wrapper::wleaf::{PV_C, PV_D, PV_E, PV_EXC, PV_PREV, PV_SIDE};
 use qumbra_node::bundle::WrapperRule;
 use qumbra_node::genesis_v6::{rehearsal_sequencer_seed, WrapperParams, REHEARSAL_L2_ID};
 
@@ -288,10 +288,80 @@ fn f5_4b_bundle_rule_negatives() {
     // The chain's own surface undecodable: this node's state, named.
     let ctx = BundleContext { surface: &[1, 2, 3], last_bundle_height: None, anchor_ok: &|_| true };
     assert_eq!(r.verify_bundle(&header_at(AT), &fx.wire, &ctx), Err(BundleRefusal::SurfaceState));
-    // 9. An exit list that does not chain to W's exit_cmt (EMPTY here).
-    assert_eq!(judge(&r, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitCommitment));
-    // The fold refuses the same way where it can judge (no proof, no signature).
-    assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitCommitment));
+    // Pre-review Q1: any exit is refused until F5-4c, rule and fold alike.
+    assert_eq!(judge(&r, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitsUnsupported { n: 1 }));
+    assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.exits = vec![e]; false })), Err(BundleRefusal::ExitsUnsupported { n: 1 }));
+    // The fold refuses the verify path's refusals where it can judge (no proof, no signature).
     assert_eq!(r.fold_bundle(&off, &fx.wire), wrapper("Thread(\"k_next\")"));
     assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.l2_id = 2; false })), Err(BundleRefusal::L2Id { got: 2, want: REHEARSAL_L2_ID }));
+}
+
+fn put_u64(w: &mut [u32], off: usize, x: u64) {
+    for j in 0..4 {
+        w[off + j] = ((x >> (16 * j)) & 0xffff) as u32;
+    }
+}
+
+fn put_digest(w: &mut [u32], off: usize, d: &qlab_wrapper::hash::Digest) {
+    for (l, lane) in d.iter().enumerate() {
+        put_u64(w, off + 4 * l, *lane);
+    }
+}
+
+/// Pre-review Q3: the fold has no proof to lean on, so the three checks that
+/// are belts on the verify path (W binds them) are reachable here — each
+/// refused by name on the fixture's bytes with W's words edited.
+#[test]
+fn f5_4b_fold_only_negatives() {
+    let fx = fixture();
+    let r = rule();
+    let surface = genesis_bytes();
+    // exit_cmt not the (empty) list's chain.
+    assert_eq!(r.fold_bundle(&surface, &mutated(|w| { w.w_pvs[PV_EXC] = 1; false })), Err(BundleRefusal::ExitCommitment));
+    // ΔE = 5 with no exits: Σv ≠ ΔE.
+    assert_eq!(r.fold_bundle(&surface, &mutated(|w| { put_u64(&mut w.w_pvs, PV_SIDE + PV_E, 5); false })), Err(BundleRefusal::ExitSum));
+    // D_cum moving backwards: a predecessor above the out side's D_cum, which
+    // W's in side and prev link are edited to match.
+    let stated_d = WireBundle::decode(&fx.wire).unwrap().stated_surface().unwrap().out.d_cum;
+    let mut prev = fx.genesis.clone();
+    prev.out.d_cum = stated_d + 1000;
+    prev.commitment = Surface::commit(prev.version, prev.l2_id, &prev.prev, &prev.out, &prev.newest_anchor, &prev.exit_cmt);
+    let bytes = mutated(|w| {
+        put_u64(&mut w.w_pvs, PV_D, prev.out.d_cum);
+        put_digest(&mut w.w_pvs, PV_PREV, &prev.commitment);
+        false
+    });
+    assert_eq!(r.fold_bundle(&encode_surface(&prev), &bytes), Err(BundleRefusal::Counters));
+}
+
+/// Pre-review Q4: the real rule on replay and on snapshot resume — the
+/// fixture chain on a disk-backed node, reopened both ways, re-derives the
+/// live surface and last bundle height (the fold on replay; the walk-back's
+/// `bundle_surface` on the snapshot path, nothing replayed).
+#[test]
+fn f5_4b_the_proven_bundle_survives_replay_and_snapshot_resume() {
+    let fx = fixture();
+    let dir = std::env::temp_dir().join(format!("qlab-f5-4b-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let setup = || V6Setup { committee0: validators().0.clone(), wrapper: Some(rule().into_setup()) };
+    let live = {
+        let mut node = MemNode::open_v6(&dir, genesis_block_v6(8, 0), setup()).unwrap();
+        for _ in 1..=8 {
+            let (h, b) = chain_block(&tip_header(&node), vec![], vec![]);
+            node.apply_block(h, b, &NoTxs).unwrap();
+        }
+        let record = record_at_tip(&node);
+        let (h, b) = chain_block(&tip_header(&node), record, fx.wire.clone());
+        node.apply_block(h, b, &NoTxs).expect("accepted");
+        (node.tip_hash(), node.wrapper_surface().to_vec(), node.last_bundle_height())
+    };
+    assert_eq!(live.2, Some(9));
+    let replayed = MemNode::open_v6(&dir, genesis_block_v6(8, 0), setup()).expect("full replay");
+    assert_eq!(replayed.recovery_report().snapshot_height, None);
+    assert_eq!((replayed.tip_hash(), replayed.wrapper_surface().to_vec(), replayed.last_bundle_height()), live);
+    replayed.save_snapshot().unwrap();
+    let resumed = MemNode::open_v6(&dir, genesis_block_v6(8, 0), setup()).expect("snapshot resume");
+    assert_eq!((resumed.recovery_report().snapshot_height, resumed.recovery_report().replayed_records), (Some(9), 0));
+    assert_eq!((resumed.tip_hash(), resumed.wrapper_surface().to_vec(), resumed.last_bundle_height()), live);
+    let _ = std::fs::remove_dir_all(&dir);
 }
