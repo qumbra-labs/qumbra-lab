@@ -43,6 +43,14 @@ pub struct Template {
 pub struct TemplateBody {
     pub coinbase_payees: Vec<CoinbasePayee>,
     pub txs: Vec<Vec<u8>>,
+    /// The node's finality record on a V6 net (lab #785), opaque here and
+    /// echoed back on submit: the template's header commits to it. Empty on
+    /// V4/V5.
+    pub finality: Vec<u8>,
+    /// The node's body-section axis (lab #785, M1 on PR #791):
+    /// [`BodySections::V6`] when the template came from a V6 node. It keys
+    /// the payee cap (V6: 1) and is echoed on submit.
+    pub sections: qlab_devnet::forms::BodySections,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -216,6 +216,8 @@ fn a_joiner_whose_bodies_are_lost_and_reordered_converges_through_the_re_ask() {
             coinbase_payees: body.coinbase_payees.clone(),
             short_ids: Vec::new(),
             prefilled: Vec::new(),
+            finality: Vec::new(),
+            bundle: Vec::new(),
         };
         let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(GenesisForm::Annulet, &ann)).encode();
         producer.transport().send(PeerId(2), &frame).expect("send");

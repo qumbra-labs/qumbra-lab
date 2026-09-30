@@ -263,7 +263,8 @@ impl Pool {
     pub fn assemble_now(&self) -> Result<AssembledCoinbase, PoolError> {
         let g = self.inner.lock().expect("pool mutex");
         let t = g.source.current();
-        assemble_coinbase(t.form, t.header.height, &g.pplns, &g.accounts, g.pool_rkm)
+        let sections = t.body.as_ref().map_or(qlab_devnet::forms::BodySections::None, |b| b.sections);
+        crate::payee::assemble_coinbase_for(t.form, sections, t.header.height, &g.pplns, &g.accounts, g.pool_rkm)
             .map_err(PoolError::Assemble)
     }
 
@@ -273,10 +274,11 @@ impl Pool {
     pub fn assemble_for(
         &self,
         form: qlab_devnet::forms::GenesisForm,
+        sections: qlab_devnet::forms::BodySections,
         height: u64,
     ) -> Result<AssembledCoinbase, PoolError> {
         let g = self.inner.lock().expect("pool mutex");
-        assemble_coinbase(form, height, &g.pplns, &g.accounts, g.pool_rkm)
+        crate::payee::assemble_coinbase_for(form, sections, height, &g.pplns, &g.accounts, g.pool_rkm)
             .map_err(PoolError::Assemble)
     }
 
@@ -961,6 +963,8 @@ mod tests {
                 amount: 5_000,
             }],
             txs: Vec::new(),
+            finality: Vec::new(),
+            sections: qlab_devnet::forms::BodySections::None,
         }
     }
 

@@ -50,7 +50,7 @@ use qlab_devnet::params_devnet::{
     EPOCH_LENGTH_BLOCKS, JAIL_BLOCKS,
 };
 use qlab_devnet::pow::PowEngine;
-use qlab_devnet::forms::{ChainRules, GenesisForm};
+use qlab_devnet::forms::{BodySections, ChainRules, GenesisForm};
 use qlab_devnet::halt::{regime as halt_regime, RuleSchedule};
 use qlab_devnet::validation::{
     expected_difficulty, pow_seed, validate_header_under, ValidationError,
@@ -61,7 +61,7 @@ use qlab_node::metrics::Metrics;
 use qlab_node::recovery::Finalizer;
 use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
 use qlab_node::telemetry::{AppliedTip, StateLag};
-use qlab_node::{genesis_block_for, genesis_block, FinalizeOutcome, MemNode, Mempool, MempoolError, NodeError, NodeState as _,
+use qlab_node::{genesis_block_for, genesis_block, genesis_block_v6, FinalizeOutcome, MemNode, Mempool, MempoolError, NodeError, NodeState as _,
     RecoveryReport, RewindReport,};
 use qlab_devnet::body::TxVerifier;
 
@@ -116,6 +116,9 @@ pub struct AssembledCandidate {
     pub seed_hash: Hash32,
     /// Next key-block hash, when this branch already holds that seed block.
     pub next_seed_hash: Option<Hash32>,
+    /// The body-section axis the body was assembled under (lab #785): the
+    /// template RPC tells a pool it is on V6, whose payee cap is 1.
+    pub sections: BodySections,
 }
 
 /// A self-mining grind parked between loop iterations (lab #651): the
@@ -231,6 +234,19 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// installs the value once at startup via [`Self::set_chain_rules`] (the one
     /// selection point); there is no config/CLI/env path to it (H1).
     rules: ChainRules,
+    /// The body-section axis (lab #785 F5-3b-2): [`BodySections::V6`] exactly
+    /// on an adapter built by [`Self::open_v6`] / [`Self::new_v6`]. A
+    /// construction-time property like the state node's — it selects the
+    /// genesis block and the datadir's record form, so it is never installed
+    /// later ([`Self::set_chain_rules`] cannot move it).
+    sections: BodySections,
+    /// The vote set of this node's **latest local finalization** (lab #785
+    /// ruling Q3): the raw material a V6 miner's finality record is built
+    /// from. Memory only, one entry, replaced at each finalization — a
+    /// restart mines without a record until the next one (≤ one cadence).
+    /// Every verified vote is kept, jailed signers included: a record is
+    /// judged against committee₀ (ruling Q1), not the local roster.
+    last_finalized_votes: Option<(Checkpoint, Vec<Vote>)>,
     /// Counters that attribute ingest refusals to a layer (issue #74 drill
     /// evidence). Surfaced in the binary's telemetry line so the docker drill can
     /// answer "which layer rejected the old branch?" from the logs rather than from
@@ -691,6 +707,44 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         Self::assemble(GenesisForm::V4, committee, pow, verifier, sim, state)
     }
 
+    /// New in-memory **V6** adapter (lab #785 F5-3b-2): `GenesisForm::V5`
+    /// with the V6 body sections, over the V6 genesis block. The genesis
+    /// committee is committee₀, the roster finality records are judged by.
+    pub fn new_v6(committee: CommitteeState, pow: P, verifier: V, sim: SimConfig) -> Self {
+        let genesis = genesis_block_v6(sim.genesis_difficulty, 0);
+        let state = MemNode::in_memory_v6(genesis.clone(), committee.committee().clone());
+        let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
+        let mut me = Self::assemble_on(GenesisForm::V5, genesis.header(), ec, pow, verifier, sim, state);
+        me.sections = BodySections::V6;
+        me
+    }
+
+    /// New disk-backed **V6** adapter — [`Self::open_for`]'s resume path
+    /// (fork-choice chain adopted from the state node, finality and
+    /// punishments restored) keyed `(V5, V6)` before the datadir is read.
+    pub fn open_v6(
+        dir: impl AsRef<std::path::Path>,
+        committee: CommitteeState,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+    ) -> Result<Self, NodeError> {
+        let dir = dir.as_ref().to_path_buf();
+        let genesis = genesis_block_v6(sim.genesis_difficulty, 0);
+        let state = MemNode::open_v6(&dir, genesis.clone(), committee.committee().clone())?;
+        let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
+        let mut me = Self::assemble_on(GenesisForm::V5, genesis.header(), ec, pow, verifier, sim, state);
+        me.sections = BodySections::V6;
+        me.dir = Some(dir.clone());
+        me.chain = me.state.chain().chain().clone();
+        if let Some(checkpoint) = me.state.restored_checkpoint() {
+            me.finality = FinalityTracker::from_restored_checkpoint(checkpoint);
+        }
+        me.restore_punishments(&dir)?;
+        me.advance_epoch();
+        Ok(me)
+    }
+
     /// New **disk-backed** adapter (M10-T0-1, `qumbra-node` binary): the state
     /// machine is opened at `dir` and resumes restart-safely (atomic snapshot +
     /// block-log tail), so accepted blocks and finalizations persist across
@@ -878,6 +932,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             breq_observed: 0,
             sequencer_key: None,
             equivocations: Vec::new(),
+            sections: BodySections::None,
+            last_finalized_votes: None,
             pending_seals: HashMap::new(),
         }
     }
@@ -2015,6 +2071,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// without assembling a body or advancing the mining clock. The pool uses
     /// this once at startup so its first template request carries a real payee
     /// list; there is no payee-free compatibility request.
+    /// The body-section axis this adapter was built with (lab #785).
+    pub fn sections(&self) -> BodySections {
+        self.sections
+    }
+
     pub fn mine_template_context(&mut self) -> Option<(GenesisForm, u64)> {
         let parent_hash = self.mining_parent_hash()?;
         let parent = self.chain.header(&parent_hash)?;
@@ -2035,6 +2096,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let height = parent.height + 1;
         let cap = match self.rules.form {
             GenesisForm::V4 => 1,
+            // Lab #785 ruling (b): V6's cap is native and 1 (lab #790).
+            GenesisForm::V5 if self.sections == BodySections::V6 => qlab_devnet::body::COINBASE_PAYEE_CAP_V6,
             GenesisForm::V5 => coinbase_payee_cap_v5(height),
             GenesisForm::Annulet => return Err("no mined block on an Annulet (sequencer) net: the producer lands with B2 (lab #706)".into()),
         };
@@ -2267,6 +2330,39 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
     /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
     /// path as a self-mined block. A fork here is a consensus-adjacent fork.
+    /// The finality record a V6 block on `parent_hash` carries (lab #785
+    /// ruling Q3), or `None`.
+    ///
+    /// **Policy, not rule** (Q4): nothing forces inclusion, and an honest
+    /// miner includes the newest record it holds. The material is the vote set
+    /// of this node's latest local finalization; the record goes in iff it
+    /// passes the body rule at this exact position
+    /// ([`qlab_node::Node::record_passes_at_tip`]: above `CR(parent)`, an
+    /// ancestor of the parent, committee₀ signatures). Anything else is
+    /// **omitted**:
+    ///
+    /// - a parent that is not the applied tip — the check needs the parent's
+    ///   own ancestry, which the node has only at its tip;
+    /// - no finalization since (re)start — the votes are memory-only, so a
+    ///   restarted miner mines without a record for up to one cadence;
+    /// - votes whose signer indices have moved: tally votes carry the current
+    ///   epoch's indices, and after a tombstone `advance_to` shifts them, so
+    ///   they no longer verify against committee₀ by genesis index. That is an
+    ///   omission (anchors wait for a later record), never an invalid block.
+    ///   No membership change is staged in production (ruling Q1's premise).
+    fn finality_record_for(&self, parent_hash: &Hash32) -> Option<Vec<u8>> {
+        if *parent_hash != self.state.tip_hash() {
+            return None;
+        }
+        let (cp, votes) = self.last_finalized_votes.as_ref()?;
+        let record = qlab_devnet::finality_record::FinalityRecord {
+            cp: *cp,
+            votes: votes.iter().take(qlab_devnet::params_devnet::FROZEN_COMMITTEE_SIZE).cloned().collect(),
+        };
+        self.state.record_passes_at_tip(&record).ok()?;
+        Some(record.encode())
+    }
+
     fn assemble_on_parent(
         &mut self,
         parent_hash: Hash32,
@@ -2280,7 +2376,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
         let parent = *self.chain.header(&parent_hash)?;
         let candidate_height = parent.height + 1;
+        if self.sections == BodySections::V6 {
+            body.finality = self.finality_record_for(&parent_hash).unwrap_or_default();
+            // The mempool admitted against local finality; V6 anchors are
+            // judged against the RECORD (this block's own included), so the
+            // template keeps only txs the body rule will accept. Off the
+            // applied tip nothing can be judged, so nothing is carried.
+            let recorded = if body.finality.is_empty() {
+                self.state.recorded_finality()
+            } else {
+                self.last_finalized_votes.as_ref().map(|(cp, _)| cp.height)
+            };
+            let at_tip = parent_hash == self.state.tip_hash();
+            body.txs.retain(|tx| at_tip && self.state.v6_anchor_ok_at_tip(&tx.public.anchor, recorded));
+        }
         let bc = match self.rules.form {
+            GenesisForm::V5 if self.sections == BodySections::V6 => body.commitment_v6(),
             GenesisForm::V4 => body.commitment_at(candidate_height),
             GenesisForm::V5 => body.commitment_v5_at(candidate_height),
             // No mined block on an Annulet (sequencer) net: the producer lands
@@ -2305,6 +2416,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         seed_hash.copy_from_slice(&seed);
         let next_seed_hash = self.next_seed_hash_if_known(candidate.height, &parent_hash);
         Some(AssembledCandidate {
+            sections: self.sections,
             form: self.rules.form,
             header: candidate,
             body,
@@ -2613,6 +2725,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         // The one installed source (lab #470): the P2P codec reads the form
         // from the same ChainRules consensus runs under.
         self.rules.form
+    }
+
+    fn wire_form(&self) -> crate::compact::WireForm {
+        crate::compact::WireForm { form: self.rules.form, sections: self.sections }
     }
 
     fn genesis_block_hash(&self) -> Hash32 {
@@ -2934,7 +3050,48 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         // `is_valid_anchor` also reads the finalized head (checkpoint path,
         // not `apply_state`), so the two do not go stale together; a lagging
         // finality only makes the authority predicate more conservative.
-        let validate_result = match self.rules.form {
+        // Lab #785 F5-3b-2 (ruling J1 on issue #785): a V6 verdict reads the
+        // block's OWN ancestry, which this node has exactly when the block
+        // extends its applied tip. There the full rule runs and every failure
+        // is intrinsic. Off the tip, the only part of the verdict this node can
+        // compute is the pair-only binding, and then:
+        //
+        // - a block on the **main chain** — settled history, or a branch whose
+        //   header work has already won — falls through to the buffer. The full
+        //   rule runs at application, at the block's own position, and the
+        //   buffered body is what lets `rejoin_main_chain` rewind to the fork
+        //   point at all (it rewinds only when `fork + 1`'s body is held);
+        // - a **live side branch** is judged by its header alone — the #134
+        //   unjudged arm, never charged — and its body is NOT buffered: the
+        //   V6 rule cannot be evaluated off its own ancestry, and with ~8 MB
+        //   bundle bodies the pending cap would fill with unverifiable proofs.
+        //   If the branch later wins, the body is refetched (#130 (c)) and
+        //   arrives as a main-chain block under the first bullet. One refetch
+        //   on a sibling reorg is the price.
+        let validate_result = if self.sections == BodySections::V6 {
+            if header.prev == self.state.tip_hash() {
+                self.state.validate_block_v6(&header, &body, &self.verifier)
+            } else if let Err(e) = qlab_devnet::body::check_body_binding_v6(&header, &body) {
+                Err(e)
+            } else if self.block_is_settled_history(&header) {
+                Ok(())
+            } else {
+                let submitted = self.submit_header(header);
+                let hash = header.header_hash_for(self.rules.form);
+                match submitted {
+                    IngestOutcome::Accepted | IngestOutcome::Duplicate
+                        if self.chain.main_chain_hash_at(header.height) == Some(hash) =>
+                    {
+                        Ok(())
+                    }
+                    IngestOutcome::Accepted | IngestOutcome::Duplicate => {
+                        self.ingest_counters.unjudged_anchor += 1;
+                        return IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON);
+                    }
+                    other => return other,
+                }
+            }
+        } else { match self.rules.form {
             GenesisForm::V4 => validate_body_with_names(
                 &header,
                 &body,
@@ -2952,7 +3109,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             // "This NODE cannot judge" (the `Ignored` family): the Annulet
             // body rule is served from B2 on; the sender is not at fault.
             GenesisForm::Annulet => return IngestOutcome::Ignored(ANNULET_NOT_SERVED_REASON),
-        };
+        } };
         match validate_result {
             Ok(()) => {}
             Err(e) => match Self::body_fault_class(&e) {
@@ -3271,6 +3428,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
             match self.finality.try_finalize(cp, &active_now, &committee) {
                 Ok(()) => {
                     self.seen_checkpoints.insert(id);
+                    // Lab #785 Q3: every verified vote for this checkpoint,
+                    // ascending by signer — a V6 miner's record material.
+                    let mut votes = added.accumulated.clone();
+                    votes.sort_by_key(|v| v.signer);
+                    self.last_finalized_votes = Some((*cp, votes));
                     self.observe_finality_advance(cp, prev_cp, tip);
                     // Advance the consensus finalized pointer (no reorg past finality).
                     //
@@ -8049,4 +8211,199 @@ mod tests {
         a.set_chain_rules(ChainRules { form: GenesisForm::V5, halt: RuleSchedule::V1_0 });
     }
 
+
+    // --- lab #785 F5-3b-2: the V6 miner's record ------------------------------
+
+    /// A V6 adapter over the frozen 21, with blocks 1–8 mined and applied.
+    fn v6_at_8() -> (NodeAdapter<KeccakPow, MockVerifier>, Vec<Validator>) {
+        let (committee, validators) = devnet_committee(qlab_devnet::params_devnet::FROZEN_COMMITTEE_SIZE);
+        let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
+        let mut a = NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg);
+        for _ in 0..8 {
+            let (h, b) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, b), IngestOutcome::Accepted);
+        }
+        (a, validators)
+    }
+
+    /// Ruling Q3 on issue #785: the miner includes the retained vote set iff
+    /// it passes the body rule at this position — and a set that fails
+    /// (here one tampered signature) is **omitted**, never included. The
+    /// control proves the omission is the tamper's doing.
+    #[test]
+    fn a_v6_miner_omits_a_record_that_fails_its_own_check() {
+        let (mut a, validators) = v6_at_8();
+        let hash8 = a.chain().main_chain_hash_at(8).expect("height 8");
+        let cp = Checkpoint::new(8, hash8, hash8);
+        let good: Vec<Vote> = validators[..15].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+
+        let other = Checkpoint::new(8, [0xEE; 32], [0xEE; 32]);
+        let mut tampered = good.clone();
+        tampered[3] = Vote { signer: 3, signature: validators[3].sign_checkpoint(&other).signature };
+        a.last_finalized_votes = Some((cp, tampered));
+        let (_, body) = a.assemble_block().map(|c| (c.header, c.body)).expect("candidate");
+        assert!(body.finality.is_empty(), "a record failing committee₀ is omitted");
+
+        a.last_finalized_votes = Some((cp, good));
+        let (h, body) = a.assemble_block().map(|c| (c.header, c.body)).expect("candidate");
+        assert!(!body.finality.is_empty(), "the control: an honest set is included");
+        assert_eq!(h.tx_body_commitment, body.commitment_v6(), "the header commits the record");
+    }
+
+    /// The V6 payee cap on the template RPC path is 1 (ruling (b)).
+    #[test]
+    fn a_v6_template_refuses_a_second_payee() {
+        let (mut a, _) = v6_at_8();
+        let total = qlab_devnet::emission_exact::coinbase_exact(9);
+        let two = [
+            CoinbasePayee { rkm: [1; 4], amount: total / 2 },
+            CoinbasePayee { rkm: [2; 4], amount: total - total / 2 },
+        ];
+        let err = a.assemble_block_for_payees(&two).err().expect("refused");
+        assert!(err.contains("want 1..=1"), "{err}");
+    }
+
+    fn v6_adapter() -> NodeAdapter<KeccakPow, MockVerifier> {
+        let (committee, _) = devnet_committee(qlab_devnet::params_devnet::FROZEN_COMMITTEE_SIZE);
+        let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
+        NodeAdapter::new_v6(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, cfg)
+    }
+
+    /// Ruling J1 on issue #785: a live side-branch V6 body is judged by its
+    /// header alone — not buffered, not charged — and when that branch wins,
+    /// the refetched body is a main-chain block: buffered, the state rewinds
+    /// to the fork point, and the branch applies under the full rule.
+    ///
+    /// The refetch half is the one that matters: without buffering main-chain
+    /// off-tip bodies, `rejoin_main_chain` (which rewinds only when `fork + 1`'s
+    /// body is held) would never move and the node would stall on its losing
+    /// branch.
+    #[test]
+    fn a_v6_side_branch_body_is_not_buffered_and_applies_after_refetch_when_it_wins() {
+        let mut a = v6_adapter();
+        let mut b = v6_adapter();
+        b.set_miner_rkm([7; 4]);
+        for _ in 0..2 {
+            let (h, body) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, body.clone()), IngestOutcome::Accepted);
+            assert_eq!(b.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let (h3, b3) = a.mine_block().expect("mine");
+        assert_eq!(a.ingest_block(h3, b3), IngestOutcome::Accepted);
+        let (h3x, b3x) = b.mine_block().expect("mine");
+        assert_eq!(b.ingest_block(h3x, b3x.clone()), IngestOutcome::Accepted);
+        let (h4x, b4x) = b.mine_block().expect("mine");
+        assert_eq!(b.ingest_block(h4x, b4x.clone()), IngestOutcome::Accepted);
+        assert_ne!(h3x.header_hash_for(GenesisForm::V5), h3.header_hash_for(GenesisForm::V5));
+
+        // The sibling at 3: a live side branch — header only, body dropped, uncharged.
+        let unjudged_before = a.ingest_counters().unjudged_anchor;
+        let out = a.ingest_block(h3x, b3x.clone());
+        assert_eq!(out, IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON));
+        assert!(!out.is_peer_fault());
+        assert!(a.pending_bodies.is_empty(), "an off-tip side-branch body is not buffered");
+        assert_eq!(a.ingest_counters().unjudged_anchor, unjudged_before + 1);
+        assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5));
+
+        // 4' makes the branch heavier: its body is a main-chain block now, buffered.
+        // (The header was submitted once to decide the branch, so the second
+        // submission inside ingest answers Duplicate.)
+        assert!(matches!(a.ingest_block(h4x, b4x), IngestOutcome::Accepted | IngestOutcome::Duplicate));
+        assert_eq!(a.pending_bodies.len(), 1, "4' is a main-chain block: buffered");
+        assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5), "3' is still missing");
+
+        // The refetch of 3' closes the gap: rewind to 2, apply 3' and 4'.
+        assert!(matches!(a.ingest_block(h3x, b3x), IngestOutcome::Duplicate | IngestOutcome::Accepted));
+        assert_eq!(a.state.tip_hash(), b.state.tip_hash());
+        assert_eq!(a.state.tip_height(), 4);
+        assert!(a.pending_bodies.is_empty());
+    }
+
+    /// The template filter (issue #785, (a)): a tx the mempool admitted under
+    /// LOCAL finality, but whose anchor is outside the record rule, stays out
+    /// of the template; with the record in the block it goes in.
+    #[test]
+    fn a_v6_template_excludes_a_tx_outside_the_record_rule() {
+        let (mut a, validators) = v6_at_8();
+        let root = a.state.commitment_root();
+        let hash8 = a.chain().main_chain_hash_at(8).expect("height 8");
+        let cp = Checkpoint::new(8, hash8, hash8);
+        let votes: Vec<Vote> = validators[..15].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert!(matches!(a.ingest_checkpoint_votes(&cp, &votes), VotesOutcome::Learned { finalized: true, .. }));
+        let tx = TxEntry::with_placeholder_discovery(
+            b"ok".to_vec(),
+            qlab_devnet::body::TxPublic {
+                anchor: root,
+                nullifiers: vec![[0x71; 32]],
+                commitments: vec![[0x72; 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+            },
+        );
+        a.submit_tx_typed(tx).expect("admitted under local finality 8");
+
+        let retained = a.last_finalized_votes.take();
+        let body = a.assemble_block().expect("candidate").body;
+        assert!(body.finality.is_empty() && body.txs.is_empty(), "no record ⇒ no valid anchor ⇒ no tx");
+
+        a.last_finalized_votes = retained;
+        let body = a.assemble_block().expect("candidate").body;
+        assert!(!body.finality.is_empty());
+        assert_eq!(body.txs.len(), 1, "the block's own record admits the anchor");
+    }
+
+    /// Review M5 on PR #791 (J1's refinement): a fork-branch V6 body is
+    /// **never judged Intrinsic off the tip** — even one its own position
+    /// refuses. The control shows the body really is invalid where it sits
+    /// (its miner, at that parent, gets `AnchorOutsideRecord`); the off-tip
+    /// node answers `Ignored(UNJUDGED)`, uncharged, unbuffered.
+    #[test]
+    fn an_invalid_v6_side_branch_body_is_never_judged_intrinsic_off_the_tip() {
+        let mut a = v6_adapter();
+        let mut b = v6_adapter();
+        b.set_miner_rkm([7; 4]);
+        let empty_root = a.state.commitment_root();
+        for _ in 0..2 {
+            let (h, body) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, body.clone()), IngestOutcome::Accepted);
+            assert_eq!(b.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let (h3, b3) = a.mine_block().expect("mine");
+        assert_eq!(a.ingest_block(h3, b3), IngestOutcome::Accepted);
+
+        // B's sibling at 3 carrying a tx whose anchor no record covers,
+        // re-ground so its header's PoW is real.
+        let cand = b.assemble_block().expect("candidate");
+        let mut body = cand.body;
+        body.txs.push(TxEntry::with_placeholder_discovery(
+            b"ok".to_vec(),
+            qlab_devnet::body::TxPublic {
+                anchor: empty_root,
+                nullifiers: vec![[0x81; 32]],
+                commitments: vec![[0x82; 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+            },
+        ));
+        let mut header = cand.header;
+        header.tx_body_commitment = body.commitment_v6();
+        let seed = qlab_devnet::validation::pow_seed(&b.chain, &header.prev, header.height, b.schedule).expect("seed");
+        while !qlab_devnet::pow::satisfies_target_for(
+            &KeccakPow.pow_hash(GenesisForm::V5, &header, &seed),
+            header.difficulty,
+            GenesisForm::V5,
+        ) {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        // Control: at its own position the body is intrinsically invalid.
+        assert_eq!(
+            b.state.validate_block_v6(&header, &body, &MockVerifier),
+            Err(BodyError::AnchorOutsideRecord { index: 0 })
+        );
+        // Off A's tip: not judged — never Rejected, never charged, never buffered.
+        let out = a.ingest_block(header, body);
+        assert_eq!(out, IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON));
+        assert!(!out.is_peer_fault());
+        assert!(a.pending_bodies.is_empty());
+    }
 }

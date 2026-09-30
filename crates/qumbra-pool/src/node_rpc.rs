@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use qlab_devnet::body::CoinbasePayee;
-use qlab_devnet::forms::GenesisForm;
+use qlab_devnet::forms::{BodySections, GenesisForm};
 use serde::{Deserialize, Serialize};
 
 use crate::hexutil;
@@ -33,7 +33,13 @@ const CONTEXT_PATH: &str = "/v1/mine/context";
 const BLOCK_PATH: &str = "/v1/mine/block";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct MineTemplateContextWire { form: String, height: u64 }
+struct MineTemplateContextWire {
+    form: String,
+    height: u64,
+    /// `"v6"` from a V6 node (lab #785), absent otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sections: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MineTemplateWire {
@@ -48,6 +54,12 @@ struct MineTemplateWire {
     next_seed_hash: Option<String>,
     coinbase_payees: Vec<CoinbasePayeeWire>,
     txs: Vec<String>,
+    /// V6 only (lab #785): the node's finality record, hex; absent on V4/V5.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    finality: String,
+    /// `"v6"` on a V6 node (lab #785): the template's section axis, echoed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sections: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,13 +68,24 @@ struct MineBlockWire {
     header: String,
     coinbase_payees: Vec<CoinbasePayeeWire>,
     txs: Vec<String>,
+    /// V6 only (lab #785): echoed from the template — the header commits it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    finality: String,
+    /// `"v6"` on a V6 node (lab #785): the template's section axis, echoed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sections: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CoinbasePayeeWire { rkm: String, amount: u64 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MineTemplateContext { pub form: GenesisForm, pub height: u64 }
+pub struct MineTemplateContext {
+    pub form: GenesisForm,
+    pub height: u64,
+    /// The node's body-section axis (lab #785): keys the payee cap.
+    pub sections: BodySections,
+}
 
 /// HTTP client for one node RPC base (`http://host:port`).
 #[derive(Clone, Debug)]
@@ -100,6 +123,7 @@ impl NodeRpcClient {
         Ok(MineTemplateContext {
             form: parse_form(&wire.form).map_err(|e| e.to_string())?,
             height: wire.height,
+            sections: parse_sections(&wire.sections).map_err(|e| e.to_string())?,
         })
     }
 
@@ -173,12 +197,7 @@ impl BlockSubmitter for NodeRpcClient {
                 return Err("a pool mines PoW blocks; an Annulet (sequencer) net has none (lab #706)".into());
             }
         };
-        let wire = MineBlockWire {
-            form: form_s.into(),
-            header: hexutil::encode(header_preimage),
-            coinbase_payees: payees_to_wire(&body.coinbase_payees),
-            txs: body.txs.iter().map(|t| hexutil::encode(t)).collect(),
-        };
+        let wire = block_wire(form_s, header_preimage, body);
         let json = serde_json::to_vec(&wire).map_err(|e| e.to_string())?;
         let (status, resp) = self.request("POST", BLOCK_PATH, Some(&json))?;
         if status.contains("202") || status.contains("200") {
@@ -234,6 +253,32 @@ impl TemplateSource for NodeRpcTemplateSource {
     }
 }
 
+/// The `POST /v1/mine/block` body for a completed header and its template
+/// body — the V6 record echoed back (lab #785), absent on V4/V5.
+fn block_wire(form_s: &str, header_preimage: &[u8], body: &TemplateBody) -> MineBlockWire {
+    MineBlockWire {
+        form: form_s.into(),
+        header: hexutil::encode(header_preimage),
+        coinbase_payees: payees_to_wire(&body.coinbase_payees),
+        txs: body.txs.iter().map(|t| hexutil::encode(t)).collect(),
+        finality: hexutil::encode(&body.finality),
+        sections: match body.sections {
+            BodySections::V6 => "v6".into(),
+            BodySections::None => String::new(),
+        },
+    }
+}
+
+/// The section token a node sends (lab #785): `"v6"` or absent. Anything
+/// else is refused by name — a pool must not guess a body shape.
+fn parse_sections(s: &str) -> Result<BodySections, TemplateError> {
+    match s {
+        "" => Ok(BodySections::None),
+        "v6" => Ok(BodySections::V6),
+        other => Err(TemplateError::UnknownForm(format!("sections {other}"))),
+    }
+}
+
 fn template_from_wire(w: MineTemplateWire) -> Result<Template, TemplateError> {
     let form = parse_form(&w.form)?;
     let mut header = header_from_parts(
@@ -262,6 +307,8 @@ fn template_from_wire(w: MineTemplateWire) -> Result<Template, TemplateError> {
         body: Some(TemplateBody {
             coinbase_payees,
             txs,
+            finality: hexutil::decode(&w.finality)?,
+            sections: parse_sections(&w.sections)?,
         }),
     })
 }
@@ -301,5 +348,50 @@ mod tests {
         assert_eq!(c.port, 9420);
         assert!(NodeRpcClient::parse("https://x:1").is_err());
         assert!(NodeRpcClient::parse("http://noport").is_err());
+    }
+
+    /// Lab #785: a V6 template's record reaches the pool's body and is echoed
+    /// on submit (the header commits it); a V5 template has none and its
+    /// submit JSON carries no `finality` key at all.
+    #[test]
+    fn the_v6_record_round_trips_through_the_pool_and_v5_stays_unchanged() {
+        let json = |finality: &str| {
+            let extra = if finality.is_empty() { String::new() } else { format!(r#","finality":"{finality}""#) };
+            format!(
+                r#"{{"form":"v5","prev":"{p}","height":1,"timestamp":75,"difficulty":8,"nonce":0,"tx_body_commitment":"{c}","seed_hash":"{s}","next_seed_hash":null,"coinbase_payees":[],"txs":[]{extra}}}"#,
+                p = "11".repeat(32),
+                c = "22".repeat(32),
+                s = "33".repeat(32),
+            )
+        };
+        let v6: MineTemplateWire = serde_json::from_str(&json("0a0b")).unwrap();
+        let t6 = template_from_wire(v6).unwrap();
+        let body6 = t6.body.expect("a node template carries a body");
+        assert_eq!(body6.finality, vec![0x0a, 0x0b]);
+        let v5: MineTemplateWire = serde_json::from_str(&json("")).unwrap();
+        let body5 = template_from_wire(v5).unwrap().body.unwrap();
+        assert!(body5.finality.is_empty());
+
+        let submit = |body: &TemplateBody| block_wire("v5", &[], body);
+        assert!(serde_json::to_string(&submit(&body6)).unwrap().contains(r#""finality":"0a0b""#));
+        assert!(!serde_json::to_string(&submit(&body5)).unwrap().contains("finality"));
+    }
+
+    /// Lab #785, M1: the node's `sections` token reaches the context and the
+    /// template, is echoed on submit, and an unknown token is refused by name.
+    #[test]
+    fn the_sections_token_is_read_echoed_and_never_guessed() {
+        let ctx: MineTemplateContextWire = serde_json::from_str(r#"{"form":"v5","height":9,"sections":"v6"}"#).unwrap();
+        assert_eq!(parse_sections(&ctx.sections).unwrap(), BodySections::V6);
+        let plain: MineTemplateContextWire = serde_json::from_str(r#"{"form":"v5","height":9}"#).unwrap();
+        assert_eq!(parse_sections(&plain.sections).unwrap(), BodySections::None);
+        assert!(parse_sections("v7").is_err());
+        let body = TemplateBody {
+            coinbase_payees: vec![],
+            txs: vec![],
+            finality: vec![],
+            sections: BodySections::V6,
+        };
+        assert!(serde_json::to_string(&block_wire("v5", &[], &body)).unwrap().contains(r#""sections":"v6""#));
     }
 }

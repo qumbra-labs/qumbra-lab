@@ -222,6 +222,21 @@ impl ChainRules {
 mod tests {
     use super::*;
 
+    /// Lab #785 (review M3): format 10 is the V6 net, `(V5, BodySections::V6)`;
+    /// every other served version maps with no sections; unserved stay `None`.
+    #[test]
+    fn format_10_is_v5_with_the_v6_sections_and_nothing_else_carries_them() {
+        assert_eq!(V6_GENESIS_FORMAT_VERSION, 10);
+        assert_eq!(forms_of_genesis_format_version(10), Some((GenesisForm::V5, BodySections::V6)));
+        assert_eq!(forms_of_genesis_format_version(8), Some((GenesisForm::V4, BodySections::None)));
+        assert_eq!(forms_of_genesis_format_version(9), Some((GenesisForm::V5, BodySections::None)));
+        assert_eq!(forms_of_genesis_format_version(32), Some((GenesisForm::Annulet, BodySections::None)));
+        for v in [0u32, 7, 11, 31, 33, u32::MAX] {
+            assert_eq!(forms_of_genesis_format_version(v), None, "{v}");
+        }
+        assert_eq!(GenesisForm::from_genesis_format_version(10), None, "format 10 is not a bare form");
+    }
+
     #[test]
     fn the_default_context_is_v4_v1_0() {
         assert_eq!(ChainRules::default(), ChainRules::V1_0);

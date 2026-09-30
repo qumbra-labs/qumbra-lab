@@ -83,6 +83,17 @@ pub struct MineTemplateWire {
     pub next_seed_hash: Option<String>,
     pub coinbase_payees: Vec<CoinbasePayeeWire>,
     pub txs: Vec<String>,
+    /// **V6 only, additive** (lab #785, the M1 condition on PR #791): `"v6"`
+    /// on a V6 net, absent otherwise — a pool builds its payee list under the
+    /// V6 cap (1) instead of V5's height-keyed one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sections: String,
+    /// **V6 only, additive** (lab #785 F5-3b-2): the finality record's
+    /// canonical bytes as hex, absent from the JSON when empty — so every
+    /// V4/V5 template and block body is byte-identical to before (ruling Q4:
+    /// no RPC version bump; the golden below asserts it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finality: String,
 }
 
 /// JSON body of `POST /v1/mine/block`.
@@ -92,6 +103,17 @@ pub struct MineBlockWire {
     pub header: String,
     pub coinbase_payees: Vec<CoinbasePayeeWire>,
     pub txs: Vec<String>,
+    /// **V6 only, additive** (lab #785, the M1 condition on PR #791): `"v6"`
+    /// on a V6 net, absent otherwise — a pool builds its payee list under the
+    /// V6 cap (1) instead of V5's height-keyed one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sections: String,
+    /// **V6 only, additive** (lab #785 F5-3b-2): the finality record's
+    /// canonical bytes as hex, absent from the JSON when empty — so every
+    /// V4/V5 template and block body is byte-identical to before (ruling Q4:
+    /// no RPC version bump; the golden below asserts it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finality: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +126,11 @@ pub struct CoinbasePayeeWire {
 pub struct MineTemplateContextWire {
     pub form: String,
     pub height: u64,
+    /// **V6 only, additive** (lab #785, the M1 condition on PR #791): `"v6"`
+    /// on a V6 net, absent otherwise — a pool builds its payee list under the
+    /// V6 cap (1) instead of V5's height-keyed one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sections: String,
 }
 
 /// Channels the discovery server uses to reach the run loop.
@@ -129,6 +156,8 @@ impl MineTemplateWire {
             next_seed_hash: c.next_seed_hash.map(|h| hex_encode(&h)),
             coinbase_payees: payees_to_wire(&c.body.coinbase_payees),
             txs: c.body.txs.iter().map(|tx| hex_encode(&encode_tx(tx))).collect(),
+            finality: hex_encode(&c.body.finality),
+            sections: sections_token(c.sections),
         }
     }
 }
@@ -139,14 +168,21 @@ impl MineBlockWire {
         let header_bytes = hex_decode(&self.header).ok_or_else(|| "header: bad hex".to_string())?;
         let header = decode_header(form, &header_bytes).map_err(|e| format!("header: {e:?}"))?;
         let payees = payees_from_wire(&self.coinbase_payees, header.height)?;
-        let cap = match form {
-            GenesisForm::V4 => 1,
-            GenesisForm::V5 => coinbase_payee_cap_v5(header.height),
-            // `parse_form` never yields Annulet (the mining RPC serves only the
-            // PoW forms); the arm is the exhaustive statement of why.
-            GenesisForm::Annulet => {
-                return Err("no mining RPC on an Annulet (sequencer) net (lab #706)".into())
-            }
+        // Lab #785 (M1): a V6 block's payee cap is V6's (1), named by the
+        // `sections` token the template carried; the body rule refuses an
+        // over-cap V6 list regardless — this is the pre-check agreeing with it.
+        let cap = match (form, self.sections.as_str()) {
+            (GenesisForm::V5, "v6") => qlab_devnet::body::COINBASE_PAYEE_CAP_V6,
+            (_, "") => match form {
+                GenesisForm::V4 => 1,
+                GenesisForm::V5 => coinbase_payee_cap_v5(header.height),
+                // `parse_form` never yields Annulet (the mining RPC serves only
+                // the PoW forms); the arm is the exhaustive statement of why.
+                GenesisForm::Annulet => {
+                    return Err("no mining RPC on an Annulet (sequencer) net (lab #706)".into())
+                }
+            },
+            (_, other) => return Err(format!("sections: `{other}` is not a section set on form {}", self.form)),
         };
         if payees.len() > cap {
             return Err(format!(
@@ -160,7 +196,11 @@ impl MineBlockWire {
             let tx = decode_tx(&bytes).map_err(|e| format!("tx[{i}]: {e:?}"))?;
             txs.push(tx);
         }
-        Ok((form, header, BlockBody::new(txs, payees)))
+        let mut body = BlockBody::new(txs, payees);
+        if !self.finality.is_empty() {
+            body.finality = hex_decode(&self.finality).ok_or_else(|| "finality: bad hex".to_string())?;
+        }
+        Ok((form, header, body))
     }
 }
 
@@ -232,6 +272,14 @@ pub fn render_block_outcome(o: &BlockSubmitOutcome) -> (u16, String) {
         }
         BlockSubmitOutcome::Refused { name } => (400, format!("refused: {name}")),
         BlockSubmitOutcome::Unavailable { name } => (503, format!("unavailable: {name}")),
+    }
+}
+
+/// The wire token for the body-section axis (lab #785): `"v6"` or empty.
+pub fn sections_token(sections: qlab_devnet::forms::BodySections) -> String {
+    match sections {
+        qlab_devnet::forms::BodySections::V6 => "v6".into(),
+        qlab_devnet::forms::BodySections::None => String::new(),
     }
 }
 
@@ -308,6 +356,8 @@ mod tests {
             header: header_hex(GenesisForm::V5, &header),
             coinbase_payees: payees_to_wire(&body.coinbase_payees),
             txs: vec![],
+            finality: String::new(),
+            sections: String::new(),
         };
         let json = serde_json::to_string(&wire).unwrap();
         let back: MineBlockWire = serde_json::from_str(&json).unwrap();
@@ -333,5 +383,78 @@ mod tests {
         let hex = rkm_hex(&[1, 2, 3, 4]);
         assert_eq!(hex, "0100000000000000020000000000000003000000000000000400000000000000");
         assert_eq!(rkm_from_hex(&hex).unwrap(), [1, 2, 3, 4]);
+    }
+
+    /// Lab #785 ruling Q4: the V6 `finality` field is additive — no RPC
+    /// version bump — because it is absent from the JSON whenever it is
+    /// empty. Golden: a V5 template's bytes are exactly the pre-V6 shape.
+    #[test]
+    fn a_v5_template_serializes_byte_identically_and_finality_is_additive() {
+        let mut wire = MineTemplateWire {
+            form: "v5".into(),
+            prev: "aa".into(),
+            height: 1,
+            timestamp: 2,
+            difficulty: 3,
+            nonce: 4,
+            tx_body_commitment: "bb".into(),
+            seed_hash: "cc".into(),
+            next_seed_hash: None,
+            coinbase_payees: vec![],
+            txs: vec![],
+            finality: String::new(),
+            sections: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&wire).unwrap(),
+            r#"{"form":"v5","prev":"aa","height":1,"timestamp":2,"difficulty":3,"nonce":4,"tx_body_commitment":"bb","seed_hash":"cc","next_seed_hash":null,"coinbase_payees":[],"txs":[]}"#
+        );
+        wire.finality = "0102".into();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.ends_with(r#","txs":[],"finality":"0102"}"#), "{json}");
+        let back: MineTemplateWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.finality, "0102");
+    }
+
+    /// The submitted block carries the record back into the body.
+    #[test]
+    fn a_submitted_v6_block_decodes_its_finality() {
+        let header = BlockHeader::genesis_for(GenesisForm::V5, 8, 0);
+        let wire = MineBlockWire {
+            form: "v5".into(),
+            header: header_hex(GenesisForm::V5, &header),
+            coinbase_payees: vec![],
+            txs: vec![],
+            finality: "0a0b".into(),
+            sections: String::new(),
+        };
+        let (_, _, body) = wire.decode().unwrap();
+        assert_eq!(body.finality, vec![0x0a, 0x0b]);
+        let bad = MineBlockWire { finality: "zz".into(), ..wire };
+        assert!(bad.decode().is_err());
+    }
+
+    /// Lab #785, M1: a block tagged `sections: "v6"` is pre-checked under the
+    /// V6 payee cap (1) even above V5's 11,520 boundary; untagged, V5's cap
+    /// applies; a token that names no section set is refused.
+    #[test]
+    fn a_v6_tagged_block_is_prechecked_under_the_v6_payee_cap() {
+        let mut header = BlockHeader::genesis_for(GenesisForm::V5, 8, 0);
+        header.height = 11_521;
+        let two = vec![
+            CoinbasePayeeWire { rkm: rkm_hex(&[1; 4]), amount: 1 },
+            CoinbasePayeeWire { rkm: rkm_hex(&[2; 4]), amount: 1 },
+        ];
+        let wire = |sections: &str| MineBlockWire {
+            form: "v5".into(),
+            header: header_hex(GenesisForm::V5, &header),
+            coinbase_payees: two.clone(),
+            txs: vec![],
+            finality: String::new(),
+            sections: sections.into(),
+        };
+        assert!(wire("").decode().is_ok(), "V5 above its boundary allows two");
+        assert!(matches!(wire("v6").decode(), Err(e) if e.contains("cap 1")));
+        assert!(wire("v9").decode().is_err());
     }
 }

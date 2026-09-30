@@ -137,8 +137,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         // Learn only form/height, then make the first template request with an
         // explicit pool-owned payee list. No payee-free template shim exists.
         let context = NodeRpcClient::parse(&url)?.fetch_context()?;
-        let initial_payees = assemble_coinbase(
+        let initial_payees = qumbra_pool::payee::assemble_coinbase_for(
             context.form,
+            context.sections,
             context.height,
             &PplnsWindow::default(),
             &Accounts::default(),
@@ -175,7 +176,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 std::thread::sleep(poll);
                 let polled = live.client().fetch_context()
                     .and_then(|context| pool_poll
-                        .assemble_for(context.form, context.height)
+                        .assemble_for(context.form, context.sections, context.height)
                         .map_err(|e| e.to_string()))
                     .and_then(|coinbase| live.poll(&coinbase.payees()));
                 match polled {

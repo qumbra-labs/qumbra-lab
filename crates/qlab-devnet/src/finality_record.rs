@@ -52,8 +52,10 @@
 //!
 //! ## The anchor rule ([`anchor_ok`])
 //!
-//! A commitment root first reached at height `h` is a valid anchor in block B
-//! at height H iff `h ≤ CR(B)` and `H − h ≤ MAX_ANCHOR_AGE_BLOCKS` — the
+//! A commitment root is a valid anchor in block B at height H iff it was the
+//! commitment root after **some** ancestor height `h` with `h ≤ CR(B)` and
+//! `H − h ≤ MAX_ANCHOR_AGE_BLOCKS` (a root repeats across output-free blocks,
+//! so the height tested is the newest one under the ceiling — review M4) — the
 //! window measured from **B's own height**, never a node's tip, and finality
 //! read from the **record**, never a node's pointer. No record in the
 //! ancestry, no valid anchor. Transaction anchors and a wrapper bundle's
@@ -280,9 +282,12 @@ pub fn recorded_after(prior: Option<u64>, own: Option<&FinalityRecord>) -> Optio
     own.map(|r| r.cp.height).or(prior)
 }
 
-/// **The anchor rule** (module doc): a root first reached at height `root_h`
-/// is a valid anchor in a block at `block_h` whose recorded finality (its own
-/// record included) is `recorded`.
+/// **The anchor rule** (module doc) for one height: a root that was the
+/// commitment root after height `root_h` is a valid anchor in a block at
+/// `block_h` whose recorded finality (its own record included) is `recorded`.
+/// A root held at several heights is valid iff this holds for some one of
+/// them — the newest under the ceiling is the only candidate worth testing
+/// (`body::v6_anchor_ok`, review M4).
 ///
 /// `root_h < block_h` is implied whenever the caller passes a finality its
 /// rules produced (a record names an ancestor, so `recorded < block_h`); the
