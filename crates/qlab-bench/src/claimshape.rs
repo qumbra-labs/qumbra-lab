@@ -51,7 +51,7 @@ pub(crate) fn run_claimshape(power: &str, layout: bool, lane: Option<&str>, pcs:
     }
     let Some(lane) = lane else { return };
     let (name, cfg): (&str, FriCfg) = match lane {
-        "b4" => ("b4/q43/g22/fp16/a16 — the L2 lane (ruled, Q2)", L2_CFG),
+        "b4" => ("b4/q45/g22/fp16/a16 — the L2 lane (frozen, lab #785 F5-2)", L2_CFG),
         "b16" => ("b16/q21/g22/fp16/a16 — the L1 point (comparison)", CONSENSUS_CFG),
         other => {
             eprintln!("claimshape: unknown --lane `{other}`; expected b4|b16");

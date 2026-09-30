@@ -23,6 +23,20 @@ pub const B2_CFG: FriCfg = FriCfg {
     max_log_arity: 4,
 };
 
+/// **b2/q91/g22/fp16/a16** — wrapper version 1's lane, W on the bundle's
+/// composed-security budget (lab #785 F5-2, Larry's Q-L2). A bundle is 18
+/// proofs at K = 16 (16 members, W, the deposit-sum proof), so each needs
+/// 100 + log₂ 18 = 104.17 conjectured bits: q86 gives 86 × 0.910 + 22 =
+/// 100.26, q91 gives 104.81 (q90 would be 103.9). Only version 1 uses it;
+/// [`B2_CFG`] stays M4's interior lane (q86) and the measurement versions'.
+pub const W_V1_CFG: FriCfg = FriCfg {
+    log_blowup: 1,
+    num_queries: 91,
+    grind_bits: 22,
+    log_final_poly_len: 4,
+    max_log_arity: 4,
+};
+
 /// The outer lane a leaf is proven on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Outer {

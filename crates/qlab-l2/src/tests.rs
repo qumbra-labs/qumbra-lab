@@ -3,19 +3,21 @@ use p3_air::symbolic::{get_max_constraint_degree, AirLayout};
 use p3_air::BaseAir;
 use p3_matrix::Matrix;
 
-/// The provisional lane's value (lab #704 ruling: provisional, not frozen —
-/// this lock guards against an *accidental* move; a deliberate one is the
-/// lane review's to make, at [`make_config_l2`]).
+/// The frozen lane's value (lab #785 F5-2, Larry's Q-L2: b4/q45, frozen for
+/// v1). Moving it is a consensus change: the bundle's composed security and
+/// every member proof's bytes follow it.
 #[test]
 fn l2_cfg_provisional_is_value_locked() {
     assert_eq!(L2_CFG_PROVISIONAL.log_blowup, 2);
-    assert_eq!(L2_CFG_PROVISIONAL.num_queries, 43);
+    assert_eq!(L2_CFG_PROVISIONAL.num_queries, 45);
     assert_eq!(L2_CFG_PROVISIONAL.grind_bits, 22);
     assert_eq!(L2_CFG_PROVISIONAL.log_final_poly_len, 4);
     assert_eq!(L2_CFG_PROVISIONAL.max_log_arity, 4);
-    assert_eq!(L2_CFG_PROVISIONAL.label(), "b4/q43/g22/fp16/a16");
-    // 2197-corrected: 43 × 1.853 + 22 = 101.6 ≥ 100; the capacity proxy
-    // (43 × 2 + 22 = 108) is asserted inside make_config_with.
+    assert_eq!(L2_CFG_PROVISIONAL.label(), "b4/q45/g22/fp16/a16");
+    // 2197-corrected: 45 × 1.853 + 22 = 105.39 ≥ 104.17 = 100 + log2(18), the
+    // K = 16 bundle's per-proof budget; the capacity proxy (45 × 2 + 22 =
+    // 112) is asserted inside make_config_with.
+    assert!(45.0 * 1.853 + 22.0 >= 100.0 + 18f64.log2());
     let _ = make_config_l2();
 }
 

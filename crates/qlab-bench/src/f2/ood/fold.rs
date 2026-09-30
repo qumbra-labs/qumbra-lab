@@ -1368,7 +1368,7 @@ pub(in crate::f2::ood) mod tests {
     use p3_matrix::Dimensions;
     use p3_maybe_rayon::prelude::*;
     use qlab_air::l2test::{satisfied, violations_at};
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use crate::f2::F2_LANE;
 
     use super::super::fri_fs::tests::{shared, Shared};
     use super::super::lane::phase_ranges;
@@ -1399,7 +1399,7 @@ pub(in crate::f2::ood) mod tests {
             let sh = shared();
             let ho = handoff();
             let proof = sh.proof;
-            let geom = Geom::new(sh.log_height, &L2_CFG_PROVISIONAL).unwrap();
+            let geom = Geom::new(sh.log_height, &F2_LANE).unwrap();
             let all: Vec<QOpening> = (0..sh.indices.len())
                 .map(|q| QOpening::from_proof(proof, q, &geom).unwrap())
                 .collect();
@@ -1919,7 +1919,7 @@ pub(in crate::f2::ood) mod tests {
     fn fri_folds_accept_a_real_s3_schedule() {
         let (proof, pvs) = crate::f2::s3_proof();
         let shape = qlab_l2::Shape::S;
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let geom = Geom::new(shape.log_height(), &cfg).unwrap();
         assert_eq!(
             (geom.lde, geom.arities.clone(), geom.path.clone()),

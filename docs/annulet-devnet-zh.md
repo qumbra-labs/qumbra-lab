@@ -72,7 +72,7 @@ docker build -f deploy/docker/Dockerfile --target runtime -t qumbra-lab:annulet-
 - **运行时修改注册表。** A2 之前，注册表只在 genesis 里设定。
 - **浏览器或证明页面。** 属于 D1。
 - **防滥用。** 水龙头不要票券也不限流，16 次请求就能把它发空。
-- **lane 是临时的**（`L2_CFG_PROVISIONAL`，A1），这里没有把它定下来。
+- **lane 已冻结在 b4/q45**（`L2_CFG_PROVISIONAL`，lab #785 F5-2，2026-09-30；此前是暂定的 q43）。
 - **乱序的区块体要多等一个重新请求的周期。** 在 Annulet 节点上，父块还没应用的 sealed 区块体不会被暂存，而是当作孤块丢掉，等 `BODY_REQUEST_TIMEOUT_MS` 之后再取一次。测试 (c) 证明它能收敛，但没证明它快。
 - **Phase 0 的性质。** 原文引自 l2-own-circuit-decision §4：
 

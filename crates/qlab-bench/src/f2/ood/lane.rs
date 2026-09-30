@@ -530,7 +530,7 @@ pub(super) mod toy {
     use p3_uni_stark::{prove, verify, Proof, StarkGenericConfig};
     use qlab_air::l2test::violations_at;
     use qlab_consensus::{Config, IS_ZK};
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use crate::f2::F2_LANE;
 
     use crate::f2::price::fri_log_arities;
 
@@ -590,7 +590,7 @@ pub(super) mod toy {
     /// seeded so CI replays the same transcript every run.
     pub(in crate::f2::ood) fn toy_proof(log_height: usize, seed: u64) -> (Proof<Config>, Vec<Val>) {
         let (trace, pvs) = toy_trace(log_height);
-        let config = qlab_consensus::make_config_seeded(&L2_CFG_PROVISIONAL, seed);
+        let config = qlab_consensus::make_config_seeded(&F2_LANE, seed);
         let proof = prove(&config, &Toy, trace, &pvs);
         verify(&config, &Toy, &proof, &pvs).expect("toy hiding proof verifies");
         (proof, pvs)
@@ -606,7 +606,7 @@ pub(super) mod toy {
         Vec<Val>,
     ) {
         let (trace, pvs) = toy_trace(log_height);
-        let config = qlab_consensus::legacy::make_legacy_config_with(&L2_CFG_PROVISIONAL);
+        let config = qlab_consensus::legacy::make_legacy_config_with(&F2_LANE);
         let proof = prove(&config, &Toy, trace, &pvs);
         verify(&config, &Toy, &proof, &pvs).expect("toy non-hiding proof verifies");
         (proof, pvs)
@@ -652,7 +652,7 @@ pub(super) mod toy {
         seed: u64,
     ) -> (Proof<Config>, Vec<Val>) {
         let (trace, pvs) = toy_trace(log_height);
-        let config = qlab_consensus::make_config_seeded(&L2_CFG_PROVISIONAL, seed);
+        let config = qlab_consensus::make_config_seeded(&F2_LANE, seed);
         let proof = prove(&config, &ToyPeriodic, trace, &pvs);
         verify(&config, &ToyPeriodic, &proof, &pvs).expect("periodic toy proof verifies");
         (proof, pvs)
@@ -673,7 +673,7 @@ pub(super) mod toy {
     /// p3-fri `verifier.rs:298-339`), leaving only the tampering itself to
     /// be refused.
     pub(in crate::f2::ood) fn regrind(proof: &mut Proof<Config>, pvs: &[Val], log_height: usize) {
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let mut ch = native_through_f2(proof, pvs, log_height);
         let _fri_alpha: E = ch.sample_algebra_element();
         let fri = &proof.opening_proof.1;
@@ -727,7 +727,7 @@ pub(super) mod toy {
         log_height: usize,
     ) -> Native {
         let o = &proof.opened_values;
-        let mut ch = qlab_l2::make_config_l2().initialise_challenger();
+        let mut ch = crate::f2::f2_config().initialise_challenger();
         ch.observe(Val::from_usize(proof.degree_bits));
         ch.observe(Val::from_usize(log_height));
         ch.observe(Val::ZERO);

@@ -72,7 +72,7 @@ docker build -f deploy/docker/Dockerfile --target runtime -t qumbra-lab:annulet-
 - **Runtime registry changes.** The registry is genesis-only until A2.
 - **An explorer or attestation page.** Those are D1's.
 - **Abuse resistance.** The faucet has no tickets and no rate limit, and 16 requests exhaust it.
-- **The lane is provisional** (`L2_CFG_PROVISIONAL`, A1). Nothing here freezes it.
+- **The lane is frozen at b4/q45** (`L2_CFG_PROVISIONAL`, lab #785 F5-2, 2026-09-30; provisional at q43 until then).
 - **Out-of-order bodies cost a re-ask interval.** A sealed body whose parent is not yet applied is not held for later on an Annulet node: it is dropped as an orphan and fetched again after `BODY_REQUEST_TIMEOUT_MS`. Test (c) shows that this converges, but not that it is fast.
 - **Phase 0 is what it is.** From l2-own-circuit-decision §4, verbatim:
 
