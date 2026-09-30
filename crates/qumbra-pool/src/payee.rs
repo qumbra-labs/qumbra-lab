@@ -295,8 +295,11 @@ pub fn assemble_coinbase_for(
             assemble_coinbase(form, height, window, accounts, pool_rkm)
         }
         qlab_devnet::forms::BodySections::V6 => {
-            if form != GenesisForm::V5 {
-                return Err(AssembleError::NoCoinbaseOnForm(form));
+            // An exhaustive match, not a comparison (the lab #706 lock): the V6
+            // section axis exists only beside V5.
+            match form {
+                GenesisForm::V5 => {}
+                GenesisForm::V4 | GenesisForm::Annulet => return Err(AssembleError::NoCoinbaseOnForm(form)),
             }
             if pool_rkm == [0u64; 4] {
                 return Err(AssembleError::ZeroPoolRkm);
