@@ -2452,7 +2452,8 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         }
         let (form, height) = self.p2p.node_mut().mine_template_context()
             .ok_or_else(|| "assemble-unavailable".to_string())?;
-        Ok(MineTemplateContextWire { form: crate::mine_rpc::form_token(form), height })
+        let sections = crate::mine_rpc::sections_token(self.p2p.node().sections());
+        Ok(MineTemplateContextWire { form: crate::mine_rpc::form_token(form), height, sections })
     }
 
     fn serve_mine_template(&mut self, payees: &[qlab_devnet::body::CoinbasePayee]) -> Result<MineTemplateWire, String> {
@@ -2494,12 +2495,9 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         use qlab_p2p::n1::ChainView;
         let form = self.p2p.node().genesis_form();
         self.nonce = self.nonce.wrapping_add(1);
-        let outcome = self.p2p.announce_block_named_for_payees(
-            header,
-            body.txs,
-            body.coinbase_payees,
-            self.nonce,
-        );
+        // The whole body (lab #785): the V6 template's record is committed in
+        // the header, so it must travel with the block.
+        let outcome = self.p2p.announce_block_body(header, body, self.nonce);
         // Refresh the template cache: a new tip (or a refusal that left the
         // tip alone) must not keep serving a stale job as if it were live.
         self.cached_mine_template = None;
@@ -2799,8 +2797,9 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         match step {
             MineStep::Mined(header, body) => {
                 self.nonce = self.nonce.wrapping_add(1);
-                let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
-                self.p2p.announce_block(header, body.txs, coinbase, rkm, self.nonce);
+                // The whole body (lab #785): a V6 block's finality record
+                // travels with it; V4/V5 bodies announce byte-identically.
+                let _ = self.p2p.announce_block_body(header, body, self.nonce);
                 self.last_mine = Instant::now();
                 true
             }

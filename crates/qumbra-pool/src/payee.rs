@@ -278,6 +278,42 @@ pub fn payee_cap_above(
     }
 }
 
+/// [`assemble_coinbase`] on a net with body sections (lab #785, M1 on PR
+/// #791): V6 is `GenesisForm::V5` with a **native payee cap of 1**
+/// (`COINBASE_PAYEE_CAP_V6`, ruling (b)) — V5's height-keyed cap of 8 above
+/// 11,520 would build a list the V6 body rule refuses.
+pub fn assemble_coinbase_for(
+    form: GenesisForm,
+    sections: qlab_devnet::forms::BodySections,
+    height: u64,
+    window: &PplnsWindow,
+    accounts: &Accounts,
+    pool_rkm: [u64; 4],
+) -> Result<AssembledCoinbase, AssembleError> {
+    match sections {
+        qlab_devnet::forms::BodySections::None => {
+            assemble_coinbase(form, height, window, accounts, pool_rkm)
+        }
+        qlab_devnet::forms::BodySections::V6 => {
+            if form != GenesisForm::V5 {
+                return Err(AssembleError::NoCoinbaseOnForm(form));
+            }
+            if pool_rkm == [0u64; 4] {
+                return Err(AssembleError::ZeroPoolRkm);
+            }
+            let amount = if height == 0 { 0 } else { coinbase_exact(height) };
+            let cap = qlab_devnet::body::COINBASE_PAYEE_CAP_V6;
+            let winner = pick_payees(window, accounts, pool_rkm, cap, amount);
+            // `pick_payees` honours the cap; the Σ-equals-schedule rule is the
+            // V5 one unchanged (V6's cap ≤ V5's post-boundary cap, so the V5
+            // check with the boundary at 0 is exactly the V6 Σ rule).
+            check_scheduled_coinbase_payees_above(Some(0), height, &winner)
+                .map_err(|e| AssembleError::Schedule(format!("{e:?}")))?;
+            Ok(AssembledCoinbase::V5 { payees: winner })
+        }
+    }
+}
+
 /// Assemble the coinbase for `height` under `form`.
 pub fn assemble_coinbase(
     form: GenesisForm,
@@ -450,6 +486,45 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Lab #785, M1 on PR #791: on a V6 node the pool pays ONE winner at
+    /// every height — above V5's 11,520 boundary too, where the same window
+    /// on V5 pays up to eight. Σ still equals the schedule.
+    #[test]
+    fn a_v6_pool_pays_one_winner_where_v5_pays_eight() {
+        let mut accounts = Accounts::default();
+        let mut pairs = Vec::new();
+        for i in 1..=10u64 {
+            let login = format!("miner-{i}");
+            accounts.register(login.clone(), rkm(i));
+            pairs.push((login, i));
+        }
+        let borrowed: Vec<(&str, u64)> =
+            pairs.iter().map(|(login, weight)| (login.as_str(), *weight)).collect();
+        let w = window(&borrowed);
+        let v6 = qlab_devnet::forms::BodySections::V6;
+        for height in [1u64, 11_520, 11_521] {
+            let payees = assemble_coinbase_for(GenesisForm::V5, v6, height, &w, &accounts, rkm(99))
+                .unwrap()
+                .payees();
+            assert_eq!(payees.len(), 1, "height {height}");
+            assert_eq!(payees[0].amount, coinbase_exact(height));
+        }
+        let v5 = assemble_coinbase_for(
+            GenesisForm::V5,
+            qlab_devnet::forms::BodySections::None,
+            11_521,
+            &w,
+            &accounts,
+            rkm(99),
+        )
+        .unwrap();
+        assert_eq!(v5.payees().len(), qlab_devnet::body::COINBASE_PAYEE_CAP_V5);
+        assert!(matches!(
+            assemble_coinbase_for(GenesisForm::V4, v6, 5, &w, &accounts, rkm(99)),
+            Err(AssembleError::NoCoinbaseOnForm(GenesisForm::V4))
+        ));
     }
 
     #[test]
@@ -631,6 +706,8 @@ mod tests {
         let body = crate::template::TemplateBody {
             coinbase_payees: Vec::new(),
             txs: Vec::new(),
+            finality: Vec::new(),
+            sections: qlab_devnet::forms::BodySections::None,
         };
         assert!(check_body_payee(&body, rkm(9), &Accounts::default(), std::iter::empty()).is_ok());
 
@@ -638,6 +715,8 @@ mod tests {
         let minting = crate::template::TemplateBody {
             coinbase_payees: vec![CoinbasePayee { rkm: [0; 4], amount: 1 }],
             txs: Vec::new(),
+            finality: Vec::new(),
+            sections: qlab_devnet::forms::BodySections::None,
         };
         assert_eq!(
             check_body_payee(&minting, rkm(9), &Accounts::default(), std::iter::empty()),

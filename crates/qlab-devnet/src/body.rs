@@ -979,6 +979,17 @@ pub fn check_body_binding_above(
     header: &BlockHeader,
     body: &BlockBody,
 ) -> Result<(), BodyError> {
+    // The v2/v3 preimage holds one payee pair and refuses more by `expect`.
+    // Every binding function refuses an over-cap list by name BEFORE hashing,
+    // so no body — peer-supplied or not — can reach a preimage assert through
+    // one (lab #785 review; pinned by
+    // `no_over_cap_body_reaches_a_preimage_assert_through_any_funnel`).
+    if body.coinbase_payees.len() > COINBASE_PAYEE_CAP_V5_AT_BIRTH {
+        return Err(BodyError::TooManyCoinbasePayees {
+            got: body.coinbase_payees.len(),
+            cap: COINBASE_PAYEE_CAP_V5_AT_BIRTH,
+        });
+    }
     let got = body.commitment_above(boundary, header.height);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch {
@@ -3371,5 +3382,58 @@ mod tests {
         assert!(!v6_anchor_ok(&[3], 50, None), "no record, no anchor");
         assert!(!v6_anchor_ok(&[], 50, Some(16)));
         assert!(!v6_anchor_ok(&[16], 16, Some(16)), "an anchor is below its block");
+    }
+
+    /// 🔒 Lab #785 review on PR #791: **no body can reach a preimage cap
+    /// assert through any validation funnel or binding function.** The
+    /// preimages refuse an over-cap payee list by `assert!`/`expect` (the
+    /// #253 house rule: a release-mode check, not a comment), so an assert
+    /// reachable from the wire would be a crash-on-demand. Every form's
+    /// funnel and every public binding function therefore checks the cap
+    /// first and refuses by name. This walks each one with a list one over
+    /// its cap, at heights on both sides of the V5 boundary, under a header
+    /// committing to nothing in particular — the answer must be the named
+    /// refusal, never a panic.
+    #[test]
+    fn no_over_cap_body_reaches_a_preimage_assert_through_any_funnel() {
+        let payees = |n: usize| {
+            BlockBody::new(
+                vec![],
+                (0..n).map(|i| CoinbasePayee { rkm: [i as u64 + 1; 4], amount: 1 }).collect(),
+            )
+        };
+        let header_at = |h: u64| BlockHeader {
+            height: h,
+            ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, [0x5A; 32])
+        };
+        let cv = Cv { recorded: None, anchor_heights: vec![] };
+        let too_many = |got: usize, cap: usize| Err(BodyError::TooManyCoinbasePayees { got, cap });
+        let b = COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT.expect("stamped");
+        for h in [0, 1, b, b + 1] {
+            let hdr = header_at(h);
+            // V4: one payee pair, at every height.
+            let over4 = payees(COINBASE_PAYEE_CAP_V5_AT_BIRTH + 1);
+            assert_eq!(validate_body(&hdr, &over4, &MockVerifier, is_final), too_many(2, 1), "v4 {h}");
+            assert_eq!(check_body_binding(&hdr, &over4), too_many(2, 1), "v4 binding {h}");
+            // V5: its height-keyed cap, plus one.
+            let cap5 = coinbase_payee_cap_v5(h);
+            let over5 = payees(cap5 + 1);
+            assert_eq!(
+                validate_body_v5(&hdr, &over5, &MockVerifier, is_final, &names::EmptyNameView),
+                too_many(cap5 + 1, cap5),
+                "v5 {h}"
+            );
+            assert_eq!(check_body_binding_v5(&hdr, &over5), too_many(cap5 + 1, cap5), "v5 binding {h}");
+            // V6: native cap 1, and V5's post-boundary maximum is refused too.
+            for n in [2, COINBASE_PAYEE_CAP_V5 + 1] {
+                let over6 = payees(n);
+                assert_eq!(
+                    validate_body_v6(&hdr, &over6, &MockVerifier, &cv, &RefuseAllBundles, &names::EmptyNameView),
+                    too_many(n, 1),
+                    "v6 {h} n={n}"
+                );
+                assert_eq!(check_body_binding_v6(&hdr, &over6), too_many(n, 1), "v6 binding {h} n={n}");
+            }
+        }
     }
 }

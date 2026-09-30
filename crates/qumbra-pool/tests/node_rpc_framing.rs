@@ -88,6 +88,8 @@ fn expected_template(tx_bytes: usize) -> Template {
         body: Some(TemplateBody {
             coinbase_payees: payees(),
             txs: vec![vec![TX_BYTE; tx_bytes]],
+            finality: Vec::new(),
+            sections: qlab_devnet::forms::BodySections::None,
         }),
     }
 }

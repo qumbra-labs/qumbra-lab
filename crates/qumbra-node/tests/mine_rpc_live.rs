@@ -345,6 +345,8 @@ fn live_template_then_submit_advances_tip() {
             header: header_hex(GenesisForm::V5, &header),
             coinbase_payees: wire.coinbase_payees,
             txs: wire.txs,
+            finality: wire.finality,
+            sections: wire.sections,
         };
         let (status, text) = http_post(addr, "/v1/mine/block", &serde_json::to_vec(&post).unwrap());
         assert!(status.contains("202"), "{status} {text}");
@@ -592,6 +594,8 @@ fn template_header_decodes_under_v5() {
         next_seed_hash: None,
         coinbase_payees: vec![CoinbasePayeeWire { rkm: rkm_hex(&RIG_RKM), amount: 1 }],
         txs: vec![],
+        finality: String::new(),
+        sections: String::new(),
     };
     let header = qlab_devnet::header::BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: hex32(&wire.prev),

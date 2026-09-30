@@ -1205,6 +1205,32 @@ mod tests {
         }
     }
 
+    /// Review M3 (lab #785): variant 4 is written only for a block carrying
+    /// a section; a variant-4 record with both empty is a second spelling of
+    /// a variant-0/2 record and is refused by name at read.
+    #[test]
+    fn a_v6_record_with_no_section_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i785-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rec = WireRecord::BlockV6(V6WireBlock {
+            header: annulet_golden_block().header,
+            txs: Vec::new(),
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+            finality: Vec::new(),
+            bundle: Vec::new(),
+        });
+        let bytes = bincode::serialize(&rec).unwrap();
+        let mut f = Vec::new();
+        f.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        f.extend_from_slice(&bytes);
+        fs::write(dir.join(BLOCK_LOG), f).unwrap();
+        let err = read_records(&dir).expect_err("an empty V6 record is refused");
+        assert!(err.to_string().contains("V6 block record with no section"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A seal of any other width is corrupt data, refused by name at read.
     #[test]
     fn an_annulet_record_with_a_short_seal_is_refused_by_name() {

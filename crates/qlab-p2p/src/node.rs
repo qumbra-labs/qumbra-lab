@@ -19,7 +19,7 @@ use crate::codec::{
     encode_inv, encode_locator, evidence_id, tx_id, InvItem, InvKind, InvVec,
 };
 use crate::compact::{
-    decode_announce, decode_get_block_txn, encode_announce, encode_get_block_txn, reconstruct, short_id, BlockAnnounce, BlockTxn, GetBlockTxn, PrefilledTx,
+    decode_announce_for, decode_get_block_txn, encode_announce, encode_announce_for, encode_get_block_txn, reconstruct, short_id, BlockAnnounce, BlockTxn, GetBlockTxn, PrefilledTx,
     Reconstruct,
 };
 use crate::addrman::AddrManager;
@@ -574,6 +574,10 @@ struct ServedBody {
     // the `#[allow(dead_code)]` they carried until now is gone because they are no
     // longer dead.
     coinbase_payees: Vec<CoinbasePayee>,
+    /// The V6 sections (lab #785), empty on every other net — body fields, so
+    /// the cache must hold them to rebuild the exact body.
+    finality: Vec<u8>,
+    bundle: Vec<u8>,
     weight: usize,
 }
 
@@ -636,11 +640,19 @@ impl ServedBodies {
         txs: Vec<TxEntry>,
         coinbase_payees: Vec<CoinbasePayee>,
     ) {
+        self.insert_body(height, hash, BlockBody::new(txs, coinbase_payees))
+    }
+
+    /// [`Self::insert`] from a whole body — the V6 sections included.
+    fn insert_body(&mut self, height: u64, hash: Hash32, body: BlockBody) {
+        let BlockBody { txs, coinbase_payees, finality, bundle } = body;
         // This is the retained body-surface meter, not the V5 wire length. The
         // count byte is an encoding byte; `ServedBody` does not retain it.
         let weight = crate::n1::txs_weight(&txs)
-            + crate::n1::coinbase_payees_weight(&coinbase_payees);
-        let entry = ServedBody { height, txs, coinbase_payees, weight };
+            + crate::n1::coinbase_payees_weight(&coinbase_payees)
+            + finality.len()
+            + bundle.len();
+        let entry = ServedBody { height, txs, coinbase_payees, finality, bundle, weight };
         if let Some(old) = self.by_hash.insert(hash, entry) {
             // Same hash re-completed (e.g. re-announce after restart): replace,
             // do not double-count.
@@ -1457,14 +1469,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         coinbase_payees: Vec<CoinbasePayee>,
         nonce: u64,
     ) -> IngestOutcome {
+        self.announce_block_body(header, BlockBody::new(txs, coinbase_payees), nonce)
+    }
+
+    /// Announce a locally produced block from its **whole body** (lab #785
+    /// F5-3b-2): the V6 sections travel with it. The pre-V6 entry points above
+    /// are this with no sections.
+    pub fn announce_block_body(&mut self, header: BlockHeader, body: BlockBody, nonce: u64) -> IngestOutcome {
         let bh = header.header_hash_for(self.node.genesis_form());
         // Ingest first, and do not put on the wire what our own node rejects
         // (issue #77, the own-announce seam): a locally-produced header/body pair
         // that fails the binding is a local bug, and announcing it would make this
         // node the origin of the very object every peer must penalise.
-        let outcome = self
-            .node
-            .ingest_block(header, BlockBody::new(txs.clone(), coinbase_payees.clone()));
+        let outcome = self.node.ingest_block(header, body.clone());
         // Issue #134 widens this from `Rejected` to `Rejected | Ignored`. `Ignored` now
         // also covers a body whose anchors this node **could not evaluate**, and
         // announcing one would make this node the origin of an object it never
@@ -1477,12 +1494,18 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
             return outcome;
         }
-        self.blocks.insert(header.height, bh, txs.clone(), coinbase_payees.clone());
+        self.blocks.insert_body(header.height, bh, body.clone());
         self.seen.insert(bh);
 
-        let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
-        let ann = BlockAnnounce { seal: None, header, nonce, coinbase_payees, short_ids, prefilled };
-        let payload = encode_announce(self.node.genesis_form(), &ann);
+        let (prefilled, short_ids) = build_announce_parts(&body.txs, nonce);
+        let BlockBody { coinbase_payees, finality, bundle, .. } = body;
+        let ann = BlockAnnounce { seal: None, finality, bundle, header, nonce, coinbase_payees, short_ids, prefilled };
+        // A bundle is not relayable until F5-5 (ruling Q2 on issue #785); the
+        // body rule refuses every bundle today, so ingest above has already
+        // returned for one. Not sending is the only answer either way.
+        let Ok(payload) = encode_announce_for(self.node.wire_form(), &ann) else {
+            return outcome;
+        };
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
         }
@@ -2027,10 +2050,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// refuse them: see that method for the loop this closed on the live net.
     fn body_for_serving(&self, hash: &Hash32) -> Option<BlockBody> {
         if let Some(entry) = self.blocks.get(hash) {
-            return Some(BlockBody::new(
-                entry.txs.clone(),
-                entry.coinbase_payees.clone(),
-            ));
+            return Some(BlockBody {
+                txs: entry.txs.clone(),
+                coinbase_payees: entry.coinbase_payees.clone(),
+                finality: entry.finality.clone(),
+                bundle: entry.bundle.clone(),
+            });
         }
         self.node.held_body(hash)
     }
@@ -2361,8 +2386,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                         let mut served = false;
                         if let Some(b) = body {
                             let ann = whole_block_announce(h.clone(), b);
-                            let bytes = encode_announce(self.node.genesis_form(), &ann);
-                            let cost = bytes.len() as u64;
+                            // Lab #785: a body this net cannot relay (a V6
+                            // bundle before F5-5) degrades to the header like
+                            // every other gate here.
+                            let bytes = encode_announce_for(self.node.wire_form(), &ann).unwrap_or_default();
+                            let cost = if bytes.is_empty() { u64::MAX } else { bytes.len() as u64 };
                             // Charged at the encoded answer size — the number
                             // the peer's inbound limiter will see — against
                             // both the per-message bound and the per-key
@@ -3054,7 +3082,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     // (2) §7 BIP-152 block relay.
     fn on_block_announce(&mut self, from: PeerId, payload: &[u8]) {
-        let ann = match decode_announce(self.node.genesis_form(), payload) {
+        let ann = match decode_announce_for(self.node.wire_form(), payload) {
             Ok(a) => a,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
@@ -3234,7 +3262,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // sequencer net's block goes through its sealed ingest.
         let outcome = self
             .node
-            .ingest_wire_block(ann.wire_header(), BlockBody::new(txs.clone(), ann.coinbase_payees.clone()));
+            .ingest_wire_block(ann.wire_header(), announced_body(&ann, txs.clone()));
         // Orphan-triggered sync kick (M10-T0-1, issue #62 item 6 — the N7 finding):
         // an announced block whose parent is unknown was previously dropped, and
         // gap recovery relied solely on the taller-peer handshake. Instead, kick
@@ -3271,9 +3299,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
-        self.blocks.insert(ann.header.height, bh, txs, ann.coinbase_payees.clone());
+        self.blocks.insert_body(ann.header.height, bh, announced_body(&ann, txs));
         self.seen.insert(bh);
-        let payload = encode_announce(self.node.genesis_form(), &ann);
+        let Ok(payload) = encode_announce_for(self.node.wire_form(), &ann) else {
+            return;
+        };
         for pid in self.peers.ready_peers() {
             if Some(pid) != except {
                 self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -3321,6 +3351,8 @@ where
             short_ids,
             prefilled,
             seal: Some(sealed.sig.clone()),
+            finality: Vec::new(),
+            bundle: Vec::new(),
         };
         let payload = encode_announce(crate::n1::ChainView::genesis_form(&self.node), &ann);
         let peers = self.peers.ready_peers();
@@ -3358,12 +3390,24 @@ where
 /// ids, and there are none. Fixing it rather than inventing one keeps the encoding
 /// a pure function of the block, so two nodes serving the same block serve the
 /// same bytes.
+/// The body an announce describes, given its reconstructed txs (lab #785:
+/// the V6 sections ride the announce itself).
+fn announced_body(ann: &BlockAnnounce, txs: Vec<TxEntry>) -> BlockBody {
+    BlockBody {
+        txs,
+        coinbase_payees: ann.coinbase_payees.clone(),
+        finality: ann.finality.clone(),
+        bundle: ann.bundle.clone(),
+    }
+}
+
 fn whole_block_announce(wire: crate::codec::WireHeader, body: BlockBody) -> BlockAnnounce {
     let (header, seal) = match wire {
         crate::codec::WireHeader::L1(h) => (h, None),
         crate::codec::WireHeader::Sealed(s) => (s.header, Some(s.sig)),
     };
     let coinbase_payees = body.coinbase_payees;
+    let (finality, bundle) = (body.finality, body.bundle);
     let prefilled = body
         .txs
         .into_iter()
@@ -3377,6 +3421,8 @@ fn whole_block_announce(wire: crate::codec::WireHeader, body: BlockBody) -> Bloc
         coinbase_payees,
         short_ids: Vec::new(),
         prefilled,
+        finality,
+        bundle,
     }
 }
 
@@ -4601,7 +4647,7 @@ mod tests {
         let bh = header.header_hash();
         // …announced with no transactions at all (fully-prefilled, empty).
         let (prefilled, short_ids) = build_announce_parts(&[], 0xBEEF);
-        let ann = BlockAnnounce { seal: None,
+        let ann = BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header,
             nonce: 0xBEEF,
             coinbase_payees: Vec::new(),
@@ -4934,7 +4980,7 @@ mod tests {
         }
         assert!(!b.blocks.contains(&bh));
         let (prefilled, short_ids) = build_announce_parts(&txs, 0xC0DE);
-        let ann = BlockAnnounce { seal: None,
+        let ann = BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header,
             nonce: 0xC0DE,
             coinbase_payees: Vec::new(),
@@ -6318,5 +6364,24 @@ mod tests {
             );
             assert_eq!(nodes[1].node().chain().tip_height(), 0, "nor was the header taken");
         }
+    }
+
+    /// Ruling Q2 on issue #785, the served-body half: `GetData(Block)` answers
+    /// with `whole_block_announce` encoded under the node's wire form, so a
+    /// body carrying a bundle cannot be encoded there either — the serve path
+    /// then degrades to the header like its other gates. A record alone serves.
+    #[test]
+    fn the_served_body_frame_refuses_a_bundle_and_carries_a_record() {
+        use crate::compact::{decode_announce_for, encode_announce_for, AnnounceEncodeError, WireForm};
+        let header = BlockHeader::genesis_for(qlab_devnet::forms::GenesisForm::V5, 8, 0);
+        let mut body = BlockBody::new(vec![], vec![]);
+        body.finality = vec![0x5A; 64];
+        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body.clone());
+        let bytes = encode_announce_for(WireForm::V6, &ann).expect("a record is relayable");
+        assert_eq!(decode_announce_for(WireForm::V6, &bytes).unwrap().finality, body.finality);
+
+        body.bundle = vec![1];
+        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body);
+        assert_eq!(encode_announce_for(WireForm::V6, &ann), Err(AnnounceEncodeError::BundleNotRelayable));
     }
 }

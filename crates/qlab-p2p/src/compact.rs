@@ -26,7 +26,48 @@ use crate::codec::{
     decode_tx_for, decode_wire_header, encode_tx_for, encode_wire_header, header_msg_len, tx_id, DecodeError,
     Reader, WireHeader,
 };
-use qlab_devnet::forms::GenesisForm;
+use qlab_devnet::forms::{BodySections, GenesisForm};
+
+/// The key the **body** codecs are selected by (lab #785 F5-3b-2): the genesis
+/// form plus the body-section axis. Only bodies differ on V6, so header and
+/// tx codecs keep taking [`GenesisForm`] alone; this type reaches exactly the
+/// codecs that carry a body (the announce, which is also the served-body
+/// frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireForm {
+    pub form: GenesisForm,
+    pub sections: BodySections,
+}
+
+impl WireForm {
+    /// A net without body sections — every V4, V5 and Annulet net.
+    pub const fn plain(form: GenesisForm) -> Self {
+        WireForm { form, sections: BodySections::None }
+    }
+
+    /// The V6 net: `(V5, BodySections::V6)`.
+    pub const V6: WireForm = WireForm { form: GenesisForm::V5, sections: BodySections::V6 };
+}
+
+impl From<GenesisForm> for WireForm {
+    fn from(form: GenesisForm) -> Self {
+        WireForm::plain(form)
+    }
+}
+
+/// Why an announce could not be encoded (lab #785 F5-3b-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnounceEncodeError {
+    /// The body carries a wrapper bundle. A bundle (≤ ≈ 8.32 MB) does not fit
+    /// beside the rest of a frame under today's `MAX_PAYLOAD`; F5-5 raises the
+    /// frame together with the backlog caps as one change. Until then no node
+    /// produces a bundle-carrying announce it could not send — and every
+    /// bundle is refused by the body rule anyway (`RefuseAllBundles`).
+    BundleNotRelayable,
+    /// A section on a net whose bodies have none (a program error upstream:
+    /// such a body cannot have passed validation).
+    SectionOnForm,
+}
 
 /// Project a list into the byte-frozen v4 announce pair.
 fn single_payee_parts(payees: &[CoinbasePayee]) -> Option<(u64, [u64; 4])> {
@@ -100,6 +141,13 @@ pub struct BlockAnnounce {
     /// net (lab #708), where the announce carries the 3,462-B sealed header
     /// in place of the L1 header; `None` on every L1 announce.
     pub seal: Option<Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]>>,
+    /// **V6 only** (lab #785): the finality record's canonical bytes, empty
+    /// when absent. On the wire as `varint len ‖ bytes` after the coinbase
+    /// section; absent from every other form's frame.
+    pub finality: Vec<u8>,
+    /// **V6 only**: the wrapper bundle's bytes, empty when absent. Never
+    /// encoded until F5-5 ([`AnnounceEncodeError::BundleNotRelayable`]).
+    pub bundle: Vec<u8>,
 }
 
 /// A request for the transactions a peer could not reconstruct, by index.
@@ -139,9 +187,29 @@ impl BlockAnnounce {
 // (`qlab_note::compact::*_with_width`) at body validation, keyed on the form
 // (`GenesisForm::discovery_payload_len`). The frame needed no edit.
 
-/// Encode a `BlockAnnounce`.
+/// Encode a `BlockAnnounce` on a net without body sections. The V4, V5 and
+/// Annulet frames are byte-identical to before lab #785 (goldens below).
+///
+/// # Panics
+///
+/// On an announce carrying a V6 section — a sectioned body belongs to
+/// [`encode_announce_for`].
 pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
-    encode_announce_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, form, a)
+    encode_announce_for(WireForm::plain(form), a).expect("a sectionless announce always encodes")
+}
+
+/// Encode a `BlockAnnounce` under its [`WireForm`] (lab #785 F5-3b-2): the V6
+/// frame appends `varint len ‖ finality ‖ varint len ‖ bundle` after the
+/// coinbase section, and refuses a bundle by name until F5-5.
+pub fn encode_announce_for(wf: WireForm, a: &BlockAnnounce) -> Result<Vec<u8>, AnnounceEncodeError> {
+    match wf.sections {
+        BodySections::None if !a.finality.is_empty() || !a.bundle.is_empty() => {
+            return Err(AnnounceEncodeError::SectionOnForm)
+        }
+        BodySections::V6 if !a.bundle.is_empty() => return Err(AnnounceEncodeError::BundleNotRelayable),
+        _ => {}
+    }
+    Ok(encode_announce_inner(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, wf, a))
 }
 
 /// [`encode_announce`] with the V5 payee-cap boundary injected for drills.
@@ -150,6 +218,12 @@ pub fn encode_announce_above(
     form: GenesisForm,
     a: &BlockAnnounce,
 ) -> Vec<u8> {
+    assert!(a.finality.is_empty() && a.bundle.is_empty(), "sections belong to encode_announce_for (lab #785)");
+    encode_announce_inner(payee_boundary, WireForm::plain(form), a)
+}
+
+fn encode_announce_inner(payee_boundary: Option<u64>, wf: WireForm, a: &BlockAnnounce) -> Vec<u8> {
+    let form = wf.form;
     let mut out = Vec::new();
     out.extend_from_slice(&encode_wire_header(form, &a.wire_header()));
     out.extend_from_slice(&a.nonce.to_le_bytes());
@@ -173,7 +247,7 @@ pub fn encode_announce_above(
             // The v5 payee-list form (lab #470 stage 2): count ‖ [rkm ‖
             // amount]×N, mirroring the v5 body-preimage tail — the total is
             // Σ amounts and travels nowhere else on this wire either.
-            let cap = coinbase_payee_cap_v5_above(payee_boundary, a.header.height);
+            let cap = payee_cap(payee_boundary, wf, a.header.height);
             assert!(a.coinbase_payees.len() <= cap);
             out.push(a.coinbase_payees.len() as u8);
             for payee in &a.coinbase_payees {
@@ -183,6 +257,12 @@ pub fn encode_announce_above(
                 out.extend_from_slice(&payee.amount.to_le_bytes());
             }
         }
+    }
+    if wf.sections == BodySections::V6 {
+        write_varint(&mut out, a.finality.len() as u64);
+        out.extend_from_slice(&a.finality);
+        write_varint(&mut out, a.bundle.len() as u64);
+        out.extend_from_slice(&a.bundle);
     }
     write_varint(&mut out, a.short_ids.len() as u64);
     for s in &a.short_ids {
@@ -198,9 +278,24 @@ pub fn encode_announce_above(
     out
 }
 
-/// Decode a `BlockAnnounce`.
+/// The announce's payee cap: V5's height-keyed cap, or V6's native cap.
+fn payee_cap(payee_boundary: Option<u64>, wf: WireForm, height: u64) -> usize {
+    match wf.sections {
+        BodySections::V6 => qlab_devnet::body::COINBASE_PAYEE_CAP_V6,
+        BodySections::None => coinbase_payee_cap_v5_above(payee_boundary, height),
+    }
+}
+
+/// Decode a `BlockAnnounce` on a net without body sections. A V6 frame's
+/// section bytes are trailing bytes here, refused as such.
 pub fn decode_announce(form: GenesisForm, buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
-    decode_announce_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, form, buf)
+    decode_announce_inner(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, WireForm::plain(form), buf)
+}
+
+/// Decode a `BlockAnnounce` under its [`WireForm`] (lab #785 F5-3b-2). A
+/// bundle section decodes (it is bytes); the body rule refuses it.
+pub fn decode_announce_for(wf: WireForm, buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
+    decode_announce_inner(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, wf, buf)
 }
 
 /// [`decode_announce`] with the V5 payee-cap boundary injected for drills.
@@ -209,6 +304,11 @@ pub fn decode_announce_above(
     form: GenesisForm,
     buf: &[u8],
 ) -> Result<BlockAnnounce, DecodeError> {
+    decode_announce_inner(payee_boundary, WireForm::plain(form), buf)
+}
+
+fn decode_announce_inner(payee_boundary: Option<u64>, wf: WireForm, buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
+    let form = wf.form;
     let mut r = Reader::new(buf);
     let hdr_bytes = r.rest(header_msg_len(form), "announce.header")?;
     let (header, seal) = match decode_wire_header(form, &hdr_bytes)? {
@@ -232,7 +332,7 @@ pub fn decode_announce_above(
         }
         GenesisForm::V5 => {
             let count = r.u8("announce.payee_count")? as usize;
-            let cap = coinbase_payee_cap_v5_above(payee_boundary, header.height);
+            let cap = payee_cap(payee_boundary, wf, header.height);
             if count > cap {
                 return Err(DecodeError::TooManyCoinbasePayees {
                     got: count,
@@ -251,6 +351,15 @@ pub fn decode_announce_above(
             payees
         }
     };
+    let (finality, bundle) = if wf.sections == BodySections::V6 {
+        let n = r.varint()? as usize;
+        let finality = r.rest(n, "announce.finality")?;
+        let n = r.varint()? as usize;
+        let bundle = r.rest(n, "announce.bundle")?;
+        (finality, bundle)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let n_short = r.varint()? as usize;
     let mut short_ids = Vec::with_capacity(n_short);
     for _ in 0..n_short {
@@ -266,7 +375,7 @@ pub fn decode_announce_above(
         prefilled.push(PrefilledTx { index, tx: decode_tx_for(form, &tx_bytes)? });
     }
     r.finish()?;
-    Ok(BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled, seal })
+    Ok(BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled, seal, finality, bundle })
 }
 
 // --- GetBlockTxn ---
@@ -436,7 +545,7 @@ mod tests {
 
     #[test]
     fn announce_round_trips() {
-        let a = BlockAnnounce { seal: None,
+        let a = BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header: header(),
             nonce: 0xDEADBEEF,
             coinbase_payees: Vec::new(),
@@ -470,7 +579,7 @@ mod tests {
         let coinbase = tx(0);
         let t1 = tx(1);
         let t2 = tx(2);
-        let a = BlockAnnounce { seal: None,
+        let a = BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header: header(),
             nonce,
             coinbase_payees: Vec::new(),
@@ -494,7 +603,7 @@ mod tests {
         let nonce = 7;
         let t1 = tx(1);
         let t2 = tx(2);
-        let a = BlockAnnounce { seal: None,
+        let a = BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header: header(),
             nonce,
             coinbase_payees: Vec::new(),
@@ -510,7 +619,7 @@ mod tests {
     // ── v5 payee-list announce (lab #470 stage 2) ───────────────────────────
 
     fn sample_announce() -> BlockAnnounce {
-        BlockAnnounce { seal: None,
+        BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header: header(),
             nonce: 0xDEADBEEF,
             coinbase_payees: vec![CoinbasePayee {
@@ -605,7 +714,7 @@ mod tests {
                 body.commitment_v5_above(Some(boundary), height),
             )
         };
-        let a = BlockAnnounce { seal: None,
+        let a = BlockAnnounce { seal: None, finality: Vec::new(), bundle: Vec::new(),
             header,
             nonce: 0,
             coinbase_payees: payees,
@@ -683,6 +792,8 @@ mod tests {
             short_ids: vec![[0xAB; SHORTID_LEN]],
             prefilled: vec![PrefilledTx { index: 0, tx: golden_l1_tx() }],
             seal: None,
+            finality: Vec::new(),
+            bundle: Vec::new(),
         }
     }
 
@@ -696,10 +807,82 @@ mod tests {
         let v5 = encode_announce(GenesisForm::V5, &golden_l1_announce(GenesisForm::V5));
         assert_eq!(hex(&v5), "1111111111111111111111111111111111111111111111111111111111111111050700000000002a000000000000000001000000000000e8030000000000002222222222222222222222222222222222222222222222222222222222222222a659efbeadde00000000010100000000000000020000000000000003000000000000000400000000000000881300000000000001abababababab01009001010101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040007000000000000000270660100");
         for (form, bytes) in [(GenesisForm::V4, &v4), (GenesisForm::V5, &v5)] {
+            // Lab #785: the whole-body path (`announce_block_body`) encodes
+            // through `encode_announce_for` under a sectionless wire form —
+            // the same pinned bytes.
+            assert_eq!(
+                encode_announce_for(WireForm::plain(form), &golden_l1_announce(form)).unwrap(),
+                *bytes,
+                "{form:?} via encode_announce_for"
+            );
             let back = decode_announce(form, bytes).unwrap();
             assert!(back.seal.is_none());
             assert_eq!(encode_announce(form, &back), *bytes, "{form:?} round trip");
         }
+    }
+
+    /// Lab #785 F5-3b-2: the V6 frame is the V5 frame with the two section
+    /// varints (and their bytes) after the coinbase section — so a V6
+    /// announce with both sections absent is the V5 frame plus exactly two
+    /// zero bytes at that point. The V4/V5 goldens above are unmoved.
+    #[test]
+    fn the_v6_announce_frame_is_v5_plus_its_sections() {
+        let mut a = golden_l1_announce(GenesisForm::V5);
+        let v5 = encode_announce(GenesisForm::V5, &a);
+        let v6_empty = encode_announce_for(WireForm::V6, &a).unwrap();
+        // header ‖ nonce 8 ‖ payee count 1 ‖ one payee (rkm 32 + amount 8): the sections go here.
+        let at = header_msg_len(GenesisForm::V5) + 8 + 1 + 40;
+        let mut expect = v5[..at].to_vec();
+        expect.extend_from_slice(&[0, 0]);
+        expect.extend_from_slice(&v5[at..]);
+        assert_eq!(v6_empty, expect);
+
+        a.finality = vec![0x5A; 300];
+        let v6 = encode_announce_for(WireForm::V6, &a).unwrap();
+        let back = decode_announce_for(WireForm::V6, &v6).unwrap();
+        assert_eq!(back.finality, a.finality);
+        assert!(back.bundle.is_empty());
+        assert_eq!(encode_announce_for(WireForm::V6, &back).unwrap(), v6, "round trip");
+        // The same bytes under V5: the sections are trailing bytes, refused.
+        assert!(decode_announce(GenesisForm::V5, &v6).is_err());
+        // And a V5 frame under V6 is short by its sections.
+        assert!(decode_announce_for(WireForm::V6, &v5).is_err());
+    }
+
+    /// Ruling Q2 on issue #785: a bundle is refused at encode, by name, until
+    /// F5-5 raises the frame — on every path, since the served-body answer is
+    /// this same frame. A section on a sectionless net is a program error,
+    /// refused likewise.
+    #[test]
+    fn a_bundle_is_not_relayable_until_f5_5() {
+        let mut a = golden_l1_announce(GenesisForm::V5);
+        a.bundle = vec![1];
+        assert_eq!(encode_announce_for(WireForm::V6, &a), Err(AnnounceEncodeError::BundleNotRelayable));
+        a.bundle.clear();
+        a.finality = vec![1];
+        assert_eq!(
+            encode_announce_for(WireForm::plain(GenesisForm::V5), &a),
+            Err(AnnounceEncodeError::SectionOnForm)
+        );
+    }
+
+    /// V6's payee cap is 1 on the wire as in the body rule (ruling (b)).
+    #[test]
+    fn the_v6_announce_refuses_a_second_payee() {
+        let mut a = golden_l1_announce(GenesisForm::V5);
+        a.header.height = 11_521;
+        a.coinbase_payees.push(CoinbasePayee { rkm: [9; 4], amount: 1 });
+        // V5 above its boundary accepts two; the same frame shape under V6 does not.
+        let v5 = encode_announce(GenesisForm::V5, &a);
+        assert!(decode_announce(GenesisForm::V5, &v5).is_ok());
+        let at = header_msg_len(GenesisForm::V5) + 8 + 1 + 80;
+        let mut v6 = v5[..at].to_vec();
+        v6.extend_from_slice(&[0, 0]);
+        v6.extend_from_slice(&v5[at..]);
+        assert!(matches!(
+            decode_announce_for(WireForm::V6, &v6),
+            Err(DecodeError::TooManyCoinbasePayees { got: 2, cap: 1 })
+        ));
     }
 
     /// The Annulet announce (lab #708, served by B2): the 3,462-B sealed
@@ -735,6 +918,8 @@ mod tests {
             short_ids: vec![[0xAB; SHORTID_LEN]],
             prefilled: vec![PrefilledTx { index: 0, tx: tx.clone() }],
             seal: Some(Box::new([0xA5; ANNULET_SIG_LEN])),
+            finality: Vec::new(),
+            bundle: Vec::new(),
         };
         let bytes = encode_announce(GenesisForm::Annulet, &ann);
         let mut expected = String::from("111111111111111111111111111111111111111111111111111111111111111120070000000000000100000000000009000000000000003333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444422222222222222222222222222222222222222222222222222222222222222220000");

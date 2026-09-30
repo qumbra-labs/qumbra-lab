@@ -2039,16 +2039,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // construction — the #402 split, and #786's race, do not exist here.
         if self.sections == BodySections::V6 {
             let _ = gate;
-            let view = V6View { node: &*self, block_height: header.height };
-            qlab_devnet::body::validate_body_v6(
-                &header,
-                &body,
-                verifier,
-                &view,
-                &qlab_devnet::body::RefuseAllBundles,
-                &self.names,
-            )
-            .map_err(NodeError::Body)?;
+            self.validate_block_v6(&header, &body, verifier).map_err(NodeError::Body)?;
             let block = StoredBlock::from_parts(&header, &body);
             let hash = self.apply_state(&block)?;
             if let Some(dir) = &self.dir {
@@ -2100,6 +2091,55 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             persist::append_record(dir, &LogRecord::Block(block)).map_err(NodeError::Io)?;
         }
         Ok(hash)
+    }
+
+    /// The **V6 body verdict** for a block extending this node's applied tip
+    /// (lab #785): the full `validate_body_v6` over the tip's ancestry. The
+    /// relay path asks this before accepting a body at the tip; application
+    /// asks it again inside [`Self::apply_block_gated`]. Only meaningful when
+    /// `header.prev` is the tip — the view IS the tip's ancestry — so any
+    /// other position panics: a verdict there would be read off the wrong
+    /// ancestry.
+    pub fn validate_block_v6<V: TxVerifier>(
+        &self,
+        header: &BlockHeader,
+        body: &BlockBody,
+        verifier: &V,
+    ) -> Result<(), BodyError> {
+        assert_eq!(self.sections, BodySections::V6, "validate_block_v6 on a non-V6 node");
+        assert_eq!(header.prev, self.chain.tip_hash(), "a V6 verdict is defined only at the tip");
+        let view = V6View { node: self, block_height: header.height };
+        qlab_devnet::body::validate_body_v6(
+            header,
+            body,
+            verifier,
+            &view,
+            &qlab_devnet::body::RefuseAllBundles,
+            &self.names,
+        )
+    }
+
+    /// Would `record` pass the V6 record rule in the **next** block on this
+    /// node's applied tip (lab #785 ruling Q3)? The miner's self-check: a
+    /// record that fails it is omitted, never included. Same view, same
+    /// function the body rule runs, so the answer cannot drift from the rule.
+    pub fn record_passes_at_tip(
+        &self,
+        record: &qlab_devnet::finality_record::FinalityRecord,
+    ) -> Result<(), qlab_devnet::finality_record::RecordError> {
+        use qlab_devnet::body::V6ChainView as _;
+        assert_eq!(self.sections, BodySections::V6, "record_passes_at_tip on a non-V6 node");
+        let view = V6View { node: self, block_height: self.chain.tip_height() + 1 };
+        record.check(view.recorded_finality(), |h| view.ancestor_at(h), view.committee0())
+    }
+
+    /// Would a tx anchored at `root` pass V6's anchor rule in the next block
+    /// on this node's applied tip, given that block's recorded finality
+    /// `recorded` (its own record counted)? The assembler's filter — the
+    /// mempool admits against local finality, which V6 anchors never read.
+    pub fn v6_anchor_ok_at_tip(&self, root: &Hash32, recorded: Option<u64>) -> bool {
+        let heights = self.anchor_heights_by_root.get(root).map_or(&[][..], Vec::as_slice);
+        qlab_devnet::body::v6_anchor_ok(heights, self.chain.tip_height() + 1, recorded)
     }
 
     /// **Apply a sealed Annulet block** (lab #708): the seal was validated by
@@ -3814,13 +3854,25 @@ mod tests {
         };
         let replayed = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).expect("full replay");
         assert_eq!((replayed.tip_hash(), replayed.recorded_finality()), (tip, Some(8)));
+        assert_eq!(replayed.recovery_report().snapshot_height, None, "no snapshot yet: a full replay");
         replayed.save_snapshot().unwrap();
-        let resumed = MemNode::open_v6(&dir, genesis, c0.clone()).expect("snapshot resume");
+        let mut resumed = MemNode::open_v6(&dir, genesis.clone(), c0.clone()).expect("snapshot resume");
         assert_eq!(
             persist::snapshot_on_disk(&dir).unwrap(),
             persist::SnapshotOnDisk::At { applied_height: 10 }
         );
+        // The snapshot path was actually taken (review M2): nothing replayed,
+        // so the record came from `recompute_recorded`, not from apply_state.
+        assert_eq!(resumed.recovery_report().snapshot_height, Some(10));
+        assert_eq!(resumed.recovery_report().replayed_records, 0);
         assert_eq!((resumed.tip_hash(), resumed.recorded_finality()), (tip, Some(8)));
+        // …and the re-derived record is load-bearing: a post-resume block
+        // spending against the empty root (valid only under the record) applies.
+        let empty_root = MemNode::in_memory_v6(genesis, c0.clone()).commitment_root();
+        let parent = resumed.chain.block(&tip).unwrap().header();
+        let (h11, b11) = v6_block(&parent, vec![tx(empty_root, 0x54)], vec![]);
+        resumed.apply_block(h11, b11, &MockVerifier).expect("anchored under the resumed record");
+        assert_eq!(resumed.tip_height(), 11);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3833,9 +3885,34 @@ mod tests {
         let r = v6_script(&mut node, AnchorGate::Live);
         assert!(r[9].is_ok());
         let at8 = node.ancestor_at(&node.tip_hash(), 8).unwrap().header().header_hash_for(GenesisForm::V5);
+        let block9 = node.ancestor_at(&node.tip_hash(), 9).unwrap().clone();
+        assert!(block9.sections.is_some(), "block 9 carries the record");
         node.rewind_to(at8).unwrap();
         assert_eq!(node.recorded_finality(), None);
         assert_eq!(node.sections(), BodySections::V6);
+        // Re-applying the carrying block restores it (review M3).
+        node.apply_block(block9.header(), block9.body(), &MockVerifier).expect("block 9 re-applies");
+        assert_eq!(node.recorded_finality(), Some(8));
+    }
+
+    /// Review M3: the stored-binding funnel refuses a sectioned block on a
+    /// net without sections, by name, before any hashing under the wrong form.
+    #[test]
+    fn the_stored_binding_refuses_sections_on_a_sectionless_net() {
+        let genesis5 = genesis_block_for(GenesisForm::V5, 8, 0);
+        let body = {
+            let mut b = BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(1), [1; 4]);
+            b.finality = vec![1, 2, 3];
+            b
+        };
+        let header =
+            BlockHeader::child_of_for(GenesisForm::V5, &genesis5.header(), 75, 8, body.commitment_v6());
+        let block = StoredBlock::from_parts(&header, &body);
+        assert!(matches!(
+            check_stored_binding_for(GenesisForm::V5, BodySections::None, &block),
+            Err(NodeError::Body(BodyError::SectionOnForm { .. }))
+        ));
+        assert!(check_stored_binding_for(GenesisForm::V5, BodySections::V6, &block).is_ok());
     }
 
     /// A V6 genesis binds `commitment_v6`, and a V5 node refuses a V6

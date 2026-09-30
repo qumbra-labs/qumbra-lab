@@ -197,6 +197,13 @@ pub trait ChainView {
         qlab_devnet::forms::GenesisForm::V4
     }
 
+    /// The body-codec key (lab #785 F5-3b-2): the genesis form plus the body
+    /// section axis. Defaults to no sections; `NodeAdapter` overrides it from
+    /// its installed rules, beside [`Self::genesis_form`].
+    fn wire_form(&self) -> crate::compact::WireForm {
+        crate::compact::WireForm::plain(self.genesis_form())
+    }
+
     /// The header named by `hash` as its **message unit** (lab #708): the
     /// bare header on an L1 net; the sealed header on an Annulet net, whose
     /// headers never travel without their seal. `None` when this node cannot
