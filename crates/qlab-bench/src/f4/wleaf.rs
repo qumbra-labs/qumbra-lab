@@ -11,7 +11,7 @@
 //!              levels 2..31 (60): the four roots as one aligned subtree,
 //!              its old side the empty subtree zeros[2] (aa_next ≡ 0 mod 4)
 //!     history  C_in appended to CH (64)
-//!   slot ×k (661 perms):
+//!   slot ×k (662 perms):
 //!     F3's slot    SD 6 | inserts 3 × 131 | appends 2 × 64 | registry 33
 //!     vPublic ×2   old leaf, new leaf, supply pair path (34 each; P only)
 //!     exits ×2     the exit chain's steps (P redeems on asset 0)

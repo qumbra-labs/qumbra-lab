@@ -131,14 +131,14 @@ comparisons, and passing them is not a claim of full recursive verification.
 ## R-PV (F2b-3): option (c) on every leaf PV group
 
 Ruled on issue #750 (R-PV and its addendum). **C1 exposes every inner leaf PV unchanged**
-as its own public values `[0, pv_len)`: 116 for S3, 128 for P3, 101 for R. No group is
+as its own public values `[0, pv_len)`: 116 for S3, 144 for P3 (128 before F5-4d added the exit recipient, lab #785), 101 for R. No group is
 compressed. No inner PV is hashed, summed or folded into another value. So option (c)
 covers every group:
 
 | shape | exposed groups (all of them) | compressed |
 |---|---|---|
 | S3 | anchor, nf1, nf2, cm1, cm2, fee, registry_root, nf3 | none |
-| P3 | S3's first seven, vp1/vp2 (sign, amount, asset), nf3 | none |
+| P3 | S3's first seven, vp1/vp2 (sign, amount, asset), nf3, xrkm (F5-4d) | none |
 | R | anchor, nf, cm, fee, old_root, new_root, asset, cm_seed | none |
 
 C1 does **not** range-check them. Only two constraint groups read an inner-PV cell:

@@ -465,6 +465,7 @@ where
             .map_err(|err| BodyError::L2SurfaceMalformed { index: i, err })?
             .ok_or(BodyError::L2SurfaceMissing { index: i })?;
         check_l2_arity(&tx.public, surface.shape, i)?;
+        check_l2_no_exit(&surface, i)?;
         if Some(surface.registry_root) != pre_root {
             return Err(BodyError::L2RegistryRootStale { index: i });
         }
@@ -525,6 +526,19 @@ pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: 
             L2ShapeTag::S | L2ShapeTag::P => BodyError::L2WrongArity { index },
             L2ShapeTag::R => BodyError::L2RegistryWriteArity { index },
         });
+    }
+    Ok(())
+}
+
+/// Lab #785 F5-4d: an asset-0 redeem is shape P's exit edge, and only a
+/// wrapper bundle (V6) pays an exit on L1. The Annulet has no bridge, so it
+/// refuses one by name — as it does a nonzero recipient, which the circuit
+/// allows only on an exit. The one rule the body check and the mempool both
+/// apply.
+pub fn check_l2_no_exit(surface: &L2Surface, index: usize) -> Result<(), BodyError> {
+    let exits = surface.vpublic.iter().flatten().any(|t| t.redeem && t.asset == 0 && t.amount > 0);
+    if exits || surface.exit_rkm != [0; 32] {
+        return Err(BodyError::L2ExitWithoutBridge { index });
     }
     Ok(())
 }
@@ -820,6 +834,26 @@ mod tests {
         cheap.public.fee = FEES.tier_s;
         let body = BlockBody::new(vec![cheap], vec![]);
         assert_eq!(check_at(&body, new), Err(BodyError::WrongFee { index: 0, expected: FEES.tier_r, got: FEES.tier_s }));
+    }
+
+    /// Lab #785 F5-4d (pre-review U6): the Annulet refuses the exit edge by
+    /// name — an asset-0 redeem, or a recipient without one — while a redeem
+    /// of another asset still passes.
+    #[test]
+    fn an_exit_is_refused_on_the_annulet_by_name() {
+        let t = |redeem, amount, asset| VPublicTerm { redeem, amount, asset };
+        let exit = L2Surface { vpublic: Some([VPublicTerm::NONE, t(true, 10, 0)]), exit_rkm: [0xE7; 32], ..p_surface() };
+        let body = BlockBody::new(vec![l2_tx(1, &s_surface()), l2_tx(9, &exit)], vec![]);
+        assert_eq!(check(&body), Err(BodyError::L2ExitWithoutBridge { index: 1 }));
+        assert_eq!(check_l2_no_exit(&exit, 1), Err(BodyError::L2ExitWithoutBridge { index: 1 }));
+        let no_rkm = L2Surface { exit_rkm: [0; 32], ..exit };
+        assert_eq!(check_l2_no_exit(&no_rkm, 0), Err(BodyError::L2ExitWithoutBridge { index: 0 }));
+        let stray = L2Surface { exit_rkm: [0xE7; 32], ..p_surface() };
+        assert_eq!(check_l2_no_exit(&stray, 0), Err(BodyError::L2ExitWithoutBridge { index: 0 }));
+        let other = L2Surface { vpublic: Some([t(true, 10, 7), VPublicTerm::NONE]), ..p_surface() };
+        assert_eq!(check_l2_no_exit(&other, 0), Ok(()));
+        assert_eq!(check_l2_no_exit(&p_surface(), 0), Ok(()));
+        assert_eq!(check_l2_no_exit(&s_surface(), 0), Ok(()));
     }
 
     #[test]

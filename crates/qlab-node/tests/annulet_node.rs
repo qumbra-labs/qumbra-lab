@@ -492,6 +492,19 @@ fn the_annulet_mempool_refuses_a_stale_root_and_an_uncovered_redeem() {
     assert!(pool.admit(p_tx(&n, 13, redeem(40, 7)), &n, &OkProof, &EmptyNameView).is_ok(), "60 + 40 = 100");
 }
 
+/// Lab #785 F5-4d (pre-review U6): the pool refuses the exit edge — an
+/// asset-0 redeem — by name before any supply arithmetic; the Annulet has no
+/// bridge to pay it.
+#[test]
+fn the_annulet_mempool_refuses_an_exit_by_name() {
+    let (n, _g) = node();
+    let mut pool = Mempool::new(MempoolParams::default());
+    assert!(matches!(
+        pool.admit(p_tx(&n, 3, redeem(10, 0)), &n, &OkProof, &EmptyNameView),
+        Err(MempoolError::L2SurfaceInvalid(BodyError::L2ExitWithoutBridge { index: 0 }))
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Lab #728 (B3b): registry writes are chain state; genesis supply is
 // outstanding from height 0.

@@ -2604,6 +2604,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::L2RegistryWriteArity { .. }
             | BodyError::L2SecondRegistryWrite { .. }
             | BodyError::L2RegistryWriteRootMismatch { .. }
+            // Lab #785 F5-4d: an exit on the Annulet — the surface alone says so.
+            | BodyError::L2ExitWithoutBridge { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
             | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #785 F5-3b, the V6 form. A section on the wrong form reads

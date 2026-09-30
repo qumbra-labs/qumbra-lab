@@ -107,13 +107,13 @@ opening、被消费的公共值、alpha 和 zeta。这些是算术组件检查�
 ## R-PV（F2b-3）：所有叶子 PV 分组都走 (c)
 
 依据 issue #750 的 R-PV 裁定及其补充。**C1 把内层叶子的全部 PV 原样暴露**为自己的公共值
-`[0, pv_len)`：S3 116 个，P3 128 个，R 101 个。没有任何分组被压缩，也没有哪个内层 PV
+`[0, pv_len)`：S3 116 个，P3 144 个（F5-4d 加入退出收款人之前是 128 个，lab #785），R 101 个。没有任何分组被压缩，也没有哪个内层 PV
 被哈希、求和或并入别的值。因此 (c) 覆盖全部分组：
 
 | shape | 暴露的分组（全部） | 压缩的分组 |
 |---|---|---|
 | S3 | anchor、nf1、nf2、cm1、cm2、fee、registry_root、nf3 | 无 |
-| P3 | S3 的前七组、vp1/vp2（sign、amount、asset）、nf3 | 无 |
+| P3 | S3 的前七组、vp1/vp2（sign、amount、asset）、nf3、xrkm（F5-4d） | 无 |
 | R | anchor、nf、cm、fee、old_root、new_root、asset、cm_seed | 无 |
 
 C1 **不**做范围检查。读取内层 PV 单元的约束只有两组：`bind_inner_pv`（PV = R⁻¹ · 吸收的

@@ -3959,6 +3959,26 @@ mod tests {
         assert_sat(&row2, "an exit on row 2");
     }
 
+    /// Lab #785 F5-4d forgeries (pre-review U5). (1) A redeem of Cloaked
+    /// asset 5 whose `z` claims asset 0 — everything else an exit would
+    /// carry is consistent (recipient named, balance holds) — is refused by
+    /// the close binding `leaf_asset · z = 0`. (2) A MINT of asset 0 carrying
+    /// a recipient: `s = 0` keeps the Cloaked gate shut and `XE = 0`, so both
+    /// the gate and `(1 − XE)·xrkm` refuse it.
+    #[test]
+    fn l2p_neg_exit_forgeries() {
+        // 100 (0) + 50 (5) → 90 (0) + 40 (5) + fee 10, redeeming 10 of asset 5.
+        let vp = [VPublic::NONE, VPublic::redeem(10)];
+        let honest_shape = bucket_exit(0xe417_0007, [(100, 0), (50, 5)], [(90, 0), (40, 5)], 10, vp, [0; 4]);
+        assert_unsat(&honest_shape, "a redeem of Cloaked asset 5");
+        let mut z_lie = bucket_exit(0xe417_0007, [(100, 0), (50, 5)], [(90, 0), (40, 5)], 10, vp, EXIT_TO);
+        z_lie.air.asset[1] = 0; // the trace fill now writes z = 1 on row 2
+        assert_unsat(&z_lie, "z = 1 on a non-zero asset (a forged exit)");
+        // 100 (0) + 50 (7) → 100 (0) + 50 (7) + fee 10, minting 10 of asset 0.
+        let mint = bucket_exit(0xe417_0008, [(100, 0), (50, 7)], [(100, 0), (50, 7)], 10, [VPublic::mint(10), VPublic::NONE], EXIT_TO);
+        assert_unsat(&mint, "a mint of asset 0 carrying a recipient");
+    }
+
     /// Lab #785 F5-4d: the recipient is canonical — nonzero exactly when the
     /// transaction exits. An exit to the zero recipient, a non-exit carrying
     /// one, and a zero-amount asset-0 "redeem" (no exit) carrying one are

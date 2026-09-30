@@ -364,7 +364,7 @@ mod tests {
 
     /// One real round trip on the lane: a one-transaction leaf proven on the
     /// decided outer lane (b2, non-hiding) and verified natively; a PV moved
-    /// after proving is refused. [P] ≈ 0.5 GiB (k-model at 2^14 × 3,224).
+    /// after proving is refused. [P] ≈ 0.5 GiB (k-model at 2^14 × 3,225).
     #[test]
     fn f3leaf_proves_and_verifies_at_b2() {
         let fx = fixture(&[L2ShapeTag::P], SEED);

@@ -608,6 +608,8 @@ impl Mempool {
                     .ok_or(MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMissing { index: 0 }))?;
                 qlab_devnet::annulet::check_l2_arity(&entry.public, surface.shape, 0)
                     .map_err(MempoolError::L2SurfaceInvalid)?;
+                // Lab #785 F5-4d: no bridge here — the body rule's twin.
+                qlab_devnet::annulet::check_l2_no_exit(&surface, 0).map_err(MempoolError::L2SurfaceInvalid)?;
                 // Lab #712: the surface names the registry root the next
                 // block's parent (this tip) carries — the body rule's twin.
                 let root = state
