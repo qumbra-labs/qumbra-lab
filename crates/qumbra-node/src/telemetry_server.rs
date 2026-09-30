@@ -128,6 +128,10 @@ fn ready_body(ready: bool, replay: Option<qlab_node::ReplayPosition>) -> String 
     }
 }
 
+/// The `/v1/supply/bridge` slot (lab #785 F5-4c-1): `None` ⇒ 404, `Some(Err)`
+/// ⇒ 503 with the ledger's reason, `Some(Ok)` ⇒ the payload.
+pub type BridgeSlot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
+
 /// A running telemetry listener: bound address + worker thread + the shared
 /// snapshot the run loop refreshes + the readiness latch the handover flips.
 pub struct TelemetryServer {
@@ -142,7 +146,7 @@ pub struct TelemetryServer {
     /// The `/v1/supply/bridge` payload (lab #785 F5-4c-1): `Some` only on a
     /// V6 node once it has rendered one; `None` ⇒ 404, which readers show as
     /// unavailable — never as zero.
-    bridge: Arc<Mutex<Option<Result<Vec<u8>, String>>>>,
+    bridge: BridgeSlot,
     /// `false` from bind until [`Self::mark_ready`]: `/v1/ready` says
     /// `starting` and `/v1/telemetry` 404s. Never cleared — a node is not
     /// un-opened.
@@ -167,7 +171,7 @@ impl TelemetryServer {
             .ok_or_else(|| io::Error::other("telemetry listener has no ip address"))?;
         let served = Arc::new(AtomicU64::new(0));
         let snapshot: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let bridge: Arc<Mutex<Option<Result<Vec<u8>, String>>>> = Arc::new(Mutex::new(None));
+        let bridge: BridgeSlot = Arc::new(Mutex::new(None));
         let ready = Arc::new(AtomicBool::new(false));
 
         let worker = Arc::clone(&server);
@@ -275,7 +279,7 @@ impl TelemetryServer {
 
     /// The `/v1/supply/bridge` slot (lab #785 F5-4c-1), adopted like
     /// [`Self::snapshot`]; a V6 node fills it, every other node leaves `None`.
-    pub(crate) fn bridge(&self) -> Arc<Mutex<Option<Result<Vec<u8>, String>>>> {
+    pub(crate) fn bridge(&self) -> BridgeSlot {
         Arc::clone(&self.bridge)
     }
 

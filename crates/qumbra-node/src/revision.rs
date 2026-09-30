@@ -371,10 +371,17 @@ pub fn revision_digest_v6(
     frozen_digest_hex: &str,
     wrapper: &crate::genesis_v6::WrapperParams,
 ) -> Hash32 {
+    revision_digest_v6_of(id, frozen_digest_hex, &wrapper.digest())
+}
+
+/// [`revision_digest_v6`] from the WrapperParams **digest** — what a V6 halt
+/// marker carries and a [`crate::release::RevisionIdentity::V6`] holds (lab
+/// #785 F5-4c-2).
+pub fn revision_digest_v6_of(id: &str, frozen_digest_hex: &str, wrapper_digest: &Hash32) -> Hash32 {
     let mut buf = Vec::with_capacity(REVISION_TAG_V6.len() + 64);
     buf.extend_from_slice(REVISION_TAG_V6);
     buf.extend_from_slice(&revision_digest(id, frozen_digest_hex));
-    buf.extend_from_slice(&wrapper.digest());
+    buf.extend_from_slice(wrapper_digest);
     keccak256(&buf)
 }
 

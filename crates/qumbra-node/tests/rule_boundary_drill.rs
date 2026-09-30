@@ -169,12 +169,14 @@ fn the_two_binary_handoff_refuses_the_pre_rule_binary_after_the_boundary() {
         plan: qlab_devnet::halt::HaltPlan::Armed { height: DRILL_HALT_HEIGHT },
         revision: Some(REVISION_V1_0),
         resumes_from: None,
+        identity: qumbra_node::release::RevisionIdentity::L1,
     };
     let resume = Release {
         name: "drill: exact-emission resume",
         plan: qlab_devnet::halt::HaltPlan::None,
         revision: Some(REVISION_V1_1_EXACT_EMISSION),
         resumes_from: Some(DRILL_HALT_HEIGHT),
+        identity: qumbra_node::release::RevisionIdentity::L1,
     };
     armed.validate().unwrap();
     resume.validate().unwrap();
@@ -205,6 +207,7 @@ fn the_two_binary_handoff_refuses_the_pre_rule_binary_after_the_boundary() {
         plan: qlab_devnet::halt::HaltPlan::None,
         revision: Some(REVISION_V1_0),
         resumes_from: None,
+        identity: qumbra_node::release::RevisionIdentity::L1,
     };
     assert!(matches!(
         plain_pre_rule.check_against_marker(Some(&passed)),
@@ -229,6 +232,7 @@ fn the_shipped_boundary_would_survive_the_startup_grid_check() {
         plan: qlab_devnet::halt::HaltPlan::Armed { height: RULE_BOUNDARY_HEIGHT },
         revision: Some(REVISION_V1_0),
         resumes_from: None,
+        identity: qumbra_node::release::RevisionIdentity::L1,
     };
     armed.validate().expect("8,640 = 8 x 1,080 is on the cadence grid");
 }

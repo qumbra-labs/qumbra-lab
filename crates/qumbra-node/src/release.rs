@@ -121,7 +121,7 @@ use qlab_devnet::halt::{HaltError, HaltPlan, PostHaltRules, RuleSchedule};
 use serde::{Deserialize, Serialize};
 
 use crate::genesis::GenesisError;
-use crate::revision::{own_frozen_digest_hex, revision_digest, Revision, RevisionError};
+use crate::revision::{own_frozen_digest_hex, revision_digest, revision_digest_v6_of, Revision, RevisionError};
 use qlab_devnet::header::Hash32;
 
 /// The halt height the **drill** binaries use. On the cadence grid (16 = 2 × 8) and
@@ -236,6 +236,37 @@ pub const REVISION_V1_0_1_DRILL: Revision = Revision {
     frozen_digest_hex: "ead6e181afc5ef1c309cb3abd1021ca9a82e750ac51d8090fa4923956d37aba4",
 };
 
+/// **Which net's identity a revision is folded into** (lab #785 F5-4c-2, C1).
+///
+/// `Revision` stays the unit of identity; a V6 net folds its genesis's frozen
+/// wrapper constants in ([`crate::revision::revision_digest_v6`]), so the
+/// same release is a different rule domain and marker identity on a V6 net.
+/// `L1` (T1 and V5) is exactly [`Revision::digest`], byte for byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevisionIdentity {
+    L1,
+    V6 { wrapper_digest: Hash32 },
+}
+
+impl RevisionIdentity {
+    /// `r`'s identity digest on this net — the post-halt rule domain and the
+    /// marker's in-force identity.
+    pub fn digest_of(self, r: &Revision) -> Hash32 {
+        match self {
+            RevisionIdentity::L1 => r.digest(),
+            RevisionIdentity::V6 { wrapper_digest } => revision_digest_v6_of(r.id, r.frozen_digest_hex, &wrapper_digest),
+        }
+    }
+
+    /// The marker schema a data dir of this net carries.
+    pub fn marker_schema(self) -> u32 {
+        match self {
+            RevisionIdentity::L1 => MARKER_SCHEMA,
+            RevisionIdentity::V6 { .. } => MARKER_SCHEMA_V6,
+        }
+    }
+}
+
 /// What this binary is: its name, its halt schedule, the revision it carries, and
 /// the upgrade boundary it resumes past (if any).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +281,10 @@ pub struct Release {
     /// The upgrade boundary this release resumes past. `Some(H)` means "this is the
     /// binary that follows the halt at H"; above H it enforces the post-halt rules.
     pub resumes_from: Option<u64>,
+    /// The net this release's revision identity is folded for (lab #785
+    /// F5-4c-2): `L1` in every constant; `prepare_v6` sets `V6` from the
+    /// genesis's WrapperParams ([`Self::on_v6`]).
+    pub identity: RevisionIdentity,
 }
 
 /// Why a release refuses to start.
@@ -284,6 +319,10 @@ pub enum ReleaseError {
     /// revision in force — and nothing on disk distinguishes the two cases. Refused
     /// with a reason rather than guessed at, and never treated as "no marker".
     UnknownMarkerSchema { found: u32, expected: u32, marked: u64 },
+    /// **Lab #785 F5-4c-2.** The marker belongs to the other kind of net: an L1
+    /// marker under a V6 release, or a V6 marker under an L1 release. The
+    /// identities differ by construction, so neither may run the other's data dir.
+    MarkerOfAnotherNet { marker: &'static str, release: &'static str, marked: u64 },
 }
 
 impl std::fmt::Display for ReleaseError {
@@ -326,6 +365,13 @@ impl std::fmt::Display for ReleaseError {
                  silently admit a downgrade. Remedy: deploy the release that follows the halt at \
                  {marked} (it declares resumes_from={marked}, which restates the revision in \
                  force), or remove the marker deliberately if this data dir never resumed."
+            ),
+            ReleaseError::MarkerOfAnotherNet { marker, release, marked } => write!(
+                f,
+                "the halt marker in this data dir (height {marked}) is a {marker} net's, and this \
+                 binary is running a {release} net: their revision identities differ by \
+                 construction (a V6 net folds its wrapper constants in). Refusing to start — \
+                 this data dir belongs to another net."
             ),
         }
     }
@@ -378,6 +424,17 @@ pub fn build_rev_line() -> String {
 }
 
 impl Release {
+    /// This release on a V6 net whose genesis WrapperParams digest is
+    /// `wrapper_digest` (lab #785 F5-4c-2).
+    pub fn on_v6(self, wrapper_digest: Hash32) -> Self {
+        Release { identity: RevisionIdentity::V6 { wrapper_digest }, ..self }
+    }
+
+    /// `r`'s identity digest under this release's net.
+    fn identity_digest(&self, r: &Revision) -> Hash32 {
+        self.identity.digest_of(r)
+    }
+
     /// Structural startup validation, independent of any on-disk state:
     /// grid rule (H2), the carried revision describes this binary (H4), and a
     /// declared resume carries a revision (H4).
@@ -402,7 +459,7 @@ impl Release {
     pub fn rule_schedule(&self) -> Result<RuleSchedule, ReleaseError> {
         let post_halt = match (self.resumes_from, &self.revision) {
             (Some(from_height), Some(rev)) => {
-                Some(PostHaltRules { from_height, domain: rev.digest() })
+                Some(PostHaltRules { from_height, domain: self.identity_digest(rev) })
             }
             (Some(height), None) => return Err(ReleaseError::ResumeWithoutRevision { height }),
             (None, _) => None,
@@ -432,13 +489,15 @@ impl Release {
     pub fn check_against_marker(&self, marker: Option<&HaltMarker>) -> Result<(), ReleaseError> {
         let Some(m) = marker else { return Ok(()) };
         // (0) A marker we cannot interpret is refused with a reason — never read as
-        //     "no marker", and never allowed to fall through to a fresh start.
-        if m.schema != MARKER_SCHEMA {
-            return Err(ReleaseError::UnknownMarkerSchema {
-                found: m.schema,
-                expected: MARKER_SCHEMA,
-                marked: m.height,
-            });
+        //     "no marker", and never allowed to fall through to a fresh start. A
+        //     marker of the other net's kind (lab #785 F5-4c-2) is refused by name.
+        let expected = self.identity.marker_schema();
+        if m.schema != expected {
+            if matches!(m.schema, MARKER_SCHEMA | MARKER_SCHEMA_V6) {
+                let net = |s: u32| if s == MARKER_SCHEMA_V6 { "V6" } else { "L1" };
+                return Err(ReleaseError::MarkerOfAnotherNet { marker: net(m.schema), release: net(expected), marked: m.height });
+            }
+            return Err(ReleaseError::UnknownMarkerSchema { found: m.schema, expected, marked: m.height });
         }
         // (1) A binary that cannot go past the boundary cannot change the rules above
         //     it, so it needs no declaration. This is the "restart the halted binary
@@ -454,7 +513,7 @@ impl Release {
         //     still halted AT the boundary the pre-halt revision is trivially in
         //     force, so matching on it there would let the pre-announcement binary
         //     through — the one refusal this gate exists for.
-        if m.resumed && self.revision.map(|r| r.digest()) == Some(m.in_force_digest()) {
+        if m.resumed && self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()) {
             return Ok(());
         }
         // (3) Either the boundary is still closed — a halted node is resumed
@@ -483,7 +542,7 @@ impl Release {
     /// Restarting a binary whose transition is already recorded returns `false`, so an
     /// ordinary restart costs no fsync and no log line.
     pub fn supersedes(&self, m: &HaltMarker) -> bool {
-        if m.schema != MARKER_SCHEMA {
+        if m.schema != self.identity.marker_schema() {
             return false;
         }
         if !self.plan.halt_at().is_none_or(|h| h > m.height) {
@@ -493,7 +552,7 @@ impl Release {
             return false; // not a declared transition
         }
         // Already on the record: this exact revision in force, boundary marked passed.
-        !(m.resumed && self.revision.map(|r| r.digest()) == Some(m.in_force_digest()))
+        !(m.resumed && self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()))
     }
 
     /// **The rule schedule this release enforces on *this data dir*** (#81).
@@ -516,8 +575,8 @@ impl Release {
         if schedule.post_halt.is_some() {
             return Ok(schedule); // this binary declares the boundary itself
         }
-        if let Some(m) = marker.filter(|m| m.schema == MARKER_SCHEMA && m.resumed) {
-            if self.revision.map(|r| r.digest()) == Some(m.in_force_digest()) {
+        if let Some(m) = marker.filter(|m| m.schema == self.identity.marker_schema() && m.resumed) {
+            if self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()) {
                 schedule.post_halt =
                     Some(PostHaltRules { from_height: m.height, domain: m.in_force_digest() });
                 schedule.validate()?;
@@ -537,7 +596,15 @@ impl Release {
             Some(r) => {
                 s.push_str(&format!("  revision:     {}\n", r.id));
                 s.push_str(&format!("  frozen digest: {}\n", r.frozen_digest_hex));
-                s.push_str(&format!("  rule domain:  {}\n", r.digest_hex()));
+                s.push_str(&format!("  rule domain:  {}\n", crate::genesis::hex_encode(&self.identity_digest(r))));
+                // Lab #785 F5-4c-2: only a V6 identity adds a line, so an L1
+                // banner keeps today's bytes exactly.
+                if let RevisionIdentity::V6 { wrapper_digest } = self.identity {
+                    s.push_str(&format!(
+                        "  identity:     V6 (WrapperParams {})\n",
+                        crate::genesis::hex_encode(&wrapper_digest)
+                    ));
+                }
             }
             None => s.push_str("  revision:     ⚠️  NONE — this binary carries no revision\n"),
         }
@@ -605,6 +672,25 @@ pub struct HaltMarker {
     /// `height`.
     #[serde(default)]
     pub resumed: bool,
+    /// **Lab #785 F5-4c-2.** A V6 net's WrapperParams digest (hex), present
+    /// exactly on a [`MARKER_SCHEMA_V6`] marker and absent — not serialized —
+    /// on an L1 one, so an L1 marker file is byte-identical to before. A binary
+    /// that predates this field refuses a V6 marker outright
+    /// (`deny_unknown_fields`, and its schema is not one it knows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_digest_hex: Option<String>,
+}
+
+/// 64 hex characters → 32 bytes, or `None`.
+fn parse_hash32(h: &str) -> Option<Hash32> {
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// File name of the halt marker inside a node's data dir.
@@ -614,11 +700,26 @@ pub const HALT_MARKER_FILE: &str = "halt.marker";
 /// implicit 0 of the height-keyed marker, whose `revision_id` meant something else.
 pub const MARKER_SCHEMA: u32 = 1;
 
+/// The marker schema of a **V6** net's data dir (lab #785 F5-4c-2, ruling
+/// change 1): its own number, so no binary can read a V6 marker as an L1 one.
+pub const MARKER_SCHEMA_V6: u32 = 2;
+
+/// The marker fields a release's identity sets: its schema and, on V6, the
+/// WrapperParams digest.
+fn identity_fields(release: &Release) -> (u32, Option<String>) {
+    match release.identity {
+        RevisionIdentity::L1 => (MARKER_SCHEMA, None),
+        RevisionIdentity::V6 { wrapper_digest } => (MARKER_SCHEMA_V6, Some(crate::genesis::hex_encode(&wrapper_digest))),
+    }
+}
+
 impl HaltMarker {
     /// The marker a binary running `release` writes on reaching `height`.
     pub fn for_release(release: &Release, height: u64, boundary_finalized: bool) -> Self {
+        let (schema, wrapper_digest_hex) = identity_fields(release);
         HaltMarker {
-            schema: MARKER_SCHEMA,
+            schema,
+            wrapper_digest_hex,
             height,
             revision_id: release.revision.map(|r| r.id.to_string()).unwrap_or_else(|| "-".into()),
             frozen_digest_hex: release
@@ -638,8 +739,10 @@ impl HaltMarker {
     /// it the marker keeps naming the pre-upgrade revision, and every release after
     /// the upgrade is refused — the defect #81 was filed for.
     pub fn superseded_by(&self, release: &Release) -> Self {
+        let (schema, wrapper_digest_hex) = identity_fields(release);
         HaltMarker {
-            schema: MARKER_SCHEMA,
+            schema,
+            wrapper_digest_hex,
             height: self.height,
             revision_id: release.revision.map(|r| r.id.to_string()).unwrap_or_else(|| "-".into()),
             frozen_digest_hex: release
@@ -655,7 +758,28 @@ impl HaltMarker {
     /// gate compares a binary's own [`Revision::digest`] against, and the post-halt
     /// rule domain above [`Self::height`].
     pub fn in_force_digest(&self) -> Hash32 {
-        revision_digest(&self.revision_id, &self.frozen_digest_hex)
+        match self.wrapper_digest() {
+            None => revision_digest(&self.revision_id, &self.frozen_digest_hex),
+            Some(w) => revision_digest_v6_of(&self.revision_id, &self.frozen_digest_hex, &w),
+        }
+    }
+
+    /// The V6 WrapperParams digest this marker names, if any. [`Self::load`]
+    /// refuses a marker whose field does not match its schema or does not
+    /// decode, so here it is well-formed.
+    fn wrapper_digest(&self) -> Option<Hash32> {
+        self.wrapper_digest_hex.as_deref().map(|h| parse_hash32(h).expect("checked at load"))
+    }
+
+    /// Schema and field agree: a V6 marker names a 32-byte digest, an L1 one
+    /// names none.
+    fn check_identity_fields(&self) -> Result<(), String> {
+        match (self.schema, &self.wrapper_digest_hex) {
+            (MARKER_SCHEMA_V6, Some(h)) if parse_hash32(h).is_some() => Ok(()),
+            (MARKER_SCHEMA_V6, _) => Err("a V6 marker must name its 32-byte WrapperParams digest".into()),
+            (_, None) => Ok(()),
+            (s, Some(_)) => Err(format!("a schema-{s} marker names a WrapperParams digest")),
+        }
     }
 
     /// Path of the marker inside `data_dir`.
@@ -672,7 +796,9 @@ impl HaltMarker {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&p).map_err(GenesisError::Io)?;
-        toml::from_str(&text).map(Some).map_err(|e| GenesisError::Parse(e.to_string()))
+        let m: Self = toml::from_str(&text).map_err(|e| GenesisError::Parse(e.to_string()))?;
+        m.check_identity_fields().map_err(GenesisError::Parse)?;
+        Ok(Some(m))
     }
 
     /// Write the marker durably (fsync) into `data_dir`.
@@ -735,6 +861,7 @@ pub const RELEASE: Release = Release {
     plan: HaltPlan::Armed { height: RULE_BOUNDARY_HEIGHT },
     revision: Some(REVISION_V1_0),
     resumes_from: None,
+    identity: RevisionIdentity::L1,
 };
 
 /// **The post-boundary release**: the binary that resumes past
@@ -752,6 +879,7 @@ pub const RELEASE: Release = Release {
     plan: HaltPlan::None,
     revision: Some(REVISION_V1_1_EXACT_EMISSION),
     resumes_from: Some(RULE_BOUNDARY_HEIGHT),
+    identity: RevisionIdentity::L1,
 };
 
 /// Drill binary **A** — the armed pre-upgrade release. Halts at
@@ -762,6 +890,7 @@ pub const RELEASE: Release = Release {
     plan: HaltPlan::Armed { height: DRILL_HALT_HEIGHT },
     revision: Some(REVISION_V1_0),
     resumes_from: None,
+    identity: RevisionIdentity::L1,
 };
 
 /// Drill binary **B** — the post-upgrade release. Carries the inert
@@ -772,6 +901,7 @@ pub const RELEASE: Release = Release {
     plan: HaltPlan::None,
     revision: Some(REVISION_V1_0_1_DRILL),
     resumes_from: Some(DRILL_HALT_HEIGHT),
+    identity: RevisionIdentity::L1,
 };
 
 /// Drill binary **C** — drill (c)'s negative: resumes past the halt but carries no
@@ -782,6 +912,7 @@ pub const RELEASE: Release = Release {
     plan: HaltPlan::None,
     revision: None,
     resumes_from: Some(DRILL_HALT_HEIGHT),
+    identity: RevisionIdentity::L1,
 };
 
 /// Drill binary **D** — drill (d)'s: the stand-down. The upgrade at
@@ -795,6 +926,7 @@ pub const RELEASE: Release = Release {
     },
     revision: Some(REVISION_V1_0),
     resumes_from: None,
+    identity: RevisionIdentity::L1,
 };
 
 #[cfg(test)]
@@ -812,6 +944,7 @@ mod tests {
             plan: HaltPlan::Armed { height: RULE_BOUNDARY_HEIGHT },
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         }
     }
     fn rule_resume() -> Release {
@@ -820,6 +953,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_1_EXACT_EMISSION),
             resumes_from: Some(RULE_BOUNDARY_HEIGHT),
+            identity: RevisionIdentity::L1,
         }
     }
 
@@ -867,6 +1001,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         };
         assert!(matches!(
             pre_rule.check_against_marker(Some(&marker)),
@@ -879,6 +1014,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_1_EXACT_EMISSION),
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         };
         routine.check_against_marker(Some(&marker)).expect("in-force revision starts");
         // …and it reads the domain off the marker, so it does not fork from the
@@ -932,6 +1068,7 @@ mod tests {
             plan: HaltPlan::Armed { height: DRILL_HALT_HEIGHT },
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         }
     }
     fn resume() -> Release {
@@ -940,6 +1077,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0_1_DRILL),
             resumes_from: Some(DRILL_HALT_HEIGHT),
+            identity: RevisionIdentity::L1,
         }
     }
     /// A marker for a node **halted at** `h` under v1.0 and not yet resumed.
@@ -959,6 +1097,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(rev),
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         }
     }
 
@@ -1036,6 +1175,7 @@ mod tests {
                 plan: HaltPlan::None,
                 revision: Some(REVISION_V1_0_1_DRILL),
                 resumes_from: Some(h),
+                identity: RevisionIdentity::L1,
             };
             let s = r.rule_schedule().expect("a declared resume is startable");
             let p = s.post_halt.expect("resuming ⇒ post-halt rules, always");
@@ -1052,6 +1192,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: None,
             resumes_from: Some(16),
+            identity: RevisionIdentity::L1,
         };
         assert!(no_rev.rule_schedule().is_err());
     }
@@ -1065,6 +1206,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: None,
             resumes_from: Some(DRILL_HALT_HEIGHT),
+            identity: RevisionIdentity::L1,
         };
         assert_eq!(
             bad.validate(),
@@ -1078,6 +1220,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: None,
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         };
         assert_eq!(silent.validate(), Ok(()), "no marker ⇒ a plain v1.0-shaped release is fine");
         assert_eq!(
@@ -1196,6 +1339,7 @@ mod tests {
         let deliberate = Release {
             name: "test-deliberate-downgrade",
             resumes_from: Some(DRILL_HALT_HEIGHT),
+            identity: RevisionIdentity::L1,
             ..routine(REVISION_V1_0)
         };
         assert_eq!(deliberate.check_against_marker(Some(&resumed)), Ok(()));
@@ -1293,6 +1437,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0),
             resumes_from: Some(DRILL_HALT_HEIGHT),
+            identity: RevisionIdentity::L1,
         };
         assert_eq!(
             second.rule_schedule_on(Some(&m)).unwrap().post_halt,
@@ -1382,6 +1527,7 @@ mod tests {
             plan: HaltPlan::Armed { height: DRILL_HALT_HEIGHT },
             revision: Some(REVISION_V1_0_1_DRILL),
             resumes_from: Some(DRILL_HALT_HEIGHT),
+            identity: RevisionIdentity::L1,
         };
         assert_eq!(
             r.validate(),
@@ -1409,6 +1555,7 @@ mod tests {
             plan: HaltPlan::Cancelled { height: DRILL_HALT_HEIGHT, reason: "review" },
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: RevisionIdentity::L1,
         };
         assert_eq!(r.validate(), Ok(()));
         assert_eq!(r.halt_at(), None);
@@ -1458,5 +1605,135 @@ mod tests {
         "#;
         let err = crate::config::NodeConfig::from_toml(toml);
         assert!(err.is_err(), "a config key that looks like a halt override must not parse");
+    }
+
+    // --- lab #785 F5-4c-2: the V6 identity (C1) -------------------------------
+
+    fn rehearsal_wrapper_digest() -> Hash32 {
+        crate::genesis_v6::WrapperParams::rehearsal().digest()
+    }
+
+    /// The L1 arm is byte-identical at all five sites, for every shipped
+    /// revision: the identity digest, the declared post-halt domain, the
+    /// banner's `rule domain:` line (and no `identity:` line), the marker's
+    /// in-force digest, and the marker-keyed schedule.
+    #[test]
+    fn the_l1_identity_is_the_revision_digest_at_every_site() {
+        for rev in [REVISION_V1_0, REVISION_V1_1_EXACT_EMISSION, REVISION_V1_0_1_DRILL] {
+            assert_eq!(RevisionIdentity::L1.digest_of(&rev), rev.digest(), "{}", rev.id);
+            let declared = Release { revision: Some(rev), ..resume() };
+            assert_eq!(declared.rule_schedule().unwrap().post_halt.unwrap().domain, rev.digest());
+            let banner = declared.banner(None);
+            assert!(banner.contains(&format!("  rule domain:  {}\n", rev.digest_hex())), "{banner}");
+            assert!(!banner.contains("identity:"), "an L1 banner keeps today's lines");
+            let m = HaltMarker::for_release(&declared, DRILL_HALT_HEIGHT, true).superseded_by(&declared);
+            assert_eq!(m.in_force_digest(), rev.digest());
+            let routine = Release { resumes_from: None, ..declared };
+            assert_eq!(routine.rule_schedule_on(Some(&m)).unwrap().post_halt.unwrap().domain, rev.digest());
+            assert!(declared.check_against_marker(Some(&m)).is_ok());
+        }
+    }
+
+    /// An L1 marker's file bytes are exactly today's: the same six fields in
+    /// the same order, no new key (checked against a mirror of the pre-C1
+    /// struct, serialized the way `write` does).
+    #[test]
+    fn an_l1_marker_is_written_byte_identical_to_before() {
+        #[derive(Serialize)]
+        struct PreC1Marker {
+            schema: u32,
+            height: u64,
+            revision_id: String,
+            frozen_digest_hex: String,
+            boundary_finalized: bool,
+            resumed: bool,
+        }
+        let m = HaltMarker::for_release(&armed(), DRILL_HALT_HEIGHT, true).superseded_by(&resume());
+        let old = PreC1Marker {
+            schema: m.schema,
+            height: m.height,
+            revision_id: m.revision_id.clone(),
+            frozen_digest_hex: m.frozen_digest_hex.clone(),
+            boundary_finalized: m.boundary_finalized,
+            resumed: m.resumed,
+        };
+        let now = toml::to_string_pretty(&m).unwrap();
+        assert_eq!(now, toml::to_string_pretty(&old).unwrap());
+        assert!(!now.contains("wrapper_digest_hex"));
+        assert_eq!(m.schema, MARKER_SCHEMA);
+    }
+
+    /// A V6 release writes a schema-2 marker naming its WrapperParams digest;
+    /// it round-trips through disk, and its in-force digest is the V6 one.
+    #[test]
+    fn a_v6_marker_carries_and_recomputes_its_identity() {
+        let w = rehearsal_wrapper_digest();
+        let v6 = resume().on_v6(w);
+        let m = HaltMarker::for_release(&armed().on_v6(w), DRILL_HALT_HEIGHT, true).superseded_by(&v6);
+        assert_eq!(m.schema, MARKER_SCHEMA_V6);
+        assert_eq!(m.in_force_digest(), revision_digest_v6_of(REVISION_V1_0_1_DRILL.id, REVISION_V1_0_1_DRILL.frozen_digest_hex, &w));
+        assert_ne!(m.in_force_digest(), REVISION_V1_0_1_DRILL.digest());
+        let dir = std::env::temp_dir().join(format!("qmb_c1_marker_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        m.write(&dir).unwrap();
+        assert_eq!(HaltMarker::load(&dir).unwrap(), Some(m.clone()));
+        assert!(v6.check_against_marker(Some(&m)).is_ok());
+        assert_eq!(v6.rule_schedule().unwrap().post_halt.unwrap().domain, m.in_force_digest());
+        assert!(v6.banner(Some(&m)).contains("  identity:     V6 (WrapperParams "));
+        // A marker whose field disagrees with its schema is refused at load.
+        for bad in [
+            HaltMarker { wrapper_digest_hex: None, ..m.clone() },
+            HaltMarker { wrapper_digest_hex: Some("zz".into()), ..m.clone() },
+            HaltMarker { schema: MARKER_SCHEMA, ..m.clone() },
+        ] {
+            std::fs::write(HaltMarker::path(&dir), toml::to_string_pretty(&bad).unwrap()).unwrap();
+            assert!(matches!(HaltMarker::load(&dir), Err(GenesisError::Parse(_))), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both directions refuse by name: an L1 release on a V6 marker, a V6
+    /// release on an L1 marker.
+    #[test]
+    fn neither_net_runs_the_others_data_dir() {
+        let w = rehearsal_wrapper_digest();
+        let v6_marker = HaltMarker::for_release(&armed().on_v6(w), DRILL_HALT_HEIGHT, true);
+        let l1_marker = HaltMarker::for_release(&armed(), DRILL_HALT_HEIGHT, true);
+        assert_eq!(
+            resume().check_against_marker(Some(&v6_marker)),
+            Err(ReleaseError::MarkerOfAnotherNet { marker: "V6", release: "L1", marked: DRILL_HALT_HEIGHT })
+        );
+        assert_eq!(
+            resume().on_v6(w).check_against_marker(Some(&l1_marker)),
+            Err(ReleaseError::MarkerOfAnotherNet { marker: "L1", release: "V6", marked: DRILL_HALT_HEIGHT })
+        );
+        assert!(!resume().supersedes(&v6_marker) && !resume().on_v6(w).supersedes(&l1_marker));
+        // An unknown schema is still the unknown-schema refusal.
+        let odd = HaltMarker { schema: 9, ..l1_marker };
+        assert!(matches!(resume().check_against_marker(Some(&odd)), Err(ReleaseError::UnknownMarkerSchema { found: 9, .. })));
+    }
+
+    /// 🔒 The V6 rule domains over the rehearsal WrapperParams, copied from
+    /// the named `halt-status --genesis` runs (`logs/f5-4c2-runs/3-…`, `5-…`):
+    /// the armed build's revision (v1.0, also the V6 revision `genesis init
+    /// --t2` prints) and the resume build's (v1.1-exact-emission). The L1
+    /// domains the same runs printed without `--genesis` are the unmoved
+    /// `c7b5d40b…` / `90a9b58f…`.
+    #[test]
+    fn the_v6_rule_domains_are_pinned() {
+        let v6 = RevisionIdentity::V6 { wrapper_digest: rehearsal_wrapper_digest() };
+        assert_eq!(
+            crate::genesis::hex_encode(&v6.digest_of(&REVISION_V1_0)),
+            "89e36dac55fcae4d1e4f3975e74df689ae4984b997272f3f65b44c4d77e2ffe4"
+        );
+        assert_eq!(
+            crate::genesis::hex_encode(&v6.digest_of(&REVISION_V1_1_EXACT_EMISSION)),
+            "d45b52cf38adf8e1ba4f14fe8feeadff55cf4b31d1f3358298355d2cb8632daa"
+        );
+        assert_eq!(REVISION_V1_0.digest_hex(), "c7b5d40be4784f792a53c5df9f9e17bfe31df2327ec7986edad59ffaf3733259");
+        assert_eq!(
+            REVISION_V1_1_EXACT_EMISSION.digest_hex(),
+            "90a9b58f1205520cf778190f46f9c55150fdc3b610024f5d06353f535a3007d1"
+        );
     }
 }

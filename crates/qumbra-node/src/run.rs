@@ -524,7 +524,7 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// The `/v1/supply/bridge` slot (lab #785 F5-4c-1), adopted from the
     /// telemetry server; filled only on a V6 node (`Err` = the ledger's own
     /// refusal, served with its reason).
-    bridge_snapshot: Arc<Mutex<Option<Result<Vec<u8>, String>>>>,
+    bridge_snapshot: crate::telemetry_server::BridgeSlot,
     /// When the telemetry snapshot was last encoded.
     last_telemetry_render: Instant,
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
@@ -873,7 +873,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             || genesis.verify_startup(config.expected_genesis_hash.as_deref()),
             pow,
             verifier,
-            RELEASE,
+            // Lab #785 F5-4c-2 (C1): a V6 net's rule domain and halt-marker
+            // identity fold in its genesis's wrapper constants.
+            RELEASE.on_v6(genesis.wrapper.digest()),
         )
     }
 
@@ -6606,6 +6608,7 @@ mod tests {
             plan: HaltPlan::Armed { height: DH },
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: crate::release::RevisionIdentity::L1,
         }
     }
     fn resume_release() -> Release {
@@ -6614,6 +6617,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0_1_DRILL),
             resumes_from: Some(DH),
+            identity: crate::release::RevisionIdentity::L1,
         }
     }
 
@@ -6836,6 +6840,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: None,
             resumes_from: Some(DH),
+            identity: crate::release::RevisionIdentity::L1,
         };
         let err = RunningNode::start_with_release(
             &config, &genesis, KeccakPow, DevnetRehearsalVerifier, norev,
@@ -6852,6 +6857,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: crate::release::RevisionIdentity::L1,
         };
         let err2 = RunningNode::start_with_release(
             &config, &genesis, KeccakPow, DevnetRehearsalVerifier, undeclared,
@@ -6965,6 +6971,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0_1_DRILL),
             resumes_from: None,
+            identity: crate::release::RevisionIdentity::L1,
         };
         let mut later = RunningNode::start_with_release(
             &config, &genesis, KeccakPow, DevnetRehearsalVerifier, routine,
@@ -7017,6 +7024,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: crate::release::RevisionIdentity::L1,
         };
         assert!(matches!(
             RunningNode::start_with_release(
@@ -7156,6 +7164,7 @@ mod tests {
             plan: HaltPlan::Armed { height: H2 },
             revision: Some(REVISION_V1_0_1_DRILL),
             resumes_from: None,
+            identity: crate::release::RevisionIdentity::L1,
         };
         {
             let mut node = RunningNode::start_with_release(
@@ -7183,6 +7192,7 @@ mod tests {
             plan: HaltPlan::None,
             revision: Some(REVISION_V1_0),
             resumes_from: Some(H2),
+            identity: crate::release::RevisionIdentity::L1,
         };
         let mut node = RunningNode::start_with_release(
             &config, &genesis, KeccakPow, DevnetRehearsalVerifier, up2,
@@ -7207,6 +7217,7 @@ mod tests {
             plan: HaltPlan::Cancelled { height: DH, reason: "review stood it down" },
             revision: Some(REVISION_V1_0),
             resumes_from: None,
+            identity: crate::release::RevisionIdentity::L1,
         };
         let mut node = RunningNode::start_with_release(
             &config, &genesis, KeccakPow, DevnetRehearsalVerifier, cancelled,
