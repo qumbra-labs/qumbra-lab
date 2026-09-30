@@ -117,14 +117,13 @@ pub fn encode_addrs(addrs: &[String]) -> Vec<u8> {
 pub fn decode_addrs(buf: &[u8]) -> Result<Vec<String>, DecodeError> {
     let mut pos = 0usize;
     let n = read_varint(buf, &mut pos)? as usize;
-    let mut addrs = Vec::with_capacity(n);
+    let mut addrs = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
         let len = read_varint(buf, &mut pos)? as usize;
-        if pos + len > buf.len() {
-            return Err(DecodeError::Truncated { what: "addr" });
-        }
-        let s = String::from_utf8(buf[pos..pos + len].to_vec()).map_err(|_| DecodeError::Varint)?;
-        pos += len;
+        let end = pos.checked_add(len).filter(|end| *end <= buf.len());
+        let Some(end) = end else { return Err(DecodeError::Truncated { what: "addr" }) };
+        let s = String::from_utf8(buf[pos..end].to_vec()).map_err(|_| DecodeError::Varint)?;
+        pos = end;
         addrs.push(s);
     }
     if pos != buf.len() {
@@ -304,6 +303,19 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hardening: an `Addr` payload's count and each address length are
+    /// peer-supplied — `u64::MAX` for either is an error, never a panic.
+    #[test]
+    fn absurd_addr_count_and_length_are_errors() {
+        let mut huge = Vec::new();
+        crate::varint::write_varint(&mut huge, u64::MAX);
+        assert!(decode_addrs(&huge).is_err(), "count");
+        let mut one = Vec::new();
+        crate::varint::write_varint(&mut one, 1);
+        one.extend_from_slice(&huge);
+        assert!(decode_addrs(&one).is_err(), "length");
+    }
 
     #[test]
     fn version_round_trips() {

@@ -361,13 +361,13 @@ fn decode_announce_inner(payee_boundary: Option<u64>, wf: WireForm, buf: &[u8]) 
         (Vec::new(), Vec::new())
     };
     let n_short = r.varint()? as usize;
-    let mut short_ids = Vec::with_capacity(n_short);
+    let mut short_ids = Vec::with_capacity(n_short.min(r.remaining() / SHORTID_LEN));
     for _ in 0..n_short {
         let s = r.rest(SHORTID_LEN, "announce.shortid")?;
         short_ids.push(s.try_into().unwrap());
     }
     let n_pf = r.varint()? as usize;
-    let mut prefilled = Vec::with_capacity(n_pf);
+    let mut prefilled = Vec::with_capacity(n_pf.min(r.remaining()));
     for _ in 0..n_pf {
         let index = r.varint()? as u32;
         let tx_len = r.varint()? as usize;
@@ -396,7 +396,7 @@ pub fn decode_get_block_txn(buf: &[u8]) -> Result<GetBlockTxn, DecodeError> {
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("gbt.block_hash")?;
     let n = r.varint()? as usize;
-    let mut indexes = Vec::with_capacity(n);
+    let mut indexes = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         indexes.push(r.varint()? as u32);
     }
@@ -434,7 +434,7 @@ pub fn decode_block_txn_for(form: GenesisForm, buf: &[u8]) -> Result<BlockTxn, D
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("bt.block_hash")?;
     let n = r.varint()? as usize;
-    let mut txs = Vec::with_capacity(n);
+    let mut txs = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         let tx_len = r.varint()? as usize;
         let tx_bytes = r.rest(tx_len, "bt.tx")?;
@@ -819,6 +819,61 @@ mod tests {
             assert!(back.seal.is_none());
             assert_eq!(encode_announce(form, &back), *bytes, "{form:?} round trip");
         }
+    }
+
+    /// Hardening: every peer-supplied length and count on the announce frame
+    /// — the prefilled tx length, the short-id and prefilled counts, and the
+    /// V6 section lengths — is an error at any value, `u64::MAX` included,
+    /// never a panic or an unbounded allocation, on V4, V5 and V6.
+    #[test]
+    fn absurd_lengths_and_counts_are_errors_on_every_announce_frame() {
+        let huge = {
+            let mut v = Vec::new();
+            write_varint(&mut v, u64::MAX);
+            v
+        };
+        for (wf, form) in [
+            (WireForm::plain(GenesisForm::V4), GenesisForm::V4),
+            (WireForm::plain(GenesisForm::V5), GenesisForm::V5),
+            (WireForm::V6, GenesisForm::V5),
+        ] {
+            let mut a = golden_l1_announce(form);
+            a.short_ids.clear();
+            a.prefilled.clear();
+            let base = encode_announce_for(wf, &a).unwrap();
+            // The frame ends `… n_short = 0 ‖ n_pf = 0`.
+            let stem = &base[..base.len() - 2];
+            // (1) One prefilled tx whose length prefix is u64::MAX.
+            let mut f = stem.to_vec();
+            f.extend_from_slice(&[0, 1, 0]);
+            f.extend_from_slice(&huge);
+            assert!(decode_announce_for(wf, &f).is_err(), "{wf:?} tx_len");
+            // (2) An absurd short-id count.
+            let mut f = stem.to_vec();
+            f.extend_from_slice(&huge);
+            f.push(0);
+            assert!(decode_announce_for(wf, &f).is_err(), "{wf:?} n_short");
+            // (3) An absurd prefilled count.
+            let mut f = stem.to_vec();
+            f.push(0);
+            f.extend_from_slice(&huge);
+            assert!(decode_announce_for(wf, &f).is_err(), "{wf:?} n_pf");
+        }
+        // (4) V6: a section length of u64::MAX, right after the coinbase section.
+        let a = golden_l1_announce(GenesisForm::V5);
+        let at = header_msg_len(GenesisForm::V5) + 8 + 1 + 40;
+        let mut f = encode_announce(GenesisForm::V5, &a)[..at].to_vec();
+        f.extend_from_slice(&huge);
+        assert!(decode_announce_for(WireForm::V6, &f).is_err(), "finality length");
+        let mut f = encode_announce(GenesisForm::V5, &a)[..at].to_vec();
+        f.push(0);
+        f.extend_from_slice(&huge);
+        assert!(decode_announce_for(WireForm::V6, &f).is_err(), "bundle length");
+        // (5) The other two count sites on this wire.
+        let mut g = [0u8; 32].to_vec();
+        g.extend_from_slice(&huge);
+        assert!(decode_get_block_txn(&g).is_err());
+        assert!(decode_block_txn(&g).is_err());
     }
 
     /// Lab #785 F5-3b-2: the V6 frame is the V5 frame with the two section
