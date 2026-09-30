@@ -1006,10 +1006,13 @@ mod tests {
     use super::*;
 
     /// W's width, read off the named `f4leaf --check` runs.
-    const W_WIDTH_PIN: usize = 3_470;
+    /// Lab #785 F5-4d: 3,470 → 3,471 (one SD block more; W moves again in
+    /// 4d-2).
+    const W_WIDTH_PIN: usize = 3_471;
 
-    /// The program: 11 prologue, 65 slot and 7 epilogue segments in ring
-    /// order; 127 + 661 + 67 perms; width pinned from the named runs;
+    /// The program: 11 prologue, 66 slot and 7 epilogue segments in ring
+    /// order (the slot opens with its `SD_BLOCKS` SD blocks and closes on the
+    /// anchor); 127 + 662 + 67 perms; width pinned from the named runs;
     /// degree 3; every constraint group non-empty; the carries cover
     /// `MAX_CLAIMS`.
     #[test]
@@ -1020,6 +1023,11 @@ mod tests {
         let sum = |r: std::ops::Range<usize>| prog[r].iter().map(|s| s.len()).sum::<usize>();
         assert_eq!((sum(0..SLOT_BASE), sum(SLOT_BASE..EPI_BASE), sum(EPI_BASE..PAD)), (PRO_PERMS, SLOT_PERMS, EPI_PERMS));
         assert_eq!(slot_program().len(), SLOT_SEGS);
+        assert_eq!((SD_BLOCKS, SLOT_SEGS, SLOT_PERMS), (6, 66, 662));
+        let slot = slot_program();
+        assert_eq!(slot[..SD_BLOCKS], (0..SD_BLOCKS).map(Seg::Sd).collect::<Vec<_>>()[..]);
+        assert_eq!(slot[SD_BLOCKS], Seg::LeafOld(0));
+        assert_eq!(slot[SLOT_SEGS - 3..], [APart::Low, APart::L30, APart::Last].map(Seg::Anch)[..]);
         assert_eq!(W_WIDTH, W_WIDTH_PIN);
         let air = WAir::new(2);
         assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 3);
@@ -1032,7 +1040,7 @@ mod tests {
     #[test]
     fn f4w_heights_by_k() {
         let rows = |k: usize| (PRO_PERMS + k * SLOT_PERMS + EPI_PERMS) * 24;
-        assert_eq!([1, 2, 4, 8, 16].map(rows), [20_520, 36_384, 68_112, 131_568, 258_480]);
+        assert_eq!([1, 2, 4, 8, 16].map(rows), [20_544, 36_432, 68_208, 131_760, 258_864]);
         assert_eq!([1, 2, 4, 8, 16].map(w_height), [1 << 15, 1 << 16, 1 << 17, 1 << 18, 1 << 18]);
     }
 

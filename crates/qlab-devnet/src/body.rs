@@ -1795,6 +1795,7 @@ mod tests {
             registry_root: [0x44; 32],
             vpublic: None,
             write: None,
+            exit_rkm: [0; 32],
         }
         .encode();
         let body = BlockBody::from_single_payee(vec![good_tx(2), tx], 0, [0; 4]);

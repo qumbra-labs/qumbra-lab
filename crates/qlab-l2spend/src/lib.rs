@@ -540,7 +540,7 @@ fn build_s_slot<E: Endpoint, R: rand::CryptoRng>(
     let (_, proof) = qlab_l2::prove_s(&inst);
     let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
     let discovery = discovery_for(&notes, outs, rng);
-    let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None, write: None };
+    let surface = L2Surface { shape: L2ShapeTag::S, registry_root: digest_bytes(&inst.registry_root), vpublic: None, write: None, exit_rkm: [0; 32] };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::S })
 }
 
@@ -626,6 +626,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
             new_root,
             leaf_lanes: new_leaf.state()[..15].try_into().expect("15 lanes"),
         }),
+        exit_rkm: [0; 32],
     };
     let tx = TxEntry {
         proof: bincode::serialize(&proof).expect("a proof serializes"),
@@ -767,7 +768,7 @@ fn prove_p_slot<R: rand::CryptoRng>(
         }
     };
     let surface =
-        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]), write: None };
+        L2Surface { shape: L2ShapeTag::P, registry_root: digest_bytes(&registry_root), vpublic: Some([term(0), term(1)]), write: None, exit_rkm: [0; 32] };
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 

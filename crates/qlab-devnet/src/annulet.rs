@@ -125,6 +125,10 @@ pub struct L2Surface {
     /// `Some` exactly for shape R (lab #728): the write — the root after it
     /// and the new leaf, whole. `None` for S and P.
     pub write: Option<RegistryWriteSurface>,
+    /// Shape P's exit recipient (lab #785 F5-4d): the L1 `rkm` an asset-0
+    /// redeem pays, lane-major LE — the proof's `PV_XRKM`. All zero when the
+    /// transaction does not exit, and on S and R (where it is not encoded).
+    pub exit_rkm: Hash32,
 }
 
 /// The registry write an R surface carries (lab #728 Q1): the root after the
@@ -148,10 +152,11 @@ impl RegistryWriteSurface {
     }
 }
 
-/// Encoded surface lengths: S = tag ‖ root; P = S ‖ 2 × (redeem ‖ amount ‖ asset).
+/// Encoded surface lengths: S = tag ‖ root; P = S ‖ 2 × (redeem ‖ amount ‖
+/// asset) ‖ exit_rkm (32, lab #785 F5-4d).
 pub const L2_SURFACE_LEN_S: usize = 1 + 32;
 /// See [`L2_SURFACE_LEN_S`].
-pub const L2_SURFACE_LEN_P: usize = L2_SURFACE_LEN_S + 2 * (1 + 8 + 2);
+pub const L2_SURFACE_LEN_P: usize = L2_SURFACE_LEN_S + 2 * (1 + 8 + 2) + 32;
 /// R = tag ‖ old root ‖ new root ‖ the new leaf's 15 lanes (u64 LE) — 185 B.
 pub const L2_SURFACE_LEN_R: usize = L2_SURFACE_LEN_S + 32 + 15 * 8;
 
@@ -178,6 +183,10 @@ impl L2Surface {
         let mut out = Vec::with_capacity(L2_SURFACE_LEN_R);
         out.push(self.shape.byte());
         out.extend_from_slice(&self.registry_root);
+        assert!(
+            self.shape == L2ShapeTag::P || self.exit_rkm == [0; 32],
+            "an exit recipient exists only on shape P (lab #785 F5-4d)"
+        );
         match (self.shape, &self.vpublic, &self.write) {
             (L2ShapeTag::S, None, None) => {}
             (L2ShapeTag::P, Some(terms), None) => {
@@ -186,6 +195,7 @@ impl L2Surface {
                     out.extend_from_slice(&t.amount.to_le_bytes());
                     out.extend_from_slice(&t.asset.to_le_bytes());
                 }
+                out.extend_from_slice(&self.exit_rkm);
             }
             (L2ShapeTag::R, None, Some(w)) => {
                 out.extend_from_slice(&w.new_root);
@@ -238,6 +248,10 @@ impl L2Surface {
                 Some(terms)
             }
         };
+        let exit_rkm: Hash32 = match shape {
+            L2ShapeTag::P => rest[32 + 2 * 11..32 + 2 * 11 + 32].try_into().expect("length checked"),
+            L2ShapeTag::S | L2ShapeTag::R => [0; 32],
+        };
         let write = match shape {
             L2ShapeTag::S | L2ShapeTag::P => None,
             L2ShapeTag::R => {
@@ -249,7 +263,7 @@ impl L2Surface {
                 Some(RegistryWriteSurface { new_root, leaf_lanes })
             }
         };
-        Ok(Some(L2Surface { shape, registry_root, vpublic, write }))
+        Ok(Some(L2Surface { shape, registry_root, vpublic, write, exit_rkm }))
     }
 }
 
@@ -556,7 +570,7 @@ mod tests {
     const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 
     fn s_surface() -> L2Surface {
-        L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None }
+        L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None, exit_rkm: [0; 32] }
     }
 
     fn p_surface() -> L2Surface {
@@ -565,6 +579,7 @@ mod tests {
             registry_root: [0x44; 32],
             vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 100, asset: 7 }]),
             write: None,
+            exit_rkm: [0; 32],
         }
     }
 
@@ -720,6 +735,7 @@ mod tests {
             registry_root: [0x44; 32],
             vpublic: None,
             write: Some(RegistryWriteSurface { new_root, leaf_lanes }),
+            exit_rkm: [0; 32],
         }
     }
 

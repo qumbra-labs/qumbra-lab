@@ -857,8 +857,9 @@ mod tests {
         // The domain and the chain position both enter.
         assert_ne!(sd_step(&EMPTY, L2ShapeTag::R, &t.pvs), sd_step(&d, L2ShapeTag::R, &t.pvs));
         assert_eq!(sd_words(L2ShapeTag::S, &[]), vec![1, 0], "tag, pv_len");
-        // Permutations per step (26 message words per block): S 5, P 5, R 4.
-        assert_eq!((sd_perms(qlab_air::l2::PV_LEN), sd_perms(qlab_air::l2p::PV_LEN), sd_perms(qlab_air::l2r::PV_LEN)), (5, 5, 4));
+        // Permutations per step (26 message words per block): S 5, P 6 (the
+        // exit recipient, lab #785 F5-4d), R 4.
+        assert_eq!((sd_perms(qlab_air::l2::PV_LEN), sd_perms(qlab_air::l2p::PV_LEN), sd_perms(qlab_air::l2r::PV_LEN)), (5, 6, 4));
         for (tag, len) in [(L2ShapeTag::S, qlab_air::l2::PV_LEN), (L2ShapeTag::P, qlab_air::l2p::PV_LEN), (L2ShapeTag::R, qlab_air::l2r::PV_LEN)] {
             let (blocks, h) = sd_chain(&d, tag, &vec![7; len]);
             assert_eq!(blocks.len(), sd_perms(len));

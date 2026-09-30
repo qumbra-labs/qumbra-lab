@@ -283,6 +283,7 @@ mod tests {
                 registry_root: ext().registry_root,
                 vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem, amount, asset: 7 }]),
                 write: None,
+                exit_rkm: [0; 32],
             }
             .encode(),
         };

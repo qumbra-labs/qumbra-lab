@@ -345,6 +345,7 @@ fn saturated_pvs(shape: Shape) -> Vec<u32> {
             &[qlab_l2::VPublic::redeem(u64::MAX); 2],
             &[u64::MAX; 2],
             &d,
+            &d,
         ),
         Shape::R => qlab_l2::pv_vec_r(&d, &d, &d, u64::MAX, &d, &d, u64::MAX, &d),
     }

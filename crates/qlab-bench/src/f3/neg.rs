@@ -577,17 +577,22 @@ mod tests {
     use super::*;
     use crate::f3::cmp::LT_WIDTH;
 
-    /// The program and the shape: 50 segments in ring order, 559 perms a
-    /// slot (the census's count), width 3,224, degree 3 (b2 is a lane), and
+    /// The program and the shape: 51 segments in ring order, 560 perms a
+    /// slot (the census's count), width 3,225 (lab #785 F5-4d: one SD block
+    /// more, 50 → 51, 559 → 560, 3,224 → 3,225), degree 3 (b2 is a lane), and
     /// every constraint group non-empty.
     #[test]
     fn f3leaf_program_width_and_degree() {
         let prog = slot_program();
         assert_eq!(prog.len(), NSEG);
+        assert_eq!((NSEG, SLOT_PERMS), (51, 560));
+        assert_eq!(prog[..SD_BLOCKS], (0..SD_BLOCKS).map(Seg::Sd).collect::<Vec<_>>()[..]);
+        assert_eq!(prog[SD_BLOCKS], Seg::LeafOld(0));
+        assert_eq!(prog[NSEG - 1], Seg::Pair(PathId::R, Part::LastB));
         assert!(prog.iter().enumerate().all(|(i, s)| s.idx() == i));
         assert_eq!(prog.iter().map(|s| s.len()).sum::<usize>(), SLOT_PERMS);
         assert_eq!(super::super::census::slot_perms(), SLOT_PERMS);
-        assert_eq!(LEAF_WIDTH, 3_224);
+        assert_eq!(LEAF_WIDTH, 3_225);
         let air = LeafAir::new(2);
         assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 3);
         assert!(phase_ranges(&air).iter().all(|r| !r.is_empty()), "every group emits");
@@ -634,7 +639,7 @@ mod tests {
     }
 
     /// Approval 1(a): the SD test vectors — the fixture leaf `[P, R]`'s SD in,
-    /// after its P transaction (five blocks), and out (after its R, four
+    /// after its P transaction (six blocks since lab #785 F5-4d), and out (after its R, four
     /// blocks) — natively and in the AIR's trace and public values. The
     /// literals are `qlab-bench f3vec`'s output.
     #[test]

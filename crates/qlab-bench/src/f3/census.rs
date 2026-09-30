@@ -46,12 +46,12 @@ pub(crate) fn tx_perms(tag: L2ShapeTag) -> usize {
 }
 
 /// The slot every transaction occupies (approved deviation 4): the most of
-/// each segment any shape uses — 5 SD blocks, 3 inserts, 2 appends, one
+/// each segment any shape uses — 6 SD blocks (P, since lab #785 F5-4d), 3 inserts, 2 appends, one
 /// registry replacement.
 pub(crate) fn slot_perms() -> usize {
     SD_SLOT + 3 * insert_perms() + 2 * append_perms() + replace_perms()
 }
-const SD_SLOT: usize = 5;
+const SD_SLOT: usize = 6;
 
 /// One leaf's census row.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,15 +115,16 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The model, pinned to the F3-2b AIR: a slot is 5 SD blocks, 3 inserts,
-    /// 2 appends and one replacement — 559 perms, the leaf program's own
+    /// The model, pinned to the F3-2b AIR: a slot is 6 SD blocks, 3 inserts,
+    /// 2 appends and one replacement — 560 perms, the leaf program's own
     /// count — and every roadmap k fits the 32 GB class at b2 and b4 [P].
     #[test]
     fn f3_census_model() {
         assert_eq!((insert_perms(), append_perms(), replace_perms()), (131, 64, 33));
-        assert_eq!(tx_perms(L2ShapeTag::P), 3 * 131 + 2 * 64 + 5);
+        assert_eq!(tx_perms(L2ShapeTag::P), 3 * 131 + 2 * 64 + 6);
         assert_eq!(tx_perms(L2ShapeTag::S), 3 * 131 + 2 * 64 + 5);
         assert_eq!(tx_perms(L2ShapeTag::R), 131 + 2 * 64 + 33 + 4);
+        assert_eq!(slot_perms(), 560);
         assert_eq!(slot_perms(), super::super::leaf::SLOT_PERMS);
         assert_eq!(row(4).width, super::super::leaf::LEAF_WIDTH);
         for (k, log_h) in [(4, 16), (8, 17), (16, 18)] {

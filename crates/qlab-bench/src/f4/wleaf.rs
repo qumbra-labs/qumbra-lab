@@ -12,7 +12,7 @@
 //!              its old side the empty subtree zeros[2] (aa_next ≡ 0 mod 4)
 //!     history  C_in appended to CH (64)
 //!   slot ×k (661 perms):
-//!     F3's slot    SD 5 | inserts 3 × 131 | appends 2 × 64 | registry 33
+//!     F3's slot    SD 6 | inserts 3 × 131 | appends 2 × 64 | registry 33
 //!     vPublic ×2   old leaf, new leaf, supply pair path (34 each; P only)
 //!     exits ×2     the exit chain's steps (P redeems on asset 0)
 //!     anchor       32: a transaction's anchor opened in CH, a claim's in AA
@@ -22,7 +22,7 @@
 //! **The claim slot** (tag `C`, SD word 0 = `0x04`): insert 0 is its `cnf`,
 //! committed to `K` (not `N`); append 0 is its `cm2`; its anchor opens in
 //! `AA` (`A ≠ 0`); its fee chunks add into the fee accumulator. Inserts 1–2,
-//! append 1, SD block 4, the registry and the `vPublic` segments are off for
+//! append 1, SD blocks 4–5, the registry and the `vPublic` segments are off for
 //! a claim.
 //!
 //! **The fee note** is appended in every wrapper (value 0 with no claims):
