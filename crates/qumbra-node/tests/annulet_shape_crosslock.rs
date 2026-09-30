@@ -46,7 +46,7 @@ fn the_wire_tag_and_the_circuit_shape_are_one_set() {
 /// u16` = 11 bytes).
 #[test]
 fn the_surface_carries_the_circuits_extra_public_values() {
-    assert_eq!(Shape::P.pv_len() - Shape::S.pv_len(), 2 * 6, "P adds two 6-element vPublic rows");
+    assert_eq!(Shape::P.pv_len() - Shape::S.pv_len(), 2 * 6 + 16, "P adds two 6-element vPublic rows and the 16-chunk exit recipient (F5-4d)");
     assert_eq!(Shape::S.pv_vpublic(0), None);
     // A4 appended `nf₃` (16 PVs) to both shapes, after P's vPublic rows —
     // so vPublic starts where S's v1 PVs end, not at S's pv_len.

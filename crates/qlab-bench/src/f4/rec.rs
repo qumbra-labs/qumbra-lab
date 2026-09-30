@@ -528,7 +528,9 @@ mod tests {
     #[test]
     fn f4census_w_and_deposit() {
         let w2 = cost(&w_child(16, Lane::B2));
-        assert_eq!((w2.opened_ext, w2.challenger_perms, w2.per_query_perms, w2.keccak_total()), (6_948, 862, 169, 15_396));
+        assert_eq!((w2.opened_ext, w2.challenger_perms, w2.per_query_perms, w2.keccak_total()), (6_950, 862, 169, 15_396));
+        // F5-4d: W +1 column opens 2 more terms (ζ, ζ·g); 27,808 words stay in
+        // the same flush block, so the challenger and totals do not move.
         let w4 = cost(&w_child(16, Lane::B4));
         assert_eq!((w4.challenger_perms, w4.per_query_perms, w4.keccak_total()), (857, 175, 8_382));
         assert_eq!((w2.query_rows, w4.query_rows), (1 << 19, 1 << 18));

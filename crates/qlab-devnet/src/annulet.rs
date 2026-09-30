@@ -794,7 +794,8 @@ mod tests {
         p.push(0);
         p.extend_from_slice(&100u64.to_le_bytes());
         p.extend_from_slice(&7u16.to_le_bytes());
-        assert_eq!(p_surface().encode(), p, "P bytes unchanged");
+        p.extend_from_slice(&[0u8; 32]); // F5-4d: the exit recipient, zero on a non-exit
+        assert_eq!(p_surface().encode(), p, "P bytes: unchanged up to F5-4d's appended recipient");
         let mut short = b.clone();
         short.pop();
         assert_eq!(L2Surface::decode(&short), Err(L2SurfaceError::WrongLength { got: 184, want: 185 }));
