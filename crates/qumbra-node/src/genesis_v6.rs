@@ -424,7 +424,17 @@ mod tests {
         let pin = g.hash_hex();
         let mut swapped = g.clone();
         swapped.base.committee_keys[3] = Validator::from_seed(3, [0x33; 32]).verifying_key().encode().to_vec();
+        // A swapped committee is no longer the rehearsal committee, so the
+        // rehearsal sequencer key refuses it first, by name…
+        assert!(
+            matches!(swapped.verify_startup(Some(&pin)), Err(GenesisError::V6Refused(ref m)) if m.contains("rehearsal sequencer key")),
+            "{:?}",
+            swapped.verify_startup(Some(&pin))
+        );
+        // …and with a launch sequencer key the pin is what refuses it.
+        swapped.wrapper.sequencer_key = Validator::from_seed(0, [0x44; 32]).verifying_key().encode().to_vec();
         assert!(matches!(swapped.verify_startup(Some(&pin)), Err(GenesisError::WrongGenesisHash { .. })));
+        assert!(swapped.verify_startup(None).is_ok(), "only the pin refuses it");
         // And the committee a node takes is the file's, key for key.
         let c = g.committee().unwrap();
         for (i, enc) in g.base.committee_keys.iter().enumerate() {

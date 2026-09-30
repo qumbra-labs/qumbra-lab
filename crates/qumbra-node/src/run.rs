@@ -3893,6 +3893,9 @@ mod tests {
     /// own miner and committee. Finalizing checkpoint 8 makes the next mined
     /// block carry the finality record, the node's recorded finality becomes
     /// 8, and all of it survives a restart on the same data dir.
+    ///
+    /// Slot 8 is signed only once the tip is `CHECKPOINT_SIGN_HYSTERESIS_BLOCKS`
+    /// past it (issue #269), so the node mines to `8 + H` first.
     #[test]
     fn a_v6_node_mines_a_record_and_keeps_it_across_restart() {
         let (mut config, _, base) = rig("v6", true);
@@ -3902,24 +3905,25 @@ mod tests {
         let mut node = RunningNode::start_v6(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         assert_eq!(node.p2p.node().sections(), qlab_devnet::forms::BodySections::V6);
+        let signed_at = 8 + qlab_devnet::params_devnet::CHECKPOINT_SIGN_HYSTERESIS_BLOCKS;
         node.try_checkpoint();
-        for _ in 0..8 {
+        for _ in 0..signed_at {
             assert!(node.try_mine(), "KeccakPow mines at the rehearsal difficulty");
             node.try_checkpoint();
         }
         assert_eq!(node.finalized_height(), Some(8), "the committee finalized checkpoint 8");
         assert_eq!(node.p2p.node().state().recorded_finality(), None, "no record mined yet");
-        assert!(node.try_mine(), "block 9");
-        assert_eq!(node.tip_height(), 9);
+        assert!(node.try_mine(), "the block after finalization");
+        assert_eq!(node.tip_height(), signed_at + 1);
         assert_eq!(
             node.p2p.node().state().recorded_finality(),
             Some(8),
-            "the node's own block 9 carries the record for 8"
+            "the node's own next block carries the record for 8"
         );
         node.save_snapshot().unwrap();
         drop(node);
         let reopened = RunningNode::start_v6(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
-        assert_eq!(reopened.tip_height(), 9);
+        assert_eq!(reopened.tip_height(), signed_at + 1);
         assert_eq!(reopened.p2p.node().state().recorded_finality(), Some(8), "re-derived on reopen");
         let _ = std::fs::remove_dir_all(&base);
     }
