@@ -367,7 +367,7 @@ mod tests {
     }
 
     fn body(txs: Vec<TxEntry>) -> BlockBody {
-        BlockBody { txs, coinbase_payees: Vec::new() }
+        BlockBody::new(txs, Vec::new())
     }
 
     /// Asset 7: mint 1,000 at h1, mint 500 + redeem 200 at h2, an S transfer

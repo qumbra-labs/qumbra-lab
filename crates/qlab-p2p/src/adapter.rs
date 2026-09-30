@@ -2464,6 +2464,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::L2RegistryWriteRootMismatch { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
             | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
+            // Lab #785 F5-3b, the V6 form. A section on the wrong form and the
+            // bundle stub read the pair alone. The finality record and the V6
+            // anchor rule read the block's OWN ancestry (CR(parent), ancestor
+            // hashes, roots by height, committee₀) — never this node's tip or
+            // local finality — so every node that holds the parent reaches the
+            // same verdict, live or replaying. That is the property Q-L5 bought,
+            // and it is what takes AnchorOutsideRecord out of #134's amnesty
+            // where AnchorNotFinal stays in it.
+            BodyError::SectionOnForm { .. }
+            | BodyError::BundleRefused
+            | BodyError::FinalityRecord { .. }
+            | BodyError::AnchorOutsideRecord { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #367, the rule half — split by what the verdict reads:
             BodyError::RiderRule { err, .. } => match err {
                 // Grammar, record kind and record size read only the revealed

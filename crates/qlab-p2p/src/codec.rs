@@ -923,6 +923,31 @@ mod tests {
         let (cp2, votes2) = decode_checkpoint_votes(&rec.encode()).unwrap();
         assert_eq!(cp2, cp);
         assert_eq!(votes2.iter().map(|v| v.signer).collect::<Vec<_>>(), (0..15).collect::<Vec<_>>());
+        // Review K2: the full 21-vote record, both directions, sizes computed.
+        let size = |n: usize| 72 + 1 + n * (1 + 2 + SIG_LEN);
+        assert_eq!(gossip.len(), size(15));
+        let all: Vec<Vote> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        let gossip21 = encode_checkpoint_votes(&cp, &all);
+        let rec21 = FinalityRecord { cp, votes: all.clone() };
+        assert_eq!(rec21.encode(), gossip21);
+        assert_eq!(gossip21.len(), size(21));
+        assert_eq!(FinalityRecord::decode(&gossip21).expect("21 votes").votes.len(), 21);
+        let (_, back21) = decode_checkpoint_votes(&rec21.encode()).unwrap();
+        assert_eq!(back21.iter().map(|v| v.signer).collect::<Vec<_>>(), (0..21).collect::<Vec<_>>());
+    }
+
+    /// Review K3: the record decoder reads qlab-note's canonical LEB128; the
+    /// gossip encoder writes qlab-cbserver's. Today cbserver's is a
+    /// re-export of qlab-note's (one function), so this pins that the two
+    /// stay byte-equal at every boundary if either is ever re-implemented.
+    #[test]
+    fn the_two_varint_writers_agree_at_every_boundary() {
+        for v in [0u64, 1, 127, 128, 255, 256, 3309, 16_383, 16_384, 2_097_151, 2_097_152, u32::MAX as u64, u64::MAX] {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            qlab_note::compact::write_varint(&mut a, v);
+            qlab_cbserver::codec::write_varint(&mut b, v);
+            assert_eq!(a, b, "{v}");
+        }
     }
     use qlab_devnet::header::ZERO_HASH;
 

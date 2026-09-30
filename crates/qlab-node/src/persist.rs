@@ -140,6 +140,41 @@ enum WireRecord {
     /// variant 2: written only on an Annulet net, so an L1 log never holds one
     /// and variants 0–2 (and `FORMAT_VERSION`) do not move.
     AnnuletBlock(AnnuletWireBlock),
+    /// Variant 4 — a **V6** block carrying at least one body section (lab
+    /// #785 F5-3b): its own frozen layout, additive like variants 2 and 3. A
+    /// V6 block with both sections absent is written as variant 0 or 2, the
+    /// same bytes it would have on any L1 net, so `FORMAT_VERSION` does not
+    /// move and a pre-V6 binary refuses a section-carrying record through the
+    /// ordinary record-does-not-decode path.
+    BlockV6(V6WireBlock),
+}
+
+/// The V6 block record (lab #785 F5-3b), explicit mirrors like
+/// [`AnnuletWireBlock`] so a later field on `StoredBlock` cannot move these
+/// bytes. Single payee: V6's cap is 1 until N-payee apply (lab #790), and
+/// that baton adds its own variant.
+#[derive(Serialize, Deserialize)]
+struct V6WireBlock {
+    header: crate::store::StoredHeader,
+    txs: Vec<V6WireTx>,
+    coinbase: u64,
+    coinbase_rkm: [u64; 4],
+    finality: Vec<u8>,
+    bundle: Vec<u8>,
+}
+
+/// One transaction of a [`V6WireBlock`]: the current L1 fields, rider
+/// included, no L2 surface (V6 is L1).
+#[derive(Serialize, Deserialize)]
+struct V6WireTx {
+    anchor: Hash32,
+    nullifiers: Vec<Hash32>,
+    commitments: Vec<Hash32>,
+    bucket_actions: u32,
+    fee: u64,
+    proof: Vec<u8>,
+    discovery: Vec<u8>,
+    rider: Vec<u8>,
 }
 
 /// The Annulet block record (lab #708), its own frozen layout — explicit
@@ -216,6 +251,30 @@ impl From<&LogRecord> for WireRecord {
         }
         match rec {
             LogRecord::Finalize(h) => WireRecord::Finalize(*h),
+            LogRecord::Block(b) if b.sections.is_some() => {
+                let sections = b.sections.as_ref().expect("guarded");
+                WireRecord::BlockV6(V6WireBlock {
+                    header: b.header.clone(),
+                    txs: b
+                        .txs
+                        .iter()
+                        .map(|t| V6WireTx {
+                            anchor: t.anchor,
+                            nullifiers: t.nullifiers.clone(),
+                            commitments: t.commitments.clone(),
+                            bucket_actions: t.bucket_actions,
+                            fee: t.fee,
+                            proof: t.proof.clone(),
+                            discovery: t.discovery.clone(),
+                            rider: t.rider.clone(),
+                        })
+                        .collect(),
+                    coinbase: b.coinbase,
+                    coinbase_rkm: b.coinbase_rkm,
+                    finality: sections.finality.clone(),
+                    bundle: sections.bundle.clone(),
+                })
+            }
             LogRecord::Block(b) if rider_free(b) => WireRecord::Block(LegacyStoredBlock {
                 header: b.header.clone(),
                 txs: b
@@ -261,6 +320,7 @@ fn annulet_record_to_block(a: AnnuletWireBlock) -> StoredBlock {
             .collect(),
         coinbase: 0,
         coinbase_rkm: [0; 4],
+        sections: None,
         annulet: Some(crate::store::AnnuletStoredSeal {
             ext: qlab_devnet::annulet::AnnuletHeaderFields {
                 l1_anchor_height: a.l1_anchor_height,
@@ -278,7 +338,29 @@ impl From<WireRecord> for LogRecord {
             WireRecord::Finalize(h) => LogRecord::Finalize(h),
             WireRecord::BlockV4(b) => LogRecord::Block(b),
             WireRecord::AnnuletBlock(a) => LogRecord::Block(annulet_record_to_block(a)),
-            WireRecord::Block(l) => LogRecord::Block(StoredBlock { annulet: None,
+            WireRecord::BlockV6(v) => LogRecord::Block(StoredBlock {
+                annulet: None,
+                header: v.header,
+                txs: v
+                    .txs
+                    .into_iter()
+                    .map(|t| crate::store::StoredTx {
+                        l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+                        anchor: t.anchor,
+                        nullifiers: t.nullifiers,
+                        commitments: t.commitments,
+                        bucket_actions: t.bucket_actions,
+                        fee: t.fee,
+                        proof: t.proof,
+                        discovery: t.discovery,
+                        rider: t.rider,
+                    })
+                    .collect(),
+                coinbase: v.coinbase,
+                coinbase_rkm: v.coinbase_rkm,
+                sections: Some(crate::store::StoredSections { finality: v.finality, bundle: v.bundle }),
+            }),
+            WireRecord::Block(l) => LogRecord::Block(StoredBlock { annulet: None, sections: None,
                 header: l.header,
                 txs: l
                     .txs
@@ -395,6 +477,21 @@ fn check_record_buckets(rec: &WireRecord, record_index: usize) -> io::Result<()>
             check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
         }
         WireRecord::BlockV4(b) => {
+            check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
+        }
+        WireRecord::BlockV6(b) => {
+            // Lab #785: variant 4 is written only for a block carrying a
+            // section; one with neither is a second spelling of a variant-0/2
+            // record — refused by name, never normalised.
+            if b.finality.is_empty() && b.bundle.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{BLOCK_LOG}: record {record_index} is a V6 block record with no section. \
+                         This datadir is corrupt — re-sync it; do not start against it."
+                    ),
+                ));
+            }
             check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
         }
         WireRecord::AnnuletBlock(b) => {
@@ -848,7 +945,7 @@ mod tests {
     // --- lab #367: the rider's on-disk story --------------------------------
 
     fn a_stored_block(rider: Vec<u8>) -> StoredBlock {
-        StoredBlock { annulet: None,
+        StoredBlock { annulet: None, sections: None,
             header: crate::store::StoredHeader {
                 prev: h(0x11),
                 height: 9_000,
@@ -1059,6 +1156,7 @@ mod tests {
             }],
             coinbase: 0,
             coinbase_rkm: [0; 4],
+            sections: None,
             annulet: Some(crate::store::AnnuletStoredSeal {
                 ext: qlab_devnet::annulet::AnnuletHeaderFields {
                     l1_anchor_height: 0x0102_0304_0506_0708,

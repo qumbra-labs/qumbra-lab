@@ -2084,7 +2084,7 @@ mod tests {
     // ---- the incremental projection -----------------------------------------
 
     fn stored(height: u64, prev: Hash32, discovery: Vec<Vec<u8>>) -> StoredBlock {
-        StoredBlock { annulet: None,
+        StoredBlock { annulet: None, sections: None,
             header: StoredHeader {
                 height,
                 prev,
