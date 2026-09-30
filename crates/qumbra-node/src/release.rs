@@ -323,6 +323,13 @@ pub enum ReleaseError {
     /// marker under a V6 release, or a V6 marker under an L1 release. The
     /// identities differ by construction, so neither may run the other's data dir.
     MarkerOfAnotherNet { marker: &'static str, release: &'static str, marked: u64 },
+    /// **Lab #785 F5-4c-2 (review T1).** A V6 marker of a *different* V6 net:
+    /// its WrapperParams digest is not this release's.
+    MarkerOfAnotherV6Net { marker_wrapper: String, release_wrapper: String, marked: u64 },
+    /// **Review T5.** A marker whose identity fields do not agree with its
+    /// schema (a V6 schema without a well-formed WrapperParams digest, or an
+    /// L1 schema with one).
+    MalformedMarker { why: String, marked: u64 },
 }
 
 impl std::fmt::Display for ReleaseError {
@@ -366,6 +373,15 @@ impl std::fmt::Display for ReleaseError {
                  {marked} (it declares resumes_from={marked}, which restates the revision in \
                  force), or remove the marker deliberately if this data dir never resumed."
             ),
+            ReleaseError::MarkerOfAnotherV6Net { marker_wrapper, release_wrapper, marked } => write!(
+                f,
+                "the halt marker in this data dir (height {marked}) is a V6 net's with WrapperParams \
+                 {marker_wrapper}, and this binary is running the V6 net with WrapperParams \
+                 {release_wrapper}: another net's data dir. Refusing to start."
+            ),
+            ReleaseError::MalformedMarker { why, marked } => {
+                write!(f, "the halt marker in this data dir (height {marked}) is malformed: {why}. Refusing to start.")
+            }
             ReleaseError::MarkerOfAnotherNet { marker, release, marked } => write!(
                 f,
                 "the halt marker in this data dir (height {marked}) is a {marker} net's, and this \
@@ -435,6 +451,22 @@ impl Release {
         self.identity.digest_of(r)
     }
 
+    /// A marker of this release's schema must also be this net's: well-formed
+    /// (review T5) and, on V6, naming this release's WrapperParams (review T1).
+    fn check_marker_identity(&self, m: &HaltMarker) -> Result<(), ReleaseError> {
+        let marker_wrapper = m.wrapper_digest().map_err(|why| ReleaseError::MalformedMarker { why, marked: m.height })?;
+        match (self.identity, marker_wrapper) {
+            (RevisionIdentity::V6 { wrapper_digest }, Some(w)) if w != wrapper_digest => {
+                Err(ReleaseError::MarkerOfAnotherV6Net {
+                    marker_wrapper: crate::genesis::hex_encode(&w),
+                    release_wrapper: crate::genesis::hex_encode(&wrapper_digest),
+                    marked: m.height,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Structural startup validation, independent of any on-disk state:
     /// grid rule (H2), the carried revision describes this binary (H4), and a
     /// declared resume carries a revision (H4).
@@ -499,6 +531,9 @@ impl Release {
             }
             return Err(ReleaseError::UnknownMarkerSchema { found: m.schema, expected, marked: m.height });
         }
+        // Review T1: two V6 nets share the V6 schema; the marker must be THIS
+        // net's — checked before any other step, whatever the release declares.
+        self.check_marker_identity(m)?;
         // (1) A binary that cannot go past the boundary cannot change the rules above
         //     it, so it needs no declaration. This is the "restart the halted binary
         //     to inspect it" case, and it must keep working.
@@ -513,7 +548,7 @@ impl Release {
         //     still halted AT the boundary the pre-halt revision is trivially in
         //     force, so matching on it there would let the pre-announcement binary
         //     through — the one refusal this gate exists for.
-        if m.resumed && self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()) {
+        if m.resumed && self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()?) {
             return Ok(());
         }
         // (3) Either the boundary is still closed — a halted node is resumed
@@ -542,7 +577,7 @@ impl Release {
     /// Restarting a binary whose transition is already recorded returns `false`, so an
     /// ordinary restart costs no fsync and no log line.
     pub fn supersedes(&self, m: &HaltMarker) -> bool {
-        if m.schema != self.identity.marker_schema() {
+        if m.schema != self.identity.marker_schema() || self.check_marker_identity(m).is_err() {
             return false;
         }
         if !self.plan.halt_at().is_none_or(|h| h > m.height) {
@@ -552,7 +587,10 @@ impl Release {
             return false; // not a declared transition
         }
         // Already on the record: this exact revision in force, boundary marked passed.
-        !(m.resumed && self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()))
+        match m.in_force_digest() {
+            Ok(d) => !(m.resumed && self.revision.map(|r| self.identity_digest(&r)) == Some(d)),
+            Err(_) => false,
+        }
     }
 
     /// **The rule schedule this release enforces on *this data dir*** (#81).
@@ -576,9 +614,10 @@ impl Release {
             return Ok(schedule); // this binary declares the boundary itself
         }
         if let Some(m) = marker.filter(|m| m.schema == self.identity.marker_schema() && m.resumed) {
-            if self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()) {
+            self.check_marker_identity(m)?;
+            if self.revision.map(|r| self.identity_digest(&r)) == Some(m.in_force_digest()?) {
                 schedule.post_halt =
-                    Some(PostHaltRules { from_height: m.height, domain: m.in_force_digest() });
+                    Some(PostHaltRules { from_height: m.height, domain: m.in_force_digest()? });
                 schedule.validate()?;
             }
         }
@@ -621,7 +660,7 @@ impl Release {
                 m.height,
                 m.revision_id,
                 m.frozen_digest_hex,
-                crate::genesis::hex_encode(&m.in_force_digest())
+                m.in_force_digest().map_or_else(|e| format!("MALFORMED ({e})"), |d| crate::genesis::hex_encode(&d))
             )),
             Some(m) => s.push_str(&format!(
                 "  halt marker:  HALTED at height {} under revision `{}` (frozen digest {}, \
@@ -681,7 +720,9 @@ pub struct HaltMarker {
     pub wrapper_digest_hex: Option<String>,
 }
 
-/// 64 hex characters → 32 bytes, or `None`.
+/// 64 hex characters → 32 bytes, or `None`. Canonical only (review T4): the
+/// input must be its own lower-case re-encoding, so no `+` sign, no upper
+/// case — one marker text per digest.
 fn parse_hash32(h: &str) -> Option<Hash32> {
     if h.len() != 64 {
         return None;
@@ -690,7 +731,7 @@ fn parse_hash32(h: &str) -> Option<Hash32> {
     for (i, b) in out.iter_mut().enumerate() {
         *b = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
-    Some(out)
+    (crate::genesis::hex_encode(&out) == h).then_some(out)
 }
 
 /// File name of the halt marker inside a node's data dir.
@@ -757,29 +798,31 @@ impl HaltMarker {
     /// The digest of the revision **in force** on this data dir — what the resume
     /// gate compares a binary's own [`Revision::digest`] against, and the post-halt
     /// rule domain above [`Self::height`].
-    pub fn in_force_digest(&self) -> Hash32 {
-        match self.wrapper_digest() {
-            None => revision_digest(&self.revision_id, &self.frozen_digest_hex),
-            Some(w) => revision_digest_v6_of(&self.revision_id, &self.frozen_digest_hex, &w),
+    /// A malformed marker (identity fields that disagree with its schema) is
+    /// a refusal, never a panic (review T5).
+    pub fn in_force_digest(&self) -> Result<Hash32, ReleaseError> {
+        match self.wrapper_digest().map_err(|why| ReleaseError::MalformedMarker { why, marked: self.height })? {
+            None => Ok(revision_digest(&self.revision_id, &self.frozen_digest_hex)),
+            Some(w) => Ok(revision_digest_v6_of(&self.revision_id, &self.frozen_digest_hex, &w)),
         }
     }
 
-    /// The V6 WrapperParams digest this marker names, if any. [`Self::load`]
-    /// refuses a marker whose field does not match its schema or does not
-    /// decode, so here it is well-formed.
-    fn wrapper_digest(&self) -> Option<Hash32> {
-        self.wrapper_digest_hex.as_deref().map(|h| parse_hash32(h).expect("checked at load"))
-    }
-
-    /// Schema and field agree: a V6 marker names a 32-byte digest, an L1 one
-    /// names none.
-    fn check_identity_fields(&self) -> Result<(), String> {
-        match (self.schema, &self.wrapper_digest_hex) {
-            (MARKER_SCHEMA_V6, Some(h)) if parse_hash32(h).is_some() => Ok(()),
-            (MARKER_SCHEMA_V6, _) => Err("a V6 marker must name its 32-byte WrapperParams digest".into()),
-            (_, None) => Ok(()),
+    /// The V6 WrapperParams digest this marker names, checked against its
+    /// schema: a V6 marker names a canonical 32-byte digest, an L1 one none.
+    fn wrapper_digest(&self) -> Result<Option<Hash32>, String> {
+        match (self.schema, self.wrapper_digest_hex.as_deref()) {
+            (MARKER_SCHEMA_V6, Some(h)) => {
+                parse_hash32(h).map(Some).ok_or_else(|| "its WrapperParams digest is not 64 lower-case hex digits".into())
+            }
+            (MARKER_SCHEMA_V6, None) => Err("a V6 marker must name its WrapperParams digest".into()),
+            (_, None) => Ok(None),
             (s, Some(_)) => Err(format!("a schema-{s} marker names a WrapperParams digest")),
         }
+    }
+
+    /// Schema and field agree (see [`Self::wrapper_digest`]).
+    fn check_identity_fields(&self) -> Result<(), String> {
+        self.wrapper_digest().map(|_| ())
     }
 
     /// Path of the marker inside `data_dir`.
@@ -1245,7 +1288,7 @@ mod tests {
         // revision the marker records, so a gate keyed on digest equality ALONE would
         // have let it through: this is the assertion that pins the `resumed` gating.
         let wrong = routine(REVISION_V1_0);
-        assert_eq!(wrong.revision.unwrap().digest(), m.in_force_digest(), "same revision");
+        assert_eq!(wrong.revision.unwrap().digest(), m.in_force_digest().unwrap(), "same revision");
         assert!(matches!(
             wrong.check_against_marker(Some(&m)),
             Err(ReleaseError::UndeclaredResume { marked, declared: None, .. })
@@ -1460,7 +1503,7 @@ mod tests {
         assert_eq!(advanced.height, halted.height, "the boundary height never moves");
         assert_eq!(advanced.boundary_finalized, halted.boundary_finalized, "audit preserved");
         assert!(advanced.resumed);
-        assert_eq!(advanced.in_force_digest(), REVISION_V1_0_1_DRILL.digest());
+        assert_eq!(advanced.in_force_digest().unwrap(), REVISION_V1_0_1_DRILL.digest());
 
         // Restarting the upgraded binary is not a second transition.
         assert!(!up.supersedes(&advanced), "no redundant fsync, no second log line");
@@ -1627,7 +1670,7 @@ mod tests {
             assert!(banner.contains(&format!("  rule domain:  {}\n", rev.digest_hex())), "{banner}");
             assert!(!banner.contains("identity:"), "an L1 banner keeps today's lines");
             let m = HaltMarker::for_release(&declared, DRILL_HALT_HEIGHT, true).superseded_by(&declared);
-            assert_eq!(m.in_force_digest(), rev.digest());
+            assert_eq!(m.in_force_digest().unwrap(), rev.digest());
             let routine = Release { resumes_from: None, ..declared };
             assert_eq!(routine.rule_schedule_on(Some(&m)).unwrap().post_halt.unwrap().domain, rev.digest());
             assert!(declared.check_against_marker(Some(&m)).is_ok());
@@ -1671,14 +1714,14 @@ mod tests {
         let v6 = resume().on_v6(w);
         let m = HaltMarker::for_release(&armed().on_v6(w), DRILL_HALT_HEIGHT, true).superseded_by(&v6);
         assert_eq!(m.schema, MARKER_SCHEMA_V6);
-        assert_eq!(m.in_force_digest(), revision_digest_v6_of(REVISION_V1_0_1_DRILL.id, REVISION_V1_0_1_DRILL.frozen_digest_hex, &w));
-        assert_ne!(m.in_force_digest(), REVISION_V1_0_1_DRILL.digest());
+        assert_eq!(m.in_force_digest().unwrap(), revision_digest_v6_of(REVISION_V1_0_1_DRILL.id, REVISION_V1_0_1_DRILL.frozen_digest_hex, &w));
+        assert_ne!(m.in_force_digest().unwrap(), REVISION_V1_0_1_DRILL.digest());
         let dir = std::env::temp_dir().join(format!("qmb_c1_marker_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         m.write(&dir).unwrap();
         assert_eq!(HaltMarker::load(&dir).unwrap(), Some(m.clone()));
         assert!(v6.check_against_marker(Some(&m)).is_ok());
-        assert_eq!(v6.rule_schedule().unwrap().post_halt.unwrap().domain, m.in_force_digest());
+        assert_eq!(v6.rule_schedule().unwrap().post_halt.unwrap().domain, m.in_force_digest().unwrap());
         assert!(v6.banner(Some(&m)).contains("  identity:     V6 (WrapperParams "));
         // A marker whose field disagrees with its schema is refused at load.
         for bad in [
@@ -1711,6 +1754,51 @@ mod tests {
         // An unknown schema is still the unknown-schema refusal.
         let odd = HaltMarker { schema: 9, ..l1_marker };
         assert!(matches!(resume().check_against_marker(Some(&odd)), Err(ReleaseError::UnknownMarkerSchema { found: 9, .. })));
+    }
+
+    /// Review T1: a V6 marker of ANOTHER V6 net is refused by name, before any
+    /// other step — halted and a release declaring the resume; resumed; and a
+    /// release that cannot pass the boundary at all. Nothing is rewritten.
+    #[test]
+    fn a_v6_marker_of_another_v6_net_is_refused_in_every_case() {
+        let (a, b) = (rehearsal_wrapper_digest(), [0x5b; 32]);
+        let refused = |r: Result<(), ReleaseError>| matches!(r, Err(ReleaseError::MarkerOfAnotherV6Net { .. }));
+        let halted_a = HaltMarker::for_release(&armed().on_v6(a), DRILL_HALT_HEIGHT, true);
+        assert!(refused(resume().on_v6(b).check_against_marker(Some(&halted_a))), "halted + declaring release");
+        assert!(!resume().on_v6(b).supersedes(&halted_a), "no rewrite");
+        let resumed_a = halted_a.superseded_by(&resume().on_v6(a));
+        assert!(refused(resume().on_v6(b).check_against_marker(Some(&resumed_a))), "resumed");
+        assert!(refused(Release { resumes_from: None, ..resume().on_v6(b) }.check_against_marker(Some(&resumed_a))), "routine");
+        assert!(refused(armed().on_v6(b).check_against_marker(Some(&halted_a))), "cannot pass the boundary");
+        assert!(matches!(
+            Release { resumes_from: None, ..resume().on_v6(b) }.rule_schedule_on(Some(&resumed_a)),
+            Err(ReleaseError::MarkerOfAnotherV6Net { .. })
+        ));
+        // Its own net still passes.
+        assert!(resume().on_v6(a).check_against_marker(Some(&resumed_a)).is_ok());
+    }
+
+    /// Review T4/T5: the digest text is canonical (no `+`, no upper case),
+    /// and a malformed in-memory marker is a refusal, not a panic.
+    #[test]
+    fn marker_identity_fields_are_canonical_and_never_panic() {
+        let w = rehearsal_wrapper_digest();
+        let m = HaltMarker::for_release(&armed().on_v6(w), DRILL_HALT_HEIGHT, true);
+        let hex = m.wrapper_digest_hex.clone().unwrap();
+        assert!(parse_hash32(&hex).is_some());
+        assert!(parse_hash32(&hex.to_uppercase()).is_none(), "upper case");
+        assert!(parse_hash32(&format!("+{}", &hex[1..])).is_none(), "a leading sign");
+        for bad in [
+            HaltMarker { wrapper_digest_hex: Some(hex.to_uppercase()), ..m.clone() },
+            HaltMarker { wrapper_digest_hex: None, ..m.clone() },
+            HaltMarker { schema: MARKER_SCHEMA, ..m.clone() },
+        ] {
+            assert!(matches!(bad.in_force_digest(), Err(ReleaseError::MalformedMarker { .. })), "{bad:?}");
+            // Neither the banner nor the gate panics on it.
+            let _ = armed().on_v6(w).banner(Some(&bad));
+            let _ = armed().on_v6(w).banner(Some(&HaltMarker { resumed: true, ..bad.clone() }));
+            assert!(armed().on_v6(w).check_against_marker(Some(&bad)).is_err());
+        }
     }
 
     /// 🔒 The V6 rule domains over the rehearsal WrapperParams, copied from

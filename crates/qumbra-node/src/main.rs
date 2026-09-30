@@ -777,7 +777,10 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // The banner is a multi-line string shared with the one-shot `halt-status`
     // (which stays unstamped, like all one-shot command output); here on the
     // run path each of its lines gets the journal stamp.
-    for line in RELEASE
+    // Lab #785 F5-4c-2 (review T2): the node's OWN release — on a V6 net it
+    // carries the V6 identity, and the logged rule domain must be that one.
+    for line in node
+        .release()
         .banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref())
         .lines()
     {
@@ -865,16 +868,16 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
     // format-10 file folds its WrapperParams into the identity; any other
     // file, and no flag at all, is this binary's L1 identity, whose output is
     // byte-identical to before.
-    let release = match flag(args, "--genesis") {
-        None => RELEASE,
-        Some(path) => {
-            let bytes = std::fs::read(path)?;
-            match qumbra_node::genesis_v6::GenesisFileV6::from_bytes(&bytes) {
-                Ok(g) => RELEASE.on_v6(g.wrapper.digest()),
-                Err(qumbra_node::genesis::GenesisError::NotV6Genesis { .. }) => RELEASE,
-                Err(e) => return Err(Box::new(e)),
-            }
+    // Review T3: the file must be a genesis (any other bytes refuse), and
+    // `--genesis` with no value is an error, never a silent L1 answer.
+    let release = if has_flag(args, "--genesis") {
+        let path = flag(args, "--genesis").filter(|p| !p.starts_with("--")).ok_or("--genesis needs a genesis file path")?;
+        match qumbra_node::annulet_genesis::load_any(&std::fs::read(path)?)? {
+            qumbra_node::annulet_genesis::AnyGenesis::V6(g) => RELEASE.on_v6(g.wrapper.digest()),
+            qumbra_node::annulet_genesis::AnyGenesis::L1(_) | qumbra_node::annulet_genesis::AnyGenesis::Annulet(_) => RELEASE,
         }
+    } else {
+        RELEASE
     };
     println!("qumbra-node halt-status (issue #74)");
     print!("{}", release.banner(marker.as_ref()));

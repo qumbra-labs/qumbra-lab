@@ -22,12 +22,12 @@
 //!
 //! [`WrapperParams`] freezes the L2's consensus constants for this net. Their
 //! keccak is folded into the V6 revision digest
-//! ([`crate::revision::revision_digest_v6`]) beside `frozen_digest`. In F5-3c
-//! that digest is **computed, pinned and printed** (`genesis init --t2`) — it
-//! is **not yet** a V6 net's rule domain or halt-marker identity: `prepare_v6`
-//! runs the release's ordinary `Revision::digest()`, exactly as T1 and V5 do.
-//! Wiring it in (with T1's and V5's domains byte-identical and a CI pin) is
-//! F5-4 condition C1 (review of PR #794).
+//! ([`crate::revision::revision_digest_v6`]) beside `frozen_digest`. Since
+//! F5-4c-2 (C1) that digest **is** a V6 net's rule domain and halt-marker
+//! identity: `prepare_v6` runs `RELEASE.on_v6(wrapper.digest())`, and a V6
+//! data dir's marker is schema 2 naming the WrapperParams digest
+//! ([`crate::release::RevisionIdentity`]). T1's and V5's domains and markers
+//! are byte-identical.
 
 use serde::{Deserialize, Serialize};
 

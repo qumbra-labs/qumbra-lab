@@ -803,6 +803,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         Self::prepare_v6(config, genesis, pow, verifier)?.open()
     }
 
+    /// [`Self::start_v6`] against an explicit [`Release`], folded for this V6
+    /// net exactly as [`Self::prepare_v6`] folds [`RELEASE`] (lab #785 F5-4c-2,
+    /// review T6). Test-only: the halt semantics of a V6 data dir, through the
+    /// real run path.
+    #[cfg(test)]
+    pub(crate) fn start_v6_with_release(
+        config: &NodeConfig,
+        genesis: &crate::genesis_v6::GenesisFileV6,
+        pow: P,
+        verifier: V,
+        release: Release,
+    ) -> Result<Self, RunError> {
+        Self::prepare_l1_family(
+            config,
+            &genesis.base,
+            PreparedGenesis::V6(genesis),
+            || genesis.verify_startup(config.expected_genesis_hash.as_deref()),
+            pow,
+            verifier,
+            release.on_v6(genesis.wrapper.digest()),
+        )?
+        .open()
+    }
+
     /// [`Self::start`] against an explicit [`Release`] (issue #74).
     ///
     /// This is a **Rust API for tests**, not a runtime override: the binary calls
@@ -7069,6 +7093,45 @@ mod tests {
         let m = HaltMarker::load(&config.data_dir).unwrap().unwrap();
         assert_eq!(m.revision_id, "v1.0.1-drill");
         assert!(m.resumed);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Lab #785 F5-4c-2 (review T6): a V6 node under a halting release writes
+    /// a schema-2 marker naming its WrapperParams digest; it restarts under
+    /// the same identity; and the L1 path on that data dir is refused by name,
+    /// leaving the marker as it was.
+    #[test]
+    fn a_v6_node_halts_with_its_own_marker_and_the_l1_path_is_refused() {
+        use crate::release::{HaltMarker, MARKER_SCHEMA_V6};
+        let (mut config, l1_genesis, base) = rig("v6_halt_identity", true);
+        let genesis = crate::genesis_v6::GenesisFileV6::new_rehearsal();
+        std::fs::write(&config.genesis_file, genesis.to_bytes()).unwrap();
+        config.expected_genesis_hash = Some(genesis.hash_hex());
+        {
+            let mut node =
+                RunningNode::start_v6_with_release(&config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release())
+                    .unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            node.try_checkpoint();
+            mine_and_checkpoint(&mut node, DH);
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+        let m = HaltMarker::load(&config.data_dir).unwrap().expect("the halted node wrote its marker");
+        assert_eq!(m.schema, MARKER_SCHEMA_V6);
+        assert_eq!(m.wrapper_digest_hex, Some(crate::genesis::hex_encode(&genesis.wrapper.digest())));
+        let raw = std::fs::read_to_string(HaltMarker::path(&config.data_dir)).unwrap();
+        drop(
+            RunningNode::start_v6_with_release(&config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release())
+                .expect("the same V6 identity restarts on its own data dir"),
+        );
+        let err = RunningNode::start_with_release(&config, &l1_genesis, KeccakPow, DevnetRehearsalVerifier, armed_release());
+        assert!(
+            matches!(err, Err(RunError::Release(ReleaseError::MarkerOfAnotherNet { marker: "V6", release: "L1", .. }))),
+            "{:?}",
+            err.as_ref().err()
+        );
+        assert_eq!(std::fs::read_to_string(HaltMarker::path(&config.data_dir)).unwrap(), raw, "untouched");
         let _ = std::fs::remove_dir_all(&base);
     }
 
