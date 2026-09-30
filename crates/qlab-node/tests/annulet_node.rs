@@ -63,7 +63,7 @@ fn s_tx(node: &MemNode, nf: u8) -> TxEntry {
         },
         discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None, write: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None, write: None, exit_rkm: [0; 32] }.encode(),
     };
     t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
     t
@@ -128,6 +128,7 @@ fn the_annulet_mempool_prices_with_the_l2_table_and_refuses_what_block_validatio
         registry_root: root(),
         vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 5, asset: 7 }]),
         write: None,
+        exit_rkm: [0; 32],
     }
     .encode();
     p.public.fee = 1;
@@ -222,6 +223,7 @@ fn the_l2_surface_is_part_of_pool_identity() {
             registry_root: root(),
             vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 1, asset: 7 }]),
             write: None,
+            exit_rkm: [0; 32],
         }
         .encode(),
         ..s.clone()
@@ -399,7 +401,7 @@ fn the_genesis_notes_survive_restart_exactly_once() {
 /// A P transaction carrying `terms` (mock-proved), at the P tier.
 fn p_tx(n: &MemNode, nf: u8, terms: [VPublicTerm; 2]) -> TxEntry {
     let mut t = s_tx(n, nf);
-    t.l2 = L2Surface { shape: L2ShapeTag::P, registry_root: root(), vpublic: Some(terms), write: None }.encode();
+    t.l2 = L2Surface { shape: L2ShapeTag::P, registry_root: root(), vpublic: Some(terms), write: None, exit_rkm: [0; 32] }.encode();
     t.public.fee = FEES.tier_p;
     t
 }
@@ -477,7 +479,7 @@ fn the_annulet_mempool_refuses_a_stale_root_and_an_uncovered_redeem() {
     n.apply_sealed_block(&sealed_child(&key, &g, &b1), b1, &OkProof).unwrap();
     let mut pool = Mempool::new(MempoolParams::default());
     let mut stale = s_tx(&n, 3);
-    stale.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: [0x99; 32], vpublic: None, write: None }.encode();
+    stale.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: [0x99; 32], vpublic: None, write: None, exit_rkm: [0; 32] }.encode();
     assert!(matches!(
         pool.admit(stale, &n, &OkProof, &EmptyNameView),
         Err(MempoolError::L2SurfaceInvalid(BodyError::L2RegistryRootStale { index: 0 }))
@@ -488,6 +490,19 @@ fn the_annulet_mempool_refuses_a_stale_root_and_an_uncovered_redeem() {
         Err(MempoolError::RedeemExceedsOutstanding { asset: 7 })
     ), "60 pooled + 41 > 100");
     assert!(pool.admit(p_tx(&n, 13, redeem(40, 7)), &n, &OkProof, &EmptyNameView).is_ok(), "60 + 40 = 100");
+}
+
+/// Lab #785 F5-4d (pre-review U6): the pool refuses the exit edge — an
+/// asset-0 redeem — by name before any supply arithmetic; the Annulet has no
+/// bridge to pay it.
+#[test]
+fn the_annulet_mempool_refuses_an_exit_by_name() {
+    let (n, _g) = node();
+    let mut pool = Mempool::new(MempoolParams::default());
+    assert!(matches!(
+        pool.admit(p_tx(&n, 3, redeem(10, 0)), &n, &OkProof, &EmptyNameView),
+        Err(MempoolError::L2SurfaceInvalid(BodyError::L2ExitWithoutBridge { index: 0 }))
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +536,7 @@ fn r_tx(n: &MemNode, nf: u8, old_root: Hash32, new_root: Hash32, leaf_lanes: [u6
         registry_root: old_root,
         vpublic: None,
         write: Some(qlab_devnet::annulet::RegistryWriteSurface { new_root, leaf_lanes }),
+        exit_rkm: [0; 32],
     }
     .encode();
     t
@@ -529,7 +545,7 @@ fn r_tx(n: &MemNode, nf: u8, old_root: Hash32, new_root: Hash32, leaf_lanes: [u6
 /// An S transaction bound to `at` rather than the genesis root.
 fn s_tx_at(n: &MemNode, nf: u8, at: Hash32) -> TxEntry {
     let mut t = s_tx(n, nf);
-    t.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: at, vpublic: None, write: None }.encode();
+    t.l2 = L2Surface { shape: L2ShapeTag::S, registry_root: at, vpublic: None, write: None, exit_rkm: [0; 32] }.encode();
     t
 }
 

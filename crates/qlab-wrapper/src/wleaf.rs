@@ -11,8 +11,8 @@
 //!              levels 2..31 (60): the four roots as one aligned subtree,
 //!              its old side the empty subtree zeros[2] (aa_next ≡ 0 mod 4)
 //!     history  C_in appended to CH (64)
-//!   slot ×k (661 perms):
-//!     F3's slot    SD 5 | inserts 3 × 131 | appends 2 × 64 | registry 33
+//!   slot ×k (662 perms):
+//!     F3's slot    SD 6 | inserts 3 × 131 | appends 2 × 64 | registry 33
 //!     vPublic ×2   old leaf, new leaf, supply pair path (34 each; P only)
 //!     exits ×2     the exit chain's steps (P redeems on asset 0)
 //!     anchor       32: a transaction's anchor opened in CH, a claim's in AA
@@ -22,7 +22,7 @@
 //! **The claim slot** (tag `C`, SD word 0 = `0x04`): insert 0 is its `cnf`,
 //! committed to `K` (not `N`); append 0 is its `cm2`; its anchor opens in
 //! `AA` (`A ≠ 0`); its fee chunks add into the fee accumulator. Inserts 1–2,
-//! append 1, SD block 4, the registry and the `vPublic` segments are off for
+//! append 1, SD blocks 4–5, the registry and the `vPublic` segments are off for
 //! a claim.
 //!
 //! **The fee note** is appended in every wrapper (value 0 with no claims):
@@ -55,7 +55,10 @@ use crate::lane::LaneBuilder;
 // The program
 // ---------------------------------------------------------------------------
 
-pub const SD_BLOCKS: usize = 5;
+/// SD blocks per slot: the most any shape needs (S 5, P 6, R 4, C 1) —
+/// P's exit recipient (lab #785 F5-4d) took it from 5 to 6.
+pub const SD_BLOCKS: usize = 6;
+const _: () = assert!(SD_BLOCKS == sd_perms(qlab_air::l2p::PV_LEN));
 pub const INSERTS: usize = 3;
 pub const APPENDS: usize = 2;
 pub const R_DEPTH: usize = qlab_air::l2::REGISTRY_DEPTH;
@@ -140,7 +143,10 @@ pub const PRO: usize = 3 + 4 + 4;
 /// The absorbed roots form one aligned depth-2 subtree of AA.
 pub const ABS_LEVELS: usize = 2;
 const _: () = assert!(M_ABS == 1 << ABS_LEVELS);
-pub const SLOT_SEGS: usize = 65;
+/// The slot's segments after the SD blocks: inserts 3 × 11, appends 2 × 4,
+/// the registry 4, `vPublic` 2 × 5, exits 2, anchor 3.
+const SLOT_TAIL: usize = 3 * 11 + 2 * 4 + 4 + 2 * 5 + 2 + 3;
+pub const SLOT_SEGS: usize = SD_BLOCKS + SLOT_TAIL;
 pub const SLOT_BASE: usize = PRO;
 pub const EPI_BASE: usize = SLOT_BASE + SLOT_SEGS;
 pub const EPI: usize = 7;
@@ -161,30 +167,32 @@ impl Seg {
     /// The segment's ring position.
     pub const fn idx(self) -> usize {
         let b = SLOT_BASE;
+        // The slot's segments after its SD blocks.
+        let l = SLOT_BASE + SD_BLOCKS;
         match self {
             Seg::AbsNode(j) => j,
             Seg::Pair(PathId::Abs, p) => 3 + part_off(p),
             Seg::Pair(PathId::Hist, p) => 7 + part_off(p),
             Seg::Sd(k) => b + k,
-            Seg::LeafOld(i) => b + 5 + 11 * i,
-            Seg::LeafMid(i) => b + 5 + 11 * i + 1,
-            Seg::Pair(PathId::Mid(i), p) => b + 5 + 11 * i + 2 + part_off(p),
-            Seg::LeafNew(i) => b + 5 + 11 * i + 6,
-            Seg::Pair(PathId::New(i), p) => b + 5 + 11 * i + 7 + part_off(p),
-            Seg::Pair(PathId::C(j), p) => b + 38 + 4 * j + part_off(p),
-            Seg::RegLeaf => b + 46,
-            Seg::Pair(PathId::R, Part::Bulk) => b + 47,
-            Seg::Pair(PathId::R, Part::LastA) => b + 48,
-            Seg::Pair(PathId::R, _) => b + 49,
-            Seg::SupOld(k) => b + 50 + 5 * k,
-            Seg::SupNew(k) => b + 51 + 5 * k,
-            Seg::Pair(PathId::Sup(k), Part::Bulk) => b + 52 + 5 * k,
-            Seg::Pair(PathId::Sup(k), Part::LastA) => b + 53 + 5 * k,
-            Seg::Pair(PathId::Sup(k), _) => b + 54 + 5 * k,
-            Seg::Exit(k) => b + 60 + k,
-            Seg::Anch(APart::Low) => b + 62,
-            Seg::Anch(APart::L30) => b + 63,
-            Seg::Anch(APart::Last) => b + 64,
+            Seg::LeafOld(i) => l + 11 * i,
+            Seg::LeafMid(i) => l + 11 * i + 1,
+            Seg::Pair(PathId::Mid(i), p) => l + 11 * i + 2 + part_off(p),
+            Seg::LeafNew(i) => l + 11 * i + 6,
+            Seg::Pair(PathId::New(i), p) => l + 11 * i + 7 + part_off(p),
+            Seg::Pair(PathId::C(j), p) => l + 33 + 4 * j + part_off(p),
+            Seg::RegLeaf => l + 41,
+            Seg::Pair(PathId::R, Part::Bulk) => l + 42,
+            Seg::Pair(PathId::R, Part::LastA) => l + 43,
+            Seg::Pair(PathId::R, _) => l + 44,
+            Seg::SupOld(k) => l + 45 + 5 * k,
+            Seg::SupNew(k) => l + 46 + 5 * k,
+            Seg::Pair(PathId::Sup(k), Part::Bulk) => l + 47 + 5 * k,
+            Seg::Pair(PathId::Sup(k), Part::LastA) => l + 48 + 5 * k,
+            Seg::Pair(PathId::Sup(k), _) => l + 49 + 5 * k,
+            Seg::Exit(k) => l + 55 + k,
+            Seg::Anch(APart::Low) => l + 57,
+            Seg::Anch(APart::L30) => l + 58,
+            Seg::Anch(APart::Last) => l + 59,
             Seg::FeeRho => EPI_BASE,
             Seg::FeeRseed => EPI_BASE + 1,
             Seg::FeeNote => EPI_BASE + 2,
@@ -273,7 +281,18 @@ pub fn slot_program() -> Vec<Seg> {
 }
 
 pub const PRO_PERMS: usize = 127;
-pub const SLOT_PERMS: usize = 661;
+pub const SLOT_PERMS: usize = 662;
+
+/// Lab #785 F5-4d: the SD bump moves no height — the rows `(127 + 662k +
+/// 67)·24` for k = 1, 2, 4, 8, 16 round to the same powers of two as before.
+const fn w_rows(k: usize) -> usize {
+    (PRO_PERMS + k * SLOT_PERMS + EPI_PERMS) * NUM_ROUNDS
+}
+const _: () = assert!(w_rows(1).next_power_of_two() == 1 << 15);
+const _: () = assert!(w_rows(2).next_power_of_two() == 1 << 16);
+const _: () = assert!(w_rows(4).next_power_of_two() == 1 << 17);
+const _: () = assert!(w_rows(8).next_power_of_two() == 1 << 18);
+const _: () = assert!(w_rows(MAX_K).next_power_of_two() == 1 << 18);
 pub const EPI_PERMS: usize = 67;
 
 /// The perm index of segment `seg`'s `i`-th perm (`slot` ignored outside a slot).
@@ -295,7 +314,7 @@ pub fn row_of(perm: usize, r: usize) -> usize {
 }
 
 pub fn w_height(k: usize) -> usize {
-    ((PRO_PERMS + k * SLOT_PERMS + EPI_PERMS) * NUM_ROUNDS).next_power_of_two()
+    w_rows(k).next_power_of_two()
 }
 
 /// Tag column order.
@@ -430,6 +449,8 @@ pub const KSN_OFF: usize = KX_OFF + 2;
 pub const KSU_OFF: usize = KSN_OFF + 2;
 pub const MZ_OFF: usize = KSU_OFF + 2;
 pub const W_WIDTH: usize = MZ_OFF + 2;
+/// Lab #785 F5-4d-1: one SD block more (3,470 → 3,471); 4d-2 moves it again.
+const _: () = assert!(W_WIDTH == 3_471);
 
 // ---------------------------------------------------------------------------
 // Public values

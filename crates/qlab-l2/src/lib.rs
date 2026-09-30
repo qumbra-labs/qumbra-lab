@@ -323,10 +323,12 @@ pub fn verify_r(pvs: &[Val], proof: &Proof<Config>) -> bool {
 /// A4 (design #283): S3/P3 — the 3×2 shapes (slot 3 the fee input,
 /// `d3` exact-or-dummy) over the NF operand-order constraint. S 721 cols /
 /// 158 perms / 1,113 constraints; P 798 / 252 / 1,328. Named `l2_goldens`
-/// run, twice, byte-identical.
+/// run, twice, byte-identical. F5-4d (lab #785): P's exit edge — P 804 /
+/// 252 / 1,358, 144 PVs (P was `57a1bc84…f9c0`); S and R unmoved. Named
+/// `l2_goldens` run, twice, byte-identical.
 pub const SHAPE_S_DIGEST_V1: &str = "0bd458286dc5608d25d17c6f8b1f2652387722a6a9c82a14aa97b7b5d03cf6a2";
 /// See [`SHAPE_S_DIGEST_V1`].
-pub const SHAPE_P_DIGEST_V1: &str = "57a1bc84601dad21c54d84728915ead38d25a48cd9a76cdf344924c51f47f9c0";
+pub const SHAPE_P_DIGEST_V1: &str = "a072476c85f42a3f30388e0c3b5372ea230d4347829057f360b05d8924b7999c";
 /// See [`SHAPE_S_DIGEST_V1`] (lab #724; A3 lab #731 on main pins `5f081f55…507f`).
 /// With the NF operand-order constraint over A3 — 1,226 constraints
 /// (A3's 1,225 + 1); A2+NF was `cfdc4cbd…89e0`. Named `l2_goldens` run, twice,

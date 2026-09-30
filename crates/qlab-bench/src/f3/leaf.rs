@@ -12,11 +12,11 @@
 //! so b2 is a lane.
 //!
 //! **The program** (approved on #767, deviation 4). Every transaction owns a
-//! fixed **slot** of [`SLOT_PERMS`] = 559 perms, the same for S, P and R, so
+//! fixed **slot** of [`SLOT_PERMS`] = 560 perms, the same for S, P and R, so
 //! one leaf AIR per `k` covers every shape mix:
 //!
 //! ```text
-//!   SD blocks ×5 | insert ×3 (131 each) | append ×2 (64 each) | registry (33)
+//!   SD blocks ×6 | insert ×3 (131 each) | append ×2 (64 each) | registry (33)
 //!   insert i:  LEAF_OLD (lo,hi) · LEAF_MID (lo,K) · 32 levels of (OLD, MID)
 //!              · LEAF_NEW (K,hi) · 32 levels of (EMPTY, NEW)
 //!   append j:  32 levels of (EMPTY, cm)
@@ -27,7 +27,7 @@
 //! are **interleaved level by level** (A/B perm pairs): a sibling and a bit
 //! are held for two perms, not a whole path. The shape tag — a one-hot
 //! register bound to `SD`'s word 0 — gates activity: inserts 2 and 3 and SD
-//! block 4 are off for R, the registry segment is off for S/P. An inactive
+//! blocks 4–5 are off for R, the registry segment is off for S/P. An inactive
 //! segment's perms still hash (anything), but no running root, index or `SD`
 //! moves and its comparator cells are zero.
 //!
@@ -114,8 +114,10 @@ pub(crate) fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
 // The slot program
 // ---------------------------------------------------------------------------
 
-/// SD blocks per slot: the most any shape needs (S 5, P 5, R 4).
-pub(crate) const SD_BLOCKS: usize = 5;
+/// SD blocks per slot: the most any shape needs (S 5, P 6, R 4) — P's exit
+/// recipient (lab #785 F5-4d) took it from 5 to 6.
+pub(crate) const SD_BLOCKS: usize = 6;
+const _: () = assert!(SD_BLOCKS == sd_perms(qlab_air::l2p::PV_LEN));
 /// Nullifier inserts per slot (S/P 3, R 1).
 pub(crate) const INSERTS: usize = 3;
 /// Commitment appends per slot (every shape 2).
@@ -167,7 +169,7 @@ pub(crate) enum Seg {
 }
 
 /// Segments per slot; `PAD` is ring position [`NSEG`].
-pub(crate) const NSEG: usize = 50;
+pub(crate) const NSEG: usize = SD_BLOCKS + 3 * 11 + 2 * 4 + 4;
 /// The ring's columns: the slot's segments and `PAD`.
 pub(crate) const NSEG_COLS: usize = NSEG + 1;
 /// The slot's last segment (its end is the slot boundary).
@@ -176,18 +178,20 @@ pub(crate) const LAST_SEG: usize = NSEG - 1;
 impl Seg {
     /// The segment's ring position.
     pub(crate) const fn idx(self) -> usize {
+        // The slot's segments after its SD blocks.
+        let l = SD_BLOCKS;
         match self {
             Seg::Sd(b) => b,
-            Seg::LeafOld(i) => 5 + 11 * i,
-            Seg::LeafMid(i) => 5 + 11 * i + 1,
-            Seg::Pair(PathId::Mid(i), p) => 5 + 11 * i + 2 + part_off(p),
-            Seg::LeafNew(i) => 5 + 11 * i + 6,
-            Seg::Pair(PathId::New(i), p) => 5 + 11 * i + 7 + part_off(p),
-            Seg::Pair(PathId::C(j), p) => 38 + 4 * j + part_off(p),
-            Seg::RegLeaf => 46,
-            Seg::Pair(PathId::R, Part::Bulk) => 47,
-            Seg::Pair(PathId::R, Part::LastA) => 48,
-            Seg::Pair(PathId::R, _) => 49,
+            Seg::LeafOld(i) => l + 11 * i,
+            Seg::LeafMid(i) => l + 11 * i + 1,
+            Seg::Pair(PathId::Mid(i), p) => l + 11 * i + 2 + part_off(p),
+            Seg::LeafNew(i) => l + 11 * i + 6,
+            Seg::Pair(PathId::New(i), p) => l + 11 * i + 7 + part_off(p),
+            Seg::Pair(PathId::C(j), p) => l + 33 + 4 * j + part_off(p),
+            Seg::RegLeaf => l + 41,
+            Seg::Pair(PathId::R, Part::Bulk) => l + 42,
+            Seg::Pair(PathId::R, Part::LastA) => l + 43,
+            Seg::Pair(PathId::R, _) => l + 44,
             Seg::Pad => NSEG,
         }
     }
@@ -257,7 +261,13 @@ pub(crate) fn slot_program() -> Vec<Seg> {
 }
 
 /// Perms per slot.
-pub(crate) const SLOT_PERMS: usize = 559;
+pub(crate) const SLOT_PERMS: usize = 560;
+
+/// Lab #785 F5-4d: the SD bump moves no height — `560·24·k` for k = 4, 8,
+/// 16 rounds to the same powers of two as before.
+const _: () = assert!((4 * SLOT_PERMS * NUM_ROUNDS).next_power_of_two() == 1 << 16);
+const _: () = assert!((8 * SLOT_PERMS * NUM_ROUNDS).next_power_of_two() == 1 << 17);
+const _: () = assert!((16 * SLOT_PERMS * NUM_ROUNDS).next_power_of_two() == 1 << 18);
 
 /// The first perm of segment `seg` within its slot.
 pub(crate) fn seg_start(seg: Seg) -> usize {
@@ -371,6 +381,8 @@ pub(crate) const SDC: usize = W + 1;
 pub(crate) const SDF: usize = SDC + 1;
 /// The leaf's width.
 pub(crate) const LEAF_WIDTH: usize = SDF + 1;
+/// Lab #785 F5-4d: one SD block more (3,224 → 3,225).
+const _: () = assert!(LEAF_WIDTH == 3_225);
 /// Per-perm columns start here (the ring onward).
 const PLAN_BASE: usize = SEG_OFF;
 const PLAN_WIDTH: usize = LEAF_WIDTH - PLAN_BASE;

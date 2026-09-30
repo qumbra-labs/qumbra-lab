@@ -796,6 +796,11 @@ pub enum BodyError {
     /// the parent's root and the header carries one post-block root, so a
     /// block holds at most one write.
     L2SecondRegistryWrite { index: usize },
+    /// An asset-0 redeem — shape P's exit edge (lab #785 F5-4d) — or a
+    /// nonzero exit recipient on an Annulet net. Only a wrapper bundle pays
+    /// an exit on L1; the Annulet has no bridge, so its supply would drop
+    /// with nothing paid out.
+    L2ExitWithoutBridge { index: usize },
     /// A registry write whose `new_root` is not the block header's
     /// `registry_root` — the block contradicts itself (lab #728).
     L2RegistryWriteRootMismatch { index: usize },
@@ -1795,6 +1800,7 @@ mod tests {
             registry_root: [0x44; 32],
             vpublic: None,
             write: None,
+            exit_rkm: [0; 32],
         }
         .encode();
         let body = BlockBody::from_single_payee(vec![good_tx(2), tx], 0, [0; 4]);

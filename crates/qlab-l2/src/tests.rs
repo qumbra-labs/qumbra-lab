@@ -62,13 +62,15 @@ fn l2_shape_geometry_is_locked() {
     assert_eq!(get_max_constraint_degree::<Val, _>(&s, AirLayout::from_air::<Val>(&s)), 4);
     let p = verifier_air_p();
     assert_eq!(<L2ShapePAir as BaseAir<Val>>::width(&p), Shape::P.width());
-    assert_eq!(<L2ShapePAir as BaseAir<Val>>::num_public_values(&p), 128);
+    assert_eq!(<L2ShapePAir as BaseAir<Val>>::num_public_values(&p), 144);
     assert_eq!(get_max_constraint_degree::<Val, _>(&p, AirLayout::from_air::<Val>(&p)), 4);
 
     // A4 (S3/P3): slot 3's fee chain and `PV_NF3` appended after each
     // shape's v1 PVs.
     assert_eq!((Shape::S.width(), Shape::S.log_height(), Shape::S.perms(), Shape::S.pv_len()), (721, 19, 158, 116));
-    assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (798, 20, 252, 128));
+    assert_eq!((Shape::P.width(), Shape::P.log_height(), Shape::P.perms(), Shape::P.pv_len()), (804, 20, 252, 144));
+    // F5-4d (lab #785): P's exit edge (+6 columns) and recipient (+16 PVs).
+    assert_eq!(qlab_air::l2p::PV_XRKM, 128);
     assert_eq!((qlab_air::l2::PV_NF3, qlab_air::l2p::PV_NF3), (100, 112));
     let r = verifier_air_r();
     assert_eq!(<L2ShapeRAir as BaseAir<Val>>::width(&r), Shape::R.width());
@@ -271,7 +273,8 @@ fn l2_golden_pv_vectors() {
     assert_eq!(pv_s[..100], GOLDEN_PV_S, "shape-S fixture PVs — the v1 prefix, byte for byte");
     assert_eq!(pv_s[100..], GOLDEN_PV_NF3, "shape-S fixture PVs — A4's nf3");
     assert_eq!(pv_p[..112], GOLDEN_PV_P, "shape-P fixture PVs — the v1 prefix, byte for byte");
-    assert_eq!(pv_p[112..], GOLDEN_PV_NF3, "shape-P fixture PVs — A4's nf3 (the same dummy slot 3)");
+    assert_eq!(pv_p[112..128], GOLDEN_PV_NF3, "shape-P fixture PVs — A4's nf3 (the same dummy slot 3)");
+    assert_eq!(pv_p[128..], [0; 16], "shape-P fixture PVs — F5-4d's exit recipient, zero on a non-exit");
     // A3 appended the seed's commitment; A2's 85 values do not move.
     let pv_r = fixture::shape_r().pvs;
     assert_eq!(pv_r[..85], GOLDEN_PV_R, "shape-R fixture PVs — A2's prefix, byte for byte");

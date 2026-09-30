@@ -517,6 +517,7 @@ mod tests {
                 registry_root: state.registry_root_bytes().expect("an Annulet state has a registry"),
                 vpublic: None,
                 write: None,
+                exit_rkm: [0; 32],
             }
             .encode(),
         };

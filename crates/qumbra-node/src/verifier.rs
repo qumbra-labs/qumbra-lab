@@ -178,7 +178,12 @@ impl L2Verifier {
             }
             (L2ShapeTag::P, Some(terms)) => {
                 check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_P)?;
-                let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms), &nf3);
+                // Lab #785 F5-4d: the exit recipient from the surface. The PV
+                // vector is built here from 16-bit chunks (`pv_chunks`), so
+                // every recipient word is < 2^16 by construction — the range
+                // P's non-zero test relies on (ruling (e)).
+                let xrkm = digest_words(&surface.exit_rkm);
+                let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms), &nf3, &xrkm);
                 qlab_l2::verify_p(&qlab_l2::public_values(&pvs), &proof)
             }
             // A canonical surface pairs S with no vPublic and P with some; R
@@ -578,7 +583,7 @@ mod tests {
             },
             discovery: vec![0x00],
             rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-            l2: qlab_devnet::annulet::L2Surface { shape: surface_shape, registry_root: h32(root), vpublic, write: None }.encode(),
+            l2: qlab_devnet::annulet::L2Surface { shape: surface_shape, registry_root: h32(root), vpublic, write: None, exit_rkm: [0; 32] }.encode(),
         }
     }
 
@@ -722,11 +727,14 @@ mod tests {
             qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 0x0001_0002_0003_0004, asset: 9 },
             qlab_devnet::annulet::VPublicTerm { redeem: false, amount: 77, asset: 3 },
         ];
-        let pvs = qlab_l2::pv_vec_p(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &[0; 4], 0, &[0; 4], &vpublic(&t), &vpublic_assets(&t), &[0; 4]);
+        let pvs = qlab_l2::pv_vec_p(&[0; 4], &[0; 4], &[0; 4], &[0; 4], &[0; 4], 0, &[0; 4], &vpublic(&t), &vpublic_assets(&t), &[0; 4], &[7, 0, 0, 0]);
         let v1 = qlab_l2::PV_VP1;
         assert_eq!(&pvs[v1..v1 + 6], &[1, 4, 3, 2, 1, 9]);
         let v2 = qlab_l2::PV_VP2;
         assert_eq!(&pvs[v2..v2 + 6], &[0, 77, 0, 0, 0, 3]);
+        // F5-4d: the recipient follows, 16 × 16-bit words.
+        assert_eq!(&pvs[qlab_air::l2p::PV_XRKM..qlab_air::l2p::PV_XRKM + 4], &[7, 0, 0, 0]);
+        assert_eq!(pvs.len(), qlab_air::l2p::PV_LEN);
     }
 
     /// The L1 constraints digest is deterministic and pinned (PENDING until

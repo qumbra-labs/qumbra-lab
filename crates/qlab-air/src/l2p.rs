@@ -67,7 +67,7 @@
 //! bind bank (idle between `BREG` and `BANCHOR`). No new accumulator: every
 //! cross-row binding in shape P rides an existing bank's idle span.
 //!
-//! ### Column accounting over pre-A4 shape S's 702 (+76 → 778; +72 → 774 before lab #704 Q1; A4's P3 +20 → 798) — see
+//! ### Column accounting over pre-A4 shape S's 702 (+76 → 778; +72 → 774 before lab #704 Q1; A4's P3 +20 → 798; F5-4d's exit edge +6 → 804) — see
 //! `l2p_trace_width_is_read_off_the_matrix`, every column named.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -236,9 +236,23 @@ const D3_COL: usize = L3_COL + 1;
 /// `L3 · d3` — relaxes the fee chain's anchor bind.
 const L3D3_COL: usize = D3_COL + 1;
 
+// --- Lab #785 F5-4d: the asset-0 exit edge ---
+/// `z_k = [asset_k = 0]`, per input, bound to the registry leaf's asset lane
+/// (`AG_Rk`) at the balance close; held for the whole trace.
+const Z_OFF: usize = L3D3_COL + 1;
+/// The inverses witnessing `z_k` (0 when the asset is 0).
+const ZINV_OFF: usize = Z_OFF + 2;
+/// `XE` — this transaction exits: `e_0 + e_1 − e_0·e_1`, `e_k = s_k·z_k·nz_k`
+/// (an asset-0 redeem of a nonzero amount). Held.
+const XE_COL: usize = ZINV_OFF + 2;
+/// `XINV` — the inverse of `Σ xrkm limbs`: an exit's recipient is nonzero.
+const XINV_COL: usize = XE_COL + 1;
+
 /// The shape-P3 trace width: P's 778 + 20 (ring +9, two selectors, one
-/// injection flag, one bind close, the fee bank, `L3`, `d3`, `L3·d3`).
-pub const L2P_WIDTH: usize = L3D3_COL + 1; // 798
+/// injection flag, one bind close, the fee bank, `L3`, `d3`, `L3·d3`), then
+/// F5-4d's +6 (`z` ×2, `zinv` ×2, `XE`, `XINV`).
+pub const L2P_WIDTH: usize = XINV_COL + 1; // 804
+const _: () = assert!(L2P_WIDTH == 804, "the F5-4d census: 798 + 6");
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 252
@@ -321,7 +335,11 @@ pub const PV_VP1: usize = 100;
 pub const PV_VP2: usize = 106;
 /// A4: the fee input's nullifier, appended (every earlier offset holds).
 pub const PV_NF3: usize = 112;
-pub const PV_LEN: usize = 128;
+/// Lab #785 F5-4d: the exit recipient `rkm` (16 × 16-bit words), appended —
+/// zero unless the transaction exits, nonzero when it does. One per
+/// transaction (ruling Q-4d-1): both exit rows pay it.
+pub const PV_XRKM: usize = 128;
+pub const PV_LEN: usize = 144;
 const fn pv_vp_sign(k: usize) -> usize {
     PV_VP1 + 6 * k
 }
@@ -364,6 +382,7 @@ pub fn pv_vec_l2p(
     vp: &[VPublic; 2],
     vpa: &[u64; 2],
     nf3: &[u64; 4],
+    xrkm: &[u64; 4],
 ) -> Vec<u32> {
     let mut out = Vec::with_capacity(PV_LEN);
     for d in [anchor, nf1, nf2, cm1, cm2] {
@@ -381,7 +400,8 @@ pub fn pv_vec_l2p(
         out.push(vpa[k] as u32);
     }
     out.extend_from_slice(&pv_chunks(nf3));
-    debug_assert_eq!(out.len(), PV_LEN);
+    out.extend_from_slice(&pv_chunks(xrkm));
+    assert_eq!(out.len(), PV_LEN);
     out
 }
 
@@ -458,6 +478,10 @@ pub struct L2ShapePAir {
     pub vp: [VPublic; 2],
     /// A4: slot 3 (the fee input) is a dummy — the fee is charged to a row.
     pub d3: bool,
+    /// Lab #785 F5-4d: the two inputs' assets (the trace's `z`/`zinv`) and
+    /// the exit recipient (`XE`/`XINV`); the public values carry the recipient.
+    pub asset: [u64; 2],
+    pub xrkm: [u64; 4],
 }
 
 impl L2ShapePAir {
@@ -478,6 +502,8 @@ impl L2ShapePAir {
             ropen: [false; 2],
             vp: [VPublic::NONE; 2],
             d3: true,
+            asset: [0; 2],
+            xrkm: [0; 4],
         }
     }
 
@@ -1093,13 +1119,20 @@ where
         for k in 0..2 {
             builder.assert_zero(pol(POL_NZ + k) * (pol(POL_VPINV + k) * sum_m(k) - AB::Expr::ONE));
             builder.assert_zero((AB::Expr::ONE - pol(POL_NZ + k)) * sum_m(k));
-            // A Cloaked asset (neither flag) carries vPublic = 0.
-            builder.assert_zero(sum_m(k) * (AB::Expr::ONE - pol(POL_HY + k) - pol(POL_RG + k)));
-            // REQ_k = nz_k · (1 − s_k · ropen_k): the issuer key is required to
-            // mint, and to redeem an asset that is not redeem_open.
+            // A Cloaked asset (neither flag) carries vPublic = 0 — except a
+            // REDEEM of asset 0, the exit edge (lab #785 F5-4d, F-B (ii)):
+            // `x_k = s_k·z_k`, an expression (`s_k` is a public value). A mint
+            // on asset 0 (`s_k = 0`) is still refused. Degree 3.
+            let x = pv(pv_vp_sign(k)) * local[Z_OFF + k].clone();
+            builder.assert_zero(
+                sum_m(k) * (AB::Expr::ONE - pol(POL_HY + k) - pol(POL_RG + k)) * (AB::Expr::ONE - x.clone()),
+            );
+            // REQ_k = nz_k · (1 − s_k · ropen_k) · (1 − x_k): the issuer key is
+            // required to mint, and to redeem an asset that is not redeem_open —
+            // but never to redeem asset 0 (it has no issuer). Degree 3.
             builder.assert_eq(
                 pol(POL_REQ + k),
-                pol(POL_NZ + k) - pol(POL_NZ + k) * pv(pv_vp_sign(k)) * pol(POL_ROPEN + k),
+                (pol(POL_NZ + k) - pol(POL_NZ + k) * pv(pv_vp_sign(k)) * pol(POL_ROPEN + k)) * (AB::Expr::ONE - x),
             );
         }
         // The two "current input" muxes.
@@ -1270,6 +1303,36 @@ where
         }
         builder.assert_zero(close_q.clone() * sum_m(1));
         builder.assert_zero(close_q * pv(pv_vp_sign(1)));
+
+        // --- Lab #785 F5-4d: the asset-0 exit edge and its recipient ---
+        {
+            let z = |k: usize| local[Z_OFF + k].clone();
+            let zinv = |k: usize| local[ZINV_OFF + k].clone();
+            let xe = local[XE_COL].clone();
+            for k in 0..2 {
+                // `z_k = [the registry leaf's asset = 0]`, bound on the close
+                // row where `AG_Rk` holds the leaf's asset lane (ruling
+                // Q-4d-3). Degree 3.
+                builder.assert_bool(z(k));
+                let leaf_asset = ac(if k == 0 { AG_R1 } else { AG_R2 });
+                builder.assert_zero(close.clone() * (leaf_asset.clone() * zinv(k) - (AB::Expr::ONE - z(k))));
+                builder.assert_zero(close.clone() * leaf_asset * z(k));
+            }
+            // `e_k = s_k · z_k · nz_k`: degree 2 in columns, because `s_k` is a
+            // public value (a constant to the AIR). `XE = e_0 ∨ e_1` is the
+            // exit edge's one degree-4 constraint (`e_0 · e_1`); the shape
+            // already had others, so the maximum stays 4.
+            let e = |k: usize| pv(pv_vp_sign(k)) * z(k) * pol(POL_NZ + k);
+            builder.assert_eq(xe.clone(), e(0) + e(1) - e(0) * e(1));
+            // The recipient: nonzero on an exit (Σ of 16 16-bit limbs is below
+            // 2^20 < p, so it is 0 only when every limb is — the verifier's
+            // 16-bit PV range check is what makes that true), zero otherwise.
+            let sum_x = (0..16).map(|j| pv(PV_XRKM + j)).fold(AB::Expr::ZERO, |a, e| a + e);
+            builder.assert_zero(xe.clone() * (AB::Expr::ONE - local[XINV_COL].clone() * sum_x));
+            for j in 0..16 {
+                builder.assert_zero((AB::Expr::ONE - xe.clone()) * pv(PV_XRKM + j));
+            }
+        }
 
         // --- The #219 latch (verbatim) + the dummy slot's asset ---
         {
@@ -1461,6 +1524,10 @@ where
         // The policy constants are per-transaction declarations.
         for k in [POL_HY, POL_HY + 1, POL_RG, POL_RG + 1, POL_ROPEN, POL_ROPEN + 1, POL_NZ, POL_NZ + 1, POL_VPINV, POL_VPINV + 1] {
             t.assert_eq(next[POL_OFF + k].clone(), local[POL_OFF + k].clone());
+        }
+        // Lab #785 F5-4d: so are the exit edge's.
+        for c in [Z_OFF, Z_OFF + 1, ZINV_OFF, ZINV_OFF + 1, XE_COL, XINV_COL] {
+            t.assert_eq(next[c].clone(), local[c].clone());
         }
         {
             t.assert_eq(
@@ -2090,6 +2157,8 @@ pub const SHAPE_P_LOG_HEIGHT: usize = 20;
 /// Build shape P from caller-supplied commitment-tree witnesses + anchor, the
 /// per-input policy openings, the registry root and the two `vPublic` terms.
 /// Selectors are computed honestly from the assets; balance is NOT asserted.
+/// No exit: the recipient PV is zero ([`build_bucket_l2p_exit_with_witnesses`]
+/// takes one).
 #[allow(clippy::too_many_arguments)]
 pub fn build_bucket_l2p_with_witnesses(
     log_height: usize,
@@ -2102,6 +2171,28 @@ pub fn build_bucket_l2p_with_witnesses(
     registry_root: [u64; 4],
     vp: [VPublic; 2],
     fee_slot: &FeeSlot,
+) -> L2PBucketInstance {
+    build_bucket_l2p_exit_with_witnesses(
+        log_height, inputs, outputs, fee, witnesses, anchor, policy, registry_root, vp, fee_slot, [0; 4],
+    )
+}
+
+/// [`build_bucket_l2p_with_witnesses`] with the exit recipient `xrkm` (lab
+/// #785 F5-4d): the L1 `rkm` an asset-0 redeem pays. It must be nonzero
+/// exactly when the transaction exits, or the trace is unsatisfiable.
+#[allow(clippy::too_many_arguments)]
+pub fn build_bucket_l2p_exit_with_witnesses(
+    log_height: usize,
+    inputs: &[L2TxInput; 2],
+    outputs: &[L2TxOutput; 2],
+    fee: u64,
+    witnesses: &[MerkleWitness; 2],
+    anchor: [u64; 4],
+    policy: &[L2PolicyInput; 2],
+    registry_root: [u64; 4],
+    vp: [VPublic; 2],
+    fee_slot: &FeeSlot,
+    xrkm: [u64; 4],
 ) -> L2PBucketInstance {
     let (nk1, nf1, _cm1) = derive_input_l2(&inputs[0]);
     let (nk2, nf2, _cm2) = derive_input_l2(&inputs[1]);
@@ -2252,7 +2343,7 @@ pub fn build_bucket_l2p_with_witnesses(
         if vp[0].amount != 0 { inputs[0].asset } else { 0 },
         if vp[1].amount != 0 { inputs[1].asset } else { 0 },
     ];
-    let pvs = pv_vec_l2p(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &vp, &vpa, &nf3);
+    let pvs = pv_vec_l2p(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &vp, &vpa, &nf3, &xrkm);
     L2PBucketInstance {
         air: L2ShapePAir {
             log_height,
@@ -2269,6 +2360,8 @@ pub fn build_bucket_l2p_with_witnesses(
             ropen,
             vp,
             d3: fee_slot.is_dummy(),
+            asset: [inputs[0].asset, inputs[1].asset],
+            xrkm,
         },
         pvs,
         anchor,
@@ -2292,6 +2385,19 @@ pub fn build_bucket_l2p(
     assets: &[PolicyAsset; 2],
     vp: [VPublic; 2],
 ) -> L2PBucketInstance {
+    build_bucket_l2p_exit(log_height, inputs, outputs, fee, assets, vp, [0; 4])
+}
+
+/// [`build_bucket_l2p`] with the exit recipient `xrkm` (lab #785 F5-4d).
+pub fn build_bucket_l2p_exit(
+    log_height: usize,
+    inputs: &[L2TxInput; 2],
+    outputs: &[L2TxOutput; 2],
+    fee: u64,
+    assets: &[PolicyAsset; 2],
+    vp: [VPublic; 2],
+    xrkm: [u64; 4],
+) -> L2PBucketInstance {
     let (_, _, cm1) = derive_input_l2(&inputs[0]);
     let (_, _, cm2) = derive_input_l2(&inputs[1]);
     let (witnesses, anchor) = fabricated_shared_tree(&cm1, &cm2);
@@ -2305,9 +2411,10 @@ pub fn build_bucket_l2p(
             .policy_input_for(&derive_rkm_l2(&inputs[1]), rw[1])
             .expect("input 1: rkm frozen or not allowlisted"),
     ];
-    build_bucket_l2p_with_witnesses(
+    build_bucket_l2p_exit_with_witnesses(
         log_height, inputs, outputs, fee, &witnesses, anchor, &policy, registry_root, vp,
         &FeeSlot::Dummy { input: dummy_fee_input(&inputs[0].rho) },
+        xrkm,
     )
 }
 
@@ -2430,7 +2537,20 @@ impl L2ShapePAir {
             }
         });
         let sgn: [u32; 2] = [self.vp[0].redeem as u32, self.vp[1].redeem as u32];
-        let req: [u32; 2] = core::array::from_fn(|k| nz[k] * (1 - sgn[k] * ropen[k]));
+        // Lab #785 F5-4d: the exit edge.
+        let zf: [u32; 2] = [(self.asset[0] == 0) as u32, (self.asset[1] == 0) as u32];
+        let zinv: [F; 2] = core::array::from_fn(|k| {
+            let a = F::from_u64(self.asset[k]);
+            if a == F::ZERO { F::ZERO } else { a.inverse() }
+        });
+        let ek: [u32; 2] = core::array::from_fn(|k| sgn[k] * zf[k] * nz[k]);
+        let xe: u32 = ek[0] + ek[1] - ek[0] * ek[1];
+        let xinv: F = {
+            let sx: u64 = self.xrkm.iter().flat_map(|l| (0..4).map(move |j| (l >> (16 * j)) & 0xffff)).sum();
+            let sx = F::from_u64(sx);
+            if sx == F::ZERO { F::ZERO } else { sx.inverse() }
+        };
+        let req: [u32; 2] = core::array::from_fn(|k| nz[k] * (1 - sgn[k] * ropen[k]) * (1 - sgn[k] * zf[k]));
         // Running comparison flags [block][lane].
         let mut cmp_lt = [[0u32; 4]; 2];
         let mut cmp_eq = [[0u32; 4]; 2];
@@ -2775,6 +2895,12 @@ impl L2ShapePAir {
             }
             row[POL_OFF + POL_RQ] = F::from_u32(rq);
             row[POL_OFF + POL_ALW] = F::from_u32(alw);
+            for k in 0..2 {
+                row[Z_OFF + k] = F::from_u32(zf[k]);
+                row[ZINV_OFF + k] = zinv[k];
+            }
+            row[XE_COL] = F::from_u32(xe);
+            row[XINV_COL] = xinv;
             let sgnf = |vv: i64| -> F {
                 if vv >= 0 {
                     F::from_u32(vv as u32)
@@ -3302,8 +3428,8 @@ mod tests {
     #[test]
     fn l2p_named_offsets_are_the_constant_chain() {
         assert_eq!(
-            (W_OFF, EQ_OFF, EG_OFF, EQ3_OFF, SEL2_OFF, CMP_OFF, POL_OFF, L2P_WIDTH),
-            (560, 575, 607, 693, 725, 755, 777, 798)
+            (W_OFF, EQ_OFF, EG_OFF, EQ3_OFF, SEL2_OFF, CMP_OFF, POL_OFF, Z_OFF, L2P_WIDTH),
+            (560, 575, 607, 693, 725, 755, 777, 798, 804)
         );
     }
 
@@ -3408,12 +3534,14 @@ mod tests {
         assert_eq!(comparisons, 22);
         assert_eq!(policy, 14);
         assert_eq!(fee_input, 11);
+        let exit_edge = 2 * 2 // z, zinv — per input (lab #785 F5-4d)
+            + 2; // XE, XINV
         assert_eq!(
             trace.width(),
-            SHAPE_S + ring + roles + gates + comparisons + policy + fee_input,
+            SHAPE_S + ring + roles + gates + comparisons + policy + fee_input + exit_edge,
             "width must be 702 plus exactly the columns named above"
         );
-        assert_eq!(trace.width(), 798, "the shape-P3 width (P's 778 + A4's 20)");
+        assert_eq!(trace.width(), 804, "the shape-P3 width (P's 778 + A4's 20 + F5-4d's 6)");
         // The accounting is over pre-A4 S (702); S3 is that + its own ring
         // growth (32 → 40 limbs) + the same 11 fee-input columns.
         assert_eq!(crate::l2::L2_WIDTH, SHAPE_S + 8 + 11, "S3 = pre-A4 S + ring + fee input");
@@ -3446,9 +3574,10 @@ mod tests {
         // A4 adds: 2 role selectors; the two row-fee chains' 4 chunk closes
         // each (`close·d3·f1·fee·ep`); the two row-fee asset bindings; and the
         // 16 bind-bank transitions whose AISS leg carries `(1 − L3)`.
+        // F5-4d (lab #785) adds one: `XE`'s definition (`e_0 · e_1`).
         assert_eq!(
             hist.get(&4).copied().unwrap_or(0),
-            24 + 1 + 16 + 16 + 3 + 8 + 2 + 16,
+            24 + 1 + 16 + 16 + 3 + 8 + 2 + 16 + 1,
             "deg-4 constraints"
         );
     }
@@ -3795,9 +3924,77 @@ mod tests {
         assert_unsat(&bad, "a mint on a Cloaked asset");
         bad.air.hy[0] = true; // claim Hybrid for asset 0: the mode lane refuses
         assert_unsat(&bad, "a mint on a Cloaked asset with a lied mode");
-        // A redeem on Cloaked likewise.
-        let bad2 = bucket(0xc10a_0002, 100, 0, 50, 7, 80, 0, 50, 7, 10, [VPublic::redeem(10), VPublic::NONE]);
+        // A redeem on a Cloaked asset other than 0 likewise (lab #785 F5-4d:
+        // asset 0's redeem is the exit edge, `l2p_asset0_redeem_is_the_exit`).
+        let bad2 = bucket(0xc10a_0002, 100, 0, 50, 5, 90, 0, 40, 5, 10, [VPublic::NONE, VPublic::redeem(10)]);
         assert_unsat(&bad2, "a redeem on a Cloaked asset");
+    }
+
+    /// Like [`bucket`], with the exit recipient.
+    #[allow(clippy::too_many_arguments)]
+    fn bucket_exit(seed: u64, v: [(u64, u64); 2], o: [(u64, u64); 2], fee: u64, vp: [VPublic; 2], xrkm: [u64; 4]) -> L2PBucketInstance {
+        let mut r = Rnd(seed);
+        let inputs = [r.input(v[0].0, v[0].1), r.input(v[1].0, v[1].1)];
+        let outputs = [r.output(o[0].0, o[0].1), r.output(o[1].0, o[1].1)];
+        let asset_of = |a: u64| if a == 7 { hybrid7(false) } else { PolicyAsset::cloaked(a) };
+        build_bucket_l2p_exit(SHAPE_P_LOG_HEIGHT, &inputs, &outputs, fee, &[asset_of(v[0].1), asset_of(v[1].1)], vp, xrkm)
+    }
+    /// A recipient that is NOT the spender's key (any L1 `rkm` is a valid
+    /// payee — exiting to someone else is legitimate).
+    const EXIT_TO: [u64; 4] = [0x0e71_0001, 0x0e71_0002, 0x0e71_0003, 0x0e71_0004];
+
+    /// Lab #785 F5-4d (F-B (ii)): a redeem of asset 0 — Cloaked, no issuer —
+    /// is the exit: it needs no issuer key, runs no freeze or allowlist leg,
+    /// and pays the named recipient. Asset 0 (100) + asset 7 (50) → 80 (0) +
+    /// 50 (7) + fee 10, redeeming 10 of asset 0.
+    #[test]
+    fn l2p_asset0_redeem_is_the_exit() {
+        let vp = [VPublic::redeem(10), VPublic::NONE];
+        let exit = bucket_exit(0xe417_0001, [(100, 0), (50, 7)], [(80, 0), (50, 7)], 10, vp, EXIT_TO);
+        assert_ne!(EXIT_TO, derive_rkm_l2(&Rnd(0xe417_0001).input(100, 0)), "the recipient is not the spender");
+        assert_eq!(&exit.pvs[PV_XRKM..PV_XRKM + 16], &pv_chunks(&EXIT_TO)[..]);
+        assert_sat(&exit, "an asset-0 redeem to a named recipient");
+        // The exit row on the second input (asset 7 first): also an exit.
+        let row2 = bucket_exit(0xe417_0002, [(50, 7), (100, 0)], [(50, 7), (80, 0)], 10, [VPublic::NONE, VPublic::redeem(10)], EXIT_TO);
+        assert_sat(&row2, "an exit on row 2");
+    }
+
+    /// Lab #785 F5-4d forgeries (pre-review U5). (1) A redeem of Cloaked
+    /// asset 5 whose `z` claims asset 0 — everything else an exit would
+    /// carry is consistent (recipient named, balance holds) — is refused by
+    /// the close binding `leaf_asset · z = 0`. (2) A MINT of asset 0 carrying
+    /// a recipient: `s = 0` keeps the Cloaked gate shut and `XE = 0`, so both
+    /// the gate and `(1 − XE)·xrkm` refuse it.
+    #[test]
+    fn l2p_neg_exit_forgeries() {
+        // 100 (0) + 50 (5) → 90 (0) + 40 (5) + fee 10, redeeming 10 of asset 5.
+        let vp = [VPublic::NONE, VPublic::redeem(10)];
+        let honest_shape = bucket_exit(0xe417_0007, [(100, 0), (50, 5)], [(90, 0), (40, 5)], 10, vp, [0; 4]);
+        assert_unsat(&honest_shape, "a redeem of Cloaked asset 5");
+        let mut z_lie = bucket_exit(0xe417_0007, [(100, 0), (50, 5)], [(90, 0), (40, 5)], 10, vp, EXIT_TO);
+        z_lie.air.asset[1] = 0; // the trace fill now writes z = 1 on row 2
+        assert_unsat(&z_lie, "z = 1 on a non-zero asset (a forged exit)");
+        // 100 (0) + 50 (7) → 100 (0) + 50 (7) + fee 10, minting 10 of asset 0.
+        let mint = bucket_exit(0xe417_0008, [(100, 0), (50, 7)], [(100, 0), (50, 7)], 10, [VPublic::mint(10), VPublic::NONE], EXIT_TO);
+        assert_unsat(&mint, "a mint of asset 0 carrying a recipient");
+    }
+
+    /// Lab #785 F5-4d: the recipient is canonical — nonzero exactly when the
+    /// transaction exits. An exit to the zero recipient, a non-exit carrying
+    /// one, and a zero-amount asset-0 "redeem" (no exit) carrying one are
+    /// each refused; the zero-amount row with no recipient is fine.
+    #[test]
+    fn l2p_neg_exit_recipient_is_canonical() {
+        let vp = [VPublic::redeem(10), VPublic::NONE];
+        let zero_to = bucket_exit(0xe417_0003, [(100, 0), (50, 7)], [(80, 0), (50, 7)], 10, vp, [0; 4]);
+        assert_unsat(&zero_to, "an exit to the zero recipient");
+        let stray = bucket_exit(0xe417_0004, [(100, 0), (50, 7)], [(90, 0), (50, 7)], 10, [VPublic::NONE; 2], EXIT_TO);
+        assert_unsat(&stray, "a recipient on a transaction that does not exit");
+        let zero_amount = [VPublic::redeem(0), VPublic::NONE];
+        let z = bucket_exit(0xe417_0005, [(100, 0), (50, 7)], [(90, 0), (50, 7)], 10, zero_amount, EXIT_TO);
+        assert_unsat(&z, "a zero-amount asset-0 redeem is no exit, so no recipient");
+        let z_ok = bucket_exit(0xe417_0006, [(100, 0), (50, 7)], [(90, 0), (50, 7)], 10, zero_amount, [0; 4]);
+        assert_sat(&z_ok, "a zero-amount asset-0 redeem with no recipient");
     }
 
     /// 🔴 **Allowlist path under the wrong root**: a Regulated input whose
@@ -4490,6 +4687,10 @@ pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
         ("L3_COL", L3_COL),
         ("D3_COL", D3_COL),
         ("L3D3_COL", L3D3_COL),
+        ("Z_OFF", Z_OFF),
+        ("ZINV_OFF", ZINV_OFF),
+        ("XE_COL", XE_COL),
+        ("XINV_COL", XINV_COL),
     ];
     v.sort_by_key(|(_, c)| *c);
     v

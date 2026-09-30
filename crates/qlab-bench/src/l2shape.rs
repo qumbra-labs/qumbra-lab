@@ -34,7 +34,7 @@
 //!               freeze root) with its asset-0 fee spend.
 //! - `p19`     — **CANARY** (#700's rule: a 2^19 run of the same shape and lane
 //!               before any 2^20): the shape-P AIR at 2^19 in chain-only mode —
-//!               same 798 columns, half the rows; the P program does not fit
+//!               same 804 columns, half the rows; the P program does not fit
 //!               2^19 (252 perms > 170), so the canary prices width × height only.
 //!
 //! Lanes (the FRI points), each asserted ≥ 100 bits by `make_config_with`'s
@@ -576,7 +576,7 @@ mod tests {
     }
 
     /// Shape P through the real prover at the L2 lane (`L2_CFG`, b4/q45 since
-    /// lab #785 F5-2; b4/q43 when written) (2^20 × 798 — the
+    /// lab #785 F5-2; b4/q43 when written) (2^20 × 804 — the
     /// ~15 GB class; the local scoped run skips it by name and it was run
     /// once on its own under the lock, see `docs/w3-run3.md`): the honest
     /// instance proves and verifies, then each of `anchor`, `nf₁`, `fee`,

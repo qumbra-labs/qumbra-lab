@@ -577,17 +577,22 @@ mod tests {
     use super::*;
     use crate::f3::cmp::LT_WIDTH;
 
-    /// The program and the shape: 50 segments in ring order, 559 perms a
-    /// slot (the census's count), width 3,224, degree 3 (b2 is a lane), and
+    /// The program and the shape: 51 segments in ring order, 560 perms a
+    /// slot (the census's count), width 3,225 (lab #785 F5-4d: one SD block
+    /// more, 50 → 51, 559 → 560, 3,224 → 3,225), degree 3 (b2 is a lane), and
     /// every constraint group non-empty.
     #[test]
     fn f3leaf_program_width_and_degree() {
         let prog = slot_program();
         assert_eq!(prog.len(), NSEG);
+        assert_eq!((NSEG, SLOT_PERMS), (51, 560));
+        assert_eq!(prog[..SD_BLOCKS], (0..SD_BLOCKS).map(Seg::Sd).collect::<Vec<_>>()[..]);
+        assert_eq!(prog[SD_BLOCKS], Seg::LeafOld(0));
+        assert_eq!(prog[NSEG - 1], Seg::Pair(PathId::R, Part::LastB));
         assert!(prog.iter().enumerate().all(|(i, s)| s.idx() == i));
         assert_eq!(prog.iter().map(|s| s.len()).sum::<usize>(), SLOT_PERMS);
         assert_eq!(super::super::census::slot_perms(), SLOT_PERMS);
-        assert_eq!(LEAF_WIDTH, 3_224);
+        assert_eq!(LEAF_WIDTH, 3_225);
         let air = LeafAir::new(2);
         assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 3);
         assert!(phase_ranges(&air).iter().all(|r| !r.is_empty()), "every group emits");
@@ -634,14 +639,14 @@ mod tests {
     }
 
     /// Approval 1(a): the SD test vectors — the fixture leaf `[P, R]`'s SD in,
-    /// after its P transaction (five blocks), and out (after its R, four
+    /// after its P transaction (six blocks since lab #785 F5-4d), and out (after its R, four
     /// blocks) — natively and in the AIR's trace and public values. The
     /// literals are `qlab-bench f3vec`'s output.
     #[test]
     fn f3leaf_sd_vectors() {
         const SD_IN: Digest = [0x2e14bf6b332aa7b0, 0x153cf3d726326217, 0x4fd48521c7bae5fb, 0xe7b0935ef4961c3e];
-        const AFTER_P: Digest = [0x4648ef13d0b6e74f, 0xdc1073de28246423, 0x2e083b862b002575, 0xc74bd36d2b5f23d5];
-        const SD_OUT: Digest = [0xc5feb7bf2e2b0a93, 0xc2f4d8cac6a7e75c, 0xfb6455911a040a71, 0x0d5dc862ea5ab067];
+        const AFTER_P: Digest = [0xc20dca281ddbe757, 0x1766688fba25a511, 0xf729d765197769e0, 0x639dd63eac513545];
+        const SD_OUT: Digest = [0x484656deab6c552b, 0x19cdc67e7dca9cfd, 0xb0e078452e6ebd4f, 0x324ec65b434467ec];
         assert_eq!(sd_vectors(), [SD_IN, AFTER_P, SD_OUT], "native");
         let fx = fixture(&[P, R], SEED);
         assert_eq!((fx.rin.sd, fx.rout.sd), (SD_IN, SD_OUT), "the native leaf");

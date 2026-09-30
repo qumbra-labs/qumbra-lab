@@ -85,7 +85,7 @@ fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
         },
         discovery: Vec::new(),
         rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
-        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None, write: None }.encode(),
+        l2: L2Surface { shape: L2ShapeTag::S, registry_root: root(), vpublic: None, write: None, exit_rkm: [0; 32] }.encode(),
     };
     t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
     t

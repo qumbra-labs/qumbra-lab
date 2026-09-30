@@ -125,6 +125,10 @@ pub struct L2Surface {
     /// `Some` exactly for shape R (lab #728): the write — the root after it
     /// and the new leaf, whole. `None` for S and P.
     pub write: Option<RegistryWriteSurface>,
+    /// Shape P's exit recipient (lab #785 F5-4d): the L1 `rkm` an asset-0
+    /// redeem pays, lane-major LE — the proof's `PV_XRKM`. All zero when the
+    /// transaction does not exit, and on S and R (where it is not encoded).
+    pub exit_rkm: Hash32,
 }
 
 /// The registry write an R surface carries (lab #728 Q1): the root after the
@@ -148,10 +152,11 @@ impl RegistryWriteSurface {
     }
 }
 
-/// Encoded surface lengths: S = tag ‖ root; P = S ‖ 2 × (redeem ‖ amount ‖ asset).
+/// Encoded surface lengths: S = tag ‖ root; P = S ‖ 2 × (redeem ‖ amount ‖
+/// asset) ‖ exit_rkm (32, lab #785 F5-4d).
 pub const L2_SURFACE_LEN_S: usize = 1 + 32;
 /// See [`L2_SURFACE_LEN_S`].
-pub const L2_SURFACE_LEN_P: usize = L2_SURFACE_LEN_S + 2 * (1 + 8 + 2);
+pub const L2_SURFACE_LEN_P: usize = L2_SURFACE_LEN_S + 2 * (1 + 8 + 2) + 32;
 /// R = tag ‖ old root ‖ new root ‖ the new leaf's 15 lanes (u64 LE) — 185 B.
 pub const L2_SURFACE_LEN_R: usize = L2_SURFACE_LEN_S + 32 + 15 * 8;
 
@@ -178,6 +183,10 @@ impl L2Surface {
         let mut out = Vec::with_capacity(L2_SURFACE_LEN_R);
         out.push(self.shape.byte());
         out.extend_from_slice(&self.registry_root);
+        assert!(
+            self.shape == L2ShapeTag::P || self.exit_rkm == [0; 32],
+            "an exit recipient exists only on shape P (lab #785 F5-4d)"
+        );
         match (self.shape, &self.vpublic, &self.write) {
             (L2ShapeTag::S, None, None) => {}
             (L2ShapeTag::P, Some(terms), None) => {
@@ -186,6 +195,7 @@ impl L2Surface {
                     out.extend_from_slice(&t.amount.to_le_bytes());
                     out.extend_from_slice(&t.asset.to_le_bytes());
                 }
+                out.extend_from_slice(&self.exit_rkm);
             }
             (L2ShapeTag::R, None, Some(w)) => {
                 out.extend_from_slice(&w.new_root);
@@ -238,6 +248,10 @@ impl L2Surface {
                 Some(terms)
             }
         };
+        let exit_rkm: Hash32 = match shape {
+            L2ShapeTag::P => rest[32 + 2 * 11..32 + 2 * 11 + 32].try_into().expect("length checked"),
+            L2ShapeTag::S | L2ShapeTag::R => [0; 32],
+        };
         let write = match shape {
             L2ShapeTag::S | L2ShapeTag::P => None,
             L2ShapeTag::R => {
@@ -249,7 +263,7 @@ impl L2Surface {
                 Some(RegistryWriteSurface { new_root, leaf_lanes })
             }
         };
-        Ok(Some(L2Surface { shape, registry_root, vpublic, write }))
+        Ok(Some(L2Surface { shape, registry_root, vpublic, write, exit_rkm }))
     }
 }
 
@@ -451,6 +465,7 @@ where
             .map_err(|err| BodyError::L2SurfaceMalformed { index: i, err })?
             .ok_or(BodyError::L2SurfaceMissing { index: i })?;
         check_l2_arity(&tx.public, surface.shape, i)?;
+        check_l2_no_exit(&surface, i)?;
         if Some(surface.registry_root) != pre_root {
             return Err(BodyError::L2RegistryRootStale { index: i });
         }
@@ -515,6 +530,19 @@ pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: 
     Ok(())
 }
 
+/// Lab #785 F5-4d: an asset-0 redeem is shape P's exit edge, and only a
+/// wrapper bundle (V6) pays an exit on L1. The Annulet has no bridge, so it
+/// refuses one by name — as it does a nonzero recipient, which the circuit
+/// allows only on an exit. The one rule the body check and the mempool both
+/// apply.
+pub fn check_l2_no_exit(surface: &L2Surface, index: usize) -> Result<(), BodyError> {
+    let exits = surface.vpublic.iter().flatten().any(|t| t.redeem && t.asset == 0 && t.amount > 0);
+    if exits || surface.exit_rkm != [0; 32] {
+        return Err(BodyError::L2ExitWithoutBridge { index });
+    }
+    Ok(())
+}
+
 /// A body's registry write (lab #728): `(tx index, the root it was proven
 /// against, the write)` for its one shape-R transaction, `None` when it has
 /// none, and a second R refused by index. The one scan both
@@ -556,7 +584,7 @@ mod tests {
     const FEES: L2FeeTable = L2FeeTable { tier_s: 1, tier_p: 2, tier_r: 4 };
 
     fn s_surface() -> L2Surface {
-        L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None }
+        L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None, exit_rkm: [0; 32] }
     }
 
     fn p_surface() -> L2Surface {
@@ -565,6 +593,7 @@ mod tests {
             registry_root: [0x44; 32],
             vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: false, amount: 100, asset: 7 }]),
             write: None,
+            exit_rkm: [0; 32],
         }
     }
 
@@ -680,12 +709,12 @@ mod tests {
 
     #[test]
     fn surfaces_round_trip_at_their_lengths() {
-        for (s, len) in [(s_surface(), 33usize), (p_surface(), 55)] {
+        for (s, len) in [(s_surface(), 33usize), (p_surface(), 87)] {
             let b = s.encode();
             assert_eq!(b.len(), len);
             assert_eq!(L2Surface::decode(&b), Ok(Some(s)));
         }
-        assert_eq!((L2_SURFACE_LEN_S, L2_SURFACE_LEN_P), (33, 55));
+        assert_eq!((L2_SURFACE_LEN_S, L2_SURFACE_LEN_P), (33, 87), "P: + the exit recipient (F5-4d)");
         assert_eq!(L2Surface::decode(L2_SURFACE_ABSENT), Ok(None));
         assert_eq!((L2ShapeTag::S.byte(), L2ShapeTag::P.byte()), (0x01, 0x02));
     }
@@ -720,6 +749,7 @@ mod tests {
             registry_root: [0x44; 32],
             vpublic: None,
             write: Some(RegistryWriteSurface { new_root, leaf_lanes }),
+            exit_rkm: [0; 32],
         }
     }
 
@@ -764,7 +794,8 @@ mod tests {
         p.push(0);
         p.extend_from_slice(&100u64.to_le_bytes());
         p.extend_from_slice(&7u16.to_le_bytes());
-        assert_eq!(p_surface().encode(), p, "P bytes unchanged");
+        p.extend_from_slice(&[0u8; 32]); // F5-4d: the exit recipient, zero on a non-exit
+        assert_eq!(p_surface().encode(), p, "P bytes: unchanged up to F5-4d's appended recipient");
         let mut short = b.clone();
         short.pop();
         assert_eq!(L2Surface::decode(&short), Err(L2SurfaceError::WrongLength { got: 184, want: 185 }));
@@ -804,6 +835,26 @@ mod tests {
         cheap.public.fee = FEES.tier_s;
         let body = BlockBody::new(vec![cheap], vec![]);
         assert_eq!(check_at(&body, new), Err(BodyError::WrongFee { index: 0, expected: FEES.tier_r, got: FEES.tier_s }));
+    }
+
+    /// Lab #785 F5-4d (pre-review U6): the Annulet refuses the exit edge by
+    /// name — an asset-0 redeem, or a recipient without one — while a redeem
+    /// of another asset still passes.
+    #[test]
+    fn an_exit_is_refused_on_the_annulet_by_name() {
+        let t = |redeem, amount, asset| VPublicTerm { redeem, amount, asset };
+        let exit = L2Surface { vpublic: Some([VPublicTerm::NONE, t(true, 10, 0)]), exit_rkm: [0xE7; 32], ..p_surface() };
+        let body = BlockBody::new(vec![l2_tx(1, &s_surface()), l2_tx(9, &exit)], vec![]);
+        assert_eq!(check(&body), Err(BodyError::L2ExitWithoutBridge { index: 1 }));
+        assert_eq!(check_l2_no_exit(&exit, 1), Err(BodyError::L2ExitWithoutBridge { index: 1 }));
+        let no_rkm = L2Surface { exit_rkm: [0; 32], ..exit };
+        assert_eq!(check_l2_no_exit(&no_rkm, 0), Err(BodyError::L2ExitWithoutBridge { index: 0 }));
+        let stray = L2Surface { exit_rkm: [0xE7; 32], ..p_surface() };
+        assert_eq!(check_l2_no_exit(&stray, 0), Err(BodyError::L2ExitWithoutBridge { index: 0 }));
+        let other = L2Surface { vpublic: Some([t(true, 10, 7), VPublicTerm::NONE]), ..p_surface() };
+        assert_eq!(check_l2_no_exit(&other, 0), Ok(()));
+        assert_eq!(check_l2_no_exit(&p_surface(), 0), Ok(()));
+        assert_eq!(check_l2_no_exit(&s_surface(), 0), Ok(()));
     }
 
     #[test]

@@ -992,7 +992,7 @@ mod tests {
             }),
         };
         let tx = TxEntry {
-            l2: L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None }.encode(),
+            l2: L2Surface { shape: L2ShapeTag::S, registry_root: [0x44; 32], vpublic: None, write: None, exit_rkm: [0; 32] }.encode(),
             ..golden_l1_tx()
         };
         let ann = BlockAnnounce {

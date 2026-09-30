@@ -592,7 +592,10 @@ mod tests {
     fn hiding_geometry_matches_stage_zero_and_extra_p_fold() {
         for (shape, ood, paths, leaf, compress, floor, lane) in [
             (Shape::S, 1478, vec![15, 11, 7, 3], 33, 93, 206, 5800),
-            (Shape::P, 1632, vec![16, 12, 8, 4, 3], 36, 103, 227, 6398),
+            // F5-4d (lab #785): P's +6 columns open 12 more OOD values, +16
+            // PVs cross one F0 flush block and the OOD bytes one duplicate
+            // block (FS +2, lane +3).
+            (Shape::P, 1644, vec![16, 12, 8, 4, 3], 36, 103, 229, 6401),
             (Shape::R, 1504, vec![14, 10, 6, 3], 33, 87, 208, 5547),
         ] {
             let g = geometry(shape, 8);
@@ -613,7 +616,8 @@ mod tests {
         let cfg = F2_LANE;
         for (shape, leaf, comp, columns, periodic, pvs) in [
             (Shape::S, 25, 57, 15_877, 96, 6_519),
-            (Shape::P, 27, 60, 17_111, 99, 7_135),
+            // F5-4d: 12 more opened terms, 8 held cells and 4 PV limbs each.
+            (Shape::P, 27, 60, 17_207, 99, 7_183),
             (Shape::R, 25, 54, 16_083, 95, 6_623),
         ] {
             let g = geometry(shape, 8);
@@ -691,7 +695,10 @@ mod tests {
         // dimensions are F2b-0's (S3 1,216 x 2^15, ROM 2,227, 1,312 inputs).
         for (shape, perms, columns, rom, pvs) in [
             (Shape::S, 207, 11_746, 2_227, 1_151),
-            (Shape::P, 228, 12_655, 2_593, 1_295),
+            // F5-4d (named `f2price --shape p3` run): the challenger +2 (F0
+            // and F2 flushes); the machine +28 inputs (12 opened values, 16
+            // PVs) and +2 registers — ROM 12 + 3r + i, width 12 + 4r; +16 PVs.
+            (Shape::P, 230, 12_777, 2_627, 1_311),
             (Shape::R, 209, 12_040, 2_364, 1_136),
         ] {
             let g = geometry(shape, 8);
@@ -781,7 +788,7 @@ mod tests {
     fn live_air_census_pins_hiding_chunks_and_periodic_columns() {
         for (shape, count, periodic) in [
             (Shape::S, 1113, 40),
-            (Shape::P, 1328, 40),
+            (Shape::P, 1358, 40),
             (Shape::R, 1226, 41),
         ] {
             let r = symbolic(shape);

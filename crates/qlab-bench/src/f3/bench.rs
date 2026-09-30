@@ -332,14 +332,17 @@ mod tests {
         assert_eq!(chunks, 2);
         /// (outer, k, log h, lde, arities, queries, opened, challenger, per query, both leaves, columns, rows)
         type Row = (Outer, usize, usize, usize, &'static [usize], usize, usize, usize, usize, usize, usize, usize);
+        // F5-4d (lab #785): one leaf column more opens 2 more terms (ζ, ζ·g),
+        // and 4·terms + 8 = 25,840 words crosses a 34-word flush block: one
+        // more challenger perm, both proofs +2. Queries and columns unmoved.
         #[rustfmt::skip]
         let want: [Row; 6] = [
-            (Outer::B2, 4, 16, 17, &[4, 4, 4], 86, 6456, 792, 148, 27040, 4922, 524288),
-            (Outer::B2, 8, 17, 18, &[4, 4, 4, 1], 86, 6456, 795, 156, 28422, 4964, 524288),
-            (Outer::B2, 16, 18, 19, &[4, 4, 4, 2], 86, 6456, 795, 161, 29282, 4995, 524288),
-            (Outer::B4, 4, 16, 18, &[4, 4, 4], 43, 6456, 787, 153, 14732, 4891, 262144),
-            (Outer::B4, 8, 17, 19, &[4, 4, 4, 1], 43, 6456, 790, 162, 15512, 4935, 262144),
-            (Outer::B4, 16, 18, 20, &[4, 4, 4, 2], 43, 6456, 790, 167, 15942, 4966, 262144),
+            (Outer::B2, 4, 16, 17, &[4, 4, 4], 86, 6458, 793, 148, 27042, 4922, 524288),
+            (Outer::B2, 8, 17, 18, &[4, 4, 4, 1], 86, 6458, 796, 156, 28424, 4964, 524288),
+            (Outer::B2, 16, 18, 19, &[4, 4, 4, 2], 86, 6458, 796, 161, 29284, 4995, 524288),
+            (Outer::B4, 4, 16, 18, &[4, 4, 4], 43, 6458, 788, 153, 14734, 4891, 262144),
+            (Outer::B4, 8, 17, 19, &[4, 4, 4, 1], 43, 6458, 791, 162, 15514, 4935, 262144),
+            (Outer::B4, 16, 18, 20, &[4, 4, 4, 2], 43, 6458, 791, 167, 15944, 4966, 262144),
         ];
         for (outer, k, lh, lde, ar, q, opened, ch, pq, both, cols, rows) in want {
             assert_eq!(row(k).log_h as usize, lh, "{outer:?} k = {k}");
@@ -364,7 +367,7 @@ mod tests {
 
     /// One real round trip on the lane: a one-transaction leaf proven on the
     /// decided outer lane (b2, non-hiding) and verified natively; a PV moved
-    /// after proving is refused. [P] ≈ 0.5 GiB (k-model at 2^14 × 3,224).
+    /// after proving is refused. [P] ≈ 0.5 GiB (k-model at 2^14 × 3,225).
     #[test]
     fn f3leaf_proves_and_verifies_at_b2() {
         let fx = fixture(&[L2ShapeTag::P], SEED);

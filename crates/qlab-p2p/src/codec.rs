@@ -1143,6 +1143,7 @@ mod tests {
                 registry_root: [0x44; 32],
                 vpublic: Some([VPublicTerm::NONE, VPublicTerm { redeem: true, amount: 5, asset: 7 }]),
                 write: None,
+                exit_rkm: [0; 32],
             }
             .encode(),
         }
