@@ -1318,7 +1318,7 @@ pub(in crate::f2::ood) mod tests {
     use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
     use qlab_air::l2test::{satisfied, violations_at};
     use qlab_consensus::ProverRng;
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use crate::f2::F2_LANE;
 
     use super::super::bind::tests::{exported, Exported};
     use super::super::fri_fs::tests::{shared, Shared};
@@ -1380,7 +1380,7 @@ pub(in crate::f2::ood) mod tests {
                 zk: qlab_consensus::IS_ZK,
             };
             let chunks = proof.opened_values.quotient_chunks.len();
-            let geom = Geom::new(dims, chunks, &L2_CFG_PROVISIONAL).unwrap();
+            let geom = Geom::new(dims, chunks, &F2_LANE).unwrap();
             let inputs = proof_inputs_dims(dims, proof, sh.pvs).unwrap();
             let mut zvals = proof.opened_values.random.clone().unwrap();
             zvals.extend(&inputs.local);
@@ -1488,7 +1488,7 @@ pub(in crate::f2::ood) mod tests {
             zk: qlab_consensus::IS_ZK,
         };
         let chunks = proof.opened_values.quotient_chunks.len();
-        let geom = Geom::new(dims, chunks, &L2_CFG_PROVISIONAL).unwrap();
+        let geom = Geom::new(dims, chunks, &F2_LANE).unwrap();
         let zeta = proof_inputs_dims(dims, proof, pvs).unwrap().zeta;
         let op = Opening::from_proof(proof, query, &geom).unwrap();
         native_reduced(&geom, proof, &op, index, zeta, fri_alpha).unwrap()

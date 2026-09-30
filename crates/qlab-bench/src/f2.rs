@@ -16,7 +16,7 @@ use bincode::Options;
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_uni_stark::{verify, Proof};
 use qlab_consensus::{Config, Val, CAP_HEIGHT, IS_ZK, NUM_RANDOM_CODEWORDS, SALT_ELEMS};
-use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
+use qlab_l2::Shape;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -52,6 +52,76 @@ fn shape_name(shape: Shape) -> &'static str {
     }
 }
 
+/// **The lane F2 (and F4b's census) was built and measured under**:
+/// **b4/q43/g22/fp16/a16**, the L2 lane's value until lab #785 F5-2 froze the
+/// L2 lane at q45 (`qlab_l2`'s lane, Larry's Q-L2). F2's OOD components
+/// (C1/C2) and every golden they pin derive from this query count, and the
+/// wrapper recursion they serve is deferred (lab #782, behind the lookup
+/// milestone), so F2 keeps its own lane rather than following the frozen
+/// one: it proves, verifies and replays its own fixtures here, and **no
+/// longer verifies real v1 member proofs**. The deferred recursion
+/// milestone re-targets the frozen lane when it is revived.
+/// `f2_lane_is_the_measured_lane_not_the_frozen_one` pins the pair.
+pub(crate) const F2_LANE: qlab_consensus::FriCfg = qlab_consensus::FriCfg {
+    log_blowup: 2,
+    num_queries: 43,
+    grind_bits: 22,
+    log_final_poly_len: 4,
+    max_log_arity: 4,
+};
+
+/// The hiding `StarkConfig` on [`F2_LANE`] — F2's stand-in for
+/// `qlab_l2::make_config_l2`.
+pub(crate) fn f2_config() -> Config {
+    qlab_consensus::make_config_with(&F2_LANE)
+}
+
+/// A real shape fixture (qlab-l2's instances) proven on [`F2_LANE`]: what
+/// `qlab_l2::prove_{s,p,r}` do on the L2 lane.
+pub(crate) fn f2_prove(shape: Shape) -> (Vec<Val>, Proof<Config>) {
+    let blowup = F2_LANE.log_blowup;
+    match shape {
+        Shape::S => {
+            let inst = qlab_l2::fixture::shape_s3_merge_at(shape.log_height());
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let trace = inst.air.generate_trace::<Val>(blowup);
+            (pvs.clone(), p3_uni_stark::prove(&f2_config(), &inst.air, trace, &pvs))
+        }
+        Shape::P => {
+            let inst = qlab_l2::fixture::shape_p3_merge_at(shape.log_height());
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let trace = inst.air.generate_trace::<Val>(blowup);
+            (pvs.clone(), p3_uni_stark::prove(&f2_config(), &inst.air, trace, &pvs))
+        }
+        Shape::R => {
+            let inst = qlab_l2::fixture::shape_r();
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let trace = inst.air.generate_trace::<Val>(blowup);
+            (pvs.clone(), p3_uni_stark::prove(&f2_config(), &inst.air, trace, &pvs))
+        }
+    }
+}
+
+/// `qlab_l2::verify_{s,p,r}` on [`F2_LANE`]: the PV length and widths, then
+/// the proof.
+pub(crate) fn f2_verify(shape: Shape, pvs: &[Val], proof: &Proof<Config>) -> bool {
+    pvs.len() == shape.pv_len()
+        && match shape {
+            Shape::S => {
+                qlab_l2::pv_in_range(pvs, &qlab_air::l2::audit_pv_bits())
+                    && p3_uni_stark::verify(&f2_config(), &qlab_l2::verifier_air_s(), proof, pvs).is_ok()
+            }
+            Shape::P => {
+                qlab_l2::pv_in_range(pvs, &qlab_air::l2p::audit_pv_bits())
+                    && p3_uni_stark::verify(&f2_config(), &qlab_l2::verifier_air_p(), proof, pvs).is_ok()
+            }
+            Shape::R => {
+                qlab_l2::pv_in_range(pvs, &qlab_air::l2r::audit_pv_bits())
+                    && p3_uni_stark::verify(&f2_config(), &qlab_l2::verifier_air_r(), proof, pvs).is_ok()
+            }
+        }
+}
+
 fn parse_shape(value: &str) -> Result<Shape> {
     match value {
         "s3" => Ok(Shape::S),
@@ -62,7 +132,7 @@ fn parse_shape(value: &str) -> Result<Shape> {
 }
 
 fn config_words() -> Vec<usize> {
-    let c = L2_CFG_PROVISIONAL;
+    let c = F2_LANE;
     vec![
         c.log_blowup,
         c.num_queries,
@@ -144,16 +214,14 @@ fn read_fixture(path: &Path) -> Result<Fixture> {
 fn native_verify(shape: Shape, pvs: &[Val], proof: &Proof<Config>) -> Result<()> {
     // Malformed foreign proofs must produce a failed command, not a census.
     let valid = catch_unwind(AssertUnwindSafe(|| match shape {
-        Shape::S => qlab_l2::verify_s(pvs, proof),
-        Shape::P => qlab_l2::verify_p(pvs, proof),
-        Shape::R => qlab_l2::verify_r(pvs, proof),
+        Shape::S | Shape::P | Shape::R => f2_verify(shape, pvs, proof),
     }))
     .unwrap_or(false);
     require(valid, "native L2 verification failed")
 }
 
 fn validate_geometry(shape: Shape, proof: &Proof<Config>, g: &price::Geometry) -> Result<()> {
-    let cfg = L2_CFG_PROVISIONAL;
+    let cfg = F2_LANE;
     let o = &proof.opened_values;
     require(
         proof.degree_bits == shape.log_height() + IS_ZK,
@@ -311,12 +379,12 @@ fn census(shape: Shape, fixture: &Fixture) -> Result<Value> {
     let counts = counters.report();
     require(
         counts["leaf_absorb_permutations"]
-            == geometry.leaf_per_query * L2_CFG_PROVISIONAL.num_queries,
+            == geometry.leaf_per_query * F2_LANE.num_queries,
         "measured leaf permutations disagree with projection",
     )?;
     require(
         counts["path_compression_permutations"]
-            == geometry.compress_per_query * L2_CFG_PROVISIONAL.num_queries,
+            == geometry.compress_per_query * F2_LANE.num_queries,
         "measured path permutations disagree with projection",
     )?;
     require(
@@ -333,11 +401,7 @@ fn census(shape: Shape, fixture: &Fixture) -> Result<Value> {
 }
 
 fn prove_fixture(shape: Shape, revision: &str) -> Result<Fixture> {
-    let (pvs, proof) = match shape {
-        Shape::S => qlab_l2::prove_s(&qlab_l2::fixture::shape_s3_merge_at(shape.log_height())),
-        Shape::P => qlab_l2::prove_p(&qlab_l2::fixture::shape_p3_merge_at(shape.log_height())),
-        Shape::R => qlab_l2::prove_r(&qlab_l2::fixture::shape_r()),
-    };
+    let (pvs, proof) = f2_prove(shape);
     native_verify(shape, &pvs, &proof)?;
     Ok(Fixture {
         version: FIXTURE_VERSION,
@@ -474,8 +538,8 @@ pub(crate) fn run(mode: &str, args: &[String], power: &str) -> Result<()> {
                 .ok_or("missing quotient census")? as usize;
             json!({"symbolic_air": air, "projected_opening_schedule": price::geometry(shape, chunks).report(shape),
                 "input_openings": price::input_openings(shape.width(), shape.log_height(), chunks,
-                    L2_CFG_PROVISIONAL.num_queries),
-                "query_phase": price::query_phase(shape.log_height(), L2_CFG_PROVISIONAL.num_queries),
+                    F2_LANE.num_queries),
+                "query_phase": price::query_phase(shape.log_height(), F2_LANE.num_queries),
                 "ood_arithmetic": ood::price(shape)?,
                 "composed_c1": price::composed_c1(shape)?,
                 "composed_c2": price::composed_c2(shape),
@@ -594,6 +658,21 @@ fn s3_proof() -> (Proof<Config>, Vec<Val>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #785 F5-2: F2 keeps the lane it was measured under while the L2
+    /// lane is frozen at q45. The pair is stated here so the divergence is
+    /// explicit and cannot drift: the two differ in the query count only.
+    #[test]
+    fn f2_lane_is_the_measured_lane_not_the_frozen_one() {
+        let l2 = qlab_l2::L2_CFG;
+        assert_eq!(F2_LANE.label(), "b4/q43/g22/fp16/a16", "F2's measured lane");
+        assert_eq!(l2.label(), "b4/q45/g22/fp16/a16", "the frozen L2 lane");
+        assert_eq!(
+            (F2_LANE.log_blowup, F2_LANE.grind_bits, F2_LANE.log_final_poly_len, F2_LANE.max_log_arity),
+            (l2.log_blowup, l2.grind_bits, l2.log_final_poly_len, l2.max_log_arity),
+            "the two lanes differ in the query count only"
+        );
+    }
 
     #[test]
     fn options_refuse_silent_lane_changes_and_proving_from_census() {

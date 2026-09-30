@@ -1565,7 +1565,8 @@ pub(super) mod tests {
     use p3_maybe_rayon::prelude::*;
     use p3_util::reverse_bits_len;
     use qlab_air::l2test::{satisfied, violations_at};
-    use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
+    use qlab_l2::Shape;
+    use crate::f2::F2_LANE;
 
     use super::super::c1::tests::{honest_seam, native_sums};
     use super::super::fold::tests::native_query_of;
@@ -1609,7 +1610,7 @@ pub(super) mod tests {
                 zk: qlab_consensus::IS_ZK,
             };
             let chunks = sh.proof.opened_values.quotient_chunks.len();
-            let cfg = L2_CFG_PROVISIONAL;
+            let cfg = F2_LANE;
             let path = open::Geom::new(dims, chunks, &cfg).unwrap().path;
             let cap_of = |i: usize| sh.indices[i] >> path;
             let other = (1..sh.indices.len())
@@ -2315,7 +2316,7 @@ pub(super) mod tests {
     /// source-order `open_input` sum. It carries the indices of `layout`'s
     /// covered slots, which must be the first ones.
     fn native_seam(proof: &Proof<Config>, pvs: &[Val], shape: Shape, layout: &Layout) -> Seam {
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let fri = &proof.opening_proof.1;
         let mut ch = native_through_f2(proof, pvs, shape.log_height());
         let fri_alpha: E = ch.sample_algebra_element();
@@ -2369,7 +2370,7 @@ pub(super) mod tests {
     fn c2_accepts_a_real_s3_production_schedule() {
         let (proof, pvs) = crate::f2::s3_proof();
         let shape = Shape::S;
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let dims = Dims::from(shape);
         let layout = Layout::new(dims, 8, &cfg, vec![0, 1]).unwrap();
         let seam = native_seam(&proof, &pvs, shape, &layout);
@@ -2476,12 +2477,12 @@ pub(super) mod tests {
     fn c2_refuses_a_randomizer_opening_altered_in_the_proof() {
         let fx = fixture();
         let l = &fx.air.layout;
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let (pvs, dims) = (fx.sh.pvs, fx.dims);
         let mut proof = copy(fx.sh.proof);
         proof.opened_values.random.as_mut().unwrap()[2] += basis(1);
         regrind(&mut proof, pvs, dims.log_height);
-        assert!(p3_uni_stark::verify(&qlab_l2::make_config_l2(), &Toy, &proof, pvs).is_err());
+        assert!(p3_uni_stark::verify(&crate::f2::f2_config(), &Toy, &proof, pvs).is_err());
         let program = Program::compile_dims(dims, &Toy).unwrap();
         let inputs = proof_inputs_dims(dims, &proof, pvs).unwrap();
         let c1 = super::super::c1::honest(&program, &inputs, &proof, pvs, &cfg, 64 << 20).unwrap();
@@ -2520,7 +2521,7 @@ pub(super) mod tests {
     /// query's register rows; rounds 0-3 unchanged).
     pub(in crate::f2::ood) fn p3_last_round_negatives(proof: &Proof<Config>, pvs: &[Val]) {
         let shape = Shape::P;
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let layout = Layout::new(Dims::from(shape), 8, &cfg, vec![0, 1]).unwrap();
         assert_eq!(layout.fg.geom.arities, vec![4, 4, 4, 4, 1], "P3's schedule");
         let rounds = layout.fg.geom.rounds();

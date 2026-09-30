@@ -751,7 +751,7 @@ pub(in crate::f2::ood) mod tests {
     use p3_air::symbolic::{get_symbolic_constraints, AirLayout};
     use p3_challenger::{CanObserve, CanSampleBits, FieldChallenger, GrindingChallenger};
     use qlab_air::l2test::{satisfied, violations_at};
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use crate::f2::F2_LANE;
 
     use super::super::bind;
     use super::super::lane::toy::{native_through_f2, toy_proof, Native};
@@ -791,7 +791,7 @@ pub(in crate::f2::ood) mod tests {
                 &bind::Data::from_proof(&proof, &pvs).unwrap(),
             )
             .unwrap();
-            let shape = Shape::new(LOG_HEIGHT, &L2_CFG_PROVISIONAL).unwrap();
+            let shape = Shape::new(LOG_HEIGHT, &F2_LANE).unwrap();
             let air = FriFsAir::new(Layout::new(shape), 64 << 20).unwrap();
             let data = Data::from_proof(&proof, f2.digests[2]).unwrap();
             let honest = Replay::new(&air.layout, &data).unwrap();

@@ -32,7 +32,8 @@ use p3_maybe_rayon::prelude::*;
 use p3_uni_stark::{prove, verify, Proof, ProverConstraintFolder, VerifierConstraintFolder};
 use qlab_consensus::legacy::{make_legacy_config_with, LegacyNonHidingConfig};
 use qlab_consensus::{Config, FriCfg};
-use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
+use qlab_l2::Shape;
+use crate::f2::F2_LANE;
 use serde_json::{json, Map, Value};
 
 use super::lane::{phase_ranges, Phased};
@@ -232,7 +233,7 @@ impl<'a> Leaf<'a> {
             inputs,
             proof,
             pvs,
-            cfg: L2_CFG_PROVISIONAL,
+            cfg: F2_LANE,
             pv_check: Box::new(move |c1_pvs| check_leaf_pvs(shape, c1_pvs)),
         })
     }
@@ -587,7 +588,7 @@ mod tests {
             inputs,
             proof: sh.proof,
             pvs: sh.pvs,
-            cfg: L2_CFG_PROVISIONAL,
+            cfg: F2_LANE,
             pv_check: Box::new(move |pvs| check_pv_widths(&widths, pvs)),
         }
     }
@@ -685,7 +686,7 @@ mod tests {
         type Edit = fn(&mut Proof<Config>);
         let leaf = toy_leaf();
         let sh = shared();
-        let (cfg, max) = (L2_CFG_PROVISIONAL, 64 << 20);
+        let (cfg, max) = (F2_LANE, 64 << 20);
         let edited = |edit: Edit| {
             let mut p = copy(sh.proof);
             edit(&mut p);
@@ -874,8 +875,8 @@ mod tests {
                 degree_bits: p.degree_bits,
             }
         };
-        verify(&qlab_l2::make_config_l2(), &Toy, sh.proof, sh.pvs).unwrap();
-        let legacy = make_legacy_config_with(&L2_CFG_PROVISIONAL);
+        verify(&crate::f2::f2_config(), &Toy, sh.proof, sh.pvs).unwrap();
+        let legacy = make_legacy_config_with(&F2_LANE);
         let err = verify(&legacy, &Toy, &retype(sh.proof, true), sh.pvs).unwrap_err();
         assert!(
             matches!(err, VerificationError::RandomizationError),
@@ -900,10 +901,10 @@ mod tests {
     fn f2wrap_refuses_toy_pvs_routed_to_the_wrong_offset() {
         let leaf = toy_leaf();
         let sh = shared();
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let swapped = [sh.pvs[1], sh.pvs[0]];
         let mut proof = copy(sh.proof);
-        assert!(verify(&qlab_l2::make_config_l2(), &Toy, &proof, &swapped).is_err());
+        assert!(verify(&crate::f2::f2_config(), &Toy, &proof, &swapped).is_err());
         let inputs = proof_inputs_dims(leaf.dims, &proof, &swapped).unwrap();
         let err = compiled(leaf.dims, &Toy, &inputs).err().unwrap();
         assert_eq!(err, "native OOD identity fails on the leaf's openings");
@@ -932,6 +933,7 @@ mod tests {
         use qlab_air::{l2, l2p, l2r};
         let (proof, pvs) = crate::f2::s3_proof();
         assert!(Leaf::of(Shape::S, &proof, &pvs).is_ok());
+        assert!(crate::f2::f2_verify(Shape::S, &pvs, &proof), "the honest S3 verifies on F2's lane");
         let mut as_p = pvs[..l2p::PV_VP1].to_vec();
         as_p.extend([Val::ZERO; l2p::PV_NF3 - l2p::PV_VP1]);
         as_p.extend_from_slice(&pvs[l2::PV_NF3..]);
@@ -948,7 +950,7 @@ mod tests {
                 "native OOD identity fails on the leaf's openings",
             ),
         ] {
-            assert!(!qlab_l2::verify_s(bad, &proof), "{name}");
+            assert!(!crate::f2::f2_verify(Shape::S, bad, &proof), "{name}");
             assert_eq!(Leaf::of(Shape::S, &proof, bad).err().unwrap(), name);
         }
     }

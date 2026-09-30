@@ -1561,7 +1561,7 @@ pub(in crate::f2::ood) mod tests {
     use p3_maybe_rayon::prelude::*;
     use p3_uni_stark::StarkGenericConfig;
     use qlab_air::l2test::{satisfied, violations_at};
-    use qlab_l2::L2_CFG_PROVISIONAL;
+    use crate::f2::F2_LANE;
 
     use super::super::bind;
     use super::super::fri_fs::tests::shared;
@@ -1608,7 +1608,7 @@ pub(in crate::f2::ood) mod tests {
             let inputs = proof_inputs_dims(dims(), sh.proof, sh.pvs).unwrap();
             let values = compare_native(&program, &Toy, &inputs).unwrap();
             assert_eq!(values[program.residual], E::ZERO, "native OOD relation");
-            let air = C1Air::new(&program, &L2_CFG_PROVISIONAL, 64 << 20).unwrap();
+            let air = C1Air::new(&program, &F2_LANE, 64 << 20).unwrap();
             let data = Data::from_proof(sh.proof, sh.pvs).unwrap();
             let honest = Replay::new(&air.layout, &data).unwrap();
             let ranges = phase_ranges(&air);
@@ -1645,7 +1645,7 @@ pub(in crate::f2::ood) mod tests {
         let proof = fx.proof;
         let c = &proof.commitments;
         let fri = &proof.opening_proof.1;
-        let mut ch = qlab_l2::make_config_l2().initialise_challenger();
+        let mut ch = crate::f2::f2_config().initialise_challenger();
         ch.observe(Val::from_usize(proof.degree_bits));
         ch.observe(Val::from_usize(LOG_HEIGHT));
         ch.observe(Val::ZERO);
@@ -2235,7 +2235,7 @@ pub(in crate::f2::ood) mod tests {
     #[test]
     fn c1_refuses_real_proofs_with_an_altered_opened_value() {
         let fx = fixture();
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         for which in [
             "quotient chunk 3 limb 2",
             "trace at zeta",
@@ -2249,7 +2249,7 @@ pub(in crate::f2::ood) mod tests {
                 _ => o.trace_next.as_mut().unwrap()[0] += E::ONE,
             }
             assert!(
-                p3_uni_stark::verify(&qlab_l2::make_config_l2(), &Toy, &proof, fx.pvs).is_err(),
+                p3_uni_stark::verify(&crate::f2::f2_config(), &Toy, &proof, fx.pvs).is_err(),
                 "{which}: p3 accepted it"
             );
             let inputs = proof_inputs_dims(dims(), &proof, fx.pvs).unwrap();
@@ -2285,7 +2285,7 @@ pub(in crate::f2::ood) mod tests {
     #[test]
     fn c1_refuses_verifier_programs_on_the_doubled_domain() {
         let fx = fixture();
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         // The next point on g_2N: the residual does not read it.
         let wrong = Program::compile_on(dims(), &Toy, Domains::NextOn2N).unwrap();
         let err = compare_native(&wrong, &Toy, &fx.inputs).unwrap_err();

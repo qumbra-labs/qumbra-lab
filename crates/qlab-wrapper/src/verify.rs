@@ -50,6 +50,14 @@ pub fn version(id: u32) -> Option<(usize, Outer)> {
     VERSIONS.iter().find(|(v, _, _)| *v == id).map(|(_, k, o)| (*k, *o))
 }
 
+/// The FRI config W is proven and verified under for `id`: version 1 is
+/// [`crate::config::W_V1_CFG`] (b2/q91, lab #785 F5-2); every other version
+/// is measurement only and keeps its lane's config (b2/q86 or b4/q43).
+pub fn version_cfg(id: u32) -> Option<qlab_consensus::FriCfg> {
+    let (_, outer) = version(id)?;
+    Some(if id == 1 { crate::config::W_V1_CFG } else { outer.cfg() })
+}
+
 /// The version a `(k, lane)` bench cell runs under.
 pub fn version_for(k: usize, outer: Outer) -> Option<u32> {
     VERSIONS.iter().find(|(_, kk, o)| *kk == k && *o == outer).map(|(v, _, _)| *v)
@@ -57,7 +65,9 @@ pub fn version_for(k: usize, outer: Outer) -> Option<u32> {
 
 /// `(version, k, outer lane)`.
 pub const VERSIONS: [(u32, usize, Outer); 8] = [
+    // The chain version: b2 at q91 (`W_V1_CFG`, via `version_cfg`).
     (1, 16, Outer::B2),
+    // Measurement only, q86, not the v1 lane (devnet/test versions of smaller k).
     (0x8001, 1, Outer::B2),
     (0x8002, 2, Outer::B2),
     (0x8004, 4, Outer::B2),
@@ -288,7 +298,8 @@ pub fn verify_wrapper<P>(
     if b.version != prev.version {
         return Err(VError::Version);
     }
-    let (k, outer) = version(b.version).ok_or(VError::Version)?;
+    let (k, _) = version(b.version).ok_or(VError::Version)?;
+    let w_cfg = version_cfg(b.version).ok_or(VError::Version)?;
     if b.w_pvs.len() != W_PV_LEN || b.w_pvs.iter().any(|x| *x >= 1 << 16) {
         return Err(VError::PvRange);
     }
@@ -337,7 +348,7 @@ pub fn verify_wrapper<P>(
     }
     // V3 — F4b: the wrapper root proof.
     let w_vals: Vec<Val> = public_values(&b.w_pvs);
-    verify(&make_legacy_config_with(&outer.cfg()), &WAir::new(k), b.w_proof, &w_vals).map_err(|_| VError::WProof)?;
+    verify(&make_legacy_config_with(&w_cfg), &WAir::new(k), b.w_proof, &w_vals).map_err(|_| VError::WProof)?;
     let (win, wout) = (roots_at(&b.w_pvs, 0), roots_at(&b.w_pvs, 1));
     // V4 — F4b: the batch side's SD, computed where members are aggregated.
     let sd = b.members.iter().fold(win.f3.sd, |h, m| {

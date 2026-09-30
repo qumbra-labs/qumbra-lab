@@ -117,6 +117,36 @@ pub(crate) mod tests {
 
     const ANY: &dyn Fn(&Digest) -> bool = &|_| true;
 
+    /// Lab #785 F5-2: version 1 proves W on `W_V1_CFG` (b2/q91); the
+    /// measurement versions keep their lanes (b2/q86, b4/q43), and `B2_CFG`
+    /// stays M4's interior lane. The K = 16 bundle is 18 proofs, so each
+    /// needs 100 + log₂ 18 = 104.17 bits (rec.rs's accounting): the frozen
+    /// L2 lane and W v1 clear it, q86 does not, and the union over 16 + 1
+    /// member-lane proofs and W clears 100.
+    #[test]
+    fn version_1_is_w_v1_and_the_bundle_clears_its_budget() {
+        use crate::f4::rec::{BETA_B2, BETA_B4, GRIND};
+        use qlab_wrapper::config::{B2_CFG, W_V1_CFG};
+        // `FriCfg` has no `PartialEq`; its label spells all five fields.
+        let lab = |id: u32| version_cfg(id).map(|c| c.label());
+        assert_eq!(lab(1), Some(W_V1_CFG.label()));
+        assert_eq!(W_V1_CFG.label(), "b2/q91/g22/fp16/a16");
+        for id in [0x8001, 0x8002, 0x8004, 0x8008] {
+            assert_eq!(lab(id), Some(B2_CFG.label()), "{id:#x}: measurement only, q86");
+        }
+        assert_eq!(lab(0x8110), Some(Outer::B4.cfg().label()));
+        assert!(version_cfg(2).is_none());
+        assert_eq!(B2_CFG.label(), "b2/q86/g22/fp16/a16", "M4's interior lane, unchanged");
+        assert_eq!(crate::m4interior::INTERIOR_B2_CFG.label(), B2_CFG.label());
+        let need = 100.0 + 18f64.log2();
+        let l2 = qlab_l2::L2_CFG.num_queries as f64 * BETA_B4 + GRIND;
+        let w = W_V1_CFG.num_queries as f64 * BETA_B2 + GRIND;
+        assert!(l2 >= need && w >= need, "{l2} {w} vs {need}");
+        assert!(B2_CFG.num_queries as f64 * BETA_B2 + GRIND < need, "q86 alone would not clear the bundle's budget");
+        let composed = -(17.0 * 2f64.powf(-l2) + 2f64.powf(-w)).log2();
+        assert!(composed >= 100.0, "{composed}");
+    }
+
     #[test]
     fn f4_verify_wrapper_accepts_and_chains() {
         let c = case();

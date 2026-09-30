@@ -17,7 +17,7 @@ use p3_uni_stark::StarkConfig;
 use qlab_consensus::{
     Challenge, Dft, ProverRng, Val, CAP_HEIGHT, NUM_RANDOM_CODEWORDS, SALT_ELEMS,
 };
-use qlab_l2::L2_CFG_PROVISIONAL;
+use crate::f2::F2_LANE;
 use serde_json::{json, Value};
 
 #[derive(Clone, Default)]
@@ -92,7 +92,7 @@ impl Counters {
             CAP_HEIGHT,
             ProverRng::from_os(),
         ));
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let params = FriParameters {
             log_blowup: cfg.log_blowup,
             log_final_poly_len: cfg.log_final_poly_len,

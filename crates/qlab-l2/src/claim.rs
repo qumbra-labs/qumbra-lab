@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use p3_uni_stark::{prove, verify};
 
-use crate::{make_config_l2, public_values, Config, Proof, Val, L2_CFG_PROVISIONAL};
+use crate::{make_config_l2, public_values, Config, Proof, Val, L2_CFG};
 pub use qlab_air::claim::{
     build_claim, build_claim_with_witness, pv_vec_claim, rkm_burn, BurnNote, ClaimAir, ClaimCredit,
     ClaimInstance, CLAIM_PERMS, CLAIM_WIDTH, PV_A, PV_CM2, PV_CNF, PV_CV, PV_FEE, PV_LEN,
@@ -71,7 +71,7 @@ pub fn verifier_air_claim() -> ClaimAir {
 pub fn prove_claim(inst: &ClaimInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_CLAIM, "a claim proves at 2^{LOG_HEIGHT_CLAIM}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }

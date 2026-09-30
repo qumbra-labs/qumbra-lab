@@ -150,7 +150,9 @@ pub(crate) fn cell(kinds: &[WTag], outer: Outer, member_bytes: Option<[u64; 4]>,
     let chunks = 1usize << get_log_num_quotient_chunks::<Val, _>(&air, layout, 0);
 
     // W.
-    let config = make_legacy_config_with(&outer.cfg());
+    // Version 1 proves on W_V1_CFG (b2/q91); measurement versions on their lane.
+    let w_cfg = qlab_wrapper::verify::version_cfg(version).expect("the version exists");
+    let config = make_legacy_config_with(&w_cfg);
     let t = Instant::now();
     let proof = prove(&config, &air, trace, &pvs);
     let prove_s = t.elapsed().as_secs_f64();
@@ -202,7 +204,7 @@ pub(crate) fn cell(kinds: &[WTag], outer: Outer, member_bytes: Option<[u64; 4]>,
         "mode": "f4leaf --prove", "issue": 775, "k": k,
         "kinds": kinds.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>(),
         "kind_counts": {"S": counts[0], "P": counts[1], "R": counts[2], "C": counts[3]},
-        "version": version, "outer_lane": outer.label(), "outer_pcs": "non-hiding (qlab_consensus::legacy)",
+        "version": version, "outer_lane": outer.label(), "w_lane": w_cfg.label(), "outer_pcs": "non-hiding (qlab_consensus::legacy)",
         "built": {"evidence": "M", "width": width, "height": height, "log_height": height.trailing_zeros(),
             "public_values": W_PV_LEN, "constraints": constraints, "max_degree": degree, "quotient_chunks": chunks},
         "honest_scan": {"evidence": "M", "every_row_holds": true, "seconds": scan_s},

@@ -26,9 +26,10 @@
 //!   rendering expands shared subtrees (exponential in the worst case); the
 //!   walk hashes content and uses node addresses only as a within-walk cache.
 //!
-//! **The lane is not in the digest.** `L2_CFG_PROVISIONAL` is not frozen
-//! (#704 ruling); the digest pins the shapes, and a lane change must not
-//! read as a shape change.
+//! **The lane is not in the digest.** The digest pins the shapes, and a
+//! lane change must not read as a shape change. The lane, frozen at q45 since
+//! lab #785 F5-2, is pinned by its own value lock and enters the L1 frozen
+//! parameters with F5's re-genesis.
 //!
 //! **A Plonky3 bump that moves `constraints_digest` is a freeze event**: the
 //! symbolic builder is Plonky3's, so a different builder can present the same

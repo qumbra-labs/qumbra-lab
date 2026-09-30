@@ -7,7 +7,7 @@
 //!   the b2 (`INTERIOR_B2_CFG`) or b4 (`INTERIOR_B4_CFG`) outer lane;
 //! - **the members** S / P / R / C and **the deposit-sum proof**: hiding
 //!   (`HidingFriPcs`, the trace committed at 2N, salted leaves, a randomizer)
-//!   on the L2 lane (`qlab_l2::L2_CFG_PROVISIONAL`);
+//!   on the lane F2 and this census were measured under (`crate::f2::F2_LANE`, b4/q43; the L2 lane itself is frozen at q45 since lab #785 F5-2);
 //! - **rung-1 outputs**: F2's C1 and C2 per member, non-hiding at the rung's
 //!   lane.
 //!
@@ -54,7 +54,8 @@ pub(crate) enum Lane {
     B2,
     /// Non-hiding b4/q43 (`INTERIOR_B4_CFG`).
     B4,
-    /// The hiding L2 lane, b4/q43 (`L2_CFG_PROVISIONAL`).
+    /// The hiding member lane this census prices, b4/q43 (`crate::f2::F2_LANE`,
+    /// the L2 lane's value when F2/F4b were measured; the L2 lane is q45 since F5-2).
     L2,
 }
 
@@ -63,7 +64,7 @@ impl Lane {
         match self {
             Lane::B2 => INTERIOR_B2_CFG,
             Lane::B4 => INTERIOR_B4_CFG,
-            Lane::L2 => qlab_l2::L2_CFG_PROVISIONAL,
+            Lane::L2 => crate::f2::F2_LANE,
         }
     }
     pub(crate) fn hiding(self) -> bool {
@@ -73,7 +74,7 @@ impl Lane {
         match self {
             Lane::B2 => "b2/q86/g22 non-hiding",
             Lane::B4 => "b4/q43/g22 non-hiding",
-            Lane::L2 => "b4/q43/g22 hiding (L2)",
+            Lane::L2 => "b4/q43/g22 hiding (F2's measured lane)",
         }
     }
     /// The k-model constant for a component proven on this lane.

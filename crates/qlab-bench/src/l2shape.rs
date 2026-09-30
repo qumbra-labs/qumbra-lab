@@ -41,7 +41,7 @@
 //! capacity proxy and labelled with its 2197-corrected figure:
 //! - `b2/q86/g22/fp16/a16`  — the interior lane's ruled point (`m4interior`),
 //!   100.2 corrected; shape P's second lane by the stage-1 ruling.
-//! - `b4/q43/g22/fp16/a16`  — the L2 lane, read from `qlab_l2::L2_CFG_PROVISIONAL`
+//! - `b4/q43/g22/fp16/a16`  — the L2 lane, read from `qlab_l2::L2_CFG`
 //!   (lab #704: one source; equal in value to the M4 leaf point `AGG_CFG`,
 //!   not tied to it), 101.6 corrected.
 //! - `b8/q29/g22/fp16/a16`  — derived the same way as q43 (see `B8_CFG`).
@@ -64,7 +64,7 @@ use qlab_air::l2::{
 use qlab_air::l2p::{L2ShapePAir, SHAPE_P_LOG_HEIGHT, SHAPE_P_PERMS};
 use qlab_air::l2r::{L2ShapeRAir, SHAPE_R_PERMS};
 use qlab_consensus::CONSENSUS_CFG;
-use qlab_l2::L2_CFG_PROVISIONAL as L2_CFG;
+use qlab_l2::L2_CFG;
 
 use qlab_consensus::legacy::{make_legacy_config_with, LegacyNonHidingConfig};
 
@@ -107,7 +107,7 @@ pub(crate) const B8_CFG: FriCfg = FriCfg {
 
 const LANES: [(&str, &str, FriCfg); 4] = [
     ("b2/q86/g22/fp16/a16", "100.2 corrected (B″)", B2_CFG),
-    ("b4/q43/g22/fp16/a16", "101.6 corrected (B″) — the L2 lane, provisional", L2_CFG),
+    ("b4/q45/g22/fp16/a16", "105.4 corrected — the L2 lane, frozen (lab #785 F5-2)", L2_CFG),
     ("b8/q29/g22/fp16/a16", "≥100.9 corrected (bracketed, see B8_CFG)", B8_CFG),
     ("b16/q21/g22/fp16/a16", "100.6 corrected (B″)", CONSENSUS_CFG),
 ];
@@ -568,7 +568,7 @@ mod tests {
         let bits_conservative = 29.0 * 2.72 + 22.0;
         assert!(bits_conservative >= 100.0, "{bits_conservative}");
         assert!(28.0 * 2.72 + 22.0 < 100.0, "q28 does not clear the conservative end");
-        assert_eq!(L2_CFG.label(), "b4/q43/g22/fp16/a16");
+        assert_eq!(L2_CFG.label(), "b4/q45/g22/fp16/a16");
         assert_eq!(CONSENSUS_CFG.label(), "b16/q21/g22/fp16/a16");
         assert_eq!(B2_CFG.label(), "b2/q86/g22/fp16/a16");
         assert!(86.0 * 0.910 + 22.0 >= 100.0, "b2/q86 at the 2197-corrected rate");
@@ -593,7 +593,7 @@ mod tests {
         let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
         assert_eq!(trace.width(), qlab_l2::Shape::P.width(), "the shape-P width, read off the matrix prove is handed");
         let proof = prove(&config, &air, trace, &pvs);
-        verify(&config, &air, &proof, &pvs).expect("shape P must verify at b4/q43");
+        verify(&config, &air, &proof, &pvs).expect("shape P must verify on the L2 lane");
         for (idx, name) in [
             (PV_ANCHOR + 2, "anchor"),
             (PV_NF1 + 5, "nf1"),
@@ -663,7 +663,7 @@ mod tests {
         let config = make_config_with(&L2_CFG);
         let trace = air.generate_trace::<Val>(L2_CFG.log_blowup);
         let proof = prove(&config, &air, trace, &pvs);
-        verify(&config, &air, &proof, &pvs).expect("shape S must verify at b4/q43");
+        verify(&config, &air, &proof, &pvs).expect("shape S must verify on the L2 lane");
     }
 
     /// 🔴 Stage-2 carry-over (lab #700 stage-1 ruling, cargo item 0 (ii)): the

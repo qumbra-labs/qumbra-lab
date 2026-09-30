@@ -71,7 +71,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
         }
         ("p", Some(rc)) => {
             let inst = qlab_l2::fixture::shape_p();
-            let cfg = qlab_l2::L2_CFG_PROVISIONAL;
+            let cfg = qlab_l2::L2_CFG;
             let pvs = qlab_l2::public_values(&inst.pvs);
             let trace = inst.air.generate_trace::<qlab_l2::Val>(cfg.log_blowup);
             let t = Instant::now();
@@ -108,7 +108,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let ok = qlab_l2::verify_p(&pvs, &proof);
             let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("shape P @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, verify_s, bytes)
+            (format!("shape P @ {} (2^{})", qlab_l2::L2_CFG.label(), qlab_l2::LOG_HEIGHT_P), secs, ok, verify_s, bytes)
         }
         ("claim", None) => {
             // F1 (lab #756): the claim at the L2 lane (b4, 2^17).
@@ -121,7 +121,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let ok = qlab_l2::claim::verify_claim(&pvs, &proof, qlab_l2::fixture::CLAIM_L2_ID, tier).is_ok();
             let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
-            (format!("claim @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::claim::LOG_HEIGHT_CLAIM), secs, ok, verify_s, bytes)
+            (format!("claim @ {} (2^{})", qlab_l2::L2_CFG.label(), qlab_l2::claim::LOG_HEIGHT_CLAIM), secs, ok, verify_s, bytes)
         }
         ("p19", None) => {
             use p3_air::BaseAir;
@@ -129,7 +129,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let air = L2ShapePAir::chain_only(qlab_l2::LOG_HEIGHT_P - 1);
             let pvs = vec![qlab_l2::Val::ZERO; <L2ShapePAir as BaseAir<qlab_l2::Val>>::num_public_values(&air)];
             let config = qlab_l2::make_config_l2();
-            let trace = air.generate_trace::<qlab_l2::Val>(qlab_l2::L2_CFG_PROVISIONAL.log_blowup);
+            let trace = air.generate_trace::<qlab_l2::Val>(qlab_l2::L2_CFG.log_blowup);
             let t = Instant::now();
             let proof = p3_uni_stark::prove(&config, &air, trace, &pvs);
             let secs = t.elapsed().as_secs_f64();
@@ -138,7 +138,7 @@ pub(crate) fn run_zkpeak(power: &str, case: &str, phases: bool, rc: Option<usize
             let verify_s = tv.elapsed().as_secs_f64();
             let bytes = bincode::serialize(&proof).expect("bincode").len();
             (
-                format!("CANARY: shape-P AIR chain-only @ {} (2^{})", qlab_l2::L2_CFG_PROVISIONAL.label(), qlab_l2::LOG_HEIGHT_P - 1),
+                format!("CANARY: shape-P AIR chain-only @ {} (2^{})", qlab_l2::L2_CFG.label(), qlab_l2::LOG_HEIGHT_P - 1),
                 secs,
                 ok,
                 verify_s,

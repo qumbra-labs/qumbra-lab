@@ -521,7 +521,7 @@ fn proof_inputs_dims(dims: Dims, proof: &Proof<Config>, pvs: &[Val]) -> Result<I
             && proof.opened_values.preprocessed_next.is_none(),
         "unexpected preprocessed OOD values",
     )?;
-    let config = qlab_l2::make_config_l2();
+    let config = crate::f2::f2_config();
     let mut challenger = config.initialise_challenger();
     // uni-stark 0.6.1 prefix: committed degree, original degree, prep width.
     challenger.observe(Val::from_usize(proof.degree_bits));
@@ -724,7 +724,7 @@ pub(crate) fn hiding_c1_fingerprint(shape: Shape) -> Result<Value> {
     use p3_air::BaseAir;
     fn go<A: Air<SymbolicAirBuilder<Val>>>(shape: Shape, air: &A) -> Result<Value> {
         let program = Program::compile(shape, air)?;
-        let c1 = c1::C1Air::new(&program, &qlab_l2::L2_CFG_PROVISIONAL, 8 << 30)?;
+        let c1 = c1::C1Air::new(&program, &crate::f2::F2_LANE, 8 << 30)?;
         let cs = p3_air::symbolic::get_symbolic_constraints::<Val, _>(&c1, p3_air::symbolic::AirLayout::from_air::<Val>(&c1));
         let degree = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
         Ok(json!({"shape": format!("{shape:?}"), "width": c1.width(), "public_values": c1.num_public_values(),
@@ -1005,7 +1005,7 @@ mod tests {
     #[test]
     fn legacy_toy_ood_component_holds_and_matches_the_query_walk() {
         use super::lane::toy::{toy_legacy_proof, Toy};
-        let cfg = qlab_l2::L2_CFG_PROVISIONAL;
+        let cfg = crate::f2::F2_LANE;
         let (proof, pvs) = toy_legacy_proof(8);
         let ood = legacy_ood((2, 2, 8), &Toy, &proof, &pvs, &cfg, true, Some(&cfg), 64 << 20).unwrap();
         assert!(ood.ok, "{}", ood.report);

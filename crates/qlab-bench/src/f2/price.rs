@@ -9,7 +9,8 @@ use p3_air::Air;
 use p3_keccak_air::NUM_KECCAK_COLS;
 use p3_uni_stark::get_log_num_quotient_chunks;
 use qlab_consensus::{FriCfg, Val, CAP_HEIGHT, IS_ZK, SALT_ELEMS};
-use qlab_l2::{Shape, L2_CFG_PROVISIONAL};
+use qlab_l2::Shape;
+use crate::f2::F2_LANE;
 use serde_json::{json, Value};
 
 #[derive(Default)]
@@ -100,7 +101,7 @@ pub(super) struct Geometry {
 
 /// LDE height of a hiding commitment to a `log_height` trace on the L2 lane.
 pub(super) fn lde_log(log_height: usize) -> usize {
-    log_height + IS_ZK + L2_CFG_PROVISIONAL.log_blowup
+    log_height + IS_ZK + F2_LANE.log_blowup
 }
 
 /// Leaf absorb perms for one salted matrix row of `width` base values:
@@ -128,7 +129,7 @@ pub(super) fn fri_log_arities(lde_log: usize, cfg: &FriCfg) -> Vec<usize> {
 }
 
 pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
-    let cfg = L2_CFG_PROVISIONAL;
+    let cfg = F2_LANE;
     let lde_log = lde_log(shape.log_height());
     let log_arities = fri_log_arities(lde_log, &cfg);
     let mut domain_log = lde_log;
@@ -188,7 +189,7 @@ pub(super) fn geometry(shape: Shape, chunks: usize) -> Geometry {
 ///
 /// Both are stated; which one F2 uses is a layout decision, not made in code.
 pub(super) fn rom_encoding(rom_width: usize, rom_log_height: usize) -> Value {
-    let cfg = L2_CFG_PROVISIONAL;
+    let cfg = F2_LANE;
     let rows = 1usize << rom_log_height;
     let path = lde_log(rom_log_height) - CAP_HEIGHT;
     let leaf = leaf_perms(rom_width);
@@ -298,7 +299,7 @@ pub(super) fn input_openings(
 ///   final x chain; 4·final_len Horner cells) and the held betas and final
 ///   polynomial.
 pub(super) fn query_phase(log_height: usize, queries: usize) -> Value {
-    let cfg = L2_CFG_PROVISIONAL;
+    let cfg = F2_LANE;
     let lde = lde_log(log_height);
     let arities = fri_log_arities(lde, &cfg);
     let final_bits = cfg.log_blowup + cfg.log_final_poly_len;
@@ -398,7 +399,7 @@ pub(super) fn composed_c1_layout(
     chunks: usize,
     m: &MachineDims,
 ) -> Value {
-    let cfg = L2_CFG_PROVISIONAL;
+    let cfg = F2_LANE;
     let lde = lde_log(log_height);
     let arities = fri_log_arities(lde, &cfg);
     let rounds = arities.len();
@@ -487,7 +488,7 @@ pub(super) fn composed_c2_layout(
     chunks: usize,
     queries: usize,
 ) -> Value {
-    let cfg = L2_CFG_PROVISIONAL;
+    let cfg = F2_LANE;
     let lde = lde_log(log_height);
     let path = lde - CAP_HEIGHT;
     let blocks = |u64s: usize| u64s.div_ceil(17);
@@ -550,13 +551,13 @@ pub(crate) fn composed_c2(shape: Shape) -> Value {
         shape.width(),
         shape.log_height(),
         8,
-        L2_CFG_PROVISIONAL.num_queries,
+        F2_LANE.num_queries,
     )
 }
 
 impl Geometry {
     pub(super) fn report(&self, shape: Shape) -> Value {
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         let native =
             cfg.num_queries * (self.leaf_per_query + self.compress_per_query) + self.fs_floor;
         let lane = native + self.duplicate + 1;
@@ -609,7 +610,7 @@ mod tests {
         // The input-batch share plus the FRI commit-phase share is the
         // census geometry's per-query count, for every shape; at S, 43
         // queries, that is the measured 1,419 leaf / 3,999 path perms.
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         for (shape, leaf, comp, columns, periodic, pvs) in [
             (Shape::S, 25, 57, 15_877, 96, 6_519),
             (Shape::P, 27, 60, 17_111, 99, 7_135),
@@ -647,7 +648,7 @@ mod tests {
         // share, for every shape; with the input share they are the whole
         // per-query count. At S, 43 queries: the measured 344 leaf / 1,548
         // path perms (1,419 − 1,075 and 3,999 − 2,451).
-        let cfg = L2_CFG_PROVISIONAL;
+        let cfg = F2_LANE;
         for (shape, leaf, comp, columns, periodic, pvs) in [
             (Shape::S, 8, 36, 4_657, 74, 807),
             (Shape::P, 9, 43, 4_690, 77, 939),

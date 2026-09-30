@@ -1,8 +1,13 @@
-# L2 shape v1 —— shape 已冻结，lane 暂定
+# L2 shape v1 —— shape 已冻结，lane 冻结在 q45（F5-2）
 
 > [English](l2-shape-v1.md)（技术细节以英文版为准）· 跟踪：lab issue #704（l2-roadmap A1）· 电路：lab PR #701 / issue #700（W3）· crate：`crates/qlab-l2`
 
-**状态（2026-09-23）：** L2 的两个交易 shape，**S** 和 **P**，已按 v1 冻结。它们的 program、几何、公共值布局、note 块、电路内的域常量和约束集，都在 `qlab-l2` 和 `qlab-note` 里按名字钉住了。**lane 没有冻结**：协调者那边对 lane 的 PCS 配置有一项审查还在进行，`L2_CFG_PROVISIONAL` 在此期间保持暂定。这项审查可能改变证明的线上字节而不动 AIR，所以**证明字节数一律不钉**。
+**状态（2026-09-23）：** L2 的两个交易 shape，**S** 和 **P**，已按 v1 冻结。它们的 program、几何、公共值布局、note 块、电路内的域常量和约束集，都在 `qlab-l2` 和 `qlab-note` 里按名字钉住了。**lane 没有冻结**：协调者那边对 lane 的 PCS 配置有一项审查还在进行，`L2_CFG` 在此期间保持暂定。这项审查可能改变证明的线上字节而不动 AIR，所以**证明字节数一律不钉**。
+
+**更新（2026-09-30，lab issue #785，F5-2）：lane 已冻结在 b4/q45/g22/fp16/a16。**
+- **为什么是 q45。** v1 上链的对象是 wrapper 证明包（Q2 = 乙）。K = 16 时一个包里有 18 个证明，每个证明要有 100 + log₂ 18 = 104.17 位猜想安全性。q43 只有 101.68 位，q45 是 105.39 位（Larry 定的 Q-L2）。W 自己的车道同一步改成 b2/q91（`qlab-wrapper` 里的 `W_V1_CFG`）。
+- **在哪里钉住。** 新值由 `l2_cfg_is_value_locked` 钉住。它会在 F5 的重新创世（F5-3）时写进 L1 的冻结参数。
+- **§3 的字节数是 q43 下测的，已经作废。** q45 的字节数等合并后在箱子上重测。
 
 ## 1. 冻结了什么
 
@@ -46,11 +51,11 @@ W3 构建的 shape P，冻结树按**原始 `rkm`** 建键。#704 的裁定（Q1
 
 | 对象 | 状态 |
 |---|---|
-| lane `L2_CFG_PROVISIONAL` = b4/q43/g22/fp16/a16 | **暂定**。只在 `qlab_l2::make_config_l2()` 一处构建，审查结论落地时只改这一处。`l2_cfg_provisional_is_value_locked` 防的是*意外*改动。为什么是 b4：两个 shape 都是 4 次（4 个商块），而 Plonky3 0.6.1 在 b2 下验证不了 4 个商块的 AIR（`l2shape_b2_is_not_a_lane_for_a_degree_4_air`）。q43/g22 按 2197 修正口径是 101.6 位。 |
+| lane `L2_CFG` = **b4/q45/g22/fp16/a16** | **已冻结**（lab #785 F5-2，2026-09-30；之前是暂定的 q43）。只在 `qlab_l2::make_config_l2()` 一处构建，由 `l2_cfg_is_value_locked` 钉住。为什么是 b4：两个 shape 都是 4 次（4 个商块），而 Plonky3 0.6.1 在 b2 下验证不了 4 个商块的 AIR（`l2shape_b2_is_not_a_lane_for_a_degree_4_air`）。q45/g22 按 2197 修正口径是 105.39 位，高于证明包对每个证明要求的 104.17 位（q43 是 101.6 位）。 |
 | 证明线上字节 | **不钉。** 没有 `WIRE_BYTES_S/P` 常量，也没有字节测试；下面的数字只是测量值。 |
 | 固定实例的证明字节 | 按设计永远不钉。Plonky3 的 grind 见证由并行的 `find_any` 找出，所有查询下标都在它之后抽取，所以同一个实例在不同线程调度下会得到不同的证明。钉住的是公共值向量和 note 块。 |
 
-## 3. 暂定 lane 下的测量（W3 记录，不是钉值）
+## 3. 暂定 q43 lane 下的测量（W3 记录，不是钉值；已被 q45 取代）
 
 Apple M5 Max / 36 GiB，release 二进制直接跑在 `scripts/rig run` 里的 `/usr/bin/time -l` 下，无 swap；出处 `docs/w3-run1.md` … `w3-run4.md`。
 
@@ -64,7 +69,7 @@ Apple M5 Max / 36 GiB，release 二进制直接跑在 `scripts/rig run` 里的 `
 
 ## 4. A1 新增的测试
 
-`qlab-l2`：`l2_cfg_provisional_is_value_locked`、`l2_crate_deps_are_exactly_air_and_consensus`、`l2_shape_geometry_is_locked`、`l2_verifier_air_is_instance_independent`、`l2_prove_verify_roundtrip_s`、`l2_prove_verify_roundtrip_p`、`l2_shape_digests_are_pinned`、`l2_golden_pv_vectors`。`qlab-note`：`l2_payload_len_is_128`、`l2_golden_note_block`。`qlab-air`：`l2p_neg_raw_rkm_keyed_witness`。已有测试按 P v1 更新，没有删除任何测试。
+`qlab-l2`：`l2_cfg_is_value_locked`、`l2_crate_deps_are_exactly_air_and_consensus`、`l2_shape_geometry_is_locked`、`l2_verifier_air_is_instance_independent`、`l2_prove_verify_roundtrip_s`、`l2_prove_verify_roundtrip_p`、`l2_shape_digests_are_pinned`、`l2_golden_pv_vectors`。`qlab-note`：`l2_payload_len_is_128`、`l2_golden_note_block`。`qlab-air`：`l2p_neg_raw_rkm_keyed_witness`。已有测试按 P v1 更新，没有删除任何测试。
 
 ## 5. Shape R —— 注册表写入（A2，lab #724）
 

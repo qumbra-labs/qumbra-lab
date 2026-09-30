@@ -4,7 +4,7 @@
 //!
 //! It owns:
 //!
-//! - **the L2 lane** — [`L2_CFG_PROVISIONAL`] and [`make_config_l2`], the one
+//! - **the L2 lane** — [`L2_CFG`] and [`make_config_l2`], the one
 //!   site where the L2's `StarkConfig` is built. **Provisional**: the #704
 //!   ruling parks the lane freeze behind a coordinator-side review of the
 //!   lane's PCS configuration, so no proof-wire byte count is pinned here.
@@ -54,14 +54,24 @@ pub mod fixture;
 // The lane
 // ---------------------------------------------------------------------------
 
-/// The L2 lane — **PROVISIONAL**: **b4/q43/g22/fp16/a16**.
+/// The L2 lane — **FROZEN** at **b4/q45/g22/fp16/a16** (lab #785 F5-2,
+/// Larry's Q-L2, 2026-09-30).
 ///
-/// **Not frozen.** The lab #704 ruling parks the lane freeze behind a
-/// coordinator-side review of the lane's PCS configuration, whose outcome can
-/// move the proof wire without touching the AIRs. Hence no wire-byte pin
-/// exists for the L2; the bytes measured under this lane (S 285,605 B,
-/// P 312,677 B at `docs/w3-run{1..4}.md`) are recorded in
-/// `docs/l2-shape-v1.md` as measurements, not pins.
+/// **Why q45.** The enshrined object is the wrapper *bundle* (Q2 = B): at
+/// K = 16 it carries 18 proofs (16 members, W, the deposit-sum proof), so a
+/// ≥ 100-bit bundle needs each proof at 100 + log₂ 18 = 104.17 conjectured
+/// bits (the union bound). q43 gave 43 × 1.853 + 22 = 101.68; **q45 gives
+/// 105.39**. W's own lane moves with it (`qlab-wrapper`'s `W_V1_CFG`,
+/// b2/q91 = 104.81); composed, the bundle is 101.18 bits.
+///
+/// **Frozen, not provisional.** The lab #704 ruling had parked the freeze
+/// behind a review of the lane's PCS configuration; Q-L2 settles it for v1.
+/// The lane is not in this crate's shape digest (`digest`, by design) and
+/// enters the L1 frozen parameters with F5's re-genesis (F5-3). The proof
+/// bytes measured at q43 (S 285,605 B, P 312,677 B at
+/// `docs/w3-run{1..4}.md`) are superseded; the q45 bytes are the post-merge
+/// box measurement's. qlab-bench's F2 stays on the q43 lane it was measured
+/// under (`crate::f2::F2_LANE` there).
 ///
 /// **Why b4 — the only lane at degree 4.** Both shapes have max constraint
 /// degree 4, i.e. 4 quotient chunks. At b2 (`log_blowup = 1`) the quotient
@@ -70,14 +80,14 @@ pub mod fixture;
 /// `OodEvaluationMismatch` — pinned by `qlab-bench`'s
 /// `l2shape_b2_is_not_a_lane_for_a_degree_4_air`. b4 is the smallest blowup
 /// that works; b8 costs 2.0× the RAM for −28 % bytes (W3 stage 1). Queries:
-/// q43 at g22 = 43 × 1.853 + 22 = 101.6 bits under the 2197-corrected
-/// accounting (`fri-soundness-accounting-2026-07.md` §6).
+/// the 2197-corrected accounting (`fri-soundness-accounting-2026-07.md` §6)
+/// at β = 1.853 bits per query and g22, as above.
 ///
-/// Equal in value to the M4 leaf lane (`qlab-bench`'s `AGG_CFG`) and
-/// deliberately **not** cross-locked to it: the two lanes may diverge.
-pub const L2_CFG_PROVISIONAL: FriCfg = FriCfg {
+/// Once equal in value to the M4 leaf lane (`qlab-bench`'s `AGG_CFG`, q43)
+/// and deliberately **not** cross-locked to it: the two lanes now differ.
+pub const L2_CFG: FriCfg = FriCfg {
     log_blowup: 2,
-    num_queries: 43,
+    num_queries: 45,
     grind_bits: 22,
     log_final_poly_len: 4,
     max_log_arity: 4,
@@ -86,7 +96,7 @@ pub const L2_CFG_PROVISIONAL: FriCfg = FriCfg {
 /// The L2 `StarkConfig` — **the one site** where the L2's PCS and FRI
 /// parameters are chosen, so a lane or PCS change is one edit here.
 pub fn make_config_l2() -> Config {
-    qlab_consensus::make_config_with(&L2_CFG_PROVISIONAL)
+    qlab_consensus::make_config_with(&L2_CFG)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +269,7 @@ pub fn public_values(pvs: &[u32]) -> Vec<Val> {
 pub fn prove_s(inst: &L2BucketInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_S, "shape S proves at 2^{LOG_HEIGHT_S}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }
@@ -276,7 +286,7 @@ pub fn verify_s(pvs: &[Val], proof: &Proof<Config>) -> bool {
 pub fn prove_p(inst: &L2PBucketInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_P, "shape P proves at 2^{LOG_HEIGHT_P}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }
@@ -292,7 +302,7 @@ pub fn verify_p(pvs: &[Val], proof: &Proof<Config>) -> bool {
 pub fn prove_r(inst: &L2ShapeRInstance) -> (Vec<Val>, Proof<Config>) {
     assert_eq!(inst.air.log_height, LOG_HEIGHT_R, "shape R proves at 2^{LOG_HEIGHT_R}");
     let pvs = public_values(&inst.pvs);
-    let trace = inst.air.generate_trace::<Val>(L2_CFG_PROVISIONAL.log_blowup);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
     let proof = prove(&make_config_l2(), &inst.air, trace, &pvs);
     (pvs, proof)
 }

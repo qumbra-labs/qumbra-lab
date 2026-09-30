@@ -9,7 +9,7 @@
 //! generated trace), perms, height, max constraint degree, constraint count,
 //! PV length — and allocates one 2^17 trace. `--lane` runs the fixture claim
 //! (`qlab_l2::fixture::claim`) through the real prover `RUNS` times at one
-//! lane (b4 = the L2 lane `qlab_l2::L2_CFG_PROVISIONAL`, the ruled one; b16 =
+//! lane (b4 = the L2 lane `qlab_l2::L2_CFG`, the ruled one; b16 =
 //! the L1 point `CONSENSUS_CFG`, for comparison) and prints best-of prove and
 //! verify, and the proof's bytes. One lane per process: wrap the RELEASE
 //! binary in `/usr/bin/time -l` (as `l2shape`); peak footprint is that
@@ -24,7 +24,7 @@ use p3_matrix::Matrix;
 use qlab_air::claim::{ClaimAir, CLAIM_LOG_HEIGHT, CLAIM_PERMS};
 use qlab_air::l2::ROWS_PER_PERM;
 use qlab_consensus::CONSENSUS_CFG;
-use qlab_l2::L2_CFG_PROVISIONAL as L2_CFG;
+use qlab_l2::L2_CFG;
 
 use crate::l2shape::{bench_lane, PcsKind};
 use crate::{FriCfg, Val, RUNS};
@@ -51,7 +51,7 @@ pub(crate) fn run_claimshape(power: &str, layout: bool, lane: Option<&str>, pcs:
     }
     let Some(lane) = lane else { return };
     let (name, cfg): (&str, FriCfg) = match lane {
-        "b4" => ("b4/q43/g22/fp16/a16 — the L2 lane (ruled, Q2)", L2_CFG),
+        "b4" => ("b4/q45/g22/fp16/a16 — the L2 lane (frozen, lab #785 F5-2)", L2_CFG),
         "b16" => ("b16/q21/g22/fp16/a16 — the L1 point (comparison)", CONSENSUS_CFG),
         other => {
             eprintln!("claimshape: unknown --lane `{other}`; expected b4|b16");
