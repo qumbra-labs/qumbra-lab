@@ -18,10 +18,14 @@
 //!   is ready, and why not.
 //!
 //! A built bundle is proven, signed, judged by the node's own rule
-//! ([`super::bundle::self_check`]) and only then written: `DIR/bundle.bin`,
-//! `DIR/manifest.json`, and the state file. A bundle the rule refuses is
-//! written as `DIR/bundle.refused.bin` beside a manifest naming the refusal,
-//! and the state file is not touched. Progress goes to stderr, the manifest
+//! ([`super::bundle::self_check`]) and only then written, named by its index
+//! `n` in the run: `DIR/bundle-<n>.bin`, `DIR/manifest-<n>.json`, then the
+//! state file — each through a temp file and a rename. An accepted
+//! `bundle-<n>.bin` is never overwritten. A bundle that fails anything after
+//! the prove (the rule, the surface or counters it moves, the byte
+//! reconciliation, the signature) is written as `DIR/bundle-<n>.refused.bin`
+//! beside a manifest naming why, and the state file is not touched. A run
+//! holds `<state>.lock` while it builds. Progress goes to stderr, the manifest
 //! path to stdout.
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -34,7 +38,7 @@ use serde_json::json;
 use super::bundle::{assemble, manifest, prove, rehearsal_signer, self_check, sign, Timings};
 use super::chain::{self, Http};
 use super::members::{plan, Ask, Chain, Keys};
-use super::state::{digest_hex, plan_surface, RunState};
+use super::state::{digest_hex, plan_surface, write_atomic, RunState, StateLock};
 use crate::f4::bench::default_kinds;
 use crate::f4::native::WTag;
 
@@ -71,8 +75,22 @@ pub(crate) fn parse(args: &[String]) -> Result<Cmd, String> {
     let known = [
         "--burn-rkm", "--genesis", "--chain", "--state", "--out", "--seed", "--next", "--exit-rkm", "--exit-v", "--check",
     ];
-    if let Some(bad) = args.iter().filter(|a| a.starts_with("--")).find(|a| !known.contains(&a.as_str())) {
-        return Err(format!("unknown flag {bad}"));
+    let takes_value = ["--genesis", "--chain", "--state", "--out", "--seed", "--exit-rkm", "--exit-v"];
+    let mut seen: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !a.starts_with("--") {
+            return Err(format!("stray argument {a:?}"));
+        }
+        if !known.contains(&a) {
+            return Err(format!("unknown flag {a}"));
+        }
+        if seen.contains(&a) {
+            return Err(format!("{a} given twice"));
+        }
+        seen.push(a);
+        i += if takes_value.contains(&a) && args.get(i + 1).is_some_and(|v| !v.starts_with("--")) { 2 } else { 1 };
     }
     let genesis = PathBuf::from(need("--genesis")?);
     if has("--burn-rkm") {
@@ -157,7 +175,17 @@ fn build(b: &Build) -> Result<(), String> {
             s
         }
     };
+    // One run per state file at a time (a --check reads only).
+    let _lock = if b.check { None } else { Some(StateLock::take(&b.state)?) };
     let (state, prev) = run.replay()?;
+    // This bundle's outputs are named by its index in the run, and an
+    // accepted one is never overwritten.
+    let n = run.bundles.len();
+    let (accepted, refused, mpath) =
+        (b.out.join(format!("bundle-{n}.bin")), b.out.join(format!("bundle-{n}.refused.bin")), b.out.join(format!("manifest-{n}.json")));
+    if accepted.exists() {
+        return Err(format!("{} exists: bundle {n} of this run was already built", accepted.display()));
+    }
     let keys = Keys::from_text(&run.seed);
     eprintln!("f5box: reading {}", b.chain);
     let view = chain::read(&Http { base: b.chain.clone() })?;
@@ -200,30 +228,49 @@ fn build(b: &Build) -> Result<(), String> {
     let mut timings = Timings::new();
     let mut log = |what: &str| eprintln!("f5box: proving {what}");
     let proofs = prove(&p, &mut timings, &mut log)?;
-    let mut wb = assemble(&p, params.l2_id, proofs);
-    sign(&mut wb, &signer, &net);
+    let mut wb = assemble(&p, params.l2_id, proofs)?;
+    // From here on the proofs exist: every failure writes the bundle as
+    // refused, with a manifest naming why, and returns an error — never a panic.
+    let signed = sign(&mut wb, &signer, &net);
     let bytes = wb.encode();
     eprintln!("f5box: the node's rule over {} bytes", bytes.len());
     let rule = WrapperRule::from_genesis(&genesis).map_err(|e| format!("{e:?}"))?;
     let t = Instant::now();
     let verdict = self_check(&rule, &bytes, &prev, &view);
     timings.push(("self_check".into(), t.elapsed().as_secs_f64()));
-    let mut m = manifest(&p, &wb, &bytes, &net, &view, &timings);
+    let mut m = manifest(&p, &wb, &bytes, &net, params.wrapper_spacing_blocks, &view, &timings);
     let stated = plan_surface(params.l2_id, &p);
-    let ok = match &verdict {
-        Ok(o) => o.surface == encode_surface(&stated) && o.exits == p.exits.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect::<Vec<_>>(),
-        Err(_) => false,
-    };
-    m["self_check"] = match &verdict {
-        Ok(o) => json!({"accepted": true, "surface_is_stated": ok, "d_batch": o.d_batch, "e_batch": o.e_batch}),
-        Err(r) => json!({"accepted": false, "refusal": format!("{r:?}")}),
-    };
-    let name = if ok { "bundle.bin" } else { "bundle.refused.bin" };
-    std::fs::write(b.out.join(name), &bytes).map_err(|e| format!("{name}: {e}"))?;
-    let mpath = b.out.join("manifest.json");
-    std::fs::write(&mpath, serde_json::to_string_pretty(&m).expect("json")).map_err(|e| format!("manifest: {e}"))?;
-    if !ok {
-        return Err(format!("the node's rule refuses the bundle: {verdict:?} — wrote {name}; the state is unchanged"));
+    let exits: Vec<_> = p.exits.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect();
+    let e_plan = p.exits.iter().map(|e| e.v).sum::<u64>();
+    let mut why: Vec<String> = Vec::new();
+    if let Err(e) = &signed {
+        why.push(e.clone());
+    }
+    if m["bytes_reconciled"] != true {
+        why.push(format!("the byte parts sum to {}, the encoding is {}", m["bytes"]["total"], bytes.len()));
+    }
+    match (&verdict, &stated) {
+        (Ok(o), Ok(st)) => {
+            if o.surface != encode_surface(st).to_vec() {
+                why.push("the rule's surface is not the plan's".into());
+            }
+            if o.exits != exits || o.d_batch != p.inp.d_batch || o.e_batch != e_plan {
+                why.push(format!("the rule moved (exits {}, D {}, E {}), the plan ({}, {}, {})", o.exits.len(), o.d_batch, o.e_batch, exits.len(), p.inp.d_batch, e_plan));
+            }
+        }
+        (Err(r), _) => why.push(format!("refused: {r:?}")),
+        (_, Err(e)) => why.push(e.clone()),
+    }
+    m["self_check"] = json!({"accepted": why.is_empty(), "why": why});
+    let ok = why.is_empty();
+    let (write, other) = if ok { (&accepted, &refused) } else { (&refused, &accepted) };
+    write_atomic(write, &bytes)?;
+    let text = serde_json::to_string_pretty(&m).map_err(|e| format!("manifest json: {e}"))?;
+    write_atomic(&mpath, text.as_bytes())?;
+    if ok {
+        let _ = std::fs::remove_file(other);
+    } else {
+        return Err(format!("the bundle is refused: {why:?} — wrote {}; the state is unchanged", write.display()));
     }
     run.push(&p);
     run.save(&b.state)?;

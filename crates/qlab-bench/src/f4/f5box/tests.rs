@@ -452,7 +452,7 @@ fn f5box_the_state_file_replays_what_was_built() {
         assert_eq!((st.roots(), pv.commitment), (state.roots(), prev.commitment));
     }
     assert_eq!(two.owned.len(), 16 + 16);
-    assert_eq!(plan_surface(params().l2_id, &r.deposit).commitment, r.prev1.commitment);
+    assert_eq!(plan_surface(params().l2_id, &r.deposit).unwrap().commitment, r.prev1.commitment);
     // Written and read back from disk, atomically.
     let dir = std::env::temp_dir().join(format!("f5box-state-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -497,8 +497,8 @@ fn stub_bundle(p: &Plan, net: &Hash32) -> (WireBundle, Vec<u8>) {
     };
     let members = p.insts.iter().map(|_| copy(&dep)).collect();
     let proofs = Proofs { w: crate::f4::bundle_node::w_proof_stub(), dep_pvs, dep, members };
-    let mut wb = assemble(p, params().l2_id, proofs);
-    sign(&mut wb, &rehearsal_signer(&params()).expect("the rehearsal key"), net);
+    let mut wb = assemble(p, params().l2_id, proofs).expect("one proof per member");
+    sign(&mut wb, &rehearsal_signer(&params()).expect("the rehearsal key"), net).expect("signs");
     let bytes = wb.encode();
     (wb, bytes)
 }
@@ -522,13 +522,15 @@ fn f5box_the_assembled_bundle_meets_the_node_rule_up_to_the_member_proofs() {
             other => panic!("expected the member-0 refusal, got {other:?}"),
         }
         let out = rule.fold_bundle(&encode_surface(prev), &bytes).expect("the fold accepts");
-        assert_eq!(out.surface, encode_surface(&plan_surface(params().l2_id, p)).to_vec());
+        assert_eq!(out.surface, encode_surface(&plan_surface(params().l2_id, p).unwrap()).to_vec());
         assert_eq!(out.exits, p.exits.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect::<Vec<_>>());
         assert_eq!((out.d_batch, out.e_batch), (p.inp.d_batch, p.exits.iter().map(|e| e.v).sum::<u64>()));
         let (_, other_net) = stub_bundle(p, &[0x6c; 32]);
         assert_eq!(self_check(&rule, &other_net, prev, view).err(), Some(BundleRefusal::Signature));
-        let m = manifest(p, &wb, &bytes, &NET_ID, view, &Timings::new());
+        let m = manifest(p, &wb, &bytes, &NET_ID, params().wrapper_spacing_blocks, view, &Timings::new());
         assert_eq!(m["bytes"]["total"], bytes.len());
+        assert_eq!(m["bytes_reconciled"], true);
+        assert_eq!(m["wrapper_spacing_blocks"], 48);
         assert_eq!(BundleBytes::of(&wb).total(), bytes.len());
         assert_eq!(m["members"].as_array().unwrap().len(), 16);
         assert_eq!(m["absorbed"].as_array().unwrap().len(), 4);
@@ -561,6 +563,8 @@ fn f5box_the_command_line() {
         ("--genesis g --chain c --state s --out o --seed x --exit-v 5", "--exit-rkm/--exit-v ride the mix"),
         ("--genesis g --chain c --state s --out o --seed x --bogus", "unknown flag --bogus"),
         ("--genesis --chain c", "--genesis takes a value"),
+        ("--genesis g --chain c --state s --out o --seed x stray", "stray argument \"stray\""),
+        ("--genesis g --chain c --state s --out o --seed x --chain d", "--chain given twice"),
     ] {
         let e = parse(&a(args)).unwrap_err();
         assert!(e.starts_with(why), "{args}: {e}");
@@ -573,8 +577,11 @@ fn f5box_the_command_line() {
     assert!(parse(&a(&all_zero)).unwrap_err().starts_with("--exit-rkm"));
 }
 
-/// No f5box source calls the rule's test knobs: the bundle f5box judges is
-/// judged by the production constructor only.
+/// A **text lint**: no f5box source names the rule's two test-knob calls.
+/// The guarantee itself is structural — `wrapper-test-knobs` is enabled only
+/// by qlab-bench's dev-dependency (resolver 2), so the release `f5box` binary
+/// links a `WrapperRule` without the knobs; this test only keeps a test-build
+/// call from creeping into the command's sources.
 #[test]
 fn f5box_calls_no_rule_knob() {
     let sources = [
@@ -590,4 +597,24 @@ fn f5box_calls_no_rule_knob() {
             assert!(!text.contains(knob), "an f5box source calls `{knob}`");
         }
     }
+}
+
+/// `write_atomic` leaves the new bytes and no temp; the state lock is
+/// exclusive while held and free once dropped.
+#[test]
+fn f5box_atomic_writes_and_the_state_lock() {
+    use super::state::{write_atomic, StateLock};
+    let dir = std::env::temp_dir().join(format!("f5box-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bundle-0.bin");
+    write_atomic(&f, b"one").unwrap();
+    write_atomic(&f, b"two").unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"two");
+    assert!(!dir.join("bundle-0.bin.tmp").exists());
+    let state = dir.join("state.json");
+    let held = StateLock::take(&state).expect("free");
+    assert!(StateLock::take(&state).err().expect("held").contains("another f5box run holds this state"));
+    drop(held);
+    assert!(StateLock::take(&state).is_ok());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

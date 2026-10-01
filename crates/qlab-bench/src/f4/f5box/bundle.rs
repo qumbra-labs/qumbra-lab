@@ -53,6 +53,7 @@ pub(crate) fn w_pvs_u32(p: &Plan) -> Vec<u32> {
 /// refused by row rather than proven into garbage — then the deposit-sum
 /// proof. `log` hears each step as it starts.
 pub(crate) fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) -> Result<Proofs, String> {
+    let cfg = qlab_wrapper::verify::version_cfg(CHAIN_VERSION).ok_or("no lane for the chain version")?;
     let mut members = Vec::with_capacity(p.insts.len());
     for (i, inst) in p.insts.iter().enumerate() {
         log(&format!("member {i} ({:?})", inst.tag()));
@@ -71,7 +72,6 @@ pub(crate) fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) 
     }
     timings.push(("w_trace_and_scan".into(), t.elapsed().as_secs_f64()));
     log("W: prove");
-    let cfg = qlab_wrapper::verify::version_cfg(CHAIN_VERSION).expect("the chain version");
     let t = Instant::now();
     let w = p3_uni_stark::prove(&make_legacy_config_with(&cfg), &air, trace, &pvs);
     timings.push(("w_prove".into(), t.elapsed().as_secs_f64()));
@@ -83,9 +83,11 @@ pub(crate) fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) 
 }
 
 /// The canonical bundle of `p` with `proofs`, unsigned.
-pub(crate) fn assemble(p: &Plan, l2_id: u64, proofs: Proofs) -> WireBundle {
-    assert_eq!(proofs.members.len(), p.insts.len(), "one proof per member");
-    WireBundle {
+pub(crate) fn assemble(p: &Plan, l2_id: u64, proofs: Proofs) -> Result<WireBundle, String> {
+    if proofs.members.len() != p.insts.len() {
+        return Err(format!("{} member proofs for {} members", proofs.members.len(), p.insts.len()));
+    }
+    Ok(WireBundle {
         version: CHAIN_VERSION,
         l2_id,
         w_pvs: w_pvs_u32(p),
@@ -100,7 +102,7 @@ pub(crate) fn assemble(p: &Plan, l2_id: u64, proofs: Proofs) -> WireBundle {
             .collect(),
         exits: p.exits.clone(),
         sig: Box::new([0; SEQUENCER_SIG_LEN]),
-    }
+    })
 }
 
 /// The rehearsal sequencer's signing key, refused unless `params` names its
@@ -113,16 +115,18 @@ pub(crate) fn rehearsal_signer(params: &WrapperParams) -> Result<SigningKey<MlDs
     Ok(SigningKey::<MlDsa65>::from_seed(&qumbra_node::genesis_v6::rehearsal_sequencer_seed().into()))
 }
 
-/// The message the sequencer signs for `wb` on `net`.
-pub(crate) fn signed_message(wb: &WireBundle, net: &Hash32) -> Vec<u8> {
-    let stated = wb.stated_surface().expect("W's PVs are 16-bit chunks");
-    sign_message(net, wb.l2_id, &stated.commitment)
+/// The message the sequencer signs for `wb` on `net`; `None` when W's PVs
+/// state no surface (a PV word past 16 bits).
+pub(crate) fn signed_message(wb: &WireBundle, net: &Hash32) -> Option<Vec<u8>> {
+    let stated = wb.stated_surface()?;
+    Some(sign_message(net, wb.l2_id, &stated.commitment))
 }
 
-/// Sign `wb` for `net`.
-pub(crate) fn sign(wb: &mut WireBundle, sk: &SigningKey<MlDsa65>, net: &Hash32) {
-    let sig = sk.sign(&signed_message(wb, net)).encode();
-    wb.sig.copy_from_slice(sig.as_slice());
+/// Sign `wb` for `net`. An error, never a panic: it runs after the proofs.
+pub(crate) fn sign(wb: &mut WireBundle, sk: &SigningKey<MlDsa65>, net: &Hash32) -> Result<(), String> {
+    let msg = signed_message(wb, net).ok_or("W's public values state no surface: nothing to sign")?;
+    wb.sig.copy_from_slice(sk.sign(&msg).encode().as_slice());
+    Ok(())
 }
 
 /// The node's rule over `bytes`, at the block after the served tip, threading
@@ -139,23 +143,29 @@ pub(crate) fn self_check(rule: &WrapperRule, bytes: &[u8], prev: &Surface, view:
 /// chain without decoding it — the absorbed roots, every member's tag and PV
 /// digest, the burns claimed and the notes spent, the exit, the signed
 /// message's digest, byte counts per part and in total, and the timings.
-pub(crate) fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, view: &ChainView, timings: &Timings) -> Value {
+///
+/// It never panics — it runs after the proofs. The byte parts are computed
+/// from the codec's layout, independently of `encode()`; `bytes_reconciled`
+/// says whether they sum to the encoding, and the command refuses a bundle
+/// whose parts do not.
+pub(crate) fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, spacing: u64, view: &ChainView, timings: &Timings) -> Value {
     let pv_digest = |pvs: &[u32]| {
         let le: Vec<u8> = pvs.iter().flat_map(|w| w.to_le_bytes()).collect();
         hex(&qlab_devnet::hash::keccak256(&le))
     };
     let member_bytes: Vec<usize> = wb.members.iter().map(|m| proof_len(&m.proof)).collect();
     let parts = BundleBytes::of(wb);
-    assert_eq!(parts.total(), bytes.len(), "the manifest's parts reconcile to the encoded bundle");
-    let stated = wb.stated_surface().expect("16-bit PVs");
+    let stated = wb.stated_surface().map(|s| digest_hex(&s.commitment));
+    let signed = signed_message(wb, net).map(|m| hex(&qlab_devnet::hash::keccak256(&m)));
     json!({
         "mode": "f5box", "issue": 785, "version": wb.version, "l2_id": wb.l2_id,
         "net_id": hex(net),
         "prev_surface": digest_hex(&p.inp.prev),
-        "stated_surface": digest_hex(&stated.commitment),
-        "signed_message_keccak": hex(&qlab_devnet::hash::keccak256(&signed_message(wb, net))),
+        "stated_surface": stated,
+        "signed_message_keccak": signed,
+        "wrapper_spacing_blocks": spacing,
         "chain": {"tip": view.anchors.tip_height, "finalized_local": view.anchors.finalized_height, "leaves": view.tree.len(),
-            "anchor_rule": "absorbed roots chosen from /v1/anchors (local finality); V7 judges by the finality record, so the node may refuse until a record covers them"},
+            "self_check_cannot_see": "the self-check is the node's rule over these bytes, but with three inputs the node owns: spacing (last_bundle_height = None — post no sooner than wrapper_spacing_blocks after the previous bundle's block); the chain's real surface (V5/V6 thread from the replayed state file, which can be ahead of the chain); and the finality record (V7 judged against /v1/anchors, the node's local finality — the node may answer 422 until a record covers the absorbed roots; retry)"},
         "absorbed": p.absorbed.iter().map(|a| json!({"root": digest_hex(&a.root), "leaf_count": a.count})).collect::<Vec<_>>(),
         "members": p.members.iter().enumerate().map(|(i, m)| json!({
             "slot": i, "tag": format!("{:?}", m.tag), "pv_words": m.pvs.len(), "pv_keccak": pv_digest(&m.pvs), "proof_bytes": member_bytes[i],
@@ -170,6 +180,7 @@ pub(crate) fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, vi
         "exits": p.exits.iter().map(|e| json!({"rkm": digest_hex(&e.rkm), "v": e.v})).collect::<Vec<_>>(),
         "exit_cmt": digest_hex(&p.exit_cmt),
         "bytes": parts.json(),
+        "bytes_reconciled": parts.total() == bytes.len(),
         "timings_seconds": timings.iter().map(|(k, v)| json!({"step": k, "seconds": v})).collect::<Vec<_>>(),
     })
 }

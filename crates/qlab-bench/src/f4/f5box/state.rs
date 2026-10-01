@@ -49,14 +49,14 @@ pub(crate) struct RunState {
 
 /// The surface a wrapper states, from its statement — `verify_wrapper`'s
 /// success value and the sequencer's signed commitment.
-pub(crate) fn surface_of(l2_id: u64, rin: &WRoots, rout: &WRoots, inp: &WInputs, members: &[Member], exit_cmt: &Digest) -> Surface {
+pub(crate) fn surface_of(l2_id: u64, rin: &WRoots, rout: &WRoots, inp: &WInputs, members: &[Member], exit_cmt: &Digest) -> Result<Surface, String> {
     let pvs: Vec<u32> =
         w_pvs(rin, rout, inp, fee_of(members), exit_cmt).iter().map(p3_field::PrimeField32::as_canonical_u32).collect();
-    stated_surface(qlab_wrapper::genesis::CHAIN_VERSION, l2_id, &pvs).expect("W's PVs are 16-bit chunks")
+    stated_surface(qlab_wrapper::genesis::CHAIN_VERSION, l2_id, &pvs).ok_or_else(|| "W's public values state no surface".to_string())
 }
 
 /// The surface `plan` states.
-pub(crate) fn plan_surface(l2_id: u64, p: &Plan) -> Surface {
+pub(crate) fn plan_surface(l2_id: u64, p: &Plan) -> Result<Surface, String> {
     surface_of(l2_id, &p.rin, &p.rout, &p.inp, &p.members, &p.exit_cmt)
 }
 
@@ -226,13 +226,10 @@ impl RunState {
         Self::from_json(&v).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Write via a sibling temp file and a rename: a crash leaves the old
-    /// file or the new one, never half of either.
+    /// Written atomically ([`write_atomic`]).
     pub(crate) fn save(&self, path: &std::path::Path) -> Result<(), String> {
-        let tmp = path.with_extension("tmp");
-        let text = serde_json::to_string_pretty(&self.to_json()).expect("json");
-        std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+        let text = serde_json::to_string_pretty(&self.to_json()).map_err(|e| format!("state json: {e}"))?;
+        write_atomic(path, text.as_bytes())
     }
 
     /// **Replay** every recorded wrapper from the V6 genesis state through
@@ -252,8 +249,52 @@ impl RunState {
             if exit_chain(&b.exits) != exit_cmt {
                 return Err(format!("bundle {i}: the exit list does not chain to its exit_cmt"));
             }
-            prev = surface_of(self.l2_id, &rin, &rout, &b.inp, &b.members, &exit_cmt);
+            prev = surface_of(self.l2_id, &rin, &rout, &b.inp, &b.members, &exit_cmt).map_err(|e| format!("bundle {i}: {e}"))?;
         }
         Ok((state, prev))
+    }
+}
+
+/// Write `bytes` to `path` via `<file name>.tmp` beside it: written, fsynced,
+/// renamed over. A crash leaves the old file or the new one, never half of
+/// either; a failed rename removes the temp.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let name = path.file_name().ok_or_else(|| format!("{}: not a file path", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// A run's exclusive hold on its state file: `<state>.lock`, created with
+/// `create_new` (O_EXCL), removed on drop. Two runs on one state file would
+/// both replay the same `prev` and race the rename.
+pub(crate) struct StateLock(std::path::PathBuf);
+
+impl StateLock {
+    pub(crate) fn take(state: &std::path::Path) -> Result<Self, String> {
+        let mut name = state.file_name().ok_or_else(|| format!("{}: not a file path", state.display()))?.to_os_string();
+        name.push(".lock");
+        let path = state.with_file_name(name);
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| {
+            format!("{}: {e} — another f5box run holds this state; remove the lock only if no run is live", path.display())
+        })?;
+        Ok(StateLock(path))
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
