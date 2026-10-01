@@ -118,6 +118,34 @@ impl Get for Routes {
     }
 }
 
+/// A server that lies in one stream: f5box must refuse, by name.
+enum Lie {
+    /// `/v1/coinbase` holds heights `0..100` only.
+    ShortCoinbase,
+    /// `/v1/tree/leaves` answers an empty page under its own total.
+    EmptyLeafPage,
+    /// `/v1/tree/leaves` serves more leaves than its total.
+    LeavesPastTotal,
+}
+
+struct Lying(Routes, Lie);
+
+impl Get for Lying {
+    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+        let real = self.0.get(path)?;
+        if !path.starts_with("/v1/tree/leaves") {
+            return Ok(real);
+        }
+        let mut page = qlab_node::TreeLeaves::from_bytes(&real).expect("the real page decodes");
+        match self.1 {
+            Lie::EmptyLeafPage => page.leaves.clear(),
+            Lie::LeavesPastTotal => page.total = 3,
+            Lie::ShortCoinbase => {}
+        }
+        Ok(page.to_bytes())
+    }
+}
+
 /// The run: the chain at four tips, and both wrappers planned on it.
 struct Run {
     /// Nothing recorded yet (tip 7).
@@ -135,6 +163,10 @@ struct Run {
     state1: WState,
     prev1: Surface,
     mix: Plan,
+    /// After the mix.
+    state2: WState,
+    /// The tip-169 routes, for the lying-server cases.
+    routes: Routes,
 }
 
 fn chain_of(view: &ChainView) -> Chain<'_> {
@@ -162,34 +194,39 @@ fn run() -> &'static Run {
         let deposit_view = b.view();
         b.mine_to(169);
         let mix_view = b.view();
+        let routes = Routes::of(&b.node);
 
         let keys = Keys::from_text("f5box lane");
         let state0 = WState::genesis(&v6_genesis_registry());
         let prev0 = genesis_surface(params().l2_id, &v6_genesis_registry_root());
         let claims = vec![WTag::C; 16];
-        let burns = deposit_view.burns(form(), params().l2_id);
-        let ask = Ask { kinds: &claims, burns: &burns, owned: &[], exit: None, bundle: 0 };
+        let burns = deposit_view.burns(form(), params().l2_id).expect("the burns");
+        let ask = Ask { kinds: &claims, burns: &burns, owned: &[], exit: None };
         let deposit = plan(&state0, &prev0, &chain_of(&deposit_view), &keys, &ask).expect("the deposit plans");
         let mut state1 = state0.clone();
         state1.apply(&deposit.inp, &deposit.members).expect("and applies");
         let prev1 = surface_after(&deposit);
 
         let kinds = default_kinds(16);
-        let burns = mix_view.burns(form(), params().l2_id);
-        let ask = Ask { kinds: &kinds, burns: &burns, owned: &deposit.credited, exit: Some(EXIT), bundle: 1 };
+        let burns = mix_view.burns(form(), params().l2_id).expect("the burns");
+        let ask = Ask { kinds: &kinds, burns: &burns, owned: &deposit.credited, exit: Some(EXIT) };
         let mix = plan(&state1, &prev1, &chain_of(&mix_view), &keys, &ask).expect("the mix plans");
-        Run { early, short, deposit_view, mix_view, keys, state0, prev0, deposit, state1, prev1, mix }
+        let mut state2 = state1.clone();
+        state2.apply(&mix.inp, &mix.members).expect("and applies");
+        Run { early, short, deposit_view, mix_view, keys, state0, prev0, deposit, state1, prev1, mix, state2, routes }
     })
 }
 
-/// The absorbed roots are served anchors; every claim opens at the newest.
-fn assert_absorbed_are_served(p: &Plan, view: &ChainView) {
+/// The absorbed roots are the four newest served anchors, oldest first, at
+/// exactly `counts`; every claim opens at the newest.
+fn assert_absorbed(p: &Plan, view: &ChainView, counts: [u64; 4]) {
+    assert_eq!(p.absorbed.map(|a| a.count), counts);
+    let served: Vec<Hash32> = view.anchors.roots[..4].iter().rev().copied().collect();
+    assert_eq!(p.absorbed.map(|a| digest_to_bytes(&a.root)).to_vec(), served, "the four newest served roots, oldest first");
     for a in &p.absorbed {
-        assert!(view.anchors.roots.contains(&digest_to_bytes(&a.root)), "absorbed root at count {} is served", a.count);
         assert_eq!(view.tree.root_at(a.count), a.root);
     }
     let newest = p.absorbed[3];
-    assert!(p.absorbed.iter().all(|a| a.count <= newest.count), "the newest is last");
     for (inst, burn) in p.insts.iter().filter_map(|i| if let Inst::C(c) = i { Some(c) } else { None }).zip(&p.claimed) {
         assert_eq!(inst.anchor, newest.root);
         assert_eq!(inst.cm, burn.cm, "the claim opens the burn's leaf");
@@ -206,7 +243,7 @@ fn f5box_reads_the_burns_the_chain_appended() {
     assert_eq!(r.prev0.commitment, REHEARSAL_GENESIS_SURFACE);
     assert_eq!(r.prev0.out, r.state0.roots());
     // Heights 1..=24 have matured by tip 169 (leaf at h + 144), in order.
-    let burns = r.mix_view.burns(form(), params().l2_id);
+    let burns = r.mix_view.burns(form(), params().l2_id).expect("the burns");
     assert_eq!(burns.iter().map(|b| b.height).collect::<Vec<_>>(), (1..=25).collect::<Vec<_>>());
     assert_eq!(burns.iter().map(|b| b.pos).collect::<Vec<_>>(), (0..25).collect::<Vec<_>>());
     assert!(burns.iter().all(|b| b.note.rkm == qlab_air::claim::rkm_burn(params().l2_id)));
@@ -214,8 +251,10 @@ fn f5box_reads_the_burns_the_chain_appended() {
     let young = r.mix_view.immature_burns(params().l2_id);
     assert_eq!(young.first(), Some(&(26, 170)));
     assert_eq!(young.len(), 169 - 25);
-    // Under any other form the derivation finds nothing: the form is load-bearing.
-    assert!(r.mix_view.burns(GenesisForm::V4, params().l2_id).is_empty());
+    // Under any other form the first matured burn rebuilds to no leaf, and
+    // the read says which: the form is load-bearing, and a miss is named.
+    let e = r.mix_view.burns(GenesisForm::V4, params().l2_id).unwrap_err();
+    assert!(e.contains("minted at 1 "), "{e}");
 }
 
 /// The deposit: sixteen claims at the genesis surface, every absorbed root a
@@ -225,8 +264,7 @@ fn f5box_the_deposit_is_sixteen_claims_over_the_served_tree() {
     let r = run();
     let p = &r.deposit;
     assert!(p.members.iter().all(|m| m.tag == WTag::C) && p.members.len() == 16);
-    assert_absorbed_are_served(p, &r.deposit_view);
-    assert_eq!(p.absorbed[3].count, 16, "record 160 covers the sixteenth leaf");
+    assert_absorbed(p, &r.deposit_view, [13, 14, 15, 16]);
     let sum: u64 = p.claimed.iter().map(|b| b.note.value).sum();
     assert_eq!(p.inp.d_batch, sum);
     assert_eq!((p.rout.d_cum, p.rout.e_cum), (sum, 0));
@@ -243,6 +281,10 @@ fn f5box_the_deposit_is_sixteen_claims_over_the_served_tree() {
     }
     assert!(p.exits.is_empty() && p.exit_cmt == [0; 4]);
     assert_eq!(r.state1.roots(), p.rout);
+    // Every credit is a real note: its commitment is in C after the deposit.
+    for c in &p.credited {
+        assert!(r.state1.l2.c.position_of(&c.cm(&r.keys)).is_some(), "credit {c:?} is in C");
+    }
 }
 
 /// The mix: `default_kinds(16)` over the deposit's notes — R moves the
@@ -255,7 +297,7 @@ fn f5box_the_mix_spends_the_deposit_and_pays_the_exit() {
     let p = &r.mix;
     assert_eq!(p.members.iter().map(|m| m.tag).collect::<Vec<_>>(), default_kinds(16));
     assert_eq!(p.inp.prev, r.prev1.commitment);
-    assert_absorbed_are_served(p, &r.mix_view);
+    assert_absorbed(p, &r.mix_view, [21, 22, 23, 24]);
     let c_in = r.state1.l2.c.root();
     let (reg_before, reg_after) = (r.state1.l2.r.root(), p.rout.f3.r);
     assert_ne!(reg_before, reg_after, "R wrote the registry");
@@ -282,9 +324,15 @@ fn f5box_the_mix_spends_the_deposit_and_pays_the_exit() {
     assert_eq!(p.spent.len(), 12);
     assert_eq!(p.spent, r.deposit.credited[..12]);
     assert_eq!(p.claimed.iter().map(|b| b.height).collect::<Vec<_>>(), vec![17, 18, 19, 20]);
-    // Change: every spend returns `v − fee` (− the exit, slot 0) to this run.
-    let first_change = r.deposit.credited[0].value - TX_FEE - EXIT.v;
-    assert_eq!(p.credited.iter().find(|c| c.value == first_change).map(|c| c.value), Some(first_change));
+    // Change: every spend returns `v − fee` (− the exit, slot 0) to this run,
+    // as a real note — its commitment is the one the member published, and
+    // it is in C after the mix (S/P change, R change and the claim credits).
+    assert_eq!(p.credited[0].cm(&r.keys), first.cm_out[0], "slot 0's change is its first output");
+    assert_eq!(p.credited[0].value, r.deposit.credited[0].value - TX_FEE - EXIT.v);
+    assert_eq!(p.credited.len(), 12 + 4);
+    for c in &p.credited {
+        assert!(r.state2.l2.c.position_of(&c.cm(&r.keys)).is_some(), "credit {c:?} is in C");
+    }
 }
 
 /// A plan that cannot be built is refused by name, and the state it was
@@ -293,39 +341,40 @@ fn f5box_the_mix_spends_the_deposit_and_pays_the_exit() {
 fn f5box_plan_refusals_are_named() {
     let r = run();
     let claims = vec![WTag::C; 16];
-    let ask = |burns: &'static [super::chain::Burn]| Ask { kinds: &claims, burns, owned: &[], exit: None, bundle: 0 };
+    let ask = |burns: &'static [super::chain::Burn]| Ask { kinds: &claims, burns, owned: &[], exit: None };
     let leak = |v: Vec<super::chain::Burn>| -> &'static [super::chain::Burn] { Box::leak(v.into_boxed_slice()) };
 
     // Nothing recorded: no anchor.
-    let burns = leak(r.early.burns(form(), params().l2_id));
+    let burns = leak(r.early.burns(form(), params().l2_id).unwrap());
     let e = plan(&r.state0, &r.prev0, &chain_of(&r.early), &r.keys, &ask(burns)).err();
     assert_eq!(e, Some(PlanError::NoAnchor));
     // Record 152 covers eight matured burns: sixteen claims cannot be built.
-    let burns = leak(r.short.burns(form(), params().l2_id));
+    let burns = leak(r.short.burns(form(), params().l2_id).unwrap());
     let e = plan(&r.state0, &r.prev0, &chain_of(&r.short), &r.keys, &ask(burns)).err();
     assert_eq!(e, Some(PlanError::Burns { need: 16, have: 8 }));
     // A burn is claimed once: on the post-deposit state the sixteen are spent
     // claims, and only the four the deposit's anchor did not cover remain.
-    let burns = leak(r.mix_view.burns(form(), params().l2_id));
+    let burns = leak(r.mix_view.burns(form(), params().l2_id).unwrap());
     let e = plan(&r.state1, &r.prev1, &chain_of(&r.mix_view), &r.keys, &ask(burns)).err();
     assert_eq!(e, Some(PlanError::Burns { need: 16, have: 8 }));
     // The mix needs twelve notes; the genesis state owns none.
     let kinds = default_kinds(16);
-    let a = Ask { kinds: &kinds, burns, owned: &r.deposit.credited, exit: Some(EXIT), bundle: 1 };
+    let a = Ask { kinds: &kinds, burns, owned: &r.deposit.credited, exit: Some(EXIT) };
     assert_eq!(plan(&r.state0, &r.prev0, &chain_of(&r.mix_view), &r.keys, &a).err(), Some(PlanError::Notes { need: 12, have: 0 }));
     // A note is spent once: after the mix, its twelve spent notes are gone.
-    let mut state2 = r.state1.clone();
-    state2.apply(&r.mix.inp, &r.mix.members).expect("the mix applies");
-    let e = plan(&state2, &surface_after(&r.mix), &chain_of(&r.mix_view), &r.keys, &a).err();
+    let e = plan(&r.state2, &surface_after(&r.mix), &chain_of(&r.mix_view), &r.keys, &a).err();
     assert_eq!(e, Some(PlanError::Notes { need: 12, have: 4 }));
     // An exit the first P's note cannot pay.
     let big = Exit { v: r.deposit.credited[0].value, ..EXIT };
     let a = Ask { exit: Some(big), ..a };
     let e = plan(&r.state1, &r.prev1, &chain_of(&r.mix_view), &r.keys, &a).err();
     assert_eq!(e, Some(PlanError::ExitAboveNote { note: r.deposit.credited[0].value, fee: TX_FEE, exit: big.v }));
-    // An exit with no P to carry it.
-    let a = Ask { kinds: &claims, burns, owned: &[], exit: Some(EXIT), bundle: 1 };
+    // An exit with no P to carry it; two writes in one wrapper.
+    let a = Ask { kinds: &claims, burns, owned: &[], exit: Some(EXIT) };
     assert_eq!(plan(&r.state1, &r.prev1, &chain_of(&r.mix_view), &r.keys, &a).err(), Some(PlanError::ExitWithoutP));
+    let two_r = [WTag::R, WTag::P, WTag::R];
+    let a = Ask { kinds: &two_r, burns, owned: &r.deposit.credited, exit: None };
+    assert_eq!(plan(&r.state1, &r.prev1, &chain_of(&r.mix_view), &r.keys, &a).err(), Some(PlanError::SecondR));
     // The deposit run left its inputs as they were.
     assert_eq!(r.state0.roots(), r.prev0.out);
 }
@@ -349,4 +398,23 @@ fn f5box_built_members_satisfy_their_circuits() {
         };
         assert!(verdict.is_ok(), "slot {slot} ({:?}): {verdict:?}", inst.tag());
     }
+}
+
+/// Every stream must be whole: a server that serves a short coinbase stream,
+/// an empty leaf page under its own total, or more leaves than its total is
+/// refused by name — never read as a shorter chain.
+#[test]
+fn f5box_a_short_or_lying_stream_is_refused() {
+    let r = run();
+    let mut short = Routes { anchors: r.routes.anchors.clone(), leaves: LeavesView { leaves: r.routes.leaves.leaves.clone() }, discovery: r.routes.discovery.clone() };
+    short.discovery.blocks.truncate(100);
+    let e = chain::read(&Lying(short, Lie::ShortCoinbase)).err().expect("refused");
+    assert!(e.contains("/v1/coinbase: an empty page at 100 below the tip 169"), "{e}");
+    let again = |lie| Lying(Routes { anchors: r.routes.anchors.clone(), leaves: LeavesView { leaves: r.routes.leaves.leaves.clone() }, discovery: r.routes.discovery.clone() }, lie);
+    let e = chain::read(&again(Lie::EmptyLeafPage)).err().expect("refused");
+    assert!(e.contains("an empty page at 0 of a total of 25"), "{e}");
+    let e = chain::read(&again(Lie::LeavesPastTotal)).err().expect("refused");
+    assert!(e.contains("25 leaves past 0 served with a total of 3"), "{e}");
+    // The honest routes read whole.
+    assert!(chain::read(&r.routes).is_ok());
 }

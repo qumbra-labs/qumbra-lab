@@ -24,10 +24,14 @@
 //! verifiers can check.
 //!
 //! **The key schedule.** Everything private is derived from one run seed:
-//! `lanes(label, bundle, slot) = Keccak256(DOMAIN ‖ seed ‖ label ‖ bundle ‖
+//! `lanes(label, wrapper, slot) = Keccak256(DOMAIN ‖ seed ‖ label ‖ wrapper ‖
 //! slot)` — the L2 spend key, each credit's `rseed`, each claim's `r_v`, each
 //! dummy. A rehearsal key, in the clear by design (Q-6-1's synthetic state):
-//! nothing it holds is anyone's money but the rehearsal's.
+//! nothing it holds is anyone's money but the rehearsal's. `wrapper` is the
+//! wrapper's own position in the chain, `AA`'s length over [`M_ABS`] (every
+//! wrapper absorbs exactly four roots), never a caller's count: a wrapper
+//! planned on a state that already applied it is at a new position, so it can
+//! never reuse a dummy's nullifier.
 // The `f5box` command (the next PR) is the non-test consumer of the rest.
 #![allow(dead_code)]
 use qlab_air::claim::{build_claim_with_witness, claim_cnf, BurnNote, ClaimCredit, ClaimInstance};
@@ -74,13 +78,13 @@ impl Keys {
         Keys { seed: qlab_devnet::hash::keccak256(seed.as_bytes()) }
     }
 
-    /// `Keccak256(DOMAIN ‖ seed ‖ label ‖ bundle ‖ slot)` as four lanes.
-    pub(crate) fn lanes(&self, label: &str, bundle: u64, slot: u64) -> Digest {
+    /// `Keccak256(DOMAIN ‖ seed ‖ label ‖ wrapper ‖ slot)` as four lanes.
+    pub(crate) fn lanes(&self, label: &str, wrapper: u64, slot: u64) -> Digest {
         let mut msg = DOMAIN.to_vec();
         msg.extend_from_slice(&self.seed);
         msg.extend_from_slice(&(label.len() as u64).to_le_bytes());
         msg.extend_from_slice(label.as_bytes());
-        msg.extend_from_slice(&bundle.to_le_bytes());
+        msg.extend_from_slice(&wrapper.to_le_bytes());
         msg.extend_from_slice(&slot.to_le_bytes());
         qlab_wrapper::codec::digest_from_bytes(&qlab_devnet::hash::keccak256(&msg))
     }
@@ -184,8 +188,6 @@ pub(crate) struct Ask<'a> {
     pub owned: &'a [Owned],
     /// Paid by the first P, if any.
     pub exit: Option<Exit>,
-    /// This bundle's index in the run (the key schedule's separation).
-    pub bundle: u64,
 }
 
 /// A built wrapper: the members, the native statement and what it moves.
@@ -227,6 +229,8 @@ pub(crate) enum PlanError {
     ExitAboveNote { note: u64, fee: u64, exit: u64 },
     /// An exit with nowhere to ride: no P in the slot order.
     ExitWithoutP,
+    /// More than one R in the slot order (v1 allows one per wrapper).
+    SecondR,
     /// A transaction's note cannot pay the fee.
     NoteBelowFee { value: u64 },
     /// The registry has no free slot for R.
@@ -253,6 +257,10 @@ pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, a
     if ask.exit.is_some() && !ask.kinds.contains(&WTag::P) {
         return Err(PlanError::ExitWithoutP);
     }
+    if ask.kinds.iter().filter(|t| **t == WTag::R).count() > 1 {
+        return Err(PlanError::SecondR);
+    }
+    let wrapper = state.aa.len() / M_ABS as u64;
     // The absorbed roots: the four newest distinct anchors, oldest first,
     // the newest repeated when fewer exist. Every claim opens at the newest.
     let anchors = chain.view.anchors().map_err(PlanError::Chain)?;
@@ -294,7 +302,7 @@ pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, a
     let mut exits: Vec<Exit> = Vec::new();
     let (mut claimed, mut spent, mut credited) = (Vec::new(), Vec::new(), Vec::new());
     let mut d_batch = 0u64;
-    let slot_keys = |label: &str, slot: usize| keys.lanes(label, ask.bundle, slot as u64);
+    let slot_keys = |label: &str, slot: usize| keys.lanes(label, wrapper, slot as u64);
     // A transaction's second input slot (#219): value 0, asset 0, off-tree.
     let dummy = |slot: usize| L2TxInput {
         sk: slot_keys("dummy-sk", slot),
@@ -351,11 +359,9 @@ pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, a
                 let change = n
                     .value
                     .checked_sub(TX_FEE)
-                    .and_then(|v| v.checked_sub(exit_v))
-                    .ok_or(match exit {
-                        Some(_) => PlanError::ExitAboveNote { note: n.value, fee: TX_FEE, exit: exit_v },
-                        None => PlanError::NoteBelowFee { value: n.value },
-                    })?;
+                    .ok_or(PlanError::NoteBelowFee { value: n.value })?
+                    .checked_sub(exit_v)
+                    .ok_or(PlanError::ExitAboveNote { note: n.value, fee: TX_FEE, exit: exit_v })?;
                 let outputs = [to_me(change, slot, 0), to_me(0, slot, 1)];
                 let dummy = dummy(slot);
                 let inst = if *kind == WTag::S {

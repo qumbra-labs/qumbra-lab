@@ -15,6 +15,8 @@
 //! is two orders of magnitude wider than that lag.
 // The `f5box` command (the next PR) is the non-test consumer of the rest.
 #![allow(dead_code)]
+use std::collections::HashMap;
+
 use qlab_cbserver::codec::{BlockCoinbase, CoinbasePage};
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::forms::GenesisForm;
@@ -47,11 +49,20 @@ pub(crate) struct ChainView {
     pub anchors: AnchorSet,
     /// Every block's coinbase facts, `0..=tip`, ascending.
     pub coinbase: Vec<BlockCoinbase>,
+    /// Every prefix root of `tree` → its leaf count (computed once).
+    by_root: HashMap<Digest, u64>,
+    /// Every leaf → its position (computed once).
+    by_leaf: HashMap<Digest, u64>,
 }
 
 /// Read the three routes. The anchor set first: every root it names is a
 /// prefix of the leaves read after it, so the two never disagree in the
 /// direction that matters (a root with no matching local count).
+///
+/// **Every stream must be whole, or the read fails by name** — a short page
+/// is never taken for the end (#309/#312's lesson): the leaves must reach
+/// the served `total` and never pass it, and the coinbase stream must hold
+/// every height `0..=tip`.
 pub(crate) fn read(node: &impl Get) -> Result<ChainView, String> {
     let anchors = AnchorSet::from_bytes(&node.get("/v1/anchors")?).map_err(|e| format!("/v1/anchors: {e:?}"))?;
     let mut tree = CommitmentTree::new();
@@ -61,32 +72,47 @@ pub(crate) fn read(node: &impl Get) -> Result<ChainView, String> {
         if page.from != tree.len() {
             return Err(format!("/v1/tree/leaves: asked from {}, served from {}", tree.len(), page.from));
         }
+        if tree.len() + page.leaves.len() as u64 > page.total {
+            return Err(format!("/v1/tree/leaves: {} leaves past {} served with a total of {}", page.leaves.len(), tree.len(), page.total));
+        }
+        if page.leaves.is_empty() && tree.len() < page.total {
+            return Err(format!("/v1/tree/leaves: an empty page at {} of a total of {}", tree.len(), page.total));
+        }
         for leaf in &page.leaves {
             tree.append_bytes(leaf);
         }
-        if page.leaves.is_empty() || tree.len() >= page.total {
+        if tree.len() == page.total {
             break;
         }
     }
     let mut coinbase: Vec<BlockCoinbase> = Vec::new();
-    let mut from = 0u64;
-    loop {
+    while (coinbase.len() as u64) <= anchors.tip_height {
+        let from = coinbase.len() as u64;
         let body = node.get(&format!("/v1/coinbase?from={from}&to={}", anchors.tip_height))?;
         let page = CoinbasePage::from_bytes(&body).map_err(|e| format!("/v1/coinbase: {e:?}"))?;
-        let Some(last) = page.last_height() else { break };
-        if last < from {
-            return Err(format!("/v1/coinbase: a page from {from} ended at {last}"));
+        if page.blocks.is_empty() {
+            return Err(format!("/v1/coinbase: an empty page at {from} below the tip {}", anchors.tip_height));
         }
-        coinbase.extend(page.blocks);
-        if last >= anchors.tip_height {
-            break;
+        for b in page.blocks {
+            if b.height != coinbase.len() as u64 {
+                return Err(format!("/v1/coinbase: height {} served where {} was due", b.height, coinbase.len()));
+            }
+            coinbase.push(b);
         }
-        from = last + 1;
     }
-    if coinbase.iter().enumerate().any(|(i, b)| b.height != i as u64) {
-        return Err("/v1/coinbase: the stream is not every height from genesis".into());
+    if coinbase.len() as u64 != anchors.tip_height + 1 {
+        return Err(format!("/v1/coinbase: {} heights for a tip of {}", coinbase.len(), anchors.tip_height));
     }
-    Ok(ChainView { tree, anchors, coinbase })
+    let mut prefix = CommitmentTree::new();
+    let mut by_root = HashMap::from([(prefix.root(), 0u64)]);
+    let mut by_leaf = HashMap::new();
+    for i in 0..tree.len() {
+        let leaf = tree.leaf(i);
+        prefix.append(leaf);
+        by_root.insert(prefix.root(), i + 1);
+        by_leaf.entry(leaf).or_insert(i);
+    }
+    Ok(ChainView { tree, anchors, coinbase, by_root, by_leaf })
 }
 
 /// One valid anchor as this tree states it: the leaf count whose root it is.
@@ -101,17 +127,10 @@ impl ChainView {
     /// A served root no prefix of the tree reproduces is an error: the tree
     /// and the anchor set disagree, and nothing built on either is sound.
     pub(crate) fn anchors(&self) -> Result<Vec<Anchor>, String> {
-        let mut prefix = CommitmentTree::new();
-        let mut by_root = std::collections::HashMap::new();
-        by_root.insert(prefix.root(), 0u64);
-        for i in 0..self.tree.len() {
-            prefix.append(self.tree.leaf(i));
-            by_root.insert(prefix.root(), i + 1);
-        }
         let mut out = Vec::new();
         for bytes in &self.anchors.roots {
             let root = digest_from_bytes(bytes);
-            let count = *by_root.get(&root).ok_or("a served anchor is no prefix of the served leaves")?;
+            let count = *self.by_root.get(&root).ok_or("a served anchor is no prefix of the served leaves")?;
             out.push(Anchor { count, root });
         }
         out.sort_by_key(|a| std::cmp::Reverse(a.count));
@@ -121,21 +140,28 @@ impl ChainView {
 
     /// Every burn note of `l2_id` the chain has appended: coinbase notes paid
     /// to `rkm_burn(l2_id)`, reconstructed under `form`, each found in the
-    /// tree. A burn whose leaf is not appended yet (immature, frozen §2) is
-    /// not one; ascending by minted height.
-    pub(crate) fn burns(&self, form: GenesisForm, l2_id: u64) -> Vec<Burn> {
+    /// tree; ascending by minted height. A burn still maturing (frozen §2) is
+    /// not one yet ([`Self::immature_burns`]); a **matured** burn whose
+    /// rebuilt commitment is in no served leaf is an error naming its height
+    /// — the wrong form, or a server whose streams disagree.
+    pub(crate) fn burns(&self, form: GenesisForm, l2_id: u64) -> Result<Vec<Burn>, String> {
         let rkm = qlab_air::claim::rkm_burn(l2_id);
-        self.coinbase
-            .iter()
-            .filter(|b| b.coinbase_rkm == rkm)
-            .filter_map(|b| {
-                let n = qlab_node::coinbase_note_parts_for(form, b.height, b.coinbase_rkm, b.coinbase, b.fees, b.name_burn)?;
-                let note = qlab_air::claim::BurnNote { value: n.value, rkm: n.rkm, rho: n.rho, rseed: n.rseed };
-                let cm = n.commitment();
-                let pos = self.tree.position_of(&cm)?;
-                Some(Burn { height: b.height, note, cm, pos })
-            })
-            .collect()
+        let mut out = Vec::new();
+        for b in self.coinbase.iter().filter(|b| b.coinbase_rkm == rkm) {
+            if qlab_node::coinbase_leaf_appears_at(b.height) > self.anchors.tip_height {
+                continue;
+            }
+            let Some(n) = qlab_node::coinbase_note_parts_for(form, b.height, b.coinbase_rkm, b.coinbase, b.fees, b.name_burn) else {
+                continue; // a block that minted nothing
+            };
+            let cm = n.commitment();
+            let pos = *self.by_leaf.get(&cm).ok_or_else(|| {
+                format!("the matured burn minted at {} rebuilds to a commitment in no served leaf (form {form:?})", b.height)
+            })?;
+            let note = qlab_air::claim::BurnNote { value: n.value, rkm: n.rkm, rho: n.rho, rseed: n.rseed };
+            out.push(Burn { height: b.height, note, cm, pos });
+        }
+        Ok(out)
     }
 
     /// The burns minted but not appended yet at the served tip, each with the
@@ -144,7 +170,7 @@ impl ChainView {
         let rkm = qlab_air::claim::rkm_burn(l2_id);
         self.coinbase
             .iter()
-            .filter(|b| b.coinbase_rkm == rkm && b.height + qlab_node::COINBASE_MATURITY_BLOCKS > self.anchors.tip_height)
+            .filter(|b| b.coinbase_rkm == rkm && qlab_node::coinbase_leaf_appears_at(b.height) > self.anchors.tip_height)
             .map(|b| (b.height, qlab_node::coinbase_leaf_appears_at(b.height)))
             .collect()
     }
