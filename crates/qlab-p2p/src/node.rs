@@ -176,7 +176,7 @@ fn hex32(h: &Hash32) -> String {
 ///
 /// The counter says *that* a newer peer is talking; the journal line says *what*
 /// it is speaking, which is the difference between "something is off" and "node1
-/// is sending 0x0044". But one line per frame would be the flooding channel this
+/// is sending 0x0045". But one line per frame would be the flooding channel this
 /// baton is supposed to close — at the inbound frame budget
 /// ([`crate::ratelimit::MSG_REFILL_PER_SEC`] = 64/s per rate key) that is 64
 /// lines/s/peer of attacker-chosen text into the operator's log.
@@ -287,8 +287,8 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 ///
 /// *(Lab #785 F5-5a: both caps doubled with the frame, so the margins above
 /// grew. A V6 window holding a bundle-bearing body (≤ 16 MiB each, at most one
-/// per spacing window of 48 blocks) is the case this table does not size; F5-5b
-/// paces bundle-bearing bodies.)*
+/// per spacing window of 48 blocks) is the case this table does not size; on a
+/// V6 net the window is [`MAX_BODIES_IN_FLIGHT_CATCHUP_V6`] (F5-5b).)*
 ///
 /// The third row is the binding one and it is the row this constant exists for.
 /// The requester paces itself on the FRAME axis (see
@@ -357,13 +357,47 @@ struct BodyReq {
     peer: PeerId,
 }
 
-pub const fn body_window_for(lag: u64) -> usize {
-    if lag > CATCHUP_LAG_BLOCKS {
-        MAX_BODIES_IN_FLIGHT_CATCHUP
-    } else {
+pub const fn body_window_for(lag: u64, sections: qlab_devnet::forms::BodySections) -> usize {
+    if lag <= CATCHUP_LAG_BLOCKS {
         MAX_BODIES_IN_FLIGHT
+    } else if matches!(sections, qlab_devnet::forms::BodySections::V6) {
+        MAX_BODIES_IN_FLIGHT_CATCHUP_V6
+    } else {
+        MAX_BODIES_IN_FLIGHT_CATCHUP
     }
 }
+
+/// **One bundle asked of a peer per this many blocks** (lab #785 F5-5b, the
+/// ruling's per-peer limit): the wrapper's spacing (`WRAPPER_SPACING_BLOCKS_V1`
+/// = 48). The window starts at every answered ask — admitted or refused
+/// (pre-review X1 (b)) — so a peer cannot make this node verify bundles faster
+/// than the chain can carry them, valid or not. `[devnet-placeholder]`.
+pub const BUNDLE_PEER_WINDOW_BLOCKS: u64 = 48;
+
+/// Bound on [`P2pNode`]'s remembered relay origins (F5-5b pre-review X6).
+const MAX_RELAY_ORIGINS: usize = 256;
+
+/// How long an unanswered bundle ask is held (lab #785 F5-5b).
+/// `[devnet-placeholder]`.
+pub const BUNDLE_ASK_TIMEOUT_MS: u64 = 60_000;
+
+/// **The catch-up window on a V6 net** (lab #785 F5-5b, Q-5b-3).
+/// `[devnet-placeholder]`.
+///
+/// [`MAX_BODIES_IN_FLIGHT_CATCHUP`] (96) is sized so a window's answers fit one
+/// inbound byte burst at proof-sized bodies; it does not size a bundle-bearing
+/// body (≤ 16 MiB). One bundle per spacing window (48 blocks) means a 48-body
+/// window holds at most one: 16 MiB + 47 proof-sized bodies ≈ 23 MB, inside
+/// the 32 MiB burst (asserted below at a 160 KB body). F5-6 measures V6
+/// catch-up throughput across bundle blocks; a byte-aware window replaces this
+/// block count if that measurement says so.
+pub const MAX_BODIES_IN_FLIGHT_CATCHUP_V6: usize = 48;
+const _: () = assert!(
+    crate::wire::MAX_PAYLOAD as u64 + (MAX_BODIES_IN_FLIGHT_CATCHUP_V6 as u64 - 1) * 160_000
+        <= crate::ratelimit::BYTE_BURST,
+    "a V6 catch-up window with one bundle body fits one inbound burst"
+);
+const _: () = assert!(MAX_BODIES_IN_FLIGHT_CATCHUP_V6 <= MAX_BODIES_IN_FLIGHT_CATCHUP);
 
 /// **How long an unanswered body request is held before it may be re-asked**
 /// (issue #130 (c)).
@@ -727,6 +761,18 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// peer cannot serve is not a welshed inv, and without this set there is no way
     /// to tell those two apart.
     body_reqs: HashMap<Hash32, BodyReq>,
+    /// **The bundle asked of each peer, and when** (lab #785 F5-5b): at most one
+    /// in flight per peer; an answer must match it, and an ask unanswered past
+    /// [`BUNDLE_ASK_TIMEOUT_MS`] is forgotten.
+    bundle_asks: HashMap<PeerId, (Hash32, u64)>,
+    /// The tip height at which each peer last answered a bundle ask, whatever
+    /// the verdict: at most one per [`BUNDLE_PEER_WINDOW_BLOCKS`].
+    bundle_answered_at: HashMap<PeerId, u64>,
+    /// The peer each off-tip `AcceptedNoRelay` block came from, so its
+    /// after-apply relay skips it (F5-5b pre-review X6). Bounded by
+    /// [`MAX_RELAY_ORIGINS`]; losing an entry only costs that peer a
+    /// duplicate announce.
+    relay_origin: HashMap<Hash32, PeerId>,
     /// **What each body request has been answered with, and for how long it has
     /// been wanted** (issue #229) — observation only, never read by any decision.
     ///
@@ -850,6 +896,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             addrs: AddrManager::new(),
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
+            bundle_asks: HashMap::new(),
+            bundle_answered_at: HashMap::new(),
+            relay_origin: HashMap::new(),
             body_asks: HashMap::new(),
             body_declines: HashMap::new(),
             body_rr: 0,
@@ -1503,15 +1552,21 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
             return outcome;
         }
+        // Lab #785 F5-5b (pre-review X6): an own or pool block accepted off
+        // the tip is announced once, by `relay_applied_blocks` after it
+        // applies — not now and again then.
+        if outcome == IngestOutcome::AcceptedNoRelay {
+            self.seen.insert(bh);
+            return outcome;
+        }
         self.blocks.insert_body(header.height, bh, body.clone());
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&body.txs, nonce);
         let BlockBody { coinbase_payees, finality, bundle, .. } = body;
         let ann = BlockAnnounce { seal: None, finality, bundle, header, nonce, coinbase_payees, short_ids, prefilled };
-        // A bundle is not relayable until F5-5 (ruling Q2 on issue #785); the
-        // body rule refuses every bundle today, so ingest above has already
-        // returned for one. Not sending is the only answer either way.
+        // A section on a sectionless net is the one refusal left (a program
+        // error upstream); a V6 bundle travels inline since F5-5b.
         let Ok(payload) = encode_announce_for(self.node.wire_form(), &ann) else {
             return outcome;
         };
@@ -1519,6 +1574,33 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
         }
         outcome
+    }
+
+    /// Announce the blocks the node accepted off its tip without relay and
+    /// has since applied (lab #785 F5-5b, ruling J1 as amended) — the relay
+    /// [`IngestOutcome::AcceptedNoRelay`] withheld, now that the full rule has
+    /// run on them. Compact relay, as an own block is announced; the salt is
+    /// taken from the block hash (it only randomises short ids).
+    fn relay_applied_blocks(&mut self) {
+        for (header, body) in self.node.take_relay_after_apply() {
+            let bh = header.header_hash_for(self.node.genesis_form());
+            // Never back to the peer it came from (pre-review X6).
+            let origin = self.relay_origin.remove(&bh);
+            self.blocks.insert_body(header.height, bh, body.clone());
+            self.seen.insert(bh);
+            let nonce = u64::from_le_bytes(bh[..8].try_into().expect("8 bytes"));
+            let (prefilled, short_ids) = build_announce_parts(&body.txs, nonce);
+            let BlockBody { coinbase_payees, finality, bundle, .. } = body;
+            let ann = BlockAnnounce { seal: None, finality, bundle, header, nonce, coinbase_payees, short_ids, prefilled };
+            let Ok(payload) = encode_announce_for(self.node.wire_form(), &ann) else {
+                continue;
+            };
+            for pid in self.peers.ready_peers() {
+                if Some(pid) != origin {
+                    self.send(pid, MsgType::BlockAnnounce, payload.clone());
+                }
+            }
+        }
     }
 
     // --- the driver ---
@@ -1608,6 +1690,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             timings.dispatch += lap(&mut t);
         }
+        // Lab #785 F5-5b (J1 amended): blocks accepted off the tip without
+        // relay, and applied since.
+        self.relay_applied_blocks();
+        self.bundle_asks.retain(|_, (_, at)| now_ms.saturating_sub(*at) < BUNDLE_ASK_TIMEOUT_MS);
         // Ask for a recent finalized checkpoint before the first header request.
         // An honest peer then queues the quorum evidence ahead of its Headers
         // response, letting a fresh joiner establish the checkpoint before it
@@ -1787,7 +1873,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // every 15 s, which is exactly the number the incident needed and did not
         // have. Nothing here is read by the requester.
         self.prune_body_asks(now_ms);
-        let window = body_window_for(self.node.state_lag_blocks());
+        let window = body_window_for(self.node.state_lag_blocks(), self.node.wire_form().sections);
         let room = window.saturating_sub(self.body_reqs.len());
         if room == 0 {
             return;
@@ -2101,7 +2187,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 self.send(from, MsgType::Addr, crate::peer::encode_addrs(&addrs));
             }
             MsgType::Addr => self.on_addr(from, &env.payload),
-            MsgType::Inv => self.on_inv(from, &env.payload),
+            MsgType::Inv => self.on_inv(from, &env.payload, now_ms),
+            MsgType::Bundle => self.on_bundle(from, &env.payload),
             MsgType::GetData => self.on_getdata(from, &env.payload, key, now_ms),
             MsgType::NotFound => self.on_not_found(from, &env.payload),
             MsgType::Tx => self.on_tx(from, &env.payload),
@@ -2197,7 +2284,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     // --- inventory gossip ---
 
-    fn on_inv(&mut self, from: PeerId, payload: &[u8]) {
+    fn on_inv(&mut self, from: PeerId, payload: &[u8], now_ms: u64) {
         let inv = match decode_inv(payload) {
             Ok(i) => i,
             Err(_) => {
@@ -2214,6 +2301,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             if self.already_have(&it) {
                 continue;
             }
+            // Lab #785 F5-5b: a bundle is asked for only on a V6 net, one at a
+            // time per peer, and at most once per window per peer.
+            if it.kind == InvKind::Bundle && !self.may_ask_bundle(from) {
+                continue;
+            }
+            if it.kind == InvKind::Bundle {
+                self.bundle_asks.insert(from, (it.id, now_ms));
+            }
             want.push(it);
         }
         if !want.is_empty() {
@@ -2226,7 +2321,58 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             InvKind::Tx => self.node.has_tx(&it.id) || self.seen.contains(&it.id),
             InvKind::Block => self.node.has_header(&it.id) || self.seen.contains(&it.id),
             InvKind::Checkpoint => self.node.has_checkpoint(&it.id) || self.seen.contains(&it.id),
+            // Not `seen` (pre-review X3): a bundle lost in a reorg and
+            // re-posted must be askable again.
+            InvKind::Bundle => self.node.bundle_not_wanted(&it.id),
         }
+    }
+
+    /// Whether this node may ask `from` for a bundle now (lab #785 F5-5b).
+    fn may_ask_bundle(&self, from: PeerId) -> bool {
+        self.node.wire_form().sections == qlab_devnet::forms::BodySections::V6
+            && !self.node.bundle_slot_full()
+            && !self.bundle_asks.contains_key(&from)
+            && self
+                .bundle_answered_at
+                .get(&from)
+                .is_none_or(|at| self.node.tip_height() >= at + BUNDLE_PEER_WINDOW_BLOCKS)
+    }
+
+    /// A bundle answering our ask (lab #785 F5-5b). Unasked or mismatched
+    /// bytes are dropped uncharged (an ask may have timed out) — the ask is
+    /// looked up before the payload is hashed (pre-review X7). Any answer to an
+    /// ask starts the peer's window. Admitted: relayed onward, never to its
+    /// sender. Refused: charged only when the refusal reads the bytes alone
+    /// (Q-5b-2).
+    fn on_bundle(&mut self, from: PeerId, payload: &[u8]) {
+        let Some(&(asked, _)) = self.bundle_asks.get(&from) else { return };
+        if qlab_devnet::hash::keccak256(payload) != asked {
+            return;
+        }
+        self.bundle_asks.remove(&from);
+        self.bundle_answered_at.insert(from, self.node.tip_height());
+        match self.node.admit_bundle(payload.to_vec(), false) {
+            crate::n1::BundleAdmit::Admitted(id) => {
+                self.relay_inv(InvItem { kind: InvKind::Bundle, id }, Some(from));
+            }
+            crate::n1::BundleAdmit::Refused { charged: true, .. } => {
+                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            }
+            crate::n1::BundleAdmit::Refused { charged: false, .. }
+            | crate::n1::BundleAdmit::SlotHeld
+            | crate::n1::BundleAdmit::Unsupported => {}
+        }
+    }
+
+    /// **The operator route's admission** (lab #785 F5-5b, `POST /v1/bundle`):
+    /// the slot's rule with `replace` honoured, and on admission the bundle is
+    /// advertised to every ready peer.
+    pub fn submit_bundle(&mut self, bytes: Vec<u8>, replace: bool) -> crate::n1::BundleAdmit {
+        let verdict = self.node.admit_bundle(bytes, replace);
+        if let crate::n1::BundleAdmit::Admitted(id) = &verdict {
+            self.relay_inv(InvItem { kind: InvKind::Bundle, id: *id }, None);
+        }
+        verdict
     }
 
     /// A peer telling us it cannot serve something we asked for.
@@ -2275,10 +2421,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // hook may REMOVE an entry from it (releasing the slot for an immediate
         // re-ask). Decide "was this an ask of ours" first, on the pre-decline
         // state, or the release would turn an honest `NotFound` into a welsh.
-        let welshed = inv
-            .items
-            .iter()
-            .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id));
+        // Lab #785 F5-5b: a bundle the peer advertised and has since cleared
+        // from its slot (applied, or no longer verifying) is an honest `NotFound`.
+        if inv.items.iter().any(|it| it.kind == InvKind::Bundle) {
+            self.bundle_asks.remove(&from);
+        }
+        let welshed = inv.items.iter().any(|it| {
+            it.kind != InvKind::Bundle && !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id)
+        });
         for it in &inv.items {
             self.note_body_answer(&it.id, from, BodyAnswer::DontHave);
             // Lab #427: same release-and-re-route as the header-only answer —
@@ -2454,6 +2604,17 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // unchanged `try_finalize` re-verifies roster membership, every
                 // signature and the count against quorum before anything moves.
                 // Nothing here can make a peer's claim load-bearing.
+                // Lab #785 F5-5b: the held bundle, against the same serve
+                // byte budget as bodies; one no longer held is `NotFound`
+                // (the asker does not charge a bundle `NotFound`).
+                InvKind::Bundle => match self.node.held_bundle(&it.id) {
+                    Some(bytes) => {
+                        if self.limiter.may_serve_body_bytes(key.clone(), bytes.len() as u64, now_ms) {
+                            self.send(from, MsgType::Bundle, bytes);
+                        }
+                    }
+                    None => not_found.push(it),
+                },
                 InvKind::Checkpoint => match checkpoint_query_height(&it.id) {
                     Some(at_or_below) => {
                         // The amplifier gate (#91's shape): a 45 B request against a
@@ -2570,7 +2731,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             // kick either: syncing toward it would be asking for more of what we
             // have decided not to accept.
             IngestOutcome::Ignored(_) => {}
-            IngestOutcome::Rejected(_) | IngestOutcome::Duplicate => {}
+            IngestOutcome::Rejected(_) | IngestOutcome::Duplicate | IngestOutcome::AcceptedNoRelay => {}
         }
     }
 
@@ -2911,7 +3072,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     self.seen.insert(id);
                     self.relay_inv(InvItem { kind: InvKind::Block, id }, Some(from));
                 }
-                IngestOutcome::Duplicate => {}
+                IngestOutcome::Duplicate | IngestOutcome::AcceptedNoRelay => {}
                 // An orphan mid-batch means the batch didn't connect; stop and let
                 // the next locator round re-anchor.
                 IngestOutcome::Orphan | IngestOutcome::Rejected(_) => break,
@@ -3301,6 +3462,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // no evidence the body is the header's body. That verdict comes from
         // `ingest_block`, and it was being computed and then discarded, so a
         // mismatched body would have been stored and relayed onward.
+        // Lab #785 F5-5b (J1 amended): accepted off the tip, buffered on the
+        // binding check — seen, so it is not refetched, but not relayed until
+        // applied (`relay_applied_blocks`).
+        if outcome == IngestOutcome::AcceptedNoRelay {
+            self.seen.insert(bh);
+            if let Some(peer) = except {
+                if self.relay_origin.len() >= MAX_RELAY_ORIGINS {
+                    self.relay_origin.clear();
+                }
+                self.relay_origin.insert(bh, peer);
+            }
+            return;
+        }
         if !matches!(outcome, IngestOutcome::Accepted) {
             if outcome.is_peer_fault() {
                 if let Some(peer) = except {
@@ -3494,14 +3668,10 @@ mod tests {
             let ann = whole_block_announce(crate::codec::WireHeader::L1(header), b.clone());
             encode_announce_for(WireForm::V6, &ann).map(|w| w.len())
         };
-        // The encoder refuses a bundle until F5-5b, so the bundle-free body is
-        // encoded and the bundle added at its wire cost: its bytes plus a
-        // length varint of ≤ 4 B in place of the empty section's 1 B (+4 is
-        // conservative by one).
-        let bundle = std::mem::take(&mut body.bundle);
-        let pre = |b: &BlockBody, extra: usize| b.preimage_v6().len() + extra;
-        let w = wire_len(&body).expect("bundle-free V6 body encodes") + bundle.len() + 4;
-        assert!(w <= pre(&body, bundle.len()) + FRAME_OVERHEAD_BOUND, "announce {w} vs preimage {}", pre(&body, bundle.len()));
+        // Since F5-5b the encoder carries the bundle: measured directly.
+        let w = wire_len(&body).expect("a V6 body with a bundle encodes");
+        let pre = body.preimage_v6().len();
+        assert!(w <= pre + FRAME_OVERHEAD_BOUND, "announce {w} vs preimage {pre}");
         // Grown to exactly the bound with section bytes.
         let room = MAX_V6_BODY_BYTES - body.preimage_v6().len();
         body.finality = vec![3; room + body.finality.len()];
@@ -4401,11 +4571,12 @@ mod tests {
         let (mut n0, peer, _hub) = node_and_peer();
         assert_eq!(n0.unknown_stats(), UnknownStats::default());
 
-        // 0x0044 is the next code after `BlockTxn` — the literal shape of "the
-        // upgraded host allocated one more type than I know about".
-        let frame = unknown_type_frame(0x0044, &[]);
+        // 0x0045 is the next code after `Bundle` (0x0044, lab #785 F5-5b) — the
+        // literal shape of "the upgraded host allocated one more type than I
+        // know about".
+        let frame = unknown_type_frame(0x0045, &[]);
         assert!(
-            matches!(Frame::decode(&frame), Ok(Frame::UnknownType { msg_type_raw: 0x0044, .. })),
+            matches!(Frame::decode(&frame), Ok(Frame::UnknownType { msg_type_raw: 0x0045, .. })),
             "the framing layer classifies it rather than erroring"
         );
 
@@ -4428,7 +4599,7 @@ mod tests {
         // nothing scored, still counted. One tolerated frame would not prove the
         // peer survives a real skew, which is a stream and not a single message.
         for i in 0..10 {
-            let f = unknown_type_frame(if i % 2 == 0 { 0x0044 } else { 0x0100 }, &[9; 16]);
+            let f = unknown_type_frame(if i % 2 == 0 { 0x0045 } else { 0x0100 }, &[9; 16]);
             peer.send(PeerId(1), &f).unwrap();
         }
         n0.tick(2);
@@ -4541,7 +4712,7 @@ mod tests {
         for i in 0..(BURST + EXCESS) {
             // Vary the code so the journal cap is exercised under flood too: 65,536
             // codes are available to an attacker and only 8 may ever be printed.
-            let f = unknown_type_frame(0x0044u16.wrapping_add(i as u16), &[7; 32]);
+            let f = unknown_type_frame(0x0045u16.wrapping_add(i as u16), &[7; 32]);
             peer.send(PeerId(1), &f).unwrap();
         }
         n0.tick(1);
@@ -4659,9 +4830,11 @@ mod tests {
             assert_eq!(mt.as_u16(), code);
             assert_eq!(MsgType::from_u16(code), Some(mt), "0x{code:04x} predates this baton");
         }
-        // And no code was allocated: the highest assigned type is still BlockTxn.
+        // And no code was allocated by that baton: the highest assigned type
+        // is Bundle (lab #785 F5-5b), the one code after BlockTxn.
         assert_eq!(MsgType::BlockTxn.as_u16(), 0x0043);
-        assert!(MsgType::from_u16(0x0044).is_none(), "nothing new was added");
+        assert_eq!(MsgType::Bundle.as_u16(), 0x0044);
+        assert!(MsgType::from_u16(0x0045).is_none(), "nothing past Bundle was added");
     }
 
     #[test]
@@ -6470,13 +6643,12 @@ mod tests {
         }
     }
 
-    /// Ruling Q2 on issue #785, the served-body half: `GetData(Block)` answers
-    /// with `whole_block_announce` encoded under the node's wire form, so a
-    /// body carrying a bundle cannot be encoded there either — the serve path
-    /// then degrades to the header like its other gates. A record alone serves.
+    /// The served-body half: `GetData(Block)` answers with
+    /// `whole_block_announce` under the node's wire form. A record serves,
+    /// and since lab #785 F5-5b a bundle does too.
     #[test]
-    fn the_served_body_frame_refuses_a_bundle_and_carries_a_record() {
-        use crate::compact::{decode_announce_for, encode_announce_for, AnnounceEncodeError, WireForm};
+    fn the_served_body_frame_carries_a_record_and_a_bundle() {
+        use crate::compact::{decode_announce_for, encode_announce_for, WireForm};
         let header = BlockHeader::genesis_for(qlab_devnet::forms::GenesisForm::V5, 8, 0);
         let mut body = BlockBody::new(vec![], vec![]);
         body.finality = vec![0x5A; 64];
@@ -6484,8 +6656,10 @@ mod tests {
         let bytes = encode_announce_for(WireForm::V6, &ann).expect("a record is relayable");
         assert_eq!(decode_announce_for(WireForm::V6, &bytes).unwrap().finality, body.finality);
 
-        body.bundle = vec![1];
-        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body);
-        assert_eq!(encode_announce_for(WireForm::V6, &ann), Err(AnnounceEncodeError::BundleNotRelayable));
+        body.bundle = vec![1, 2, 3];
+        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body.clone());
+        let bytes = encode_announce_for(WireForm::V6, &ann).expect("a bundle is relayable (F5-5b)");
+        let back = decode_announce_for(WireForm::V6, &bytes).unwrap();
+        assert_eq!((back.finality, back.bundle), (body.finality, body.bundle));
     }
 }

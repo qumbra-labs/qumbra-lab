@@ -69,7 +69,7 @@ use crate::bodywait::{AskSetObservation, MineDuty, RejoinGate};
 use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
 use crate::node::body_window_for;
 use crate::n1::{
-    BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
+    BlockIngest, BundleAdmit, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
 use crate::punish::{self, PunishmentRestore};
 
@@ -289,6 +289,32 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Running weight of [`Self::pending_bodies`] in bytes, so the byte budget is a
     /// subtraction rather than a walk of the map on every insert.
     pending_bytes: usize,
+    /// Blocks accepted as [`IngestOutcome::AcceptedNoRelay`] (lab #785 F5-5b,
+    /// J1 amended), to be relayed once applied — if, when applied, they are
+    /// within [`RELAY_AFTER_APPLY_WINDOW`] of the header tip.
+    relay_after_apply: std::collections::HashSet<Hash32>,
+    /// Applied blocks awaiting the P2P layer's relay
+    /// ([`BlockIngest::take_relay_after_apply`]).
+    applied_for_relay: Vec<(BlockHeader, BlockBody)>,
+    /// **The producer's one-slot bundle pool** (lab #785 F5-5b): the bundle the
+    /// next template carries, verified at the tip it was last checked at.
+    /// First wins (Q-5-4); cleared when a bundle block is applied or when it
+    /// no longer verifies at a new tip.
+    bundle_slot: Option<HeldBundle>,
+    /// **Refusals already paid for** (F5-5b pre-review X1 (c)): the id of
+    /// every bundle refused at the current applied tip, with its verdict — the
+    /// same bytes at the same tip are never verified twice. Reset when the tip
+    /// moves (a context refusal is about one tip). Ids refused on the bytes
+    /// alone are refused at every tip and kept in `bundle_refused_bytes`.
+    bundle_refused_at_tip: (Hash32, HashMap<Hash32, String>),
+    /// Ids refused on the bytes alone — forever, bounded by
+    /// [`MAX_REFUSED_BUNDLE_IDS`] (oldest dropped first).
+    bundle_refused_bytes: (HashSet<Hash32>, std::collections::VecDeque<Hash32>),
+    /// The bundle id the last applied bundle block carried, and that block
+    /// (F5-5b pre-review X3): a peer's advert of it is not asked for while
+    /// that block is on the main chain. A reorg that drops it makes a
+    /// re-post of the same bundle askable again.
+    last_applied_bundle: Option<(Hash32, u64, Hash32)>,
     /// The node's data dir, when disk-backed — the durability seam for the committee
     /// punishment ledger (issue #133). `None` for an in-memory adapter, which keeps
     /// every in-process sim, soak and test writing nothing.
@@ -634,6 +660,51 @@ pub const UNJUDGED_ANCHOR_REASON: &str =
 ///   height it is being served. Charging for it bans honest peers for serving correct
 ///   history — the whole of #134.
 ///
+/// **How near the header tip an off-tip V6 block must be, when applied, to be
+/// relayed then** (lab #785 F5-5b). `[devnet-placeholder]`.
+///
+/// J1 as amended relays such a block only after the full rule has run on it.
+/// A catching-up node applies history it was handed off the tip; peers at the
+/// tip already hold it, and relaying each such body (up to 16 MB) after the
+/// fact would be all cost. Only a block that is — once applied — within this
+/// many heights of the best header is news worth relaying.
+pub const RELAY_AFTER_APPLY_WINDOW: u64 = 2;
+
+/// A bundle held in the producer's slot (lab #785 F5-5b).
+#[derive(Clone, Debug)]
+pub struct HeldBundle {
+    /// keccak of the bytes — the `InvKind::Bundle` id and the template's
+    /// `bundle_id`.
+    pub id: Hash32,
+    pub bytes: Vec<u8>,
+    /// The applied tip it last verified at.
+    pub verified_at: Hash32,
+}
+
+/// **Who pays for a refused bundle** (lab #785 F5-5b, Q-5b-2): only what
+/// the bytes alone prove — the codec, the sequencer's signature, the
+/// `l2_id`, the exit list's shape — is the sender's fault. Anything judged
+/// against this node's surface or tip (spacing, threading, V7, a proof under
+/// a valid signature, the counters) is not: the sender may be ahead of us,
+/// or we behind. Exhaustive on purpose: a new refusal is classified here.
+pub(crate) fn bundle_refusal_charged(r: &qlab_devnet::body::BundleRefusal) -> bool {
+    use qlab_devnet::body::BundleRefusal::*;
+    match r {
+        Codec(_) | Signature | L2Id { .. } | TooManyExits { .. } | ZeroExitRkm { .. } | ZeroExitValue { .. }
+        | NoStatedSurface => true,
+        NoRule | SurfaceState | Spacing { .. } | Wrapper(_) | StatedSurface | ExitCommitment | ExitSum | Counters => {
+            false
+        }
+    }
+}
+
+/// Bound on each remembered-refusal set (F5-5b pre-review X1 (c)).
+pub const MAX_REFUSED_BUNDLE_IDS: usize = 256;
+
+/// Bound on the pending relay marks (a mark for a block never applied is
+/// dropped with the rest past this many).
+const MAX_RELAY_MARKS: usize = 256;
+
 /// The match on it is **exhaustive on purpose** (no wildcard arm): a new `BodyError`
 /// variant must declare which kind it is, and cannot inherit "peer fault" by silence
 /// the way `AnchorNotFinal` did.
@@ -944,6 +1015,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             miner_rkm: UNCONFIGURED_MINER_RKM,
             pending_bodies: BTreeMap::new(),
             pending_bytes: 0,
+            relay_after_apply: std::collections::HashSet::new(),
+            applied_for_relay: Vec::new(),
+            bundle_slot: None,
+            bundle_refused_at_tip: ([0; 32], HashMap::new()),
+            bundle_refused_bytes: (HashSet::new(), std::collections::VecDeque::new()),
+            last_applied_bundle: None,
             dir: None,
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
@@ -1450,7 +1527,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // `ask_set` field — the doc comment's "everything else is read here so
         // the two views of the ask set cannot disagree" is the reason the
         // predicate must not grow a second source for this number (#661).
-        let ask_set = self.missing_body_hashes(body_window_for(lag.blocks())).len();
+        let ask_set = self.missing_body_hashes(body_window_for(lag.blocks(), self.sections)).len();
         let armed = self.stip_moved_ms.is_some()
             && stuck_ms >= self.unobtainable_threshold_ms()
             && (off_main || self.breq_observed > 0 || ask_set > 0);
@@ -1798,6 +1875,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// The held bundle still verifies at the applied tip, or it is dropped
+    /// (lab #785 F5-5b: spacing, an aged-out anchor, a reorg). Re-checked once
+    /// per tip change, not per template.
+    fn recheck_bundle_slot(&mut self) {
+        let tip = self.state.tip_hash();
+        let Some(held) = &self.bundle_slot else { return };
+        if held.verified_at == tip {
+            return;
+        }
+        // The context half only (pre-review X5): the signature and the proofs
+        // were verified at admission and do not change between tips.
+        if self.sections == BodySections::V6 && self.state.recheck_bundle_at_tip(&held.bytes).is_ok() {
+            if let Some(h) = self.bundle_slot.as_mut() {
+                h.verified_at = tip;
+            }
+        } else {
+            self.bundle_slot = None;
+        }
+    }
+
+    /// The bundle the producer's slot holds (lab #785 F5-5b; ops / tests).
+    pub fn held_bundle_slot(&self) -> Option<&HeldBundle> {
+        self.bundle_slot.as_ref()
+    }
+
     /// Apply every held body that has become applicable, **in ascending height
     /// order**, until none extends the state tip.
     ///
@@ -1832,6 +1934,24 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             };
             match self.state.apply_block_gated(header, body.clone(), &self.verifier, gate) {
                 Ok(_) => {
+                    // Lab #785 F5-5b: a bundle block moved the wrapper surface;
+                    // whatever the slot held no longer threads.
+                    if !body.bundle.is_empty() {
+                        self.bundle_slot = None;
+                        self.last_applied_bundle = Some((
+                            qlab_devnet::hash::keccak256(&body.bundle),
+                            header.height,
+                            header.header_hash_for(self.rules.form),
+                        ));
+                    }
+                    // Lab #785 F5-5b: a block accepted off the tip without relay
+                    // is relayed now that the full rule has run — if it is news.
+                    let hash = header.header_hash_for(self.rules.form);
+                    if self.relay_after_apply.remove(&hash)
+                        && header.height + RELAY_AFTER_APPLY_WINDOW >= self.chain.tip_height()
+                    {
+                        self.applied_for_relay.push((header, body.clone()));
+                    }
                     // The registry read here is the post-apply one — `apply_block`
                     // has already folded this body's own riders in, which is what
                     // makes the name-eviction leg see the block that outraced a
@@ -1870,6 +1990,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // The finalized head is part of the view that has to catch up, not a separate
         // concern — see `sync_state_finality`.
         self.sync_state_finality();
+        self.recheck_bundle_slot();
         // Anything no longer worth holding is dead weight — and it is the SAME rule
         // the entry gate admits against (issue #162). Two rules here would either
         // re-drop the sibling body on the tick it was accepted, or accumulate bodies
@@ -2424,6 +2545,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             };
             let at_tip = parent_hash == self.state.tip_hash();
             body.txs.retain(|tx| at_tip && self.state.v6_anchor_ok_at_tip(&tx.public.anchor, recorded));
+            // Lab #785 F5-5b: the slot's bundle, when it verified at this
+            // parent (the tip) and the body stays within the V6 bound;
+            // otherwise the block goes out without it and the slot keeps it.
+            self.recheck_bundle_slot();
+            if let Some(held) = self.bundle_slot.as_ref().filter(|h| at_tip && h.verified_at == parent_hash) {
+                let mut with = body.clone();
+                with.bundle = held.bytes.clone();
+                if with.preimage_v6().len() <= qlab_devnet::body::MAX_V6_BODY_BYTES {
+                    body = with;
+                }
+            }
         }
         let bc = match self.rules.form {
             GenesisForm::V5 if self.sections == BodySections::V6 => body.commitment_v6(),
@@ -2980,6 +3112,79 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
+    fn take_relay_after_apply(&mut self) -> Vec<(BlockHeader, BlockBody)> {
+        std::mem::take(&mut self.applied_for_relay)
+    }
+
+    fn admit_bundle(&mut self, bytes: Vec<u8>, replace: bool) -> BundleAdmit {
+        if self.sections != BodySections::V6 {
+            return BundleAdmit::Unsupported;
+        }
+        if self.bundle_slot.is_some() && !replace {
+            return BundleAdmit::SlotHeld;
+        }
+        // A lagging state machine cannot judge a bundle at its tip: not
+        // admitted, and not the sender's fault (#130 (a)'s rule).
+        if self.state_lag().is_lagging() {
+            return BundleAdmit::Refused { charged: false, reason: "state lagging its chain".into() };
+        }
+        let id = qlab_devnet::hash::keccak256(&bytes);
+        let tip = self.state.tip_hash();
+        // X1 (c): a verdict already reached is returned, not re-derived.
+        if self.bundle_refused_bytes.0.contains(&id) {
+            return BundleAdmit::Refused { charged: true, reason: "refused before (on its bytes)".into() };
+        }
+        if self.bundle_refused_at_tip.0 != tip {
+            self.bundle_refused_at_tip = (tip, HashMap::new());
+        }
+        if let Some(reason) = self.bundle_refused_at_tip.1.get(&id) {
+            return BundleAdmit::Refused { charged: false, reason: format!("refused before at this tip: {reason}") };
+        }
+        match self.state.verify_bundle_at_tip(&bytes) {
+            Ok(_) => {
+                self.bundle_slot = Some(HeldBundle { id, bytes, verified_at: tip });
+                BundleAdmit::Admitted(id)
+            }
+            Err(r) => {
+                let charged = bundle_refusal_charged(&r);
+                let reason = format!("{r:?}");
+                if charged {
+                    let (set, order) = &mut self.bundle_refused_bytes;
+                    if set.insert(id) {
+                        order.push_back(id);
+                        while order.len() > MAX_REFUSED_BUNDLE_IDS {
+                            if let Some(old) = order.pop_front() {
+                                set.remove(&old);
+                            }
+                        }
+                    }
+                } else if self.bundle_refused_at_tip.1.len() < MAX_REFUSED_BUNDLE_IDS {
+                    self.bundle_refused_at_tip.1.insert(id, reason.clone());
+                }
+                BundleAdmit::Refused { charged, reason }
+            }
+        }
+    }
+
+    fn bundle_not_wanted(&self, id: &Hash32) -> bool {
+        if self.bundle_slot.as_ref().is_some_and(|h| h.id == *id) || self.bundle_refused_bytes.0.contains(id) {
+            return true;
+        }
+        if self.bundle_refused_at_tip.0 == self.state.tip_hash() && self.bundle_refused_at_tip.1.contains_key(id) {
+            return true;
+        }
+        self.last_applied_bundle
+            .is_some_and(|(applied, h, hash)| applied == *id && self.main_chain_hash_at(h) == Some(hash))
+    }
+
+    fn held_bundle(&self, id: &Hash32) -> Option<Vec<u8>> {
+        self.bundle_slot.as_ref().filter(|h| h.id == *id).map(|h| h.bytes.clone())
+    }
+
+    fn bundle_slot_full(&self) -> bool {
+        self.bundle_slot.is_some()
+    }
+
     fn ingest_wire_header(&mut self, header: crate::codec::WireHeader) -> IngestOutcome {
         match header {
             crate::codec::WireHeader::L1(h) => self.ingest_header(h),
@@ -3137,12 +3342,27 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         // header this call just accepted, and the P2P layer caches and relays
         // only on `Accepted`.
         let mut v6_submitted: Option<IngestOutcome> = None;
+        // Lab #785 F5-5b (J1 amended): accepted here on the binding check alone,
+        // so not relayed until applied.
+        let mut v6_off_tip = false;
         let validate_result = if self.sections == BodySections::V6 {
             if header.prev == self.state.tip_hash() {
+                // F5-5b pre-review X4: a bundle costs a proof verification, so
+                // a block carrying one shows its header's work first — a forged
+                // header (no PoW, matching commitment) is refused before the
+                // body rule runs. On a failure the header path names the
+                // refusal exactly as it always has; on success it re-runs below.
+                if !body.bundle.is_empty()
+                    && validate_header_under(&self.chain, &self.pow, &header, self.block_time, self.schedule, &self.rules)
+                        .is_err()
+                {
+                    return self.submit_header(header);
+                }
                 self.state.validate_block_v6(&header, &body, &self.verifier)
             } else if let Err(e) = qlab_devnet::body::check_body_binding_v6(&header, &body) {
                 Err(e)
             } else if self.block_is_settled_history(&header) {
+                v6_off_tip = true;
                 Ok(())
             } else {
                 let submitted = self.submit_header(header);
@@ -3152,6 +3372,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
                         if self.chain.main_chain_hash_at(header.height) == Some(hash) =>
                     {
                         v6_submitted = Some(submitted);
+                        v6_off_tip = true;
                         Ok(())
                     }
                     IngestOutcome::Accepted | IngestOutcome::Duplicate => {
@@ -3249,10 +3470,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         }
         // 2. Header into the consensus chain (PoW / fork-choice) — unless the
         //    V6 off-tip arm already did (F1 above).
-        let outcome = match v6_submitted {
+        let block_hash = header.header_hash_for(self.rules.form);
+        let mut outcome = match v6_submitted {
             Some(outcome) => outcome,
             None => self.submit_header(header),
         };
+        if v6_off_tip && outcome == IngestOutcome::Accepted {
+            if self.relay_after_apply.len() >= MAX_RELAY_MARKS {
+                self.relay_after_apply.clear();
+            }
+            self.relay_after_apply.insert(block_hash);
+            outcome = IngestOutcome::AcceptedNoRelay;
+        }
         // 3. Application is gated on **whether we hold this header**, never on
         //    whether the header was NEW (issue #130 (a)).
         //
@@ -3267,7 +3496,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         //    filed against. `Ignored` is deliberately excluded: a halted release must
         //    not apply above its halt height (#74 H2), and `Orphan`/`Rejected` mean
         //    the header is not in the chain to apply a body against.
-        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Duplicate) {
+        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::AcceptedNoRelay | IngestOutcome::Duplicate) {
             self.buffer_body(header, body);
             self.drain_pending_bodies();
         }
@@ -8438,17 +8667,28 @@ mod tests {
         assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5));
 
         // 4' makes the branch heavier: its body is a main-chain block now, buffered.
-        // Review F1 on PR #792: a NEW main-chain header answers Accepted, so the
-        // P2P layer caches and relays the block.
-        assert_eq!(a.ingest_block(h4x, b4x), IngestOutcome::Accepted);
+        // Review F1 on PR #792: a NEW main-chain header is accepted. Lab #785
+        // F5-5b (J1 amended): accepted on the binding check alone, so NOT
+        // relayed now — `AcceptedNoRelay`, relayed once applied.
+        assert!(a.take_relay_after_apply().is_empty(), "tip blocks relay on ingest, as before");
+        assert_eq!(a.ingest_block(h4x, b4x), IngestOutcome::AcceptedNoRelay);
+        assert!(!IngestOutcome::AcceptedNoRelay.should_relay() && !IngestOutcome::AcceptedNoRelay.is_peer_fault());
         assert_eq!(a.pending_bodies.len(), 1, "4' is a main-chain block: buffered");
         assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5), "3' is still missing");
+        assert!(a.take_relay_after_apply().is_empty(), "not applied, not relayed");
 
         // The refetch of 3' closes the gap: rewind to 2, apply 3' and 4'.
-        assert!(matches!(a.ingest_block(h3x, b3x), IngestOutcome::Duplicate | IngestOutcome::Accepted));
+        assert!(matches!(
+            a.ingest_block(h3x, b3x),
+            IngestOutcome::Duplicate | IngestOutcome::Accepted | IngestOutcome::AcceptedNoRelay
+        ));
         assert_eq!(a.state.tip_hash(), b.state.tip_hash());
         assert_eq!(a.state.tip_height(), 4);
         assert!(a.pending_bodies.is_empty());
+        // Applied, and within the window of the header tip: 4' is relayed now.
+        let relayed: Vec<_> = a.take_relay_after_apply().into_iter().map(|(h, _)| h.header_hash_for(GenesisForm::V5)).collect();
+        assert!(relayed.contains(&h4x.header_hash_for(GenesisForm::V5)), "{relayed:?}");
+        assert!(a.take_relay_after_apply().is_empty(), "relayed once");
     }
 
     /// The template filter (issue #785, (a)): a tx the mempool admitted under

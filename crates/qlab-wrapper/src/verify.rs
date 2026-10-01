@@ -314,6 +314,12 @@ pub fn verify_wrapper<P>(
             return Err(VError::EAboveD);
         }
     }
+    // V5–V7 before any proof (lab #785 F5-5b pre-review X1): they read only
+    // W's PVs and this chain's state, so a genuine but stale or already-applied
+    // bundle — signed, so it reaches here — is refused for microseconds rather
+    // than after a full verification. Every check must pass either way; only
+    // which refusal a multi-fault bundle reports moves.
+    context_checks(b, prev, anchor_ok)?;
     // V1 — F4b: the recursion's per-slot member count.
     if b.members.len() != k {
         return Err(VError::Members);
@@ -361,19 +367,25 @@ pub fn verify_wrapper<P>(
     if sd != wout.f3.sd {
         return Err(VError::Sd);
     }
-    // V5 — stays verifier-side (reading B): threading-in = predecessor's out.
-    thread_check(&win, &prev.out)?;
-    // V6 — stays verifier-side (reading B): the chain link.
-    let w_prev = digest_at(&b.w_pvs, PV_PREV);
-    if w_prev != prev.commitment {
+    Ok(surface_of(b.version, prev.l2_id, &b.w_pvs))
+}
+
+/// V5–V7, the proof-free half of [`verify_wrapper`]: W's in-side threads
+/// onto the predecessor's out (V5), W's `prev` is the predecessor's
+/// commitment (V6), and every absorbed root passes the L1's anchor rule (V7).
+/// Run before any proof, and on its own by a node re-checking a held bundle at
+/// a new tip (the proofs do not change between tips). Expects `w_pvs` already
+/// range-checked (V0).
+pub fn context_checks<P>(b: &Bundle<'_, P>, prev: &Surface, anchor_ok: &dyn Fn(&Digest) -> bool) -> Result<(), VError> {
+    thread_check(&roots_at(&b.w_pvs, 0), &prev.out)?;
+    if digest_at(&b.w_pvs, PV_PREV) != prev.commitment {
         return Err(VError::Prev);
     }
-    // V7 — F5's L1 rule (stub): absorbed roots are genuine recent finalized roots.
     let absorbed: Vec<Digest> = (0..M_ABS).map(|i| digest_at(&b.w_pvs, PV_ABS + 16 * i)).collect();
     if let Some(i) = absorbed.iter().position(|a| !anchor_ok(a)) {
         return Err(VError::Anchor(i));
     }
-    Ok(surface_of(b.version, prev.l2_id, &b.w_pvs))
+    Ok(())
 }
 
 /// V5: W's threading-in values equal the predecessor's out, the first

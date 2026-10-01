@@ -53,6 +53,7 @@ impl<'a> MemberVerifier<&'a Proof<Config>> for ClaimStub {
 }
 
 /// Every transaction the fixture chain carries (none) verifies.
+#[derive(Clone)]
 struct NoTxs;
 impl TxVerifier for NoTxs {
     fn verify_tx(&self, _: &TxEntry) -> bool {
@@ -368,6 +369,102 @@ fn f5_4b_the_proven_bundle_survives_replay_and_snapshot_resume() {
     assert_eq!((resumed.recovery_report().snapshot_height, resumed.recovery_report().replayed_records), (Some(9), 0));
     assert_eq!((resumed.tip_hash(), resumed.wrapper_surface().to_vec(), resumed.last_bundle_height()), live);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lab #785 F5-5b — **the bundle path end to end on the proven fixture**,
+/// over two real `NodeAdapter`s on the fixture rule: before any record the
+/// bundle is not valid at the tip (refused, uncharged); after A finalizes 8
+/// and block 9 carries the record, the operator route admits it on A, A
+/// advertises it, B asks, verifies and holds it, B's template carries it, B
+/// mines block 10 with it and A applies that block over the wire — both
+/// slots clear and both surfaces become the stated one.
+#[test]
+fn f5_5b_the_proven_bundle_through_the_slot_gossip_and_template() {
+    use std::sync::Arc;
+
+    use qlab_devnet::committee::CommitteeState;
+    use qlab_devnet::node::SimConfig;
+    use qlab_devnet::pow::KeccakPow;
+    use qlab_p2p::adapter::NodeAdapter;
+    use qlab_p2p::n1::{BlockIngest, BundleAdmit, ChainView, IngestOutcome};
+    use qlab_p2p::peer::PeerId;
+    use qlab_p2p::transport::{InProcHub, InProcTransport};
+    use qlab_p2p::P2pNode;
+
+    type Node = P2pNode<InProcTransport, NodeAdapter<KeccakPow, NoTxs>>;
+    fn run(nodes: &mut [&mut Node], rounds: u64, base_ms: u64) -> u64 {
+        let mut now = base_ms;
+        for _ in 0..rounds {
+            now += 10;
+            for n in nodes.iter_mut() {
+                n.tick(now);
+            }
+        }
+        now
+    }
+
+    let fx = fixture();
+    let (committee, vs) = validators();
+    let sim = SimConfig { block_time_secs: 2, genesis_difficulty: 8, mine_nonce_budget: 5_000_000, ..SimConfig::default() };
+    let adapter = || {
+        let committee = CommitteeState::new(committee.clone(), qlab_devnet::params_devnet::BOND_AMOUNT);
+        NodeAdapter::new_v6(committee, KeccakPow, NoTxs, sim.clone(), Some(rule().into_setup()))
+    };
+    let hub = InProcHub::new();
+    let mut a: Node = P2pNode::new(InProcTransport::new(PeerId(1), Arc::clone(&hub)), adapter(), [1; 32]);
+    let mut b: Node = P2pNode::new(InProcTransport::new(PeerId(2), Arc::clone(&hub)), adapter(), [2; 32]);
+    hub.link(PeerId(1), PeerId(2));
+    a.add_peer(PeerId(2), None);
+    b.add_peer(PeerId(1), None);
+    let mut now = run(&mut [&mut a, &mut b], 50, 0);
+    assert_eq!(
+        a.node().state().commitment_root(),
+        chain_to_8().commitment_root(),
+        "the fixture absorbed the root this chain records"
+    );
+
+    for _ in 0..8 {
+        let (h, body) = a.node_mut().mine_block().expect("mine");
+        assert_eq!(a.node_mut().ingest_block(h, body.clone()), IngestOutcome::Accepted);
+        assert_eq!(b.node_mut().ingest_block(h, body), IngestOutcome::Accepted);
+    }
+    assert!(
+        matches!(a.submit_bundle(fx.wire.clone(), false), BundleAdmit::Refused { charged: false, .. }),
+        "no record covers the absorbed root yet: V7 is this node's judgment, not the sender's fault"
+    );
+    assert!(a.node().held_bundle_slot().is_none());
+
+    let hash8 = a.node().main_chain_hash_at(8).expect("height 8");
+    let cp8 = Checkpoint::new(8, hash8, hash8);
+    a.announce_checkpoint(cp8, (0..15).map(|i| vs[i].sign_checkpoint(&cp8)).collect());
+    let (h9, body9) = a.node_mut().mine_block().expect("mine 9");
+    assert!(!body9.finality.is_empty() && body9.bundle.is_empty(), "block 9 carries the record, no bundle");
+    assert_eq!(a.announce_block_body(h9, body9, 1), IngestOutcome::Accepted);
+    now = run(&mut [&mut a, &mut b], 200, now);
+    assert_eq!(b.node().tip_height(), 9);
+
+    assert!(matches!(a.submit_bundle(fx.wire.clone(), false), BundleAdmit::Admitted(_)), "the operator route");
+    now = run(&mut [&mut a, &mut b], 200, now);
+    assert_eq!(b.node().held_bundle_slot().map(|h| h.bytes.clone()), Some(fx.wire.clone()), "gossiped and verified on B");
+
+    let (h10, body10) = b.node_mut().mine_block().expect("mine 10");
+    assert_eq!(body10.bundle, fx.wire, "B's template carries the held bundle");
+    assert_eq!(b.announce_block_body(h10, body10, 2), IngestOutcome::Accepted);
+    run(&mut [&mut a, &mut b], 300, now);
+    assert_eq!((a.node().tip_height(), a.node().tip_hash()), (10, b.node().tip_hash()), "A applied B's bundle block");
+    let stated = WireBundle::decode(&fx.wire).unwrap().stated_surface().unwrap();
+    for n in [&a, &b] {
+        assert!(n.node().held_bundle_slot().is_none(), "a bundle block clears the slot");
+        assert_eq!(n.node().state().wrapper_surface(), &encode_surface(&stated)[..]);
+        assert_eq!(n.node().state().last_bundle_height(), Some(10));
+    }
+    // Pre-review X1: the applied bundle replayed is refused on the chain
+    // context (spacing, threading, the link) — never by a proof — and uncharged.
+    let replay = a.submit_bundle(fx.wire.clone(), false);
+    assert!(
+        matches!(&replay, BundleAdmit::Refused { charged: false, reason } if !reason.contains("WProof") && !reason.contains("Member")),
+        "{replay:?}"
+    );
 }
 
 /// F-A (lab #785 F5-4a): the node's V6 genesis registry is the registry

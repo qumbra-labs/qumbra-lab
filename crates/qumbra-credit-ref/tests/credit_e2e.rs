@@ -84,6 +84,7 @@ fn rig(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
         discovery_addr: None,
         miner_rkm: None,
         template_serving: false,
+        operator_addr: None,
     };
     (config, genesis, base)
 }

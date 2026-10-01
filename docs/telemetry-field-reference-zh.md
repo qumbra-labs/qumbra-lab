@@ -1144,7 +1144,7 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 
 **在 `/metrics` 上**是 `qumbra_unknown_msg_type_total` 与 `qumbra_unknown_inv_kind_total`，
 同样这两个数。另有 `WIRE` 日志行，在**首次**看到某个不认识的类型码时把它写出来
-（`WIRE event=unknown_type type=0x0044 … action=ignored scored=no`），每进程最多 8 个不同
+（`WIRE event=unknown_type type=0x0045 … action=ignored scored=no`），每进程最多 8 个不同
 的码，因此它自身无法被灌爆 —— 之后计数照常继续，只是不再叙述。
 
 **何时升级：** 单独永不。没有升级在进行时左边的数在涨，作为发现上报。

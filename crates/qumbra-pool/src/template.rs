@@ -51,6 +51,9 @@ pub struct TemplateBody {
     /// [`BodySections::V6`] when the template came from a V6 node. It keys
     /// the payee cap (V6: 1) and is echoed on submit.
     pub sections: qlab_devnet::forms::BodySections,
+    /// The node's L2 bundle id on a V6 net (lab #785 F5-5b), opaque here and
+    /// echoed on submit; the node reattaches the bytes. Empty when none.
+    pub bundle_id: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

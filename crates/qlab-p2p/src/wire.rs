@@ -109,6 +109,11 @@ pub enum MsgType {
     GetBlockTxn = 0x0042,
     /// The requested transactions.
     BlockTxn = 0x0043,
+
+    // --- the wrapper bundle (lab #785 F5-5b) ---
+    /// A wrapper bundle's canonical bytes, answering `GetData(Bundle)`. Sent
+    /// only on a V6 net, where every node is an F5-5b build.
+    Bundle = 0x0044,
 }
 
 impl MsgType {
@@ -136,6 +141,7 @@ impl MsgType {
             0x0041 => BlockAnnounce,
             0x0042 => GetBlockTxn,
             0x0043 => BlockTxn,
+            0x0044 => Bundle,
             _ => return None,
         })
     }

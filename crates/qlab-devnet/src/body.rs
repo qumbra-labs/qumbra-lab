@@ -1247,6 +1247,15 @@ pub trait BundleVerifier {
     /// it (every applied bundle was folded, so its stated surface is the one
     /// the chain moved to).
     fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, BundleRefusal>;
+    /// **The re-check** (lab #785 F5-5b, pre-review X5): would `bundle`,
+    /// which [`Self::verify_bundle`] already accepted against an earlier tip,
+    /// still be accepted in the block `header` heads? Only the chain-relative
+    /// checks can change between tips (spacing, threading, the link, the
+    /// anchors); a rule whose proofs and signature do not depend on the tip
+    /// overrides this to skip them. The default is the whole rule.
+    fn recheck_bundle(&self, header: &BlockHeader, bundle: &[u8], ctx: &BundleContext<'_>) -> Result<(), BundleRefusal> {
+        self.verify_bundle(header, bundle, ctx).map(|_| ())
+    }
 }
 
 /// A V6 net's wrapper chain as a node carries it (lab #785 F5-4b): the rule

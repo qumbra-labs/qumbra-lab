@@ -228,8 +228,13 @@ pub(crate) mod tests {
         assert_eq!(verify_wrapper(&bundle(c), &other, &Stub, ANY).unwrap_err(), VError::Version, "(h) a bundle version the chain is not on");
         let mut other = c.prev.clone();
         other.l2_id = STUB_L2_ID + 1;
+        // The commitment binds l2_id, so since F5-5b's X1 (V6 before the
+        // proofs) the chain link refuses another chain's surface first…
+        let unlinked = other.clone();
         other.commitment = Surface::commit(other.version, other.l2_id, &other.prev, &other.out, &other.newest_anchor, &other.exit_cmt);
-        assert_eq!(verify_wrapper(&bundle(c), &other, &Stub, ANY).unwrap_err(), VError::Member(0, "wrong l2_id".into()), "(h) another chain's l2_id");
+        assert_eq!(verify_wrapper(&bundle(c), &other, &Stub, ANY).unwrap_err(), VError::Prev, "(h) another chain's l2_id: V6");
+        // …and with the link held, V2 still refuses a member for the wrong l2_id.
+        assert_eq!(verify_wrapper(&bundle(c), &unlinked, &Stub, ANY).unwrap_err(), VError::Member(0, "wrong l2_id".into()), "(h) another chain's l2_id: V2");
 
         // V8: E_cum above D_cum on W's out (checked before the proof).
         let mut b = bundle(c);
@@ -241,6 +246,16 @@ pub(crate) mod tests {
         let absorbed0 = digest_at(&c.bundle_pvs, PV_ABS);
         let not_first: &dyn Fn(&Digest) -> bool = &move |a| *a != absorbed0;
         assert_eq!(verify_wrapper(&bundle(c), &c.prev, &Stub, not_first).unwrap_err(), VError::Anchor(0));
+
+        // F5-5b X1: the context checks run before any proof — a bundle with a
+        // broken W proof AND a stale predecessor (or an unrecorded anchor)
+        // reports the context refusal, so a replayed bundle costs no verify.
+        let mut b = bundle(c);
+        b.w_pvs[PV_SIDE + PV_C] ^= 1;
+        assert_eq!(verify_wrapper(&b, &ahead, &Stub, ANY).unwrap_err(), VError::Prev, "stale prev before V3");
+        assert_eq!(verify_wrapper(&b, &c.prev, &Stub, not_first).unwrap_err(), VError::Anchor(0), "anchor before V3");
+        assert_eq!(context_checks(&bundle(c), &c.prev, ANY), Ok(()), "the honest bundle's context half");
+        assert_eq!(context_checks(&bundle(c), &ahead, ANY), Err(VError::Prev));
     }
 
     /// V9, the deposit-sum proof (review S3; conditions (o), (p)). Every

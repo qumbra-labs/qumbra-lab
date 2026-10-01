@@ -64,6 +64,13 @@ pub(crate) fn coinbase_payees_weight(payees: &[CoinbasePayee]) -> usize {
 pub enum IngestOutcome {
     /// New and accepted into node state.
     Accepted,
+    /// **Accepted, but not to be relayed now** (lab #785 F5-5b, ruling J1 as
+    /// amended): a V6 block off this node's applied tip — on the winning
+    /// branch, or settled history — whose body is buffered on the binding
+    /// check alone. Relayed only once applied
+    /// ([`BlockIngest::take_relay_after_apply`]): at up to 16 MB a body, an
+    /// unchecked relay is the cheap side. Not a peer fault.
+    AcceptedNoRelay,
     /// Already known; no state change (do not re-relay).
     Duplicate,
     /// Well-formed but its parent/context is missing — caller should sync it.
@@ -99,6 +106,21 @@ pub enum IngestOutcome {
     /// the inability has to be a fact this node computes **about itself**, from its own
     /// numbers. "The sender told me I am syncing" is not a member and never can be.
     Ignored(&'static str),
+}
+
+/// The answer to a bundle offered for the producer's slot (lab #785 F5-5b).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BundleAdmit {
+    /// Admitted; its id (keccak of the bytes).
+    Admitted(Hash32),
+    /// The slot holds another bundle: first wins (Q-5-4). Not a fault.
+    SlotHeld,
+    /// Refused by the rule at this node's tip. `charged` is whether the
+    /// refusal reads the bytes alone — the sender's fault (Q-5b-2) — or was
+    /// judged against this node's surface or tip, which charges no one.
+    Refused { charged: bool, reason: String },
+    /// This node keeps no bundle slot (not a V6 node).
+    Unsupported,
 }
 
 impl IngestOutcome {
@@ -413,6 +435,40 @@ pub trait BlockIngest {
             crate::codec::WireHeader::L1(h) => self.ingest_block(h, body),
             crate::codec::WireHeader::Sealed(_) => IngestOutcome::Ignored(SEALED_UNSERVED_REASON),
         }
+    }
+
+    /// Blocks accepted as [`IngestOutcome::AcceptedNoRelay`] that have since
+    /// been applied and are now to be relayed, drained by the caller (lab #785
+    /// F5-5b). Default: none.
+    fn take_relay_after_apply(&mut self) -> Vec<(BlockHeader, BlockBody)> {
+        Vec::new()
+    }
+
+    /// Offer a wrapper bundle for the producer's one-slot pool (lab #785
+    /// F5-5b): verified at the applied tip, first wins; `replace` is honoured
+    /// only for the operator route. Default: no slot.
+    fn admit_bundle(&mut self, _bytes: Vec<u8>, _replace: bool) -> BundleAdmit {
+        BundleAdmit::Unsupported
+    }
+
+    /// The held bundle's bytes when its id is `id` (serving a `GetData`).
+    fn held_bundle(&self, _id: &Hash32) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Whether the slot holds a bundle — first wins, so a full slot asks
+    /// for no other (lab #785 F5-5b).
+    fn bundle_slot_full(&self) -> bool {
+        false
+    }
+
+    /// Whether a peer's advert of bundle `id` is not worth an ask (F5-5b
+    /// pre-review X3): it is the held one, it was refused on its bytes, it
+    /// was refused at this tip, or it is the bundle the last applied bundle
+    /// block on the main chain carried. Not "seen": a bundle lost in a reorg
+    /// and re-posted must propagate again.
+    fn bundle_not_wanted(&self, _id: &Hash32) -> bool {
+        false
     }
 }
 

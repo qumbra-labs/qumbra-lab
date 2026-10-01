@@ -1369,7 +1369,7 @@ change is safe to roll".
 **On `/metrics`** as `qumbra_unknown_msg_type_total` and
 `qumbra_unknown_inv_kind_total`, the same two numbers. There is also a `WIRE`
 journal line naming each distinct unknown type code the **first** time it is
-seen (`WIRE event=unknown_type type=0x0044 … action=ignored scored=no`), capped
+seen (`WIRE event=unknown_type type=0x0045 … action=ignored scored=no`), capped
 at 8 distinct codes per process so it cannot itself be flooded — the count keeps
 going after that, only the narration stops.
 

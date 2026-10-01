@@ -859,6 +859,49 @@ pub trait NodeState {
     fn is_valid_anchor(&self, root: &Hash32) -> bool;
 }
 
+/// The installed bundle rule behind [`Node`]'s one-slot validated-outcome
+/// cache (lab #785 F5-5b): `verify_bundle` for `key` returns the cached
+/// outcome once and otherwise verifies and caches; folding and the stated
+/// surface pass straight through.
+struct CachedRule<'a> {
+    inner: &'a dyn qlab_devnet::body::BundleVerifier,
+    cache: &'a std::sync::Mutex<Option<(Hash32, Hash32, qlab_devnet::body::BundleOutcome)>>,
+    key: (Hash32, Hash32),
+}
+
+impl qlab_devnet::body::BundleVerifier for CachedRule<'_> {
+    fn verify_bundle(
+        &self,
+        header: &BlockHeader,
+        bundle: &[u8],
+        ctx: &qlab_devnet::body::BundleContext<'_>,
+    ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+        // The lock is held only to read or write the slot, never across the
+        // verification (F5-5b pre-review X7), and a poisoned lock is recovered
+        // rather than propagated: the slot is a cache, so the worst a panic
+        // mid-write leaves behind is a miss.
+        let held = self.cache.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((b, p, outcome)) = held {
+            if (b, p) == self.key {
+                return Ok(outcome);
+            }
+        }
+        let outcome = self.inner.verify_bundle(header, bundle, ctx)?;
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.key.0, self.key.1, outcome.clone()));
+        Ok(outcome)
+    }
+    fn fold_bundle(
+        &self,
+        surface: &[u8],
+        bundle: &[u8],
+    ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+        self.inner.fold_bundle(surface, bundle)
+    }
+    fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, qlab_devnet::body::BundleRefusal> {
+        self.inner.bundle_surface(bundle)
+    }
+}
+
 /// A full node: chain store + commitment tree + nullifier set, plus the anchor
 /// index and optional disk durability.
 pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
@@ -918,6 +961,15 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// The wrapper chain's rule and origin (lab #785 F5-4b) — `Some` on a V6
     /// node built with `WrapperParams`; installed with committee₀.
     wrapper: Option<qlab_devnet::body::WrapperSetup>,
+    /// **The validated-outcome cache** (lab #785 F5-5b, plan item 7): one slot,
+    /// `(block hash, parent hash) → BundleOutcome`, filled when the tip-path
+    /// [`Node::validate_block_v6`] verifies a bundle and taken by the next
+    /// verification of the same block on the same parent — the ingest check
+    /// and `apply_block_gated`'s re-check — so a tip block's proofs verify once.
+    /// Sound because the V6 funnel reads only the block's own ancestry: the
+    /// same block on the same parent has the same verdict. Cleared on rewind;
+    /// replay folds and never verifies, so it never reads this.
+    bundle_cache: std::sync::Mutex<Option<(Hash32, Hash32, qlab_devnet::body::BundleOutcome)>>,
     /// The wrapper chain's surface after the applied tip, canonical bytes
     /// (opaque: only the rule decodes them). The genesis surface until the
     /// first bundle; empty on a node with no wrapper. Derived state, folded
@@ -1720,6 +1772,8 @@ impl MemNode {
     /// byte-identical to what it was, and every consumer of "have I applied this"
     /// still reads the applied store.
     pub fn rewind_to(&mut self, target: Hash32) -> Result<RewindReport, NodeError> {
+        // F5-5b: a verdict cached at the old tip is not one at the new tip.
+        *self.bundle_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let from_height = self.chain.tip_height();
         let from_hash = self.chain.tip_hash();
         if from_hash == target {
@@ -1877,6 +1931,7 @@ impl MemNode {
             committee0: None,
             recorded: BTreeMap::new(),
             wrapper: None,
+            bundle_cache: std::sync::Mutex::new(None),
             surface: Vec::new(),
             last_bundle_height: None,
             annulet_fees: None,
@@ -2154,11 +2209,68 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         assert_eq!(header.prev, self.chain.tip_hash(), "a V6 verdict is defined only at the tip");
         let view = V6View { node: self, block_height: header.height };
         // Condition (b): with no wrapper rule every bundle is refused.
-        let bundles: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
+        let inner: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
             Some(w) => &*w.rule,
             None => &qlab_devnet::body::RefuseAllBundles,
         };
-        qlab_devnet::body::validate_body_v6(header, body, verifier, &view, bundles, &self.names)
+        let cached = CachedRule {
+            inner,
+            cache: &self.bundle_cache,
+            key: (header.header_hash_for(self.form), header.prev),
+        };
+        qlab_devnet::body::validate_body_v6(header, body, verifier, &view, &cached, &self.names)
+    }
+
+    /// **Verify a bundle as if carried by the next block on the applied tip**
+    /// (lab #785 F5-5b — the producer's slot admission and its re-check at a
+    /// new tip): the installed rule (never the cache), the tip's wrapper
+    /// surface and last bundle height, spacing at `tip + 1`, and V7 under the
+    /// tip's recorded finality — conservative, since the next block's own
+    /// record can only widen it; the block that carries it is judged in full
+    /// when applied. With no wrapper rule every bundle is refused.
+    pub fn verify_bundle_at_tip(
+        &self,
+        bundle: &[u8],
+    ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+        self.judge_bundle_at_tip(bundle, |rule, header, bundle, ctx| rule.verify_bundle(header, bundle, ctx))
+    }
+
+    /// [`Self::verify_bundle_at_tip`]'s re-check form (F5-5b pre-review X5):
+    /// the same context, through [`qlab_devnet::body::BundleVerifier::recheck_bundle`]
+    /// — for a bundle already verified at an earlier tip, only the checks a
+    /// new tip can change.
+    pub fn recheck_bundle_at_tip(&self, bundle: &[u8]) -> Result<(), qlab_devnet::body::BundleRefusal> {
+        self.judge_bundle_at_tip(bundle, |rule, header, bundle, ctx| rule.recheck_bundle(header, bundle, ctx))
+    }
+
+    fn judge_bundle_at_tip<R>(
+        &self,
+        bundle: &[u8],
+        judge: impl FnOnce(
+            &dyn qlab_devnet::body::BundleVerifier,
+            &BlockHeader,
+            &[u8],
+            &qlab_devnet::body::BundleContext<'_>,
+        ) -> Result<R, qlab_devnet::body::BundleRefusal>,
+    ) -> Result<R, qlab_devnet::body::BundleRefusal> {
+        use qlab_devnet::body::V6ChainView as _;
+        assert_eq!(self.sections, BodySections::V6, "verify_bundle_at_tip on a non-V6 node");
+        let rule: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
+            Some(w) => &*w.rule,
+            None => &qlab_devnet::body::RefuseAllBundles,
+        };
+        let parent = self.chain.block(&self.chain.tip_hash()).expect("the tip is held").header();
+        let header = BlockHeader::child_of_for(self.form, &parent, parent.timestamp, parent.difficulty, [0; 32]);
+        let view = V6View { node: self, block_height: header.height };
+        let recorded = view.recorded_finality();
+        let anchor_ok =
+            |root: &Hash32| qlab_devnet::body::v6_anchor_ok(view.root_heights(root), header.height, recorded);
+        let ctx = qlab_devnet::body::BundleContext {
+            surface: view.wrapper_surface(),
+            last_bundle_height: view.last_bundle_height(),
+            anchor_ok: &anchor_ok,
+        };
+        judge(rule, &header, bundle, &ctx)
     }
 
     /// Would `record` pass the V6 record rule in the **next** block on this
@@ -4143,6 +4255,93 @@ mod tests {
             genesis_surface: 0u64.to_le_bytes().to_vec(),
         };
         V6Setup { committee0: v6_validators().0.clone(), wrapper: Some(wrapper) }
+    }
+
+/// [`CounterRule`] counting its `verify_bundle` calls (lab #785 F5-5b).
+    struct CountingRule(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl qlab_devnet::body::BundleVerifier for CountingRule {
+        fn verify_bundle(
+            &self,
+            header: &BlockHeader,
+            bundle: &[u8],
+            ctx: &qlab_devnet::body::BundleContext<'_>,
+        ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CounterRule.verify_bundle(header, bundle, ctx)
+        }
+        fn fold_bundle(&self, surface: &[u8], bundle: &[u8]) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+            CounterRule.fold_bundle(surface, bundle)
+        }
+        fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, qlab_devnet::body::BundleRefusal> {
+            CounterRule.bundle_surface(bundle)
+        }
+    }
+
+    /// Lab #785 F5-5b (item 7): a tip block's proofs verify once — the
+    /// ingest-time check and the apply-time re-check of the same block on the
+    /// same parent share one `verify_bundle`; a cached verdict for another
+    /// block, or a rewind, is not reused.
+    #[test]
+    fn a_tip_bundle_block_is_verified_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let setup = V6Setup {
+            committee0: v6_validators().0.clone(),
+            wrapper: Some(qlab_devnet::body::WrapperSetup {
+                rule: std::sync::Arc::new(CountingRule(calls.clone())),
+                genesis_surface: 0u64.to_le_bytes().to_vec(),
+            }),
+        };
+        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), setup);
+        let n = || calls.load(Ordering::SeqCst);
+        // Validated at ingest, then applied: one verification.
+        let g = node.chain.block(&node.tip_hash()).unwrap().header();
+        let (h1, b1) = bundle_block(&g, Some(5));
+        node.validate_block_v6(&h1, &b1, &MockVerifier).unwrap();
+        node.apply_block(h1, b1, &MockVerifier).unwrap();
+        assert_eq!(n(), 1, "the apply re-check took the cached verdict");
+        // Applied with no prior check: one verification.
+        let mut parent = h1;
+        for _ in 0..2 {
+            let (h, b) = bundle_block(&parent, None);
+            node.apply_block(h, b, &MockVerifier).unwrap();
+            parent = h;
+        }
+        let (h4, b4) = bundle_block(&parent, Some(9));
+        node.apply_block(h4, b4, &MockVerifier).unwrap();
+        assert_eq!(n(), 2);
+        // Two candidates checked at one tip; applying the first misses (the
+        // slot holds the second) and verifies again.
+        let mut parent = h4;
+        for _ in 0..2 {
+            let (h, b) = bundle_block(&parent, None);
+            node.apply_block(h, b, &MockVerifier).unwrap();
+            parent = h;
+        }
+        let (hx, bx) = bundle_block(&parent, Some(12));
+        let (hy, by) = bundle_block(&parent, Some(13));
+        node.validate_block_v6(&hx, &bx, &MockVerifier).unwrap();
+        node.validate_block_v6(&hy, &by, &MockVerifier).unwrap();
+        assert_eq!(n(), 4);
+        node.apply_block(hx, bx, &MockVerifier).unwrap();
+        assert_eq!(n(), 5, "a cached verdict for another block is not reused");
+        // A rewind clears it: re-checking a block validated before the rewind
+        // verifies again.
+        let tip = node.tip_hash();
+        let (hz, bz) = {
+            let mut p = node.chain.block(&tip).unwrap().header();
+            for _ in 0..2 {
+                let (h, b) = bundle_block(&p, None);
+                node.apply_block(h, b, &MockVerifier).unwrap();
+                p = h;
+            }
+            bundle_block(&p, Some(20))
+        };
+        node.validate_block_v6(&hz, &bz, &MockVerifier).unwrap();
+        assert_eq!(n(), 6);
+        node.rewind_to(hz.prev).unwrap(); // a no-op target: still clears
+        node.validate_block_v6(&hz, &bz, &MockVerifier).unwrap();
+        assert_eq!(n(), 7, "the rewind cleared the slot");
     }
 
     fn bundle_block(parent: &BlockHeader, bundle: Option<u64>) -> (BlockHeader, BlockBody) {

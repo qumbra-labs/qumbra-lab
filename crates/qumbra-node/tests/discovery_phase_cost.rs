@@ -332,6 +332,7 @@ fn a_discovery_refresh_on_an_unchanged_tip_copies_nothing() {
         discovery_addr: None,
         miner_rkm: None,
         template_serving: false,
+        operator_addr: None,
     };
     let mut node =
         RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
