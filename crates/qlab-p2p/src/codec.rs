@@ -757,6 +757,8 @@ pub enum InvKind {
     Block = 2,
     Checkpoint = 3,
     // 4 = CheckpointVotes — reserved (direct-push relay; see the type doc).
+    /// A wrapper bundle, by keccak of its bytes (lab #785 F5-5b; V6 only).
+    Bundle = 5,
 }
 
 impl InvKind {
@@ -768,6 +770,7 @@ impl InvKind {
             1 => InvKind::Tx,
             2 => InvKind::Block,
             3 => InvKind::Checkpoint,
+            5 => InvKind::Bundle,
             _ => return None,
         })
     }

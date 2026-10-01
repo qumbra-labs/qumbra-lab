@@ -2217,6 +2217,37 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         qlab_devnet::body::validate_body_v6(header, body, verifier, &view, &cached, &self.names)
     }
 
+    /// **Verify a bundle as if carried by the next block on the applied tip**
+    /// (lab #785 F5-5b — the producer's slot admission and its re-check at a
+    /// new tip): the installed rule (never the cache), the tip's wrapper
+    /// surface and last bundle height, spacing at `tip + 1`, and V7 under the
+    /// tip's recorded finality — conservative, since the next block's own
+    /// record can only widen it; the template re-verifies under the block it
+    /// builds. With no wrapper rule every bundle is refused.
+    pub fn verify_bundle_at_tip(
+        &self,
+        bundle: &[u8],
+    ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+        use qlab_devnet::body::V6ChainView as _;
+        assert_eq!(self.sections, BodySections::V6, "verify_bundle_at_tip on a non-V6 node");
+        let rule: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
+            Some(w) => &*w.rule,
+            None => &qlab_devnet::body::RefuseAllBundles,
+        };
+        let parent = self.chain.block(&self.chain.tip_hash()).expect("the tip is held").header();
+        let header = BlockHeader::child_of_for(self.form, &parent, parent.timestamp, parent.difficulty, [0; 32]);
+        let view = V6View { node: self, block_height: header.height };
+        let recorded = view.recorded_finality();
+        let anchor_ok =
+            |root: &Hash32| qlab_devnet::body::v6_anchor_ok(view.root_heights(root), header.height, recorded);
+        let ctx = qlab_devnet::body::BundleContext {
+            surface: view.wrapper_surface(),
+            last_bundle_height: view.last_bundle_height(),
+            anchor_ok: &anchor_ok,
+        };
+        rule.verify_bundle(&header, bundle, &ctx)
+    }
+
     /// Would `record` pass the V6 record rule in the **next** block on this
     /// node's applied tip (lab #785 ruling Q3)? The miner's self-check: a
     /// record that fails it is omitted, never included. Same view, same

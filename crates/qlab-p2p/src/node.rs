@@ -176,7 +176,7 @@ fn hex32(h: &Hash32) -> String {
 ///
 /// The counter says *that* a newer peer is talking; the journal line says *what*
 /// it is speaking, which is the difference between "something is off" and "node1
-/// is sending 0x0044". But one line per frame would be the flooding channel this
+/// is sending 0x0045". But one line per frame would be the flooding channel this
 /// baton is supposed to close — at the inbound frame budget
 /// ([`crate::ratelimit::MSG_REFILL_PER_SEC`] = 64/s per rate key) that is 64
 /// lines/s/peer of attacker-chosen text into the operator's log.
@@ -366,6 +366,16 @@ pub const fn body_window_for(lag: u64, sections: qlab_devnet::forms::BodySection
         MAX_BODIES_IN_FLIGHT_CATCHUP
     }
 }
+
+/// **One bundle admitted from a peer per this many blocks** (lab #785 F5-5b,
+/// the ruling's per-peer limit): the wrapper's spacing (`WRAPPER_SPACING_BLOCKS_V1`
+/// = 48). A peer cannot make this node verify bundles faster than the chain
+/// can carry them. `[devnet-placeholder]`.
+pub const BUNDLE_PEER_WINDOW_BLOCKS: u64 = 48;
+
+/// How long an unanswered bundle ask is held (lab #785 F5-5b).
+/// `[devnet-placeholder]`.
+pub const BUNDLE_ASK_TIMEOUT_MS: u64 = 60_000;
 
 /// **The catch-up window on a V6 net** (lab #785 F5-5b, Q-5b-3).
 /// `[devnet-placeholder]`.
@@ -747,6 +757,13 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// peer cannot serve is not a welshed inv, and without this set there is no way
     /// to tell those two apart.
     body_reqs: HashMap<Hash32, BodyReq>,
+    /// **The bundle asked of each peer, and when** (lab #785 F5-5b): at most one
+    /// in flight per peer; an answer must match it, and an ask unanswered past
+    /// [`BUNDLE_ASK_TIMEOUT_MS`] is forgotten.
+    bundle_asks: HashMap<PeerId, (Hash32, u64)>,
+    /// The tip height at which each peer last had a bundle admitted from it:
+    /// at most one per [`BUNDLE_PEER_WINDOW_BLOCKS`].
+    bundle_admitted_at: HashMap<PeerId, u64>,
     /// **What each body request has been answered with, and for how long it has
     /// been wanted** (issue #229) — observation only, never read by any decision.
     ///
@@ -870,6 +887,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             addrs: AddrManager::new(),
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
+            bundle_asks: HashMap::new(),
+            bundle_admitted_at: HashMap::new(),
             body_asks: HashMap::new(),
             body_declines: HashMap::new(),
             body_rr: 0,
@@ -1653,6 +1672,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // Lab #785 F5-5b (J1 amended): blocks accepted off the tip without
         // relay, and applied since.
         self.relay_applied_blocks();
+        self.bundle_asks.retain(|_, (_, at)| now_ms.saturating_sub(*at) < BUNDLE_ASK_TIMEOUT_MS);
         // Ask for a recent finalized checkpoint before the first header request.
         // An honest peer then queues the quorum evidence ahead of its Headers
         // response, letting a fresh joiner establish the checkpoint before it
@@ -2146,7 +2166,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 self.send(from, MsgType::Addr, crate::peer::encode_addrs(&addrs));
             }
             MsgType::Addr => self.on_addr(from, &env.payload),
-            MsgType::Inv => self.on_inv(from, &env.payload),
+            MsgType::Inv => self.on_inv(from, &env.payload, now_ms),
+            MsgType::Bundle => self.on_bundle(from, &env.payload),
             MsgType::GetData => self.on_getdata(from, &env.payload, key, now_ms),
             MsgType::NotFound => self.on_not_found(from, &env.payload),
             MsgType::Tx => self.on_tx(from, &env.payload),
@@ -2242,7 +2263,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     // --- inventory gossip ---
 
-    fn on_inv(&mut self, from: PeerId, payload: &[u8]) {
+    fn on_inv(&mut self, from: PeerId, payload: &[u8], now_ms: u64) {
         let inv = match decode_inv(payload) {
             Ok(i) => i,
             Err(_) => {
@@ -2259,6 +2280,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             if self.already_have(&it) {
                 continue;
             }
+            // Lab #785 F5-5b: a bundle is asked for only on a V6 net, one at a
+            // time per peer, and at most once per window per peer.
+            if it.kind == InvKind::Bundle && !self.may_ask_bundle(from) {
+                continue;
+            }
+            if it.kind == InvKind::Bundle {
+                self.bundle_asks.insert(from, (it.id, now_ms));
+            }
             want.push(it);
         }
         if !want.is_empty() {
@@ -2271,7 +2300,58 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             InvKind::Tx => self.node.has_tx(&it.id) || self.seen.contains(&it.id),
             InvKind::Block => self.node.has_header(&it.id) || self.seen.contains(&it.id),
             InvKind::Checkpoint => self.node.has_checkpoint(&it.id) || self.seen.contains(&it.id),
+            InvKind::Bundle => self.node.held_bundle(&it.id).is_some() || self.seen.contains(&it.id),
         }
+    }
+
+    /// Whether this node may ask `from` for a bundle now (lab #785 F5-5b).
+    fn may_ask_bundle(&self, from: PeerId) -> bool {
+        self.node.wire_form().sections == qlab_devnet::forms::BodySections::V6
+            && !self.node.bundle_slot_full()
+            && !self.bundle_asks.contains_key(&from)
+            && self
+                .bundle_admitted_at
+                .get(&from)
+                .is_none_or(|at| self.node.tip_height() >= at + BUNDLE_PEER_WINDOW_BLOCKS)
+    }
+
+    /// A bundle answering our ask (lab #785 F5-5b). Unasked or mismatched
+    /// bytes are dropped uncharged (an ask may have timed out). Admitted: seen
+    /// and relayed onward, never to its sender. Refused: charged only when the
+    /// refusal reads the bytes alone (Q-5b-2).
+    fn on_bundle(&mut self, from: PeerId, payload: &[u8]) {
+        let id = qlab_devnet::hash::keccak256(payload);
+        match self.bundle_asks.get(&from) {
+            Some((asked, _)) if *asked == id => {
+                self.bundle_asks.remove(&from);
+            }
+            _ => return,
+        }
+        match self.node.admit_bundle(payload.to_vec(), false) {
+            crate::n1::BundleAdmit::Admitted(id) => {
+                self.seen.insert(id);
+                self.bundle_admitted_at.insert(from, self.node.tip_height());
+                self.relay_inv(InvItem { kind: InvKind::Bundle, id }, Some(from));
+            }
+            crate::n1::BundleAdmit::Refused { charged: true, .. } => {
+                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            }
+            crate::n1::BundleAdmit::Refused { charged: false, .. }
+            | crate::n1::BundleAdmit::SlotHeld
+            | crate::n1::BundleAdmit::Unsupported => {}
+        }
+    }
+
+    /// **The operator route's admission** (lab #785 F5-5b, `POST /v1/bundle`):
+    /// the slot's rule with `replace` honoured, and on admission the bundle is
+    /// advertised to every ready peer.
+    pub fn submit_bundle(&mut self, bytes: Vec<u8>, replace: bool) -> crate::n1::BundleAdmit {
+        let verdict = self.node.admit_bundle(bytes, replace);
+        if let crate::n1::BundleAdmit::Admitted(id) = &verdict {
+            self.seen.insert(*id);
+            self.relay_inv(InvItem { kind: InvKind::Bundle, id: *id }, None);
+        }
+        verdict
     }
 
     /// A peer telling us it cannot serve something we asked for.
@@ -2320,10 +2400,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // hook may REMOVE an entry from it (releasing the slot for an immediate
         // re-ask). Decide "was this an ask of ours" first, on the pre-decline
         // state, or the release would turn an honest `NotFound` into a welsh.
-        let welshed = inv
-            .items
-            .iter()
-            .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id));
+        // Lab #785 F5-5b: a bundle the peer advertised and has since cleared
+        // from its slot (applied, or no longer verifying) is an honest `NotFound`.
+        if inv.items.iter().any(|it| it.kind == InvKind::Bundle) {
+            self.bundle_asks.remove(&from);
+        }
+        let welshed = inv.items.iter().any(|it| {
+            it.kind != InvKind::Bundle && !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id)
+        });
         for it in &inv.items {
             self.note_body_answer(&it.id, from, BodyAnswer::DontHave);
             // Lab #427: same release-and-re-route as the header-only answer —
@@ -2499,6 +2583,17 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // unchanged `try_finalize` re-verifies roster membership, every
                 // signature and the count against quorum before anything moves.
                 // Nothing here can make a peer's claim load-bearing.
+                // Lab #785 F5-5b: the held bundle, against the same serve
+                // byte budget as bodies; one no longer held is `NotFound`
+                // (the asker does not charge a bundle `NotFound`).
+                InvKind::Bundle => match self.node.held_bundle(&it.id) {
+                    Some(bytes) => {
+                        if self.limiter.may_serve_body_bytes(key.clone(), bytes.len() as u64, now_ms) {
+                            self.send(from, MsgType::Bundle, bytes);
+                        }
+                    }
+                    None => not_found.push(it),
+                },
                 InvKind::Checkpoint => match checkpoint_query_height(&it.id) {
                     Some(at_or_below) => {
                         // The amplifier gate (#91's shape): a 45 B request against a
@@ -4449,11 +4544,12 @@ mod tests {
         let (mut n0, peer, _hub) = node_and_peer();
         assert_eq!(n0.unknown_stats(), UnknownStats::default());
 
-        // 0x0044 is the next code after `BlockTxn` — the literal shape of "the
-        // upgraded host allocated one more type than I know about".
-        let frame = unknown_type_frame(0x0044, &[]);
+        // 0x0045 is the next code after `Bundle` (0x0044, lab #785 F5-5b) — the
+        // literal shape of "the upgraded host allocated one more type than I
+        // know about".
+        let frame = unknown_type_frame(0x0045, &[]);
         assert!(
-            matches!(Frame::decode(&frame), Ok(Frame::UnknownType { msg_type_raw: 0x0044, .. })),
+            matches!(Frame::decode(&frame), Ok(Frame::UnknownType { msg_type_raw: 0x0045, .. })),
             "the framing layer classifies it rather than erroring"
         );
 
@@ -4476,7 +4572,7 @@ mod tests {
         // nothing scored, still counted. One tolerated frame would not prove the
         // peer survives a real skew, which is a stream and not a single message.
         for i in 0..10 {
-            let f = unknown_type_frame(if i % 2 == 0 { 0x0044 } else { 0x0100 }, &[9; 16]);
+            let f = unknown_type_frame(if i % 2 == 0 { 0x0045 } else { 0x0100 }, &[9; 16]);
             peer.send(PeerId(1), &f).unwrap();
         }
         n0.tick(2);
@@ -4589,7 +4685,7 @@ mod tests {
         for i in 0..(BURST + EXCESS) {
             // Vary the code so the journal cap is exercised under flood too: 65,536
             // codes are available to an attacker and only 8 may ever be printed.
-            let f = unknown_type_frame(0x0044u16.wrapping_add(i as u16), &[7; 32]);
+            let f = unknown_type_frame(0x0045u16.wrapping_add(i as u16), &[7; 32]);
             peer.send(PeerId(1), &f).unwrap();
         }
         n0.tick(1);
