@@ -10,7 +10,10 @@
 //! notes of the P tariff, and `F`'s own `USDT-c3`.
 //!
 //! 1. **mint**: the issuer mints 1,000 to holder `H` (P, vPublic +1,000, AISS).
-//!    Supply 1,000.
+//!    Supply 1,000. The mint is **prepared** with the secret held in memory
+//!    (`IsskSource::Given`), its identity (nullifiers, anchor) read, the chain
+//!    checked unchanged, and only then submitted; a wrong in-memory secret is
+//!    refused before anything is proved.
 //! 2. **transfer**: `H` sends 400 to the issuer with C2's send, through a
 //!    follower, the published freeze list in hand. Supply unchanged.
 //! 3. **frozen**: `F`'s send is refused by the wallet **before proving**; a
@@ -31,7 +34,7 @@ use qumbra_faucet::annulet::served;
 use qumbra_faucet::devnet_harness::{Net, View};
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord};
 use qumbra_wallet::annulet_send::{send_annulet, SendRefusal, WalletEndpoint};
-use qumbra_wallet::issuer::{issuer_mint, redeem, IssuerFile};
+use qumbra_wallet::issuer::{prepare_mint, redeem, IssuerFile, IsskSource};
 use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -100,8 +103,21 @@ fn mint_transfer_frozen_refused_redeem_with_the_supply_ledger_matching() {
 
     // 1. Mint 1,000 to H.
     let to_h = h.wallet().address_at_index(0);
-    issuer_mint(&issuer, WalletEndpoint { url: urls[0].clone() }, ASSET, 1_000, &to_h, &keys, v[0].state_tip, Some(hash), wait, &mut rng)
-        .expect("the issuer mints");
+    // 1a. A secret held in memory that is not the chain's issuer key: refused before proving.
+    let wrong = prepare_mint(&issuer, WalletEndpoint { url: urls[0].clone() }, ASSET, 1_000, &to_h, &keys, IsskSource::Given([9; 4]), v[0].state_tip, Some(hash), wait, &mut rng);
+    assert!(matches!(wrong, Err(SendRefusal::NotTheIssuer { asset: ASSET })), "a wrong in-memory isk is refused");
+    // 1b. Prepared with the right secret in memory: identity first, then submit.
+    let prepared = prepare_mint(&issuer, WalletEndpoint { url: urls[0].clone() }, ASSET, 1_000, &to_h, &keys, IsskSource::Given(ISK), v[0].state_tip, Some(hash), wait, &mut rng)
+        .expect("the issuer prepares the mint");
+    // P3 (A4): three input slots — the issuer note, the fee note, the third slot — so three
+    // nullifiers, the same three the mint below settles at.
+    let nfs = prepared.nullifiers().to_vec();
+    assert_eq!(nfs.len(), 3, "P3 spends three slots");
+    assert!(nfs[0] != nfs[1] && nfs[1] != nfs[2] && nfs[0] != nfs[2], "distinct nullifiers");
+    assert_eq!(*prepared.anchor(), prepared.tx.public.anchor);
+    let before = net.settle_spends(0, "prepared, not submitted");
+    assert!(before.iter().all(|x| supply(x) == 50), "nothing reaches the chain before submit: {before:?}");
+    prepared.submit().expect("the issuer mints");
     let v = net.settle_spends(3, "the mint");
     assert!(v.iter().all(|x| supply(x) == 1_050), "supply = genesis + minted, on all three: {v:?}");
 
