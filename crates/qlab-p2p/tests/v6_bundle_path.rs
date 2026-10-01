@@ -172,7 +172,11 @@ fn an_admitted_bundle_gossips_to_a_peer_once() {
     let mut a = P2pNode::new(InProcTransport::new(PeerId(1), Arc::clone(&hub)), adapter(), [1; 32]);
     let mut b = P2pNode::new(InProcTransport::new(PeerId(2), Arc::clone(&hub)), adapter(), [2; 32]);
     hub.link(PeerId(1), PeerId(2));
-    let now = run(&mut [&mut a, &mut b], 20, 0);
+    // Connected both ways, so each is the other's ready peer (an inv is
+    // relayed to ready peers only).
+    a.add_peer(PeerId(2), None);
+    b.add_peer(PeerId(1), None);
+    let now = run(&mut [&mut a, &mut b], 50, 0);
     let first = bundle(0, 5, 100);
     assert!(matches!(a.submit_bundle(first.clone(), false), BundleAdmit::Admitted(_)));
     let now = run(&mut [&mut a, &mut b], 20, now);
