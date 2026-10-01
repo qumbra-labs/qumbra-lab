@@ -9,7 +9,7 @@
 //! |---|---|---|---|
 //! | [`Wallet`] / `SpendingKey` | `sk` | everything, incl. produce a spend witness | — |
 //! | [`Fvk`] | `nk`, `div_seed` | derive `rkm(d)`; **generate addresses**; **view spends** (`nf`); detect+decrypt incoming | spend |
-//! | [`Ivk`] | `div_seed` | detect+decrypt incoming; recompute `cm` (from the decrypted note) | derive `rkm`; generate addresses; compute `nf`; spend |
+//! | [`Ivk`] | `div_seed` | detect+decrypt incoming; recompute `cm` (from the decrypted note); hand a scanner `dk_d` ([`Ivk::scan_key`]) | derive `rkm`; generate addresses; compute `nf`; spend |
 //!
 //! `Fvk::to_ivk` is a one-way downgrade (drops `nk`); preimage resistance means
 //! an `Ivk` cannot recover `nk`, so it cannot view spends.
@@ -147,6 +147,19 @@ impl Ivk {
     pub fn scan(&self, d: &Diversifier, outputs: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote> {
         let kp = diversified_keypair(&self.div_seed, d);
         scan(&kp.dk, outputs, mode)
+    }
+
+    /// **The scanning key `dk_d`** for diversifier `d` — exactly the key
+    /// [`Ivk::scan`] regenerates for itself (lab #813: a scanner that fetches a
+    /// range once for many diversifiers, `qlab_cbserver::client::
+    /// light_client_scan_l2_multi_with`, needs the keys as values).
+    ///
+    /// **No capability beyond the `Ivk`'s own.** `dk_d` detects and decrypts
+    /// exactly the outputs `scan` does at `d`; it derives no `rkm`, no `nf`, no
+    /// address, and spends nothing. It is a secret of the same class as the
+    /// `Ivk` itself: whoever holds it reads `d`'s incoming notes.
+    pub fn scan_key(&self, d: &Diversifier) -> qlab_note::kem::Dk {
+        diversified_keypair(&self.div_seed, d).dk
     }
 
     /// The managed diversifier for `index` (issue #43). This is a SCANNING-side

@@ -70,6 +70,16 @@
 //! let d = qlab_wallet::address::Diversifier::default();
 //! let _ = ivk.address(d); // no such method on Ivk (needs nk to derive rkm(d))
 //! ```
+//!
+//! Lab #813 handed the `Ivk` a scanning key (`Ivk::scan_key`), and nothing
+//! more — it still cannot derive `rkm(d)`:
+//!
+//! ```compile_fail
+//! let w = qlab_wallet::Wallet::from_seed_lanes([1, 2, 3, 4]);
+//! let ivk = w.ivk();
+//! let d = qlab_wallet::address::Diversifier::default();
+//! let _ = ivk.rkm(d); // no such method on Ivk
+//! ```
 
 pub mod address;
 pub mod bech32m;

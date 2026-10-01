@@ -83,7 +83,7 @@
 //! never dropped.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::net::TcpStream;
 
@@ -643,6 +643,95 @@ where
 {
     scan_over_for::<qlab_note::l2note::L2Note, F>(fetch, dk, from, to, config, rng)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Why a multi-key scan ([`light_client_scan_l2_multi_with`]) never started,
+/// or stopped at the range — each named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MultiScanRefusal {
+    /// No keys: nothing to scan for.
+    NoKeys,
+    /// `from > to`.
+    EmptyRange { from: u64, to: u64 },
+    /// One index named twice.
+    DuplicateIndex(u64),
+    /// One key under two indices (compared by its encapsulation key): its
+    /// notes would be attributed twice.
+    DuplicateKey { first: u64, second: u64 },
+    /// The range itself could not be read or decoded — the single-key scan's
+    /// fatal case (`/v1/compact`), with its message.
+    Range(String),
+}
+
+/// A multi-key scan's result: one outcome per index, in the order given, and
+/// every path actually fetched, in order (a path is fetched at most once).
+pub struct MultiScan {
+    pub outcomes: Vec<(u64, ScanOutcome<qlab_note::l2note::L2Note>)>,
+    pub fetched: Vec<String>,
+}
+
+/// **The L2 scan for many keys over one fetch** (lab #813): every `(index,
+/// dk)` scanned over `[from, to]`, the range and each `/full` fetched **once**
+/// however many keys need it.
+///
+/// Built so that it cannot drift from [`light_client_scan_l2_with`]: each key
+/// runs **the same [`ScanDriver`]**, unchanged, over a fetch that answers every
+/// path from a cache filled by the caller's `fetch` on first request (a
+/// failure is cached as the answer too — one answer per path). So each index's
+/// outcome is the single-key scan's on the same responses; only the decoy draws
+/// (`config.decoy`, the caller's privacy posture, honoured as given) depend on
+/// the shared `rng`, and a decoy landing on a fetched path costs nothing.
+///
+/// The keys are values: an `Ivk` holder builds them with
+/// `qlab_wallet::viewing::Ivk::scan_key(d)` — no capability beyond the `Ivk`'s,
+/// and no dependency of this crate on the wallet's. The cache holds the range's
+/// responses for the call's duration.
+pub fn light_client_scan_l2_multi_with<F>(
+    fetch: &mut F,
+    keys: &[(u64, Dk)],
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> Result<MultiScan, MultiScanRefusal>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    if keys.is_empty() {
+        return Err(MultiScanRefusal::NoKeys);
+    }
+    if from > to {
+        return Err(MultiScanRefusal::EmptyRange { from, to });
+    }
+    let mut seen_index = HashSet::new();
+    let mut seen_key: HashMap<[u8; qlab_note::kem::EK_LEN], u64> = HashMap::new();
+    for (index, dk) in keys {
+        if !seen_index.insert(*index) {
+            return Err(MultiScanRefusal::DuplicateIndex(*index));
+        }
+        let ek = qlab_note::kem::ek_to_bytes(dk.encapsulation_key());
+        if let Some(first) = seen_key.insert(ek, *index) {
+            return Err(MultiScanRefusal::DuplicateKey { first, second: *index });
+        }
+    }
+    let mut cache: HashMap<String, Result<Vec<u8>, String>> = HashMap::new();
+    let mut fetched: Vec<String> = Vec::new();
+    let mut outcomes = Vec::with_capacity(keys.len());
+    for (index, dk) in keys {
+        let mut cached = |path: &str| -> Result<Vec<u8>, String> {
+            if let Some(answer) = cache.get(path) {
+                return answer.clone();
+            }
+            let answer = fetch(path);
+            fetched.push(path.to_string());
+            cache.insert(path.to_string(), answer.clone());
+            answer
+        };
+        let outcome = scan_over_for::<qlab_note::l2note::L2Note, _>(&mut cached, dk, from, to, config, rng)
+            .map_err(MultiScanRefusal::Range)?;
+        outcomes.push((*index, outcome));
+    }
+    Ok(MultiScan { outcomes, fetched })
 }
 
 #[cfg(feature = "devnet")]
@@ -2280,3 +2369,177 @@ mod tests {
 // Re-export SeedableRng for the tests' StdRng::seed_from_u64 usage.
 #[cfg(test)]
 use rand::SeedableRng;
+
+/// Lab #813: [`light_client_scan_l2_multi_with`] against a synthetic L2 range
+/// (real ML-KEM encryptions of L2 notes to one wallet's diversifiers, served
+/// through the codecs' own encoders). No node, no prove.
+#[cfg(test)]
+mod multi_tests {
+    use super::*;
+    use crate::codec::{encode_compact_response, encode_full_response};
+    use qlab_note::compact::CompactGroup;
+    use qlab_note::kem::{ek_to_bytes, Ek};
+    use qlab_note::l2note::L2Note;
+    use qlab_note::scan::encrypt_notes_to_recipient;
+    use qlab_wallet::Wallet;
+    use rand::SeedableRng;
+
+    /// One served transaction: per recipient, its bundle and payloads.
+    type Tx = Vec<EncryptedOutputs>;
+
+    /// The range: heights 1..=3.
+    ///  - h1 tx0 → index 0 (asset 0); h1 tx1 → a stranger;
+    ///  - h2 tx0 → index 1 (asset 7) AND index 0 (asset 7): one /full, two keys;
+    ///  - h3 tx0 → a stranger. Index 2 receives nothing.
+    struct Range {
+        blocks: Vec<(u64, Vec<Tx>)>,
+        wallet: Wallet,
+    }
+
+    fn note(value: u64, asset: u64, tag: u64) -> L2Note {
+        L2Note { value, asset, rkm: [tag, 1, 2, 3], rho: [tag, 4, 5, 6], rseed: [tag, 7, 8, 9] }
+    }
+
+    fn range() -> Range {
+        let wallet = Wallet::from_seed_lanes([0x813, 1, 2, 3]);
+        let stranger = Wallet::from_seed_lanes([0xbad, 1, 2, 3]);
+        let ek = |w: &Wallet, i: u64| -> Ek { w.diversified_keypair(&w.diversifier_at_index(i)).ek };
+        let mut rng = StdRng::seed_from_u64(0x813);
+        let mut enc = |e: &Ek, n: L2Note| encrypt_notes_to_recipient(e, &[n], &mut rng);
+        let blocks = vec![
+            (1, vec![vec![enc(&ek(&wallet, 0), note(500, 0, 1))], vec![enc(&ek(&stranger, 0), note(9, 0, 2))]]),
+            (2, vec![vec![enc(&ek(&wallet, 1), note(70, 7, 3)), enc(&ek(&wallet, 0), note(30, 7, 4))]]),
+            (3, vec![vec![enc(&ek(&stranger, 1), note(1, 7, 5))]]),
+        ];
+        Range { blocks, wallet }
+    }
+
+    impl Range {
+        /// The server: `/v1/compact?from=&to=` and `/v1/block/{h}/tx/{i}/full`.
+        fn route(&self, path: &str) -> Result<Vec<u8>, String> {
+            if let Some(q) = path.strip_prefix("/v1/compact?") {
+                let num = |k: &str| q.split('&').find_map(|kv| kv.strip_prefix(k)).and_then(|v| v.parse::<u64>().ok());
+                let (from, to) = (num("from=").ok_or("from")?, num("to=").ok_or("to")?);
+                let blocks: Vec<CompactBlock> = self
+                    .blocks
+                    .iter()
+                    .filter(|(h, _)| (from..=to).contains(h))
+                    .map(|(h, txs)| CompactBlock {
+                        height: *h,
+                        groups: txs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, tx)| CompactGroup { tx_index: i as u64, recipients: tx.iter().map(|o| o.bundle.clone()).collect() })
+                            .collect(),
+                    })
+                    .collect();
+                return Ok(encode_compact_response(&blocks));
+            }
+            let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+            if let ["v1", "block", h, "tx", i, "full"] = parts.as_slice() {
+                let (h, i): (u64, usize) = (h.parse().map_err(|_| "h")?, i.parse().map_err(|_| "i")?);
+                let tx = self.blocks.iter().find(|(bh, _)| *bh == h).and_then(|(_, txs)| txs.get(i)).ok_or("404")?;
+                return Ok(encode_full_response(&tx.iter().map(|o| o.payloads.clone()).collect::<Vec<_>>()));
+            }
+            Err(format!("404 {path}"))
+        }
+
+        fn keys(&self, indices: &[u64]) -> Vec<(u64, Dk)> {
+            let ivk = self.wallet.ivk();
+            indices.iter().map(|i| (*i, ivk.scan_key(&ivk.diversifier_at_index(*i)))).collect()
+        }
+    }
+
+    const OFF: ScanConfig = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+
+    /// (a) Per index, the multi-key outcome IS the single-key scan's on the
+    /// same responses (two indices with notes, one without); (b) the range and
+    /// each `/full` are fetched once — three fetches where three solo scans
+    /// make seven.
+    #[test]
+    fn multi_equals_single_per_index_over_one_fetch() {
+        let r = range();
+        let keys = r.keys(&[0, 1, 2]);
+        let mut fetch = |p: &str| r.route(p);
+        let multi = light_client_scan_l2_multi_with(&mut fetch, &keys, 1, 3, OFF, &mut StdRng::seed_from_u64(1)).expect("scans");
+        assert_eq!(multi.outcomes.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        let mut solo_fetches = 0;
+        for ((index, dk), (mi, m)) in keys.iter().zip(&multi.outcomes) {
+            assert_eq!(index, mi);
+            let mut counted = |p: &str| {
+                solo_fetches += 1;
+                r.route(p)
+            };
+            let s = light_client_scan_l2_with(&mut counted, dk, 1, 3, OFF, &mut StdRng::seed_from_u64(1)).expect("solo");
+            assert_eq!(m.notes, s.notes, "index {index}: notes");
+            assert_eq!(m.unopened, s.unopened, "index {index}: unopened");
+            assert_eq!(m.shadowed, s.shadowed, "index {index}: shadowed");
+            let st = |o: &ScanOutcome<L2Note>| {
+                (o.stats.compact_bytes, o.stats.compact_range_served, o.stats.detected_outputs, o.stats.matched_fetches, o.stats.notes_found)
+            };
+            assert_eq!(st(m), st(&s), "index {index}: stats");
+        }
+        let found: Vec<usize> = multi.outcomes.iter().map(|(_, o)| o.notes.len()).collect();
+        assert_eq!(found, vec![2, 1, 0], "index 0 at h1 and h2, index 1 at h2, index 2 nothing");
+        assert_eq!(multi.fetched, vec!["/v1/compact?from=1&to=3", "/v1/block/1/tx/0/full", "/v1/block/2/tx/0/full"]);
+        assert_eq!(solo_fetches, 3 + 2 + 1, "three compact fetches, three /full");
+    }
+
+    /// (b) With decoys on (the caller's posture, honoured), no path is ever
+    /// fetched twice — decoys go through the same cache.
+    #[test]
+    fn multi_with_decoys_fetches_no_path_twice() {
+        let r = range();
+        let keys = r.keys(&[0, 1, 2]);
+        let mut fetch = |p: &str| r.route(p);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::PerMatch { max: 3 } };
+        let multi = light_client_scan_l2_multi_with(&mut fetch, &keys, 1, 3, cfg, &mut StdRng::seed_from_u64(7)).expect("scans");
+        let mut seen = std::collections::HashSet::new();
+        assert!(multi.fetched.iter().all(|p| seen.insert(p.clone())), "a path fetched twice: {:?}", multi.fetched);
+        assert_eq!(multi.fetched.iter().filter(|p| p.starts_with("/v1/compact")).count(), 1);
+        assert!(multi.outcomes.iter().map(|(_, o)| o.stats.decoy_fetches).sum::<usize>() > 0, "decoys were drawn");
+    }
+
+    /// (c) Every refusal named.
+    #[test]
+    fn multi_refusals_are_named() {
+        let r = range();
+        let mut fetch = |p: &str| r.route(p);
+        let mut rng = StdRng::seed_from_u64(2);
+        let mut run = |keys: &[(u64, Dk)], from, to| light_client_scan_l2_multi_with(&mut fetch, keys, from, to, OFF, &mut rng).err();
+        assert_eq!(run(&[], 1, 3), Some(MultiScanRefusal::NoKeys));
+        let keys = r.keys(&[0, 1]);
+        assert_eq!(run(&keys, 3, 1), Some(MultiScanRefusal::EmptyRange { from: 3, to: 1 }));
+        let twice = vec![keys[0].clone(), (0, keys[1].1.clone())];
+        assert_eq!(run(&twice, 1, 3), Some(MultiScanRefusal::DuplicateIndex(0)));
+        let same_key = vec![keys[0].clone(), (5, keys[0].1.clone())];
+        assert_eq!(run(&same_key, 1, 3), Some(MultiScanRefusal::DuplicateKey { first: 0, second: 5 }));
+        let mut down = |_: &str| -> Result<Vec<u8>, String> { Err("503 down".into()) };
+        let e = light_client_scan_l2_multi_with(&mut down, &keys, 1, 3, OFF, &mut StdRng::seed_from_u64(3)).err();
+        assert_eq!(e, Some(MultiScanRefusal::Range("503 down".into())));
+    }
+
+    /// (d) Every returned note carries its asset: the gateway's filter (its own
+    /// asset only) reads it straight off the note.
+    #[test]
+    fn multi_notes_carry_their_asset() {
+        let r = range();
+        let mut fetch = |p: &str| r.route(p);
+        let multi = light_client_scan_l2_multi_with(&mut fetch, &r.keys(&[0, 1, 2]), 1, 3, OFF, &mut StdRng::seed_from_u64(4)).expect("scans");
+        let all: Vec<(u64, u64, u64)> = multi
+            .outcomes
+            .iter()
+            .flat_map(|(i, o)| o.notes.iter().map(move |n| (*i, n.detected.note.asset, n.detected.note.value)))
+            .collect();
+        assert_eq!(all, vec![(0, 0, 500), (0, 7, 30), (1, 7, 70)]);
+        let asset7: Vec<_> = all.iter().filter(|(_, a, _)| *a == 7).map(|(i, _, v)| (*i, *v)).collect();
+        assert_eq!(asset7, vec![(0, 30), (1, 70)]);
+        // The keys are the wallet's own: `Ivk::scan_key` is the keypair's dk.
+        let ivk = r.wallet.ivk();
+        for i in 0..3 {
+            let d = ivk.diversifier_at_index(i);
+            assert_eq!(ek_to_bytes(ivk.scan_key(&d).encapsulation_key()), ek_to_bytes(&r.wallet.diversified_keypair(&d).ek));
+        }
+    }
+}
