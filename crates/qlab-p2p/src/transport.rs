@@ -415,20 +415,79 @@ impl Transport for InProcTransport {
 // TCP transport
 // ==========================================================================
 
+/// The step a frame's receive buffer grows by (lab #785 F5-5a, Q-5-7).
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// The buffer grows with the bytes that actually arrive, never with what the
+/// header declares: a peer that sends a header claiming [`MAX_PAYLOAD`] and
+/// then nothing holds about one step, not a frame.
+///
+/// [`MAX_PAYLOAD`]: crate::wire::MAX_PAYLOAD
+pub const FRAME_READ_STEP: usize = 64 * 1024;
+
+/// How long one frame may take to arrive once its first byte has (lab #785
+/// F5-5a, Q-5-7: 120 s, so a 16 MiB frame needs ≥ 140 KB/s). Past it the
+/// connection ends, as on a malformed header. Idle time **between** frames is
+/// not bounded here — a quiet peer is not a slow one.
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+pub const FRAME_READ_DEADLINE_MS: u64 = 120_000;
+
 /// Read exactly one framed message from a blocking stream: the fixed header,
 /// then the declared body. A malformed header (bad magic / oversize) is a fatal
-/// `InvalidData` error that ends the connection.
+/// `InvalidData` error that ends the connection; a frame not finished within
+/// [`FRAME_READ_DEADLINE_MS`] of its first byte is a fatal `TimedOut`.
 fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut hdr = [0u8; HEADER_LEN];
-    stream.read_exact(&mut hdr)?;
-    let fh = FrameHeader::parse(&hdr)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut frame = Vec::with_capacity(HEADER_LEN + fh.payload_len as usize);
-    frame.extend_from_slice(&hdr);
-    let mut body = vec![0u8; fh.payload_len as usize];
-    stream.read_exact(&mut body)?;
-    frame.extend_from_slice(&body);
+    let mut frame = Vec::new();
+    read_frame_into(stream, &mut frame, Duration::from_millis(FRAME_READ_DEADLINE_MS))?;
     Ok(frame)
+}
+
+/// [`read_frame`] into `frame`, with the deadline as a parameter (tests).
+/// `frame` holds whatever arrived if this returns an error, so a test can see
+/// that the allocation tracked the bytes received.
+fn read_frame_into(stream: &mut TcpStream, frame: &mut Vec<u8>, deadline: Duration) -> io::Result<()> {
+    // The first byte: no deadline (between frames a connection may idle).
+    let _ = stream.set_read_timeout(None);
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first)?;
+    let until = Instant::now() + deadline;
+    frame.clear();
+    frame.push(first[0]);
+    frame.resize(HEADER_LEN, 0);
+    read_exact_by(stream, &mut frame[1..], until)?;
+    let fh = FrameHeader::parse(&frame[..HEADER_LEN])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let total = HEADER_LEN + fh.payload_len as usize;
+    while frame.len() < total {
+        let start = frame.len();
+        let want = (total - start).min(FRAME_READ_STEP);
+        frame.resize(start + want, 0);
+        if let Err(e) = read_exact_by(stream, &mut frame[start..], until) {
+            frame.truncate(start);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// `read_exact` against an absolute deadline: each read waits at most the time
+/// left, and the deadline passing is `TimedOut`.
+fn read_exact_by(stream: &mut TcpStream, buf: &mut [u8], until: Instant) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "frame read deadline passed"));
+        }
+        let _ = stream.set_read_timeout(Some(left));
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed mid-frame")),
+            Ok(n) => filled += n,
+            Err(ref e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Maximum bytes held in the receive queue across **all** peers (issue #91,
@@ -1511,6 +1570,67 @@ mod tests {
 
         client.shutdown();
         drop(listener);
+    }
+
+    /// A connected pair: our end and the raw peer end.
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (theirs, _) = l.accept().unwrap();
+        (ours, theirs)
+    }
+
+    /// Lab #785 F5-5a item 2: a header declaring the maximum payload, then
+    /// silence, holds one growth step — not the frame — and ends at the
+    /// deadline; a body that stalls part-way holds what arrived, plus a step.
+    #[test]
+    fn a_declared_frame_is_not_allocated_before_it_arrives() {
+        let max = crate::wire::MAX_PAYLOAD;
+        let hdr = |len: u32| {
+            let mut h = Envelope::new(MsgType::Ping, vec![]).encode();
+            h[8..12].copy_from_slice(&len.to_le_bytes());
+            h.truncate(HEADER_LEN);
+            h
+        };
+        // Header only.
+        let (mut ours, mut theirs) = tcp_pair();
+        theirs.write_all(&hdr(max)).unwrap();
+        let mut frame = Vec::new();
+        let err = read_frame_into(&mut ours, &mut frame, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(frame.capacity() <= HEADER_LEN + 2 * FRAME_READ_STEP, "held {} for a body never sent", frame.capacity());
+        // 200 KiB of body, then a stall.
+        let (mut ours, mut theirs) = tcp_pair();
+        theirs.write_all(&hdr(max)).unwrap();
+        theirs.write_all(&vec![7u8; 200 * 1024]).unwrap();
+        let mut frame = Vec::new();
+        let err = read_frame_into(&mut ours, &mut frame, Duration::from_millis(500)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(frame.capacity() <= 2 * (HEADER_LEN + 200 * 1024 + FRAME_READ_STEP), "held {}", frame.capacity());
+        assert!((max as usize) > 8 * frame.capacity(), "far below the declared frame");
+        assert_eq!((FRAME_READ_STEP, FRAME_READ_DEADLINE_MS), (64 * 1024, 120_000));
+    }
+
+    /// Lab #785 F5-5a item 2: a slow but steady sender inside the deadline is
+    /// read whole, byte-exact; an idle gap BEFORE a frame is not counted.
+    #[test]
+    fn a_slow_frame_inside_the_deadline_is_read_whole() {
+        let (mut ours, mut theirs) = tcp_pair();
+        let payload: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let want = Envelope::new(MsgType::Ping, payload).encode();
+        let send = want.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400)); // idle before the frame
+            for chunk in send.chunks(50 * 1024) {
+                theirs.write_all(chunk).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            theirs
+        });
+        let mut frame = Vec::new();
+        read_frame_into(&mut ours, &mut frame, Duration::from_millis(2_000)).unwrap();
+        assert_eq!(frame, want);
+        drop(writer.join().unwrap());
     }
 
     /// Lab #785 F5-5a: the node-wide send backlog. Two peers that each stay
