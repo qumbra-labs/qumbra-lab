@@ -75,7 +75,7 @@
 //! normally serves both.
 
 use qlab_cbserver::client::{Completeness, ScanOutcome};
-use qlab_cbserver::codec::{CoinbasePage, NullifierPage};
+use qlab_cbserver::codec::{CoinbasePage, ExitPage, NullifierPage};
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_node::AnchorSet;
 use qlab_wallet::address::Address;
@@ -86,6 +86,7 @@ use crate::bundle::WitnessBundle;
 use crate::coinbase::{
     match_mined, CoinbaseCatchUp, CoinbaseChunk, MinedChain, MinedReport, TRANSACTIONS_ONLY,
 };
+use crate::exits::{match_exits, ExitCatchUp, ExitChain, ExitChunk, ExitRefusal, ExitReport};
 use crate::scan::widest_range;
 use crate::send::{build_bundle, BuildRefusal, Spendable};
 use crate::spend::SendStep;
@@ -114,6 +115,10 @@ enum Phase {
     /// Lab #424. Runs AFTER `Spent` because a mined note can be spent like any
     /// other and [`match_mined`] needs the nullifier set to say so.
     Coinbase(CoinbaseCatchUp),
+    /// Lab #785 F5-5d. After `Coinbase` and before selection: an exit note
+    /// is spent like any other, so it too needs the nullifier set; a stream
+    /// that cannot be read only shrinks the input set, said out loud.
+    Exits(ExitCatchUp),
     Tree(TreeCatchUp),
     Anchors { got: Option<Anchors> },
     Finished,
@@ -123,6 +128,7 @@ enum Phase {
 enum Pending {
     Nullifiers { from: u64, to: u64 },
     Coinbase { from: u64, to: u64 },
+    Exits { from: u64, to: u64 },
     Leaves { from: u64 },
     Anchors,
 }
@@ -159,6 +165,15 @@ pub struct SelectDriver {
     /// verbatim. Never fatal (the 2026-08-16 ruling); it becomes the visible
     /// degradation and the caveat on an insufficient-funds refusal.
     coinbase_gap: Option<String>,
+    /// The coinbase stream as it ended, held across the exit phase until
+    /// selection runs on both.
+    mined_chain: Option<MinedChain>,
+    /// This wallet's exit notes over the served range (lab #785 F5-5d),
+    /// `None` when the stream could not be read.
+    exits: Option<ExitReport>,
+    /// 🔴 Set when this send could NOT see all of the exit stream — the
+    /// coinbase stream's posture: never fatal, always said.
+    exits_gap: Option<String>,
     /// Notes this wallet owns whose nullifiers are already on the chain, both
     /// categories — kept for the refusal text.
     skipped_spent: usize,
@@ -225,6 +240,9 @@ impl SelectDriver {
             spent: None,
             mined: None,
             coinbase_gap: None,
+            mined_chain: None,
+            exits: None,
+            exits_gap: None,
             skipped_spent: 0,
             form,
         }
@@ -305,7 +323,38 @@ impl SelectDriver {
                                 }
                                 chain
                             };
-                            self.select_inputs(&chain);
+                            self.mined_chain = Some(chain);
+                            self.phase = Phase::Exits(ExitCatchUp::new(0, self.to));
+                        }
+                    }
+                }
+                Phase::Exits(catch) => {
+                    let want = if self.exits_gap.is_some() { None } else { catch.want() };
+                    match want {
+                        Some((from, to)) => {
+                            self.pending = Some(Pending::Exits { from, to });
+                            return self.need_for(Pending::Exits { from, to });
+                        }
+                        None => {
+                            let Phase::Exits(catch) =
+                                std::mem::replace(&mut self.phase, Phase::Finished)
+                            else {
+                                unreachable!()
+                            };
+                            // The coinbase phase's shape: a failed stream is
+                            // dropped whole, a short one keeps what it served
+                            // and names the rest — both only shrink the set.
+                            let exit_chain = if self.exits_gap.is_some() {
+                                ExitChain::default()
+                            } else {
+                                let chain = catch.finish();
+                                if let Err(e) = chain.covers(Some((0, self.to))) {
+                                    self.exits_gap = Some(e.to_string());
+                                }
+                                chain
+                            };
+                            let chain = self.mined_chain.take().unwrap_or_default();
+                            self.select_inputs(&chain, &exit_chain);
                             if self.spendables.is_empty() {
                                 return self.fail(format!(
                                     "no spendable notes: the scan of 0..={} found nothing this wallet can \
@@ -396,7 +445,7 @@ impl SelectDriver {
     /// Build the input set: the scans' transaction outputs, then this wallet's
     /// own MATURE mined notes (lab #424), both with the chain's nullifiers
     /// already subtracted.
-    fn select_inputs(&mut self, chain: &MinedChain) {
+    fn select_inputs(&mut self, chain: &MinedChain, exit_chain: &ExitChain) {
         let spent = self.spent.take().expect("the spent phase precedes selection");
         for (idx, outcome) in &self.outcomes {
             let report = subtract_spent(&self.wallet, *idx, &outcome.notes, &spent);
@@ -458,9 +507,41 @@ impl SelectDriver {
             }
         }
 
-        // The degradation goes out BEFORE the selection line it explains.
+        // Lab #785 F5-5d: this wallet's exit notes, under the same rule as
+        // mined ones — inside the nullifier stream's range or not at all, the
+        // gap named; spent ones subtracted and counted as skipped.
+        if exit_chain.covered.is_some() {
+            match spent.covers_outputs(exit_chain.covered) {
+                Err(e) => {
+                    self.exits_gap = Some(format!(
+                        "the exit stream reached further than the nullifier stream ({e}), so this \
+                         send could not tell whether an exit note is already spent and left every \
+                         one of them out"
+                    ));
+                }
+                Ok(()) => {
+                    let indices: Vec<u64> = self.outcomes.iter().map(|(idx, _)| *idx).collect();
+                    let report = match_exits(&self.wallet, &indices, exit_chain, &spent);
+                    self.skipped_spent += report.spent.len();
+                    for n in &report.spendable {
+                        self.spendables.push(Spendable {
+                            div_index: n.div_index,
+                            value: n.note.value,
+                            rho: n.note.rho,
+                            rseed: n.note.rseed,
+                        });
+                    }
+                    self.exits = Some(report);
+                }
+            }
+        }
+
+        // The degradations go out BEFORE the selection line they explain.
         if let Some(line) = self.coinbase_degradation() {
             self.events.push(SendStep::CoinbaseUnavailable { why: line });
+        }
+        if let Some(line) = self.exits_degradation() {
+            self.events.push(SendStep::Warning(line));
         }
         self.events.push(SendStep::Selected {
             spendable: self.spendables.len(),
@@ -482,10 +563,33 @@ impl SelectDriver {
         })
     }
 
+    /// The one wording for "this send could not see L2 exits" (lab #785
+    /// F5-5d), shared by the visible warning and a value shortfall's caveat.
+    fn exits_degradation(&self) -> Option<String> {
+        self.exits_gap.as_ref().map(|why| {
+            format!(
+                "L2 exits were NOT visible to this send ({why}). If an L2 exit paid this \
+                 wallet, that note was not among the inputs considered."
+            )
+        })
+    }
+
     /// What a **value shortfall** — and only a value shortfall — must carry, so
     /// "you do not have it" is never confused with "this send could not see it"
     /// or with "you have it and it is not mature yet".
     fn shortfall_context(&self) -> String {
+        // Lab #785 F5-5d: an invisible exit stream is its own caveat, named
+        // before whatever the coinbase half says — both can hold at once.
+        let exits = self.exits_degradation().map_or_else(String::new, |line| {
+            format!(
+                " 🔴 {line} So this refusal is NOT evidence that the balance is too low: a node \
+                 that serves GET /v1/exits may answer it differently."
+            )
+        });
+        exits + &self.coinbase_shortfall_context()
+    }
+
+    fn coinbase_shortfall_context(&self) -> String {
         if let Some(line) = self.coinbase_degradation() {
             return format!(
                 " 🔴 {line} So this refusal is NOT evidence that the balance is too low: a node \
@@ -579,6 +683,28 @@ impl SelectDriver {
                     self.coinbase_gap = Some(e.to_string());
                 }
             }
+            Pending::Exits { .. } => {
+                let page = match ExitPage::from_bytes(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return self.supply_failed(
+                            pending,
+                            format!("GET {path} did not decode: {e:?}"),
+                        )
+                    }
+                };
+                let chunk = ExitChunk { from: page.from, to: page.to, blocks: page.blocks };
+                let Phase::Exits(catch) = &mut self.phase else {
+                    self.fatal = Some("an exit page arrived outside the exit phase".into());
+                    return;
+                };
+                // The coinbase stream's reasoning: a page that lies about its
+                // range is a named degradation, and every exit note is checked
+                // downstream anyway (a wrong value is a commitment in no tree).
+                if let Err(e) = catch.supply(chunk) {
+                    self.exits_gap = Some(e.to_string());
+                }
+            }
             Pending::Leaves { .. } => {
                 let page = match qlab_node::TreeLeaves::from_bytes(&bytes) {
                     Ok(p) => p,
@@ -636,6 +762,8 @@ impl SelectDriver {
                 self.coinbase_gap =
                     Some(crate::coinbase::CoinbaseRefusal::Endpoint { why }.to_string())
             }
+            // Lab #785 F5-5d: an older node 404s; the posture is coinbase's.
+            Pending::Exits { .. } => self.exits_gap = Some(ExitRefusal::Endpoint { why }.to_string()),
             Pending::Leaves { .. } | Pending::Anchors => {
                 self.fatal = Some(SyncRefusal::Endpoint { why }.to_string())
             }
@@ -651,6 +779,7 @@ impl SelectDriver {
         match pending {
             Pending::Nullifiers { from, to } => format!("/v1/nullifiers?from={from}&to={to}"),
             Pending::Coinbase { from, to } => format!("/v1/coinbase?from={from}&to={to}"),
+            Pending::Exits { from, to } => format!("/v1/exits?from={from}&to={to}"),
             Pending::Leaves { from } => format!("/v1/tree/leaves?from={from}"),
             Pending::Anchors => "/v1/anchors".to_string(),
         }
@@ -661,7 +790,8 @@ impl SelectDriver {
             // The coinbase stream is the compact host's, as it is for `scan`
             // (`crate::scan::gather` fetches it from the same `url`).
             Pending::Nullifiers { .. } | Pending::Coinbase { .. } => SelectEndpoint::Scan,
-            Pending::Leaves { .. } | Pending::Anchors => SelectEndpoint::Node,
+            // `/v1/exits` is the discovery server's, as the tree is.
+            Pending::Exits { .. } | Pending::Leaves { .. } | Pending::Anchors => SelectEndpoint::Node,
         };
         SelectStep::Need { endpoint, path: self.path_of(pending) }
     }

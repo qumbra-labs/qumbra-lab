@@ -30,6 +30,7 @@
 use qlab_cbserver::client::{Completeness, ScanOutcome};
 
 use crate::coinbase::MinedReport;
+use crate::exits::ExitReport;
 use qlab_ledger::spent::SpentReport;
 // The vocabulary moved to qlab-ledger with the ledger it serves; imported back
 // so there is exactly one spelling of UNAVAILABLE and one SpentCoverage.
@@ -55,6 +56,18 @@ pub enum CoinbaseCoverage {
     /// The stream could not be read or did not reach far enough — carries the
     /// reason, verbatim. The common case is a node older than lab #415, which
     /// answers 404, and that is an honest answer rather than a fault.
+    Unavailable { why: String },
+}
+
+/// How far the exit stream reached (lab #785 F5-5d) — [`CoinbaseCoverage`]'s
+/// twin, deciding the same thing: whether the total may speak for L2 exits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExitCoverage {
+    /// Every block in `range` has had its exits matched against this
+    /// wallet's keys. `None`: the endpoint held no block in range at all.
+    Covered { range: Option<(u64, u64)> },
+    /// The stream could not be read — a node older than lab #785 F5-5d
+    /// answers 404 — with the reason, verbatim.
     Unavailable { why: String },
 }
 
@@ -227,6 +240,72 @@ fn render_mined(
     out
 }
 
+/// The exits section (lab #785 F5-5d): what L2 exits paid this wallet over
+/// the range, or the named reason there is no figure — [`render_mined`]'s three
+/// states (not looked at / looked at, none / looked at, found).
+fn render_exits(exits: Option<&ExitReport>, coverage: &ExitCoverage, range: (u64, u64)) -> String {
+    match (exits, coverage) {
+        (_, ExitCoverage::Unavailable { .. }) | (None, _) => {
+            let why = match coverage {
+                ExitCoverage::Unavailable { why } => why.clone(),
+                ExitCoverage::Covered { .. } => "the exit stream was read, but this wallet's spends could \
+                                                 not be subtracted from it (see spent-subtraction above)"
+                    .to_string(),
+            };
+            format!(
+                "exits (L2 → L1): {UNAVAILABLE} — {why}\n\
+                 🔴 This scan did NOT look at L2 exits. If an L2 exit paid this wallet, it is not in \
+                 any figure below.\n\n"
+            )
+        }
+        (Some(e), ExitCoverage::Covered { range: covered }) => {
+            let mut out = match covered {
+                Some((a, b)) => format!("exits (L2 → L1): the chain's exits for {a}..={b} are in hand\n"),
+                None => format!(
+                    "exits (L2 → L1): the endpoint holds no block in {}..={} — no exit there\n",
+                    range.0, range.1
+                ),
+            };
+            if e.count() == 0 {
+                out.push_str("      no exit in this range paid this wallet, on the chain's authority\n\n");
+                return out;
+            }
+            out.push_str(&format!(
+                "      exits paid:   {}\n      spendable:    {} bessel\n",
+                e.count(),
+                e.spendable_value()
+            ));
+            if !e.spent.is_empty() {
+                out.push_str(&format!(
+                    "      spent:        {} bessel in {} exit note(s) already spent (not counted)\n",
+                    e.spent_value(),
+                    e.spent.len()
+                ));
+            }
+            out.push('\n');
+            out
+        }
+    }
+}
+
+/// [`render`] with the L2 exits section (lab #785 F5-5d) — what the CLI's
+/// `scan` prints. The total adds exits only when the exit stream was read over
+/// the range and its spends subtracted; otherwise it says, in words, that
+/// exits are not in it.
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_exits(
+    scans: &[DivScan],
+    range: (u64, u64),
+    url: &str,
+    spent: &SpentCoverage,
+    mined: Option<&MinedReport>,
+    coinbase: &CoinbaseCoverage,
+    exits: Option<&ExitReport>,
+    exit_coverage: &ExitCoverage,
+) -> String {
+    render_inner(scans, range, url, spent, mined, coinbase, Some((exits, exit_coverage)))
+}
+
 /// The whole report. `range` is what was actually scanned — printed because a
 /// balance is only ever a claim about a range, and a report that omits its
 /// range invites quoting it as a claim about the chain. `spent` says how far the
@@ -238,6 +317,18 @@ pub fn render(
     spent: &SpentCoverage,
     mined: Option<&MinedReport>,
     coinbase: &CoinbaseCoverage,
+) -> String {
+    render_inner(scans, range, url, spent, mined, coinbase, None)
+}
+
+fn render_inner(
+    scans: &[DivScan],
+    range: (u64, u64),
+    url: &str,
+    spent: &SpentCoverage,
+    mined: Option<&MinedReport>,
+    coinbase: &CoinbaseCoverage,
+    exit_part: Option<(Option<&ExitReport>, &ExitCoverage)>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -264,6 +355,9 @@ pub fn render(
     // The mined half, stated before the per-address rows because a miner's first
     // question is whether they were paid at all (lab #415).
     out.push_str(&render_mined(mined, coinbase, range));
+    if let Some((exits, coverage)) = exit_part {
+        out.push_str(&render_exits(exits, coverage, range));
+    }
     let mut all_quotable = true;
     for s in scans {
         let complete = s.never_started.is_none()
@@ -317,7 +411,27 @@ pub fn render(
         let tx_total: u128 = scans.iter().filter_map(|s| s.spendable_bessel).sum();
         let mined_total = mined.map_or(0, MinedReport::spendable_value);
         let total = if mined_quotable { tx_total + mined_total } else { tx_total };
+        // Lab #785 F5-5d: exits join the total under the same rule as mined.
+        let (total, exit_line) = match exit_part {
+            None => (total, None),
+            Some((Some(e), ExitCoverage::Covered { .. })) => (
+                total + e.spendable_value(),
+                (e.spendable_value() > 0)
+                    .then(|| format!("(including {} bessel of L2 exits — see the exits line above)\n", e.spendable_value())),
+            ),
+            Some(_) => (
+                total,
+                Some(
+                    "(L2 EXITS NOT INCLUDED: this scan could not read /v1/exits, so an exit paid to this \
+                     wallet is missing from the figure above — lab #785)\n"
+                        .to_string(),
+                ),
+            ),
+        };
         out.push_str(&format!("TOTAL spendable: {total} bessel\n"));
+        if let Some(line) = exit_line {
+            out.push_str(&line);
+        }
         if mined_quotable {
             if mined_total > 0 {
                 out.push_str(&format!(
@@ -385,6 +499,54 @@ mod tests {
             spent_bessel: 0,
             never_started: None,
         }
+    }
+
+    /// Lab #785 F5-5d: the exits section names "not looked at" the way the
+    /// mined one does, and the total says in words that exits are not in it;
+    /// with the stream read, the exit figure joins the total, said so.
+    #[test]
+    fn exits_not_fetched_are_named_and_fetched_exits_join_the_total() {
+        let scans = [div(0, Completeness::Complete, 5, 0)];
+        let blind = render_with_exits(
+            &scans,
+            (0, 8),
+            "http://x",
+            &covered(),
+            None,
+            &no_coinbase(),
+            None,
+            &ExitCoverage::Unavailable { why: "the exit stream could not be read (HTTP 404)".into() },
+        );
+        assert!(blind.contains(&format!("exits (L2 → L1): {UNAVAILABLE} — the exit stream could not be read")), "{blind}");
+        assert!(blind.contains("TOTAL spendable: 5 bessel") && blind.contains("L2 EXITS NOT INCLUDED"), "{blind}");
+
+        let w = qlab_wallet::Wallet::from_master_seed(&qlab_wallet::seed::MasterSeed::from_entropy([3; 32]), 0);
+        let rkm = w.rkm(w.diversifier_at_index(0));
+        let report = ExitReport {
+            spendable: vec![crate::exits::ExitNote {
+                height: 7,
+                index: 0,
+                div_index: 0,
+                note: qlab_node::coinbase::exit_note(7, 0, rkm, 40),
+                spent_height: None,
+            }],
+            spent: vec![],
+        };
+        let seen = render_with_exits(
+            &scans,
+            (0, 8),
+            "http://x",
+            &covered(),
+            None,
+            &no_coinbase(),
+            Some(&report),
+            &ExitCoverage::Covered { range: Some((0, 8)) },
+        );
+        assert!(seen.contains("exits (L2 → L1): the chain's exits for 0..=8 are in hand"), "{seen}");
+        assert!(seen.contains("TOTAL spendable: 45 bessel") && seen.contains("including 40 bessel of L2 exits"), "{seen}");
+        assert!(!seen.contains("L2 EXITS NOT INCLUDED"));
+        // `render` (no exits part) is the pre-F5-5d report, byte for byte.
+        assert!(!render(&scans, (0, 8), "http://x", &covered(), None, &no_coinbase()).contains("exits (L2"));
     }
 
     #[test]

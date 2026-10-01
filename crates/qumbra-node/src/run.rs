@@ -2474,7 +2474,10 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             return false;
         }
         let mut next = (*current).clone();
-        if !next.refresh(self.p2p.node().state().chain()) {
+        // Lab #785 F5-5d: each new block's exits through the node's rule,
+        // over its bundle read back by reference.
+        let state = self.p2p.node().state();
+        if !next.refresh_with_exits(state.chain(), &|b| state.exits_of(b)) {
             return false;
         }
         if let Ok(mut slot) = self.discovery_view.lock() {

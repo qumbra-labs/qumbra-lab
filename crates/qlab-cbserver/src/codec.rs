@@ -695,6 +695,154 @@ impl CoinbasePage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /v1/exits (lab #785 F5-5d)
+// ---------------------------------------------------------------------------
+
+/// Page bound for `/v1/exits`: [`MAX_COINBASE_BLOCKS`], the route's twin.
+/// `[devnet-placeholder]`, as that one is.
+pub const MAX_EXIT_BLOCKS: usize = MAX_COINBASE_BLOCKS;
+
+/// The most exits one block's entry may carry on this wire: the V6 chain's
+/// `K_exit` (version 1's `WrapperParams::k_exit`, 8). The rule refuses a
+/// bundle with more, so a served page never holds more; a decoder refuses
+/// an entry claiming more.
+pub const MAX_EXITS_PER_BLOCK: usize = 8;
+
+/// **The largest `ExitPage` this wire can carry**: version, three ten-byte
+/// varints (from, to, n_blocks), then [`MAX_EXIT_BLOCKS`] entries each of a
+/// ten-byte height, the count byte, and [`MAX_EXITS_PER_BLOCK`] × (32-byte
+/// `rkm` + ten-byte `v`). 355,359 B.
+pub const MAX_EXIT_PAGE_BYTES: usize = 1 + 3 * 10 + MAX_EXIT_BLOCKS * (10 + 1 + MAX_EXITS_PER_BLOCK * (32 + 10));
+
+/// One exit a bundle carried: an asset-0 note of `v` to `rkm` (lab #785
+/// F5-4c), as the bundle's clear exit list states it — facts, nothing
+/// derived. A holder rebuilds the note with `qlab_node::exit_note(height,
+/// index, rkm, v)`, `index` being its position in the block's list, the same
+/// function `apply_state` appended it with, and requires the leaf in its
+/// synced tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitFact {
+    /// Raw `rkm` lanes (lane-major little-endian on the wire, as
+    /// [`BlockCoinbase::coinbase_rkm`]).
+    pub rkm: [u64; 4],
+    pub v: u64,
+}
+
+/// One main-chain block's exits, in list order (empty: it carried none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockExits {
+    pub height: u64,
+    pub exits: Vec<ExitFact>,
+}
+
+/// **`GET /v1/exits?from=&to=`** (lab #785 F5-5d) — [`CoinbasePage`]'s
+/// twin, in shape and in every rule: bulk over a range and never a per-key
+/// query (`?rkm=` would tell the server whose exit is asked about); every
+/// height the server holds in range present, a block with no exits as
+/// `n_exits = 0`, so a short page is visibly short; the family's version
+/// byte, a pure route addition.
+///
+/// ```text
+/// version ‖ from(varint) ‖ to(varint) ‖ n_blocks(varint) ‖
+///  [height(varint) ‖ n_exits(u8) ‖ [rkm(32 B) ‖ v(varint)] × n_exits] × n_blocks
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitPage {
+    pub from: u64,
+    pub to: u64,
+    /// Ascending by height; at most [`MAX_EXIT_BLOCKS`] entries.
+    pub blocks: Vec<BlockExits>,
+}
+
+impl ExitPage {
+    /// Build the page for `[from, to]` — [`CoinbasePage::page`]'s arithmetic.
+    pub fn page(blocks: impl IntoIterator<Item = BlockExits>, from: u64, to: u64) -> ExitPage {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b.height < from || b.height > to {
+                continue;
+            }
+            if out.len() == MAX_EXIT_BLOCKS {
+                break;
+            }
+            out.push(b);
+        }
+        ExitPage { from, to, blocks: out }
+    }
+
+    /// The highest height this page carries.
+    pub fn last_height(&self) -> Option<u64> {
+        self.blocks.last().map(|b| b.height)
+    }
+
+    /// Known short of its range — [`CoinbasePage::is_truncated`]'s rule.
+    pub fn is_truncated(&self) -> bool {
+        self.last_height().is_some_and(|h| h < self.to)
+    }
+
+    /// # Panics
+    ///
+    /// On an entry with more than [`MAX_EXITS_PER_BLOCK`] exits: the rule
+    /// refuses such a bundle, so a server meeting one is serving a block its
+    /// chain could not hold.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(WIRE_VERSION);
+        write_varint(&mut out, self.from);
+        write_varint(&mut out, self.to);
+        write_varint(&mut out, self.blocks.len() as u64);
+        for b in &self.blocks {
+            assert!(b.exits.len() <= MAX_EXITS_PER_BLOCK, "an exit list past K_exit at height {}", b.height);
+            write_varint(&mut out, b.height);
+            out.push(b.exits.len() as u8);
+            for e in &b.exits {
+                out.extend_from_slice(&qlab_note::hash::digest_bytes(&e.rkm));
+                write_varint(&mut out, e.v);
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<ExitPage, CodecError> {
+        let mut pos = 0usize;
+        let ver = *b.get(pos).ok_or(CodecError::Truncated { what: "version" })?;
+        pos += 1;
+        if ver != WIRE_VERSION {
+            return Err(CodecError::BadVersion { got: ver });
+        }
+        let from = read_varint(b, &mut pos)?;
+        let to = read_varint(b, &mut pos)?;
+        let n_blocks = read_varint(b, &mut pos)?;
+        // The smallest entry is a height byte and a count byte: the
+        // allocation is capped by the bytes present, never by the claim.
+        let mut blocks = Vec::with_capacity((n_blocks as usize).min(b.len() / 2));
+        for _ in 0..n_blocks {
+            let height = read_varint(b, &mut pos)?;
+            let n = *b.get(pos).ok_or(CodecError::Truncated { what: "n_exits" })? as usize;
+            pos += 1;
+            if n > MAX_EXITS_PER_BLOCK {
+                return Err(CodecError::Truncated { what: "n_exits above K_exit" });
+            }
+            let mut exits = Vec::with_capacity(n);
+            for _ in 0..n {
+                if b.len() < pos + 32 {
+                    return Err(CodecError::Truncated { what: "exit rkm" });
+                }
+                let rkm_bytes: [u8; 32] = b[pos..pos + 32].try_into().expect("32 bytes");
+                pos += 32;
+                let v = read_varint(b, &mut pos)?;
+                exits.push(ExitFact { rkm: qlab_note::hash::digest_from_bytes(&rkm_bytes), v });
+            }
+            blocks.push(BlockExits { height, exits });
+        }
+        if pos != b.len() {
+            return Err(CodecError::TrailingBytes { remaining: b.len() - pos });
+        }
+        Ok(ExitPage { from, to, blocks })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1388,85 @@ mod tests {
         let beyond = NullifierPage::page(all.iter().cloned(), 99_999, 100_000);
         assert!(beyond.blocks.is_empty(), "a range the source does not hold is empty, not an error");
         assert_eq!((beyond.from, beyond.to), (99_999, 100_000), "the echoes are the request's");
+    }
+
+    // ---- /v1/exits (lab #785 F5-5d) -----------------------------------------
+
+    fn ex(rkm: u64, v: u64) -> ExitFact {
+        ExitFact { rkm: [rkm, 2, 3, 4], v }
+    }
+
+    /// The exit framing, byte for byte: header, a block with two exits, a
+    /// block with none (present, so the stream has no holes), and the
+    /// round-trip; the empty page.
+    #[test]
+    fn the_exit_page_framing_round_trips_byte_for_byte() {
+        let page = ExitPage {
+            from: 7,
+            to: 8,
+            blocks: vec![BlockExits { height: 7, exits: vec![ex(0xa1, 40), ex(0xb1, 300)] }, BlockExits { height: 8, exits: vec![] }],
+        };
+        let bytes = page.to_bytes();
+        assert_eq!(&bytes[..4], &[0x01, 0x07, 0x08, 0x02], "WIRE_VERSION, from, to, n_blocks");
+        assert_eq!(&bytes[4..6], &[0x07, 0x02], "height 7, two exits");
+        assert_eq!(&bytes[6..38], &qlab_note::hash::digest_bytes(&[0xa1, 2, 3, 4]), "rkm, lane-major LE");
+        assert_eq!(bytes[38], 40);
+        assert_eq!(&bytes[39..71], &qlab_note::hash::digest_bytes(&[0xb1, 2, 3, 4]));
+        assert_eq!(&bytes[71..73], &[0xac, 0x02], "300, a two-byte varint");
+        assert_eq!(&bytes[73..], &[0x08, 0x00], "height 8, no exits — present");
+        assert_eq!(ExitPage::from_bytes(&bytes).unwrap(), page);
+        let empty = ExitPage { from: 9, to: 9, blocks: vec![] };
+        assert_eq!(empty.to_bytes(), vec![0x01, 0x09, 0x09, 0x00]);
+        assert_eq!(ExitPage::from_bytes(&empty.to_bytes()).unwrap(), empty);
+    }
+
+    /// Paging is the coinbase route's: `[from, to]`, the cap, the visibly
+    /// short page; a full page at the cap with every entry at `K_exit` and
+    /// every varint at its widest stays under `MAX_EXIT_PAGE_BYTES`.
+    #[test]
+    fn exit_paging_is_the_coinbase_arithmetic_and_the_wire_is_bounded() {
+        let all: Vec<BlockExits> = (0..3000u64).map(|h| BlockExits { height: h, exits: vec![] }).collect();
+        let p = ExitPage::page(all.iter().cloned(), 10, 2999);
+        assert_eq!(p.blocks.len(), MAX_EXIT_BLOCKS);
+        assert_eq!((p.blocks[0].height, p.last_height()), (10, Some(10 + MAX_EXIT_BLOCKS as u64 - 1)));
+        assert!(p.is_truncated(), "visibly short: resume from last + 1");
+        let whole = ExitPage::page(all.iter().cloned(), 5, 9);
+        assert_eq!(whole.blocks.len(), 5);
+        assert!(!whole.is_truncated());
+
+        let widest = ExitFact { rkm: [u64::MAX; 4], v: u64::MAX };
+        let full = ExitPage {
+            from: u64::MAX,
+            to: u64::MAX,
+            blocks: (0..MAX_EXIT_BLOCKS)
+                .map(|i| BlockExits { height: u64::MAX - i as u64, exits: vec![widest; MAX_EXITS_PER_BLOCK] })
+                .collect(),
+        };
+        let bytes = full.to_bytes();
+        assert!(bytes.len() <= MAX_EXIT_PAGE_BYTES, "{} > {MAX_EXIT_PAGE_BYTES}", bytes.len());
+        assert_eq!(MAX_EXIT_PAGE_BYTES, 355_359);
+        assert_eq!(ExitPage::from_bytes(&bytes).unwrap(), full);
+    }
+
+    /// The exit wire refuses like its siblings — version, trailing bytes,
+    /// truncation mid-`rkm`, a block count the bytes cannot hold — and an
+    /// entry claiming more exits than `K_exit`.
+    #[test]
+    fn the_exit_wire_refuses_bad_version_trailing_truncation_and_over_cap() {
+        let good = ExitPage { from: 0, to: 1, blocks: vec![BlockExits { height: 1, exits: vec![ex(5, 1)] }] }.to_bytes();
+        let mut bad_v = good.clone();
+        bad_v[0] = 0x02;
+        assert_eq!(ExitPage::from_bytes(&bad_v), Err(CodecError::BadVersion { got: 2 }));
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(ExitPage::from_bytes(&long), Err(CodecError::TrailingBytes { remaining: 1 }));
+        assert_eq!(ExitPage::from_bytes(&good[..20]), Err(CodecError::Truncated { what: "exit rkm" }));
+        let mut lie = vec![0x01, 0x00, 0x01];
+        write_varint(&mut lie, 1 << 60);
+        assert!(ExitPage::from_bytes(&lie).is_err(), "a count the bytes cannot hold");
+        let mut over = vec![0x01, 0x00, 0x01, 0x01, 0x01, (MAX_EXITS_PER_BLOCK + 1) as u8];
+        over.extend(std::iter::repeat_n(0u8, 33 * (MAX_EXITS_PER_BLOCK + 1)));
+        assert_eq!(ExitPage::from_bytes(&over), Err(CodecError::Truncated { what: "n_exits above K_exit" }));
     }
 
     // ---- /v1/coinbase (lab #415) --------------------------------------------

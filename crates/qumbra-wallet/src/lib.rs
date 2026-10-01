@@ -135,6 +135,7 @@ pub mod coinbase;
 pub mod contacts;
 pub mod driver;
 pub mod envelope;
+pub mod exits;
 pub mod names;
 #[cfg(feature = "net")]
 pub mod net;

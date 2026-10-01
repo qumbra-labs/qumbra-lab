@@ -2611,6 +2611,23 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         Ok(())
     }
 
+    /// **The exits a stored block carries** (lab #785 F5-5d), `(rkm, v)` in
+    /// the order the fold made them exit notes: empty for a block with no
+    /// bundle; otherwise the installed rule's `bundle_exits` over the bundle
+    /// read back through its reference. Proof-free and chain-free, so it
+    /// answers for a block loaded by a snapshot resume, where no fold ran.
+    /// A bundle that cannot be read back, or that the rule cannot read exits
+    /// from, is an error naming why — never an empty list in its place.
+    pub fn exits_of(&self, block: &StoredBlock) -> Result<Vec<(Hash32, u64)>, String> {
+        let Some(r) = block.bundle_ref() else { return Ok(Vec::new()) };
+        let bytes = r.bytes().map_err(|e| e.to_string())?;
+        let rule: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
+            Some(w) => &*w.rule,
+            None => &qlab_devnet::body::RefuseAllBundles,
+        };
+        rule.bundle_exits(&bytes).map_err(|e| format!("{e:?}"))
+    }
+
     /// The wrapper chain's surface after the applied tip, canonical bytes
     /// (lab #785 F5-4b); empty on a node with no wrapper.
     pub fn wrapper_surface(&self) -> &[u8] {
@@ -4696,6 +4713,16 @@ mod tests {
         fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, qlab_devnet::body::BundleRefusal> {
             bundle.get(..8).map(<[u8]>::to_vec).ok_or(qlab_devnet::body::BundleRefusal::Codec("short".into()))
         }
+        fn bundle_exits(&self, bundle: &[u8]) -> Result<Vec<(Hash32, u64)>, qlab_devnet::body::BundleRefusal> {
+            let rest = bundle.get(8..).ok_or(qlab_devnet::body::BundleRefusal::Codec("short".into()))?;
+            if rest.len() % 40 != 0 {
+                return Err(qlab_devnet::body::BundleRefusal::Codec("exit list".into()));
+            }
+            Ok(rest
+                .chunks_exact(40)
+                .map(|c| (c[..32].try_into().unwrap(), u64::from_le_bytes(c[32..].try_into().unwrap())))
+                .collect())
+        }
     }
 
     fn exit_setup() -> V6Setup {
@@ -4727,6 +4754,28 @@ mod tests {
             node.apply_block(h, b, &MockVerifier).unwrap();
             parent = h;
         }
+    }
+
+    /// Lab #785 F5-5d: `exits_of` reads a stored block's exits through the
+    /// rule from its bundle — empty for a block without one — in the order
+    /// the fold appended them; a rule that cannot read exits refuses (never an
+    /// empty list), and so does a bundle that no longer reads back.
+    #[test]
+    fn exits_of_reads_a_stored_blocks_exits_through_the_rule() {
+        let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), exit_setup());
+        exit_script(&mut node);
+        let at = |h: u64| node.ancestor_at(&node.tip_hash(), h).unwrap().clone();
+        assert_eq!(node.exits_of(&at(1)), Ok(vec![]));
+        let want = vec![(qlab_note::hash::digest_bytes(&EXIT_A), 40), (qlab_note::hash::digest_bytes(&EXIT_B), 2)];
+        assert_eq!(node.exits_of(&at(2)), Ok(want));
+        assert_eq!(node.exits_of(&at(3)), Ok(vec![]));
+        // A rule without `bundle_exits` refuses for a bundle block.
+        let mut counted = MemNode::in_memory_v6(genesis_block_v6(8, 0), counter_setup());
+        let g = counted.chain.block(&counted.tip_hash()).unwrap().header();
+        let (h1, b1) = bundle_block(&g, Some(5));
+        counted.apply_block(h1, b1, &MockVerifier).unwrap();
+        let b = counted.chain.block(&counted.tip_hash()).unwrap().clone();
+        assert!(counted.exits_of(&b).unwrap_err().contains("NoRule"));
     }
 
     /// Lab #785 F5-4c: a bundle's exits become notes — after the block's

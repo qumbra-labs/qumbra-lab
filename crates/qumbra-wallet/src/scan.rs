@@ -36,10 +36,13 @@ use crate::coinbase::{match_mined, MinedChain, MinedReport};
 #[cfg(feature = "net")]
 use crate::coinbase::fetch_coinbase;
 #[cfg(feature = "net")]
-use crate::net::{scan_fetch, HttpCoinbaseSource, HttpNullifierSource};
+use crate::net::{scan_fetch, HttpCoinbaseSource, HttpExitSource, HttpNullifierSource};
 use crate::spent::{subtract_spent, SpentSet};
 use crate::store::WalletDir;
-use crate::view::{CoinbaseCoverage, DivScan, SpentCoverage};
+use crate::exits::{match_exits, ExitChain, ExitReport};
+#[cfg(feature = "net")]
+use crate::exits::fetch_exits;
+use crate::view::{CoinbaseCoverage, DivScan, ExitCoverage, SpentCoverage};
 
 /// The union of the height ranges several scans' outputs came from — the range
 /// the nullifier stream must cover before any of their figures may be quoted
@@ -62,6 +65,10 @@ pub struct Gathered {
     pub coinbase_coverage: CoinbaseCoverage,
     /// The per-block coinbase facts, `None` when the route could not be read.
     pub mined: Option<MinedChain>,
+    /// Lab #785 F5-5d: how far `/v1/exits` reached, or why it could not.
+    pub exit_coverage: ExitCoverage,
+    /// The per-block exit facts, `None` when the route could not be read.
+    pub exits: Option<ExitChain>,
 }
 
 /// 🔴 **One gatherer, every caller.** `history` is a different rendering of
@@ -131,12 +138,20 @@ pub fn gather(
         };
 
     // ---- 3. The spends, over the range the outputs actually reached. -------
+    let (exit_coverage, exits) = match fetch_exits(&HttpExitSource::new(url), from, to) {
+        Err(e) => (ExitCoverage::Unavailable { why: e.to_string() }, None),
+        Ok(chain) => (ExitCoverage::Covered { range: chain.covered }, Some(chain)),
+    };
+
+    // The nullifier stream must reach as far as every source of notes —
+    // exits included (lab #785 F5-5d), since an exit note is spent like any other.
     let outputs = widest_range(
         outcomes
             .iter()
             .filter_map(|(_, _, o)| o.as_ref().ok())
             .map(|o| o.stats.compact_range_served)
-            .chain(std::iter::once(mined.as_ref().and_then(|m| m.covered))),
+            .chain(std::iter::once(mined.as_ref().and_then(|m| m.covered)))
+            .chain(std::iter::once(exits.as_ref().and_then(|e| e.covered))),
     );
     let (coverage, set) = qlab_ledger::spent::coverage_for(
         &HttpNullifierSource::new(url),
@@ -144,7 +159,7 @@ pub fn gather(
         to,
         outputs,
     );
-    Gathered { outcomes, coverage, set, coinbase_coverage, mined }
+    Gathered { outcomes, coverage, set, coinbase_coverage, mined, exit_coverage, exits }
 }
 
 /// The balance view over [`gather`] — the rows a caller renders with
@@ -166,8 +181,9 @@ pub fn scan_report(
     form: qlab_devnet::forms::GenesisForm,
 ) -> ScanReport {
     let wallet = w.wallet();
-    let Gathered { outcomes, coverage, set, coinbase_coverage, mined } =
+    let Gathered { outcomes, coverage, set, coinbase_coverage, mined, exit_coverage, exits } =
         gather(w, url, from, to, form);
+    let exits = exits_report(&wallet, &w.allocated, exits.as_ref(), set.as_ref());
 
     // The mined half. A figure exists only where BOTH streams do, exactly as for
     // transaction outputs: a coinbase note can be spent, so one that could not be
@@ -199,7 +215,25 @@ pub fn scan_report(
         })
         .collect();
 
-    ScanReport { scans, spent: coverage, coinbase, coinbase_coverage }
+    ScanReport { scans, spent: coverage, coinbase, coinbase_coverage, exits, exit_coverage }
+}
+
+/// This wallet's exit notes (lab #785 F5-5d) — only when both the exit
+/// stream and the nullifier stream were read and the latter reaches as far:
+/// an exit figure that could not subtract spends would count coins already
+/// spent, so it is `None` (and the report says why) rather than a number.
+pub fn exits_report(
+    wallet: &qlab_wallet::Wallet,
+    indices: &[u64],
+    exits: Option<&ExitChain>,
+    spent: Option<&SpentSet>,
+) -> Option<ExitReport> {
+    match (exits, spent) {
+        (Some(chain), Some(set)) if set.covers_outputs(chain.covered).is_ok() => {
+            Some(match_exits(wallet, indices, chain, set))
+        }
+        _ => None,
+    }
 }
 
 /// Everything [`crate::view::render`] needs, kept together for the reason the
@@ -218,6 +252,11 @@ pub struct ScanReport {
     pub coinbase: Option<MinedReport>,
     /// How far the coinbase stream reached, or why it could not (lab #415).
     pub coinbase_coverage: CoinbaseCoverage,
+    /// This wallet's exit notes (lab #785 F5-5d), `None` when they could not
+    /// be established — as `coinbase`.
+    pub exits: Option<ExitReport>,
+    /// How far the exit stream reached, or why it could not.
+    pub exit_coverage: ExitCoverage,
 }
 
 #[cfg(test)]

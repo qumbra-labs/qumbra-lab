@@ -269,6 +269,21 @@ impl BundleVerifier for WrapperRule {
         self.fold_checks(&prev, &wb).map(|_| ())
     }
 
+    /// The clear exit list (F5-5d), past proofs skipped by length
+    /// (`qlab_wrapper::codec::exit_list`), checked against this chain's
+    /// `l2_id` and exit shape — the same refusals the rule names.
+    fn bundle_exits(&self, bundle: &[u8]) -> Result<Vec<(Hash32, u64)>, BundleRefusal> {
+        let exits = qlab_wrapper::codec::exit_list(bundle).map_err(codec_err)?;
+        if bundle.len() >= 12 {
+            let l2_id = u64::from_le_bytes(bundle[4..12].try_into().expect("8 bytes"));
+            if l2_id != self.l2_id {
+                return Err(BundleRefusal::L2Id { got: l2_id, want: self.l2_id });
+            }
+        }
+        check_exit_shape(&exits, self.k_exit).map_err(exit_shape_err)?;
+        Ok(exits.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect())
+    }
+
     /// The prefix read (F5-4c ruling Q1): kilobytes, no proof decoded — the
     /// snapshot paths' walk-back reads only what the stated surface needs.
     fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, BundleRefusal> {

@@ -1256,6 +1256,15 @@ pub trait BundleVerifier {
     fn recheck_bundle(&self, header: &BlockHeader, bundle: &[u8], ctx: &BundleContext<'_>) -> Result<(), BundleRefusal> {
         self.verify_bundle(header, bundle, ctx).map(|_| ())
     }
+    /// **The exits a bundle carries, from its bytes alone** (lab #785
+    /// F5-5d): `(rkm, v)` in list order — the order the fold turns them into
+    /// exit notes — for a bundle already applied. No proof, no chain context:
+    /// what `/v1/exits` serves after a snapshot resume, where no fold ran.
+    /// The default refuses (`NoRule`): a rule never reports "no exits" by
+    /// default.
+    fn bundle_exits(&self, _bundle: &[u8]) -> Result<Vec<(Hash32, u64)>, BundleRefusal> {
+        Err(BundleRefusal::NoRule)
+    }
 }
 
 /// A V6 net's wrapper chain as a node carries it (lab #785 F5-4b): the rule
