@@ -343,10 +343,13 @@ pub enum SubmitClass {
 
 impl SubmitAnswer {
     /// The transaction id the node echoed, when it echoed one (`accepted` and
-    /// `duplicate` both carry it — the statement tx id).
+    /// `duplicate` both carry it — the statement tx id). The **second token
+    /// only**: a V6 node appends a human-readable tail after it (lab #785
+    /// F5-6, "mined once a finality record covers its anchor").
     pub fn txid_hex(&self) -> Option<&str> {
-        let (head, rest) = self.body.split_once(' ')?;
-        matches!(head, "accepted" | "duplicate").then_some(rest.trim())
+        let mut words = self.body.split_whitespace();
+        let head = words.next()?;
+        matches!(head, "accepted" | "duplicate").then(|| words.next()).flatten()
     }
 
     pub fn class(&self) -> SubmitClass {
@@ -845,6 +848,14 @@ mod tests {
         let un = answer(503, "unavailable: state-lag — this node's applied state is behind");
         assert_eq!(un.class(), SubmitClass::Unavailable);
         assert!(!un.is_in_flight());
+
+        // Lab #785 F5-6: a V6 node's tail after the txid is the node's words
+        // for the user; the class and the txid read past it.
+        let v6 = answer(202, "accepted 1f2e3d4c (mined once a finality record covers its anchor)");
+        assert_eq!(v6.class(), SubmitClass::Accepted);
+        assert_eq!(v6.txid_hex(), Some("1f2e3d4c"));
+        let v6_dup = answer(200, "duplicate 1f2e3d4c (mined once a finality record covers its anchor)");
+        assert_eq!(v6_dup.txid_hex(), Some("1f2e3d4c"));
     }
 
     /// A refusal this binary has never heard of stays `Unknown` and keeps its

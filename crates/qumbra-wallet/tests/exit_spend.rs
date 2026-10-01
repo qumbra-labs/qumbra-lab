@@ -126,6 +126,21 @@ fn apply(node: &mut MemNode, txs: Vec<TxEntry>, finality: Vec<u8>, bundle: Vec<u
     node.apply_block(header, body, &AnyTx).expect("the block applies")
 }
 
+/// Build the next V6 block on `node`'s tip and apply it under `verifier`.
+fn try_apply<V: TxVerifier>(
+    node: &mut MemNode,
+    txs: Vec<TxEntry>,
+    finality: Vec<u8>,
+    verifier: &V,
+) -> Result<Hash32, qlab_node::NodeError> {
+    let parent = node.chain().block(&node.tip_hash()).unwrap().header();
+    let height = parent.height + 1;
+    let mut body = BlockBody::from_single_payee(txs, qlab_devnet::emission_exact::coinbase_exact(height), [height; 4]);
+    body.finality = finality;
+    let header = BlockHeader::child_of_for(GenesisForm::V5, &parent, parent.timestamp + 75, 8, body.commitment_v6());
+    node.apply_block(header, body, verifier)
+}
+
 fn get(base: &str, path: &str) -> Result<Vec<u8>, String> {
     let host = base.trim_start_matches("http://");
     let mut s = TcpStream::connect(host).map_err(|e| e.to_string())?;
@@ -161,7 +176,21 @@ impl Fixture {
     }
 }
 
-fn fixture() -> Fixture {
+/// The V6 chain, before it is served.
+struct Built {
+    node: MemNode,
+    validators: Vec<Validator>,
+    wallet: Wallet,
+    dk: Dk,
+    exit_note: Note,
+}
+
+/// Blocks 1–18 as the module docs say. With `extend` (the proven half), on to
+/// 24: block 19 pays a third party under record 16 — a new leaf, so the root
+/// moves — and the node finalizes 24 **locally**, while the chain's records
+/// still cover only 16. The wallet's newest anchor is then above the last
+/// record: admitted under local finality, mineable only under the next one.
+fn build(extend: bool) -> Built {
     let mut rng = StdRng::from_seed([0x5d; 32]);
     let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([0x5d; 32]), 0);
     let d0 = wallet.diversifier_at_index(0);
@@ -190,26 +219,51 @@ fn fixture() -> Fixture {
     apply(&mut node, vec![], vec![], vec![]);
     assert!(node.finalize(hash16).expect("finalize 16").is_recorded());
     assert_eq!(node.tip_height(), 18);
+    if extend {
+        let anchor16 = node.commitment_root();
+        let third = Wallet::from_master_seed(&MasterSeed::from_entropy([0x33; 32]), 0);
+        let third_d = third.diversifier_at_index(0);
+        let note = Note { value: QMB, rkm: third.rkm(third_d), rho: [0xE1, 2, 3, 4], rseed: [0xE5, 6, 7, 8] };
+        let ek = third.diversified_keypair(&third_d).ek;
+        apply(&mut node, vec![payment(&ek, &[note], vec![[0x81; 32], [0x82; 32]], anchor16, &mut rng)], vec![], vec![]);
+        for _ in 20..=24 {
+            apply(&mut node, vec![], vec![], vec![]);
+        }
+        assert!(node.finalize(node.tip_hash()).expect("finalize 24 locally").is_recorded());
+        assert_eq!(node.tip_height(), 24);
+    }
 
     let exit_note = qlab_node::coinbase::exit_note(9, 1, mine, EXIT_V);
     assert!(
         node.commitments_ordered().contains(&qlab_node::coinbase::exit_note_leaf(9, 1, mine, EXIT_V)),
         "the fold appended this wallet's exit leaf"
     );
+    Built { node, validators, wallet, dk: kp.dk, exit_note }
+}
 
+/// The three read projections `RunningNode` republishes, from `node`.
+fn project(
+    node: &MemNode,
+    discovery: &Mutex<Arc<DiscoveryView>>,
+    leaves: &Mutex<Arc<LeavesView>>,
+    anchors: &Mutex<Arc<AnchorsView>>,
+) {
+    let mut view = DiscoveryView::default();
+    assert!(view.refresh_with_exits(node.chain(), &|b| node.exits_of(b)));
+    *discovery.lock().unwrap() = Arc::new(view);
+    *leaves.lock().unwrap() = Arc::new(LeavesView { leaves: node.commitments_ordered().to_vec() });
+    *anchors.lock().unwrap() = Arc::new(AnchorsView { encoded: anchor_set(node).to_bytes() });
+}
+
+fn fixture() -> Fixture {
+    let Built { node, wallet, dk, exit_note, .. } = build(false);
     let discovery = Arc::new(Mutex::new(Arc::new(DiscoveryView::default())));
     let leaves_view = Arc::new(Mutex::new(Arc::new(LeavesView::default())));
     let anchors_view = Arc::new(Mutex::new(Arc::new(AnchorsView::default())));
-    {
-        let mut view = DiscoveryView::default();
-        assert!(view.refresh_with_exits(node.chain(), &|b| node.exits_of(b)));
-        *discovery.lock().unwrap() = Arc::new(view);
-        *leaves_view.lock().unwrap() = Arc::new(LeavesView { leaves: node.commitments_ordered().to_vec() });
-        *anchors_view.lock().unwrap() = Arc::new(AnchorsView { encoded: anchor_set(&node).to_bytes() });
-    }
+    project(&node, &discovery, &leaves_view, &anchors_view);
     let (submit_chan, _rx) = mpsc::sync_channel::<SubmitRequest>(1);
     let server = DiscoveryServer::start("127.0.0.1:0", discovery, leaves_view, anchors_view, submit_chan).expect("bind");
-    Fixture { url: format!("http://{}", server.addr()), wallet, dk: kp.dk, exit_note, to: 18, _server: server }
+    Fixture { url: format!("http://{}", server.addr()), wallet, dk, exit_note, to: 18, _server: server }
 }
 
 /// Pump phase 1 to its end over the fixture's server; `edit` may rewrite a
@@ -335,4 +389,133 @@ fn a_spent_exit_is_not_selected_and_a_missing_route_is_named() {
         events.iter().any(|e| matches!(e, SendStep::Warning(w) if w.contains("L2 exits were NOT visible"))),
         "and it is named: {events:?}"
     );
+}
+
+/// 🔴 **Lab #785 F5-6 (0): the proven spend of an exit note on V6** — the
+/// heavy half, split at the STARK as `coinbase_spend.rs`'s is. One real
+/// prove (~12 GB peak, ~3 s release): release only.
+///
+/// The wallet proves a spend of its exit note (form V5, the V6 net's form),
+/// POSTs it to a V6 node's discovery server, and the node admits it behind
+/// `ConsensusVerifier` under its **local** finality (24) — answering
+/// `accepted <txid> (mined once a finality record covers its anchor)`. The
+/// chain's records still cover only 16, so a block carrying the spend without
+/// a newer record is refused by the V6 block rule (V7 — the rule the
+/// producer's template filter applies, `a_v6_template_excludes_a_tx_outside_
+/// the_record_rule` in qlab-p2p); with the record of 24 it applies, and a
+/// stranger's scan detects the output.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "one real prove (~12 GB peak) — release only, behind the rig lock")]
+fn a_wallet_proves_a_spend_of_its_exit_note_and_a_v6_node_mines_it_under_a_record() {
+    use qlab_node::{NodeRpc, SubmitOutcome};
+    use qumbra_node::discovery_server::{FormView, RegistryView, TxSubmitOutcome, V6_PENDING_TAIL};
+    use qumbra_node::verifier::ConsensusVerifier;
+    use qumbra_wallet::net::SubmitClass;
+    use qumbra_wallet::spend::{preflight, prove, select, submit, SendRequest};
+    use qumbra_wallet::store::WalletDir;
+
+    let Built { node, validators, wallet, exit_note, .. } = build(true);
+    let shared = Arc::new(Mutex::new(NodeRpc::new(node)));
+    let discovery = Arc::new(Mutex::new(Arc::new(DiscoveryView::default())));
+    let leaves_view = Arc::new(Mutex::new(Arc::new(LeavesView::default())));
+    let anchors_view = Arc::new(Mutex::new(Arc::new(AnchorsView::default())));
+    project(shared.lock().unwrap().node(), &discovery, &leaves_view, &anchors_view);
+    let (submit_chan, submit_rx) = mpsc::sync_channel::<SubmitRequest>(4);
+    let server = DiscoveryServer::start_with_mine(
+        "127.0.0.1:0",
+        Arc::clone(&discovery),
+        Arc::clone(&leaves_view),
+        Arc::clone(&anchors_view),
+        submit_chan,
+        None,
+        Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
+        Arc::new(FormView {
+            form: GenesisForm::V5,
+            sections: qlab_devnet::forms::BodySections::V6,
+            ..FormView::default()
+        }),
+    )
+    .expect("bind");
+    let url = format!("http://{}", server.addr());
+
+    let dir = std::env::temp_dir().join(format!("qmb_f56_exit_spend_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    WalletDir::create(&dir, MasterSeed::from_entropy([0x5d; 32])).expect("the wallet dir");
+    let stranger = Wallet::from_master_seed(&MasterSeed::from_entropy([0x25; 32]), 0);
+    let to = stranger.address_at_index(0);
+    let amount = 25 * QMB; // the 30 QMB exit note covers it alone
+    let req = SendRequest {
+        dir: &dir,
+        url: &url,
+        node_url: &url,
+        recipient: &to,
+        contact_name: None,
+        amount,
+        scan_to: 24,
+        no_submit: false,
+        name_op: None,
+        form: GenesisForm::V5,
+    };
+    let bundle = select(&req, &mut |_| {}).expect("phase 1 selects the exit note");
+    let exit_nf = qumbra_wallet::spent::note_nullifier(&wallet, 0, &exit_note);
+    assert!(bundle.real_nullifiers().contains(&exit_nf), "the exit note is an input");
+    let current = preflight(&req).expect("fresh chain facts");
+    let art = prove(&bundle, &current, &mut |_| {}).expect("🔴 the production prove path spends an exit note");
+    assert!(art.entry.public.nullifiers.contains(&exit_nf), "the PROOF consumed the exit note");
+
+    // POST /v1/tx; this thread plays the run loop behind the shipping verifier.
+    let wire = art.wire_bytes.clone();
+    let submit_url = url.clone();
+    let client = std::thread::spawn(move || submit(&submit_url, &wire, &mut |_| {}));
+    let request = submit_rx.recv().expect("the submission reaches the queue");
+    let verdict = {
+        let (bundles, payloads) = qlab_note::compact::decode_committed_discovery(&request.tx.discovery)
+            .expect("a wallet's own tx re-decodes");
+        let mut payloads = payloads.into_iter();
+        let discovery = qlab_node::TxDiscovery {
+            recipients: bundles
+                .into_iter()
+                .map(|bundle| {
+                    let n = bundle.entries.len();
+                    qlab_node::RecipientDiscovery { payloads: payloads.by_ref().take(n).collect(), bundle }
+                })
+                .collect(),
+        };
+        match shared.lock().unwrap().submit_tx(request.tx.clone(), discovery, &ConsensusVerifier) {
+            SubmitOutcome::Accepted(txid) => TxSubmitOutcome::Accepted { txid },
+            other => panic!("admitted under local finality 24, got {other:?}"),
+        }
+    };
+    request.reply.try_send(verdict).expect("the handler is waiting");
+    let answer = client.join().unwrap().expect("the POST completed");
+    assert_eq!((answer.status, answer.class()), (202, SubmitClass::Accepted), "{}", answer.body);
+    assert!(answer.body.ends_with(V6_PENDING_TAIL), "the V6 node says when it will be mined: {}", answer.body);
+    assert!(answer.txid_hex().is_some(), "and the txid still reads: {}", answer.body);
+
+    // No record covers its anchor yet: the V6 block rule refuses the block.
+    {
+        let mut g = shared.lock().unwrap();
+        let refused = try_apply(g.node_mut(), vec![art.entry.clone()], vec![], &ConsensusVerifier);
+        assert!(refused.is_err(), "a spend anchored above the last record is not mineable yet");
+        assert_eq!(g.node().tip_height(), 24);
+    }
+    // The record of checkpoint 24 rides the next block: now it is mined.
+    let send_height = {
+        let mut g = shared.lock().unwrap();
+        let record24 = record_at_tip(g.node(), &validators);
+        try_apply(g.node_mut(), vec![art.entry.clone()], record24, &ConsensusVerifier)
+            .expect("under the record of 24, the spend applies");
+        g.node().tip_height()
+    };
+    assert_eq!(send_height, 25);
+    project(shared.lock().unwrap().node(), &discovery, &leaves_view, &anchors_view);
+
+    // The stranger detects the output.
+    let mut rng = StdRng::from_seed([0xA5; 32]);
+    let dk = stranger.diversified_keypair(&stranger.diversifier_at_index(0)).dk;
+    let got = light_client_scan(&url, &dk, send_height, send_height, ScanConfig::default(), &mut rng)
+        .expect("the stranger's scan runs");
+    assert_eq!(got.notes.len(), 1, "the stranger detects the spend's output");
+    assert_eq!(got.notes[0].detected.note.value, amount);
+    let _ = std::fs::remove_dir_all(&dir);
 }

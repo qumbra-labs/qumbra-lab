@@ -362,6 +362,28 @@ fn txid_hex(id: &Hash32) -> String {
 
 /// Render a verdict as `(status, body)` — the response wire pinned in the
 /// module docs. The first token is machine-usable; the rest is for a person.
+/// What a V6 node adds to an `accepted`/`duplicate` line (lab #785 F5-6):
+/// admission is under this node's local finality, and the block rule (V7)
+/// takes the transaction only once a finality record in the chain covers its
+/// anchor — up to one record cadence later. A human-readable tail: the first
+/// token and the txid are unchanged, and every reader keys on the first token.
+pub const V6_PENDING_TAIL: &str = " (mined once a finality record covers its anchor)";
+
+/// [`render_submit_outcome`] for a node with `sections` — the V6 tail on an
+/// admission, nothing else changed; V4/V5 bytes are `render_submit_outcome`'s.
+pub fn render_submit_outcome_for(
+    sections: qlab_devnet::forms::BodySections,
+    outcome: &TxSubmitOutcome,
+) -> (u16, String) {
+    let (code, mut body) = render_submit_outcome(outcome);
+    if sections == qlab_devnet::forms::BodySections::V6
+        && matches!(outcome, TxSubmitOutcome::Accepted { .. } | TxSubmitOutcome::Duplicate { .. })
+    {
+        body.push_str(V6_PENDING_TAIL);
+    }
+    (code, body)
+}
+
 pub fn render_submit_outcome(outcome: &TxSubmitOutcome) -> (u16, String) {
     match outcome {
         TxSubmitOutcome::Accepted { txid } => (202, format!("accepted {}", txid_hex(txid))),
@@ -480,6 +502,10 @@ pub struct DiscoveryView {
     pub exits: Vec<ExitsOf>,
 }
 
+/// What reads a stored block's exits for the projection (lab #785 F5-5d):
+/// the node's `MemNode::exits_of`, or [`exits_without_a_rule`].
+pub type ExitsOfFn<'a> = dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String> + 'a;
+
 /// One block's exits, or why they could not be read (lab #785 F5-5d).
 pub type ExitsOf = Result<Vec<qlab_cbserver::codec::ExitFact>, String>;
 
@@ -540,7 +566,7 @@ impl DiscoveryView {
     fn retry_unread_exits<C: qlab_node::ChainStore>(
         &mut self,
         chain: &C,
-        exits_of: &dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String>,
+        exits_of: &ExitsOfFn<'_>,
     ) -> bool {
         let mut changed = false;
         for (i, entry) in self.exits.iter_mut().enumerate() {
@@ -565,7 +591,7 @@ impl DiscoveryView {
     pub fn refresh_with_exits<C: qlab_node::ChainStore>(
         &mut self,
         chain: &C,
-        exits_of: &dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String>,
+        exits_of: &ExitsOfFn<'_>,
     ) -> bool {
         // Pre-review Z1: a refusal is retried on every refresh while its
         // block stays on the main chain — one transient read failure must not
@@ -676,6 +702,10 @@ pub const GENESIS_NOTES_NOT_ON_L1: &str =
 /// genesis file; its hash travels in the body.
 pub struct FormView {
     pub form: qlab_devnet::forms::GenesisForm,
+    /// The body-section axis (lab #785): `V6` on a V6 net, where a submitted
+    /// transaction is mined only once a finality record covers its anchor —
+    /// the one thing about a send the wallet cannot know and the node can say.
+    pub sections: qlab_devnet::forms::BodySections,
     pub genesis_notes: Option<Vec<u8>>,
     /// `/v1/annulet/params` (lab #720): the fee tiers under the genesis hash,
     /// encoded once; `None` on an L1 node.
@@ -685,7 +715,12 @@ pub struct FormView {
 impl Default for FormView {
     /// An L1 (v4-wire) node: the historical server, which never had a form.
     fn default() -> Self {
-        Self { form: qlab_devnet::forms::GenesisForm::V4, genesis_notes: None, annulet_params: None }
+        Self {
+            form: qlab_devnet::forms::GenesisForm::V4,
+            sections: qlab_devnet::forms::BodySections::None,
+            genesis_notes: None,
+            annulet_params: None,
+        }
     }
 }
 
@@ -874,7 +909,13 @@ impl DiscoveryServer {
                         );
                         continue;
                     }
-                    spawn_submit_handler(request, submits.clone(), Arc::clone(&inflight), form_view.form);
+                    spawn_submit_handler(
+                        request,
+                        submits.clone(),
+                        Arc::clone(&inflight),
+                        form_view.form,
+                        form_view.sections,
+                    );
                     continue;
                 }
 
@@ -1225,6 +1266,7 @@ fn spawn_submit_handler(
     submits: mpsc::SyncSender<SubmitRequest>,
     inflight: Arc<AtomicUsize>,
     form: qlab_devnet::forms::GenesisForm,
+    sections: qlab_devnet::forms::BodySections,
 ) {
     // Claim a slot before spawning; the refusal must not cost a thread either.
     if inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_SUBMITS {
@@ -1239,7 +1281,7 @@ fn spawn_submit_handler(
     }
     std::thread::spawn(move || {
         let mut request = request;
-        let (code, body) = submit_verdict(&mut request, &submits, form);
+        let (code, body) = submit_verdict(&mut request, &submits, form, sections);
         let _ = request
             .respond(tiny_http::Response::from_string(body).with_status_code(code));
         inflight.fetch_sub(1, Ordering::AcqRel);
@@ -1440,6 +1482,7 @@ fn submit_verdict(
     request: &mut tiny_http::Request,
     submits: &mpsc::SyncSender<SubmitRequest>,
     form: qlab_devnet::forms::GenesisForm,
+    sections: qlab_devnet::forms::BodySections,
 ) -> (u16, String) {
     // 1. The body, bounded BEFORE it is read: a declared oversize is refused on
     //    the header, an undeclared one on the byte that crosses the cap.
@@ -1481,7 +1524,7 @@ fn submit_verdict(
         }
     }
     match reply_rx.recv_timeout(SUBMIT_VERDICT_TIMEOUT) {
-        Ok(outcome) => render_submit_outcome(&outcome),
+        Ok(outcome) => render_submit_outcome_for(sections, &outcome),
         Err(mpsc::RecvTimeoutError::Timeout) => (
             503,
             format!(
@@ -1995,6 +2038,34 @@ mod tests {
         let discovery = qlab_devnet::body::placeholder_discovery(&public.commitments);
         let tx = qlab_devnet::body::TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: qlab_devnet::body::TxEntry::absent_rider() };
         qlab_p2p::codec::encode_tx(&tx)
+    }
+
+    /// Lab #785 F5-6 (ruling (B)): a V6 node's `accepted`/`duplicate` line
+    /// gains the record tail — first token and txid unchanged — and nothing
+    /// else does; a V4/V5 node's bytes are `render_submit_outcome`'s exactly.
+    #[test]
+    fn a_v6_node_says_its_accepted_tx_waits_for_a_record() {
+        use qlab_devnet::forms::BodySections;
+        let outcomes = [
+            TxSubmitOutcome::Accepted { txid: [0xA1; 32] },
+            TxSubmitOutcome::Duplicate { txid: [0xA1; 32] },
+            TxSubmitOutcome::Refused(TxRefusal::Submit(TxSubmitRefusal::StateLagging)),
+        ];
+        for o in &outcomes {
+            assert_eq!(render_submit_outcome_for(BodySections::None, o), render_submit_outcome(o), "V4/V5 bytes unchanged");
+        }
+        let hex = txid_hex(&[0xA1; 32]);
+        assert_eq!(
+            render_submit_outcome_for(BodySections::V6, &outcomes[0]),
+            (202, format!("accepted {hex} (mined once a finality record covers its anchor)"))
+        );
+        assert_eq!(
+            render_submit_outcome_for(BodySections::V6, &outcomes[1]),
+            (200, format!("duplicate {hex}{V6_PENDING_TAIL}"))
+        );
+        assert_eq!(render_submit_outcome_for(BodySections::V6, &outcomes[2]), render_submit_outcome(&outcomes[2]), "a refusal has no tail");
+        let (_, line) = render_submit_outcome_for(BodySections::V6, &outcomes[0]);
+        assert_eq!(line.split_whitespace().take(2).collect::<Vec<_>>(), ["accepted", hex.as_str()], "first token and txid intact");
     }
 
     /// A POSTed body reaches the loop-side consumer as the decoded transaction,
