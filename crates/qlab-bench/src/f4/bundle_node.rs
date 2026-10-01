@@ -467,6 +467,35 @@ fn f5_5b_the_proven_bundle_through_the_slot_gossip_and_template() {
     );
 }
 
+/// Lab #785 F5-5d: on the real fixture's bytes, the lengths-only exit
+/// reader reads exactly the exits `WireBundle::decode` reads (no list, and a
+/// two-entry one), and `WrapperRule::bundle_exits` refuses an exit list the
+/// rule refuses, by the same names — and another chain's `l2_id`.
+#[test]
+fn f5_5d_bundle_exits_reads_what_decode_reads() {
+    use qlab_wrapper::codec::{digest_to_bytes, exit_list};
+    let r = rule();
+    for exits in [vec![], vec![Exit { rkm: [1, 0, 0, 0], v: 3 }, Exit { rkm: [2, 9, 0, 0], v: 4 }]] {
+        let bytes = mutated(|w| {
+            w.exits = exits.clone();
+            false
+        });
+        let decoded = WireBundle::decode(&bytes).unwrap().exits;
+        assert_eq!(decoded, exits);
+        assert_eq!(exit_list(&bytes), Ok(decoded.clone()));
+        assert_eq!(r.bundle_exits(&bytes), Ok(decoded.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect()));
+    }
+    let e = Exit { rkm: [1, 0, 0, 0], v: 1 };
+    assert_eq!(r.bundle_exits(&mutated(|w| { w.exits = vec![e; 9]; false })), Err(BundleRefusal::TooManyExits { n: 9, k_exit: 8 }));
+    assert_eq!(r.bundle_exits(&mutated(|w| { w.exits = vec![Exit { rkm: [0; 4], v: 1 }]; false })), Err(BundleRefusal::ZeroExitRkm { index: 0 }));
+    assert_eq!(r.bundle_exits(&mutated(|w| { w.exits = vec![Exit { v: 0, ..e }]; false })), Err(BundleRefusal::ZeroExitValue { index: 0 }));
+    assert_eq!(r.bundle_exits(&mutated(|w| { w.l2_id = 2; false })), Err(BundleRefusal::L2Id { got: 2, want: REHEARSAL_L2_ID }));
+    assert!(matches!(r.bundle_exits(&fixture().wire[..100]), Err(BundleRefusal::Codec(_))));
+    // Pre-review Z4: the version is the rule's, refused by name.
+    let production = WrapperRule::from_params(NET_ID, &params()).unwrap();
+    assert_eq!(production.bundle_exits(&fixture().wire), Err(BundleRefusal::Wrapper("Version".into())));
+}
+
 /// F-A (lab #785 F5-4a): the node's V6 genesis registry is the registry
 /// every F3/F4 fixture starts from — asset 0's Cloaked leaf — and the
 /// native model over it is the node's genesis surface.

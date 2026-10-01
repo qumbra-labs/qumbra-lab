@@ -432,6 +432,48 @@ impl WireBundle {
     }
 }
 
+/// **The bundle's clear exit list, from its bytes alone** (lab #785 F5-5d):
+/// every proof is skipped by its length prefix, never decoded, so reading the
+/// exits costs no proof deserialisation. Each length is bounded by the bytes
+/// that remain before the reader moves (`take` refuses past the end; nothing
+/// is allocated by a claimed length), and the layout is [`WireBundle::decode`]'s
+/// exactly — the member count and tags checked, the signature present, no
+/// trailing bytes — so a byte string this accepts is one `decode` reads the
+/// same exits from, or refuses for a proof.
+pub fn exit_list(b: &[u8]) -> Result<Vec<Exit>, CodecError> {
+    let mut r = Reader { b };
+    let skip_proof = |r: &mut Reader<'_>, what: &'static str| -> Result<(), CodecError> {
+        let len = r.u32(what)? as usize;
+        r.take(len, what).map(|_| ())
+    };
+    r.u32("version")?;
+    r.u64("l2_id")?;
+    r.take(4 * W_PV_LEN, "w_pvs")?;
+    skip_proof(&mut r, "w_proof")?;
+    r.take(4 * DEP_PV_LEN, "dep_pvs")?;
+    skip_proof(&mut r, "dep_proof")?;
+    let n = r.u8("n_members")?;
+    if n as usize > MAX_K {
+        return Err(CodecError::TooManyMembers(n));
+    }
+    for _ in 0..n {
+        let t = r.u8("member tag")?;
+        let tag = tag_of(t).ok_or(CodecError::UnknownTag(t))?;
+        r.take(4 * tag.pv_len(), "member pvs")?;
+        skip_proof(&mut r, "member proof")?;
+    }
+    let n_exits = r.u8("n_exits")?;
+    let mut exits = Vec::with_capacity(n_exits as usize);
+    for _ in 0..n_exits {
+        let rkm = r.digest("exit rkm")?;
+        let v = r.u64("exit v")?;
+        exits.push(Exit { rkm, v });
+    }
+    r.take(SEQUENCER_SIG_LEN, "sequencer_sig")?;
+    r.end()?;
+    Ok(exits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +615,57 @@ mod tests {
         junk.extend_from_slice(&3u32.to_le_bytes());
         junk.extend_from_slice(&[1, 2, 3]);
         assert!(matches!(WireBundle::decode(&junk), Err(CodecError::ProofDecode("w_proof"))));
+    }
+
+    /// Lab #785 F5-5d: `exit_list` reads the clear exits past proofs it
+    /// never decodes, and refuses by name a bundle that ends early, a length
+    /// that points past the end, an unknown member tag, and trailing bytes.
+    /// (That it equals `WireBundle::decode(..).exits` on a real bundle is
+    /// qlab-bench's F4 fixture test.)
+    #[test]
+    fn exit_list_skips_proofs_by_length_and_refuses_by_name() {
+        let tag = WTag::C;
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, 4 * W_PV_LEN));
+        let opaque = |b: &mut Vec<u8>, n: usize| {
+            b.extend_from_slice(&(n as u32).to_le_bytes());
+            b.extend(std::iter::repeat_n(0xAB, n));
+        };
+        opaque(&mut b, 11); // not a proof: never decoded
+        b.extend(std::iter::repeat_n(0u8, 4 * DEP_PV_LEN));
+        opaque(&mut b, 5);
+        b.push(1);
+        b.push(tag.byte());
+        b.extend(std::iter::repeat_n(0u8, 4 * tag.pv_len()));
+        opaque(&mut b, 3);
+        let head = b.clone();
+        let exits = [Exit { rkm: [1, 2, 3, 4], v: 9 }, Exit { rkm: [5, 0, 0, 0], v: 1 }];
+        b.push(exits.len() as u8);
+        for e in &exits {
+            b.extend_from_slice(&digest_to_bytes(&e.rkm));
+            b.extend_from_slice(&e.v.to_le_bytes());
+        }
+        b.extend(std::iter::repeat_n(0u8, SEQUENCER_SIG_LEN));
+        assert_eq!(exit_list(&b), Ok(exits.to_vec()));
+        assert!(matches!(WireBundle::decode(&b), Err(CodecError::ProofDecode("w_proof"))), "decode reads the proofs");
+
+        assert_eq!(exit_list(&b[..b.len() - 1]), Err(CodecError::Truncated("sequencer_sig")));
+        assert_eq!(exit_list(&head), Err(CodecError::Truncated("n_exits")));
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(exit_list(&long), Err(CodecError::Trailing));
+        // A proof length pointing past the end: refused, nothing allocated.
+        let mut past = b[..12 + 4 * W_PV_LEN].to_vec();
+        past.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(exit_list(&past), Err(CodecError::Truncated("w_proof")));
+        let mut unknown = b.clone();
+        let at = 12 + 4 * W_PV_LEN + 4 + 11 + 4 * DEP_PV_LEN + 4 + 5 + 1;
+        unknown[at] = 0xEE;
+        assert_eq!(exit_list(&unknown), Err(CodecError::UnknownTag(0xEE)));
+        let mut many = b.clone();
+        many[at - 1] = (MAX_K + 1) as u8;
+        assert_eq!(exit_list(&many), Err(CodecError::TooManyMembers((MAX_K + 1) as u8)));
     }
 }

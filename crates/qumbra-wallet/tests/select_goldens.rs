@@ -234,6 +234,12 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
         .iter()
         .position(|p| p.starts_with("/v1/coinbase"))
         .expect("the coinbase stream is fetched (lab #424)");
+    // Lab #785 F5-5d (a test-expectation ruling on PR #806): the Exits phase
+    // sits between coinbase and the tree.
+    let ex_at = paths
+        .iter()
+        .position(|p| p.starts_with("/v1/exits"))
+        .expect("the exit stream is fetched (lab #785 F5-5d)");
     let leaves_at = paths
         .iter()
         .position(|p| p.starts_with("/v1/tree/leaves"))
@@ -243,9 +249,9 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
         .position(|p| p.as_str() == "/v1/anchors")
         .expect("the anchor set is fetched");
 
-    // Phase order is the lock: scan → nullifiers → coinbase → leaves → anchors.
+    // Phase order is the lock: scan → nullifiers → coinbase → exits → leaves → anchors.
     assert!(
-        nf_at < cb_at && cb_at < leaves_at && leaves_at < anchors_at,
+        nf_at < cb_at && cb_at < ex_at && ex_at < leaves_at && leaves_at < anchors_at,
         "phase order: {paths:?}"
     );
     assert_eq!(anchors_at, paths.len() - 1, "anchors are the last fetch: {paths:?}");
@@ -280,11 +286,14 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
     // silently could not see.
     assert_eq!(paths[nf_at], format!("/v1/nullifiers?from=0&to={t}"), "{paths:?}");
     assert_eq!(paths[cb_at], format!("/v1/coinbase?from=0&to={t}"), "{paths:?}");
+    assert_eq!(paths[ex_at], format!("/v1/exits?from=0&to={t}"), "the same range as the nullifiers: {paths:?}");
     assert_eq!(paths[leaves_at], "/v1/tree/leaves?from=0", "{paths:?}");
     assert_eq!(
         paths[nf_at + 1..leaves_at]
             .iter()
-            .filter(|p| !p.starts_with("/v1/nullifiers") && !p.starts_with("/v1/coinbase"))
+            .filter(|p| {
+                !p.starts_with("/v1/nullifiers") && !p.starts_with("/v1/coinbase") && !p.starts_with("/v1/exits")
+            })
             .count(),
         0,
         "nothing foreign between nullifiers and leaves: {paths:?}"

@@ -2470,11 +2470,16 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         let tip = self.p2p.node().state().chain().tip_hash();
         let current =
             Arc::clone(&self.discovery_view.lock().unwrap_or_else(|p| p.into_inner()));
-        if current.tip_hash() == Some(tip) {
+        // An unchanged tip is still worth a pass while a block's exits are a
+        // refusal (lab #785 F5-5d, pre-review Z1): they are retried.
+        if current.tip_hash() == Some(tip) && !current.has_unread_exits() {
             return false;
         }
         let mut next = (*current).clone();
-        if !next.refresh(self.p2p.node().state().chain()) {
+        // Lab #785 F5-5d: each new block's exits through the node's rule,
+        // over its bundle read back by reference.
+        let state = self.p2p.node().state();
+        if !next.refresh_with_exits(state.chain(), &|b| state.exits_of(b)) {
             return false;
         }
         if let Ok(mut slot) = self.discovery_view.lock() {

@@ -17,6 +17,10 @@
 //!   carries no `coinbase_rkm`, so a mining-only wallet reads `0` forever — the
 //!   figure being wrong in the safe direction is not a defence, because it is
 //!   printed under `complete`.
+//! - `GET /v1/exits?from=<height>&to=<height>` — the per-block exit lists
+//!   ([`crate::codec::ExitPage`], lab #785 F5-5d), `/v1/coinbase`'s twin: empty
+//!   for every block that carries no bundle; a 503 for a range holding one,
+//!   since this server reads no exits.
 //! - `GET /v1/block/<height>/tx/<index>/full` — full ciphertext fetch on a scan
 //!   match ([`crate::codec::encode_full_response`]).
 //! - `GET /v1/tree/frontier?at=<height>` — commitment-tree frontier for witness
@@ -36,7 +40,7 @@ use std::thread::JoinHandle;
 
 use tiny_http::{Method, Response, Server};
 
-use crate::codec::{encode_compact_response, encode_full_response, CoinbasePage, NullifierPage};
+use crate::codec::{encode_compact_response, encode_full_response, CoinbasePage, ExitPage, NullifierPage};
 use crate::data::Devnet;
 
 /// A running server: bound address + the worker thread. Drop-safe via
@@ -148,6 +152,21 @@ pub fn route(devnet: &Devnet, url: &str) -> RouteResult {
                 return Err((400, "'to' < 'from'"));
             }
             Ok(CoinbasePage::page(devnet.coinbase_range(from, to), from, to).to_bytes())
+        }
+        // /v1/exits?from=&to= — the per-block exit lists (lab #785 F5-5d),
+        // `/v1/coinbase`'s twin and served here for the same reason: a
+        // wallet pointed at this server must not read "exits unavailable"
+        // on a chain that has none. Bulk over a range; no `?rkm=` form.
+        ["v1", "exits"] => {
+            let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+            let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
+            if to < from {
+                return Err((400, "'to' < 'from'"));
+            }
+            let blocks = devnet
+                .exit_range(from, to)
+                .map_err(|_| (503, "unavailable: a block in range carries a bundle, and this server reads no exits"))?;
+            Ok(ExitPage::page(blocks, from, to).to_bytes())
         }
         // /v1/block/<height>/tx/<index>/full
         ["v1", "block", h, "tx", i, "full"] => {
@@ -298,6 +317,19 @@ mod tests {
         )
         .unwrap();
         assert!(all.blocks.iter().all(|b| b.coinbase_rkm == mine), "one payee, every block");
+    }
+
+    /// Lab #785 F5-5d: the reference server serves `/v1/exits` — every held
+    /// height, each with no exits (this devnet carries no bundle), with the
+    /// coinbase route's 400s.
+    #[test]
+    fn route_exit_range() {
+        let d = devnet();
+        let page = crate::codec::ExitPage::from_bytes(&route(&d, "/v1/exits?from=1&to=3").unwrap()).unwrap();
+        assert_eq!((page.from, page.to, page.blocks.len()), (1, 3, 3));
+        assert!(page.blocks.iter().enumerate().all(|(i, b)| b.height == 1 + i as u64 && b.exits.is_empty()));
+        assert_eq!(route(&d, "/v1/exits?from=5&to=1"), Err((400, "'to' < 'from'")));
+        assert_eq!(route(&d, "/v1/exits?to=1"), Err((400, "missing/invalid 'from'")));
     }
 
     #[test]

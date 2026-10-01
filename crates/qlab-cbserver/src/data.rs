@@ -365,6 +365,25 @@ impl Devnet {
             .collect()
     }
 
+    /// The per-block exit lists for `/v1/exits` (lab #785 F5-5d) — every
+    /// held height in range, `coinbase_range`'s rule. This server holds no
+    /// bundle rule, so it can state "no exits" only for a block that carries
+    /// no bundle; a bundle-carrying block is `Err(height)`, never an empty
+    /// list standing in for exits it cannot read.
+    pub fn exit_range(&self, from: u64, to: u64) -> Result<Vec<crate::codec::BlockExits>, u64> {
+        self.blocks
+            .iter()
+            .filter(|blk| blk.height >= from && blk.height <= to)
+            .map(|blk| {
+                if blk.body.bundle.is_empty() {
+                    Ok(crate::codec::BlockExits { height: blk.height, exits: Vec::new() })
+                } else {
+                    Err(blk.height)
+                }
+            })
+            .collect()
+    }
+
     /// The full-fetch payloads for one `(height, tx_index)`: per-recipient AEAD
     /// ciphertext lists (index-aligned with the compact entries).
     pub fn full_payloads(&self, height: u64, tx_index: u64) -> Option<Vec<Vec<Vec<u8>>>> {

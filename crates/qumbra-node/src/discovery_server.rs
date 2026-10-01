@@ -45,6 +45,13 @@
 //!   under `complete` on a chain it had mined every block of. Bulk over a
 //!   range; no per-key form, ever.
 //!
+//! - `GET /v1/exits?from=&to=` — the per-block exits a bundle paid out to L1
+//!   notes ([`qlab_cbserver::codec::ExitPage`], lab #785 F5-5d), facts a wallet
+//!   matches its own `rkm` against and rebuilds with `qlab_node::exit_note`.
+//!   An exit note has no discovery entry (it is a leaf the fold appends), so
+//!   this is the only way its holder finds it. `/v1/coinbase`'s twin; bulk over
+//!   a range, no per-key form.
+//!
 //! - `GET /v1/tree/leaves?from=` — the commitment tree's leaves in authoritative
 //!   append order ([`qlab_node::TreeLeaves`], issue #275 / decision brief B1).
 //!   How a wallet builds the **witness** to spend: it replays the stream into a
@@ -227,6 +234,8 @@ pub const REGISTRY_SLOT_PREFIX: &str = "/v1/registry/slot/";
 /// block prints its own payee) but the *question* "did this key mine anything"
 /// is not, and it is the question that would leak.
 pub const COINBASE_PATH: &str = "/v1/coinbase";
+/// `GET /v1/exits?from=&to=` (lab #785 F5-5d) — `/v1/coinbase`'s twin.
+pub const EXITS_PATH: &str = "/v1/exits";
 
 /// The most bytes `POST /v1/tx` will read as a body.
 ///
@@ -462,6 +471,27 @@ const CONTENT_TYPE_VALUE: &[u8] = b"application/octet-stream";
 pub struct DiscoveryView {
     /// Ascending by height, genesis first, main chain only.
     pub blocks: Vec<BlockDiscovery>,
+    /// **Each block's exits** (lab #785 F5-5d), aligned with `blocks`: what
+    /// `/v1/exits` serves. Computed once per block as the walk meets it, so a
+    /// steady node or a reorg re-reads only blocks new to the main chain; an
+    /// entry (and a refusal) leaves with its block. `Err` names why a bundle
+    /// block's exits could not be read — served as a 503, never as an empty
+    /// list in its place. A missing entry is "not projected", the same.
+    pub exits: Vec<ExitsOf>,
+}
+
+/// One block's exits, or why they could not be read (lab #785 F5-5d).
+pub type ExitsOf = Result<Vec<qlab_cbserver::codec::ExitFact>, String>;
+
+/// What a projection with no bundle rule at hand knows (lab #785 F5-5d): a
+/// block without a bundle has no exits; a bundle block's exits are not
+/// projected — said so, never guessed. The node's run loop projects through
+/// its rule ([`DiscoveryView::refresh_with_exits`]).
+pub fn exits_without_a_rule(block: &qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String> {
+    match block.bundle_ref() {
+        None => Ok(Vec::new()),
+        Some(_) => Err("exits not projected: no bundle rule in this projection".into()),
+    }
 }
 
 impl DiscoveryView {
@@ -496,11 +526,57 @@ impl DiscoveryView {
     /// — `chain.tip_hash()` and `header.prev` do, which is the same fork choice
     /// the state machine already committed to.
     pub fn refresh<C: qlab_node::ChainStore>(&mut self, chain: &C) -> bool {
+        self.refresh_with_exits(chain, &exits_without_a_rule)
+    }
+
+    /// Whether some held block's exits are a refusal — what makes an
+    /// unchanged tip still worth a refresh (pre-review Z1).
+    pub fn has_unread_exits(&self) -> bool {
+        self.exits.iter().any(Result::is_err)
+    }
+
+    /// Re-read the exits of every held block whose entry is a refusal; true
+    /// when one now reads.
+    fn retry_unread_exits<C: qlab_node::ChainStore>(
+        &mut self,
+        chain: &C,
+        exits_of: &dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String>,
+    ) -> bool {
+        let mut changed = false;
+        for (i, entry) in self.exits.iter_mut().enumerate() {
+            if entry.is_ok() {
+                continue;
+            }
+            let Some(block) = self.blocks.get(i).and_then(|b| chain.block(&b.hash)) else { continue };
+            if let Ok(list) = exits_of(block) {
+                *entry = Ok(list
+                    .into_iter()
+                    .map(|(rkm, v)| qlab_cbserver::codec::ExitFact { rkm: qlab_note::hash::digest_from_bytes(&rkm), v })
+                    .collect());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// [`Self::refresh`], each new block's exits read by `exits_of` (the
+    /// node's [`qlab_node::MemNode::exits_of`]: the rule over the bundle read
+    /// back by reference) — once per block, on the walk that meets it.
+    pub fn refresh_with_exits<C: qlab_node::ChainStore>(
+        &mut self,
+        chain: &C,
+        exits_of: &dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String>,
+    ) -> bool {
+        // Pre-review Z1: a refusal is retried on every refresh while its
+        // block stays on the main chain — one transient read failure must not
+        // 503 every page over that height until a reorg or restart. `Ok` stays
+        // memoised.
+        let retried = self.retry_unread_exits(chain, exits_of);
         let tip = chain.tip_hash();
         if self.tip_hash() == Some(tip) {
-            return false;
+            return retried;
         }
-        let mut fresh: Vec<BlockDiscovery> = Vec::new();
+        let mut fresh: Vec<(BlockDiscovery, ExitsOf)> = Vec::new();
         let mut hash = tip;
         loop {
             let Some(block) = chain.block(&hash) else { break };
@@ -509,16 +585,28 @@ impl DiscoveryView {
                 break;
             }
             let prev = block.header.prev;
-            fresh.push(BlockDiscovery::of(hash, block));
+            let exits = exits_of(block).map(|list| {
+                list.into_iter()
+                    .map(|(rkm, v)| qlab_cbserver::codec::ExitFact { rkm: qlab_note::hash::digest_from_bytes(&rkm), v })
+                    .collect()
+            });
+            fresh.push((BlockDiscovery::of(hash, block), exits));
             if height == 0 {
                 break;
             }
             hash = prev;
         }
-        let Some(lowest) = fresh.last().map(|b| b.height) else { return false };
+        let Some(lowest) = fresh.last().map(|(b, _)| b.height) else { return false };
         self.blocks.truncate(lowest as usize);
+        self.exits.truncate(lowest as usize);
         fresh.reverse();
-        self.blocks.extend(fresh);
+        for (b, e) in fresh {
+            // Aligned by construction: a view built without exits (an older
+            // literal) is padded "not projected" rather than misaligned.
+            self.exits.resize(self.blocks.len(), Err("exits not projected".into()));
+            self.blocks.push(b);
+            self.exits.push(e);
+        }
         true
     }
 }
@@ -838,6 +926,15 @@ impl DiscoveryServer {
                         };
                         respond_coinbase(&snapshot, query)
                     }
+                    EXITS_PATH => {
+                        // The same snapshot (lab #785 F5-5d): a block's exits
+                        // are projected with the block, as its coinbase is.
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_exits(&snapshot, query)
+                    }
                     TREE_LEAVES_PATH => {
                         let snapshot = match leaves.lock() {
                             Ok(g) => Arc::clone(&g),
@@ -887,7 +984,7 @@ impl DiscoveryServer {
                             404,
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
-                                 {COINBASE_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
+                                 {COINBASE_PATH}?from=&to=, {EXITS_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
                                  {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {REGISTRY_SLOT_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
                                  {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
                             ),
@@ -1005,6 +1102,52 @@ pub fn respond_coinbase(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u
         return Err((400, "'to' < 'from'".to_string()));
     }
     Ok(qlab_node::coinbase_page(&view.blocks, from, to).to_bytes())
+}
+
+// Pre-review Z3: the exit wire's per-block bound IS the v1 chain's K_exit; a
+// genesis change to one without the other fails to compile.
+const _: () = assert!(qlab_cbserver::codec::MAX_EXITS_PER_BLOCK == crate::genesis_v6::K_EXIT_V1 as usize);
+
+/// The socket-free `/v1/exits` core (lab #785 F5-5d) — [`respond_coinbase`]'s
+/// twin over the same projection, with the same refusals and the same page
+/// arithmetic (`ExitPage::page`, the coinbase cap). A block in the page whose
+/// exits could not be read is a **503 naming the height** — never an empty
+/// list standing in for exits the server could not see.
+pub fn respond_exits(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    use qlab_cbserver::codec::{BlockExits, ExitPage, MAX_EXIT_BLOCKS};
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+    if to < from {
+        return Err((400, "'to' < 'from'".to_string()));
+    }
+    let mut blocks = Vec::new();
+    for (i, b) in view.blocks.iter().enumerate() {
+        if b.height < from || b.height > to {
+            continue;
+        }
+        if blocks.len() == MAX_EXIT_BLOCKS {
+            break;
+        }
+        match view.exits.get(i) {
+            // Pre-review Z3: the wire carries at most K_exit (v1) per block;
+            // a longer list is refused by name, never a panic in the encoder.
+            Some(Ok(exits)) if exits.len() > qlab_cbserver::codec::MAX_EXITS_PER_BLOCK => {
+                return Err((
+                    503,
+                    format!(
+                        "unavailable: block {} carries {} exits, more than this wire's {}",
+                        b.height,
+                        exits.len(),
+                        qlab_cbserver::codec::MAX_EXITS_PER_BLOCK
+                    ),
+                ))
+            }
+            Some(Ok(exits)) => blocks.push(BlockExits { height: b.height, exits: exits.clone() }),
+            Some(Err(why)) => return Err((503, format!("unavailable: the exits of block {} ({why})", b.height))),
+            None => return Err((503, format!("unavailable: the exits of block {} (not projected)", b.height))),
+        }
+    }
+    Ok(ExitPage::page(blocks, from, to).to_bytes())
 }
 
 /// The socket-free `/v1/tree/leaves` core: a `from` query against the leaves
@@ -1436,6 +1579,7 @@ mod tests {
 
     fn a_view() -> DiscoveryView {
         DiscoveryView {
+            exits: Vec::new(),
             blocks: vec![
                 projected(0, 0, vec![]),
                 projected(1, 1, vec![qlab_devnet::body::TxEntry::empty_discovery()]),
@@ -1609,6 +1753,7 @@ mod tests {
     #[test]
     fn serves_the_per_block_nullifier_lists_over_a_real_socket() {
         let view = Arc::new(Mutex::new(Arc::new(DiscoveryView {
+            exits: Vec::new(),
             blocks: vec![
                 projected(0, 0, vec![]),
                 projected_spending(
@@ -1660,6 +1805,7 @@ mod tests {
     fn serves_the_per_block_coinbase_facts_over_a_real_socket() {
         let mine = [0x11u64, 0x22, 0x33, 0x44];
         let view = Arc::new(Mutex::new(Arc::new(DiscoveryView {
+            exits: Vec::new(),
             blocks: vec![
                 projected_mined(0, 0, vec![], [0; 4]), // genesis: no payee
                 projected_mined(1, 1, vec![], mine),
@@ -2010,6 +2156,7 @@ mod tests {
 
         let (committed, payloads) = a_committed_group_with_payloads();
         let view = DiscoveryView {
+            exits: Vec::new(),
             blocks: vec![
                 projected(0, 0, vec![]),
                 projected(1, 1, vec![committed.clone(), TxEntry::empty_discovery()]),
@@ -2053,6 +2200,7 @@ mod tests {
     fn the_payload_route_refuses_by_name_and_never_with_an_empty_list() {
         let (committed, _) = a_committed_group_with_payloads();
         let view = DiscoveryView {
+            exits: Vec::new(),
             blocks: vec![projected(0, 0, vec![]), projected(1, 1, vec![committed])],
         };
 
@@ -2071,7 +2219,7 @@ mod tests {
         assert_eq!(respond_full(&view, ("1", "x")).expect_err("must refuse").0, 400);
 
         // 🔴 A stored block whose committed region does not decode.
-        let corrupt = DiscoveryView { blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
+        let corrupt = DiscoveryView { exits: Vec::new(), blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
         let (code, msg) = respond_full(&corrupt, ("0", "0")).expect_err("must refuse");
         assert_eq!(code, 500, "{msg}");
     }
@@ -2082,7 +2230,7 @@ mod tests {
     /// not read is the absence-reads-as-healthy shape option 3 exists to remove.
     #[test]
     fn undecodable_committed_bytes_are_a_refusal_not_an_empty_group() {
-        let view = DiscoveryView { blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
+        let view = DiscoveryView { exits: Vec::new(), blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
         let err = respond(&view, "from=0&to=0").expect_err("must refuse");
         assert_eq!(err.0, 500, "{err:?}");
     }
@@ -2166,6 +2314,123 @@ mod tests {
             "and carries the winning branch's discovery, not the abandoned one's"
         );
         assert_eq!(view.blocks[0].hash, ghash, "the common prefix is untouched");
+    }
+
+    /// Lab #785 F5-5d: `/v1/exits` over the projection. Each block's exits
+    /// are read once, as the walk meets it, and a reorg reads only the new
+    /// branch; a block whose exits could not be read is a 503 naming its
+    /// height for any range covering it, and that refusal leaves the main
+    /// chain with its block. Paging and refusals are `/v1/coinbase`'s.
+    #[test]
+    fn exits_are_projected_once_per_block_and_served_or_refused_by_height() {
+        use qlab_cbserver::codec::{ExitFact, ExitPage};
+        use qlab_node::{BundleRef, ChainStore, MemChainStore, StoredSections};
+        use std::cell::Cell;
+
+        let genesis = stored(0, [0; 32], vec![]);
+        let ghash = genesis.header().header_hash();
+        let mut store = MemChainStore::new(genesis);
+        let carrying = |h: u64, prev: Hash32, bundle: &[u8]| {
+            let mut b = stored(h, prev, vec![]);
+            b.sections = Some(StoredSections { finality: vec![], bundle: BundleRef::resident(bundle) });
+            b
+        };
+        let mut prev = ghash;
+        let mut at2 = ghash;
+        for (h, bundle) in [(1u64, &b""[..]), (2, b"ok"), (3, b"bad")] {
+            let b = if bundle.is_empty() { stored(h, prev, vec![]) } else { carrying(h, prev, bundle) };
+            prev = b.header().header_hash();
+            if h == 2 {
+                at2 = prev;
+            }
+            store.put_block(b).expect("applies");
+        }
+        let reads = Cell::new(0);
+        let rule = |b: &qlab_node::StoredBlock| -> Result<Vec<(Hash32, u64)>, String> {
+            reads.set(reads.get() + 1);
+            match b.bundle_ref() {
+                None => Ok(vec![]),
+                Some(r) if r.read().unwrap() == b"ok" => Ok(vec![([7; 32], 40)]),
+                Some(_) => Err("Codec(\"bad\")".into()),
+            }
+        };
+        let mut view = DiscoveryView::default();
+        assert!(view.refresh_with_exits(&store, &rule));
+        assert_eq!(reads.get(), 4, "genesis and three blocks, once each");
+
+        let page = ExitPage::from_bytes(&respond_exits(&view, "from=0&to=2").unwrap()).unwrap();
+        assert_eq!(page.blocks.len(), 3, "every height present, the ones with no exits too");
+        assert!(page.blocks[1].exits.is_empty());
+        assert_eq!(page.blocks[2].exits, vec![ExitFact { rkm: qlab_note::hash::digest_from_bytes(&[7; 32]), v: 40 }]);
+        let (code, why) = respond_exits(&view, "from=2&to=3").unwrap_err();
+        assert_eq!(code, 503);
+        assert!(why.contains("block 3") && why.contains("bad"), "{why}");
+        for q in ["", "from=0", "to=3", "from=2&to=1", "from=x&to=1"] {
+            assert_eq!(respond_exits(&view, q).unwrap_err().0, 400, "{q:?}");
+        }
+
+        // A steady chain reads only the new block — and retries the refused
+        // one (pre-review Z1), which still refuses here.
+        let b4 = stored(4, prev, vec![]);
+        store.put_block(b4).expect("applies");
+        assert!(view.refresh_with_exits(&store, &rule));
+        assert_eq!(reads.get(), 6, "block 4, and block 3 retried");
+
+        // A heavier branch from 2 replaces 3 and 4: only its blocks are read,
+        // and 3's refusal leaves with 3.
+        let mut sib = at2;
+        for h in 3..=5u64 {
+            let mut b = stored(h, sib, vec![]);
+            b.header.nonce = 2_000 + h;
+            sib = b.header().header_hash();
+            store.put_block(b).expect("applies");
+        }
+        assert_eq!(store.tip_hash(), sib);
+        assert!(view.refresh_with_exits(&store, &rule));
+        assert_eq!(reads.get(), 10, "block 3 retried once more before the walk, then the new branch only");
+        let page = ExitPage::from_bytes(&respond_exits(&view, "from=0&to=5").unwrap()).unwrap();
+        assert_eq!(page.blocks.len(), 6);
+        assert_eq!(page.blocks[2].exits.len(), 1, "the common prefix kept its exits");
+
+        // A projection with no rule at hand says so for a bundle block.
+        let mut bare = DiscoveryView::default();
+        assert!(bare.refresh(&store));
+        assert!(respond_exits(&bare, "from=0&to=1").is_ok(), "no bundle, no exits: a truthful empty page");
+        assert_eq!(respond_exits(&bare, "from=2&to=2").unwrap_err().0, 503, "a bundle block, not projected");
+    }
+
+    /// Pre-review Z1: a refusal is not memoised for good. A rule that fails
+    /// once on a block then reads it: the next refresh, at the SAME tip,
+    /// retries it and the page serves.
+    #[test]
+    fn a_refused_blocks_exits_are_retried_at_an_unchanged_tip() {
+        use qlab_cbserver::codec::ExitPage;
+        use qlab_node::{BundleRef, MemChainStore, StoredSections};
+        use std::cell::Cell;
+
+        let genesis = stored(0, [0; 32], vec![]);
+        let ghash = genesis.header().header_hash();
+        let mut store = MemChainStore::new(genesis);
+        let mut b1 = stored(1, ghash, vec![]);
+        b1.sections = Some(StoredSections { finality: vec![], bundle: BundleRef::resident(b"ok") });
+        qlab_node::ChainStore::put_block(&mut store, b1).expect("applies");
+        let failed_once = Cell::new(false);
+        let rule = |b: &qlab_node::StoredBlock| -> Result<Vec<(Hash32, u64)>, String> {
+            match b.bundle_ref() {
+                None => Ok(vec![]),
+                Some(_) if !failed_once.replace(true) => Err("transient: the log read failed".into()),
+                Some(_) => Ok(vec![([7; 32], 1)]),
+            }
+        };
+        let mut view = DiscoveryView::default();
+        assert!(view.refresh_with_exits(&store, &rule));
+        assert!(view.has_unread_exits());
+        assert_eq!(respond_exits(&view, "from=0&to=1").unwrap_err().0, 503);
+        assert!(view.refresh_with_exits(&store, &rule), "an unchanged tip, but a refusal to retry");
+        assert!(!view.has_unread_exits());
+        let page = ExitPage::from_bytes(&respond_exits(&view, "from=0&to=1").unwrap()).unwrap();
+        assert_eq!(page.blocks[1].exits.len(), 1);
+        assert!(!view.refresh_with_exits(&store, &rule), "nothing left to do");
     }
 
     /// Lab #710: the registry routes — refused by name on an L1 node; on an

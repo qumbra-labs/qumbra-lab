@@ -1165,13 +1165,15 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let report = qumbra_wallet::scan::scan_report(&w, url, from, to, genesis_form_of(args)?);
     print!(
         "{}",
-        view::render(
+        view::render_with_exits(
             &report.scans,
             (from, to),
             url,
             &report.spent,
             report.coinbase.as_ref(),
             &report.coinbase_coverage,
+            report.exits.as_ref(),
+            &report.exit_coverage,
         )
     );
     Ok(())

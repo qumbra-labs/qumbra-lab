@@ -10,6 +10,8 @@
 //! - `GET /v1/coinbase?from=&to=` — [`HttpCoinbaseSource`], the per-block
 //!   coinbase facts a mining wallet matches its own `rkm` against (lab #415).
 //!   Bulk over a range, never a per-key probe — see [`crate::coinbase`].
+//! - `GET /v1/exits?from=&to=` — [`HttpExitSource`], the per-block exits a V6
+//!   bundle paid to L1 notes (lab #785 F5-5d), matched locally like coinbase.
 //! - `GET /v1/tree/leaves?from=N` — [`HttpLeafSource`], the witness source (B1).
 //! - `GET /v1/anchors` — [`HttpAnchorSource`], which leaf count a witness may
 //!   legally be built at. See [`crate::sync`] for why the leaf stream alone
@@ -285,6 +287,28 @@ impl CoinbaseSource for HttpCoinbaseSource {
         let page = CoinbasePage::from_bytes(&bytes)
             .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
         Ok(CoinbaseChunk { from: page.from, to: page.to, blocks: page.blocks })
+    }
+}
+
+/// `GET /v1/exits?from=&to=` (lab #785 F5-5d) — the per-block exit facts,
+/// [`HttpCoinbaseSource`]'s twin on the discovery server.
+pub struct HttpExitSource {
+    base_url: String,
+}
+
+impl HttpExitSource {
+    pub fn new(base_url: impl Into<String>) -> HttpExitSource {
+        HttpExitSource { base_url: base_url.into() }
+    }
+}
+
+impl crate::exits::ExitSource for HttpExitSource {
+    fn fetch_range(&self, from: u64, to: u64) -> Result<crate::exits::ExitChunk, String> {
+        let path = format!("/v1/exits?from={from}&to={to}");
+        let bytes = http_get(&self.base_url, &path).map_err(|e| format!("GET {path}: {e}"))?;
+        let page = qlab_cbserver::codec::ExitPage::from_bytes(&bytes)
+            .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
+        Ok(crate::exits::ExitChunk { from: page.from, to: page.to, blocks: page.blocks })
     }
 }
 

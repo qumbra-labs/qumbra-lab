@@ -107,6 +107,8 @@ pub use replay_progress::{
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
     NullifierStore, RewindError, StoredBlock, StoredHeader, StoredTx,
+    // Lab #785 F5-5c/5d: a stored V6 block's sections and its bundle reference.
+    BundleRef, StoredSections,
 };
 pub use supply::{
     supply_by_epoch, supply_by_epoch_for, SupplyBlock, SupplyEpoch, SupplyError, SupplyLedger,
