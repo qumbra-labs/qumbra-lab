@@ -43,8 +43,10 @@ pub const HEADER_LEN: usize = 12;
 /// prototype never frames a full block (≈90–115 MB/block at 10 TPS, §7) in one
 /// envelope; bodies move as compact blocks + per-tx fetches. Generous enough for
 /// a batch of headers or a bundle of ML-DSA votes, bounded enough to reject a
-/// hostile length prefix before allocating.
-pub const MAX_PAYLOAD: u32 = 8 * 1024 * 1024;
+/// hostile length prefix before allocating. 16 MiB since lab #785 F5-5a (Q-C5):
+/// a V6 block carrying a wrapper bundle (≈ 8.3 MB at the frozen lanes) travels in
+/// one announce. `[devnet-placeholder]`, NOT frozen.
+pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 /// Message types. `[devnet-placeholder]` — the *set* and *codes* are a lab
 /// proposal (§10). A code this build does not implement makes

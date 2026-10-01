@@ -76,7 +76,7 @@ pub use mempool::{
 };
 pub use node::{
     genesis_block, genesis_block_for, genesis_block_v6, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
-    RecoveryReport, RewindReport, SnapshotRejection, V6Setup,
+    RecoveryReport, RewindReport, SnapshotRejection, V6Setup, MAX_RETAINED_BODY_BYTES,
 };
 pub use recovery::{
     catch_up_slot, committee_accrual_finalized, committee_accrual_for_span, Finalizer,

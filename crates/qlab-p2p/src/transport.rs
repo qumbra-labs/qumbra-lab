@@ -437,15 +437,19 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// reader threads push as fast as the sockets deliver while `poll` only drains on
 /// the node's tick, so a peer that sends faster than we process grew this queue
 /// without limit — a per-message cap says nothing about concurrent or cumulative
-/// use. 64 MiB is 8 maximum-size frames, against a measured ~262 MiB steady RSS
-/// per node on the 2 GB T0 hosts (Phase B-WAN).
-pub const MAX_INBOX_BYTES: u64 = 64 * 1024 * 1024;
+/// use. 8 maximum-size frames (64 MiB until lab #785 F5-5a doubled the frame),
+/// against a measured ~262 MiB steady RSS per node on the 2 GB T0 hosts (Phase
+/// B-WAN) — F5-6 measures node RSS serving bundle blocks before this is called
+/// safe.
+pub const MAX_INBOX_BYTES: u64 = 128 * 1024 * 1024;
+const _: () = assert!(MAX_INBOX_BYTES == 8 * crate::wire::MAX_PAYLOAD as u64, "eight maximum frames");
 
 /// Maximum queued bytes attributable to any **one** peer. `[devnet-placeholder]`
 /// testnet-tunable, NOT frozen. Fixed at 2 × [`crate::wire::MAX_PAYLOAD`] so a
 /// single legal maximum-size frame can never be refused by its own arrival, and so
 /// one peer cannot consume the whole global budget and starve the rest.
-pub const MAX_INBOX_BYTES_PER_PEER: u64 = 16 * 1024 * 1024;
+pub const MAX_INBOX_BYTES_PER_PEER: u64 = 32 * 1024 * 1024;
+const _: () = assert!(MAX_INBOX_BYTES_PER_PEER == 2 * crate::wire::MAX_PAYLOAD as u64, "one maximum frame never refused by its own arrival");
 
 /// The receive queue, with the byte accounting that bounds it.
 #[derive(Default)]

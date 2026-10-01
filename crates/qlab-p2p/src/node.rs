@@ -232,10 +232,12 @@ pub const MAX_SERVED_BODIES: usize = 128;
 /// 1 tx/block and ~187 MB at 10 tx/block — on `t4g.small` hosts whose whole
 /// process measured ~262 MiB in the Phase B-lite soak. 8 MiB is ~57 single-tx
 /// bodies (~71 min of chain) or ~5 ten-tx bodies (~6 min), all far beyond the
-/// relay round-trip the cache serves, and 0.4 % of a 2 GB host.
+/// relay round-trip the cache serves, and 0.4 % of a 2 GB host. 24 MiB since lab
+/// #785 F5-5a (Q-C5): room for one bundle-bearing body (≤ 16 MiB) beside the
+/// ordinary ones.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
-pub const MAX_SERVED_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SERVED_BODY_BYTES: usize = 24 * 1024 * 1024;
 
 /// **How many block bodies this node will have outstanding at once** (issue
 /// #130 (c)) — the in-flight window of the historical-body requester.
@@ -279,8 +281,13 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 /// | cap | value | a 96-body window |
 /// |---|---|---|
 /// | [`crate::adapter::MAX_PENDING_BODIES`] | 512 entries | 96, 19 % |
-/// | [`crate::adapter::MAX_PENDING_BODY_BYTES`] | 32 MiB | 14.0 MB, 58 % margin |
-/// | [`crate::ratelimit::BYTE_BURST`] (our own inbound) | 16 MiB | 14.0 MB, 16 % margin |
+/// | [`crate::adapter::MAX_PENDING_BODY_BYTES`] | 64 MiB | 14.0 MB, 79 % margin |
+/// | [`crate::ratelimit::BYTE_BURST`] (our own inbound) | 32 MiB | 14.0 MB, 58 % margin |
+///
+/// *(Lab #785 F5-5a: both caps doubled with the frame, so the margins above
+/// grew. A V6 window holding a bundle-bearing body (≤ 16 MiB each, at most one
+/// per spacing window of 48 blocks) is the case this table does not size; F5-5b
+/// paces bundle-bearing bodies.)*
 ///
 /// The third row is the binding one and it is the row this constant exists for.
 /// The requester paces itself on the FRAME axis (see
@@ -289,7 +296,8 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 /// one axis over: a body dropped for bytes is dropped exactly as silently as one
 /// dropped for frames. 16 MiB ÷ 145,754 B is 115 bodies, so 96 — the largest
 /// multiple of [`MAX_BODIES_PER_GETDATA`] that keeps real margin — is the
-/// answer, and 128 (18.7 MB) would have been over it.
+/// answer, and 128 (18.7 MB) would have been over it. (Sized at the old 16 MiB
+/// burst; the burst is 32 MiB since lab #785 F5-5a and 96 is kept.)
 ///
 /// The first two rows matter for a different reason: over a pending cap
 /// `buffer_body` evicts the HIGHEST held entry, i.e. exactly the bodies a

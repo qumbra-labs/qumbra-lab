@@ -594,7 +594,12 @@ pub const MAX_PENDING_BODIES: usize = 512;
 /// would admit millions of entries; a proof-carrying body is ~145 kB (#135's
 /// measurement), so an entry cap alone would admit ~74 MB per 512 entries on hosts
 /// sized for a coinbase-only chain. The binding cap is whichever bites first.
-pub const MAX_PENDING_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// 64 MiB since lab #785 F5-5a (Q-C5, with the frame).
+pub const MAX_PENDING_BODY_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(
+    MAX_PENDING_BODY_BYTES == qlab_node::MAX_RETAINED_BODY_BYTES,
+    "the two body queues are sized against the same assumption (qlab-node's doc)"
+);
 
 /// What a duty refused for state lag says (issue #130 (a)). Named because it is a
 /// node declaring its own view stale, which is a different statement from any

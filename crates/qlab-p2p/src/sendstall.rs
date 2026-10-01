@@ -92,7 +92,18 @@ pub const SEND_STALL_MIN_BACKLOG_BYTES: u64 = 1;
 /// of malice, and the connection carries on until the *window* rules on it. The
 /// backlog never holds a partial frame it did not already start sending, so
 /// dropping at this boundary cannot desynchronise the peer's framing.
-pub const MAX_SEND_BACKLOG_BYTES_PER_PEER: u64 = 16 * 1024 * 1024;
+pub const MAX_SEND_BACKLOG_BYTES_PER_PEER: u64 = 32 * 1024 * 1024;
+
+/// **Maximum undelivered bytes held across ALL peers** (lab #785 F5-5a, Q-C5).
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// The per-peer cap bounds one queue; nothing bounded the sum, so a node serving
+/// bundle blocks to every connected peer could hold `peers ×` 32 MiB. 128 MiB is
+/// four peers' worth of full backlogs; a send past it is refused exactly like a
+/// per-peer overflow (whole frame dropped, the window rules on the connection).
+/// F5-6 measures node RSS serving bundle blocks before it is called safe.
+pub const MAX_SEND_BACKLOG_BYTES_TOTAL: u64 = 128 * 1024 * 1024;
+const _: () = assert!(MAX_SEND_BACKLOG_BYTES_TOTAL >= MAX_SEND_BACKLOG_BYTES_PER_PEER);
 
 /// One connection's send-progress state — the send-side half of "is this socket
 /// carrying anything".
