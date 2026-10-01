@@ -2969,7 +2969,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         // here: it has not been applied, and it is still in the serving cache if
         // it arrived for a new header.
         use qlab_node::ChainStore as _;
-        self.state.chain().block(hash).map(|b| b.body())
+        // Lab #785 F5-5c: a peer's request reaches this, so a bundle that
+        // cannot be read back is "not held" (NotFound), never a panic.
+        self.state.chain().block(hash).and_then(|b| b.try_body().ok())
     }
     fn has_stored_body(&self, hash: &Hash32) -> bool {
         use qlab_node::ChainStore as _;
@@ -2979,7 +2981,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         // POSSESSION (issue #198): the applied store, then the rewind archive —
         // bodies this node applied at some point and still holds. `MemNode` owns
         // that distinction because `rewind_to` is where it is created.
-        self.state.held_block(hash).map(|b| b.body())
+        self.state.held_block(hash).and_then(|b| b.try_body().ok())
     }
 
     /// The main-chain blocks whose bodies this node still needs (issue #130 (c)).

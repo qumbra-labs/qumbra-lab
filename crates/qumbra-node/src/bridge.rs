@@ -29,6 +29,9 @@ pub enum BridgeError {
     CounterDecrease { height: u64 },
     /// A row sum overflowed.
     Overflow { height: u64 },
+    /// The block's bundle could not be read back from the block log (lab
+    /// #785 F5-5c): a persistence fault, named, never a panic.
+    Unreadable { height: u64, why: String },
 }
 
 /// The bridge's per-epoch rows over the applied main chain.
