@@ -70,8 +70,16 @@ pub const FORMAT_VERSION: u32 = 3;
 ///   (`OpenOptions::append`) and the read paths ([`read_records`],
 ///   `BundleRef::read`) — never `create`/`truncate`/`set_len`/`rename`/
 ///   `remove`, and nothing compacts or rewrites it;
-/// - **torn-tail recovery never truncates**: a record torn by a crash
-///   mid-append is skipped by the reader and left on disk as it is;
+/// - **the single exception, lab #804**: a record torn by a crash
+///   mid-append (its length prefix, or its declared bytes, cut short) is cut
+///   off by [`truncate_torn_tail`] — once, by the process that writes, before
+///   its first append — so the next record lands at the last complete
+///   record's end instead of behind the torn bytes. No reference can point
+///   into a torn record (references are built only for decoded records), so
+///   this is the one truncation that cannot move bytes under one. The reader
+///   itself stays read-only: a process that only reads (an audit opening a
+///   live node's data dir) never cuts, since what it sees as torn may be an
+///   append in progress;
 /// - **a rewound block's record stays**: a reorg appends the winning branch
 ///   after it, so a reference into an orphaned block stays valid — do not
 ///   "clean up" orphans, and do not compact;
@@ -79,7 +87,8 @@ pub const FORMAT_VERSION: u32 = 3;
 ///   field, so its bytes are the record's tail.
 ///
 /// `tests::blocks_log_is_append_only_in_every_production_source` scans every
-/// crate's non-test source for anything else naming this file; the authority
+/// crate's non-test source for anything else naming this file (or its
+/// [`log_path`]); the authority
 /// is `BundleRef::read`, which re-hashes every slice it reads and refuses by
 /// name — on a log that moved, or ended short — rather than return other
 /// bytes.
@@ -503,9 +512,56 @@ pub struct Snapshot {
 }
 
 /// The block log's path under `dir`, as the shared handle a
-/// [`BundleRef`] reads through (lab #785 F5-5c).
+/// [`BundleRef`] reads through (lab #785 F5-5c) — absolute where the dir
+/// resolves, so a later change of working directory cannot strand a
+/// reference.
 pub fn log_path(dir: &Path) -> std::sync::Arc<Path> {
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     std::sync::Arc::from(dir.join(BLOCK_LOG).as_path())
+}
+
+/// **Cut a torn tail off the log** (lab #804) — `BLOCK_LOG`'s single
+/// exception to append-only. Walks the length prefixes only (no record is
+/// decoded) to the end of the last record whose declared bytes are all
+/// present; if bytes follow it — a prefix cut short, or a record shorter
+/// than it declares, i.e. a crash mid-append — the file is truncated there
+/// and synced. Returns the bytes removed, `None` when the log ends clean (or
+/// does not exist).
+///
+/// A complete record that does not decode is NOT cut: it may be a newer
+/// format, and `read_records` already refuses it by name once anything
+/// follows it.
+///
+/// **Only the process that writes the log calls this**, once, before its
+/// first append ([`crate::node::Node`]'s log writer). A reader must not: to
+/// a process reading a live node's data dir, an append in progress looks
+/// exactly like a torn tail.
+pub fn truncate_torn_tail(dir: &Path) -> io::Result<Option<u64>> {
+    use std::io::{Seek, SeekFrom};
+    let path = dir.join(BLOCK_LOG);
+    let mut f = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let file_len = f.metadata()?.len();
+    let mut complete_end = 0u64;
+    while file_len - complete_end >= 4 {
+        let mut len_buf = [0u8; 4];
+        f.seek(SeekFrom::Start(complete_end))?;
+        f.read_exact(&mut len_buf)?;
+        let len = u64::from(u32::from_le_bytes(len_buf));
+        if file_len - complete_end - 4 < len {
+            break;
+        }
+        complete_end += 4 + len;
+    }
+    if complete_end == file_len {
+        return Ok(None);
+    }
+    f.set_len(complete_end)?;
+    f.sync_all()?;
+    Ok(Some(file_len - complete_end))
 }
 
 /// Append a record to the log (source of truth). Each record is a 4-byte LE
@@ -638,8 +694,9 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
         if r.read_exact(&mut buf).is_err() {
-            // A torn trailing record from a crash mid-append: skipped, and
-            // left on disk — recovery never truncates (`BLOCK_LOG`'s invariant).
+            // A torn trailing record from a crash mid-append: skipped. The
+            // reader never truncates; the writer cuts it before its first
+            // append (`truncate_torn_tail`, lab #804).
             break;
         }
         pos += 4 + len as u64;
@@ -1391,22 +1448,86 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Lab #804, the repro — why the reader alone is not enough. A torn
+    /// record left on disk is skipped by `read_records`; an append lands
+    /// behind it; the torn prefix then swallows every later record while
+    /// fewer than its declared length follow, and once more do, the log never
+    /// reads back whole (it refuses, or loses records). (The reader is unchanged and stays read-only; the writer cuts
+    /// the tail first — the next test.)
+    #[test]
+    fn a_torn_tail_left_on_disk_buries_what_is_appended_after_it() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i804-repro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let a = LogRecord::Block(a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec()));
+        append_record(&dir, &a).unwrap();
+        let end_a = fs::metadata(dir.join(BLOCK_LOG)).unwrap().len();
+        append_record(&dir, &a).unwrap();
+        // Torn inside the second record: its prefix and part of its bytes.
+        OpenOptions::new().write(true).open(dir.join(BLOCK_LOG)).unwrap().set_len(end_a + 4 + 10).unwrap();
+        append_record(&dir, &LogRecord::Finalize(h(3))).unwrap();
+        assert_eq!(read_records(&dir).unwrap().len(), 1, "the append behind the torn record is swallowed");
+        for _ in 0..8 {
+            append_record(&dir, &a).unwrap();
+        }
+        // Ten complete records are on disk now. Whatever the torn prefix makes
+        // of the bytes behind it (here: garbage, then a refusal to open), the
+        // reader never gives back the whole log.
+        let back = read_records(&dir);
+        assert!(!matches!(&back, Ok(r) if r.len() == 10), "a buried tail loses records or refuses: {:?}", back.as_ref().map(Vec::len));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #804, the fix: `truncate_torn_tail` cuts a torn record (or a torn
+    /// length prefix) back to the last complete record's end, and the next
+    /// append lands there; a clean log, or none, is left alone.
+    #[test]
+    fn a_torn_tail_is_cut_and_the_next_append_lands_at_the_last_complete_record() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i804-fix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(truncate_torn_tail(&dir).unwrap(), None, "no log");
+        let a = LogRecord::Block(a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec()));
+        append_record(&dir, &a).unwrap();
+        let end_a = fs::metadata(dir.join(BLOCK_LOG)).unwrap().len();
+        assert_eq!(truncate_torn_tail(&dir).unwrap(), None, "a clean log");
+        assert_eq!(fs::metadata(dir.join(BLOCK_LOG)).unwrap().len(), end_a);
+
+        for torn in [end_a + 4 + 10, end_a + 2] {
+            append_record(&dir, &a).unwrap();
+            OpenOptions::new().write(true).open(dir.join(BLOCK_LOG)).unwrap().set_len(torn).unwrap();
+            assert_eq!(truncate_torn_tail(&dir).unwrap(), Some(torn - end_a), "torn at {torn}");
+            assert_eq!(fs::metadata(dir.join(BLOCK_LOG)).unwrap().len(), end_a, "cut to the last complete record");
+        }
+        append_record(&dir, &LogRecord::Finalize(h(3))).unwrap();
+        let back = read_records(&dir).unwrap();
+        assert_eq!(back.len(), 2, "the next append landed at the last complete record's end");
+        assert_eq!(back[1], LogRecord::Finalize(h(3)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 🔒 Lab #785 F5-5c — **`blocks.log` is append-only in every production
     /// source** (the belt; `BundleRef::read`'s hash re-check is the
     /// authority). Outside test code, the log's name appears only in this
-    /// file, and here only where `append_record` opens it with
-    /// `append(true)`, where `read_records` and `log_path` name its path, in
-    /// error messages, and at its definition — plus the crate's re-export.
-    /// Anything else naming it (a `create`, `set_len`, `rename`, `remove`, a
-    /// compaction) fails here, by file and line.
+    /// file — at its definition, `append_record`'s `append(true)` open, the
+    /// read and tail-cut paths' `dir.join`, `log_path`, and error messages —
+    /// plus the crate's re-export; `log_path` is called outside this file only
+    /// at the node's one spill site; and this file holds exactly one
+    /// `set_len`, `truncate_torn_tail`'s (lab #804). Anything else fails here,
+    /// by file and line. Matching is on tokens (whitespace removed), so a
+    /// rustfmt pass does not break it.
     #[test]
     fn blocks_log_is_append_only_in_every_production_source() {
+        fn ws(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut offenders = Vec::new();
         let mut scanned = 0;
+        let mut persist_prod = String::new();
+        let mut sources = Vec::new();
         for krate in fs::read_dir(&root).unwrap() {
-            let src = krate.unwrap().path().join("src");
-            let mut stack = vec![src];
+            let mut stack = vec![krate.unwrap().path().join("src")];
             while let Some(d) = stack.pop() {
                 let Ok(entries) = fs::read_dir(&d) else { continue };
                 for e in entries {
@@ -1414,53 +1535,64 @@ mod tests {
                     if p.is_dir() {
                         stack.push(p);
                     } else if p.extension().is_some_and(|x| x == "rs") {
-                        scanned += 1;
-                        let text = fs::read_to_string(&p).unwrap();
-                        for (line, code) in production_lines(&text) {
-                            if !(code.contains("BLOCK_LOG") || code.contains("\"blocks.log\"")) {
-                                continue;
-                            }
-                            let name = p.display().to_string();
-                            let here = name.ends_with("qlab-node/src/persist.rs");
-                            let allowed = (name.ends_with("qlab-node/src/lib.rs") && code.trim_start().starts_with("SnapshotOnDisk, BLOCK_LOG"))
-                                || (here && code.contains("pub const BLOCK_LOG: &str = \"blocks.log\";"))
-                                || (here && code.contains("{BLOCK_LOG}"))
-                                || (here && code.contains("std::sync::Arc::from(dir.join(BLOCK_LOG).as_path())"))
-                                || (here && code.trim() == "let path = dir.join(BLOCK_LOG);")
-                                || (here && code.trim() == ".open(dir.join(BLOCK_LOG))?;" && text.contains(".append(true)\n        .open(dir.join(BLOCK_LOG))?;"));
-                            if !allowed {
-                                offenders.push(format!("{name}:{line}: {}", code.trim()));
-                            }
-                        }
+                        sources.push(p);
                     }
+                }
+            }
+        }
+        for p in &sources {
+            scanned += 1;
+            let name = p.display().to_string().replace('\\', "/");
+            let lines = production_lines(&name, &fs::read_to_string(p).unwrap());
+            if name.ends_with("qlab-node/src/persist.rs") {
+                persist_prod = lines.iter().map(|(_, c)| ws(c)).collect();
+            }
+            for (line, code) in lines {
+                let t = ws(&code);
+                let names_log = t.contains("BLOCK_LOG") || t.contains("\"blocks.log\"");
+                let calls_log_path = t.contains("log_path(");
+                if !names_log && !calls_log_path {
+                    continue;
+                }
+                let here = name.ends_with("qlab-node/src/persist.rs");
+                let allowed = here
+                    && (t.contains("pubconstBLOCK_LOG:&str=\"blocks.log\";")
+                        || t.contains("{BLOCK_LOG}")
+                        || t == "letpath=dir.join(BLOCK_LOG);"
+                        || t == ".open(dir.join(BLOCK_LOG))?;"
+                        || t == "std::sync::Arc::from(dir.join(BLOCK_LOG).as_path())"
+                        || (calls_log_path && !names_log))
+                    || (name.ends_with("qlab-node/src/lib.rs") && names_log && !t.contains('('))
+                    || (name.ends_with("qlab-node/src/node.rs") && t == "r.spill_to_log(persist::log_path(dir),offset);");
+                if !allowed {
+                    offenders.push(format!("{name}:{line}: {}", code.trim()));
                 }
             }
         }
         assert!(scanned > 100, "the scan found the workspace ({scanned} files)");
         assert!(offenders.is_empty(), "blocks.log is append-only (persist.rs BLOCK_LOG); named outside its doors:\n{}", offenders.join("\n"));
-        // And the one open in this file is an append, never a truncate.
-        let own = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/persist.rs")).unwrap();
-        let prod: String = production_lines(&own).into_iter().map(|(_, c)| c + "\n").collect();
-        for banned in ["set_len(", ".truncate(true)", "File::create(dir.join(BLOCK_LOG", "remove_file(dir.join(BLOCK_LOG", "rename(dir.join(BLOCK_LOG"] {
-            assert!(!prod.contains(banned), "persist.rs production code contains `{banned}`");
+        // The one open for writing is an append; the one cut is the torn tail's.
+        assert!(persist_prod.contains(".append(true).open(dir.join(BLOCK_LOG))?;"), "append_record appends");
+        assert_eq!(persist_prod.matches("set_len(").count(), 1, "one set_len: truncate_torn_tail's");
+        assert!(persist_prod.contains("f.set_len(complete_end)?;"), "the cut is at the last complete record's end");
+        for banned in [".truncate(true)", "File::create(dir.join(BLOCK_LOG", "remove_file(dir.join(BLOCK_LOG", "rename(dir.join(BLOCK_LOG"] {
+            assert!(!persist_prod.contains(banned), "persist.rs production code contains `{banned}`");
         }
     }
 
     /// `(line number, code)` for every line outside `#[cfg(test)]` items, with
-    /// `//` comments dropped. Brace-counted; good enough for this crate's
-    /// formatting, and it errs toward scanning more.
-    fn production_lines(text: &str) -> Vec<(usize, String)> {
+    /// `//` comments dropped. Braces count only outside string, raw-string,
+    /// char literals and comments, and the depth must return to 0 at the end
+    /// of the file — a lexing skew fails loudly here instead of silently
+    /// skipping the rest of a file.
+    fn production_lines(name: &str, text: &str) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         let mut skipping: Option<i64> = None;
         let mut pending = false;
         let mut depth: i64 = 0;
+        let mut lex = Lex::default();
         for (i, raw) in text.lines().enumerate() {
-            let code = match raw.find("//") {
-                Some(at) if !raw[..at].contains('"') => &raw[..at],
-                _ => raw,
-            };
-            let opens = code.matches('{').count() as i64;
-            let closes = code.matches('}').count() as i64;
+            let (code, opens, closes) = lex.line(raw);
             if skipping.is_none() && code.trim() == "#[cfg(test)]" {
                 pending = true;
                 continue;
@@ -1483,10 +1615,126 @@ mod tests {
                 continue;
             }
             if !pending {
-                out.push((i + 1, code.to_string()));
+                out.push((i + 1, code));
             }
         }
+        assert_eq!(depth, 0, "{name}: brace depth {depth} at the end of the file — the scan's lexer skewed");
+        assert!(!lex.open(), "{name}: a string or comment never closed — the scan's lexer skewed");
         out
+    }
+
+    /// The scan's lexer state across lines: inside a `"…"` string, a raw
+    /// string with `n` hashes, or a block comment.
+    #[derive(Default)]
+    struct Lex {
+        in_str: bool,
+        raw: Option<usize>,
+        comment: usize,
+    }
+
+    impl Lex {
+        fn open(&self) -> bool {
+            self.in_str || self.raw.is_some() || self.comment > 0
+        }
+
+        /// The line without its `//` comment, and its braces outside
+        /// literals and comments.
+        fn line(&mut self, raw: &str) -> (String, i64, i64) {
+            let c: Vec<char> = raw.chars().collect();
+            let (mut opens, mut closes) = (0i64, 0i64);
+            let mut cut = c.len();
+            let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+            let mut j = 0;
+            while j < c.len() {
+                let ch = c[j];
+                if self.comment > 0 {
+                    if ch == '*' && c.get(j + 1) == Some(&'/') {
+                        self.comment -= 1;
+                        j += 2;
+                        continue;
+                    }
+                    if ch == '/' && c.get(j + 1) == Some(&'*') {
+                        self.comment += 1;
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if let Some(n) = self.raw {
+                    if ch == '"' && (1..=n).all(|k| c.get(j + k) == Some(&'#')) {
+                        self.raw = None;
+                        j += 1 + n;
+                        continue;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if self.in_str {
+                    match ch {
+                        '\\' => j += 2,
+                        '"' => {
+                            self.in_str = false;
+                            j += 1;
+                        }
+                        _ => j += 1,
+                    }
+                    continue;
+                }
+                match ch {
+                    '/' if c.get(j + 1) == Some(&'/') => {
+                        cut = j;
+                        break;
+                    }
+                    '/' if c.get(j + 1) == Some(&'*') => {
+                        self.comment = 1;
+                        j += 2;
+                    }
+                    'r' if (j == 0 || !ident(c[j - 1]) || (c[j - 1] == 'b' && (j < 2 || !ident(c[j - 2])))) && {
+                        let mut k = j + 1;
+                        while c.get(k) == Some(&'#') {
+                            k += 1;
+                        }
+                        c.get(k) == Some(&'"')
+                    } =>
+                    {
+                        let mut k = j + 1;
+                        while c.get(k) == Some(&'#') {
+                            k += 1;
+                        }
+                        self.raw = Some(k - j - 1);
+                        j = k + 1;
+                    }
+                    '"' => {
+                        self.in_str = true;
+                        j += 1;
+                    }
+                    '\'' => {
+                        if c.get(j + 1) == Some(&'\\') {
+                            let mut k = j + 3; // past the escaped character
+                            while k < c.len() && c[k] != '\'' {
+                                k += 1;
+                            }
+                            j = k + 1;
+                        } else if c.get(j + 2) == Some(&'\'') {
+                            j += 3;
+                        } else {
+                            j += 1; // a lifetime
+                        }
+                    }
+                    '{' => {
+                        opens += 1;
+                        j += 1;
+                    }
+                    '}' => {
+                        closes += 1;
+                        j += 1;
+                    }
+                    _ => j += 1,
+                }
+            }
+            (c[..cut].iter().collect(), opens, closes)
+        }
     }
 
     /// A seal of any other width is corrupt data, refused by name at read.

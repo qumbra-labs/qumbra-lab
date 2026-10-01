@@ -698,6 +698,27 @@ pub(crate) fn bundle_refusal_charged(r: &qlab_devnet::body::BundleRefusal) -> bo
     }
 }
 
+/// A stored body for a peer (lab #785 F5-5c): `None` when its bundle cannot
+/// be read back from the block log — served as "not held", and the fault
+/// logged, once per process (a peer can ask again; the log should not grow
+/// with it).
+fn served_body(b: &qlab_node::StoredBlock) -> Option<BlockBody> {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match b.try_body() {
+        Ok(body) => Some(body),
+        Err(e) => {
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                qlab_devnet::jeprintln!(ERROR,
+                    "SERVE block {} not served: its bundle does not read back from blocks.log ({e}); \
+                     further such faults are not logged",
+                    b.header.height
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Bound on each remembered-refusal set (F5-5b pre-review X1 (c)).
 pub const MAX_REFUSED_BUNDLE_IDS: usize = 256;
 
@@ -2971,7 +2992,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         use qlab_node::ChainStore as _;
         // Lab #785 F5-5c: a peer's request reaches this, so a bundle that
         // cannot be read back is "not held" (NotFound), never a panic.
-        self.state.chain().block(hash).and_then(|b| b.try_body().ok())
+        self.state.chain().block(hash).and_then(|b| served_body(b))
     }
     fn has_stored_body(&self, hash: &Hash32) -> bool {
         use qlab_node::ChainStore as _;
@@ -2981,7 +3002,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         // POSSESSION (issue #198): the applied store, then the rewind archive —
         // bodies this node applied at some point and still holds. `MemNode` owns
         // that distinction because `rewind_to` is where it is created.
-        self.state.held_block(hash).and_then(|b| b.try_body().ok())
+        self.state.held_block(hash).and_then(|b| served_body(b))
     }
 
     /// The main-chain blocks whose bodies this node still needs (issue #130 (c)).

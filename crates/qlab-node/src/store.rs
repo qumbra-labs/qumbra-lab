@@ -316,14 +316,20 @@ impl BundleRef {
         }
     }
 
-    /// **The bytes**, re-hashed against `id`. A log that is short of
-    /// `offset + len`, or whose bytes there are not this bundle's, refuses
-    /// with `InvalidData` naming the bundle and the offset — never a panic and
-    /// never wrong bytes.
+    /// **The bytes**, as an owned copy. See [`Self::bytes`].
     pub fn read(&self) -> std::io::Result<Vec<u8>> {
+        self.bytes().map(|b| b.to_vec())
+    }
+
+    /// **The bytes.** Resident bytes are handed back shared, as they are: they
+    /// were hashed when the ref was made. Bytes in the log are re-hashed
+    /// against `id`: a log that is short of `offset + len`, or whose bytes
+    /// there are not this bundle's, refuses with `InvalidData` naming the
+    /// bundle and the offset — never a panic and never wrong bytes.
+    pub fn bytes(&self) -> std::io::Result<std::sync::Arc<[u8]>> {
         let src = self.src.read().unwrap_or_else(|e| e.into_inner()).clone();
         let bytes = match src {
-            BundleSrc::Resident(b) => b.to_vec(),
+            BundleSrc::Resident(b) => return Ok(b),
             BundleSrc::Log { path, offset } => {
                 use std::io::{Read, Seek, SeekFrom};
                 let mut f = std::fs::File::open(&*path)?;
@@ -355,7 +361,7 @@ impl BundleRef {
                 ),
             ));
         }
-        Ok(bytes)
+        Ok(bytes.into())
     }
 }
 

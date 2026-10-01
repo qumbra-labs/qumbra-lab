@@ -175,7 +175,8 @@ pub fn harvest_matured(
     for hash in chain.chain().main_chain() {
         let Some(block) = chain.block(&hash) else { continue };
         let height = block.header.height;
-        let body = block.body();
+        // The coinbase only — no V6 bundle is read (lab #785 F5-5c).
+        let body = block.coinbase_view();
         if !body.coinbase_payees.iter().any(|p| p.rkm == mine) {
             continue; // someone else's block, or an unconfigured burn payout
         }
