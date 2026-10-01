@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use crate::peer::PeerId;
 use crate::sendstall::{
-    SendProgress, MAX_SEND_BACKLOG_BYTES_PER_PEER, SEND_STALL_WINDOW_MS, SEND_WRITE_TIMEOUT_MS,
+    SendProgress, MAX_SEND_BACKLOG_BYTES_PER_PEER, MAX_SEND_BACKLOG_BYTES_TOTAL, SEND_STALL_WINDOW_MS,
+    SEND_WRITE_TIMEOUT_MS,
 };
 use crate::wire::{FrameHeader, HEADER_LEN};
 
@@ -479,23 +480,51 @@ struct PeerWriter {
     /// Undelivered bytes, oldest first.
     pending: Vec<u8>,
     progress: SendProgress,
+    /// The node-wide backlog this writer's `pending` counts against (lab #785
+    /// F5-5a). Invariant: `budget.used` is the sum of every live writer's
+    /// `pending.len()` — added on queue, released on each accepted write and,
+    /// for whatever is left, on drop.
+    budget: Arc<SendBudget>,
+}
+
+/// **The send backlog across all peers** (lab #785 F5-5a): the bytes every
+/// [`PeerWriter`] holds undelivered, against [`MAX_SEND_BACKLOG_BYTES_TOTAL`]
+/// (re-tunable in tests). Only writers change `used`, by exactly the bytes they
+/// queue and release, so it cannot go negative or leak: a writer removed on a
+/// disconnect releases its remainder in `Drop`.
+struct SendBudget {
+    used: AtomicU64,
+    cap: AtomicU64,
+}
+
+impl SendBudget {
+    fn new() -> SendBudget {
+        SendBudget { used: AtomicU64::new(0), cap: AtomicU64::new(MAX_SEND_BACKLOG_BYTES_TOTAL) }
+    }
 }
 
 impl PeerWriter {
-    fn new(stream: TcpStream) -> PeerWriter {
-        PeerWriter { stream, pending: Vec::new(), progress: SendProgress::new() }
+    fn new(stream: TcpStream, budget: Arc<SendBudget>) -> PeerWriter {
+        PeerWriter { stream, pending: Vec::new(), progress: SendProgress::new(), budget }
     }
 
-    /// Queue one whole frame (or refuse it at the cap) and then hand the kernel
+    /// Queue one whole frame (or refuse it at a cap) and then hand the kernel
     /// as much of the backlog as it will take.
     fn send_frame(&mut self, now_ms: u64, frame: &[u8]) -> Result<(), TransportError> {
-        if self.pending.len() as u64 + frame.len() as u64 > MAX_SEND_BACKLOG_BYTES_PER_PEER {
+        let len = frame.len() as u64;
+        let over_peer = self.pending.len() as u64 + len > MAX_SEND_BACKLOG_BYTES_PER_PEER;
+        // Writers are mutated only under `TcpShared::writers`' lock, so the
+        // check and the add below cannot interleave with another writer's.
+        let over_total = self.budget.used.load(Ordering::SeqCst) + len > self.budget.cap.load(Ordering::SeqCst);
+        if over_peer || over_total {
             // Congestion, not malice — the same boundary the receive queue draws.
             // The frame is dropped whole; the connection stays up and the stall
-            // *window* is what rules on it.
+            // *window* is what rules on it. Over the node-wide cap (F5-5a) it
+            // is refused exactly like a per-peer overflow.
             self.progress.note_dropped_frame();
         } else {
             self.pending.extend_from_slice(frame);
+            self.budget.used.fetch_add(len, Ordering::SeqCst);
         }
         self.flush(now_ms)
     }
@@ -529,6 +558,7 @@ impl PeerWriter {
             }
         }
         self.pending.drain(..accepted);
+        self.budget.used.fetch_sub(accepted as u64, Ordering::SeqCst);
         self.progress.observe(now_ms, accepted as u64, self.pending.len() as u64);
         match fatal {
             Some(e) => Err(e),
@@ -537,9 +567,19 @@ impl PeerWriter {
     }
 }
 
+impl Drop for PeerWriter {
+    /// Whatever never reached the socket leaves the node-wide budget with the
+    /// writer — a disconnect, clean or not, cannot leak it.
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.pending.len() as u64, Ordering::SeqCst);
+    }
+}
+
 struct TcpShared {
     inbox: Mutex<Inbox>,
     writers: Mutex<HashMap<PeerId, PeerWriter>>,
+    /// The node-wide send backlog (lab #785 F5-5a).
+    send_budget: Arc<SendBudget>,
     running: AtomicBool,
     next_id: AtomicU64,
     /// Handles of connections we **accepted** (as opposed to dialed), so the
@@ -664,6 +704,7 @@ impl TcpTransport {
         let shared = Arc::new(TcpShared {
             inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
+            send_budget: Arc::new(SendBudget::new()),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
@@ -803,6 +844,17 @@ impl TcpTransport {
         self.shared.writers.lock().unwrap().get(&id).map(|w| w.progress.backlog()).unwrap_or(0)
     }
 
+    /// Undelivered bytes across every peer (lab #785 F5-5a; ops / tests).
+    pub fn total_backlog_bytes(&self) -> u64 {
+        self.shared.send_budget.used.load(Ordering::SeqCst)
+    }
+
+    /// Re-tune the node-wide send-backlog cap (tests / testnet), as
+    /// [`Self::set_inbound_cap`] does for connections.
+    pub fn set_send_backlog_total_cap(&self, cap: u64) {
+        self.shared.send_budget.cap.store(cap, Ordering::SeqCst);
+    }
+
     /// Re-tune the no-progress window (tests / testnet). Deliberately programmatic
     /// rather than a config key: like the rate limits, this number should move
     /// because a measurement said so.
@@ -839,7 +891,7 @@ impl TcpTransport {
         // `O_NONBLOCK` would follow it) — the send timeout does not.
         let _ = stream.set_write_timeout(Some(Duration::from_millis(SEND_WRITE_TIMEOUT_MS)));
         let writer = stream.try_clone().expect("clone tcp stream for writing");
-        shared.writers.lock().unwrap().insert(id, PeerWriter::new(writer));
+        shared.writers.lock().unwrap().insert(id, PeerWriter::new(writer, Arc::clone(&shared.send_budget)));
         if inbound {
             shared.inbound.lock().unwrap().insert(id);
         }
@@ -1199,6 +1251,7 @@ mod tests {
         Arc::new(TcpShared {
             inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
+            send_budget: Arc::new(SendBudget::new()),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
@@ -1458,6 +1511,62 @@ mod tests {
 
         client.shutdown();
         drop(listener);
+    }
+
+    /// Lab #785 F5-5a: the node-wide send backlog. Two peers that each stay
+    /// under their own cap are refused once together they would pass the
+    /// global one; the counter is exactly the sum of the per-peer backlogs.
+    #[test]
+    fn the_global_send_backlog_refuses_past_its_cap_across_peers() {
+        let (la, lb) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let a = client.connect(&la.local_addr().unwrap().to_string()).unwrap();
+        let b = client.connect(&lb.local_addr().unwrap().to_string()).unwrap();
+        assert!(fill_until_backlog(&client, a, 40) > 0 && fill_until_backlog(&client, b, 40) > 0, "buffers larger than expected");
+        assert_eq!(client.total_backlog_bytes(), client.backlog_bytes(a) + client.backlog_bytes(b));
+        let frame = fat_frame();
+        // Room for exactly one more frame node-wide, far under either peer's cap.
+        let cap = client.total_backlog_bytes() + frame.len() as u64;
+        client.set_send_backlog_total_cap(cap);
+        for pid in [a, b, a, b] {
+            let _ = client.send(pid, &frame);
+        }
+        let (ba, bb) = (client.backlog_bytes(a), client.backlog_bytes(b));
+        assert!(ba < MAX_SEND_BACKLOG_BYTES_PER_PEER && bb < MAX_SEND_BACKLOG_BYTES_PER_PEER, "each peer under its own cap");
+        assert_eq!(client.total_backlog_bytes(), ba + bb);
+        assert!(client.total_backlog_bytes() <= cap, "the node-wide cap holds");
+        assert!(client.total_backlog_bytes() + frame.len() as u64 > cap, "and the refused frames are whole");
+        assert_eq!(MAX_SEND_BACKLOG_BYTES_TOTAL, 128 * 1024 * 1024);
+        client.shutdown();
+        drop((la, lb));
+    }
+
+    /// Lab #785 F5-5a: the counter returns to exactly zero — never negative
+    /// (it would wrap to near `u64::MAX`), never leaking — when a backlogged
+    /// connection is closed by us and when it dies under us (the peer resets).
+    #[test]
+    fn the_global_send_backlog_returns_to_zero_on_any_disconnect() {
+        let (la, lb) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let a = client.connect(&la.local_addr().unwrap().to_string()).unwrap();
+        let b = client.connect(&lb.local_addr().unwrap().to_string()).unwrap();
+        assert!(fill_until_backlog(&client, a, 40) > 0 && fill_until_backlog(&client, b, 40) > 0, "buffers larger than expected");
+        let before_b = client.backlog_bytes(b);
+        // Ours: a clean close releases a's whole remainder.
+        client.disconnect(a);
+        assert_eq!(client.total_backlog_bytes(), before_b);
+        // Abnormal: b's listener goes away without ever accepting; the reader
+        // thread sees the reset and removes the writer.
+        drop(lb);
+        let start = Instant::now();
+        while client.backlog_bytes(b) > 0 && start.elapsed() < Duration::from_secs(10) {
+            let _ = client.send(b, &fat_frame());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(client.backlog_bytes(b), 0, "the dead connection's writer is gone");
+        assert_eq!(client.total_backlog_bytes(), 0, "nothing leaked, nothing went negative");
+        client.shutdown();
+        drop(la);
     }
 
     #[test]
