@@ -65,9 +65,11 @@
 //!   binds, F4-3) and `E_cum += Σ exits`, both u64 with overflow refused;
 //!   `E_cum ≤ D_cum` is `verify_wrapper`'s public check.
 //! - **The exit list (`exit_cmt`, Q3 = (c)).** An MD chain from zero over the
-//!   batch's exits `(rkm, v)`, in slot order ([`exit_state`]). **`rkm` is a
-//!   stub:** L2 transactions carry no L1 recipient yet (Larry's Q3, decided
-//!   at the shape freeze), so it is a witness bound to nothing but the chain.
+//!   batch's exits `(rkm, v)`, in slot order ([`exit_state`]). An exit is a
+//!   P row's `e_k` — a redeem of asset 0 of a **nonzero** amount (a
+//!   zero-amount redeem chains nothing) — and its `rkm` is the member's
+//!   `PV_XRKM`, one recipient per transaction (lab #785 F5-4d), which W
+//!   captures and binds; every P member's recipient words must be 16-bit.
 //!
 //! **Limits:** every append structure (`N`, `C`, `K`, `AA`, `CH`) stops at
 //! [`INDEX_CAP`] = 2^30 (inherited, Larry 2026-09-29).
@@ -404,6 +406,7 @@ impl WState {
                     if m.pvs.len() != WTag::P.pv_len() {
                         return Err(WError::Surface);
                     }
+                    m.digest_at(qlab_air::l2p::PV_XRKM)?;
                     for k in 0..2 {
                         let (sgn, amt, vpa) = vp_row(&m.pvs, k);
                         if sgn > 1 || vpa >= 1 << SUPPLY_DEPTH {
@@ -527,6 +530,10 @@ pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member]
             if m.pvs.len() != WTag::P.pv_len() {
                 return Err(WError::Surface);
             }
+            // V5 (lab #785 F5-4d-2): the recipient's words are 16-bit on every
+            // P member, as W's capture forces — never more permissive than the
+            // circuit.
+            m.digest_at(qlab_air::l2p::PV_XRKM)?;
             for (k, vw) in ex.vp.iter().enumerate() {
                 let (sgn, amt, vpa) = vp_row(&m.pvs, k);
                 if sgn > 1 || vpa >= 1 << SUPPLY_DEPTH {
@@ -849,6 +856,10 @@ mod tests {
         let (rin, w, rout) = s.apply(&inp, std::slice::from_ref(&z)).unwrap();
         assert_eq!(rout.e_cum, rin.e_cum);
         assert_eq!(check_wrapper_leaf(&rin, &inp, std::slice::from_ref(&z), &w).unwrap().1, EMPTY, "no exit chained");
+        // V5: a recipient word ≥ 2^16 is refused on any P member, exit or not.
+        let mut wide = p_member(&mut rng, &s, NO_VP);
+        wide.pvs[qlab_air::l2p::PV_XRKM + 3] = 1 << 16;
+        assert_eq!(s.clone().apply(&inp, std::slice::from_ref(&wide)).unwrap_err(), WError::Surface);
         let z2 = p_member(&mut rng, &s, [(1, 0, 0), (1, 2, 0)]);
         let (rin, w, _) = s.apply(&inp, std::slice::from_ref(&z2)).unwrap();
         let xr = z2.digest_at(qlab_air::l2p::PV_XRKM).unwrap();

@@ -75,6 +75,8 @@ pub(crate) const EXIT_ROWS: [(u32, u64, u32); 2] = [(1, 40, 0), (0, 0, 0)];
 /// Lab #785 F5-4d-2: a zero-amount asset-0 redeem (no exit, P's `e_k = 0`)
 /// and an exit of 2 on row 2.
 pub(crate) const ZERO_REDEEM_ROWS: [(u32, u64, u32); 2] = [(1, 0, 0), (1, 2, 0)];
+/// Lab #785 F5-4d-2: both rows exit (40 and 2) to the one recipient.
+pub(crate) const TWO_EXIT_ROWS: [(u32, u64, u32); 2] = [(1, 40, 0), (1, 2, 0)];
 
 /// A wrapper over `kinds`, on a state that already holds one prefill wrapper
 /// (an S and a P transaction and a claim: every tree past its genesis,
@@ -383,6 +385,7 @@ pub(crate) fn cases() -> Vec<Case> {
         ("d exit recipient register not P's PV", neg_xr_not_the_pv),
         ("d zero-amount asset-0 redeem flagged an exit", neg_zero_redeem_flagged),
         ("d NZ claimed on a zero amount", neg_nz_on_zero),
+        ("d an exit hidden (NZ = XF = KX = 0 on m != 0)", neg_exit_hidden),
         ("S4 D overflow", neg_d_overflow),
         ("S5 asset-0 redeem moves the supply leaf", neg_asset0_moves_supply),
         ("S5 an exit left out of the chain", neg_exit_skipped),
@@ -543,6 +546,25 @@ fn neg_zero_redeem_flagged() -> Neg {
         |plan, _| each_perm(plan, 0, |p| p.set(XF_OFF, Val::ONE)),
         0,
         "flags",
+    )
+}
+
+/// Lab #785 F5-4d-2 (pre-review V2): hiding an exit — `NZ`, `XF` and `KX`
+/// all cleared on a row whose `m ≠ 0` — is refused by `m · (1 − NZ) = 0`.
+fn neg_exit_hidden() -> Neg {
+    let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
+    judge(
+        "d an exit hidden (NZ = XF = KX = 0 on m != 0)",
+        &fx,
+        |plan, _| {
+            each_perm(plan, 0, |p| {
+                p.set(NZ_OFF, Val::ZERO);
+                p.set(XF_OFF, Val::ZERO);
+                p.set(KX_OFF, Val::ZERO);
+            })
+        },
+        0,
+        "vp",
     )
 }
 
@@ -1109,6 +1131,18 @@ mod tests {
         let fx = wfixture_rows(&[P], SEED, EXIT_ROWS);
         assert_eq!((fx.rout.e_cum, fx.rout.sup), (fx.rin.e_cum + 40, fx.rin.sup));
         assert_ne!(fx.exit_cmt, EMPTY);
+        // Lab #785 F5-4d-2 (pre-review V3): a zero-amount asset-0 redeem
+        // beside an exit of 2 — only the exit chains — and both rows exiting
+        // to the transaction's one recipient, two chain entries.
+        base(&(vec![P], SEED, ZERO_REDEEM_ROWS));
+        let fx = wfixture_rows(&[P], SEED, ZERO_REDEEM_ROWS);
+        let xr = |fx: &WFixture| pv_digest_of(&fx.members[0].pvs, qlab_air::l2p::PV_XRKM);
+        assert_eq!(fx.rout.e_cum, fx.rin.e_cum + 2);
+        assert_eq!(fx.exit_cmt, h4(&exit_state(&EMPTY, &xr(&fx), 2)));
+        base(&(vec![P], SEED, TWO_EXIT_ROWS));
+        let fx = wfixture_rows(&[P], SEED, TWO_EXIT_ROWS);
+        assert_eq!(fx.rout.e_cum, fx.rin.e_cum + 42);
+        assert_eq!(fx.exit_cmt, h4(&exit_state(&h4(&exit_state(&EMPTY, &xr(&fx), 40)), &xr(&fx), 2)));
         // (i): the two claims' fees carry out of limb 0.
         const { assert!(2 * (CLAIM_FEE & 0xffff) >= 1 << 16) };
     }
@@ -1117,7 +1151,7 @@ mod tests {
     #[test]
     fn f4w_negatives_refuse_at_their_binding_rows() {
         let cases = cases();
-        assert_eq!(cases.len(), 48);
+        assert_eq!(cases.len(), 52);
         let missed: Vec<String> = cases
             .iter()
             .map(|(_, f)| f())
