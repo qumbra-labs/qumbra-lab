@@ -565,3 +565,59 @@ fn send_names_its_endpoints_and_refuses_before_it_proves() {
     assert!(err.contains("scan never started"), "a dead endpoint is named: {err}");
     assert!(!err.contains("proving"), "nothing was proved: {err}");
 }
+
+/// Every file under `dir` with its length and mtime — "nothing changed".
+fn listing(dir: &std::path::Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                stack.push(e.path());
+            }
+            out.push((e.path(), m.len(), m.modified().unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Lab #821: `ivk export` through the real binary. Its stdout is exactly one
+/// hex line that decodes (`Ivk::from_bytes`) to the wallet's own scanning
+/// keys; stderr names the data class; nothing under the wallet dir changed;
+/// a missing `--dir` and an unknown subcommand are refused.
+#[test]
+fn ivk_export_prints_the_viewing_key_and_writes_nothing() {
+    let dir = tmp("ivk_export");
+    let d = dir.to_str().unwrap();
+    let (_, stderr, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "{stderr}");
+    let before = listing(&dir);
+
+    let (stdout, stderr, ok) = run(&["ivk", "export", "--dir", d], None);
+    assert!(ok, "a pipe is not a terminal: {stderr}");
+    assert!(stderr.contains("cannot spend"), "the data class is said: {stderr}");
+    let line = stdout.trim();
+    assert_eq!(stdout.lines().count(), 1, "one line: {stdout}");
+    assert_eq!(line.len(), 66);
+    let bytes: Vec<u8> = (0..33).map(|i| u8::from_str_radix(&line[2 * i..2 * i + 2], 16).unwrap()).collect();
+    let ivk = qlab_wallet::viewing::Ivk::from_bytes(&bytes).expect("decodes");
+    let wallet = WalletDir::open(&dir).unwrap().wallet();
+    for i in 0..3 {
+        let dv = wallet.diversifier_at_index(i);
+        assert_eq!(
+            qlab_note::kem::ek_to_bytes(ivk.scan_key(&dv).encapsulation_key()),
+            qlab_note::kem::ek_to_bytes(&wallet.diversified_keypair(&dv).ek),
+            "index {i}"
+        );
+    }
+    assert_eq!(listing(&dir), before, "ivk export wrote nothing under the wallet dir");
+
+    let (_, err, ok) = run(&["ivk", "export"], None);
+    assert!(!ok && err.contains("--dir"), "{err}");
+    let (_, err, ok) = run(&["ivk", "import", "--dir", d], None);
+    assert!(!ok && err.contains("usage: qumbra-wallet ivk export"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
