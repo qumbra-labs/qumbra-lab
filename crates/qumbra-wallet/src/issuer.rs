@@ -474,6 +474,42 @@ fn rearmed(w: &WalletDir, outputs: &[qlab_note::l2note::L2Note; 2], asset: u16) 
     outputs.iter().any(|n| n.asset == u64::from(asset) && n.rkm == mine)
 }
 
+/// An issuance **built and proved but not yet submitted**.
+///
+/// Split from submission so an issuer service can durably record the attempt's
+/// identity — the spent notes' nullifiers and the anchor the proof was built
+/// at — *before* the transaction leaves the machine. After a submit whose
+/// outcome is unknown, that record is what lets the service ask the chain
+/// whether the attempt landed (its nullifier appears) or is dead (still absent
+/// once its anchor can no longer be included), instead of proving again: a
+/// second attempt would spend a *different* issuer note, so both would land.
+pub struct PreparedIssue<E: Endpoint> {
+    session: Session<E>,
+    pub tx: qlab_devnet::body::TxEntry,
+    pub outputs: [qlab_note::l2note::L2Note; 2],
+    pub split_fee_note: Option<qlab_note::l2note::L2Note>,
+    pub rearmed: bool,
+}
+
+impl<E: Endpoint> PreparedIssue<E> {
+    /// The nullifiers this transaction spends; any of them on chain means it landed.
+    pub fn nullifiers(&self) -> &[[u8; 32]] {
+        &self.tx.public.nullifiers
+    }
+
+    /// The finalized commitment root the proof is built against.
+    pub fn anchor(&self) -> &[u8; 32] {
+        &self.tx.public.anchor
+    }
+
+    /// Submit on the Annulet tx wire. Consumes the preparation: one prepared
+    /// transaction is submitted through this path at most once.
+    pub fn submit(self) -> Result<IssueReport, SendRefusal> {
+        self.session.served.submit(&self.tx)?;
+        Ok(IssueReport { outputs: self.outputs, split_fee_note: self.split_fee_note, rearmed: self.rearmed })
+    }
+}
+
 /// **Mint** `amount` of `asset` to `to`, on the row of an issuer-held note of
 /// the asset, with the issuer secret from `issuer.v1`.
 #[allow(clippy::too_many_arguments)]
@@ -489,12 +525,47 @@ pub fn issuer_mint<E: Endpoint>(
     split_wait: Duration,
     rng: &mut StdRng,
 ) -> Result<IssueReport, SendRefusal> {
+    prepare_mint(w, endpoint, asset, amount, to, freeze_keys, IsskSource::File, scan_to, pin, split_wait, rng)?.submit()
+}
+
+/// Where a mint or a closed redeem takes the issuer secret from.
+#[derive(Clone, Copy)]
+pub enum IsskSource {
+    /// `issuer.v1` in the wallet dir: the secret in force for the key the
+    /// chain shows (a pending rotation the chain now shows is promoted).
+    File,
+    /// Supplied by the caller, held in memory only. Refused before anything is
+    /// proved unless it matches the issuer key the chain shows.
+    Given([u64; 4]),
+}
+
+/// The issuer secret for `asset` against the `issuer_key` the chain shows:
+/// `Ok(None)` when this source holds none for that key.
+fn isk_from(w: &WalletDir, source: IsskSource, asset: u16, issuer_key: &[u64; 4]) -> Result<Option<[u64; 4]>, SendRefusal> {
+    match source {
+        IsskSource::File => IssuerFile::isk_for_key(&w.dir, asset, issuer_key).map_err(SendRefusal::Issuer),
+        IsskSource::Given(isk) => Ok((issuer_key_of(&isk) == *issuer_key).then_some(isk)),
+    }
+}
+
+/// Build and prove a mint without submitting it; see [`PreparedIssue`].
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_mint<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    asset: u16,
+    amount: u64,
+    to: &Address,
+    freeze_keys: &[[u64; 4]],
+    isk: IsskSource,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    split_wait: Duration,
+    rng: &mut StdRng,
+) -> Result<PreparedIssue<E>, SendRefusal> {
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
     let leaf = session.served.registry(u64::from(asset))?.leaf;
-    // The secret in force (a pending rotation the chain now shows is promoted).
-    let isk = IssuerFile::isk_for_key(&w.dir, asset, &leaf.issuer_key)
-        .map_err(SendRefusal::Issuer)?
-        .ok_or(SendRefusal::NotTheIssuer { asset })?;
+    let isk = isk_from(w, isk, asset, &leaf.issuer_key)?.ok_or(SendRefusal::NotTheIssuer { asset })?;
     let base = session.index.spendable(asset).iter().min_by_key(|n| n.note.value).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?;
     let recipient = recipient_of(to).ok_or(SendRefusal::Issuer("the recipient address has no valid ek".into()))?;
     let (fee, split) = exact_fee_note(w, &session, session.tiers.p, split_wait, rng)?;
@@ -511,9 +582,8 @@ pub fn issuer_mint<E: Endpoint>(
         [VPublic::mint(amount), VPublic::NONE],
         rng,
     )?;
-    session.served.submit(&built.tx)?;
     let rearmed = rearmed(w, &built.outputs, asset);
-    Ok(IssueReport { outputs: built.outputs, split_fee_note: split, rearmed })
+    Ok(PreparedIssue { session, tx: built.tx, outputs: built.outputs, split_fee_note: split, rearmed })
 }
 
 /// **Redeem** `amount` of `asset` from a note this wallet holds: with the
@@ -532,10 +602,28 @@ pub fn redeem<E: Endpoint>(
     split_wait: Duration,
     rng: &mut StdRng,
 ) -> Result<IssueReport, SendRefusal> {
+    prepare_redeem(w, endpoint, asset, amount, freeze_keys, IsskSource::File, scan_to, pin, split_wait, rng)?.submit()
+}
+
+/// Build and prove a redeem without submitting it; see [`PreparedIssue`].
+/// Without a matching secret it proceeds only when the asset is `redeem_open`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_redeem<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    asset: u16,
+    amount: u64,
+    freeze_keys: &[[u64; 4]],
+    isk: IsskSource,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    split_wait: Duration,
+    rng: &mut StdRng,
+) -> Result<PreparedIssue<E>, SendRefusal> {
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
     let leaf = session.served.registry(u64::from(asset))?.leaf;
     let redeem_open = leaf.flags & FLAG_REDEEM_OPEN != 0;
-    let isk = match IssuerFile::isk_for_key(&w.dir, asset, &leaf.issuer_key).map_err(SendRefusal::Issuer)? {
+    let isk = match isk_from(w, isk, asset, &leaf.issuer_key)? {
         Some(k) => k,
         None if redeem_open => [0; 4],
         None => return Err(SendRefusal::NotTheIssuer { asset }),
@@ -562,9 +650,8 @@ pub fn redeem<E: Endpoint>(
         [VPublic::redeem(amount), VPublic::NONE],
         rng,
     )?;
-    session.served.submit(&built.tx)?;
     let rearmed = rearmed(w, &built.outputs, asset);
-    Ok(IssueReport { outputs: built.outputs, split_fee_note: split, rearmed })
+    Ok(PreparedIssue { session, tx: built.tx, outputs: built.outputs, split_fee_note: split, rearmed })
 }
 
 #[cfg(test)]
