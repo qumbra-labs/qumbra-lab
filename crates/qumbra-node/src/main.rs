@@ -364,6 +364,7 @@ fn print_v6_identity(gf: &qumbra_node::genesis_v6::GenesisFileV6, hash: &str) {
     println!("  K_exit:         {}", gf.wrapper.k_exit);
     println!("  bundle spacing: {} blocks", gf.wrapper.wrapper_spacing_blocks);
     println!("  record version: {}", gf.wrapper.finality_record_version);
+    println!("  claim fee tier: {} bessel [placeholder — Q-4d-2]", gf.wrapper.claim_fee_tier);
     println!("  l2_id:          {}", gf.wrapper.l2_id);
     println!("  genesis surface:{:?}", gf.wrapper.genesis_surface);
     println!("  sequencer key:  {} B{}", gf.wrapper.sequencer_key.len(),

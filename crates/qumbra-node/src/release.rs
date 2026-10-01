@@ -1802,7 +1802,8 @@ mod tests {
     }
 
     /// 🔒 The V6 rule domains over the rehearsal WrapperParams, copied from
-    /// the named `halt-status --genesis` runs (`logs/f5-4c2-runs/3-…`, `5-…`):
+    /// the named `halt-status --genesis` runs (`logs/f5-4c2-runs/3-…`, `5-…`;
+    /// re-pinned in F5-4d-2 for `claim_fee_tier`, `logs/f5-4d2-runs/`):
     /// the armed build's revision (v1.0, also the V6 revision `genesis init
     /// --t2` prints) and the resume build's (v1.1-exact-emission). The L1
     /// domains the same runs printed without `--genesis` are the unmoved
@@ -1812,11 +1813,11 @@ mod tests {
         let v6 = RevisionIdentity::V6 { wrapper_digest: rehearsal_wrapper_digest() };
         assert_eq!(
             crate::genesis::hex_encode(&v6.digest_of(&REVISION_V1_0)),
-            "89e36dac55fcae4d1e4f3975e74df689ae4984b997272f3f65b44c4d77e2ffe4"
+            "7a5b813e84f2772b69ccefe3c2736f52c6b685d684ba17d180eb13b6ce245c84"
         );
         assert_eq!(
             crate::genesis::hex_encode(&v6.digest_of(&REVISION_V1_1_EXACT_EMISSION)),
-            "d45b52cf38adf8e1ba4f14fe8feeadff55cf4b31d1f3358298355d2cb8632daa"
+            "61ed57d375cd890eaf7965bc93969803baefd3f243fb154e7461372b4aac6ad6"
         );
         assert_eq!(REVISION_V1_0.digest_hex(), "c7b5d40be4784f792a53c5df9f9e17bfe31df2327ec7986edad59ffaf3733259");
         assert_eq!(

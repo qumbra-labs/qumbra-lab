@@ -1,4 +1,7 @@
 /target
+# Extra cargo target dirs (e.g. `--target-dir target-resume` for a feature
+# build beside the default one) — lab #785 F5-4d-2 committed one by accident.
+/target-*
 **/*.rs.bk
 .DS_Store
 docs/scratch/

@@ -14,7 +14,8 @@
 //!   slot ×k (662 perms):
 //!     F3's slot    SD 6 | inserts 3 × 131 | appends 2 × 64 | registry 33
 //!     vPublic ×2   old leaf, new leaf, supply pair path (34 each; P only)
-//!     exits ×2     the exit chain's steps (P redeems on asset 0)
+//!     exits ×2     the exit chain's steps (P's nonzero redeems of asset 0,
+//!                  to P's captured recipient)
 //!     anchor       32: a transaction's anchor opened in CH, a claim's in AA
 //!   epilogue (67 perms): ρ(prev), rseed(prev), the fee note, its append to C
 //! ```
@@ -349,6 +350,8 @@ fn captures() -> Vec<Capture> {
         (VM_OFF + 4, 4, vec![(p, l2p::PV_VP2 + 1)]),
         (VA_OFF, 1, vec![(p, l2p::PV_VP1 + 5)]),
         (VA_OFF + 1, 1, vec![(p, l2p::PV_VP2 + 5)]),
+        // Lab #785 F5-4d-2: the exit recipient, one per transaction (Q-4d-1).
+        (XR_OFF, 16, vec![(p, l2p::PV_XRKM)]),
     ]
 }
 
@@ -448,9 +451,15 @@ pub const KX_OFF: usize = XF_OFF + 2;
 pub const KSN_OFF: usize = KX_OFF + 2;
 pub const KSU_OFF: usize = KSN_OFF + 2;
 pub const MZ_OFF: usize = KSU_OFF + 2;
-pub const W_WIDTH: usize = MZ_OFF + 2;
-/// Lab #785 F5-4d-1: one SD block more (3,470 → 3,471); 4d-2 moves it again.
-const _: () = assert!(W_WIDTH == 3_471);
+/// Lab #785 F5-4d-2: a P slot's exit recipient (captured, P's `PV_XRKM`),
+/// and per row `[m ≠ 0]` with its inverse witness.
+pub const XR_OFF: usize = MZ_OFF + 2;
+pub const NZ_OFF: usize = XR_OFF + 16;
+pub const NZINV_OFF: usize = NZ_OFF + 2;
+pub const W_WIDTH: usize = NZINV_OFF + 2;
+/// Lab #785 F5-4d: one SD block more (4d-1, 3,470 → 3,471), then the exit
+/// recipient's 16 registers and `NZ`/`NZINV` per row (4d-2, → 3,491).
+const _: () = assert!(W_WIDTH == 3_491);
 
 // ---------------------------------------------------------------------------
 // Public values
@@ -808,7 +817,10 @@ impl WAir {
                 builder.assert_zero(c(BP) - c(BIT) * c(PW));
                 builder.assert_zero(c(KCH) - seg(Seg::Anch(APart::Last)) * (tag(0) + tag(1) + tag(2)));
                 for k in 0..2 {
-                    builder.assert_zero(c(XF_OFF + k) - tag(T_P) * c(ZV_OFF + k) * c(VS_OFF + k));
+                    // An exit is P's `e_k`: a redeem (`vs`) of asset 0 (`zv`) of a
+                    // nonzero amount (`NZ`, lab #785 F5-4d-2). `zv·vs = zv − MZ`
+                    // keeps it degree 3.
+                    builder.assert_zero(c(XF_OFF + k) - tag(T_P) * (c(ZV_OFF + k) - c(MZ_OFF + k)) * c(NZ_OFF + k));
                     builder.assert_zero(c(KX_OFF + k) - seg(Seg::Exit(k)) * c(XF_OFF + k));
                     builder.assert_zero(c(KSN_OFF + k) - seg(Seg::SupNew(k)) * tag(T_P));
                     builder.assert_zero(c(KSU_OFF + k) - seg(sup_last(k)) * tag(T_P));
@@ -881,7 +893,7 @@ impl WAir {
             "surface_hold" => {
                 let free = fin.clone() * c(W);
                 let mut t = builder.when_transition();
-                for col in (NF_OFF..=ASSET).chain(ANC_OFF..ANC_OFF + 16).chain(VS_OFF..VA_OFF + 2) {
+                for col in (NF_OFF..=ASSET).chain(ANC_OFF..ANC_OFF + 16).chain(VS_OFF..VA_OFF + 2).chain(XR_OFF..XR_OFF + 16) {
                     t.assert_zero((one.clone() - free.clone()) * (n(col) - c(col)));
                 }
             }
@@ -1221,6 +1233,11 @@ impl WAir {
                     builder.assert_bool(cur[ZV_OFF + k]);
                     builder.assert_zero(c(VA_OFF + k) * c(ZVINV_OFF + k) - (one.clone() - c(ZV_OFF + k)));
                     builder.assert_zero(c(VA_OFF + k) * c(ZV_OFF + k));
+                    // `NZ = [m ≠ 0]` (lab #785 F5-4d-2): four 16-bit chunks sum
+                    // below 2^18 < p, so the sum is 0 exactly when m is.
+                    let sm = (0..4).fold(AB::Expr::ZERO, |a, j| a + c(VM_OFF + 4 * k + j));
+                    builder.assert_zero(c(NZ_OFF + k) - sm.clone() * c(NZINV_OFF + k));
+                    builder.assert_zero(sm * (one.clone() - c(NZ_OFF + k)));
                     // The old and new supply leaves H(asset ‖ outstanding).
                     for s in [Seg::SupOld(k), Seg::SupNew(k)] {
                         let g = seg(s) * tag(T_P);
@@ -1296,12 +1313,12 @@ impl WAir {
                 let dom = crate::hash::exit_domain_lanes();
                 let kx = c(KX_OFF) + c(KX_OFF + 1);
                 for l in 0..25 {
-                    if (4..8).contains(&l) {
-                        continue; // rkm: a free witness, bound only through the chain (Q3 = (c))
-                    }
                     for m in 0..4 {
                         let e: AB::Expr = match (l, m) {
                             (0..=3, m) => c(EXC_OFF + 4 * l + m),
+                            // rkm: the captured recipient (lab #785 F5-4d-2),
+                            // one per transaction — both rows pay it.
+                            (4..=7, m) => c(XR_OFF + 4 * (l - 4) + m),
                             (8, m) => c(KX_OFF) * c(VM_OFF + m) + c(KX_OFF + 1) * c(VM_OFF + 4 + m),
                             (9, 0) => AB::Expr::ONE,
                             (16, 3) => konst(0x8000),
