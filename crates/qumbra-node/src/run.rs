@@ -461,6 +461,63 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
     })
 }
 
+/// [`preflight`] over **any** genesis form, dispatched exactly as `run`
+/// dispatches it (`annulet_genesis::load_any`): each form gets the
+/// verification its own `prepare` applies — the L1 file's, the **V6** file's
+/// `verify_startup` against `expected_genesis_hash` (the V6 hash, not the
+/// base's) with the committee keys checked against its committee₀, the
+/// **Annulet** file's `verify` and its sequencer-net refusals — and the halt
+/// gates of the release that form runs under (`RELEASE.on_v6` on a V6 net; an
+/// Annulet net has none). `qumbra-node check` runs this.
+///
+/// Lab #785 F5-6: `check` loaded every genesis as the L1 base, so it refused
+/// each V6 config `run` accepts — and the box run's producer preflight with it.
+pub fn preflight_any(config: &NodeConfig, genesis: &crate::annulet_genesis::AnyGenesis) -> Result<Preflight, RunError> {
+    use crate::annulet_genesis::AnyGenesis;
+    let summary = |genesis_hash: String, committee_size: u32, quorum: u32, keys_held: usize| Preflight {
+        genesis_hash,
+        committee_size,
+        quorum,
+        keys_held,
+        listen_addr: config.listen_addr.clone(),
+        dial_peers: config.dial_peers.len(),
+        mining: config.mining,
+        miner_rkm: config.miner_rkm.clone(),
+    };
+    match genesis {
+        AnyGenesis::L1(g) => {
+            let pf = preflight(config, g)?;
+            RELEASE.validate()?;
+            RELEASE.check_against_marker(HaltMarker::load(&config.data_dir)?.as_ref())?;
+            Ok(pf)
+        }
+        AnyGenesis::V6(g) => {
+            g.verify_startup(config.expected_genesis_hash.as_deref())?;
+            let validators = g.base.load_validators(&config.committee_key_paths)?;
+            check_miner_payout(config)?;
+            config.operator_bind().map_err(RunError::Config)?;
+            let release = RELEASE.on_v6(g.wrapper.digest());
+            release.validate()?;
+            release.check_against_marker(HaltMarker::load(&config.data_dir)?.as_ref())?;
+            Ok(summary(g.hash_hex(), g.base.frozen.committee_size, g.base.frozen.quorum, validators.len()))
+        }
+        AnyGenesis::Annulet(g) => {
+            g.verify(config.expected_genesis_hash.as_deref())?;
+            if !config.committee_key_paths.is_empty() {
+                return Err(RunError::Annulet("committee_key_paths are set, but a sequencer net has no committee"));
+            }
+            if config.mining {
+                return Err(RunError::Annulet(
+                    "mining = true, but an Annulet node produces only as the sequencer, selected by the \
+                     sequencer key file in the data dir",
+                ));
+            }
+            config.operator_bind().map_err(RunError::Config)?;
+            Ok(summary(g.hash_hex(), 0, 0, 0))
+        }
+    }
+}
+
 /// Cached `GET /v1/mine/template` answer. Refreshed when the tip or the
 /// mempool length moves — not on every poll, because assembly advances
 /// the deterministic mining clock.
@@ -5715,6 +5772,37 @@ mod tests {
     /// is now refused by `check`, exactly as `run` refuses it. The unset case is
     /// still legal for a node that does not mine, which is the other half below
     /// and the regression that mattered most.
+    /// Lab #785 F5-6: `preflight_any` checks a V6 config the way `run` opens
+    /// it — the V6 hash is the pin, the committee keys verify against its
+    /// committee₀ — while the L1 base loader refuses the same file by name
+    /// (what `check` hit on the box). On an L1 genesis it is `preflight`.
+    #[test]
+    fn preflight_any_checks_a_v6_config_the_way_run_opens_it() {
+        use crate::annulet_genesis::{load_any, AnyGenesis};
+        let (mut config, l1, base) = rig("preflight_any", true);
+        config.miner_rkm = Some("01".repeat(32));
+        let l1_any = load_any(&l1.to_bytes()).expect("an L1 file loads");
+        assert_eq!(preflight_any(&config, &l1_any).expect("L1"), preflight(&config, &l1).expect("L1"));
+
+        let v6 = crate::genesis_v6::GenesisFileV6::new_rehearsal();
+        std::fs::write(&config.genesis_file, v6.to_bytes()).unwrap();
+        assert!(matches!(GenesisFile::from_bytes(&v6.to_bytes()), Err(GenesisError::V6Refused(_))), "the L1 loader refuses it");
+        let any = load_any(&std::fs::read(&config.genesis_file).unwrap()).expect("load_any dispatches it");
+        assert!(matches!(any, AnyGenesis::V6(_)));
+        config.expected_genesis_hash = Some(v6.hash_hex());
+        let pf = preflight_any(&config, &any).expect("a V6 config preflights");
+        assert_eq!((pf.genesis_hash.as_str(), pf.committee_size, pf.quorum, pf.keys_held), (v6.hash_hex().as_str(), 21, 15, 21));
+        for pin in [v6.base.hash_hex(), "00".repeat(32)] {
+            let mut bad = config.clone();
+            bad.expected_genesis_hash = Some(pin);
+            assert!(matches!(preflight_any(&bad, &any), Err(RunError::Genesis(GenesisError::WrongGenesisHash { .. }))));
+        }
+        let mut no_payout = config.clone();
+        no_payout.miner_rkm = None;
+        assert!(matches!(preflight_any(&no_payout, &any), Err(RunError::MiningWithoutPayout)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn preflight_refuses_a_miner_rkm_the_node_could_not_start_with() {
         let (mut config, genesis, base) = rig("preflight_rkm", true);
