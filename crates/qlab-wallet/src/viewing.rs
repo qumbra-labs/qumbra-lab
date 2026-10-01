@@ -162,6 +162,38 @@ impl Ivk {
         diversified_keypair(&self.div_seed, d).dk
     }
 
+    /// The encoding's version byte ([`Ivk::to_bytes`]).
+    pub const ENCODING_VERSION: u8 = 1;
+
+    /// **The incoming viewing key as bytes** (lab #821): `version u8 = 1 ‖
+    /// div_seed[32]` — what an `Ivk`-only host (the Annulet gateway) is given.
+    ///
+    /// **Data class.** These 33 bytes read **every incoming note to this
+    /// wallet, across all its diversifiers** — past and future — for as long as
+    /// the wallet exists. They cannot spend, cannot see spends (no `nk`), and
+    /// cannot generate addresses. Handle them as the wallet's privacy, not its
+    /// funds. A `Dk` is never encoded: a host derives each `dk_d` it scans with
+    /// from these bytes via [`Ivk::scan_key`].
+    pub fn to_bytes(&self) -> [u8; 33] {
+        let mut out = [0u8; 33];
+        out[0] = Self::ENCODING_VERSION;
+        out[1..].copy_from_slice(&self.div_seed);
+        out
+    }
+
+    /// Decode [`Ivk::to_bytes`]'s form; anything else is refused by name.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Ivk, IvkDecode> {
+        if bytes.len() != 33 {
+            return Err(IvkDecode::Length(bytes.len()));
+        }
+        if bytes[0] != Self::ENCODING_VERSION {
+            return Err(IvkDecode::Version(bytes[0]));
+        }
+        let mut div_seed = [0u8; 32];
+        div_seed.copy_from_slice(&bytes[1..]);
+        Ok(Ivk { div_seed })
+    }
+
     /// The managed diversifier for `index` (issue #43). This is a SCANNING-side
     /// capability — it needs only `div_seed` (which the `ivk` holds), not `nk` —
     /// so an `ivk` holder (e.g. an exchange) can enumerate its own diversifier
@@ -177,6 +209,26 @@ impl Ivk {
     // crate-level compile_fail doc-tests). `diversifier_at_index` above is
     // div_seed-only and confers no address-generation power.
 }
+
+/// Why [`Ivk::from_bytes`] refused its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IvkDecode {
+    /// Not 33 bytes.
+    Length(usize),
+    /// A version byte this build does not read.
+    Version(u8),
+}
+
+impl core::fmt::Display for IvkDecode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            IvkDecode::Length(n) => write!(f, "an encoded Ivk is 33 bytes, not {n}"),
+            IvkDecode::Version(v) => write!(f, "Ivk encoding version {v} (this build reads {})", Ivk::ENCODING_VERSION),
+        }
+    }
+}
+
+impl std::error::Error for IvkDecode {}
 
 /// A Qumbra wallet — the root of the key hierarchy. Owns the [`SpendingKey`] and
 /// derives every subordinate key/address from it. This is the ONLY type that can
@@ -295,6 +347,32 @@ mod tests {
     use super::*;
 
     const SK: Lanes = [0x1234, 0x5678, 0x9abc, 0xdef0];
+
+    /// Lab #821: an `Ivk` round-trips through its bytes to the same scanning
+    /// keys; a wrong length or version is refused by name.
+    #[test]
+    fn ivk_bytes_round_trip_and_refuse_by_name() {
+        let w = Wallet::from_seed_lanes(SK);
+        let bytes = w.ivk().to_bytes();
+        assert_eq!(bytes[0], Ivk::ENCODING_VERSION);
+        let back = Ivk::from_bytes(&bytes).expect("decodes");
+        assert_eq!(back.to_bytes(), bytes);
+        for i in 0..3 {
+            let d = w.diversifier_at_index(i);
+            assert_eq!(
+                qlab_note::kem::ek_to_bytes(back.scan_key(&d).encapsulation_key()),
+                qlab_note::kem::ek_to_bytes(&w.diversified_keypair(&d).ek),
+                "index {i}"
+            );
+            assert_eq!(back.diversifier_at_index(i), d);
+        }
+        assert_eq!(Ivk::from_bytes(&bytes[..32]).err(), Some(IvkDecode::Length(32)));
+        assert_eq!(Ivk::from_bytes(&[bytes.as_slice(), &[0]].concat()).err(), Some(IvkDecode::Length(34)));
+        let mut v2 = bytes;
+        v2[0] = 2;
+        assert_eq!(Ivk::from_bytes(&v2).err(), Some(IvkDecode::Version(2)));
+        assert_ne!(Wallet::from_seed_lanes([9, 9, 9, 9]).ivk().to_bytes(), bytes, "per wallet");
+    }
 
     #[test]
     fn fvk_views_spends_matching_spending_key() {

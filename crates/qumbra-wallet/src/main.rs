@@ -32,6 +32,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("send") => send(&args[1..]),
         Some("names") => names(&args[1..]),
         Some("issuer") => issuer(&args[1..]),
+        Some("ivk") => ivk(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -432,6 +433,11 @@ fn usage() {
                             shown only where this wallet dir holds a local `sends.v1` record, and\n\
                             is labeled as such (a restored wallet never has one)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
+         qumbra-wallet ivk export --dir DIR [--i-understand-this-is-a-viewing-key]\n  \
+                            the incoming viewing key as hex on stdout, for a scan-only host; writes\n\
+                            nothing; refuses a terminal without the flag. An incoming viewing key\n\
+                            reads EVERY incoming note to this wallet, across all its addresses, past\n\
+                            and future; it cannot spend and cannot see spends\n  \
          qumbra-wallet send --dir DIR --url URL --node URL --scan-to N\n  \
                             (--to ADDR-or-qumbra:URI-or-NAME.qmb | --to-contact NAME) [--amount BESSEL]\n  \
                             --to NAME.qmb resolves LOCALLY against the synced registry (D2)\n\
@@ -816,6 +822,47 @@ fn contact(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// prints. Position: derived at an ALLOCATED index's diversifier (default 0) —
 /// the identity this wallet already displays — not the faucet's fixed default
 /// diversifier, which is that binary's own convention.
+/// The flag that lets `ivk export` print to a terminal (lab #821).
+const IVK_ACK: &str = "--i-understand-this-is-a-viewing-key";
+
+/// What an exported incoming viewing key is (lab #821) — said in the help and
+/// on every export.
+const IVK_DATA_CLASS: &str = "an incoming viewing key reads EVERY incoming note to this wallet, across \
+all its addresses, past and future; it cannot spend and cannot see spends";
+
+/// `ivk export --dir DIR` (lab #821): the wallet's incoming viewing key as hex
+/// (`qlab_wallet::viewing::Ivk::to_bytes`) on stdout, for a host that only
+/// scans (the Annulet gateway). Writes nothing anywhere; refuses a terminal
+/// unless told otherwise, so the key goes where a pipe sends it rather than
+/// into a scrollback.
+fn ivk(args: &[String]) -> Result<(), Box<dyn Error>> {
+    match args.first().map(String::as_str) {
+        Some("export") => {
+            let rest = &args[1..];
+            let dir = dir_of(rest)?;
+            use std::io::IsTerminal;
+            ivk_export_gate(std::io::stdout().is_terminal(), has_flag(rest, IVK_ACK))?;
+            let w = WalletDir::open(&dir)?;
+            let hex: String = w.wallet().ivk().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("incoming viewing key of {} — {IVK_DATA_CLASS}", dir.display());
+            println!("{hex}");
+            Ok(())
+        }
+        _ => Err(format!("usage: qumbra-wallet ivk export --dir DIR [{IVK_ACK}]").into()),
+    }
+}
+
+/// Whether `ivk export` may print: never to a terminal without the flag.
+fn ivk_export_gate(stdout_is_terminal: bool, acknowledged: bool) -> Result<(), String> {
+    if stdout_is_terminal && !acknowledged {
+        return Err(format!(
+            "refusing to print an incoming viewing key to a terminal: {IVK_DATA_CLASS}. Pipe it to \
+             where it is going (e.g. `| ssh host 'cat > ivk.hex'`), or pass {IVK_ACK}"
+        ));
+    }
+    Ok(())
+}
+
 fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
     let dir = dir_of(args)?;
     let w = WalletDir::open(&dir)?;
@@ -1483,6 +1530,17 @@ fn resolve_send_amount(
 #[cfg(test)]
 mod tests {
     use super::{names_register_with, resolve_net, resolve_send_amount, NetSource};
+
+    /// Lab #821: `ivk export` never prints to a terminal without the flag,
+    /// and the refusal names the data class and the flag.
+    #[test]
+    fn ivk_export_refuses_a_terminal_without_the_flag() {
+        use super::{ivk_export_gate, IVK_ACK};
+        assert!(ivk_export_gate(false, false).is_ok(), "a pipe needs no flag");
+        assert!(ivk_export_gate(true, true).is_ok(), "the flag admits a terminal");
+        let why = ivk_export_gate(true, false).unwrap_err();
+        assert!(why.contains(IVK_ACK) && why.contains("cannot spend"), "{why}");
+    }
     use qlab_devnet::body::{TxEntry, TxPublic};
     use qlab_devnet::fees::ArityBucket;
     use qlab_devnet::forms::GenesisForm;
