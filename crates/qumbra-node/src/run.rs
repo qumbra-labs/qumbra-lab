@@ -2394,6 +2394,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             Arc::clone(&self.registry_view),
             Arc::new(crate::discovery_server::FormView {
                 form: self.form(),
+                sections: self.p2p.node().sections(),
                 genesis_notes: self.genesis_notes_body(),
                 annulet_params: self.annulet_params_body(),
             }),
