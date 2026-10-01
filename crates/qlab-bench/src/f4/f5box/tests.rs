@@ -575,6 +575,18 @@ fn f5box_the_command_line() {
     assert!(parse(&a(&zero)).unwrap_err().starts_with("--exit-v must be nonzero"));
     let all_zero = format!("--next --genesis g --chain c --state s --out o --exit-rkm {}", "0".repeat(64));
     assert!(parse(&a(&all_zero)).unwrap_err().starts_with("--exit-rkm"));
+
+    // The argv `main` really hands the mode (box run, 2026-10-01: `stray
+    // argument "f5box"`): the mode token leads, and it is not a stray — for
+    // every path. A second one is.
+    let real = |s: &str| a(&format!("f5box {s}"));
+    assert_eq!(parse(&real("--burn-rkm --genesis g")), Ok(Cmd::BurnRkm { genesis: "g".into() }));
+    assert_eq!(parse(&real("--genesis g --chain http://n --state s --out o --seed lane")), Ok(first));
+    let Cmd::Build(c) = parse(&real("--genesis g --chain c --state s --out o --seed lane --check")).unwrap() else { panic!() };
+    assert!(c.check && c.exit.is_none());
+    let Cmd::Build(n) = parse(&real(&format!("--next --genesis g --chain c --state s --out o --exit-rkm {hex} --exit-v 7 --check"))).unwrap() else { panic!() };
+    assert_eq!((n.exit.map(|e| e.v), n.check, n.seed), (Some(7), true, None));
+    assert_eq!(parse(&real("f5box --burn-rkm --genesis g")).unwrap_err(), "stray argument \"f5box\"");
 }
 
 /// A **text lint**: no f5box source names the rule's two test-knob calls.
