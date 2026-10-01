@@ -34,7 +34,7 @@ const BLOCK_PATH: &str = "/v1/mine/block";
 
 /// The body cap on every answer from the node's mine RPC (lab #785 F5-5a).
 /// A template carries the block's transactions as hex, so its size follows
-/// the block's: a V6 body is at most `MAX_V6_BODY_WIRE_BYTES` (15 MiB), 2× in
+/// the block's: a V6 body is at most `MAX_V6_BODY_BYTES` (15 MiB), 2× in
 /// hex plus JSON; 64 MiB covers it. Past it, the answer is refused by name.
 pub const NODE_RPC_MAX_BODY: usize = 64 * 1024 * 1024;
 

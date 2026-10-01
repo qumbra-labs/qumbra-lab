@@ -3,7 +3,7 @@
 //! Serving history is free bandwidth for an attacker: a ~50 B `GetData(Block)`
 //! item buys a whole body (~145 KB per transaction at FROZEN v1.0 sizes), and
 //! before this baton the serve side had no cost control at all — no item cap on
-//! a `GetData` (one 8 MiB frame can name ~250 k items) and no budget on served
+//! a `GetData` (one 16 MiB frame — 8 MiB then — can name ~500 k items) and no budget on served
 //! body bytes. The caps are enumerated in `qlab_p2p::ratelimit`'s body-serving
 //! posture table; these tests hold each one to #91's acceptance rule: **an
 //! over-limit ask is refused AND an at-limit ask is served** — only testing the

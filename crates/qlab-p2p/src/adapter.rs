@@ -5588,7 +5588,9 @@ mod tests {
         // The byte budget bites first when bodies carry proofs.
         let (mut b, anchor) = adapter_with_finalized_genesis();
         let mut fat = BlockBody::from_single_payee(vec![tx_with(anchor, 1, b"ok")], 0, [0; 4]);
-        fat.txs[0].proof = vec![0u8; 2 * 1024 * 1024];
+        // Sized from the budget (lab #785 F5-5a: 32 → 64 MiB): 23 of these
+        // are well past it.
+        fat.txs[0].proof = vec![0u8; MAX_PENDING_BODY_BYTES / 16];
         for height in 1..24u64 {
             b.buffer_body(header_at(height), fat.clone());
         }

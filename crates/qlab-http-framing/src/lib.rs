@@ -77,6 +77,11 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024;
 /// [`read_response_capped`]; this default exists for code outside it.
 pub const DEFAULT_MAX_BODY: usize = 64 * 1024 * 1024;
 
+/// Trailer fields accepted after a chunked body's last chunk (lab #785
+/// F5-5a, W6). Each line is already bounded by [`MAX_LINE_BYTES`]; this
+/// bounds their number, so the trailer section costs at most 512 KiB.
+pub const MAX_TRAILER_LINES: usize = 64;
+
 /// Socket read granularity. Not a body cap — see [`FramingError::Truncated`]
 /// for why a lying `Content-Length` costs a timeout rather than an
 /// allocation: the body is accumulated as it arrives, never pre-allocated
@@ -110,6 +115,8 @@ pub enum FramingError {
     /// `Content-Length` over it is refused before a byte of body is read, and
     /// a chunked or close-delimited body as soon as it passes it.
     BodyTooLarge { got: usize, cap: usize },
+    /// More than [`MAX_TRAILER_LINES`] trailer fields after the last chunk.
+    TooManyTrailers,
     /// The socket itself failed.
     Io(String),
 }
@@ -145,6 +152,9 @@ impl std::fmt::Display for FramingError {
                     f,
                     "http-framing: truncated-body: want {want} bytes, got {got}"
                 )
+            }
+            FramingError::TooManyTrailers => {
+                write!(f, "http-framing: too-many-trailers: over {MAX_TRAILER_LINES}")
             }
             FramingError::BodyTooLarge { got, cap } => {
                 write!(f, "http-framing: body-too-large: {got} bytes, cap {cap}")
@@ -219,8 +229,9 @@ pub fn read_response<R: Read>(inner: R) -> Result<Response, FramingError> {
 /// [`read_response`] with the caller's body cap (lab #785 F5-5a): a body
 /// over `max_body` bytes is [`FramingError::BodyTooLarge`] — a declared
 /// `Content-Length` before any body is read, a chunked or close-delimited
-/// one as soon as it passes the cap. Never more than `max_body` plus one read
-/// chunk is held.
+/// one as soon as it passes the cap. While reading, the decoder's buffer
+/// and the body it returns may both hold up to `max_body` bytes, so the peak
+/// is about 2–3 × `max_body` (W7); never an amount the peer declared.
 pub fn read_response_capped<R: Read>(inner: R, max_body: usize) -> Result<Response, FramingError> {
     let mut w = Wire::new(inner);
 
@@ -314,12 +325,14 @@ fn read_chunked<R: Read>(w: &mut Wire<R>, max_body: usize) -> Result<Vec<u8>, Fr
         let size =
             parse_hex(size_field).ok_or_else(|| FramingError::BadChunkSize { got: clip(&line) })?;
         if size == 0 {
-            // Trailers, then the empty line that ends the message.
-            loop {
+            // Trailers, then the empty line that ends the message — at most
+            // `MAX_TRAILER_LINES` of them (W6).
+            for _ in 0..=MAX_TRAILER_LINES {
                 if w.line()?.is_empty() {
                     return Ok(out);
                 }
             }
+            return Err(FramingError::TooManyTrailers);
         }
         let got = out.len().saturating_add(size);
         if got > max_body {
@@ -524,6 +537,20 @@ mod tests {
             Err(FramingError::Truncated { want: 5, got: 3 })
         );
         assert_eq!(DEFAULT_MAX_BODY, 64 * 1024 * 1024);
+    }
+
+    /// Lab #785 F5-5a (W6): a chunked body's trailer section is bounded.
+    #[test]
+    fn chunked_trailers_are_bounded() {
+        let mut ok = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n".to_vec();
+        for _ in 0..MAX_TRAILER_LINES {
+            ok.extend_from_slice(b"X-T: 1\r\n");
+        }
+        let mut many = ok.clone();
+        ok.extend_from_slice(b"\r\n");
+        assert_eq!(read(&ok).unwrap().body, b"abc", "exactly the bound is fine");
+        many.extend_from_slice(b"X-T: 1\r\n\r\n");
+        assert_eq!(read(&many), Err(FramingError::TooManyTrailers));
     }
 
     #[test]

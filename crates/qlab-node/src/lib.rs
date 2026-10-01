@@ -87,7 +87,7 @@ pub use rpc::{
     coinbase_page, main_chain_roots_of, repeated_nullifier_in_tx, serve, AnchorSet, BlockDiscovery,
     names_page, nullifier_page, CheckpointFacts, FullRefusal, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
     RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TreeLeaves,
-    TxDiscovery, MAX_COMPACT_BLOCKS, MAX_TREE_LEAVES, RPC_VERSION,
+    TxDiscovery, MAX_COMPACT_BLOCKS, MAX_COMPACT_PAGE_BYTES, MAX_TREE_LEAVES, RPC_VERSION,
 };
 pub use telemetry::{
     AppliedTip, BlockIdentity, DurableAgreement, DurableHead, DurableView, LocalCommitment,

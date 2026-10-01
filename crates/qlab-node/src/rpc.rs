@@ -225,6 +225,17 @@ pub struct TxDiscovery {
 /// height + 1. `1024` blocks is ~21 hours of chain at the 75 s target.
 pub const MAX_COMPACT_BLOCKS: usize = 1024;
 
+/// **A `/v1/compact` page's byte bound** (lab #785 F5-5a, pre-review W5).
+/// `[devnet-placeholder]`, NOT frozen.
+///
+/// The count bound alone allows ≈ 1,024 × a full V6 block's discovery bytes —
+/// on the order of 130 MB at 15 MiB bodies, over every client's body cap. A page
+/// therefore also stops before passing this many encoded bytes, and always
+/// serves at least one block, so a client paging from "last served + 1" (the
+/// #309 contract, which already tolerates short pages) always moves. Half the
+/// wallet's 64 MiB GET cap, asserted on the client side.
+pub const MAX_COMPACT_PAGE_BYTES: usize = 32 * 1024 * 1024;
+
 /// One main-chain block's **committed** note-discovery, as the verbatim bytes the
 /// body preimage covers — the projection `/v1/compact` serves.
 ///
@@ -479,7 +490,20 @@ pub fn compact_response(
     from: u64,
     to: u64,
 ) -> Result<Vec<u8>, CodecError> {
-    let mut out = Vec::new();
+    compact_response_within(blocks, from, to, MAX_COMPACT_PAGE_BYTES)
+}
+
+/// [`compact_response`] with the byte bound as a parameter (tests): the page
+/// stops at [`MAX_COMPACT_BLOCKS`] blocks or before passing `max_bytes`,
+/// whichever comes first, and always carries at least one block.
+pub fn compact_response_within(
+    blocks: &[BlockDiscovery],
+    from: u64,
+    to: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CodecError> {
+    let base = encode_compact_response(&[]).len();
+    let (mut out, mut bytes) = (Vec::new(), base);
     for b in blocks {
         if b.height < from || b.height > to {
             continue;
@@ -487,7 +511,13 @@ pub fn compact_response(
         if out.len() == MAX_COMPACT_BLOCKS {
             break;
         }
-        out.push(CompactBlock { height: b.height, groups: b.compact_groups()? });
+        let block = CompactBlock { height: b.height, groups: b.compact_groups()? };
+        let add = encode_compact_response(std::slice::from_ref(&block)).len() - base;
+        if !out.is_empty() && bytes + add > max_bytes {
+            break;
+        }
+        bytes += add;
+        out.push(block);
     }
     Ok(encode_compact_response(&out))
 }
@@ -2802,6 +2832,30 @@ mod tests {
 
         // A height the node does not have serves nothing / errors as cbserver does.
         assert!(matches!(rpc.route("/v1/block/9/tx/0/full"), Err((404, _))));
+    }
+
+    /// Lab #785 F5-5a (pre-review W5): a compact page is bounded by bytes as
+    /// well as blocks — it stops before passing the bound, never serves less
+    /// than one block (so a client paging from "last served + 1" moves), and
+    /// a client resuming there gets the rest.
+    #[test]
+    fn a_compact_page_stops_at_its_byte_bound_and_always_moves() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        for i in [1u8, 5, 9] {
+            let tx = tx_with(anchor, &[i, i + 1], &[i + 20, i + 21], fee);
+            apply_block_with(rpc.node_mut(), vec![tx]);
+        }
+        let chain = rpc.main_chain_discovery();
+        let one = compact_response_within(&chain, 1, 1, usize::MAX).unwrap().len();
+        let base = encode_compact_response(&[]).len();
+        let page = |from, max| decode_compact_response(&compact_response_within(&chain, from, 3, max).unwrap()).unwrap();
+        assert_eq!(page(1, usize::MAX).len(), 3, "unbounded by bytes: the whole range");
+        let first = page(1, one + (one - base) / 2);
+        assert_eq!(first.iter().map(|b| b.height).collect::<Vec<_>>(), vec![1], "stops before passing the bound");
+        assert_eq!(page(1, 1).len(), 1, "a bound below one block still serves one block");
+        assert_eq!(page(2, usize::MAX).iter().map(|b| b.height).collect::<Vec<_>>(), vec![2, 3], "the client resumes from last + 1");
+        assert_eq!(MAX_COMPACT_PAGE_BYTES, 32 * 1024 * 1024);
     }
 
     /// 🔴 **The baton's first acceptance item, stated as a byte identity.**

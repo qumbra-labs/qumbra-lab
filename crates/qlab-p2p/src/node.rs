@@ -230,9 +230,10 @@ pub const MAX_SERVED_BODIES: usize = 128;
 /// budget alone would admit ~200k entries; a proof-carrying body is ~145,754 B
 /// per tx at FROZEN v1.0 sizes, so the entry cap alone would admit ~19 MB at
 /// 1 tx/block and ~187 MB at 10 tx/block — on `t4g.small` hosts whose whole
-/// process measured ~262 MiB in the Phase B-lite soak. 8 MiB is ~57 single-tx
-/// bodies (~71 min of chain) or ~5 ten-tx bodies (~6 min), all far beyond the
-/// relay round-trip the cache serves, and 0.4 % of a 2 GB host. 24 MiB since lab
+/// process measured ~262 MiB in the Phase B-lite soak. The original 8 MiB was
+/// ~57 single-tx bodies (~71 min of chain) or ~5 ten-tx bodies (~6 min), all
+/// far beyond the relay round-trip the cache serves, and 0.4 % of a 2 GB host.
+/// 24 MiB since lab
 /// #785 F5-5a (Q-C5): room for one bundle-bearing body (≤ 16 MiB) beside the
 /// ordinary ones.
 ///
@@ -2317,7 +2318,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // for a block we cannot serve (see `request_missing_bodies`), and it is the
         // only answer expressible: `InvItem` cannot hold a kind we do not have.
         self.count_unknown_inv(&inv);
-        // Issue #371 S3: one 8 MiB `GetData` can name ~250 k items, and every
+        // Issue #371 S3: one 16 MiB `GetData` frame can name ~500 k items (8 MiB
+        // and ~250 k before lab #785 F5-5a), and every
         // item costs a lookup and an answer. Items past the cap are IGNORED —
         // not `NotFound` (scored by the receiver on some paths), not headers
         // (that answer is itself the ~50 MB header-storm amplifier). An honest
@@ -3506,6 +3508,43 @@ mod tests {
         assert_eq!(body.preimage_v6().len(), MAX_V6_BODY_BYTES);
         let w = wire_len(&body).expect("a body at the bound encodes");
         assert!(w <= MAX_V6_BODY_BYTES + FRAME_OVERHEAD_BOUND && w <= crate::wire::MAX_PAYLOAD as usize, "{w}");
+    }
+
+    /// Lab #785 F5-5a (pre-review W4): the derivation itself, where the 4 KiB
+    /// slack cannot hide it — one proof-sized transaction with a rider, one
+    /// payee, and a section-dominated body grown to exactly the bound: the
+    /// whole-block announce is at most its canonical bytes + 110 B (the
+    /// derived +96, with room for the per-tx terms).
+    #[test]
+    fn the_announce_overhead_derivation_holds_on_a_one_tx_body() {
+        use crate::compact::{encode_announce_for, WireForm};
+        use qlab_devnet::body::{CoinbasePayee, TxPublic, MAX_V6_BODY_BYTES};
+        use qlab_devnet::fees::ArityBucket;
+        use qlab_devnet::forms::GenesisForm;
+        let mut tx = TxEntry::with_placeholder_discovery(
+            vec![5; 145_754],
+            TxPublic {
+                anchor: [5; 32],
+                nullifiers: vec![[6; 32]; 3],
+                commitments: vec![[7; 32]; 2],
+                bucket: ArityBucket::TwoByTwo,
+                fee: 1,
+            },
+        );
+        tx.rider = vec![9; 40];
+        let mut body = BlockBody {
+            txs: vec![tx],
+            coinbase_payees: vec![CoinbasePayee { rkm: [5; 4], amount: 7 }],
+            finality: Vec::new(),
+            bundle: Vec::new(),
+        };
+        body.finality = vec![3; MAX_V6_BODY_BYTES - body.preimage_v6().len()];
+        let pre = body.preimage_v6().len();
+        assert_eq!(pre, MAX_V6_BODY_BYTES);
+        let header = BlockHeader::genesis_for(GenesisForm::V5, 0, 0);
+        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body);
+        let wire = encode_announce_for(WireForm::V6, &ann).expect("encodes").len();
+        assert!(wire <= pre + 110, "announce {wire} vs preimage {pre}: the derivation's +96 does not hold");
     }
     use crate::codec::encode_headers;
     use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, StubNode, TxPool};
@@ -4795,11 +4834,13 @@ mod tests {
     #[test]
     fn serving_cache_byte_budget_binds_and_keeps_at_least_one_body() {
         let mut c = ServedBodies::new();
-        let three_mib = 3 * 1024 * 1024;
-        let h1 = cache_insert(&mut c, 1, three_mib);
-        let h2 = cache_insert(&mut c, 2, three_mib);
-        assert_eq!(c.len(), 2, "6 MiB fits the 8 MiB budget");
-        let h3 = cache_insert(&mut c, 3, three_mib);
+        // Sized from the budget (lab #785 F5-5a: 8 → 24 MiB): two fit, three
+        // do not.
+        let part = MAX_SERVED_BODY_BYTES * 3 / 8;
+        let h1 = cache_insert(&mut c, 1, part);
+        let h2 = cache_insert(&mut c, 2, part);
+        assert_eq!(c.len(), 2, "two 3/8 shares fit the budget");
+        let h3 = cache_insert(&mut c, 3, part);
         assert!(c.bytes <= MAX_SERVED_BODY_BYTES, "the budget holds after eviction");
         assert!(!c.contains(&h1), "lowest height paid for the overflow");
         assert!(c.contains(&h2) && c.contains(&h3));

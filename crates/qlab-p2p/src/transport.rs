@@ -467,6 +467,9 @@ fn read_frame_into(stream: &mut TcpStream, frame: &mut Vec<u8>, deadline: Durati
             return Err(e);
         }
     }
+    // W2: the step growth may have doubled past `total`; the inbox accounts a
+    // frame by its length, so its capacity must be that length.
+    frame.shrink_to_fit();
     Ok(())
 }
 
@@ -551,6 +554,14 @@ struct PeerWriter {
 /// (re-tunable in tests). Only writers change `used`, by exactly the bytes they
 /// queue and release, so it cannot go negative or leak: a writer removed on a
 /// disconnect releases its remainder in `Drop`.
+///
+/// **What it bounds:** queued bytes (`len`). Memory follows because a writer's
+/// buffer is released when it drains and shrunk when its capacity passes twice
+/// what it holds (W2), so held memory is at most ≈ 2× this budget.
+///
+/// **At the cap** the node sheds the connection holding the most backlog (the
+/// oldest last accepted write breaks a tie, [`shed_choice`]) rather than drop
+/// a healthy peer's frame (W3): a slow reader can exhaust only itself.
 struct SendBudget {
     used: AtomicU64,
     cap: AtomicU64,
@@ -618,12 +629,32 @@ impl PeerWriter {
         }
         self.pending.drain(..accepted);
         self.budget.used.fetch_sub(accepted as u64, Ordering::SeqCst);
+        // Lab #785 F5-5a (W2): the budget counts `len`, so `capacity` must
+        // follow it down, or one 16 MiB frame keeps 16 MiB per connection for
+        // its life. Released when empty; halved past 2× what it holds.
+        if self.pending.is_empty() {
+            self.pending = Vec::new();
+        } else if self.pending.capacity() > 2 * self.pending.len() {
+            self.pending.shrink_to(self.pending.len());
+        }
         self.progress.observe(now_ms, accepted as u64, self.pending.len() as u64);
         match fatal {
             Some(e) => Err(e),
             None => Ok(()),
         }
     }
+}
+
+/// **Which connection the node-wide send cap sheds** (lab #785 F5-5a, W3):
+/// the one holding the most undelivered bytes; among equals, the one whose
+/// kernel last accepted a byte longest ago (never = oldest). `None` when no
+/// connection holds a backlog.
+pub(crate) fn shed_choice(candidates: &[(PeerId, u64, Option<u64>)]) -> Option<PeerId> {
+    candidates
+        .iter()
+        .filter(|(_, backlog, _)| *backlog > 0)
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)).then_with(|| b.0.cmp(&a.0)))
+        .map(|(id, _, _)| *id)
 }
 
 impl Drop for PeerWriter {
@@ -639,6 +670,8 @@ struct TcpShared {
     writers: Mutex<HashMap<PeerId, PeerWriter>>,
     /// The node-wide send backlog (lab #785 F5-5a).
     send_budget: Arc<SendBudget>,
+    /// Connections shed at the node-wide send cap (W3; ops / tests).
+    shed: AtomicU64,
     running: AtomicBool,
     next_id: AtomicU64,
     /// Handles of connections we **accepted** (as opposed to dialed), so the
@@ -764,6 +797,7 @@ impl TcpTransport {
             inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
             send_budget: Arc::new(SendBudget::new()),
+            shed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
@@ -908,6 +942,11 @@ impl TcpTransport {
         self.shared.send_budget.used.load(Ordering::SeqCst)
     }
 
+    /// Connections shed at the node-wide send cap (lab #785 F5-5a, W3).
+    pub fn shed_count(&self) -> u64 {
+        self.shared.shed.load(Ordering::SeqCst)
+    }
+
     /// Re-tune the node-wide send-backlog cap (tests / testnet), as
     /// [`Self::set_inbound_cap`] does for connections.
     pub fn set_send_backlog_total_cap(&self, cap: u64) {
@@ -1043,6 +1082,32 @@ impl Transport for TcpTransport {
     fn send(&self, to: PeerId, frame: &[u8]) -> Result<(), TransportError> {
         let now = self.shared.now_ms();
         let mut writers = self.shared.writers.lock().unwrap();
+        if !writers.contains_key(&to) {
+            return Err(TransportError::NotConnected(to));
+        }
+        // Lab #785 F5-5a (W3): at the node-wide cap, shed the connection that
+        // holds the most backlog (ties: the oldest last accepted write) until
+        // this frame fits, instead of refusing a healthy peer's frame. A frame
+        // larger than the whole cap sheds nobody; its own writer refuses it.
+        let len = frame.len() as u64;
+        let budget = Arc::clone(&self.shared.send_budget);
+        while len <= budget.cap.load(Ordering::SeqCst)
+            && budget.used.load(Ordering::SeqCst) + len > budget.cap.load(Ordering::SeqCst)
+        {
+            let candidates: Vec<(PeerId, u64, Option<u64>)> = writers
+                .iter()
+                .map(|(id, w)| (*id, w.pending.len() as u64, w.progress.last_accept_ms()))
+                .collect();
+            let Some(victim) = shed_choice(&candidates) else { break };
+            if let Some(w) = writers.remove(&victim) {
+                self.shared.evicting.lock().unwrap().insert(victim);
+                self.shared.shed.fetch_add(1, Ordering::SeqCst);
+                let _ = w.stream.shutdown(std::net::Shutdown::Both);
+            }
+            if victim == to {
+                return Err(TransportError::NotConnected(to));
+            }
+        }
         let w = writers.get_mut(&to).ok_or(TransportError::NotConnected(to))?;
         // Serialised by the writers lock, so frames never interleave on a socket —
         // and now bounded in time as well: a peer that stopped reading costs one
@@ -1311,6 +1376,7 @@ mod tests {
             inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
             send_budget: Arc::new(SendBudget::new()),
+            shed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
@@ -1552,7 +1618,9 @@ mod tests {
         assert!(fill_until_backlog(&client, pid, 40) > 0, "buffers larger than expected");
 
         let frame = fat_frame();
-        for _ in 0..20 {
+        // Enough frames to reach the cap, whatever it is (lab #785 F5-5a:
+        // 16 → 32 MiB).
+        for _ in 0..(MAX_SEND_BACKLOG_BYTES_PER_PEER / frame.len() as u64 + 4) {
             let _ = client.send(pid, &frame);
         }
         let backlog = client.backlog_bytes(pid);
@@ -1633,32 +1701,53 @@ mod tests {
         drop(writer.join().unwrap());
     }
 
-    /// Lab #785 F5-5a: the node-wide send backlog. Two peers that each stay
-    /// under their own cap are refused once together they would pass the
-    /// global one; the counter is exactly the sum of the per-peer backlogs.
+    /// Lab #785 F5-5a (W3): at the node-wide send cap the connection holding
+    /// the most backlog is shed and the frame to a healthy peer goes through —
+    /// a slow reader exhausts only itself. Two backlogged peers (listeners that
+    /// never read); a third, reading peer; the cap set to what A and B hold.
     #[test]
-    fn the_global_send_backlog_refuses_past_its_cap_across_peers() {
+    fn at_the_global_cap_the_largest_backlog_is_shed_not_a_healthy_frame() {
         let (la, lb) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let healthy = TcpTransport::bind("127.0.0.1:0").unwrap();
         let client = TcpTransport::bind("127.0.0.1:0").unwrap();
         let a = client.connect(&la.local_addr().unwrap().to_string()).unwrap();
         let b = client.connect(&lb.local_addr().unwrap().to_string()).unwrap();
+        let c = client.connect(&healthy.local_addr().to_string()).unwrap();
         assert!(fill_until_backlog(&client, a, 40) > 0 && fill_until_backlog(&client, b, 40) > 0, "buffers larger than expected");
-        assert_eq!(client.total_backlog_bytes(), client.backlog_bytes(a) + client.backlog_bytes(b));
         let frame = fat_frame();
-        // Room for exactly one more frame node-wide, far under either peer's cap.
-        let cap = client.total_backlog_bytes() + frame.len() as u64;
-        client.set_send_backlog_total_cap(cap);
-        for pid in [a, b, a, b] {
-            let _ = client.send(pid, &frame);
+        let _ = client.send(a, &frame); // a holds more than b
+        assert!(client.backlog_bytes(a) > client.backlog_bytes(b));
+        assert_eq!(client.total_backlog_bytes(), client.backlog_bytes(a) + client.backlog_bytes(b));
+        client.set_send_backlog_total_cap(client.total_backlog_bytes());
+        // A frame to the healthy peer would cross the cap: a is shed, not it.
+        client.send(c, &frame).expect("the healthy peer's frame is not refused");
+        assert_eq!(client.shed_count(), 1);
+        assert!(!client.peers().contains(&a), "the largest backlog was shed");
+        assert!(client.peers().contains(&b) && client.peers().contains(&c));
+        assert!(client.total_backlog_bytes() <= client.shared.send_budget.cap.load(Ordering::SeqCst));
+        let start = Instant::now();
+        let mut got = Vec::new();
+        while got.is_empty() && start.elapsed() < Duration::from_secs(10) {
+            got = healthy.poll();
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let (ba, bb) = (client.backlog_bytes(a), client.backlog_bytes(b));
-        assert!(ba < MAX_SEND_BACKLOG_BYTES_PER_PEER && bb < MAX_SEND_BACKLOG_BYTES_PER_PEER, "each peer under its own cap");
-        assert_eq!(client.total_backlog_bytes(), ba + bb);
-        assert!(client.total_backlog_bytes() <= cap, "the node-wide cap holds");
-        assert!(client.total_backlog_bytes() + frame.len() as u64 > cap, "and the refused frames are whole");
-        assert_eq!(MAX_SEND_BACKLOG_BYTES_TOTAL, 128 * 1024 * 1024);
+        assert_eq!(got.len(), 1, "and it arrived");
         client.shutdown();
+        healthy.shutdown();
         drop((la, lb));
+    }
+
+    /// Lab #785 F5-5a (W3): the shed choice — the largest backlog; among
+    /// equals the oldest last accepted write (never counts as oldest); no
+    /// connection without a backlog is ever chosen.
+    #[test]
+    fn the_shed_choice_is_the_largest_backlog_then_the_oldest_write() {
+        let p = PeerId;
+        assert_eq!(shed_choice(&[(p(1), 10, Some(5)), (p(2), 30, Some(9)), (p(3), 20, None)]), Some(p(2)));
+        assert_eq!(shed_choice(&[(p(1), 30, Some(5)), (p(2), 30, Some(9))]), Some(p(1)), "older write first");
+        assert_eq!(shed_choice(&[(p(1), 30, Some(5)), (p(2), 30, None)]), Some(p(2)), "never accepted is oldest");
+        assert_eq!(shed_choice(&[(p(1), 0, None), (p(2), 0, Some(1))]), None, "an idle peer is never shed");
+        assert_eq!(shed_choice(&[]), None);
     }
 
     /// Lab #785 F5-5a: the counter returns to exactly zero — never negative

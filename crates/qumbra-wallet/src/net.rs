@@ -538,6 +538,8 @@ fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> 
 /// not bytes; 64 MiB covers them on today's chains, and a page past it is
 /// refused by name (`body-too-large`) rather than allocated for.
 pub const GET_MAX_BODY: usize = 64 * 1024 * 1024;
+// The server's compact page byte bound (W5) sits well inside this cap.
+const _: () = assert!(2 * qlab_node::MAX_COMPACT_PAGE_BYTES <= GET_MAX_BODY);
 
 /// The whole-response ceiling on a POST's answer (lab #785 F5-5a): the routes
 /// answer with a verdict or, at most, one assembled transaction
