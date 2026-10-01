@@ -174,6 +174,12 @@ pub struct SelectDriver {
     /// 🔴 Set when this send could NOT see all of the exit stream — the
     /// coinbase stream's posture: never fatal, always said.
     exits_gap: Option<String>,
+    /// Indices into `spendables` of the exit notes (pre-review Z2): their
+    /// facts are the node's word, so their leaves are checked against the
+    /// synced tree before a bundle is built.
+    exit_inputs: Vec<usize>,
+    /// Exit notes dropped because their leaf is not in the synced tree.
+    exits_not_in_tree: usize,
     /// Notes this wallet owns whose nullifiers are already on the chain, both
     /// categories — kept for the refusal text.
     skipped_spent: usize,
@@ -243,6 +249,8 @@ impl SelectDriver {
             mined_chain: None,
             exits: None,
             exits_gap: None,
+            exit_inputs: Vec::new(),
+            exits_not_in_tree: 0,
             skipped_spent: 0,
             form,
         }
@@ -399,6 +407,23 @@ impl SelectDriver {
                         Ok(a) => a,
                         Err(e) => return self.fail(e.to_string()),
                     };
+                    // Pre-review Z2: an exit note is the node's `/v1/exits`
+                    // facts until its leaf is found in the tree — a lying node
+                    // must shrink the input set, not fail the send at
+                    // `build_bundle`. Dropped notes are named.
+                    let dropped = Self::drop_exits_not_in_tree(
+                        &self.wallet,
+                        &mut self.spendables,
+                        &self.exit_inputs,
+                        &synced.tree,
+                    );
+                    if dropped > 0 {
+                        self.exits_not_in_tree = dropped;
+                        self.events.push(SendStep::Warning(format!(
+                            "{dropped} exit note(s) the node's /v1/exits named are not in the \
+                             commitment tree, so they were left out of this send"
+                        )));
+                    }
                     self.events.push(SendStep::Tree {
                         held: synced.count,
                         fetched: synced.fetched,
@@ -524,6 +549,7 @@ impl SelectDriver {
                     let report = match_exits(&self.wallet, &indices, exit_chain, &spent);
                     self.skipped_spent += report.spent.len();
                     for n in &report.spendable {
+                        self.exit_inputs.push(self.spendables.len());
                         self.spendables.push(Spendable {
                             div_index: n.div_index,
                             value: n.note.value,
@@ -550,7 +576,30 @@ impl SelectDriver {
         });
     }
 
-    /// The one wording for "this send could not see coinbase", shared by the
+    /// Drop, from `spendables`, every exit note (by `exit_inputs`) whose leaf is
+/// not in `tree` (pre-review Z2); the count dropped.
+fn drop_exits_not_in_tree(
+    wallet: &Wallet,
+    spendables: &mut Vec<Spendable>,
+    exit_inputs: &[usize],
+    tree: &CommitmentTree,
+) -> usize {
+    let before = spendables.len();
+    let mut i = 0usize;
+    spendables.retain(|s| {
+        let is_exit = exit_inputs.contains(&i);
+        i += 1;
+        if !is_exit {
+            return true;
+        }
+        let d = wallet.diversifier_at_index(s.div_index);
+        let note = qlab_note::note::Note { value: s.value, rkm: wallet.rkm(d), rho: s.rho, rseed: s.rseed };
+        tree.position_of(&note.commitment()).is_some()
+    });
+    before - spendables.len()
+}
+
+/// The one wording for "this send could not see coinbase", shared by the
     /// visible degradation and by the refusal a shrunk set produces — so a user
     /// meets the same sentence in both places.
     fn coinbase_degradation(&self) -> Option<String> {
@@ -586,7 +635,16 @@ impl SelectDriver {
                  that serves GET /v1/exits may answer it differently."
             )
         });
-        exits + &self.coinbase_shortfall_context()
+        let unproven = if self.exits_not_in_tree > 0 {
+            format!(
+                " 🔴 {} exit note(s) named by the node's /v1/exits are not in the commitment tree \
+                 and were left out.",
+                self.exits_not_in_tree
+            )
+        } else {
+            String::new()
+        };
+        exits + &unproven + &self.coinbase_shortfall_context()
     }
 
     fn coinbase_shortfall_context(&self) -> String {

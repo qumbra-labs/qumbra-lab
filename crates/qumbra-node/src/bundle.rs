@@ -274,11 +274,15 @@ impl BundleVerifier for WrapperRule {
     /// `l2_id` and exit shape — the same refusals the rule names.
     fn bundle_exits(&self, bundle: &[u8]) -> Result<Vec<(Hash32, u64)>, BundleRefusal> {
         let exits = qlab_wrapper::codec::exit_list(bundle).map_err(codec_err)?;
-        if bundle.len() >= 12 {
-            let l2_id = u64::from_le_bytes(bundle[4..12].try_into().expect("8 bytes"));
-            if l2_id != self.l2_id {
-                return Err(BundleRefusal::L2Id { got: l2_id, want: self.l2_id });
-            }
+        // `exit_list` accepted it, so the 12-byte head is present.
+        let version = u32::from_le_bytes(bundle[0..4].try_into().expect("4 bytes"));
+        let l2_id = u64::from_le_bytes(bundle[4..12].try_into().expect("8 bytes"));
+        if l2_id != self.l2_id {
+            return Err(BundleRefusal::L2Id { got: l2_id, want: self.l2_id });
+        }
+        // Pre-review Z4: belt only (an applied bundle passed V0), named.
+        if version != self.version {
+            return Err(wrapper_err(VError::Version));
         }
         check_exit_shape(&exits, self.k_exit).map_err(exit_shape_err)?;
         Ok(exits.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect())

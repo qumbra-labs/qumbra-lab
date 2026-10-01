@@ -491,6 +491,9 @@ fn f5_5d_bundle_exits_reads_what_decode_reads() {
     assert_eq!(r.bundle_exits(&mutated(|w| { w.exits = vec![Exit { v: 0, ..e }]; false })), Err(BundleRefusal::ZeroExitValue { index: 0 }));
     assert_eq!(r.bundle_exits(&mutated(|w| { w.l2_id = 2; false })), Err(BundleRefusal::L2Id { got: 2, want: REHEARSAL_L2_ID }));
     assert!(matches!(r.bundle_exits(&fixture().wire[..100]), Err(BundleRefusal::Codec(_))));
+    // Pre-review Z4: the version is the rule's, refused by name.
+    let production = WrapperRule::from_params(NET_ID, &params()).unwrap();
+    assert_eq!(production.bundle_exits(&fixture().wire), Err(BundleRefusal::Wrapper("Version".into())));
 }
 
 /// F-A (lab #785 F5-4a): the node's V6 genesis registry is the registry

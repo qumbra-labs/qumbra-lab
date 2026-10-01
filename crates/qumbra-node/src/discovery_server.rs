@@ -529,6 +529,36 @@ impl DiscoveryView {
         self.refresh_with_exits(chain, &exits_without_a_rule)
     }
 
+    /// Whether some held block's exits are a refusal — what makes an
+    /// unchanged tip still worth a refresh (pre-review Z1).
+    pub fn has_unread_exits(&self) -> bool {
+        self.exits.iter().any(Result::is_err)
+    }
+
+    /// Re-read the exits of every held block whose entry is a refusal; true
+    /// when one now reads.
+    fn retry_unread_exits<C: qlab_node::ChainStore>(
+        &mut self,
+        chain: &C,
+        exits_of: &dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String>,
+    ) -> bool {
+        let mut changed = false;
+        for (i, entry) in self.exits.iter_mut().enumerate() {
+            if entry.is_ok() {
+                continue;
+            }
+            let Some(block) = self.blocks.get(i).and_then(|b| chain.block(&b.hash)) else { continue };
+            if let Ok(list) = exits_of(block) {
+                *entry = Ok(list
+                    .into_iter()
+                    .map(|(rkm, v)| qlab_cbserver::codec::ExitFact { rkm: qlab_note::hash::digest_from_bytes(&rkm), v })
+                    .collect());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// [`Self::refresh`], each new block's exits read by `exits_of` (the
     /// node's [`qlab_node::MemNode::exits_of`]: the rule over the bundle read
     /// back by reference) — once per block, on the walk that meets it.
@@ -537,9 +567,14 @@ impl DiscoveryView {
         chain: &C,
         exits_of: &dyn Fn(&qlab_node::StoredBlock) -> Result<Vec<(Hash32, u64)>, String>,
     ) -> bool {
+        // Pre-review Z1: a refusal is retried on every refresh while its
+        // block stays on the main chain — one transient read failure must not
+        // 503 every page over that height until a reorg or restart. `Ok` stays
+        // memoised.
+        let retried = self.retry_unread_exits(chain, exits_of);
         let tip = chain.tip_hash();
         if self.tip_hash() == Some(tip) {
-            return false;
+            return retried;
         }
         let mut fresh: Vec<(BlockDiscovery, ExitsOf)> = Vec::new();
         let mut hash = tip;
@@ -1069,6 +1104,10 @@ pub fn respond_coinbase(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u
     Ok(qlab_node::coinbase_page(&view.blocks, from, to).to_bytes())
 }
 
+// Pre-review Z3: the exit wire's per-block bound IS the v1 chain's K_exit; a
+// genesis change to one without the other fails to compile.
+const _: () = assert!(qlab_cbserver::codec::MAX_EXITS_PER_BLOCK == crate::genesis_v6::K_EXIT_V1 as usize);
+
 /// The socket-free `/v1/exits` core (lab #785 F5-5d) — [`respond_coinbase`]'s
 /// twin over the same projection, with the same refusals and the same page
 /// arithmetic (`ExitPage::page`, the coinbase cap). A block in the page whose
@@ -1090,6 +1129,19 @@ pub fn respond_exits(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16,
             break;
         }
         match view.exits.get(i) {
+            // Pre-review Z3: the wire carries at most K_exit (v1) per block;
+            // a longer list is refused by name, never a panic in the encoder.
+            Some(Ok(exits)) if exits.len() > qlab_cbserver::codec::MAX_EXITS_PER_BLOCK => {
+                return Err((
+                    503,
+                    format!(
+                        "unavailable: block {} carries {} exits, more than this wire's {}",
+                        b.height,
+                        exits.len(),
+                        qlab_cbserver::codec::MAX_EXITS_PER_BLOCK
+                    ),
+                ))
+            }
             Some(Ok(exits)) => blocks.push(BlockExits { height: b.height, exits: exits.clone() }),
             Some(Err(why)) => return Err((503, format!("unavailable: the exits of block {} ({why})", b.height))),
             None => return Err((503, format!("unavailable: the exits of block {} (not projected)", b.height))),
@@ -2317,11 +2369,12 @@ mod tests {
             assert_eq!(respond_exits(&view, q).unwrap_err().0, 400, "{q:?}");
         }
 
-        // A steady chain reads only the new block.
+        // A steady chain reads only the new block — and retries the refused
+        // one (pre-review Z1), which still refuses here.
         let b4 = stored(4, prev, vec![]);
         store.put_block(b4).expect("applies");
         assert!(view.refresh_with_exits(&store, &rule));
-        assert_eq!(reads.get(), 5);
+        assert_eq!(reads.get(), 6, "block 4, and block 3 retried");
 
         // A heavier branch from 2 replaces 3 and 4: only its blocks are read,
         // and 3's refusal leaves with 3.
@@ -2334,7 +2387,7 @@ mod tests {
         }
         assert_eq!(store.tip_hash(), sib);
         assert!(view.refresh_with_exits(&store, &rule));
-        assert_eq!(reads.get(), 8, "the new branch only");
+        assert_eq!(reads.get(), 10, "block 3 retried once more before the walk, then the new branch only");
         let page = ExitPage::from_bytes(&respond_exits(&view, "from=0&to=5").unwrap()).unwrap();
         assert_eq!(page.blocks.len(), 6);
         assert_eq!(page.blocks[2].exits.len(), 1, "the common prefix kept its exits");
@@ -2344,6 +2397,40 @@ mod tests {
         assert!(bare.refresh(&store));
         assert!(respond_exits(&bare, "from=0&to=1").is_ok(), "no bundle, no exits: a truthful empty page");
         assert_eq!(respond_exits(&bare, "from=2&to=2").unwrap_err().0, 503, "a bundle block, not projected");
+    }
+
+    /// Pre-review Z1: a refusal is not memoised for good. A rule that fails
+    /// once on a block then reads it: the next refresh, at the SAME tip,
+    /// retries it and the page serves.
+    #[test]
+    fn a_refused_blocks_exits_are_retried_at_an_unchanged_tip() {
+        use qlab_cbserver::codec::ExitPage;
+        use qlab_node::{BundleRef, MemChainStore, StoredSections};
+        use std::cell::Cell;
+
+        let genesis = stored(0, [0; 32], vec![]);
+        let ghash = genesis.header().header_hash();
+        let mut store = MemChainStore::new(genesis);
+        let mut b1 = stored(1, ghash, vec![]);
+        b1.sections = Some(StoredSections { finality: vec![], bundle: BundleRef::resident(b"ok") });
+        qlab_node::ChainStore::put_block(&mut store, b1).expect("applies");
+        let failed_once = Cell::new(false);
+        let rule = |b: &qlab_node::StoredBlock| -> Result<Vec<(Hash32, u64)>, String> {
+            match b.bundle_ref() {
+                None => Ok(vec![]),
+                Some(_) if !failed_once.replace(true) => Err("transient: the log read failed".into()),
+                Some(_) => Ok(vec![([7; 32], 1)]),
+            }
+        };
+        let mut view = DiscoveryView::default();
+        assert!(view.refresh_with_exits(&store, &rule));
+        assert!(view.has_unread_exits());
+        assert_eq!(respond_exits(&view, "from=0&to=1").unwrap_err().0, 503);
+        assert!(view.refresh_with_exits(&store, &rule), "an unchanged tip, but a refusal to retry");
+        assert!(!view.has_unread_exits());
+        let page = ExitPage::from_bytes(&respond_exits(&view, "from=0&to=1").unwrap()).unwrap();
+        assert_eq!(page.blocks[1].exits.len(), 1);
+        assert!(!view.refresh_with_exits(&store, &rule), "nothing left to do");
     }
 
     /// Lab #710: the registry routes — refused by name on an L1 node; on an

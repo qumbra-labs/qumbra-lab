@@ -307,6 +307,27 @@ fn a_spent_exit_is_not_selected_and_a_missing_route_is_named() {
         other => panic!("selection narrates: {other:?}"),
     }
 
+    // Pre-review Z2: a lying node names an exit of 10,000 QMB to this wallet
+    // that no block appended. Its leaf is not in the tree: it is dropped
+    // before the bundle is built, named, and the send proceeds.
+    let mine = f.wallet.rkm(f.wallet.diversifier_at_index(0));
+    let lie = move |path: &str, bytes: Vec<u8>| -> Vec<u8> {
+        if !path.starts_with("/v1/exits") {
+            return bytes;
+        }
+        let mut page = qlab_cbserver::codec::ExitPage::from_bytes(&bytes).expect("an exit page");
+        if let Some(b) = page.blocks.iter_mut().find(|b| b.height == 12) {
+            b.exits.push(qlab_cbserver::codec::ExitFact { rkm: mine, v: 10_000 * QMB });
+        }
+        page.to_bytes()
+    };
+    let (outcome, events, _) = pump(&f, 5 * QMB, &lie);
+    assert!(outcome.is_ok(), "a lie shrinks the input set, it does not fail the send: {:?}", outcome.err());
+    assert!(
+        events.iter().any(|e| matches!(e, SendStep::Warning(w) if w.contains("1 exit note(s)") && w.contains("not in the commitment tree"))),
+        "and the dropped note is named: {events:?}"
+    );
+
     // A node without the route: the send proceeds on what it can see and says so.
     let (outcome, events, _) = pump(&f, 5 * QMB, &|path, b| if path.starts_with("/v1/exits") { b"<html>404</html>".to_vec() } else { b });
     assert!(outcome.is_ok(), "an unreadable exit stream only shrinks the input set");

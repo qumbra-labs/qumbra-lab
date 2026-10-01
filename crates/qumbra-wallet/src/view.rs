@@ -259,15 +259,20 @@ fn render_exits(exits: Option<&ExitReport>, coverage: &ExitCoverage, range: (u64
             )
         }
         (Some(e), ExitCoverage::Covered { range: covered }) => {
+            // Pre-review Z2: these are the node's `/v1/exits` facts; a scan
+            // holds no tree to check the leaves against, and says so.
             let mut out = match covered {
-                Some((a, b)) => format!("exits (L2 → L1): the chain's exits for {a}..={b} are in hand\n"),
+                Some((a, b)) => format!(
+                    "exits (L2 → L1): per the node's /v1/exits for {a}..={b} — leaves not yet checked \
+                     against the tree (a send checks them)\n"
+                ),
                 None => format!(
                     "exits (L2 → L1): the endpoint holds no block in {}..={} — no exit there\n",
                     range.0, range.1
                 ),
             };
             if e.count() == 0 {
-                out.push_str("      no exit in this range paid this wallet, on the chain's authority\n\n");
+                out.push_str("      no exit in this range paid this wallet, per the node's /v1/exits\n\n");
                 return out;
             }
             out.push_str(&format!(
@@ -542,7 +547,7 @@ mod tests {
             Some(&report),
             &ExitCoverage::Covered { range: Some((0, 8)) },
         );
-        assert!(seen.contains("exits (L2 → L1): the chain's exits for 0..=8 are in hand"), "{seen}");
+        assert!(seen.contains("exits (L2 → L1): per the node's /v1/exits for 0..=8 — leaves not yet checked"), "{seen}");
         assert!(seen.contains("TOTAL spendable: 45 bessel") && seen.contains("including 40 bessel of L2 exits"), "{seen}");
         assert!(!seen.contains("L2 EXITS NOT INCLUDED"));
         // `render` (no exits part) is the pre-F5-5d report, byte for byte.
