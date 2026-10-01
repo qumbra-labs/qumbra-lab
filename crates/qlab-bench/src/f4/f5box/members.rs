@@ -32,8 +32,6 @@
 //! wrapper absorbs exactly four roots), never a caller's count: a wrapper
 //! planned on a state that already applied it is at a new position, so it can
 //! never reuse a dummy's nullifier.
-// The `f5box` command (the next PR) is the non-test consumer of the rest.
-#![allow(dead_code)]
 use qlab_air::claim::{build_claim_with_witness, claim_cnf, BurnNote, ClaimCredit, ClaimInstance};
 use qlab_air::l2::{
     build_bucket_l2_dummy1, derive_input_l2, dummy_fee_input, l2_cm, FeeSlot, L2BucketInstance, L2TxInput, L2TxOutput,

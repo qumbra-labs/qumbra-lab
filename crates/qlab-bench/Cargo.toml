@@ -31,6 +31,9 @@ qlab-node = { path = "../qlab-node" }
 # and form) and the node's own rkm-hex convention from the node crate — never
 # a copy. No feature: the rule's test knobs stay on the dev-dependency below.
 qumbra-node = { path = "../qumbra-node" }
+# `f5box` signs as the rehearsal sequencer (the in-code seed's signing half),
+# as the F5-4b fixture already did under the dev-dependency this replaces.
+ml-dsa = "=0.1.1"
 qlab-p2p = { path = "../qlab-p2p" }
 qlab-pow = { path = "../qlab-pow" }
 
@@ -85,5 +88,3 @@ qlab-air = { path = "../qlab-air", features = ["test-support"] }
 # bundle rule (`qumbra_node::bundle::WrapperRule`), whose measurement version
 # and member stub are behind this dev-only feature (ruling 5915423092).
 qumbra-node = { path = "../qumbra-node", features = ["wrapper-test-knobs"] }
-# The fixture's sequencer signature (the rehearsal key's signing half).
-ml-dsa = "=0.1.1"

@@ -12,9 +12,16 @@
 //!    spending the notes the deposit credited, the first P paying the exit.
 //!
 //! [`chain`] reads the node; [`members`] builds real members over real trees
-//! and checks the wrapper natively.
+//! and checks the wrapper natively; [`bundle`] proves, signs and judges the
+//! result by the node's own rule; [`state`] keeps the run between bundles;
+//! [`run`] is the command.
+pub(crate) mod bundle;
 pub(crate) mod chain;
 pub(crate) mod members;
+pub(crate) mod run;
+pub(crate) mod state;
+
+pub(crate) use run::run;
 
 #[cfg(test)]
 mod tests;

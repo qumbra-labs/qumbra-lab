@@ -13,8 +13,6 @@
 //! cadence. A root chosen here is therefore valid at the latest once the next
 //! record covers it — the submitter retries; the anchor window (1,152 blocks)
 //! is two orders of magnitude wider than that lag.
-// The `f5box` command (the next PR) is the non-test consumer of the rest.
-#![allow(dead_code)]
 use std::collections::HashMap;
 
 use qlab_cbserver::codec::{BlockCoinbase, CoinbasePage};

@@ -27,7 +27,7 @@ pub(crate) mod ood;
 pub(crate) mod verify;
 pub(crate) mod wleaf;
 
-/// `qlab-bench f4leaf --check | f4neg …`.
+/// `qlab-bench f4leaf --check | f4neg … | f5box …`.
 pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
     match mode {
         "f4leaf" if args.iter().any(|a| a == "--prove") => bench::prove_run(args),
@@ -37,6 +37,7 @@ pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
         "f4census" => rec::run(args),
         "f4gate" => gate::run(args),
         "f4ood" => ood::run(args),
+        "f5box" => f5box::run(args),
         other => Err(format!("unknown f4 mode `{other}`")),
     }
 }
