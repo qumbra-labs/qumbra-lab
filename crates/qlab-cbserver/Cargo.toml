@@ -18,7 +18,7 @@ qlab-note = { path = "../qlab-note" }
 # The consensus Merkle node hash for the commitment tree/frontier, and cm packing.
 qlab-air = { path = "../qlab-air" }
 # Real devnet block/header/chain types for the data source.
-qlab-devnet = { path = "../qlab-devnet", optional = true }
+qlab-devnet = { path = "../qlab-devnet", default-features = false, optional = true }
 # Minimal maintained blocking HTTP/1.1 server (no async runtime). Pinned exactly
 # per bench discipline. Chosen over axum/hyper for a localhost reference server.
 tiny_http = "=0.12.0"
@@ -45,5 +45,7 @@ required-features = ["devnet"]
 # consumer keeps exactly what it had. OFF for consumers that need only the
 # light-client scan (qumbra-ffi: iOS cannot build RandomX, which rides in via
 # qlab-devnet -> qlab-pow -> randomx-rs's C++ cmake).
-default = ["devnet"]
+default = ["devnet", "randomx"]
 devnet = ["dep:qlab-devnet"]
+# qlab-devnet's RandomX chain, for `devnet` users that want it (the default does).
+randomx = ["qlab-devnet?/randomx"]
