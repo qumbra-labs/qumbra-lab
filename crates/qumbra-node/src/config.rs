@@ -202,6 +202,18 @@ pub struct NodeConfig {
     /// template RPC, gated, default off.
     #[serde(default)]
     pub template_serving: bool,
+    /// OPTIONAL — bind address for the operator listener, `POST /v1/bundle`
+    /// (lab #785 F5-5b): where the L2 sequencer hands its signed bundle to a
+    /// producer's node. **Unset = no listener**, and **loopback only**: a
+    /// non-loopback value is refused by name at `check` and at startup (see
+    /// [`crate::operator_server`] for why). The sequencer is co-hosted with
+    /// the node or reaches this port through a tunnel.
+    ///
+    /// Deployment ordering caveat, same as `metrics_addr`: `deny_unknown_fields`
+    /// is deliberate, so a config carrying this key is REFUSED by a binary built
+    /// before this change. Ship the binary first, then the config.
+    #[serde(default)]
+    pub operator_addr: Option<String>,
 }
 
 /// The serde default behind [`NodeConfig::discovery_addr`]: **on, loopback**.
@@ -261,6 +273,16 @@ impl NodeConfig {
         }
     }
 
+    /// The operator listener's address (lab #785 F5-5b), or a refusal naming a
+    /// non-loopback one. `Ok(None)` = not configured.
+    pub fn operator_bind(&self) -> Result<Option<&str>, ConfigError> {
+        match self.operator_addr.as_deref() {
+            None => Ok(None),
+            Some(a) if crate::operator_server::is_loopback_hostport(a.trim()) => Ok(Some(a.trim())),
+            Some(a) => Err(ConfigError::Parse(crate::operator_server::non_loopback_refusal(a))),
+        }
+    }
+
     /// The configured payout key as circuit lanes, or an error describing why the
     /// string is not one. `Ok(None)` = not configured (see [`Self::miner_rkm`]).
     ///
@@ -316,6 +338,23 @@ mod tests {
         // The contrast that makes the asymmetry deliberate rather than accidental.
         assert!(c.metrics_addr.is_none(), "metrics stays off unless asked for");
         assert!(c.telemetry_addr.is_none(), "telemetry stays off unless asked for");
+    }
+
+    /// Lab #785 F5-5b: the operator listener is off unless set, and a
+    /// non-loopback address is refused by name — never warned about.
+    #[test]
+    fn the_operator_listener_is_off_by_default_and_loopback_only() {
+        let c = NodeConfig::from_toml(SAMPLE).expect("parse");
+        assert_eq!(c.operator_bind().unwrap(), None);
+        for ok in ["127.0.0.1:9430", "localhost:9430", "[::1]:9430"] {
+            let c = NodeConfig::from_toml(&format!("{SAMPLE}\noperator_addr = \"{ok}\"\n")).expect("parse");
+            assert_eq!(c.operator_bind().unwrap(), Some(ok));
+        }
+        for bad in ["0.0.0.0:9430", "10.1.2.3:9430", "[::]:9430"] {
+            let c = NodeConfig::from_toml(&format!("{SAMPLE}\noperator_addr = \"{bad}\"\n")).expect("parse");
+            let err = c.operator_bind().expect_err("refused").to_string();
+            assert!(err.contains(bad) && err.contains("loopback"), "{err}");
+        }
     }
 
     /// The only way to have no listener, and it has to be written down. A missing

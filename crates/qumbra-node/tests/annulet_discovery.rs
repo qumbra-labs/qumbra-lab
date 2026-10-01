@@ -55,6 +55,7 @@ fn producer(tag: &str, g: &AnnuletGenesisFile) -> RunningNode<KeccakPow, DevnetR
         discovery_addr: None,
         miner_rkm: None,
         template_serving: false,
+        operator_addr: None,
     };
     RunningNode::start_annulet(&config, g, KeccakPow, DevnetRehearsalVerifier).expect("starts")
 }

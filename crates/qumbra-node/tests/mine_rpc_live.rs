@@ -117,6 +117,7 @@ fn rig_t2(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
         discovery_addr: None,
         miner_rkm: Some(rkm_hex(&RIG_RKM)),
         template_serving: false,
+        operator_addr: None,
     };
     (config, genesis, base)
 }

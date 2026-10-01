@@ -438,6 +438,9 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
     // `check` must refuse whatever `run` is about to refuse, or it tells an
     // operator a swap is safe when startup is about to reject it.
     check_miner_payout(config)?;
+    // Lab #785 F5-5b: `check` refuses the non-loopback operator listener
+    // startup is about to refuse.
+    config.operator_bind().map_err(RunError::Config)?;
     Ok(Preflight {
         genesis_hash: genesis.hash_hex(),
         committee_size: genesis.frozen.committee_size,
@@ -544,6 +547,10 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// `discovery_addr = "off"` — **this is the one listener whose default is on**;
     /// see [`crate::discovery_server`] for why it inverts `metrics_addr`'s default.
     discovery_server: Option<DiscoveryServer>,
+    /// The loopback-only `POST /v1/bundle` listener (lab #785 F5-5b), when
+    /// `operator_addr` is set, and the queue its handler fills.
+    operator_server: Option<crate::operator_server::OperatorServer>,
+    bundle_rx: Option<std::sync::mpsc::Receiver<crate::operator_server::BundleSubmitRequest>>,
     /// The commitment-tree leaves as of the last refresh — what
     /// `/v1/tree/leaves` serves (issue #275). Same Arc-swap discipline as
     /// [`Self::discovery_view`].
@@ -1217,6 +1224,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             discovery_view: Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
             last_discovery_refresh: Instant::now(),
             discovery_server: None,
+            operator_server: None,
+            bundle_rx: None,
             leaves_view: Arc::new(Mutex::new(Arc::new(LeavesView::default()))),
             leaves_sig: None,
             anchors_view: Arc::new(Mutex::new(Arc::new(AnchorsView::default()))),
@@ -2391,6 +2400,31 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         Ok(bound)
     }
 
+    /// Bind the loopback-only operator listener, `POST /v1/bundle` (lab #785
+    /// F5-5b). A non-loopback address is refused by name; an unbindable one is
+    /// an error, never a silent no-op.
+    pub fn start_operator_endpoint(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let srv = crate::operator_server::OperatorServer::start(addr, tx)?;
+        let bound = srv.addr();
+        self.operator_server = Some(srv);
+        self.bundle_rx = Some(rx);
+        Ok(bound)
+    }
+
+    /// Answer every queued `POST /v1/bundle`: the slot's verdict, and on
+    /// admission the inv to our peers ([`P2pNode::submit_bundle`]).
+    pub fn drain_bundle_submits(&mut self) {
+        loop {
+            let req = match self.bundle_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(req)) => req,
+                _ => break,
+            };
+            let verdict = self.p2p.submit_bundle(req.bytes, req.replace);
+            let _ = req.reply.try_send(verdict);
+        }
+    }
+
     /// The bound `/v1/compact` address, if serving.
     pub fn discovery_addr(&self) -> Option<std::net::SocketAddr> {
         self.discovery_server.as_ref().map(|s| s.addr())
@@ -3476,6 +3510,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         // `try_recv` (issue #275).
         self.drain_remote_submits();
         self.drain_mine_rpc();
+        self.drain_bundle_submits();
         phases.submit = lap(&mut t);
         if self.telemetry_server.is_some()
             && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
@@ -3869,6 +3904,7 @@ mod tests {
             discovery_addr: None,
             miner_rkm: None,
             template_serving: false,
+            operator_addr: None,
         };
         (config, genesis, base)
     }
@@ -6227,6 +6263,7 @@ mod tests {
             discovery_addr: None,
             miner_rkm: miner_rkm.map(str::to_string),
             template_serving: false,
+            operator_addr: None,
         }
     }
 

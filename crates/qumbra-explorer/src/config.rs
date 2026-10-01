@@ -245,6 +245,7 @@ mod tests {
             discovery_addr: None,
             miner_rkm: None,
             template_serving: false,
+            operator_addr: None,
         }
     }
 

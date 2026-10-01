@@ -508,6 +508,9 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // nobody owns. `qumbra-node check` refuses the same combination via
     // `preflight`, so the two operator surfaces agree.
     qumbra_node::run::check_miner_payout(&config)?;
+    // Lab #785 F5-5b: a pure config fact too — a non-loopback operator
+    // listener is refused before anything loads.
+    config.operator_bind().map_err(qumbra_node::run::RunError::Config)?;
     qlab_devnet::jprintln!("STARTUP loading genesis file {}", config.genesis_file.display());
     // Lab #708: dispatched by the file's leading format_version — an L1
     // genesis runs the L1 node, an Annulet genesis the sequencer net.
@@ -634,6 +637,18 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // decision.md`'s option 2a with extra steps — the chain commits discovery
     // correctly and hands it to nobody. Turning it off is an explicit
     // `discovery_addr = "off"`.
+    // Lab #785 F5-5b — the operator listener, `POST /v1/bundle`: off unless
+    // set, loopback only (refused above otherwise).
+    match config.operator_bind().map_err(qumbra_node::run::RunError::Config)? {
+        Some(addr) => {
+            let bound = node.start_operator_endpoint(addr)?;
+            qlab_devnet::jprintln!(
+                "  operator:     http://{bound}/v1/bundle (L2 bundle hand-off, POST only, loopback)"
+            );
+        }
+        None => qlab_devnet::jprintln!("  operator:     not served (set operator_addr to accept L2 bundles)"),
+    }
+
     if let Some(addr) = config.discovery_bind() {
         let bound = node.start_discovery_endpoint(addr)?;
         let view = node.discovery_view();
