@@ -27,6 +27,10 @@ qlab-devnet = { path = "../qlab-devnet" }
 qlab-disclosure = { path = "../qlab-disclosure" }
 qlab-wallet = { path = "../qlab-wallet" }
 qlab-node = { path = "../qlab-node" }
+# Lab #785 F5-6 (1): `f5box` reads a V6 genesis file (its wrapper parameters
+# and form) and the node's own rkm-hex convention from the node crate — never
+# a copy. No feature: the rule's test knobs stay on the dev-dependency below.
+qumbra-node = { path = "../qumbra-node" }
 qlab-p2p = { path = "../qlab-p2p" }
 qlab-pow = { path = "../qlab-pow" }
 

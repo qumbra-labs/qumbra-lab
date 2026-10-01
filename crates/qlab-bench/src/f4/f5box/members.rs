@@ -1,0 +1,452 @@
+//! Lab #785 F5-6 (1) — **real members over a real state**: the claims, the
+//! transactions and the native wrapper statement f5box proves, built from the
+//! box node's L1 tree and the wrapper state the chain's bundles left behind.
+//!
+//! Every member is an instance of the circuit the node verifies it with — a
+//! claim of `qlab_air::claim`, shapes S, P and R of `qlab_air::{l2, l2p, l2r}`
+//! — over witnesses taken from the trees themselves:
+//!
+//! - **a claim** opens a burn note (a coinbase paid to `rkm_burn(l2_id)`) in
+//!   the L1 tree at the newest absorbed root, pays the genesis claim fee, and
+//!   credits `v − fee` to this run's L2 key;
+//! - **a transaction** spends one note this run owns, at the wrapper's `C_in`
+//!   (the root the prologue appends to `CH`), its second input slot a dummy
+//!   (#219 on L2) and slot 3 a dummy fee input; S and P open asset 0 under the
+//!   registry root **at their slot** (a member after the R reads the written
+//!   registry), R registers the lowest free asset slot as a Cloaked asset;
+//! - **the first P** carries the exit: an asset-0 redeem of `exit.v` paid to
+//!   `exit.rkm` (F5-4d's edge).
+//!
+//! [`plan`] builds them in slot order, then applies the whole wrapper to a
+//! copy of the state with the native statement (`WState::apply`, which
+//! asserts `check_wrapper_leaf` agrees) — the sequencer's prefilter. A plan
+//! that comes back `Ok` is a wrapper W can prove, over members the node's
+//! verifiers can check.
+//!
+//! **The key schedule.** Everything private is derived from one run seed:
+//! `lanes(label, wrapper, slot) = Keccak256(DOMAIN ‖ seed ‖ label ‖ wrapper ‖
+//! slot)` — the L2 spend key, each credit's `rseed`, each claim's `r_v`, each
+//! dummy. A rehearsal key, in the clear by design (Q-6-1's synthetic state):
+//! nothing it holds is anyone's money but the rehearsal's. `wrapper` is the
+//! wrapper's own position in the chain, `AA`'s length over [`M_ABS`] (every
+//! wrapper absorbs exactly four roots), never a caller's count: a wrapper
+//! planned on a state that already applied it is at a new position, so it can
+//! never reuse a dummy's nullifier.
+// The `f5box` command (the next PR) is the non-test consumer of the rest.
+#![allow(dead_code)]
+use qlab_air::claim::{build_claim_with_witness, claim_cnf, BurnNote, ClaimCredit, ClaimInstance};
+use qlab_air::l2::{
+    build_bucket_l2_dummy1, derive_input_l2, dummy_fee_input, l2_cm, FeeSlot, L2BucketInstance, L2TxInput, L2TxOutput,
+    RegistryLeaf,
+};
+use qlab_air::l2p::{
+    build_bucket_l2p_exit_with_witnesses, derive_rkm_l2, dummy_allow_witness, CanonicalFreezeTree, L2PBucketInstance,
+    L2PolicyInput, VPublic,
+};
+use qlab_air::l2r::{build_shape_r_with_witnesses, L2ShapeRInstance, RegistryWrite, SeedOutput};
+use qlab_air::narrow::{derive_output_rho, off_tree_witness};
+use qlab_cbserver::registry::RegistryTree;
+use qlab_consensus::{Config, Proof};
+use qlab_wrapper::codec::{exit_chain, Exit};
+use qlab_wrapper::hash::WRoots;
+use qlab_wrapper::verify::Surface;
+
+use super::chain::{Anchor, Burn, ChainView};
+use crate::f3::native::Digest;
+use crate::f4::dep::DepEntry;
+use crate::f4::native::{Member, WInputs, WState, WTag, WWitness, M_ABS};
+
+/// The key schedule's domain.
+const DOMAIN: &[u8] = b"qumbra:f5box:v1";
+
+/// The fee every f5box transaction pays (bessel): S, P and R carry no fee
+/// rule (no tariff check exists for them, lab #785 census); a fixed nonzero
+/// value keeps the asset-0 fee path in use.
+pub(crate) const TX_FEE: u64 = 10_000;
+
+/// This run's L2 diversifier: every note f5box owns is at one `rkm`.
+const D: [u64; 2] = [1, 0];
+
+/// The run's private schedule.
+#[derive(Clone)]
+pub(crate) struct Keys {
+    seed: [u8; 32],
+}
+
+impl Keys {
+    pub(crate) fn from_text(seed: &str) -> Self {
+        Keys { seed: qlab_devnet::hash::keccak256(seed.as_bytes()) }
+    }
+
+    /// `Keccak256(DOMAIN ‖ seed ‖ label ‖ wrapper ‖ slot)` as four lanes.
+    pub(crate) fn lanes(&self, label: &str, wrapper: u64, slot: u64) -> Digest {
+        let mut msg = DOMAIN.to_vec();
+        msg.extend_from_slice(&self.seed);
+        msg.extend_from_slice(&(label.len() as u64).to_le_bytes());
+        msg.extend_from_slice(label.as_bytes());
+        msg.extend_from_slice(&wrapper.to_le_bytes());
+        msg.extend_from_slice(&slot.to_le_bytes());
+        qlab_wrapper::codec::digest_from_bytes(&qlab_devnet::hash::keccak256(&msg))
+    }
+
+    fn sk(&self) -> Digest {
+        self.lanes("sk", 0, 0)
+    }
+
+    /// An asset-0 note of this run's, as a spend input.
+    pub(crate) fn input(&self, n: &Owned) -> L2TxInput {
+        L2TxInput { sk: self.sk(), value: n.value, asset: 0, rho: n.rho, rseed: n.rseed, d: D }
+    }
+
+    /// This run's L2 recipient key (every credit, every change output, the
+    /// sequencer fee note).
+    pub(crate) fn rkm(&self) -> Digest {
+        derive_rkm_l2(&self.input(&Owned { value: 0, rho: [0; 4], rseed: [0; 4] }))
+    }
+}
+
+/// An asset-0 L2 note this run owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Owned {
+    pub value: u64,
+    pub rho: Digest,
+    pub rseed: Digest,
+}
+
+impl Owned {
+    pub(crate) fn cm(&self, keys: &Keys) -> Digest {
+        l2_cm(self.value, 0, &keys.rkm(), &self.rho, &self.rseed)
+    }
+}
+
+/// One built member: its circuit instance.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Inst {
+    S(L2BucketInstance),
+    P(L2PBucketInstance),
+    /// With the leaf it writes (bound through `new_root`, not a PV).
+    R(L2ShapeRInstance, RegistryLeaf),
+    C(ClaimInstance),
+}
+
+impl Inst {
+    pub(crate) fn tag(&self) -> WTag {
+        match self {
+            Inst::S(_) => WTag::S,
+            Inst::P(_) => WTag::P,
+            Inst::R(..) => WTag::R,
+            Inst::C(_) => WTag::C,
+        }
+    }
+
+    pub(crate) fn pvs(&self) -> &[u32] {
+        match self {
+            Inst::S(i) => &i.pvs,
+            Inst::P(i) => &i.pvs,
+            Inst::R(i, _) => &i.pvs,
+            Inst::C(i) => &i.pvs,
+        }
+    }
+
+    /// The member W threads.
+    pub(crate) fn member(&self) -> Member {
+        let write = match self {
+            Inst::R(_, leaf) => Some(*leaf),
+            _ => None,
+        };
+        Member { tag: self.tag(), pvs: self.pvs().to_vec(), write }
+    }
+
+    /// Prove it under the L2 lane (7–31 GiB; box only).
+    pub(crate) fn prove(&self) -> Proof<Config> {
+        match self {
+            Inst::S(i) => qlab_l2::prove_s(i).1,
+            Inst::P(i) => qlab_l2::prove_p(i).1,
+            Inst::R(i, _) => qlab_l2::prove_r(i).1,
+            Inst::C(i) => qlab_l2::claim::prove_claim(i).1,
+        }
+    }
+}
+
+/// The chain facts a plan is built against.
+pub(crate) struct Chain<'a> {
+    pub view: &'a ChainView,
+    pub l2_id: u64,
+    /// The genesis claim tariff (`WrapperParams::claim_fee_tier`).
+    pub fee_tier: u64,
+}
+
+/// What to build.
+pub(crate) struct Ask<'a> {
+    /// The slot order (`default_kinds(16)`, or sixteen claims).
+    pub kinds: &'a [WTag],
+    /// The burns a claim may take, in order (already-claimed ones are skipped
+    /// by their `cnf`).
+    pub burns: &'a [Burn],
+    /// The notes a transaction may spend, in order (spent ones are skipped by
+    /// their nullifier).
+    pub owned: &'a [Owned],
+    /// Paid by the first P, if any.
+    pub exit: Option<Exit>,
+}
+
+/// A built wrapper: the members, the native statement and what it moves.
+pub(crate) struct Plan {
+    pub insts: Vec<Inst>,
+    pub members: Vec<Member>,
+    /// Each claim's value opening, in claim order (the deposit-sum proof's).
+    pub deps: Vec<DepEntry>,
+    pub inp: WInputs,
+    pub exits: Vec<Exit>,
+    /// The absorbed roots, oldest first (`absorbed[M_ABS − 1]` the newest).
+    pub absorbed: [Anchor; M_ABS],
+    /// The burns claimed, in claim order.
+    pub claimed: Vec<Burn>,
+    /// The owned notes spent, in slot order.
+    pub spent: Vec<Owned>,
+    /// The notes this wrapper creates for this run (credits, change).
+    pub credited: Vec<Owned>,
+    pub rin: WRoots,
+    pub wit: WWitness,
+    pub rout: WRoots,
+    pub exit_cmt: Digest,
+}
+
+/// Why a plan is refused — every one named, none a panic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PlanError {
+    /// The node serves no valid anchor (nothing finalized yet).
+    NoAnchor,
+    /// The served anchors and the served leaves disagree.
+    Chain(String),
+    /// Fewer claimable burns under the newest anchor than the claims need.
+    Burns { need: usize, have: usize },
+    /// Fewer unspent owned notes than the transactions need.
+    Notes { need: usize, have: usize },
+    /// A burn worth less than the claim fee.
+    BurnBelowFee { height: u64, value: u64, fee: u64 },
+    /// The first P's note cannot pay the fee and the exit.
+    ExitAboveNote { note: u64, fee: u64, exit: u64 },
+    /// An exit with nowhere to ride: no P in the slot order.
+    ExitWithoutP,
+    /// More than one R in the slot order (v1 allows one per wrapper).
+    SecondR,
+    /// A transaction's note cannot pay the fee.
+    NoteBelowFee { value: u64 },
+    /// The registry has no free slot for R.
+    RegistryFull,
+    /// The native wrapper statement refuses the batch.
+    Wrapper(String),
+}
+
+/// The policy input of an asset-0 note at `rkm` under `reg`: Cloaked, the
+/// empty canonical freeze tree, the dummy allowlist path, no issuer secret —
+/// `qlab_l2spend::policy_input`'s Cloaked arm.
+fn asset0_policy(reg: &RegistryTree, rkm: &Digest) -> L2PolicyInput {
+    L2PolicyInput {
+        leaf: *reg.leaf(0).expect("asset 0's leaf is in every registry (lab #785 F-A)"),
+        reg_witness: reg.witness(0).expect("asset 0's leaf is in every registry"),
+        freeze: CanonicalFreezeTree::empty().opening_for(rkm).expect("the empty freeze tree freezes no key"),
+        allow: dummy_allow_witness(),
+        isk: [0; 4],
+    }
+}
+
+/// Build the wrapper `ask` names on `state`, whose surface is `prev`.
+pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, ask: &Ask) -> Result<Plan, PlanError> {
+    if ask.exit.is_some() && !ask.kinds.contains(&WTag::P) {
+        return Err(PlanError::ExitWithoutP);
+    }
+    if ask.kinds.iter().filter(|t| **t == WTag::R).count() > 1 {
+        return Err(PlanError::SecondR);
+    }
+    let wrapper = state.aa.len() / M_ABS as u64;
+    // The absorbed roots: the four newest distinct anchors, oldest first,
+    // the newest repeated when fewer exist. Every claim opens at the newest.
+    let anchors = chain.view.anchors().map_err(PlanError::Chain)?;
+    let newest = *anchors.first().ok_or(PlanError::NoAnchor)?;
+    let mut absorbed: Vec<Anchor> = anchors.iter().take(M_ABS).rev().copied().collect();
+    while absorbed.len() < M_ABS {
+        absorbed.push(newest);
+    }
+    let absorbed: [Anchor; M_ABS] = absorbed.try_into().expect("exactly M_ABS");
+
+    // The burns: in the tree under the newest anchor, never claimed.
+    let n_claims = ask.kinds.iter().filter(|t| **t == WTag::C).count();
+    let fresh_cnf = |b: &Burn| state.k.low_leaf_of(&claim_cnf(&b.cm, &b.note.rseed)).is_some();
+    let burns: Vec<Burn> = ask.burns.iter().filter(|b| b.pos < newest.count && fresh_cnf(b)).take(n_claims).copied().collect();
+    if burns.len() < n_claims {
+        return Err(PlanError::Burns { need: n_claims, have: burns.len() });
+    }
+
+    // The notes: in C at the wrapper's `C_in`, never spent.
+    let (c_in, c_count) = (state.l2.c.root(), state.l2.c.len());
+    let n_tx = ask.kinds.len() - n_claims;
+    let spendable = |n: &Owned| {
+        let input = keys.input(n);
+        state.l2.c.position_of(&n.cm(keys)).is_some_and(|p| p < c_count)
+            && state.l2.n.low_leaf_of(&derive_input_l2(&input).1).is_some()
+    };
+    let notes: Vec<Owned> = ask.owned.iter().filter(|n| spendable(n)).take(n_tx).copied().collect();
+    if notes.len() < n_tx {
+        return Err(PlanError::Notes { need: n_tx, have: notes.len() });
+    }
+
+    let me = keys.rkm();
+    let mut reg = state.l2.r.clone();
+    let (mut burn_i, mut note_i) = (0usize, 0usize);
+    let mut exit_left = ask.exit;
+    // Everything but the native statement; `Plan` is assembled after it.
+    let mut insts: Vec<Inst> = Vec::new();
+    let mut deps: Vec<DepEntry> = Vec::new();
+    let mut exits: Vec<Exit> = Vec::new();
+    let (mut claimed, mut spent, mut credited) = (Vec::new(), Vec::new(), Vec::new());
+    let mut d_batch = 0u64;
+    let slot_keys = |label: &str, slot: usize| keys.lanes(label, wrapper, slot as u64);
+    // A transaction's second input slot (#219): value 0, asset 0, off-tree.
+    let dummy = |slot: usize| L2TxInput {
+        sk: slot_keys("dummy-sk", slot),
+        value: 0,
+        asset: 0,
+        rho: slot_keys("dummy-rho", slot),
+        rseed: slot_keys("dummy-rseed", slot),
+        d: [0, 0],
+    };
+    let fee_slot = |slot: usize| FeeSlot::Dummy { input: dummy_fee_input(&slot_keys("fee-dummy", slot)) };
+    let to_me = |value: u64, slot: usize, j: usize| L2TxOutput {
+        value,
+        asset: 0,
+        rkm: me,
+        rho: [0; 4],
+        rseed: slot_keys(if j == 0 { "out0" } else { "out1" }, slot),
+    };
+
+    for (slot, kind) in ask.kinds.iter().enumerate() {
+        let inst = match kind {
+            WTag::C => {
+                let b = burns[burn_i];
+                burn_i += 1;
+                if b.note.value < chain.fee_tier {
+                    return Err(PlanError::BurnBelowFee { height: b.height, value: b.note.value, fee: chain.fee_tier });
+                }
+                let r_v = slot_keys("r_v", slot);
+                let credit = ClaimCredit { rkm: me, rseed: slot_keys("credit", slot) };
+                let path = chain.view.tree.auth_path(b.pos, newest.count);
+                let note: BurnNote = b.note;
+                let inst = build_claim_with_witness(
+                    qlab_l2::claim::LOG_HEIGHT_CLAIM,
+                    &qlab_air::claim::rkm_burn(chain.l2_id),
+                    &note,
+                    &path,
+                    newest.root,
+                    &r_v,
+                    &credit,
+                    chain.fee_tier,
+                );
+                deps.push(DepEntry { v: b.note.value, r_v });
+                d_batch = d_batch.checked_add(b.note.value).ok_or(PlanError::Wrapper("D_batch overflows u64".into()))?;
+                credited.push(Owned { value: b.note.value - chain.fee_tier, rho: inst.cnf, rseed: credit.rseed });
+                claimed.push(b);
+                Inst::C(inst)
+            }
+            WTag::S | WTag::P => {
+                let n = notes[note_i];
+                note_i += 1;
+                let real = keys.input(&n);
+                let real_w = state.l2.c.auth_path(state.l2.c.position_of(&n.cm(keys)).expect("spendable"), c_count);
+                let exit = if *kind == WTag::P { exit_left.take() } else { None };
+                let exit_v = exit.map_or(0, |e| e.v);
+                let change = n
+                    .value
+                    .checked_sub(TX_FEE)
+                    .ok_or(PlanError::NoteBelowFee { value: n.value })?
+                    .checked_sub(exit_v)
+                    .ok_or(PlanError::ExitAboveNote { note: n.value, fee: TX_FEE, exit: exit_v })?;
+                let outputs = [to_me(change, slot, 0), to_me(0, slot, 1)];
+                let dummy = dummy(slot);
+                let inst = if *kind == WTag::S {
+                    let leaf0 = *reg.leaf(0).expect("asset 0's leaf");
+                    let w0 = reg.witness(0).expect("asset 0's leaf");
+                    Inst::S(build_bucket_l2_dummy1(
+                        qlab_l2::LOG_HEIGHT_S,
+                        &real,
+                        &real_w,
+                        &dummy,
+                        &off_tree_witness(),
+                        &outputs,
+                        TX_FEE,
+                        c_in,
+                        &[leaf0, leaf0],
+                        &[w0, w0],
+                        reg.root(),
+                        &fee_slot(slot),
+                    ))
+                } else {
+                    let policy = [asset0_policy(&reg, &derive_rkm_l2(&real)), asset0_policy(&reg, &derive_rkm_l2(&dummy))];
+                    let vp = [exit.map_or(VPublic::NONE, |e| VPublic::redeem(e.v)), VPublic::NONE];
+                    let mut inst = build_bucket_l2p_exit_with_witnesses(
+                        qlab_l2::LOG_HEIGHT_P,
+                        &[real.clone(), dummy],
+                        &outputs,
+                        TX_FEE,
+                        &[real_w, off_tree_witness()],
+                        c_in,
+                        &policy,
+                        reg.root(),
+                        vp,
+                        &fee_slot(slot),
+                        exit.map_or([0; 4], |e| e.rkm),
+                    );
+                    inst.air.dv = true;
+                    if let Some(e) = exit {
+                        exits.push(e);
+                    }
+                    Inst::P(inst)
+                };
+                let nf0 = match &inst {
+                    Inst::S(i) => i.nf[0],
+                    Inst::P(i) => i.nf[0],
+                    _ => unreachable!(),
+                };
+                if change > 0 {
+                    credited.push(Owned { value: change, rho: derive_output_rho(&nf0, 0), rseed: outputs[0].rseed });
+                }
+                spent.push(n);
+                inst
+            }
+            WTag::R => {
+                let n = notes[note_i];
+                note_i += 1;
+                let change = n.value.checked_sub(TX_FEE).ok_or(PlanError::NoteBelowFee { value: n.value })?;
+                let fee_in = keys.input(&n);
+                let w = state.l2.c.auth_path(state.l2.c.position_of(&n.cm(keys)).expect("spendable"), c_count);
+                let asset = (1u16..=u16::MAX).find(|a| reg.leaf(*a).is_none()).ok_or(PlanError::RegistryFull)?;
+                let leaf = RegistryLeaf::cloaked(u64::from(asset));
+                let write = RegistryWrite { isk: [0; 4], old_leaf: None, new_leaf: leaf, opening: reg.opening_at(asset) };
+                let seed = SeedOutput { rkm: me, rseed: slot_keys("seed", slot) };
+                let out0 = to_me(change, slot, 0);
+                let inst = build_shape_r_with_witnesses(qlab_l2::LOG_HEIGHT_R, &fee_in, &w, c_in, &out0, TX_FEE, &write, &seed);
+                reg.apply_update(leaf).map_err(|e| PlanError::Wrapper(format!("registry write: {e:?}")))?;
+                if change > 0 {
+                    credited.push(Owned { value: change, rho: inst.nf, rseed: out0.rseed });
+                }
+                spent.push(n);
+                Inst::R(inst, leaf)
+            }
+        };
+        insts.push(inst);
+    }
+
+    // The native statement, on a copy: the sequencer's prefilter.
+    let members: Vec<Member> = insts.iter().map(Inst::member).collect();
+    let inp = WInputs { prev: prev.commitment, rkm_seq: me, absorbed: absorbed.map(|a| a.root), d_batch };
+    let mut st = state.clone();
+    let (rin, wit, rout) = st.apply(&inp, &members).map_err(|e| PlanError::Wrapper(format!("{e:?}")))?;
+    let exit_cmt = crate::f4::native::check_wrapper_leaf(&rin, &inp, &members, &wit)
+        .map_err(|e| PlanError::Wrapper(format!("{e:?}")))?
+        .1;
+    if exit_chain(&exits) != exit_cmt {
+        return Err(PlanError::Wrapper("the exit list does not chain to W's exit_cmt".into()));
+    }
+    Ok(Plan { insts, members, deps, inp, exits, absorbed, claimed, spent, credited, rin, wit, rout, exit_cmt })
+}

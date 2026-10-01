@@ -18,6 +18,7 @@ pub(crate) mod bench;
 #[cfg(test)]
 mod bundle_node;
 pub(crate) mod dep;
+pub(crate) mod f5box;
 pub(crate) mod gate;
 pub(crate) mod native;
 pub(crate) mod rec;
