@@ -345,16 +345,17 @@ mod tests {
 
     /// 🔒 The V6 rehearsal genesis, from the named `genesis init --t2` runs ×2
     /// (byte-identical files; lab #785 F5-3c, re-pinned in F5-4a over the
-    /// asset-0 genesis registry, finding F-A). The V5 rehearsal genesis
+    /// asset-0 genesis registry, finding F-A, and in F5-4d-2 for
+    /// `claim_fee_tier`, logs `f5-4d2-runs/genesis-init-{1,2}`). The V5 rehearsal genesis
     /// (`83776614…`) and T1 (`740ba41c…`) keep their own pins in `genesis.rs`.
     #[test]
     fn the_v6_rehearsal_genesis_is_pinned() {
         let a = GenesisFileV6::new_rehearsal();
         assert_eq!(a, GenesisFileV6::new_rehearsal(), "deterministic");
-        assert_eq!(a.hash_hex(), "68594df44b53151dd5bccfc23832c5a527831f717784d16124640b29f84d0093");
+        assert_eq!(a.hash_hex(), "4f725b2932b06154cdc069016ccf4435bbeaea89ddcfaccdc70ed6c6d367bfd4");
         assert_eq!(
             a.wrapper.digest_hex(),
-            "7567956821dce68d5f1b4021fb18290c57edae0732bb0ee2c5df7445c3e31224"
+            "cdc45b2bb0a1be7b35f4b835220a47a6ce8c06c6e1d0f8f10b92a00cec326efb"
         );
         assert_eq!(
             hex_encode(&crate::revision::revision_digest_v6(
@@ -362,7 +363,7 @@ mod tests {
                 crate::release::REVISION_V1_0.frozen_digest_hex,
                 &a.wrapper,
             )),
-            "89e36dac55fcae4d1e4f3975e74df689ae4984b997272f3f65b44c4d77e2ffe4"
+            "7a5b813e84f2772b69ccefe3c2736f52c6b685d684ba17d180eb13b6ce245c84"
         );
         assert_eq!(a.base.format_version, 10);
         assert_eq!(a.forms(), (GenesisForm::V5, BodySections::V6));
