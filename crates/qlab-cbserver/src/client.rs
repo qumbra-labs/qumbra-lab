@@ -684,8 +684,12 @@ pub struct MultiScan {
 ///
 /// The keys are values: an `Ivk` holder builds them with
 /// `qlab_wallet::viewing::Ivk::scan_key(d)` — no capability beyond the `Ivk`'s,
-/// and no dependency of this crate on the wallet's. The cache holds the range's
-/// responses for the call's duration.
+/// and no dependency of this crate on the wallet's.
+///
+/// **Memory:** the cache holds the whole range's `/v1/compact` pages and every
+/// fetched `/full` for the call's duration, so a long range costs its bytes in
+/// memory at once — scan in the ranges you would page anyway (a watcher scans
+/// from its last height).
 pub fn light_client_scan_l2_multi_with<F>(
     fetch: &mut F,
     keys: &[(u64, Dk)],
