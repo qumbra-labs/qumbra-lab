@@ -1473,7 +1473,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // `ask_set` field — the doc comment's "everything else is read here so
         // the two views of the ask set cannot disagree" is the reason the
         // predicate must not grow a second source for this number (#661).
-        let ask_set = self.missing_body_hashes(body_window_for(lag.blocks())).len();
+        let ask_set = self.missing_body_hashes(body_window_for(lag.blocks(), self.sections)).len();
         let armed = self.stip_moved_ms.is_some()
             && stuck_ms >= self.unobtainable_threshold_ms()
             && (off_main || self.breq_observed > 0 || ask_set > 0);

@@ -287,8 +287,8 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 ///
 /// *(Lab #785 F5-5a: both caps doubled with the frame, so the margins above
 /// grew. A V6 window holding a bundle-bearing body (≤ 16 MiB each, at most one
-/// per spacing window of 48 blocks) is the case this table does not size; F5-5b
-/// paces bundle-bearing bodies.)*
+/// per spacing window of 48 blocks) is the case this table does not size; on a
+/// V6 net the window is [`MAX_BODIES_IN_FLIGHT_CATCHUP_V6`] (F5-5b).)*
 ///
 /// The third row is the binding one and it is the row this constant exists for.
 /// The requester paces itself on the FRAME axis (see
@@ -357,13 +357,33 @@ struct BodyReq {
     peer: PeerId,
 }
 
-pub const fn body_window_for(lag: u64) -> usize {
-    if lag > CATCHUP_LAG_BLOCKS {
-        MAX_BODIES_IN_FLIGHT_CATCHUP
-    } else {
+pub const fn body_window_for(lag: u64, sections: qlab_devnet::forms::BodySections) -> usize {
+    if lag <= CATCHUP_LAG_BLOCKS {
         MAX_BODIES_IN_FLIGHT
+    } else if matches!(sections, qlab_devnet::forms::BodySections::V6) {
+        MAX_BODIES_IN_FLIGHT_CATCHUP_V6
+    } else {
+        MAX_BODIES_IN_FLIGHT_CATCHUP
     }
 }
+
+/// **The catch-up window on a V6 net** (lab #785 F5-5b, Q-5b-3).
+/// `[devnet-placeholder]`.
+///
+/// [`MAX_BODIES_IN_FLIGHT_CATCHUP`] (96) is sized so a window's answers fit one
+/// inbound byte burst at proof-sized bodies; it does not size a bundle-bearing
+/// body (≤ 16 MiB). One bundle per spacing window (48 blocks) means a 48-body
+/// window holds at most one: 16 MiB + 47 proof-sized bodies ≈ 23 MB, inside
+/// the 32 MiB burst (asserted below at a 160 KB body). F5-6 measures V6
+/// catch-up throughput across bundle blocks; a byte-aware window replaces this
+/// block count if that measurement says so.
+pub const MAX_BODIES_IN_FLIGHT_CATCHUP_V6: usize = 48;
+const _: () = assert!(
+    crate::wire::MAX_PAYLOAD as u64 + (MAX_BODIES_IN_FLIGHT_CATCHUP_V6 as u64 - 1) * 160_000
+        <= crate::ratelimit::BYTE_BURST,
+    "a V6 catch-up window with one bundle body fits one inbound burst"
+);
+const _: () = assert!(MAX_BODIES_IN_FLIGHT_CATCHUP_V6 <= MAX_BODIES_IN_FLIGHT_CATCHUP);
 
 /// **How long an unanswered body request is held before it may be re-asked**
 /// (issue #130 (c)).
@@ -1509,9 +1529,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let (prefilled, short_ids) = build_announce_parts(&body.txs, nonce);
         let BlockBody { coinbase_payees, finality, bundle, .. } = body;
         let ann = BlockAnnounce { seal: None, finality, bundle, header, nonce, coinbase_payees, short_ids, prefilled };
-        // A bundle is not relayable until F5-5 (ruling Q2 on issue #785); the
-        // body rule refuses every bundle today, so ingest above has already
-        // returned for one. Not sending is the only answer either way.
+        // A section on a sectionless net is the one refusal left (a program
+        // error upstream); a V6 bundle travels inline since F5-5b.
         let Ok(payload) = encode_announce_for(self.node.wire_form(), &ann) else {
             return outcome;
         };
@@ -1813,7 +1832,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // every 15 s, which is exactly the number the incident needed and did not
         // have. Nothing here is read by the requester.
         self.prune_body_asks(now_ms);
-        let window = body_window_for(self.node.state_lag_blocks());
+        let window = body_window_for(self.node.state_lag_blocks(), self.node.wire_form().sections);
         let room = window.saturating_sub(self.body_reqs.len());
         if room == 0 {
             return;
@@ -3527,14 +3546,10 @@ mod tests {
             let ann = whole_block_announce(crate::codec::WireHeader::L1(header), b.clone());
             encode_announce_for(WireForm::V6, &ann).map(|w| w.len())
         };
-        // The encoder refuses a bundle until F5-5b, so the bundle-free body is
-        // encoded and the bundle added at its wire cost: its bytes plus a
-        // length varint of ≤ 4 B in place of the empty section's 1 B (+4 is
-        // conservative by one).
-        let bundle = std::mem::take(&mut body.bundle);
-        let pre = |b: &BlockBody, extra: usize| b.preimage_v6().len() + extra;
-        let w = wire_len(&body).expect("bundle-free V6 body encodes") + bundle.len() + 4;
-        assert!(w <= pre(&body, bundle.len()) + FRAME_OVERHEAD_BOUND, "announce {w} vs preimage {}", pre(&body, bundle.len()));
+        // Since F5-5b the encoder carries the bundle: measured directly.
+        let w = wire_len(&body).expect("a V6 body with a bundle encodes");
+        let pre = body.preimage_v6().len();
+        assert!(w <= pre + FRAME_OVERHEAD_BOUND, "announce {w} vs preimage {pre}");
         // Grown to exactly the bound with section bytes.
         let room = MAX_V6_BODY_BYTES - body.preimage_v6().len();
         body.finality = vec![3; room + body.finality.len()];
@@ -6503,13 +6518,12 @@ mod tests {
         }
     }
 
-    /// Ruling Q2 on issue #785, the served-body half: `GetData(Block)` answers
-    /// with `whole_block_announce` encoded under the node's wire form, so a
-    /// body carrying a bundle cannot be encoded there either — the serve path
-    /// then degrades to the header like its other gates. A record alone serves.
+    /// The served-body half: `GetData(Block)` answers with
+    /// `whole_block_announce` under the node's wire form. A record serves,
+    /// and since lab #785 F5-5b a bundle does too.
     #[test]
-    fn the_served_body_frame_refuses_a_bundle_and_carries_a_record() {
-        use crate::compact::{decode_announce_for, encode_announce_for, AnnounceEncodeError, WireForm};
+    fn the_served_body_frame_carries_a_record_and_a_bundle() {
+        use crate::compact::{decode_announce_for, encode_announce_for, WireForm};
         let header = BlockHeader::genesis_for(qlab_devnet::forms::GenesisForm::V5, 8, 0);
         let mut body = BlockBody::new(vec![], vec![]);
         body.finality = vec![0x5A; 64];
@@ -6517,8 +6531,10 @@ mod tests {
         let bytes = encode_announce_for(WireForm::V6, &ann).expect("a record is relayable");
         assert_eq!(decode_announce_for(WireForm::V6, &bytes).unwrap().finality, body.finality);
 
-        body.bundle = vec![1];
-        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body);
-        assert_eq!(encode_announce_for(WireForm::V6, &ann), Err(AnnounceEncodeError::BundleNotRelayable));
+        body.bundle = vec![1, 2, 3];
+        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body.clone());
+        let bytes = encode_announce_for(WireForm::V6, &ann).expect("a bundle is relayable (F5-5b)");
+        let back = decode_announce_for(WireForm::V6, &bytes).unwrap();
+        assert_eq!((back.finality, back.bundle), (body.finality, body.bundle));
     }
 }

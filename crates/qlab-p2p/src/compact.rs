@@ -95,12 +95,6 @@ const _: () = assert!(
 /// Why an announce could not be encoded (lab #785 F5-3b-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnounceEncodeError {
-    /// The body carries a wrapper bundle. A bundle (≤ ≈ 8.32 MB) does not fit
-    /// beside the rest of a frame under today's `MAX_PAYLOAD`; F5-5 raises the
-    /// frame together with the backlog caps as one change. Until then no node
-    /// produces a bundle-carrying announce it could not send — and every
-    /// bundle is refused by the body rule anyway (`RefuseAllBundles`).
-    BundleNotRelayable,
     /// A section on a net whose bodies have none (a program error upstream:
     /// such a body cannot have passed validation).
     SectionOnForm,
@@ -182,8 +176,9 @@ pub struct BlockAnnounce {
     /// when absent. On the wire as `varint len ‖ bytes` after the coinbase
     /// section; absent from every other form's frame.
     pub finality: Vec<u8>,
-    /// **V6 only**: the wrapper bundle's bytes, empty when absent. Never
-    /// encoded until F5-5 ([`AnnounceEncodeError::BundleNotRelayable`]).
+    /// **V6 only**: the wrapper bundle's bytes, empty when absent. Carried
+    /// inline since lab #785 F5-5b (the 16 MiB frame of F5-5a; the V6 body
+    /// bound keeps a whole block inside it).
     pub bundle: Vec<u8>,
 }
 
@@ -237,13 +232,12 @@ pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
 
 /// Encode a `BlockAnnounce` under its [`WireForm`] (lab #785 F5-3b-2): the V6
 /// frame appends `varint len ‖ finality ‖ varint len ‖ bundle` after the
-/// coinbase section, and refuses a bundle by name until F5-5.
+/// coinbase section (a bundle carried inline since F5-5b).
 pub fn encode_announce_for(wf: WireForm, a: &BlockAnnounce) -> Result<Vec<u8>, AnnounceEncodeError> {
     match wf.sections {
         BodySections::None if !a.finality.is_empty() || !a.bundle.is_empty() => {
             return Err(AnnounceEncodeError::SectionOnForm)
         }
-        BodySections::V6 if !a.bundle.is_empty() => return Err(AnnounceEncodeError::BundleNotRelayable),
         _ => {}
     }
     Ok(encode_announce_inner(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, wf, a))
@@ -962,15 +956,28 @@ mod tests {
         assert!(decode_announce_for(WireForm::V6, &v5).is_err());
     }
 
-    /// Ruling Q2 on issue #785: a bundle is refused at encode, by name, until
-    /// F5-5 raises the frame — on every path, since the served-body answer is
-    /// this same frame. A section on a sectionless net is a program error,
-    /// refused likewise.
+    /// Lab #785 F5-5b: a V6 announce carries its bundle inline, byte-exact —
+    /// the V5 frame with `varint len ‖ finality ‖ varint len ‖ bundle` at the
+    /// section point — and round-trips. A section on a sectionless net is a
+    /// program error, refused by name.
     #[test]
-    fn a_bundle_is_not_relayable_until_f5_5() {
+    fn a_v6_announce_carries_its_bundle_byte_exact() {
         let mut a = golden_l1_announce(GenesisForm::V5);
-        a.bundle = vec![1];
-        assert_eq!(encode_announce_for(WireForm::V6, &a), Err(AnnounceEncodeError::BundleNotRelayable));
+        let v5 = encode_announce(GenesisForm::V5, &a);
+        a.finality = vec![0x5A; 300];
+        a.bundle = (0..200u32).map(|i| (i * 7) as u8).collect();
+        let v6 = encode_announce_for(WireForm::V6, &a).unwrap();
+        let at = header_msg_len(GenesisForm::V5) + 8 + 1 + 40;
+        let mut expect = v5[..at].to_vec();
+        expect.extend_from_slice(&[0xAC, 0x02]); // varint 300
+        expect.extend_from_slice(&a.finality);
+        expect.extend_from_slice(&[0xC8, 0x01]); // varint 200
+        expect.extend_from_slice(&a.bundle);
+        expect.extend_from_slice(&v5[at..]);
+        assert_eq!(v6, expect, "byte-exact");
+        let back = decode_announce_for(WireForm::V6, &v6).unwrap();
+        assert_eq!((back.finality.as_slice(), back.bundle.as_slice()), (a.finality.as_slice(), a.bundle.as_slice()));
+        assert_eq!(encode_announce_for(WireForm::V6, &back).unwrap(), v6, "round trip");
         a.bundle.clear();
         a.finality = vec![1];
         assert_eq!(
