@@ -18,7 +18,7 @@ qlab-l2 = { path = "../qlab-l2" }
 qlab-note = { path = "../qlab-note" }
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
-qlab-p2p = { path = "../qlab-p2p" }
+qlab-p2p = { path = "../qlab-p2p", default-features = false }
 qlab-node = { path = "../qlab-node", default-features = false }
 bincode = "1"
 rand = "0.10"

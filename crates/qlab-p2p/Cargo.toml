@@ -25,11 +25,11 @@ publish.workspace = true
 # Real consensus objects that travel on the wire: BlockHeader/Hash32/Checkpoint/
 # Vote/Committee/TxEntry. Depended on, never modified (additive-only). N7 reroutes
 # these to qlab-consensus/qlab-node once N1 lands.
-qlab-devnet = { path = "../qlab-devnet" }
+qlab-devnet = { path = "../qlab-devnet", default-features = false }
 # The RATIFIED §5 note-discovery / compact-block wire codec — reused verbatim for
 # compact-block relay (write_varint/read_varint + encode/decode_compact_response +
 # WIRE_VERSION). This is the "§5 framing" the issue cites, reused not re-rolled.
-qlab-cbserver = { path = "../qlab-cbserver" }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false, features = ["devnet"] }
 # Keccak-256 for message-id / inventory hashing (the consensus hash; never forked).
 qlab-air = { path = "../qlab-air" }
 # Decode ML-DSA-65 checkpoint-vote signatures off the wire (Signature::decode).
@@ -38,8 +38,16 @@ ml-dsa = "=0.1.1"
 # N7 integration: the real node-state (chain/commitment tree/nullifier set +
 # the N4 mempool) the `adapter` module wires the N1 traits onto, and the real
 # PoW engine (RandomX + LWMA + key-block schedule) for header validation.
-qlab-node = { path = "../qlab-node" }
-qlab-pow = { path = "../qlab-pow" }
+qlab-node = { path = "../qlab-node", default-features = false }
+qlab-pow = { path = "../qlab-pow", default-features = false }
+
+[features]
+# The RandomX C++ chain behind the three crates above. Default-on, so every
+# existing consumer resolves exactly as before; a consumer that only needs the
+# wire and the adapter types (qlab-l2spend, qumbra-wallet without its own
+# `randomx`) opts out with `default-features = false`.
+default = ["randomx"]
+randomx = ["qlab-devnet/randomx", "qlab-node/randomx", "qlab-pow/randomx", "qlab-cbserver/randomx"]
 
 [dev-dependencies]
 # Deterministic committee keys + compact-block fixtures for gossip/relay tests.
