@@ -2622,6 +2622,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // and it is what takes AnchorOutsideRecord out of #134's amnesty
             // where AnchorNotFinal stays in it.
             BodyError::SectionOnForm { .. }
+            // Lab #785 F5-5a: the body bound reads the body's own bytes.
+            | BodyError::BodyTooLarge { .. }
             | BodyError::FinalityRecord { .. }
             | BodyError::AnchorOutsideRecord { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #785 F5-4b, the bundle rule: every step reads the bundle's

@@ -63,6 +63,35 @@ const MIN_PREFILLED_BYTES: usize = 2 + MIN_TX_WIRE_BYTES;
 /// The smallest `BlockTxn` entry: length varint + a tx.
 const MIN_BLOCK_TXN_ENTRY_BYTES: usize = 1 + MIN_TX_WIRE_BYTES;
 
+/// **How much a whole-block announce can exceed its body's canonical bytes**
+/// (lab #785 F5-5a, the body bound's tie to the frame). A V6 body is bounded
+/// by consensus on `BlockBody::preimage_v6().len()` (≤
+/// [`qlab_devnet::body::MAX_V6_BODY_BYTES`]); what crosses one frame is the
+/// historical-body answer, `encode_announce_for(V6, whole_block_announce)` —
+/// every tx prefilled. The difference, from the two encoders:
+///
+/// - **only in the announce:** the V5 header (97 B), the salt nonce (8), the
+///   short-id count (1 B: zero ids) and the prefilled count (a varint, ≤ 4 B);
+/// - **only in the preimage:** the domain tag `qumbra:body:v6` (14 B);
+/// - **per transaction:** the preimage writes the proof, discovery and rider
+///   lengths as u64 (8 B each, the rider's always), the wire as varints (≤ 4 B
+///   below 2^28, i.e. any length inside a 15 MiB body; the rider omitted when
+///   absent), while the nf/cm counts are 1 B in the preimage and a varint
+///   (≤ 2 B, at most 255) on the wire: the wire tx is ≥ 10 B shorter, which
+///   pays for the prefilled entry's index and length varints (≤ 3 + 4 B) —
+///   no per-transaction growth at all;
+/// - **sections:** finality and bundle lengths are u64 in the preimage and
+///   varints (≤ 4 B) in the announce; the coinbase payee bytes are identical.
+///
+/// So the announce is at most the preimage + 96 B. 4 KiB is a stated bound
+/// with room, and `MAX_V6_BODY_BYTES + FRAME_OVERHEAD_BOUND ≤ MAX_PAYLOAD` is
+/// asserted below; a fixture test holds the inequality on real encodings.
+pub const FRAME_OVERHEAD_BOUND: usize = 4 * 1024;
+const _: () = assert!(
+    qlab_devnet::body::MAX_V6_BODY_BYTES + FRAME_OVERHEAD_BOUND <= crate::wire::MAX_PAYLOAD as usize,
+    "a body at the consensus bound fits one frame"
+);
+
 /// Why an announce could not be encoded (lab #785 F5-3b-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnounceEncodeError {
