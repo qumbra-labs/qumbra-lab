@@ -76,7 +76,7 @@ pub use mempool::{
 };
 pub use node::{
     genesis_block, genesis_block_for, genesis_block_v6, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
-    RecoveryReport, RewindReport, SnapshotRejection, V6Setup,
+    RecoveryReport, RewindReport, SnapshotRejection, V6Setup, MAX_RETAINED_BODY_BYTES,
 };
 pub use recovery::{
     catch_up_slot, committee_accrual_finalized, committee_accrual_for_span, Finalizer,
@@ -87,7 +87,7 @@ pub use rpc::{
     coinbase_page, main_chain_roots_of, repeated_nullifier_in_tx, serve, AnchorSet, BlockDiscovery,
     names_page, nullifier_page, CheckpointFacts, FullRefusal, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
     RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TreeLeaves,
-    TxDiscovery, MAX_COMPACT_BLOCKS, MAX_TREE_LEAVES, RPC_VERSION,
+    TxDiscovery, MAX_COMPACT_BLOCKS, MAX_COMPACT_PAGE_BYTES, MAX_TREE_LEAVES, RPC_VERSION,
 };
 pub use telemetry::{
     AppliedTip, BlockIdentity, DurableAgreement, DurableHead, DurableView, LocalCommitment,

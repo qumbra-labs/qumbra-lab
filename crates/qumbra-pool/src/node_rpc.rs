@@ -32,6 +32,12 @@ const TEMPLATE_PATH: &str = "/v1/mine/template";
 const CONTEXT_PATH: &str = "/v1/mine/context";
 const BLOCK_PATH: &str = "/v1/mine/block";
 
+/// The body cap on every answer from the node's mine RPC (lab #785 F5-5a).
+/// A template carries the block's transactions as hex, so its size follows
+/// the block's: a V6 body is at most `MAX_V6_BODY_BYTES` (15 MiB), 2× in
+/// hex plus JSON; 64 MiB covers it. Past it, the answer is refused by name.
+pub const NODE_RPC_MAX_BODY: usize = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MineTemplateContextWire {
     form: String,
@@ -177,7 +183,7 @@ impl NodeRpcClient {
         // one stopped at EOF, i.e. only because the server closed; against a
         // keep-alive peer every template poll would have hung to the 30 s
         // read timeout instead of returning.
-        let resp = crate::http::read_response(&mut s).map_err(|e| e.to_string())?;
+        let resp = crate::http::read_response_capped(&mut s, NODE_RPC_MAX_BODY).map_err(|e| e.to_string())?;
         let body = resp.body_string();
         Ok((resp.status, body))
     }

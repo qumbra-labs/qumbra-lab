@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use crate::peer::PeerId;
 use crate::sendstall::{
-    SendProgress, MAX_SEND_BACKLOG_BYTES_PER_PEER, SEND_STALL_WINDOW_MS, SEND_WRITE_TIMEOUT_MS,
+    SendProgress, MAX_SEND_BACKLOG_BYTES_PER_PEER, MAX_SEND_BACKLOG_BYTES_TOTAL, SEND_STALL_WINDOW_MS,
+    SEND_WRITE_TIMEOUT_MS,
 };
 use crate::wire::{FrameHeader, HEADER_LEN};
 
@@ -414,20 +415,82 @@ impl Transport for InProcTransport {
 // TCP transport
 // ==========================================================================
 
+/// The step a frame's receive buffer grows by (lab #785 F5-5a, Q-5-7).
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// The buffer grows with the bytes that actually arrive, never with what the
+/// header declares: a peer that sends a header claiming [`MAX_PAYLOAD`] and
+/// then nothing holds about one step, not a frame.
+///
+/// [`MAX_PAYLOAD`]: crate::wire::MAX_PAYLOAD
+pub const FRAME_READ_STEP: usize = 64 * 1024;
+
+/// How long one frame may take to arrive once its first byte has (lab #785
+/// F5-5a, Q-5-7: 120 s, so a 16 MiB frame needs ≥ 140 KB/s). Past it the
+/// connection ends, as on a malformed header. Idle time **between** frames is
+/// not bounded here — a quiet peer is not a slow one.
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+pub const FRAME_READ_DEADLINE_MS: u64 = 120_000;
+
 /// Read exactly one framed message from a blocking stream: the fixed header,
 /// then the declared body. A malformed header (bad magic / oversize) is a fatal
-/// `InvalidData` error that ends the connection.
+/// `InvalidData` error that ends the connection; a frame not finished within
+/// [`FRAME_READ_DEADLINE_MS`] of its first byte is a fatal `TimedOut`.
 fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut hdr = [0u8; HEADER_LEN];
-    stream.read_exact(&mut hdr)?;
-    let fh = FrameHeader::parse(&hdr)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let mut frame = Vec::with_capacity(HEADER_LEN + fh.payload_len as usize);
-    frame.extend_from_slice(&hdr);
-    let mut body = vec![0u8; fh.payload_len as usize];
-    stream.read_exact(&mut body)?;
-    frame.extend_from_slice(&body);
+    let mut frame = Vec::new();
+    read_frame_into(stream, &mut frame, Duration::from_millis(FRAME_READ_DEADLINE_MS))?;
     Ok(frame)
+}
+
+/// [`read_frame`] into `frame`, with the deadline as a parameter (tests).
+/// `frame` holds whatever arrived if this returns an error, so a test can see
+/// that the allocation tracked the bytes received.
+fn read_frame_into(stream: &mut TcpStream, frame: &mut Vec<u8>, deadline: Duration) -> io::Result<()> {
+    // The first byte: no deadline (between frames a connection may idle).
+    let _ = stream.set_read_timeout(None);
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first)?;
+    let until = Instant::now() + deadline;
+    frame.clear();
+    frame.push(first[0]);
+    frame.resize(HEADER_LEN, 0);
+    read_exact_by(stream, &mut frame[1..], until)?;
+    let fh = FrameHeader::parse(&frame[..HEADER_LEN])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let total = HEADER_LEN + fh.payload_len as usize;
+    while frame.len() < total {
+        let start = frame.len();
+        let want = (total - start).min(FRAME_READ_STEP);
+        frame.resize(start + want, 0);
+        if let Err(e) = read_exact_by(stream, &mut frame[start..], until) {
+            frame.truncate(start);
+            return Err(e);
+        }
+    }
+    // W2: the step growth may have doubled past `total`; the inbox accounts a
+    // frame by its length, so its capacity must be that length.
+    frame.shrink_to_fit();
+    Ok(())
+}
+
+/// `read_exact` against an absolute deadline: each read waits at most the time
+/// left, and the deadline passing is `TimedOut`.
+fn read_exact_by(stream: &mut TcpStream, buf: &mut [u8], until: Instant) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "frame read deadline passed"));
+        }
+        let _ = stream.set_read_timeout(Some(left));
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed mid-frame")),
+            Ok(n) => filled += n,
+            Err(ref e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Maximum bytes held in the receive queue across **all** peers (issue #91,
@@ -437,15 +500,19 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// reader threads push as fast as the sockets deliver while `poll` only drains on
 /// the node's tick, so a peer that sends faster than we process grew this queue
 /// without limit — a per-message cap says nothing about concurrent or cumulative
-/// use. 64 MiB is 8 maximum-size frames, against a measured ~262 MiB steady RSS
-/// per node on the 2 GB T0 hosts (Phase B-WAN).
-pub const MAX_INBOX_BYTES: u64 = 64 * 1024 * 1024;
+/// use. 8 maximum-size frames (64 MiB until lab #785 F5-5a doubled the frame),
+/// against a measured ~262 MiB steady RSS per node on the 2 GB T0 hosts (Phase
+/// B-WAN) — F5-6 measures node RSS serving bundle blocks before this is called
+/// safe.
+pub const MAX_INBOX_BYTES: u64 = 128 * 1024 * 1024;
+const _: () = assert!(MAX_INBOX_BYTES == 8 * crate::wire::MAX_PAYLOAD as u64, "eight maximum frames");
 
 /// Maximum queued bytes attributable to any **one** peer. `[devnet-placeholder]`
 /// testnet-tunable, NOT frozen. Fixed at 2 × [`crate::wire::MAX_PAYLOAD`] so a
 /// single legal maximum-size frame can never be refused by its own arrival, and so
 /// one peer cannot consume the whole global budget and starve the rest.
-pub const MAX_INBOX_BYTES_PER_PEER: u64 = 16 * 1024 * 1024;
+pub const MAX_INBOX_BYTES_PER_PEER: u64 = 32 * 1024 * 1024;
+const _: () = assert!(MAX_INBOX_BYTES_PER_PEER == 2 * crate::wire::MAX_PAYLOAD as u64, "one maximum frame never refused by its own arrival");
 
 /// The receive queue, with the byte accounting that bounds it.
 #[derive(Default)]
@@ -475,23 +542,59 @@ struct PeerWriter {
     /// Undelivered bytes, oldest first.
     pending: Vec<u8>,
     progress: SendProgress,
+    /// The node-wide backlog this writer's `pending` counts against (lab #785
+    /// F5-5a). Invariant: `budget.used` is the sum of every live writer's
+    /// `pending.len()` — added on queue, released on each accepted write and,
+    /// for whatever is left, on drop.
+    budget: Arc<SendBudget>,
+}
+
+/// **The send backlog across all peers** (lab #785 F5-5a): the bytes every
+/// [`PeerWriter`] holds undelivered, against [`MAX_SEND_BACKLOG_BYTES_TOTAL`]
+/// (re-tunable in tests). Only writers change `used`, by exactly the bytes they
+/// queue and release, so it cannot go negative or leak: a writer removed on a
+/// disconnect releases its remainder in `Drop`.
+///
+/// **What it bounds:** queued bytes (`len`). Memory follows because a writer's
+/// buffer is released when it drains and shrunk when its capacity passes twice
+/// what it holds (W2), so held memory is at most ≈ 2× this budget.
+///
+/// **At the cap** the node sheds the connection holding the most backlog (the
+/// oldest last accepted write breaks a tie, [`shed_choice`]) rather than drop
+/// a healthy peer's frame (W3): a slow reader can exhaust only itself.
+struct SendBudget {
+    used: AtomicU64,
+    cap: AtomicU64,
+}
+
+impl SendBudget {
+    fn new() -> SendBudget {
+        SendBudget { used: AtomicU64::new(0), cap: AtomicU64::new(MAX_SEND_BACKLOG_BYTES_TOTAL) }
+    }
 }
 
 impl PeerWriter {
-    fn new(stream: TcpStream) -> PeerWriter {
-        PeerWriter { stream, pending: Vec::new(), progress: SendProgress::new() }
+    fn new(stream: TcpStream, budget: Arc<SendBudget>) -> PeerWriter {
+        PeerWriter { stream, pending: Vec::new(), progress: SendProgress::new(), budget }
     }
 
-    /// Queue one whole frame (or refuse it at the cap) and then hand the kernel
+    /// Queue one whole frame (or refuse it at a cap) and then hand the kernel
     /// as much of the backlog as it will take.
     fn send_frame(&mut self, now_ms: u64, frame: &[u8]) -> Result<(), TransportError> {
-        if self.pending.len() as u64 + frame.len() as u64 > MAX_SEND_BACKLOG_BYTES_PER_PEER {
+        let len = frame.len() as u64;
+        let over_peer = self.pending.len() as u64 + len > MAX_SEND_BACKLOG_BYTES_PER_PEER;
+        // Writers are mutated only under `TcpShared::writers`' lock, so the
+        // check and the add below cannot interleave with another writer's.
+        let over_total = self.budget.used.load(Ordering::SeqCst) + len > self.budget.cap.load(Ordering::SeqCst);
+        if over_peer || over_total {
             // Congestion, not malice — the same boundary the receive queue draws.
             // The frame is dropped whole; the connection stays up and the stall
-            // *window* is what rules on it.
+            // *window* is what rules on it. Over the node-wide cap (F5-5a) it
+            // is refused exactly like a per-peer overflow.
             self.progress.note_dropped_frame();
         } else {
             self.pending.extend_from_slice(frame);
+            self.budget.used.fetch_add(len, Ordering::SeqCst);
         }
         self.flush(now_ms)
     }
@@ -525,6 +628,15 @@ impl PeerWriter {
             }
         }
         self.pending.drain(..accepted);
+        self.budget.used.fetch_sub(accepted as u64, Ordering::SeqCst);
+        // Lab #785 F5-5a (W2): the budget counts `len`, so `capacity` must
+        // follow it down, or one 16 MiB frame keeps 16 MiB per connection for
+        // its life. Released when empty; halved past 2× what it holds.
+        if self.pending.is_empty() {
+            self.pending = Vec::new();
+        } else if self.pending.capacity() > 2 * self.pending.len() {
+            self.pending.shrink_to(self.pending.len());
+        }
         self.progress.observe(now_ms, accepted as u64, self.pending.len() as u64);
         match fatal {
             Some(e) => Err(e),
@@ -533,9 +645,33 @@ impl PeerWriter {
     }
 }
 
+/// **Which connection the node-wide send cap sheds** (lab #785 F5-5a, W3):
+/// the one holding the most undelivered bytes; among equals, the one whose
+/// kernel last accepted a byte longest ago (never = oldest). `None` when no
+/// connection holds a backlog.
+pub(crate) fn shed_choice(candidates: &[(PeerId, u64, Option<u64>)]) -> Option<PeerId> {
+    candidates
+        .iter()
+        .filter(|(_, backlog, _)| *backlog > 0)
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)).then_with(|| b.0.cmp(&a.0)))
+        .map(|(id, _, _)| *id)
+}
+
+impl Drop for PeerWriter {
+    /// Whatever never reached the socket leaves the node-wide budget with the
+    /// writer — a disconnect, clean or not, cannot leak it.
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.pending.len() as u64, Ordering::SeqCst);
+    }
+}
+
 struct TcpShared {
     inbox: Mutex<Inbox>,
     writers: Mutex<HashMap<PeerId, PeerWriter>>,
+    /// The node-wide send backlog (lab #785 F5-5a).
+    send_budget: Arc<SendBudget>,
+    /// Connections shed at the node-wide send cap (W3; ops / tests).
+    shed: AtomicU64,
     running: AtomicBool,
     next_id: AtomicU64,
     /// Handles of connections we **accepted** (as opposed to dialed), so the
@@ -660,6 +796,8 @@ impl TcpTransport {
         let shared = Arc::new(TcpShared {
             inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
+            send_budget: Arc::new(SendBudget::new()),
+            shed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
@@ -799,6 +937,22 @@ impl TcpTransport {
         self.shared.writers.lock().unwrap().get(&id).map(|w| w.progress.backlog()).unwrap_or(0)
     }
 
+    /// Undelivered bytes across every peer (lab #785 F5-5a; ops / tests).
+    pub fn total_backlog_bytes(&self) -> u64 {
+        self.shared.send_budget.used.load(Ordering::SeqCst)
+    }
+
+    /// Connections shed at the node-wide send cap (lab #785 F5-5a, W3).
+    pub fn shed_count(&self) -> u64 {
+        self.shared.shed.load(Ordering::SeqCst)
+    }
+
+    /// Re-tune the node-wide send-backlog cap (tests / testnet), as
+    /// [`Self::set_inbound_cap`] does for connections.
+    pub fn set_send_backlog_total_cap(&self, cap: u64) {
+        self.shared.send_budget.cap.store(cap, Ordering::SeqCst);
+    }
+
     /// Re-tune the no-progress window (tests / testnet). Deliberately programmatic
     /// rather than a config key: like the rate limits, this number should move
     /// because a measurement said so.
@@ -835,7 +989,7 @@ impl TcpTransport {
         // `O_NONBLOCK` would follow it) — the send timeout does not.
         let _ = stream.set_write_timeout(Some(Duration::from_millis(SEND_WRITE_TIMEOUT_MS)));
         let writer = stream.try_clone().expect("clone tcp stream for writing");
-        shared.writers.lock().unwrap().insert(id, PeerWriter::new(writer));
+        shared.writers.lock().unwrap().insert(id, PeerWriter::new(writer, Arc::clone(&shared.send_budget)));
         if inbound {
             shared.inbound.lock().unwrap().insert(id);
         }
@@ -928,6 +1082,32 @@ impl Transport for TcpTransport {
     fn send(&self, to: PeerId, frame: &[u8]) -> Result<(), TransportError> {
         let now = self.shared.now_ms();
         let mut writers = self.shared.writers.lock().unwrap();
+        if !writers.contains_key(&to) {
+            return Err(TransportError::NotConnected(to));
+        }
+        // Lab #785 F5-5a (W3): at the node-wide cap, shed the connection that
+        // holds the most backlog (ties: the oldest last accepted write) until
+        // this frame fits, instead of refusing a healthy peer's frame. A frame
+        // larger than the whole cap sheds nobody; its own writer refuses it.
+        let len = frame.len() as u64;
+        let budget = Arc::clone(&self.shared.send_budget);
+        while len <= budget.cap.load(Ordering::SeqCst)
+            && budget.used.load(Ordering::SeqCst) + len > budget.cap.load(Ordering::SeqCst)
+        {
+            let candidates: Vec<(PeerId, u64, Option<u64>)> = writers
+                .iter()
+                .map(|(id, w)| (*id, w.pending.len() as u64, w.progress.last_accept_ms()))
+                .collect();
+            let Some(victim) = shed_choice(&candidates) else { break };
+            if let Some(w) = writers.remove(&victim) {
+                self.shared.evicting.lock().unwrap().insert(victim);
+                self.shared.shed.fetch_add(1, Ordering::SeqCst);
+                let _ = w.stream.shutdown(std::net::Shutdown::Both);
+            }
+            if victim == to {
+                return Err(TransportError::NotConnected(to));
+            }
+        }
         let w = writers.get_mut(&to).ok_or(TransportError::NotConnected(to))?;
         // Serialised by the writers lock, so frames never interleave on a socket —
         // and now bounded in time as well: a peer that stopped reading costs one
@@ -1195,6 +1375,8 @@ mod tests {
         Arc::new(TcpShared {
             inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
+            send_budget: Arc::new(SendBudget::new()),
+            shed: AtomicU64::new(0),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
@@ -1436,7 +1618,9 @@ mod tests {
         assert!(fill_until_backlog(&client, pid, 40) > 0, "buffers larger than expected");
 
         let frame = fat_frame();
-        for _ in 0..20 {
+        // Enough frames to reach the cap, whatever it is (lab #785 F5-5a:
+        // 16 → 32 MiB).
+        for _ in 0..(MAX_SEND_BACKLOG_BYTES_PER_PEER / frame.len() as u64 + 4) {
             let _ = client.send(pid, &frame);
         }
         let backlog = client.backlog_bytes(pid);
@@ -1454,6 +1638,144 @@ mod tests {
 
         client.shutdown();
         drop(listener);
+    }
+
+    /// A connected pair: our end and the raw peer end.
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (theirs, _) = l.accept().unwrap();
+        (ours, theirs)
+    }
+
+    /// Lab #785 F5-5a item 2: a header declaring the maximum payload, then
+    /// silence, holds one growth step — not the frame — and ends at the
+    /// deadline; a body that stalls part-way holds what arrived, plus a step.
+    #[test]
+    fn a_declared_frame_is_not_allocated_before_it_arrives() {
+        let max = crate::wire::MAX_PAYLOAD;
+        let hdr = |len: u32| {
+            let mut h = Envelope::new(MsgType::Ping, vec![]).encode();
+            h[8..12].copy_from_slice(&len.to_le_bytes());
+            h.truncate(HEADER_LEN);
+            h
+        };
+        // Header only.
+        let (mut ours, mut theirs) = tcp_pair();
+        theirs.write_all(&hdr(max)).unwrap();
+        let mut frame = Vec::new();
+        let err = read_frame_into(&mut ours, &mut frame, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(frame.capacity() <= HEADER_LEN + 2 * FRAME_READ_STEP, "held {} for a body never sent", frame.capacity());
+        // 200 KiB of body, then a stall.
+        let (mut ours, mut theirs) = tcp_pair();
+        theirs.write_all(&hdr(max)).unwrap();
+        theirs.write_all(&vec![7u8; 200 * 1024]).unwrap();
+        let mut frame = Vec::new();
+        let err = read_frame_into(&mut ours, &mut frame, Duration::from_millis(500)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(frame.capacity() <= 2 * (HEADER_LEN + 200 * 1024 + FRAME_READ_STEP), "held {}", frame.capacity());
+        assert!((max as usize) > 8 * frame.capacity(), "far below the declared frame");
+        assert_eq!((FRAME_READ_STEP, FRAME_READ_DEADLINE_MS), (64 * 1024, 120_000));
+    }
+
+    /// Lab #785 F5-5a item 2: a slow but steady sender inside the deadline is
+    /// read whole, byte-exact; an idle gap BEFORE a frame is not counted.
+    #[test]
+    fn a_slow_frame_inside_the_deadline_is_read_whole() {
+        let (mut ours, mut theirs) = tcp_pair();
+        let payload: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let want = Envelope::new(MsgType::Ping, payload).encode();
+        let send = want.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400)); // idle before the frame
+            for chunk in send.chunks(50 * 1024) {
+                theirs.write_all(chunk).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            theirs
+        });
+        let mut frame = Vec::new();
+        read_frame_into(&mut ours, &mut frame, Duration::from_millis(2_000)).unwrap();
+        assert_eq!(frame, want);
+        drop(writer.join().unwrap());
+    }
+
+    /// Lab #785 F5-5a (W3): at the node-wide send cap the connection holding
+    /// the most backlog is shed and the frame to a healthy peer goes through —
+    /// a slow reader exhausts only itself. Two backlogged peers (listeners that
+    /// never read); a third, reading peer; the cap set to what A and B hold.
+    #[test]
+    fn at_the_global_cap_the_largest_backlog_is_shed_not_a_healthy_frame() {
+        let (la, lb) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let healthy = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let a = client.connect(&la.local_addr().unwrap().to_string()).unwrap();
+        let b = client.connect(&lb.local_addr().unwrap().to_string()).unwrap();
+        let c = client.connect(&healthy.local_addr().to_string()).unwrap();
+        assert!(fill_until_backlog(&client, a, 40) > 0 && fill_until_backlog(&client, b, 40) > 0, "buffers larger than expected");
+        let frame = fat_frame();
+        let _ = client.send(a, &frame); // a holds more than b
+        assert!(client.backlog_bytes(a) > client.backlog_bytes(b));
+        assert_eq!(client.total_backlog_bytes(), client.backlog_bytes(a) + client.backlog_bytes(b));
+        client.set_send_backlog_total_cap(client.total_backlog_bytes());
+        // A frame to the healthy peer would cross the cap: a is shed, not it.
+        client.send(c, &frame).expect("the healthy peer's frame is not refused");
+        assert_eq!(client.shed_count(), 1);
+        assert!(!client.peers().contains(&a), "the largest backlog was shed");
+        assert!(client.peers().contains(&b) && client.peers().contains(&c));
+        assert!(client.total_backlog_bytes() <= client.shared.send_budget.cap.load(Ordering::SeqCst));
+        let start = Instant::now();
+        let mut got = Vec::new();
+        while got.is_empty() && start.elapsed() < Duration::from_secs(10) {
+            got = healthy.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(got.len(), 1, "and it arrived");
+        client.shutdown();
+        healthy.shutdown();
+        drop((la, lb));
+    }
+
+    /// Lab #785 F5-5a (W3): the shed choice — the largest backlog; among
+    /// equals the oldest last accepted write (never counts as oldest); no
+    /// connection without a backlog is ever chosen.
+    #[test]
+    fn the_shed_choice_is_the_largest_backlog_then_the_oldest_write() {
+        let p = PeerId;
+        assert_eq!(shed_choice(&[(p(1), 10, Some(5)), (p(2), 30, Some(9)), (p(3), 20, None)]), Some(p(2)));
+        assert_eq!(shed_choice(&[(p(1), 30, Some(5)), (p(2), 30, Some(9))]), Some(p(1)), "older write first");
+        assert_eq!(shed_choice(&[(p(1), 30, Some(5)), (p(2), 30, None)]), Some(p(2)), "never accepted is oldest");
+        assert_eq!(shed_choice(&[(p(1), 0, None), (p(2), 0, Some(1))]), None, "an idle peer is never shed");
+        assert_eq!(shed_choice(&[]), None);
+    }
+
+    /// Lab #785 F5-5a: the counter returns to exactly zero — never negative
+    /// (it would wrap to near `u64::MAX`), never leaking — when a backlogged
+    /// connection is closed by us and when it dies under us (the peer resets).
+    #[test]
+    fn the_global_send_backlog_returns_to_zero_on_any_disconnect() {
+        let (la, lb) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let a = client.connect(&la.local_addr().unwrap().to_string()).unwrap();
+        let b = client.connect(&lb.local_addr().unwrap().to_string()).unwrap();
+        assert!(fill_until_backlog(&client, a, 40) > 0 && fill_until_backlog(&client, b, 40) > 0, "buffers larger than expected");
+        let before_b = client.backlog_bytes(b);
+        // Ours: a clean close releases a's whole remainder.
+        client.disconnect(a);
+        assert_eq!(client.total_backlog_bytes(), before_b);
+        // Abnormal: b's listener goes away without ever accepting; the reader
+        // thread sees the reset and removes the writer.
+        drop(lb);
+        let start = Instant::now();
+        while client.backlog_bytes(b) > 0 && start.elapsed() < Duration::from_secs(10) {
+            let _ = client.send(b, &fat_frame());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(client.backlog_bytes(b), 0, "the dead connection's writer is gone");
+        assert_eq!(client.total_backlog_bytes(), 0, "nothing leaked, nothing went negative");
+        client.shutdown();
+        drop(la);
     }
 
     #[test]

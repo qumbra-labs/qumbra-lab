@@ -85,7 +85,8 @@ pub const MSG_REFILL_PER_SEC: u64 = 64;
 /// 2 × [`crate::wire::MAX_PAYLOAD`] so that a single legal maximum-size frame can
 /// never on its own exhaust the budget — a limit that a well-formed message trips
 /// by existing would be a liveness bug wearing a security hat.
-pub const BYTE_BURST: u64 = 16 * 1024 * 1024;
+pub const BYTE_BURST: u64 = 32 * 1024 * 1024;
+const _: () = assert!(BYTE_BURST == 2 * crate::wire::MAX_PAYLOAD as u64, "one maximum frame never exhausts the burst");
 
 /// Sustained inbound **byte** rate per rate key.
 ///
@@ -185,16 +186,18 @@ pub const MAX_GETDATA_ITEMS: usize = 256;
 /// items past it degrade to header-only, exactly as past
 /// `crate::node::MAX_BODIES_PER_GETDATA`.
 ///
-/// 8 MiB = one second of the peer's own inbound byte budget
-/// ([`BYTE_REFILL_PER_SEC`]) and half its burst ([`BYTE_BURST`]) — the answer a
+/// Half the asker's inbound burst ([`BYTE_BURST`]) and one frame — the answer a
 /// single request may provoke can never exceed what the asker's inbound limiter
-/// admits in the second it arrives, so an honest server is never spending
-/// bandwidth on frames the asker's own throttle will drop. At T0 coinbase-only
+/// admits at once, so an honest server is never spending bandwidth on frames the
+/// asker's own throttle will drop. (Until lab #785 F5-5a this was also "one
+/// second of [`BYTE_REFILL_PER_SEC`]"; the frame doubled and the refill rate,
+/// which is the sustained bandwidth, did not — Q-5a-1.) At T0 coinbase-only
 /// sizes this cap is unreachable (16 bodies ≈ 3 KB); at FROZEN v1.0 tx sizes it
 /// binds at ~55 single-tx bodies, still above the 16-body count cap.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
-pub const MAX_BODY_BYTES_PER_GETDATA: u64 = 8 * 1024 * 1024;
+pub const MAX_BODY_BYTES_PER_GETDATA: u64 = 16 * 1024 * 1024;
+const _: () = assert!(MAX_BODY_BYTES_PER_GETDATA == BYTE_BURST / 2, "half the asker's burst");
 
 /// Burst of **served body bytes** one rate key may draw at once (issue #371 S3).
 ///
@@ -205,7 +208,8 @@ pub const MAX_BODY_BYTES_PER_GETDATA: u64 = 8 * 1024 * 1024;
 /// is degraded to headers.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
-pub const BODY_SERVE_BYTE_BURST: u64 = 16 * 1024 * 1024;
+pub const BODY_SERVE_BYTE_BURST: u64 = 32 * 1024 * 1024;
+const _: () = assert!(BODY_SERVE_BYTE_BURST == BYTE_BURST, "the serve burst mirrors the inbound one");
 
 /// Sustained **served body bytes** per rate key (issue #371 S3). Mirrors
 /// [`BYTE_REFILL_PER_SEC`] — see [`BODY_SERVE_BYTE_BURST`] for why the two sides

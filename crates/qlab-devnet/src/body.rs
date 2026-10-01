@@ -102,6 +102,15 @@ pub const BODY_PREIMAGE_DOMAIN_V6: &[u8] = b"qumbra:body:v6";
 /// #790). N-payee apply is its own baton, and that baton raises this cap.
 pub const COINBASE_PAYEE_CAP_V6: usize = 1;
 
+/// **The V6 body bound** (lab #785 F5-5a, ruling Q-5-1 as amended): a V6
+/// body's canonical bytes — exactly what [`BlockBody::commitment_v6`] hashes,
+/// [`BlockBody::preimage_v6`] — may not exceed this. A consensus rule,
+/// intrinsic: a block that cannot be relayed in one frame is not valid.
+/// qlab-p2p ties it to the frame (`MAX_V6_BODY_BYTES + FRAME_OVERHEAD_BOUND ≤
+/// MAX_PAYLOAD`, asserted there, where the wire codec lives).
+/// `[devnet-placeholder]`, NOT frozen.
+pub const MAX_V6_BODY_BYTES: usize = 15 * 1024 * 1024;
+
 /// The maximum v5 coinbase payee count after the cap rule activates.
 ///
 /// Eight is the ruled pool split: large enough to reduce payout variance for a
@@ -570,7 +579,14 @@ impl BlockBody {
     /// v6 tag, plus the two section tail. The V6 payee cap is native
     /// ([`COINBASE_PAYEE_CAP_V6`]).
     pub fn commitment_v6(&self) -> Hash32 {
-        keccak256(&self.preimage_form(BodyPreimageForm::V6, COINBASE_PAYEE_CAP_V6))
+        keccak256(&self.preimage_v6())
+    }
+
+    /// The **v6** body's canonical bytes — the preimage
+    /// [`BlockBody::commitment_v6`] hashes, and what [`MAX_V6_BODY_BYTES`]
+    /// measures (lab #785 F5-5a): one encoder for both.
+    pub fn preimage_v6(&self) -> Vec<u8> {
+        self.preimage_form(BodyPreimageForm::V6, COINBASE_PAYEE_CAP_V6)
     }
 
     /// The **v5** body commitment (lab #470). Stage-2 state: not yet
@@ -818,6 +834,9 @@ pub enum BodyError {
     /// F5-4b), named by the step that refused it. A node with no bundle rule
     /// refuses every bundle with [`BundleRefusal::NoRule`].
     Bundle { refusal: BundleRefusal },
+    /// A V6 body whose canonical bytes exceed [`MAX_V6_BODY_BYTES`] (lab #785
+    /// F5-5a): it could not travel in one frame.
+    BodyTooLarge { got: usize, cap: usize },
     /// **V6's anchor rule**: the tx at `index` names a root that is not a
     /// commitment root at some ancestor height `h` with `h ≤` the block's
     /// recorded finality and `H − h ≤ MAX_ANCHOR_AGE_BLOCKS`.
@@ -1286,7 +1305,9 @@ pub fn v6_anchor_ok(heights: &[u64], block_h: u64, recorded: Option<u64>) -> boo
 }
 
 /// The V6 header/body binding: the payee cap first (so the preimage's cap
-/// assert is unreachable from a peer), then [`BlockBody::commitment_v6`].
+/// assert is unreachable from a peer), then the body bound
+/// ([`MAX_V6_BODY_BYTES`], lab #785 F5-5a) over the same bytes, then
+/// [`BlockBody::commitment_v6`] — one preimage, measured and hashed.
 pub fn check_body_binding_v6(header: &BlockHeader, body: &BlockBody) -> Result<(), BodyError> {
     if body.coinbase_payees.len() > COINBASE_PAYEE_CAP_V6 {
         return Err(BodyError::TooManyCoinbasePayees {
@@ -1294,7 +1315,11 @@ pub fn check_body_binding_v6(header: &BlockHeader, body: &BlockBody) -> Result<(
             cap: COINBASE_PAYEE_CAP_V6,
         });
     }
-    let got = body.commitment_v6();
+    let pre = body.preimage_v6();
+    if pre.len() > MAX_V6_BODY_BYTES {
+        return Err(BodyError::BodyTooLarge { got: pre.len(), cap: MAX_V6_BODY_BYTES });
+    }
+    let got = keccak256(&pre);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch { expected: header.tx_body_commitment, got });
     }
@@ -3442,6 +3467,27 @@ mod tests {
             let one = BlockBody::from_single_payee(vec![], coinbase_exact(h), MINER_RKM);
             assert_eq!(v6(h, &one, &cv), Ok(()), "height {h}");
         }
+    }
+
+    /// Lab #785 F5-5a, the V6 body bound: measured on the body's own canonical
+    /// bytes (`preimage_v6`, what the commitment hashes). Exactly at
+    /// [`MAX_V6_BODY_BYTES`] binds; one byte over is refused by name — by the
+    /// binding check, and through the V6 funnel before any section rule runs.
+    #[test]
+    fn a_v6_body_over_its_byte_bound_is_refused_by_name() {
+        assert_eq!(MAX_V6_BODY_BYTES, 15 * 1024 * 1024);
+        let fixed = BlockBody::default().preimage_v6().len();
+        let mut at = BlockBody::default();
+        at.bundle = vec![7; MAX_V6_BODY_BYTES - fixed];
+        assert_eq!(at.preimage_v6().len(), MAX_V6_BODY_BYTES);
+        assert_eq!(check_body_binding_v6(&header_v6(1, &at), &at), Ok(()));
+        let mut over = at.clone();
+        over.bundle.push(7);
+        let want = Err(BodyError::BodyTooLarge { got: MAX_V6_BODY_BYTES + 1, cap: MAX_V6_BODY_BYTES });
+        let header = header_v6(1, &over);
+        assert_eq!(check_body_binding_v6(&header, &over), want);
+        let cv = Cv { recorded: None, anchor_heights: vec![] };
+        assert_eq!(validate_body_v6(&header, &over, &MockVerifier, &cv, &RefuseAllBundles, &names::EmptyNameView), want);
     }
 
     /// 🔒 With no bundle rule every bundle is refused (ruling condition (b)):

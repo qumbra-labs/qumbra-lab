@@ -64,7 +64,9 @@ pub const MAX_RETAINED_BODIES: usize =
 /// against different assumptions. Weight is the same crude sum the P2P side meters
 /// with (proof bytes + 32 per nullifier/commitment + per-tx overhead), not a
 /// serialization — this runs on a rewind and must not cost one.
-pub const MAX_RETAINED_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// 64 MiB since lab #785 F5-5a, with `MAX_PENDING_BODY_BYTES` (asserted on the
+/// qlab-p2p side, which can see both).
+pub const MAX_RETAINED_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// **Blocks this node has APPLIED AT SOME POINT and still holds, whether or not
 /// they are in the applied chain right now** (issue #198).

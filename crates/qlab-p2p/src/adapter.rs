@@ -594,7 +594,12 @@ pub const MAX_PENDING_BODIES: usize = 512;
 /// would admit millions of entries; a proof-carrying body is ~145 kB (#135's
 /// measurement), so an entry cap alone would admit ~74 MB per 512 entries on hosts
 /// sized for a coinbase-only chain. The binding cap is whichever bites first.
-pub const MAX_PENDING_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// 64 MiB since lab #785 F5-5a (Q-C5, with the frame).
+pub const MAX_PENDING_BODY_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(
+    MAX_PENDING_BODY_BYTES == qlab_node::MAX_RETAINED_BODY_BYTES,
+    "the two body queues are sized against the same assumption (qlab-node's doc)"
+);
 
 /// What a duty refused for state lag says (issue #130 (a)). Named because it is a
 /// node declaring its own view stale, which is a different statement from any
@@ -2617,6 +2622,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // and it is what takes AnchorOutsideRecord out of #134's amnesty
             // where AnchorNotFinal stays in it.
             BodyError::SectionOnForm { .. }
+            // Lab #785 F5-5a: the body bound reads the body's own bytes.
+            | BodyError::BodyTooLarge { .. }
             | BodyError::FinalityRecord { .. }
             | BodyError::AnchorOutsideRecord { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #785 F5-4b, the bundle rule: every step reads the bundle's
@@ -5581,7 +5588,9 @@ mod tests {
         // The byte budget bites first when bodies carry proofs.
         let (mut b, anchor) = adapter_with_finalized_genesis();
         let mut fat = BlockBody::from_single_payee(vec![tx_with(anchor, 1, b"ok")], 0, [0; 4]);
-        fat.txs[0].proof = vec![0u8; 2 * 1024 * 1024];
+        // Sized from the budget (lab #785 F5-5a: 32 → 64 MiB): 23 of these
+        // are well past it.
+        fat.txs[0].proof = vec![0u8; MAX_PENDING_BODY_BYTES / 16];
         for height in 1..24u64 {
             b.buffer_body(header_at(height), fat.clone());
         }

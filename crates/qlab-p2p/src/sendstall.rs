@@ -12,16 +12,22 @@
 //! the socket — not on any decision the node made — and every field on node2's own
 //! TELEMETRY read healthy throughout (`slag=0 mready=synced peers=6 dialable=3/3`).
 //!
-//! ## The signal is *no progress*, not *slowness*
+//! ## The signal is a drain floor per window (lab #785 F5-5a, W3)
 //!
 //! This module holds one small state machine per connection, and its whole
 //! discipline is in [`SendProgress::observe`]:
 //!
-//! * bytes the kernel **accepted** restart the window, however few and however
-//!   slowly they arrive — a merely-slow WAN link never trips this;
+//! * a backlog must drain at least [`SEND_DRAIN_FLOOR_BYTES`] per
+//!   [`SEND_STALL_WINDOW_MS`]; reaching the floor restarts the window — a
+//!   merely-slow WAN link (any rate above ≈ 550 B/s) never trips this;
 //! * a backlog that drains to empty clears the state entirely;
-//! * only a backlog that sits with **zero** accepted bytes for
-//!   [`SEND_STALL_WINDOW_MS`] is a stall.
+//! * a backlog that does not reach the floor within one window is a stall.
+//!
+//! *(Until F5-5a the rule was "any accepted byte restarts the window" — the
+//! signal was no-progress, not slowness. With the node-wide send budget that
+//! became an attack: a reader accepting one byte per window pinned a full
+//! per-peer backlog forever and, four of them, the whole budget. The floor is
+//! far below any honest link and far above a trickle.)*
 //!
 //! A false close on a healthy link is its own liveness cost, so the bias is
 //! deliberately toward leaving connections alone. What a stall verdict costs when
@@ -92,7 +98,27 @@ pub const SEND_STALL_MIN_BACKLOG_BYTES: u64 = 1;
 /// of malice, and the connection carries on until the *window* rules on it. The
 /// backlog never holds a partial frame it did not already start sending, so
 /// dropping at this boundary cannot desynchronise the peer's framing.
-pub const MAX_SEND_BACKLOG_BYTES_PER_PEER: u64 = 16 * 1024 * 1024;
+pub const MAX_SEND_BACKLOG_BYTES_PER_PEER: u64 = 32 * 1024 * 1024;
+
+/// **Maximum undelivered bytes held across ALL peers** (lab #785 F5-5a, Q-C5).
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// The per-peer cap bounds one queue; nothing bounded the sum, so a node serving
+/// bundle blocks to every connected peer could hold `peers ×` 32 MiB. 128 MiB is
+/// four peers' worth of full backlogs. At it the transport sheds the
+/// connection holding the most backlog (W3) rather than refuse a healthy
+/// peer's frame; a frame larger than the whole cap is refused whole.
+/// F5-6 measures node RSS serving bundle blocks before it is called safe.
+pub const MAX_SEND_BACKLOG_BYTES_TOTAL: u64 = 128 * 1024 * 1024;
+
+/// **The bytes a backlog must drain per [`SEND_STALL_WINDOW_MS`]** (lab #785
+/// F5-5a, W3). `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// 64 KiB per two minutes is ≈ 550 B/s — orders of magnitude below any link
+/// that carries this protocol at all, and far above a reader that trickles a
+/// byte at a time to keep a 32 MiB backlog pinned.
+pub const SEND_DRAIN_FLOOR_BYTES: u64 = 64 * 1024;
+const _: () = assert!(MAX_SEND_BACKLOG_BYTES_TOTAL >= MAX_SEND_BACKLOG_BYTES_PER_PEER);
 
 /// One connection's send-progress state — the send-side half of "is this socket
 /// carrying anything".
@@ -100,9 +126,15 @@ pub const MAX_SEND_BACKLOG_BYTES_PER_PEER: u64 = 16 * 1024 * 1024;
 pub struct SendProgress {
     /// Bytes handed to us that the kernel has not taken.
     backlog: u64,
-    /// When the current zero-progress window started. `None` whenever the backlog
-    /// is empty — nothing undelivered is not a stall, it is an idle socket.
+    /// When the current window started. `None` whenever the backlog is empty —
+    /// nothing undelivered is not a stall, it is an idle socket.
     stalled_since_ms: Option<u64>,
+    /// Bytes drained in the current window (lab #785 F5-5a): reaching
+    /// [`SEND_DRAIN_FLOOR_BYTES`] restarts the window.
+    drained_in_window: u64,
+    /// When the kernel last accepted any byte (the node-wide shed's tie-break:
+    /// oldest first). `None` if it never has.
+    last_accept_ms: Option<u64>,
     /// Whole frames refused because the backlog was at its cap (ops only, never
     /// a scoring input).
     dropped_frames: u64,
@@ -119,14 +151,32 @@ impl SendProgress {
     /// The three-way rule is the whole policy — see the module docs.
     pub fn observe(&mut self, now_ms: u64, accepted: u64, backlog: u64) {
         self.backlog = backlog;
+        if accepted > 0 {
+            self.last_accept_ms = Some(now_ms);
+        }
         if backlog == 0 {
             // Fully delivered: there is nothing to be stalled about.
             self.stalled_since_ms = None;
-        } else if accepted > 0 || self.stalled_since_ms.is_none() {
-            // Progress restarts the window; so does the first byte that fails to
-            // go out. "Slow" therefore never accumulates into "stalled".
-            self.stalled_since_ms = Some(now_ms);
+            self.drained_in_window = 0;
+            return;
         }
+        if self.stalled_since_ms.is_none() {
+            // The first byte that fails to go out opens a window.
+            self.stalled_since_ms = Some(now_ms);
+            self.drained_in_window = 0;
+        }
+        self.drained_in_window = self.drained_in_window.saturating_add(accepted);
+        if self.drained_in_window >= SEND_DRAIN_FLOOR_BYTES {
+            // The floor met: a fresh window (lab #785 F5-5a, W3).
+            self.stalled_since_ms = Some(now_ms);
+            self.drained_in_window = 0;
+        }
+    }
+
+    /// When the kernel last accepted a byte of this connection's (lab #785
+    /// F5-5a); `None` if never.
+    pub fn last_accept_ms(&self) -> Option<u64> {
+        self.last_accept_ms
     }
 
     /// Record a whole frame refused at the backlog cap.
@@ -144,8 +194,8 @@ impl SendProgress {
         self.dropped_frames
     }
 
-    /// How long this connection has held a backlog without the kernel taking a
-    /// single byte. `0` when there is nothing undelivered.
+    /// How long this connection's current window has run without draining the
+    /// floor. `0` when there is nothing undelivered.
     pub fn stalled_for_ms(&self, now_ms: u64) -> u64 {
         match self.stalled_since_ms {
             Some(t) => now_ms.saturating_sub(t),
@@ -154,7 +204,8 @@ impl SendProgress {
     }
 
     /// **The decision.** A connection is stalled when it holds at least
-    /// [`SEND_STALL_MIN_BACKLOG_BYTES`] and has made no progress for `window_ms`.
+    /// [`SEND_STALL_MIN_BACKLOG_BYTES`] and has not drained
+    /// [`SEND_DRAIN_FLOOR_BYTES`] within `window_ms`.
     ///
     /// `window_ms` is a parameter rather than the constant so the transport can be
     /// re-tuned (and so tests do not have to wait two minutes for a verdict).
@@ -193,26 +244,37 @@ mod tests {
         assert_eq!(p.stalled_for_ms(SEND_STALL_WINDOW_MS), SEND_STALL_WINDOW_MS);
     }
 
+    /// Lab #785 F5-5a, W3 — the inversion of #289's "any accepted byte
+    /// restarts the window": a reader trickling a byte just inside every
+    /// window is stalled when the first window closes without the floor.
     #[test]
-    fn any_accepted_byte_restarts_the_window() {
-        // The task's central constraint: the signal is no-progress, not slowness.
-        // This socket is pathologically slow — one byte per window — and must
-        // never be dropped.
+    fn a_one_byte_per_window_reader_is_stalled() {
         let mut p = SendProgress::new();
-        let mut now = 0u64;
-        p.observe(now, 0, 1_000_000);
-        for _ in 0..10 {
-            now += SEND_STALL_WINDOW_MS - 1;
-            assert!(!p.is_stalled(now, SEND_STALL_WINDOW_MS));
-            p.observe(now, 1, 999_999);
-            assert!(
-                !p.is_stalled(now, SEND_STALL_WINDOW_MS),
-                "a single accepted byte is progress and restarts the clock"
-            );
+        p.observe(0, 0, 1_000_000);
+        p.observe(SEND_STALL_WINDOW_MS - 1, 1, 999_999);
+        assert!(!p.is_stalled(SEND_STALL_WINDOW_MS - 1, SEND_STALL_WINDOW_MS));
+        assert!(p.is_stalled(SEND_STALL_WINDOW_MS, SEND_STALL_WINDOW_MS), "one byte is not the floor");
+        assert_eq!(p.last_accept_ms(), Some(SEND_STALL_WINDOW_MS - 1));
+        assert_eq!(SEND_DRAIN_FLOOR_BYTES, 64 * 1024);
+    }
+
+    /// Lab #785 F5-5a, W3: a slow but honest link — the floor drained in
+    /// every window, in small pieces — is never stalled, however long the
+    /// backlog lasts; partial drains add up within a window.
+    #[test]
+    fn draining_the_floor_each_window_is_never_stalled() {
+        let mut p = SendProgress::new();
+        let (mut now, mut backlog) = (0u64, 40 * SEND_DRAIN_FLOOR_BYTES);
+        p.observe(now, 0, backlog);
+        for _ in 0..20 {
+            for _ in 0..4 {
+                now += SEND_STALL_WINDOW_MS / 5;
+                backlog -= SEND_DRAIN_FLOOR_BYTES / 4;
+                p.observe(now, SEND_DRAIN_FLOOR_BYTES / 4, backlog);
+                assert!(!p.is_stalled(now, SEND_STALL_WINDOW_MS), "at {now}");
+            }
         }
-        // …and the moment progress stops, the window runs from *that* point.
-        assert!(!p.is_stalled(now + SEND_STALL_WINDOW_MS - 1, SEND_STALL_WINDOW_MS));
-        assert!(p.is_stalled(now + SEND_STALL_WINDOW_MS, SEND_STALL_WINDOW_MS));
+        assert!(p.backlog() > 0, "still owed, never stalled");
     }
 
     #[test]

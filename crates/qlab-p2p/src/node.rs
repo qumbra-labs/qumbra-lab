@@ -230,12 +230,15 @@ pub const MAX_SERVED_BODIES: usize = 128;
 /// budget alone would admit ~200k entries; a proof-carrying body is ~145,754 B
 /// per tx at FROZEN v1.0 sizes, so the entry cap alone would admit ~19 MB at
 /// 1 tx/block and ~187 MB at 10 tx/block — on `t4g.small` hosts whose whole
-/// process measured ~262 MiB in the Phase B-lite soak. 8 MiB is ~57 single-tx
-/// bodies (~71 min of chain) or ~5 ten-tx bodies (~6 min), all far beyond the
-/// relay round-trip the cache serves, and 0.4 % of a 2 GB host.
+/// process measured ~262 MiB in the Phase B-lite soak. The original 8 MiB was
+/// ~57 single-tx bodies (~71 min of chain) or ~5 ten-tx bodies (~6 min), all
+/// far beyond the relay round-trip the cache serves, and 0.4 % of a 2 GB host.
+/// 24 MiB since lab
+/// #785 F5-5a (Q-C5): room for one bundle-bearing body (≤ 16 MiB) beside the
+/// ordinary ones.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
-pub const MAX_SERVED_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SERVED_BODY_BYTES: usize = 24 * 1024 * 1024;
 
 /// **How many block bodies this node will have outstanding at once** (issue
 /// #130 (c)) — the in-flight window of the historical-body requester.
@@ -279,8 +282,13 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 /// | cap | value | a 96-body window |
 /// |---|---|---|
 /// | [`crate::adapter::MAX_PENDING_BODIES`] | 512 entries | 96, 19 % |
-/// | [`crate::adapter::MAX_PENDING_BODY_BYTES`] | 32 MiB | 14.0 MB, 58 % margin |
-/// | [`crate::ratelimit::BYTE_BURST`] (our own inbound) | 16 MiB | 14.0 MB, 16 % margin |
+/// | [`crate::adapter::MAX_PENDING_BODY_BYTES`] | 64 MiB | 14.0 MB, 79 % margin |
+/// | [`crate::ratelimit::BYTE_BURST`] (our own inbound) | 32 MiB | 14.0 MB, 58 % margin |
+///
+/// *(Lab #785 F5-5a: both caps doubled with the frame, so the margins above
+/// grew. A V6 window holding a bundle-bearing body (≤ 16 MiB each, at most one
+/// per spacing window of 48 blocks) is the case this table does not size; F5-5b
+/// paces bundle-bearing bodies.)*
 ///
 /// The third row is the binding one and it is the row this constant exists for.
 /// The requester paces itself on the FRAME axis (see
@@ -289,7 +297,8 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 /// one axis over: a body dropped for bytes is dropped exactly as silently as one
 /// dropped for frames. 16 MiB ÷ 145,754 B is 115 bodies, so 96 — the largest
 /// multiple of [`MAX_BODIES_PER_GETDATA`] that keeps real margin — is the
-/// answer, and 128 (18.7 MB) would have been over it.
+/// answer, and 128 (18.7 MB) would have been over it. (Sized at the old 16 MiB
+/// burst; the burst is 32 MiB since lab #785 F5-5a and 96 is kept.)
 ///
 /// The first two rows matter for a different reason: over a pending cap
 /// `buffer_body` evicts the HIGHEST held entry, i.e. exactly the bodies a
@@ -2309,7 +2318,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // for a block we cannot serve (see `request_missing_bodies`), and it is the
         // only answer expressible: `InvItem` cannot hold a kind we do not have.
         self.count_unknown_inv(&inv);
-        // Issue #371 S3: one 8 MiB `GetData` can name ~250 k items, and every
+        // Issue #371 S3: one 16 MiB `GetData` frame can name ~500 k items (8 MiB
+        // and ~250 k before lab #785 F5-5a), and every
         // item costs a lookup and an answer. Items past the cap are IGNORED —
         // not `NotFound` (scored by the receiver on some paths), not headers
         // (that answer is itself the ~50 MB header-storm amplifier). An honest
@@ -3444,6 +3454,98 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #785 F5-5a: the V6 body bound's tie to the frame, on real
+    /// encodings. A body mixing proof-sized transactions, many tiny ones (the
+    /// per-transaction framing case), a rider, a finality record, a coinbase
+    /// payee and a frozen-lane-sized bundle encodes as a whole-block announce
+    /// in at most its canonical bytes plus `FRAME_OVERHEAD_BOUND`; a body
+    /// grown to exactly `MAX_V6_BODY_BYTES` encodes within `MAX_PAYLOAD`.
+    #[test]
+    fn a_v6_body_at_its_bound_fits_one_frame() {
+        use crate::compact::{encode_announce_for, WireForm, FRAME_OVERHEAD_BOUND};
+        use qlab_devnet::body::{CoinbasePayee, TxPublic, MAX_V6_BODY_BYTES};
+        use qlab_devnet::fees::ArityBucket;
+        use qlab_devnet::forms::GenesisForm;
+        let tx = |i: u32, proof_len: usize, n: usize| {
+            let k = (i % 251) as u8;
+            TxEntry::with_placeholder_discovery(
+                vec![k; proof_len],
+                TxPublic {
+                    anchor: [k; 32],
+                    nullifiers: vec![[k; 32]; n],
+                    commitments: vec![[k.wrapping_add(1); 32]; n],
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: 1,
+                },
+            )
+        };
+        let mut txs: Vec<TxEntry> = (0..3).map(|i| tx(i, 145_754, 3)).collect();
+        txs.extend((3..5_003).map(|i| tx(i, 0, 1)));
+        txs[4].rider = vec![9; 40];
+        let mut body = BlockBody {
+            txs,
+            coinbase_payees: vec![CoinbasePayee { rkm: [5; 4], amount: 7 }],
+            finality: vec![3; 2_000],
+            bundle: vec![1; 8_281_292],
+        };
+        let header = BlockHeader::genesis_for(GenesisForm::V5, 0, 0);
+        let wire_len = |b: &BlockBody| {
+            let ann = whole_block_announce(crate::codec::WireHeader::L1(header), b.clone());
+            encode_announce_for(WireForm::V6, &ann).map(|w| w.len())
+        };
+        // The encoder refuses a bundle until F5-5b, so the bundle-free body is
+        // encoded and the bundle added at its wire cost: its bytes plus a
+        // length varint of ≤ 4 B in place of the empty section's 1 B (+4 is
+        // conservative by one).
+        let bundle = std::mem::take(&mut body.bundle);
+        let pre = |b: &BlockBody, extra: usize| b.preimage_v6().len() + extra;
+        let w = wire_len(&body).expect("bundle-free V6 body encodes") + bundle.len() + 4;
+        assert!(w <= pre(&body, bundle.len()) + FRAME_OVERHEAD_BOUND, "announce {w} vs preimage {}", pre(&body, bundle.len()));
+        // Grown to exactly the bound with section bytes.
+        let room = MAX_V6_BODY_BYTES - body.preimage_v6().len();
+        body.finality = vec![3; room + body.finality.len()];
+        assert_eq!(body.preimage_v6().len(), MAX_V6_BODY_BYTES);
+        let w = wire_len(&body).expect("a body at the bound encodes");
+        assert!(w <= MAX_V6_BODY_BYTES + FRAME_OVERHEAD_BOUND && w <= crate::wire::MAX_PAYLOAD as usize, "{w}");
+    }
+
+    /// Lab #785 F5-5a (pre-review W4): the derivation itself, where the 4 KiB
+    /// slack cannot hide it — one proof-sized transaction with a rider, one
+    /// payee, and a section-dominated body grown to exactly the bound: the
+    /// whole-block announce is at most its canonical bytes + 110 B (the
+    /// derived +96, with room for the per-tx terms).
+    #[test]
+    fn the_announce_overhead_derivation_holds_on_a_one_tx_body() {
+        use crate::compact::{encode_announce_for, WireForm};
+        use qlab_devnet::body::{CoinbasePayee, TxPublic, MAX_V6_BODY_BYTES};
+        use qlab_devnet::fees::ArityBucket;
+        use qlab_devnet::forms::GenesisForm;
+        let mut tx = TxEntry::with_placeholder_discovery(
+            vec![5; 145_754],
+            TxPublic {
+                anchor: [5; 32],
+                nullifiers: vec![[6; 32]; 3],
+                commitments: vec![[7; 32]; 2],
+                bucket: ArityBucket::TwoByTwo,
+                fee: 1,
+            },
+        );
+        tx.rider = vec![9; 40];
+        let mut body = BlockBody {
+            txs: vec![tx],
+            coinbase_payees: vec![CoinbasePayee { rkm: [5; 4], amount: 7 }],
+            finality: Vec::new(),
+            bundle: Vec::new(),
+        };
+        body.finality = vec![3; MAX_V6_BODY_BYTES - body.preimage_v6().len()];
+        let pre = body.preimage_v6().len();
+        assert_eq!(pre, MAX_V6_BODY_BYTES);
+        let header = BlockHeader::genesis_for(GenesisForm::V5, 0, 0);
+        let ann = whole_block_announce(crate::codec::WireHeader::L1(header), body);
+        let wire = encode_announce_for(WireForm::V6, &ann).expect("encodes").len();
+        assert!(wire <= pre + 110, "announce {wire} vs preimage {pre}: the derivation's +96 does not hold");
+    }
     use crate::codec::encode_headers;
     use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, StubNode, TxPool};
     use crate::transport::{
@@ -4732,11 +4834,13 @@ mod tests {
     #[test]
     fn serving_cache_byte_budget_binds_and_keeps_at_least_one_body() {
         let mut c = ServedBodies::new();
-        let three_mib = 3 * 1024 * 1024;
-        let h1 = cache_insert(&mut c, 1, three_mib);
-        let h2 = cache_insert(&mut c, 2, three_mib);
-        assert_eq!(c.len(), 2, "6 MiB fits the 8 MiB budget");
-        let h3 = cache_insert(&mut c, 3, three_mib);
+        // Sized from the budget (lab #785 F5-5a: 8 → 24 MiB): two fit, three
+        // do not.
+        let part = MAX_SERVED_BODY_BYTES * 3 / 8;
+        let h1 = cache_insert(&mut c, 1, part);
+        let h2 = cache_insert(&mut c, 2, part);
+        assert_eq!(c.len(), 2, "two 3/8 shares fit the budget");
+        let h3 = cache_insert(&mut c, 3, part);
         assert!(c.bytes <= MAX_SERVED_BODY_BYTES, "the budget holds after eviction");
         assert!(!c.contains(&h1), "lowest height paid for the overflow");
         assert!(c.contains(&h2) && c.contains(&h3));
