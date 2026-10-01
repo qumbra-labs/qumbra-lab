@@ -831,15 +831,13 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("check requires --config FILE")?;
     let config = NodeConfig::load(cfg_path)?;
-    let genesis = GenesisFile::load(&config.genesis_file)?;
-    let pf = qumbra_node::run::preflight(&config, &genesis)?;
-    // Halt-height release gates (#74), exactly as `run` would apply them: the
-    // cadence-grid + revision-digest checks, and — if this data dir has already
-    // halted — the resume gate. A pre-flight that skipped these would tell an
-    // operator a swap is safe when startup is about to refuse it.
-    let marker = HaltMarker::load(&config.data_dir)?;
-    RELEASE.validate()?;
-    RELEASE.check_against_marker(marker.as_ref())?;
+    // Lab #785 F5-6: the genesis is loaded the way `run` loads it — dispatched
+    // by its format version — and checked the way that form's `prepare` checks
+    // it, halt gates included (#74: the cadence-grid + revision-digest checks
+    // and, on a halted data dir, the resume gate — a pre-flight that skipped
+    // them would call a swap safe that startup is about to refuse).
+    let genesis = qumbra_node::annulet_genesis::load_any(&std::fs::read(&config.genesis_file)?)?;
+    let pf = qumbra_node::run::preflight_any(&config, &genesis)?;
     println!("qumbra-node check: OK ({cfg_path})");
     println!("  genesis hash: {}", pf.genesis_hash);
     println!(
