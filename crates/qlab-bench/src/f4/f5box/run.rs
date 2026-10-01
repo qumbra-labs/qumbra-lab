@@ -62,8 +62,16 @@ pub(crate) struct Build {
     pub check: bool,
 }
 
-/// Parse `args` (after the mode). Every refusal names the flag.
+/// Parse `args`. Every refusal names the flag.
+///
+/// `main` hands every f4 mode `argv[1..]`, **the mode token included** (the
+/// other modes look flags up by position, so they never noticed): a leading
+/// `f5box` is the mode, not a stray argument, and is dropped here — exactly one.
 pub(crate) fn parse(args: &[String]) -> Result<Cmd, String> {
+    let args = match args.first() {
+        Some(mode) if mode == "f5box" => &args[1..],
+        _ => args,
+    };
     let has = |k: &str| args.iter().any(|a| a == k);
     let get = |k: &str| -> Result<Option<String>, String> {
         match args.iter().position(|a| a == k) {
