@@ -155,6 +155,12 @@ fn fixture() -> &'static Fixture {
     })
 }
 
+/// The fixture's W proof — a real `Proof<LegacyNonHidingConfig>` object, for
+/// F5-6 (1)'s stub assembly (`f5box::tests`), which never reaches V3.
+pub(super) fn w_proof_stub() -> qlab_consensus::Proof<qlab_consensus::legacy::LegacyNonHidingConfig> {
+    WireBundle::decode(&fixture().wire).expect("the fixture decodes").w_proof
+}
+
 /// Sign `wb` as the rehearsal sequencer, for `net`.
 fn sign(wb: &mut WireBundle, net: &Hash32) {
     let sk = SigningKey::<MlDsa65>::from_seed(&rehearsal_sequencer_seed().into());

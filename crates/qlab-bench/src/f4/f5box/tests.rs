@@ -418,3 +418,176 @@ fn f5box_a_short_or_lying_stream_is_refused() {
     // The honest routes read whole.
     assert!(chain::read(&r.routes).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// (c)+(d)+(e): the state file, the assembly, the signature, the command
+// ---------------------------------------------------------------------------
+
+use super::bundle::{assemble, manifest, rehearsal_signer, self_check, sign, BundleBytes, Proofs, Timings};
+use super::run::{burn_rkm_hex, parse, Build, Cmd};
+use super::state::{plan_surface, RunState};
+use qlab_devnet::body::{BundleRefusal, BundleVerifier};
+use qlab_wrapper::codec::{encode_surface, WireBundle};
+
+/// The run's state after the deposit, and after the mix.
+fn states() -> (RunState, RunState) {
+    let r = run();
+    let mut s = RunState::new(NET_ID, params().l2_id, "f5box lane");
+    s.push(&r.deposit);
+    let one = s.clone();
+    s.push(&r.mix);
+    (one, s)
+}
+
+/// The state file round-trips through its JSON, and replaying it rebuilds
+/// exactly the state and surface each next bundle threads from.
+#[test]
+fn f5box_the_state_file_replays_what_was_built() {
+    let r = run();
+    let (one, two) = states();
+    for (s, state, prev) in [(&one, &r.state1, &r.prev1), (&two, &r.state2, &surface_after(&r.mix))] {
+        let back = RunState::from_json(&s.to_json()).expect("round trip");
+        assert_eq!(back.to_json(), s.to_json());
+        let (st, pv) = back.replay().expect("replays");
+        assert_eq!((st.roots(), pv.commitment), (state.roots(), prev.commitment));
+    }
+    assert_eq!(two.owned.len(), 16 + 16);
+    assert_eq!(plan_surface(params().l2_id, &r.deposit).commitment, r.prev1.commitment);
+    // Written and read back from disk, atomically.
+    let dir = std::env::temp_dir().join(format!("f5box-state-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    two.save(&path).expect("saves");
+    assert_eq!(RunState::load(&path).expect("loads").to_json(), two.to_json());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A state file that does not thread is refused by bundle index, never
+/// trusted: a member's PV changed, a `prev` changed, an exit dropped, an
+/// unknown format.
+#[test]
+fn f5box_a_tampered_state_file_is_refused() {
+    let (_, two) = states();
+    let mut bad = two.clone();
+    bad.bundles[0].members[3].pvs[qlab_air::claim::PV_CM2] ^= 1;
+    let e = bad.replay().err().expect("refused");
+    assert!(e.starts_with("bundle 1 does not thread"), "{e}");
+    let mut bad = two.clone();
+    bad.bundles[1].inp.prev[0] ^= 1;
+    assert_eq!(bad.replay().err().as_deref(), Some("bundle 1 does not thread from its predecessor's surface"));
+    let mut bad = two.clone();
+    bad.bundles[1].exits.clear();
+    assert_eq!(bad.replay().err().as_deref(), Some("bundle 1: the exit list does not chain to its exit_cmt"));
+    // A reordered wrapper is a different wrapper: it replays, to a surface
+    // its successor does not thread from.
+    let mut bad = two.clone();
+    bad.bundles[0].members.swap(0, 1);
+    assert_eq!(bad.replay().err().as_deref(), Some("bundle 1 does not thread from its predecessor's surface"));
+    let mut v = two.to_json();
+    v["format"] = 2.into();
+    assert!(RunState::from_json(&v).unwrap_err().starts_with("state format 2"));
+}
+
+/// Stub proofs: a real W-config proof object (the F5-4b fixture's), the
+/// deposit-sum proof proven for real (2^10 rows), each member a copy of it.
+fn stub_bundle(p: &Plan, net: &Hash32) -> (WireBundle, Vec<u8>) {
+    let (dep_pvs, dep) = crate::f4::dep::prove_dep(&p.deps).expect("the openings fit");
+    let copy = |q: &qlab_consensus::Proof<qlab_consensus::Config>| -> qlab_consensus::Proof<qlab_consensus::Config> {
+        bincode::deserialize(&bincode::serialize(q).unwrap()).unwrap()
+    };
+    let members = p.insts.iter().map(|_| copy(&dep)).collect();
+    let proofs = Proofs { w: crate::f4::bundle_node::w_proof_stub(), dep_pvs, dep, members };
+    let mut wb = assemble(p, params().l2_id, proofs);
+    sign(&mut wb, &rehearsal_signer(&params()).expect("the rehearsal key"), net);
+    let bytes = wb.encode();
+    (wb, bytes)
+}
+
+/// The assembly through the node's own rule: both bundles, signed by the
+/// rehearsal sequencer, pass every check the rule makes before the member
+/// proofs — codec, `l2_id`, exit shape, signature, V8, V5–V7 (the served
+/// anchors), V1 — and are refused exactly at member 0's stub proof; the
+/// proof-free fold accepts them and states the plan's surface, exits and
+/// counters; signed for another net, the signature refuses; the manifest's
+/// byte parts reconcile to the encoding.
+#[test]
+fn f5box_the_assembled_bundle_meets_the_node_rule_up_to_the_member_proofs() {
+    let r = run();
+    let rule = WrapperRule::from_params(NET_ID, &params()).expect("the rule");
+    for (p, prev, view) in [(&r.deposit, &r.prev0, &r.deposit_view), (&r.mix, &r.prev1, &r.mix_view)] {
+        let (wb, bytes) = stub_bundle(p, &NET_ID);
+        assert_eq!(WireBundle::decode(&bytes).expect("decodes").encode(), bytes, "canonical");
+        match self_check(&rule, &bytes, prev, view) {
+            Err(BundleRefusal::Wrapper(v)) => assert!(v.starts_with("Member(0,"), "refused at {v}"),
+            other => panic!("expected the member-0 refusal, got {other:?}"),
+        }
+        let out = rule.fold_bundle(&encode_surface(prev), &bytes).expect("the fold accepts");
+        assert_eq!(out.surface, encode_surface(&plan_surface(params().l2_id, p)).to_vec());
+        assert_eq!(out.exits, p.exits.iter().map(|e| (digest_to_bytes(&e.rkm), e.v)).collect::<Vec<_>>());
+        assert_eq!((out.d_batch, out.e_batch), (p.inp.d_batch, p.exits.iter().map(|e| e.v).sum::<u64>()));
+        let (_, other_net) = stub_bundle(p, &[0x6c; 32]);
+        assert_eq!(self_check(&rule, &other_net, prev, view).err(), Some(BundleRefusal::Signature));
+        let m = manifest(p, &wb, &bytes, &NET_ID, view, &Timings::new());
+        assert_eq!(m["bytes"]["total"], bytes.len());
+        assert_eq!(BundleBytes::of(&wb).total(), bytes.len());
+        assert_eq!(m["members"].as_array().unwrap().len(), 16);
+        assert_eq!(m["absorbed"].as_array().unwrap().len(), 4);
+        assert_eq!(m["exits"].as_array().unwrap().len(), p.exits.len());
+        assert_eq!(m["prev_surface"], super::state::digest_hex(&prev.commitment));
+    }
+}
+
+/// The command line: every refusal names its flag; the burn rkm prints in
+/// the form `miner_rkm` parses back.
+#[test]
+fn f5box_the_command_line() {
+    let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    assert_eq!(parse(&a("--burn-rkm --genesis g")), Ok(Cmd::BurnRkm { genesis: "g".into() }));
+    let first = parse(&a("--genesis g --chain http://n --state s --out o --seed lane")).unwrap();
+    assert_eq!(
+        first,
+        Cmd::Build(Build { genesis: "g".into(), chain: "http://n".into(), state: "s".into(), out: "o".into(), seed: Some("lane".into()), exit: None, check: false })
+    );
+    let hex = burn_rkm_hex(7);
+    assert_eq!(qumbra_node::config::rkm_lanes_from_hex(&hex).unwrap(), qlab_air::claim::rkm_burn(7));
+    let next = parse(&a(&format!("--next --genesis g --chain c --state s --out o --exit-rkm {hex} --check"))).unwrap();
+    let Cmd::Build(b) = next else { panic!() };
+    assert_eq!(b.exit, Some(Exit { rkm: qlab_air::claim::rkm_burn(7), v: qlab_devnet::emission_exact::BESSEL_PER_QMB }));
+    assert!(b.check && b.seed.is_none());
+    for (args, why) in [
+        ("--chain c --state s --out o --seed x", "--genesis is required"),
+        ("--genesis g --chain c --state s --out o", "the first run needs --seed"),
+        ("--next --genesis g --chain c --state s --out o", "--next needs --exit-rkm"),
+        ("--genesis g --chain c --state s --out o --seed x --exit-v 5", "--exit-rkm/--exit-v ride the mix"),
+        ("--genesis g --chain c --state s --out o --seed x --bogus", "unknown flag --bogus"),
+        ("--genesis --chain c", "--genesis takes a value"),
+    ] {
+        let e = parse(&a(args)).unwrap_err();
+        assert!(e.starts_with(why), "{args}: {e}");
+    }
+    let with_seed = format!("--next --genesis g --chain c --state s --out o --exit-rkm {hex} --seed x");
+    assert!(parse(&a(&with_seed)).unwrap_err().starts_with("--next reads the seed"));
+    let zero = format!("--next --genesis g --chain c --state s --out o --exit-rkm {hex} --exit-v 0");
+    assert!(parse(&a(&zero)).unwrap_err().starts_with("--exit-v must be nonzero"));
+    let all_zero = format!("--next --genesis g --chain c --state s --out o --exit-rkm {}", "0".repeat(64));
+    assert!(parse(&a(&all_zero)).unwrap_err().starts_with("--exit-rkm"));
+}
+
+/// No f5box source calls the rule's test knobs: the bundle f5box judges is
+/// judged by the production constructor only.
+#[test]
+fn f5box_calls_no_rule_knob() {
+    let sources = [
+        include_str!("mod.rs"),
+        include_str!("chain.rs"),
+        include_str!("members.rs"),
+        include_str!("state.rs"),
+        include_str!("bundle.rs"),
+        include_str!("run.rs"),
+    ];
+    for text in sources {
+        for knob in [concat!("for_", "version("), concat!("with_", "members(")] {
+            assert!(!text.contains(knob), "an f5box source calls `{knob}`");
+        }
+    }
+}
