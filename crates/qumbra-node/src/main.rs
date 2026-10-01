@@ -492,6 +492,13 @@ fn mine_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
+    // F5-6 box run 3: the stop signals are armed FIRST — before the entry line,
+    // the genesis load and the replay — because a signal that arrives before any
+    // handler gets the inherited disposition, which for a node a script started
+    // in the background is "ignored". Until the loop starts, a stop exits at
+    // once; after, it is the graceful flush (`shutdown::install_for_startup`).
+    // It prints nothing, so the entry line is still the first output (#300).
+    let shutdown = qumbra_node::shutdown::install_for_startup()?;
     // Lab #300: the entry line is the FIRST act — before config load, and so
     // before everything downstream of it. A node that spends an hour computing
     // before its banner is indistinguishable from a dead one; this line makes
@@ -810,8 +817,9 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     qlab_devnet::jprintln!("{}", qumbra_node::shutdown::stop_signals_line());
 
     // One seam, two platform mechanisms — see `shutdown.rs` for why Windows needs
-    // its own handler rather than ctrlc's (lab #478).
-    let shutdown = qumbra_node::shutdown::install()?;
+    // its own handler rather than ctrlc's (lab #478). Armed at entry (above); from
+    // here a stop is the graceful flush.
+    qumbra_node::shutdown::mark_started();
 
     let flushed = node.run_until(&shutdown);
     // Release any console handler blocked waiting for this (Windows only; a no-op

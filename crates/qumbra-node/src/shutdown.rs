@@ -91,14 +91,48 @@ Closing the console window also flushes, but Windows caps that at ~5 s; prefer C
     }
 }
 
+/// Whether the node has reached its event loop ([`mark_started`]). Before that,
+/// a stop request is not deferred to a loop that is not running yet: see
+/// [`install_for_startup`].
+static STARTED: AtomicBool = AtomicBool::new(true);
+
 /// Arm the platform's stop mechanism and hand back the flag the event loop polls.
 ///
-/// Call once. A second call is a programming error on unix (`ctrlc` refuses a
-/// second handler) and would re-register on Windows.
+/// Call once (this or [`install_for_startup`]). A second call is a programming
+/// error on unix (`ctrlc` refuses a second handler) and would re-register on
+/// Windows.
 pub fn install() -> Result<Arc<AtomicBool>, Box<dyn std::error::Error>> {
     let flag = Arc::new(AtomicBool::new(false));
     imp::arm(Arc::clone(&flag))?;
     Ok(flag)
+}
+
+/// **Arm the stop signals before startup** (the F5-6 box run): the same
+/// mechanism as [`install`], armed as the process's first act, so a stop is
+/// never lost to a startup window.
+///
+/// Why it matters: until a handler is installed, a signal gets the disposition
+/// the process inherited, and a command a non-interactive shell runs in the
+/// background (`node … &` in a script) inherits SIGINT and SIGQUIT **ignored**
+/// (POSIX). `qumbra-node run` used to install its handler only after loading
+/// the genesis, opening the datadir and replaying the log, so a SIGINT in that
+/// window was discarded — not pending, nothing to check later — and the node ran
+/// on (box run 3: a stop sent a second after a start was swallowed).
+///
+/// Until [`mark_started`]: a stop **ends the process now** (exit status 130 on
+/// unix; on Windows the handler declines the event, so the default terminate
+/// runs) — exactly what the default action did before a handler existed, and
+/// datadir-safe for the same reason a SIGKILL is (`tests/sigkill_replay.rs`).
+/// After it: the flag the event loop polls, the graceful flush, as [`install`].
+pub fn install_for_startup() -> Result<Arc<AtomicBool>, Box<dyn std::error::Error>> {
+    STARTED.store(false, Ordering::SeqCst);
+    install()
+}
+
+/// The event loop is about to poll the stop flag: from here a stop is the
+/// graceful flush ([`install_for_startup`]).
+pub fn mark_started() {
+    STARTED.store(true, Ordering::SeqCst);
 }
 
 /// Tell the platform layer that the graceful-shutdown flush has finished.
@@ -125,7 +159,16 @@ mod imp {
         // has no config-reload path, and a terminal hangup that would otherwise
         // kill the process mid-loop is exactly the case where a flush is wanted
         // (issue #145).
-        ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))?;
+        //
+        // `ctrlc` runs this closure on its own thread (a self-pipe), not in the
+        // signal handler, so the startup exit below may print and exit.
+        ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+            if !STARTED.load(Ordering::SeqCst) {
+                qlab_devnet::jprintln!(WARN, "stop requested during startup — exiting before the node runs (the datadir replays as after any hard stop)");
+                std::process::exit(130);
+            }
+        })?;
         Ok(())
     }
 
@@ -188,6 +231,12 @@ mod imp {
             // Say "not handled" and let the default terminate.
             return FALSE_;
         };
+        if !STARTED.load(Ordering::SeqCst) {
+            // Still starting up (`install_for_startup`): no loop will read the
+            // flag yet, so decline and let the default terminate, as before a
+            // handler existed.
+            return FALSE_;
+        }
         if handle_console_event(event, flag, &FLUSHED, CLOSE_GRACE) {
             TRUE_
         } else {
