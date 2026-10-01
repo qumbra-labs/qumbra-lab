@@ -46,10 +46,12 @@
 # box.log; nothing here needs a terminal. The box's auto-shutdown should be set
 # beyond the run (ruled +480 min).
 #
-# How "landed" is read: no node route or log line states a bundle's inclusion
-# (a named gap for the sequencer-v0 milestone). The script re-posts the same
-# bytes: 409 = still pooled; 422 naming Spacing / Thread / Prev = the chain's
-# surface has moved past it (landed); every answer is logged.
+# How "landed" is read: the node's applied bridge counters, `GET
+# /v1/supply/bridge` on the telemetry listener (D_cum, E_cum) — the deposit has
+# landed when D_cum equals its manifest's d_cum, the mix when E_cum equals its
+# manifest's e_cum. A re-post of the same bytes answering 422 Spacing / Thread /
+# Prev is logged as secondary confirmation only. (No route states a bundle's
+# inclusion height: a named gap for the sequencer-v0 milestone.)
 set -euo pipefail
 
 die() { log "FAIL: $*"; echo "F5-6 BOX VERDICT: FAIL — $*"; exit 1; }
@@ -126,6 +128,28 @@ run_measured() {
 
 tip_of() { grep -o 'TELEMETRY tip=[0-9]*' "$1" 2>/dev/null | tail -1 | cut -d= -f2; }
 
+# `/v1/supply/bridge`: ver u8 ‖ covered u64 ‖ d_cum u64 ‖ e_cum u64 ‖ … (LE).
+# Echoes "covered d_cum e_cum", or nothing when the route does not answer.
+bridge() {
+  local f="$RUN/producer/bridge.bin"
+  curl -sf -o "$f" "http://127.0.0.1:$P_TELE/v1/supply/bridge" || return 0
+  [ "$(od -An -t u1 -N 1 "$f" | tr -d ' ')" = 1 ] || return 0
+  od -An -t u8 --endian=little -j 1 -N 24 "$f" | xargs
+}
+
+# A manifest's integer field (serde_json's pretty form: `"key": 123,`; the
+# keys read here — d_cum, e_cum, total — each occur once at any depth).
+mfield() { sed -n "s/^ *\"$2\": \([0-9]*\).*/\1/p" "$1" | head -1; }
+
+# Log a waiting line only when it changes, plus one heartbeat per 10 min.
+LAST_WAIT=""; LAST_BEAT=0
+wait_log() {
+  local now; now=$(date +%s)
+  if [ "$*" != "$LAST_WAIT" ] || [ $((now - LAST_BEAT)) -ge 600 ]; then
+    log "$*"; LAST_WAIT="$*"; LAST_BEAT=$now
+  fi
+}
+
 node_config() { # name listen disc tele metr oper mining(true|false) keys(yes|no) dial
   local name=$1 dir="$RUN/$1"
   mkdir -p "$dir"
@@ -186,17 +210,22 @@ post_and_land() {
     esac
     [ "$i" = 120 ] && die "bundle $n not admitted after 120 attempts"
   done
+  # Primary: the applied bridge counters reach the manifest's (D for the
+  # deposit, E for the mix). Secondary, logged only: a re-post's 422.
+  local want_d want_e b
+  want_d=$(mfield "$F5/manifest-$n.json" d_cum); want_e=$(mfield "$F5/manifest-$n.json" e_cum)
+  [ -n "$want_d" ] && [ -n "$want_e" ] || die "manifest-$n.json names no d_cum/e_cum"
   for i in $(seq 1 120); do
     sleep 60
-    code=$(curl -s -o "$F5/land-$n.body" -w '%{http_code}' --data-binary "@$file" "http://127.0.0.1:$P_OPER/v1/bundle" || echo 000)
-    body=$(head -c 300 "$F5/land-$n.body" 2>/dev/null || true)
-    log "bundle $n landed? $i: $code $body (tip $(tip_of "$RUN/producer/node.out"))"
-    case "$code" in
-      422) if grep -qE 'Spacing|Thread|Prev' "$F5/land-$n.body"; then
-             echo "$(tip_of "$RUN/producer/node.out") $body" > "$F5/landed-$n"; log "bundle $n LANDED"; return 0
-           fi ;;
-      202) log "bundle $n was re-admitted: it had left the pool without landing; watching again" ;;
-    esac
+    b=$(bridge)
+    wait_log "bundle $n landed? bridge (covered D E) = ${b:-unavailable}, want D=$want_d E=$want_e (tip $(tip_of "$RUN/producer/node.out"))"
+    if [ -n "$b" ] && [ "$(echo "$b" | cut -d' ' -f2)" = "$want_d" ] && [ "$(echo "$b" | cut -d' ' -f3)" = "$want_e" ]; then
+      echo "$(echo "$b" | cut -d' ' -f1) $b" > "$F5/landed-$n"
+      log "bundle $n LANDED: bridge covered height $(echo "$b" | cut -d' ' -f1), D=$want_d E=$want_e"
+      code=$(curl -s -o "$F5/land-$n.body" -w '%{http_code}' --data-binary "@$file" "http://127.0.0.1:$P_OPER/v1/bundle" || echo 000)
+      log "bundle $n re-post (confirmation only): $code $(head -c 300 "$F5/land-$n.body" 2>/dev/null || true)"
+      return 0
+    fi
   done
   die "bundle $n not seen landed after 120 checks"
 }
@@ -236,7 +265,7 @@ mkdir -p "$F5"
 if ! is_done ready; then
   until f5box --seed box --check > "$F5/check-0.json" 2>"$F5/check-0.err"; do
     producer_up || die "the producer exited (see $RUN/producer/node.err)"
-    log "deposit not plannable yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$F5/check-0.err")"
+    wait_log "deposit not plannable yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$F5/check-0.err" | sed 's/at tip [0-9]*//')"
     sleep 60
   done
   log "the deposit plans at tip $(tip_of "$RUN/producer/node.out")"
@@ -265,7 +294,7 @@ if ! is_done mix; then
   if [ ! -e "$F5/bundle-1.bin" ]; then
     until f5box --next --exit-rkm "$(cat "$WDIR/rkm")" --exit-v "$EXIT_V" --check > "$F5/check-1.json" 2>"$F5/check-1.err"; do
       producer_up || die "the producer exited"
-      log "the mix does not plan yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$F5/check-1.err")"
+      wait_log "the mix does not plan yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$F5/check-1.err" | sed 's/at tip [0-9]*//')"
       sleep 60
     done
     log "building the mix (8 P / 3 S / 1 R / 4 C + W + deposit-sum)"
@@ -286,6 +315,7 @@ if ! is_done peers; then
     node_config "peer$k" "$base" $((base + 1)) $((base + 2)) $((base + 3)) - false no "$P_LISTEN"
   done
   start_s=$(date +%s)
+  echo "$start_s" > "$RUN/peers.window"   # the producer's node.rss over [start, end] is its curve under the catch-up
   for k in 1 2 3; do
     pid=$(start_measured "$RUN/peer$k/node" "$NODE" run --config "$RUN/peer$k/node.toml" --sample-interval-secs 5)
     [ -n "$pid" ] || die "peer$k did not start (see $RUN/peer$k/node.err)"
@@ -301,6 +331,7 @@ if ! is_done peers; then
     echo "$(( $(date +%s) - start_s ))" > "$RUN/peer$k/catchup.seconds"
     log "peer$k reached $t in $(cat "$RUN/peer$k/catchup.seconds") s"
   done
+  date +%s >> "$RUN/peers.window"
   for k in 1 2 3; do stop_node "$RUN/peer$k"; done
   done_mark peers
 fi
@@ -334,4 +365,4 @@ fi
 
 stop_node "$RUN/producer"
 log "measurements: $RUN/*/node.time, *.rss, $F5/build-*.time, $F5/manifest-*.json, peer*/catchup.seconds"
-echo "F5-6 BOX VERDICT: PASS — deposit and mix landed ($(cut -d' ' -f1 "$F5/landed-0"), $(cut -d' ' -f1 "$F5/landed-1")), 3/3 peers caught up ($(cat "$RUN"/peer*/catchup.seconds | paste -sd/ -) s), exit spent; manifests $F5/manifest-0.json $F5/manifest-1.json"
+echo "F5-6 BOX VERDICT: PASS — deposit landed at $(cut -d' ' -f1 "$F5/landed-0") ($(mfield "$F5/manifest-0.json" total) B), mix at $(cut -d' ' -f1 "$F5/landed-1") ($(mfield "$F5/manifest-1.json" total) B); 3/3 fresh peers caught up in $(cat "$RUN"/peer*/catchup.seconds | paste -sd/ -) s (concurrent, under 3-way contention); exit spent; manifests $F5/manifest-0.json $F5/manifest-1.json"
