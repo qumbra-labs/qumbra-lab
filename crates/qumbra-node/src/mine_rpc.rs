@@ -251,7 +251,9 @@ pub fn payees_from_query(query: &str) -> Result<Vec<CoinbasePayee>, String> {
 pub fn outcome_from_ingest(form: GenesisForm, header: &BlockHeader, outcome: IngestOutcome) -> BlockSubmitOutcome {
     let hash = header.header_hash_for(form);
     match outcome {
-        IngestOutcome::Accepted => BlockSubmitOutcome::Accepted { hash },
+        // An own-mined block extends the tip; an off-tip arm's "accepted, not
+        // relayed yet" is still an acceptance (lab #785 F5-5b).
+        IngestOutcome::Accepted | IngestOutcome::AcceptedNoRelay => BlockSubmitOutcome::Accepted { hash },
         IngestOutcome::Duplicate => BlockSubmitOutcome::Duplicate { hash },
         IngestOutcome::Orphan => BlockSubmitOutcome::Orphan { hash },
         IngestOutcome::Rejected(reason) => BlockSubmitOutcome::Refused {

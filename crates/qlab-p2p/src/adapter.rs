@@ -289,6 +289,13 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Running weight of [`Self::pending_bodies`] in bytes, so the byte budget is a
     /// subtraction rather than a walk of the map on every insert.
     pending_bytes: usize,
+    /// Blocks accepted as [`IngestOutcome::AcceptedNoRelay`] (lab #785 F5-5b,
+    /// J1 amended), to be relayed once applied — if, when applied, they are
+    /// within [`RELAY_AFTER_APPLY_WINDOW`] of the header tip.
+    relay_after_apply: std::collections::HashSet<Hash32>,
+    /// Applied blocks awaiting the P2P layer's relay
+    /// ([`BlockIngest::take_relay_after_apply`]).
+    applied_for_relay: Vec<(BlockHeader, BlockBody)>,
     /// The node's data dir, when disk-backed — the durability seam for the committee
     /// punishment ledger (issue #133). `None` for an in-memory adapter, which keeps
     /// every in-process sim, soak and test writing nothing.
@@ -634,6 +641,20 @@ pub const UNJUDGED_ANCHOR_REASON: &str =
 ///   height it is being served. Charging for it bans honest peers for serving correct
 ///   history — the whole of #134.
 ///
+/// **How near the header tip an off-tip V6 block must be, when applied, to be
+/// relayed then** (lab #785 F5-5b). `[devnet-placeholder]`.
+///
+/// J1 as amended relays such a block only after the full rule has run on it.
+/// A catching-up node applies history it was handed off the tip; peers at the
+/// tip already hold it, and relaying each such body (up to 16 MB) after the
+/// fact would be all cost. Only a block that is — once applied — within this
+/// many heights of the best header is news worth relaying.
+pub const RELAY_AFTER_APPLY_WINDOW: u64 = 2;
+
+/// Bound on the pending relay marks (a mark for a block never applied is
+/// dropped with the rest past this many).
+const MAX_RELAY_MARKS: usize = 256;
+
 /// The match on it is **exhaustive on purpose** (no wildcard arm): a new `BodyError`
 /// variant must declare which kind it is, and cannot inherit "peer fault" by silence
 /// the way `AnchorNotFinal` did.
@@ -944,6 +965,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             miner_rkm: UNCONFIGURED_MINER_RKM,
             pending_bodies: BTreeMap::new(),
             pending_bytes: 0,
+            relay_after_apply: std::collections::HashSet::new(),
+            applied_for_relay: Vec::new(),
             dir: None,
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
@@ -1832,6 +1855,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             };
             match self.state.apply_block_gated(header, body.clone(), &self.verifier, gate) {
                 Ok(_) => {
+                    // Lab #785 F5-5b: a block accepted off the tip without relay
+                    // is relayed now that the full rule has run — if it is news.
+                    let hash = header.header_hash_for(self.rules.form);
+                    if self.relay_after_apply.remove(&hash)
+                        && header.height + RELAY_AFTER_APPLY_WINDOW >= self.chain.tip_height()
+                    {
+                        self.applied_for_relay.push((header, body.clone()));
+                    }
                     // The registry read here is the post-apply one — `apply_block`
                     // has already folded this body's own riders in, which is what
                     // makes the name-eviction leg see the block that outraced a
@@ -2980,6 +3011,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
+    fn take_relay_after_apply(&mut self) -> Vec<(BlockHeader, BlockBody)> {
+        std::mem::take(&mut self.applied_for_relay)
+    }
+
     fn ingest_wire_header(&mut self, header: crate::codec::WireHeader) -> IngestOutcome {
         match header {
             crate::codec::WireHeader::L1(h) => self.ingest_header(h),
@@ -3137,12 +3172,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         // header this call just accepted, and the P2P layer caches and relays
         // only on `Accepted`.
         let mut v6_submitted: Option<IngestOutcome> = None;
+        // Lab #785 F5-5b (J1 amended): accepted here on the binding check alone,
+        // so not relayed until applied.
+        let mut v6_off_tip = false;
         let validate_result = if self.sections == BodySections::V6 {
             if header.prev == self.state.tip_hash() {
                 self.state.validate_block_v6(&header, &body, &self.verifier)
             } else if let Err(e) = qlab_devnet::body::check_body_binding_v6(&header, &body) {
                 Err(e)
             } else if self.block_is_settled_history(&header) {
+                v6_off_tip = true;
                 Ok(())
             } else {
                 let submitted = self.submit_header(header);
@@ -3152,6 +3191,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
                         if self.chain.main_chain_hash_at(header.height) == Some(hash) =>
                     {
                         v6_submitted = Some(submitted);
+                        v6_off_tip = true;
                         Ok(())
                     }
                     IngestOutcome::Accepted | IngestOutcome::Duplicate => {
@@ -3249,10 +3289,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         }
         // 2. Header into the consensus chain (PoW / fork-choice) — unless the
         //    V6 off-tip arm already did (F1 above).
-        let outcome = match v6_submitted {
+        let block_hash = header.header_hash_for(self.rules.form);
+        let mut outcome = match v6_submitted {
             Some(outcome) => outcome,
             None => self.submit_header(header),
         };
+        if v6_off_tip && outcome == IngestOutcome::Accepted {
+            if self.relay_after_apply.len() >= MAX_RELAY_MARKS {
+                self.relay_after_apply.clear();
+            }
+            self.relay_after_apply.insert(block_hash);
+            outcome = IngestOutcome::AcceptedNoRelay;
+        }
         // 3. Application is gated on **whether we hold this header**, never on
         //    whether the header was NEW (issue #130 (a)).
         //
@@ -3267,7 +3315,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         //    filed against. `Ignored` is deliberately excluded: a halted release must
         //    not apply above its halt height (#74 H2), and `Orphan`/`Rejected` mean
         //    the header is not in the chain to apply a body against.
-        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Duplicate) {
+        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::AcceptedNoRelay | IngestOutcome::Duplicate) {
             self.buffer_body(header, body);
             self.drain_pending_bodies();
         }
@@ -8438,17 +8486,28 @@ mod tests {
         assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5));
 
         // 4' makes the branch heavier: its body is a main-chain block now, buffered.
-        // Review F1 on PR #792: a NEW main-chain header answers Accepted, so the
-        // P2P layer caches and relays the block.
-        assert_eq!(a.ingest_block(h4x, b4x), IngestOutcome::Accepted);
+        // Review F1 on PR #792: a NEW main-chain header is accepted. Lab #785
+        // F5-5b (J1 amended): accepted on the binding check alone, so NOT
+        // relayed now — `AcceptedNoRelay`, relayed once applied.
+        assert!(a.take_relay_after_apply().is_empty(), "tip blocks relay on ingest, as before");
+        assert_eq!(a.ingest_block(h4x, b4x), IngestOutcome::AcceptedNoRelay);
+        assert!(!IngestOutcome::AcceptedNoRelay.should_relay() && !IngestOutcome::AcceptedNoRelay.is_peer_fault());
         assert_eq!(a.pending_bodies.len(), 1, "4' is a main-chain block: buffered");
         assert_eq!(a.state.tip_hash(), h3.header_hash_for(GenesisForm::V5), "3' is still missing");
+        assert!(a.take_relay_after_apply().is_empty(), "not applied, not relayed");
 
         // The refetch of 3' closes the gap: rewind to 2, apply 3' and 4'.
-        assert!(matches!(a.ingest_block(h3x, b3x), IngestOutcome::Duplicate | IngestOutcome::Accepted));
+        assert!(matches!(
+            a.ingest_block(h3x, b3x),
+            IngestOutcome::Duplicate | IngestOutcome::Accepted | IngestOutcome::AcceptedNoRelay
+        ));
         assert_eq!(a.state.tip_hash(), b.state.tip_hash());
         assert_eq!(a.state.tip_height(), 4);
         assert!(a.pending_bodies.is_empty());
+        // Applied, and within the window of the header tip: 4' is relayed now.
+        let relayed: Vec<_> = a.take_relay_after_apply().into_iter().map(|(h, _)| h.header_hash_for(GenesisForm::V5)).collect();
+        assert!(relayed.contains(&h4x.header_hash_for(GenesisForm::V5)), "{relayed:?}");
+        assert!(a.take_relay_after_apply().is_empty(), "relayed once");
     }
 
     /// The template filter (issue #785, (a)): a tx the mempool admitted under

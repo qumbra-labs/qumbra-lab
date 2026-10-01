@@ -64,6 +64,13 @@ pub(crate) fn coinbase_payees_weight(payees: &[CoinbasePayee]) -> usize {
 pub enum IngestOutcome {
     /// New and accepted into node state.
     Accepted,
+    /// **Accepted, but not to be relayed now** (lab #785 F5-5b, ruling J1 as
+    /// amended): a V6 block off this node's applied tip — on the winning
+    /// branch, or settled history — whose body is buffered on the binding
+    /// check alone. Relayed only once applied
+    /// ([`BlockIngest::take_relay_after_apply`]): at up to 16 MB a body, an
+    /// unchecked relay is the cheap side. Not a peer fault.
+    AcceptedNoRelay,
     /// Already known; no state change (do not re-relay).
     Duplicate,
     /// Well-formed but its parent/context is missing — caller should sync it.
@@ -413,6 +420,13 @@ pub trait BlockIngest {
             crate::codec::WireHeader::L1(h) => self.ingest_block(h, body),
             crate::codec::WireHeader::Sealed(_) => IngestOutcome::Ignored(SEALED_UNSERVED_REASON),
         }
+    }
+
+    /// Blocks accepted as [`IngestOutcome::AcceptedNoRelay`] that have since
+    /// been applied and are now to be relayed, drained by the caller (lab #785
+    /// F5-5b). Default: none.
+    fn take_relay_after_apply(&mut self) -> Vec<(BlockHeader, BlockBody)> {
+        Vec::new()
     }
 }
 

@@ -1521,6 +1521,29 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         outcome
     }
 
+    /// Announce the blocks the node accepted off its tip without relay and
+    /// has since applied (lab #785 F5-5b, ruling J1 as amended) — the relay
+    /// [`IngestOutcome::AcceptedNoRelay`] withheld, now that the full rule has
+    /// run on them. Compact relay, as an own block is announced; the salt is
+    /// taken from the block hash (it only randomises short ids).
+    fn relay_applied_blocks(&mut self) {
+        for (header, body) in self.node.take_relay_after_apply() {
+            let bh = header.header_hash_for(self.node.genesis_form());
+            self.blocks.insert_body(header.height, bh, body.clone());
+            self.seen.insert(bh);
+            let nonce = u64::from_le_bytes(bh[..8].try_into().expect("8 bytes"));
+            let (prefilled, short_ids) = build_announce_parts(&body.txs, nonce);
+            let BlockBody { coinbase_payees, finality, bundle, .. } = body;
+            let ann = BlockAnnounce { seal: None, finality, bundle, header, nonce, coinbase_payees, short_ids, prefilled };
+            let Ok(payload) = encode_announce_for(self.node.wire_form(), &ann) else {
+                continue;
+            };
+            for pid in self.peers.ready_peers() {
+                self.send(pid, MsgType::BlockAnnounce, payload.clone());
+            }
+        }
+    }
+
     // --- the driver ---
 
     /// Process everything that has arrived since the last call. `now_ms` is the
@@ -1608,6 +1631,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             timings.dispatch += lap(&mut t);
         }
+        // Lab #785 F5-5b (J1 amended): blocks accepted off the tip without
+        // relay, and applied since.
+        self.relay_applied_blocks();
         // Ask for a recent finalized checkpoint before the first header request.
         // An honest peer then queues the quorum evidence ahead of its Headers
         // response, letting a fresh joiner establish the checkpoint before it
@@ -2570,7 +2596,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             // kick either: syncing toward it would be asking for more of what we
             // have decided not to accept.
             IngestOutcome::Ignored(_) => {}
-            IngestOutcome::Rejected(_) | IngestOutcome::Duplicate => {}
+            IngestOutcome::Rejected(_) | IngestOutcome::Duplicate | IngestOutcome::AcceptedNoRelay => {}
         }
     }
 
@@ -2911,7 +2937,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     self.seen.insert(id);
                     self.relay_inv(InvItem { kind: InvKind::Block, id }, Some(from));
                 }
-                IngestOutcome::Duplicate => {}
+                IngestOutcome::Duplicate | IngestOutcome::AcceptedNoRelay => {}
                 // An orphan mid-batch means the batch didn't connect; stop and let
                 // the next locator round re-anchor.
                 IngestOutcome::Orphan | IngestOutcome::Rejected(_) => break,
@@ -3301,6 +3327,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // no evidence the body is the header's body. That verdict comes from
         // `ingest_block`, and it was being computed and then discarded, so a
         // mismatched body would have been stored and relayed onward.
+        // Lab #785 F5-5b (J1 amended): accepted off the tip, buffered on the
+        // binding check — seen, so it is not refetched, but not relayed until
+        // applied (`relay_applied_blocks`).
+        if outcome == IngestOutcome::AcceptedNoRelay {
+            self.seen.insert(bh);
+            return;
+        }
         if !matches!(outcome, IngestOutcome::Accepted) {
             if outcome.is_peer_fault() {
                 if let Some(peer) = except {
