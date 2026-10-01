@@ -587,8 +587,14 @@ mod tests {
     #[test]
     fn f4census_perms_p_matches_the_boxs_lane_counts() {
         use crate::f3::bench::Outer;
+        // Lab #785 F5-4d-2 (from the named `f4census` runs): W's +20 columns
+        // push the F2 opened-values flush over five blocks (818 → 823), and
+        // `perms_p` counts that flush twice (the observation and its draw
+        // refill, `+ blocks[2]`): +10 lane perms at every cell. The query
+        // slots (⌈3,491/34⌉ = 103, as before) and the gate's columns (F2's
+        // mosaic collapses to 3 shapes) do not move.
         for (log_h, child, lane, cols) in
-            [(15, Outer::B4, 8_380, 3_792), (18, Outer::B4, 9_200, 3_832), (18, Outer::B2, 16_214, 3_954)]
+            [(15, Outer::B4, 8_390, 3_792), (18, Outer::B4, 9_210, 3_832), (18, Outer::B2, 16_224, 3_954)]
         {
             let shape = super::super::gate::w_gate_shape(log_h, child);
             assert_eq!(super::super::gate::perms_p(&shape), lane, "{log_h} {child:?}");
