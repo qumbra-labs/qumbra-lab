@@ -72,6 +72,11 @@ pub const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// extensions are short; anything longer is a broken peer.
 pub const MAX_LINE_BYTES: usize = 8 * 1024;
 
+/// The body cap a caller gets from [`read_response`] (lab #785 F5-5a).
+/// Every client in the workspace names its own cap through
+/// [`read_response_capped`]; this default exists for code outside it.
+pub const DEFAULT_MAX_BODY: usize = 64 * 1024 * 1024;
+
 /// Socket read granularity. Not a body cap — see [`FramingError::Truncated`]
 /// for why a lying `Content-Length` costs a timeout rather than an
 /// allocation: the body is accumulated as it arrives, never pre-allocated
@@ -101,6 +106,10 @@ pub enum FramingError {
     UnterminatedLine,
     /// The peer stopped before the framing said the body ended.
     Truncated { want: usize, got: usize },
+    /// The body is larger than the caller's cap (lab #785 F5-5a): a declared
+    /// `Content-Length` over it is refused before a byte of body is read, and
+    /// a chunked or close-delimited body as soon as it passes it.
+    BodyTooLarge { got: usize, cap: usize },
     /// The socket itself failed.
     Io(String),
 }
@@ -136,6 +145,9 @@ impl std::fmt::Display for FramingError {
                     f,
                     "http-framing: truncated-body: want {want} bytes, got {got}"
                 )
+            }
+            FramingError::BodyTooLarge { got, cap } => {
+                write!(f, "http-framing: body-too-large: {got} bytes, cap {cap}")
             }
             FramingError::Io(e) => write!(f, "http-framing: io: {e}"),
         }
@@ -201,6 +213,15 @@ impl Response {
 /// connection, so a keep-alive peer would have stalled every template poll
 /// until the 30 s read timeout.
 pub fn read_response<R: Read>(inner: R) -> Result<Response, FramingError> {
+    read_response_capped(inner, DEFAULT_MAX_BODY)
+}
+
+/// [`read_response`] with the caller's body cap (lab #785 F5-5a): a body
+/// over `max_body` bytes is [`FramingError::BodyTooLarge`] — a declared
+/// `Content-Length` before any body is read, a chunked or close-delimited
+/// one as soon as it passes the cap. Never more than `max_body` plus one read
+/// chunk is held.
+pub fn read_response_capped<R: Read>(inner: R, max_body: usize) -> Result<Response, FramingError> {
     let mut w = Wire::new(inner);
 
     let sep = loop {
@@ -239,11 +260,11 @@ pub fn read_response<R: Read>(inner: R) -> Result<Response, FramingError> {
                 .filter(|c| !c.is_empty())
                 .collect();
             if codings.len() == 1 && codings[0].eq_ignore_ascii_case("chunked") {
-                read_chunked(&mut w)?
+                read_chunked(&mut w, max_body)?
             } else if codings.is_empty()
                 || (codings.len() == 1 && codings[0].eq_ignore_ascii_case("identity"))
             {
-                read_delimited(&mut w, &headers)?
+                read_delimited(&mut w, &headers, max_body)?
             } else {
                 // `gzip`, `chunked, gzip`, anything layered. Named, not guessed.
                 return Err(FramingError::UnsupportedTransferEncoding {
@@ -251,7 +272,7 @@ pub fn read_response<R: Read>(inner: R) -> Result<Response, FramingError> {
                 });
             }
         }
-        None => read_delimited(&mut w, &headers)?,
+        None => read_delimited(&mut w, &headers, max_body)?,
     };
 
     Ok(Response {
@@ -266,20 +287,24 @@ pub fn read_response<R: Read>(inner: R) -> Result<Response, FramingError> {
 fn read_delimited<R: Read>(
     w: &mut Wire<R>,
     headers: &[(String, String)],
+    max_body: usize,
 ) -> Result<Vec<u8>, FramingError> {
     match find_header(headers, "Content-Length") {
         Some(v) => {
             let n = parse_decimal(v)
                 .ok_or_else(|| FramingError::BadContentLength { got: v.to_string() })?;
+            if n > max_body {
+                return Err(FramingError::BodyTooLarge { got: n, cap: max_body });
+            }
             w.take(n)
         }
-        None => w.rest(),
+        None => w.rest(max_body),
     }
 }
 
 /// `<hex-size>[;ext]CRLF <data> CRLF`, repeated, terminated by a zero-size
 /// chunk and optional trailer fields.
-fn read_chunked<R: Read>(w: &mut Wire<R>) -> Result<Vec<u8>, FramingError> {
+fn read_chunked<R: Read>(w: &mut Wire<R>, max_body: usize) -> Result<Vec<u8>, FramingError> {
     let mut out = Vec::new();
     loop {
         let line = w.line()?;
@@ -295,6 +320,10 @@ fn read_chunked<R: Read>(w: &mut Wire<R>) -> Result<Vec<u8>, FramingError> {
                     return Ok(out);
                 }
             }
+        }
+        let got = out.len().saturating_add(size);
+        if got > max_body {
+            return Err(FramingError::BodyTooLarge { got, cap: max_body });
         }
         out.extend_from_slice(&w.take(size)?);
         if w.take(2)? != b"\r\n" {
@@ -439,8 +468,15 @@ impl<R: Read> Wire<R> {
     }
 
     /// Everything until EOF.
-    fn rest(&mut self) -> Result<Vec<u8>, FramingError> {
-        while self.fill()? {}
+    fn rest(&mut self, max: usize) -> Result<Vec<u8>, FramingError> {
+        while self.fill()? {
+            if self.buffered().len() > max {
+                return Err(FramingError::BodyTooLarge { got: self.buffered().len(), cap: max });
+            }
+        }
+        if self.buffered().len() > max {
+            return Err(FramingError::BodyTooLarge { got: self.buffered().len(), cap: max });
+        }
         let out = self.buf[self.pos..].to_vec();
         self.pos = self.buf.len();
         Ok(out)
@@ -454,6 +490,40 @@ mod tests {
 
     fn read(bytes: &[u8]) -> Result<Response, FramingError> {
         read_response(Cursor::new(bytes.to_vec()))
+    }
+
+    /// Lab #785 F5-5a item 9: each framing over the cap is refused by name —
+    /// a declared length before any body byte, a chunked stream and a
+    /// close-delimited one as they pass it; exactly the cap is fine; a short
+    /// body is still `Truncated`.
+    #[test]
+    fn a_body_over_the_cap_is_refused_by_name() {
+        let cap = |b: &[u8], c: usize| read_response_capped(Cursor::new(b.to_vec()), c);
+        // A lying Content-Length: refused with no body sent at all.
+        assert_eq!(
+            cap(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999999\r\n\r\n", 1024),
+            Err(FramingError::BodyTooLarge { got: 999_999_999_999, cap: 1024 })
+        );
+        assert!(cap(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", 5).is_ok(), "exactly at the cap");
+        assert_eq!(
+            cap(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello!", 5),
+            Err(FramingError::BodyTooLarge { got: 6, cap: 5 })
+        );
+        // Chunked: 3 + 3 passes a cap of 5 at the second chunk.
+        assert_eq!(
+            cap(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n", 5),
+            Err(FramingError::BodyTooLarge { got: 6, cap: 5 })
+        );
+        // Close-delimited.
+        let mut big = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        big.extend(vec![b'x'; 100_000]);
+        assert!(matches!(cap(&big, 1000), Err(FramingError::BodyTooLarge { cap: 1000, .. })));
+        // Short is still short.
+        assert_eq!(
+            cap(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel", 5),
+            Err(FramingError::Truncated { want: 5, got: 3 })
+        );
+        assert_eq!(DEFAULT_MAX_BODY, 64 * 1024 * 1024);
     }
 
     #[test]

@@ -61,6 +61,12 @@ use qlab_node::{Telemetry, DURABLE_HEAD_SINCE_VERSION, READABLE_TELEMETRY_VERSIO
 /// The route a node serves its versioned telemetry wire on.
 pub const TELEMETRY_PATH: &str = "/v1/telemetry";
 
+/// The body cap on every fetch this view makes (lab #785 F5-5a): telemetry
+/// (one line per supply epoch) and the bridge rows (one per bundle epoch) are
+/// kilobytes on any chain this tool watches; 4 MiB is generous, and a node
+/// that answers with more is refused by name instead of allocated for.
+pub const MAX_RESPONSE_BODY: usize = 4 * 1024 * 1024;
+
 /// The default per-endpoint deadline.
 ///
 /// Chosen against what it is measuring, not by taste: a node's snapshot is
@@ -303,7 +309,7 @@ fn fetch(base_url: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, Strin
     // `WouldBlock`); keep the `read:` token so the reason still names the
     // step (`a_silent_node_times_out_and_reads_as_unreachable`). Named
     // refusals stay `http-framing: …`.
-    let resp = qlab_http_framing::read_response(&mut stream).map_err(|e| match e {
+    let resp = qlab_http_framing::read_response_capped(&mut stream, MAX_RESPONSE_BODY).map_err(|e| match e {
         qlab_http_framing::FramingError::Io(detail) => format!("read: {detail}"),
         other => other.to_string(),
     })?;

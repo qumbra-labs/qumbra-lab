@@ -529,16 +529,29 @@ fn connect(base_url: &str) -> std::io::Result<(Box<dyn ReadWrite>, String)> {
 /// de-chunked but ignored `Content-Length`, so a keep-alive peer hung every
 /// wallet request to [`REQUEST_TIMEOUT`].
 fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> {
-    read_response_limited(stream, None)
+    read_response_limited(stream, Some(POST_MAX_RESPONSE))
 }
+
+/// The body cap on every wallet GET without its own ceiling (lab #785
+/// F5-5a): scan pages, names, coinbase, nullifiers, the full-tx route. The
+/// servers bound pages by count (`MAX_COMPACT_BLOCKS`, `MAX_TREE_LEAVES`, …),
+/// not bytes; 64 MiB covers them on today's chains, and a page past it is
+/// refused by name (`body-too-large`) rather than allocated for.
+pub const GET_MAX_BODY: usize = 64 * 1024 * 1024;
+
+/// The whole-response ceiling on a POST's answer (lab #785 F5-5a): the routes
+/// answer with a verdict or, at most, one assembled transaction
+/// (`MAX_TX_WIRE_BYTES_ANNULET` = 512 KiB) — 4 MiB is generous.
+pub const POST_MAX_RESPONSE: usize = 4 * 1024 * 1024;
 
 /// [`read_response`] with an optional ceiling on the **whole** response —
 /// status line, headers and body together.
 ///
-/// `None` is this module's historical behaviour and stays the default for every
-/// wallet route: those talk to a server the operator chose, page by page, with
-/// the server's own caps (`MAX_TREE_LEAVES`, `MAX_NULLIFIER_BLOCKS`,
-/// `MAX_COINBASE_BLOCKS`) bounding what a well-behaved peer returns.
+/// `None` is the default for every wallet route: those talk to a server the
+/// operator chose, page by page, with the server's own caps (`MAX_TREE_LEAVES`,
+/// `MAX_NULLIFIER_BLOCKS`, `MAX_COINBASE_BLOCKS`) bounding what a well-behaved
+/// peer returns — and, since lab #785 F5-5a, [`GET_MAX_BODY`] bounding what a
+/// hostile one can make this process allocate.
 ///
 /// `Some(n)` exists for lab #475's review finding 1: `qumbra-node mine` fetches
 /// `genesis.qmb` through this module, which put an **unbounded read inside the
@@ -576,10 +589,10 @@ fn read_response_limited(
     // with nothing read is still an error: that is a truncated exchange.
     let reader = TlsEof::new(stream);
     let resp = match limit {
-        None => qlab_http_framing::read_response(reader)?,
+        None => qlab_http_framing::read_response_capped(reader, GET_MAX_BODY)?,
         Some(n) => {
             let mut limited = reader.take(n as u64 + 1);
-            let result = qlab_http_framing::read_response(&mut limited);
+            let result = qlab_http_framing::read_response_capped(&mut limited, n);
             if limited.limit() == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -779,7 +792,7 @@ mod tests {
 
         // And `None` is the historical behaviour every wallet route keeps.
         let (status, body) =
-            read_response_limited(&mut response_bytes(9_000), None).expect("unbounded as before");
+            read_response_limited(&mut response_bytes(9_000), None).expect("under the GET body cap");
         assert_eq!(status, 200);
         assert_eq!(body.len(), 9_000);
     }

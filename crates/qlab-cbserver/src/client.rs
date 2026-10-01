@@ -1069,6 +1069,13 @@ where
 /// `qumbra-faucet`, `qumbra-explorer` and `qumbra-ffi`, for the benefit of one
 /// leaf binary. So `base_url must be http://` below is not a stale copy of the
 /// wallet's old refusal — it is an accurate statement about this helper.
+/// [`http_get`]'s body cap (lab #785 F5-5a): the largest page a discovery
+/// route serves at its own count caps (`MAX_COMPACT_BLOCKS`, `MAX_TREE_LEAVES`)
+/// on today's chains, with headroom. The servers bound pages by count, not
+/// bytes, so a page at protocol-spec §7's full throughput could exceed it; that
+/// is refused by name (`body-too-large`), never allocated.
+pub const HTTP_GET_MAX_BODY: usize = 64 * 1024 * 1024;
+
 pub fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>> {
     let authority = base_url
         .strip_prefix("http://")
@@ -1079,7 +1086,7 @@ pub fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>
     );
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
-    let resp = qlab_http_framing::read_response(&mut stream)?;
+    let resp = qlab_http_framing::read_response_capped(&mut stream, HTTP_GET_MAX_BODY)?;
     let status_ok = resp.status.as_bytes().windows(3).any(|w| w == b"200");
     if !status_ok {
         return Err(std::io::Error::new(
