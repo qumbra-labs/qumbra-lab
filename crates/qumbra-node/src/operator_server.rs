@@ -28,7 +28,12 @@
 //! | `409 slot-held` | the slot already holds a bundle; first wins — retry with `?replace=1` to replace it |
 //! | `400 refused: <reason>` | the bytes alone are wrong (codec, signature, l2 id, exit shape) |
 //! | `422 refused: <reason>` | well-formed, but not valid at this tip (spacing, thread, proofs, state lag) |
-//! | `503 unavailable: …` | not a V6 node, or no verdict in time |
+//! | `503 unavailable: …` | not a V6 node, the queue is full, or no verdict in time |
+//!
+//! **A `503 no-verdict-in-time` is not a refusal**: the post stays queued and
+//! the run loop still judges it. A retry answered `409 slot-held` after such a
+//! 503 means the earlier post was admitted (the slot holds it, and the `202`
+//! went to a handler that had stopped waiting).
 //!
 //! `400` and `422` are split on exactly the line the P2P path charges on
 //! (ruling Q-5b-2): what the bytes alone prove versus what is judged against

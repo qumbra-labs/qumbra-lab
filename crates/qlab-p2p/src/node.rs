@@ -367,11 +367,15 @@ pub const fn body_window_for(lag: u64, sections: qlab_devnet::forms::BodySection
     }
 }
 
-/// **One bundle admitted from a peer per this many blocks** (lab #785 F5-5b,
-/// the ruling's per-peer limit): the wrapper's spacing (`WRAPPER_SPACING_BLOCKS_V1`
-/// = 48). A peer cannot make this node verify bundles faster than the chain
-/// can carry them. `[devnet-placeholder]`.
+/// **One bundle asked of a peer per this many blocks** (lab #785 F5-5b, the
+/// ruling's per-peer limit): the wrapper's spacing (`WRAPPER_SPACING_BLOCKS_V1`
+/// = 48). The window starts at every answered ask — admitted or refused
+/// (pre-review X1 (b)) — so a peer cannot make this node verify bundles faster
+/// than the chain can carry them, valid or not. `[devnet-placeholder]`.
 pub const BUNDLE_PEER_WINDOW_BLOCKS: u64 = 48;
+
+/// Bound on [`P2pNode`]'s remembered relay origins (F5-5b pre-review X6).
+const MAX_RELAY_ORIGINS: usize = 256;
 
 /// How long an unanswered bundle ask is held (lab #785 F5-5b).
 /// `[devnet-placeholder]`.
@@ -761,9 +765,14 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// in flight per peer; an answer must match it, and an ask unanswered past
     /// [`BUNDLE_ASK_TIMEOUT_MS`] is forgotten.
     bundle_asks: HashMap<PeerId, (Hash32, u64)>,
-    /// The tip height at which each peer last had a bundle admitted from it:
-    /// at most one per [`BUNDLE_PEER_WINDOW_BLOCKS`].
-    bundle_admitted_at: HashMap<PeerId, u64>,
+    /// The tip height at which each peer last answered a bundle ask, whatever
+    /// the verdict: at most one per [`BUNDLE_PEER_WINDOW_BLOCKS`].
+    bundle_answered_at: HashMap<PeerId, u64>,
+    /// The peer each off-tip `AcceptedNoRelay` block came from, so its
+    /// after-apply relay skips it (F5-5b pre-review X6). Bounded by
+    /// [`MAX_RELAY_ORIGINS`]; losing an entry only costs that peer a
+    /// duplicate announce.
+    relay_origin: HashMap<Hash32, PeerId>,
     /// **What each body request has been answered with, and for how long it has
     /// been wanted** (issue #229) — observation only, never read by any decision.
     ///
@@ -888,7 +897,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
             bundle_asks: HashMap::new(),
-            bundle_admitted_at: HashMap::new(),
+            bundle_answered_at: HashMap::new(),
+            relay_origin: HashMap::new(),
             body_asks: HashMap::new(),
             body_declines: HashMap::new(),
             body_rr: 0,
@@ -1542,6 +1552,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
             return outcome;
         }
+        // Lab #785 F5-5b (pre-review X6): an own or pool block accepted off
+        // the tip is announced once, by `relay_applied_blocks` after it
+        // applies — not now and again then.
+        if outcome == IngestOutcome::AcceptedNoRelay {
+            self.seen.insert(bh);
+            return outcome;
+        }
         self.blocks.insert_body(header.height, bh, body.clone());
         self.seen.insert(bh);
 
@@ -1567,6 +1584,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     fn relay_applied_blocks(&mut self) {
         for (header, body) in self.node.take_relay_after_apply() {
             let bh = header.header_hash_for(self.node.genesis_form());
+            // Never back to the peer it came from (pre-review X6).
+            let origin = self.relay_origin.remove(&bh);
             self.blocks.insert_body(header.height, bh, body.clone());
             self.seen.insert(bh);
             let nonce = u64::from_le_bytes(bh[..8].try_into().expect("8 bytes"));
@@ -1577,7 +1596,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 continue;
             };
             for pid in self.peers.ready_peers() {
-                self.send(pid, MsgType::BlockAnnounce, payload.clone());
+                if Some(pid) != origin {
+                    self.send(pid, MsgType::BlockAnnounce, payload.clone());
+                }
             }
         }
     }
@@ -2300,7 +2321,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             InvKind::Tx => self.node.has_tx(&it.id) || self.seen.contains(&it.id),
             InvKind::Block => self.node.has_header(&it.id) || self.seen.contains(&it.id),
             InvKind::Checkpoint => self.node.has_checkpoint(&it.id) || self.seen.contains(&it.id),
-            InvKind::Bundle => self.node.held_bundle(&it.id).is_some() || self.seen.contains(&it.id),
+            // Not `seen` (pre-review X3): a bundle lost in a reorg and
+            // re-posted must be askable again.
+            InvKind::Bundle => self.node.bundle_not_wanted(&it.id),
         }
     }
 
@@ -2310,27 +2333,26 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             && !self.node.bundle_slot_full()
             && !self.bundle_asks.contains_key(&from)
             && self
-                .bundle_admitted_at
+                .bundle_answered_at
                 .get(&from)
                 .is_none_or(|at| self.node.tip_height() >= at + BUNDLE_PEER_WINDOW_BLOCKS)
     }
 
     /// A bundle answering our ask (lab #785 F5-5b). Unasked or mismatched
-    /// bytes are dropped uncharged (an ask may have timed out). Admitted: seen
-    /// and relayed onward, never to its sender. Refused: charged only when the
-    /// refusal reads the bytes alone (Q-5b-2).
+    /// bytes are dropped uncharged (an ask may have timed out) — the ask is
+    /// looked up before the payload is hashed (pre-review X7). Any answer to an
+    /// ask starts the peer's window. Admitted: relayed onward, never to its
+    /// sender. Refused: charged only when the refusal reads the bytes alone
+    /// (Q-5b-2).
     fn on_bundle(&mut self, from: PeerId, payload: &[u8]) {
-        let id = qlab_devnet::hash::keccak256(payload);
-        match self.bundle_asks.get(&from) {
-            Some((asked, _)) if *asked == id => {
-                self.bundle_asks.remove(&from);
-            }
-            _ => return,
+        let Some(&(asked, _)) = self.bundle_asks.get(&from) else { return };
+        if qlab_devnet::hash::keccak256(payload) != asked {
+            return;
         }
+        self.bundle_asks.remove(&from);
+        self.bundle_answered_at.insert(from, self.node.tip_height());
         match self.node.admit_bundle(payload.to_vec(), false) {
             crate::n1::BundleAdmit::Admitted(id) => {
-                self.seen.insert(id);
-                self.bundle_admitted_at.insert(from, self.node.tip_height());
                 self.relay_inv(InvItem { kind: InvKind::Bundle, id }, Some(from));
             }
             crate::n1::BundleAdmit::Refused { charged: true, .. } => {
@@ -2348,7 +2370,6 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     pub fn submit_bundle(&mut self, bytes: Vec<u8>, replace: bool) -> crate::n1::BundleAdmit {
         let verdict = self.node.admit_bundle(bytes, replace);
         if let crate::n1::BundleAdmit::Admitted(id) = &verdict {
-            self.seen.insert(*id);
             self.relay_inv(InvItem { kind: InvKind::Bundle, id: *id }, None);
         }
         verdict
@@ -3446,6 +3467,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // applied (`relay_applied_blocks`).
         if outcome == IngestOutcome::AcceptedNoRelay {
             self.seen.insert(bh);
+            if let Some(peer) = except {
+                if self.relay_origin.len() >= MAX_RELAY_ORIGINS {
+                    self.relay_origin.clear();
+                }
+                self.relay_origin.insert(bh, peer);
+            }
             return;
         }
         if !matches!(outcome, IngestOutcome::Accepted) {
@@ -4803,9 +4830,11 @@ mod tests {
             assert_eq!(mt.as_u16(), code);
             assert_eq!(MsgType::from_u16(code), Some(mt), "0x{code:04x} predates this baton");
         }
-        // And no code was allocated: the highest assigned type is still BlockTxn.
+        // And no code was allocated by that baton: the highest assigned type
+        // is Bundle (lab #785 F5-5b), the one code after BlockTxn.
         assert_eq!(MsgType::BlockTxn.as_u16(), 0x0043);
-        assert!(MsgType::from_u16(0x0044).is_none(), "nothing new was added");
+        assert_eq!(MsgType::Bundle.as_u16(), 0x0044);
+        assert!(MsgType::from_u16(0x0045).is_none(), "nothing past Bundle was added");
     }
 
     #[test]

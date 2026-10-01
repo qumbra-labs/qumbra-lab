@@ -154,7 +154,7 @@ pub const CHECKPOINT_QUERY_SERVE_INTERVAL_MS: u64 = 5_000;
 // | `GetData` items examined per message | [`MAX_GETDATA_ITEMS`] | serve side |
 // | body bytes per `GetData` answer | [`MAX_BODY_BYTES_PER_GETDATA`] | serve side |
 // | served body bytes per key, sustained | [`BODY_SERVE_BYTES_PER_SEC`] (burst [`BODY_SERVE_BYTE_BURST`]) | serve side |
-// | asks outstanding at once | `crate::node::body_window_for` (16 near tip, 128 catching up) | request side |
+// | asks outstanding at once | `crate::node::body_window_for` (16 near tip; catching up `MAX_BODIES_IN_FLIGHT_CATCHUP` = 96, or `MAX_BODIES_IN_FLIGHT_CATCHUP_V6` = 48 on a V6 net) | request side |
 // | asks per `GetData` message | `crate::node::MAX_BODIES_PER_GETDATA` (16) | request side |
 // | asks against our own inbound budget | [`RateLimiter::frame_headroom`] − `crate::node::BODY_ASK_FRAME_HEADROOM` | request side |
 // | re-ask pacing | `crate::node::BODY_REQUEST_TIMEOUT_MS` | request side |

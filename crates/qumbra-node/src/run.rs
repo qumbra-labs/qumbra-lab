@@ -7587,7 +7587,8 @@ mod tests {
         // A well-formed frame at our protocol version carrying a type code no build
         // implements — exactly what an additive `MsgType` looks like to a host that
         // predates it. Hand-built, because `Envelope::new` cannot express it.
-        let unknown_type: u16 = 0x0044;
+        // 0x0044 is `Bundle` since lab #785 F5-5b.
+        let unknown_type: u16 = 0x0045;
         assert!(qlab_p2p::MsgType::from_u16(unknown_type).is_none());
         let mut frame = Vec::new();
         frame.extend_from_slice(&qlab_p2p::MAGIC);

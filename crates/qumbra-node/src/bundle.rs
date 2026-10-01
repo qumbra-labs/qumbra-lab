@@ -51,7 +51,7 @@ use qlab_wrapper::codec::{
 };
 use qlab_wrapper::genesis::{genesis_surface, CHAIN_VERSION};
 use qlab_consensus::{Config, Proof};
-use qlab_wrapper::verify::{roots_at, thread_check, verify_wrapper, BundleMember, MemberVerifier, Surface, TypedMembers, VError};
+use qlab_wrapper::verify::{context_checks, roots_at, thread_check, verify_wrapper, BundleMember, MemberVerifier, Surface, TypedMembers, VError};
 
 use crate::genesis::GenesisError;
 use crate::genesis_v6::{GenesisFileV6, WrapperParams};
@@ -243,6 +243,30 @@ impl BundleVerifier for WrapperRule {
         let prev = decode_surface(surface).map_err(|_| BundleRefusal::SurfaceState)?;
         let wb = WireBundle::decode(bundle).map_err(codec_err)?;
         self.fold_checks(&prev, &wb)
+    }
+
+    /// Steps 1–5 and the tip-relative halves of 7 and 9 — spacing, the
+    /// version, V5–V7 ([`context_checks`]) and the fold's tail — with no
+    /// signature and no proof: those were checked when the bundle was
+    /// admitted and do not depend on the tip (F5-5b pre-review X5).
+    fn recheck_bundle(&self, header: &BlockHeader, bundle: &[u8], ctx: &BundleContext<'_>) -> Result<(), BundleRefusal> {
+        let wb = WireBundle::decode(bundle).map_err(codec_err)?;
+        if wb.l2_id != self.l2_id {
+            return Err(BundleRefusal::L2Id { got: wb.l2_id, want: self.l2_id });
+        }
+        if let Some(last) = ctx.last_bundle_height {
+            let since = header.height.saturating_sub(last);
+            if since < self.spacing {
+                return Err(BundleRefusal::Spacing { since, need: self.spacing });
+            }
+        }
+        let prev = decode_surface(ctx.surface).map_err(|_| BundleRefusal::SurfaceState)?;
+        if wb.version != self.version || wb.version != prev.version {
+            return Err(wrapper_err(VError::Version));
+        }
+        let anchor_ok = |d: &qlab_wrapper::hash::Digest| (ctx.anchor_ok)(&digest_to_bytes(d));
+        context_checks(&wb.bundle(), &prev, &anchor_ok).map_err(wrapper_err)?;
+        self.fold_checks(&prev, &wb).map(|_| ())
     }
 
     /// The prefix read (F5-4c ruling Q1): kilobytes, no proof decoded — the

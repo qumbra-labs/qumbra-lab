@@ -458,6 +458,13 @@ fn f5_5b_the_proven_bundle_through_the_slot_gossip_and_template() {
         assert_eq!(n.node().state().wrapper_surface(), &encode_surface(&stated)[..]);
         assert_eq!(n.node().state().last_bundle_height(), Some(10));
     }
+    // Pre-review X1: the applied bundle replayed is refused on the chain
+    // context (spacing, threading, the link) — never by a proof — and uncharged.
+    let replay = a.submit_bundle(fx.wire.clone(), false);
+    assert!(
+        matches!(&replay, BundleAdmit::Refused { charged: false, reason } if !reason.contains("WProof") && !reason.contains("Member")),
+        "{replay:?}"
+    );
 }
 
 /// F-A (lab #785 F5-4a): the node's V6 genesis registry is the registry

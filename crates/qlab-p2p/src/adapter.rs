@@ -301,6 +301,20 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// First wins (Q-5-4); cleared when a bundle block is applied or when it
     /// no longer verifies at a new tip.
     bundle_slot: Option<HeldBundle>,
+    /// **Refusals already paid for** (F5-5b pre-review X1 (c)): the id of
+    /// every bundle refused at the current applied tip, with its verdict — the
+    /// same bytes at the same tip are never verified twice. Reset when the tip
+    /// moves (a context refusal is about one tip). Ids refused on the bytes
+    /// alone are refused at every tip and kept in `bundle_refused_bytes`.
+    bundle_refused_at_tip: (Hash32, HashMap<Hash32, String>),
+    /// Ids refused on the bytes alone — forever, bounded by
+    /// [`MAX_REFUSED_BUNDLE_IDS`] (oldest dropped first).
+    bundle_refused_bytes: (HashSet<Hash32>, std::collections::VecDeque<Hash32>),
+    /// The bundle id the last applied bundle block carried, and that block
+    /// (F5-5b pre-review X3): a peer's advert of it is not asked for while
+    /// that block is on the main chain. A reorg that drops it makes a
+    /// re-post of the same bundle askable again.
+    last_applied_bundle: Option<(Hash32, u64, Hash32)>,
     /// The node's data dir, when disk-backed — the durability seam for the committee
     /// punishment ledger (issue #133). `None` for an in-memory adapter, which keeps
     /// every in-process sim, soak and test writing nothing.
@@ -684,6 +698,9 @@ pub(crate) fn bundle_refusal_charged(r: &qlab_devnet::body::BundleRefusal) -> bo
     }
 }
 
+/// Bound on each remembered-refusal set (F5-5b pre-review X1 (c)).
+pub const MAX_REFUSED_BUNDLE_IDS: usize = 256;
+
 /// Bound on the pending relay marks (a mark for a block never applied is
 /// dropped with the rest past this many).
 const MAX_RELAY_MARKS: usize = 256;
@@ -1001,6 +1018,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             relay_after_apply: std::collections::HashSet::new(),
             applied_for_relay: Vec::new(),
             bundle_slot: None,
+            bundle_refused_at_tip: ([0; 32], HashMap::new()),
+            bundle_refused_bytes: (HashSet::new(), std::collections::VecDeque::new()),
+            last_applied_bundle: None,
             dir: None,
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
@@ -1864,7 +1884,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if held.verified_at == tip {
             return;
         }
-        if self.sections == BodySections::V6 && self.state.verify_bundle_at_tip(&held.bytes).is_ok() {
+        // The context half only (pre-review X5): the signature and the proofs
+        // were verified at admission and do not change between tips.
+        if self.sections == BodySections::V6 && self.state.recheck_bundle_at_tip(&held.bytes).is_ok() {
             if let Some(h) = self.bundle_slot.as_mut() {
                 h.verified_at = tip;
             }
@@ -1916,6 +1938,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                     // whatever the slot held no longer threads.
                     if !body.bundle.is_empty() {
                         self.bundle_slot = None;
+                        self.last_applied_bundle = Some((
+                            qlab_devnet::hash::keccak256(&body.bundle),
+                            header.height,
+                            header.header_hash_for(self.rules.form),
+                        ));
                     }
                     // Lab #785 F5-5b: a block accepted off the tip without relay
                     // is relayed now that the full rule has run — if it is news.
@@ -3101,14 +3128,53 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         if self.state_lag().is_lagging() {
             return BundleAdmit::Refused { charged: false, reason: "state lagging its chain".into() };
         }
+        let id = qlab_devnet::hash::keccak256(&bytes);
+        let tip = self.state.tip_hash();
+        // X1 (c): a verdict already reached is returned, not re-derived.
+        if self.bundle_refused_bytes.0.contains(&id) {
+            return BundleAdmit::Refused { charged: true, reason: "refused before (on its bytes)".into() };
+        }
+        if self.bundle_refused_at_tip.0 != tip {
+            self.bundle_refused_at_tip = (tip, HashMap::new());
+        }
+        if let Some(reason) = self.bundle_refused_at_tip.1.get(&id) {
+            return BundleAdmit::Refused { charged: false, reason: format!("refused before at this tip: {reason}") };
+        }
         match self.state.verify_bundle_at_tip(&bytes) {
             Ok(_) => {
-                let id = qlab_devnet::hash::keccak256(&bytes);
-                self.bundle_slot = Some(HeldBundle { id, bytes, verified_at: self.state.tip_hash() });
+                self.bundle_slot = Some(HeldBundle { id, bytes, verified_at: tip });
                 BundleAdmit::Admitted(id)
             }
-            Err(r) => BundleAdmit::Refused { charged: bundle_refusal_charged(&r), reason: format!("{r:?}") },
+            Err(r) => {
+                let charged = bundle_refusal_charged(&r);
+                let reason = format!("{r:?}");
+                if charged {
+                    let (set, order) = &mut self.bundle_refused_bytes;
+                    if set.insert(id) {
+                        order.push_back(id);
+                        while order.len() > MAX_REFUSED_BUNDLE_IDS {
+                            if let Some(old) = order.pop_front() {
+                                set.remove(&old);
+                            }
+                        }
+                    }
+                } else if self.bundle_refused_at_tip.1.len() < MAX_REFUSED_BUNDLE_IDS {
+                    self.bundle_refused_at_tip.1.insert(id, reason.clone());
+                }
+                BundleAdmit::Refused { charged, reason }
+            }
         }
+    }
+
+    fn bundle_not_wanted(&self, id: &Hash32) -> bool {
+        if self.bundle_slot.as_ref().is_some_and(|h| h.id == *id) || self.bundle_refused_bytes.0.contains(id) {
+            return true;
+        }
+        if self.bundle_refused_at_tip.0 == self.state.tip_hash() && self.bundle_refused_at_tip.1.contains_key(id) {
+            return true;
+        }
+        self.last_applied_bundle
+            .is_some_and(|(applied, h, hash)| applied == *id && self.main_chain_hash_at(h) == Some(hash))
     }
 
     fn held_bundle(&self, id: &Hash32) -> Option<Vec<u8>> {
@@ -3281,6 +3347,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         let mut v6_off_tip = false;
         let validate_result = if self.sections == BodySections::V6 {
             if header.prev == self.state.tip_hash() {
+                // F5-5b pre-review X4: a bundle costs a proof verification, so
+                // a block carrying one shows its header's work first — a forged
+                // header (no PoW, matching commitment) is refused before the
+                // body rule runs. On a failure the header path names the
+                // refusal exactly as it always has; on success it re-runs below.
+                if !body.bundle.is_empty()
+                    && validate_header_under(&self.chain, &self.pow, &header, self.block_time, self.schedule, &self.rules)
+                        .is_err()
+                {
+                    return self.submit_header(header);
+                }
                 self.state.validate_block_v6(&header, &body, &self.verifier)
             } else if let Err(e) = qlab_devnet::body::check_body_binding_v6(&header, &body) {
                 Err(e)

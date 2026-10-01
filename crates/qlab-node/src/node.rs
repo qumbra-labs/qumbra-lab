@@ -876,14 +876,18 @@ impl qlab_devnet::body::BundleVerifier for CachedRule<'_> {
         bundle: &[u8],
         ctx: &qlab_devnet::body::BundleContext<'_>,
     ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
-        let mut slot = self.cache.lock().expect("bundle cache");
-        if let Some((b, p, outcome)) = slot.take() {
+        // The lock is held only to read or write the slot, never across the
+        // verification (F5-5b pre-review X7), and a poisoned lock is recovered
+        // rather than propagated: the slot is a cache, so the worst a panic
+        // mid-write leaves behind is a miss.
+        let held = self.cache.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((b, p, outcome)) = held {
             if (b, p) == self.key {
                 return Ok(outcome);
             }
         }
         let outcome = self.inner.verify_bundle(header, bundle, ctx)?;
-        *slot = Some((self.key.0, self.key.1, outcome.clone()));
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.key.0, self.key.1, outcome.clone()));
         Ok(outcome)
     }
     fn fold_bundle(
@@ -1769,7 +1773,7 @@ impl MemNode {
     /// still reads the applied store.
     pub fn rewind_to(&mut self, target: Hash32) -> Result<RewindReport, NodeError> {
         // F5-5b: a verdict cached at the old tip is not one at the new tip.
-        *self.bundle_cache.lock().expect("bundle cache") = None;
+        *self.bundle_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let from_height = self.chain.tip_height();
         let from_hash = self.chain.tip_hash();
         if from_hash == target {
@@ -2222,12 +2226,33 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// new tip): the installed rule (never the cache), the tip's wrapper
     /// surface and last bundle height, spacing at `tip + 1`, and V7 under the
     /// tip's recorded finality — conservative, since the next block's own
-    /// record can only widen it; the template re-verifies under the block it
-    /// builds. With no wrapper rule every bundle is refused.
+    /// record can only widen it; the block that carries it is judged in full
+    /// when applied. With no wrapper rule every bundle is refused.
     pub fn verify_bundle_at_tip(
         &self,
         bundle: &[u8],
     ) -> Result<qlab_devnet::body::BundleOutcome, qlab_devnet::body::BundleRefusal> {
+        self.judge_bundle_at_tip(bundle, |rule, header, bundle, ctx| rule.verify_bundle(header, bundle, ctx))
+    }
+
+    /// [`Self::verify_bundle_at_tip`]'s re-check form (F5-5b pre-review X5):
+    /// the same context, through [`qlab_devnet::body::BundleVerifier::recheck_bundle`]
+    /// — for a bundle already verified at an earlier tip, only the checks a
+    /// new tip can change.
+    pub fn recheck_bundle_at_tip(&self, bundle: &[u8]) -> Result<(), qlab_devnet::body::BundleRefusal> {
+        self.judge_bundle_at_tip(bundle, |rule, header, bundle, ctx| rule.recheck_bundle(header, bundle, ctx))
+    }
+
+    fn judge_bundle_at_tip<R>(
+        &self,
+        bundle: &[u8],
+        judge: impl FnOnce(
+            &dyn qlab_devnet::body::BundleVerifier,
+            &BlockHeader,
+            &[u8],
+            &qlab_devnet::body::BundleContext<'_>,
+        ) -> Result<R, qlab_devnet::body::BundleRefusal>,
+    ) -> Result<R, qlab_devnet::body::BundleRefusal> {
         use qlab_devnet::body::V6ChainView as _;
         assert_eq!(self.sections, BodySections::V6, "verify_bundle_at_tip on a non-V6 node");
         let rule: &dyn qlab_devnet::body::BundleVerifier = match &self.wrapper {
@@ -2245,7 +2270,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             last_bundle_height: view.last_bundle_height(),
             anchor_ok: &anchor_ok,
         };
-        rule.verify_bundle(&header, bundle, &ctx)
+        judge(rule, &header, bundle, &ctx)
     }
 
     /// Would `record` pass the V6 record rule in the **next** block on this

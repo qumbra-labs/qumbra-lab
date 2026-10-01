@@ -461,6 +461,15 @@ pub trait BlockIngest {
     fn bundle_slot_full(&self) -> bool {
         false
     }
+
+    /// Whether a peer's advert of bundle `id` is not worth an ask (F5-5b
+    /// pre-review X3): it is the held one, it was refused on its bytes, it
+    /// was refused at this tip, or it is the bundle the last applied bundle
+    /// block on the main chain carried. Not "seen": a bundle lost in a reorg
+    /// and re-posted must propagate again.
+    fn bundle_not_wanted(&self, _id: &Hash32) -> bool {
+        false
+    }
 }
 
 /// [`BlockIngest`]'s default answer to a sealed header: not a peer fault — the
