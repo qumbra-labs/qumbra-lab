@@ -126,7 +126,12 @@ run_measured() {
   return $rc
 }
 
-tip_of() { grep -o 'TELEMETRY tip=[0-9]*' "$1" 2>/dev/null | tail -1 | cut -d= -f2; }
+# Under `set -euo pipefail` a pipeline whose first stage finds nothing FAILS,
+# and `x=$(that)` then ends the script silently (box run 3: `tip_of` on a log
+# with no TELEMETRY line yet). Every helper whose output is assigned is
+# therefore total: it prints nothing rather than failing.
+tip_of() { { grep -o 'TELEMETRY tip=[0-9]*' "$1" 2>/dev/null || true; } | tail -1 | cut -d= -f2; }
+final_of() { { grep -o 'TELEMETRY tip=[0-9]* final=[0-9]*' "$1" 2>/dev/null || true; } | tail -1 | sed 's/.*final=//'; }
 
 # `/v1/supply/bridge`: ver u8 ‖ covered u64 ‖ d_cum u64 ‖ e_cum u64 ‖ … (LE).
 # Echoes "covered d_cum e_cum", or nothing when the route does not answer.
@@ -134,12 +139,12 @@ bridge() {
   local f="$RUN/producer/bridge.bin"
   curl -sf -o "$f" "http://127.0.0.1:$P_TELE/v1/supply/bridge" || return 0
   [ "$(od -An -t u1 -N 1 "$f" | tr -d ' ')" = 1 ] || return 0
-  od -An -t u8 --endian=little -j 1 -N 24 "$f" | xargs
+  od -An -t u8 --endian=little -j 1 -N 24 "$f" | xargs || true
 }
 
 # A manifest's integer field (serde_json's pretty form: `"key": 123,`; the
 # keys read here — d_cum, e_cum, total — each occur once at any depth).
-mfield() { sed -n "s/^ *\"$2\": \([0-9]*\).*/\1/p" "$1" | head -1; }
+mfield() { { sed -n "s/^ *\"$2\": \([0-9]*\).*/\1/p" "$1" || true; } | head -1 || true; }
 
 # Log a waiting line only when it changes, plus one heartbeat per 10 min.
 LAST_WAIT=""; LAST_BEAT=0
@@ -177,12 +182,17 @@ start_producer() {
   pid=$(start_measured "$RUN/producer/node" "$NODE" run --config "$RUN/producer/node.toml" --sample-interval-secs 10)
   [ -n "$pid" ] || die "the producer did not start (see $RUN/producer/node.err)"
   echo "$pid" > "$RUN/producer/node.pid"
+  date +%s > "$RUN/producer/node.started"
   log "producer up (pid $pid)"
 }
 
 stop_node() { # dir
   local pid; pid=$(cat "$1/node.pid" 2>/dev/null || true)
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+  # A node SIGINTed in its first second may not have installed its handler
+  # yet and swallows the signal (box run 3): never stop one younger than 5 s.
+  local started; started=$(cat "$1/node.started" 2>/dev/null || echo 0)
+  while [ $(( $(date +%s) - started )) -lt 5 ]; do sleep 1; done
   kill -INT "$pid"
   for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   kill -0 "$pid" 2>/dev/null && die "$1: did not stop on SIGINT within 120 s"
@@ -234,15 +244,16 @@ post_and_land() {
 if ! is_done genesis; then
   mkdir -p "$NET"
   [ -e "$GEN" ] || "$NODE" genesis init --t2 --out "$NET" > "$NET/init.log" 2>&1 || die "genesis init (see $NET/init.log)"
-  grep 'GENESIS HASH:' "$NET/init.log" | awk '{print $3}' > "$NET/genesis.hash"
+  { grep 'GENESIS HASH:' "$NET/init.log" || true; } | awk '{print $3}' > "$NET/genesis.hash"
   [ "$(wc -c < "$NET/genesis.hash")" -ge 64 ] || die "no GENESIS HASH line in $NET/init.log"
   "$BENCH" f5box --burn-rkm --genesis "$GEN" > "$NET/burn.rkm" || die "f5box --burn-rkm"
   mkdir -p "$WDIR"
   [ -e "$WDIR/address" ] || {
     "$WALLET" keygen --dir "$WDIR" > "$WDIR/keygen.log" 2>&1 || die "wallet keygen"
-    grep -A1 'address \[0\]:' "$WDIR/keygen.log" | tail -1 | tr -d ' ' > "$WDIR/address"
+    { grep -A1 'address \[0\]:' "$WDIR/keygen.log" || true; } | tail -1 | tr -d ' ' > "$WDIR/address"
   }
-  "$WALLET" miner-rkm --dir "$WDIR" | sed -n 's/.*miner_rkm = "\([0-9a-f]*\)".*/\1/p' > "$WDIR/rkm"
+  "$WALLET" miner-rkm --dir "$WDIR" > "$WDIR/miner-rkm.out" 2>&1 || die "wallet miner-rkm (see $WDIR/miner-rkm.out)"
+  sed -n 's/.*miner_rkm = "\([0-9a-f]*\)".*/\1/p' "$WDIR/miner-rkm.out" > "$WDIR/rkm"
   [ "$(wc -c < "$WDIR/rkm")" -ge 64 ] || die "no miner_rkm from the wallet"
   log "genesis $(cat "$NET/genesis.hash"); burn rkm $(cat "$NET/burn.rkm"); exit to wallet rkm $(cat "$WDIR/rkm")"
   done_mark genesis
@@ -268,8 +279,21 @@ if ! is_done ready; then
     wait_log "deposit not plannable yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$F5/check-0.err" | sed 's/at tip [0-9]*//')"
     sleep 60
   done
-  log "the deposit plans at tip $(tip_of "$RUN/producer/node.out")"
+  log "the deposit plans at tip $(tip_of "$RUN/producer/node.out"), local final $(final_of "$RUN/producer/node.out")"
   if [ -z "$RESUME" ]; then
+    # The Anchor(0) lesson (box run 3): a producer's record material is
+    # memory-only, so stopping it between a local finalization and the block
+    # that records it loses that record for good — and the deposit, which
+    # absorbs roots under local finality, then waits a cadence. Stop only when
+    # the tip is a full cadence past local final F: record F is in block ≈ F+3
+    # by then, and slot F+8 is not finalized before tip F+10.
+    until t=$(tip_of "$RUN/producer/node.out"); f=$(final_of "$RUN/producer/node.out"); \
+          [ -n "$t" ] && [ -n "$f" ] && [ "$t" -ge $((f + 8)) ]; do
+      producer_up || die "the producer exited (see $RUN/producer/node.err)"
+      wait_log "checkpoint waits for tip ≥ final + 8 (tip ${t:-?}, final ${f:-?})"
+      sleep 5
+    done
+    log "checkpoint at tip $t, local final $f (its record is in a block)"
     stop_node "$RUN/producer"
     tar -C "$RUN/producer" -cf "$RUN/datadir-pre-deposit.tar" data || die "tarring the datadir"
     log "checkpoint $RUN/datadir-pre-deposit.tar ($(wc -c < "$RUN/datadir-pre-deposit.tar") B)"
@@ -312,6 +336,10 @@ if ! is_done peers; then
   for k in 1 2 3; do
     base=$((PORT + 10 * k))
     rm -rf "$RUN/peer$k/data"
+    # A rerun must not read the last run's output (box run 3 measured "0 s"
+    # off a stale TELEMETRY line): every file this phase measures starts empty.
+    mkdir -p "$RUN/peer$k"
+    for f in node.out node.err node.rss node.time node.timepid catchup.seconds; do : > "$RUN/peer$k/$f"; done
     node_config "peer$k" "$base" $((base + 1)) $((base + 2)) $((base + 3)) - false no "$P_LISTEN"
   done
   start_s=$(date +%s)
@@ -320,6 +348,7 @@ if ! is_done peers; then
     pid=$(start_measured "$RUN/peer$k/node" "$NODE" run --config "$RUN/peer$k/node.toml" --sample-interval-secs 5)
     [ -n "$pid" ] || die "peer$k did not start (see $RUN/peer$k/node.err)"
     echo "$pid" > "$RUN/peer$k/node.pid"
+    date +%s > "$RUN/peer$k/node.started"
   done
   for k in 1 2 3; do
     for _ in $(seq 1 720); do
