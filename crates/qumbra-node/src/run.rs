@@ -460,6 +460,9 @@ struct CachedMineTemplate {
     /// by it), so a finalization since the cache was filled makes it stale.
     record_height: Option<u64>,
     payees: Vec<qlab_devnet::body::CoinbasePayee>,
+    /// Lab #785 F5-5b: the slot's bundle — a new or replaced bundle at the
+    /// same tip makes the cached job stale.
+    bundle: Option<qlab_devnet::header::Hash32>,
     wire: MineTemplateWire,
 }
 
@@ -2633,7 +2636,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
                 Some(Ok(req)) => req,
                 _ => break,
             };
-            let outcome = self.submit_mined_block(req.header, req.body);
+            let outcome = self.submit_mined_block(req.header, req.body, req.bundle_id);
             let _ = req.reply.try_send(outcome);
         }
     }
@@ -2655,10 +2658,12 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         let tip = self.p2p.node().tip_hash();
         let mempool_len = self.p2p.node().mempool().len();
         let record_height = self.p2p.node().record_material_height();
+        let bundle = self.p2p.node().held_bundle_slot().map(|h| h.id);
         if let Some(cached) = &self.cached_mine_template {
             if cached.tip == tip
                 && cached.mempool_len == mempool_len
                 && cached.record_height == record_height
+                && cached.bundle == bundle
                 && cached.payees == payees
             {
                 return Ok(cached.wire.clone());
@@ -2675,6 +2680,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             mempool_len,
             record_height,
             payees: payees.to_vec(),
+            bundle,
             wire: wire.clone(),
         });
         Ok(wire)
@@ -2683,12 +2689,25 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
     fn submit_mined_block(
         &mut self,
         header: qlab_devnet::header::BlockHeader,
-        body: qlab_devnet::body::BlockBody,
+        mut body: qlab_devnet::body::BlockBody,
+        bundle_id: Option<[u8; 32]>,
     ) -> BlockSubmitOutcome {
         if !self.template_serving {
             return BlockSubmitOutcome::Unavailable {
                 name: "template-serving-disabled".into(),
             };
+        }
+        // Lab #785 F5-5b: the template named the slot's bundle by id; put the
+        // bytes back. An id the slot no longer holds is a stale job, refused
+        // by name rather than submitted without the bundle the header commits.
+        if let Some(id) = bundle_id {
+            use qlab_p2p::n1::BlockIngest;
+            match self.p2p.node().held_bundle(&id) {
+                Some(bytes) => body.bundle = bytes,
+                None => {
+                    return BlockSubmitOutcome::Refused { name: crate::mine_rpc::UNKNOWN_BUNDLE.into() }
+                }
+            }
         }
         use qlab_p2p::n1::ChainView;
         let form = self.p2p.node().genesis_form();

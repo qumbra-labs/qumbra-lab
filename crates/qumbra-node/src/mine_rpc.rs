@@ -56,6 +56,9 @@ pub struct TemplateContextRequest {
 pub struct BlockSubmitRequest {
     pub header: BlockHeader,
     pub body: BlockBody,
+    /// The template's bundle id echoed back (lab #785 F5-5b): the run loop
+    /// reattaches the slot's bytes, or refuses an id it no longer holds.
+    pub bundle_id: Option<[u8; 32]>,
     pub reply: mpsc::SyncSender<BlockSubmitOutcome>,
 }
 
@@ -94,6 +97,13 @@ pub struct MineTemplateWire {
     /// no RPC version bump; the golden below asserts it).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finality: String,
+    /// **V6 only, additive** (lab #785 F5-5b): the id (Keccak-256, hex) of the
+    /// L2 bundle the node attached from its slot, absent when the body carries
+    /// none. The bytes stay on the node: the pool echoes the id on submit and
+    /// the node reattaches what it holds, so a template stays small and every
+    /// bundle-free template and block is byte-identical to before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bundle_id: String,
 }
 
 /// JSON body of `POST /v1/mine/block`.
@@ -114,6 +124,13 @@ pub struct MineBlockWire {
     /// no RPC version bump; the golden below asserts it).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finality: String,
+    /// **V6 only, additive** (lab #785 F5-5b): the id (Keccak-256, hex) of the
+    /// L2 bundle the node attached from its slot, absent when the body carries
+    /// none. The bytes stay on the node: the pool echoes the id on submit and
+    /// the node reattaches what it holds, so a template stays small and every
+    /// bundle-free template and block is byte-identical to before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bundle_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +175,7 @@ impl MineTemplateWire {
             txs: c.body.txs.iter().map(|tx| hex_encode(&encode_tx(tx))).collect(),
             finality: hex_encode(&c.body.finality),
             sections: sections_token(c.sections),
+            bundle_id: bundle_id_hex(&c.body.bundle),
         }
     }
 }
@@ -201,6 +219,34 @@ impl MineBlockWire {
             body.finality = hex_decode(&self.finality).ok_or_else(|| "finality: bad hex".to_string())?;
         }
         Ok((form, header, body))
+    }
+
+    /// The echoed bundle id (lab #785 F5-5b), `None` when absent. Only a V6
+    /// block may name one.
+    pub fn bundle_id(&self) -> Result<Option<[u8; 32]>, String> {
+        if self.bundle_id.is_empty() {
+            return Ok(None);
+        }
+        if self.sections != "v6" {
+            return Err("bundle_id: only a V6 block carries a bundle".into());
+        }
+        let bytes = hex_decode(&self.bundle_id).ok_or_else(|| "bundle_id: bad hex".to_string())?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| format!("bundle_id: decoded {} bytes, want 32", bytes.len()))
+    }
+}
+
+/// The named refusal for a submitted block whose bundle the node no longer
+/// holds (replaced, applied, or dropped since the template was served).
+pub const UNKNOWN_BUNDLE: &str = "unknown-bundle";
+
+/// The template's bundle id: Keccak-256 of the bytes, hex; empty for none.
+pub fn bundle_id_hex(bundle: &[u8]) -> String {
+    if bundle.is_empty() {
+        String::new()
+    } else {
+        hex_encode(&qlab_devnet::hash::keccak256(bundle))
     }
 }
 
@@ -360,6 +406,7 @@ mod tests {
             txs: vec![],
             finality: String::new(),
             sections: String::new(),
+            bundle_id: String::new(),
         };
         let json = serde_json::to_string(&wire).unwrap();
         let back: MineBlockWire = serde_json::from_str(&json).unwrap();
@@ -406,6 +453,7 @@ mod tests {
             txs: vec![],
             finality: String::new(),
             sections: String::new(),
+            bundle_id: String::new(),
         };
         assert_eq!(
             serde_json::to_string(&wire).unwrap(),
@@ -416,6 +464,38 @@ mod tests {
         assert!(json.ends_with(r#","txs":[],"finality":"0102"}"#), "{json}");
         let back: MineTemplateWire = serde_json::from_str(&json).unwrap();
         assert_eq!(back.finality, "0102");
+        // Lab #785 F5-5b: `bundle_id` is additive the same way — absent when
+        // empty (the golden above), present only when a bundle rode along.
+        wire.bundle_id = "ee".repeat(32);
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.ends_with(&format!(r#","finality":"0102","bundle_id":"{}"}}"#, "ee".repeat(32))), "{json}");
+        assert_eq!(bundle_id_hex(&[]), "", "no bundle, no id");
+        assert_eq!(bundle_id_hex(b"abc"), hex_encode(&qlab_devnet::hash::keccak256(b"abc")));
+    }
+
+    /// Lab #785 F5-5b: a submitted block's echoed bundle id decodes to the
+    /// 32 bytes the node looks up; it must be well-formed and only a V6 block
+    /// may name one.
+    #[test]
+    fn a_submitted_block_names_its_bundle_by_id_and_only_on_v6() {
+        let header = BlockHeader::genesis_for(GenesisForm::V5, 8, 0);
+        let wire = |sections: &str, bundle_id: String| MineBlockWire {
+            form: "v5".into(),
+            header: header_hex(GenesisForm::V5, &header),
+            coinbase_payees: vec![],
+            txs: vec![],
+            finality: String::new(),
+            sections: sections.into(),
+            bundle_id,
+        };
+        assert_eq!(wire("v6", String::new()).bundle_id(), Ok(None));
+        assert_eq!(wire("v6", "11".repeat(32)).bundle_id(), Ok(Some([0x11; 32])));
+        assert!(wire("v6", "11".repeat(31)).bundle_id().is_err(), "31 bytes");
+        assert!(wire("v6", "zz".into()).bundle_id().is_err());
+        assert!(wire("", "11".repeat(32)).bundle_id().is_err(), "a V5 block names no bundle");
+        let json = serde_json::to_string(&wire("v6", "11".repeat(32))).unwrap();
+        let back: MineBlockWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bundle_id().unwrap(), Some([0x11; 32]));
     }
 
     /// The submitted block carries the record back into the body.
@@ -429,6 +509,7 @@ mod tests {
             txs: vec![],
             finality: "0a0b".into(),
             sections: String::new(),
+            bundle_id: String::new(),
         };
         let (_, _, body) = wire.decode().unwrap();
         assert_eq!(body.finality, vec![0x0a, 0x0b]);
@@ -454,6 +535,7 @@ mod tests {
             txs: vec![],
             finality: String::new(),
             sections: sections.into(),
+            bundle_id: String::new(),
         };
         assert!(wire("").decode().is_ok(), "V5 above its boundary allows two");
         assert!(matches!(wire("v6").decode(), Err(e) if e.contains("cap 1")));

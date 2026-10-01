@@ -347,6 +347,7 @@ fn live_template_then_submit_advances_tip() {
             txs: wire.txs,
             finality: wire.finality,
             sections: wire.sections,
+            bundle_id: wire.bundle_id,
         };
         let (status, text) = http_post(addr, "/v1/mine/block", &serde_json::to_vec(&post).unwrap());
         assert!(status.contains("202"), "{status} {text}");
@@ -596,6 +597,7 @@ fn template_header_decodes_under_v5() {
         txs: vec![],
         finality: String::new(),
         sections: String::new(),
+        bundle_id: String::new(),
     };
     let header = qlab_devnet::header::BlockHeader { ext: qlab_devnet::annulet::HeaderExt::NONE,
         prev: hex32(&wire.prev),

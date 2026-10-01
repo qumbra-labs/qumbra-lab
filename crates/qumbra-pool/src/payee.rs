@@ -711,6 +711,7 @@ mod tests {
             txs: Vec::new(),
             finality: Vec::new(),
             sections: qlab_devnet::forms::BodySections::None,
+            bundle_id: Vec::new(),
         };
         assert!(check_body_payee(&body, rkm(9), &Accounts::default(), std::iter::empty()).is_ok());
 
@@ -720,6 +721,7 @@ mod tests {
             txs: Vec::new(),
             finality: Vec::new(),
             sections: qlab_devnet::forms::BodySections::None,
+            bundle_id: Vec::new(),
         };
         assert_eq!(
             check_body_payee(&minting, rkm(9), &Accounts::default(), std::iter::empty()),

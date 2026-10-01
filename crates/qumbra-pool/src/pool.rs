@@ -965,6 +965,7 @@ mod tests {
             txs: Vec::new(),
             finality: Vec::new(),
             sections: qlab_devnet::forms::BodySections::None,
+            bundle_id: Vec::new(),
         }
     }
 

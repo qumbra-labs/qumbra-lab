@@ -1266,12 +1266,17 @@ fn mine_block_verdict(
         Ok(v) => v,
         Err(e) => return (400, format!("refused: {e}")),
     };
+    let bundle_id = match wire.bundle_id() {
+        Ok(v) => v,
+        Err(e) => return (400, format!("refused: {e}")),
+    };
     let (tx, rx) = mpsc::sync_channel(1);
     if mine
         .blocks
         .try_send(crate::mine_rpc::BlockSubmitRequest {
             header,
             body,
+            bundle_id,
             reply: tx,
         })
         .is_err()

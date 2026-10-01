@@ -66,6 +66,10 @@ struct MineTemplateWire {
     /// `"v6"` on a V6 node (lab #785): the template's section axis, echoed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sections: String,
+    /// The node's L2 bundle id (lab #785 F5-5b), hex, echoed — the node
+    /// holds the bytes and reattaches them; absent when there is none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    bundle_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,6 +84,10 @@ struct MineBlockWire {
     /// `"v6"` on a V6 node (lab #785): the template's section axis, echoed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sections: String,
+    /// The node's L2 bundle id (lab #785 F5-5b), hex, echoed — the node
+    /// holds the bytes and reattaches them; absent when there is none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    bundle_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -272,6 +280,7 @@ fn block_wire(form_s: &str, header_preimage: &[u8], body: &TemplateBody) -> Mine
             BodySections::V6 => "v6".into(),
             BodySections::None => String::new(),
         },
+        bundle_id: hexutil::encode(&body.bundle_id),
     }
 }
 
@@ -315,6 +324,7 @@ fn template_from_wire(w: MineTemplateWire) -> Result<Template, TemplateError> {
             txs,
             finality: hexutil::decode(&w.finality)?,
             sections: parse_sections(&w.sections)?,
+            bundle_id: hexutil::decode(&w.bundle_id)?,
         }),
     })
 }
@@ -397,7 +407,28 @@ mod tests {
             txs: vec![],
             finality: vec![],
             sections: BodySections::V6,
+            bundle_id: Vec::new(),
         };
         assert!(serde_json::to_string(&block_wire("v5", &[], &body)).unwrap().contains(r#""sections":"v6""#));
+    }
+
+    /// Lab #785 F5-5b: the node's bundle id rides the template into the pool
+    /// and back out on submit unchanged; with none, the submit JSON carries
+    /// no `bundle_id` key at all.
+    #[test]
+    fn the_bundle_id_is_echoed_and_absent_when_empty() {
+        let json = format!(
+            r#"{{"form":"v5","prev":"{p}","height":1,"timestamp":75,"difficulty":8,"nonce":0,"tx_body_commitment":"{c}","seed_hash":"{s}","next_seed_hash":null,"coinbase_payees":[],"txs":[],"sections":"v6","bundle_id":"{b}"}}"#,
+            p = "11".repeat(32),
+            c = "22".repeat(32),
+            s = "33".repeat(32),
+            b = "44".repeat(32),
+        );
+        let body = template_from_wire(serde_json::from_str(&json).unwrap()).unwrap().body.unwrap();
+        assert_eq!(body.bundle_id, vec![0x44; 32]);
+        let out = serde_json::to_string(&block_wire("v5", &[], &body)).unwrap();
+        assert!(out.contains(&format!(r#""bundle_id":"{}""#, "44".repeat(32))), "{out}");
+        let none = TemplateBody { bundle_id: Vec::new(), ..body };
+        assert!(!serde_json::to_string(&block_wire("v5", &[], &none)).unwrap().contains("bundle_id"));
     }
 }
