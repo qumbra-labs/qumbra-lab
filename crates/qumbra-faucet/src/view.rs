@@ -66,7 +66,7 @@ impl NodeView<'_> {
                 self.0.form(),
                 block.header.height,
                 |minted_at| {
-                    by_height.get(&minted_at).and_then(|h| chain.block(h)).map(|b| b.body())
+                    by_height.get(&minted_at).and_then(|h| chain.block(h)).map(|b| b.coinbase_view())
                 },
             );
             if matured.is_some() {

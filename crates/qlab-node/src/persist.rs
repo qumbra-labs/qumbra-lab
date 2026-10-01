@@ -2,7 +2,8 @@
 //!
 //! Durability has two layers with different jobs:
 //!
-//! - **`blocks.log`** — an append-only, length-prefixed `bincode` stream of
+//! - **`blocks.log`** — an **append-only** (see [`BLOCK_LOG`] for why that is
+//!   now load-bearing), length-prefixed `bincode` stream of
 //!   [`LogRecord`]s: every accepted block AND every finalization, in order. This
 //!   is the **source of truth**: replaying it from genesis reconstructs the exact
 //!   node state ([`crate::node::Node::replay`]) — including the finalized head,
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Hash32, StoredBlock};
+use crate::store::{BundleRef, Hash32, StoredBlock};
 
 /// On-disk format version for both the block log and the snapshot. Bump on any
 /// incompatible change to [`StoredBlock`] or [`Snapshot`].
@@ -58,6 +59,39 @@ use crate::store::{Hash32, StoredBlock};
 pub const FORMAT_VERSION: u32 = 3;
 
 /// The append-only log file name (source of truth: blocks + finalizations).
+///
+/// # 🔒 The log's invariant: append-only, for the life of the data dir
+///
+/// **Since lab #785 F5-5c a V6 bundle is held in memory as a byte offset into
+/// this file** ([`crate::store::BundleRef`]), so the following is load-bearing,
+/// not a convention:
+///
+/// - production code opens this file only through [`append_record`]
+///   (`OpenOptions::append`) and the read paths ([`read_records`],
+///   `BundleRef::read`) — never `create`/`truncate`/`set_len`/`rename`/
+///   `remove`, and nothing compacts or rewrites it;
+/// - **the single exception, lab #804**: a record torn by a crash
+///   mid-append (its length prefix, or its declared bytes, cut short) is cut
+///   off by [`truncate_torn_tail`] — once, by the process that writes, before
+///   its first append — so the next record lands at the last complete
+///   record's end instead of behind the torn bytes. No reference can point
+///   into a torn record (references are built only for decoded records), so
+///   this is the one truncation that cannot move bytes under one. The reader
+///   itself stays read-only: a process that only reads (an audit opening a
+///   live node's data dir) never cuts, since what it sees as torn may be an
+///   append in progress;
+/// - **a rewound block's record stays**: a reorg appends the winning branch
+///   after it, so a reference into an orphaned block stays valid — do not
+///   "clean up" orphans, and do not compact;
+/// - a bundle's offset is exact: [`V6WireBlock`]'s `bundle` is its last
+///   field, so its bytes are the record's tail.
+///
+/// `tests::blocks_log_is_append_only_in_every_production_source` scans every
+/// crate's non-test source for anything else naming this file (or its
+/// [`log_path`]); the authority
+/// is `BundleRef::read`, which re-hashes every slice it reads and refuses by
+/// name — on a log that moved, or ended short — rather than return other
+/// bytes.
 pub const BLOCK_LOG: &str = "blocks.log";
 /// The snapshot file name (fast-restart derived state).
 pub const SNAPSHOT: &str = "snapshot.bin";
@@ -214,15 +248,27 @@ fn rider_free(b: &StoredBlock) -> bool {
 impl From<&LogRecord> for WireRecord {
     /// # Panics
     ///
-    /// On an unsealed Annulet block (the genesis block, which is never
-    /// logged), and on an L1 block carrying an L2 surface: the L1 layouts have
-    /// no place for a surface (`StoredTx.l2` is `serde(skip)`), so writing one
-    /// would drop it silently.
+    /// As [`to_wire`], and on a bundle that cannot be read back (tests only;
+    /// [`append_record`] takes the fallible path).
     fn from(rec: &LogRecord) -> Self {
+        to_wire(rec).expect("a logged block's bundle reads back")
+    }
+}
+
+/// The on-disk encoding of `rec`.
+///
+/// # Panics
+///
+/// On an unsealed Annulet block (the genesis block, which is never
+/// logged), and on an L1 block carrying an L2 surface: the L1 layouts have
+/// no place for a surface (`StoredTx.l2` is `serde(skip)`), so writing one
+/// would drop it silently.
+fn to_wire(rec: &LogRecord) -> io::Result<WireRecord> {
+    {
         if let LogRecord::Block(b) = rec {
             if let Some(a) = &b.annulet {
                 let sig = a.sig.as_ref().expect("an Annulet log record carries its seal (lab #708)");
-                return WireRecord::AnnuletBlock(AnnuletWireBlock {
+                return Ok(WireRecord::AnnuletBlock(AnnuletWireBlock {
                     header: b.header.clone(),
                     l1_anchor_height: a.ext.l1_anchor_height,
                     l1_anchor_root: a.ext.l1_anchor_root,
@@ -242,14 +288,14 @@ impl From<&LogRecord> for WireRecord {
                             l2: t.l2.clone(),
                         })
                         .collect(),
-                });
+                }));
             }
             assert!(
                 b.txs.iter().all(|t| t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT),
                 "an L2 surface has no L1 log record (lab #708)"
             );
         }
-        match rec {
+        Ok(match rec {
             LogRecord::Finalize(h) => WireRecord::Finalize(*h),
             LogRecord::Block(b) if b.sections.is_some() => {
                 let sections = b.sections.as_ref().expect("guarded");
@@ -272,7 +318,12 @@ impl From<&LogRecord> for WireRecord {
                     coinbase: b.coinbase,
                     coinbase_rkm: b.coinbase_rkm,
                     finality: sections.finality.clone(),
-                    bundle: sections.bundle.clone(),
+                    // The LAST field: the bundle's bytes are the record's
+                    // tail, which is what `bundle_offset` relies on.
+                    bundle: match &sections.bundle {
+                        Some(r) => r.read()?,
+                        None => Vec::new(),
+                    },
                 })
             }
             LogRecord::Block(b) if rider_free(b) => WireRecord::Block(LegacyStoredBlock {
@@ -294,8 +345,16 @@ impl From<&LogRecord> for WireRecord {
                 coinbase_rkm: b.coinbase_rkm,
             }),
             LogRecord::Block(b) => WireRecord::BlockV4(b.clone()),
-        }
+        })
     }
+}
+
+/// Where a V6 record's bundle bytes sit in the log (lab #785 F5-5c): the
+/// record's last `len` bytes, since `bundle` is [`V6WireBlock`]'s last field
+/// and bincode writes a `Vec<u8>`'s bytes contiguously after its length.
+/// `record_end` is the file offset just past the record.
+fn bundle_offset(record_end: u64, len: usize) -> u64 {
+    record_end - len as u64
 }
 
 fn annulet_record_to_block(a: AnnuletWireBlock) -> StoredBlock {
@@ -333,7 +392,16 @@ fn annulet_record_to_block(a: AnnuletWireBlock) -> StoredBlock {
 }
 
 impl From<WireRecord> for LogRecord {
+    /// A record with no place in a log: a V6 bundle stays resident.
     fn from(rec: WireRecord) -> Self {
+        log_record(rec, None)
+    }
+}
+
+/// `rec` as a [`LogRecord`]; with `at = (log, record_end)`, a V6 bundle
+/// becomes a [`BundleRef`] into the log and its bytes are dropped here.
+fn log_record(rec: WireRecord, at: Option<(&std::sync::Arc<Path>, u64)>) -> LogRecord {
+    {
         match rec {
             WireRecord::Finalize(h) => LogRecord::Finalize(h),
             WireRecord::BlockV4(b) => LogRecord::Block(b),
@@ -358,7 +426,18 @@ impl From<WireRecord> for LogRecord {
                     .collect(),
                 coinbase: v.coinbase,
                 coinbase_rkm: v.coinbase_rkm,
-                sections: Some(crate::store::StoredSections { finality: v.finality, bundle: v.bundle }),
+                sections: Some(crate::store::StoredSections {
+                    finality: v.finality,
+                    bundle: match at {
+                        Some((log, end)) if !v.bundle.is_empty() => Some(BundleRef::in_log(
+                            qlab_devnet::hash::keccak256(&v.bundle),
+                            u32::try_from(v.bundle.len()).expect("a record's length is a u32"),
+                            std::sync::Arc::clone(log),
+                            bundle_offset(end, v.bundle.len()),
+                        )),
+                        _ => BundleRef::resident(&v.bundle),
+                    },
+                }),
             }),
             WireRecord::Block(l) => LogRecord::Block(StoredBlock { annulet: None, sections: None,
                 header: l.header,
@@ -432,21 +511,84 @@ pub struct Snapshot {
     pub roots_by_height: Vec<(u64, Hash32)>,
 }
 
+/// The block log's path under `dir`, as the shared handle a
+/// [`BundleRef`] reads through (lab #785 F5-5c) — absolute where the dir
+/// resolves, so a later change of working directory cannot strand a
+/// reference.
+pub fn log_path(dir: &Path) -> std::sync::Arc<Path> {
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    std::sync::Arc::from(dir.join(BLOCK_LOG).as_path())
+}
+
+/// **Cut a torn tail off the log** (lab #804) — `BLOCK_LOG`'s single
+/// exception to append-only. Walks the length prefixes only (no record is
+/// decoded) to the end of the last record whose declared bytes are all
+/// present; if bytes follow it — a prefix cut short, or a record shorter
+/// than it declares, i.e. a crash mid-append — the file is truncated there
+/// and synced. Returns the bytes removed, `None` when the log ends clean (or
+/// does not exist).
+///
+/// A complete record that does not decode is NOT cut: it may be a newer
+/// format, and `read_records` already refuses it by name once anything
+/// follows it.
+///
+/// **Only the process that writes the log calls this**, once, before its
+/// first append ([`crate::node::Node`]'s log writer). A reader must not: to
+/// a process reading a live node's data dir, an append in progress looks
+/// exactly like a torn tail.
+pub fn truncate_torn_tail(dir: &Path) -> io::Result<Option<u64>> {
+    use std::io::{Seek, SeekFrom};
+    let path = dir.join(BLOCK_LOG);
+    let mut f = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let file_len = f.metadata()?.len();
+    let mut complete_end = 0u64;
+    while file_len - complete_end >= 4 {
+        let mut len_buf = [0u8; 4];
+        f.seek(SeekFrom::Start(complete_end))?;
+        f.read_exact(&mut len_buf)?;
+        let len = u64::from(u32::from_le_bytes(len_buf));
+        if file_len - complete_end - 4 < len {
+            break;
+        }
+        complete_end += 4 + len;
+    }
+    if complete_end == file_len {
+        return Ok(None);
+    }
+    f.set_len(complete_end)?;
+    f.sync_all()?;
+    Ok(Some(file_len - complete_end))
+}
+
 /// Append a record to the log (source of truth). Each record is a 4-byte LE
 /// length prefix followed by its `bincode`, flushed + fsync'd before returning.
-pub fn append_record(dir: &Path, rec: &LogRecord) -> io::Result<()> {
-    let bytes = bincode::serialize(&WireRecord::from(rec)).map_err(to_io)?;
-    let mut f = BufWriter::new(
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(BLOCK_LOG))?,
-    );
+///
+/// Returns where a V6 record's bundle bytes landed (lab #785 F5-5c), so the
+/// caller can drop its resident copy ([`BundleRef::spill_to_log`]); `None`
+/// for every other record. One writer per data dir, so the file's length at
+/// open is where `O_APPEND` writes.
+pub fn append_record(dir: &Path, rec: &LogRecord) -> io::Result<Option<u64>> {
+    let wire = to_wire(rec)?;
+    let bundle_len = match &wire {
+        WireRecord::BlockV6(v) if !v.bundle.is_empty() => Some(v.bundle.len()),
+        _ => None,
+    };
+    let bytes = bincode::serialize(&wire).map_err(to_io)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(BLOCK_LOG))?;
+    let start = file.metadata()?.len();
+    let mut f = BufWriter::new(file);
     f.write_all(&(bytes.len() as u32).to_le_bytes())?;
     f.write_all(&bytes)?;
     f.flush()?;
     f.into_inner()?.sync_all()?;
-    Ok(())
+    Ok(bundle_len.map(|len| bundle_offset(start + 4 + bytes.len() as u64, len)))
 }
 
 /// Read every record from the log in order. Missing log ⇒ empty vec. A truncated
@@ -538,6 +680,10 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
     let file_len = fs::metadata(&path)?.len();
     let mut r = BufReader::new(File::open(&path)?);
     let mut out = Vec::new();
+    // Lab #785 F5-5c: where each record ends, so a V6 bundle is kept as a
+    // reference into this file and its bytes are dropped once decoded.
+    let log = log_path(dir);
+    let mut pos: u64 = 0;
     loop {
         let mut len_buf = [0u8; 4];
         match r.read_exact(&mut len_buf) {
@@ -548,8 +694,12 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
         if r.read_exact(&mut buf).is_err() {
-            break; // torn trailing record from a crash mid-append
+            // A torn trailing record from a crash mid-append: skipped. The
+            // reader never truncates; the writer cuts it before its first
+            // append (`truncate_torn_tail`, lab #804).
+            break;
         }
+        pos += 4 + len as u64;
         match bincode::deserialize::<WireRecord>(&buf) {
             Ok(rec) => {
                 // Lab #470 stage 3: a record whose bucket_actions is not a
@@ -561,7 +711,7 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
                 // a silent coercion to TwoByTwo, i.e. a wrong body rebuilt
                 // from disk with nothing pointing at it.
                 check_record_buckets(&rec, out.len())?;
-                out.push(LogRecord::from(rec));
+                out.push(log_record(rec, Some((&log, pos))));
             }
             Err(e) => {
                 // Tolerated only if nothing follows it (a crash mid-append).
@@ -1229,6 +1379,362 @@ mod tests {
         let err = read_records(&dir).expect_err("an empty V6 record is refused");
         assert!(err.to_string().contains("V6 block record with no section"), "{err}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #785 F5-5c: a V6 block's bundle reaches disk as its record's tail;
+    /// `append_record` returns that offset, `read_records` gives the block back
+    /// with a reference to it (no resident bytes), and the reference reads back
+    /// the bytes — through a later record appended after it, too.
+    #[test]
+    fn a_v6_bundle_is_held_as_a_reference_into_the_log() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-f55c-ref-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let bundle: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+        let mut block = a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec());
+        block.sections = Some(crate::store::StoredSections {
+            finality: vec![9, 9],
+            bundle: crate::store::BundleRef::resident(&bundle),
+        });
+        assert_eq!(append_record(&dir, &LogRecord::Finalize(h(1))).unwrap(), None, "no bundle, no offset");
+        let at = append_record(&dir, &LogRecord::Block(block.clone())).unwrap().expect("a bundle's offset");
+        append_record(&dir, &LogRecord::Finalize(h(2))).unwrap();
+        let log = fs::read(dir.join(BLOCK_LOG)).unwrap();
+        assert_eq!(&log[at as usize..at as usize + bundle.len()], &bundle[..], "the offset is the bytes' place");
+
+        let back = read_records(&dir).unwrap();
+        assert_eq!(back.len(), 3);
+        let LogRecord::Block(b) = &back[1] else { panic!("the block") };
+        assert_eq!(b, &block, "same id and length: the same block");
+        let r = b.bundle_ref().expect("a bundle");
+        assert!(!r.is_resident(), "read from the log: a reference, its bytes dropped");
+        assert_eq!(r.log_offset(), Some(at));
+        assert_eq!(r.read().unwrap(), bundle);
+        assert_eq!(b.body().preimage_v6(), block.body().preimage_v6(), "the log's body is the resident one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #785 F5-5c: the hash re-check is the authority. A reference whose
+    /// bytes were rewritten, or whose log ends short of it, refuses by name
+    /// (`InvalidData`) — never a panic, never other bytes.
+    #[test]
+    fn a_reference_into_a_moved_or_short_log_refuses_by_name() {
+        use std::io::{Seek, SeekFrom};
+        let dir = std::env::temp_dir().join(format!("qlab-persist-f55c-moved-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let bundle = vec![0x5a; 64];
+        let mut block = a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec());
+        block.sections = Some(crate::store::StoredSections { finality: vec![1], bundle: crate::store::BundleRef::resident(&bundle) });
+        let at = append_record(&dir, &LogRecord::Block(block)).unwrap().unwrap();
+        let LogRecord::Block(b) = read_records(&dir).unwrap().remove(0) else { panic!() };
+        let r = b.bundle_ref().unwrap().clone();
+        assert_eq!(r.read().unwrap(), bundle);
+
+        // Test-only writes: production code never does this (the invariant).
+        let mut f = OpenOptions::new().write(true).open(dir.join(BLOCK_LOG)).unwrap();
+        f.seek(SeekFrom::Start(at + 10)).unwrap();
+        f.write_all(&[0xa5]).unwrap();
+        drop(f);
+        let e = r.read().expect_err("moved bytes");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("not this bundle"), "{e}");
+        assert!(b.try_body().is_err(), "the serving path sees the error, not a panic");
+
+        OpenOptions::new().write(true).open(dir.join(BLOCK_LOG)).unwrap().set_len(at + 5).unwrap();
+        let e = r.read().expect_err("a short log");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("ends short"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #804, the repro — why the reader alone is not enough. A torn
+    /// record left on disk is skipped by `read_records`; an append lands
+    /// behind it; the torn prefix then swallows every later record while
+    /// fewer than its declared length follow, and once more do, the log never
+    /// reads back whole (it refuses, or loses records). (The reader is unchanged and stays read-only; the writer cuts
+    /// the tail first — the next test.)
+    #[test]
+    fn a_torn_tail_left_on_disk_buries_what_is_appended_after_it() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i804-repro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let a = LogRecord::Block(a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec()));
+        append_record(&dir, &a).unwrap();
+        let end_a = fs::metadata(dir.join(BLOCK_LOG)).unwrap().len();
+        append_record(&dir, &a).unwrap();
+        // Torn inside the second record: its prefix and part of its bytes.
+        OpenOptions::new().write(true).open(dir.join(BLOCK_LOG)).unwrap().set_len(end_a + 4 + 10).unwrap();
+        append_record(&dir, &LogRecord::Finalize(h(3))).unwrap();
+        assert_eq!(read_records(&dir).unwrap().len(), 1, "the append behind the torn record is swallowed");
+        for _ in 0..8 {
+            append_record(&dir, &a).unwrap();
+        }
+        // Ten complete records are on disk now. Whatever the torn prefix makes
+        // of the bytes behind it (here: garbage, then a refusal to open), the
+        // reader never gives back the whole log.
+        let back = read_records(&dir);
+        assert!(!matches!(&back, Ok(r) if r.len() == 10), "a buried tail loses records or refuses: {:?}", back.as_ref().map(Vec::len));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #804, the fix: `truncate_torn_tail` cuts a torn record (or a torn
+    /// length prefix) back to the last complete record's end, and the next
+    /// append lands there; a clean log, or none, is left alone.
+    #[test]
+    fn a_torn_tail_is_cut_and_the_next_append_lands_at_the_last_complete_record() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i804-fix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(truncate_torn_tail(&dir).unwrap(), None, "no log");
+        let a = LogRecord::Block(a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec()));
+        append_record(&dir, &a).unwrap();
+        let end_a = fs::metadata(dir.join(BLOCK_LOG)).unwrap().len();
+        assert_eq!(truncate_torn_tail(&dir).unwrap(), None, "a clean log");
+        assert_eq!(fs::metadata(dir.join(BLOCK_LOG)).unwrap().len(), end_a);
+
+        for torn in [end_a + 4 + 10, end_a + 2] {
+            append_record(&dir, &a).unwrap();
+            OpenOptions::new().write(true).open(dir.join(BLOCK_LOG)).unwrap().set_len(torn).unwrap();
+            assert_eq!(truncate_torn_tail(&dir).unwrap(), Some(torn - end_a), "torn at {torn}");
+            assert_eq!(fs::metadata(dir.join(BLOCK_LOG)).unwrap().len(), end_a, "cut to the last complete record");
+        }
+        append_record(&dir, &LogRecord::Finalize(h(3))).unwrap();
+        let back = read_records(&dir).unwrap();
+        assert_eq!(back.len(), 2, "the next append landed at the last complete record's end");
+        assert_eq!(back[1], LogRecord::Finalize(h(3)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 🔒 Lab #785 F5-5c — **`blocks.log` is append-only in every production
+    /// source** (the belt; `BundleRef::read`'s hash re-check is the
+    /// authority). Outside test code, the log's name appears only in this
+    /// file — at its definition, `append_record`'s `append(true)` open, the
+    /// read and tail-cut paths' `dir.join`, `log_path`, and error messages —
+    /// plus the crate's re-export; `log_path` is called outside this file only
+    /// at the node's one spill site; and this file holds exactly one
+    /// `set_len`, `truncate_torn_tail`'s (lab #804). Anything else fails here,
+    /// by file and line. Matching is on tokens (whitespace removed), so a
+    /// rustfmt pass does not break it.
+    #[test]
+    fn blocks_log_is_append_only_in_every_production_source() {
+        fn ws(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut offenders = Vec::new();
+        let mut scanned = 0;
+        let mut persist_prod = String::new();
+        let mut sources = Vec::new();
+        for krate in fs::read_dir(&root).unwrap() {
+            let mut stack = vec![krate.unwrap().path().join("src")];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = fs::read_dir(&d) else { continue };
+                for e in entries {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().is_some_and(|x| x == "rs") {
+                        sources.push(p);
+                    }
+                }
+            }
+        }
+        for p in &sources {
+            scanned += 1;
+            let name = p.display().to_string().replace('\\', "/");
+            let lines = production_lines(&name, &fs::read_to_string(p).unwrap());
+            if name.ends_with("qlab-node/src/persist.rs") {
+                persist_prod = lines.iter().map(|(_, c)| ws(c)).collect();
+            }
+            for (line, code) in lines {
+                let t = ws(&code);
+                let names_log = t.contains("BLOCK_LOG") || t.contains("\"blocks.log\"");
+                let calls_log_path = t.contains("log_path(");
+                if !names_log && !calls_log_path {
+                    continue;
+                }
+                let here = name.ends_with("qlab-node/src/persist.rs");
+                let allowed = here
+                    && (t.contains("pubconstBLOCK_LOG:&str=\"blocks.log\";")
+                        || t.contains("{BLOCK_LOG}")
+                        || t == "letpath=dir.join(BLOCK_LOG);"
+                        || t == ".open(dir.join(BLOCK_LOG))?;"
+                        || t == "std::sync::Arc::from(dir.join(BLOCK_LOG).as_path())"
+                        || (calls_log_path && !names_log))
+                    || (name.ends_with("qlab-node/src/lib.rs") && names_log && !t.contains('('))
+                    || (name.ends_with("qlab-node/src/node.rs") && t == "r.spill_to_log(persist::log_path(dir),offset);");
+                if !allowed {
+                    offenders.push(format!("{name}:{line}: {}", code.trim()));
+                }
+            }
+        }
+        assert!(scanned > 100, "the scan found the workspace ({scanned} files)");
+        assert!(offenders.is_empty(), "blocks.log is append-only (persist.rs BLOCK_LOG); named outside its doors:\n{}", offenders.join("\n"));
+        // The one open for writing is an append; the one cut is the torn tail's.
+        assert!(persist_prod.contains(".append(true).open(dir.join(BLOCK_LOG))?;"), "append_record appends");
+        assert_eq!(persist_prod.matches("set_len(").count(), 1, "one set_len: truncate_torn_tail's");
+        assert!(persist_prod.contains("f.set_len(complete_end)?;"), "the cut is at the last complete record's end");
+        for banned in [".truncate(true)", "File::create(dir.join(BLOCK_LOG", "remove_file(dir.join(BLOCK_LOG", "rename(dir.join(BLOCK_LOG"] {
+            assert!(!persist_prod.contains(banned), "persist.rs production code contains `{banned}`");
+        }
+    }
+
+    /// `(line number, code)` for every line outside `#[cfg(test)]` items, with
+    /// `//` comments dropped. Braces count only outside string, raw-string,
+    /// char literals and comments, and the depth must return to 0 at the end
+    /// of the file — a lexing skew fails loudly here instead of silently
+    /// skipping the rest of a file.
+    fn production_lines(name: &str, text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut skipping: Option<i64> = None;
+        let mut pending = false;
+        let mut depth: i64 = 0;
+        let mut lex = Lex::default();
+        for (i, raw) in text.lines().enumerate() {
+            let (code, opens, closes) = lex.line(raw);
+            if skipping.is_none() && code.trim() == "#[cfg(test)]" {
+                pending = true;
+                continue;
+            }
+            if pending {
+                if opens > 0 {
+                    skipping = Some(depth);
+                    pending = false;
+                } else if code.trim_end().ends_with(';') {
+                    pending = false;
+                    depth += opens - closes;
+                    continue;
+                }
+            }
+            depth += opens - closes;
+            if let Some(at) = skipping {
+                if depth <= at {
+                    skipping = None;
+                }
+                continue;
+            }
+            if !pending {
+                out.push((i + 1, code));
+            }
+        }
+        assert_eq!(depth, 0, "{name}: brace depth {depth} at the end of the file — the scan's lexer skewed");
+        assert!(!lex.open(), "{name}: a string or comment never closed — the scan's lexer skewed");
+        out
+    }
+
+    /// The scan's lexer state across lines: inside a `"…"` string, a raw
+    /// string with `n` hashes, or a block comment.
+    #[derive(Default)]
+    struct Lex {
+        in_str: bool,
+        raw: Option<usize>,
+        comment: usize,
+    }
+
+    impl Lex {
+        fn open(&self) -> bool {
+            self.in_str || self.raw.is_some() || self.comment > 0
+        }
+
+        /// The line without its `//` comment, and its braces outside
+        /// literals and comments.
+        fn line(&mut self, raw: &str) -> (String, i64, i64) {
+            let c: Vec<char> = raw.chars().collect();
+            let (mut opens, mut closes) = (0i64, 0i64);
+            let mut cut = c.len();
+            let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+            let mut j = 0;
+            while j < c.len() {
+                let ch = c[j];
+                if self.comment > 0 {
+                    if ch == '*' && c.get(j + 1) == Some(&'/') {
+                        self.comment -= 1;
+                        j += 2;
+                        continue;
+                    }
+                    if ch == '/' && c.get(j + 1) == Some(&'*') {
+                        self.comment += 1;
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if let Some(n) = self.raw {
+                    if ch == '"' && (1..=n).all(|k| c.get(j + k) == Some(&'#')) {
+                        self.raw = None;
+                        j += 1 + n;
+                        continue;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if self.in_str {
+                    match ch {
+                        '\\' => j += 2,
+                        '"' => {
+                            self.in_str = false;
+                            j += 1;
+                        }
+                        _ => j += 1,
+                    }
+                    continue;
+                }
+                match ch {
+                    '/' if c.get(j + 1) == Some(&'/') => {
+                        cut = j;
+                        break;
+                    }
+                    '/' if c.get(j + 1) == Some(&'*') => {
+                        self.comment = 1;
+                        j += 2;
+                    }
+                    'r' if (j == 0 || !ident(c[j - 1]) || (c[j - 1] == 'b' && (j < 2 || !ident(c[j - 2])))) && {
+                        let mut k = j + 1;
+                        while c.get(k) == Some(&'#') {
+                            k += 1;
+                        }
+                        c.get(k) == Some(&'"')
+                    } =>
+                    {
+                        let mut k = j + 1;
+                        while c.get(k) == Some(&'#') {
+                            k += 1;
+                        }
+                        self.raw = Some(k - j - 1);
+                        j = k + 1;
+                    }
+                    '"' => {
+                        self.in_str = true;
+                        j += 1;
+                    }
+                    '\'' => {
+                        if c.get(j + 1) == Some(&'\\') {
+                            let mut k = j + 3; // past the escaped character
+                            while k < c.len() && c[k] != '\'' {
+                                k += 1;
+                            }
+                            j = k + 1;
+                        } else if c.get(j + 2) == Some(&'\'') {
+                            j += 3;
+                        } else {
+                            j += 1; // a lifetime
+                        }
+                    }
+                    '{' => {
+                        opens += 1;
+                        j += 1;
+                    }
+                    '}' => {
+                        closes += 1;
+                        j += 1;
+                    }
+                    _ => j += 1,
+                }
+            }
+            (c[..cut].iter().collect(), opens, closes)
+        }
     }
 
     /// A seal of any other width is corrupt data, refused by name at read.

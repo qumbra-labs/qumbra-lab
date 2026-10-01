@@ -1288,7 +1288,7 @@ pub fn main_chain_counts_of<C: ChainStore, N: NullifierStore, T: CommitmentStore
         .iter()
         .map(|b| {
             let matured = crate::coinbase::matured_coinbase_leaf(b.header.height, |minted_at| {
-                by_height.get(&minted_at).map(|a| a.body())
+                by_height.get(&minted_at).map(|a| a.coinbase_view())
             });
             if matured.is_some() {
                 count += 1;

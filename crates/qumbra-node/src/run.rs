@@ -87,7 +87,9 @@ fn supply_block_of(hash: qlab_devnet::header::Hash32, block: &qlab_node::StoredB
         fees: block.txs.iter().map(|tx| tx.fee).sum(),
         // Lab #367: the burned name-fee portion, from the committed riders —
         // zero on every rider-free (i.e. every pre-boundary) block.
-        name_burn: block.body().total_name_burn(),
+        // From the riders alone (`BlockBody::total_name_burn`'s input): the
+        // bundle is not read for it (lab #785 F5-5c).
+        name_burn: qlab_devnet::names::burn_of_riders(block.txs.iter().map(|t| t.rider.as_slice())),
     }
 }
 
@@ -126,9 +128,15 @@ enum BridgeState {
     Refused { at_tip: qlab_devnet::header::Hash32, error: crate::bridge::BridgeError },
 }
 
-/// A stored block's bundle bytes (empty when it carries none).
-fn bundle_bytes(block: &qlab_node::StoredBlock) -> &[u8] {
-    block.sections.as_ref().map_or(&[][..], |s| s.bundle.as_slice())
+/// A stored block's bundle bytes (empty when it carries none), read back
+/// through its reference (lab #785 F5-5c).
+fn bundle_bytes(block: &qlab_node::StoredBlock) -> Result<Vec<u8>, crate::bridge::BridgeError> {
+    match block.bundle_ref() {
+        None => Ok(Vec::new()),
+        Some(r) => r
+            .read()
+            .map_err(|e| crate::bridge::BridgeError::Unreadable { height: block.header.height, why: e.to_string() }),
+    }
 }
 
 /// Build the bridge ledger from the applied main chain (lab #785 F5-4c-1) —
@@ -140,7 +148,7 @@ fn rebuild_bridge_ledger<C: ChainStore>(
     let mut ledger = crate::bridge::BridgeLedger::new(EPOCH_LENGTH_BLOCKS);
     for (height, hash) in (0u64..).zip(main_chain) {
         let block = state_chain.block(hash).expect("every canonical state-chain hash has its stored body");
-        ledger.push(height, *hash, block.header.prev, bundle_bytes(block))?;
+        ledger.push(height, *hash, block.header.prev, &bundle_bytes(block)?)?;
     }
     Ok(ledger)
 }
@@ -2343,7 +2351,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             else {
                 break;
             };
-            if let Err(e) = ledger.push(height, hash, block.header.prev, bundle_bytes(block)) {
+            if let Err(e) = bundle_bytes(block).and_then(|b| ledger.push(height, hash, block.header.prev, &b)) {
                 return refuse(&mut guard, e);
             }
         }

@@ -115,6 +115,7 @@ pub fn audit_with_claim(
     let chain = main_chain_of(&node);
     let tip = chain.iter().map(|b| b.header.height).max().unwrap_or(0);
     let bodies: Vec<(u64, qlab_devnet::body::BlockBody)> =
+        // `body()` stays: an Annulet block carries no V6 bundle (local CLI).
         chain.iter().map(|b| (b.header.height, b.body())).collect();
     let issuance = genesis_issuance(&genesis.notes()).map_err(|reason| SupplyAuditError::Genesis {
         path: PathBuf::from("<genesis notes>"),

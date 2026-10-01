@@ -225,8 +225,144 @@ pub struct StoredBlock {
 pub struct StoredSections {
     /// The finality record's canonical bytes; empty when absent.
     pub finality: Vec<u8>,
-    /// The wrapper bundle's canonical bytes; empty when absent.
-    pub bundle: Vec<u8>,
+    /// The wrapper bundle, by reference (lab #785 F5-5c); `None` when absent.
+    pub bundle: Option<BundleRef>,
+}
+
+/// **A wrapper bundle by reference** (lab #785 F5-5c, ruling Q-5-6): its id
+/// (keccak of the bytes) and length in memory, the bytes themselves either
+/// resident or in `blocks.log` at a byte offset.
+///
+/// A bundle is up to ~15 MiB and every accepted one used to stay in the chain
+/// store for the life of the process. A disk-backed node now keeps it resident
+/// only from acceptance until its record is appended, then
+/// [`Self::spill_to_log`] swaps the shared storage to the log offset, freeing
+/// the bytes for every clone at once; a node opened from its log holds offsets
+/// from the start. The in-memory store (every test node, every sim) keeps
+/// bytes resident behind the same API.
+///
+/// **What makes the offset safe** is `blocks.log`'s invariant, stated in
+/// `persist.rs`: append-only, never truncated, rewritten, renamed or
+/// compacted. And every read re-hashes the slice and compares it to `id`, so a
+/// byte that moved anyway refuses by name instead of folding wrong bytes.
+///
+/// Equality is the id and length: where the bytes live is not part of the
+/// value. Not serialisable — a ref never reaches the snapshot or the log.
+#[derive(Clone)]
+pub struct BundleRef {
+    pub id: Hash32,
+    pub len: u32,
+    src: std::sync::Arc<std::sync::RwLock<BundleSrc>>,
+}
+
+#[derive(Clone)]
+enum BundleSrc {
+    Resident(std::sync::Arc<[u8]>),
+    Log { path: std::sync::Arc<std::path::Path>, offset: u64 },
+}
+
+impl PartialEq for BundleRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.len == other.len
+    }
+}
+impl Eq for BundleRef {}
+
+impl std::fmt::Debug for BundleRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let at = match &*self.src.read().unwrap_or_else(|e| e.into_inner()) {
+            BundleSrc::Resident(_) => "resident".to_string(),
+            BundleSrc::Log { offset, .. } => format!("log@{offset}"),
+        };
+        f.debug_struct("BundleRef").field("id", &hex8(&self.id)).field("len", &self.len).field("at", &at).finish()
+    }
+}
+
+fn hex8(h: &Hash32) -> String {
+    h[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+impl BundleRef {
+    /// Bytes in hand, resident (`None` for an empty bundle: absent).
+    pub fn resident(bytes: &[u8]) -> Option<Self> {
+        (!bytes.is_empty()).then(|| Self {
+            id: qlab_devnet::hash::keccak256(bytes),
+            len: u32::try_from(bytes.len()).expect("a bundle is below the V6 body bound"),
+            src: std::sync::Arc::new(std::sync::RwLock::new(BundleSrc::Resident(bytes.into()))),
+        })
+    }
+
+    /// A bundle in the block log at `offset`, already hashed by the reader.
+    pub fn in_log(id: Hash32, len: u32, log: std::sync::Arc<std::path::Path>, offset: u64) -> Self {
+        Self { id, len, src: std::sync::Arc::new(std::sync::RwLock::new(BundleSrc::Log { path: log, offset })) }
+    }
+
+    /// The record holding these bytes is appended at `offset` in `log`: drop
+    /// the resident copy, for this ref and every clone of it.
+    pub fn spill_to_log(&self, log: std::sync::Arc<std::path::Path>, offset: u64) {
+        *self.src.write().unwrap_or_else(|e| e.into_inner()) = BundleSrc::Log { path: log, offset };
+    }
+
+    /// Whether the bytes are resident (else in the log).
+    pub fn is_resident(&self) -> bool {
+        matches!(&*self.src.read().unwrap_or_else(|e| e.into_inner()), BundleSrc::Resident(_))
+    }
+
+    /// The log offset, when the bytes live there.
+    pub fn log_offset(&self) -> Option<u64> {
+        match &*self.src.read().unwrap_or_else(|e| e.into_inner()) {
+            BundleSrc::Log { offset, .. } => Some(*offset),
+            BundleSrc::Resident(_) => None,
+        }
+    }
+
+    /// **The bytes**, as an owned copy. See [`Self::bytes`].
+    pub fn read(&self) -> std::io::Result<Vec<u8>> {
+        self.bytes().map(|b| b.to_vec())
+    }
+
+    /// **The bytes.** Resident bytes are handed back shared, as they are: they
+    /// were hashed when the ref was made. Bytes in the log are re-hashed
+    /// against `id`: a log that is short of `offset + len`, or whose bytes
+    /// there are not this bundle's, refuses with `InvalidData` naming the
+    /// bundle and the offset — never a panic and never wrong bytes.
+    pub fn bytes(&self) -> std::io::Result<std::sync::Arc<[u8]>> {
+        let src = self.src.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let bytes = match src {
+            BundleSrc::Resident(b) => return Ok(b),
+            BundleSrc::Log { path, offset } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&*path)?;
+                f.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; self.len as usize];
+                f.read_exact(&mut buf).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "bundle {} ({} B) at {}@{offset}: the block log ends short of it ({e}) — \
+                             blocks.log is append-only, so it was truncated outside this node",
+                            hex8(&self.id),
+                            self.len,
+                            path.display()
+                        ),
+                    )
+                })?;
+                buf
+            }
+        };
+        if qlab_devnet::hash::keccak256(&bytes) != self.id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "bundle {} ({} B): the bytes at its reference are not this bundle — \
+                     blocks.log is append-only, so it was rewritten outside this node",
+                    hex8(&self.id),
+                    self.len
+                ),
+            ));
+        }
+        Ok(bytes.into())
+    }
 }
 
 impl StoredBlock {
@@ -241,7 +377,7 @@ impl StoredBlock {
             coinbase_rkm,
             sections: body.has_v6_sections().then(|| StoredSections {
                 finality: body.finality.clone(),
-                bundle: body.bundle.clone(),
+                bundle: BundleRef::resident(&body.bundle),
             }),
         }
     }
@@ -303,14 +439,40 @@ impl StoredBlock {
     }
 
     /// The live devnet body this block round-trips to.
+    ///
+    /// **Local-trust paths only** (lab #785 F5-5c): a V6 bundle is read
+    /// through its [`BundleRef`], and a log that has moved under it panics by
+    /// name here. Anything a peer's request or an RPC can reach uses
+    /// [`Self::try_body`].
     pub fn body(&self) -> BlockBody {
+        self.try_body().unwrap_or_else(|e| panic!("stored block {}: {e}", self.header.height))
+    }
+
+    /// [`Self::body`], with a bundle that cannot be read back returned as the
+    /// error it is.
+    pub fn try_body(&self) -> std::io::Result<BlockBody> {
         let mut body =
             BlockBody::from_single_payee(self.txs.iter().map(TxEntry::from).collect(), self.coinbase, self.coinbase_rkm);
         if let Some(s) = &self.sections {
             body.finality = s.finality.clone();
-            body.bundle = s.bundle.clone();
+            if let Some(r) = &s.bundle {
+                body.bundle = r.read()?;
+            }
         }
-        body
+        Ok(body)
+    }
+
+    /// The block's transactions and coinbase as a body, **without its V6
+    /// sections** (lab #785 F5-5c) — for derivations that read only those
+    /// (the coinbase note: payee, fees, name burn), so a bundle is never read
+    /// from disk to find a coinbase. Its commitment is NOT the block's.
+    pub fn coinbase_view(&self) -> BlockBody {
+        BlockBody::from_single_payee(self.txs.iter().map(TxEntry::from).collect(), self.coinbase, self.coinbase_rkm)
+    }
+
+    /// The bundle reference, when this block carries one.
+    pub fn bundle_ref(&self) -> Option<&BundleRef> {
+        self.sections.as_ref().and_then(|s| s.bundle.as_ref())
     }
 }
 

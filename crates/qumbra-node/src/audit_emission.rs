@@ -310,7 +310,8 @@ pub fn audit_emission_for(
         }
         blocks_in_interval += 1;
         if let Some(want) = payee {
-            let body = block.body();
+            // The coinbase only — no V6 bundle is read (lab #785 F5-5c).
+            let body = block.coinbase_view();
             if let Some(paid) = body.coinbase_payees.iter().find(|p| p.rkm == want) {
                 payee_blocks += 1;
                 payee_bessel += u128::from(paid.amount);

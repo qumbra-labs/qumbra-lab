@@ -780,17 +780,37 @@ fn check_stored_binding_for(
     sections: BodySections,
     block: &StoredBlock,
 ) -> Result<(), NodeError> {
+    let bundle = block.bundle_ref().map(|r| r.bytes()).transpose().map_err(NodeError::Io)?;
+    check_stored_binding_with(form, sections, block, bundle.as_deref())
+}
+
+/// [`check_stored_binding_for`] over a bundle the caller has already read
+/// (lab #785 F5-5c, pre-review Y4): `apply_state` reads a bundle once and
+/// hands the same bytes to this check and to the fold.
+fn check_stored_binding_with(
+    form: GenesisForm,
+    sections: BodySections,
+    block: &StoredBlock,
+    bundle: Option<&[u8]>,
+) -> Result<(), NodeError> {
     if sections == BodySections::None && block.sections.is_some() {
         return Err(NodeError::Body(qlab_devnet::body::BodyError::SectionOnForm { section: "finality/bundle" }));
     }
+    // Lab #785 F5-5c: the bundle is the caller's bytes (read back through
+    // its reference once); the rest is the stored block's.
+    let mut body = block.coinbase_view();
+    if let Some(s) = &block.sections {
+        body.finality = s.finality.clone();
+        body.bundle = bundle.map(<[u8]>::to_vec).unwrap_or_default();
+    }
     let got = match (form, sections) {
-        (GenesisForm::V5, BodySections::V6) => block.body().commitment_v6(),
+        (GenesisForm::V5, BodySections::V6) => body.commitment_v6(),
         (_, BodySections::V6) => unreachable!("BodySections::V6 exists only beside GenesisForm::V5 (forms.rs)"),
-        (GenesisForm::V4, _) => block.body().commitment_at(block.header.height),
-        (GenesisForm::V5, _) => block.body().commitment_v5_at(block.header.height),
+        (GenesisForm::V4, _) => body.commitment_at(block.header.height),
+        (GenesisForm::V5, _) => body.commitment_v5_at(block.header.height),
         // Lab #708: the Annulet body commitment (B1). Genesis never passes this
         // funnel (it is bound at construction, over its genesis notes).
-        (GenesisForm::Annulet, _) => qlab_devnet::annulet::body_commitment_annulet(&block.body()),
+        (GenesisForm::Annulet, _) => qlab_devnet::annulet::body_commitment_annulet(&body),
     };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
@@ -930,6 +950,9 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     retained: RetainedBodies,
     /// Directory backing the block log + snapshot; `None` = in-memory only.
     dir: Option<PathBuf>,
+    /// Whether this process has cut a torn log tail yet (lab #804): done
+    /// once, before the first append — [`Self::append_log`].
+    log_tail_cut: bool,
     /// Recovery provenance for the startup banner. In-memory nodes carry the
     /// all-zero fresh report; disk-backed `open` replaces it before returning.
     recovery: RecoveryReport,
@@ -1539,7 +1562,12 @@ impl MemNode {
             // The binding is still checked (issue #77): this path skips
             // `apply_state`, so it would otherwise be the one door a corrupted
             // log record enters by.
-            check_stored_binding_for(node.form, node.sections, block).ok()?;
+            if let Err(e) = check_stored_binding_for(node.form, node.sections, block) {
+                // Named here (F5-5c pre-review Y6): the fall-through to a full
+                // replay would otherwise hide the cause until it refuses.
+                qlab_devnet::jprintln!("SNAPSHOT resume: block {} does not bind ({e}); falling back", block.header.height);
+                return None;
+            }
             node.chain.put_block((*block).clone()).ok()?;
         }
         if node.chain.tip_hash() != snap.tip {
@@ -1924,6 +1952,7 @@ impl MemNode {
             nullifiers_ordered: Vec::new(),
             retained: RetainedBodies { form, ..RetainedBodies::default() },
             dir,
+            log_tail_cut: false,
             recovery: RecoveryReport::default(),
             names: crate::name_registry::NameRegistry::default(),
             form,
@@ -2141,8 +2170,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             self.validate_block_v6(&header, &body, verifier).map_err(NodeError::Body)?;
             let block = StoredBlock::from_parts(&header, &body);
             let hash = self.apply_state(&block)?;
-            if let Some(dir) = &self.dir {
-                persist::append_record(dir, &LogRecord::Block(block)).map_err(NodeError::Io)?;
+            let rec = LogRecord::Block(block);
+            let at = self.append_log(&rec)?;
+            // Lab #785 F5-5c: the bundle is on disk now — the chain store's
+            // copy (a clone of this ref) drops its resident bytes too.
+            if let (Some(offset), Some(dir), LogRecord::Block(b)) = (at, &self.dir, &rec) {
+                if let Some(r) = b.bundle_ref() {
+                    r.spill_to_log(persist::log_path(dir), offset);
+                }
             }
             return Ok(hash);
         }
@@ -2186,9 +2221,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         }
         let block = StoredBlock::from_parts(&header, &body);
         let hash = self.apply_state(&block)?;
-        if let Some(dir) = &self.dir {
-            persist::append_record(dir, &LogRecord::Block(block)).map_err(NodeError::Io)?;
-        }
+        self.append_log(&LogRecord::Block(block))?;
         Ok(hash)
     }
 
@@ -2330,13 +2363,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         let block = StoredBlock::from_sealed_parts(sealed, &body);
         let hash = self.apply_state(&block)?;
         self.chain.set_finalized(hash).map_err(NodeError::AnnuletFinality)?;
-        if let Some(dir) = &self.dir {
-            // The block (persist variant 3), then its finalization — the L1
-            // `Finalize` record, so the snapshot's "finality was logged" check
-            // and every resume path hold unchanged.
-            persist::append_record(dir, &LogRecord::Block(block)).map_err(NodeError::Io)?;
-            persist::append_record(dir, &LogRecord::Finalize(hash)).map_err(NodeError::Io)?;
-        }
+        // The block (persist variant 3), then its finalization — the L1
+        // `Finalize` record, so the snapshot's "finality was logged" check
+        // and every resume path hold unchanged.
+        self.append_log(&LogRecord::Block(block))?;
+        self.append_log(&LogRecord::Finalize(hash))?;
         Ok(hash)
     }
 
@@ -2566,10 +2597,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             if block.header.height == 0 {
                 break;
             }
-            if let Some(sec) = block.sections.as_ref().filter(|s| !s.bundle.is_empty()) {
+            if let Some(bundle) = block.bundle_ref() {
                 let bundle_err = |refusal| NodeError::Body(BodyError::Bundle { refusal });
                 let rule = &self.wrapper.as_ref().ok_or(bundle_err(qlab_devnet::body::BundleRefusal::NoRule))?.rule;
-                self.surface = rule.bundle_surface(&sec.bundle).map_err(bundle_err)?;
+                // Lab #785 F5-5c: the one bundle a snapshot path reads back.
+                let bytes = bundle.bytes().map_err(NodeError::Io)?;
+                self.surface = rule.bundle_surface(&bytes).map_err(bundle_err)?;
                 self.last_bundle_height = Some(block.header.height);
                 break;
             }
@@ -2638,7 +2671,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // The funnel guard (issue #77): every state mutation — fresh application
         // and disk-log replay alike — passes through here, so the header/body
         // binding is re-established before anything is folded into state.
-        check_stored_binding_for(self.form, self.sections, block)?;
+        // Lab #785 F5-5c (pre-review Y4): a bundle is read once — resident
+        // bytes as they are, log bytes re-hashed — for this check and the fold
+        // below; one that cannot be read back is a persistence error by name.
+        let bundle_bytes = block.bundle_ref().map(|r| r.bytes()).transpose().map_err(NodeError::Io)?;
+        check_stored_binding_with(self.form, self.sections, block, bundle_bytes.as_deref())?;
         // Lab #785: a V6 block's record height, decoded before any mutation. A
         // live block was validated in full before reaching here; a logged one
         // that no longer decodes is a corrupt log, named rather than skipped.
@@ -2647,12 +2684,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // proof-free half of the rule, over the surface the parent left. A live
         // block passed the whole rule first; a logged bundle that no longer
         // folds (or a node with no rule) stops here by name, never a skip.
-        let bundle_outcome = match block.sections.as_ref().filter(|s| !s.bundle.is_empty()) {
+        let bundle_outcome = match &bundle_bytes {
             None => None,
-            Some(sec) => {
+            Some(bytes) => {
                 let bundle_err = |refusal| NodeError::Body(BodyError::Bundle { refusal });
                 let rule = &self.wrapper.as_ref().ok_or(bundle_err(qlab_devnet::body::BundleRefusal::NoRule))?.rule;
-                Some(rule.fold_bundle(&self.surface, &sec.bundle).map_err(bundle_err)?)
+                Some(rule.fold_bundle(&self.surface, bytes).map_err(bundle_err)?)
             }
         };
         // Lab #785 F5-4c: the exit notes' leaves, derived before any mutation.
@@ -2749,7 +2786,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // construction.
         let matured =
             crate::coinbase::matured_coinbase_leaf_for(self.form, block.header.height, |minted_at| {
-                self.ancestor_at(&block.header.prev, minted_at).map(|b| b.body())
+                self.ancestor_at(&block.header.prev, minted_at).map(|b| b.coinbase_view())
             });
         let hash = self
             .chain
@@ -2845,10 +2882,27 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         if let Err(refusal) = self.chain.set_finalized(hash) {
             return Ok(FinalizeOutcome::Refused(refusal));
         }
-        if let Some(dir) = &self.dir {
-            persist::append_record(dir, &LogRecord::Finalize(hash)).map_err(NodeError::Io)?;
-        }
+        self.append_log(&LogRecord::Finalize(hash))?;
         Ok(FinalizeOutcome::Recorded)
+    }
+
+    /// **The node's one log writer**: append `rec` when disk-backed (a no-op
+    /// in memory), returning where a V6 bundle landed. The first call in a
+    /// process cuts a torn tail first (lab #804, `persist::truncate_torn_tail`)
+    /// — here, not at open, because only the process that writes may: an
+    /// audit opening a live node's data dir would see that node's append in
+    /// progress as a torn tail.
+    fn append_log(&mut self, rec: &LogRecord) -> Result<Option<u64>, NodeError> {
+        let Some(dir) = &self.dir else { return Ok(None) };
+        if !self.log_tail_cut {
+            if let Some(cut) = persist::truncate_torn_tail(dir).map_err(NodeError::Io)? {
+                qlab_devnet::jprintln!(
+                    "STARTUP blocks.log: cut a torn tail of {cut} B (a crash mid-append) before the first append (lab #804)"
+                );
+            }
+            self.log_tail_cut = true;
+        }
+        persist::append_record(dir, rec).map_err(NodeError::Io)
     }
 
     /// Persist the current derived state as an atomic snapshot (no-op for an
@@ -4275,6 +4329,130 @@ mod tests {
         fn bundle_surface(&self, bundle: &[u8]) -> Result<Vec<u8>, qlab_devnet::body::BundleRefusal> {
             CounterRule.bundle_surface(bundle)
         }
+    }
+
+    /// Lab #785 F5-5c: on a disk-backed V6 node an applied bundle is held as
+    /// a reference into `blocks.log` (its resident bytes dropped on append),
+    /// reads back byte-exact, and both reopen paths — full replay and snapshot
+    /// resume — hold references and reach the same surface and last bundle
+    /// height. An in-memory node keeps the bytes, behind the same API.
+    #[test]
+    fn an_applied_bundle_lives_in_the_log_and_reopens_both_ways() {
+        let dir = std::env::temp_dir().join(format!("qlab-f5-5c-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = genesis_block_v6(8, 0);
+        let (h1, b1) = bundle_block(&g.header(), Some(5));
+        let (h2, b2) = bundle_block(&h1, None);
+        let live = {
+            let mut node = MemNode::open_v6(&dir, g.clone(), counter_setup()).unwrap();
+            node.apply_block(h1, b1.clone(), &MockVerifier).unwrap();
+            node.apply_block(h2, b2, &MockVerifier).unwrap();
+            let stored = node.chain.block(&h1.header_hash_for(GenesisForm::V5)).unwrap();
+            let r = stored.bundle_ref().expect("block 1 carries the bundle");
+            assert!(!r.is_resident(), "spilled to the log once appended");
+            let at = r.log_offset().unwrap() as usize;
+            let log = std::fs::read(dir.join(persist::BLOCK_LOG)).unwrap();
+            assert_eq!(&log[at..at + b1.bundle.len()], &b1.bundle[..], "the reference is the bytes' place");
+            assert_eq!(stored.body().preimage_v6(), b1.preimage_v6(), "body() reads it back");
+            (node.tip_hash(), node.wrapper_surface().to_vec(), node.last_bundle_height())
+        };
+        assert_eq!(live.2, Some(1));
+        let held = |n: &MemNode| n.chain.block(&h1.header_hash_for(GenesisForm::V5)).unwrap().bundle_ref().unwrap().is_resident();
+
+        let replayed = MemNode::open_v6(&dir, g.clone(), counter_setup()).expect("full replay");
+        assert_eq!(replayed.recovery_report().snapshot_height, None);
+        assert_eq!((replayed.tip_hash(), replayed.wrapper_surface().to_vec(), replayed.last_bundle_height()), live);
+        assert!(!held(&replayed), "opened from the log: a reference");
+        replayed.save_snapshot().unwrap();
+        let resumed = MemNode::open_v6(&dir, g.clone(), counter_setup()).expect("snapshot resume");
+        assert_eq!(resumed.recovery_report().snapshot_height, Some(2));
+        assert_eq!((resumed.tip_hash(), resumed.wrapper_surface().to_vec(), resumed.last_bundle_height()), live);
+        assert!(!held(&resumed));
+
+        let mut mem = MemNode::in_memory_v6(g, counter_setup());
+        mem.apply_block(h1, b1.clone(), &MockVerifier).unwrap();
+        assert!(held(&mem), "the in-memory store keeps the bytes");
+        assert_eq!(
+            mem.chain.block(&h1.header_hash_for(GenesisForm::V5)).unwrap().body().preimage_v6(),
+            resumed.chain.block(&h1.header_hash_for(GenesisForm::V5)).unwrap().body().preimage_v6(),
+            "one API, one body"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #785 F5-5c, conditions 2–3: bytes that moved under a live
+    /// reference refuse by name on the serving path (`try_body`) and on the
+    /// walk-back; a reopen over them refuses by name too (the moved bytes no
+    /// longer bind to the header); a log cut short of the reference refuses
+    /// the same way. Nothing panics.
+    #[test]
+    fn a_bundle_whose_log_moved_refuses_by_name() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("qlab-f5-5c-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = genesis_block_v6(8, 0);
+        let (h1, b1) = bundle_block(&g.header(), Some(5));
+        let mut node = MemNode::open_v6(&dir, g.clone(), counter_setup()).unwrap();
+        node.apply_block(h1, b1, &MockVerifier).unwrap();
+        let hash = h1.header_hash_for(GenesisForm::V5);
+        let at = node.chain.block(&hash).unwrap().bundle_ref().unwrap().log_offset().unwrap();
+
+        // Test-only write: production code never rewrites the log.
+        let mut f = std::fs::OpenOptions::new().write(true).open(dir.join(persist::BLOCK_LOG)).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[0xEE]).unwrap();
+        drop(f);
+        let e = node.chain.block(&hash).unwrap().try_body().err().expect("serving refuses");
+        assert!(e.to_string().contains("not this bundle"), "{e}");
+        let e = node.recompute_wrapper().expect_err("the walk-back refuses");
+        assert!(matches!(&e, NodeError::Io(io) if io.to_string().contains("not this bundle")), "{e}");
+        let e = MemNode::open_v6(&dir, g, counter_setup()).err().expect("a reopen refuses");
+        assert!(matches!(e, NodeError::BodyCommitmentMismatch { height: 1, .. }), "{e}");
+
+        std::fs::OpenOptions::new().write(true).open(dir.join(persist::BLOCK_LOG)).unwrap().set_len(at + 3).unwrap();
+        let e = node.chain.block(&hash).unwrap().try_body().err().expect("a short log refuses");
+        assert!(e.to_string().contains("ends short"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #804 through the node: a crash tears the last record (a bundle
+    /// block's); opening reads up to it and leaves the file as it is (a
+    /// reader never cuts); the node's first append cuts the tail and lands at
+    /// the last complete record's end, so a reopen sees every block — and the
+    /// re-applied bundle's reference reads back.
+    #[test]
+    fn the_first_append_after_a_torn_tail_cuts_it() {
+        let dir = std::env::temp_dir().join(format!("qlab-i804-node-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = genesis_block_v6(8, 0);
+        let (h1, b1) = bundle_block(&g.header(), Some(5));
+        let (h2, b2) = bundle_block(&h1, None);
+        let (h3, b3) = bundle_block(&h2, None);
+        let (h4, b4) = bundle_block(&h3, Some(9));
+        let log = dir.join(persist::BLOCK_LOG);
+        {
+            let mut node = MemNode::open_v6(&dir, g.clone(), counter_setup()).unwrap();
+            for (h, b) in [(h1, b1), (h2, b2), (h3, b3), (h4, b4.clone())] {
+                node.apply_block(h, b, &MockVerifier).unwrap();
+            }
+        }
+        let full = std::fs::metadata(&log).unwrap().len();
+        std::fs::OpenOptions::new().write(true).open(&log).unwrap().set_len(full - 5).unwrap();
+
+        let mut node = MemNode::open_v6(&dir, g.clone(), counter_setup()).expect("opens up to the torn record");
+        assert_eq!(node.tip_height(), 3);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), full - 5, "opening never cuts");
+        node.apply_block(h4, b4.clone(), &MockVerifier).expect("re-applied");
+        let at = node.chain.block(&h4.header_hash_for(GenesisForm::V5)).unwrap().bundle_ref().unwrap().log_offset().unwrap();
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), full, "the torn bytes were cut, the record re-written in their place");
+        assert_eq!(node.chain.block(&h4.header_hash_for(GenesisForm::V5)).unwrap().bundle_ref().unwrap().read().unwrap(), b4.bundle);
+        drop(node);
+
+        let reopened = MemNode::open_v6(&dir, g, counter_setup()).expect("reopens whole");
+        assert_eq!(reopened.tip_height(), 4);
+        let r = reopened.chain.block(&h4.header_hash_for(GenesisForm::V5)).unwrap().bundle_ref().unwrap().clone();
+        assert_eq!((r.log_offset(), r.read().unwrap()), (Some(at), b4.bundle));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Lab #785 F5-5b (item 7): a tip block's proofs verify once — the
