@@ -5,6 +5,7 @@
 //! qlab-bench f5box --genesis FILE --chain URL --state FILE --out DIR --seed TEXT [--check]
 //! qlab-bench f5box --next --genesis FILE --chain URL --state FILE --out DIR
 //!                  --exit-rkm HEX [--exit-v BESSEL] [--check]
+//! … [--claim FILE]   (either build: a depositor's claim file as the first claim)
 //! ```
 //!
 //! - `--burn-rkm` prints `rkm_burn(l2_id)` of the genesis in `miner_rkm`'s
@@ -16,6 +17,11 @@
 //!   `--exit-rkm` (`qumbra-wallet miner-rkm`'s form).
 //! - `--check` plans and stops: no prove, nothing written — whether the chain
 //!   is ready, and why not.
+//! - `--claim FILE` (lab #831 W3c) takes a depositor's claim file —
+//!   `qumbra-wallet deposit claim --out FILE`, the claim of a transaction-output
+//!   burn f5box cannot see — as the wrapper's first claim: read against this
+//!   genesis and its claim tier, its proof verified before anything is proved,
+//!   refused by name when its anchor is a root this wrapper does not absorb.
 //!
 //! A built bundle is proven, signed, judged by the node's own rule
 //! ([`super::bundle::self_check`]) and only then written, named by its index
@@ -37,7 +43,7 @@ use serde_json::json;
 
 use super::bundle::{assemble, manifest, prove, rehearsal_signer, self_check, sign, Timings};
 use super::chain::{self, Http};
-use super::members::{plan, Ask, Chain, Keys};
+use super::members::{plan, take_claim_file, Ask, Chain, Keys};
 use super::state::{digest_hex, plan_surface, write_atomic, RunState, StateLock};
 use crate::f4::bench::default_kinds;
 use crate::f4::native::WTag;
@@ -59,6 +65,8 @@ pub(crate) struct Build {
     pub seed: Option<String>,
     /// `Some` with `--next`: the exit the first P pays.
     pub exit: Option<Exit>,
+    /// Lab #831 W3c: a depositor's claim file, taken as the first claim.
+    pub claim: Option<PathBuf>,
     pub check: bool,
 }
 
@@ -82,8 +90,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Cmd, String> {
     let need = |k: &str| -> Result<String, String> { get(k)?.ok_or_else(|| format!("{k} is required")) };
     let known = [
         "--burn-rkm", "--genesis", "--chain", "--state", "--out", "--seed", "--next", "--exit-rkm", "--exit-v", "--check",
+        "--claim",
     ];
-    let takes_value = ["--genesis", "--chain", "--state", "--out", "--seed", "--exit-rkm", "--exit-v"];
+    let takes_value = ["--genesis", "--chain", "--state", "--out", "--seed", "--exit-rkm", "--exit-v", "--claim"];
     let mut seen: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -134,6 +143,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Cmd, String> {
         out: PathBuf::from(need("--out")?),
         seed,
         exit,
+        claim: get("--claim")?.map(PathBuf::from),
         check: has("--check"),
     }))
 }
@@ -148,6 +158,27 @@ fn load_genesis(path: &Path) -> Result<GenesisFileV6, String> {
     let g = GenesisFileV6::from_bytes(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
     g.verify_startup(None).map_err(|e| format!("{}: {e:?}", path.display()))?;
     Ok(g)
+}
+
+/// **Read a depositor's claim file** (lab #831 W3c): decoded against this
+/// genesis and its claim tier (`qlab_l2spend::decode_claim_artifact` refuses
+/// another chain, another tier, another L2's burn address, a malformed file),
+/// its `l2_id` this chain's, its proof a canonical `bincode` proof — and, with
+/// `verify`, the proof verified under the claim AIR for this `l2_id` and tier,
+/// so a bad file is refused before the hour of proving the rest.
+pub(crate) fn read_claim_file(path: &Path, net: &[u8; 32], l2_id: u64, tier: u64, verify: bool) -> Result<qlab_l2spend::ClaimFile, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = qlab_l2spend::decode_claim_artifact(&bytes, net, tier).map_err(|e| format!("{}: {e}", path.display()))?;
+    if file.l2_id != l2_id {
+        return Err(format!("{}: a claim to L2 {}, and this chain bridges L2 {l2_id}", path.display(), file.l2_id));
+    }
+    let proof: qlab_consensus::Proof<qlab_consensus::Config> =
+        bincode::deserialize(&file.proof).map_err(|e| format!("{}: the proof does not decode: {e}", path.display()))?;
+    if verify {
+        qlab_l2::claim::verify_claim_u32(&file.pvs, &proof, l2_id, tier)
+            .map_err(|e| format!("{}: the claim's proof does not verify: {e:?}", path.display()))?;
+    }
+    Ok(file)
 }
 
 /// `qlab-bench f5box …`.
@@ -203,7 +234,7 @@ fn build(b: &Build) -> Result<(), String> {
     let kinds: &[WTag] = if b.exit.is_some() { &mix } else { &claims };
     let ask = Ask { kinds, burns: &burns, owned: &run.owned, exit: b.exit };
     let chain = Chain { view: &view, l2_id: params.l2_id, fee_tier: params.claim_fee_tier };
-    let p = match plan(&state, &prev, &chain, &keys, &ask) {
+    let mut p = match plan(&state, &prev, &chain, &keys, &ask) {
         Ok(p) => p,
         Err(e) => {
             let young = view.immature_burns(params.l2_id);
@@ -215,6 +246,12 @@ fn build(b: &Build) -> Result<(), String> {
             ));
         }
     };
+    // Lab #831 W3c: a depositor's claim, verified before anything is proved.
+    if let Some(path) = &b.claim {
+        let file = read_claim_file(path, &net, params.l2_id, params.claim_fee_tier, true)?;
+        eprintln!("f5box: taking {} as the first claim ({} bessel)", path.display(), file.value);
+        p = take_claim_file(&state, p, file, &keys).map_err(|e| format!("{}: {e:?}", path.display()))?;
+    }
     if b.check {
         let report = json!({
             "mode": "f5box --check", "plannable": true, "tip": view.anchors.tip_height,
@@ -222,6 +259,7 @@ fn build(b: &Build) -> Result<(), String> {
             "absorbed_leaf_counts": p.absorbed.map(|a| a.count),
             "claimed_burn_heights": p.claimed.iter().map(|b| b.height).collect::<Vec<_>>(),
             "d_batch": p.inp.d_batch, "exits": p.exits.len(),
+            "claim_file": b.claim.as_ref().map(|c| c.display().to_string()),
         });
         println!("{}", serde_json::to_string_pretty(&report).expect("json"));
         return Ok(());

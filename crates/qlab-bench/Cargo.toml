@@ -26,6 +26,10 @@ qlab-devnet = { path = "../qlab-devnet" }
 # bench mode measures it; integration tests drive the end-to-end wallet flow.
 qlab-disclosure = { path = "../qlab-disclosure" }
 qlab-wallet = { path = "../qlab-wallet" }
+# Lab #831 W3c: f5box reads depositors' claim files (`decode_claim_artifact`)
+# and takes them as members; the lane also builds W2's exit and W3b's claim
+# with the wallet's own assembly from here.
+qlab-l2spend = { path = "../qlab-l2spend" }
 qlab-node = { path = "../qlab-node" }
 # Lab #785 F5-6 (1): `f5box` reads a V6 genesis file (its wrapper parameters
 # and form) and the node's own rkm-hex convention from the node crate — never
@@ -88,10 +92,6 @@ qlab-air = { path = "../qlab-air", features = ["test-support"] }
 # bundle rule (`qumbra_node::bundle::WrapperRule`), whose measurement version
 # and member stub are behind this dev-only feature (ruling 5915423092).
 qumbra-node = { path = "../qumbra-node", features = ["wrapper-test-knobs"] }
-# Lab #831 W2: the wallet's exit P is assembled by `qlab_l2spend::exit_instance`
-# and handed to f5box's wrapper as a member — the lane's proof that the CLI's
-# `--out` exit is a member the node's rule takes. Dev-only.
-qlab-l2spend = { path = "../qlab-l2spend" }
 # Lab #831 W3b: the wallet's scan sets its deposit aside (`deposits::set_aside`)
 # before f5box's tx-output burn reader takes the opening. Dev-only.
 qlab-ledger = { path = "../qlab-ledger" }

@@ -141,7 +141,7 @@ impl Member {
     fn as_tx(&self) -> Option<TxSurface> {
         self.tag.shape().map(|tag| TxSurface { tag, pvs: self.pvs.clone(), write: self.write })
     }
-    fn digest_at(&self, off: usize) -> Result<Digest, WError> {
+    pub(crate) fn digest_at(&self, off: usize) -> Result<Digest, WError> {
         let c = self.pvs.get(off..off + 16).ok_or(WError::Surface)?;
         if c.iter().any(|x| *x >= 1 << 16) {
             return Err(WError::Surface);
