@@ -312,7 +312,12 @@ fn parse_query(query: Option<&str>) -> Result<Query<'_>, UriError> {
                 q.asset = Some(asset_id(v).map_err(|why| UriError::BadValue { key: REQ_ASSET, got: truncated(v), why })?);
             }
             // BIP-21: a `req-` key this module does not define refuses the URI.
-            k if k.starts_with("req-") => return Err(UriError::UnknownRequiredKey { key: truncated(k) }),
+            // The prefix test folds ASCII case: keys are case-sensitive, so
+            // `Req-asset` is not `req-asset` — and read as an ignorable key it
+            // would turn an asset request into a QMB one. Refused instead.
+            k if k.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("req-")) => {
+                return Err(UriError::UnknownRequiredKey { key: truncated(k) })
+            }
             // Unknown keys MUST be ignored (forward compatibility),
             // including their values, well-formed or not.
             _ => {}
@@ -745,6 +750,10 @@ mod tests {
             assert!(want.to_string().contains(key), "the refusal names the key");
         }
         assert!(parse(&format!("qumbra:{a}?request-foo=1")).is_ok(), "only the `req-` prefix is must-understand");
+        // The prefix folds case: a mis-cased `req-asset` is refused, never read as QMB.
+        for key in ["Req-asset", "REQ-ASSET", "rEq-foo"] {
+            assert_eq!(parse(&format!("qumbra:{a}?{key}=7&amount=1")).unwrap_err(), UriError::UnknownRequiredKey { key: key.into() });
+        }
     }
 
     /// `req-asset` round-trips through `encode_asset` → `parse_request` in base
