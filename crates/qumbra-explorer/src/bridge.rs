@@ -122,4 +122,100 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(Ok(&behind)), &covered())).unwrap();
         assert_eq!(v["circulating"], crate::json::UNAVAILABLE);
     }
+
+    // -----------------------------------------------------------------------
+    // Goldens — the reader half lives in `qumbra-explorer-web` (lab #833)
+    // -----------------------------------------------------------------------
+
+    /// Keccak-256 over the golden documents concatenated, in **source**, so a
+    /// blind file regeneration cannot make the goldens pass by itself.
+    const GOLDEN_DIGEST: &str = "6047c2c16ef2b19450819115192dc69e2a9ee042b4b196286d990443043c0d4b";
+
+    /// Two epochs, so the page's table has more than one row to order.
+    fn golden_view() -> BridgeView {
+        BridgeView {
+            covered_height: 14,
+            d_cum: 1_000,
+            e_cum: 40,
+            rows: vec![
+                BridgeRow { epoch: 0, start_height: 0, end_height: 7, bridged_in: 600, bridged_out: 0 },
+                BridgeRow { epoch: 1, start_height: 8, end_height: 14, bridged_in: 400, bridged_out: 40 },
+            ],
+        }
+    }
+
+    /// Every state the page renders: the attestation checked, the same rows
+    /// with `circulating` refused (supply rows behind the tip), a refusing
+    /// ledger, and a chain with no bridge.
+    fn golden_cases() -> Vec<(&'static str, String)> {
+        let lagging = Telemetry::assemble(20, Some(8), Some(75), 0, 3, 1, qlab_devnet::params_devnet::DEGRADED_MODE_LAG_BLOCKS)
+            .with_supply(covered().supply);
+        vec![
+            ("bridge-v6", bridge_document(Some(Ok(&golden_view())), &covered())),
+            ("bridge-circulating-unavailable", bridge_document(Some(Ok(&golden_view())), &lagging)),
+            ("bridge-refused", bridge_document(Some(Err("CounterDecrease { height: 7 }".into())), &covered())),
+            ("bridge-not-v6", not_v6()),
+        ]
+    }
+
+    /// 🔴 GOLDEN — the checked-in files ARE the vectors, and
+    /// `qumbra-explorer-web/fixtures/` holds the same bytes. Update them only
+    /// with an intentional, documented shape change; regenerating is not
+    /// enough on its own, since [`golden_digest_locks_the_regenerated_files`]
+    /// pins a digest in source.
+    #[test]
+    fn golden_files_match_the_encoder_byte_for_byte() {
+        for (name, produced) in golden_cases() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("goldens").join(name);
+            let on_disk = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("golden {name} missing at {}: {e}", path.display()));
+            assert_eq!(
+                on_disk.trim_end_matches('\n'),
+                produced,
+                "golden {name} drifted — see this test's docs before updating the file"
+            );
+        }
+    }
+
+    /// The goldens read back in the front end's direction: real JSON, a
+    /// version, `available`; a document that does not apply says why and
+    /// carries no figures; `circulating` is a number or the token, never
+    /// anything else.
+    #[test]
+    fn the_goldens_decode_and_say_whether_they_apply() {
+        for (name, produced) in golden_cases() {
+            let v: serde_json::Value = serde_json::from_str(&produced).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(v["v"], 1, "{name} is versioned");
+            if v["available"] == true {
+                assert!(v["epochs"].is_array(), "{name} carries its rows");
+                let c = &v["circulating"];
+                assert!(c.is_u64() || *c == crate::json::UNAVAILABLE, "{name}: circulating is {c}");
+            } else {
+                assert_eq!(v["available"], false, "{name} states available");
+                assert!(v["why"].as_str().is_some_and(|w| !w.is_empty()), "{name} says why");
+                assert!(v.get("epochs").is_none(), "{name} carries no figures");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes files; run explicitly when a shape change is intended"]
+    fn regenerate_goldens() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("goldens");
+        std::fs::create_dir_all(&dir).expect("goldens dir");
+        for (name, produced) in golden_cases() {
+            std::fs::write(dir.join(name), format!("{produced}\n")).expect("write golden");
+            println!("wrote {name}");
+        }
+        let all: String = golden_cases().into_iter().map(|(_, s)| s).collect();
+        let hex: String = qlab_note::hash::keccak256(all.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        println!("GOLDEN_DIGEST = \"{hex}\"");
+    }
+
+    #[test]
+    fn golden_digest_locks_the_regenerated_files() {
+        let all: String = golden_cases().into_iter().map(|(_, s)| s).collect();
+        let hex: String = qlab_note::hash::keccak256(all.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_DIGEST, "GOLDEN digest — update ONLY with an intentional, documented shape change");
+    }
 }

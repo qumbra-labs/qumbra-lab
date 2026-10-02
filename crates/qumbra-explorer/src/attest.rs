@@ -25,7 +25,7 @@
 //! locks the agreement.
 
 use qlab_node::asset_supply::{AssetLedger, AttestDocument};
-use qlab_node::registry_store::RegistryStore;
+use qlab_node::registry_store::{RegistryLeaf, RegistryStore};
 use qlab_node::{ChainStore, Hash32, MemNode};
 
 use crate::txlist::hex32;
@@ -176,9 +176,15 @@ pub fn registry_document(node: &MemNode) -> String {
     let Some(store) = node.registry() else {
         return not_annulet(REGISTRY_PATH);
     };
-    let tree = store.tree();
-    let leaves: Vec<String> = tree
-        .leaves()
+    encode_registry(node.chain().tip_height(), &store.root_bytes(), store.tree().leaves())
+}
+
+/// The registry document's bytes, from its three inputs: split from
+/// [`registry_document`] so the goldens can pin the encoding without a node
+/// (the root is a hash, and a golden built over a live store would pin the
+/// tree's hashing as well as this document's shape).
+pub fn encode_registry<'a>(height: u64, root: &Hash32, leaves: impl Iterator<Item = &'a RegistryLeaf>) -> String {
+    let leaves: Vec<String> = leaves
         .map(|l| {
             format!(
                 "{{\"asset\":{},\"mode\":\"{}\",\"issuer_key\":\"{}\",\"freeze_root\":\"{}\",\
@@ -193,11 +199,10 @@ pub fn registry_document(node: &MemNode) -> String {
             )
         })
         .collect();
-    let root: Hash32 = store.root_bytes();
     format!(
         "{{\"v\":1,\"available\":true,\"height\":{},\"root\":\"{}\",\"assets\":[{}]}}",
-        node.chain().tip_height(),
-        hex32(&root),
+        height,
+        hex32(root),
         leaves.join(",")
     )
 }
@@ -432,6 +437,147 @@ mod tests {
         let reg: serde_json::Value = serde_json::from_str(&registry_document(&n)).unwrap();
         let leaf = reg["assets"].as_array().unwrap().iter().find(|a| a["asset"] == usdt).unwrap();
         assert_eq!(leaf["mode"], "hybrid");
+    }
+
+    // -----------------------------------------------------------------------
+    // Goldens — the reader half lives in `qumbra-explorer-web` (lab #833)
+    // -----------------------------------------------------------------------
+
+    /// Keccak-256 over the golden documents concatenated, in **source**, so a
+    /// blind file regeneration cannot make the goldens pass by itself.
+    const GOLDEN_DIGEST: &str = "83df1666ddbb0fd53f41add6c34567624828c491813593e71d51ff337f9c0058";
+
+    /// The attestation as `annulet_node()` serves it: genesis 4 fee units and
+    /// 1,000 of asset 7, then mint 500 at height 1 and redeem 120 at height 2.
+    fn agreed_document() -> AttestDocument {
+        use qlab_node::asset_supply::{
+            AssetRow, FlowRow, GenesisRow, ATTEST_VERSION, FRAMING, GENESIS_NOTE, LABEL, REPLAY,
+        };
+        let s = |x: &str| x.to_string();
+        AttestDocument {
+            v: ATTEST_VERSION,
+            label: s(LABEL),
+            framing: s(FRAMING),
+            replay: s(REPLAY),
+            tip_height: 2,
+            genesis_note: s(GENESIS_NOTE),
+            genesis: vec![GenesisRow { asset: 0, issued: s("4") }, GenesisRow { asset: 7, issued: s("1000") }],
+            assets: vec![
+                AssetRow { asset: 0, minted: s("0"), redeemed: s("0"), outstanding: s("4") },
+                AssetRow { asset: 7, minted: s("500"), redeemed: s("120"), outstanding: s("1380") },
+            ],
+            flows: vec![
+                FlowRow { height: 1, asset: 7, minted: s("500"), redeemed: s("0") },
+                FlowRow { height: 2, asset: 7, minted: s("0"), redeemed: s("120") },
+            ],
+            node_agrees: true,
+            node_divergences: Vec::new(),
+        }
+    }
+
+    /// The registry leaves the goldens carry: the fee unit (Cloaked), asset 7
+    /// (Hybrid, a freeze root) and asset 9 (Regulated, an allow root, redeem
+    /// open). The root is a fixed pattern, not a hash — see [`encode_registry`].
+    fn golden_leaves() -> Vec<RegistryLeaf> {
+        let mut a7 = RegistryLeaf::cloaked(7);
+        a7.mode = 1;
+        a7.issuer_key = [1, 2, 3, 4];
+        a7.freeze_root = [5, 6, 7, 8];
+        let mut a9 = RegistryLeaf::cloaked(9);
+        a9.mode = 2;
+        a9.issuer_key = [9, 10, 11, 12];
+        a9.allow_root = [13, 14, 15, 16];
+        a9.flags = 1;
+        vec![RegistryLeaf::cloaked(0), a7, a9]
+    }
+
+    /// Every state the page renders for the two Annulet documents: agreed, a
+    /// node that disagrees with the recomputation (its lines served verbatim),
+    /// the registry, and both documents on an L1 chain.
+    fn golden_cases() -> Vec<(&'static str, String)> {
+        let mut divergent = agreed_document();
+        divergent.node_agrees = false;
+        divergent.node_divergences = vec!["outstanding asset=7: recomputed 1380, node 1379".to_string()];
+        vec![
+            ("attest-agreed", encode(&agreed_document())),
+            ("attest-divergent", encode(&divergent)),
+            ("attest-not-annulet", not_annulet(ATTEST_PATH)),
+            ("assets-registry", encode_registry(2, &[0xA5; 32], golden_leaves().iter())),
+            ("assets-not-annulet", not_annulet(REGISTRY_PATH)),
+        ]
+    }
+
+    /// 🔴 GOLDEN — the checked-in files ARE the vectors, and
+    /// `qumbra-explorer-web/fixtures/` holds the same bytes. Update them only
+    /// with an intentional, documented shape change; regenerating is not
+    /// enough on its own, since [`golden_digest_locks_the_regenerated_files`]
+    /// pins a digest in source.
+    #[test]
+    fn golden_files_match_the_encoder_byte_for_byte() {
+        for (name, produced) in golden_cases() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("goldens").join(name);
+            let on_disk = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("golden {name} missing at {}: {e}", path.display()));
+            assert_eq!(
+                on_disk.trim_end_matches('\n'),
+                produced,
+                "golden {name} drifted — see this test's docs before updating the file"
+            );
+        }
+    }
+
+    /// The goldens read back in the front end's direction: real JSON, a
+    /// version, and `available` on every document; a document that does not
+    /// apply says why and carries no figures. The attestation goldens also
+    /// parse as the shared [`AttestDocument`].
+    #[test]
+    fn the_goldens_decode_and_say_whether_they_apply() {
+        for (name, produced) in golden_cases() {
+            let v: serde_json::Value = serde_json::from_str(&produced).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(v["v"].is_u64(), "{name} is versioned");
+            let available = v["available"].as_bool().unwrap_or_else(|| panic!("{name} states available"));
+            if available {
+                assert!(v["assets"].is_array(), "{name} carries its assets");
+            } else {
+                assert!(v["why"].as_str().is_some_and(|w| !w.is_empty()), "{name} says why");
+                assert!(v.get("assets").is_none(), "{name} carries no figures");
+            }
+            if available && name.starts_with("attest-") {
+                let _: AttestDocument = serde_json::from_str(&produced).unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+
+    /// The pure registry encoder is exactly what `registry_document` serves.
+    #[test]
+    fn registry_document_is_its_encoder_over_the_node() {
+        let n = annulet_node();
+        let store = n.registry().unwrap();
+        assert_eq!(
+            registry_document(&n),
+            encode_registry(n.chain().tip_height(), &store.root_bytes(), store.tree().leaves())
+        );
+    }
+
+    #[test]
+    #[ignore = "writes files; run explicitly when a shape change is intended"]
+    fn regenerate_goldens() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("goldens");
+        std::fs::create_dir_all(&dir).expect("goldens dir");
+        for (name, produced) in golden_cases() {
+            std::fs::write(dir.join(name), format!("{produced}\n")).expect("write golden");
+            println!("wrote {name}");
+        }
+        let all: String = golden_cases().into_iter().map(|(_, s)| s).collect();
+        let hex: String = qlab_note::hash::keccak256(all.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        println!("GOLDEN_DIGEST = \"{hex}\"");
+    }
+
+    #[test]
+    fn golden_digest_locks_the_regenerated_files() {
+        let all: String = golden_cases().into_iter().map(|(_, s)| s).collect();
+        let hex: String = qlab_note::hash::keccak256(all.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_DIGEST, "GOLDEN digest — update ONLY with an intentional, documented shape change");
     }
 }
 
