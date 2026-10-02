@@ -1090,3 +1090,67 @@ fn xff_is_honored_only_when_the_peer_is_a_named_trusted_proxy() {
     );
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Lab #683 — a harvest pass that stops short of the tip is not published
+// ---------------------------------------------------------------------------
+
+/// 🔴 **Both partial-pass branches of `FaucetService::tick`** (coordinator
+/// pre-review of lab PR #839). The per-pass bound is set below the chain length,
+/// so the catch-up takes several ticks:
+///
+/// 1. **Fresh start:** until a pass reaches the tip the page says "no harvest
+///    pass yet" (`notes_maturing: None`) — never a count from a partial walk
+///    (lab #543's spelling of "has not looked").
+/// 2. **Later:** a tick that finds more than a budget of new blocks stops short
+///    again, and the page keeps the last complete pass's answer rather than
+///    replacing it with the partial one.
+#[test]
+fn a_partial_harvest_pass_is_not_published() {
+    let wallet = faucet_wallet();
+    let mine = wallet.rkm(Diversifier::default());
+    let burn = [0xBE, 0xEF, 0xBE, 0xEF];
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Disabled).with_harvest_budget(40);
+    let mut rng = rand::rngs::StdRng::from_seed([0x68; 32]);
+    let maturing = |svc: &FaucetService| svc.status().lock().unwrap().notes_maturing;
+
+    // One faucet note at height 1 — spendable at tip `spendable_at_tip(1)` = 145,
+    // so immature through both branches below; tip 101.
+    node.mine_empty(1, mine);
+    node.mine_empty(100, burn);
+
+    // Branch 1: heights 0..=39, then 40..=79 — short of the tip both times.
+    for _ in 0..2 {
+        let report = svc.tick(&mut node, &mut rng);
+        assert!(!report.harvest.caught_up, "{:?}", report.harvest);
+        assert_eq!(maturing(&svc), None, "a partial pass is not the inventory's answer");
+    }
+    let report = svc.tick(&mut node, &mut rng);
+    assert!(report.harvest.caught_up, "80..=101 reaches the tip: {:?}", report.harvest);
+    assert_eq!(maturing(&svc), Some(1), "a complete pass is published");
+
+    // Branch 2: 42 new blocks > the budget of 40 — this tick stops short of the
+    // tip, and the page keeps the last complete answer. Tip 143 < 145: the note
+    // is still immature (CI run 37003985692 mined 45 here, reaching 146, and the
+    // pending re-read correctly funded it — the test's arithmetic, not the code).
+    node.mine_empty(42, burn);
+    assert!(node.chain_state().tip_height() < spendable_at_tip(1));
+    let report = svc.tick(&mut node, &mut rng);
+    assert!(!report.harvest.caught_up, "{:?}", report.harvest);
+    assert_eq!(report.harvest.funded, 0, "still immature at tip 143");
+    assert_eq!(report.harvest.maturing, 1, "the pending note is re-read every pass");
+    assert_eq!(maturing(&svc), Some(1), "the previous complete pass's answer stands");
+    let report = svc.tick(&mut node, &mut rng);
+    assert!(report.harvest.caught_up, "{:?}", report.harvest);
+    assert_eq!(maturing(&svc), Some(1));
+
+    // And the matured path out of the pending set: at tip 145 the note is funded
+    // once and nothing is maturing.
+    node.mine_empty(spendable_at_tip(1) - node.chain_state().tip_height(), burn);
+    let report = svc.tick(&mut node, &mut rng);
+    assert!(report.harvest.caught_up, "{:?}", report.harvest);
+    assert_eq!((report.harvest.funded, report.harvest.maturing), (1, 0));
+    assert_eq!(maturing(&svc), Some(0));
+    assert_eq!(svc.status().lock().unwrap().notes_held, 1);
+}

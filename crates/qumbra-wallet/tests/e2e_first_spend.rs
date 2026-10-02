@@ -43,7 +43,6 @@
 //! Two real proves (grant + spend), ~12 GB peak each, sequential — release
 //! only, behind the rig lock, per the bench discipline.
 
-use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Mutex};
 
 use qlab_cbserver::client::{light_client_scan, Completeness, ScanConfig};
@@ -62,7 +61,7 @@ use qlab_note::compact::decode_committed_discovery;
 use qlab_wallet::address::Diversifier;
 use qlab_wallet::seed::MasterSeed;
 use qlab_wallet::Wallet;
-use qumbra_faucet::harvest::{harvest_matured, spendable_at_tip};
+use qumbra_faucet::harvest::{harvest_matured, spendable_at_tip, HarvestCursor};
 use qumbra_node::discovery_server::{
     AnchorsView, DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxSubmitOutcome,
 };
@@ -187,7 +186,7 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
             ..FaucetConfig::default()
         },
     );
-    let mut seen = HashSet::new();
+    let mut seen = HarvestCursor::new();
     {
         let g = shared.lock().unwrap();
         let report = harvest_matured(&mut faucet, g.node(), &faucet_wallet, fd, &mut seen);

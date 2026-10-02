@@ -46,8 +46,15 @@
 //! The threshold is no longer a duplicated constant either: [`spendable_at_tip`]
 //! delegates to [`qlab_node::coinbase_leaf_appears_at`], the same function the append
 //! schedule uses, so there is one statement of the rule and this file quotes it.
+//!
+//! ## Cost: a cursor, not a walk (lab #683)
+//!
+//! This pass runs on the node loop's tick. It used to re-read the whole main chain
+//! every tick, and on svc1 that held the loop for 37 s of every 37 s window. It now
+//! resumes from a [`HarvestCursor`] and reads only what is not yet settled, bounded
+//! per pass by [`HARVEST_BLOCKS_PER_PASS`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use qlab_faucet::{Faucet, OwnedNote};
 use qlab_node::{coinbase_note_for, coinbase_note_leaf_for, ChainStore, MemNode, NodeState};
@@ -99,6 +106,21 @@ pub struct HarvestReport {
     /// whole "why can I not have funds yet" answer is built from, and it is the fact
     /// `qlab-faucet` structurally cannot compute (see the module docs).
     pub next_maturity: Option<u64>,
+    /// Whether this pass read through to the tip (lab #683). A pass that stopped at
+    /// [`HARVEST_BLOCKS_PER_PASS`] has not seen the newest blocks, so its
+    /// `maturing` / `next_maturity` are partial and the caller must not publish
+    /// them as the answer — see `FaucetService::tick`.
+    pub caught_up: bool,
+    /// Main-chain heights whose block body this node does not hold, so they could
+    /// not be read this pass (they stay pending and are retried). Normally 0; a
+    /// non-zero value that persists is a node fault worth a log line, because a
+    /// coinbase of the faucet's own could be in one of them.
+    pub unreadable: usize,
+    /// Whether this pass found the main chain rewritten under the read position
+    /// and restarted the read from genesis. The previous pass's facts describe a
+    /// chain that no longer exists, so the caller drops them — see
+    /// `FaucetService::tick`.
+    pub reset: bool,
 }
 
 /// The two facts about coinbase that has **not** landed yet, and the only way to
@@ -129,19 +151,99 @@ impl HarvestReport {
     }
 }
 
-/// Walk `node`'s main chain, fund every **matured, unspent** coinbase note paid to
-/// this wallet at `d` that the faucet does not already know about, and report what
-/// is still maturing.
+/// How many **new** main-chain blocks one [`harvest_matured`] pass may read
+/// before it yields the loop (lab #683).
 ///
-/// `seen` is the set of coinbase-note commitments already funded (or already known
-/// spent); it is the caller's, so a restarted process that has re-derived its
-/// inventory does not double-count. Funding twice would put two `OwnedNote`s with
-/// the same `cm` in the inventory, and `select_pair` would happily choose both —
-/// a self-inflicted double-spend attempt that the node's nullifier set would refuse
-/// and that would cost a proof to discover.
+/// A steady pass reads only the blocks since the last pass, plus the handful of
+/// heights still pending (see [`HarvestCursor`]), so it never comes near this. The
+/// bound is for the pass that is *not* steady: a fresh process (or a reorg below
+/// the read position) starts from genesis, and at T2's last-measured tip that one
+/// walk alone held the loop for ~40 s. Bounded, it is spread over ticks, and until
+/// it reaches the tip the report says [`HarvestReport::caught_up`]` = false` so the
+/// status page keeps saying "no harvest pass yet" rather than publishing a partial
+/// count (lab #543).
+pub const HARVEST_BLOCKS_PER_PASS: u64 = 512;
+
+/// Where the next harvest pass resumes, and what it has already funded.
+///
+/// 🔴 **Lab #683: this is what stops every tick re-walking the whole main chain.**
+/// Before it, the pass walked genesis → tip on every tick of the node loop that
+/// also serves consensus — O(chain) per tick, measured at 18.5 s per pass at tip
+/// 7,080 and growing 4.23 ms per block, which by tip ~19,000 is one whole block
+/// interval spent in the hook.
+///
+/// **Two positions, kept apart on purpose.** Every main-chain height below
+/// [`Self::next_height`] has been read once. Of those, every height *not* in
+/// [`Self::pending`] is *settled* — its block is not the faucet's, or its note is
+/// funded, or known spent, or it mints nothing — and none of that can change while
+/// the block stays on the main chain, so no pass reads it again. The pending set
+/// holds the heights that could not settle yet: a note of the faucet's still inside
+/// the §2 gate, or a main-chain header whose body this node does not hold. Each
+/// pass re-reads the pending heights and then reads forward from `next_height`.
+///
+/// Keeping them apart is what makes `caught_up` mean "the read reached the tip"
+/// (coordinator pre-review of lab PR #839): a single "settled below" position would
+/// stop at a height that never settles — a body that never arrives — and once that
+/// height fell a whole pass budget behind the tip, no pass would reach the tip
+/// again and the page would say "no harvest pass yet" forever, silently.
+///
+/// **Reorgs.** The cursor remembers the main-chain hash at `next_height − 1`. If a
+/// later pass finds a different hash there (or none), the main chain was rewritten
+/// under the read position: everything read is no longer known to be the main
+/// chain's, so the cursor goes back to genesis, the pending set is dropped, and the
+/// report says [`HarvestReport::reset`]. One hash suffices — every hash commits to
+/// its parent, so a rewrite anywhere below changes the hash at `next_height − 1`.
+/// `seen` survives the reset, so nothing is funded twice.
+#[derive(Clone, Debug, Default)]
+pub struct HarvestCursor {
+    /// Coinbase-note commitments already funded (or already known spent), so a
+    /// re-read never funds twice.
+    seen: HashSet<[u8; 32]>,
+    /// Every main-chain height below this has been read once.
+    next: u64,
+    /// The main-chain hash at `next - 1` when it was last advanced — the reorg
+    /// check. `None` while `next` is 0.
+    below_hash: Option<[u8; 32]>,
+    /// Heights below `next` that have not settled (see the type docs).
+    pending: BTreeSet<u64>,
+}
+
+impl HarvestCursor {
+    /// A cursor at genesis with nothing seen — what a fresh process starts with.
+    pub fn new() -> HarvestCursor {
+        HarvestCursor::default()
+    }
+
+    /// Record a coinbase-note commitment as known spent, so no pass funds it — the
+    /// service's lab #310 path, which learns of a spent input at submission.
+    pub fn mark_seen(&mut self, leaf: [u8; 32]) {
+        self.seen.insert(leaf);
+    }
+
+    /// The first main-chain height the next pass reads forward from.
+    pub fn next_height(&self) -> u64 {
+        self.next
+    }
+
+    /// Heights already read that have not settled, ascending.
+    pub fn pending(&self) -> Vec<u64> {
+        self.pending.iter().copied().collect()
+    }
+}
+
+/// Fund every **matured, unspent** coinbase note paid to this wallet at `d` that
+/// the faucet does not already know about, reading `node`'s main chain from
+/// `cursor` forward, and report what is still maturing.
+///
+/// `cursor` is the caller's and outlives the pass: its `seen` set is what keeps a
+/// re-read from funding twice — funding twice would put two `OwnedNote`s with the
+/// same `cm` in the inventory, and `select_pair` would happily choose both, a
+/// self-inflicted double-spend attempt that the node's nullifier set would refuse
+/// and that would cost a proof to discover — and its position is what keeps the
+/// pass from re-reading the settled chain (lab #683, see [`HarvestCursor`]).
 ///
 /// **Spent notes are subtracted, not re-funded (lab issue #310).** A restart
-/// begins with an empty `seen` and re-walks every matured coinbase paying this
+/// begins with a fresh cursor and re-walks every matured coinbase paying this
 /// `rkm`. Notes whose nullifiers are already in the consensus set are marked
 /// `seen` and counted in [`HarvestReport::skipped_spent`], never funded: the chain
 /// is the authority on spent-ness, and the wallet derives the nullifier the same
@@ -149,16 +251,35 @@ impl HarvestReport {
 /// re-includes already-spent notes, every dispense double-spends, and the retry
 /// budget burns while the page still says ready.
 ///
-/// O(tip) per call: it re-walks the chain. That is deliberate at lab scale and it is
-/// the honest cost of having no per-height note index; a T1-scale faucet would keep
-/// a cursor. Called on the node loop's tick, so the loop pays it — see
-/// `qumbra_node::run::RunningNode::run_until_with`.
+/// Reads at most [`HARVEST_BLOCKS_PER_PASS`] new blocks. Called on the node loop's
+/// tick, so the loop pays it — see `qumbra_node::run::RunningNode::run_until_with`.
 pub fn harvest_matured(
     faucet: &mut Faucet,
     node: &MemNode,
     wallet: &Wallet,
     d: Diversifier,
-    seen: &mut HashSet<[u8; 32]>,
+    cursor: &mut HarvestCursor,
+) -> HarvestReport {
+    harvest_matured_bounded(faucet, node, wallet, d, cursor, HARVEST_BLOCKS_PER_PASS)
+}
+
+/// What reading one height found.
+enum Visit {
+    /// Nothing about this height can change while it stays on the main chain.
+    Settled,
+    /// Not settled yet: re-read it next pass.
+    Pending,
+}
+
+/// [`harvest_matured`] with the per-pass bound on new blocks as a parameter, so
+/// the catch-up path is testable on a chain far shorter than the production bound.
+pub fn harvest_matured_bounded(
+    faucet: &mut Faucet,
+    node: &MemNode,
+    wallet: &Wallet,
+    d: Diversifier,
+    cursor: &mut HarvestCursor,
+    max_new_blocks: u64,
 ) -> HarvestReport {
     let mine = wallet.rkm(d);
     let tip = node.tip_height();
@@ -170,21 +291,37 @@ pub fn harvest_matured(
     // held, counted, and could never witness or spend.
     let form = node.form();
     let chain = node.chain();
+    let index = chain.chain();
     let mut report = HarvestReport::default();
 
-    for hash in chain.chain().main_chain() {
-        let Some(block) = chain.block(&hash) else { continue };
-        let height = block.header.height;
+    // The reorg check: what was read is only settled while it is still the main
+    // chain's (see `HarvestCursor`).
+    if cursor.next > 0 {
+        let below = index.main_chain_hash_at(cursor.next - 1);
+        if below.is_none() || below != cursor.below_hash {
+            cursor.next = 0;
+            cursor.below_hash = None;
+            cursor.pending.clear();
+            report.reset = true;
+        }
+    }
+
+    let mut visit = |height: u64, seen: &mut HashSet<[u8; 32]>, report: &mut HarvestReport| -> Visit {
+        let Some(block) = index.main_chain_hash_at(height).and_then(|hash| chain.block(&hash)) else {
+            // A header without its body: not readable yet, so not settled.
+            report.unreadable += 1;
+            return Visit::Pending;
+        };
         // The coinbase only — no V6 bundle is read (lab #785 F5-5c).
         let body = block.coinbase_view();
         if !body.coinbase_payees.iter().any(|p| p.rkm == mine) {
-            continue; // someone else's block, or an unconfigured burn payout
+            return Visit::Settled; // someone else's block, or an unconfigured burn payout
         }
         let Some(leaf) = coinbase_note_leaf_for(form, height, &body) else {
-            continue; // a non-minting block (genesis)
+            return Visit::Settled; // a non-minting block (genesis)
         };
         if seen.contains(&leaf) {
-            continue;
+            return Visit::Settled;
         }
         // The frozen §2 delay. No longer a gate this code has to *impose* — since
         // issue #102 an immature coinbase has no tree leaf, so a grant built on one
@@ -195,21 +332,44 @@ pub fn harvest_matured(
         if tip < at {
             report.maturing += 1;
             report.next_maturity = Some(report.next_maturity.map_or(at, |m: u64| m.min(at)));
-            continue;
+            return Visit::Pending;
         }
-        let Some(note) = coinbase_note_for(form, height, &body) else { continue };
+        let Some(note) = coinbase_note_for(form, height, &body) else { return Visit::Settled };
         // Lab #310: the chain knows which notes are spent. Derive the nullifier
         // the way a spend does, and skip any whose nf is already permanent.
         let nf = qlab_note::hash::digest_bytes(&wallet.nullifier(&note.rho));
         if node.is_spent(&nf) {
             seen.insert(leaf);
             report.skipped_spent += 1;
-            continue;
+            return Visit::Settled;
         }
         faucet.fund(OwnedNote::from_coinbase(wallet, note.value, note.rho, note.rseed, d, height));
         seen.insert(leaf);
         report.funded += 1;
+        Visit::Settled
+    };
+
+    // (1) The pending heights. Their number is bounded by the faucet's own blocks
+    // inside the §2 window plus any bodies not yet held, not by the chain.
+    for height in std::mem::take(&mut cursor.pending) {
+        if let Visit::Pending = visit(height, &mut cursor.seen, &mut report) {
+            cursor.pending.insert(height);
+        }
     }
+
+    // (2) Forward from the read position, at most `max_new_blocks`.
+    if cursor.next <= tip {
+        let end = tip.min(cursor.next.saturating_add(max_new_blocks.max(1)) - 1);
+        for height in cursor.next..=end {
+            if let Visit::Pending = visit(height, &mut cursor.seen, &mut report) {
+                cursor.pending.insert(height);
+            }
+        }
+        cursor.next = end + 1;
+        cursor.below_hash = index.main_chain_hash_at(end);
+    }
+
+    report.caught_up = cursor.next > tip;
     report
 }
 
@@ -217,7 +377,7 @@ pub fn harvest_matured(
 mod tests {
     use super::*;
     use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
-    use qlab_devnet::header::BlockHeader;
+    use qlab_devnet::header::{BlockHeader, Hash32};
     use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
     use qlab_faucet::{FaucetConfig, FaucetLimits, TicketPolicy, TicketSecret};
     use qlab_devnet::forms::GenesisForm;
@@ -295,7 +455,7 @@ mod tests {
         let mut node = MemNode::in_memory_for(GenesisForm::V5, genesis.clone());
         let mut tip = genesis.header();
         let mut faucet = faucet_for(&wallet);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
 
         // Block 1 pays the faucet; grow to the height its leaf is appended at.
         mine_v5(&mut node, &mut tip, 1, wallet.rkm(d));
@@ -348,7 +508,7 @@ mod tests {
         let mut node = MemNode::in_memory(genesis.clone());
         let mut tip = genesis.header();
         let mut faucet = faucet_for(&wallet);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
 
         // One block to the faucet, nowhere near maturity: stock exists, none of it
         // spendable, and nothing funded in yet.
@@ -392,7 +552,7 @@ mod tests {
         let mut node = MemNode::in_memory(genesis.clone());
         let mut tip = genesis.header();
         let mut faucet = faucet_for(&wallet);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
 
         // Block 1 pays the faucet; nothing else does. Grow to one block SHORT of
         // the threshold.
@@ -432,7 +592,7 @@ mod tests {
         let mut node = MemNode::in_memory(genesis.clone());
         let mut tip = genesis.header();
         let mut faucet = faucet_for(&wallet);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
 
         mine(&mut node, &mut tip, 2, wallet.rkm(d));
         mine(&mut node, &mut tip, COINBASE_MATURITY_BLOCKS + 1, [0xCC; 4]);
@@ -505,7 +665,7 @@ mod tests {
             "one block below spendable_at_tip the leaf must not exist"
         );
         let mut faucet = faucet_for(&miner);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
         let early = harvest_matured(&mut faucet, &node, &miner, d, &mut seen);
         assert_eq!(early.funded, 0, "and the harvester funds nothing");
         assert_eq!(early.maturing, 1);
@@ -533,11 +693,15 @@ mod tests {
         let mut node = MemNode::in_memory(genesis.clone());
         let mut tip = genesis.header();
         let mut faucet = faucet_for(&wallet);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
 
         mine(&mut node, &mut tip, COINBASE_MATURITY_BLOCKS + 4, other.rkm(d));
         let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
-        assert_eq!(r, HarvestReport::default(), "no notes, none maturing, no next maturity");
+        assert_eq!(
+            r,
+            HarvestReport { caught_up: true, ..HarvestReport::default() },
+            "no notes, none maturing, no next maturity"
+        );
         assert_eq!(faucet.inventory().len(), 0);
     }
 
@@ -615,9 +779,9 @@ mod tests {
         assert!(node.is_spent(&nf1), "nullifier is now permanent — the chain says spent");
         let _ = tip;
 
-        // Restart path: empty seen, empty inventory, re-walk the chain.
+        // Restart path: fresh cursor, empty inventory, re-walk the chain.
         let mut faucet = faucet_for(&wallet);
-        let mut seen = HashSet::new();
+        let mut seen = HarvestCursor::new();
         let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
         assert_eq!(
             r.skipped_spent, 1,
@@ -630,5 +794,174 @@ mod tests {
         assert_eq!(r2.skipped_spent, 0, "seen remembers the spent leaf");
         assert_eq!(r2.funded, 0);
         assert_eq!(faucet.inventory().len(), 1);
+    }
+    /// Mine `n` blocks paying `rkm` **without finalizing them**, so a later
+    /// `rewind_to` may take them back. Returns each block's header and hash.
+    fn mine_unfinalized(
+        node: &mut MemNode,
+        tip: &mut BlockHeader,
+        n: u64,
+        rkm: [u64; 4],
+    ) -> Vec<(BlockHeader, Hash32)> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let height = tip.height + 1;
+            let body = BlockBody::from_single_payee(Vec::new(), coinbase(height), rkm);
+            let header =
+                BlockHeader::child_of(tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
+            let hash = node.apply_block(header, body, &NoTx).expect("applies");
+            *tip = header;
+            out.push((header, hash));
+        }
+        out
+    }
+
+    /// 🔴 **Lab #683: a settled chain is not read again.** The read position moves
+    /// past every block; the faucet's own note stays pending while it is inside the
+    /// §2 gate — so what a steady pass re-reads is the pending set plus the new
+    /// blocks, not the chain.
+    #[test]
+    fn the_cursor_passes_settled_blocks_and_stops_at_a_maturing_note() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0683; 4]);
+        let d = Diversifier::default();
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+        let mut faucet = faucet_for(&wallet);
+        let mut cursor = HarvestCursor::new();
+
+        // Ten blocks to somebody else: all settled, the cursor goes past the tip.
+        mine(&mut node, &mut tip, 10, [0xBB; 4]);
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert!(r.caught_up);
+        assert_eq!(cursor.next_height(), 11, "genesis..=10 are read");
+        assert!(cursor.pending().is_empty(), "and settled");
+
+        // One to the faucet at height 11, then more to somebody else: 11 stays
+        // pending while the note matures, and the read position goes on.
+        mine(&mut node, &mut tip, 1, wallet.rkm(d));
+        mine(&mut node, &mut tip, 5, [0xBB; 4]);
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert_eq!((r.funded, r.maturing), (0, 1));
+        assert_eq!(cursor.pending(), vec![11], "the maturing note is pending");
+        assert_eq!(cursor.next_height(), 17);
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert_eq!((r.funded, r.maturing), (0, 1), "and a re-read still counts it");
+
+        // At maturity it is funded once and the cursor goes to the tip.
+        let to_mine = spendable_at_tip(11) - node.tip_height();
+        mine(&mut node, &mut tip, to_mine, [0xBB; 4]);
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert_eq!((r.funded, r.maturing), (1, 0));
+        assert_eq!(cursor.next_height(), node.tip_height() + 1);
+        assert!(cursor.pending().is_empty(), "funded is settled");
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert_eq!(r.funded, 0, "nothing is funded twice");
+        assert_eq!(faucet.inventory().len(), 1);
+    }
+
+    /// 🔴 **Lab #683: the catch-up walk is bounded per pass**, and until it reaches
+    /// the tip the report says so — a partial pass must not be published as the
+    /// inventory's answer (lab #543). The total funded over the catch-up equals what
+    /// one unbounded walk funds.
+    #[test]
+    fn a_bounded_catch_up_reaches_the_tip_over_several_passes() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0684; 4]);
+        let d = Diversifier::default();
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+
+        mine(&mut node, &mut tip, 3, wallet.rkm(d));
+        mine(&mut node, &mut tip, COINBASE_MATURITY_BLOCKS + 2, [0xBB; 4]);
+        let tip_height = node.tip_height();
+
+        let mut faucet = faucet_for(&wallet);
+        let mut cursor = HarvestCursor::new();
+        let mut funded = 0;
+        let mut passes = 0;
+        loop {
+            let r = harvest_matured_bounded(&mut faucet, &node, &wallet, d, &mut cursor, 40);
+            funded += r.funded;
+            passes += 1;
+            if r.caught_up {
+                break;
+            }
+            assert!(cursor.next_height() <= tip_height, "not caught up means short of the tip");
+            assert!(passes < 100, "the catch-up must make progress");
+        }
+        assert_eq!(passes, (tip_height + 1).div_ceil(40), "40 blocks per pass, no more");
+        assert_eq!(funded, 3, "the bounded walk funds what an unbounded one would");
+        assert_eq!(faucet.inventory().len(), 3);
+    }
+
+    /// 🔴 **Lab #683: a reorg under the cursor is noticed.** The settled prefix was
+    /// settled *as the main chain's*; when the main chain below the cursor is
+    /// replaced by a branch that pays the faucet, the cursor must go back and read
+    /// it, or that note is never funded.
+    #[test]
+    fn a_reorg_below_the_cursor_is_read_again() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0685; 4]);
+        let d = Diversifier::default();
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+        let mut faucet = faucet_for(&wallet);
+        let mut cursor = HarvestCursor::new();
+
+        // Branch A: heights 1..=5 to somebody else, unfinalized; read past them.
+        let a = mine_unfinalized(&mut node, &mut tip, 5, [0xBB; 4]);
+        harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert_eq!(cursor.next_height(), 6);
+
+        // Branch B forks after height 2: height 3 pays the faucet.
+        node.rewind_to(a[1].1).expect("rewind to height 2");
+        let mut tip = a[1].0;
+        mine_unfinalized(&mut node, &mut tip, 1, wallet.rkm(d));
+        mine_unfinalized(&mut node, &mut tip, 5, [0xCC; 4]);
+        assert_eq!(node.tip_height(), 8);
+
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut cursor);
+        assert!(r.reset, "the rewrite under the read position is reported: {r:?}");
+        assert_eq!(r.maturing, 1, "the faucet's note on the new branch is found: {r:?}");
+        assert_eq!(cursor.pending(), vec![3], "and it is pending");
+        assert_eq!(cursor.next_height(), 9);
+    }
+
+    /// 🔴 **Coordinator pre-review of lab PR #839: a height that does not settle
+    /// does not hold the read back.** The faucet's own note stays pending for the
+    /// whole §2 window — far longer than one pass's budget here — and every pass
+    /// still reaches the tip, so `caught_up` keeps meaning "the read reached the
+    /// tip". Under a single "settled below" position the read would restart at the
+    /// pending height each pass, never get further than one budget past it, and
+    /// report `caught_up = false` for as long as the height stayed unsettled.
+    #[test]
+    fn a_pending_height_does_not_hold_the_read_back() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0686; 4]);
+        let d = Diversifier::default();
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+        let mut faucet = faucet_for(&wallet);
+        let mut cursor = HarvestCursor::new();
+        let budget = 10;
+
+        mine(&mut node, &mut tip, 1, wallet.rkm(d));
+        // Catch up block by block-budget while the note at height 1 is immature,
+        // the chain growing past it by more than a budget each round.
+        for _ in 0..5 {
+            mine(&mut node, &mut tip, budget, [0xBB; 4]);
+            let mut r = harvest_matured_bounded(&mut faucet, &node, &wallet, d, &mut cursor, budget);
+            let mut passes = 1;
+            while !r.caught_up {
+                assert!(passes < 20, "the read never reaches the tip: {r:?}");
+                r = harvest_matured_bounded(&mut faucet, &node, &wallet, d, &mut cursor, budget);
+                passes += 1;
+            }
+            assert_eq!(r.maturing, 1, "the pending note is still counted: {r:?}");
+            assert_eq!(cursor.pending(), vec![1]);
+            assert_eq!(cursor.next_height(), node.tip_height() + 1, "the read reached the tip");
+        }
+        assert!(node.tip_height() - 1 > budget, "the pending height is more than a budget behind");
     }
 }
