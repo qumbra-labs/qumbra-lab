@@ -16,7 +16,7 @@
 //! then sets the note aside as a pending deposit
 //! (`qlab_ledger::deposits::set_aside`), never as balance.
 
-use qlab_ledger::deposits::{burn_rkm, parse_l2_route, L2Answer, L2Route};
+use qlab_ledger::deposits::{burn_l2_id, burn_rkm, L2Answer, L2Route};
 use qlab_wallet::address::Address;
 use qlab_wallet::Wallet;
 
@@ -26,7 +26,23 @@ use qlab_wallet::Wallet;
 #[cfg(feature = "net")]
 pub fn fetch_l2(url: &str) -> Result<L2Answer, String> {
     let body = crate::net::http_get(url, "/v1/l2").map_err(|e| format!("GET /v1/l2: {e}"))?;
-    parse_l2_route(&body)
+    qlab_ledger::deposits::parse_l2_route(&body)
+}
+
+/// **The library's burn rule** (lab #831 W3a, Q2): a payment to the burn of
+/// an L2 the node names is a deposit, and a deposit is sealed to this
+/// wallet's own key — so a recipient that pays such a burn under any other
+/// encapsulation key (a pasted burn address sealed to a stranger) is refused,
+/// whichever surface built the send. The CLI's `send` refuses every burn
+/// before this; `deposit` builds the one recipient that passes.
+pub fn refuse_foreign_burn(wallet: &Wallet, recipient: &Address, l2_ids: &[u64]) -> Result<(), String> {
+    match burn_l2_id(&recipient.rkm_lanes(), l2_ids) {
+        Some(l2_id) if recipient.ek != wallet.address_at_index(0).ek => Err(format!(
+            "the recipient is L2 {l2_id}'s burn address sealed to a key that is not this wallet's: that would burn \
+             coins nobody here could claim. A deposit is made with `deposit`, sealed to this wallet"
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn hex(b: &[u8]) -> String {
@@ -97,5 +113,13 @@ mod tests {
         assert!(check_bridge(&route(1, [0; 32]), 1, &g).unwrap_err().starts_with("--genesis-hash does not match"));
         let no = L2Answer::NotBridged { why: "not a V6 net".into() };
         assert!(check_bridge(&no, 1, &g).unwrap_err().contains("bridges no L2 (not a V6 net)"));
+
+        // The library rule: the self-sealed deposit payee passes; the same burn
+        // sealed to a stranger's key is refused; an ordinary address passes.
+        let stranger = Wallet::from_master_seed(&MasterSeed::from_entropy([7u8; ENTROPY_LEN]), 0);
+        let foreign = burn_address(&stranger, 1);
+        assert_eq!(refuse_foreign_burn(&w, &a, &[1]), Ok(()));
+        assert!(refuse_foreign_burn(&w, &foreign, &[1]).unwrap_err().contains("L2 1's burn address sealed to a key"));
+        assert_eq!(refuse_foreign_burn(&w, &stranger.address_at_index(0), &[1]), Ok(()));
     }
 }

@@ -1074,6 +1074,9 @@ fn deposit(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let out = flag(args, "--out");
     let no_submit = has_flag(args, "--no-submit");
+    // The net, resolved before the gate prints anything: `--net annulet`, an
+    // unknown net or a bad stamp is refused here, never after "confirmed".
+    genesis_form_of(args)?;
 
     // The gate, before anything else: an irreversible burn into a chain the
     // user did not name, or an L2 it does not bridge, is never built.

@@ -86,6 +86,12 @@ pub fn parse_l2_route(body: &[u8]) -> Result<L2Answer, String> {
     let l2_id: u64 = id.parse().map_err(|_| format!("/v1/l2: l2_id {id} does not fit a u64"))?;
     let hex32 = |field: &str, rest: &str| -> Result<([u8; 32], usize), String> {
         let h = rest.get(..64).ok_or(format!("/v1/l2: {field} is not 64 hex digits"))?;
+        // Byte pairs below index by byte: a multi-byte character inside the
+        // window would split mid-character, so refuse it by name first — this
+        // reader gates a burn and must never panic on a node's body.
+        if !h.is_ascii() {
+            return Err(format!("/v1/l2: {field} is not lower-case hex"));
+        }
         let mut out = [0u8; 32];
         for (i, b) in out.iter_mut().enumerate() {
             let pair = &h[2 * i..2 * i + 2];
@@ -267,6 +273,8 @@ mod tests {
             yes.replacen(r#""v":1"#, r#""v":2"#, 1),
             yes.replacen("l2_id\":1", "l2_id\":01", 1),
             yes.replacen(&h('c'), &h('C'), 1),
+            // A multi-byte character straddling a hex pair: refused, not a panic.
+            yes.replacen(&h('c'), &format!("a\u{e9}{}", "c".repeat(61)), 1),
             format!("{yes} "),
             yes.replacen(r#""available":true,"#, "", 1),
             "404 not found".to_string(),

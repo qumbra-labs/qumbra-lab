@@ -267,6 +267,9 @@ fn select_with_rng(
     let mut scanned: Vec<(u64, ScanOutcome)> = Vec::new();
     // Lab #831 W3: the bridged L2, as the node names it (see `scan::gather`).
     let l2_ids = crate::deposit::fetch_l2(req.url).map(|a| a.l2_ids()).unwrap_or_default();
+    // Lab #831 W3a (Q2): every caller of `execute*` — not only the CLI — is
+    // refused a burn sealed to anyone but this wallet.
+    crate::deposit::refuse_foreign_burn(wallet, req.recipient, &l2_ids).map_err(SendError::Refused)?;
     for &idx in &w.allocated {
         let d = wallet.diversifier_at_index(idx);
         let kp = wallet.diversified_keypair(&d);
