@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "chain": { "applied_height": 200, "header_tip": 205, "behind_by": 5 },
+  "finalized_height": 200,
+  "peers": 3,
+  "availability": {
+    "kind": "ready",
+    "admits_requests": true,
+    "blocks_until_servable": 0,
+    "explain": "ready — 2 grants of value available",
+    "detail": { "grants": 2 }
+  },
+  "queued": 0,
+  "queue_capacity": 32,
+  "wait_blocks": 1,
+  "grant_value_bessel": 1000000000,
+  "tickets_required": false,
+  "confirmed": 4,
+  "notes_held": 2,
+  "notes_maturing": 0,
+  "address_placeholder": "qaddr1…"
+}

@@ -68,6 +68,9 @@ qlab-l2spend = { path = "../qlab-l2spend" }
 # TOML service config, same posture and same `=`-free pin as the node's.
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+# The JSON view the React page reads (`src/api.rs`). Already in the lockfile
+# (qlab-l2, qlab-stratum, qlab-http-framing).
+serde_json = "1"
 # The HTTP listener. Same `=` pin as qlab-node's RPC surface, qlab-cbserver's
 # reference server and qumbra-node's /metrics + /v1/telemetry — one HTTP
 # implementation in the tree, not four.

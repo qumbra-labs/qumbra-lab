@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "chain": null,
+  "finalized_height": null,
+  "peers": 0,
+  "availability": {
+    "kind": "starting",
+    "admits_requests": false,
+    "blocks_until_servable": null,
+    "explain": "starting — this faucet's node is rebuilding its state from disk, reading its log. It replays every record it has after a restart, which takes minutes to hours depending on how recent its last snapshot is. Nothing is wrong and nothing is lost; requests are refused rather than queued until it can bind a grant to a finalized anchor.",
+    "detail": { "replayed": 0, "total": 0 }
+  },
+  "queued": 0,
+  "queue_capacity": 32,
+  "wait_blocks": 1,
+  "grant_value_bessel": 1000000000,
+  "tickets_required": true,
+  "confirmed": 0,
+  "notes_held": 0,
+  "notes_maturing": null,
+  "address_placeholder": "qaddr1…"
+}

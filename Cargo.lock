@@ -1890,6 +1890,7 @@ dependencies = [
  "qumbra-node",
  "rand 0.10.2",
  "serde",
+ "serde_json",
  "tiny_http",
  "toml",
  "tracing",
