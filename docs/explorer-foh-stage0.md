@@ -150,10 +150,14 @@ options, **(a) proposed**:
 - Served bound: last `MAX_CHECKPOINTS = 512` (~2.8 days at the 8-block cadence), a serving
   bound regardless of the tracker's growth. `span` = height delta from the previous finalized
   checkpoint (the Ebb-and-Flow story: span > cadence means degraded time was crossed).
-- **Honesty field `history_from_height`**: the tracker rehydrates from one checkpoint at
-  restart (`adapter.rs:648`), so depth is process-lifetime. The document says where its
-  history actually begins; the page renders "since the observer last restarted" rather than
-  implying chain-lifetime history.
+- **Honesty field `history_from_height`**: where the **tracker's record** begins. The
+  tracker rehydrates from one checkpoint at restart (`adapter.rs:648`), so the record starts
+  no earlier than the last restart — but **the serving bound does not move it**: once more
+  than 512 checkpoints are held, the oldest served row is later than `history_from_height`
+  (test-locked in `checkpoints.rs`). "Where does this list begin" is answered by the
+  document's own `checkpoints[0].height`, not by this field. *(Corrected 2026-10-02, lab
+  #486: this line used to say the page renders "since the observer last restarted", which
+  is false once the bound engages — explorer-web#17.)*
 - `slot` is not retained per historical checkpoint today (only the live head's `sslot` in
   telemetry); the ticker ships without it rather than growing node state — noted as the one
   divergence from the tracker's "(fid, slot, span)" wish. If slot is wanted, that is node-side
@@ -177,7 +181,12 @@ anywhere today).
 - **Bound: `VITALS_SAMPLES = 1440` × 60 s = 24 h**, ≈ 1440 × 40 B ≈ **58 KB resident**,
   fixed — proposed as the #135 bound. Document worst case ≈ 120 KB JSON, served whole (no
   paging needed at this size).
-- Process-lifetime, `since` says so (same honesty rule as R2). Not persisted, same grounds.
+- `since` is the **oldest retained sample**: it advances as the ring evicts, so it equals
+  the process start only until the ring first fills (~24 h). This is **not** R2's rule —
+  `history_from_height` does not advance with its bound, `since` does (test-locked in
+  `vitals.rs`). Not persisted, same grounds as R2. *(Corrected 2026-10-02, lab #486: this
+  line used to read "Process-lifetime, `since` says so (same honesty rule as R2)", and the
+  page inherited a restart-dated sentence from it — explorer-web#14.)*
 
 ### R4 — `GET /v1/names/events?from=&to=` (scope item 6: name-event feed) — §4 has the full design
 
