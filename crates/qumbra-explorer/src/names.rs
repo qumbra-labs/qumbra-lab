@@ -723,7 +723,7 @@ mod tests {
     /// Keccak-256 over the golden documents concatenated, in **source**, so a
     /// blind file regeneration cannot make the goldens pass by itself.
     const GOLDEN_DIGEST: &str =
-        "fdc9a79b6decc7b0c3e5e8c6b4f365e60910804e7af20fde6a06390b68df4b8a";
+        "cce06cf75fab1146fafe1a2b61f88c1acce4a13f33b9d8c089385fd1934feb0d";
 
     /// The three states `qumbra-explorer-web` renders (stage 2), same bytes both
     /// sides of the repo boundary: the live post-boundary feed with all three op
@@ -738,10 +738,15 @@ mod tests {
             ],
         );
         let pre_boundary = view_of(15_761, vec![]);
+        // A native-names net (T2/v5, lab #573): the same feed with no boundary,
+        // so `boundary_height` is JSON null — the field whose `Number(null) === 0`
+        // coercion was explorer-web#19's second half, until now in no golden.
+        let native = NameEventsView { name_boundary: None, ..feed.clone() };
         vec![
             ("names-feed", document(&page(&feed, 19_000, 19_450))),
             ("names-empty-covered", document(&page(&pre_boundary, 15_000, 15_761))),
             ("names-no-coverage", document(&page(&pre_boundary, 20_000, 20_100))),
+            ("names-native", document(&page(&native, 19_000, 19_450))),
         ]
     }
 

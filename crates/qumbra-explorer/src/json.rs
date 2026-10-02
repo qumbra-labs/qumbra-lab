@@ -371,7 +371,7 @@ mod tests {
     // Updated for the lab #486 item-7 additive `network` key (v stays 1 — the
     // burned precedent); the same-baton web-fixture refresh rides this baton's
     // qumbra-explorer-web PR, per the stage-0 binding rule.
-    const GOLDEN_DIGEST: &str = "ef0b68b20b36e6543aec64851ce8197fb5dbb7ed8040d2ff87cbe6828be7cef6";
+    const GOLDEN_DIGEST: &str = "9a8a0442302d89b87d86a79a5c31a3d828c603d63353c94342303eb52a48102d";
 
     fn hash32(first: u8) -> [u8; 32] {
         let mut h = [0u8; 32];
@@ -762,6 +762,16 @@ mod tests {
     /// The four states the front end in `qumbra-explorer-web` renders, and the
     /// **same bytes** it asserts against. One artifact, two directions: a field
     /// renamed on either side of the repo boundary turns one of the two red.
+    /// The chain the health goldens describe. **Deliberately no real net** (lab
+    /// #573): these goldens used to carry T1's truncated genesis hash and
+    /// `qumbra-devnet-t0`, and a reader of the corpus took that as a fact about
+    /// the live chain. A synthetic name cannot go stale at the next re-genesis.
+    /// The hash is full-length, as `/v1/health.json` serves it, so the page's
+    /// handling of a real-length hash is exercised rather than assumed; it is
+    /// Keccak-256 of the ASCII text `qumbra-explorer golden corpus genesis`.
+    const GOLDEN_NETWORK: &str = "qumbra-golden";
+    const GOLDEN_GENESIS: &str = "84af34c91c82be08fb577ba0c2cc06beb1fcb3d2d8f798fb2f712070c70f55ea";
+
     fn golden_cases() -> Vec<(&'static str, String)> {
         let agreed = Telemetry::assemble(1052, Some(1048), Some(42), 0, 7, 3, MAX_LAG)
             .with_checkpoint(Some(0xb682_3616), None)
@@ -785,13 +795,10 @@ mod tests {
             .with_supply(vec![epoch_row(4, 123_456_789, 123_456_789)])
             .with_durable_head(Some((8, hash32(0x11))));
         vec![
-            ("agreed", health(&agreed, "138e1524addb", 30, "qumbra-devnet-t0")),
-            ("durable-lag", health(&lag, "138e1524addb", 30, "qumbra-devnet-t0")),
-            ("durable-absent", health(&absent, "138e1524addb", 30, "qumbra-devnet-t0")),
-            (
-                "coverage-unavailable",
-                health(&uncovered, "138e1524addb", 30, "qumbra-devnet-t0"),
-            ),
+            ("agreed", health(&agreed, GOLDEN_GENESIS, 30, GOLDEN_NETWORK)),
+            ("durable-lag", health(&lag, GOLDEN_GENESIS, 30, GOLDEN_NETWORK)),
+            ("durable-absent", health(&absent, GOLDEN_GENESIS, 30, GOLDEN_NETWORK)),
+            ("coverage-unavailable", health(&uncovered, GOLDEN_GENESIS, 30, GOLDEN_NETWORK)),
         ]
     }
 
