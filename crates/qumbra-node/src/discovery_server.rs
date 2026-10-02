@@ -711,6 +711,11 @@ pub const L2_NOT_V6: &str = r#"{"v":1,"available":false,"why":"not a V6 net"}"#;
 /// `l2_id` its wrapper rule enforces, the WrapperParams digest, the V6
 /// revision digest of the release in force (`null` for a release that
 /// carries none), and the V6 genesis hash — all lower-case hex.
+///
+/// `revision` is `null` on a build whose release carries no revision, and it
+/// moves with every release; a wallet therefore keys its burn gate on
+/// `l2_id` + `genesis` only, never on `revision`, which is served for an
+/// operator's comparison and nothing else.
 pub fn l2_route_body(genesis: &crate::genesis_v6::GenesisFileV6, revision: Option<qlab_devnet::header::Hash32>) -> Vec<u8> {
     let hex = crate::genesis::hex_encode;
     format!(
