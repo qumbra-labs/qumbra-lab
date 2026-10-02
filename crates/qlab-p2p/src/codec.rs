@@ -553,8 +553,10 @@ fn bucket_from_u8(v: u8) -> Result<ArityBucket, DecodeError> {
 /// Encode a transaction (public values + opaque proof).
 pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
     // The L1 wire has no L2 section; dropping one silently would change the
-    // tx's identity (lab #706). A real assert (#253): unreachable from a peer,
-    // since `decode_tx` never produces a surface.
+    // tx's identity (lab #706). A real assert (#253). It is unreachable from an
+    // L1 peer — `decode_tx` never produces a surface — but NOT from a stored
+    // Annulet transaction: a caller holding one of those, without the net's
+    // form at hand, uses [`canonical_tx_wire`] (the G5 drill's explorer panic).
     assert!(
         tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT,
         "an L2-surface transaction has no L1 wire encoding: use encode_tx_annulet (lab #706)"
@@ -725,10 +727,23 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
 /// transaction). For every L1 transaction (surface absent) the id is the
 /// L1 wire's hash, unchanged byte for byte.
 pub fn tx_id(tx: &TxEntry) -> Hash32 {
+    keccak256(&canonical_tx_wire(tx))
+}
+
+/// **A transaction's canonical wire, chosen by the transaction itself** — the
+/// L1 wire when it carries no L2 surface, the Annulet wire when it does: the
+/// rule [`tx_id`] hashes, total over every transaction a node can hold. For a
+/// caller that measures or serves a STORED transaction without knowing the
+/// net's form (the explorer's wire size): [`encode_tx`] alone asserts the
+/// surface is absent, and an Annulet follower's stored transactions carry one
+/// — `encode_tx`'s "unreachable from a peer" holds for what `decode_tx`
+/// produces, not for what a node applied from an Annulet block (G5 drill,
+/// 2026-10-02: the explorer panicked on the first sealed L2 transaction).
+pub fn canonical_tx_wire(tx: &TxEntry) -> Vec<u8> {
     if tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT {
-        keccak256(&encode_tx(tx))
+        encode_tx(tx)
     } else {
-        keccak256(&annulet_wire_bytes(tx))
+        annulet_wire_bytes(tx)
     }
 }
 

@@ -72,7 +72,7 @@
 //! Every field is a projection of a stored block: the id is
 //! [`qlab_node::rpc::tx_id`] over the transaction's own declared public surface,
 //! the counts are that surface's own lengths, the fee is the posted fee as
-//! committed, and the wire size is [`qlab_p2p::codec::encode_tx`] — the canonical
+//! committed, and the wire size is [`qlab_p2p::codec::canonical_tx_wire`] — the canonical
 //! encoder itself, never an arithmetic restatement of its framing. There is no
 //! second source and no index: the stored chain answers all of D1.
 
@@ -138,7 +138,7 @@ pub struct TxFacts {
     /// function's design, so the id a sender was given is the id that appears
     /// here.
     pub txid: Hash32,
-    /// The canonical wire size, in bytes: `qlab_p2p::codec::encode_tx`'s output
+    /// The canonical wire size, in bytes: `qlab_p2p::codec::canonical_tx_wire`'s output
     /// length for this transaction. The encoder, not a restatement of it.
     pub wire_bytes: u64,
     /// The posted fee in bessel, as committed. The per-bucket price is a frozen
@@ -168,7 +168,11 @@ impl TxFacts {
                 tx.bucket_actions,
                 tx.fee,
             ),
-            wire_bytes: qlab_p2p::codec::encode_tx(&TxEntry::from(tx)).len() as u64,
+            // The transaction's own canonical wire — the Annulet wire when it
+            // carries an L2 surface (an Annulet follower's stored tx), the L1
+            // wire otherwise. The L1-only `encode_tx` asserted on the former and
+            // took the explorer down on the first sealed L2 tx (G5 drill).
+            wire_bytes: qlab_p2p::codec::canonical_tx_wire(&TxEntry::from(tx)).len() as u64,
             fee: tx.fee,
             nullifiers: tx.nullifiers.len() as u32,
             commitments: tx.commitments.len() as u32,
@@ -687,6 +691,29 @@ mod tests {
             "measured by running the encoder, never restated"
         );
         assert!(facts.wire_bytes > 4096, "the proof is in there: {facts:?}");
+    }
+
+    /// The G5 drill's panic, as a test: an Annulet follower's chain carries a
+    /// block with an **L2-surface** transaction (the issuer's mint), and the
+    /// explorer's projection walks it — it used to measure the wire with the
+    /// L1-only `encode_tx`, which asserts the surface away and took the process
+    /// down. Now it projects, and the size is the Annulet wire's own length.
+    #[test]
+    fn an_l2_surface_transaction_projects_with_its_annulet_wire_size() {
+        let mut l2 = stored_tx(0x22, 7, 3, 2, 512);
+        l2.l2 = vec![0x01, 0x02, 0x03, 0x04];
+        let facts = TxFacts::of(&l2);
+        assert_eq!(facts.wire_bytes, qlab_p2p::codec::encode_tx_annulet(&TxEntry::from(&l2)).len() as u64);
+        assert!(facts.wire_bytes > qlab_p2p::codec::encode_tx(&TxEntry::from(&stored_tx(0x22, 7, 3, 2, 512))).len() as u64);
+
+        let mut chain = qlab_node::MemChainStore::new(stored_block(0, vec![]));
+        let mut view = TxListView::default();
+        assert!(view.refresh(&chain));
+        let mut b1 = stored_block(1, vec![l2, stored_tx(0x33, 1, 1, 1, 64)]);
+        b1.header.prev = chain.tip_hash();
+        chain.put_block(b1).expect("link");
+        assert!(view.refresh(&chain), "the block with the L2 transaction projects");
+        assert_eq!((view.tip_height, view.tx_count()), (1, 2));
     }
 
     /// The id is the statement id — the same one a sender was handed at submit —
