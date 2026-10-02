@@ -483,6 +483,16 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
             report.harvest.funded
         );
     }
+    if report.harvest.reset {
+        // Lab #683: the main chain was rewritten under the harvest's read
+        // position; it re-reads from genesis, bounded per tick.
+        qlab_devnet::jprintln!(WARN, "FAUCET harvest-reset: chain rewritten below the read position, re-reading");
+    }
+    if report.harvest.unreadable > 0 {
+        // A main-chain height whose body this node does not hold; retried every
+        // tick. A coinbase of the faucet's own could be in it.
+        qlab_devnet::jprintln!(WARN, "FAUCET harvest-unreadable {} height(s) with no body", report.harvest.unreadable);
+    }
     if report.harvest.skipped_spent > 0 {
         // Lab #310: spent notes the restart walk would otherwise re-fund.
         qlab_devnet::jprintln!(

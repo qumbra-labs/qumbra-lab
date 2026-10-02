@@ -43,7 +43,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use qlab_wallet::Wallet;
 // `NodeState::is_spent` is how a refused grant's inputs are diagnosed as stale.
 
-use crate::harvest::{harvest_matured, HarvestCursor, HarvestReport};
+use crate::harvest::{harvest_matured_bounded, HarvestCursor, HarvestReport, HARVEST_BLOCKS_PER_PASS};
 use crate::state::{classify, Availability, ServiceStatus};
 use crate::view::NodeView;
 
@@ -332,6 +332,9 @@ pub struct FaucetService {
     /// Where the next harvest pass resumes, and the coinbase-note commitments
     /// already funded, so a re-read never funds twice (lab #683).
     harvested: HarvestCursor,
+    /// New main-chain blocks one harvest pass may read — [`HARVEST_BLOCKS_PER_PASS`]
+    /// unless a test sets it ([`Self::with_harvest_budget`]).
+    harvest_budget: u64,
     /// What the last harvest pass found about coinbase that has not landed yet —
     /// `None` until one has run.
     ///
@@ -382,9 +385,18 @@ impl FaucetService {
             wallet,
             d,
             harvested: HarvestCursor::new(),
+            harvest_budget: HARVEST_BLOCKS_PER_PASS,
             harvest: None,
             status: Arc::new(Mutex::new(status)),
         }
+    }
+
+    /// The same service with a different per-pass harvest bound. For tests: the
+    /// partial-pass branches of [`Self::tick`] are otherwise reachable only on a
+    /// chain longer than [`HARVEST_BLOCKS_PER_PASS`] (lab #683).
+    pub fn with_harvest_budget(mut self, max_new_blocks: u64) -> FaucetService {
+        self.harvest_budget = max_new_blocks;
+        self
     }
 
     /// The shared gate — this is what the HTTP listener is handed.
@@ -472,13 +484,24 @@ impl FaucetService {
             // borrow all of `self`.
             let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             let state = node.chain_state();
-            report.harvest =
-                harvest_matured(&mut gate.faucet, state, &self.wallet, self.d, &mut self.harvested);
+            report.harvest = harvest_matured_bounded(
+                &mut gate.faucet,
+                state,
+                &self.wallet,
+                self.d,
+                &mut self.harvested,
+                self.harvest_budget,
+            );
         }
-        // A pass that stopped short of the tip (the bounded catch-up after a start
-        // or a reorg, lab #683) has not seen the newest coinbase, so its counts are
-        // not the answer: keep the previous one — or `None`, "no harvest pass yet",
-        // on a fresh start (lab #543).
+        // A pass that stopped short of the tip (the bounded catch-up after a start,
+        // or more than a budget of new blocks since the last tick, lab #683) has not
+        // seen the newest coinbase, so its counts are not the answer: keep the
+        // previous one — or `None`, "no harvest pass yet", on a fresh start (lab
+        // #543). A reorg under the read position drops the previous one too: it
+        // described a chain that is no longer the main chain.
+        if report.harvest.reset {
+            self.harvest = None;
+        }
         if report.harvest.caught_up {
             self.harvest = Some(report.harvest.facts());
         }
