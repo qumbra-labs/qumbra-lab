@@ -342,7 +342,7 @@ fn w1_the_annulet_ledger_reads_the_scan_as_per_asset_movements() {
     let text = render(&ledger, "fixture");
     assert!(text.contains("height 0  RECEIVED (genesis note)"), "{text}");
     assert!(text.contains("net:       asset 1 -999600 (out 1000000, back 400)"), "{text}");
-    assert!(text.contains("No recipient"), "{text}");
+    assert!(text.contains("its fee is never separated from its amount — and no recipient is ever shown"), "{text}");
     for d in [&w.dir, &stranger.dir] {
         let _ = std::fs::remove_dir_all(d);
     }

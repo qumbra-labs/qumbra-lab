@@ -145,6 +145,9 @@ pub struct L2Ledger {
     /// 🔴 What this ledger could not account for. Empty is the only state in
     /// which totals exist.
     pub gaps: Vec<String>,
+    /// No spend is known — the scan's per-asset index was not built — so
+    /// every note renders as a receipt, including any that were spent.
+    pub receipts_only: bool,
     /// Ascending by asset.
     pub totals: Option<Vec<AssetTotals>>,
 }
@@ -174,11 +177,18 @@ pub fn build(
              known, so this ledger shows receipts only",
             range.0, range.1
         ));
-    } else if index.is_none() && gaps.is_empty() {
-        // Not reachable through the scan (an index is withheld only for a
-        // reason the scan names), but a ledger without spends must never
-        // render as one that has none.
-        gaps.push("no per-asset index was built, so no spend is known — receipts only".into());
+    } else if index.is_none() {
+        // The nullifiers may be in hand and still not applied: the scan builds
+        // its index only when EVERY address's scan started, so one refused row
+        // withholds the spends of all of them. Said here in so many words, or a
+        // spent note and its change would both read as receipts under a header
+        // saying the nullifiers are in hand.
+        gaps.push(format!(
+            "spends not shown: the per-asset index could not be built ({} scan gap(s) listed \
+             here), so no spend is known and this ledger shows receipts only — a note listed \
+             as RECEIVED may since have been spent",
+            gaps.len()
+        ));
     }
 
     let received: Vec<L2Received> = owned.iter().map(L2Received::of).collect();
@@ -232,9 +242,12 @@ pub fn build(
             }
             for t in by.values_mut() {
                 t.spendable = t.received - t.spent;
-                // 🔴 The ledger and `scan` must not disagree about one wallet's
-                // money: the scan's index is the other derivation of the same
-                // figure. A release-mode assert, not a debug one (#253).
+                // The call-site contract, not an arithmetic check: `owned` and
+                // the index come from one scan, so this cannot fire on the
+                // sums above. It fires only if a caller hands `build` an index
+                // from a different scan than its `owned` — the one way the
+                // ledger and `scan` could disagree about this wallet's money.
+                // A release-mode assert, not a debug one (#253).
                 let scan_says = ix.by_asset.get(&t.asset).map_or(0, |n| n.spendable_value());
                 assert_eq!(t.spendable, scan_says, "asset {}: the ledger's spendable is not the scan's", t.asset);
             }
@@ -243,7 +256,7 @@ pub fn build(
         _ => None,
     };
 
-    L2Ledger { range, genesis_hash, verdicts, coverage: coverage.clone(), events, gaps, totals }
+    L2Ledger { range, genesis_hash, verdicts, coverage: coverage.clone(), events, gaps, receipts_only: index.is_none(), totals }
 }
 
 fn asset_label(asset: u16) -> String {
@@ -277,27 +290,49 @@ pub fn render(ledger: &L2Ledger, url: &str) -> String {
     ));
     out.push_str(&format!("genesis:  {} (verified against the endpoint)\n", hex(&ledger.genesis_hash)));
     match &ledger.coverage {
+        SpentCoverage::Unavailable { why } => out.push_str(&format!("spends:   {UNAVAILABLE} — {why}\n")),
+        _ if ledger.receipts_only => out.push_str(&format!(
+            "spends:   {UNAVAILABLE} — not applied: the scan is incomplete (gaps below), so this \
+             ledger is receipts only\n"
+        )),
         SpentCoverage::Covered { range: Some((a, b)) } => {
             out.push_str(&format!("spends:   the chain's nullifiers for {a}..={b} are in hand\n"))
         }
         SpentCoverage::Covered { range: None } => out.push_str("spends:   the endpoint held no block in range\n"),
-        SpentCoverage::Unavailable { why } => out.push_str(&format!("spends:   {UNAVAILABLE} — {why}\n")),
+    }
+    let from = ledger.range.0;
+    if from > 0 {
+        out.push_str(&format!(
+            "range:    starts at height {from}: notes received before it are not read, so a spend \
+             of one is not shown and the totals below are this range's, not the wallet's \
+             balance. Genesis notes (height 0) are read whatever the range\n"
+        ));
     }
     for v in &ledger.verdicts {
         out.push_str(&format!("  [{}] {}: {}\n", v.div_index, v.address_short, v.verdict));
     }
     out.push_str(
-        "amounts are in each asset's own units; asset 0 is the fee unit, never QMB. No recipient \
-         is ever shown: the chain does not carry one and `send --net annulet` keeps no local record\n\n",
+        "amounts are in each asset's own units; asset 0 is the fee unit, never QMB. A spend is \
+         stated as each asset's net — its fee is never separated from its amount — and no \
+         recipient is ever shown: the chain does not carry one and `send --net annulet` keeps no \
+         local record\n\n",
     );
 
     if ledger.events.is_empty() {
-        out.push_str("no events: this wallet neither received nor spent anything in this range\n");
+        if ledger.gaps.is_empty() {
+            out.push_str("no events: this wallet neither received nor spent anything in this range\n");
+        } else {
+            out.push_str(&format!("no events could be read ({} gap(s) below)\n", ledger.gaps.len()));
+        }
     }
     for event in &ledger.events {
         match event {
             L2Event::Received(r) => {
                 match r.tx_index {
+                    None if from > 0 => out.push_str(&format!(
+                        "height {}  RECEIVED (genesis note — read although the range starts at {from})\n",
+                        r.height
+                    )),
                     None => out.push_str(&format!("height {}  RECEIVED (genesis note)\n", r.height)),
                     Some(t) => out.push_str(&format!("height {}  RECEIVED (tx {t})\n", r.height)),
                 }
@@ -348,7 +383,15 @@ pub fn render(ledger: &L2Ledger, url: &str) -> String {
     match &ledger.totals {
         Some(totals) if totals.is_empty() => out.push_str("totals:   nothing in range\n"),
         Some(totals) => {
-            out.push_str("totals, per asset over this range:\n");
+            if from > 0 {
+                out.push_str(&format!(
+                    "totals, per asset over heights {from}..={} only (genesis notes included) — \
+                     not the wallet's balance:\n",
+                    ledger.range.1
+                ));
+            } else {
+                out.push_str("totals, per asset over this range:\n");
+            }
             for t in totals {
                 out.push_str(&format!(
                     "  {}: received {}, spent {}, spendable {}\n",
@@ -463,6 +506,48 @@ mod tests {
 
         let L2Event::Movement(m) = l.events.last().unwrap() else { panic!("the merge is a movement") };
         assert_eq!(m.by_asset.iter().map(|n| (n.asset, n.net())).collect::<Vec<_>>(), vec![(0, -4), (1, 0)]);
+    }
+
+    /// H1/H2 (pre-review): one refused row withholds the index while the
+    /// nullifiers are in hand — the ledger must say receipts only, not read as
+    /// a ledger with no spends; and with nothing owned it must not assert that
+    /// nothing happened.
+    #[test]
+    fn a_withheld_index_under_covered_nullifiers_is_named_and_asserts_no_absence() {
+        let w = wallet();
+        let cov = SpentCoverage::Covered { range: Some((0, 6)) };
+        let row_gap = "outputs for address [1] over heights 0..=6: the scan never started (503)".to_string();
+        let notes = vec![owned(&w, 0, 600, 1, 30, 4, Some(0))];
+
+        let l = build((0, 6), [1; 32], Vec::new(), &notes, None, &cov, vec![row_gap.clone()]);
+        assert!(l.receipts_only && l.totals.is_none());
+        assert!(l.gaps.iter().any(|g| g.starts_with("spends not shown")), "{:?}", l.gaps);
+        let text = render(&l, "fixture");
+        assert!(text.contains("spends:   UNAVAILABLE — not applied"), "{text}");
+        assert!(!text.contains("are in hand"), "{text}");
+
+        let empty = render(&build((0, 6), [1; 32], Vec::new(), &[], None, &cov, vec![row_gap]), "fixture");
+        assert!(empty.contains("no events could be read (2 gap(s) below)"), "{empty}");
+        assert!(!empty.contains("neither received nor spent"), "{empty}");
+    }
+
+    /// H3 (pre-review): a range starting after 0 says what it cannot see, its
+    /// totals are labelled as the range's, and a genesis note read anyway says so.
+    #[test]
+    fn a_range_after_zero_labels_its_totals_and_its_genesis_notes() {
+        let w = wallet();
+        let notes = vec![owned(&w, 0, 5, 1, 10, 0, None), owned(&w, 0, 9, 0, 11, 7, Some(0))];
+        let set = SpentSet::from_parts(Some((5, 9)), []);
+        let index = AssetIndex::build(&w, notes.clone(), &set);
+
+        let l = build((5, 9), [1; 32], Vec::new(), &notes, Some(&index), &SpentCoverage::Covered { range: Some((5, 9)) }, Vec::new());
+
+        let text = render(&l, "fixture");
+        assert!(text.contains("range:    starts at height 5"), "{text}");
+        assert!(text.contains("RECEIVED (genesis note — read although the range starts at 5)"), "{text}");
+        assert!(text.contains("over heights 5..=9 only (genesis notes included) — not the wallet's balance"), "{text}");
+        let whole = render(&build((0, 9), [1; 32], Vec::new(), &notes, Some(&index), &SpentCoverage::Covered { range: Some((0, 9)) }, Vec::new()), "fixture");
+        assert!(!whole.contains("range:    starts at"), "{whole}");
     }
 
     /// The scan's own reasons are carried in, and any one of them withholds

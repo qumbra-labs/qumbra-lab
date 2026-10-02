@@ -1515,6 +1515,11 @@ fn scan_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u6
 /// `scan --net annulet`, read as a ledger.
 fn history_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u64) -> Result<(), Box<dyn Error>> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
+    // Refused rather than ignored: a ledger reads one endpoint, and a flag that
+    // looks like it chose a second one must not be silently dropped.
+    if flag(args, "--node").is_some() {
+        return Err("history --net annulet reads only --url (the scan endpoint); --node is not used — drop it".into());
+    }
     let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
     eprintln!(
         "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
