@@ -435,16 +435,36 @@ pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, a
         insts.push(inst);
     }
 
-    // The native statement, on a copy: the sequencer's prefilter.
     let members: Vec<Member> = insts.iter().map(Inst::member).collect();
     let inp = WInputs { prev: prev.commitment, rkm_seq: me, absorbed: absorbed.map(|a| a.root), d_batch };
+    let (rin, wit, rout, exit_cmt) = statement(state, &inp, &members, &exits)?;
+    Ok(Plan { insts, members, deps, inp, exits, absorbed, claimed, spent, credited, rin, wit, rout, exit_cmt })
+}
+
+/// The native statement, on a copy of `state`: the sequencer's prefilter —
+/// apply the members, check the wrapper leaf, and require `exits` to chain
+/// to the `exit_cmt` it states.
+fn statement(state: &WState, inp: &WInputs, members: &[Member], exits: &[Exit]) -> Result<(WRoots, WWitness, WRoots, Digest), PlanError> {
     let mut st = state.clone();
-    let (rin, wit, rout) = st.apply(&inp, &members).map_err(|e| PlanError::Wrapper(format!("{e:?}")))?;
-    let exit_cmt = crate::f4::native::check_wrapper_leaf(&rin, &inp, &members, &wit)
+    let (rin, wit, rout) = st.apply(inp, members).map_err(|e| PlanError::Wrapper(format!("{e:?}")))?;
+    let exit_cmt = crate::f4::native::check_wrapper_leaf(&rin, inp, members, &wit)
         .map_err(|e| PlanError::Wrapper(format!("{e:?}")))?
         .1;
-    if exit_chain(&exits) != exit_cmt {
+    if exit_chain(exits) != exit_cmt {
         return Err(PlanError::Wrapper("the exit list does not chain to W's exit_cmt".into()));
     }
-    Ok(Plan { insts, members, deps, inp, exits, absorbed, claimed, spent, credited, rin, wit, rout, exit_cmt })
+    Ok((rin, wit, rout, exit_cmt))
+}
+
+/// **Lab #831 W2: a member built elsewhere, in `slot`** — the wallet's exit
+/// P, assembled by `qlab_l2spend::exit_instance` — and the native statement
+/// re-run over the result exactly as [`plan`] runs it. `exits` is the new
+/// wrapper's exit list in slot order. The bookkeeping of what this run owns
+/// (`spent`, `credited`) stays `base`'s: the swapped member's change is its
+/// builder's, not this run's.
+pub(crate) fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, exits: Vec<Exit>) -> Result<Plan, PlanError> {
+    base.insts[slot] = inst;
+    base.members = base.insts.iter().map(Inst::member).collect();
+    let (rin, wit, rout, exit_cmt) = statement(state, &base.inp, &base.members, &exits)?;
+    Ok(Plan { exits, rin, wit, rout, exit_cmt, ..base })
 }

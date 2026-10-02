@@ -88,3 +88,7 @@ qlab-air = { path = "../qlab-air", features = ["test-support"] }
 # bundle rule (`qumbra_node::bundle::WrapperRule`), whose measurement version
 # and member stub are behind this dev-only feature (ruling 5915423092).
 qumbra-node = { path = "../qumbra-node", features = ["wrapper-test-knobs"] }
+# Lab #831 W2: the wallet's exit P is assembled by `qlab_l2spend::exit_instance`
+# and handed to f5box's wrapper as a member — the lane's proof that the CLI's
+# `--out` exit is a member the node's rule takes. Dev-only.
+qlab-l2spend = { path = "../qlab-l2spend" }

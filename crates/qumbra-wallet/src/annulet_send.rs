@@ -107,6 +107,8 @@ pub enum SendRefusal {
     /// Another registry write was pooled or landed first: this one binds a
     /// root that is gone. Re-read the slot and write again.
     RegistryRaced(String),
+    /// An exit could not be assembled (lab #831 W2) — by name, before proving.
+    Exit(qlab_l2spend::ExitError),
 }
 
 impl std::fmt::Display for SendRefusal {
@@ -173,6 +175,7 @@ impl std::fmt::Display for SendRefusal {
                 "another registry write was pooled or landed first, so this one binds a registry root that is \
                  gone ({node}); re-read the slot and write again"
             ),
+            SendRefusal::Exit(e) => write!(f, "{e}"),
             SendRefusal::SplitNotIncluded { waited_secs } => write!(
                 f,
                 "the fee-split was admitted but its note was not in the served tree after {waited_secs} s; \
@@ -729,6 +732,97 @@ fn run_plan<E: Endpoint>(
     Ok(made.into_iter().map(|m| m.expect("every step ran")).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Lab #831 W2: the exit (L2 → L1)
+// ---------------------------------------------------------------------------
+
+/// The memory class an exit is proved in, stated on every exit plan: P on
+/// the hiding lane (lab #785 F5-4d-3, measured on r7g.2xlarge).
+pub const EXIT_PROVE_CLASS: &str = "32 GiB class: shape P on the hiding lane peaked at 30.04 GiB (lab #785, F5-4d-3); \
+     proved on this machine only — no prover host sees an exit's witness (lab #831 Q3)";
+
+/// **The one plan an exit shows before it proves** (lab #831 W2): one
+/// asset-0 note pays the exit and the P fee from the same row (slot 3 a
+/// dummy), its change back to this wallet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitPlan {
+    pub note: OwnedL2Note,
+    pub value: u64,
+    pub to_rkm: [u64; 4],
+    pub fee: u64,
+    pub change: u64,
+}
+
+impl std::fmt::Display for ExitPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "plan: exit {} of asset 0 to L1 — 1 transaction (shape P, an asset-0 redeem), fee {} (asset 0)",
+            self.value, self.fee
+        )?;
+        writeln!(
+            f,
+            "  input:  the asset-0 note of {} received at height {}, address [{}]",
+            self.note.note.value, self.note.height, self.note.div_index
+        )?;
+        writeln!(f, "  change: {} back to this wallet", self.change)?;
+        writeln!(f, "  prove:  {EXIT_PROVE_CLASS}")?;
+        writeln!(
+            f,
+            "  paid:   on L1, as a note to the recipient, only once a V6 bundle carrying this transaction lands; \
+             nothing here submits it"
+        )
+    }
+}
+
+/// **Exit selection** — pure: the smallest asset-0 note that covers the exit
+/// and the P tariff. One note only: an exit is one P transaction whose fee
+/// comes from its own row; asset-0 notes are combined first with an
+/// ordinary `send --net annulet --asset 0` to this wallet.
+pub fn plan_exit(index: &AssetIndex, value: u64, to_rkm: [u64; 4], tiers: Tiers) -> Result<ExitPlan, SendRefusal> {
+    if value == 0 {
+        return Err(SendRefusal::Exit(qlab_l2spend::ExitError::ZeroValue));
+    }
+    let need = value.saturating_add(tiers.p);
+    let note = index
+        .spendable(0)
+        .iter()
+        .filter(|n| n.note.value >= need)
+        .min_by_key(|n| n.note.value)
+        .cloned()
+        .ok_or(SendRefusal::NoSingleNoteCovers { asset: 0, amount: need, largest: largest(index.spendable(0)) })?;
+    let change = note.note.value - need;
+    Ok(ExitPlan { note, value, to_rkm, fee: tiers.p, change })
+}
+
+/// **The exit**: verify the form (and pin), read the tariff, scan, plan,
+/// hand the plan to `on_plan` **before anything is proved**, then build and
+/// prove the P transaction. Returns the plan and the proven transaction,
+/// which the caller writes out ([`qlab_l2spend::encode_exit_artifact`]); it
+/// is never submitted here — an Annulet net refuses an exit by name, and a
+/// V6 bundle is a sequencer's to assemble (lab #831 W4).
+#[allow(clippy::too_many_arguments)]
+pub fn exit_annulet<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    value: u64,
+    to: &Address,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    on_plan: &mut dyn FnMut(&ExitPlan) -> bool,
+    rng: &mut StdRng,
+) -> Result<(ExitPlan, qlab_l2spend::Built), SendRefusal> {
+    let session = open_session(w, endpoint, scan_to, pin, rng)?;
+    let plan = plan_exit(&session.index, value, to.rkm_lanes(), session.tiers)?;
+    if !on_plan(&plan) {
+        return Err(SendRefusal::PlanDeclined);
+    }
+    let input = plan.note.spend_input(&w.wallet());
+    let ask = qlab_l2spend::ExitAsk { value, to_rkm: plan.to_rkm };
+    let built = qlab_l2spend::build_p_exit(&session.served, &input, ask, &me(w), plan.fee, rng).map_err(SendRefusal::Exit)?;
+    Ok((plan, built))
+}
+
 /// The wallet's own transport as an [`Endpoint`]: `http://host:PORT` or
 /// `https://host[:port]`, the same TLS path every other command uses.
 #[cfg(feature = "net")]
@@ -944,6 +1038,26 @@ mod tests {
         assert!(matches!(fees[0], Src::Made { step: 0, out: 0, .. }), "{fees:?}");
         assert!(matches!(fees[1], Src::Made { step: 0, out: 1, .. }), "{fees:?}");
         assert_eq!(plan.total_fee(), 1 + 2 + 2);
+    }
+
+    /// W2 (lab #831): an exit takes the smallest asset-0 note covering the
+    /// exit and the P tier, states its memory class, and is refused by name
+    /// when no one note covers or the exit is zero.
+    #[test]
+    fn an_exit_takes_one_covering_asset_zero_note_and_states_its_prove_class() {
+        let ix = index(&[(0, 5), (0, 40), (0, 23), (1, 1_000)]);
+        let to = [0x0e71; 4];
+        let plan = plan_exit(&ix, 20, to, TIERS).unwrap();
+        assert_eq!((plan.note.note.value, plan.fee, plan.change), (23, 2, 1), "the smallest covering 20 + the P tier");
+        let text = plan.to_string();
+        assert!(text.contains("exit 20 of asset 0") && text.contains("30.04 GiB"), "{text}");
+        assert!(text.contains("nothing here submits it"), "{text}");
+        assert_eq!(
+            plan_exit(&ix, 39, to, TIERS),
+            Err(SendRefusal::NoSingleNoteCovers { asset: 0, amount: 41, largest: 40 }),
+            "asset 1's notes never pay an exit"
+        );
+        assert_eq!(plan_exit(&ix, 0, to, TIERS), Err(SendRefusal::Exit(qlab_l2spend::ExitError::ZeroValue)));
     }
 
     #[test]
