@@ -105,7 +105,7 @@ impl Devnet {
     pub fn generate(params: GenParams) -> Self {
         let mut rng = StdRng::seed_from_u64(params.seed);
         let our = generate_keypair(&mut rng);
-        Self::generate_paying(params, our)
+        Self::generate_with(params, our, None)
     }
 
     /// Generate a devnet that pays `our` — **a keypair the caller owns**, rather
@@ -122,7 +122,21 @@ impl Devnet {
     ///
     /// Everything else is [`Self::generate`]'s behaviour unchanged, including the
     /// deterministic recipient mix and the decoys.
-    pub fn generate_paying(params: GenParams, our: Keypair) -> Self {
+    ///
+    /// `rkm` is the payee address's own recipient key material, stamped on
+    /// every note paid to `our` (lab #831 W3a): a real payer pays an address,
+    /// which carries its `rkm` and its `ek` together, so a note sealed to `our`
+    /// under any other `rkm` is not a payment — and a wallet's scan now sets
+    /// such a note aside (`qlab_ledger::deposits::set_aside`) instead of
+    /// counting it. Decoy notes keep their random `rkm`.
+    pub fn generate_paying(params: GenParams, our: Keypair, rkm: [u64; 4]) -> Self {
+        Self::generate_with(params, our, Some(rkm))
+    }
+
+    /// [`Self::generate`] / [`Self::generate_paying`]: `rkm` overrides the
+    /// random `rkm` of the notes paid to `our` AFTER it is drawn, so the rng
+    /// stream — and `generate`'s chain, byte for byte — is unchanged.
+    fn generate_with(params: GenParams, our: Keypair, rkm: Option<[u64; 4]>) -> Self {
         // The rng is re-seeded identically, so `generate`'s own call is
         // byte-identical to what it produced before this split: the keypair it
         // draws first comes off the same stream position.
@@ -169,7 +183,15 @@ impl Devnet {
                     } else {
                         &decoys[(tx_i as usize) % decoys.len()].ek
                     };
-                    let notes: Vec<Note> = (0..k).map(|_| note(&mut rng)).collect();
+                    let notes: Vec<Note> = (0..k)
+                        .map(|_| {
+                            let n = note(&mut rng);
+                            match rkm {
+                                Some(rkm) if ours => Note { rkm, ..n },
+                                _ => n,
+                            }
+                        })
+                        .collect();
                     let enc = encrypt_to_recipient(ek, &notes, &mut rng);
                     // Feed the real cm bytes into the tree (append order == wire order).
                     for e in &enc.bundle.entries {
@@ -406,6 +428,30 @@ mod tests {
         assert_eq!(a.tree.root(), b.tree.root(), "same seed → same tree root");
         assert_eq!(a.expected_matches, b.expected_matches);
         assert!(a.expected_matches > 0, "some notes are planted to our wallet");
+    }
+
+    /// Lab #831 W3a: a devnet that pays an address stamps that address's `rkm`
+    /// on every note sealed to it — the note a real payer makes — and leaves
+    /// the decoys' random; `generate` itself is unchanged (the override comes
+    /// after the draw, so the rng stream does not move).
+    #[test]
+    fn a_paid_note_carries_the_payee_rkm_and_generate_is_unchanged() {
+        let mut rng = StdRng::seed_from_u64(831);
+        let rkm = [0x0831, 1, 2, 3];
+        let d = Devnet::generate_paying(GenParams::default(), generate_keypair(&mut rng), rkm);
+        let mut ours = 0;
+        for blk in &d.blocks {
+            for tx in &blk.txs {
+                for r in tx.recipients.iter().filter(|r| r.ours) {
+                    for hit in scan(&d.our.dk, &r.enc, ScanMode::FullFo) {
+                        assert_eq!(hit.note.rkm, rkm, "a paid note carries the payee's rkm");
+                        ours += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(ours, d.expected_matches);
+        assert_eq!(Devnet::generate(GenParams::default()).tree.root(), Devnet::generate(GenParams::default()).tree.root());
     }
 
     #[test]
