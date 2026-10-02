@@ -37,7 +37,7 @@ use qumbra_faucet::metrics_server::MetricsServer;
 use qumbra_faucet::service::{publish_starting, FaucetService};
 use qumbra_faucet::telemetry::{FaucetMetrics, Telemetry};
 use qumbra_node::config::NodeConfig;
-use qumbra_node::genesis::GenesisFile;
+use qumbra_node::annulet_genesis::{load_any, AnyGenesis};
 use qumbra_node::run::RunningNode;
 use qumbra_node::verifier::select_verifier;
 
@@ -221,11 +221,37 @@ fn ticket(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The genesis `check` and `run` serve, loaded the way `qumbra-node run` loads
+/// it: dispatched by its format version (`load_any`), so a **V6** net (format 10)
+/// is opened as a V6 net and not refused as "an L1 base" (lab #818).
+///
+/// An Annulet genesis is refused by name, before anything binds — that is the
+/// devnet faucet, `qumbra-faucet annulet`, which serves genesis stock and has no
+/// coinbase to harvest.
+fn load_genesis(node: &NodeConfig) -> Result<AnyGenesis, Box<dyn Error>> {
+    match load_any(&std::fs::read(&node.genesis_file)?)? {
+        AnyGenesis::Annulet(_) => Err("the genesis is an Annulet genesis; `qumbra-faucet run` serves an \
+                                      L1 or V6 net — the Annulet faucet is `qumbra-faucet annulet` (lab #716)"
+            .into()),
+        genesis => Ok(genesis),
+    }
+}
+
+fn genesis_hash_hex(genesis: &AnyGenesis) -> String {
+    match genesis {
+        AnyGenesis::L1(g) => g.hash_hex(),
+        AnyGenesis::V6(g) => g.hash_hex(),
+        AnyGenesis::Annulet(g) => g.hash_hex(),
+    }
+}
+
 fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("check requires --config FILE")?;
     let (svc, node, wallet, _secret) = load(cfg_path)?;
-    let genesis = GenesisFile::load(&node.genesis_file)?;
-    let pf = qumbra_node::run::preflight(&node, &genesis)?;
+    let genesis = load_genesis(&node)?;
+    // Lab #818: the same per-form checks `qumbra-node check` applies (#817) —
+    // the V6 hash pin and committee₀ on a V6 net, the halt gates on both.
+    let pf = qumbra_node::run::preflight_any(&node, &genesis)?;
 
     let trusted = svc.trusted_proxies()?;
     println!("qumbra-faucet check: OK ({cfg_path})");
@@ -257,10 +283,15 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
     let (svc, node_cfg, wallet, ticket_secret) = load(cfg_path)?;
-    let genesis = GenesisFile::load(&node_cfg.genesis_file)?;
+    let genesis = load_genesis(&node_cfg)?;
+    let form = match &genesis {
+        AnyGenesis::L1(g) => g.form()?,
+        AnyGenesis::V6(g) => g.forms().0,
+        AnyGenesis::Annulet(_) => unreachable!("load_genesis refuses an Annulet genesis"),
+    };
 
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis.form()?);
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form);
 
     let limits = FaucetLimits {
         ticket_policy: if svc.tickets_required() {
@@ -348,7 +379,11 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         })
     };
 
-    let node_result = RunningNode::start(&node_cfg, &genesis, RandomXPow::new(), verifier);
+    let node_result = match &genesis {
+        AnyGenesis::L1(g) => RunningNode::start(&node_cfg, g, RandomXPow::new(), verifier),
+        AnyGenesis::V6(g) => RunningNode::start_v6(&node_cfg, g, RandomXPow::new(), verifier),
+        AnyGenesis::Annulet(_) => unreachable!("load_genesis refuses an Annulet genesis"),
+    };
     opening.store(false, Ordering::Relaxed);
     let _ = publisher.join();
     let mut node = node_result?;
@@ -371,8 +406,10 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // bound. A tick harvests and then renders, so the first thing this page publishes
     // is measured rather than defaulted.
     //
-    // The Ctrl-C handler is installed **before** it, because a restart's first pass
-    // re-walks the whole main chain and that is not a moment to be unkillable.
+    // On a restart that first pass is the start of the bounded catch-up from genesis
+    // (lab #683): the page says "no harvest pass yet" until a pass reaches the tip,
+    // rather than publishing a count from a partial walk. The Ctrl-C handler is
+    // installed **before** it all the same.
     let shutdown = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&shutdown);
     ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
@@ -383,7 +420,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     qlab_devnet::jprintln!("  faucet:         http://{}/", server.addr());
     qlab_devnet::jprintln!("  node listen:    {}", node.listen_addr());
     qlab_devnet::jprintln!("  node data dir:  {}", node_cfg.data_dir.display());
-    qlab_devnet::jprintln!("  genesis hash:   {}", genesis.hash_hex());
+    qlab_devnet::jprintln!("  genesis hash:   {}", genesis_hash_hex(&genesis));
     qlab_devnet::jprintln!("  committee keys: 0 (keyless — §6.2 decision 1)");
     qlab_devnet::jprintln!("  mining:         {} (payout → this faucet)", node_cfg.mining);
     qlab_devnet::jprintln!("  grant:          {} bessel", svc.grant_value());
@@ -487,7 +524,7 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
 /// and a node that would be the sequencer.
 fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_faucet::annulet::{served, serve_grants, AnnuletFaucet, SpendKey};
-    use qumbra_node::annulet_genesis::{devnet, load_any, AnnuletGenesisFile, AnyGenesis};
+    use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile};
     let cfg_path = flag(args, "--node-config").ok_or("annulet requires --node-config FILE")?;
     let listen = flag(args, "--listen").unwrap_or("127.0.0.1:8090");
     let node_cfg = NodeConfig::load(cfg_path)?;

@@ -30,7 +30,7 @@
 //! under the same lock. They cannot drift, because nothing can observe one without
 //! the other.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use qlab_faucet::{
@@ -43,7 +43,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use qlab_wallet::Wallet;
 // `NodeState::is_spent` is how a refused grant's inputs are diagnosed as stale.
 
-use crate::harvest::{harvest_matured, HarvestReport};
+use crate::harvest::{harvest_matured, HarvestCursor, HarvestReport};
 use crate::state::{classify, Availability, ServiceStatus};
 use crate::view::NodeView;
 
@@ -329,8 +329,9 @@ pub struct FaucetService {
     /// reaches it (the type has none at all, deliberately — see PR #103).
     wallet: Wallet,
     d: Diversifier,
-    /// Coinbase-note commitments already funded, so a re-walk never funds twice.
-    harvested: HashSet<[u8; 32]>,
+    /// Where the next harvest pass resumes, and the coinbase-note commitments
+    /// already funded, so a re-read never funds twice (lab #683).
+    harvested: HarvestCursor,
     /// What the last harvest pass found about coinbase that has not landed yet —
     /// `None` until one has run.
     ///
@@ -380,7 +381,7 @@ impl FaucetService {
             gate: Arc::new(Mutex::new(FaucetGate::new(faucet))),
             wallet,
             d,
-            harvested: HashSet::new(),
+            harvested: HarvestCursor::new(),
             harvest: None,
             status: Arc::new(Mutex::new(status)),
         }
@@ -474,7 +475,13 @@ impl FaucetService {
             report.harvest =
                 harvest_matured(&mut gate.faucet, state, &self.wallet, self.d, &mut self.harvested);
         }
-        self.harvest = Some(report.harvest.facts());
+        // A pass that stopped short of the tip (the bounded catch-up after a start
+        // or a reorg, lab #683) has not seen the newest coinbase, so its counts are
+        // not the answer: keep the previous one — or `None`, "no harvest pass yet",
+        // on a fresh start (lab #543).
+        if report.harvest.caught_up {
+            self.harvest = Some(report.harvest.facts());
+        }
 
         // (2) Serve at most one request.
         //
@@ -613,7 +620,7 @@ impl FaucetService {
                 if !spent_cms.is_empty() {
                     report.dropped_spent = spent_cms.len();
                     for cm in &spent_cms {
-                        self.harvested.insert(qlab_note::hash::digest_bytes(cm));
+                        self.harvested.mark_seen(qlab_note::hash::digest_bytes(cm));
                     }
                 }
 

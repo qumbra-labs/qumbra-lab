@@ -110,7 +110,7 @@ pub mod telemetry;
 pub mod view;
 
 pub use config::{ConfigError, FaucetServiceConfig, DEFAULT_LISTEN_ADDR};
-pub use harvest::{harvest_matured, HarvestReport};
+pub use harvest::{harvest_matured, HarvestCursor, HarvestReport};
 pub use http::{resolve_client, FaucetServer, RequestOutcome, TrustedProxies};
 pub use metrics_server::MetricsServer;
 pub use service::{
