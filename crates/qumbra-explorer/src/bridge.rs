@@ -18,10 +18,20 @@ use qlab_node::Telemetry;
 /// The route.
 pub const BRIDGE_PATH: &str = "/v1/bridge";
 
+/// `reason` on a document with no figures: **which** "no figures" this is, as a
+/// token a reader can branch on (lab #833). The two are different facts — a
+/// chain with no bridge is the normal answer on every non-V6 net, a refusing
+/// ledger is a fault on a V6 one — and before the token the only difference
+/// was the English in `why`, which no reader should parse. Additive: `v` stays
+/// 1, and `why` is unchanged.
+pub const REASON_NOT_V6: &str = "not_v6";
+/// See [`REASON_NOT_V6`].
+pub const REASON_LEDGER_REFUSED: &str = "ledger_refused";
+
 /// The document for a chain with no bridge (every non-V6 net).
 pub fn not_v6() -> String {
     format!(
-        "{{\"v\":1,\"available\":false,\"why\":\"{BRIDGE_PATH} exists only on a V6 chain: \
+        "{{\"v\":1,\"available\":false,\"reason\":\"{REASON_NOT_V6}\",\"why\":\"{BRIDGE_PATH} exists only on a V6 chain: \
          this chain has no L2 bridge\"}}"
     )
 }
@@ -35,7 +45,10 @@ pub fn bridge_document(view: Option<Result<&BridgeView, String>>, t: &Telemetry)
     let v = match view {
         None => return not_v6(),
         Some(Err(why)) => {
-            return format!("{{\"v\":1,\"available\":false,\"why\":\"the bridge ledger refused: {}\"}}", crate::json::esc(&why))
+            return format!(
+                "{{\"v\":1,\"available\":false,\"reason\":\"{REASON_LEDGER_REFUSED}\",\"why\":\"the bridge ledger refused: {}\"}}",
+                crate::json::esc(&why)
+            )
         }
         Some(Ok(v)) => v,
     };
@@ -99,10 +112,12 @@ mod tests {
     fn off_v6_the_bridge_document_is_not_available() {
         let v: serde_json::Value = serde_json::from_str(&bridge_document(None, &covered())).unwrap();
         assert_eq!(v["available"], false);
+        assert_eq!(v["reason"], REASON_NOT_V6);
         // A refusing ledger says so, as itself.
         let v: serde_json::Value = serde_json::from_str(&bridge_document(Some(Err("CounterDecrease { height: 7 }".into())), &covered())).unwrap();
         assert!(v["why"].as_str().unwrap().contains("CounterDecrease"), "{v}");
         assert_eq!(v["available"], false);
+        assert_eq!(v["reason"], REASON_LEDGER_REFUSED, "a refusal says so as a token, not only in English");
         assert!(v.get("d_cum").is_none() && v.get("epochs").is_none(), "{v}");
     }
 
@@ -129,7 +144,7 @@ mod tests {
 
     /// Keccak-256 over the golden documents concatenated, in **source**, so a
     /// blind file regeneration cannot make the goldens pass by itself.
-    const GOLDEN_DIGEST: &str = "6047c2c16ef2b19450819115192dc69e2a9ee042b4b196286d990443043c0d4b";
+    const GOLDEN_DIGEST: &str = "1f16e91a8021087b94e17b6b2e6d3c9e8e06a073a4ef20c278db8519cf2a1493";
 
     /// Two epochs, so the page's table has more than one row to order.
     fn golden_view() -> BridgeView {
@@ -193,6 +208,11 @@ mod tests {
             } else {
                 assert_eq!(v["available"], false, "{name} states available");
                 assert!(v["why"].as_str().is_some_and(|w| !w.is_empty()), "{name} says why");
+                assert!(
+                    v["reason"] == REASON_NOT_V6 || v["reason"] == REASON_LEDGER_REFUSED,
+                    "{name} says which kind of no-figures: {}",
+                    v["reason"]
+                );
                 assert!(v.get("epochs").is_none(), "{name} carries no figures");
             }
         }
