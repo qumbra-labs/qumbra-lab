@@ -1115,7 +1115,8 @@ fn a_partial_harvest_pass_is_not_published() {
     let mut rng = rand::rngs::StdRng::from_seed([0x68; 32]);
     let maturing = |svc: &FaucetService| svc.status().lock().unwrap().notes_maturing;
 
-    // One faucet note at height 1, immature for the whole test; tip 101.
+    // One faucet note at height 1 — spendable at tip `spendable_at_tip(1)` = 145,
+    // so immature through both branches below; tip 101.
     node.mine_empty(1, mine);
     node.mine_empty(100, burn);
 
@@ -1129,14 +1130,27 @@ fn a_partial_harvest_pass_is_not_published() {
     assert!(report.harvest.caught_up, "80..=101 reaches the tip: {:?}", report.harvest);
     assert_eq!(maturing(&svc), Some(1), "a complete pass is published");
 
-    // Branch 2: 45 new blocks > the budget of 40 — this tick stops short of the
-    // tip, and the page keeps the last complete answer.
-    node.mine_empty(45, burn);
+    // Branch 2: 42 new blocks > the budget of 40 — this tick stops short of the
+    // tip, and the page keeps the last complete answer. Tip 143 < 145: the note
+    // is still immature (CI run 37003985692 mined 45 here, reaching 146, and the
+    // pending re-read correctly funded it — the test's arithmetic, not the code).
+    node.mine_empty(42, burn);
+    assert!(node.chain_state().tip_height() < spendable_at_tip(1));
     let report = svc.tick(&mut node, &mut rng);
     assert!(!report.harvest.caught_up, "{:?}", report.harvest);
+    assert_eq!(report.harvest.funded, 0, "still immature at tip 143");
     assert_eq!(report.harvest.maturing, 1, "the pending note is re-read every pass");
     assert_eq!(maturing(&svc), Some(1), "the previous complete pass's answer stands");
     let report = svc.tick(&mut node, &mut rng);
     assert!(report.harvest.caught_up, "{:?}", report.harvest);
     assert_eq!(maturing(&svc), Some(1));
+
+    // And the matured path out of the pending set: at tip 145 the note is funded
+    // once and nothing is maturing.
+    node.mine_empty(spendable_at_tip(1) - node.chain_state().tip_height(), burn);
+    let report = svc.tick(&mut node, &mut rng);
+    assert!(report.harvest.caught_up, "{:?}", report.harvest);
+    assert_eq!((report.harvest.funded, report.harvest.maturing), (1, 0));
+    assert_eq!(maturing(&svc), Some(0));
+    assert_eq!(svc.status().lock().unwrap().notes_held, 1);
 }
