@@ -265,11 +265,13 @@ fn select_with_rng(
     // ---- Gather spendables, and REFUSE on any non-Complete verdict: a spend
     // built on partial knowledge can double-claim a nullifier. -----------------
     let mut scanned: Vec<(u64, ScanOutcome)> = Vec::new();
+    // Lab #831 W3: the bridged L2, as the node names it (see `scan::gather`).
+    let l2_ids = crate::deposit::fetch_l2(req.url).map(|a| a.l2_ids()).unwrap_or_default();
     for &idx in &w.allocated {
         let d = wallet.diversifier_at_index(idx);
         let kp = wallet.diversified_keypair(&d);
         let mut fetch = net::scan_fetch(req.url);
-        let outcome = light_client_scan_with(
+        let mut outcome = light_client_scan_with(
             &mut fetch,
             &kp.dk,
             0,
@@ -278,6 +280,11 @@ fn select_with_rng(
             rng,
         )
         .map_err(|e| SendError::Refused(format!("scan never started for index {idx}: {e}")))?;
+        // Lab #831 W3 (Q2): a self-sealed burn (or any note under another
+        // rkm) opens under this key and is not this wallet's to spend — its
+        // commitment under this wallet's rkm is in no tree. Off the list
+        // before selection, so it can never be picked.
+        let _ = qlab_ledger::deposits::set_aside(wallet, idx, &mut outcome, &l2_ids);
         match outcome.completeness() {
             Completeness::Complete | Completeness::Shadowed { .. } => {}
             other => {

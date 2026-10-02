@@ -132,6 +132,7 @@ pub mod annulet_send;
 pub mod issuer;
 pub mod bundle;
 pub mod coinbase;
+pub mod deposit;
 pub mod contacts;
 pub mod driver;
 pub mod envelope;

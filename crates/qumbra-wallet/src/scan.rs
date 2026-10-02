@@ -69,6 +69,10 @@ pub struct Gathered {
     pub exit_coverage: ExitCoverage,
     /// The per-block exit facts, `None` when the route could not be read.
     pub exits: Option<ExitChain>,
+    /// Lab #831 W3: notes the scans opened whose `rkm` is not their address's
+    /// — pending deposits (self-sealed burns) and foreign notes — already
+    /// removed from `outcomes`, so nothing downstream can sum or spend them.
+    pub set_aside: Vec<qlab_ledger::deposits::SetAside>,
 }
 
 /// 🔴 **One gatherer, every caller.** `history` is a different rendering of
@@ -105,6 +109,12 @@ pub fn gather(
 
     // ---- 1. The outputs, per allocated address. ----------------------------
     let mut outcomes: Vec<(u64, String, Result<ScanOutcome, String>)> = Vec::new();
+    let mut set_aside = Vec::new();
+    // Lab #831 W3: the L2 this chain bridges, named by the node (`/v1/l2`),
+    // so a self-sealed burn reads as a pending deposit to it. A node that
+    // cannot say leaves the list empty: such a note is still set aside — as
+    // foreign — and so never counted.
+    let l2_ids = crate::deposit::fetch_l2(url).map(|a| a.l2_ids()).unwrap_or_default();
     for &idx in &w.allocated {
         let d = wallet.diversifier_at_index(idx);
         let kp = wallet.diversified_keypair(&d);
@@ -118,8 +128,12 @@ pub fn gather(
         // `light_client_scan` — that wrapper's own fetch is plaintext-only by
         // decision, and taking it is divergence #1 in this module's header.
         let mut fetch = scan_fetch(url);
-        let got = light_client_scan_with(&mut fetch, &kp.dk, from, to, ScanConfig::default(), &mut rng)
+        let mut got = light_client_scan_with(&mut fetch, &kp.dk, from, to, ScanConfig::default(), &mut rng)
             .map_err(|e| e.to_string());
+        // Lab #831 W3 (Q2): before anything sums or spends this scan.
+        if let Ok(outcome) = got.as_mut() {
+            set_aside.extend(qlab_ledger::deposits::set_aside(&wallet, idx, outcome, &l2_ids));
+        }
         outcomes.push((idx, short, got));
     }
 
@@ -159,7 +173,7 @@ pub fn gather(
         to,
         outputs,
     );
-    Gathered { outcomes, coverage, set, coinbase_coverage, mined, exit_coverage, exits }
+    Gathered { outcomes, coverage, set, coinbase_coverage, mined, exit_coverage, exits, set_aside }
 }
 
 /// The balance view over [`gather`] — the rows a caller renders with
@@ -181,7 +195,7 @@ pub fn scan_report(
     form: qlab_devnet::forms::GenesisForm,
 ) -> ScanReport {
     let wallet = w.wallet();
-    let Gathered { outcomes, coverage, set, coinbase_coverage, mined, exit_coverage, exits } =
+    let Gathered { outcomes, coverage, set, coinbase_coverage, mined, exit_coverage, exits, set_aside } =
         gather(w, url, from, to, form);
     let exits = exits_report(&wallet, &w.allocated, exits.as_ref(), set.as_ref());
 
@@ -215,7 +229,7 @@ pub fn scan_report(
         })
         .collect();
 
-    ScanReport { scans, spent: coverage, coinbase, coinbase_coverage, exits, exit_coverage }
+    ScanReport { scans, spent: coverage, coinbase, coinbase_coverage, exits, exit_coverage, set_aside }
 }
 
 /// This wallet's exit notes (lab #785 F5-5d) — only when both the exit
@@ -257,6 +271,8 @@ pub struct ScanReport {
     pub exits: Option<ExitReport>,
     /// How far the exit stream reached, or why it could not.
     pub exit_coverage: ExitCoverage,
+    /// Lab #831 W3: pending deposits and foreign notes, in no figure above.
+    pub set_aside: Vec<qlab_ledger::deposits::SetAside>,
 }
 
 #[cfg(test)]

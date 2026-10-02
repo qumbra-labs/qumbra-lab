@@ -20,6 +20,12 @@
 //! byte-identical to the pre-#399 lock. If a future change adds a fetch, this
 //! assertion is the thing that should fail.
 //!
+//! 🔴 **And it did, on purpose (lab #831 W3a, 2026-10-02): `GET /v1/l2` now
+//! comes first.** Selection asks the node which L2 its chain bridges before it
+//! scans, so a self-sealed burn (a pending deposit) is set aside rather than
+//! offered as an input. The lock was moved to name that request first; every
+//! other segment is unchanged.
+//!
 //! Decoy targets are random by design (a privacy mechanism), so the full-fetch
 //! segment is asserted by SHAPE (well-formed paths, bounded count, contains the
 //! real match) rather than byte-exactly; every other segment is exact. The
@@ -256,11 +262,13 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
     );
     assert_eq!(anchors_at, paths.len() - 1, "anchors are the last fetch: {paths:?}");
 
-    // Scan segment: the first request is the compact page for 0..=tip, and
-    // every request before the nullifier stream is compact or a well-formed
-    // /full fetch (the real match + its random decoys — shape, not bytes).
-    assert_eq!(paths[0], format!("/v1/compact?from=0&to={t}"), "{paths:?}");
-    let full_fetches = paths[..nf_at]
+    // Lab #831 W3a: the bridge question comes first, before anything is
+    // scanned. Then the scan segment: the compact page for 0..=tip, and every
+    // request before the nullifier stream is compact or a well-formed /full
+    // fetch (the real match + its random decoys — shape, not bytes).
+    assert_eq!(paths[0], "/v1/l2", "{paths:?}");
+    assert_eq!(paths[1], format!("/v1/compact?from=0&to={t}"), "{paths:?}");
+    let full_fetches = paths[1..nf_at]
         .iter()
         .filter(|p| {
             let mut parts = p.trim_start_matches("/v1/block/").splitn(2, "/tx/");
@@ -272,10 +280,10 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
             block_ok && tx_ok
         })
         .count();
-    let compact_pages = paths[..nf_at].iter().filter(|p| p.starts_with("/v1/compact")).count();
+    let compact_pages = paths[1..nf_at].iter().filter(|p| p.starts_with("/v1/compact")).count();
     assert_eq!(
         compact_pages + full_fetches,
-        nf_at,
+        nf_at - 1,
         "the scan segment holds nothing but compact pages and full fetches: {paths:?}"
     );
     assert!(full_fetches >= 1, "the grant's group is actually fetched: {paths:?}");

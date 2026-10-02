@@ -303,6 +303,18 @@ pub type QmbFetchFn = unsafe extern "C" fn(
 extern "C" {
     fn free(p: *mut c_void);
 }
+/// Lab #831 W3a: the L2 this chain bridges, as the node names it on
+/// `GET /v1/l2` — `[]` when it bridges none, cannot say, or answers in a form
+/// this build cannot read. A deposit the empty list cannot name is still set
+/// aside (as foreign), so the fallback never counts one.
+fn bridged_l2_ids(mut get: impl FnMut(&str) -> Result<Vec<u8>, String>) -> Vec<u64> {
+    get("/v1/l2")
+        .ok()
+        .and_then(|b| qlab_ledger::deposits::parse_l2_route(&b).ok())
+        .map(|a| a.l2_ids())
+        .unwrap_or_default()
+}
+
 
 /// Call the shell's fetch once, honouring the ownership contract in exactly one
 /// place: the buffers come from `malloc` and are released here with `free`.
@@ -427,14 +439,20 @@ unsafe fn build_ledger_over_fetch(
     let state = &*w;
 
     let mut scans: Vec<qlab_ledger::history::AddressScan> = Vec::with_capacity(n_indices);
+    let l2_ids = bridged_l2_ids(|p| fetch_bytes(fetch, fetch_ctx, p));
     for &idx in idxs {
         let d = state.wallet.diversifier_at_index(idx);
         let kp = state.wallet.diversified_keypair(&d);
         let short = state.wallet.address_at_index(idx).short().encode();
         let mut bridge = |path: &str| fetch_bytes(fetch, fetch_ctx, path);
-        let outcome =
+        let mut outcome =
             light_client_scan_with(&mut bridge, &kp.dk, from, to, ScanConfig::default(), &mut rng)
                 .map_err(|e| e.to_string());
+        // Lab #831 W3a: a self-sealed burn (a pending deposit) or any note
+        // under another rkm is not this wallet's to count or spend.
+        if let Ok(o) = outcome.as_mut() {
+            let _ = qlab_ledger::deposits::set_aside(&state.wallet, idx, o, &l2_ids);
+        }
         scans.push(qlab_ledger::history::AddressScan {
             div_index: idx,
             address_short: short,
@@ -594,6 +612,8 @@ pub unsafe extern "C" fn qmb_wallet_scan_report_over_fetch(
     // transport failure never reads as an empty wallet.
     // One bridge, defined once (see `fetch_bytes`).
     let mut bridge = |path: &str| fetch_bytes(fetch, fetch_ctx, path);
+    let l2_ids = bridged_l2_ids(&mut bridge);
+    let mut set_aside_all = Vec::new();
 
     let state = &*w;
     let mut scans = Vec::with_capacity(n_indices);
@@ -603,7 +623,12 @@ pub unsafe extern "C" fn qmb_wallet_scan_report_over_fetch(
         let short = state.wallet.address_at_index(idx).short().encode();
         match light_client_scan_with(&mut bridge, &kp.dk, from, to, ScanConfig::default(), &mut rng)
         {
-            Ok(outcome) => scans.push(DivScan::from_outcome(idx, short, &outcome)),
+            Ok(mut outcome) => {
+                // Lab #831 W3a: set aside before the balance is rendered.
+                let set = qlab_ledger::deposits::set_aside(&state.wallet, idx, &mut outcome, &l2_ids);
+                set_aside_all.extend(set);
+                scans.push(DivScan::from_outcome(idx, short, &outcome))
+            }
             Err(e) => scans.push(DivScan {
                 index: idx,
                 address_short: short,
@@ -614,7 +639,7 @@ pub unsafe extern "C" fn qmb_wallet_scan_report_over_fetch(
             }),
         }
     }
-    out_string(report::render(&scans, (from, to), label))
+    out_string(report::render(&scans, (from, to), label) + &qlab_ledger::deposits::render(&set_aside_all))
 }
 
 /// Run the light-client scan for `indices` against `base_url` over
@@ -650,13 +675,20 @@ pub unsafe extern "C" fn qmb_wallet_scan_report(
     let mut rng = StdRng::from_seed(seed);
 
     let state = &*w;
+    let l2_ids = bridged_l2_ids(|p| qlab_cbserver::client::http_get(url, p).map_err(|e| e.to_string()));
+    let mut set_aside_all = Vec::new();
     let mut scans = Vec::with_capacity(n_indices);
     for &idx in idxs {
         let d = state.wallet.diversifier_at_index(idx);
         let kp = state.wallet.diversified_keypair(&d);
         let short = state.wallet.address_at_index(idx).short().encode();
         match light_client_scan(url, &kp.dk, from, to, ScanConfig::default(), &mut rng) {
-            Ok(outcome) => scans.push(DivScan::from_outcome(idx, short, &outcome)),
+            Ok(mut outcome) => {
+                // Lab #831 W3a: set aside before the balance is rendered.
+                let set = qlab_ledger::deposits::set_aside(&state.wallet, idx, &mut outcome, &l2_ids);
+                set_aside_all.extend(set);
+                scans.push(DivScan::from_outcome(idx, short, &outcome))
+            }
             Err(e) => scans.push(DivScan {
                 index: idx,
                 address_short: short,
@@ -667,7 +699,7 @@ pub unsafe extern "C" fn qmb_wallet_scan_report(
             }),
         }
     }
-    out_string(report::render(&scans, (from, to), url))
+    out_string(report::render(&scans, (from, to), url) + &qlab_ledger::deposits::render(&set_aside_all))
 }
 
 /* --- the pumpable scan (issue #395) --------------------------------------- */
@@ -698,6 +730,9 @@ pub struct ScanState {
     // notes themselves, not just the rendered verdicts. `qmb_select_new`
     // takes them (a select consumes the scan).
     outcomes: Vec<(u64, ScanOutcome)>,
+    /// Lab #831 W3a: each index's own `rkm`, so a finished scan sets aside
+    /// what is not that address's before it is rendered or selected from.
+    own_rkm: Vec<(u64, [u64; 4])>,
     done: bool,
 }
 
@@ -731,6 +766,7 @@ pub unsafe extern "C" fn qmb_scan_new(
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
 
     let state = &*w;
+    let own_rkm = idxs.iter().map(|&idx| (idx, state.wallet.rkm(state.wallet.diversifier_at_index(idx)))).collect();
     let mut queue: VecDeque<(u64, String, Dk)> = idxs
         .iter()
         .map(|&idx| {
@@ -755,6 +791,7 @@ pub unsafe extern "C" fn qmb_scan_new(
         current,
         scans: Vec::new(),
         outcomes: Vec::new(),
+        own_rkm,
         done: false,
     }))
 }
@@ -799,8 +836,15 @@ pub unsafe extern "C" fn qmb_scan_step(s: *mut ScanState, out: *mut *mut c_char)
                 *out = out_string(path);
                 return 1;
             }
-            ScanDriverStep::Done(outcome) => {
+            ScanDriverStep::Done(mut outcome) => {
                 let (idx, short, _) = st.current.take().expect("stepped without a driver");
+                // Lab #831 W3a: the pumped scan has no `/v1/l2` step, so it
+                // names no deposit — but it still sets aside every note under
+                // another rkm, so nothing it renders or hands to a select can
+                // count or spend one.
+                if let Some(&(_, own)) = st.own_rkm.iter().find(|(i, _)| *i == idx) {
+                    let _ = qlab_ledger::deposits::set_aside_for(own, idx, &mut outcome, &[]);
+                }
                 st.scans.push(DivScan::from_outcome(idx, short, &outcome));
                 st.outcomes.push((idx, outcome));
             }
