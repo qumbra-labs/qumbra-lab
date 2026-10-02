@@ -621,3 +621,25 @@ fn ivk_export_prints_the_viewing_key_and_writes_nothing() {
     assert!(!ok && err.contains("usage: qumbra-wallet ivk export"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Lab #815, through the real binary: `send --to` an Annulet asset payment
+/// URI is refused BY NAME before anything is read or proved — never paid as
+/// QMB — and so is a URI carrying an unknown `req-` key.
+#[test]
+fn send_refuses_an_asset_payment_uri_by_name() {
+    let dir = tmp("i815_send");
+    let d = dir.to_str().unwrap();
+    let (_, stderr, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "{stderr}");
+    let addr = WalletDir::open(&dir).unwrap().wallet().address_at_index(0).encode();
+    for (q, says) in [
+        ("req-asset=7&amount=1000000", "does not pay Annulet assets from a URI"),
+        ("req-foo=1&amount=1", "req-foo"),
+    ] {
+        let uri = format!("qumbra:{addr}?{q}");
+        let (_, err, ok) = run(&["send", "--dir", d, "--url", "http://127.0.0.1:1", "--scan-to", "1", "--to", &uri], None);
+        assert!(!ok, "{q}: must be refused");
+        assert!(err.contains(says), "{q}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
