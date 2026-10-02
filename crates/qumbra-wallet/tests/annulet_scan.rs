@@ -235,3 +235,62 @@ fn a_chain_at_its_genesis_quotes_the_genesis_notes() {
     assert_eq!(report.index.expect("a figure at tip 0").balances(), vec![(1, 5)]);
     let _ = std::fs::remove_dir_all(&w.dir);
 }
+
+/// Lab #819: the rows `scan_annulet` reports come from ONE fetch of the range
+/// (the multi-key entry), and equal the pre-#819 per-index rows on the same
+/// responses — three allocated indices, notes at two, none at the third — and
+/// a range that cannot be read fails every row with the same message both ways.
+#[test]
+fn annulet_rows_scan_the_range_once_and_equal_the_per_index_rows() {
+    use qumbra_wallet::annulet::{annulet_rows, annulet_rows_per_index, AnnuletRow};
+    let mut w = wallet_dir("i819", 0x66);
+    w.allocate_next().unwrap(); // addresses 0, 1, 2
+    let (a0, a1) = (w.wallet().address_at_index(0), w.wallet().address_at_index(1));
+    let stranger_dir = wallet_dir("i819_stranger", 0x77);
+    let stranger = stranger_dir.wallet().address_at_index(0);
+    let mut rng = StdRng::seed_from_u64(819);
+    let mut blocks = BTreeMap::new();
+    blocks.insert(1, vec![vec![pay(&a0, &[note_to(&a0, 5, 0, 60)], &mut rng)], vec![pay(&stranger, &[note_to(&stranger, 1, 0, 61)], &mut rng)]]);
+    blocks.insert(2, vec![vec![pay(&a1, &[note_to(&a1, 70, 1, 62)], &mut rng), pay(&a0, &[note_to(&a0, 30, 1, 63)], &mut rng)]]);
+    let chain = FixtureChain { genesis: Vec::new(), blocks, nullifiers: BTreeMap::new(), tip: 3, annulet: true };
+
+    let run = |per_index: bool, down: bool| -> (Vec<AnnuletRow>, usize) {
+        let mut compact = 0;
+        let mut fetch = |p: &str| {
+            if p.starts_with("/v1/compact") {
+                compact += 1;
+                if down {
+                    return Err("503 compact down".to_string());
+                }
+            }
+            chain.fetch(p)
+        };
+        let mut rng = StdRng::seed_from_u64(1);
+        let rows = if per_index {
+            annulet_rows_per_index(&w, &mut fetch, 0, 10, &mut rng)
+        } else {
+            annulet_rows(&w, &mut fetch, 0, 10, &mut rng)
+        };
+        (rows, compact)
+    };
+    let ((new, new_compact), (old, old_compact)) = (run(false, false), run(true, false));
+    assert_eq!((new_compact, old_compact), (1, 3), "one range fetch, not one per index");
+    assert_eq!(new.len(), 3);
+    for (n, o) in new.iter().zip(&old) {
+        assert_eq!((n.index, &n.short), (o.index, &o.short));
+        let (n, o) = (n.scan.as_ref().unwrap(), o.scan.as_ref().unwrap());
+        assert_eq!(n.notes, o.notes);
+        assert_eq!(n.unopened, o.unopened);
+        assert_eq!(n.shadowed, o.shadowed);
+    }
+    let found: Vec<usize> = new.iter().map(|r| r.scan.as_ref().unwrap().notes.len()).collect();
+    assert_eq!(found, vec![2, 1, 0]);
+
+    let ((new, _), (old, _)) = (run(false, true), run(true, true));
+    let errs = |rows: &[AnnuletRow]| rows.iter().map(|r| (r.index, r.scan.as_ref().err().cloned())).collect::<Vec<_>>();
+    assert_eq!(errs(&new), errs(&old), "a failed range names every row the same way");
+    assert!(errs(&new).iter().all(|(_, e)| e.as_deref() == Some("503 compact down")));
+    for d in [&w.dir, &stranger_dir.dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

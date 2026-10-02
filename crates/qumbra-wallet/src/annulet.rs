@@ -27,7 +27,7 @@
 
 use std::cell::RefCell;
 
-use qlab_cbserver::client::{light_client_scan_l2_with, ScanConfig, ScanOutcome};
+use qlab_cbserver::client::{light_client_scan_l2_multi_with, light_client_scan_l2_with, MultiScanRefusal, ScanConfig, ScanOutcome};
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
 use qlab_ledger::spent::{coverage_for, widest_range, NullifierChunk, NullifierSource, SpentSet};
 use qlab_ledger::vocab::SpentCoverage;
@@ -183,13 +183,7 @@ where
     let wallet = w.wallet();
     let (genesis_hash, genesis) = verify_annulet(fetch, pin)?;
 
-    let mut rows = Vec::new();
-    for &idx in &w.allocated {
-        let kp = wallet.diversified_keypair(&wallet.diversifier_at_index(idx));
-        let scan = light_client_scan_l2_with(fetch, &kp.dk, from, to, ScanConfig::default(), rng)
-            .map_err(|e| e.to_string());
-        rows.push(AnnuletRow { index: idx, short: wallet.address_at_index(idx).short().encode(), scan });
-    }
+    let rows = annulet_rows(w, fetch, from, to, rng);
 
     let mut owned = Vec::new();
     let mut refused = Vec::new();
@@ -234,6 +228,56 @@ where
         _ => None,
     };
     Ok(AnnuletReport { genesis_hash, rows, genesis_owned, spent, index, refused })
+}
+
+/// One row per allocated index, scanned over **one** fetch of the range (lab
+/// #819): `light_client_scan_l2_multi_with` runs each index's key through the
+/// unchanged scan driver over a shared fetch, so the range and every `/full`
+/// are requested once — not once per index, which cost N× the pages and
+/// told the server how many addresses this wallet holds.
+///
+/// Each row is what [`annulet_rows_per_index`] (the pre-#819 path) gives on
+/// the same responses. A range that cannot be read fails every row with the
+/// driver's message, exactly as each per-index scan of it failed.
+pub fn annulet_rows<F>(w: &WalletDir, fetch: &mut F, from: u64, to: u64, rng: &mut StdRng) -> Vec<AnnuletRow>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let wallet = w.wallet();
+    if w.allocated.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<_> =
+        w.allocated.iter().map(|&idx| (idx, wallet.diversified_keypair(&wallet.diversifier_at_index(idx)).dk)).collect();
+    let short = |idx: u64| wallet.address_at_index(idx).short().encode();
+    match light_client_scan_l2_multi_with(fetch, &keys, from, to, ScanConfig::default(), rng) {
+        Ok(multi) => multi.outcomes.into_iter().map(|(idx, outcome)| AnnuletRow { index: idx, short: short(idx), scan: Ok(outcome) }).collect(),
+        Err(refusal) => {
+            let why = match refusal {
+                MultiScanRefusal::Range(why) => why,
+                other => format!("{other:?}"),
+            };
+            w.allocated.iter().map(|&idx| AnnuletRow { index: idx, short: short(idx), scan: Err(why.clone()) }).collect()
+        }
+    }
+}
+
+/// The pre-#819 rows: one full scan of the range per allocated index. Kept as
+/// the reference [`annulet_rows`] is tested equal to; not used by the wallet.
+#[doc(hidden)]
+pub fn annulet_rows_per_index<F>(w: &WalletDir, fetch: &mut F, from: u64, to: u64, rng: &mut StdRng) -> Vec<AnnuletRow>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let wallet = w.wallet();
+    w.allocated
+        .iter()
+        .map(|&idx| {
+            let kp = wallet.diversified_keypair(&wallet.diversifier_at_index(idx));
+            let scan = light_client_scan_l2_with(fetch, &kp.dk, from, to, ScanConfig::default(), rng).map_err(|e| e.to_string());
+            AnnuletRow { index: idx, short: wallet.address_at_index(idx).short().encode(), scan }
+        })
+        .collect()
 }
 
 /// The report as text: the verified genesis, one line per asset, the
