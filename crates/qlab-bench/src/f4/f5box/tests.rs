@@ -62,21 +62,27 @@ impl Box6 {
 
     /// Mine up to `height`, recording every eighth.
     fn mine_to(&mut self, height: u64) {
-        let burn = qlab_air::claim::rkm_burn(params().l2_id);
         while self.node.tip_height() < height {
-            let parent = self.node.chain().block(&self.node.tip_hash()).expect("the tip").header();
-            let (h, record) = (parent.height + 1, parent.height > 0 && parent.height.is_multiple_of(8));
-            let mut body = BlockBody::from_single_payee(vec![], qlab_devnet::emission_exact::coinbase_exact(h), burn);
-            if record {
-                let cp = Checkpoint::new(parent.height, self.node.tip_hash(), self.node.tip_hash());
-                body.finality = FinalityRecord { cp, votes: self.validators[..15].iter().map(|v| v.sign_checkpoint(&cp)).collect() }.encode();
-            }
-            let header = BlockHeader::child_of_for(GenesisForm::V5, &parent, parent.timestamp + 75, 8, body.commitment_v6());
-            let recorded = self.node.tip_hash();
-            self.node.apply_block(header, body, &NoTxs).expect("the block applies");
-            if record {
-                assert!(self.node.finalize(recorded).expect("finalize").is_recorded());
-            }
+            self.mine_one(vec![]);
+        }
+    }
+
+    /// One block carrying `txs` (lab #831 W3b: a deposit), recording the
+    /// cadence height its parent is, as [`Self::mine_to`] does.
+    fn mine_one(&mut self, txs: Vec<TxEntry>) {
+        let burn = qlab_air::claim::rkm_burn(params().l2_id);
+        let parent = self.node.chain().block(&self.node.tip_hash()).expect("the tip").header();
+        let (h, record) = (parent.height + 1, parent.height > 0 && parent.height.is_multiple_of(8));
+        let mut body = BlockBody::from_single_payee(txs, qlab_devnet::emission_exact::coinbase_exact(h), burn);
+        if record {
+            let cp = Checkpoint::new(parent.height, self.node.tip_hash(), self.node.tip_hash());
+            body.finality = FinalityRecord { cp, votes: self.validators[..15].iter().map(|v| v.sign_checkpoint(&cp)).collect() }.encode();
+        }
+        let header = BlockHeader::child_of_for(GenesisForm::V5, &parent, parent.timestamp + 75, 8, body.commitment_v6());
+        let recorded = self.node.tip_hash();
+        self.node.apply_block(header, body, &NoTxs).expect("the block applies");
+        if record {
+            assert!(self.node.finalize(recorded).expect("finalize").is_recorded());
         }
     }
 
@@ -731,4 +737,172 @@ fn w2_the_wallets_exit_is_a_member_the_node_rule_takes() {
     let out = rule.fold_bundle(&encode_surface(&r.prev1), &bytes).expect("the fold accepts");
     assert_eq!(out.exits, vec![(digest_to_bytes(&EXIT.rkm), EXIT.v)], "the bundle pays exactly the wallet's exit");
     assert_eq!(out.e_batch, EXIT.v);
+}
+
+// ---------------------------------------------------------------------------
+// Lab #831 W3b: the wallet's claim of its own tx-output burn
+// ---------------------------------------------------------------------------
+
+/// **W3b's lane condition** (issue #831 ruling Q1, Q-B5): a deposit made as
+/// `deposit` makes it — an ordinary L1 transaction paying `rkm_burn(1)`,
+/// sealed to the depositor's own key — on a V6 chain, then:
+///
+/// - the wallet's own light-client scan over the node's routes sets it aside
+///   as a pending deposit to L2 1 (`qlab_ledger::deposits::set_aside`), never
+///   as a spendable note, and that set-aside record is the opening;
+/// - f5box's tx-output burn reader finds it from that opening, under the
+///   newest anchor;
+/// - the wallet's claim (`qlab_l2spend::claim_instance`, blinds from
+///   `Wallet::claim_blinds`) at the newest anchor and the chain's claim tier
+///   satisfies the claim AIR on every row — and a wallet restored from the
+///   same seed builds the identical claim from the burn alone (Q-B3), while
+///   another seed builds a different one;
+/// - its claim file (stub proof) reads back, and is refused by name on
+///   another chain and at another tier;
+/// - swapped into an f5box deposit wrapper as its claim, the native statement
+///   accepts it, and the signed bundle passes the node's rule up to the member
+///   proofs (refused at `Member(0,`) while the fold states exactly this
+///   deposit as the batch's `D`.
+#[test]
+fn w3b_a_wallets_tx_output_burn_is_set_aside_found_claimed_and_taken_as_a_member() {
+    use qlab_air::claim::{BurnNote, ClaimCredit};
+    use qlab_cbserver::client::{light_client_scan_with, ScanConfig};
+    use qlab_devnet::body::TxPublic;
+    use qlab_devnet::fees::{posted_fee, ArityBucket};
+    use qlab_l2spend::{claim_instance, decode_claim_artifact, encode_claim_artifact, ClaimFileError};
+    use qlab_ledger::deposits::{set_aside, SetAsideKind};
+    use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+    use qlab_wallet::Wallet;
+    use qumbra_node::discovery_server::{respond, respond_full};
+    use rand::SeedableRng;
+    use super::chain::TxBurnOpening;
+    use super::members::reseal_claim;
+    use crate::f4::dep::DepEntry;
+
+    const DEPOSIT: u64 = 5_000_000_000;
+    let l2_id = params().l2_id;
+    let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([0x31; ENTROPY_LEN]), 0);
+    let d0 = wallet.diversifier_at_index(0);
+    let kp = wallet.diversified_keypair(&d0);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x0831);
+
+    // The chain: records every eight. Sixteen deposits (eight transactions of
+    // two burn outputs each, all sealed to this wallet) mined at height 10,
+    // anchored at height 8's root — the root the record carried by block 9
+    // covers (V6's anchor rule). Sixteen, because a v1 wrapper holds exactly
+    // K = 16 members (V1): the lane's wrapper is sixteen claims of them.
+    let mut b = Box6::new();
+    b.mine_to(8);
+    let anchor8 = b.node.commitment_root();
+    b.mine_to(9);
+    let deposits: Vec<TxEntry> = (0..8u8)
+        .map(|t| {
+            let note = |j: u64| qlab_note::note::Note {
+                value: DEPOSIT,
+                rkm: qlab_air::claim::rkm_burn(l2_id),
+                rho: [0xB1, u64::from(t), j, 4],
+                rseed: [0xB5, u64::from(t), j, 8],
+            };
+            let enc = qlab_note::scan::encrypt_to_recipient(&kp.ek, &[note(0), note(1)], &mut rng);
+            TxEntry::new(
+                b"proof-placeholder".to_vec(),
+                TxPublic {
+                    anchor: anchor8,
+                    nullifiers: vec![[0x90 + t; 32], [0xA0 + t; 32]],
+                    commitments: enc.bundle.entries.iter().map(|e| e.cm).collect(),
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: posted_fee(ArityBucket::TwoByTwo),
+                },
+                &[enc.bundle],
+                &enc.payloads,
+            )
+        })
+        .collect();
+    b.mine_one(deposits);
+    b.mine_to(25);
+    let tip = b.node.tip_height();
+
+    // The wallet's own scan, over the node's own route cores.
+    let routes = Routes::of(&b.node);
+    let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let r = if route == "/v1/compact" {
+            respond(&routes.discovery, query)
+        } else if let Some((h, rest)) = route.strip_prefix("/v1/block/").and_then(|r| r.split_once("/tx/")) {
+            respond_full(&routes.discovery, (h, rest.strip_suffix("/full").ok_or("not a full path")?))
+        } else {
+            return Err(format!("no route {route}"));
+        };
+        r.map_err(|(code, why)| format!("{path}: {code} {why}"))
+    };
+    let mut outcome = light_client_scan_with(&mut fetch, &kp.dk, 0, tip, ScanConfig::default(), &mut rng).expect("the scan runs");
+    let set = set_aside(&wallet, 0, &mut outcome, &[l2_id]);
+    assert!(outcome.notes.is_empty(), "a burn is never a spendable note");
+    assert_eq!(set.len(), 16);
+    assert!(set.iter().all(|s| s.kind == SetAsideKind::PendingDeposit { l2_id } && s.height == 10 && s.note.value == DEPOSIT));
+
+    // f5box's reader finds them from the set-aside openings.
+    let view = b.view();
+    let openings: Vec<TxBurnOpening> =
+        set.iter().map(|s| TxBurnOpening { height: s.height, value: s.note.value, rho: s.note.rho, rseed: s.note.rseed }).collect();
+    let burns = view.tx_burns(l2_id, &openings).expect("found under the newest anchor");
+    assert_eq!(burns.len(), 16);
+    let opening = openings[0];
+    let burn = *burns.iter().find(|b| b.note.rho == opening.rho).expect("the first opening's burn");
+    let newest = view.anchors().unwrap()[0];
+    assert!(burn.pos < newest.count);
+    let wrong = TxBurnOpening { value: DEPOSIT + 1, ..opening };
+    assert!(view.tx_burns(l2_id, &[wrong]).unwrap_err().contains("in no served leaf"));
+
+    // The wallet's claim, at the newest anchor and the chain's tier.
+    let tier = params().claim_fee_tier;
+    let claim_for = |w: &Wallet| {
+        let (r_v, rseed) = w.claim_blinds(&burn.cm);
+        let credit = ClaimCredit { rkm: w.rkm(w.diversifier_at_index(0)), rseed };
+        let note: BurnNote = burn.note;
+        (claim_instance(&view.tree, newest.count, &note, l2_id, &r_v, &credit, tier).expect("the claim assembles"), r_v)
+    };
+    let (inst, r_v) = claim_for(&wallet);
+    let pvs = qlab_l2::public_values(&inst.pvs);
+    let verdict = qlab_air::l2test::satisfied(&inst.air, &inst.air.generate_trace::<qlab_consensus::Val>(0), &pvs);
+    assert!(verdict.is_ok(), "the wallet's claim satisfies the claim AIR: {verdict:?}");
+    // Q-B3: the same seed rebuilds the same claim from the burn alone.
+    let restored = Wallet::from_master_seed(&MasterSeed::from_entropy([0x31; ENTROPY_LEN]), 0);
+    assert_eq!(claim_for(&restored).0.pvs, inst.pvs, "a restored wallet rebuilds the identical claim");
+    let other = Wallet::from_master_seed(&MasterSeed::from_entropy([0x32; ENTROPY_LEN]), 0);
+    assert_ne!(claim_for(&other).0.pvs, inst.pvs, "another seed builds another claim");
+
+    // The claim file (a stub proof in place of the 3 GiB one).
+    let (_, stub) = crate::f4::dep::prove_dep(&[DepEntry { v: DEPOSIT, r_v }]).expect("an opening");
+    let (genesis, other_chain) = ([0x4f; 32], [0x50; 32]);
+    let file = encode_claim_artifact(&genesis, l2_id, &inst.pvs, &stub, DEPOSIT, &r_v);
+    let read = decode_claim_artifact(&file, &genesis, tier).expect("the file reads back");
+    assert_eq!((read.l2_id, read.pvs.clone(), read.value, read.r_v), (l2_id, inst.pvs.clone(), DEPOSIT, r_v));
+    assert_eq!(decode_claim_artifact(&file, &other_chain, tier).err(), Some(ClaimFileError::OtherChain { file: genesis, expected: other_chain }));
+    assert_eq!(decode_claim_artifact(&file, &genesis, tier + 1).err(), Some(ClaimFileError::OtherTier { file: tier, expected: tier + 1 }));
+
+    // Into an f5box deposit wrapper, as its claim.
+    let state0 = WState::genesis(&qumbra_node::genesis_v6::v6_genesis_registry());
+    let prev0 = genesis_surface(l2_id, &qumbra_node::genesis_v6::v6_genesis_registry_root());
+    let keys = Keys::from_text("f5box w3b lane");
+    // f5box plans a wrapper of sixteen claims of these burns; its claim of
+    // the wallet's first burn is then replaced by the wallet's own.
+    let claims = vec![WTag::C; 16];
+    let ordered: Vec<super::chain::Burn> = std::iter::once(burn).chain(burns.iter().copied().filter(|b| b.cm != burn.cm)).collect();
+    let ask = Ask { kinds: &claims, burns: &ordered, owned: &[], exit: None };
+    let base = plan(&state0, &prev0, &chain_of(&view), &keys, &ask).expect("a sixteen-claim deposit plans");
+    let Inst::C(first) = &base.insts[0] else { panic!("slot 0 is a claim") };
+    assert_eq!(first.cm, inst.cm, "slot 0 claims the wallet's first burn");
+    let p = reseal_claim(&state0, base, 0, inst, DepEntry { v: DEPOSIT, r_v }, burn, &keys).expect("the native statement takes it");
+    assert_eq!(p.inp.d_batch, 16 * DEPOSIT, "D is the sixteen deposits");
+    assert_eq!(p.members[0].pvs, read.pvs, "member 0 is the file's claim");
+
+    let rule = WrapperRule::from_params(NET_ID, &params()).expect("the rule");
+    let (_, bytes) = stub_bundle(&p, &NET_ID);
+    match self_check(&rule, &bytes, &prev0, &view) {
+        Err(BundleRefusal::Wrapper(v)) => assert!(v.starts_with("Member(0,"), "refused at {v}"),
+        other => panic!("expected the member-0 refusal, got {other:?}"),
+    }
+    let out = rule.fold_bundle(&encode_surface(&prev0), &bytes).expect("the fold accepts");
+    assert_eq!(out.d_batch, 16 * DEPOSIT, "the bundle bridges exactly these deposits");
 }

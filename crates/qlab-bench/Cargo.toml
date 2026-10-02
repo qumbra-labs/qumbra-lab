@@ -92,3 +92,6 @@ qumbra-node = { path = "../qumbra-node", features = ["wrapper-test-knobs"] }
 # and handed to f5box's wrapper as a member — the lane's proof that the CLI's
 # `--out` exit is a member the node's rule takes. Dev-only.
 qlab-l2spend = { path = "../qlab-l2spend" }
+# Lab #831 W3b: the wallet's scan sets its deposit aside (`deposits::set_aside`)
+# before f5box's tx-output burn reader takes the opening. Dev-only.
+qlab-ledger = { path = "../qlab-ledger" }

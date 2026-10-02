@@ -1066,6 +1066,255 @@ pub fn exit_member_pvs(tx: &TxEntry, surface: &L2Surface) -> Vec<u32> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Lab #831 W3b: the deposit claim (L1 burn → L2 credit)
+// ---------------------------------------------------------------------------
+
+/// Why a claim cannot be assembled — by name, before anything is proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimError {
+    /// The opening does not pay `rkm_burn(l2_id)`.
+    NotABurn { l2_id: u64 },
+    /// The burn's rebuilt L1 commitment is no leaf of the tree.
+    NotInTree,
+    /// The burn's leaf is at or past the anchor: the anchor does not cover it.
+    AboveAnchor { pos: u64, anchor_count: u64 },
+    /// The anchor counts more leaves than the tree holds.
+    AnchorPastTree { anchor_count: u64, len: u64 },
+    /// The burn is worth no more than the claim fee: the credit would be 0 —
+    /// a note nobody can spend, for a wasted prove.
+    BelowFee { value: u64, fee: u64 },
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimError::NotABurn { l2_id } => write!(f, "the note does not pay L2 {l2_id}'s burn address"),
+            ClaimError::NotInTree => write!(f, "the burn's commitment is not in the L1 commitment tree"),
+            ClaimError::AboveAnchor { pos, anchor_count } => write!(
+                f,
+                "the burn's leaf {pos} is not under the anchor (which covers {anchor_count} leaves): pick a later anchor"
+            ),
+            ClaimError::AnchorPastTree { anchor_count, len } => {
+                write!(f, "the anchor covers {anchor_count} leaves and the tree holds {len}")
+            }
+            ClaimError::BelowFee { value, fee } => write!(
+                f,
+                "the burn holds {value}, no more than the claim fee {fee}: nothing would be credited"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+/// **A deposit claim's instance** — pure, no endpoint, no prove: the one
+/// assembly the wallet proves (`deposit claim`) and the lane hands to a
+/// wrapper as a member (`qlab-bench`'s f5box tests). The burn note
+/// `note` opens at leaf `pos` of the L1 `tree` under the root that counts
+/// `anchor_count` leaves; the claim credits `v − fee` (asset 0, ρ = `cnf`) to
+/// `credit`, with the value committed under `r_v`.
+///
+/// The anchor is the caller's choice and the proof binds it (`PV_A`); a
+/// wrapper takes the claim only if it has absorbed that root. With the
+/// blinds derived from the wallet and the burn alone
+/// (`qlab_wallet::Wallet::claim_blinds`), a claim bound to a root no wrapper
+/// absorbs costs a re-prove at another anchor, never a lost deposit.
+pub fn claim_instance(
+    tree: &CommitmentTree,
+    anchor_count: u64,
+    note: &qlab_air::claim::BurnNote,
+    l2_id: u64,
+    r_v: &[u64; 4],
+    credit: &qlab_air::claim::ClaimCredit,
+    fee: u64,
+) -> Result<qlab_air::claim::ClaimInstance, ClaimError> {
+    let burn = qlab_air::claim::rkm_burn(l2_id);
+    if note.rkm != burn {
+        return Err(ClaimError::NotABurn { l2_id });
+    }
+    if note.value <= fee {
+        return Err(ClaimError::BelowFee { value: note.value, fee });
+    }
+    if anchor_count > tree.len() {
+        return Err(ClaimError::AnchorPastTree { anchor_count, len: tree.len() });
+    }
+    let cm = qlab_air::claim::l1_cm(note.value, &note.rkm, &note.rho, &note.rseed);
+    let pos = tree.position_of(&cm).ok_or(ClaimError::NotInTree)?;
+    if pos >= anchor_count {
+        return Err(ClaimError::AboveAnchor { pos, anchor_count });
+    }
+    Ok(qlab_air::claim::build_claim_with_witness(
+        qlab_l2::claim::LOG_HEIGHT_CLAIM,
+        &burn,
+        note,
+        &tree.auth_path(pos, anchor_count),
+        tree.root_at(anchor_count),
+        r_v,
+        credit,
+        fee,
+    ))
+}
+
+/// **A claim, proved** — the hiding claim lane, ≈ 3.17 GiB / ≈ 10 s
+/// measured (l2-architecture §4.1's build update): laptop-class, local only.
+pub fn prove_claim(inst: &qlab_air::claim::ClaimInstance) -> qlab_l2::Proof<qlab_l2::Config> {
+    qlab_l2::claim::prove_claim(inst).1
+}
+
+/// The claim file's leading bytes, and the only version this build writes and reads.
+pub const CLAIM_ARTIFACT_MAGIC: &[u8; 16] = b"qumbra:l2-claim\0";
+pub const CLAIM_ARTIFACT_VERSION: u8 = 1;
+
+/// A claim file's contents, as read back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimFile {
+    pub l2_id: u64,
+    /// The claim's public values, `u32` words (the member a wrapper threads).
+    pub pvs: Vec<u32>,
+    /// The proof, as `bincode` bytes.
+    pub proof: Vec<u8>,
+    /// The deposit-sum proof's opening for this claim: the burned value and
+    /// its commitment blind. **Private to the sequencer** — this is what
+    /// reveals the amount.
+    pub value: u64,
+    pub r_v: [u64; 4],
+}
+
+/// Why a claim file is refused — by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimFileError {
+    NotAClaimFile,
+    Truncated,
+    Version { found: u8, expected: u8 },
+    OtherChain { file: [u8; 32], expected: [u8; 32] },
+    /// The claim was built at another fee tier than the chain serves.
+    OtherTier { file: u64, expected: u64 },
+    /// The claim's published burn address is not its L2's.
+    OtherL2 { l2_id: u64 },
+    Malformed(&'static str),
+}
+
+impl std::fmt::Display for ClaimFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        match self {
+            ClaimFileError::NotAClaimFile => write!(f, "not an L2 claim file (the magic does not match)"),
+            ClaimFileError::Truncated => write!(f, "the claim file ends early"),
+            ClaimFileError::Version { found, expected } => {
+                write!(f, "claim file version {found}; this build reads only version {expected}")
+            }
+            ClaimFileError::OtherChain { file, expected } => write!(
+                f,
+                "the claim file was built on the chain with genesis {}, not this one ({}) — refusing it",
+                hex(file),
+                hex(expected)
+            ),
+            ClaimFileError::OtherTier { file, expected } => write!(
+                f,
+                "the claim was built at fee tier {file} and this chain's claim tier is {expected}: rebuild it at the \
+                 chain's tier"
+            ),
+            ClaimFileError::OtherL2 { l2_id } => write!(f, "the claim does not publish L2 {l2_id}'s burn address"),
+            ClaimFileError::Malformed(why) => write!(f, "the claim file is malformed: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimFileError {}
+
+fn pv_word(pvs: &[u32], base: usize, limbs: usize) -> u64 {
+    (0..limbs).map(|j| u64::from(pvs[base + j] & 0xffff) << (16 * j)).sum()
+}
+
+/// The fee a claim's public values state (`PV_FEE`, four 16-bit limbs).
+pub fn claim_fee_of(pvs: &[u32]) -> u64 {
+    pv_word(pvs, qlab_air::claim::PV_FEE, 4)
+}
+
+/// The claim file: magic ‖ version ‖ genesis (32) ‖ l2_id (u64 LE) ‖ PV count
+/// (u32 LE) ‖ PVs (u32 LE each) ‖ proof length (u32 LE) ‖ proof ‖ value (u64
+/// LE) ‖ r_v (four u64 LE). The genesis binds it to one chain; the PVs carry
+/// the fee tier it was built at.
+pub fn encode_claim_artifact(
+    genesis_hash: &[u8; 32],
+    l2_id: u64,
+    pvs: &[u32],
+    proof: &qlab_l2::Proof<qlab_l2::Config>,
+    value: u64,
+    r_v: &[u64; 4],
+) -> Vec<u8> {
+    let proof = bincode::serialize(proof).expect("a proof serializes");
+    let mut out = CLAIM_ARTIFACT_MAGIC.to_vec();
+    out.push(CLAIM_ARTIFACT_VERSION);
+    out.extend_from_slice(genesis_hash);
+    out.extend_from_slice(&l2_id.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(pvs.len()).expect("a claim's PVs").to_le_bytes());
+    for w in pvs {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out.extend_from_slice(&u32::try_from(proof.len()).expect("a proof under 4 GiB").to_le_bytes());
+    out.extend_from_slice(&proof);
+    out.extend_from_slice(&value.to_le_bytes());
+    out.extend_from_slice(&digest_bytes(r_v));
+    out
+}
+
+/// Read a claim file back, refusing by name: the magic, the version, the
+/// chain (`expected_genesis`), the layout, the PV count, that the claim
+/// publishes its own L2's burn address, and that it was built at the chain's
+/// claim tier (`expected_tier`, the `/v1/l2` value).
+///
+/// The file's `l2_id` is checked against its own `PV_RKM_BURN`, not against
+/// the chain's: the genesis binds the chain's WrapperParams and so its one
+/// `l2_id`, which makes [`ClaimFileError::OtherChain`] the check that covers
+/// a file of another L2.
+pub fn decode_claim_artifact(bytes: &[u8], expected_genesis: &[u8; 32], expected_tier: u64) -> Result<ClaimFile, ClaimFileError> {
+    let rest = bytes.strip_prefix(CLAIM_ARTIFACT_MAGIC.as_slice()).ok_or(ClaimFileError::NotAClaimFile)?;
+    let mut r = rest;
+    let mut take = |n: usize| -> Result<&[u8], ClaimFileError> {
+        if r.len() < n {
+            return Err(ClaimFileError::Truncated);
+        }
+        let (h, t) = r.split_at(n);
+        r = t;
+        Ok(h)
+    };
+    let version = take(1)?[0];
+    if version != CLAIM_ARTIFACT_VERSION {
+        return Err(ClaimFileError::Version { found: version, expected: CLAIM_ARTIFACT_VERSION });
+    }
+    let genesis: [u8; 32] = take(32)?.try_into().expect("32 bytes");
+    if &genesis != expected_genesis {
+        return Err(ClaimFileError::OtherChain { file: genesis, expected: *expected_genesis });
+    }
+    let l2_id = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+    let n = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+    if n != qlab_air::claim::PV_LEN {
+        return Err(ClaimFileError::Malformed("not a claim's PV count"));
+    }
+    let pvs: Vec<u32> = take(4 * n)?.chunks(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect();
+    let plen = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+    let proof = take(plen)?.to_vec();
+    let value = u64::from_le_bytes(take(8)?.try_into().expect("8 bytes"));
+    let r_v = qlab_note::hash::digest_from_bytes(&take(32)?.try_into().expect("32 bytes"));
+    if !r.is_empty() {
+        return Err(ClaimFileError::Malformed("bytes after r_v"));
+    }
+    let burn = qlab_air::narrow::pv_chunks(&qlab_air::claim::rkm_burn(l2_id));
+    if pvs[qlab_air::claim::PV_RKM_BURN..qlab_air::claim::PV_RKM_BURN + 16] != burn[..] {
+        return Err(ClaimFileError::OtherL2 { l2_id });
+    }
+    if pvs[qlab_air::claim::PV_FEE..qlab_air::claim::PV_FEE + 4].iter().any(|w| *w >= 1 << 16) {
+        return Err(ClaimFileError::Malformed("a fee limb is not 16-bit"));
+    }
+    let fee = claim_fee_of(&pvs);
+    if fee != expected_tier {
+        return Err(ClaimFileError::OtherTier { file: fee, expected: expected_tier });
+    }
+    Ok(ClaimFile { l2_id, pvs, proof, value, r_v })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1143,6 +1392,32 @@ mod tests {
         let mut v0 = EXIT_ARTIFACT_MAGIC.to_vec();
         v0.push(0);
         assert_eq!(decode_exit_artifact(&v0, &g).err(), Some(ArtifactError::Version { found: 0, expected: EXIT_ARTIFACT_VERSION }));
+    }
+
+    /// Lab #831 W3b: a claim is refused by name before anything is proved —
+    /// not a burn, below the fee, an anchor past the tree, a burn in no leaf,
+    /// a burn above the anchor — and the claim file refuses what it is not.
+    #[test]
+    fn a_claim_is_refused_by_name_before_anything_is_built() {
+        use qlab_air::claim::{l1_cm, rkm_burn, BurnNote, ClaimCredit};
+        let credit = ClaimCredit { rkm: [3; 4], rseed: [4; 4] };
+        let note = BurnNote { value: 100, rkm: rkm_burn(1), rho: [1; 4], rseed: [2; 4] };
+        let mut tree = CommitmentTree::new();
+        tree.append([9; 4]);
+        let pos = tree.append(l1_cm(note.value, &note.rkm, &note.rho, &note.rseed));
+        let claim = |n: &BurnNote, count: u64, fee: u64| claim_instance(&tree, count, n, 1, &[5; 4], &credit, fee).err();
+        assert_eq!(claim(&BurnNote { rkm: rkm_burn(2), ..note }, 2, 4), Some(ClaimError::NotABurn { l2_id: 1 }));
+        assert_eq!(claim(&note, 2, 101), Some(ClaimError::BelowFee { value: 100, fee: 101 }));
+        assert_eq!(claim(&note, 2, 100), Some(ClaimError::BelowFee { value: 100, fee: 100 }), "a zero credit is refused");
+        assert_eq!(claim(&note, 3, 4), Some(ClaimError::AnchorPastTree { anchor_count: 3, len: 2 }));
+        assert_eq!(claim(&BurnNote { value: 99, ..note }, 2, 4), Some(ClaimError::NotInTree));
+        assert_eq!(claim(&note, pos, 4), Some(ClaimError::AboveAnchor { pos, anchor_count: pos }));
+        let g = [0x4f; 32];
+        assert_eq!(decode_claim_artifact(b"qumbra:l2-claim", &g, 4).err(), Some(ClaimFileError::NotAClaimFile));
+        assert_eq!(decode_claim_artifact(CLAIM_ARTIFACT_MAGIC, &g, 4).err(), Some(ClaimFileError::Truncated));
+        let mut v2 = CLAIM_ARTIFACT_MAGIC.to_vec();
+        v2.push(2);
+        assert_eq!(decode_claim_artifact(&v2, &g, 4).err(), Some(ClaimFileError::Version { found: 2, expected: 1 }));
     }
 
     #[test]

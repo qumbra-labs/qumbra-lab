@@ -1549,6 +1549,7 @@ dependencies = [
  "qlab-disclosure",
  "qlab-l2",
  "qlab-l2spend",
+ "qlab-ledger",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",

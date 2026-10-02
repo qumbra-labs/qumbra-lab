@@ -486,3 +486,39 @@ pub(crate) fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, ex
     let (rin, wit, rout, exit_cmt) = statement(state, &base.inp, &base.members, &exits)?;
     Ok(Plan { exits, rin, wit, rout, exit_cmt, ..base })
 }
+
+/// **Lab #831 W3b: a claim built elsewhere, in claim `slot`** — the wallet's
+/// claim of its own tx-output burn (`qlab_l2spend::claim_instance`) — with
+/// everything a claim moves besides its member: its deposit-sum opening
+/// replaces the slot's (`deps`), the batch total `d_batch` is recomputed from
+/// the openings, the burn it claims replaces the slot's in `claimed`, and the
+/// old claim's credit leaves `credited` (the new credit is the wallet's, not
+/// this run's). Then the native statement, exactly as [`plan`] runs it.
+/// Test-only, as [`reseal`].
+#[cfg(test)]
+pub(crate) fn reseal_claim(
+    state: &WState,
+    mut base: Plan,
+    slot: usize,
+    inst: ClaimInstance,
+    dep: DepEntry,
+    burn: Burn,
+    keys: &Keys,
+) -> Result<Plan, PlanError> {
+    let Inst::C(old) = &base.insts[slot] else { return Err(PlanError::Wrapper(format!("slot {slot} is not a claim"))) };
+    let old_credit = old.cm2;
+    let ci = base.insts[..slot].iter().filter(|i| matches!(i, Inst::C(_))).count();
+    base.deps[ci] = dep;
+    base.claimed[ci] = burn;
+    base.credited.retain(|c| c.cm(keys) != old_credit);
+    base.inp.d_batch = base
+        .deps
+        .iter()
+        .try_fold(0u64, |a, d| a.checked_add(d.v))
+        .ok_or(PlanError::Wrapper("D_batch overflows u64".into()))?;
+    base.insts[slot] = Inst::C(inst);
+    base.members = base.insts.iter().map(Inst::member).collect();
+    let exits = std::mem::take(&mut base.exits);
+    let (rin, wit, rout, exit_cmt) = statement(state, &base.inp, &base.members, &exits)?;
+    Ok(Plan { exits, rin, wit, rout, exit_cmt, ..base })
+}

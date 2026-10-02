@@ -45,6 +45,15 @@ pub const DS_DIV_SEED: &[u8] = b"qumbra:wallet:div-seed:v1";
 /// Domain string: diversified ML-KEM keypair seed
 /// `= Keccak256(DS_MLKEM_DIV ‖ div_seed ‖ d)`.
 pub const DS_MLKEM_DIV: &[u8] = b"qumbra:wallet:mlkem-div:v1";
+/// Domain string for a deposit claim's blinds (lab #831 W3b, ruling Q-B3):
+/// `Keccak256(DS_L2_CLAIM ‖ sk_bytes ‖ burn_cm_bytes ‖ label)`, `label` one
+/// of [`CLAIM_LABEL_RV`] / [`CLAIM_LABEL_RSEED`]. A tag no other derivation
+/// uses.
+pub const DS_L2_CLAIM: &[u8] = b"qumbra:wallet:l2-claim:v1";
+/// The value-commitment blind `r_v` of a claim.
+pub const CLAIM_LABEL_RV: &[u8] = b"r_v";
+/// The credited L2 note's `rseed`.
+pub const CLAIM_LABEL_RSEED: &[u8] = b"credit-rseed";
 
 /// Derive the diversifier seed that seeds every diversified ML-KEM keypair.
 fn div_seed_from_sk(sk_lanes: &Lanes) -> [u8; 32] {
@@ -318,6 +327,25 @@ impl Wallet {
     }
 
     /// The nullifier `nf = H(nk ‖ ρ)` (the wallet can also view its own spends).
+    /// **A deposit claim's two blinds** (lab #831 W3b, ruling Q-B3): the
+    /// value-commitment blind `r_v` and the credited L2 note's `rseed`, both
+    /// from this wallet's spending secret and the burn's L1 commitment `cm`
+    /// alone. So a wallet restored from its mnemonic rebuilds the claim — and
+    /// recomputes the credited note `cm2` — from a rescan of the burn, with
+    /// nothing stored; and a claim bound to an anchor no wrapper absorbs costs
+    /// a re-prove at another anchor, never a lost deposit.
+    pub fn claim_blinds(&self, burn_cm: &Lanes) -> (Lanes, Lanes) {
+        let lanes = |label: &[u8]| {
+            let mut input = Vec::with_capacity(DS_L2_CLAIM.len() + 64 + label.len());
+            input.extend_from_slice(DS_L2_CLAIM);
+            input.extend_from_slice(&digest_bytes(&self.sk.sk_lanes()));
+            input.extend_from_slice(&digest_bytes(burn_cm));
+            input.extend_from_slice(label);
+            qlab_note::hash::digest_from_bytes(&keccak256(&input))
+        };
+        (lanes(CLAIM_LABEL_RV), lanes(CLAIM_LABEL_RSEED))
+    }
+
     pub fn nullifier(&self, rho: &Lanes) -> Lanes {
         self.sk.nullifier(rho)
     }
@@ -347,6 +375,22 @@ mod tests {
     use super::*;
 
     const SK: Lanes = [0x1234, 0x5678, 0x9abc, 0xdef0];
+
+    /// Lab #831 W3b (ruling Q-B3): a claim's blinds are a function of the
+    /// wallet's secret and the burn's commitment only — the same wallet
+    /// rebuilt from its secret derives the same two, another burn or another
+    /// secret different ones, and `r_v` is never the credit's `rseed`.
+    #[test]
+    fn claim_blinds_follow_the_secret_and_the_burn_only() {
+        let (w, again) = (Wallet::from_seed_lanes(SK), Wallet::from_seed_lanes(SK));
+        let other = Wallet::from_seed_lanes([1, 2, 3, 4]);
+        let cm = [7, 8, 9, 10];
+        let (r_v, rseed) = w.claim_blinds(&cm);
+        assert_eq!(again.claim_blinds(&cm), (r_v, rseed), "a restored wallet derives the same blinds");
+        assert_ne!(w.claim_blinds(&[7, 8, 9, 11]), (r_v, rseed), "another burn");
+        assert_ne!(other.claim_blinds(&cm), (r_v, rseed), "another secret");
+        assert_ne!(r_v, rseed, "the two labels separate");
+    }
 
     /// Lab #821: an `Ivk` round-trips through its bytes to the same scanning
     /// keys; a wrong length or version is refused by name.

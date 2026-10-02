@@ -162,6 +162,36 @@ impl ChainView {
         Ok(out)
     }
 
+    /// **Lab #831 W3b (ruling Q-B5): burns paid by L1 transactions.** f5box
+    /// cannot discover one — a deposit's opening is sealed to its depositor —
+    /// so each is supplied as an opening `(height, value, ρ, rseed)` and
+    /// accepted only if, paid to `rkm_burn(l2_id)`, its rebuilt L1 commitment
+    /// is a served leaf below the newest valid anchor. Refused by name
+    /// otherwise; ascending by leaf position, like [`Self::burns`].
+    /// Test-only until the box takes claim files as members (follow-up).
+    #[cfg(test)]
+    pub(crate) fn tx_burns(&self, l2_id: u64, openings: &[TxBurnOpening]) -> Result<Vec<Burn>, String> {
+        let rkm = qlab_air::claim::rkm_burn(l2_id);
+        let newest = self.anchors()?.first().copied().ok_or("no valid anchor is served: nothing is claimable yet")?;
+        let mut out = Vec::with_capacity(openings.len());
+        for o in openings {
+            let note = qlab_air::claim::BurnNote { value: o.value, rkm, rho: o.rho, rseed: o.rseed };
+            let cm = qlab_air::claim::l1_cm(note.value, &note.rkm, &note.rho, &note.rseed);
+            let pos = *self.by_leaf.get(&cm).ok_or_else(|| {
+                format!("the burn opened at height {} rebuilds to a commitment in no served leaf (not L2 {l2_id}'s burn, or not on this chain)", o.height)
+            })?;
+            if pos >= newest.count {
+                return Err(format!(
+                    "the burn at height {} is leaf {pos}, not under the newest anchor ({} leaves): not claimable until a later root is finalized",
+                    o.height, newest.count
+                ));
+            }
+            out.push(Burn { height: o.height, note, cm, pos });
+        }
+        out.sort_by_key(|b| b.pos);
+        Ok(out)
+    }
+
     /// The burns minted but not appended yet at the served tip, each with the
     /// height its leaf appears at — the manifest's "why not yet".
     pub(crate) fn immature_burns(&self, l2_id: u64) -> Vec<(u64, u64)> {
@@ -172,6 +202,18 @@ impl ChainView {
             .map(|b| (b.height, qlab_node::coinbase_leaf_appears_at(b.height)))
             .collect()
     }
+}
+
+/// A transaction-output burn's opening, as its depositor's wallet holds it
+/// (`qlab_ledger::deposits::SetAside`): where it was mined and the note's
+/// free fields; its `rkm` is the burn address by definition.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TxBurnOpening {
+    pub height: u64,
+    pub value: u64,
+    pub rho: Digest,
+    pub rseed: Digest,
 }
 
 /// One burn note in the L1 tree.

@@ -442,6 +442,13 @@ fn usage() {
                             sealed to THIS wallet so it can be claimed and recovered. Refused unless\n\
                             the node's /v1/l2 confirms both --l2-id and --genesis-hash; `scan` then\n\
                             shows it as a pending deposit, never as balance. `send` never burns\n  \
+         qumbra-wallet deposit claim --dir DIR --url URL [--node URL] --scan-to N --net t2\n\
+                            --l2-id N --genesis-hash HEX64 [--deposit K] [--anchor-count N]\n\
+                            (--out FILE | --plan-only)\n\
+                            prove the claim of a pending deposit (about 3.17 GiB, local only) and\n\
+                            write it for the sequencer — the file reveals the deposit amount. The\n\
+                            claim opens at the newest valid anchor unless --anchor-count picks\n\
+                            another served root; it is taken once a wrapper absorbs that root\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet ivk export --dir DIR [--i-understand-this-is-a-viewing-key]\n  \
                             the incoming viewing key as hex on stdout, for a scan-only host; writes\n\
@@ -1053,6 +1060,9 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Q-W3-1: both mandatory, no warning mode); then the ordinary send flow pays
 /// [`qumbra_wallet::deposit::burn_address`].
 fn deposit(args: &[String]) -> Result<(), Box<dyn Error>> {
+    if args.first().map(String::as_str) == Some("claim") {
+        return deposit_claim(&args[1..]);
+    }
     let dir = dir_of(args)?;
     let url = flag(args, "--url").ok_or("deposit requires --url (compact/scan endpoint)")?;
     let node_url = flag(args, "--node").unwrap_or(url);
@@ -1099,6 +1109,140 @@ fn deposit(args: &[String]) -> Result<(), Box<dyn Error>> {
     );
     drop(w);
     send_resolved(args, &dir, url, node_url, scan_to, out, no_submit, burn, Some(format!("deposit to L2 {l2_id}")), amount)
+}
+
+/// `deposit claim` (lab #831 W3b): the claim of one of this wallet's pending
+/// deposits — proved here (the claim lane, ≈ 3.17 GiB, local only) and
+/// written to `--out` for the sequencer; never submitted (W4).
+///
+/// The same two-fact gate as `deposit` (`/v1/l2` must confirm `--l2-id` and
+/// `--genesis-hash`), and the chain's claim tier from that same answer. The
+/// claim opens the burn under a caller-chosen anchor — the newest finalized
+/// one the node serves by default, `--anchor-count N` to pick another served
+/// root — and is taken by a wrapper only once one absorbs that root. Its
+/// blinds come from this wallet and the burn alone
+/// (`Wallet::claim_blinds`), so a claim bound to a root no wrapper absorbs
+/// costs a re-prove at another anchor, never a lost deposit; and a wallet
+/// restored from its mnemonic rebuilds it from a rescan.
+fn deposit_claim(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::net::{HttpAnchorSource, HttpLeafSource};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("deposit claim requires --url (compact/scan endpoint)")?;
+    let node_url = flag(args, "--node").unwrap_or(url);
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("deposit claim requires --scan-to HEIGHT")?.parse()?;
+    let l2_id: u64 = flag(args, "--l2-id").ok_or("deposit claim requires --l2-id N, which the chain must confirm")?.parse()?;
+    let genesis = flag(args, "--genesis-hash")
+        .ok_or("deposit claim requires --genesis-hash HEX64, which the node must confirm")?;
+    let genesis = qumbra_wallet::annulet::parse_genesis_hash(genesis)?;
+    if flag(args, "--net") == Some("t1") || (flag(args, "--net").is_none() && BUILT_FOR_NET.is_none_or(|n| n == "t1")) {
+        return Err("T1 bridges no L2: there is nothing to claim. Pass --net t2 against a V6 node".into());
+    }
+    let form = genesis_form_of(args)?;
+    let plan_only = has_flag(args, "--plan-only");
+    let out = flag(args, "--out").map(std::path::Path::new);
+    match out {
+        Some(path) => refuse_out_path(path)?,
+        None if !plan_only => return Err("deposit claim writes the proven claim to --out FILE (or pass --plan-only)".into()),
+        None => {}
+    }
+    let pick: Option<usize> = flag(args, "--deposit").map(str::parse).transpose()?;
+    let anchor_pick: Option<u64> = flag(args, "--anchor-count").map(str::parse).transpose()?;
+
+    // The gate, and the chain's claim tier from the same answer.
+    let answer = qumbra_wallet::deposit::fetch_l2(node_url).map_err(|e| {
+        format!("the node did not say which L2 its chain bridges ({e}); refusing to build a claim without that answer")
+    })?;
+    let route = qumbra_wallet::deposit::check_bridge(&answer, l2_id, &genesis)?;
+
+    // This wallet's pending deposits to that L2, as its own scan sets them aside.
+    let w = WalletDir::open(&dir)?;
+    let wallet = w.wallet();
+    let gathered = qumbra_wallet::scan::gather(&w, url, 0, scan_to, form);
+    let mut pending: Vec<qlab_ledger::deposits::SetAside> = gathered
+        .set_aside
+        .into_iter()
+        .filter(|s| s.kind == qlab_ledger::deposits::SetAsideKind::PendingDeposit { l2_id })
+        .collect();
+    pending.sort_by_key(|s| (s.height, s.tx_index, s.cm));
+    if pending.is_empty() {
+        return Err(format!("no pending deposit to L2 {l2_id} in heights 0..={scan_to}").into());
+    }
+    // Every burn is listed, claimed or not: whether a claim landed is L2
+    // state (its cnf in the wrapper's tree), which nothing this wallet reads
+    // serves yet — a second claim of one burn is refused there, not here.
+    println!("pending deposits to L2 {l2_id} (claimed ones included — the L1 cannot say which were claimed on L2):");
+    for (k, s) in pending.iter().enumerate() {
+        println!("  deposit [{k}]: {} bessel at height {} (tx {}, address [{}])", s.note.value, s.height, s.tx_index, s.div_index);
+    }
+    let chosen = match (pick, pending.len()) {
+        (Some(k), n) if k < n => &pending[k],
+        (Some(k), n) => return Err(format!("--deposit {k}: there are {n} pending deposit(s)").into()),
+        (None, 1) => &pending[0],
+        (None, n) => return Err(format!("{n} pending deposits: pick one with --deposit K (listed above)").into()),
+    };
+
+    // The L1 tree and the anchor: the newest the node serves, or a chosen one
+    // that is also a served root.
+    let (synced, newest) = qumbra_wallet::sync::sync_and_select(&dir, &HttpLeafSource::new(node_url), &HttpAnchorSource::new(node_url))?;
+    let anchor_count = match anchor_pick {
+        None => newest.count,
+        Some(n) => {
+            let served = HttpAnchorSource::new(node_url);
+            let set = qumbra_wallet::sync::AnchorSource::anchors(&served)?;
+            if n > synced.count || !set.roots.contains(&qlab_note::hash::digest_bytes(&synced.tree.root_at(n))) {
+                return Err(format!("--anchor-count {n}: the root at that count is not one the node serves as a valid anchor").into());
+            }
+            n
+        }
+    };
+    let anchor_root = qlab_note::hash::digest_bytes(&synced.tree.root_at(anchor_count));
+
+    let note = qlab_air::claim::BurnNote {
+        value: chosen.note.value,
+        rkm: qlab_ledger::deposits::burn_rkm(l2_id),
+        rho: chosen.note.rho,
+        rseed: chosen.note.rseed,
+    };
+    let cm = qlab_air::claim::l1_cm(note.value, &note.rkm, &note.rho, &note.rseed);
+    let (r_v, rseed) = wallet.claim_blinds(&cm);
+    let credit = qlab_air::claim::ClaimCredit { rkm: wallet.rkm(wallet.diversifier_at_index(0)), rseed };
+    let fee = route.claim_fee_tier;
+    let inst = qlab_l2spend::claim_instance(&synced.tree, anchor_count, &note, l2_id, &r_v, &credit, fee)?;
+
+    let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    println!(
+        "plan: claim {} bessel burned to L2 {l2_id}: {} credited on L2 to this wallet's address 0, claim fee {fee} \
+         (the chain's tier)",
+        note.value,
+        note.value - fee
+    );
+    println!(
+        "  anchor: root {} at {anchor_count} leaves{} — the claim is taken only once a wrapper absorbs this root; \
+         one that is never absorbed costs a re-prove at another anchor (--anchor-count), never the deposit",
+        hex(&anchor_root),
+        if anchor_pick.is_none() {
+            format!(", the newest valid anchor (node finalized height {})", newest.finalized_height.map_or("none".into(), |h| h.to_string()))
+        } else {
+            String::new()
+        }
+    );
+    println!("  prove:  the claim lane, about 3.17 GiB, on this machine only");
+    println!(
+        "  privacy: the file reveals the deposit amount to whoever holds it — it is for the sequencer only"
+    );
+    if plan_only {
+        println!("--plan-only: nothing proved or written");
+        return Ok(());
+    }
+    let proof = qlab_l2spend::prove_claim(&inst);
+    let out = out.expect("checked above");
+    write_new_atomically(out, &qlab_l2spend::encode_claim_artifact(&genesis, l2_id, &inst.pvs, &proof, note.value, &r_v))?;
+    println!(
+        "wrote {}: the proven claim (version {} of the claim file, bound to this chain's genesis and its claim tier)",
+        out.display(),
+        qlab_l2spend::CLAIM_ARTIFACT_VERSION
+    );
+    Ok(())
 }
 
 /// The send after its recipient and amount are settled — shared by `send` and
@@ -1674,15 +1818,7 @@ fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         // Before anything is read or proved: a 30 GiB proof must never be
         // lost to a path that cannot take it, nor overwrite a file.
-        Some(path) => {
-            if path.exists() {
-                return Err(format!("--out {}: the file exists; refusing to overwrite it", path.display()).into());
-            }
-            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-            if !parent.is_dir() {
-                return Err(format!("--out {}: the directory {} does not exist", path.display(), parent.display()).into());
-            }
-        }
+        Some(path) => refuse_out_path(path)?,
         None => {}
     }
     let to = flag(args, "--exit-to").expect("routed here on --exit-to");
@@ -1719,6 +1855,20 @@ fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         plan.change,
         qlab_l2spend::EXIT_ARTIFACT_VERSION
     );
+    Ok(())
+}
+
+/// `--out` checked before anything is read or proved (lab #831 W2 X1): a
+/// proof must never be lost to a path that cannot take it, nor overwrite a
+/// file.
+fn refuse_out_path(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    if path.exists() {
+        return Err(format!("--out {}: the file exists; refusing to overwrite it", path.display()).into());
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!("--out {}: the directory {} does not exist", path.display(), parent.display()).into());
+    }
     Ok(())
 }
 
