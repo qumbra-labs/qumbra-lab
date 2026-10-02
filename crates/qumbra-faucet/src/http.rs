@@ -410,10 +410,18 @@ impl Body {
     }
 }
 
-/// The plain page's Content-Security-Policy: **no script at all**, its own inline
-/// stylesheet, its own two icons, forms only to this origin, never framed. The page
-/// already carried none of those things; this makes a browser refuse them too.
-const PLAIN_PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; \
+/// The plain page's one stylesheet, inline. A constant, so the CSP can name it by hash.
+const PLAIN_STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;\
+                           padding:0 1rem;line-height:1.5}code{word-break:break-all}\
+                           .state{padding:.75rem 1rem;border-left:4px solid #888;background:#f6f6f6}\
+                           .no{border-color:#a33}.yes{border-color:#3a3}\
+                           textarea{width:100%;font-family:monospace}";
+
+/// The plain page's Content-Security-Policy: **no script at all**, exactly its own
+/// stylesheet (by hash — [`PLAIN_STYLE`]; `plain_csp_hashes_the_stylesheet` fails if
+/// the two drift), its own two icons, forms only to this origin, never framed. The
+/// page already carried none of the rest; this makes a browser refuse them too.
+const PLAIN_PAGE_CSP: &str = "default-src 'none'; style-src 'sha256-6T4lZmJTWebGTMTvH3eSo1ZRM1V5iijLxNJHb8DV2kE='; img-src 'self'; \
                               form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 /// Whether the client asked for JSON — how the React page's `POST /request` is told
@@ -1121,11 +1129,7 @@ fn page(title: &str, body: &str) -> String {
          <title>Qumbra testnet faucet — {}</title>\
          <link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/favicon-32.png\">\
          <link rel=\"icon\" type=\"image/png\" sizes=\"16x16\" href=\"/favicon-16.png\">\
-         <style>body{{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;\
-         padding:0 1rem;line-height:1.5}}code{{word-break:break-all}}\
-         .state{{padding:.75rem 1rem;border-left:4px solid #888;background:#f6f6f6}}\
-         .no{{border-color:#a33}}.yes{{border-color:#3a3}}\
-         textarea{{width:100%;font-family:monospace}}</style></head><body>\n\
+         <style>{PLAIN_STYLE}</style></head><body>\n\
          <h1>Qumbra testnet faucet</h1>\n{}\n</body></html>\n",
         esc(title),
         body
@@ -1612,6 +1616,40 @@ mod tests {
         assert!(v6.starts_with("2001:db8:"), "{v6}");
         assert!(!v6.contains(":1/"), "the low 64 bits must be masked away: {v6}");
         assert_eq!(subnet_label("some-proxy-hostname"), "opaque");
+    }
+
+    /// 🔴 The CSP's style hash is the hash of the stylesheet the page actually
+    /// inlines. If `PLAIN_STYLE` changes and the hash does not, a browser refuses the
+    /// page's only stylesheet — silently, in production only.
+    #[test]
+    fn plain_csp_hashes_the_stylesheet() {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(PLAIN_STYLE.as_bytes());
+        let want = format!("style-src 'sha256-{}'", base64_std(digest.as_slice()));
+        assert!(PLAIN_PAGE_CSP.contains(&want), "{PLAIN_PAGE_CSP} lacks {want}");
+        let html = render_index(&lock(&a_status(crate::state::Availability::Ready { grants: 1 })), None);
+        assert!(html.contains(&format!("<style>{PLAIN_STYLE}</style>")), "the page inlines exactly PLAIN_STYLE");
+        assert_eq!(html.matches("<style").count(), 1, "one stylesheet, the hashed one");
+        assert!(!PLAIN_PAGE_CSP.contains("unsafe-inline") && !PLAIN_PAGE_CSP.contains("script-src"));
+    }
+
+    /// Standard base64 with padding — the encoding CSP hash sources use.
+    fn base64_std(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 
     /// The rendered page carries no script, no external reference, and — the point —
