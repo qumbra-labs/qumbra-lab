@@ -947,7 +947,11 @@ pub const EXIT_ARTIFACT_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactError {
     NotAnExitFile,
+    /// The magic, and then the file ends before its header does.
+    Truncated,
     Version { found: u8, expected: u8 },
+    /// Built against another chain: its genesis is not the one expected.
+    OtherChain { file: [u8; 32], expected: [u8; 32] },
     Tx(String),
     /// The transaction decodes but is not one exit: not shape P, no asset-0
     /// redeem, a zero recipient, or more than one exiting row.
@@ -958,6 +962,13 @@ impl std::fmt::Display for ArtifactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ArtifactError::NotAnExitFile => write!(f, "not an L2 exit file (the magic does not match)"),
+            ArtifactError::Truncated => write!(f, "the exit file ends inside its header (version byte and genesis hash)"),
+            ArtifactError::OtherChain { file, expected } => write!(
+                f,
+                "the exit file was built on the chain with genesis {}, not this one ({}) — refusing it",
+                file.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                expected.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
             ArtifactError::Version { found, expected } => write!(
                 f,
                 "exit file version {found}; this build reads only version {expected} — rebuild the exit with \
@@ -971,21 +982,34 @@ impl std::fmt::Display for ArtifactError {
 
 impl std::error::Error for ArtifactError {}
 
-/// The `--out` file: magic ‖ version ‖ the Annulet transaction wire.
-pub fn encode_exit_artifact(tx: &TxEntry) -> Vec<u8> {
+/// The `--out` file: magic ‖ version ‖ the genesis hash of the chain it was
+/// built on (32) ‖ the Annulet transaction wire. The genesis binds the file to
+/// one chain: a reader names the genesis it expects and refuses any other.
+pub fn encode_exit_artifact(genesis_hash: &[u8; 32], tx: &TxEntry) -> Vec<u8> {
     let mut out = EXIT_ARTIFACT_MAGIC.to_vec();
     out.push(EXIT_ARTIFACT_VERSION);
+    out.extend_from_slice(genesis_hash);
     out.extend_from_slice(&qlab_p2p::codec::encode_tx_annulet(tx));
     out
 }
 
 /// Read an exit file back — the magic, the version (refused by name on a
-/// mismatch), the transaction, and that it is one exit.
-pub fn decode_exit_artifact(bytes: &[u8]) -> Result<(TxEntry, L2Surface), ArtifactError> {
+/// mismatch), the chain (`expected_genesis`, refused by name when it is not
+/// the file's), the transaction, and that it is exactly the one exit
+/// [`exit_entry`] writes.
+pub fn decode_exit_artifact(bytes: &[u8], expected_genesis: &[u8; 32]) -> Result<(TxEntry, L2Surface), ArtifactError> {
     let rest = bytes.strip_prefix(EXIT_ARTIFACT_MAGIC.as_slice()).ok_or(ArtifactError::NotAnExitFile)?;
-    let (&version, wire) = rest.split_first().ok_or(ArtifactError::NotAnExitFile)?;
+    let (&version, rest) = rest.split_first().ok_or(ArtifactError::Truncated)?;
     if version != EXIT_ARTIFACT_VERSION {
         return Err(ArtifactError::Version { found: version, expected: EXIT_ARTIFACT_VERSION });
+    }
+    if rest.len() < 32 {
+        return Err(ArtifactError::Truncated);
+    }
+    let (genesis, wire) = rest.split_at(32);
+    let genesis: [u8; 32] = genesis.try_into().expect("32 bytes");
+    if &genesis != expected_genesis {
+        return Err(ArtifactError::OtherChain { file: genesis, expected: *expected_genesis });
     }
     let tx = qlab_p2p::codec::decode_tx_annulet(wire).map_err(|e| ArtifactError::Tx(format!("{e:?}")))?;
     let surface = match L2Surface::decode(&tx.l2) {
@@ -995,9 +1019,17 @@ pub fn decode_exit_artifact(bytes: &[u8]) -> Result<(TxEntry, L2Surface), Artifa
     let Some(terms) = surface.vpublic.filter(|_| surface.shape == L2ShapeTag::P) else {
         return Err(ArtifactError::NotAnExit("not shape P"));
     };
-    let exiting = terms.iter().filter(|t| t.redeem && t.asset == 0 && t.amount > 0).count();
-    if exiting != 1 {
-        return Err(ArtifactError::NotAnExit("not exactly one asset-0 redeem row"));
+    // Exactly what `exit_entry` writes: row 0 the asset-0 redeem, row 1 no
+    // term, no registry write — `[redeem, redeem]` or `[redeem, mint]` is not
+    // "an exit".
+    if !(terms[0].redeem && terms[0].asset == 0 && terms[0].amount > 0) {
+        return Err(ArtifactError::NotAnExit("row 0 is not an asset-0 redeem"));
+    }
+    if terms[1] != VPublicTerm::NONE {
+        return Err(ArtifactError::NotAnExit("row 1 carries a vPublic term"));
+    }
+    if surface.write.is_some() {
+        return Err(ArtifactError::NotAnExit("it carries a registry write"));
     }
     if surface.exit_rkm == [0; 32] {
         return Err(ArtifactError::NotAnExit("a zero recipient"));
@@ -1100,11 +1132,17 @@ mod tests {
         assert_eq!(ex(note(100, 0), ExitAsk { value: 0, ..to }), Some(ExitError::ZeroValue));
         assert_eq!(ex(note(100, 0), ExitAsk { to_rkm: [0; 4], ..to }), Some(ExitError::ZeroRecipient));
         assert_eq!(ex(note(59, 0), to), Some(ExitError::AboveNote { note: 59, fee: 10, exit: 50 }));
-        assert_eq!(decode_exit_artifact(b"qumbra:l2-exit").err(), Some(ArtifactError::NotAnExitFile));
-        assert_eq!(decode_exit_artifact(b"not an exit file at all").err(), Some(ArtifactError::NotAnExitFile));
+        let g = [0x6f; 32];
+        assert_eq!(decode_exit_artifact(b"qumbra:l2-exit", &g).err(), Some(ArtifactError::NotAnExitFile));
+        assert_eq!(decode_exit_artifact(b"not an exit file at all", &g).err(), Some(ArtifactError::NotAnExitFile));
+        assert_eq!(decode_exit_artifact(EXIT_ARTIFACT_MAGIC, &g).err(), Some(ArtifactError::Truncated), "magic only");
+        let mut v1 = EXIT_ARTIFACT_MAGIC.to_vec();
+        v1.push(EXIT_ARTIFACT_VERSION);
+        v1.extend_from_slice(&[0x6f; 31]);
+        assert_eq!(decode_exit_artifact(&v1, &g).err(), Some(ArtifactError::Truncated), "a short genesis");
         let mut v0 = EXIT_ARTIFACT_MAGIC.to_vec();
         v0.push(0);
-        assert_eq!(decode_exit_artifact(&v0).err(), Some(ArtifactError::Version { found: 0, expected: EXIT_ARTIFACT_VERSION }));
+        assert_eq!(decode_exit_artifact(&v0, &g).err(), Some(ArtifactError::Version { found: 0, expected: EXIT_ARTIFACT_VERSION }));
     }
 
     #[test]

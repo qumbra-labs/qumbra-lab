@@ -1556,18 +1556,39 @@ fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     if flag(args, "--asset").is_some_and(|a| a != "0") {
         return Err("only asset 0 exits to L1 (the exit is an asset-0 redeem); drop --asset or pass 0".into());
     }
-    for refused in ["--to", "--freeze-list"] {
+    // Every flag a send reads and an exit does not, refused by name rather
+    // than ignored: `--to`/`--to-contact` (the recipient is --exit-to),
+    // `--freeze-list` (asset 0 has none), `--node` (one endpoint), and
+    // `--no-submit` (an exit is never submitted).
+    for refused in ["--to", "--to-contact", "--freeze-list", "--node"] {
         if flag(args, refused).is_some() {
-            return Err(format!("{refused} does not apply to an exit: the L1 recipient is --exit-to, and asset 0 has no freeze list").into());
+            return Err(format!("{refused} does not apply to an exit (the L1 recipient is --exit-to; one --url endpoint; asset 0 has no freeze list)").into());
         }
     }
+    if args.iter().any(|a| a == "--no-submit") {
+        return Err("--no-submit does not apply to an exit: an exit is never submitted, only written with --out".into());
+    }
     let plan_only = args.iter().any(|a| a == "--plan-only");
-    let out = flag(args, "--out");
-    if out.is_none() && !plan_only {
-        return Err("an exit is never submitted from here: an Annulet net refuses one by name (it has no bridge), and a \
-                    V6 bundle is assembled by a sequencer (lab #831 W4). Pass --out FILE to write the proven \
-                    transaction, or --plan-only"
-            .into());
+    let out = flag(args, "--out").map(std::path::Path::new);
+    match out {
+        None if !plan_only => {
+            return Err("an exit is never submitted from here: an Annulet net refuses one by name (it has no bridge), and a \
+                        V6 bundle is assembled by a sequencer (lab #831 W4). Pass --out FILE to write the proven \
+                        transaction, or --plan-only"
+                .into())
+        }
+        // Before anything is read or proved: a 30 GiB proof must never be
+        // lost to a path that cannot take it, nor overwrite a file.
+        Some(path) => {
+            if path.exists() {
+                return Err(format!("--out {}: the file exists; refusing to overwrite it", path.display()).into());
+            }
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+            if !parent.is_dir() {
+                return Err(format!("--out {}: the directory {} does not exist", path.display(), parent.display()).into());
+            }
+        }
+        None => {}
     }
     let to = flag(args, "--exit-to").expect("routed here on --exit-to");
     let to = qlab_wallet::address::Address::decode(to).ok_or("--exit-to is not a wallet address (the L1 recipient)")?;
@@ -1585,7 +1606,7 @@ fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         print!("{plan}");
         !plan_only
     };
-    let (plan, built) = match qumbra_wallet::annulet_send::exit_annulet(&w, endpoint, amount, &to, scan_to, pin, &mut on_plan, &mut rng) {
+    let (plan, built, genesis) = match qumbra_wallet::annulet_send::exit_annulet(&w, endpoint, amount, &to, scan_to, pin, &mut on_plan, &mut rng) {
         Err(qumbra_wallet::annulet_send::SendRefusal::PlanDeclined) if plan_only => {
             println!("--plan-only: nothing proved or written");
             return Ok(());
@@ -1593,15 +1614,37 @@ fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         other => other?,
     };
     let out = out.expect("checked above");
-    std::fs::write(out, qlab_l2spend::encode_exit_artifact(&built.tx))?;
+    write_new_atomically(out, &qlab_l2spend::encode_exit_artifact(&genesis, &built.tx))?;
     println!(
-        "wrote {out}: the proven exit of {} (fee {}, change {} back) — version {} of the exit file; it is paid on L1 \
-         only once a V6 bundle carries it",
+        "wrote {}: the proven exit of {} (fee {}, change {} back) — version {} of the exit file, bound to this chain's \
+         genesis; it is paid on L1 only once a V6 bundle carries it",
+        out.display(),
         plan.value,
         plan.fee,
         plan.change,
         qlab_l2spend::EXIT_ARTIFACT_VERSION
     );
+    Ok(())
+}
+
+/// Write `bytes` to `path`, which must not exist: into a sibling temporary
+/// created with `create_new`, synced, then hard-linked to `path` (which fails
+/// rather than replace a file that appeared meanwhile) and the temporary
+/// removed. A failure after the write names the temporary that still holds
+/// the bytes, so nothing proved is lost to a path error.
+fn write_new_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    if let Err(e) = std::fs::hard_link(&tmp, path) {
+        return Err(format!("{} could not be created ({e}); the proven exit is kept in {}", path.display(), tmp.display()).into());
+    }
+    std::fs::remove_file(&tmp)?;
     Ok(())
 }
 

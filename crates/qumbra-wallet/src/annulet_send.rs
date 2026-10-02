@@ -797,8 +797,9 @@ pub fn plan_exit(index: &AssetIndex, value: u64, to_rkm: [u64; 4], tiers: Tiers)
 
 /// **The exit**: verify the form (and pin), read the tariff, scan, plan,
 /// hand the plan to `on_plan` **before anything is proved**, then build and
-/// prove the P transaction. Returns the plan and the proven transaction,
-/// which the caller writes out ([`qlab_l2spend::encode_exit_artifact`]); it
+/// prove the P transaction. Returns the plan, the proven transaction and the
+/// served genesis hash it was built against, which the caller writes out
+/// ([`qlab_l2spend::encode_exit_artifact`]); it
 /// is never submitted here — an Annulet net refuses an exit by name, and a
 /// V6 bundle is a sequencer's to assemble (lab #831 W4).
 #[allow(clippy::too_many_arguments)]
@@ -811,7 +812,7 @@ pub fn exit_annulet<E: Endpoint>(
     pin: Option<[u8; 32]>,
     on_plan: &mut dyn FnMut(&ExitPlan) -> bool,
     rng: &mut StdRng,
-) -> Result<(ExitPlan, qlab_l2spend::Built), SendRefusal> {
+) -> Result<(ExitPlan, qlab_l2spend::Built, [u8; 32]), SendRefusal> {
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
     let plan = plan_exit(&session.index, value, to.rkm_lanes(), session.tiers)?;
     if !on_plan(&plan) {
@@ -820,7 +821,7 @@ pub fn exit_annulet<E: Endpoint>(
     let input = plan.note.spend_input(&w.wallet());
     let ask = qlab_l2spend::ExitAsk { value, to_rkm: plan.to_rkm };
     let built = qlab_l2spend::build_p_exit(&session.served, &input, ask, &me(w), plan.fee, rng).map_err(SendRefusal::Exit)?;
-    Ok((plan, built))
+    Ok((plan, built, session.genesis_hash))
 }
 
 /// The wallet's own transport as an [`Endpoint`]: `http://host:PORT` or

@@ -459,10 +459,28 @@ fn statement(state: &WState, inp: &WInputs, members: &[Member], exits: &[Exit]) 
 /// **Lab #831 W2: a member built elsewhere, in `slot`** — the wallet's exit
 /// P, assembled by `qlab_l2spend::exit_instance` — and the native statement
 /// re-run over the result exactly as [`plan`] runs it. `exits` is the new
-/// wrapper's exit list in slot order. The bookkeeping of what this run owns
-/// (`spent`, `credited`) stays `base`'s: the swapped member's change is its
-/// builder's, not this run's.
-pub(crate) fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, exits: Vec<Exit>) -> Result<Plan, PlanError> {
+/// wrapper's exit list in slot order. The swapped slot's change credit (the
+/// one whose commitment is the old member's first output) is replaced by
+/// `credit`, the new member's change as this run's keys own it — or dropped
+/// when `None` — so a later plan spending from the result finds every credit
+/// it names. `spent` stays `base`'s: the lane swaps in a member that spends
+/// the same note. Test-only: f5box itself never takes a foreign member.
+#[cfg(test)]
+pub(crate) fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, exits: Vec<Exit>, keys: &Keys, credit: Option<Owned>) -> Result<Plan, PlanError> {
+    let old_change = match &base.insts[slot] {
+        Inst::S(i) => Some(i.cm_out[0]),
+        Inst::P(i) => Some(i.cm_out[0]),
+        _ => None,
+    };
+    let at = old_change.and_then(|cm| base.credited.iter().position(|c| c.cm(keys) == cm));
+    match (at, credit) {
+        (Some(k), Some(c)) => base.credited[k] = c,
+        (Some(k), None) => {
+            base.credited.remove(k);
+        }
+        (None, Some(c)) => base.credited.push(c),
+        (None, None) => {}
+    }
     base.insts[slot] = inst;
     base.members = base.insts.iter().map(Inst::member).collect();
     let (rin, wit, rout, exit_cmt) = statement(state, &base.inp, &base.members, &exits)?;

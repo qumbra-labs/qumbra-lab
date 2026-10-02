@@ -680,13 +680,34 @@ fn w2_the_wallets_exit_is_a_member_the_node_rule_takes() {
     let ek_holder = qlab_wallet::Wallet::from_master_seed(&qlab_wallet::seed::MasterSeed::from_entropy([0x31; qlab_wallet::seed::ENTROPY_LEN]), 0);
     let change_to = Recipient { rkm: r.keys.rkm(), ek: ek_holder.address_at_index(0).encapsulation_key().expect("an ek") };
     let built = exit_entry(&ei, &stub, TX_FEE, &change_to, &mut rng);
-    let file = encode_exit_artifact(&built.tx);
-    let (tx, surface) = decode_exit_artifact(&file).expect("the file reads back");
+    // The chain the file is bound to: any 32 bytes stand in for the served
+    // genesis here; what matters is that another one is refused by name.
+    let (genesis, other) = ([0x6b; 32], [0x6c; 32]);
+    let file = encode_exit_artifact(&genesis, &built.tx);
+    let (tx, surface) = decode_exit_artifact(&file, &genesis).expect("the file reads back");
     assert_eq!(exit_member_pvs(&tx, &surface), ei.inst.pvs, "the file declares exactly the instance's PVs");
+    assert_eq!(decode_exit_artifact(&file, &other).err(), Some(ArtifactError::OtherChain { file: genesis, expected: other }));
     let mut wrong = file.clone();
     wrong[qlab_l2spend::EXIT_ARTIFACT_MAGIC.len()] = 2;
-    assert_eq!(decode_exit_artifact(&wrong).err(), Some(ArtifactError::Version { found: 2, expected: 1 }));
-    assert_eq!(decode_exit_artifact(&file[1..]).err(), Some(ArtifactError::NotAnExitFile));
+    assert_eq!(decode_exit_artifact(&wrong, &genesis).err(), Some(ArtifactError::Version { found: 2, expected: 1 }));
+    assert_eq!(decode_exit_artifact(&file[1..], &genesis).err(), Some(ArtifactError::NotAnExitFile));
+    // Only exactly what `exit_entry` writes is an exit: a second redeem row,
+    // or a mint beside the redeem, is refused by name.
+    for row1 in [
+        qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 1, asset: 0 },
+        qlab_devnet::annulet::VPublicTerm { redeem: false, amount: 1, asset: 0 },
+    ] {
+        let mut s = surface;
+        s.vpublic = Some([surface.vpublic.unwrap()[0], row1]);
+        let forged = encode_exit_artifact(&genesis, &qlab_devnet::annulet::with_surface(tx.clone(), &s));
+        assert_eq!(decode_exit_artifact(&forged, &genesis).err(), Some(ArtifactError::NotAnExit("row 1 carries a vPublic term")));
+    }
+    // The wallet's change, as this run's keys own it (the lane pays it to them).
+    let change = super::members::Owned {
+        value: ei.outputs[0].value,
+        rho: qlab_air::narrow::derive_output_rho(&ei.inst.nf[0], 0),
+        rseed: ei.outputs[0].rseed,
+    };
 
     // Into the mix's slot 0, where f5box's own exit P stood.
     let kinds = default_kinds(16);
@@ -694,8 +715,11 @@ fn w2_the_wallets_exit_is_a_member_the_node_rule_takes() {
     let a = Ask { kinds: &kinds, burns: &burns, owned: &r.deposit.credited, exit: Some(EXIT) };
     let base = plan(&r.state1, &r.prev1, &chain_of(&r.mix_view), &r.keys, &a).expect("the mix plans");
     let wallet_exit = Exit { rkm: ask.to_rkm, v: ask.value };
-    let p = super::members::reseal(&r.state1, base, 0, Inst::P(ei.inst), vec![wallet_exit]).expect("the native statement takes it");
+    let p = super::members::reseal(&r.state1, base, 0, Inst::P(ei.inst), vec![wallet_exit], &r.keys, Some(change))
+        .expect("the native statement takes it");
     assert_eq!(p.members[0].pvs, exit_member_pvs(&tx, &surface), "member 0 is the file's");
+    let Inst::P(swapped) = &p.insts[0] else { panic!("slot 0 is the wallet's P") };
+    assert_eq!(p.credited[0].cm(&r.keys), swapped.cm_out[0], "slot 0's credit is the wallet's change, not the base's");
     assert_eq!(p.exit_cmt, exit_chain(&[wallet_exit]));
 
     let rule = WrapperRule::from_params(NET_ID, &params()).expect("the rule");
