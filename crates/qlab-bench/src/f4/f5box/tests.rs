@@ -630,3 +630,105 @@ fn f5box_atomic_writes_and_the_state_lock() {
     assert!(StateLock::take(&state).is_ok());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Lab #831 W2: the wallet's exit as a wrapper member
+// ---------------------------------------------------------------------------
+
+/// **W2's lane condition** (issue #831 ruling Q1): the exit the CLI writes
+/// with `send --net annulet --exit-to … --out FILE` is a member the node's
+/// rule takes. The exit P is assembled by the wallet's own code
+/// (`qlab_l2spend::exit_instance`, what `build_p_exit` proves) against the
+/// mix's state — the note the mix's slot 0 spends, the same recipient — and:
+///
+/// - its instance satisfies shape P's AIR on every row (provable, short of
+///   proving);
+/// - its `--out` file (stub proof) decodes, and the PVs the file declares —
+///   the node's own surface-to-PV mapping — are exactly the instance's;
+/// - swapped into the mix's slot 0, the wrapper's native statement accepts
+///   it, and the assembled, signed bundle passes the node's rule up to the
+///   member proofs (refused at member 0's stub, as every f5box bundle is),
+///   while the proof-free fold pays exactly this exit;
+/// - a file of another version, or not an exit file, is refused by name.
+#[test]
+fn w2_the_wallets_exit_is_a_member_the_node_rule_takes() {
+    use qlab_l2spend::{decode_exit_artifact, encode_exit_artifact, exit_entry, exit_instance, exit_member_pvs, ArtifactError, ExitAsk, Recipient};
+    use rand::SeedableRng;
+
+    let r = run();
+    let reg = &r.state1.l2.r;
+    let reg0 = qlab_cbserver::registry::RegistryOpening {
+        height: 0,
+        root: reg.root(),
+        leaf: *reg.leaf(0).expect("asset 0's leaf (F-A)"),
+        witness: reg.witness(0).expect("asset 0's leaf"),
+    };
+    let note = r.deposit.credited[0];
+    let ask = ExitAsk { value: EXIT.v, to_rkm: EXIT.rkm };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(831);
+    let ei = exit_instance(&r.state1.l2.c, &reg0, &r.keys.input(&note), ask, r.keys.rkm(), TX_FEE, &mut rng)
+        .expect("the wallet assembles the exit");
+    assert_eq!(ei.inst.anchor, r.state1.l2.c.root(), "anchored at the wrapper's C_in");
+    assert_eq!(ei.outputs[0].value, note.value - TX_FEE - EXIT.v, "the change");
+
+    let pvs = qlab_l2::public_values(&ei.inst.pvs);
+    let verdict = qlab_air::l2test::satisfied(&ei.inst.air, &ei.inst.air.generate_trace::<qlab_consensus::Val>(0), &pvs);
+    assert!(verdict.is_ok(), "the wallet's exit P satisfies its AIR: {verdict:?}");
+
+    // The `--out` file, with a stub proof in place of the 30 GiB one.
+    let (_, stub) = crate::f4::dep::prove_dep(&r.mix.deps).expect("the deposit-sum proof");
+    let ek_holder = qlab_wallet::Wallet::from_master_seed(&qlab_wallet::seed::MasterSeed::from_entropy([0x31; qlab_wallet::seed::ENTROPY_LEN]), 0);
+    let change_to = Recipient { rkm: r.keys.rkm(), ek: ek_holder.address_at_index(0).encapsulation_key().expect("an ek") };
+    let built = exit_entry(&ei, &stub, TX_FEE, &change_to, &mut rng);
+    // The chain the file is bound to: any 32 bytes stand in for the served
+    // genesis here; what matters is that another one is refused by name.
+    let (genesis, other) = ([0x6b; 32], [0x6c; 32]);
+    let file = encode_exit_artifact(&genesis, &built.tx);
+    let (tx, surface) = decode_exit_artifact(&file, &genesis).expect("the file reads back");
+    assert_eq!(exit_member_pvs(&tx, &surface), ei.inst.pvs, "the file declares exactly the instance's PVs");
+    assert_eq!(decode_exit_artifact(&file, &other).err(), Some(ArtifactError::OtherChain { file: genesis, expected: other }));
+    let mut wrong = file.clone();
+    wrong[qlab_l2spend::EXIT_ARTIFACT_MAGIC.len()] = 2;
+    assert_eq!(decode_exit_artifact(&wrong, &genesis).err(), Some(ArtifactError::Version { found: 2, expected: 1 }));
+    assert_eq!(decode_exit_artifact(&file[1..], &genesis).err(), Some(ArtifactError::NotAnExitFile));
+    // Only exactly what `exit_entry` writes is an exit: a second redeem row,
+    // or a mint beside the redeem, is refused by name.
+    for row1 in [
+        qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 1, asset: 0 },
+        qlab_devnet::annulet::VPublicTerm { redeem: false, amount: 1, asset: 0 },
+    ] {
+        let mut s = surface;
+        s.vpublic = Some([surface.vpublic.unwrap()[0], row1]);
+        let forged = encode_exit_artifact(&genesis, &qlab_devnet::annulet::with_surface(tx.clone(), &s));
+        assert_eq!(decode_exit_artifact(&forged, &genesis).err(), Some(ArtifactError::NotAnExit("row 1 carries a vPublic term")));
+    }
+    // The wallet's change, as this run's keys own it (the lane pays it to them).
+    let change = super::members::Owned {
+        value: ei.outputs[0].value,
+        rho: qlab_air::narrow::derive_output_rho(&ei.inst.nf[0], 0),
+        rseed: ei.outputs[0].rseed,
+    };
+
+    // Into the mix's slot 0, where f5box's own exit P stood.
+    let kinds = default_kinds(16);
+    let burns = r.mix_view.burns(form(), params().l2_id).expect("the burns");
+    let a = Ask { kinds: &kinds, burns: &burns, owned: &r.deposit.credited, exit: Some(EXIT) };
+    let base = plan(&r.state1, &r.prev1, &chain_of(&r.mix_view), &r.keys, &a).expect("the mix plans");
+    let wallet_exit = Exit { rkm: ask.to_rkm, v: ask.value };
+    let p = super::members::reseal(&r.state1, base, 0, Inst::P(ei.inst), vec![wallet_exit], &r.keys, Some(change))
+        .expect("the native statement takes it");
+    assert_eq!(p.members[0].pvs, exit_member_pvs(&tx, &surface), "member 0 is the file's");
+    let Inst::P(swapped) = &p.insts[0] else { panic!("slot 0 is the wallet's P") };
+    assert_eq!(p.credited[0].cm(&r.keys), swapped.cm_out[0], "slot 0's credit is the wallet's change, not the base's");
+    assert_eq!(p.exit_cmt, exit_chain(&[wallet_exit]));
+
+    let rule = WrapperRule::from_params(NET_ID, &params()).expect("the rule");
+    let (_, bytes) = stub_bundle(&p, &NET_ID);
+    match self_check(&rule, &bytes, &r.prev1, &r.mix_view) {
+        Err(BundleRefusal::Wrapper(v)) => assert!(v.starts_with("Member(0,"), "refused at {v}"),
+        other => panic!("expected the member-0 refusal, got {other:?}"),
+    }
+    let out = rule.fold_bundle(&encode_surface(&r.prev1), &bytes).expect("the fold accepts");
+    assert_eq!(out.exits, vec![(digest_to_bytes(&EXIT.rkm), EXIT.v)], "the bundle pays exactly the wallet's exit");
+    assert_eq!(out.e_batch, EXIT.v);
+}

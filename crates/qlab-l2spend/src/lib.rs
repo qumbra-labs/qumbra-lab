@@ -772,6 +772,300 @@ fn prove_p_slot<R: rand::CryptoRng>(
     Ok(Built { tx: entry(&proof, &anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P })
 }
 
+// ---------------------------------------------------------------------------
+// Lab #831 W2: the exit — shape P's asset-0 redeem edge (lab #785 F5-4d)
+// ---------------------------------------------------------------------------
+
+/// What an exit asks: `value` of asset 0 redeemed on L2 and paid on L1, by
+/// the bundle that carries it, as a bridge-coinbase note to `to_rkm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitAsk {
+    pub value: u64,
+    /// The L1 recipient's `rkm` — any address's, the spender's or another's.
+    pub to_rkm: [u64; 4],
+}
+
+/// Why an exit cannot be assembled — by name, before anything is proved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitError {
+    /// Only asset 0 exits: the edge is an asset-0 redeem.
+    NotAssetZero { asset: u64 },
+    /// An exit of nothing is not an exit (the edge needs `amount ≠ 0`).
+    ZeroValue,
+    /// The circuit's recipient must be nonzero on an exit.
+    ZeroRecipient,
+    /// The note cannot pay the fee and the exit from one row.
+    AboveNote { note: u64, fee: u64, exit: u64 },
+    /// The served registry has no asset-0 leaf to open.
+    Spend(SpendError),
+}
+
+impl std::fmt::Display for ExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExitError::NotAssetZero { asset } => {
+                write!(f, "only asset 0 exits to L1 (the exit is an asset-0 redeem); this note is asset {asset}")
+            }
+            ExitError::ZeroValue => write!(f, "an exit of 0 is not an exit"),
+            ExitError::ZeroRecipient => write!(f, "the exit recipient's rkm is zero, which the circuit refuses"),
+            ExitError::AboveNote { note, fee, exit } => write!(
+                f,
+                "the asset-0 note holds {note}, less than the exit {exit} plus the fee {fee} it pays from the \
+                 same row"
+            ),
+            ExitError::Spend(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ExitError {}
+
+impl From<SpendError> for ExitError {
+    fn from(e: SpendError) -> Self {
+        ExitError::Spend(e)
+    }
+}
+
+/// An exit's circuit instance and its two outputs, before any proof.
+pub struct ExitInstance {
+    pub inst: qlab_air::l2p::L2PBucketInstance,
+    pub outputs: [L2TxOutput; 2],
+    pub ask: ExitAsk,
+}
+
+/// **The exit's instance** — pure, no endpoint, no prove: the one assembly
+/// the wallet proves ([`build_p_exit`]) and the lane hands to a wrapper as a
+/// member (`qlab-bench`'s f5box tests). Shape P, one real asset-0 input on
+/// row 0 redeemed by `ask.value` to `ask.to_rkm`; row 1 the #219 dummy
+/// (`dv`); slot 3 a dummy fee input (`d3 = 1`), so the fee comes from row 0
+/// and `change = note − fee − exit` returns to `change_rkm` beside a 0 note.
+/// The asset-0 leaf is opened from `reg0`, which must be at `tree`'s state.
+pub fn exit_instance<R: Rng>(
+    tree: &CommitmentTree,
+    reg0: &RegistryOpening,
+    input: &L2TxInput,
+    ask: ExitAsk,
+    change_rkm: [u64; 4],
+    fee: u64,
+    rng: &mut R,
+) -> Result<ExitInstance, ExitError> {
+    if input.asset != 0 {
+        return Err(ExitError::NotAssetZero { asset: input.asset });
+    }
+    if ask.value == 0 {
+        return Err(ExitError::ZeroValue);
+    }
+    if ask.to_rkm == [0; 4] {
+        return Err(ExitError::ZeroRecipient);
+    }
+    let change = input
+        .value
+        .checked_sub(fee)
+        .and_then(|v| v.checked_sub(ask.value))
+        .ok_or(ExitError::AboveNote { note: input.value, fee, exit: ask.value })?;
+    if reg0.leaf.asset != 0 {
+        return Err(SpendError::Served(format!("the asset-0 opening is of asset {}", reg0.leaf.asset)).into());
+    }
+    // #219's second slot: value 0, asset 0, fresh keys so its nullifier
+    // never repeats, off the tree (`dv` relaxes its anchor).
+    let dummy = L2TxInput { sk: random_d4(rng), value: 0, asset: 0, rho: random_d4(rng), rseed: random_d4(rng), d: [0, 0] };
+    let rkm = |i: &L2TxInput| qlab_air::l2p::derive_rkm_l2(i);
+    let policy = [policy_for_transfer(reg0, &rkm(input))?, policy_for_transfer(reg0, &rkm(&dummy))?];
+    let outputs: [L2TxOutput; 2] = core::array::from_fn(|j| L2TxOutput {
+        value: if j == 0 { change } else { 0 },
+        asset: 0,
+        rkm: change_rkm,
+        rho: [0; 4],
+        rseed: random_d4(rng),
+    });
+    let mut inst = qlab_air::l2p::build_bucket_l2p_exit_with_witnesses(
+        qlab_l2::LOG_HEIGHT_P,
+        &[input.clone(), dummy],
+        &outputs,
+        fee,
+        &[witness_of(tree, input)?, qlab_air::narrow::off_tree_witness()],
+        tree.root(),
+        &policy,
+        reg0.root,
+        [VPublic::redeem(ask.value), VPublic::NONE],
+        &dummy_fee_slot(rng),
+        ask.to_rkm,
+    );
+    inst.air.dv = true;
+    Ok(ExitInstance { inst, outputs, ask })
+}
+
+/// The exit's transaction entry from its instance and its proof: the outputs
+/// (both to `change_to`) with their discovery, the P surface carrying the
+/// redeem term and the recipient (`exit_rkm` = the proof's `PV_XRKM`).
+pub fn exit_entry<R: rand::CryptoRng>(
+    ei: &ExitInstance,
+    proof: &qlab_l2::Proof<qlab_l2::Config>,
+    fee: u64,
+    change_to: &Recipient,
+    rng: &mut R,
+) -> Built {
+    let inst = &ei.inst;
+    let notes = output_notes(&ei.outputs, &inst.nf[0], &inst.cm_out);
+    let outs = [Out { to: change_to.clone(), value: notes[0].value, asset: 0 }, Out { to: change_to.clone(), value: 0, asset: 0 }];
+    let discovery = discovery_for(&notes, &outs, rng);
+    let surface = L2Surface {
+        shape: L2ShapeTag::P,
+        registry_root: digest_bytes(&inst.registry_root),
+        vpublic: Some([VPublicTerm { redeem: true, amount: ei.ask.value, asset: 0 }, VPublicTerm::NONE]),
+        write: None,
+        exit_rkm: digest_bytes(&ei.ask.to_rkm),
+    };
+    Built { tx: entry(proof, &inst.anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P }
+}
+
+/// **An exit, proved** (P on the hiding lane: the 32 GiB class — 30.04 GiB
+/// peak measured at F5-4d-3). Reads the commitment tree and the asset-0
+/// opening from `served`; never submits: an Annulet net refuses an exit by
+/// name (`check_l2_no_exit`), and only a V6 bundle carries one.
+pub fn build_p_exit<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    input: &L2TxInput,
+    ask: ExitAsk,
+    change_to: &Recipient,
+    fee: u64,
+    rng: &mut R,
+) -> Result<Built, ExitError> {
+    let tree = served.commitment_tree()?;
+    let reg0 = served.registry(0)?;
+    let ei = exit_instance(&tree, &reg0, input, ask, change_to.rkm, fee, rng)?;
+    let (_, proof) = qlab_l2::prove_p(&ei.inst);
+    Ok(exit_entry(&ei, &proof, fee, change_to, rng))
+}
+
+/// The `--out` file's leading bytes: what it is, then its version.
+pub const EXIT_ARTIFACT_MAGIC: &[u8; 15] = b"qumbra:l2-exit\0";
+/// The version this build writes and the only one it reads.
+pub const EXIT_ARTIFACT_VERSION: u8 = 1;
+
+/// Why an exit file is refused — by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactError {
+    NotAnExitFile,
+    /// The magic, and then the file ends before its header does.
+    Truncated,
+    Version { found: u8, expected: u8 },
+    /// Built against another chain: its genesis is not the one expected.
+    OtherChain { file: [u8; 32], expected: [u8; 32] },
+    Tx(String),
+    /// The transaction decodes but is not one exit: not shape P, no asset-0
+    /// redeem, a zero recipient, or more than one exiting row.
+    NotAnExit(&'static str),
+}
+
+impl std::fmt::Display for ArtifactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactError::NotAnExitFile => write!(f, "not an L2 exit file (the magic does not match)"),
+            ArtifactError::Truncated => write!(f, "the exit file ends inside its header (version byte and genesis hash)"),
+            ArtifactError::OtherChain { file, expected } => write!(
+                f,
+                "the exit file was built on the chain with genesis {}, not this one ({}) — refusing it",
+                file.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                expected.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+            ArtifactError::Version { found, expected } => write!(
+                f,
+                "exit file version {found}; this build reads only version {expected} — rebuild the exit with \
+                 a matching wallet"
+            ),
+            ArtifactError::Tx(e) => write!(f, "the exit file's transaction does not decode: {e}"),
+            ArtifactError::NotAnExit(why) => write!(f, "the exit file's transaction is not an exit: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ArtifactError {}
+
+/// The `--out` file: magic ‖ version ‖ the genesis hash of the chain it was
+/// built on (32) ‖ the Annulet transaction wire. The genesis binds the file to
+/// one chain: a reader names the genesis it expects and refuses any other.
+pub fn encode_exit_artifact(genesis_hash: &[u8; 32], tx: &TxEntry) -> Vec<u8> {
+    let mut out = EXIT_ARTIFACT_MAGIC.to_vec();
+    out.push(EXIT_ARTIFACT_VERSION);
+    out.extend_from_slice(genesis_hash);
+    out.extend_from_slice(&qlab_p2p::codec::encode_tx_annulet(tx));
+    out
+}
+
+/// Read an exit file back — the magic, the version (refused by name on a
+/// mismatch), the chain (`expected_genesis`, refused by name when it is not
+/// the file's), the transaction, and that it is exactly the one exit
+/// [`exit_entry`] writes.
+pub fn decode_exit_artifact(bytes: &[u8], expected_genesis: &[u8; 32]) -> Result<(TxEntry, L2Surface), ArtifactError> {
+    let rest = bytes.strip_prefix(EXIT_ARTIFACT_MAGIC.as_slice()).ok_or(ArtifactError::NotAnExitFile)?;
+    let (&version, rest) = rest.split_first().ok_or(ArtifactError::Truncated)?;
+    if version != EXIT_ARTIFACT_VERSION {
+        return Err(ArtifactError::Version { found: version, expected: EXIT_ARTIFACT_VERSION });
+    }
+    if rest.len() < 32 {
+        return Err(ArtifactError::Truncated);
+    }
+    let (genesis, wire) = rest.split_at(32);
+    let genesis: [u8; 32] = genesis.try_into().expect("32 bytes");
+    if &genesis != expected_genesis {
+        return Err(ArtifactError::OtherChain { file: genesis, expected: *expected_genesis });
+    }
+    let tx = qlab_p2p::codec::decode_tx_annulet(wire).map_err(|e| ArtifactError::Tx(format!("{e:?}")))?;
+    let surface = match L2Surface::decode(&tx.l2) {
+        Ok(Some(s)) => s,
+        _ => return Err(ArtifactError::NotAnExit("no L2 surface")),
+    };
+    let Some(terms) = surface.vpublic.filter(|_| surface.shape == L2ShapeTag::P) else {
+        return Err(ArtifactError::NotAnExit("not shape P"));
+    };
+    // Exactly what `exit_entry` writes: row 0 the asset-0 redeem, row 1 no
+    // term, no registry write — `[redeem, redeem]` or `[redeem, mint]` is not
+    // "an exit".
+    if !(terms[0].redeem && terms[0].asset == 0 && terms[0].amount > 0) {
+        return Err(ArtifactError::NotAnExit("row 0 is not an asset-0 redeem"));
+    }
+    if terms[1] != VPublicTerm::NONE {
+        return Err(ArtifactError::NotAnExit("row 1 carries a vPublic term"));
+    }
+    if surface.write.is_some() {
+        return Err(ArtifactError::NotAnExit("it carries a registry write"));
+    }
+    if surface.exit_rkm == [0; 32] {
+        return Err(ArtifactError::NotAnExit("a zero recipient"));
+    }
+    if tx.public.nullifiers.len() != 3 || tx.public.commitments.len() != 2 {
+        return Err(ArtifactError::NotAnExit("not a 3×2 transaction"));
+    }
+    Ok((tx, surface))
+}
+
+fn words(h: &[u8; 32]) -> [u64; 4] {
+    core::array::from_fn(|i| u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().expect("8 bytes")))
+}
+
+/// **The P public values a decoded exit declares** — what a wrapper threads
+/// as the member and what its proof is verified against: the node's own
+/// surface-to-PV mapping (`qumbra-node`'s `L2Verifier`, `pv_vec_p`) over the
+/// file's transaction.
+pub fn exit_member_pvs(tx: &TxEntry, surface: &L2Surface) -> Vec<u32> {
+    let p = &tx.public;
+    let terms = surface.vpublic.expect("a decoded exit is shape P");
+    qlab_l2::pv_vec_p(
+        &words(&p.anchor),
+        &words(&p.nullifiers[0]),
+        &words(&p.nullifiers[1]),
+        &words(&p.commitments[0]),
+        &words(&p.commitments[1]),
+        p.fee,
+        &words(&surface.registry_root),
+        &terms.map(|t| VPublic { redeem: t.redeem, amount: t.amount }),
+        &terms.map(|t| u64::from(t.asset)),
+        &words(&p.nullifiers[2]),
+        &words(&surface.exit_rkm),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,6 +1114,35 @@ mod tests {
         assert!(policy_for_transfer(&opening(RegistryLeaf::cloaked(0)), &rkm).is_ok());
         assert_eq!(shape_for(&RegistryLeaf::cloaked(0)), L2ShapeTag::S);
         assert_eq!(shape_for(&empty), L2ShapeTag::P);
+    }
+
+    /// Lab #831 W2: an exit is refused by name before any tree is read —
+    /// a non-zero asset, a zero exit, a zero recipient, a note that cannot
+    /// pay the exit and the fee — and the exit file refuses what is not one.
+    #[test]
+    fn an_exit_is_refused_by_name_before_anything_is_built() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(831);
+        let tree = CommitmentTree::new();
+        let reg0 = opening(RegistryLeaf::cloaked(0));
+        let note = |value, asset| L2TxInput { sk: [1; 4], value, asset, rho: [2; 4], rseed: [3; 4], d: [0, 0] };
+        let to = ExitAsk { value: 50, to_rkm: [7; 4] };
+        let mut ex = |input: L2TxInput, ask: ExitAsk| exit_instance(&tree, &reg0, &input, ask, [9; 4], 10, &mut rng).err();
+        assert_eq!(ex(note(100, 1), to), Some(ExitError::NotAssetZero { asset: 1 }));
+        assert_eq!(ex(note(100, 0), ExitAsk { value: 0, ..to }), Some(ExitError::ZeroValue));
+        assert_eq!(ex(note(100, 0), ExitAsk { to_rkm: [0; 4], ..to }), Some(ExitError::ZeroRecipient));
+        assert_eq!(ex(note(59, 0), to), Some(ExitError::AboveNote { note: 59, fee: 10, exit: 50 }));
+        let g = [0x6f; 32];
+        assert_eq!(decode_exit_artifact(b"qumbra:l2-exit", &g).err(), Some(ArtifactError::NotAnExitFile));
+        assert_eq!(decode_exit_artifact(b"not an exit file at all", &g).err(), Some(ArtifactError::NotAnExitFile));
+        assert_eq!(decode_exit_artifact(EXIT_ARTIFACT_MAGIC, &g).err(), Some(ArtifactError::Truncated), "magic only");
+        let mut v1 = EXIT_ARTIFACT_MAGIC.to_vec();
+        v1.push(EXIT_ARTIFACT_VERSION);
+        v1.extend_from_slice(&[0x6f; 31]);
+        assert_eq!(decode_exit_artifact(&v1, &g).err(), Some(ArtifactError::Truncated), "a short genesis");
+        let mut v0 = EXIT_ARTIFACT_MAGIC.to_vec();
+        v0.push(0);
+        assert_eq!(decode_exit_artifact(&v0, &g).err(), Some(ArtifactError::Version { found: 0, expected: EXIT_ARTIFACT_VERSION }));
     }
 
     #[test]

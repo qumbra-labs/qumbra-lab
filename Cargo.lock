@@ -1548,6 +1548,7 @@ dependencies = [
  "qlab-devnet",
  "qlab-disclosure",
  "qlab-l2",
+ "qlab-l2spend",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",

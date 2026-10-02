@@ -479,7 +479,11 @@ fn usage() {
                 --allow-list, --mode, --redeem-open|--redeem-closed, --rotate-key),\n\
                 and `freeze add|remove --publish` puts the new root on chain; each\n\
                 write pays one asset-0 note (change back) and returns a 0-value seed\n\
-                note of the asset, which a first mint rides on. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
+                note of the asset, which a first mint rides on. `send --net annulet --exit-to\n\
+                L1-ADDR --amount V --out FILE` builds and proves an exit (lab #831): one\n\
+                asset-0 note redeemed on L2 and paid on L1 to the address, shape P,\n\
+                32 GiB class, proved here only; it is WRITTEN, never submitted — an\n\
+                Annulet net refuses an exit, and a V6 sequencer bundles it. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
                 against any endpoint you do not trust, because without it the\n\
                 wallet reports whatever Annulet chain the endpoint serves\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
@@ -1429,6 +1433,10 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// stop after the plan with `--plan-only`. Writes nothing to the wallet dir.
 fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
+    // Lab #831 W2: an exit is its own flow — one P transaction, written out.
+    if flag(args, "--exit-to").is_some() {
+        return exit_annulet_cmd(args);
+    }
     let dir = dir_of(args)?;
     let url = flag(args, "--url").ok_or("send --net annulet requires --url (the node's discovery server)")?;
     let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
@@ -1532,6 +1540,111 @@ fn history_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to:
     let report = qumbra_wallet::annulet::scan_annulet(w, &mut fetch, from, to, pin, &mut rng)?;
     let ledger = qumbra_wallet::annulet::history(&report, (from, to));
     print!("{}", qlab_ledger::l2history::render(&ledger, url));
+    Ok(())
+}
+
+/// `send --net annulet --exit-to ADDR --amount V --out FILE` (lab #831 W2):
+/// the exit's plan, then the proven P transaction written to `--out` — never
+/// submitted. An Annulet net refuses an exit by name (it has no bridge); a
+/// V6 bundle is a sequencer's to assemble (W4, after sequencer-v0).
+fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("an exit requires --url (the L2 endpoint it is built against)")?;
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("an exit requires --scan-to HEIGHT")?.parse()?;
+    let amount: u64 = flag(args, "--amount").ok_or("an exit requires --amount (of asset 0)")?.parse()?;
+    if flag(args, "--asset").is_some_and(|a| a != "0") {
+        return Err("only asset 0 exits to L1 (the exit is an asset-0 redeem); drop --asset or pass 0".into());
+    }
+    // Every flag a send reads and an exit does not, refused by name rather
+    // than ignored: `--to`/`--to-contact` (the recipient is --exit-to),
+    // `--freeze-list` (asset 0 has none), `--node` (one endpoint), and
+    // `--no-submit` (an exit is never submitted).
+    for refused in ["--to", "--to-contact", "--freeze-list", "--node"] {
+        if flag(args, refused).is_some() {
+            return Err(format!("{refused} does not apply to an exit (the L1 recipient is --exit-to; one --url endpoint; asset 0 has no freeze list)").into());
+        }
+    }
+    if args.iter().any(|a| a == "--no-submit") {
+        return Err("--no-submit does not apply to an exit: an exit is never submitted, only written with --out".into());
+    }
+    let plan_only = args.iter().any(|a| a == "--plan-only");
+    let out = flag(args, "--out").map(std::path::Path::new);
+    match out {
+        None if !plan_only => {
+            return Err("an exit is never submitted from here: an Annulet net refuses one by name (it has no bridge), and a \
+                        V6 bundle is assembled by a sequencer (lab #831 W4). Pass --out FILE to write the proven \
+                        transaction, or --plan-only"
+                .into())
+        }
+        // Before anything is read or proved: a 30 GiB proof must never be
+        // lost to a path that cannot take it, nor overwrite a file.
+        Some(path) => {
+            if path.exists() {
+                return Err(format!("--out {}: the file exists; refusing to overwrite it", path.display()).into());
+            }
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+            if !parent.is_dir() {
+                return Err(format!("--out {}: the directory {} does not exist", path.display(), parent.display()).into());
+            }
+        }
+        None => {}
+    }
+    let to = flag(args, "--exit-to").expect("routed here on --exit-to");
+    let to = qlab_wallet::address::Address::decode(to).ok_or("--exit-to is not a wallet address (the L1 recipient)")?;
+    let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    let w = WalletDir::open(&dir)?;
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    eprintln!(
+        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
+        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
+    );
+    let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
+    let mut on_plan = |plan: &qumbra_wallet::annulet_send::ExitPlan| {
+        print!("{plan}");
+        !plan_only
+    };
+    let (plan, built, genesis) = match qumbra_wallet::annulet_send::exit_annulet(&w, endpoint, amount, &to, scan_to, pin, &mut on_plan, &mut rng) {
+        Err(qumbra_wallet::annulet_send::SendRefusal::PlanDeclined) if plan_only => {
+            println!("--plan-only: nothing proved or written");
+            return Ok(());
+        }
+        other => other?,
+    };
+    let out = out.expect("checked above");
+    write_new_atomically(out, &qlab_l2spend::encode_exit_artifact(&genesis, &built.tx))?;
+    println!(
+        "wrote {}: the proven exit of {} (fee {}, change {} back) — version {} of the exit file, bound to this chain's \
+         genesis; it is paid on L1 only once a V6 bundle carries it",
+        out.display(),
+        plan.value,
+        plan.fee,
+        plan.change,
+        qlab_l2spend::EXIT_ARTIFACT_VERSION
+    );
+    Ok(())
+}
+
+/// Write `bytes` to `path`, which must not exist: into a sibling temporary
+/// created with `create_new`, synced, then hard-linked to `path` (which fails
+/// rather than replace a file that appeared meanwhile) and the temporary
+/// removed. A failure after the write names the temporary that still holds
+/// the bytes, so nothing proved is lost to a path error.
+fn write_new_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    if let Err(e) = std::fs::hard_link(&tmp, path) {
+        return Err(format!("{} could not be created ({e}); the proven exit is kept in {}", path.display(), tmp.display()).into());
+    }
+    std::fs::remove_file(&tmp)?;
     Ok(())
 }
 
