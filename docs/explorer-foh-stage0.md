@@ -307,7 +307,7 @@ the trigger literally instead, that is a one-line ruling to ask for on #486 befo
 │      + "history since observer restart at #15320" honesty line │
 ├── NEW Work (charts, all client-computed from R1) ──────────────┤
 │ difficulty over height (SVG line) + implied hashrate label     │
-│ block-interval distribution, last 1024 (SVG histogram)         │
+│ block-interval distribution, last 256 (SVG histogram)          │
 │   caption: "LWMA targets 75 s; spread is ordinary PoW variance"│
 ├── NEW Network (from R3) ───────────────────────────────────────┤
 │ peers over 24 h (SVG line) · mempool sparkline                 │
@@ -329,6 +329,8 @@ the trigger literally instead, that is a one-line ruling to ask for on #486 befo
 │ not missing, absent by design: the chain does not carry them." │
 └────────────────────────────────────────────────────────────────┘
 ```
+
+*(Amended 2026-10-02, lab #486 ruling (b), [issuecomment-5951846102](https://github.com/qumbra-labs/qumbra-lab/issues/486#issuecomment-5951846102): the interval window is **256**, as built in stage 2, not the 1024 this sketch first said. The window is one R1 fetch that also feeds the difficulty chart and the live-blocks table, and every poll reaches the origin uncached; 256 ≈ 62 KB per poll per tab against ≈ 249 KB for 1024.)*
 
 The wall's absences move from footer-only to **stated on the page where a reader would look
 for the missing thing** — the Names section explains commits are opaque *because that is the
