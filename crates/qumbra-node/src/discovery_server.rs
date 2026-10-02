@@ -52,6 +52,12 @@
 //!   this is the only way its holder finds it. `/v1/coinbase`'s twin; bulk over
 //!   a range, no per-key form.
 //!
+//! - `GET /v1/l2` — which L2 this net bridges (lab #831 W3a-0): on V6 the
+//!   `l2_id` its wrapper rule enforces, the WrapperParams and revision digests
+//!   and the genesis hash, as JSON; elsewhere a 200 saying no
+//!   ([`L2_NOT_V6`]). A wallet burns to `rkm_burn(l2_id)` only when this names
+//!   the id — the chain's own word, not a constant in the wallet.
+//!
 //! - `GET /v1/tree/leaves?from=` — the commitment tree's leaves in authoritative
 //!   append order ([`qlab_node::TreeLeaves`], issue #275 / decision brief B1).
 //!   How a wallet builds the **witness** to spend: it replays the stream into a
@@ -687,6 +693,41 @@ pub struct AnchorsView {
 /// The genesis-notes route (lab #714, B5) — GET only, Annulet nets only.
 pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
 
+/// **`GET /v1/l2`** (lab #831 W3a-0): which L2 this net bridges, so a wallet
+/// burns only to an `l2_id` the chain itself names. A pure route addition on
+/// every node (`RPC_VERSION` unmoved, PR #315's rule); off V6 it answers
+/// [`L2_NOT_V6`] — a 200 that says no, never a 404 a reader could mistake for
+/// a transport failure, and never an empty "yes".
+pub const L2_PATH: &str = "/v1/l2";
+
+/// The version of the `/v1/l2` JSON both answers carry; a reader refuses any
+/// other.
+pub const L2_ROUTE_VERSION: u32 = 1;
+
+/// What a node that bridges no L2 answers on [`L2_PATH`].
+pub const L2_NOT_V6: &str = r#"{"v":1,"available":false,"why":"not a V6 net"}"#;
+
+/// What a V6 node answers on [`L2_PATH`], from the genesis it opened: the one
+/// `l2_id` its wrapper rule enforces, the WrapperParams digest, the V6
+/// revision digest of the release in force (`null` for a release that
+/// carries none), and the V6 genesis hash — all lower-case hex.
+///
+/// `revision` is `null` on a build whose release carries no revision, and it
+/// moves with every release; a wallet therefore keys its burn gate on
+/// `l2_id` + `genesis` only, never on `revision`, which is served for an
+/// operator's comparison and nothing else.
+pub fn l2_route_body(genesis: &crate::genesis_v6::GenesisFileV6, revision: Option<qlab_devnet::header::Hash32>) -> Vec<u8> {
+    let hex = crate::genesis::hex_encode;
+    format!(
+        r#"{{"v":{L2_ROUTE_VERSION},"available":true,"l2_id":{},"wrapper_params":"{}","revision":{},"genesis":"{}"}}"#,
+        genesis.wrapper.l2_id,
+        genesis.wrapper.digest_hex(),
+        revision.map_or("null".to_string(), |r| format!("\"{}\"", hex(&r))),
+        genesis.hash_hex(),
+    )
+    .into_bytes()
+}
+
 /// The named refusal an L1 node answers `/v1/annulet/params` with (lab #720).
 pub const ANNULET_PARAMS_NOT_ON_L1: &str =
     "Annulet params are served on an Annulet (sequencer) net only; this node runs an L1 chain (lab #720)";
@@ -710,6 +751,9 @@ pub struct FormView {
     /// `/v1/annulet/params` (lab #720): the fee tiers under the genesis hash,
     /// encoded once; `None` on an L1 node.
     pub annulet_params: Option<Vec<u8>>,
+    /// `/v1/l2` (lab #831 W3a-0): [`l2_route_body`] on a V6 node, encoded
+    /// once; `None` everywhere else, answered as [`L2_NOT_V6`].
+    pub l2: Option<Vec<u8>>,
 }
 
 impl Default for FormView {
@@ -720,6 +764,7 @@ impl Default for FormView {
             sections: qlab_devnet::forms::BodySections::None,
             genesis_notes: None,
             annulet_params: None,
+            l2: None,
         }
     }
 }
@@ -990,6 +1035,8 @@ impl DiscoveryServer {
                         };
                         Ok(snapshot.encoded.clone())
                     }
+                    // Lab #831 W3a-0: which L2 this net bridges, if any.
+                    L2_PATH => Ok(form_view.l2.clone().unwrap_or_else(|| L2_NOT_V6.as_bytes().to_vec())),
                     // Lab #714: the genesis notes (a projection of the genesis file).
                     GENESIS_NOTES_PATH => match &form_view.genesis_notes {
                         Some(bytes) => Ok(bytes.clone()),
@@ -1714,6 +1761,54 @@ mod tests {
         assert_eq!(qlab_node::AnchorSet::from_bytes(&body2).unwrap(), grown);
 
         srv.shutdown();
+    }
+
+    /// Lab #831 W3a-0: `/v1/l2`, form by form, through the real socket. Off V6
+    /// (V4, V5 and the Annulet sequencer net) it answers [`L2_NOT_V6`] — a 200
+    /// that says no; on V6 it answers the body the node built from its genesis.
+    /// And that body, for the rehearsal V6 genesis under release v1.0, is
+    /// pinned to the values `genesis_v6`'s own pin test names
+    /// (`the_v6_rehearsal_genesis_is_pinned`): l2_id 1, WrapperParams
+    /// `cdc45b2b…6efb`, revision `7a5b813e…5c84`, genesis `4f725b29…bfd4`.
+    #[test]
+    fn the_l2_route_names_the_bridged_l2_on_v6_and_says_no_elsewhere() {
+        use qlab_devnet::forms::{BodySections, GenesisForm};
+        let v6 = crate::genesis_v6::GenesisFileV6::new_rehearsal();
+        let r = crate::release::REVISION_V1_0;
+        let body = l2_route_body(&v6, Some(crate::revision::revision_digest_v6(r.id, r.frozen_digest_hex, &v6.wrapper)));
+        assert_eq!(
+            String::from_utf8(body.clone()).unwrap(),
+            concat!(
+                r#"{"v":1,"available":true,"l2_id":1,"#,
+                r#""wrapper_params":"cdc45b2bb0a1be7b35f4b835220a47a6ce8c06c6e1d0f8f10b92a00cec326efb","#,
+                r#""revision":"7a5b813e84f2772b69ccefe3c2736f52c6b685d684ba17d180eb13b6ce245c84","#,
+                r#""genesis":"4f725b2932b06154cdc069016ccf4435bbeaea89ddcfaccdc70ed6c6d367bfd4"}"#
+            )
+        );
+        let cases = [
+            (GenesisForm::V4, BodySections::None, None, L2_NOT_V6.as_bytes().to_vec()),
+            (GenesisForm::V5, BodySections::None, None, L2_NOT_V6.as_bytes().to_vec()),
+            (GenesisForm::Annulet, BodySections::None, None, L2_NOT_V6.as_bytes().to_vec()),
+            (GenesisForm::V5, BodySections::V6, Some(body.clone()), body),
+        ];
+        for (form, sections, l2, want) in cases {
+            let (tx, _rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+            let srv = DiscoveryServer::start_with_mine(
+                "127.0.0.1:0",
+                Arc::new(Mutex::new(Arc::new(a_view()))),
+                no_leaves(),
+                no_anchors(),
+                tx,
+                None,
+                Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
+                Arc::new(FormView { form, sections, l2, ..FormView::default() }),
+            )
+            .expect("bind");
+            let (status, got) = get(srv.addr(), L2_PATH);
+            assert!(status.starts_with("HTTP/1.1 200"), "{form:?}/{sections:?}: {status}");
+            assert_eq!(got, want, "{form:?}/{sections:?}");
+            srv.shutdown();
+        }
     }
 
     /// A node with nothing finalized serves an EMPTY anchor set, not a 404 and
