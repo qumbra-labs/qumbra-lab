@@ -716,11 +716,16 @@ pub const L2_NOT_V6: &str = r#"{"v":1,"available":false,"why":"not a V6 net"}"#;
 /// moves with every release; a wallet therefore keys its burn gate on
 /// `l2_id` + `genesis` only, never on `revision`, which is served for an
 /// operator's comparison and nothing else.
+///
+/// `claim_fee_tier` (added by lab #831 W3a, ruling Q-B2) is the genesis
+/// claim tariff every claim's `PV_FEE` must equal — served so a wallet builds
+/// its claim at the chain's tier, never a constant's.
 pub fn l2_route_body(genesis: &crate::genesis_v6::GenesisFileV6, revision: Option<qlab_devnet::header::Hash32>) -> Vec<u8> {
     let hex = crate::genesis::hex_encode;
     format!(
-        r#"{{"v":{L2_ROUTE_VERSION},"available":true,"l2_id":{},"wrapper_params":"{}","revision":{},"genesis":"{}"}}"#,
+        r#"{{"v":{L2_ROUTE_VERSION},"available":true,"l2_id":{},"claim_fee_tier":{},"wrapper_params":"{}","revision":{},"genesis":"{}"}}"#,
         genesis.wrapper.l2_id,
+        genesis.wrapper.claim_fee_tier,
         genesis.wrapper.digest_hex(),
         revision.map_or("null".to_string(), |r| format!("\"{}\"", hex(&r))),
         genesis.hash_hex(),
@@ -1779,7 +1784,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(body.clone()).unwrap(),
             concat!(
-                r#"{"v":1,"available":true,"l2_id":1,"#,
+                r#"{"v":1,"available":true,"l2_id":1,"claim_fee_tier":4,"#,
                 r#""wrapper_params":"cdc45b2bb0a1be7b35f4b835220a47a6ce8c06c6e1d0f8f10b92a00cec326efb","#,
                 r#""revision":"7a5b813e84f2772b69ccefe3c2736f52c6b685d684ba17d180eb13b6ce245c84","#,
                 r#""genesis":"4f725b2932b06154cdc069016ccf4435bbeaea89ddcfaccdc70ed6c6d367bfd4"}"#

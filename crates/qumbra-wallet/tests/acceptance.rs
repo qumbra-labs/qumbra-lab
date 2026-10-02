@@ -233,8 +233,9 @@ fn a_real_wallet_binary_scans_its_own_payment_over_http() {
     let div = wallet.diversifier_at_index(0);
     let payee = wallet.diversified_keypair(&div);
 
-    // 3. A devnet that pays THAT key, served over a real socket.
-    let devnet = Devnet::generate_paying(GenParams::default(), payee);
+    // 3. A devnet that pays THAT address (its key and its rkm), served over a
+    // real socket.
+    let devnet = Devnet::generate_paying(GenParams::default(), payee, wallet.rkm(div));
     let tip = devnet.tip_height();
     let handle = qlab_cbserver::server::serve(Arc::new(devnet));
     let url = handle.base_url();
@@ -318,6 +319,7 @@ fn a_real_mining_wallet_binary_reads_its_own_coinbase_over_http() {
     let devnet = Devnet::generate_paying(
         GenParams { n_blocks, txs_per_block: 0, miner_rkm: Some(mine), ..GenParams::default() },
         payee,
+        wallet.rkm(div),
     );
     let tip = devnet.tip_height();
     let handle = qlab_cbserver::server::serve(Arc::new(devnet));
@@ -371,7 +373,7 @@ fn history_through_the_real_process_is_chain_only_when_there_is_no_send_log() {
     let w = WalletDir::open(&dir).expect("keygen wrote a readable wallet dir");
     let wallet = w.wallet();
     let payee = wallet.diversified_keypair(&wallet.diversifier_at_index(0));
-    let devnet = Devnet::generate_paying(GenParams::default(), payee);
+    let devnet = Devnet::generate_paying(GenParams::default(), payee, wallet.rkm(wallet.diversifier_at_index(0)));
     let tip = devnet.tip_height();
     let handle = qlab_cbserver::server::serve(Arc::new(devnet));
     let url = handle.base_url();

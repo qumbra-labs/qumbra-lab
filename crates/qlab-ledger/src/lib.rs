@@ -16,6 +16,7 @@
 
 pub mod assets;
 pub mod coverage;
+pub mod deposits;
 pub mod history;
 pub mod l2history;
 pub mod sends;

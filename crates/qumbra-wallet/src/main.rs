@@ -30,6 +30,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("history") => history(&args[1..]),
         Some("miner-rkm") => miner_rkm(&args[1..]),
         Some("send") => send(&args[1..]),
+        Some("deposit") => deposit(&args[1..]),
         Some("names") => names(&args[1..]),
         Some("issuer") => issuer(&args[1..]),
         Some("ivk") => ivk(&args[1..]),
@@ -435,6 +436,12 @@ fn usage() {
                             --net annulet: per asset, each block this wallet spent in read as\n\
                             the net of what left and what came back (lab #831) — never a\n\
                             recipient, never an amount and a fee told apart\n  \
+         qumbra-wallet deposit --dir DIR --url URL [--node URL] --scan-to N --net t2\n\
+                            --l2-id N --genesis-hash HEX64 --amount BESSEL [--out FILE] [--no-submit]\n\
+                            an L1 → L2 deposit (lab #831): the L1 burn to the L2's burn address,\n\
+                            sealed to THIS wallet so it can be claimed and recovered. Refused unless\n\
+                            the node's /v1/l2 confirms both --l2-id and --genesis-hash; `scan` then\n\
+                            shows it as a pending deposit, never as balance. `send` never burns\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet ivk export --dir DIR [--i-understand-this-is-a-viewing-key]\n  \
                             the incoming viewing key as hex on stdout, for a scan-only host; writes\n\
@@ -903,7 +910,6 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Refuses on partial scan coverage — spending on incomplete knowledge risks
 /// double-claimed nullifiers (#244's discipline, untouched).
 fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qumbra_wallet::spend::{execute, SendError, SendRequest, SendStep};
 
     // Lab #720: the Annulet send — its own flow, before any L1 file is read.
     if flag(args, "--net") == Some("annulet") {
@@ -1025,6 +1031,93 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         ),
     };
     let amount = resolve_send_amount(uri_amount, amount_flag)?;
+    // Lab #831 W3 (Q2): only `deposit` burns, and only sealed to this wallet's
+    // own key — the burn address of the L2 this chain bridges (as the node
+    // names it) reaching `send` (pasted, a contact, a URI, a name) is refused
+    // whatever key it carries.
+    let bridged = qumbra_wallet::deposit::fetch_l2(node_url).map(|a| a.l2_ids()).unwrap_or_default();
+    if let Some(l2_id) = qlab_ledger::deposits::burn_l2_id(&recipient.rkm_lanes(), &bridged) {
+        return Err(format!(
+            "the recipient is L2 {l2_id}'s burn address: paying it is a deposit, and `send` never burns. Use \
+             `qumbra-wallet deposit`, which seals the deposit to this wallet so it can be claimed and recovered"
+        )
+        .into());
+    }
+
+    send_resolved(args, &dir, url, node_url, scan_to, out, no_submit, recipient, contact_name, amount)
+}
+
+/// `deposit` (lab #831 W3a): an L1 → L2 deposit — the L1 burn, sealed to
+/// this wallet. Before anything is scanned or proved, the node's `/v1/l2`
+/// must confirm BOTH pinned facts (`--l2-id`, `--genesis-hash`; ruling on
+/// Q-W3-1: both mandatory, no warning mode); then the ordinary send flow pays
+/// [`qumbra_wallet::deposit::burn_address`].
+fn deposit(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("deposit requires --url (compact/scan endpoint)")?;
+    let node_url = flag(args, "--node").unwrap_or(url);
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("deposit requires --scan-to HEIGHT")?.parse()?;
+    let amount: u64 = flag(args, "--amount").ok_or("deposit requires --amount BESSEL")?.parse()?;
+    let l2_id: u64 = flag(args, "--l2-id")
+        .ok_or("deposit requires --l2-id N: the L2 you mean to deposit to, which the chain must confirm")?
+        .parse()?;
+    let genesis = flag(args, "--genesis-hash")
+        .ok_or("deposit requires --genesis-hash HEX64: the chain you mean to burn on, which the node must confirm")?;
+    let genesis = qumbra_wallet::annulet::parse_genesis_hash(genesis)?;
+    for refused in ["--to", "--to-contact"] {
+        if flag(args, refused).is_some() {
+            return Err(format!("{refused} does not apply to a deposit: its payee is the L2's burn address, sealed to this wallet").into());
+        }
+    }
+    if flag(args, "--net") == Some("t1") || (flag(args, "--net").is_none() && BUILT_FOR_NET.is_none_or(|n| n == "t1")) {
+        return Err("T1 bridges no L2 and never will: a burn there is lost. Pass --net t2 against a V6 node".into());
+    }
+    let out = flag(args, "--out");
+    let no_submit = has_flag(args, "--no-submit");
+    // The net, resolved before the gate prints anything: `--net annulet`, an
+    // unknown net or a bad stamp is refused here, never after "confirmed".
+    genesis_form_of(args)?;
+
+    // The gate, before anything else: an irreversible burn into a chain the
+    // user did not name, or an L2 it does not bridge, is never built.
+    let answer = qumbra_wallet::deposit::fetch_l2(node_url).map_err(|e| {
+        format!("the node did not say which L2 its chain bridges ({e}); refusing to burn without that answer")
+    })?;
+    let route = qumbra_wallet::deposit::check_bridge(&answer, l2_id, &genesis)?;
+    let w = WalletDir::open(&dir)?;
+    let burn = qumbra_wallet::deposit::burn_address(&w.wallet(), l2_id);
+    println!(
+        "deposit: {amount} bessel to L2 {l2_id} on genesis {} — confirmed by the node's /v1/l2 (claim fee tier {}, \
+         wrapper params {})",
+        route.genesis.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        route.claim_fee_tier,
+        route.wrapper_params.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    println!(
+        "  the burn is sealed to this wallet: its scan shows it as a pending deposit until it is claimed on L2 \
+         (`qumbra-wallet scan`); it is never L1 balance again"
+    );
+    drop(w);
+    send_resolved(args, &dir, url, node_url, scan_to, out, no_submit, burn, Some(format!("deposit to L2 {l2_id}")), amount)
+}
+
+/// The send after its recipient and amount are settled — shared by `send` and
+/// `deposit` (lab #831 W3a), so a deposit is the same flow, the same proof,
+/// the same keep-the-bytes discipline, never a second copy of it.
+#[allow(clippy::too_many_arguments)]
+fn send_resolved(
+    args: &[String],
+    dir: &std::path::Path,
+    url: &str,
+    node_url: &str,
+    scan_to: u64,
+    out: Option<&str>,
+    no_submit: bool,
+    recipient: qlab_wallet::address::Address,
+    contact_name: Option<String>,
+    amount: u64,
+) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::spend::{execute, SendError, SendRequest, SendStep};
 
     // The sink. Progress belongs on stderr so a piped stdout stays the result;
     // the flow itself is `qumbra_wallet::spend`, shared with every other surface.
@@ -1082,7 +1175,7 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
 
     let req = SendRequest {
-        dir: &dir,
+        dir,
         url,
         node_url,
         recipient: &recipient,
@@ -1234,6 +1327,8 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
             &report.exit_coverage,
         )
     );
+    // Lab #831 W3: what the scan set aside, beside — never inside — the figures.
+    print!("{}", qlab_ledger::deposits::render(&report.set_aside));
     Ok(())
 }
 
