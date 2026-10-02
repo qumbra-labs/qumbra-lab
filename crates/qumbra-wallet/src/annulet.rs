@@ -262,8 +262,9 @@ where
     }
 }
 
-/// The pre-#819 rows: one full scan of the range per allocated index. Kept as
-/// the reference [`annulet_rows`] is tested equal to; not used by the wallet.
+/// The pre-#819 rows: one full scan of the range per allocated index. **Kept
+/// only as the equality reference for `tests/annulet_scan.rs`; not a scan
+/// path** — the wallet scans through [`annulet_rows`].
 #[doc(hidden)]
 pub fn annulet_rows_per_index<F>(w: &WalletDir, fetch: &mut F, from: u64, to: u64, rng: &mut StdRng) -> Vec<AnnuletRow>
 where
