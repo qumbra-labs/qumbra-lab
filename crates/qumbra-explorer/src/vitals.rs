@@ -232,7 +232,7 @@ mod tests {
     // ---- goldens -----------------------------------------------------------------
 
     const GOLDEN_DIGEST: &str =
-        "65a4ce4e9c58d45a1a2039a21b8629da103608c46249a3eb5a71a82095ec171b";
+        "b5da16949c112f804693568328f00b8e857c53f6f02f4436c5bcec98434ede5e";
 
     /// Two states the page renders: a live series and the fresh-observer empty
     /// state. Samples are **literal** — the golden locks the encoder's bytes,
@@ -253,9 +253,26 @@ mod tests {
             tip_height: 15_762,
             stall_depth: 7,
         }));
+        // At the ring's bound (lab #573): VITALS_SAMPLES + 5 pushes, so the five
+        // oldest were evicted and `since` has advanced past the first sample the
+        // observer ever took — the state that only appears ~24 h after a restart.
+        // Sample i is a formula of i: t 1787000000 + 60i, peers 3 + i mod 5,
+        // mempool i mod 4, tip 15000 + 60i/75 (integer), stall i mod 8.
+        let mut at_bound = VitalsRing::new();
+        for i in 0..(VITALS_SAMPLES as u64 + 5) {
+            assert!(at_bound.maybe_push(Sample {
+                t: 1_787_000_000 + 60 * i,
+                peers: 3 + i % 5,
+                mempool: i % 4,
+                tip_height: 15_000 + 60 * i / 75,
+                stall_depth: i % 8,
+            }));
+        }
+        assert_eq!(at_bound.since(), Some(1_787_000_000 + 60 * 5), "the five oldest fell off");
         vec![
             ("vitals-live", live.document()),
             ("vitals-empty", VitalsRing::new().document()),
+            ("vitals-at-bound", at_bound.document()),
         ]
     }
 

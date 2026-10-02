@@ -282,7 +282,7 @@ mod tests {
     // ---- goldens -----------------------------------------------------------------
 
     const GOLDEN_DIGEST: &str =
-        "42c0fb69fc2bf056c6d2b9f0ca8fe5b2057ac71a8c54d0a105501fbdf27ff621";
+        "23c38b7f375f3ae1d1d193cd9fcb3fbf8ee9ccc25ee03bdbce393b4f6b22847a";
 
     /// Two states the page renders: a live ticker (with a degraded-window span
     /// visible), and the fresh-observer empty state.
@@ -319,9 +319,28 @@ mod tests {
                 },
             ],
         };
+        // At the serving bound (lab #573): MAX_CHECKPOINTS rows, and the
+        // tracker's record begins long before the oldest one served, so
+        // `history_from_height` and `checkpoints[0].height` DIFFER — the shape
+        // that only appears ~25 h after an observer restart and that misled the
+        // page twice. Every row is a formula of its index, derivable by eye:
+        // height 4104 + 8i, block hash byte i (mod 256), fid 0x100000000000 + i,
+        // span 8 throughout (the oldest served row still carries its real span).
+        let at_bound = CheckpointsView {
+            history_from_height: Some(8),
+            rows: (0..MAX_CHECKPOINTS as u64)
+                .map(|i| CheckpointRow {
+                    height: 4_104 + 8 * i,
+                    block_id: BlockIdentity::of(&h32(i as u8)),
+                    fid: 0x1000_0000_0000 + i,
+                    span: Some(8),
+                })
+                .collect(),
+        };
         vec![
             ("checkpoints-live", document(&live)),
             ("checkpoints-empty", document(&CheckpointsView::default())),
+            ("checkpoints-at-bound", document(&at_bound)),
         ]
     }
 
@@ -348,6 +367,18 @@ mod tests {
             assert_eq!(v["v"], CHECKPOINTS_VERSION, "{name} is versioned");
             assert!(v.get("history_from_height").is_some(), "{name} states its start");
         }
+    }
+
+    /// The at-bound golden is what its name says: exactly the serving bound, and
+    /// a record that begins before the oldest row served (lab #573).
+    #[test]
+    fn the_at_bound_golden_is_at_the_bound_with_an_earlier_record() {
+        let (_, produced) = golden_cases().into_iter().find(|(n, _)| *n == "checkpoints-at-bound").unwrap();
+        let v = parse(&produced);
+        let rows = v["checkpoints"].as_array().unwrap();
+        assert_eq!(rows.len(), MAX_CHECKPOINTS);
+        assert!(v["history_from_height"].as_u64().unwrap() < rows[0]["height"].as_u64().unwrap());
+        assert_eq!(rows[0]["span"], 8, "the oldest served row keeps its real span");
     }
 
     #[test]
