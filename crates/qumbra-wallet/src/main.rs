@@ -431,7 +431,10 @@ fn usage() {
                             every note received, every note spent, and the sends reconstructed\n\
                             from them. Chain-derived throughout; the recipient of a past send is\n\
                             shown only where this wallet dir holds a local `sends.v1` record, and\n\
-                            is labeled as such (a restored wallet never has one)\n  \
+                            is labeled as such (a restored wallet never has one). With\n\
+                            --net annulet: per asset, each block this wallet spent in read as\n\
+                            the net of what left and what came back (lab #831) — never a\n\
+                            recipient, never an amount and a fee told apart\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet ivk export --dir DIR [--i-understand-this-is-a-viewing-key]\n  \
                             the incoming viewing key as hex on stdout, for a scan-only host; writes\n\
@@ -457,7 +460,7 @@ fn usage() {
                 the balance transactions-only, and the report says so)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\
-         --net  annulet (scan and send, lab #718/#720) — the Annulet L2 net: it reads\n\
+         --net  annulet (scan, send and history, lab #718/#720/#831) — the Annulet L2 net: it reads\n\
                 /v1/genesis/notes first and REFUSES an endpoint that does not serve\n\
                 an Annulet chain; balances are per asset (asset 0 = fee units, not\n\
                 QMB); no coinbase. `send --net annulet --asset N --amount V --to ADDR`\n\
@@ -1176,6 +1179,10 @@ fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
+    // Lab #831 W1: the Annulet ledger — its own flow, before any L1 net is resolved.
+    if flag(args, "--net") == Some("annulet") {
+        return history_annulet_cmd(args, &w, url, from, to);
+    }
     let report = qumbra_wallet::ledger_run::report(&dir, &w, url, from, to, genesis_form_of(args)?);
     // stderr, so a piped ledger stays a ledger — but never dropped: each note
     // names a reason a `recipient:` line below reads `not recorded`.
@@ -1501,6 +1508,25 @@ fn scan_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u6
     let mut fetch = qumbra_wallet::net::scan_fetch(url);
     let report = qumbra_wallet::annulet::scan_annulet(w, &mut fetch, from, to, pin, &mut rng)?;
     print!("{}", qumbra_wallet::annulet::render(&report, url, (from, to)));
+    Ok(())
+}
+
+/// `history --net annulet` (lab #831 W1): the same verified scan as
+/// `scan --net annulet`, read as a ledger.
+fn history_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u64) -> Result<(), Box<dyn Error>> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    eprintln!(
+        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
+        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
+    );
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    let mut fetch = qumbra_wallet::net::scan_fetch(url);
+    let report = qumbra_wallet::annulet::scan_annulet(w, &mut fetch, from, to, pin, &mut rng)?;
+    let ledger = qumbra_wallet::annulet::history(&report, (from, to));
+    print!("{}", qlab_ledger::l2history::render(&ledger, url));
     Ok(())
 }
 
