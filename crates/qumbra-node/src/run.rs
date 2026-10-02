@@ -661,6 +661,8 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     supply_ledger: Mutex<SupplyLedger>,
     /// The bridge ledger (lab #785 F5-4c-1): `Some` exactly on a V6 node.
     bridge_ledger: Option<Mutex<BridgeState>>,
+    /// `/v1/l2`'s body on a V6 node (lab #831 W3a-0), `None` elsewhere.
+    l2_route: Option<Vec<u8>>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -1102,6 +1104,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // Lab #470 stage 4a: the form is installed AT CONSTRUCTION — before
         // the datadir replay — from the same genesis file the ChainRules
         // install below reads. One source, two arrival points, both checked.
+        // Lab #831 W3a-0: what `/v1/l2` serves, from the V6 genesis this node
+        // opens under and the release in force on it; `None` off V6.
+        let l2_route = match &genesis {
+            PreparedGenesis::V6(g) => Some(crate::discovery_server::l2_route_body(
+                g,
+                release.revision.as_ref().map(|r| release.identity.digest_of(r)),
+            )),
+            _ => None,
+        };
         let (adapter, net_id, mine_interval, annulet) = match genesis {
             PreparedGenesis::L1(genesis) => {
                 let mut adapter =
@@ -1305,6 +1316,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             cached_mine_template: None,
             supply_ledger: Mutex::new(supply_ledger),
             bridge_ledger,
+            l2_route,
             process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
@@ -2454,6 +2466,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
                 sections: self.p2p.node().sections(),
                 genesis_notes: self.genesis_notes_body(),
                 annulet_params: self.annulet_params_body(),
+                l2: self.l2_route.clone(),
             }),
         )?;
         self.refresh_registry();
@@ -4178,6 +4191,13 @@ mod tests {
         assert_eq!(reopened.p2p.node().state().recorded_finality(), Some(8), "re-derived on reopen");
         // Lab #785 F5-4c-1: a V6 node keeps the bridge ledger — nothing
         // bridged on a chain with no bundle, rows covering its tip.
+        // Lab #831 W3a-0: the node's `/v1/l2` body is its genesis's, under the
+        // release in force on this V6 net.
+        let in_force = crate::release::RELEASE.on_v6(genesis.wrapper.digest());
+        assert_eq!(
+            reopened.l2_route.as_deref(),
+            Some(&crate::discovery_server::l2_route_body(&genesis, in_force.revision.as_ref().map(|r| in_force.identity.digest_of(r)))[..]),
+        );
         let v = reopened.bridge_view().expect("a V6 node serves the bridge").expect("no refusal");
         assert_eq!((v.covered_height, v.d_cum, v.e_cum), (signed_at + 1, 0, 0));
         assert!(v.rows.iter().all(|r| r.bridged_in == 0 && r.bridged_out == 0));
