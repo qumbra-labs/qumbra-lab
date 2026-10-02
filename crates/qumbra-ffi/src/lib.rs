@@ -2269,7 +2269,12 @@ mod tests {
             let full_ptr = qmb_wallet_address(w, 0);
             let full = CStr::from_ptr(full_ptr).to_str().unwrap().to_string();
             qmb_string_free(full_ptr);
-            for (q, says) in [("req-asset=7&amount=1000000", "Annulet asset 7"), ("req-asset=7", "Annulet asset 7"), ("req-foo=1", "req-foo")] {
+            for (q, says) in [
+                ("req-asset=7&req-amount=1000000", "Annulet asset 7"),
+                ("req-asset=7", "Annulet asset 7"),
+                ("req-asset=7&amount=1000000", "carries its amount as req-amount"),
+                ("req-foo=1", "req-foo"),
+            ] {
                 let uri = CString::new(format!("qumbra:{full}?{q}")).unwrap();
                 let (mut amount, mut has): (u64, u8) = (0, 0);
                 let mut err: *mut c_char = ptr::null_mut();

@@ -633,7 +633,8 @@ fn send_refuses_an_asset_payment_uri_by_name() {
     assert!(ok, "{stderr}");
     let addr = WalletDir::open(&dir).unwrap().wallet().address_at_index(0).encode();
     for (q, says) in [
-        ("req-asset=7&amount=1000000", "does not pay Annulet assets from a URI"),
+        ("req-asset=7&req-amount=1000000", "does not pay Annulet assets from a URI"),
+        ("req-asset=7&amount=1000000", "carries its amount as req-amount"),
         ("req-foo=1&amount=1", "req-foo"),
     ] {
         let uri = format!("qumbra:{addr}?{q}");

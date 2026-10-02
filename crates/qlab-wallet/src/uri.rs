@@ -31,7 +31,13 @@
 //!   asset amount is the wallet's business). `req-asset=0` is refused: absent
 //!   means L1 QMB, and asset 0's meaning depends on the net. *(Spec correction
 //!   pending in qumbra-design: the amendment's "decimals from the registry
-//!   leaf" names a field the registry does not have.)* [`parse`] — the QMB
+//!   leaf" names a field the registry does not have.)* The asset amount
+//!   travels as **`req-amount=<base units>`**, never `amount=` (lab #815
+//!   follow-up): a wallet that predates the `req-` rule ignores every `req-`
+//!   key, and would read an `amount=` beside `req-asset` as that many QMB —
+//!   under `req-amount` it sees an amount-less QMB request instead. So
+//!   `amount=` beside `req-asset` is refused ([`UriError::AmountBesideAsset`]),
+//!   and `req-amount` without `req-asset` is an unknown required key. [`parse`] — the QMB
 //!   reader every current consumer calls — refuses a `req-asset` URI by name
 //!   ([`UriError::AssetRequest`]) rather than ever reading it as QMB;
 //!   [`parse_request`] is for a caller that pays assets.
@@ -120,6 +126,9 @@ pub enum UriError {
     /// A `req-asset` URI given to [`parse`], the QMB reader: this is a request
     /// for an Annulet asset, and reading it as QMB would pay the wrong thing.
     AssetRequest { asset: u16 },
+    /// `amount=` beside `req-asset`: an asset request carries its amount as
+    /// `req-amount`, and a mixed URI could mean two things.
+    AmountBesideAsset,
 }
 
 impl std::fmt::Display for UriError {
@@ -147,6 +156,11 @@ impl std::fmt::Display for UriError {
                 f,
                 "the URI requires `{key}`, which this wallet does not understand — a `req-` key \
                  must not be ignored, so the whole request is refused"
+            ),
+            UriError::AmountBesideAsset => write!(
+                f,
+                "an asset request carries its amount as req-amount; amount= beside req-asset is \
+                 refused (a wallet that ignores req- keys would read it as QMB)"
             ),
             UriError::AssetRequest { asset } => write!(
                 f,
@@ -192,10 +206,11 @@ pub fn encode(
 }
 
 /// Encode an **Annulet asset** payment request (lab #815): `req-asset=N`
-/// first after the `?`, then `amount` (base units — the URI carries no scale),
+/// first after the `?`, then `req-amount` (base units — the URI carries no
+/// scale; never `amount=`, which a pre-`req-` wallet would read as QMB),
 /// `memo`, `label` as [`encode`] writes them. Asset 0 is refused: a QMB
-/// request is [`encode`]'s, with no `req-asset`. The only `req-` key this
-/// module ever writes is the one it defines.
+/// request is [`encode`]'s, with no `req-asset`. The only `req-` keys this
+/// module ever writes are the two it defines.
 pub fn encode_asset(
     addr: &Address,
     asset: u16,
@@ -212,7 +227,7 @@ pub fn encode_asset(
     }
     let mut out = format!("{URI_SCHEME}:{}?{REQ_ASSET}={asset}", addr.encode());
     if let Some(u) = base_units {
-        out.push_str(&format!("&amount={u}"));
+        out.push_str(&format!("&{REQ_AMOUNT}={u}"));
     }
     if let Some(m) = memo {
         out.push_str(&format!("&memo={}", b64url_encode(m)));
@@ -260,20 +275,28 @@ fn parse_fields(s: &str) -> Result<Parsed<'_>, UriError> {
     };
 
     let q = parse_query(query)?;
-    Ok(Parsed { address, amount: q.amount, asset: q.asset, label: q.label, memo: q.memo })
+    match (q.asset, q.amount, q.req_amount) {
+        // A mixed URI could mean two things: refused, in both readers.
+        (Some(_), Some(_), _) => return Err(UriError::AmountBesideAsset),
+        // `req-amount` is understood only beside `req-asset`.
+        (None, _, Some(_)) => return Err(UriError::UnknownRequiredKey { key: REQ_AMOUNT.into() }),
+        _ => {}
+    }
+    Ok(Parsed { address, amount: q.amount, req_amount: q.req_amount, asset: q.asset, label: q.label, memo: q.memo })
 }
 
 /// The query, walked once: every known key decoded, the `amount` kept raw
 /// until the walk knows whether `req-asset` sets its unit (it may come after).
 struct Query<'a> {
     amount: Option<&'a str>,
+    req_amount: Option<&'a str>,
     asset: Option<u16>,
     label: Option<String>,
     memo: Option<Vec<u8>>,
 }
 
 fn parse_query(query: Option<&str>) -> Result<Query<'_>, UriError> {
-    let mut q = Query { amount: None, asset: None, label: None, memo: None };
+    let mut q = Query { amount: None, req_amount: None, asset: None, label: None, memo: None };
     let Some(query) = query else { return Ok(q) };
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -304,6 +327,12 @@ fn parse_query(query: Option<&str>) -> Result<Query<'_>, UriError> {
                 let v = known_value("label", value)?;
                 q.label = Some(percent_decode(v).map_err(|why| UriError::BadValue { key: "label", got: truncated(v), why })?);
             }
+            REQ_AMOUNT => {
+                if q.req_amount.is_some() {
+                    return Err(UriError::DuplicateKey { key: REQ_AMOUNT });
+                }
+                q.req_amount = Some(known_value(REQ_AMOUNT, value)?);
+            }
             REQ_ASSET => {
                 if q.asset.is_some() {
                     return Err(UriError::DuplicateKey { key: REQ_ASSET });
@@ -330,13 +359,16 @@ fn parse_query(query: Option<&str>) -> Result<Query<'_>, UriError> {
 struct Parsed<'a> {
     address: Address,
     amount: Option<&'a str>,
+    req_amount: Option<&'a str>,
     asset: Option<u16>,
     label: Option<String>,
     memo: Option<Vec<u8>>,
 }
 
-/// The one `req-` key this module defines.
+/// The asset an Annulet payment request asks for.
 pub const REQ_ASSET: &str = "req-asset";
+/// That request's amount, in the asset's base units — never `amount=`.
+pub const REQ_AMOUNT: &str = "req-amount";
 
 /// What a payment request asks for ([`parse_request`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,14 +403,14 @@ impl std::fmt::Debug for Request {
 }
 
 /// Parse a payment URI of **either** kind (lab #815): QMB as [`parse`] reads
-/// it, or an Annulet asset under `req-asset` with a base-units `amount`. For a
+/// it, or an Annulet asset under `req-asset` with a base-units `req-amount`. For a
 /// caller that pays assets; a QMB-only caller uses [`parse`], which refuses an
 /// asset request by name.
 pub fn parse_request(s: &str) -> Result<Request, UriError> {
     let p = parse_fields(s)?;
     let requested = match p.asset {
         None => Requested::Qmb { bessel: p.amount.map(qmb_amount).transpose()? },
-        Some(asset) => Requested::Asset { asset, base_units: p.amount.map(base_units_amount).transpose()? },
+        Some(asset) => Requested::Asset { asset, base_units: p.req_amount.map(base_units_amount).transpose()? },
     };
     Ok(Request { address: p.address, requested, label: p.label, memo: p.memo })
 }
@@ -387,17 +419,17 @@ fn qmb_amount(v: &str) -> Result<u64, UriError> {
     qmb_to_bessel(v).map_err(|why| UriError::BadValue { key: "amount", got: truncated(v), why })
 }
 
-/// `amount` under `req-asset`: digits only, fitting u64 base units. A `.`,
-/// sign or anything else is refused by name — the URI carries no scale.
+/// `req-amount`: digits only, fitting u64 base units. A `.`, sign or
+/// anything else is refused by name — the URI carries no scale.
 fn base_units_amount(v: &str) -> Result<u64, UriError> {
-    let bad = |why| UriError::BadValue { key: "amount", got: truncated(v), why };
+    let bad = |why| UriError::BadValue { key: REQ_AMOUNT, got: truncated(v), why };
     if v.is_empty() {
         return Err(bad("empty amount"));
     }
     if !v.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad(
-            "with req-asset, amount is an unsigned integer in the asset's base units — the URI \
-             carries no scale (no `.`, sign, exponent or separators)",
+            "req-amount is an unsigned integer in the asset's base units — the URI carries no \
+             scale (no `.`, sign, exponent or separators)",
         ));
     }
     v.bytes()
@@ -770,7 +802,10 @@ mod tests {
         ] {
             let uri = encode_asset(&addr, asset, units, label, memo).expect("a valid asset request");
             assert!(uri.starts_with(&format!("qumbra:{}?req-asset={asset}", addr.encode())), "{uri}");
-            assert_eq!(uri.matches("req-").count(), 1, "the only req- key is the one defined");
+            let keys: Vec<&str> = uri.split_once('?').unwrap().1.split('&').map(|kv| kv.split('=').next().unwrap()).collect();
+            assert!(keys.iter().all(|k| !k.starts_with("req-") || *k == REQ_ASSET || *k == REQ_AMOUNT), "{keys:?}");
+            assert!(!keys.contains(&"amount"), "an asset request never writes amount=: {uri}");
+            assert_eq!(keys.contains(&REQ_AMOUNT), units.is_some(), "{uri}");
             let r = parse_request(&uri).expect("own encoding parses");
             assert_eq!(r.address.to_raw_bytes(), addr.to_raw_bytes());
             assert_eq!(r.requested, Requested::Asset { asset, base_units: units });
@@ -780,8 +815,8 @@ mod tests {
             assert_eq!(refused, UriError::AssetRequest { asset });
             assert!(refused.to_string().contains("does not pay Annulet assets from a URI"), "{refused}");
         }
-        // `req-asset` after `amount` still sets the amount's unit.
-        let late = format!("qumbra:{}?amount=5&req-asset=9", addr.encode());
+        // `req-amount` before `req-asset` is still that asset's amount.
+        let late = format!("qumbra:{}?req-amount=5&req-asset=9", addr.encode());
         assert_eq!(parse_request(&late).unwrap().requested, Requested::Asset { asset: 9, base_units: Some(5) });
     }
 
@@ -802,16 +837,51 @@ mod tests {
         }
         assert!(matches!(req("req-asset"), Err(UriError::BadValue { key: REQ_ASSET, .. })), "no value");
         for bad in ["1.5", "1.0", "+5", "-5", "1e6", "1_000", "", "18446744073709551616"] {
-            match req(&format!("req-asset=7&amount={bad}")) {
-                Err(UriError::BadValue { key: "amount", .. }) => {}
+            match req(&format!("req-asset=7&req-amount={bad}")) {
+                Err(UriError::BadValue { key: REQ_AMOUNT, .. }) => {}
                 other => panic!("amount {bad:?}: {other:?}"),
             }
         }
-        match req("req-asset=7&amount=2.50").unwrap_err() {
+        match req("req-asset=7&req-amount=2.50").unwrap_err() {
             UriError::BadValue { why, .. } => assert!(why.contains("carries no scale"), "{why}"),
             e => panic!("{e:?}"),
         }
         assert!(encode_asset(&golden_address(), 0, Some(1), None, None).is_err(), "asset 0 is never emitted");
+    }
+
+    /// Lab #815 follow-up: a wallet built before the `req-` rule ignores every
+    /// `req-` key, so an asset request's `amount=` would read to it as QMB. An
+    /// asset amount is `req-amount`; `amount=` beside `req-asset` is refused by
+    /// name in BOTH readers (a mixed URI cannot mean two things), in either key
+    /// order.
+    #[test]
+    fn amount_beside_req_asset_is_refused_in_both_readers() {
+        let a = golden_address().encode();
+        for q in ["req-asset=7&amount=1500000", "amount=1500000&req-asset=7", "req-asset=7&req-amount=5&amount=5"] {
+            let uri = format!("qumbra:{a}?{q}");
+            assert_eq!(parse(&uri).unwrap_err(), UriError::AmountBesideAsset, "{q}");
+            assert_eq!(parse_request(&uri).unwrap_err(), UriError::AmountBesideAsset, "{q}");
+        }
+        let why = UriError::AmountBesideAsset.to_string();
+        assert!(why.contains("carries its amount as req-amount") && why.contains("amount= beside req-asset is refused"), "{why}");
+    }
+
+    /// `req-amount` means something only beside `req-asset`: alone it is an
+    /// unknown required key (refused as any other), and a duplicate is refused.
+    #[test]
+    fn req_amount_without_req_asset_is_an_unknown_required_key() {
+        let a = golden_address().encode();
+        for q in ["req-amount=5", "amount=1&req-amount=5"] {
+            let uri = format!("qumbra:{a}?{q}");
+            let want = UriError::UnknownRequiredKey { key: REQ_AMOUNT.into() };
+            assert_eq!(parse(&uri).unwrap_err(), want, "{q}");
+            assert_eq!(parse_request(&uri).unwrap_err(), want, "{q}");
+        }
+        let dup = format!("qumbra:{a}?req-asset=7&req-amount=1&req-amount=1");
+        assert_eq!(parse_request(&dup).unwrap_err(), UriError::DuplicateKey { key: REQ_AMOUNT });
+        // And the asset request proper reads its amount from req-amount.
+        let ok = parse_request(&format!("qumbra:{a}?req-asset=7&req-amount=1500000")).unwrap();
+        assert_eq!(ok.requested, Requested::Asset { asset: 7, base_units: Some(1_500_000) });
     }
 
     /// Old-style URIs are untouched: `parse_request` reads the golden as the QMB
