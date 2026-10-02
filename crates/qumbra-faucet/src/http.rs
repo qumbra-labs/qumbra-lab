@@ -40,6 +40,27 @@
 //! same form and the same length `PendingRequest`'s `Debug` uses), the ticket (a
 //! bearer credential), and any request body.
 //!
+//! ## Two front ends, one listener (2026-10-02)
+//!
+//! The public page is a React app in `qumbra-labs/qumbra-faucet-web`, served as static
+//! files **on the same origin** by svc1's Caddy, which path-routes `/api/*`, `/request`,
+//! `/plain*` and `/healthz` here (Larry, 2026-10-02: front end and back end deployed
+//! separately, same origin). This process serves it no script and holds no copy of it,
+//! so a page change never restarts the one host holding a hot key — a restart replays
+//! `blocks.log`, which has taken hours (#359).
+//!
+//! What this listener serves:
+//!
+//! * the JSON the page reads — [`crate::api`]: `GET /api/status`, `GET /api/r/<n>`, and
+//!   `POST /request` answered as JSON when the request says `Accept: application/json`.
+//!   The POST stays on `/request` so the journal line, the metrics label, OPERATOR.md's
+//!   `FAUCET POST /request` check and Cloudflare's rate-limit rule all keep matching;
+//! * the **plain page**, unchanged, for a visitor without JavaScript: at `/plain` and
+//!   `/plain/r/<n>` behind the proxy (where `/` is the React page), and still at `/` and
+//!   `/r/<n>` for anyone reaching this listener directly. The plain page's form posts to
+//!   the path it was served from's own route — `/` at `/`, `/request` at `/plain`, so the
+//!   public form is covered by the same edge rule as the React page's POST.
+//!
 //! ## Rendering
 //!
 //! No JavaScript, no external fetches, no cookies, no redirects. One `<form>`, text,
@@ -352,6 +373,7 @@ const FAVICON_16: &[u8] = include_bytes!("../assets/brand/favicon-16.png");
 enum Body {
     Html(String),
     Text(String),
+    Json(String),
     Png(&'static [u8]),
 }
 
@@ -360,14 +382,80 @@ impl Body {
         match self {
             Body::Html(_) => "text/html; charset=utf-8",
             Body::Text(_) => "text/plain; charset=utf-8",
+            Body::Json(_) => "application/json",
             Body::Png(_) => "image/png",
+        }
+    }
+
+    /// Headers that belong to the body's kind rather than to the route, so no route
+    /// can serve a page without its CSP or a JSON document a cache may keep.
+    fn kind_headers(&self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Body::Html(_) => &[
+                ("Content-Security-Policy", PLAIN_PAGE_CSP),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Referrer-Policy", "no-referrer"),
+            ],
+            // The faucet's live state: never a cached copy of it.
+            Body::Json(_) => &[("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")],
+            Body::Text(_) | Body::Png(_) => &[],
         }
     }
 
     fn into_bytes(self) -> Vec<u8> {
         match self {
-            Body::Html(s) | Body::Text(s) => s.into_bytes(),
+            Body::Html(s) | Body::Text(s) | Body::Json(s) => s.into_bytes(),
             Body::Png(b) => b.to_vec(),
+        }
+    }
+}
+
+/// The plain page's one stylesheet, inline. A constant, so the CSP can name it by hash.
+const PLAIN_STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;\
+                           padding:0 1rem;line-height:1.5}code{word-break:break-all}\
+                           .state{padding:.75rem 1rem;border-left:4px solid #888;background:#f6f6f6}\
+                           .no{border-color:#a33}.yes{border-color:#3a3}\
+                           textarea{width:100%;font-family:monospace}";
+
+/// The plain page's Content-Security-Policy: **no script at all**, exactly its own
+/// stylesheet (by hash — [`PLAIN_STYLE`]; `plain_csp_hashes_the_stylesheet` fails if
+/// the two drift), its own two icons, forms only to this origin, never framed. The
+/// page already carried none of the rest; this makes a browser refuse them too.
+const PLAIN_PAGE_CSP: &str = "default-src 'none'; style-src 'sha256-6T4lZmJTWebGTMTvH3eSo1ZRM1V5iijLxNJHb8DV2kE='; img-src 'self'; \
+                              form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+/// Whether the client asked for JSON — how the React page's `POST /request` is told
+/// apart from the plain form's.
+fn wants_json(request: &tiny_http::Request) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("Accept") && h.value.as_str().contains("application/json"))
+}
+
+/// Where a plain page was served from, which decides where its form posts and where
+/// its receipt link points (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlainAt {
+    /// `/` on this listener, reached directly: the form posts to `/` (#677).
+    Root,
+    /// `/plain` behind the proxy: the form posts to `/request`, receipts are under
+    /// `/plain/r/`.
+    Plain,
+}
+
+impl PlainAt {
+    fn form_action(self) -> &'static str {
+        match self {
+            PlainAt::Root => "/",
+            PlainAt::Plain => "/request",
+        }
+    }
+
+    fn receipt_path(self, receipt: u64) -> String {
+        match self {
+            PlainAt::Root => format!("/r/{receipt}"),
+            PlainAt::Plain => format!("/plain/r/{receipt}"),
         }
     }
 }
@@ -577,14 +665,54 @@ impl FaucetServer {
                     (tiny_http::Method::Get, "/") => {
                         ("/", 200, Body::Html(render_index(&snapshot(&status), None)), None)
                     }
-                    (tiny_http::Method::Get, p) if p.starts_with("/r/") => {
-                        let receipt = p.trim_start_matches("/r/").parse::<u64>().ok();
+                    (tiny_http::Method::Get, "/plain") => (
+                        "/plain",
+                        200,
+                        Body::Html(render_index_at(&snapshot(&status), None, PlainAt::Plain)),
+                        None,
+                    ),
+                    // The JSON the public page reads (`crate::api`). Fixed route labels,
+                    // like everything else here.
+                    (tiny_http::Method::Get, "/api/status") => (
+                        "/api/status",
+                        200,
+                        Body::Json(
+                            crate::api::status_json(&snapshot(&status), &address_placeholder())
+                                .to_string(),
+                        ),
+                        None,
+                    ),
+                    (tiny_http::Method::Get, p) if p.starts_with("/api/r/") => {
+                        let receipt = p.trim_start_matches("/api/r/").parse::<u64>().ok();
+                        match receipt.and_then(|r| lock(&gate).state_of(r).map(|s| (r, s))) {
+                            Some((r, state)) => (
+                                "/api/r/{receipt}",
+                                200,
+                                Body::Json(crate::api::receipt_json(r, &state).to_string()),
+                                None,
+                            ),
+                            None => (
+                                "/api/r/{receipt}",
+                                404,
+                                Body::Json(crate::api::unknown_receipt_json().to_string()),
+                                None,
+                            ),
+                        }
+                    }
+                    (tiny_http::Method::Get, p)
+                        if p.starts_with("/r/") || p.starts_with("/plain/r/") =>
+                    {
+                        let (label, digits) = match p.strip_prefix("/plain/r/") {
+                            Some(d) => ("/plain/r/{receipt}", d),
+                            None => ("/r/{receipt}", p.trim_start_matches("/r/")),
+                        };
+                        let receipt = digits.parse::<u64>().ok();
                         match receipt.and_then(|r| lock(&gate).state_of(r).map(|s| (r, s))) {
                             Some((r, state)) => {
-                                ("/r/{receipt}", 200, Body::Html(render_receipt(r, &state)), None)
+                                (label, 200, Body::Html(render_receipt(r, &state)), None)
                             }
                             None => (
-                                "/r/{receipt}",
+                                label,
                                 404,
                                 Body::Html(page(
                                     "unknown receipt",
@@ -638,10 +766,20 @@ impl FaucetServer {
                             RequestOutcome::QueueFull { .. } => Some(75),
                             _ => None,
                         };
+                        // The React page posts here too, asking for JSON: same route, same
+                        // label, same journal line (see the module docs). A plain-form
+                        // post answers with the plain page, its form still pointing at
+                        // the route it came through.
+                        let body = if wants_json(&request) {
+                            Body::Json(crate::api::outcome_json(&outcome).to_string())
+                        } else {
+                            let at = if path == "/" { PlainAt::Root } else { PlainAt::Plain };
+                            Body::Html(render_index_at(&snapshot(&status), Some(&outcome), at))
+                        };
                         (
                             "/request",
                             outcome.status(),
-                            Body::Html(render_index(&snapshot(&status), Some(&outcome))),
+                            body,
                             retry.map(|s| ("Retry-After".to_string(), s.to_string())),
                         )
                     }
@@ -668,8 +806,9 @@ impl FaucetServer {
                         404,
                         Body::Html(page(
                             "not found",
-                            "<p>This faucet serves <code>/</code>, a receipt at \
-                             <code>/r/&lt;n&gt;</code>, and its two icons.</p>",
+                            "<p>This faucet serves <code>/</code> (also at <code>/plain</code>), \
+                             a receipt at <code>/r/&lt;n&gt;</code>, the JSON its public page \
+                             reads under <code>/api/</code>, and its two icons.</p>",
                         )),
                         None,
                     ),
@@ -741,6 +880,7 @@ impl FaucetServer {
                 // once for every route: `/healthz` used to answer "ok\n" labelled
                 // `text/html`, which was harmless only because nothing parsed it.
                 let content_type = body.content_type();
+                let kind_headers = body.kind_headers();
                 let mut response = tiny_http::Response::from_data(body.into_bytes())
                     .with_status_code(status_code)
                     .with_header(
@@ -750,6 +890,11 @@ impl FaucetServer {
                         )
                         .expect("static content type parses"),
                     );
+                for (name, value) in kind_headers {
+                    if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+                        response = response.with_header(h);
+                    }
+                }
                 if let Some((name, value)) = extra_header {
                     if let Ok(h) =
                         tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
@@ -984,11 +1129,7 @@ fn page(title: &str, body: &str) -> String {
          <title>Qumbra testnet faucet — {}</title>\
          <link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/favicon-32.png\">\
          <link rel=\"icon\" type=\"image/png\" sizes=\"16x16\" href=\"/favicon-16.png\">\
-         <style>body{{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;\
-         padding:0 1rem;line-height:1.5}}code{{word-break:break-all}}\
-         .state{{padding:.75rem 1rem;border-left:4px solid #888;background:#f6f6f6}}\
-         .no{{border-color:#a33}}.yes{{border-color:#3a3}}\
-         textarea{{width:100%;font-family:monospace}}</style></head><body>\n\
+         <style>{PLAIN_STYLE}</style></head><body>\n\
          <h1>Qumbra testnet faucet</h1>\n{}\n</body></html>\n",
         esc(title),
         body
@@ -1001,6 +1142,10 @@ fn qmb(bessel: u64) -> String {
 }
 
 fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
+    render_index_at(s, outcome, PlainAt::Root)
+}
+
+fn render_index_at(s: &ServiceStatus, outcome: Option<&RequestOutcome>, at: PlainAt) -> String {
     let mut body = String::new();
 
     if let Some(o) = outcome {
@@ -1010,6 +1155,12 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
             o.status(),
             esc(&o.message())
         ));
+        // The message names `/r/<n>`, which behind the proxy is the React page. A
+        // reader on the plain page gets the plain receipt's own link.
+        if let (PlainAt::Plain, RequestOutcome::Queued { receipt, .. }) = (at, o) {
+            let href = at.receipt_path(*receipt);
+            body.push_str(&format!("<p>Your receipt without JavaScript: <a href=\"{href}\">{href}</a></p>\n"));
+        }
     }
 
     let class = if s.availability.admits_requests() { "yes" } else { "no" };
@@ -1020,7 +1171,7 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
 
     body.push_str(&format!(
         "<h2>Ask for {} QMB</h2>\n\
-         <form method=\"post\" action=\"/\">\n\
+         <form method=\"post\" action=\"{}\">\n\
          <p><label for=\"address\">Your Qumbra address</label><br>\n\
          <textarea id=\"address\" name=\"address\" rows=\"4\" required \
          placeholder=\"{}\"></textarea></p>\n\
@@ -1029,6 +1180,7 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
          <p><button type=\"submit\">Request {} QMB</button></p>\n\
          </form>\n",
         qmb(s.grant_value),
+        at.form_action(),
         esc(&address_placeholder()),
         if s.tickets_required { "" } else { " (not required on this faucet)" },
         if s.tickets_required { " required" } else { "" },
@@ -1464,6 +1616,40 @@ mod tests {
         assert!(v6.starts_with("2001:db8:"), "{v6}");
         assert!(!v6.contains(":1/"), "the low 64 bits must be masked away: {v6}");
         assert_eq!(subnet_label("some-proxy-hostname"), "opaque");
+    }
+
+    /// 🔴 The CSP's style hash is the hash of the stylesheet the page actually
+    /// inlines. If `PLAIN_STYLE` changes and the hash does not, a browser refuses the
+    /// page's only stylesheet — silently, in production only.
+    #[test]
+    fn plain_csp_hashes_the_stylesheet() {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(PLAIN_STYLE.as_bytes());
+        let want = format!("style-src 'sha256-{}'", base64_std(digest.as_slice()));
+        assert!(PLAIN_PAGE_CSP.contains(&want), "{PLAIN_PAGE_CSP} lacks {want}");
+        let html = render_index(&lock(&a_status(crate::state::Availability::Ready { grants: 1 })), None);
+        assert!(html.contains(&format!("<style>{PLAIN_STYLE}</style>")), "the page inlines exactly PLAIN_STYLE");
+        assert_eq!(html.matches("<style").count(), 1, "one stylesheet, the hashed one");
+        assert!(!PLAIN_PAGE_CSP.contains("unsafe-inline") && !PLAIN_PAGE_CSP.contains("script-src"));
+    }
+
+    /// Standard base64 with padding — the encoding CSP hash sources use.
+    fn base64_std(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 
     /// The rendered page carries no script, no external reference, and — the point —

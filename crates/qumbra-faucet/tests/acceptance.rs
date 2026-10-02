@@ -1154,3 +1154,100 @@ fn a_partial_harvest_pass_is_not_published() {
     assert_eq!(maturing(&svc), Some(0));
     assert_eq!(svc.status().lock().unwrap().notes_held, 1);
 }
+
+// ---------------------------------------------------------------------------
+// 2026-10-02 — the public page is a separate, same-origin React app
+// ---------------------------------------------------------------------------
+
+/// Like [`post_request_to`] on `/request`, asking for JSON the way the public page does.
+fn post_request_json(addr: SocketAddr, address: &str) -> (u16, String, String) {
+    let body = format!("address={address}");
+    http(
+        addr,
+        &format!(
+            "POST /request HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+/// 🔴 **The JSON the public page reads, and the plain page beside it, over real
+/// sockets.** The page is a separate artifact served on the same origin (Larry,
+/// 2026-10-02); this listener answers its JSON and keeps the plain page for a
+/// visitor without JavaScript.
+///
+/// The load-bearing assertion is the journal line: the page's POST goes to
+/// `/request`, so `FAUCET POST /request 202` — what OPERATOR.md's proven-grant check
+/// greps, and what Cloudflare's rate-limit rule matches — is unchanged by the page
+/// having moved.
+#[test]
+fn the_public_page_reads_json_and_the_plain_page_still_serves() {
+    let wallet = faucet_wallet();
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Disabled);
+    funded(&mut node, &mut svc, &wallet);
+    let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
+
+    // GET /api/status: the snapshot as JSON, never cached.
+    let (status, head, body) = get(server.addr(), "/api/status");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(header(&head, "Content-Type"), Some("application/json"), "{head}");
+    assert_eq!(header(&head, "Cache-Control"), Some("no-store"), "{head}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(v["version"], 1);
+    assert_eq!(v["availability"]["kind"], "ready", "{v}");
+    assert_eq!(v["availability"]["admits_requests"], true);
+
+    // POST /request asking for JSON: the outcome as JSON, on the same route.
+    let (_, addr) = requester(0xC0DE_0A01);
+    let (status, head, body) = post_request_json(server.addr(), &addr.encode());
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(header(&head, "Content-Type"), Some("application/json"));
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!((v["outcome"].as_str(), v["receipt"].as_u64()), (Some("queued"), Some(1)), "{v}");
+    assert!(
+        server.journal().iter().any(|l| l.starts_with("FAUCET POST /request 202")),
+        "the page's POST must journal as `FAUCET POST /request`: {:?}",
+        server.journal()
+    );
+    // A bad address is a typed 400 in JSON too, and the body never echoes it.
+    let (status, _, body) = post_request_json(server.addr(), "not-an-address");
+    assert_eq!(status, 400);
+    assert!(body.contains("\"bad_address\"") && !body.contains("not-an-address"), "{body}");
+
+    // GET /api/r/<n>: the receipt as JSON; an unknown one is a JSON 404.
+    let (status, _, body) = get(server.addr(), "/api/r/1");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"state\":\"queued\""), "{body}");
+    let (status, _, body) = get(server.addr(), "/api/r/999");
+    assert_eq!(status, 404);
+    assert!(body.contains("\"state\":\"unknown\""), "{body}");
+
+    // GET /plain: the plain page, posting to `/request` (the route the edge rule
+    // covers), with a CSP that forbids any script.
+    let (status, head, body) = get(server.addr(), "/plain");
+    assert_eq!(status, 200);
+    assert!(body.contains("action=\"/request\""), "{body}");
+    assert!(!body.contains("<script"), "{body}");
+    let csp = header(&head, "Content-Security-Policy").expect("the plain page carries a CSP");
+    assert!(csp.contains("default-src 'none'") && !csp.contains("script-src"), "{csp}");
+
+    // A plain-form POST to /request answers with the plain page and a plain receipt link.
+    let (_, addr2) = requester(0xC0DE_0A02);
+    let (status, _, body) = post_request(server.addr(), &addr2.encode(), None);
+    assert_eq!(status, 202, "{body}");
+    assert!(body.contains("href=\"/plain/r/2\""), "{body}");
+    let (status, _, body) = get(server.addr(), "/plain/r/2");
+    assert_eq!(status, 200);
+    assert!(body.contains("waiting"), "{body}");
+    server.shutdown();
+}

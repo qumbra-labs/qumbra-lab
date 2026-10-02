@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "status": 400,
+  "message": "that is not a Qumbra address. Paste the whole bech32m string your wallet showed you, with no line breaks.",
+  "outcome": "bad_address"
+}
