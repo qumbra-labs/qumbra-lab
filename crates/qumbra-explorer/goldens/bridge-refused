@@ -1,1 +1,1 @@
-{"v":1,"available":false,"why":"the bridge ledger refused: CounterDecrease { height: 7 }"}
+{"v":1,"available":false,"reason":"ledger_refused","why":"the bridge ledger refused: CounterDecrease { height: 7 }"}
