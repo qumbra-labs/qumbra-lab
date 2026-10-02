@@ -110,10 +110,10 @@ fn scan(w: &WalletDir, chain: &FixtureChain, pin: Option<[u8; 32]>) -> Result<qu
     scan_annulet(w, &mut fetch, 0, 10, pin, &mut rng)
 }
 
-#[test]
-fn a_fixture_l2_stream_scans_into_per_asset_balances() {
-    let w = wallet_dir("balances", 0x11);
-    let stranger = wallet_dir("balances_stranger", 0x22);
+/// The two-asset chain C1's done-when scans, shared with the W1 ledger test:
+/// genesis USDT-test (asset 1) to address 0, a fee-unit grant to address 1 at
+/// height 1, and at height 2 the genesis note spent with 400 back to address 0.
+fn two_asset_chain(w: &WalletDir, stranger: &WalletDir) -> FixtureChain {
     let (a0, a1) = (w.wallet().address_at_index(0), w.wallet().address_at_index(1));
     let s0 = stranger.wallet().address_at_index(0);
     let mut rng = StdRng::seed_from_u64(1);
@@ -134,7 +134,14 @@ fn a_fixture_l2_stream_scans_into_per_asset_balances() {
     let spent_genesis = OwnedL2Note::from_genesis(&w.wallet(), 0, genesis[0].cm, usdt_genesis).unwrap().nullifier(&w.wallet());
     let mut nullifiers = BTreeMap::new();
     nullifiers.insert(2, vec![spent_genesis, [0xEE; 32]]);
-    let chain = FixtureChain { genesis, blocks, nullifiers, tip: 3, annulet: true };
+    FixtureChain { genesis, blocks, nullifiers, tip: 3, annulet: true }
+}
+
+#[test]
+fn a_fixture_l2_stream_scans_into_per_asset_balances() {
+    let w = wallet_dir("balances", 0x11);
+    let stranger = wallet_dir("balances_stranger", 0x22);
+    let chain = two_asset_chain(&w, &stranger);
 
     let report = scan(&w, &chain, Some(GENESIS)).expect("an Annulet endpoint with the pinned genesis");
     assert_eq!(report.genesis_hash, GENESIS);
@@ -300,4 +307,67 @@ fn annulet_rows_scan_the_range_once_and_equal_the_per_index_rows() {
     for d in [&w.dir, &stranger_dir.dir] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// 🔴 **W1's done-when** (lab #831): `history --net annulet` over the C1
+/// chain — the genesis receipt, the height-1 grant, and the height-2 spend
+/// read as asset 1's net (−999,600: 1,000,000 out, 400 back); the totals close
+/// on the scan's own per-asset balances, from the same report.
+#[test]
+fn w1_the_annulet_ledger_reads_the_scan_as_per_asset_movements() {
+    use qlab_ledger::l2history::{render, AssetTotals, L2Event};
+    let w = wallet_dir("w1_ledger", 0x11);
+    let stranger = wallet_dir("w1_ledger_stranger", 0x22);
+    let chain = two_asset_chain(&w, &stranger);
+    let report = scan(&w, &chain, Some(GENESIS)).unwrap();
+
+    let ledger = qumbra_wallet::annulet::history(&report, (0, 10));
+
+    assert!(ledger.gaps.is_empty(), "{:?}", ledger.gaps);
+    assert_eq!(ledger.events.iter().map(L2Event::height).collect::<Vec<_>>(), vec![0, 1, 2]);
+    let L2Event::Movement(m) = &ledger.events[2] else { panic!("height 2 is the spend") };
+    assert_eq!(m.by_asset.iter().map(|n| (n.asset, n.net())).collect::<Vec<_>>(), vec![(1, -999_600)]);
+    assert_eq!(
+        ledger.totals.as_deref().unwrap(),
+        &[
+            AssetTotals { asset: 0, received: 2, spent: 0, spendable: 2 },
+            AssetTotals { asset: 1, received: 1_000_400, spent: 1_000_000, spendable: 400 },
+        ]
+    );
+    assert_eq!(
+        ledger.totals.as_deref().unwrap().iter().map(|t| (t.asset, t.spendable)).collect::<Vec<_>>(),
+        report.index.as_ref().unwrap().balances(),
+        "the ledger's spendable is `scan`'s figure"
+    );
+    let text = render(&ledger, "fixture");
+    assert!(text.contains("height 0  RECEIVED (genesis note)"), "{text}");
+    assert!(text.contains("net:       asset 1 -999600 (out 1000000, back 400)"), "{text}");
+    assert!(text.contains("its fee is never separated from its amount — and no recipient is ever shown"), "{text}");
+    for d in [&w.dir, &stranger.dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// W1: a scan whose nullifier stream could not be read is a receipts-only
+/// ledger with no totals, and says why.
+#[test]
+fn w1_no_nullifier_stream_is_a_receipts_only_ledger() {
+    let w = wallet_dir("w1_unquotable", 0x55);
+    let a0 = w.wallet().address_at_index(0);
+    let mut rng = StdRng::seed_from_u64(5);
+    let mut blocks = BTreeMap::new();
+    blocks.insert(1, vec![vec![pay(&a0, &[note_to(&a0, 9, 0, 50)], &mut rng)]]);
+    let chain = FixtureChain { genesis: Vec::new(), blocks, nullifiers: BTreeMap::new(), tip: 1, annulet: true };
+    let mut rng = StdRng::seed_from_u64(6);
+    let mut fetch = |p: &str| if p.starts_with("/v1/nullifiers") { Err("404".into()) } else { chain.fetch(p) };
+    let report = scan_annulet(&w, &mut fetch, 0, 10, None, &mut rng).unwrap();
+
+    let ledger = qumbra_wallet::annulet::history(&report, (0, 10));
+
+    assert!(ledger.totals.is_none());
+    assert_eq!(ledger.events.len(), 1, "the receipt is still shown");
+    let text = qlab_ledger::l2history::render(&ledger, "fixture");
+    assert!(text.contains("totals:   UNAVAILABLE"), "{text}");
+    assert!(text.contains("receipts only"), "{text}");
+    let _ = std::fs::remove_dir_all(&w.dir);
 }

@@ -157,6 +157,10 @@ pub struct AnnuletReport {
     pub rows: Vec<AnnuletRow>,
     /// Genesis notes whose `rkm` is one of this wallet's addresses'.
     pub genesis_owned: usize,
+    /// Every note this scan made the wallet's, genesis notes first — what the
+    /// ledger (`history --net annulet`, lab #831 W1) is built from, kept
+    /// whether or not an index could be.
+    pub owned: Vec<OwnedL2Note>,
     pub spent: SpentCoverage,
     /// `Some` only when every scan started and the nullifier stream covers
     /// what they found (lab #314): the per-asset figures.
@@ -224,10 +228,10 @@ where
 
     let every_scan_started = rows.iter().all(|r| r.scan.is_ok());
     let index = match (&set, every_scan_started) {
-        (Some(set), true) => Some(AssetIndex::build(&wallet, owned, set)),
+        (Some(set), true) => Some(AssetIndex::build(&wallet, owned.clone(), set)),
         _ => None,
     };
-    Ok(AnnuletReport { genesis_hash, rows, genesis_owned, spent, index, refused })
+    Ok(AnnuletReport { genesis_hash, rows, genesis_owned, owned, spent, index, refused })
 }
 
 /// One row per allocated index, scanned over **one** fetch of the range (lab
@@ -318,6 +322,53 @@ pub fn render(report: &AnnuletReport, url: &str, range: (u64, u64)) -> String {
         out.push_str(&format!("refused:  {why}\n"));
     }
     out
+}
+
+/// **The Annulet ledger** (lab #831 W1): the scan's report, read as this
+/// wallet's history. Every verdict and every gap is the scan's own — an
+/// address whose scan never started, outputs detected and not read, a note
+/// refused — handed to [`qlab_ledger::l2history::build`] verbatim, so the
+/// ledger and `scan --net annulet` can never disagree about what was read.
+pub fn history(report: &AnnuletReport, range: (u64, u64)) -> qlab_ledger::l2history::L2Ledger {
+    use qlab_cbserver::client::Completeness;
+    use qlab_ledger::l2history::{build, L2Verdict};
+    use qlab_ledger::vocab::UNAVAILABLE;
+
+    let mut verdicts = Vec::new();
+    let mut gaps = Vec::new();
+    for row in &report.rows {
+        let verdict = match &row.scan {
+            Err(why) => {
+                gaps.push(format!(
+                    "outputs for address [{}] over heights {}..={}: the scan never started ({why})",
+                    row.index, range.0, range.1
+                ));
+                format!("{UNAVAILABLE} — the scan never started: {why}")
+            }
+            Ok(outcome) => match outcome.completeness() {
+                Completeness::Complete => "complete".to_string(),
+                Completeness::Shadowed { opened, spendable } => format!(
+                    "complete; {} of {opened} opened note(s) are already dead (another note claims \
+                     their nullifier) and are in no figure",
+                    opened - spendable
+                ),
+                Completeness::Incomplete { detected, opened }
+                | Completeness::IncompleteAndShadowed { detected, opened, .. } => {
+                    gaps.push(format!(
+                        "outputs for address [{}]: {detected} output(s) are this key's by the \
+                         committed discovery and only {opened} could be read",
+                        row.index
+                    ));
+                    format!("{UNAVAILABLE} — {detected} detected, {opened} read")
+                }
+            },
+        };
+        verdicts.push(L2Verdict { div_index: row.index, address_short: row.short.clone(), verdict });
+    }
+    for why in &report.refused {
+        gaps.push(format!("a note the scan opened was not made this wallet's: {why}"));
+    }
+    build(range, report.genesis_hash, verdicts, &report.owned, report.index.as_ref(), &report.spent, gaps)
 }
 
 /// [`render`] with a fixed URL and range — the tests' view of the text.
