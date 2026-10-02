@@ -43,6 +43,8 @@ pub enum L2Answer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct L2Route {
     pub l2_id: u64,
+    /// The genesis claim tariff a claim's `PV_FEE` must equal (ruling Q-B2).
+    pub claim_fee_tier: u64,
     pub wrapper_params: [u8; 32],
     pub revision: Option<[u8; 32]>,
     pub genesis: [u8; 32],
@@ -79,11 +81,19 @@ pub fn parse_l2_route(body: &[u8]) -> Result<L2Answer, String> {
         return Ok(L2Answer::NotBridged { why: why.to_string() });
     }
     let rest = rest.strip_prefix(r#""available":true,"l2_id":"#).ok_or("/v1/l2: neither a bridged nor a not-bridged answer")?;
+    let decimal = |field: &str, s: &str| -> Result<u64, String> {
+        if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) || (s.len() > 1 && s.starts_with('0')) {
+            return Err(format!("/v1/l2: {field} {s:?} is not a canonical decimal"));
+        }
+        s.parse().map_err(|_| format!("/v1/l2: {field} {s} does not fit a u64"))
+    };
     let (id, rest) = rest.split_once(',').ok_or("/v1/l2: truncated after l2_id")?;
-    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) || (id.len() > 1 && id.starts_with('0')) {
-        return Err(format!("/v1/l2: l2_id {id:?} is not a canonical decimal"));
-    }
-    let l2_id: u64 = id.parse().map_err(|_| format!("/v1/l2: l2_id {id} does not fit a u64"))?;
+    let l2_id = decimal("l2_id", id)?;
+    // A body without the tier (a node from before lab #831 W3a) is refused
+    // here by name: a claim cannot be built without it.
+    let rest = rest.strip_prefix(r#""claim_fee_tier":"#).ok_or("/v1/l2: claim_fee_tier missing (a node older than this wallet)")?;
+    let (tier, rest) = rest.split_once(',').ok_or("/v1/l2: truncated after claim_fee_tier")?;
+    let claim_fee_tier = decimal("claim_fee_tier", tier)?;
     let hex32 = |field: &str, rest: &str| -> Result<([u8; 32], usize), String> {
         let h = rest.get(..64).ok_or(format!("/v1/l2: {field} is not 64 hex digits"))?;
         // Byte pairs below index by byte: a multi-byte character inside the
@@ -118,7 +128,7 @@ pub fn parse_l2_route(body: &[u8]) -> Result<L2Answer, String> {
     if &rest[n..] != r#""}"# {
         return Err("/v1/l2: bytes after genesis".into());
     }
-    Ok(L2Answer::Bridged(L2Route { l2_id, wrapper_params, revision, genesis }))
+    Ok(L2Answer::Bridged(L2Route { l2_id, claim_fee_tier, wrapper_params, revision, genesis }))
 }
 
 /// Why a note left the spendable list.
@@ -257,12 +267,12 @@ mod tests {
     fn the_l2_route_reader_takes_exactly_the_canonical_answers() {
         let h = |c: char| c.to_string().repeat(64);
         let yes = format!(
-            r#"{{"v":1,"available":true,"l2_id":1,"wrapper_params":"{}","revision":"{}","genesis":"{}"}}"#,
+            r#"{{"v":1,"available":true,"l2_id":1,"claim_fee_tier":4,"wrapper_params":"{}","revision":"{}","genesis":"{}"}}"#,
             h('c'),
             h('7'),
             h('4')
         );
-        let route = L2Route { l2_id: 1, wrapper_params: [0xcc; 32], revision: Some([0x77; 32]), genesis: [0x44; 32] };
+        let route = L2Route { l2_id: 1, claim_fee_tier: 4, wrapper_params: [0xcc; 32], revision: Some([0x77; 32]), genesis: [0x44; 32] };
         assert_eq!(parse_l2_route(yes.as_bytes()), Ok(L2Answer::Bridged(route.clone())));
         let null_rev = yes.replace(&format!(r#""{}","genesis""#, h('7')), r#"null,"genesis""#);
         assert_eq!(parse_l2_route(null_rev.as_bytes()), Ok(L2Answer::Bridged(L2Route { revision: None, ..route })));
@@ -272,6 +282,8 @@ mod tests {
         for bad in [
             yes.replacen(r#""v":1"#, r#""v":2"#, 1),
             yes.replacen("l2_id\":1", "l2_id\":01", 1),
+            yes.replacen("\"claim_fee_tier\":4,", "", 1),
+            yes.replacen("claim_fee_tier\":4", "claim_fee_tier\":-4", 1),
             yes.replacen(&h('c'), &h('C'), 1),
             // A multi-byte character straddling a hex pair: refused, not a panic.
             yes.replacen(&h('c'), &format!("a\u{e9}{}", "c".repeat(61)), 1),

@@ -1087,8 +1087,10 @@ fn deposit(args: &[String]) -> Result<(), Box<dyn Error>> {
     let w = WalletDir::open(&dir)?;
     let burn = qumbra_wallet::deposit::burn_address(&w.wallet(), l2_id);
     println!(
-        "deposit: {amount} bessel to L2 {l2_id} on genesis {} — confirmed by the node's /v1/l2 (wrapper params {})",
+        "deposit: {amount} bessel to L2 {l2_id} on genesis {} — confirmed by the node's /v1/l2 (claim fee tier {}, \
+         wrapper params {})",
         route.genesis.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        route.claim_fee_tier,
         route.wrapper_params.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
     println!(

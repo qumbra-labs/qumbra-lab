@@ -93,6 +93,12 @@ fn serve() -> (String, u64, DiscoveryServer) {
     view.refresh(node.chain());
     let (submit, _rx) = mpsc::sync_channel::<SubmitRequest>(1);
     let v6 = qumbra_node::genesis_v6::GenesisFileV6::new_rehearsal();
+    // Ruling Q-B2: the served tier is the genesis's, read back through the
+    // wallet's own reader — 4, the rehearsal WrapperParams' placeholder.
+    let served = qlab_ledger::deposits::parse_l2_route(&l2_route_body(&v6, None)).expect("the reader takes the node's body");
+    let qlab_ledger::deposits::L2Answer::Bridged(route) = served else { panic!("a V6 body is bridged") };
+    assert_eq!((route.l2_id, route.claim_fee_tier), (1, qumbra_node::genesis_v6::WrapperParams::rehearsal().claim_fee_tier));
+    assert_eq!(route.claim_fee_tier, 4);
     let server = DiscoveryServer::start_with_mine(
         "127.0.0.1:0",
         Arc::new(Mutex::new(Arc::new(view))),

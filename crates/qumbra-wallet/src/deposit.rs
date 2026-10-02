@@ -93,7 +93,7 @@ mod tests {
     use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 
     fn route(l2_id: u64, genesis: [u8; 32]) -> L2Answer {
-        L2Answer::Bridged(L2Route { l2_id, wrapper_params: [1; 32], revision: None, genesis })
+        L2Answer::Bridged(L2Route { l2_id, claim_fee_tier: 4, wrapper_params: [1; 32], revision: None, genesis })
     }
 
     /// Q2 and Q-W3-1: the deposit payee pays the burn and is sealed to this
