@@ -2259,6 +2259,30 @@ mod tests {
         }
     }
 
+    /// Lab #815: an Annulet asset request is REFUSED across the ABI, by name —
+    /// never handed back as an address with an amount-less (or QMB) request,
+    /// which a shell would then pay in QMB. So is an unknown `req-` key.
+    #[test]
+    fn an_asset_payment_uri_is_refused_across_the_abi_never_read_as_qmb() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let full_ptr = qmb_wallet_address(w, 0);
+            let full = CStr::from_ptr(full_ptr).to_str().unwrap().to_string();
+            qmb_string_free(full_ptr);
+            for (q, says) in [("req-asset=7&amount=1000000", "Annulet asset 7"), ("req-asset=7", "Annulet asset 7"), ("req-foo=1", "req-foo")] {
+                let uri = CString::new(format!("qumbra:{full}?{q}")).unwrap();
+                let (mut amount, mut has): (u64, u8) = (0, 0);
+                let mut err: *mut c_char = ptr::null_mut();
+                let out = qmb_uri_parse(uri.as_ptr(), &mut amount, &mut has, &mut err);
+                assert!(out.is_null(), "{q}: refused, not parsed");
+                let why = CStr::from_ptr(err).to_str().unwrap().to_string();
+                qmb_string_free(err);
+                assert!(why.contains(says), "{q}: {why}");
+            }
+            qmb_wallet_free(w);
+        }
+    }
+
     /// The Receive screen's QR: a real SVG of the full address, across the ABI.
     #[test]
     fn the_address_qr_renders_as_svg() {
