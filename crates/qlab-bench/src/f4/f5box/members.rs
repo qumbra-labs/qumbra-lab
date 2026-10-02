@@ -125,6 +125,10 @@ pub(crate) enum Inst {
     /// With the leaf it writes (bound through `new_root`, not a PV).
     R(L2ShapeRInstance, RegistryLeaf),
     C(ClaimInstance),
+    /// Lab #831 W3c: a claim proven elsewhere — a depositor's claim file
+    /// (`qumbra-wallet deposit claim`): its public values and its proof, as
+    /// `bincode` bytes already verified when the file was taken.
+    Proven { pvs: Vec<u32>, proof: Vec<u8> },
 }
 
 impl Inst {
@@ -133,7 +137,7 @@ impl Inst {
             Inst::S(_) => WTag::S,
             Inst::P(_) => WTag::P,
             Inst::R(..) => WTag::R,
-            Inst::C(_) => WTag::C,
+            Inst::C(_) | Inst::Proven { .. } => WTag::C,
         }
     }
 
@@ -143,6 +147,7 @@ impl Inst {
             Inst::P(i) => &i.pvs,
             Inst::R(i, _) => &i.pvs,
             Inst::C(i) => &i.pvs,
+            Inst::Proven { pvs, .. } => pvs,
         }
     }
 
@@ -155,13 +160,15 @@ impl Inst {
         Member { tag: self.tag(), pvs: self.pvs().to_vec(), write }
     }
 
-    /// Prove it under the L2 lane (7–31 GiB; box only).
+    /// Prove it under the L2 lane (7–31 GiB; box only). A claim proven
+    /// elsewhere is not proven again: its proof is the file's.
     pub(crate) fn prove(&self) -> Proof<Config> {
         match self {
             Inst::S(i) => qlab_l2::prove_s(i).1,
             Inst::P(i) => qlab_l2::prove_p(i).1,
             Inst::R(i, _) => qlab_l2::prove_r(i).1,
             Inst::C(i) => qlab_l2::claim::prove_claim(i).1,
+            Inst::Proven { proof, .. } => bincode::deserialize(proof).expect("a claim file's proof decoded when it was taken"),
         }
     }
 }
@@ -235,6 +242,11 @@ pub(crate) enum PlanError {
     RegistryFull,
     /// The native wrapper statement refuses the batch.
     Wrapper(String),
+    /// Lab #831 W3c: a claim file was given and the wrapper has no claim slot.
+    NoClaimSlot,
+    /// Lab #831 W3c: the claim file opens its burn under a root no wrapper
+    /// has absorbed and this one does not absorb.
+    ClaimAnchorNotAbsorbed { root: Digest },
 }
 
 /// The policy input of an asset-0 note at `rkm` under `reg`: Cloaked, the
@@ -487,38 +499,76 @@ pub(crate) fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, ex
     Ok(Plan { exits, rin, wit, rout, exit_cmt, ..base })
 }
 
-/// **Lab #831 W3b: a claim built elsewhere, in claim `slot`** — the wallet's
-/// claim of its own tx-output burn (`qlab_l2spend::claim_instance`) — with
-/// everything a claim moves besides its member: its deposit-sum opening
+/// **Swap claim slot `slot`'s member for `inst`** (lab #831 W3b/W3c), with
+/// everything a claim moves besides its member: its deposit-sum opening `dep`
 /// replaces the slot's (`deps`), the batch total `d_batch` is recomputed from
-/// the openings, the burn it claims replaces the slot's in `claimed`, and the
-/// old claim's credit leaves `credited` (the new credit is the wallet's, not
-/// this run's). Then the native statement, exactly as [`plan`] runs it.
-/// Test-only, as [`reseal`].
-#[cfg(test)]
-pub(crate) fn reseal_claim(
-    state: &WState,
-    mut base: Plan,
-    slot: usize,
-    inst: ClaimInstance,
-    dep: DepEntry,
-    burn: Burn,
-    keys: &Keys,
-) -> Result<Plan, PlanError> {
-    let Inst::C(old) = &base.insts[slot] else { return Err(PlanError::Wrapper(format!("slot {slot} is not a claim"))) };
+/// the openings, the old claim's credit leaves `credited` (the new credit is
+/// its depositor's, not this run's), and the burn it claims replaces the
+/// slot's in `claimed` — or leaves it, for a claim whose burn f5box cannot see
+/// (`burn: None`, a depositor's claim file). Then the native statement,
+/// exactly as [`plan`] runs it.
+///
+/// Dropping a burn from `claimed` is safe: outside the tests nothing reads
+/// `claimed` positionally — the manifest and `--check` only list it — and the
+/// state file does not track burns (a burn's claim is known to the wrapper by
+/// its `cnf`, which the member's PVs carry).
+fn swap_claim(state: &WState, mut base: Plan, slot: usize, inst: Inst, dep: DepEntry, burn: Option<Burn>, keys: &Keys) -> Result<Plan, PlanError> {
+    let Inst::C(old) = &base.insts[slot] else { return Err(PlanError::Wrapper(format!("slot {slot} is not a claim f5box built"))) };
     let old_credit = old.cm2;
-    let ci = base.insts[..slot].iter().filter(|i| matches!(i, Inst::C(_))).count();
+    let ci = base.insts[..slot].iter().filter(|i| i.tag() == WTag::C).count();
     base.deps[ci] = dep;
-    base.claimed[ci] = burn;
+    match burn {
+        Some(b) => base.claimed[ci] = b,
+        None => {
+            base.claimed.remove(ci);
+        }
+    }
     base.credited.retain(|c| c.cm(keys) != old_credit);
     base.inp.d_batch = base
         .deps
         .iter()
         .try_fold(0u64, |a, d| a.checked_add(d.v))
         .ok_or(PlanError::Wrapper("D_batch overflows u64".into()))?;
-    base.insts[slot] = Inst::C(inst);
+    base.insts[slot] = inst;
     base.members = base.insts.iter().map(Inst::member).collect();
     let exits = std::mem::take(&mut base.exits);
     let (rin, wit, rout, exit_cmt) = statement(state, &base.inp, &base.members, &exits)?;
     Ok(Plan { exits, rin, wit, rout, exit_cmt, ..base })
+}
+
+/// **Lab #831 W3b: a claim built elsewhere, in claim `slot`** — the wallet's
+/// claim instance, with the burn it claims. Test-only; the box takes a claim
+/// FILE through [`take_claim_file`].
+#[cfg(test)]
+pub(crate) fn reseal_claim(
+    state: &WState,
+    base: Plan,
+    slot: usize,
+    inst: ClaimInstance,
+    dep: DepEntry,
+    burn: Burn,
+    keys: &Keys,
+) -> Result<Plan, PlanError> {
+    swap_claim(state, base, slot, Inst::C(inst), dep, Some(burn), keys)
+}
+
+/// **Lab #831 W3c: a depositor's claim file, as this wrapper's first claim.**
+/// The file's public values and proof become the member, its `(v, r_v)` the
+/// deposit-sum opening; the claim f5box planned for that slot is dropped (its
+/// burn stays claimable by a later wrapper). Refused by name when the plan has
+/// no claim slot, or when the claim's anchor is a root neither absorbed before
+/// nor by this wrapper — a wrapper takes a claim only under a root in `AA`;
+/// the depositor rebuilds it at a newer anchor (`deposit claim
+/// --anchor-count`). The proof is verified by the caller before this, so an
+/// unprovable file never costs an hour of proving the rest.
+pub(crate) fn take_claim_file(state: &WState, base: Plan, file: qlab_l2spend::ClaimFile, keys: &Keys) -> Result<Plan, PlanError> {
+    let slot = base.insts.iter().position(|i| matches!(i, Inst::C(_))).ok_or(PlanError::NoClaimSlot)?;
+    let member = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None };
+    let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("the claim file's anchor: {e:?}")))?;
+    let absorbed_before = (0..state.aa.len()).any(|i| state.aa.leaf(i) == anchor);
+    if !absorbed_before && !base.inp.absorbed.contains(&anchor) {
+        return Err(PlanError::ClaimAnchorNotAbsorbed { root: anchor });
+    }
+    let dep = DepEntry { v: file.value, r_v: file.r_v };
+    swap_claim(state, base, slot, Inst::Proven { pvs: file.pvs, proof: file.proof }, dep, None, keys)
 }

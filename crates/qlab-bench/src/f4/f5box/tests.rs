@@ -312,7 +312,7 @@ fn f5box_the_mix_spends_the_deposit_and_pays_the_exit() {
             Inst::S(i) => (i.anchor, Some(i.registry_root)),
             Inst::P(i) => (i.anchor, Some(i.registry_root)),
             Inst::R(i, _) => (i.anchor, None),
-            Inst::C(_) => continue,
+            Inst::C(_) | Inst::Proven { .. } => continue,
         };
         assert_eq!(anchor, c_in, "slot {slot} anchors at C_in");
         if let Some(root) = regroot {
@@ -401,6 +401,7 @@ fn f5box_built_members_satisfy_their_circuits() {
             Inst::R(i, _) => qlab_air::l2test::satisfied(&i.air, &i.air.generate_trace::<Val>(0), &pvs),
             Inst::S(i) => qlab_air::l2test::satisfied(&i.air, &i.air.generate_trace::<Val>(0), &pvs),
             Inst::C(i) => qlab_air::l2test::satisfied(&i.air, &i.air.generate_trace::<Val>(0), &pvs),
+            Inst::Proven { .. } => unreachable!("f5box builds every member of the mix itself"),
         };
         assert!(verdict.is_ok(), "slot {slot} ({:?}): {verdict:?}", inst.tag());
     }
@@ -554,7 +555,7 @@ fn f5box_the_command_line() {
     let first = parse(&a("--genesis g --chain http://n --state s --out o --seed lane")).unwrap();
     assert_eq!(
         first,
-        Cmd::Build(Build { genesis: "g".into(), chain: "http://n".into(), state: "s".into(), out: "o".into(), seed: Some("lane".into()), exit: None, check: false })
+        Cmd::Build(Build { genesis: "g".into(), chain: "http://n".into(), state: "s".into(), out: "o".into(), seed: Some("lane".into()), exit: None, claim: None, check: false })
     );
     let hex = burn_rkm_hex(7);
     assert_eq!(qumbra_node::config::rkm_lanes_from_hex(&hex).unwrap(), qlab_air::claim::rkm_burn(7));
@@ -593,6 +594,13 @@ fn f5box_the_command_line() {
     let Cmd::Build(n) = parse(&real(&format!("--next --genesis g --chain c --state s --out o --exit-rkm {hex} --exit-v 7 --check"))).unwrap() else { panic!() };
     assert_eq!((n.exit.map(|e| e.v), n.check, n.seed), (Some(7), true, None));
     assert_eq!(parse(&real("f5box --burn-rkm --genesis g")).unwrap_err(), "stray argument \"f5box\"");
+
+    // Lab #831 W3c: `--claim FILE` rides either build.
+    let Cmd::Build(d) = parse(&real("--genesis g --chain c --state s --out o --seed lane --claim deposit.claim")).unwrap() else { panic!() };
+    assert_eq!(d.claim.as_deref(), Some(std::path::Path::new("deposit.claim")));
+    let Cmd::Build(m) = parse(&real(&format!("--next --genesis g --chain c --state s --out o --exit-rkm {hex} --claim x.claim"))).unwrap() else { panic!() };
+    assert!(m.claim.is_some() && m.exit.is_some());
+    assert!(parse(&a("--genesis g --chain c --state s --out o --seed x --claim")).unwrap_err().starts_with("--claim takes a value"));
 }
 
 /// A **text lint**: no f5box source names the rule's two test-knob calls.
@@ -766,83 +774,19 @@ fn w2_the_wallets_exit_is_a_member_the_node_rule_takes() {
 #[test]
 fn w3b_a_wallets_tx_output_burn_is_set_aside_found_claimed_and_taken_as_a_member() {
     use qlab_air::claim::{BurnNote, ClaimCredit};
-    use qlab_cbserver::client::{light_client_scan_with, ScanConfig};
-    use qlab_devnet::body::TxPublic;
-    use qlab_devnet::fees::{posted_fee, ArityBucket};
     use qlab_l2spend::{claim_instance, decode_claim_artifact, encode_claim_artifact, ClaimFileError};
-    use qlab_ledger::deposits::{set_aside, SetAsideKind};
     use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
     use qlab_wallet::Wallet;
-    use qumbra_node::discovery_server::{respond, respond_full};
-    use rand::SeedableRng;
     use super::chain::TxBurnOpening;
     use super::members::reseal_claim;
     use crate::f4::dep::DepEntry;
 
-    const DEPOSIT: u64 = 5_000_000_000;
+    const DEPOSIT: u64 = DEPOSIT_V;
     let l2_id = params().l2_id;
-    let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([0x31; ENTROPY_LEN]), 0);
-    let d0 = wallet.diversifier_at_index(0);
-    let kp = wallet.diversified_keypair(&d0);
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0x0831);
-
-    // The chain: records every eight. Sixteen deposits (eight transactions of
-    // two burn outputs each, all sealed to this wallet) mined at height 10,
-    // anchored at height 8's root — the root the record carried by block 9
-    // covers (V6's anchor rule). Sixteen, because a v1 wrapper holds exactly
-    // K = 16 members (V1): the lane's wrapper is sixteen claims of them.
-    let mut b = Box6::new();
-    b.mine_to(8);
-    let anchor8 = b.node.commitment_root();
-    b.mine_to(9);
-    let deposits: Vec<TxEntry> = (0..8u8)
-        .map(|t| {
-            let note = |j: u64| qlab_note::note::Note {
-                value: DEPOSIT,
-                rkm: qlab_air::claim::rkm_burn(l2_id),
-                rho: [0xB1, u64::from(t), j, 4],
-                rseed: [0xB5, u64::from(t), j, 8],
-            };
-            let enc = qlab_note::scan::encrypt_to_recipient(&kp.ek, &[note(0), note(1)], &mut rng);
-            TxEntry::new(
-                b"proof-placeholder".to_vec(),
-                TxPublic {
-                    anchor: anchor8,
-                    nullifiers: vec![[0x90 + t; 32], [0xA0 + t; 32]],
-                    commitments: enc.bundle.entries.iter().map(|e| e.cm).collect(),
-                    bucket: ArityBucket::TwoByTwo,
-                    fee: posted_fee(ArityBucket::TwoByTwo),
-                },
-                &[enc.bundle],
-                &enc.payloads,
-            )
-        })
-        .collect();
-    b.mine_one(deposits);
-    b.mine_to(25);
-    let tip = b.node.tip_height();
-
-    // The wallet's own scan, over the node's own route cores.
-    let routes = Routes::of(&b.node);
-    let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
-        let (route, query) = path.split_once('?').unwrap_or((path, ""));
-        let r = if route == "/v1/compact" {
-            respond(&routes.discovery, query)
-        } else if let Some((h, rest)) = route.strip_prefix("/v1/block/").and_then(|r| r.split_once("/tx/")) {
-            respond_full(&routes.discovery, (h, rest.strip_suffix("/full").ok_or("not a full path")?))
-        } else {
-            return Err(format!("no route {route}"));
-        };
-        r.map_err(|(code, why)| format!("{path}: {code} {why}"))
-    };
-    let mut outcome = light_client_scan_with(&mut fetch, &kp.dk, 0, tip, ScanConfig::default(), &mut rng).expect("the scan runs");
-    let set = set_aside(&wallet, 0, &mut outcome, &[l2_id]);
-    assert!(outcome.notes.is_empty(), "a burn is never a spendable note");
+    let Deposits { wallet, set, view } = deposit_chain(8);
     assert_eq!(set.len(), 16);
-    assert!(set.iter().all(|s| s.kind == SetAsideKind::PendingDeposit { l2_id } && s.height == 10 && s.note.value == DEPOSIT));
 
     // f5box's reader finds them from the set-aside openings.
-    let view = b.view();
     let openings: Vec<TxBurnOpening> =
         set.iter().map(|s| TxBurnOpening { height: s.height, value: s.note.value, rho: s.note.rho, rseed: s.note.rseed }).collect();
     let burns = view.tx_burns(l2_id, &openings).expect("found under the newest anchor");
@@ -905,4 +849,185 @@ fn w3b_a_wallets_tx_output_burn_is_set_aside_found_claimed_and_taken_as_a_member
     }
     let out = rule.fold_bundle(&encode_surface(&prev0), &bytes).expect("the fold accepts");
     assert_eq!(out.d_batch, 16 * DEPOSIT, "the bundle bridges exactly these deposits");
+}
+
+// ---------------------------------------------------------------------------
+// Lab #831 W3b/W3c: deposits sealed to a wallet, as its own scan sees them
+// ---------------------------------------------------------------------------
+
+/// Every lane deposit's value.
+const DEPOSIT_V: u64 = 5_000_000_000;
+
+/// A V6 chain carrying `2 × n_txs` deposits to L2 1 — `n_txs` transactions of
+/// two burn outputs each, all sealed to `wallet`'s address 0 as `deposit`
+/// seals them — mined at height 10 and anchored at height 8's root (the root
+/// the record carried by block 9 covers: V6's anchor rule), with records to
+/// height 24; then the wallet's own light-client scan over the node's own
+/// route cores, which must set every one aside as a pending deposit and keep
+/// none as a spendable note.
+struct Deposits {
+    wallet: qlab_wallet::Wallet,
+    set: Vec<qlab_ledger::deposits::SetAside>,
+    view: ChainView,
+}
+
+fn deposit_chain(n_txs: u8) -> Deposits {
+    use qlab_cbserver::client::{light_client_scan_with, ScanConfig};
+    use qlab_devnet::body::TxPublic;
+    use qlab_devnet::fees::{posted_fee, ArityBucket};
+    use qlab_ledger::deposits::{set_aside, SetAsideKind};
+    use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+    use qumbra_node::discovery_server::{respond, respond_full};
+    use rand::SeedableRng;
+
+    let l2_id = params().l2_id;
+    let wallet = qlab_wallet::Wallet::from_master_seed(&MasterSeed::from_entropy([0x31; ENTROPY_LEN]), 0);
+    let kp = wallet.diversified_keypair(&wallet.diversifier_at_index(0));
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x0831);
+    let mut b = Box6::new();
+    b.mine_to(8);
+    let anchor8 = b.node.commitment_root();
+    b.mine_to(9);
+    let deposits: Vec<TxEntry> = (0..n_txs)
+        .map(|t| {
+            let note = |j: u64| qlab_note::note::Note {
+                value: DEPOSIT_V,
+                rkm: qlab_air::claim::rkm_burn(l2_id),
+                rho: [0xB1, u64::from(t), j, 4],
+                rseed: [0xB5, u64::from(t), j, 8],
+            };
+            let enc = qlab_note::scan::encrypt_to_recipient(&kp.ek, &[note(0), note(1)], &mut rng);
+            TxEntry::new(
+                b"proof-placeholder".to_vec(),
+                TxPublic {
+                    anchor: anchor8,
+                    nullifiers: vec![[0x90 + t; 32], [0xA0 + t; 32]],
+                    commitments: enc.bundle.entries.iter().map(|e| e.cm).collect(),
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: posted_fee(ArityBucket::TwoByTwo),
+                },
+                &[enc.bundle],
+                &enc.payloads,
+            )
+        })
+        .collect();
+    b.mine_one(deposits);
+    b.mine_to(25);
+    let tip = b.node.tip_height();
+    let routes = Routes::of(&b.node);
+    let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let r = if route == "/v1/compact" {
+            respond(&routes.discovery, query)
+        } else if let Some((h, rest)) = route.strip_prefix("/v1/block/").and_then(|r| r.split_once("/tx/")) {
+            respond_full(&routes.discovery, (h, rest.strip_suffix("/full").ok_or("not a full path")?))
+        } else {
+            return Err(format!("no route {route}"));
+        };
+        r.map_err(|(code, why)| format!("{path}: {code} {why}"))
+    };
+    let mut outcome = light_client_scan_with(&mut fetch, &kp.dk, 0, tip, ScanConfig::default(), &mut rng).expect("the scan runs");
+    let set = set_aside(&wallet, 0, &mut outcome, &[l2_id]);
+    assert!(outcome.notes.is_empty(), "a burn is never a spendable note");
+    assert_eq!(set.len(), 2 * usize::from(n_txs));
+    assert!(set.iter().all(|s| s.kind == SetAsideKind::PendingDeposit { l2_id } && s.height == 10 && s.note.value == DEPOSIT_V));
+    Deposits { wallet, set, view: b.view() }
+}
+
+/// **W3c's lane condition** (issue #831, the box side): a depositor's claim
+/// FILE, as `qumbra-wallet deposit claim --out` writes it, read by f5box's
+/// `--claim` path and taken as a wrapper's first claim.
+///
+/// - `read_claim_file` reads it against the genesis, the L2 and the tier; with
+///   verification on, the file's (stub) proof is refused by name before
+///   anything is proved — a real file's proof verifies on the box;
+/// - taken into a sixteen-claim wrapper of the chain's other deposits, the
+///   member is the file's PVs and proof, D counts the file's `v`, and the
+///   signed bundle passes the node's rule up to the member proofs while the
+///   fold states D = the sixteen deposits;
+/// - a claim whose anchor this wrapper does not absorb, and a claim of a burn
+///   the wrapper already claims, are refused by name.
+#[test]
+fn w3c_f5box_takes_a_depositors_claim_file_as_a_member() {
+    use qlab_air::claim::{BurnNote, ClaimCredit};
+    use qlab_l2spend::{claim_instance, encode_claim_artifact};
+    use super::chain::TxBurnOpening;
+    use super::members::{take_claim_file, PlanError};
+    use super::run::read_claim_file;
+    use crate::f4::dep::DepEntry;
+
+    let l2_id = params().l2_id;
+    let tier = params().claim_fee_tier;
+    // Eighteen deposits: the wallet claims the first; f5box plans sixteen of
+    // the other seventeen, so no burn is claimed twice.
+    let Deposits { wallet, set, view } = deposit_chain(9);
+    let openings: Vec<TxBurnOpening> =
+        set.iter().map(|s| TxBurnOpening { height: s.height, value: s.note.value, rho: s.note.rho, rseed: s.note.rseed }).collect();
+    let burns = view.tx_burns(l2_id, &openings).expect("found");
+    let mine = *burns.iter().find(|b| b.note.rho == openings[0].rho).expect("the first deposit");
+    let others: Vec<super::chain::Burn> = burns.iter().copied().filter(|b| b.cm != mine.cm).collect();
+    let newest = view.anchors().unwrap()[0];
+
+    // The wallet's claim file, as `deposit claim` writes it (a stub proof in
+    // place of the 3 GiB one), at an anchor and written to disk.
+    let claim_at = |count: u64| {
+        let (r_v, rseed) = wallet.claim_blinds(&mine.cm);
+        let credit = ClaimCredit { rkm: wallet.rkm(wallet.diversifier_at_index(0)), rseed };
+        let note: BurnNote = mine.note;
+        let inst = claim_instance(&view.tree, count, &note, l2_id, &r_v, &credit, tier).expect("the claim assembles");
+        let (_, stub) = crate::f4::dep::prove_dep(&[DepEntry { v: DEPOSIT_V, r_v }]).expect("an opening");
+        encode_claim_artifact(&NET_ID, l2_id, &inst.pvs, &stub, DEPOSIT_V, &r_v)
+    };
+    let dir = std::env::temp_dir().join(format!("f5box-w3c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deposit.claim");
+    std::fs::write(&path, claim_at(newest.count)).unwrap();
+
+    // Read: the stub proof is refused by name when verifying; the rest reads.
+    let e = read_claim_file(&path, &NET_ID, l2_id, tier, true).unwrap_err();
+    assert!(e.contains("the claim's proof does not verify"), "{e}");
+    assert!(read_claim_file(&path, &[0x6c; 32], l2_id, tier, false).unwrap_err().contains("was built on the chain with genesis"), "another chain");
+    assert!(read_claim_file(&path, &NET_ID, l2_id, tier + 1, false).is_err(), "another tier");
+    let file = read_claim_file(&path, &NET_ID, l2_id, tier, false).expect("the file reads");
+
+    // Taken into a sixteen-claim wrapper of the other deposits.
+    let state0 = WState::genesis(&qumbra_node::genesis_v6::v6_genesis_registry());
+    let prev0 = genesis_surface(l2_id, &qumbra_node::genesis_v6::v6_genesis_registry_root());
+    let keys = Keys::from_text("f5box w3c lane");
+    let claims = vec![WTag::C; 16];
+    let ask = Ask { kinds: &claims, burns: &others, owned: &[], exit: None };
+    let base = plan(&state0, &prev0, &chain_of(&view), &keys, &ask).expect("sixteen claims of the others");
+    let p = take_claim_file(&state0, base, file.clone(), &keys).expect("the native statement takes the file");
+    assert_eq!(p.members[0].pvs, file.pvs, "member 0 is the file's claim");
+    assert_eq!(p.inp.d_batch, 16 * DEPOSIT_V);
+    assert_eq!(p.claimed.len(), 15, "the burn f5box cannot see is not in its own bookkeeping");
+    let reproved = bincode::serialize(&p.insts[0].prove()).unwrap();
+    assert_eq!(reproved, file.proof, "a file's member is not proven again: its proof is the file's");
+
+    let rule = WrapperRule::from_params(NET_ID, &params()).expect("the rule");
+    let (_, bytes) = stub_bundle(&p, &NET_ID);
+    match self_check(&rule, &bytes, &prev0, &view) {
+        Err(BundleRefusal::Wrapper(v)) => assert!(v.starts_with("Member(0,"), "refused at {v}"),
+        other => panic!("expected the member-0 refusal, got {other:?}"),
+    }
+    assert_eq!(rule.fold_bundle(&encode_surface(&prev0), &bytes).expect("the fold accepts").d_batch, 16 * DEPOSIT_V);
+
+    // A claim at a root this wrapper does not absorb: the tree just past the
+    // burn's own leaf, a prefix of block 10's leaves that no anchor names (the
+    // tree does not grow after height 10, so every served root covering the
+    // burn is the newest one).
+    assert!(mine.pos + 1 < view.tree.len());
+    std::fs::write(dir.join("stale.claim"), claim_at(mine.pos + 1)).unwrap();
+    let stale = read_claim_file(&dir.join("stale.claim"), &NET_ID, l2_id, tier, false).unwrap();
+    let base = plan(&state0, &prev0, &chain_of(&view), &keys, &ask).unwrap();
+    assert!(matches!(take_claim_file(&state0, base, stale, &keys), Err(PlanError::ClaimAnchorNotAbsorbed { .. })));
+    // A claim of a burn the wrapper already claims: the statement refuses it.
+    let with_mine: Vec<super::chain::Burn> = std::iter::once(mine).chain(others.iter().copied()).collect();
+    let ask2 = Ask { kinds: &claims, burns: &with_mine[..16], owned: &[], exit: None };
+    let mut twice_plan = plan(&state0, &prev0, &chain_of(&view), &keys, &ask2).unwrap();
+    twice_plan.insts.swap(0, 1);
+    twice_plan.deps.swap(0, 1);
+    twice_plan.claimed.swap(0, 1);
+    assert!(matches!(take_claim_file(&state0, twice_plan, file, &keys), Err(PlanError::Wrapper(_))), "a burn is claimed once");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
