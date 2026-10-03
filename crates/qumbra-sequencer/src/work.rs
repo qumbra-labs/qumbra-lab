@@ -81,10 +81,9 @@ impl LeftOut {
                 short(&root)
             ),
             LeftOut::NoRootRoom => format!(
-                "claim {}: its anchor root {}… would be a {}th new root; a later wrapper takes it",
+                "claim {}: its anchor root {}… would exceed the {M_ABS} new roots a wrapper absorbs; a later wrapper takes it",
                 short(id),
-                short(&root),
-                M_ABS + 1
+                short(&root)
             ),
         }
     }
@@ -136,6 +135,44 @@ pub fn select(
 /// the user's claim proved against a root no record covered yet, 0 notes.
 pub fn only_anchors_lag(taken: usize, waiting: usize, notes: usize) -> bool {
     taken + waiting > 0 && taken + waiting.min(K.saturating_sub(taken)) + notes >= K
+}
+
+/// The draft's answer when the selection plus the fillers do not make a
+/// wrapper — `None` when they do. A short that is only claims waiting for a
+/// finality record to cover their root ([`only_anchors_lag`]) is a
+/// [`NotDrafted::Wait`] naming those claims, the tip and CR (the pass polls
+/// it under `--max-wait`, ending at exit 3); otherwise a
+/// [`NotDrafted::Short`] whose `why` names every claim left out and the
+/// fillers' shortfall.
+pub fn not_drafted(
+    sel: &Selection,
+    ids: &[[u8; 32]],
+    anchors: &[qlab_wprover::f3::native::Digest],
+    notes: usize,
+    tip: u64,
+    cr: Option<u64>,
+) -> Option<NotDrafted> {
+    let taken = sel.take.len();
+    if taken > 0 && taken + notes >= K {
+        return None;
+    }
+    let line = |(i, why): &(usize, LeftOut)| why.sentence(&ids[*i], &anchors[*i]);
+    let waiting: Vec<String> = sel.left.iter().filter(|(_, why)| *why == LeftOut::NotAbsorbable).map(line).collect();
+    if only_anchors_lag(taken, waiting.len(), notes) {
+        let cr = cr.map_or("none".to_string(), |c| c.to_string());
+        return Some(NotDrafted::Wait(format!(
+            "{} claim(s) await a finality record covering their anchor (tip {tip}, CR {cr}): {}",
+            waiting.len(),
+            waiting.join("; ")
+        )));
+    }
+    let mut why: Vec<String> = sel.left.iter().map(line).collect();
+    if taken < K {
+        let slots = K - taken;
+        let advice = if notes < slots { " — `seed` gives the sequencer notes" } else { "" };
+        why.push(format!("{notes} spendable sequencer note(s) for {slots} filler slot(s){advice}"));
+    }
+    Some(NotDrafted::Short { have: taken + notes.min(K - taken), need: K, why })
 }
 
 /// The work: everything between queued claims and a signed bundle.
@@ -204,30 +241,16 @@ impl Work for RealWork {
         }
         let before: Vec<_> = (0..state.aa.len()).map(|i| state.aa.leaf(i)).collect();
         let anchors: Vec<_> = claims.iter().map(|(_, a, _)| *a).collect();
-        let Selection { take, mut roots, left } = select(&anchors, &before, &absorbable);
+        let sel = select(&anchors, &before, &absorbable);
         // The rest of the wrapper is fillers, one per spendable sequencer
         // note (S3); a wrapper with no claim is never posted.
         let keys = Keys::from_seed(*self.key.filler_seed);
         let notes = spendable(&state, &keys, &self.run.owned).len();
-        if take.is_empty() || take.len() + notes < K {
-            let named: Vec<String> = left.iter().map(|(i, why)| why.sentence(&claims[*i].0, &anchors[*i])).collect();
-            // Claims only waiting for a record to cover their root would make
-            // the wrapper: that is a wait (bounded by the pass's --max-wait),
-            // not a short.
-            let waiting = left.iter().filter(|(_, why)| *why == LeftOut::NotAbsorbable).count();
-            if only_anchors_lag(take.len(), waiting, notes) {
-                return Ok(Err(NotDrafted::Wait(format!(
-                    "{} claim(s) wait for a finality record to cover their anchor: {}",
-                    waiting,
-                    named.join("; ")
-                ))));
-            }
-            let mut why = named;
-            if take.len() < K {
-                why.push(format!("{notes} spendable sequencer note(s) for {} filler slot(s)", K - take.len()));
-            }
-            return Ok(Err(NotDrafted::Short { have: take.len() + notes.min(K - take.len()), need: K, why }));
+        let ids: Vec<[u8; 32]> = claims.iter().map(|(id, _, _)| *id).collect();
+        if let Some(not) = not_drafted(&sel, &ids, &anchors, notes, w.tip, w.cr) {
+            return Ok(Err(not));
         }
+        let Selection { take, mut roots, .. } = sel;
         for r in &absorbable {
             if roots.len() == M_ABS {
                 break;
@@ -304,8 +327,8 @@ impl Work for RealWork {
 mod tests {
     use super::*;
 
-    /// Selection takes absorbed and absorbable roots in arrival order, at
-    /// most M_ABS new roots, and names every claim it leaves out and why.
+    /// The predicate: a short is only anchors lagging when the waiting
+    /// claims would fill the wrapper with the ones taken and the fillers.
     #[test]
     fn a_wrapper_short_only_on_anchors_waits() {
         assert!(only_anchors_lag(15, 1, 0), "box run 2: 15 taken + the user's claim waiting");
@@ -315,6 +338,8 @@ mod tests {
         assert!(!only_anchors_lag(0, 0, 16), "no traffic: never a wrapper of padding");
     }
 
+    /// Selection takes absorbed and absorbable roots in arrival order, at
+    /// most M_ABS new roots, and names every claim it leaves out and why.
     #[test]
     fn selection_names_what_it_leaves_out() {
         let r = |k: u64| [k, 0, 0, 0];
@@ -329,6 +354,47 @@ mod tests {
         assert_eq!(s.left, vec![(5, LeftOut::NoRootRoom), (6, LeftOut::NotAbsorbable)]);
         let line = LeftOut::NotAbsorbable.sentence(&[0xab; 32], &r(9));
         assert!(line.starts_with("claim abababababababab: its anchor root ") && line.contains("no finality record covers it"), "{line}");
-        assert!(LeftOut::NoRootRoom.sentence(&[0xab; 32], &r(6)).contains("5th new root"));
+        let root9: String = qlab_wrapper::codec::digest_to_bytes(&r(9))[..8].iter().map(|x| format!("{x:02x}")).collect();
+        assert!(line.contains(&format!("its anchor root {root9}…")), "{line}");
+        assert!(LeftOut::NoRootRoom.sentence(&[0xab; 32], &r(6)).contains(&format!("exceed the {M_ABS} new roots")));
+    }
+
+    /// The draft's answer, variant and text: box run 2's shape (15 claims
+    /// taken, the 16th waiting on a record, no notes) is a Wait naming only
+    /// the waiting claim with tip and CR; with nothing waiting it is a Short
+    /// naming every claim left out and the fillers' shortfall; a full
+    /// wrapper is no answer at all.
+    #[test]
+    fn the_draft_waits_or_names_the_short() {
+        let r = |k: u64| [k, 0, 0, 0];
+        let ids: Vec<[u8; 32]> = (0..18u8).map(|k| [k; 32]).collect();
+        let mut anchors = vec![r(1); 15];
+        anchors.push(r(9)); // not absorbable
+        anchors.push(r(6)); // absorbable, but no root room
+        anchors.push(r(9));
+        let sel = Selection {
+            take: (0..15).collect(),
+            roots: vec![],
+            left: vec![(15, LeftOut::NotAbsorbable), (16, LeftOut::NoRootRoom)],
+        };
+        match not_drafted(&sel, &ids, &anchors, 0, 220, Some(212)) {
+            Some(NotDrafted::Wait(w)) => {
+                assert!(w.starts_with("1 claim(s) await a finality record covering their anchor (tip 220, CR 212): claim 0f0f"), "{w}");
+                assert!(!w.contains("exceed"), "only the waiting claims are listed: {w}");
+            }
+            _ => panic!("box run 2's shape must wait"),
+        }
+        let sel = Selection { take: (0..3).collect(), roots: vec![], left: vec![(16, LeftOut::NoRootRoom)] };
+        match not_drafted(&sel, &ids, &anchors, 10, 220, None) {
+            Some(NotDrafted::Short { have, need, why }) => {
+                assert_eq!((have, need), (13, K));
+                assert_eq!(why.len(), 2);
+                assert!(why[0].starts_with("claim 1010101010101010") && why[0].contains("exceed"), "{}", why[0]);
+                assert_eq!(why[1], format!("10 spendable sequencer note(s) for {} filler slot(s) — `seed` gives the sequencer notes", K - 3));
+            }
+            _ => panic!("3 claims + 10 notes is short"),
+        }
+        let full = Selection { take: (0..1).collect(), roots: vec![], left: vec![] };
+        assert!(not_drafted(&full, &ids, &anchors, 15, 220, None).is_none(), "1 claim + 15 notes is a wrapper");
     }
 }

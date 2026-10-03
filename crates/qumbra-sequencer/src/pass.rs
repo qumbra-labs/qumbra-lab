@@ -328,6 +328,8 @@ impl Run<'_> {
         if self.clock.now().saturating_add(self.cfg.poll_secs) > self.deadline {
             return Err(Outcome::Ceiling(format!("--max-wait reached while {what}")));
         }
+        // Never silent: every poll says what it waits for.
+        eprintln!("SEQ waiting: {what}; next poll in {} s", self.cfg.poll_secs);
         self.clock.sleep(self.cfg.poll_secs);
         Ok(())
     }
