@@ -21,8 +21,17 @@
 //! 6. **mode change**: Hybrid → Regulated (an allow list added), proved with
 //!    the rotated secret, which is promoted; the freeze root is kept.
 //!
+//! 7. **register with a given secret**: wallet `G`, which has no `issuer.v1`,
+//!    registers asset 14 to a secret it holds in memory only
+//!    (`issuer_register_with`, `IsskSource::Given`); the served leaf carries
+//!    that secret's key and `G`'s wallet dir still holds no `issuer.v1`.
+//! 8. **update with a given secret**: a wrong given secret is refused before
+//!    anything is proved, a rotation with a given secret is refused (its next
+//!    secret has nowhere to be recorded), and the right one publishes asset
+//!    14's freeze root — still with no `issuer.v1` in `G`'s dir.
+//!
 //! After every write the three nodes agree (tip, tree, nullifiers, supplies,
-//! registry root), and no write issues supply. 6 R proves (plus one proved
+//! registry root), and no write issues supply. 8 R proves (plus one proved
 //! race loser when `H`'s write is still pooled).
 
 use std::time::Duration;
@@ -36,7 +45,7 @@ use qumbra_faucet::annulet::served;
 use qumbra_faucet::devnet_harness::{Net, View};
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord};
 use qumbra_wallet::annulet_send::{send_annulet, SendRefusal, WalletEndpoint};
-use qumbra_wallet::issuer::{issuer_register, issuer_update, IssuerFile, LeafPolicy};
+use qumbra_wallet::issuer::{issuer_register, issuer_register_with, issuer_update, issuer_update_with, IssuerFile, IsskSource, LeafPolicy, ISSUER_FILE};
 use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -70,6 +79,7 @@ fn no_supply(v: &[View; 3], asset: u16) {
 #[test]
 fn register_update_freeze_rotate_and_change_mode_at_runtime() {
     let (issuer, h, f) = (wallet("issuer", 0x41), wallet("h", 0x42), wallet("f", 0x43));
+    let gw = wallet("given", 0x44);
     IssuerFile::add(&issuer.dir, USDT, ISK).unwrap();
 
     let usdt = RegistryLeaf {
@@ -87,6 +97,7 @@ fn register_update_freeze_rotate_and_change_mode_at_runtime() {
         note(&h, 10, 0, 4),
         note(&f, 50, u64::from(USDT), 5),
         note(&f, 2, 0, 6),
+        note(&gw, 10, 0, 7),
     ];
     let g = AnnuletGenesisFile::assemble(
         "annulet-c4a-test",
@@ -190,7 +201,34 @@ fn register_update_freeze_rotate_and_change_mode_at_runtime() {
     // Registry writes issue nothing: asset 2's supply is F's genesis 50.
     assert!(v.iter().all(|x| x.supplies.iter().any(|(a, s)| *a == USDT && *s == 50)), "{v:?}");
 
-    for d in [&issuer.dir, &h.dir, &f.dir] {
+    // 7. G registers asset 14 to a secret held in memory only.
+    const GIVEN: [u64; 4] = [0x6157_0001, 0x6157_0002, 0x6157_0003, 0x6157_0004];
+    let no_file = || !gw.dir.join(ISSUER_FILE).exists();
+    assert!(no_file());
+    let r = issuer_register_with(&gw, at(2), 14, &hybrid, IsskSource::Given(GIVEN), v[2].state_tip, pin, &mut rng)
+        .expect("registers asset 14 with a given secret");
+    let v = net.settle_spends(7, "register 14 (given secret)");
+    assert_eq!(agree(&v), r.new_root);
+    let leaf14 = follower.registry(14).unwrap().leaf;
+    assert_eq!((leaf14.issuer_key, leaf14.mode), (issuer_key_of(&GIVEN), MODE_HYBRID));
+    assert!(no_file(), "a given secret is never written to issuer.v1");
+    no_supply(&v, 14);
+
+    // 8. Updates with a given secret: a wrong one and a rotation are refused before proving; the right one
+    //    publishes asset 14's freeze root.
+    let freeze14 = LeafPolicy { freeze_keys: Some(keys.clone()), ..Default::default() };
+    let wrong = issuer_update_with(&gw, at(0), 14, &freeze14, false, IsskSource::Given([9; 4]), v[0].state_tip, pin, &mut rng);
+    assert!(matches!(wrong, Err(SendRefusal::NotTheIssuer { asset: 14 })), "{:?}", wrong.err());
+    let rotate = issuer_update_with(&gw, at(0), 14, &freeze14, true, IsskSource::Given(GIVEN), v[0].state_tip, pin, &mut rng);
+    assert!(matches!(rotate, Err(SendRefusal::LeafRefused(_))), "{:?}", rotate.err());
+    let r = issuer_update_with(&gw, at(0), 14, &freeze14, false, IsskSource::Given(GIVEN), v[0].state_tip, pin, &mut rng)
+        .expect("publishes asset 14's freeze root with a given secret");
+    let v = net.settle_spends(8, "the freeze of 14 (given secret)");
+    assert_eq!(agree(&v), r.new_root);
+    assert_eq!(follower.registry(14).unwrap().leaf.freeze_root, CanonicalFreezeTree::from_keys(&keys).root);
+    assert!(no_file());
+
+    for d in [&issuer.dir, &h.dir, &f.dir, &gw.dir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

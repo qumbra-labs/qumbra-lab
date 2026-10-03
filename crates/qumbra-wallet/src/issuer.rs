@@ -397,6 +397,24 @@ pub fn issuer_register<E: Endpoint>(
     pin: Option<[u8; 32]>,
     rng: &mut StdRng,
 ) -> Result<RegistryReport, SendRefusal> {
+    issuer_register_with(w, endpoint, asset, policy, IsskSource::File, scan_to, pin, rng)
+}
+
+/// [`issuer_register`] with the secret's source named: [`IsskSource::File`]
+/// is `issuer_register` itself; [`IsskSource::Given`] registers the leaf to
+/// the caller's secret, held in memory only — `issuer.v1` is neither read nor
+/// written, as for a mint or a redeem with a given secret.
+#[allow(clippy::too_many_arguments)]
+pub fn issuer_register_with<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    asset: u16,
+    policy: &LeafPolicy,
+    source: IsskSource,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    rng: &mut StdRng,
+) -> Result<RegistryReport, SendRefusal> {
     use rand::Rng as _;
     if policy.mode.is_none() {
         return Err(SendRefusal::LeafRefused("a registration names its mode (cloaked, hybrid or regulated)".into()));
@@ -407,14 +425,16 @@ pub fn issuer_register<E: Endpoint>(
     if session.served.registry_slot(u64::from(asset))?.leaf.is_some() {
         return Err(SendRefusal::SlotTaken { asset });
     }
-    let held = IssuerFile::load(&w.dir).map_err(SendRefusal::Issuer)?.and_then(|f| f.isk(asset));
-    let isk = match held {
-        Some(k) => k,
-        None => {
-            let k = [rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()];
-            IssuerFile::add(&w.dir, asset, k).map_err(SendRefusal::Issuer)?;
-            k
-        }
+    let isk = match source {
+        IsskSource::Given(k) => k,
+        IsskSource::File => match IssuerFile::load(&w.dir).map_err(SendRefusal::Issuer)?.and_then(|f| f.isk(asset)) {
+            Some(k) => k,
+            None => {
+                let k = [rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()];
+                IssuerFile::add(&w.dir, asset, k).map_err(SendRefusal::Issuer)?;
+                k
+            }
+        },
     };
     let leaf = leaf_with(empty, policy, issuer_key_of(&isk))?;
     registry_write(w, &session, leaf, isk, rng)
@@ -435,12 +455,35 @@ pub fn issuer_update<E: Endpoint>(
     pin: Option<[u8; 32]>,
     rng: &mut StdRng,
 ) -> Result<RegistryReport, SendRefusal> {
+    issuer_update_with(w, endpoint, asset, policy, rotate_key, IsskSource::File, scan_to, pin, rng)
+}
+
+/// [`issuer_update`] with the secret's source named. With
+/// [`IsskSource::Given`] the write is proved with the caller's secret, held in
+/// memory only (refused before anything is proved unless it matches the key
+/// the chain shows), and `issuer.v1` is neither read nor written — so a key
+/// rotation, whose next secret must be recorded before submission, is refused.
+#[allow(clippy::too_many_arguments)]
+pub fn issuer_update_with<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    asset: u16,
+    policy: &LeafPolicy,
+    rotate_key: bool,
+    source: IsskSource,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    rng: &mut StdRng,
+) -> Result<RegistryReport, SendRefusal> {
     use rand::Rng as _;
+    if rotate_key && matches!(source, IsskSource::Given(_)) {
+        return Err(SendRefusal::LeafRefused(
+            "a key rotation records its next secret in issuer.v1, which a given secret never touches; rotate from the file".into(),
+        ));
+    }
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
     let served = session.served.registry_slot(u64::from(asset))?.leaf.ok_or(SendRefusal::SlotEmpty { asset })?;
-    let isk = IssuerFile::isk_for_key(&w.dir, asset, &served.issuer_key)
-        .map_err(SendRefusal::Issuer)?
-        .ok_or(SendRefusal::NotTheIssuer { asset })?;
+    let isk = isk_from(w, source, asset, &served.issuer_key)?.ok_or(SendRefusal::NotTheIssuer { asset })?;
     // The policy is checked before a rotation's secret is recorded.
     let leaf = leaf_with(served, policy, served.issuer_key)?;
     let leaf = if rotate_key {
@@ -528,7 +571,8 @@ pub fn issuer_mint<E: Endpoint>(
     prepare_mint(w, endpoint, asset, amount, to, freeze_keys, IsskSource::File, scan_to, pin, split_wait, rng)?.submit()
 }
 
-/// Where a mint or a closed redeem takes the issuer secret from.
+/// Where an issuer write — a registration, an update, a mint or a closed
+/// redeem — takes the issuer secret from.
 #[derive(Clone, Copy)]
 pub enum IsskSource {
     /// `issuer.v1` in the wallet dir: the secret in force for the key the
