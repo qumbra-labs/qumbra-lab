@@ -43,7 +43,11 @@ impl std::fmt::Display for BundleFetchRefusal {
 impl std::error::Error for BundleFetchRefusal {}
 
 /// Fetch the bundle at `height` and bind it to `expected_id` (keccak of the
-/// bytes); the bytes, or a refusal by name.
+/// bytes); the bytes, or a refusal by name. Pass a fetch that bounds the
+/// route on the wire — `net::verified_scan_fetch` does, through
+/// `annulet_verify::response_ceiling` (the V6 body bound + head slack); the
+/// [`BundleFetchRefusal::TooLarge`] check here is belt and braces for any
+/// other fetch.
 pub fn fetch_bundle<F>(fetch: &mut F, height: u64, expected_id: [u8; 32]) -> Result<Vec<u8>, BundleFetchRefusal>
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,

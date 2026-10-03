@@ -102,6 +102,9 @@ pub fn response_ceiling(path: &str) -> Option<usize> {
         MAX_BODY_ANSWER_BYTES
     } else if route.starts_with("/v1/registry/") && route != "/v1/registry/root" {
         MAX_REGISTRY_ANSWER_BYTES
+    } else if route.starts_with(crate::v6_bundle::BUNDLE_PATH_PREFIX) {
+        // Lab #860 R2: one raw V6 bundle, bounded by the V6 body bound.
+        qlab_devnet::body::MAX_V6_BODY_BYTES
     } else {
         return None;
     };

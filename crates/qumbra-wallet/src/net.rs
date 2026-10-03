@@ -855,6 +855,8 @@ mod tests {
             ("/v1/headers?from=1&to=256", MAX_HEADERS_ANSWER_BYTES),
             ("/v1/block/7/body", MAX_BODY_ANSWER_BYTES),
             ("/v1/registry/1", MAX_REGISTRY_ANSWER_BYTES),
+            // Lab #860 R2: the raw bundle route.
+            ("/v1/bundle/48", qlab_devnet::body::MAX_V6_BODY_BYTES),
         ] {
             let ceiling = response_ceiling(path).expect("a bounded route");
             assert_eq!(ceiling, body_max + RESPONSE_HEAD_SLACK, "{path}");
