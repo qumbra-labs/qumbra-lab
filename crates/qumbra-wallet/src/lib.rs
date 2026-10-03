@@ -127,6 +127,11 @@ mod build_rev_tests {
 
 pub mod annulet;
 #[cfg(feature = "verify")]
+pub mod annulet_driver;
+#[cfg(feature = "verify")]
+#[doc(hidden)]
+pub mod annulet_reference;
+#[cfg(feature = "verify")]
 pub mod annulet_verify;
 #[cfg(feature = "verify")]
 pub mod asset_view;

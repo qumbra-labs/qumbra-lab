@@ -399,8 +399,18 @@ pub fn coverage_for(
     to: u64,
     outputs: Option<(u64, u64)>,
 ) -> (crate::vocab::SpentCoverage, Option<SpentSet>) {
+    coverage_of(fetch_spent(source, from, to), outputs)
+}
+
+/// [`coverage_for`]'s verdict over a stream already paged — by
+/// [`fetch_spent`] or by a caller-pumped [`SpentCatchUp`] (lab #858 WA1) — so
+/// the Covered/Unavailable rule has one copy whichever way the pages came.
+pub fn coverage_of(
+    stream: Result<SpentSet, SpentRefusal>,
+    outputs: Option<(u64, u64)>,
+) -> (crate::vocab::SpentCoverage, Option<SpentSet>) {
     use crate::vocab::SpentCoverage;
-    match fetch_spent(source, from, to) {
+    match stream {
         Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
         Ok(set) => match set.covers_outputs(outputs) {
             Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),

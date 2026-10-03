@@ -701,6 +701,174 @@ pub fn light_client_scan_l2_multi_with<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
+    let mut driver = MultiScanDriver::new(keys.to_vec(), from, to, config);
+    loop {
+        match driver.step(rng) {
+            MultiScanStep::Need(path) => driver.supply(fetch(&path)),
+            MultiScanStep::Done(multi) => return Ok(multi),
+            MultiScanStep::Failed(refusal) => return Err(refusal),
+        }
+    }
+}
+
+/// One observation from a caller-pumped [`MultiScanDriver`]. `Done` and
+/// `Failed` are terminal.
+pub enum MultiScanStep {
+    Need(String),
+    Done(MultiScan),
+    Failed(MultiScanRefusal),
+}
+
+/// **The multi-key scan, caller-pumped** (lab #858 WA1): what
+/// [`light_client_scan_l2_multi_with`] does, with no I/O — that function is
+/// now this driver's pump, so there is one orchestration of the shared-cache
+/// scan, not two.
+///
+/// Each key runs **the same [`ScanDriver`]**, in the order given; a path some
+/// earlier key already fetched is answered from the cache inside the driver
+/// (an error answer included — one answer per path), so a `Need` is emitted
+/// only for a path not yet fetched, and `fetched` lists every `Need` in order.
+pub struct MultiScanDriver {
+    keys: Vec<(u64, Dk)>,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    checked: bool,
+    current: Option<ScanDriver<qlab_note::l2note::L2Note>>,
+    cache: HashMap<String, Result<Vec<u8>, String>>,
+    fetched: Vec<String>,
+    outcomes: Vec<(u64, ScanOutcome<qlab_note::l2note::L2Note>)>,
+    pending: Option<String>,
+    failed: Option<MultiScanRefusal>,
+    completed: bool,
+}
+
+impl MultiScanDriver {
+    pub fn new(keys: Vec<(u64, Dk)>, from: u64, to: u64, config: ScanConfig) -> Self {
+        MultiScanDriver {
+            keys,
+            from,
+            to,
+            config,
+            checked: false,
+            current: None,
+            cache: HashMap::new(),
+            fetched: Vec::new(),
+            outcomes: Vec::new(),
+            pending: None,
+            failed: None,
+            completed: false,
+        }
+    }
+
+    /// The refusals the pump made before any fetch, in its order.
+    fn check(&self) -> Result<(), MultiScanRefusal> {
+        if self.keys.is_empty() {
+            return Err(MultiScanRefusal::NoKeys);
+        }
+        if self.from > self.to {
+            return Err(MultiScanRefusal::EmptyRange { from: self.from, to: self.to });
+        }
+        let mut seen_index = HashSet::new();
+        let mut seen_key: HashMap<[u8; qlab_note::kem::EK_LEN], u64> = HashMap::new();
+        for (index, dk) in &self.keys {
+            if !seen_index.insert(*index) {
+                return Err(MultiScanRefusal::DuplicateIndex(*index));
+            }
+            let ek = qlab_note::kem::ek_to_bytes(dk.encapsulation_key());
+            if let Some(first) = seen_key.insert(ek, *index) {
+                return Err(MultiScanRefusal::DuplicateKey { first, second: *index });
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance until the scan needs one path not yet fetched, completes, or
+    /// fails. `Done` and `Failed` are terminal: a step after `Done` fails by
+    /// name, as [`ScanDriver`]'s does.
+    pub fn step(&mut self, rng: &mut StdRng) -> MultiScanStep {
+        if let Some(refusal) = &self.failed {
+            return MultiScanStep::Failed(refusal.clone());
+        }
+        if self.completed {
+            let refusal = MultiScanRefusal::Range("multi-scan driver already completed".into());
+            self.failed = Some(refusal.clone());
+            return MultiScanStep::Failed(refusal);
+        }
+        if let Some(path) = &self.pending {
+            return MultiScanStep::Need(path.clone());
+        }
+        if !self.checked {
+            if let Err(refusal) = self.check() {
+                self.failed = Some(refusal.clone());
+                return MultiScanStep::Failed(refusal);
+            }
+            self.checked = true;
+        }
+        loop {
+            let at = self.outcomes.len();
+            let Some((index, dk)) = self.keys.get(at) else {
+                self.completed = true;
+                return MultiScanStep::Done(MultiScan {
+                    outcomes: std::mem::take(&mut self.outcomes),
+                    fetched: std::mem::take(&mut self.fetched),
+                });
+            };
+            let index = *index;
+            let driver = self
+                .current
+                .get_or_insert_with(|| ScanDriver::new_for(dk.clone(), self.from, self.to, self.config));
+            match driver.step(rng) {
+                ScanDriverStep::Need(path) => match self.cache.get(&path) {
+                    Some(answer) => driver.supply(answer.clone()),
+                    None => {
+                        self.pending = Some(path.clone());
+                        return MultiScanStep::Need(path);
+                    }
+                },
+                ScanDriverStep::Done(outcome) => {
+                    self.current = None;
+                    self.outcomes.push((index, outcome));
+                }
+                ScanDriverStep::Failed(why) => {
+                    let refusal = MultiScanRefusal::Range(why);
+                    self.failed = Some(refusal.clone());
+                    return MultiScanStep::Failed(refusal);
+                }
+            }
+        }
+    }
+
+    /// Answer the outstanding `Need`. An answer with none outstanding fails
+    /// the driver by name.
+    pub fn supply(&mut self, response: Result<Vec<u8>, String>) {
+        let Some(path) = self.pending.take() else {
+            self.failed = Some(MultiScanRefusal::Range("multi-scan driver received a response without requesting a path".into()));
+            return;
+        };
+        self.fetched.push(path.clone());
+        self.cache.insert(path, response.clone());
+        if let Some(driver) = self.current.as_mut() {
+            driver.supply(response);
+        }
+    }
+}
+
+/// The pre-WA1 [`light_client_scan_l2_multi_with`], verbatim. **Kept only as
+/// the equality reference for the multi-scan driver's tests (lab #858 WA1);
+/// not a scan path**, and deleted with WA2.
+#[doc(hidden)]
+pub fn light_client_scan_l2_multi_with_reference<F>(
+    fetch: &mut F,
+    keys: &[(u64, Dk)],
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> Result<MultiScan, MultiScanRefusal>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
     if keys.is_empty() {
         return Err(MultiScanRefusal::NoKeys);
     }
@@ -2545,5 +2713,109 @@ mod multi_tests {
             let d = ivk.diversifier_at_index(i);
             assert_eq!(ek_to_bytes(ivk.scan_key(&d).encapsulation_key()), ek_to_bytes(&r.wallet.diversified_keypair(&d).ek));
         }
+    }
+
+    /// (e) Lab #858 WA1: the caller-pumped [`MultiScanDriver`] is the pre-WA1
+    /// loop — over decoys off and on, every refusal, and a transport failure
+    /// at every fetch, the pump and the verbatim reference agree on the
+    /// outcomes, the refusal, `fetched` (byte-identical) and the rng's state
+    /// after; and a hand-stepped driver never asks for a path twice.
+    #[test]
+    fn multi_driver_is_the_reference_loop() {
+        type Run = (Result<(Vec<(u64, Vec<LocatedNote<L2Note>>, Vec<UnopenedOutput>, String)>, Vec<String>), MultiScanRefusal>, u64);
+        fn view(r: Result<MultiScan, MultiScanRefusal>, rng: &mut StdRng) -> Run {
+            let r = r.map(|m| {
+                let outs = m.outcomes.into_iter().map(|(i, o)| (i, o.notes, o.unopened, format!("{:?} {:?}", o.shadowed, o.stats))).collect();
+                (outs, m.fetched)
+            });
+            (r, rng.next_u64())
+        }
+        let r = range();
+        let keys = r.keys(&[0, 1, 2]);
+        let decoys = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::PerMatch { max: 3 } };
+        type Case = (Vec<(u64, Dk)>, u64, u64, ScanConfig);
+        let cases: Vec<Case> = vec![
+            (keys.clone(), 1, 3, OFF),
+            (keys.clone(), 1, 3, decoys),
+            (keys.clone(), 2, 3, OFF),
+            (Vec::new(), 1, 3, OFF),
+            (keys.clone(), 3, 1, OFF),
+            (vec![keys[0].clone(), (0, keys[1].1.clone())], 1, 3, OFF),
+            (vec![keys[0].clone(), (5, keys[0].1.clone())], 1, 3, OFF),
+        ];
+        for (n, (keys, from, to, cfg)) in cases.iter().enumerate() {
+            let honest = {
+                let mut fetch = |p: &str| r.route(p);
+                let mut rng = StdRng::seed_from_u64(11);
+                view(light_client_scan_l2_multi_with_reference(&mut fetch, keys, *from, *to, *cfg, &mut rng), &mut rng)
+            };
+            let fetches = honest.0.as_ref().map_or(0, |(_, f)| f.len());
+            // `None` is the honest run; `Some(k)` fails the k-th fetch.
+            for fail_at in std::iter::once(None).chain((0..fetches).map(Some)) {
+                let run = |pump: bool| {
+                    let mut calls = 0;
+                    let mut fetch = |p: &str| {
+                        calls += 1;
+                        if Some(calls - 1) == fail_at { Err(format!("503 at {p}")) } else { r.route(p) }
+                    };
+                    let mut rng = StdRng::seed_from_u64(11);
+                    let out = if pump {
+                        light_client_scan_l2_multi_with(&mut fetch, keys, *from, *to, *cfg, &mut rng)
+                    } else {
+                        light_client_scan_l2_multi_with_reference(&mut fetch, keys, *from, *to, *cfg, &mut rng)
+                    };
+                    view(out, &mut rng)
+                };
+                assert_eq!(run(true), run(false), "case {n}, failing fetch {fail_at:?}");
+            }
+            // Suspension: step by hand; no Need repeats a supplied path, and
+            // the Needs are exactly the reference's `fetched`.
+            let mut d = MultiScanDriver::new(keys.clone(), *from, *to, *cfg);
+            let mut rng = StdRng::seed_from_u64(11);
+            let mut asked: Vec<String> = Vec::new();
+            let done = loop {
+                match d.step(&mut rng) {
+                    MultiScanStep::Need(p) => {
+                        assert!(!asked.contains(&p), "case {n}: {p} asked twice");
+                        assert!(matches!(d.step(&mut rng), MultiScanStep::Need(q) if q == p), "an outstanding Need repeats until supplied");
+                        asked.push(p.clone());
+                        d.supply(r.route(&p));
+                    }
+                    MultiScanStep::Done(m) => break Ok(m),
+                    MultiScanStep::Failed(e) => break Err(e),
+                }
+            };
+            assert_eq!(view(done, &mut rng), honest, "case {n}: hand-stepped");
+            if let Ok((_, fetched)) = &honest.0 {
+                assert_eq!(&asked, fetched, "case {n}: the Needs are the reference's fetches");
+            }
+        }
+    }
+
+    /// (f) Lab #858 WA1: `Done` and `Failed` are terminal, and misuse fails
+    /// by name — a step after `Done`, an answer with no `Need` outstanding.
+    #[test]
+    fn multi_driver_misuse_fails_by_name() {
+        let r = range();
+        let mut rng = StdRng::seed_from_u64(12);
+        let mut d = MultiScanDriver::new(r.keys(&[0, 1]), 1, 3, OFF);
+        loop {
+            match d.step(&mut rng) {
+                MultiScanStep::Need(p) => d.supply(r.route(&p)),
+                MultiScanStep::Done(m) => {
+                    assert_eq!(m.outcomes.len(), 2);
+                    break;
+                }
+                MultiScanStep::Failed(e) => panic!("{e:?}"),
+            }
+        }
+        let after = MultiScanRefusal::Range("multi-scan driver already completed".into());
+        assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == after), "a step after Done");
+        assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == after), "and it stays failed");
+
+        let mut d = MultiScanDriver::new(r.keys(&[0]), 1, 3, OFF);
+        d.supply(Ok(Vec::new()));
+        let stray = MultiScanRefusal::Range("multi-scan driver received a response without requesting a path".into());
+        assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == stray), "an answer with no Need");
     }
 }

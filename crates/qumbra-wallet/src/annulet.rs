@@ -25,13 +25,16 @@
 //! scan lends to `qumbra-wallet`'s TLS transport, so the flow is the same over
 //! a socket, over https, and over an in-process fixture.
 
-use std::cell::RefCell;
-
-use qlab_cbserver::client::{light_client_scan_l2_multi_with, light_client_scan_l2_with, MultiScanRefusal, ScanConfig, ScanOutcome};
+use qlab_cbserver::client::{
+    light_client_scan_l2_multi_with, light_client_scan_l2_with, MultiScan, MultiScanDriver, MultiScanRefusal, MultiScanStep,
+    ScanConfig, ScanOutcome,
+};
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
-use qlab_ledger::spent::{coverage_for, widest_range, NullifierChunk, NullifierSource, SpentSet};
+use qlab_ledger::spent::{coverage_of, widest_range, NullifierChunk, SpentCatchUp, SpentRefusal, SpentSet};
 use qlab_ledger::vocab::SpentCoverage;
 use qlab_note::l2note::{GenesisPlaintext, L2Note};
+use qlab_note::kem::Dk;
+use qlab_wallet::Wallet;
 use rand::rngs::StdRng;
 
 use crate::store::WalletDir;
@@ -113,26 +116,6 @@ where
     Ok((served, opened))
 }
 
-/// A [`NullifierSource`] over a fetch closure.
-struct FetchNullifiers<'a, F>(RefCell<&'a mut F>);
-
-impl<F> NullifierSource for FetchNullifiers<'_, F>
-where
-    F: FnMut(&str) -> Result<Vec<u8>, String>,
-{
-    fn fetch_range(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
-        let path = format!("/v1/nullifiers?from={from}&to={to}");
-        let bytes = (self.0.borrow_mut())(&path).map_err(|e| format!("GET {path}: {e}"))?;
-        let page = qlab_cbserver::codec::NullifierPage::from_bytes(&bytes)
-            .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
-        Ok(NullifierChunk {
-            from: page.from,
-            to: page.to,
-            blocks: page.blocks.into_iter().map(|b| (b.height, b.nullifiers)).collect(),
-        })
-    }
-}
-
 /// Where the nullifier stream must start for owned genesis notes: height 1
 /// is the first a genesis note can be spent in, and height 0 when the scan
 /// starts there — so a chain still at its genesis (tip 0) is covered by the
@@ -192,7 +175,8 @@ where
 /// over `from ..= to`, match `genesis`'s notes, read the spends, and index.
 /// Lab #850 (AD1) split it out so the verified scan
 /// ([`crate::annulet_verify`]) runs the same body over genesis notes read from
-/// the genesis **file** it hashed, not from `/v1/genesis/notes`.
+/// the genesis **file** it hashed, not from `/v1/genesis/notes`. Since lab
+/// #858 WA1 it is the pump of [`AnnuletScanCore`], the one orchestration.
 pub fn scan_annulet_from<F>(
     w: &WalletDir,
     fetch: &mut F,
@@ -205,52 +189,238 @@ pub fn scan_annulet_from<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let wallet = w.wallet();
-    let rows = annulet_rows(w, fetch, from, to, rng);
+    let mut core = AnnuletScanCore::new(w.wallet(), w.allocated.clone(), from, to, genesis_hash, genesis.to_vec());
+    loop {
+        match core.step(rng) {
+            CoreStep::Need(path) => core.supply(fetch(&path)),
+            CoreStep::Done(report) => return report,
+            CoreStep::Failed(why) => unreachable!("the pump never misuses the scan core: {why}"),
+        }
+    }
+}
 
-    let mut owned = Vec::new();
-    let mut refused = Vec::new();
-    for (cm, note) in genesis {
-        for &idx in &w.allocated {
-            if wallet.rkm(wallet.diversifier_at_index(idx)) == note.rkm {
-                match OwnedL2Note::from_genesis(&wallet, idx, *cm, *note) {
-                    Ok(n) => owned.push(n),
-                    Err(e) => refused.push(format!("genesis note: {e}")),
+/// One observation from a caller-pumped [`AnnuletScanCore`]. `Done` and
+/// `Failed` are terminal. The scan itself never fails — what it cannot read
+/// becomes a row's or the spends' named gap, as it always has; `Failed` is
+/// only a host's misuse (a step after `Done`, an answer with no `Need`
+/// outstanding), by name.
+pub enum CoreStep {
+    Need(String),
+    Done(AnnuletReport),
+    Failed(String),
+}
+
+/// **The scan body, caller-pumped** (lab #858 WA1): every allocated address
+/// over one shared fetch ([`MultiScanDriver`]), the genesis notes matched, the
+/// nullifier stream paged through [`SpentCatchUp`] — the one copy of the
+/// paging checks — and judged by [`coverage_of`], the one copy of the
+/// Covered/Unavailable rule. No I/O: [`scan_annulet_from`] and the verified
+/// driver ([`crate::annulet_driver`]) are its pumps.
+pub struct AnnuletScanCore {
+    wallet: Wallet,
+    allocated: Vec<u64>,
+    from: u64,
+    to: u64,
+    genesis_hash: [u8; 32],
+    genesis: Vec<([u8; 32], L2Note)>,
+    phase: CorePhase,
+    pending: Option<String>,
+    failed: Option<String>,
+}
+
+enum CorePhase {
+    Rows(Option<Box<MultiScanDriver>>),
+    Spent { tally: Box<Tally>, catch: SpentCatchUp },
+    Finished,
+}
+
+/// What the rows made the wallet's, before the spends are read.
+struct Tally {
+    rows: Vec<AnnuletRow>,
+    owned: Vec<OwnedL2Note>,
+    refused: Vec<String>,
+    genesis_owned: usize,
+    outputs: Option<(u64, u64)>,
+    /// The paging's verdict, once a page or the transport ended it.
+    stream: Option<Result<SpentSet, SpentRefusal>>,
+}
+
+impl AnnuletScanCore {
+    pub fn new(
+        wallet: Wallet,
+        allocated: Vec<u64>,
+        from: u64,
+        to: u64,
+        genesis_hash: [u8; 32],
+        genesis: Vec<([u8; 32], L2Note)>,
+    ) -> Self {
+        let rows = (!allocated.is_empty())
+            .then(|| Box::new(MultiScanDriver::new(scan_keys(&wallet, &allocated), from, to, ScanConfig::default())));
+        AnnuletScanCore { wallet, allocated, from, to, genesis_hash, genesis, phase: CorePhase::Rows(rows), pending: None, failed: None }
+    }
+
+    /// Advance until the scan needs one path or completes.
+    pub fn step(&mut self, rng: &mut StdRng) -> CoreStep {
+        if let Some(why) = &self.failed {
+            return CoreStep::Failed(why.clone());
+        }
+        if let Some(path) = &self.pending {
+            return CoreStep::Need(path.clone());
+        }
+        loop {
+            match std::mem::replace(&mut self.phase, CorePhase::Finished) {
+                CorePhase::Rows(None) => self.spent_phase(Vec::new()),
+                CorePhase::Rows(Some(mut multi)) => match multi.step(rng) {
+                    MultiScanStep::Need(path) => {
+                        self.phase = CorePhase::Rows(Some(multi));
+                        self.pending = Some(path.clone());
+                        return CoreStep::Need(path);
+                    }
+                    MultiScanStep::Done(m) => {
+                        let rows = rows_of(&self.wallet, &self.allocated, Ok(m));
+                        self.spent_phase(rows);
+                    }
+                    MultiScanStep::Failed(refusal) => {
+                        let rows = rows_of(&self.wallet, &self.allocated, Err(refusal));
+                        self.spent_phase(rows);
+                    }
+                },
+                CorePhase::Spent { mut tally, catch } => {
+                    if tally.stream.is_none() {
+                        if let Some((from, to)) = catch.want() {
+                            let path = nullifiers_path(from, to);
+                            self.phase = CorePhase::Spent { tally, catch };
+                            self.pending = Some(path.clone());
+                            return CoreStep::Need(path);
+                        }
+                        tally.stream = Some(Ok(catch.finish()));
+                    }
+                    let stream = tally.stream.take().expect("set above or by a page");
+                    return CoreStep::Done(self.report(*tally, stream));
+                }
+                CorePhase::Finished => {
+                    let why = "scan core already completed".to_string();
+                    self.failed = Some(why.clone());
+                    return CoreStep::Failed(why);
                 }
             }
         }
     }
-    let genesis_owned = owned.len();
-    for row in &rows {
-        if let Ok(outcome) = &row.scan {
-            for located in &outcome.notes {
-                match OwnedL2Note::from_located(&wallet, row.index, located) {
-                    Ok(n) => owned.push(n),
-                    Err(e) => refused.push(format!("height {} tx {}: {e}", located.height, located.tx_index)),
+
+    /// Answer the outstanding `Need`. An answer with none outstanding fails
+    /// the core by name.
+    pub fn supply(&mut self, answer: Result<Vec<u8>, String>) {
+        if self.failed.is_some() {
+            return;
+        }
+        let Some(path) = self.pending.take() else {
+            self.failed = Some("scan core received a response without requesting a path".into());
+            return;
+        };
+        match &mut self.phase {
+            CorePhase::Rows(Some(multi)) => multi.supply(answer),
+            CorePhase::Spent { tally, catch } => {
+                let fed = nullifier_chunk(&path, answer)
+                    .map_err(|why| SpentRefusal::Endpoint { why })
+                    .and_then(|page| catch.supply(page));
+                if let Err(e) = fed {
+                    tally.stream = Some(Err(e));
                 }
             }
+            CorePhase::Rows(None) | CorePhase::Finished => {}
         }
     }
 
-    // The nullifier stream must cover everything the owned notes could have
-    // been spent in: a genesis note from height 1 on (from 0 when the scan
-    // starts at 0, which also covers a chain still at its genesis).
-    let outputs = widest_range(
-        rows.iter()
-            .filter_map(|r| r.scan.as_ref().ok())
-            .map(|o| o.stats.compact_range_served)
-            .chain(std::iter::once((genesis_owned > 0).then_some((genesis_from(from), genesis_from(from))))),
-    );
-    let nf_from = if genesis_owned > 0 { genesis_from(from) } else { from };
-    let source = FetchNullifiers(RefCell::new(fetch));
-    let (spent, set): (SpentCoverage, Option<SpentSet>) = coverage_for(&source, nf_from, to, outputs);
+    fn spent_phase(&mut self, rows: Vec<AnnuletRow>) {
+        let wallet = &self.wallet;
+        let mut owned = Vec::new();
+        let mut refused = Vec::new();
+        for (cm, note) in &self.genesis {
+            for &idx in &self.allocated {
+                if wallet.rkm(wallet.diversifier_at_index(idx)) == note.rkm {
+                    match OwnedL2Note::from_genesis(wallet, idx, *cm, *note) {
+                        Ok(n) => owned.push(n),
+                        Err(e) => refused.push(format!("genesis note: {e}")),
+                    }
+                }
+            }
+        }
+        let genesis_owned = owned.len();
+        for row in &rows {
+            if let Ok(outcome) = &row.scan {
+                for located in &outcome.notes {
+                    match OwnedL2Note::from_located(wallet, row.index, located) {
+                        Ok(n) => owned.push(n),
+                        Err(e) => refused.push(format!("height {} tx {}: {e}", located.height, located.tx_index)),
+                    }
+                }
+            }
+        }
 
-    let every_scan_started = rows.iter().all(|r| r.scan.is_ok());
-    let index = match (&set, every_scan_started) {
-        (Some(set), true) => Some(AssetIndex::build(&wallet, owned.clone(), set)),
-        _ => None,
-    };
-    AnnuletReport { genesis_hash, rows, genesis_owned, owned, spent, index, refused }
+        // The nullifier stream must cover everything the owned notes could have
+        // been spent in: a genesis note from height 1 on (from 0 when the scan
+        // starts at 0, which also covers a chain still at its genesis).
+        let from = self.from;
+        let outputs = widest_range(
+            rows.iter()
+                .filter_map(|r| r.scan.as_ref().ok())
+                .map(|o| o.stats.compact_range_served)
+                .chain(std::iter::once((genesis_owned > 0).then_some((genesis_from(from), genesis_from(from))))),
+        );
+        let nf_from = if genesis_owned > 0 { genesis_from(from) } else { from };
+        let tally = Box::new(Tally { rows, owned, refused, genesis_owned, outputs, stream: None });
+        self.phase = CorePhase::Spent { tally, catch: SpentCatchUp::new(nf_from, self.to) };
+    }
+
+    fn report(&self, tally: Tally, stream: Result<SpentSet, SpentRefusal>) -> AnnuletReport {
+        let Tally { rows, owned, refused, genesis_owned, outputs, .. } = tally;
+        let (spent, set): (SpentCoverage, Option<SpentSet>) = coverage_of(stream, outputs);
+        let every_scan_started = rows.iter().all(|r| r.scan.is_ok());
+        let index = match (&set, every_scan_started) {
+            (Some(set), true) => Some(AssetIndex::build(&self.wallet, owned.clone(), set)),
+            _ => None,
+        };
+        AnnuletReport { genesis_hash: self.genesis_hash, rows, genesis_owned, owned, spent, index, refused }
+    }
+}
+
+/// `/v1/nullifiers` over `from ..= to`.
+fn nullifiers_path(from: u64, to: u64) -> String {
+    format!("/v1/nullifiers?from={from}&to={to}")
+}
+
+/// One `/v1/nullifiers` answer as a page, or why not — the one reading of
+/// the route, for the synchronous source and the pumped core alike.
+fn nullifier_chunk(path: &str, answer: Result<Vec<u8>, String>) -> Result<NullifierChunk, String> {
+    let bytes = answer.map_err(|e| format!("GET {path}: {e}"))?;
+    let page = qlab_cbserver::codec::NullifierPage::from_bytes(&bytes)
+        .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
+    Ok(NullifierChunk {
+        from: page.from,
+        to: page.to,
+        blocks: page.blocks.into_iter().map(|b| (b.height, b.nullifiers)).collect(),
+    })
+}
+
+/// Each allocated index's scan key.
+fn scan_keys(wallet: &Wallet, allocated: &[u64]) -> Vec<(u64, Dk)> {
+    allocated.iter().map(|&idx| (idx, wallet.diversified_keypair(&wallet.diversifier_at_index(idx)).dk)).collect()
+}
+
+/// The rows out of a multi-key scan: one per index, or every index failed
+/// with the driver's message.
+fn rows_of(wallet: &Wallet, allocated: &[u64], scan: Result<MultiScan, MultiScanRefusal>) -> Vec<AnnuletRow> {
+    let short = |idx: u64| wallet.address_at_index(idx).short().encode();
+    match scan {
+        Ok(multi) => multi.outcomes.into_iter().map(|(idx, outcome)| AnnuletRow { index: idx, short: short(idx), scan: Ok(outcome) }).collect(),
+        Err(refusal) => {
+            let why = match refusal {
+                MultiScanRefusal::Range(why) => why,
+                other => format!("{other:?}"),
+            };
+            allocated.iter().map(|&idx| AnnuletRow { index: idx, short: short(idx), scan: Err(why.clone()) }).collect()
+        }
+    }
 }
 
 /// One row per allocated index, scanned over **one** fetch of the range (lab
@@ -270,19 +440,8 @@ where
     if w.allocated.is_empty() {
         return Vec::new();
     }
-    let keys: Vec<_> =
-        w.allocated.iter().map(|&idx| (idx, wallet.diversified_keypair(&wallet.diversifier_at_index(idx)).dk)).collect();
-    let short = |idx: u64| wallet.address_at_index(idx).short().encode();
-    match light_client_scan_l2_multi_with(fetch, &keys, from, to, ScanConfig::default(), rng) {
-        Ok(multi) => multi.outcomes.into_iter().map(|(idx, outcome)| AnnuletRow { index: idx, short: short(idx), scan: Ok(outcome) }).collect(),
-        Err(refusal) => {
-            let why = match refusal {
-                MultiScanRefusal::Range(why) => why,
-                other => format!("{other:?}"),
-            };
-            w.allocated.iter().map(|&idx| AnnuletRow { index: idx, short: short(idx), scan: Err(why.clone()) }).collect()
-        }
-    }
+    let keys = scan_keys(&wallet, &w.allocated);
+    rows_of(&wallet, &w.allocated, light_client_scan_l2_multi_with(fetch, &keys, from, to, ScanConfig::default(), rng))
 }
 
 /// The pre-#819 rows: one full scan of the range per allocated index. **Kept
