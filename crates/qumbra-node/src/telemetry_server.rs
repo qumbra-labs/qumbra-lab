@@ -562,11 +562,18 @@ mod tests {
         let addr = srv.addr();
         let (status, _) = get(addr, WRAPPER_PATH);
         assert!(status.contains(" 404"), "no wrapper off V6: {status}");
-        let view = WrapperView { l2_id: 1, tip: 268, cr: Some(232), last_bundle_height: Some(268), last_bundle_id: Some([7; 32]) };
+        let view = WrapperView {
+            l2_id: 1,
+            tip: 268,
+            cr: Some(232),
+            last_bundle_height: Some(268),
+            last_bundle_id: Some([7; 32]),
+            anchors: vec![qlab_node::wrapper_route::AnchorFact { root: [9; 32], heights: vec![230, 231] }],
+        };
         *srv.wrapper().lock().unwrap() = Some(Ok(view.to_body()));
         let (status, body) = get(addr, WRAPPER_PATH);
         assert!(status.contains(" 200"), "{status}");
-        assert_eq!(parse(&body), Ok(view));
+        assert_eq!(parse(&body), Ok(view.clone()));
         let (status, body) = get(addr, TELEMETRY_PATH);
         assert!(status.contains(" 200"), "{status}");
         assert_eq!(Telemetry::from_bytes(&body).unwrap(), t, "the telemetry wire is unchanged beside it");

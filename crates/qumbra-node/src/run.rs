@@ -2416,6 +2416,12 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             cr: state.recorded_finality(),
             last_bundle_height: last.map(|(h, _)| h),
             last_bundle_id: last.map(|(_, id)| id),
+            // Lab #847 S0b: the anchor window's facts, from the same borrow.
+            anchors: state
+                .anchor_window()
+                .into_iter()
+                .map(|(root, heights)| qlab_node::wrapper_route::AnchorFact { root, heights })
+                .collect(),
         };
         Some(view.check().map(|()| view))
     }
@@ -4244,15 +4250,19 @@ mod tests {
         // finality) and no bundle yet; the body round-trips the strict reader.
         let w = reopened.wrapper_view().expect("a V6 node serves /v1/wrapper").expect("no refusal");
         assert_eq!(
-            w,
-            qlab_node::wrapper_route::WrapperView {
-                l2_id: genesis.wrapper.l2_id,
-                tip: signed_at + 1,
-                cr: Some(8),
-                last_bundle_height: None,
-                last_bundle_id: None,
-            }
+            (w.l2_id, w.tip, w.cr, w.last_bundle_height, w.last_bundle_id),
+            (genesis.wrapper.l2_id, signed_at + 1, Some(8), None, None)
         );
+        // Lab #847 S0b: the anchor window is served (every applied height
+        // is inside it on a chain this short), and the reader's selection is
+        // V7's: only roots at heights ≤ CR (8) pass for the next block.
+        let served: usize = w.anchors.iter().map(|a| a.heights.len()).sum();
+        assert_eq!(served as u64, signed_at + 2, "heights 0..=tip, each once");
+        let pass = w.absorbable();
+        assert!(!pass.is_empty());
+        for a in &w.anchors {
+            assert_eq!(pass.contains(&a.root), a.heights[0] <= 8, "{:?}", a.heights);
+        }
         assert_eq!(qlab_node::wrapper_route::parse(&w.to_body()), Ok(w));
         assert!(v.rows.iter().all(|r| r.bridged_in == 0 && r.bridged_out == 0));
         let _ = std::fs::remove_dir_all(&base);
