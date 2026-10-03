@@ -21,15 +21,15 @@ use qlab_devnet::forms::GenesisForm;
 use qlab_node::{AnchorSet, TreeLeaves};
 use qlab_wrapper::codec::digest_from_bytes;
 
-use crate::f3::native::Digest;
+use qlab_wprover::f3::native::Digest;
 
 /// A node's served routes, by path and query. `Err` for anything but a 200.
-pub(crate) trait Get {
+pub trait Get {
     fn get(&self, path: &str) -> Result<Vec<u8>, String>;
 }
 
 /// Plain HTTP to a node's discovery address (`http://host:port`).
-pub(crate) struct Http {
+pub struct Http {
     pub base: String,
 }
 
@@ -40,7 +40,7 @@ impl Get for Http {
 }
 
 /// What f5box reads from the node, once per run.
-pub(crate) struct ChainView {
+pub struct ChainView {
     /// The L1 commitment tree, rebuilt from the served leaves.
     pub tree: CommitmentTree,
     /// The node's valid-anchor set, as served (newest first).
@@ -61,7 +61,7 @@ pub(crate) struct ChainView {
 /// is never taken for the end (#309/#312's lesson): the leaves must reach
 /// the served `total` and never pass it, and the coinbase stream must hold
 /// every height `0..=tip`.
-pub(crate) fn read(node: &impl Get) -> Result<ChainView, String> {
+pub fn read(node: &impl Get) -> Result<ChainView, String> {
     let anchors = AnchorSet::from_bytes(&node.get("/v1/anchors")?).map_err(|e| format!("/v1/anchors: {e:?}"))?;
     let mut tree = CommitmentTree::new();
     loop {
@@ -115,7 +115,7 @@ pub(crate) fn read(node: &impl Get) -> Result<ChainView, String> {
 
 /// One valid anchor as this tree states it: the leaf count whose root it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Anchor {
+pub struct Anchor {
     pub count: u64,
     pub root: Digest,
 }
@@ -124,7 +124,7 @@ impl ChainView {
     /// The served anchors this tree reproduces, newest (largest count) first.
     /// A served root no prefix of the tree reproduces is an error: the tree
     /// and the anchor set disagree, and nothing built on either is sound.
-    pub(crate) fn anchors(&self) -> Result<Vec<Anchor>, String> {
+    pub fn anchors(&self) -> Result<Vec<Anchor>, String> {
         let mut out = Vec::new();
         for bytes in &self.anchors.roots {
             let root = digest_from_bytes(bytes);
@@ -142,7 +142,7 @@ impl ChainView {
     /// not one yet ([`Self::immature_burns`]); a **matured** burn whose
     /// rebuilt commitment is in no served leaf is an error naming its height
     /// — the wrong form, or a server whose streams disagree.
-    pub(crate) fn burns(&self, form: GenesisForm, l2_id: u64) -> Result<Vec<Burn>, String> {
+    pub fn burns(&self, form: GenesisForm, l2_id: u64) -> Result<Vec<Burn>, String> {
         let rkm = qlab_air::claim::rkm_burn(l2_id);
         let mut out = Vec::new();
         for b in self.coinbase.iter().filter(|b| b.coinbase_rkm == rkm) {
@@ -169,8 +169,8 @@ impl ChainView {
     /// is a served leaf below the newest valid anchor. Refused by name
     /// otherwise; ascending by leaf position, like [`Self::burns`].
     /// Test-only until the box takes claim files as members (follow-up).
-    #[cfg(test)]
-    pub(crate) fn tx_burns(&self, l2_id: u64, openings: &[TxBurnOpening]) -> Result<Vec<Burn>, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tx_burns(&self, l2_id: u64, openings: &[TxBurnOpening]) -> Result<Vec<Burn>, String> {
         let rkm = qlab_air::claim::rkm_burn(l2_id);
         let newest = self.anchors()?.first().copied().ok_or("no valid anchor is served: nothing is claimable yet")?;
         let mut out = Vec::with_capacity(openings.len());
@@ -194,7 +194,7 @@ impl ChainView {
 
     /// The burns minted but not appended yet at the served tip, each with the
     /// height its leaf appears at — the manifest's "why not yet".
-    pub(crate) fn immature_burns(&self, l2_id: u64) -> Vec<(u64, u64)> {
+    pub fn immature_burns(&self, l2_id: u64) -> Vec<(u64, u64)> {
         let rkm = qlab_air::claim::rkm_burn(l2_id);
         self.coinbase
             .iter()
@@ -207,9 +207,9 @@ impl ChainView {
 /// A transaction-output burn's opening, as its depositor's wallet holds it
 /// (`qlab_ledger::deposits::SetAside`): where it was mined and the note's
 /// free fields; its `rkm` is the burn address by definition.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TxBurnOpening {
+pub struct TxBurnOpening {
     pub height: u64,
     pub value: u64,
     pub rho: Digest,
@@ -218,7 +218,7 @@ pub(crate) struct TxBurnOpening {
 
 /// One burn note in the L1 tree.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Burn {
+pub struct Burn {
     /// The height whose block minted it.
     pub height: u64,
     pub note: qlab_air::claim::BurnNote,

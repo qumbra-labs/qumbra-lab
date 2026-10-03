@@ -1,0 +1,37 @@
+[package]
+name = "qumbra-sequencer"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The V6 sequencer (lab #847). S1b: the library is f5box's planning, proving,
+# assembly, signing, self-check and state halves, moved verbatim out of
+# qlab-bench (which keeps f5box's CLI and tests and re-exports these
+# modules); the intake (S2) and the loop (S4) build on it.
+[features]
+# The test-only helpers the bench's f5box lane drives (transaction-output
+# burns by opening, resealing a foreign member): `cfg(test)` in this crate
+# cannot reach another crate's tests, so they sit behind this feature, which
+# only qlab-bench's dev-dependency turns on (qumbra-node's
+# `wrapper-test-knobs` precedent).
+test-support = []
+
+[dependencies]
+qlab-air = { path = "../qlab-air" }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+qlab-consensus = { path = "../qlab-consensus" }
+qlab-devnet = { path = "../qlab-devnet" }
+qlab-l2 = { path = "../qlab-l2" }
+qlab-l2spend = { path = "../qlab-l2spend" }
+qlab-node = { path = "../qlab-node" }
+qlab-wprover = { path = "../qlab-wprover" }
+qlab-wrapper = { path = "../qlab-wrapper" }
+qumbra-node = { path = "../qumbra-node" }
+# The sequencer's signature (lab #785 F5-4b): ML-DSA-65, pinned as the node's.
+ml-dsa = "=0.1.1"
+p3-field = "=0.6.1"
+p3-uni-stark = "=0.6.1"
+bincode = "1"
+serde = "1"
+serde_json = "1"

@@ -50,9 +50,9 @@ use qlab_wrapper::hash::WRoots;
 use qlab_wrapper::verify::Surface;
 
 use super::chain::{Anchor, Burn, ChainView};
-use crate::f3::native::Digest;
-use crate::f4::dep::DepEntry;
-use crate::f4::native::{Member, WInputs, WState, WTag, WWitness, M_ABS};
+use qlab_wprover::f3::native::Digest;
+use qlab_wprover::f4::dep::DepEntry;
+use qlab_wprover::f4::native::{Member, WInputs, WState, WTag, WWitness, M_ABS};
 
 /// The key schedule's domain.
 const DOMAIN: &[u8] = b"qumbra:f5box:v1";
@@ -60,24 +60,24 @@ const DOMAIN: &[u8] = b"qumbra:f5box:v1";
 /// The fee every f5box transaction pays (bessel): S, P and R carry no fee
 /// rule (no tariff check exists for them, lab #785 census); a fixed nonzero
 /// value keeps the asset-0 fee path in use.
-pub(crate) const TX_FEE: u64 = 10_000;
+pub const TX_FEE: u64 = 10_000;
 
 /// This run's L2 diversifier: every note f5box owns is at one `rkm`.
 const D: [u64; 2] = [1, 0];
 
 /// The run's private schedule.
 #[derive(Clone)]
-pub(crate) struct Keys {
+pub struct Keys {
     seed: [u8; 32],
 }
 
 impl Keys {
-    pub(crate) fn from_text(seed: &str) -> Self {
+    pub fn from_text(seed: &str) -> Self {
         Keys { seed: qlab_devnet::hash::keccak256(seed.as_bytes()) }
     }
 
     /// `Keccak256(DOMAIN ‖ seed ‖ label ‖ wrapper ‖ slot)` as four lanes.
-    pub(crate) fn lanes(&self, label: &str, wrapper: u64, slot: u64) -> Digest {
+    pub fn lanes(&self, label: &str, wrapper: u64, slot: u64) -> Digest {
         let mut msg = DOMAIN.to_vec();
         msg.extend_from_slice(&self.seed);
         msg.extend_from_slice(&(label.len() as u64).to_le_bytes());
@@ -92,34 +92,34 @@ impl Keys {
     }
 
     /// An asset-0 note of this run's, as a spend input.
-    pub(crate) fn input(&self, n: &Owned) -> L2TxInput {
+    pub fn input(&self, n: &Owned) -> L2TxInput {
         L2TxInput { sk: self.sk(), value: n.value, asset: 0, rho: n.rho, rseed: n.rseed, d: D }
     }
 
     /// This run's L2 recipient key (every credit, every change output, the
     /// sequencer fee note).
-    pub(crate) fn rkm(&self) -> Digest {
+    pub fn rkm(&self) -> Digest {
         derive_rkm_l2(&self.input(&Owned { value: 0, rho: [0; 4], rseed: [0; 4] }))
     }
 }
 
 /// An asset-0 L2 note this run owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Owned {
+pub struct Owned {
     pub value: u64,
     pub rho: Digest,
     pub rseed: Digest,
 }
 
 impl Owned {
-    pub(crate) fn cm(&self, keys: &Keys) -> Digest {
+    pub fn cm(&self, keys: &Keys) -> Digest {
         l2_cm(self.value, 0, &keys.rkm(), &self.rho, &self.rseed)
     }
 }
 
 /// One built member: its circuit instance.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum Inst {
+pub enum Inst {
     S(L2BucketInstance),
     P(L2PBucketInstance),
     /// With the leaf it writes (bound through `new_root`, not a PV).
@@ -132,7 +132,7 @@ pub(crate) enum Inst {
 }
 
 impl Inst {
-    pub(crate) fn tag(&self) -> WTag {
+    pub fn tag(&self) -> WTag {
         match self {
             Inst::S(_) => WTag::S,
             Inst::P(_) => WTag::P,
@@ -141,7 +141,7 @@ impl Inst {
         }
     }
 
-    pub(crate) fn pvs(&self) -> &[u32] {
+    pub fn pvs(&self) -> &[u32] {
         match self {
             Inst::S(i) => &i.pvs,
             Inst::P(i) => &i.pvs,
@@ -152,7 +152,7 @@ impl Inst {
     }
 
     /// The member W threads.
-    pub(crate) fn member(&self) -> Member {
+    pub fn member(&self) -> Member {
         let write = match self {
             Inst::R(_, leaf) => Some(*leaf),
             _ => None,
@@ -162,7 +162,7 @@ impl Inst {
 
     /// Prove it under the L2 lane (7–31 GiB; box only). A claim proven
     /// elsewhere is not proven again: its proof is the file's.
-    pub(crate) fn prove(&self) -> Proof<Config> {
+    pub fn prove(&self) -> Proof<Config> {
         match self {
             Inst::S(i) => qlab_l2::prove_s(i).1,
             Inst::P(i) => qlab_l2::prove_p(i).1,
@@ -174,7 +174,7 @@ impl Inst {
 }
 
 /// The chain facts a plan is built against.
-pub(crate) struct Chain<'a> {
+pub struct Chain<'a> {
     pub view: &'a ChainView,
     pub l2_id: u64,
     /// The genesis claim tariff (`WrapperParams::claim_fee_tier`).
@@ -182,7 +182,7 @@ pub(crate) struct Chain<'a> {
 }
 
 /// What to build.
-pub(crate) struct Ask<'a> {
+pub struct Ask<'a> {
     /// The slot order (`default_kinds(16)`, or sixteen claims).
     pub kinds: &'a [WTag],
     /// The burns a claim may take, in order (already-claimed ones are skipped
@@ -196,7 +196,7 @@ pub(crate) struct Ask<'a> {
 }
 
 /// A built wrapper: the members, the native statement and what it moves.
-pub(crate) struct Plan {
+pub struct Plan {
     pub insts: Vec<Inst>,
     pub members: Vec<Member>,
     /// Each claim's value opening, in claim order (the deposit-sum proof's).
@@ -219,7 +219,7 @@ pub(crate) struct Plan {
 
 /// Why a plan is refused — every one named, none a panic.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PlanError {
+pub enum PlanError {
     /// The node serves no valid anchor (nothing finalized yet).
     NoAnchor,
     /// The served anchors and the served leaves disagree.
@@ -263,7 +263,7 @@ fn asset0_policy(reg: &RegistryTree, rkm: &Digest) -> L2PolicyInput {
 }
 
 /// Build the wrapper `ask` names on `state`, whose surface is `prev`.
-pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, ask: &Ask) -> Result<Plan, PlanError> {
+pub fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, ask: &Ask) -> Result<Plan, PlanError> {
     if ask.exit.is_some() && !ask.kinds.contains(&WTag::P) {
         return Err(PlanError::ExitWithoutP);
     }
@@ -459,7 +459,7 @@ pub(crate) fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, a
 fn statement(state: &WState, inp: &WInputs, members: &[Member], exits: &[Exit]) -> Result<(WRoots, WWitness, WRoots, Digest), PlanError> {
     let mut st = state.clone();
     let (rin, wit, rout) = st.apply(inp, members).map_err(|e| PlanError::Wrapper(format!("{e:?}")))?;
-    let exit_cmt = crate::f4::native::check_wrapper_leaf(&rin, inp, members, &wit)
+    let exit_cmt = qlab_wprover::f4::native::check_wrapper_leaf(&rin, inp, members, &wit)
         .map_err(|e| PlanError::Wrapper(format!("{e:?}")))?
         .1;
     if exit_chain(exits) != exit_cmt {
@@ -477,8 +477,8 @@ fn statement(state: &WState, inp: &WInputs, members: &[Member], exits: &[Exit]) 
 /// when `None` — so a later plan spending from the result finds every credit
 /// it names. `spent` stays `base`'s: the lane swaps in a member that spends
 /// the same note. Test-only: f5box itself never takes a foreign member.
-#[cfg(test)]
-pub(crate) fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, exits: Vec<Exit>, keys: &Keys, credit: Option<Owned>) -> Result<Plan, PlanError> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reseal(state: &WState, mut base: Plan, slot: usize, inst: Inst, exits: Vec<Exit>, keys: &Keys, credit: Option<Owned>) -> Result<Plan, PlanError> {
     let old_change = match &base.insts[slot] {
         Inst::S(i) => Some(i.cm_out[0]),
         Inst::P(i) => Some(i.cm_out[0]),
@@ -539,8 +539,8 @@ fn swap_claim(state: &WState, mut base: Plan, slot: usize, inst: Inst, dep: DepE
 /// **Lab #831 W3b: a claim built elsewhere, in claim `slot`** — the wallet's
 /// claim instance, with the burn it claims. Test-only; the box takes a claim
 /// FILE through [`take_claim_file`].
-#[cfg(test)]
-pub(crate) fn reseal_claim(
+#[cfg(any(test, feature = "test-support"))]
+pub fn reseal_claim(
     state: &WState,
     base: Plan,
     slot: usize,
@@ -561,7 +561,7 @@ pub(crate) fn reseal_claim(
 /// the depositor rebuilds it at a newer anchor (`deposit claim
 /// --anchor-count`). The proof is verified by the caller before this, so an
 /// unprovable file never costs an hour of proving the rest.
-pub(crate) fn take_claim_file(state: &WState, base: Plan, file: qlab_l2spend::ClaimFile, keys: &Keys) -> Result<Plan, PlanError> {
+pub fn take_claim_file(state: &WState, base: Plan, file: qlab_l2spend::ClaimFile, keys: &Keys) -> Result<Plan, PlanError> {
     let slot = base.insts.iter().position(|i| matches!(i, Inst::C(_))).ok_or(PlanError::NoClaimSlot)?;
     let member = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None };
     let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("the claim file's anchor: {e:?}")))?;

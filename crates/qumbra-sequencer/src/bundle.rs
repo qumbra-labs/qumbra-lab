@@ -29,14 +29,14 @@ use serde_json::{json, Value};
 use super::chain::ChainView;
 use super::members::Plan;
 use super::state::digest_hex;
-use crate::f4::dep::prove_dep;
-use crate::f4::wleaf::{build_plan, fee_of, first_violation, render, w_pvs, WAir};
+use qlab_wprover::f4::dep::prove_dep;
+use qlab_wprover::f4::wleaf::{build_plan, fee_of, first_violation, render, w_pvs, WAir};
 
 /// Wall seconds per step, in order.
-pub(crate) type Timings = Vec<(String, f64)>;
+pub type Timings = Vec<(String, f64)>;
 
 /// The proofs of a plan.
-pub(crate) struct Proofs {
+pub struct Proofs {
     pub w: Proof<LegacyNonHidingConfig>,
     pub dep_pvs: Vec<u32>,
     pub dep: Proof<Config>,
@@ -44,7 +44,7 @@ pub(crate) struct Proofs {
 }
 
 /// W's public values for `p`, as the wire carries them.
-pub(crate) fn w_pvs_u32(p: &Plan) -> Vec<u32> {
+pub fn w_pvs_u32(p: &Plan) -> Vec<u32> {
     w_pvs(&p.rin, &p.rout, &p.inp, fee_of(&p.members), &p.exit_cmt).iter().map(PrimeField32::as_canonical_u32).collect()
 }
 
@@ -52,7 +52,7 @@ pub(crate) fn w_pvs_u32(p: &Plan) -> Vec<u32> {
 /// then W — after a full scan of its honest trace, so an unsatisfiable W is
 /// refused by row rather than proven into garbage — then the deposit-sum
 /// proof. `log` hears each step as it starts.
-pub(crate) fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) -> Result<Proofs, String> {
+pub fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) -> Result<Proofs, String> {
     let cfg = qlab_wrapper::verify::version_cfg(CHAIN_VERSION).ok_or("no lane for the chain version")?;
     let mut members = Vec::with_capacity(p.insts.len());
     for (i, inst) in p.insts.iter().enumerate() {
@@ -83,7 +83,7 @@ pub(crate) fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) 
 }
 
 /// The canonical bundle of `p` with `proofs`, unsigned.
-pub(crate) fn assemble(p: &Plan, l2_id: u64, proofs: Proofs) -> Result<WireBundle, String> {
+pub fn assemble(p: &Plan, l2_id: u64, proofs: Proofs) -> Result<WireBundle, String> {
     if proofs.members.len() != p.insts.len() {
         return Err(format!("{} member proofs for {} members", proofs.members.len(), p.insts.len()));
     }
@@ -108,7 +108,7 @@ pub(crate) fn assemble(p: &Plan, l2_id: u64, proofs: Proofs) -> Result<WireBundl
 /// The rehearsal sequencer's signing key, refused unless `params` names its
 /// verifying half: f5box signs only for a genesis that trusts the in-code
 /// rehearsal key (Q-6-1: a rehearsal genesis, no secret).
-pub(crate) fn rehearsal_signer(params: &WrapperParams) -> Result<SigningKey<MlDsa65>, String> {
+pub fn rehearsal_signer(params: &WrapperParams) -> Result<SigningKey<MlDsa65>, String> {
     if params.sequencer_key != qumbra_node::genesis_v6::rehearsal_sequencer_key() {
         return Err("this genesis's sequencer key is not the in-code rehearsal key; f5box signs only for a rehearsal genesis".into());
     }
@@ -117,13 +117,13 @@ pub(crate) fn rehearsal_signer(params: &WrapperParams) -> Result<SigningKey<MlDs
 
 /// The message the sequencer signs for `wb` on `net`; `None` when W's PVs
 /// state no surface (a PV word past 16 bits).
-pub(crate) fn signed_message(wb: &WireBundle, net: &Hash32) -> Option<Vec<u8>> {
+pub fn signed_message(wb: &WireBundle, net: &Hash32) -> Option<Vec<u8>> {
     let stated = wb.stated_surface()?;
     Some(sign_message(net, wb.l2_id, &stated.commitment))
 }
 
 /// Sign `wb` for `net`. An error, never a panic: it runs after the proofs.
-pub(crate) fn sign(wb: &mut WireBundle, sk: &SigningKey<MlDsa65>, net: &Hash32) -> Result<(), String> {
+pub fn sign(wb: &mut WireBundle, sk: &SigningKey<MlDsa65>, net: &Hash32) -> Result<(), String> {
     let msg = signed_message(wb, net).ok_or("W's public values state no surface: nothing to sign")?;
     wb.sig.copy_from_slice(sk.sign(&msg).encode().as_slice());
     Ok(())
@@ -131,7 +131,7 @@ pub(crate) fn sign(wb: &mut WireBundle, sk: &SigningKey<MlDsa65>, net: &Hash32) 
 
 /// The node's rule over `bytes`, at the block after the served tip, threading
 /// from `prev`, every absorbed root judged against the served anchor set.
-pub(crate) fn self_check(rule: &WrapperRule, bytes: &[u8], prev: &Surface, view: &ChainView) -> Result<BundleOutcome, BundleRefusal> {
+pub fn self_check(rule: &WrapperRule, bytes: &[u8], prev: &Surface, view: &ChainView) -> Result<BundleOutcome, BundleRefusal> {
     let surface = encode_surface(prev);
     let anchor_ok = |root: &Hash32| view.anchors.roots.contains(root);
     let ctx = BundleContext { surface: &surface, last_bundle_height: None, anchor_ok: &anchor_ok };
@@ -148,7 +148,7 @@ pub(crate) fn self_check(rule: &WrapperRule, bytes: &[u8], prev: &Surface, view:
 /// from the codec's layout, independently of `encode()`; `bytes_reconciled`
 /// says whether they sum to the encoding, and the command refuses a bundle
 /// whose parts do not.
-pub(crate) fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, spacing: u64, view: &ChainView, timings: &Timings) -> Value {
+pub fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, spacing: u64, view: &ChainView, timings: &Timings) -> Value {
     let pv_digest = |pvs: &[u32]| {
         let le: Vec<u8> = pvs.iter().flat_map(|w| w.to_le_bytes()).collect();
         hex(&qlab_devnet::hash::keccak256(&le))
@@ -192,7 +192,7 @@ fn proof_len<T: serde::Serialize>(p: &T) -> usize {
 
 /// The canonical bytes, by part (`qlab_wrapper::codec`'s layout): every
 /// byte is in exactly one part, so the parts sum to the encoding.
-pub(crate) struct BundleBytes {
+pub struct BundleBytes {
     /// `version ‖ l2_id`, the two proof lengths, `n_members`, each member's
     /// tag and proof length, `n_exits`.
     pub framing: usize,
@@ -207,7 +207,7 @@ pub(crate) struct BundleBytes {
 }
 
 impl BundleBytes {
-    pub(crate) fn of(wb: &WireBundle) -> Self {
+    pub fn of(wb: &WireBundle) -> Self {
         BundleBytes {
             framing: 4 + 8 + 4 + 4 + 1 + 5 * wb.members.len() + 1,
             w_pvs: 4 * wb.w_pvs.len(),
@@ -221,7 +221,7 @@ impl BundleBytes {
         }
     }
 
-    pub(crate) fn total(&self) -> usize {
+    pub fn total(&self) -> usize {
         self.framing + self.w_pvs + self.w_proof + self.dep_pvs + self.dep_proof + self.member_pvs + self.member_proofs + self.exits + self.sig
     }
 

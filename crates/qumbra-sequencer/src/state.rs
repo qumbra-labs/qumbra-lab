@@ -18,16 +18,16 @@ use qumbra_node::genesis_v6::{v6_genesis_registry, v6_genesis_registry_root};
 use serde_json::{json, Value};
 
 use super::members::{Owned, Plan};
-use crate::f3::native::Digest;
-use crate::f4::native::{check_wrapper_leaf, Member, WInputs, WRoots, WState, WTag, M_ABS};
-use crate::f4::wleaf::{fee_of, w_pvs};
+use qlab_wprover::f3::native::Digest;
+use qlab_wprover::f4::native::{check_wrapper_leaf, Member, WInputs, WRoots, WState, WTag, M_ABS};
+use qlab_wprover::f4::wleaf::{fee_of, w_pvs};
 
 /// The file's format.
-pub(crate) const STATE_FORMAT: u64 = 1;
+pub const STATE_FORMAT: u64 = 1;
 
 /// One wrapper as built.
 #[derive(Clone, Debug)]
-pub(crate) struct Built {
+pub struct Built {
     pub inp: WInputs,
     pub members: Vec<Member>,
     pub exits: Vec<Exit>,
@@ -35,7 +35,7 @@ pub(crate) struct Built {
 
 /// What f5box has built for one chain.
 #[derive(Clone, Debug)]
-pub(crate) struct RunState {
+pub struct RunState {
     /// The V6 genesis hash (the net id the sequencer signs).
     pub genesis: [u8; 32],
     pub l2_id: u64,
@@ -49,14 +49,14 @@ pub(crate) struct RunState {
 
 /// The surface a wrapper states, from its statement — `verify_wrapper`'s
 /// success value and the sequencer's signed commitment.
-pub(crate) fn surface_of(l2_id: u64, rin: &WRoots, rout: &WRoots, inp: &WInputs, members: &[Member], exit_cmt: &Digest) -> Result<Surface, String> {
+pub fn surface_of(l2_id: u64, rin: &WRoots, rout: &WRoots, inp: &WInputs, members: &[Member], exit_cmt: &Digest) -> Result<Surface, String> {
     let pvs: Vec<u32> =
         w_pvs(rin, rout, inp, fee_of(members), exit_cmt).iter().map(p3_field::PrimeField32::as_canonical_u32).collect();
     stated_surface(qlab_wrapper::genesis::CHAIN_VERSION, l2_id, &pvs).ok_or_else(|| "W's public values state no surface".to_string())
 }
 
 /// The surface `plan` states.
-pub(crate) fn plan_surface(l2_id: u64, p: &Plan) -> Result<Surface, String> {
+pub fn plan_surface(l2_id: u64, p: &Plan) -> Result<Surface, String> {
     surface_of(l2_id, &p.rin, &p.rout, &p.inp, &p.members, &p.exit_cmt)
 }
 
@@ -75,7 +75,7 @@ fn unhex32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-pub(crate) fn digest_hex(d: &Digest) -> String {
+pub fn digest_hex(d: &Digest) -> String {
     hex(&digest_to_bytes(d))
 }
 
@@ -96,7 +96,7 @@ fn tag_name(t: WTag) -> &'static str {
     }
 }
 
-pub(crate) fn tag_of(s: &str) -> Result<WTag, String> {
+pub fn tag_of(s: &str) -> Result<WTag, String> {
     match s {
         "S" => Ok(WTag::S),
         "P" => Ok(WTag::P),
@@ -141,7 +141,7 @@ fn exit_of(v: &Value) -> Result<Exit, String> {
 }
 
 impl Built {
-    pub(crate) fn of(p: &Plan) -> Self {
+    pub fn of(p: &Plan) -> Self {
         Built { inp: p.inp.clone(), members: p.members.clone(), exits: p.exits.clone() }
     }
 
@@ -186,17 +186,17 @@ impl Built {
 }
 
 impl RunState {
-    pub(crate) fn new(genesis: [u8; 32], l2_id: u64, seed: &str) -> Self {
+    pub fn new(genesis: [u8; 32], l2_id: u64, seed: &str) -> Self {
         RunState { genesis, l2_id, seed: seed.to_string(), bundles: Vec::new(), owned: Vec::new() }
     }
 
     /// Record a built wrapper and its credits.
-    pub(crate) fn push(&mut self, p: &Plan) {
+    pub fn push(&mut self, p: &Plan) {
         self.bundles.push(Built::of(p));
         self.owned.extend(p.credited.iter().copied());
     }
 
-    pub(crate) fn to_json(&self) -> Value {
+    pub fn to_json(&self) -> Value {
         json!({
             "format": STATE_FORMAT,
             "genesis": hex(&self.genesis),
@@ -207,7 +207,7 @@ impl RunState {
         })
     }
 
-    pub(crate) fn from_json(v: &Value) -> Result<Self, String> {
+    pub fn from_json(v: &Value) -> Result<Self, String> {
         if v["format"].as_u64() != Some(STATE_FORMAT) {
             return Err(format!("state format {} (this f5box reads {STATE_FORMAT})", v["format"]));
         }
@@ -220,14 +220,14 @@ impl RunState {
         })
     }
 
-    pub(crate) fn load(path: &std::path::Path) -> Result<Self, String> {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let v: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         Self::from_json(&v).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Written atomically ([`write_atomic`]).
-    pub(crate) fn save(&self, path: &std::path::Path) -> Result<(), String> {
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(&self.to_json()).map_err(|e| format!("state json: {e}"))?;
         write_atomic(path, text.as_bytes())
     }
@@ -237,7 +237,7 @@ impl RunState {
     /// from. A wrapper that does not thread from its predecessor's surface,
     /// that the statement refuses, or whose exit list does not chain to its
     /// `exit_cmt` is refused by index.
-    pub(crate) fn replay(&self) -> Result<(WState, Surface), String> {
+    pub fn replay(&self) -> Result<(WState, Surface), String> {
         let mut state = WState::genesis(&v6_genesis_registry());
         let mut prev = genesis_surface(self.l2_id, &v6_genesis_registry_root());
         for (i, b) in self.bundles.iter().enumerate() {
@@ -258,7 +258,7 @@ impl RunState {
 /// Write `bytes` to `path` via `<file name>.tmp` beside it: written, fsynced,
 /// renamed over. A crash leaves the old file or the new one, never half of
 /// either; a failed rename removes the temp.
-pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let name = path.file_name().ok_or_else(|| format!("{}: not a file path", path.display()))?;
     let mut tmp_name = name.to_os_string();
@@ -279,10 +279,10 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), S
 /// A run's exclusive hold on its state file: `<state>.lock`, created with
 /// `create_new` (O_EXCL), removed on drop. Two runs on one state file would
 /// both replay the same `prev` and race the rename.
-pub(crate) struct StateLock(std::path::PathBuf);
+pub struct StateLock(std::path::PathBuf);
 
 impl StateLock {
-    pub(crate) fn take(state: &std::path::Path) -> Result<Self, String> {
+    pub fn take(state: &std::path::Path) -> Result<Self, String> {
         let mut name = state.file_name().ok_or_else(|| format!("{}: not a file path", state.display()))?.to_os_string();
         name.push(".lock");
         let path = state.with_file_name(name);

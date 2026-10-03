@@ -17,6 +17,8 @@ qlab-wrapper = { path = "../qlab-wrapper" }
 # Lab #847 S1a: the wrapper's proving half (F3/F4 native statement, W leaf
 # and deposit AIRs) lives here now; f3.rs/f4.rs re-export it at the old paths.
 qlab-wprover = { path = "../qlab-wprover" }
+# Lab #847 S1b: f5box's library half (plan, prove, assemble, sign, state).
+qumbra-sequencer = { path = "../qumbra-sequencer" }
 # The node's commitment and registry trees (lab #767): F3's native reference
 # builds on them so its roots are the node's roots bit for bit.
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
@@ -95,6 +97,8 @@ qlab-air = { path = "../qlab-air", features = ["test-support"] }
 # bundle rule (`qumbra_node::bundle::WrapperRule`), whose measurement version
 # and member stub are behind this dev-only feature (ruling 5915423092).
 qumbra-node = { path = "../qumbra-node", features = ["wrapper-test-knobs"] }
+# Lab #847 S1b: f5box's lane drives the sequencer's test-only helpers.
+qumbra-sequencer = { path = "../qumbra-sequencer", features = ["test-support"] }
 # Lab #831 W3b: the wallet's scan sets its deposit aside (`deposits::set_aside`)
 # before f5box's tx-output burn reader takes the opening. Dev-only.
 qlab-ledger = { path = "../qlab-ledger" }
