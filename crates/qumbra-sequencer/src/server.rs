@@ -119,7 +119,7 @@ impl Intake {
             State::Queued => held_reason(item.kind).map_or(String::new(), |h| format!(r#","held":{}"#, json_str(h))),
             State::Planned(n) => format!(r#","bundle":{n}"#),
             State::Landed(h) => format!(r#","height":{h}"#),
-            State::Refused(why) => format!(r#","why":{}"#, json_str(why)),
+            State::Refused(r) => format!(r#","why":{}"#, json_str(r.sentence())),
         };
         (200, format!(r#"{{"v":{v},"id":"{id_hex}","state":"{}"{extra}}}"#, item.state.name()))
     }
@@ -205,11 +205,14 @@ mod tests {
         assert_eq!(i.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"planned","bundle":2}}"#));
         i.queue.set_state(&id, State::Landed(268)).unwrap();
         assert_eq!(i.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"landed","height":268}}"#));
-        i.queue.set_state(&id, State::Refused("the native statement refuses it: Nullifier".into())).unwrap();
+        let (mut i2, d2) = intake("states-refused");
+        i2.post(W3C_CLAIM);
+        i2.queue.set_state(&id, State::Refused(crate::queue::Refusal::CnfOnChain)).unwrap();
         assert_eq!(
-            i.status(&h).1,
-            format!(r#"{{"v":1,"id":"{h}","state":"refused","why":"the native statement refuses it: Nullifier"}}"#)
+            i2.status(&h).1,
+            format!(r#"{{"v":1,"id":"{h}","state":"refused","why":"the chain already holds this claim's cnf"}}"#)
         );
+        let _ = std::fs::remove_dir_all(&d2);
         assert_eq!(held_reason(crate::intake::Kind::Claim), None);
         assert!(held_reason(crate::intake::Kind::Exit).unwrap().contains("lab #847 Q4"));
         let _ = std::fs::remove_dir_all(&d);

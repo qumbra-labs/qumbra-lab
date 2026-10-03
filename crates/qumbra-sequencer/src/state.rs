@@ -145,7 +145,7 @@ impl Built {
         Built { inp: p.inp.clone(), members: p.members.clone(), exits: p.exits.clone() }
     }
 
-    fn to_json(&self) -> Value {
+    pub fn to_json(&self) -> Value {
         json!({
             "inputs": {
                 "prev": digest_hex(&self.inp.prev),
@@ -160,7 +160,7 @@ impl Built {
         })
     }
 
-    fn from_json(v: &Value) -> Result<Self, String> {
+    pub fn from_json(v: &Value) -> Result<Self, String> {
         let i = &v["inputs"];
         let abs: Vec<Digest> = i["absorbed"].as_array().ok_or("inputs.absorbed")?.iter().map(digest_of).collect::<Result<_, _>>()?;
         let absorbed: [Digest; M_ABS] = abs.try_into().map_err(|_| format!("inputs.absorbed is not {M_ABS} roots"))?;
@@ -188,6 +188,13 @@ impl Built {
 impl RunState {
     pub fn new(genesis: [u8; 32], l2_id: u64, seed: &str) -> Self {
         RunState { genesis, l2_id, seed: seed.to_string(), bundles: Vec::new(), owned: Vec::new() }
+    }
+
+    /// Record a wrapper the chain applied, as built (lab #847 S4: the loop
+    /// pushes only on an observed inclusion). It credits this run nothing —
+    /// a claims-only wrapper's credits are its depositors'.
+    pub fn push_built(&mut self, b: Built) {
+        self.bundles.push(b);
     }
 
     /// Record a built wrapper and its credits.
