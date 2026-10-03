@@ -107,6 +107,45 @@ impl Keys {
     pub fn rkm(&self) -> Digest {
         derive_rkm_l2(&self.input(&Owned { value: 0, rho: [0; 4], rseed: [0; 4] }))
     }
+
+    /// **A seed claim's credit `rseed`** (lab #847 S3b):
+    /// `Keccak256(DOMAIN ‖ seed ‖ SEED_CREDIT ‖ cnf)` — bound to the claim's
+    /// cnf, so the sequencer recomputes it from the claim's own public values
+    /// and recognises its credit without keeping any record of the claims
+    /// `seed` made.
+    pub fn seed_rseed(&self, cnf: &Digest) -> Digest {
+        let mut msg = DOMAIN.to_vec();
+        msg.extend_from_slice(&self.seed);
+        msg.extend_from_slice(&(SEED_CREDIT.len() as u64).to_le_bytes());
+        msg.extend_from_slice(SEED_CREDIT.as_bytes());
+        msg.extend_from_slice(&qlab_wrapper::codec::digest_to_bytes(cnf));
+        qlab_wrapper::codec::digest_from_bytes(&qlab_devnet::hash::keccak256(&msg))
+    }
+
+    /// The credit `seed` gives the claim of a burn whose cnf is `cnf`: this
+    /// key's `rkm`, [`Keys::seed_rseed`].
+    pub fn seed_credit(&self, cnf: &Digest) -> ClaimCredit {
+        ClaimCredit { rkm: self.rkm(), rseed: self.seed_rseed(cnf) }
+    }
+}
+
+/// The label of a seed claim's credit `rseed` (lab #847 S3b).
+pub const SEED_CREDIT: &str = "seed-credit";
+
+/// **Whether a claim credits this sequencer** (lab #847 S3b): the note a seed
+/// claim creates — `value − fee` to `keys.rkm()`, ρ = its cnf, rseed
+/// [`Keys::seed_rseed`] — if its `cm2` is exactly that note's commitment,
+/// else `None`. A wallet's claim never matches: its rseed is the wallet's,
+/// and the seed is the sequencer's. Seed claims take S2's path unchanged
+/// (intake's checks, its dedupe, the queue's states); only here, at plan
+/// time, does the sequencer see that one is its own.
+pub fn own_credit(pvs: &[u32], value: u64, keys: &Keys) -> Option<Owned> {
+    let m = Member { tag: WTag::C, pvs: pvs.to_vec(), write: None };
+    let cnf = m.digest_at(qlab_air::claim::PV_CNF).ok()?;
+    let cm2 = m.digest_at(qlab_air::claim::PV_CM2).ok()?;
+    let value = value.checked_sub(qlab_l2spend::claim_fee_of(pvs))?;
+    let n = Owned { value, rho: cnf, rseed: keys.seed_rseed(&cnf) };
+    (n.cm(keys) == cm2).then_some(n)
 }
 
 /// An asset-0 L2 note this run owns.
@@ -367,8 +406,9 @@ pub fn filler(state: &WState, keys: &Keys, wrapper: u64, slot: usize, n: &Owned)
 /// claims and spendable notes together are short of [`K`], or the claims
 /// alone exceed it, and by the native statement exactly as [`plan`] runs it.
 /// The sequencer's fee note goes to `keys` (the filler wallet, lab #847 S5);
-/// [`Plan::credited`] carries it and each filler's two outputs — the notes
-/// the next wrapper may spend once this one lands.
+/// [`Plan::credited`] carries it, each filler's two outputs, and the credit
+/// of every claim that is the sequencer's own ([`own_credit`], S3b's seed
+/// claims) — the notes the next wrapper may spend once this one lands.
 pub fn plan_claims(
     state: &WState,
     prev: &Surface,
@@ -389,7 +429,9 @@ pub fn plan_claims(
     let mut insts = Vec::with_capacity(K);
     let mut deps = Vec::with_capacity(K);
     let mut d_batch = 0u64;
+    let mut own = Vec::new();
     for file in files {
+        own.extend(own_credit(&file.pvs, file.value, keys));
         let member = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None };
         let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("a claim's anchor: {e:?}")))?; // debug-ok: a PV read error, no opening
         let absorbed_before = (0..state.aa.len()).any(|i| state.aa.leaf(i) == anchor);
@@ -402,7 +444,7 @@ pub fn plan_claims(
     }
     let n_claims = insts.len();
     let wrapper = state.aa.len() / M_ABS as u64;
-    let mut credited = Vec::with_capacity(2 * n_fill + 1);
+    let mut credited = own;
     for (j, n) in notes[..n_fill].iter().enumerate() {
         let (inst, made) = filler(state, keys, wrapper, n_claims + j, n)?;
         insts.push(inst);
@@ -920,6 +962,31 @@ mod tests {
         let listed = [owned[0], owned[2], stranger, owned[1], owned[3], owned[2]];
         let got: Vec<u64> = spendable(&state, &keys, &listed).iter().map(|n| n.value).collect();
         assert_eq!(got, [3_000, 2_000, 1_000, 0]);
+    }
+
+    /// A claim built with `seed`'s credit is recognised from its public values
+    /// alone, as the note it creates; the same burn claimed to anyone else's
+    /// key — or to this key with any other rseed, or under another seed — is
+    /// not. Both ways, so a wallet's claim can never be counted as ours.
+    #[test]
+    fn a_seed_claim_is_recognised_and_a_foreign_one_never() {
+        use qlab_air::claim::{l1_cm, rkm_burn};
+        let keys = Keys::from_seed([1; 32]);
+        let note = BurnNote { value: 5_000, rkm: rkm_burn(1), rho: [1; 4], rseed: [2; 4] };
+        let cm = l1_cm(note.value, &note.rkm, &note.rho, &note.rseed);
+        let mut tree = qlab_cbserver::tree::CommitmentTree::new();
+        tree.append(cm);
+        let cnf = claim_cnf(&cm, &note.rseed);
+        let fee = 4;
+        let claim = |credit: &ClaimCredit| qlab_l2spend::claim_instance(&tree, 1, &note, 1, &[5; 4], credit, fee).unwrap().pvs;
+        let ours = claim(&keys.seed_credit(&cnf));
+        assert_eq!(own_credit(&ours, note.value, &keys), Some(Owned { value: note.value - fee, rho: cnf, rseed: keys.seed_rseed(&cnf) }));
+        assert_eq!(own_credit(&ours, note.value + 1, &keys), None, "a stated value that is not the claim's");
+        assert_eq!(own_credit(&ours, note.value, &Keys::from_seed([2; 32])), None, "another sequencer's seed");
+        let wallet = claim(&ClaimCredit { rkm: [3; 4], rseed: [4; 4] });
+        assert_eq!(own_credit(&wallet, note.value, &keys), None, "a wallet's claim");
+        let our_key_other_rseed = claim(&ClaimCredit { rkm: keys.rkm(), rseed: [4; 4] });
+        assert_eq!(own_credit(&our_key_other_rseed, note.value, &keys), None, "our rkm but not the seed rseed");
     }
 
     /// Elimination names the culprit: with sixteen copies of one claim, the

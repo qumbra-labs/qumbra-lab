@@ -22,6 +22,13 @@
 //!   its whole life — so `run` refuses while an intake serves that directory.
 //!   v0 runs the pass on a copy of the queue (the box rehearsal does), or
 //!   with intake stopped; sharing a live queue is not built.
+//! - `seed --genesis G --key FILE --node URL --out DIR --burn BESSEL
+//!   [--count N] [--scan URL] [--intake IP:PORT] [--plan] [--poll S]
+//!   [--max-wait S]` — the sequencer's first L2 notes (S3b): burns from its
+//!   own L1 wallet (the key file's fourth derivation, in memory only), one
+//!   per L1 transaction, then the claims of those burns credited to its
+//!   filler wallet, handed to the intake. `--plan` prints the shortfall, the
+//!   funding and the proof budget and proves nothing. Resumable.
 //! - `--version`.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,6 +45,8 @@ const USAGE: &str = "usage: qumbra-sequencer intake --genesis FILE --queue DIR -
                      qumbra-sequencer queue --queue DIR\n       \
                      qumbra-sequencer run --genesis FILE --queue DIR --state FILE --node URL --telemetry IP:PORT \
                      --operator IP:PORT --key FILE --out DIR [--max-bundles N] [--max-wait SECS] [--poll SECS]\n       \
+                     qumbra-sequencer seed --genesis FILE --key FILE --node URL --out DIR --burn BESSEL [--count N] \
+                     [--scan URL] [--intake IP:PORT] [--plan] [--poll SECS] [--max-wait SECS]\n       \
                      qumbra-sequencer --version";
 
 /// `--max-bundles` default: one bundle per pass.
@@ -89,10 +98,39 @@ fn run_pass(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::from(3))
         }
         Outcome::Short { have, need } => {
-            eprintln!("SEQ not plannable: {have} claims of the {need} a wrapper holds — fillers land in lab #847 S3");
+            eprintln!(
+                "SEQ not plannable: {have} of the {need} members a wrapper holds (claims, plus one filler per spendable \
+                 sequencer note) — `seed` gives the sequencer its first notes"
+            );
             Ok(ExitCode::from(4))
         }
     }
+}
+
+/// `seed --max-wait` default, per burn: room for a block or two.
+const DEFAULT_SEED_WAIT_SECS: u64 = 1800;
+
+/// `seed` (S3b): the sequencer's first notes.
+fn run_seed(args: &[String]) -> Result<(), String> {
+    let genesis = load_genesis(Path::new(&flag(args, "--genesis")?))?;
+    let key = key::load(Path::new(&flag(args, "--key")?), &genesis.wrapper)?;
+    let node = flag(args, "--node")?;
+    let scan = if args.iter().any(|a| a == "--scan") { flag(args, "--scan")? } else { node.clone() };
+    let intake = if args.iter().any(|a| a == "--intake") { Some(loopback(&flag(args, "--intake")?)?) } else { None };
+    let s = qumbra_sequencer::seed::Seed {
+        genesis,
+        key,
+        node,
+        scan,
+        intake,
+        out: PathBuf::from(flag(args, "--out")?),
+        count: usize::try_from(opt_u64(args, "--count", qumbra_sequencer::seed::DEFAULT_COUNT as u64)?).map_err(|_| "--count is too large")?,
+        burn: flag(args, "--burn")?.parse().map_err(|_| "--burn takes a whole number of bessel".to_string())?,
+        plan: args.iter().any(|a| a == "--plan"),
+        poll_secs: opt_u64(args, "--poll", DEFAULT_POLL_SECS)?,
+        max_wait_secs: opt_u64(args, "--max-wait", DEFAULT_SEED_WAIT_SECS)?,
+    };
+    s.run()
 }
 
 fn flag(args: &[String], name: &str) -> Result<String, String> {
@@ -124,6 +162,7 @@ fn run(args: &[String]) -> Result<(), String> {
             eprintln!("INTAKE l2_id={} claim_fee_tier={} genesis={}", chain.l2_id, chain.claim_fee_tier, hex32(&chain.genesis));
             serve(addr, Intake { chain, queue })
         }
+        Some("seed") => run_seed(&args[1..]),
         Some("queue") => {
             let queue = Queue::open_existing(Path::new(&flag(&args[1..], "--queue")?))?;
             for item in queue.items() {

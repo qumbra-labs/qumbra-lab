@@ -24,6 +24,7 @@ pub mod key;
 pub mod members;
 pub mod pass;
 pub mod queue;
+pub mod seed;
 pub mod server;
 pub mod state;
 pub mod work;
@@ -31,7 +32,7 @@ pub mod work;
 #[cfg(test)]
 mod tests {
     /// Every source of this crate, by name.
-    const SOURCES: [(&str, &str); 12] = [
+    const SOURCES: [(&str, &str); 13] = [
         ("bundle.rs", include_str!("bundle.rs")),
         ("chain.rs", include_str!("chain.rs")),
         ("intake.rs", include_str!("intake.rs")),
@@ -40,6 +41,7 @@ mod tests {
         ("main.rs", include_str!("main.rs")),
         ("members.rs", include_str!("members.rs")),
         ("queue.rs", include_str!("queue.rs")),
+        ("seed.rs", include_str!("seed.rs")),
         ("server.rs", include_str!("server.rs")),
         ("state.rs", include_str!("state.rs")),
         ("pass.rs", include_str!("pass.rs")),
