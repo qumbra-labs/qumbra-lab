@@ -303,18 +303,49 @@ PASS=("$SEQ" run --genesis "$GEN" --queue "$QDIR" --state "$STATE" --node "$DISC
 # left out and the pass answered 15 of 16. Each attempt keeps its own
 # files (DIR/PREFIX-<n>.*); bounded by 90 min.
 SHORT_WAIT_SECS=5400
-next_attempt() { echo $(( $(find "$1" -maxdepth 1 -name "$2-*.time" 2>/dev/null | wc -l) + 1 )); }
+next_attempt() { # one past the highest PREFIX-<n>.time — never reuses a number
+  local max
+  max=$(find "$1" -maxdepth 1 -name "$2-*.time" 2>/dev/null | { grep -oE "/$2-[0-9]+\.time\$" || true; } | sed -E "s|.*-([0-9]+)\.time\$|\1|" | sort -n | tail -1)
+  echo $(( ${max:-0} + 1 ))
+}
 
-# Run a pass attempt by attempt until it drains (exit 0); the attempt that
-# landed goes in DIR/PREFIX.landed.
+# Run a pass attempt by attempt until one LANDS; that attempt goes in
+# DIR/PREFIX.landed. Landed = its err carries `SEQ landed bundle`, whatever the
+# exit code: 0, or 3 when the pass then stops at its own `--max-bundles 1`
+# ceiling (box run 2's pass 1: landed at 244, exit 3). Exit 3 WITHOUT a
+# landing is the real `--max-wait` ceiling and dies by name; exit 4 is a
+# short, waited out; anything else dies. A rerun first looks for an attempt
+# that already landed (newest first) and takes it, so a resumed box never
+# runs a landed pass again — a fresh pass on the drained queue would answer
+# Drained/short and must not stand in for it.
+landed_attempt() { # dir prefix → the newest attempt number whose err shows a landing
+  local f
+  # Exactly PREFIX-<digits>.err: `run-*` would also match run-a-1.err.
+  for f in $(find "$1" -maxdepth 1 -name "$2-*.err" 2>/dev/null | grep -E "/$2-[0-9]+\.err\$" | sort -V -r); do
+    grep -q 'SEQ landed bundle' "$f" && { basename "$f" .err | sed "s/^$2-//"; return 0; }
+  done
+  return 0
+}
 pass_until_landed() {
-  local dir=$1 pre=$2 n rc deadline=$(( $(date +%s) + SHORT_WAIT_SECS ))
+  local dir=$1 pre=$2 n rc prior deadline=$(( $(date +%s) + SHORT_WAIT_SECS ))
+  prior=$(landed_attempt "$dir" "$pre")
+  if [ -n "$prior" ]; then
+    echo "$prior" > "$dir/$pre.landed"
+    log "$pre attempt $prior already landed — taken, not run again"
+    return 0
+  fi
   while :; do
     n=$(next_attempt "$dir" "$pre")
     clear_stale_locks
     rc=0; run_measured "$dir/$pre-$n" "${PASS[@]}" || rc=$?
+    if grep -q 'SEQ landed bundle' "$dir/$pre-$n.err" 2>/dev/null; then
+      echo "$n" > "$dir/$pre.landed"
+      log "$pre attempt $n landed (exit $rc)"
+      return 0
+    fi
     case $rc in
-      0) echo "$n" > "$dir/$pre.landed"; return 0 ;;
+      0) die "$pre attempt $n exited 0 with nothing landed (see $dir/$pre-$n.err)" ;;
+      3) die "$pre attempt $n hit its --max-wait ceiling without landing (see $dir/$pre-$n.err)" ;;
       4) [ "$(date +%s)" -lt "$deadline" ] || die "$pre still short after $((SHORT_WAIT_SECS / 60)) min (see $dir/$pre-$n.err)"
          wait_log "$pre attempt $n short — a claim's anchor is not absorbable yet: $(tail -1 "$dir/$pre-$n.err")"
          sleep 60 ;;
