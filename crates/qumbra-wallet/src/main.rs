@@ -482,8 +482,8 @@ fn usage() {
                 when there is none); when no one note of the asset covers the\n\
                 amount it merges notes first (3x2, one exact fee note each) and\n\
                 prints the whole plan with its total fee before proving anything\n\
-                (--plan-only stops there). Nothing is written to\n\
-                the wallet dir. A policy asset's sender passes the issuer's\n\
+                (--plan-only stops there). Only the verified-header record is\n\
+                written to the wallet dir. A policy asset's sender passes the issuer's\n\
                 published freeze list with --freeze-list FILE (a frozen address is\n\
                 refused before anything is proved). `issuer keygen|freeze|allow|mint|\n\
                 redeem|register|update --asset N` are the issuer's verbs (lab #722,\n\

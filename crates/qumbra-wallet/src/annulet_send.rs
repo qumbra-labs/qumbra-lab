@@ -25,9 +25,11 @@
 //!   vPublic = 0. What the wallet cannot open itself (a non-empty freeze tree,
 //!   a Regulated allowlist) is refused by name; its owner is C3.
 //!
-//! **Nothing is written to the wallet dir.** The commitment tree is rebuilt in
-//! memory; no L1 file (`tree-leaves.v1`, `sends.v1`) is read or written on an
-//! Annulet net.
+//! **Only the verified-header record is written to the wallet dir.** The
+//! session's verified scan (lab #869) keeps lab #852 WA0's record of the
+//! headers it verified, as `scan` does; the commitment tree is rebuilt in
+//! memory, and no L1 file (`tree-leaves.v1`, `sends.v1`) is read or written
+//! on an Annulet net.
 
 use std::time::{Duration, Instant};
 
