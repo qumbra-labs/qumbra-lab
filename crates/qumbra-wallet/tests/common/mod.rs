@@ -112,7 +112,7 @@ pub fn view_of(chain: &MemChainStore) -> DiscoveryView {
 }
 
 /// How the endpoint lies — one answer each.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Lie {
     None,
     /// `/genesis.qmb` is another file.
@@ -205,6 +205,13 @@ impl Endpoint {
                 }
                 Ok(qlab_p2p::served::encode_headers_page(AN, 1, &units))
             }
+            // Lab #869: what `open_session` reads after the verified scan.
+            "/v1/annulet/params" => Ok(qlab_cbserver::registry::encode_annulet_params(&qlab_cbserver::registry::AnnuletParams {
+                genesis_hash: self.file.hash(),
+                fee_tier_s: self.file.params.fee_tier_s,
+                fee_tier_p: self.file.params.fee_tier_p,
+                fee_tier_r: self.file.params.fee_tier_r,
+            })),
             "/v1/compact" => respond(&self.served, query).map_err(err),
             "/v1/nullifiers" if self.lie == Lie::NoNullifiers => Err("503 unavailable: state lag".into()),
             "/v1/nullifiers" => respond_nullifiers(&self.view, query).map_err(err),

@@ -38,7 +38,8 @@ use qlab_l2spend::{build_p_merge, build_p_with, build_s, build_s_merge, shape_fo
 use qlab_wallet::address::Address;
 use rand::rngs::StdRng;
 
-use crate::annulet::{scan_annulet, AnnuletRefusal};
+use crate::annulet::AnnuletRefusal;
+use crate::annulet_verify::{into_report, scan_annulet_verified};
 use crate::store::WalletDir;
 
 /// The fee tiers a send pays, from the node.
@@ -64,6 +65,10 @@ impl Tiers {
 /// Why a send cannot be planned or made — by name.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendRefusal {
+    /// The verified scan every Annulet write starts from refused the endpoint
+    /// (lab #869 (a)): no pin, or a chain that does not verify. Nothing was
+    /// planned or proved.
+    Verify(crate::annulet_verify::VerifyRefusal),
     /// No single spendable note of `asset` covers the amount (plus the fee,
     /// for asset 0). Notes cannot be merged in 2×2 (lab #720 P4).
     NoSingleNoteCovers { asset: u16, amount: u64, largest: u64 },
@@ -141,6 +146,7 @@ impl std::fmt::Display for SendRefusal {
                 f,
                 "no quotable balance: the scan did not establish both the outputs and the spends"
             ),
+            SendRefusal::Verify(e) => write!(f, "verified Annulet scan refused: {e}"),
             SendRefusal::Form(e) => write!(f, "{e}"),
             SendRefusal::ParamsGenesisMismatch => {
                 write!(f, "the endpoint's /v1/annulet/params name a different genesis than it serves")
@@ -511,8 +517,15 @@ pub struct Session<E: Endpoint> {
     pub genesis_hash: [u8; 32],
 }
 
-/// Verify the form (and pin), read the tariff (checked against the served
-/// genesis), and scan to `scan_to`.
+/// **The verified session** (lab #869 (a)): the genesis by its bytes against
+/// `pin`, every seal to the verified tip, each note's block recomputed
+/// ([`scan_annulet_verified`]) — then the tariff, checked against that
+/// genesis. The index every plan selects from is built only from the verified
+/// scan; there is no unverified path into a [`Session`]. `pin` is required: `None` is
+/// refused by name ([`crate::annulet_verify::VerifyRefusal::NoPin`]) before
+/// anything is fetched. The spends subtracted are still the endpoint's list
+/// (lab #853): a withheld spend can make a plan pick a spent note, which the
+/// node refuses after the proof — time lost, never money.
 pub fn open_session<E: Endpoint>(
     w: &WalletDir,
     endpoint: E,
@@ -522,7 +535,8 @@ pub fn open_session<E: Endpoint>(
 ) -> Result<Session<E>, SendRefusal> {
     let served = Served::new(endpoint);
     let mut fetch = |p: &str| served.endpoint.get(p);
-    let report = scan_annulet(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Form)?;
+    let verified = scan_annulet_verified(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Verify)?;
+    let report = into_report(verified);
     let params = served.params()?;
     if params.genesis_hash != report.genesis_hash {
         return Err(SendRefusal::ParamsGenesisMismatch);
@@ -833,8 +847,10 @@ pub struct WalletEndpoint {
 
 #[cfg(feature = "net")]
 impl Endpoint for WalletEndpoint {
+    /// Every read goes through AD1b's per-route response ceilings, the same
+    /// transport as [`crate::net::verified_scan_fetch`].
     fn get(&self, path: &str) -> Result<Vec<u8>, String> {
-        crate::net::http_get(&self.url, path).map_err(|e| e.to_string())
+        crate::net::http_get_limited(&self.url, path, crate::annulet_verify::response_ceiling(path)).map_err(|e| e.to_string())
     }
     fn post(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         crate::net::http_post_bytes(&self.url, path, body).map_err(|e| e.to_string())

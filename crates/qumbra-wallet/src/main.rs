@@ -498,9 +498,10 @@ fn usage() {
                 asset-0 note redeemed on L2 and paid on L1 to the address, shape P,\n\
                 32 GiB class, proved here only; it is WRITTEN, never submitted — an\n\
                 Annulet net refuses an exit, and a V6 sequencer bundles it. --genesis-hash HEX64 pins the chain:\n\
-                REQUIRED for `scan`/`history --net annulet`, which verify the genesis file,\n\
-                every seal and each note's block against it (lab #850) and print no\n\
-                figure otherwise; RECOMMENDED for the others\n\
+                REQUIRED for every --net annulet command: `scan`/`history` verify the\n\
+                genesis file, every seal and each note's block against it (lab #850)\n\
+                and print no figure otherwise; `send`, the exit and the issuer verbs\n\
+                plan only from that verified scan (lab #869)\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
                 build was CUT for when it carries the release lane\'s stamp, and to\n\
                 t1 only for an unstamped build; the flag overrides either. A\n\
@@ -1506,7 +1507,7 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
         let dir = dir_of(args)?;
         let url = flag(args, "--url").ok_or("a registry write requires --url")?;
         let scan_to: u64 = flag(args, "--scan-to").ok_or("requires --scan-to HEIGHT")?.parse()?;
-        let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+        let pin = Some(required_pin(args, "issuer registry write")?);
         let mut seed = [0u8; 32];
         rand::rng().fill_bytes(&mut seed);
         Ok((WalletDir::open(&dir)?, qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() }, scan_to, pin, StdRng::from_seed(seed)))
@@ -1629,7 +1630,7 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
             let url = flag(args, "--url").ok_or("issuer mint/redeem requires --url")?;
             let scan_to: u64 = flag(args, "--scan-to").ok_or("requires --scan-to HEIGHT")?.parse()?;
             let amount: u64 = flag(args, "--amount").ok_or("requires --amount")?.parse()?;
-            let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+            let pin = Some(required_pin(args, "issuer mint/redeem")?);
             let keys = match flag(args, "--freeze-list") {
                 Some(p) => list(p)?,
                 None => Vec::new(),
@@ -1687,7 +1688,7 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     let amount: u64 = flag(args, "--amount").ok_or("send requires --amount")?.parse()?;
     let to = flag(args, "--to").ok_or("send --net annulet requires --to ADDRESS")?;
     let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
-    let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    let pin = Some(required_pin(args, "send --net annulet")?);
     // Lab #722: the asset issuer's published freeze-key list, when it has one.
     let freeze_keys = match flag(args, "--freeze-list") {
         Some(path) => qumbra_wallet::issuer::read_key_list(&std::fs::read_to_string(path)?)?,
@@ -1698,8 +1699,7 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
     eprintln!(
-        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
-        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
+        "net: annulet (from --net; verifying genesis bytes against --genesis-hash, the seal chain and each note's block)"
     );
     let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
     let plan_only = args.iter().any(|a| a == "--plan-only");
@@ -1738,6 +1738,20 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         report.plan.total_fee()
     );
     Ok(())
+}
+
+/// `--genesis-hash`, required (lab #869 (a)): every Annulet write — send,
+/// exit, registry write, mint/redeem — opens its session on the verified scan,
+/// which needs the chain named by its genesis hash. The same rule `deposit`
+/// and `scan`/`history --net annulet` already follow.
+fn required_pin(args: &[String], verb: &str) -> Result<[u8; 32], Box<dyn Error>> {
+    let hex = flag(args, "--genesis-hash").ok_or_else(|| {
+        format!(
+            "{verb} requires --genesis-hash HEX64: an Annulet write starts from a scan verified against the chain it \
+             names (lab #869)"
+        )
+    })?;
+    Ok(qumbra_wallet::annulet::parse_genesis_hash(hex)?)
 }
 
 /// `scan --net annulet` (lab #718): verify the endpoint serves an Annulet
@@ -1881,14 +1895,13 @@ fn exit_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let to = flag(args, "--exit-to").expect("routed here on --exit-to");
     let to = qlab_wallet::address::Address::decode(to).ok_or("--exit-to is not a wallet address (the L1 recipient)")?;
-    let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
+    let pin = Some(required_pin(args, "exit")?);
     let w = WalletDir::open(&dir)?;
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
     eprintln!(
-        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
-        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
+        "net: annulet (from --net; verifying genesis bytes against --genesis-hash, the seal chain and each note's block)"
     );
     let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
     let mut on_plan = |plan: &qumbra_wallet::annulet_send::ExitPlan| {
