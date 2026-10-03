@@ -253,6 +253,65 @@ pub enum PlanError {
     /// Lab #831 W3c: the claim file opens its burn under a root no wrapper
     /// has absorbed and this one does not absorb.
     ClaimAnchorNotAbsorbed { root: Digest },
+    /// Lab #847 S4: fewer real members than a wrapper holds (K = 16), and
+    /// nothing yet fills the rest — fillers land in S3.
+    Short { have: usize, need: usize },
+}
+
+/// A wrapper's member count (wrapper version 1's K, lab #785 Q1).
+pub const K: usize = 16;
+
+/// **Lab #847 S4: a wrapper of wallets' claims only** — every member a claim
+/// file intake verified, in the order given. `absorbed` is the four roots
+/// this wrapper absorbs, oldest first, chosen by the caller (the loop picks
+/// them under the record-covered height); every claim's anchor must be one
+/// of them or a root an earlier wrapper absorbed. Refused by name with
+/// [`PlanError::Short`] for fewer than [`K`] claims (S3 brings fillers),
+/// and by the native statement exactly as [`plan`] runs it. The sequencer's
+/// fee note goes to `keys` (the filler wallet, lab #847 S5).
+pub fn plan_claims(
+    state: &WState,
+    prev: &Surface,
+    absorbed: [Anchor; M_ABS],
+    files: Vec<qlab_l2spend::ClaimFile>,
+    keys: &Keys,
+) -> Result<Plan, PlanError> {
+    if files.len() != K {
+        return Err(PlanError::Short { have: files.len(), need: K });
+    }
+    let roots = absorbed.map(|a| a.root);
+    let mut insts = Vec::with_capacity(K);
+    let mut deps = Vec::with_capacity(K);
+    let mut d_batch = 0u64;
+    for file in files {
+        let member = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None };
+        let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("a claim's anchor: {e:?}")))?;
+        let absorbed_before = (0..state.aa.len()).any(|i| state.aa.leaf(i) == anchor);
+        if !absorbed_before && !roots.contains(&anchor) {
+            return Err(PlanError::ClaimAnchorNotAbsorbed { root: anchor });
+        }
+        d_batch = d_batch.checked_add(file.value).ok_or(PlanError::Wrapper("D_batch overflows u64".into()))?;
+        deps.push(DepEntry { v: file.value, r_v: file.r_v });
+        insts.push(Inst::Proven { pvs: file.pvs, proof: file.proof });
+    }
+    let members: Vec<Member> = insts.iter().map(Inst::member).collect();
+    let inp = WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: roots, d_batch };
+    let (rin, wit, rout, exit_cmt) = statement(state, &inp, &members, &[])?;
+    Ok(Plan {
+        insts,
+        members,
+        deps,
+        inp,
+        exits: Vec::new(),
+        absorbed,
+        claimed: Vec::new(),
+        spent: Vec::new(),
+        credited: Vec::new(),
+        rin,
+        wit,
+        rout,
+        exit_cmt,
+    })
 }
 
 /// The policy input of an asset-0 note at `rkm` under `reg`: Cloaked, the
@@ -577,4 +636,58 @@ pub fn take_claim_file(state: &WState, base: Plan, file: qlab_l2spend::ClaimFile
     }
     let dep = DepEntry { v: file.value, r_v: file.r_v };
     swap_claim(state, base, slot, Inst::Proven { pvs: file.pvs, proof: file.proof }, dep, None, keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intake::tests::{w3c_chain, W3C_CLAIM};
+    use crate::state::RunState;
+
+    fn w3c_file() -> qlab_l2spend::ClaimFile {
+        let c = w3c_chain();
+        qlab_l2spend::decode_claim_artifact(W3C_CLAIM, &c.genesis, c.claim_fee_tier).unwrap()
+    }
+
+    fn anchor_of(file: &qlab_l2spend::ClaimFile) -> Anchor {
+        let root = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None }.digest_at(qlab_air::claim::PV_A).unwrap();
+        Anchor { count: 0, root }
+    }
+
+    /// Fewer than K real members is refused by name — S4 plans no fillers.
+    #[test]
+    fn fewer_than_k_claims_is_short() {
+        let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
+        let f = w3c_file();
+        let a = anchor_of(&f);
+        let files = vec![f; K - 1];
+        let err = plan_claims(&state, &prev, [a; M_ABS], files, &Keys::from_seed([1; 32])).err().unwrap();
+        assert_eq!(err, PlanError::Short { have: K - 1, need: K });
+    }
+
+    /// A claim whose anchor this wrapper does not absorb (and no earlier one
+    /// did) is refused by name, before the native statement.
+    #[test]
+    fn a_claim_under_an_unabsorbed_root_is_refused() {
+        let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
+        let f = w3c_file();
+        let a = anchor_of(&f);
+        let other = Anchor { count: 0, root: [7; 4] };
+        let err = plan_claims(&state, &prev, [other; M_ABS], vec![f; K], &Keys::from_seed([1; 32])).err().unwrap();
+        assert_eq!(err, PlanError::ClaimAnchorNotAbsorbed { root: a.root });
+    }
+
+    /// Sixteen copies of one claim get past the cheap checks and reach the
+    /// native statement — the sequencer's prefilter — which refuses the
+    /// batch (it repeats one cnf sixteen times). Intake's dedupe is a
+    /// convenience; this refusal, and the node's, are the guarantee. The test
+    /// pins that the refusal comes from the statement, not which check fires.
+    #[test]
+    fn the_native_statement_refuses_a_repeated_claim() {
+        let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
+        let f = w3c_file();
+        let a = anchor_of(&f);
+        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f; K], &Keys::from_seed([1; 32])).err().unwrap();
+        assert!(matches!(err, PlanError::Wrapper(_)), "{err:?}");
+    }
 }
