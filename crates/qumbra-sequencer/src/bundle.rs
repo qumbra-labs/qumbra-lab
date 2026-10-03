@@ -167,9 +167,17 @@ pub fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, spacing: 
         "chain": {"tip": view.anchors.tip_height, "finalized_local": view.anchors.finalized_height, "leaves": view.tree.len(),
             "self_check_cannot_see": "the self-check is the node's rule over these bytes, but with three inputs the node owns: spacing (last_bundle_height = None — post no sooner than wrapper_spacing_blocks after the previous bundle's block); the chain's real surface (V5/V6 thread from the replayed state file, which can be ahead of the chain); and the finality record (V7 judged against /v1/anchors, the node's local finality — the node may answer 422 until a record covers the absorbed roots; retry)"},
         "absorbed": p.absorbed.iter().map(|a| json!({"root": digest_hex(&a.root), "leaf_count": a.count})).collect::<Vec<_>>(),
-        "members": p.members.iter().enumerate().map(|(i, m)| json!({
-            "slot": i, "tag": format!("{:?}", m.tag), "pv_words": m.pvs.len(), "pv_keccak": pv_digest(&m.pvs), "proof_bytes": member_bytes[i], // debug-ok: a member tag, a unit enum
-        })).collect::<Vec<_>>(),
+        "members": p.members.iter().enumerate().map(|(i, m)| {
+            let mut row = json!({
+                "slot": i, "tag": format!("{:?}", m.tag), "pv_words": m.pvs.len(), "pv_keccak": pv_digest(&m.pvs), "proof_bytes": member_bytes[i], // debug-ok: a member tag, a unit enum
+            });
+            // Lab #847 S3: padding is marked, traffic is not (an f5box
+            // manifest, which plans no fillers, is unchanged).
+            if p.filler.get(i).copied().unwrap_or(false) {
+                row["filler"] = json!(true);
+            }
+            row
+        }).collect::<Vec<_>>(),
         "claimed_burns": p.claimed.iter().map(|b| json!({
             "minted_height": b.height, "leaf_height": qlab_node::coinbase_leaf_appears_at(b.height), "leaf_pos": b.pos, "value": b.note.value,
             "cm": hex(&digest_to_bytes(&b.cm)),

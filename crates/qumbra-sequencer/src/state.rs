@@ -131,11 +131,11 @@ fn leaf_of(v: &Value) -> Result<RegistryLeaf, String> {
     })
 }
 
-fn owned_json(n: &Owned) -> Value {
+pub(crate) fn owned_json(n: &Owned) -> Value {
     json!({"value": n.value, "rho": digest_hex(&n.rho), "rseed": digest_hex(&n.rseed)})
 }
 
-fn owned_of(v: &Value) -> Result<Owned, String> {
+pub(crate) fn owned_of(v: &Value) -> Result<Owned, String> {
     Ok(Owned { value: u64_of(&v["value"], "owned.value")?, rho: digest_of(&v["rho"])?, rseed: digest_of(&v["rseed"])? })
 }
 

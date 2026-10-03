@@ -13,8 +13,11 @@
 //!   claims, proves, signs, posts to the operator listener, and records a
 //!   bundle only once `/v1/wrapper` names it. Exit 0 when nothing is left to
 //!   plan and nothing is in flight; 3 at a ceiling (`--max-bundles`,
-//!   `--max-wait`, re-posts), naming what is left; 4 when fewer than 16 claims
-//!   are plannable (fillers land in S3). Resumable: the next pass reconciles.
+//!   `--max-wait`, re-posts), naming what is left; 4 when the plannable
+//!   claims plus one filler per spendable sequencer note are fewer than 16, or
+//!   no claim is plannable (S3: the sequencer fills with S self-transfers of
+//!   its own notes; before it holds any — S3b seeds them — a wrapper needs 16
+//!   real claims). Resumable: the next pass reconciles.
 //!   `run` takes the queue directory's lock, the same one `intake` holds for
 //!   its whole life — so `run` refuses while an intake serves that directory.
 //!   v0 runs the pass on a copy of the queue (the box rehearsal does), or
