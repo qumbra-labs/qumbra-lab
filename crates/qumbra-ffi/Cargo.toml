@@ -43,7 +43,10 @@ rand = "0.10"
 # lab #400: the selection core + witness bundle, LEAN — no rustls, no prover,
 # no RandomX chain (the wasm/iOS graphs must stay clean; features are additive,
 # so native workspace builds still unify to the full wallet).
-qumbra-wallet = { path = "../qumbra-wallet", default-features = false }
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["verify"] }
+# The Annulet asset view's JSON (lab #858 WA2). Not a new crate in the graph:
+# qumbra-wallet's `verify` feature already carries it. Value-built, no derive.
+serde_json = "1"
 # The name-service types (NameOp, rider codec, fee table, grammar) the generic
 # qmb_name_* surface exposes (lab #659). default-features off for the same
 # reason as qlab-cbserver above: the randomx C++ chain must not enter the
@@ -73,4 +76,12 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 qumbra-node = { path = "../qumbra-node" }
 qlab-devnet = { path = "../qlab-devnet" }
+# Lab #858 WA2: tests/annulet_abi.rs runs qumbra-wallet's own lying-endpoint
+# fixture (tests/common, path-included) and signs fixture lists with the TEST
+# list key — `test-support` here only, never in [dependencies], so no release
+# or wasm build of this crate can reach the test signer (pinned by
+# `the_test_list_key_is_not_reachable_from_a_release_build`).
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["verify", "test-support"] }
+qlab-p2p = { path = "../qlab-p2p" }
+qlab-air = { path = "../qlab-air" }
 qlab-node = { path = "../qlab-node" }
