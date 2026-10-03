@@ -3,7 +3,16 @@
 # `qumbra-sequencer` end to end, measured. Coordinator-run, on the box only
 # (never a laptop): an L1 proof is ≈ 31 GiB.
 #
-#   scripts/s6-box.sh RUN_DIR [--bin DIR] [--port-base N] [--count N] [--resume-from TAR]
+#   scripts/s6-box.sh RUN_DIR [--bin DIR] [--port-base N] [--count N] [--resume-from TAR] [--r3]
+#
+# --r3 (lab #860 R3/R3b) adds the V6 round trip after pass 2: the user wallet
+# exits its first claim's credit (`qumbra-wallet exit --net v6 --submit` — the
+# first real P proof on this lane, ≈ 30 GiB), and pass 3 — one exit P and
+# fifteen fillers — is drafted, killed -9 and landed by its rerun, as pass 2.
+# Measured: the exit's prove wall and peak, pass 3's peak and wall, its
+# bundle bytes; asserted: exactly one P, fifteen fillers, fifteen S proving
+# steps, the bundle's exit list paying the exit's value, E grown by it, and
+# /v1/l2/index past the landing.
 #
 # --resume-from TAR restores a RUN_DIR pulled from an earlier box (tar of the
 # run dir, extracted into RUN_DIR's parent unless RUN_DIR already holds a
@@ -49,6 +58,13 @@
 #             rerun must land it WITHOUT proving again (no `SEQ proving`
 #             before `SEQ landed` in its log): the pending record and the
 #             bytes in --out carry it.
+#   exit      (--r3) the user wallet's `exit --net v6 --submit` of its first
+#             claim's credit — the P lane, ≈ 30 GiB; a wait-class refusal
+#             before the proof (no bundle yet, the index moved, not final
+#             yet) is retried, bounded; any other refusal dies by name.
+#   pass3     (--r3) 1 exit P + 15 S fillers, drilled as pass 2 (killed -9
+#             after drafting, landed by its rerun with no re-prove), then
+#             /v1/l2/index read past the landing (a frozen index dies by name).
 #
 # Locks: `intake` and `run` hold `queue/index.lock` and `run` also
 # `seq-state.json.lock` — files created new and removed when the process
@@ -65,6 +81,10 @@
 #   pass1/run-<n>.{time,rss,err}    the claims-only pass, per attempt (short = wait); run.landed names the one that landed
 #   pass2/run-a-<n>.*               the filler pass up to the kill; run-a.drafted names it
 #   pass2/run-b-<n>.*               the rerun: reconcile + land, no prove; run-b.landed
+#   exit/exit-<n>.{time,rss,out,err} (--r3) each exit attempt; exit.proved names
+#                                   the one that proved: the P's wall and peak
+#   pass3/run-a-<n>.*, run-b-<n>.*  (--r3) the exit pass's drill, as pass 2's;
+#                                   pass3/index.height the index after it
 #   producer/node-<n>.time, node.rss  the producer, one time file per start
 # The last line is one verdict.
 set -euo pipefail
@@ -79,11 +99,13 @@ BIN="$HERE/target/release"
 PORT=39500
 COUNT=15
 RESUME=""
+R3=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin) BIN=$(cd "$2" && pwd); shift 2 ;;
     --port-base) PORT=$2; shift 2 ;;
     --count) COUNT=$2; shift 2 ;;
+    --r3) R3=1; shift ;;
     --resume-from) RESUME=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
@@ -158,7 +180,11 @@ run_measured() {
   local tpid=$! cpid=""
   for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
   [ -n "$cpid" ] && sample_rss "$cpid" "$tag.rss"
+  # Registered for the cleanup trap while it runs (a seed run, a pass, the
+  # wallet's 30 GiB exit proof): a die or a signal never leaves it running.
+  PASS_PID=$cpid
   local rc=0; wait "$tpid" || rc=$?
+  PASS_PID=""
   return $rc
 }
 
@@ -354,6 +380,52 @@ pass_until_landed() {
   done
 }
 
+# The restart drill (pass 2, and the exit pass with --r3): run-a attempt by
+# attempt — a short (exit 4) waited out — until one drafts; that attempt is
+# killed -9 with its bundle in flight; then the rerun (run-b) must land the
+# drafted bundle without proving again. DIR holds every attempt's files.
+drill_pass() {
+  local DIR=$1 WHAT=$2 a_deadline m A tpid cpid rc B before_land
+  if [ ! -e "$DIR/killed" ]; then
+    # run-a, attempt by attempt: a short (exit 4) is waited out as in pass 1;
+    # the attempt that drafts is killed -9.
+    a_deadline=$(( $(date +%s) + SHORT_WAIT_SECS ))
+    while :; do
+      m=$(next_attempt "$DIR" run-a); A="$DIR/run-a-$m"
+      clear_stale_locks
+      /usr/bin/time -v -o "$A.time" "${PASS[@]}" >>"$A.out" 2>>"$A.err" &
+      tpid=$!
+      cpid=""; for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
+      [ -n "$cpid" ] || die "$WHAT attempt $m did not start"
+      PASS_PID=$cpid
+      sample_rss "$cpid" "$A.rss"
+      while ! grep -q 'SEQ drafted bundle' "$A.err" 2>/dev/null && kill -0 "$cpid" 2>/dev/null; do sleep 5; done
+      if grep -q 'SEQ drafted bundle' "$A.err" 2>/dev/null; then
+        kill -9 "$cpid" || die "$WHAT (run-a-$m) exited before the kill — see $A.err"
+        wait "$tpid" 2>/dev/null || true
+        PASS_PID=""
+        echo "$m" > "$DIR/run-a.drafted"
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$DIR/killed"
+        log "$WHAT KILLED (-9) after: $(grep 'SEQ drafted bundle' "$A.err" | tail -1)"
+        break
+      fi
+      rc=0; wait "$tpid" || rc=$?; PASS_PID=""
+      [ "$rc" = 4 ] || die "$WHAT attempt $m ended before drafting, exit $rc (see $A.err)"
+      [ "$(date +%s)" -lt "$a_deadline" ] || die "$WHAT still short after $((SHORT_WAIT_SECS / 60)) min (see $A.err)"
+      wait_log "$WHAT attempt $m short — a claim's anchor is not absorbable yet: $(tail -1 "$A.err")"
+      sleep 60
+    done
+  fi
+  # The rerun (clear_stale_locks inside: the -9'd pass left queue/index.lock
+  # and the state lock) must land the drafted bundle without proving again.
+  pass_until_landed "$DIR" run-b
+  B="$DIR/run-b-$(cat "$DIR/run-b.landed")"
+  grep -q 'SEQ landed bundle' "$B.err" || die "the rerun landed nothing"
+  before_land=$(cat "$DIR"/run-b-*.err | sed -n '1,/SEQ landed bundle/p' | { grep -c 'SEQ proving' || true; })
+  [ "$before_land" = 0 ] || die "the rerun proved again ($before_land 'SEQ proving' lines before it landed) — the pending record did not carry the bundle"
+  log "$WHAT rerun landed without proving: $(grep 'SEQ landed bundle' "$B.err" | tail -1)"
+}
+
 # --- genesis -------------------------------------------------------------------------
 if ! is_done genesis; then
   mkdir -p "$NET"
@@ -469,54 +541,93 @@ if ! is_done pass2; then
   user_claim 2
   stop_intake
   mkdir -p "$RUN/pass2"
-  if [ ! -e "$RUN/pass2/killed" ]; then
-    # run-a, attempt by attempt: a short (exit 4) is waited out as in pass 1;
-    # the attempt that drafts is killed -9.
-    a_deadline=$(( $(date +%s) + SHORT_WAIT_SECS ))
-    while :; do
-      m=$(next_attempt "$RUN/pass2" run-a); A="$RUN/pass2/run-a-$m"
-      clear_stale_locks
-      /usr/bin/time -v -o "$A.time" "${PASS[@]}" >>"$A.out" 2>>"$A.err" &
-      tpid=$!
-      cpid=""; for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
-      [ -n "$cpid" ] || die "pass 2 attempt $m did not start"
-      PASS_PID=$cpid
-      sample_rss "$cpid" "$A.rss"
-      while ! grep -q 'SEQ drafted bundle' "$A.err" 2>/dev/null && kill -0 "$cpid" 2>/dev/null; do sleep 5; done
-      if grep -q 'SEQ drafted bundle' "$A.err" 2>/dev/null; then
-        kill -9 "$cpid" || die "pass 2 (run-a-$m) exited before the kill — see $A.err"
-        wait "$tpid" 2>/dev/null || true
-        PASS_PID=""
-        echo "$m" > "$RUN/pass2/run-a.drafted"
-        date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN/pass2/killed"
-        log "pass 2 KILLED (-9) after: $(grep 'SEQ drafted bundle' "$A.err" | tail -1)"
-        break
-      fi
-      rc=0; wait "$tpid" || rc=$?; PASS_PID=""
-      [ "$rc" = 4 ] || die "pass 2 attempt $m ended before drafting, exit $rc (see $A.err)"
-      [ "$(date +%s)" -lt "$a_deadline" ] || die "pass 2 still short after $((SHORT_WAIT_SECS / 60)) min (see $A.err)"
-      wait_log "pass 2 attempt $m short — a claim's anchor is not absorbable yet: $(tail -1 "$A.err")"
-      sleep 60
-    done
-  fi
-  # The rerun (clear_stale_locks inside: the -9'd pass left queue/index.lock
-  # and the state lock) must land the drafted bundle without proving again.
-  pass_until_landed "$RUN/pass2" run-b
-  B="$RUN/pass2/run-b-$(cat "$RUN/pass2/run-b.landed")"
-  grep -q 'SEQ landed bundle' "$B.err" || die "the rerun landed nothing"
-  before_land=$(cat "$RUN"/pass2/run-b-*.err | sed -n '1,/SEQ landed bundle/p' | { grep -c 'SEQ proving' || true; })
-  [ "$before_land" = 0 ] || die "the rerun proved again ($before_land 'SEQ proving' lines before it landed) — the pending record did not carry the bundle"
-  log "pass 2 rerun landed without proving: $(grep 'SEQ landed bundle' "$B.err" | tail -1)"
+  drill_pass "$RUN/pass2" "pass 2"
   start_intake
   done_mark pass2
+fi
+
+# --- R3: the user's exit, and the exit pass --------------------------------------------------
+# The landed bundle number a pass's landing attempt names.
+landed_n() { sed -n 's/.*SEQ landed bundle \([0-9]*\) .*/\1/p' "$1" | tail -1; }
+EXITF="$RUN/exit/exit.file"
+if [ -n "$R3" ] && ! is_done exit; then
+  mkdir -p "$RUN/exit"
+  intake_up || start_intake
+  # `exit` refuses (before any proof) until its credit has landed and the
+  # index agrees with its bundle; retried, bounded. Each attempt keeps its own
+  # files; the one that proves carries the P's wall and peak.
+  # A rerun after a die between the proof and its record: the attempt whose
+  # output says it wrote the file is the one that proved.
+  if [ -e "$EXITF" ] && [ ! -e "$RUN/exit/exit.proved" ]; then
+    for f in $(find "$RUN/exit" -maxdepth 1 -name 'exit-*.out' | grep -E '/exit-[0-9]+\.out$' | sort -V -r); do
+      grep -q '^wrote ' "$f" && { basename "$f" .out | sed 's/^exit-//' > "$RUN/exit/exit.proved"; break; }
+    done
+  fi
+  x_deadline=$(( $(date +%s) + 3600 ))
+  until [ -e "$EXITF" ]; do
+    n=$(next_attempt "$RUN/exit" exit); X="$RUN/exit/exit-$n"
+    tip=$(tip_of "$RUN/producer/node.out")
+    [ -n "$tip" ] || die "no tip in the producer's log to scan the wallet to"
+    if run_measured "$X" "$WALLET" exit --net v6 --dir "$WDIR" --url "$DISC" --node "$DISC" \
+         --scan-to "$tip" --l2-id "$L2_ID" --genesis-hash "$(cat "$NET/genesis.hash")" \
+         --exit-to "$(cat "$WDIR/address")" --out "$EXITF" --submit --intake "127.0.0.1:$P_INT"; then
+      echo "$n" > "$RUN/exit/exit.proved"
+      break
+    fi
+    [ -e "$EXITF" ] && { echo "$n" > "$RUN/exit/exit.proved"; break; }   # proved, the POST failed: handed over below
+    producer_up || die "the producer exited"
+    # Only the wait-class refusals are retried: no bundle yet, the index
+    # moved under the read, not final/spendable YET. Anything else — no
+    # credit (both claims landed in passes 1–2, so none is a wait here), a
+    # genesis or flag refusal — dies at once, by name.
+    why=$(tail -1 "$X.err")
+    case "$why" in
+      *"no bundle has landed"*|*"the index moved under this read"*|*YET*) ;;
+      *) die "the exit was refused before any proof: $why (see $X.err)" ;;
+    esac
+    [ "$(date +%s)" -lt "$x_deadline" ] || die "the exit was still waiting after 60 min: $why"
+    wait_log "exit attempt $n waits before any proof: $why"; sleep 60
+  done
+  # Handed to the intake: the wallet's --submit, or here if its POST failed.
+  if ! grep -qE 'the intake took it|already held by the intake' "$RUN"/exit/exit-*.out 2>/dev/null; then
+    code=$(curl -s -o "$RUN/exit/post.body" -w '%{http_code}' --data-binary "@$EXITF" "http://127.0.0.1:$P_INT/v1/intake" || echo 000)
+    case "$code" in 202|409) log "the intake took the exit ($code)" ;; *) die "the intake refused the exit: $code $(head -c 300 "$RUN/exit/post.body")" ;; esac
+  fi
+  EXIT_V=$({ grep -ho 'plan: exit [0-9]* bessel' "$RUN"/exit/exit-*.out || true; } | tail -1 | awk '{print $3}')
+  [ -n "$EXIT_V" ] || die "no exit amount in the wallet's plan line (see $RUN/exit/exit-*.out)"
+  echo "$EXIT_V" > "$RUN/exit/exit.value"
+  log "exit of $EXIT_V bessel proved (attempt $(cat "$RUN/exit/exit.proved")) and with the intake"
+  done_mark exit
+fi
+if [ -n "$R3" ] && ! is_done pass3; then
+  stop_intake
+  mkdir -p "$RUN/pass3"
+  drill_pass "$RUN/pass3" "pass 3 (the exit)"
+  # The node's L2 index has folded past the exit's landing (read while the
+  # producer still runs).
+  lh=$(sed -n 's/.*SEQ landed bundle [0-9]* [0-9a-f]* at \([0-9]*\).*/\1/p' "$RUN/pass3/run-b-$(cat "$RUN/pass3/run-b.landed").err" | tail -1)
+  [ -n "$lh" ] || die "pass 3's landing line names no height"
+  i_deadline=$(( $(date +%s) + 600 ))
+  while :; do
+    idx=$(curl -s -m 10 "$DISC/v1/l2/index" || true)
+    case "$idx" in *'"refused":"'*) die "/v1/l2/index is frozen: $idx" ;; esac
+    ih=$(printf '%s' "$idx" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')
+    [ -n "$ih" ] && [ "$ih" -ge "$lh" ] && break
+    [ "$(date +%s)" -lt "$i_deadline" ] || die "/v1/l2/index did not reach the exit's landing at $lh within 10 min (answer: ${idx:-none})"
+    sleep 15
+  done
+  echo "$ih" > "$RUN/pass3/index.height"
+  log "/v1/l2/index at $ih, past the exit's landing at $lh"
+  start_intake
+  done_mark pass3
 fi
 
 stop_intake
 stop_pid_file "$RUN/producer/node.pid" producer INT
 sleep 2   # GNU time writes node-<n>.time as the producer exits
-# The filler pass's manifest: the highest-numbered bundle (pass 2's), by number.
-M2=$(find "$OUT" -maxdepth 1 -name 'bundle-*.json' | sort -V | tail -1)
-[ -n "$M2" ] || die "no bundle manifest under $OUT"
+# The filler pass's manifest: the bundle pass 2's rerun landed, by number.
+M2="$OUT/bundle-$(landed_n "$RUN/pass2/run-b-$(cat "$RUN/pass2/run-b.landed").err").json"
+[ -r "$M2" ] || die "no manifest $M2 for pass 2's landed bundle"
 fillers=$(jq '[.members[] | select(.filler == true)] | length' "$M2")
 n_s=$(jq '[.timings_seconds[] | select(.step | test("_S$"))] | length' "$M2")
 [ "$fillers" = 15 ] && [ "$n_s" = 15 ] || die "$M2 has $fillers filler member(s) and $n_s S proving step(s), not 15 and 15"
@@ -528,4 +639,22 @@ seed_peak=$(for f in "$SEED"/seed-*.time; do peak_kib "$f"; done | sort -n | tai
 seed_wall=$(for f in "$SEED"/seed-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }')
 burn_secs=$(cat "$SEED"/seed-*.err 2>/dev/null | { grep -o 'prove_secs: [0-9.]*' || true; } | awk '{print $2}' | paste -sd' ' -)
 log "measurements: $SEED/seed-*.time, $P1V.time, $AV.time, $BV.time, $M2, producer/node-*.time"
-echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$P1V.time") KiB, wall $(wall_s "$P1V.time") s (attempt $(cat "$RUN/pass1/run.landed")); pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$AV.time") KiB), rerun landed it with no re-prove in $(wall_s "$BV.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(for f in "$RUN"/producer/node-*.time; do peak_kib "$f"; done | sort -n | tail -1) KiB over $(for f in "$RUN"/producer/node-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }') s across $(find "$RUN/producer" -maxdepth 1 -name 'node-*.time' | wc -l | tr -d ' ') start(s)"
+R3V=""
+if [ -n "$R3" ]; then
+  M3="$OUT/bundle-$(landed_n "$RUN/pass3/run-b-$(cat "$RUN/pass3/run-b.landed").err").json"
+  [ -r "$M3" ] || die "no manifest $M3 for pass 3's landed bundle"
+  n_p=$(jq '[.members[] | select(.tag == "P")] | length' "$M3")
+  f3=$(jq '[.members[] | select(.filler == true)] | length' "$M3")
+  s3=$(jq '[.timings_seconds[] | select(.step | test("_S$"))] | length' "$M3")
+  [ "$n_p" = 1 ] && [ "$f3" = 15 ] && [ "$s3" = 15 ] || die "$M3 has $n_p P, $f3 fillers and $s3 S steps, not 1, 15 and 15"
+  ev=$(cat "$RUN/exit/exit.value")
+  [ "$(jq '.exits | length' "$M3")" = 1 ] && [ "$(jq '.exits[0].v' "$M3")" = "$ev" ] || die "$M3's exit list does not pay the exit's $ev bessel"
+  de=$(( $(jq '.e_cum' "$M3") - $(jq '.e_cum' "$M2") ))
+  [ "$de" = "$ev" ] || die "E grew by $de across the exit pass, not the exit's $ev"
+  lh=$(sed -n 's/.*SEQ landed bundle [0-9]* [0-9a-f]* at \([0-9]*\).*/\1/p' "$RUN/pass3/run-b-$(cat "$RUN/pass3/run-b.landed").err" | tail -1)
+  XP="$RUN/exit/exit-$(cat "$RUN/exit/exit.proved")"
+  A3="$RUN/pass3/run-a-$(cat "$RUN/pass3/run-a.drafted")"
+  B3="$RUN/pass3/run-b-$(cat "$RUN/pass3/run-b.landed")"
+  R3V="; R3 round trip: exit of $ev bessel proved by the wallet in $(wall_s "$XP.time") s at peak $(peak_kib "$XP.time") KiB (the P lane); pass 3 (1 P + 15 S) killed -9 after drafting (run-a peak $(peak_kib "$A3.time") KiB), rerun landed it at ${lh:-?} with no re-prove in $(wall_s "$B3.time") s; bundle $(jq '.bytes.total' "$M3") B, exits [$ev], E +$de, /v1/l2/index at $(cat "$RUN/pass3/index.height") ($M3)"
+fi
+echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$P1V.time") KiB, wall $(wall_s "$P1V.time") s (attempt $(cat "$RUN/pass1/run.landed")); pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$AV.time") KiB), rerun landed it with no re-prove in $(wall_s "$BV.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(for f in "$RUN"/producer/node-*.time; do peak_kib "$f"; done | sort -n | tail -1) KiB over $(for f in "$RUN"/producer/node-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }') s across $(find "$RUN/producer" -maxdepth 1 -name 'node-*.time' | wc -l | tr -d ' ') start(s)$R3V"
