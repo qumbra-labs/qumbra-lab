@@ -121,6 +121,13 @@ pub struct Anchor {
 }
 
 impl ChainView {
+    /// The leaf count after which `root` was the commitment root, if it is a
+    /// prefix root of the served leaves (lab #847 S4: an absorbable root's
+    /// `Anchor`).
+    pub fn count_of(&self, root: &Digest) -> Option<u64> {
+        self.by_root.get(root).copied()
+    }
+
     /// The served anchors this tree reproduces, newest (largest count) first.
     /// A served root no prefix of the tree reproduces is an error: the tree
     /// and the anchor set disagree, and nothing built on either is sound.

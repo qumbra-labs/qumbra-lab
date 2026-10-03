@@ -253,9 +253,9 @@ pub enum PlanError {
     /// Lab #831 W3c: the claim file opens its burn under a root no wrapper
     /// has absorbed and this one does not absorb.
     ClaimAnchorNotAbsorbed { root: Digest },
-    /// Lab #847 S4: fewer real members than a wrapper holds (K = 16), and
-    /// nothing yet fills the rest — fillers land in S3.
-    Short { have: usize, need: usize },
+    /// Lab #847 S4: not exactly K = 16 claims — fewer means nothing yet
+    /// fills the rest (fillers land in S3), more is the caller's mistake.
+    WrongCount { have: usize, need: usize },
 }
 
 /// A wrapper's member count (wrapper version 1's K, lab #785 Q1).
@@ -266,7 +266,7 @@ pub const K: usize = 16;
 /// this wrapper absorbs, oldest first, chosen by the caller (the loop picks
 /// them under the record-covered height); every claim's anchor must be one
 /// of them or a root an earlier wrapper absorbed. Refused by name with
-/// [`PlanError::Short`] for fewer than [`K`] claims (S3 brings fillers),
+/// [`PlanError::WrongCount`] for any count but [`K`] (fewer: S3 brings fillers),
 /// and by the native statement exactly as [`plan`] runs it. The sequencer's
 /// fee note goes to `keys` (the filler wallet, lab #847 S5).
 pub fn plan_claims(
@@ -277,7 +277,7 @@ pub fn plan_claims(
     keys: &Keys,
 ) -> Result<Plan, PlanError> {
     if files.len() != K {
-        return Err(PlanError::Short { have: files.len(), need: K });
+        return Err(PlanError::WrongCount { have: files.len(), need: K });
     }
     let roots = absorbed.map(|a| a.root);
     let mut insts = Vec::with_capacity(K);
@@ -654,15 +654,18 @@ mod tests {
         Anchor { count: 0, root }
     }
 
-    /// Fewer than K real members is refused by name — S4 plans no fillers.
+    /// Any count but K is refused by name — S4 plans no fillers, and takes
+    /// no more than a wrapper holds.
     #[test]
-    fn fewer_than_k_claims_is_short() {
+    fn not_k_claims_is_refused() {
         let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
         let f = w3c_file();
         let a = anchor_of(&f);
-        let files = vec![f; K - 1];
-        let err = plan_claims(&state, &prev, [a; M_ABS], files, &Keys::from_seed([1; 32])).err().unwrap();
-        assert_eq!(err, PlanError::Short { have: K - 1, need: K });
+        let keys = Keys::from_seed([1; 32]);
+        for n in [K - 1, K + 1] {
+            let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone(); n], &keys).err().unwrap();
+            assert_eq!(err, PlanError::WrongCount { have: n, need: K });
+        }
     }
 
     /// A claim whose anchor this wrapper does not absorb (and no earlier one
