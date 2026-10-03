@@ -8,8 +8,15 @@
 //! its bytes to the index's id (`keccak == id`), reads W's stated public
 //! values, and requires the served leaves (truncated to the bundle's
 //! `c_next`) and the asset-0 registry opening to fold to the C and R roots
-//! the bundle states ([`check_anchor`]). A lying index costs a refusal by
-//! name, never a ≈ 30 GiB proof.
+//! the bundle states ([`check_anchor`]). An index that disagrees with its
+//! own bundle costs a refusal by name before any proof. **What this does
+//! not establish**: the id and the bytes both come from the same node, so
+//! `keccak == id` is self-consistency, not authenticity — the anchor
+//! bundle's L1 inclusion is not verified by this wallet (follow-up R3c, lab #886: check
+//! it against the L1 block body the wallet's scan already reads). A node
+//! that fabricates a consistent bundle, leaves and opening passes here and
+//! wastes a ≈ 30 GiB proof; the chain then refuses the exit — a lying node
+//! can waste a proof, never funds.
 //!
 //! **Which note.** V6 v1 has no L2 note discovery (design D1 — bundles carry
 //! no ciphertexts). The wallet's L2 notes are the credits of its own claims,
@@ -63,8 +70,9 @@ pub enum ExitV6Refusal {
     IndexMoved { anchor: u64, now: u64 },
     /// The registry opening does not fold to the R root the bundle states.
     RegistryRootMismatch,
-    /// No landed, unspent credit of this wallet's own claims.
-    NoCredit,
+    /// No landed, unspent credit of this wallet's own claims at claim tier
+    /// `tier`.
+    NoCredit { tier: u64 },
     /// `--amount` names part of a note: refused (no change on V6 v1).
     PartialExit { amount: u64, note: u64 },
 }
@@ -85,9 +93,10 @@ impl std::fmt::Display for ExitV6Refusal {
             ExitV6Refusal::RegistryRootMismatch => {
                 write!(f, "the served asset-0 registry opening does not fold to the R root the anchor bundle states")
             }
-            ExitV6Refusal::NoCredit => write!(
+            ExitV6Refusal::NoCredit { tier } => write!(
                 f,
-                "no landed, unspent credit of this wallet's claims: a claim's credit is spendable once its bundle has landed"
+                "no landed, unspent credit of this wallet's claims matches at claim tier {tier}: a credit is spendable once \
+                 its claim's bundle has landed; if the claim landed under another tier, nothing here can find it"
             ),
             ExitV6Refusal::PartialExit { amount, note } => write!(
                 f,
@@ -159,18 +168,19 @@ pub fn pick_credit(
     spent: &HashSet<[u8; 32]>,
     wallet: &Wallet,
     amount: Option<u64>,
+    tier: u64,
 ) -> Result<OwnedL2Note, ExitV6Refusal> {
     let usable: Vec<&OwnedL2Note> = credits
         .iter()
         .filter(|c| tree.position_of(&qlab_note::hash::digest_from_bytes(&c.cm)).is_some() && !spent.contains(&c.nullifier(wallet)))
         .collect();
     match amount {
-        None => usable.first().map(|c| (*c).clone()).ok_or(ExitV6Refusal::NoCredit),
+        None => usable.first().map(|c| (*c).clone()).ok_or(ExitV6Refusal::NoCredit { tier }),
         Some(a) => match usable.iter().find(|c| c.note.value == a) {
             Some(c) => Ok((*c).clone()),
             None => match usable.first() {
                 Some(c) => Err(ExitV6Refusal::PartialExit { amount: a, note: c.note.value }),
-                None => Err(ExitV6Refusal::NoCredit),
+                None => Err(ExitV6Refusal::NoCredit { tier }),
             },
         },
     }
@@ -194,8 +204,13 @@ pub fn anchor_of(index: &qlab_ledger::deposits::L2IndexAnswer) -> Result<(u64, [
 pub fn intake_verdict(status: u16, body: &[u8]) -> Result<String, String> {
     let body = String::from_utf8_lossy(body);
     match status {
-        202 | 409 => Ok(format!(
-            "the intake took it ({status}: {}) — HELD: the sequencer does not plan exits until lab #860 R3b lands",
+        202 => Ok(format!(
+            "the intake took it (202: {}) — HELD: the sequencer does not plan exits until lab #860 R3b lands",
+            body.trim()
+        )),
+        409 => Ok(format!(
+            "already held by the intake (409 — a replay or an earlier submission: {}) — HELD: the sequencer does not \
+             plan exits until lab #860 R3b lands",
             body.trim()
         )),
         _ => Err(format!("the intake refused the exit ({status}: {})", body.trim())),
@@ -224,6 +239,7 @@ pub fn plan<E: qlab_l2spend::Endpoint, R: rand::CryptoRng>(
     l2_id: u64,
     tier: u64,
     to_rkm: [u64; 4],
+    change_to: &qlab_l2spend::Recipient,
     amount: Option<u64>,
     rng: &mut R,
 ) -> Result<ExitV6Plan, String> {
@@ -234,11 +250,17 @@ pub fn plan<E: qlab_l2spend::Endpoint, R: rand::CryptoRng>(
     let tree = served.commitment_tree_at(out.f3.c_next).map_err(|e| format!("{e:?}"))?;
     let reg0 = served.registry(0).map_err(|e| format!("{e:?}"))?;
     check_anchor(&tree, &reg0, height, &out).map_err(|e| e.to_string())?;
-    let spent = served.spent_nullifiers().map_err(|e| format!("{e:?}"))?;
-    let credit = pick_credit(&credits(wallet, set_aside, l2_id, tier), &tree, &spent, wallet, amount).map_err(|e| e.to_string())?;
+    let spent = served.spent_nullifiers().map_err(|e| {
+        format!(
+            "{e:?} (a /v1/l2/nullifiers page past this wallet's ceiling of {} nullifiers per height reads as a transport error)",
+            crate::annulet_verify::MAX_L2_NULLIFIERS_PER_HEIGHT
+        )
+    })?;
+    let credit = pick_credit(&credits(wallet, set_aside, l2_id, tier), &tree, &spent, wallet, amount, tier).map_err(|e| e.to_string())?;
     let ask = qlab_l2spend::ExitAsk { value: credit.note.value - EXIT_FEE_V6, to_rkm };
-    let change = wallet.rkm(wallet.diversifier_at_index(0));
-    let ei = qlab_l2spend::exit_instance(&tree, &reg0, &credit.spend_input(wallet), ask, change, EXIT_FEE_V6, rng)
+    // The change (0 at a whole-note exit) goes to the same recipient the
+    // entry is assembled for — one source for both.
+    let ei = qlab_l2spend::exit_instance(&tree, &reg0, &credit.spend_input(wallet), ask, change_to.rkm, EXIT_FEE_V6, rng)
         .map_err(|e| format!("{e:?}"))?;
     Ok(ExitV6Plan { credit, anchor_height: height, anchor_id: id, c_next: out.f3.c_next, ei })
 }
@@ -295,16 +317,17 @@ mod tests {
             tree.append(qlab_note::hash::digest_from_bytes(&c.cm));
         }
         let none = HashSet::new();
-        assert_eq!(pick_credit(&all, &tree, &none, &w, None).unwrap().note.value, 49_996);
-        assert_eq!(pick_credit(&all, &tree, &none, &w, Some(29_996)).unwrap().note.value, 29_996);
+        assert_eq!(pick_credit(&all, &tree, &none, &w, None, 4).unwrap().note.value, 49_996);
+        assert_eq!(pick_credit(&all, &tree, &none, &w, Some(29_996), 4).unwrap().note.value, 29_996);
         assert_eq!(
-            pick_credit(&all, &tree, &none, &w, Some(10_000)),
+            pick_credit(&all, &tree, &none, &w, Some(10_000), 4),
             Err(ExitV6Refusal::PartialExit { amount: 10_000, note: 49_996 })
         );
         assert!(ExitV6Refusal::PartialExit { amount: 1, note: 2 }.to_string().contains("no L2 note discovery (design D1)"));
-        assert_eq!(pick_credit(&all, &tree, &none, &w, Some(69_996)), Err(ExitV6Refusal::PartialExit { amount: 69_996, note: 49_996 }), "not landed");
+        assert_eq!(pick_credit(&all, &tree, &none, &w, Some(69_996), 4), Err(ExitV6Refusal::PartialExit { amount: 69_996, note: 49_996 }), "not landed");
         let spent: HashSet<[u8; 32]> = [all[0].nullifier(&w), all[1].nullifier(&w)].into_iter().collect();
-        assert_eq!(pick_credit(&all, &tree, &spent, &w, None), Err(ExitV6Refusal::NoCredit));
+        assert_eq!(pick_credit(&all, &tree, &spent, &w, None, 4), Err(ExitV6Refusal::NoCredit { tier: 4 }));
+        assert!(ExitV6Refusal::NoCredit { tier: 4 }.to_string().contains("at claim tier 4") , "the tier is named");
     }
 
     /// The planned instance is built at the checked anchor: its anchor is
@@ -319,7 +342,7 @@ mod tests {
         tree.append(qlab_note::hash::digest_from_bytes(&all[0].cm));
         let reg = qlab_cbserver::registry::RegistryTree::from_leaves(&[qlab_air::l2::RegistryLeaf::cloaked(0)]).unwrap();
         let reg0 = qlab_cbserver::registry::decode_registry_opening(&qlab_cbserver::registry::encode_registry_opening(&reg, 40, 0).unwrap()).unwrap();
-        let credit = pick_credit(&all, &tree, &HashSet::new(), &w, None).unwrap();
+        let credit = pick_credit(&all, &tree, &HashSet::new(), &w, None, 4).unwrap();
         let to = qlab_wallet::address::Address::decode(&wallet(9).address_at_index(0).encode()).unwrap().rkm_lanes();
         assert_eq!(to, wallet(9).rkm(wallet(9).diversifier_at_index(0)), "--exit-to's address decodes to its rkm");
         let ask = qlab_l2spend::ExitAsk { value: credit.note.value - EXIT_FEE_V6, to_rkm: to };
@@ -329,12 +352,107 @@ mod tests {
         assert_eq!(ei.ask.value, 49_996, "the whole credit at fee 0");
     }
 
+    /// A fake V6 node: the index, one bundle frame stating `out`, the leaves,
+    /// the asset-0 opening and an empty nullifier page — and the frame's id.
+    struct FakeV6 {
+        index: String,
+        frame: Vec<u8>,
+        leaves: Vec<[u8; 32]>,
+        reg: Vec<u8>,
+        nulls: Vec<u8>,
+    }
+    impl qlab_l2spend::Endpoint for &FakeV6 {
+        fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+            if path == "/v1/l2/index" {
+                Ok(self.index.clone().into_bytes())
+            } else if path.starts_with("/v1/bundle/") {
+                Ok(self.frame.clone())
+            } else if path.starts_with("/v1/l2/tree/leaves") {
+                Ok(qlab_node::TreeLeaves { from: 0, total: self.leaves.len() as u64, leaves: self.leaves.clone() }.to_bytes())
+            } else if path == "/v1/l2/registry/0" {
+                Ok(self.reg.clone())
+            } else if path.starts_with("/v1/l2/nullifiers") {
+                Ok(self.nulls.clone())
+            } else {
+                Err(format!("not served: {path}"))
+            }
+        }
+        fn post(&self, _: &str, _: &[u8]) -> Result<(u16, Vec<u8>), String> {
+            Err("no".into())
+        }
+    }
+
+    fn put_digest(w: &mut [u32], off: usize, d: &[u64; 4]) {
+        for (l, lane) in d.iter().enumerate() {
+            for j in 0..4 {
+                w[off + 4 * l + j] = ((lane >> (16 * j)) & 0xffff) as u32;
+            }
+        }
+    }
+
+    /// `plan` end to end over a fake node: the index's bundle (a real frame
+    /// stating the served tree's C at c_next and the opening's R) checks, the
+    /// wallet's credit is found among the leaves, and the instance is built
+    /// at that anchor, whole at fee 0. An index naming another id is refused
+    /// by name, before any tree is read.
+    #[test]
+    fn plan_checks_the_anchor_and_builds_the_exit() {
+        use qlab_wrapper::wleaf::{PV_C, PV_CN, PV_R, PV_SIDE, W_PV_LEN};
+        let w = wallet(7);
+        let d = deposit(50_000, 1);
+        let credit = claim_credit(&w, &d, 1, 4).unwrap();
+        let leaves = vec![[9u8; 32], credit.cm];
+        let mut tree = CommitmentTree::new();
+        for l in &leaves {
+            tree.append_bytes(l);
+        }
+        let reg = qlab_cbserver::registry::RegistryTree::from_leaves(&[qlab_air::l2::RegistryLeaf::cloaked(0)]).unwrap();
+        let reg_bytes = qlab_cbserver::registry::encode_registry_opening(&reg, 244, 0).unwrap();
+        let reg_root = qlab_cbserver::registry::decode_registry_opening(&reg_bytes).unwrap().root;
+        let mut pvs = vec![0u32; W_PV_LEN];
+        put_digest(&mut pvs, PV_SIDE + PV_C, &tree.root());
+        pvs[PV_SIDE + PV_CN] = 2;
+        put_digest(&mut pvs, PV_SIDE + PV_R, &reg_root);
+        let frame = qlab_wrapper::codec::encode_frame(&qlab_wrapper::codec::FrameParts {
+            version: 1,
+            l2_id: 1,
+            w_pvs: &pvs,
+            w_proof: &[],
+            dep_pvs: &[],
+            dep_proof: &[],
+            members: &[],
+            exits: &[],
+            sig: &[0u8; qlab_wrapper::codec::SEQUENCER_SIG_LEN],
+        });
+        let id = qlab_devnet::hash::keccak256(&frame);
+        let hexid: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        let node = FakeV6 {
+            index: format!(r#"{{"v":1,"height":244,"bundle_id":"{hexid}","refused":null}}"#),
+            frame,
+            leaves,
+            reg: reg_bytes,
+            nulls: qlab_cbserver::codec::NullifierPage { from: 0, to: 244, blocks: vec![] }.to_bytes(),
+        };
+        let me = crate::annulet_send::recipient_of(&w.address_at_index(0)).unwrap();
+        let to = wallet(9).rkm(wallet(9).diversifier_at_index(0));
+        let mut rng = rand::rng();
+        let p = plan(&qlab_l2spend::Served::v6(&node), &w, std::slice::from_ref(&d), 1, 4, to, &me, None, &mut rng).unwrap();
+        assert_eq!((p.anchor_height, p.anchor_id, p.c_next), (244, id, 2));
+        assert_eq!((p.credit.cm, p.ei.ask.value), (credit.cm, 49_996));
+        assert_eq!((p.ei.inst.anchor, p.ei.inst.registry_root), (tree.root(), reg_root));
+        assert_eq!(me.rkm, w.rkm(w.diversifier_at_index(0)), "the change recipient is address 0 — one source");
+        let lying = FakeV6 { index: node.index.replace(&hexid, &"ab".repeat(32)), ..node };
+        let err = plan(&qlab_l2spend::Served::v6(&lying), &w, &[d], 1, 4, to, &me, None, &mut rng).err().unwrap();
+        assert!(err.contains("the bundle served for height 244 hashes to"), "the id mismatch is named: {err}");
+    }
+
     /// The intake's answer: taken (and said HELD) or refused by name.
     #[test]
     fn the_intake_answer_is_taken_and_held_or_named() {
         let taken = intake_verdict(202, br#"{"v":1,"id":"ab","kind":"exit","replay":false}"#).unwrap();
         assert!(taken.contains("HELD") && taken.contains("R3b"), "{taken}");
-        assert!(intake_verdict(409, b"conflict").unwrap().contains("HELD"));
+        let again = intake_verdict(409, b"conflict").unwrap();
+        assert!(again.starts_with("already held by the intake (409") && again.contains("HELD"), "{again}");
         assert_eq!(intake_verdict(400, br#"{"error":"refused","why":"x"}"#).unwrap_err(), r#"the intake refused the exit (400: {"error":"refused","why":"x"})"#);
     }
 

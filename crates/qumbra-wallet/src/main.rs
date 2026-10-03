@@ -1257,7 +1257,8 @@ fn deposit_claim(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// `exit --net v6` (lab #860 R3): one claim credit of this wallet, exited
 /// whole from a V6 chain's L2 to an L1 address. The gate is W3a's (`/v1/l2`
 /// must confirm `--l2-id` and `--genesis-hash`); the anchor and its check are
-/// [`qumbra_wallet::exit_v6::plan`]'s, all before the proof; the file binds
+/// [`qumbra_wallet::exit_v6::plan`]'s, all before the proof (self-consistency
+/// of the node's index and bundle — L1 inclusion is R3c); the file binds
 /// the V6 genesis. `--submit` POSTs it to the sequencer's intake, which holds
 /// exits until the sequencer plans them (R3b).
 fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1287,6 +1288,9 @@ fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         None => {}
     }
     let submit = has_flag(args, "--submit");
+    if submit && plan_only {
+        return Err("--submit with --plan-only: a plan proves and writes nothing, so there is nothing to hand over".into());
+    }
     let intake = match (submit, flag(args, "--intake")) {
         (true, Some(a)) => Some(a.parse::<std::net::SocketAddr>().map_err(|_| format!("--intake {a} is not an ip:port address"))?),
         (true, None) => return Err("--submit requires --intake IP:PORT (the sequencer's intake, loopback or a tunnel to it)".into()),
@@ -1304,7 +1308,8 @@ fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     let gathered = qumbra_wallet::scan::gather(&w, url, 0, scan_to, qlab_devnet::forms::GenesisForm::V5);
     let served = qlab_l2spend::Served::v6(qumbra_wallet::annulet_send::WalletEndpoint { url: node_url.to_string() });
     let mut rng = rand::rng();
-    let plan = exit_v6::plan(&served, &wallet, &gathered.set_aside, l2_id, route.claim_fee_tier, to.rkm_lanes(), amount, &mut rng)?;
+    let change_to = qumbra_wallet::annulet_send::me(&w);
+    let plan = exit_v6::plan(&served, &wallet, &gathered.set_aside, l2_id, route.claim_fee_tier, to.rkm_lanes(), &change_to, amount, &mut rng)?;
     let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     println!(
         "plan: exit {} bessel — the whole credit of the claim of the deposit at height {} — to L1 {}, fee {EXIT_FEE_V6}",
@@ -1317,8 +1322,9 @@ fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         plan.c_next
     );
     println!(
-        "  trust: the L2 index is a hint checked against that bundle; nullifier completeness is NOT verified (lab #853): \
-         a credit already spent elsewhere would be refused by the sequencer, not here"
+        "  trust: the L2 index is checked against that bundle, but the anchor bundle's L1 inclusion is NOT verified by \
+         this wallet — a lying node can waste a proof, never funds; nullifier completeness is NOT verified (lab #853): \
+         a credit already spent would be refused by the chain, not here"
     );
     println!("  prove:  the P lane, about 30 GiB, on this machine only");
     println!("  HELD:   the sequencer holds exits until it plans them (lab #860 R3b) — this exit will not land before that");
@@ -1326,7 +1332,7 @@ fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("--plan-only: nothing proved or written");
         return Ok(());
     }
-    let built = qlab_l2spend::prove_exit(&plan.ei, EXIT_FEE_V6, &qumbra_wallet::annulet_send::me(&w), &mut rng);
+    let built = qlab_l2spend::prove_exit(&plan.ei, EXIT_FEE_V6, &change_to, &mut rng);
     let bytes = qlab_l2spend::encode_exit_artifact(&genesis, &built.tx);
     let out = out.expect("checked above");
     write_new_atomically(out, &bytes)?;

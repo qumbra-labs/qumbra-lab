@@ -108,9 +108,11 @@ pub const MAX_REGISTRY_ANSWER_BYTES: usize = 4 * 1024;
 /// "refused":…}` — a reason of a few hundred bytes at most.
 pub const MAX_L2_INDEX_ANSWER_BYTES: usize = 1024;
 
-/// The nullifiers one V6 height can carry: one bundle of K = 16 members, a
-/// transaction member publishing three (two inputs and the fee slot) — 48 —
-/// rounded up for room.
+/// The nullifiers one V6 height can carry, as this wallet bounds them: one
+/// bundle of K = 16 members, a transaction member publishing three (two
+/// inputs and the fee slot) — 48 — rounded up to 64. **An assumption, named**:
+/// a page past it fails on the wire as a transport error, and the V6 exit
+/// plan says so beside that error.
 pub const MAX_L2_NULLIFIERS_PER_HEIGHT: usize = 64;
 
 /// **The whole-response ceiling for each route the verified scan reads**

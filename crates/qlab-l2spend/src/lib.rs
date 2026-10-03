@@ -1382,6 +1382,36 @@ pub fn decode_claim_artifact(bytes: &[u8], expected_genesis: &[u8; 32], expected
 #[cfg(test)]
 mod tests {
 
+    /// `commitment_tree_at(n)` stops at `n` leaves across pages, even when
+    /// more are served, and refuses by name when fewer are.
+    #[test]
+    fn the_tree_at_a_count_truncates_and_refuses_a_short_serve() {
+        struct Leaves(Vec<[u8; 32]>);
+        impl Endpoint for Leaves {
+            fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+                let from: u64 = path.rsplit_once("from=").ok_or("no from")?.1.parse().map_err(|_| "from")?;
+                // Two leaves a page, to cross a page boundary.
+                let start = (from as usize).min(self.0.len());
+                let end = (start + 2).min(self.0.len());
+                let page = qlab_node::TreeLeaves { from, total: self.0.len() as u64, leaves: self.0[start..end].to_vec() };
+                Ok(page.to_bytes())
+            }
+            fn post(&self, _: &str, _: &[u8]) -> Result<(u16, Vec<u8>), String> {
+                Err("no".into())
+            }
+        }
+        let leaves: Vec<[u8; 32]> = (1..=5u8).map(|k| [k; 32]).collect();
+        let v6 = Served::v6(Leaves(leaves.clone()));
+        let mut want = CommitmentTree::new();
+        for l in &leaves[..3] {
+            want.append_bytes(l);
+        }
+        let got = v6.commitment_tree_at(3).unwrap();
+        assert_eq!((got.len(), got.root()), (3, want.root()), "three of five, across a page boundary");
+        assert_eq!(v6.commitment_tree().unwrap().len(), 5);
+        assert!(matches!(v6.commitment_tree_at(6), Err(SpendError::Served(ref why)) if why.contains("fewer than the 6")));
+    }
+
     /// Lab #860 R3: `Served::v6` reads the index's routes under `/v1/l2`
     /// (leaves, nullifiers, the registry opening), `Served::new` the Annulet
     /// paths unchanged, and under `v6` every Annulet-only route is refused by
@@ -1415,6 +1445,17 @@ mod tests {
         assert!(named(v6.registry_slot(1).err()), "registry slot");
         assert!(named(v6.params().err()), "params");
         assert!(named(v6.genesis_notes().err()), "genesis notes");
+        let dk = qlab_note::kem::generate_keypair(&mut rand::rng()).dk;
+        assert!(named(v6.detect(&dk, 0, 1).err()), "detection");
+        let public = qlab_devnet::body::TxPublic {
+            anchor: [0; 32],
+            nullifiers: vec![],
+            commitments: vec![],
+            bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
+            fee: 0,
+        };
+        let tx = TxEntry { proof: vec![], public, discovery: vec![0], rider: vec![], l2: vec![] };
+        assert!(named(v6.submit(&tx).err()), "POST /v1/tx");
         assert!(rec.0.borrow().is_empty(), "an Annulet-only route is refused without a fetch");
         let annulet = Served::new(&rec);
         let _ = annulet.commitment_tree();
