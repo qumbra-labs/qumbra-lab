@@ -650,6 +650,13 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     registry_view: Arc<Mutex<Arc<crate::discovery_server::RegistryView>>>,
     /// The applied tip the registry view was last read at.
     registry_sig: Option<u64>,
+    /// The L2 index (lab #860 R1): derived from the main chain's bundles on
+    /// a V6 net, never persisted; rebuilt by the first refresh after start.
+    l2_index: crate::l2_index::L2Index,
+    /// What `/v1/l2/…` serves; the default (not V6) refuses by name.
+    l2_index_view: Arc<Mutex<Arc<crate::l2_index::L2IndexView>>>,
+    /// The tip hash the index was last refreshed at.
+    l2_index_sig: Option<qlab_devnet::header::Hash32>,
     /// The `POST /v1/tx` rendezvous: the server enqueues, the run loop answers
     /// ([`Self::drain_remote_submits`]). `None` until the discovery endpoint
     /// starts.
@@ -1326,6 +1333,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             anchors_sig: None,
             registry_view: Arc::new(Mutex::new(Arc::new(crate::discovery_server::RegistryView::default()))),
             registry_sig: None,
+            l2_index: crate::l2_index::L2Index::genesis(),
+            l2_index_view: Arc::new(Mutex::new(Arc::new(crate::l2_index::L2IndexView::default()))),
+            l2_index_sig: None,
             submit_rx: None,
             context_rx: None,
             template_rx: None,
@@ -2493,6 +2503,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         self.refresh_discovery();
         self.refresh_leaves();
         self.refresh_anchors();
+        self.refresh_l2_index();
         // The submit rendezvous (issue #275): the server holds the sender, this
         // loop drains the receiver once per iteration.
         let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
@@ -2505,7 +2516,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             templates: template_tx,
             blocks: block_tx,
         };
-        let srv = DiscoveryServer::start_with_mine(
+        let srv = DiscoveryServer::start_with_l2(
             addr,
             Arc::clone(&self.discovery_view),
             Arc::clone(&self.leaves_view),
@@ -2521,6 +2532,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
                 annulet_params: self.annulet_params_body(),
                 l2: self.l2_route.clone(),
             }),
+            Arc::clone(&self.l2_index_view),
         )?;
         self.refresh_registry();
         let bound = srv.addr();
@@ -2674,6 +2686,32 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
     /// the tree and the applied tip it is served at; on an L1 node, nothing
     /// (the routes refuse by name). Keyed on the tip: a block's registry
     /// write (lab #728) moves the tree, and the next refresh serves it.
+    /// Re-fold the L2 index for `/v1/l2/…` (lab #860 R1): a V6 net only,
+    /// keyed on the tip hash, the bundles past the index folded (or a replay
+    /// from genesis after a reorg below it — [`crate::l2_index::L2Index::refresh`]).
+    pub fn refresh_l2_index(&mut self) -> bool {
+        let v6 = matches!(self.p2p.node().sections(), qlab_devnet::forms::BodySections::V6);
+        if !v6 {
+            return false;
+        }
+        let state = self.p2p.node().state();
+        let tip = state.chain().tip_hash();
+        if self.l2_index_sig == Some(tip) {
+            return false;
+        }
+        self.l2_index.refresh(state.chain());
+        self.l2_index_sig = Some(tip);
+        if let Ok(mut slot) = self.l2_index_view.lock() {
+            *slot = Arc::new(self.l2_index.view());
+        }
+        true
+    }
+
+    /// The L2 index `/v1/l2/…` is serving (tests / accounting).
+    pub fn l2_index_view(&self) -> Arc<crate::l2_index::L2IndexView> {
+        Arc::clone(&self.l2_index_view.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
     pub fn refresh_registry(&mut self) -> bool {
         let state = self.p2p.node().state();
         let tip = state.chain().tip_height();
@@ -3638,6 +3676,8 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
             phases.disc.leaves = lap(&mut d);
             self.refresh_anchors();
             phases.disc.anchors = lap(&mut d);
+            // Lab #860 R1: on the discovery cadence, keyed on the tip hash.
+            self.refresh_l2_index();
             self.refresh_registry();
             self.last_discovery_refresh = Instant::now();
         }

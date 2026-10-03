@@ -148,6 +148,12 @@ qlab-l2 = { path = "../qlab-l2" }
 qlab-wrapper = { path = "../qlab-wrapper" }
 
 [dev-dependencies]
+# Lab #860 R1: the L2 index tests build real bundle frames over the fold's
+# synth fixtures and W's PV builder (no proving), and read /v1/l2/index with
+# the wallet's strict reader.
+qlab-wprover = { path = "../qlab-wprover" }
+qlab-ledger = { path = "../qlab-ledger" }
+p3-field = "=0.6.1"
 # Issue #101 acceptance (`tests/coinbase_spend.rs`): the miner's key hierarchy —
 # `Wallet::rkm(d)` is what a block's `coinbase_rkm` carries, and `spend_input` is
 # the only spend-witness constructor, so this is what proves the minted note is
