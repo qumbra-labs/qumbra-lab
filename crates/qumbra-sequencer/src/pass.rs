@@ -58,6 +58,15 @@
 //! bounds how many bundles one pass lands. Hitting either ends the pass with
 //! [`Outcome::Ceiling`] naming what is left (exit 3). Nothing spins silently.
 //!
+//! Discards are bounded by `MAX_DISCARDS` per pass. One reached during the
+//! startup reconcile counts toward that bound but is not followed by a poll
+//! (the chain already moved past it); one reached after a post waits one
+//! poll before re-drafting. A discarded bundle's file is not deleted then:
+//! landing bundle `m` deletes `bundle-(m − KEEP_BUNDLES).bin` and nothing
+//! else, so a discarded `bundle-n.bin` goes when the bundle numbered `n + 8`
+//! lands, and stays if that number is itself discarded — stray bytes in
+//! `--out`, never re-posted, harmless.
+//!
 //! No log line, record or manifest written here carries a claim's `v`, `r_v`
 //! or an opening: items are named by id.
 
