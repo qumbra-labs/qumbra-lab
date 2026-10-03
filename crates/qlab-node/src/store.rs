@@ -19,6 +19,7 @@
 //! [`crate::node::Node`] via [`crate::persist`], not baked into the stores.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -508,6 +509,11 @@ pub trait ChainStore {
     fn finalized_height(&self) -> Option<u64>;
     /// Look up a stored block by hash.
     fn block(&self, hash: &Hash32) -> Option<&StoredBlock>;
+    /// The same block, shared (lab #850 AD1): what a serving snapshot holds so
+    /// it can encode headers and bodies off the consensus loop without a
+    /// second copy. Required, not defaulted: a store that answered `None`
+    /// here would serve a chain with no bodies and look healthy.
+    fn block_shared(&self, hash: &Hash32) -> Option<Arc<StoredBlock>>;
     /// Whether a block with this hash is stored.
     fn contains(&self, hash: &Hash32) -> bool;
     /// Mark `hash` finalized (must be known, strictly advance, descend finality).
@@ -618,7 +624,10 @@ impl std::fmt::Display for RewindError {
 #[derive(Clone)]
 pub struct MemChainStore {
     chain: ChainState,
-    blocks: HashMap<Hash32, StoredBlock>,
+    /// Shared (lab #850 AD1): the discovery server's snapshot holds the same
+    /// `Arc`s to serve headers and bodies, so serving costs pointers, not a
+    /// second copy of the block store, and never a request into the loop.
+    blocks: HashMap<Hash32, Arc<StoredBlock>>,
     genesis: Hash32,
 }
 
@@ -638,7 +647,7 @@ impl MemChainStore {
         let chain = ChainState::new_for(form, header);
         let ghash = header.header_hash_for(form);
         let mut blocks = HashMap::new();
-        blocks.insert(ghash, genesis);
+        blocks.insert(ghash, Arc::new(genesis));
         Self { chain, blocks, genesis: ghash }
     }
 
@@ -682,7 +691,7 @@ impl MemChainStore {
         loop {
             let block =
                 self.blocks.get(&cur).ok_or(RewindError::MissingBlockOnPath { height })?;
-            path.push(block.clone());
+            path.push(StoredBlock::clone(block));
             if block.header.height == 0 {
                 break;
             }
@@ -741,7 +750,7 @@ impl MemChainStore {
 impl ChainStore for MemChainStore {
     fn put_block(&mut self, block: StoredBlock) -> Result<Hash32, InsertError> {
         let hash = self.chain.insert_header(block.header())?;
-        self.blocks.insert(hash, block);
+        self.blocks.insert(hash, Arc::new(block));
         Ok(hash)
     }
     fn genesis_block_hash(&self) -> Hash32 {
@@ -760,7 +769,10 @@ impl ChainStore for MemChainStore {
         self.chain.finalized_height()
     }
     fn block(&self, hash: &Hash32) -> Option<&StoredBlock> {
-        self.blocks.get(hash)
+        self.blocks.get(hash).map(Arc::as_ref)
+    }
+    fn block_shared(&self, hash: &Hash32) -> Option<Arc<StoredBlock>> {
+        self.blocks.get(hash).cloned()
     }
     fn contains(&self, hash: &Hash32) -> bool {
         self.blocks.contains_key(hash)

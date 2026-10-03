@@ -184,14 +184,33 @@ pub fn scan_annulet<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let wallet = w.wallet();
     let (genesis_hash, genesis) = verify_annulet(fetch, pin)?;
+    Ok(scan_annulet_from(w, fetch, from, to, genesis_hash, &genesis, rng))
+}
 
+/// [`scan_annulet`] after its genesis is known: scan every allocated address
+/// over `from ..= to`, match `genesis`'s notes, read the spends, and index.
+/// Lab #850 (AD1) split it out so the verified scan
+/// ([`crate::annulet_verify`]) runs the same body over genesis notes read from
+/// the genesis **file** it hashed, not from `/v1/genesis/notes`.
+pub fn scan_annulet_from<F>(
+    w: &WalletDir,
+    fetch: &mut F,
+    from: u64,
+    to: u64,
+    genesis_hash: [u8; 32],
+    genesis: &[([u8; 32], L2Note)],
+    rng: &mut StdRng,
+) -> AnnuletReport
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let wallet = w.wallet();
     let rows = annulet_rows(w, fetch, from, to, rng);
 
     let mut owned = Vec::new();
     let mut refused = Vec::new();
-    for (cm, note) in &genesis {
+    for (cm, note) in genesis {
         for &idx in &w.allocated {
             if wallet.rkm(wallet.diversifier_at_index(idx)) == note.rkm {
                 match OwnedL2Note::from_genesis(&wallet, idx, *cm, *note) {
@@ -231,7 +250,7 @@ where
         (Some(set), true) => Some(AssetIndex::build(&wallet, owned.clone(), set)),
         _ => None,
     };
-    Ok(AnnuletReport { genesis_hash, rows, genesis_owned, owned, spent, index, refused })
+    AnnuletReport { genesis_hash, rows, genesis_owned, owned, spent, index, refused }
 }
 
 /// One row per allocated index, scanned over **one** fetch of the range (lab

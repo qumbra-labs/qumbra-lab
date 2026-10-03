@@ -17,7 +17,7 @@ publish.workspace = true
 [[bin]]
 name = "qumbra-wallet"
 path = "src/main.rs"
-required-features = ["net", "prove"]
+required-features = ["net", "prove", "verify"]
 
 [[bin]]
 name = "qumbra-prover-host"
@@ -128,7 +128,12 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 # the browser shell. Heavy halves are default-ON features — every existing
 # consumer is unchanged; qumbra-ffi opts down to the core.
 [features]
-default = ["net", "prove", "randomx", "host"]
+default = ["net", "prove", "randomx", "host", "verify"]
+# Lab #850 (AD1): the verified Annulet scan — the served-chain codecs of
+# qlab-p2p (headers + whole-block frames), no prover. In default for the CLI
+# and the desktop/macOS shells; qumbra-ffi builds this crate with
+# default-features = false, so the iOS/Android/wasm graphs are unchanged.
+verify = ["dep:qlab-p2p"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.

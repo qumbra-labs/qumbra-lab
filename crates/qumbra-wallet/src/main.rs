@@ -1745,17 +1745,58 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn scan_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u64) -> Result<(), Box<dyn Error>> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
     let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
-    eprintln!(
-        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
-        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
-    );
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
     let mut fetch = qumbra_wallet::net::scan_fetch(url);
-    let report = qumbra_wallet::annulet::scan_annulet(w, &mut fetch, from, to, pin, &mut rng)?;
-    print!("{}", qumbra_wallet::annulet::render(&report, url, (from, to)));
+    let (report, range, trust) = annulet_report(w, &mut fetch, from, to, pin, &mut rng)?;
+    print!("{}", qumbra_wallet::annulet::render(&report, url, range));
+    println!("{trust}");
     Ok(())
+}
+
+/// The Annulet scan both `scan` and `history` read (lab #850 AD1): with
+/// `--genesis-hash`, the **verified** scan — genesis by its bytes, every seal
+/// from genesis to the verified tip, each note's block recomputed — and the
+/// range ends at the verified tip; without it, the endpoint's word, and the
+/// trust line says so beside every figure.
+fn annulet_report<F>(
+    w: &WalletDir,
+    fetch: &mut F,
+    from: u64,
+    to: u64,
+    pin: Option<[u8; 32]>,
+    rng: &mut rand::rngs::StdRng,
+) -> Result<(qumbra_wallet::annulet::AnnuletReport, (u64, u64), String), Box<dyn Error>>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    match pin {
+        Some(_) => {
+            eprintln!("net: annulet (from --net; verifying genesis bytes, the seal chain and each note's block)");
+            let v = qumbra_wallet::annulet_verify::scan_annulet_verified(w, fetch, from, to, pin, rng)?;
+            let (bodies, bytes) = v.body_cost();
+            let trust = format!(
+                "trust:    VERIFIED — genesis file hashed to the pin; seals verified 1..={}; {bodies} block body(ies) \
+                 ({bytes} B) recomputed for the notes found. Spends are the endpoint's list (a withheld spend \
+                 is not detected).",
+                v.chain().tip()
+            );
+            let range = v.range();
+            let report = qumbra_wallet::annulet_verify::into_report(v);
+            Ok((report, range, trust))
+        }
+        None => {
+            eprintln!(
+                "net: annulet (from --net; UNVERIFIED — no --genesis-hash, so every figure is the endpoint's word)"
+            );
+            let report = qumbra_wallet::annulet::scan_annulet(w, fetch, from, to, None, rng)?;
+            let trust = "trust:    UNVERIFIED — no --genesis-hash: these figures are the endpoint's word, not a \
+                         chain this wallet checked. Pass --genesis-hash to verify."
+                .to_string();
+            Ok((report, (from, to), trust))
+        }
+    }
 }
 
 /// `history --net annulet` (lab #831 W1): the same verified scan as
@@ -1768,17 +1809,14 @@ fn history_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to:
         return Err("history --net annulet reads only --url (the scan endpoint); --node is not used — drop it".into());
     }
     let pin = flag(args, "--genesis-hash").map(qumbra_wallet::annulet::parse_genesis_hash).transpose()?;
-    eprintln!(
-        "net: annulet (from --net; verified against the endpoint's /v1/genesis/notes{})",
-        if pin.is_some() { ", pinned by --genesis-hash" } else { " — unpinned: pass --genesis-hash against an endpoint you do not trust" }
-    );
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
     let mut fetch = qumbra_wallet::net::scan_fetch(url);
-    let report = qumbra_wallet::annulet::scan_annulet(w, &mut fetch, from, to, pin, &mut rng)?;
-    let ledger = qumbra_wallet::annulet::history(&report, (from, to));
+    let (report, range, trust) = annulet_report(w, &mut fetch, from, to, pin, &mut rng)?;
+    let ledger = qumbra_wallet::annulet::history(&report, range);
     print!("{}", qlab_ledger::l2history::render(&ledger, url));
+    println!("{trust}");
     Ok(())
 }
 

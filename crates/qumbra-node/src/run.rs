@@ -2472,6 +2472,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
                 form: self.form(),
                 sections: self.p2p.node().sections(),
                 genesis_notes: self.genesis_notes_body(),
+                genesis_file: self.genesis_file_body(),
                 annulet_params: self.annulet_params_body(),
                 l2: self.l2_route.clone(),
             }),

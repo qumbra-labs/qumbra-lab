@@ -3560,6 +3560,17 @@ where
     }
 }
 
+/// The body an announce describes, given its reconstructed txs (lab #785:
+/// the V6 sections ride the announce itself).
+pub fn announced_body(ann: &BlockAnnounce, txs: Vec<TxEntry>) -> BlockBody {
+    BlockBody {
+        txs,
+        coinbase_payees: ann.coinbase_payees.clone(),
+        finality: ann.finality.clone(),
+        bundle: ann.bundle.clone(),
+    }
+}
+
 /// **A whole block, in the announce codec** (issue #130 (c)): every transaction
 /// prefilled, no short ids.
 ///
@@ -3574,18 +3585,10 @@ where
 /// ids, and there are none. Fixing it rather than inventing one keeps the encoding
 /// a pure function of the block, so two nodes serving the same block serve the
 /// same bytes.
-/// The body an announce describes, given its reconstructed txs (lab #785:
-/// the V6 sections ride the announce itself).
-fn announced_body(ann: &BlockAnnounce, txs: Vec<TxEntry>) -> BlockBody {
-    BlockBody {
-        txs,
-        coinbase_payees: ann.coinbase_payees.clone(),
-        finality: ann.finality.clone(),
-        bundle: ann.bundle.clone(),
-    }
-}
-
-fn whole_block_announce(wire: crate::codec::WireHeader, body: BlockBody) -> BlockAnnounce {
+///
+/// `pub` since lab #850 (AD1): `/v1/block/{h}/body` serves exactly this
+/// frame, so a wallet decodes the same bytes a peer does.
+pub fn whole_block_announce(wire: crate::codec::WireHeader, body: BlockBody) -> BlockAnnounce {
     let (header, seal) = match wire {
         crate::codec::WireHeader::L1(h) => (h, None),
         crate::codec::WireHeader::Sealed(s) => (s.header, Some(s.sig)),

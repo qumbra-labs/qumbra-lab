@@ -194,6 +194,7 @@ use qlab_node::{
     compact_response, full_response, BlockDiscovery, FullRefusal, Hash32, MempoolError, TreeLeaves,
 };
 use qlab_p2p::adapter::TxSubmitRefusal;
+use qlab_p2p::served::{BODY_PATH_SHAPE, HEADERS_PATH, MAX_HEADERS_PAGE};
 
 /// The note-discovery route (issue #188 baton 2).
 pub const COMPACT_PATH: &str = "/v1/compact";
@@ -506,6 +507,15 @@ pub struct DiscoveryView {
     /// block's exits could not be read — served as a 503, never as an empty
     /// list in its place. A missing entry is "not projected", the same.
     pub exits: Vec<ExitsOf>,
+    /// **Each block itself, shared** (lab #850 AD1), aligned with `blocks`:
+    /// what `/v1/headers` and `/v1/block/{h}/body` encode from. The `Arc`s
+    /// are the chain store's own ([`qlab_node::ChainStore::block_shared`]),
+    /// so this costs pointers, not a second copy of the block store; and it
+    /// is the same projection `/v1/compact` reads, so a header page and a
+    /// body are never answered from two different chains. A view built
+    /// without it (an older literal) serves neither route — a 503 naming
+    /// the gap, never an empty page.
+    pub stored: Vec<Arc<qlab_node::StoredBlock>>,
 }
 
 /// What reads a stored block's exits for the projection (lab #785 F5-5d):
@@ -608,10 +618,10 @@ impl DiscoveryView {
         if self.tip_hash() == Some(tip) {
             return retried;
         }
-        let mut fresh: Vec<(BlockDiscovery, ExitsOf)> = Vec::new();
+        let mut fresh: Vec<(BlockDiscovery, ExitsOf, Arc<qlab_node::StoredBlock>)> = Vec::new();
         let mut hash = tip;
-        loop {
-            let Some(block) = chain.block(&hash) else { break };
+        while let Some(shared) = chain.block_shared(&hash) {
+            let block = shared.as_ref();
             let height = block.header.height;
             if self.blocks.get(height as usize).map(|b| b.hash) == Some(hash) {
                 break;
@@ -622,20 +632,27 @@ impl DiscoveryView {
                     .map(|(rkm, v)| qlab_cbserver::codec::ExitFact { rkm: qlab_note::hash::digest_from_bytes(&rkm), v })
                     .collect()
             });
-            fresh.push((BlockDiscovery::of(hash, block), exits));
+            fresh.push((BlockDiscovery::of(hash, block), exits, Arc::clone(&shared)));
             if height == 0 {
                 break;
             }
             hash = prev;
         }
-        let Some(lowest) = fresh.last().map(|(b, _)| b.height) else { return false };
+        let Some(lowest) = fresh.last().map(|(b, _, _)| b.height) else { return false };
         self.blocks.truncate(lowest as usize);
         self.exits.truncate(lowest as usize);
+        // Lab #850: a view built without `stored` (an older literal) cannot be
+        // padded with blocks it never held, so it re-projects them from here
+        // on only — a gap is a 503 on the two routes, never a misalignment.
+        self.stored.truncate(lowest as usize);
         fresh.reverse();
-        for (b, e) in fresh {
+        for (b, e, st) in fresh {
             // Aligned by construction: a view built without exits (an older
             // literal) is padded "not projected" rather than misaligned.
             self.exits.resize(self.blocks.len(), Err("exits not projected".into()));
+            if self.stored.len() == self.blocks.len() {
+                self.stored.push(st);
+            }
             self.blocks.push(b);
             self.exits.push(e);
         }
@@ -689,6 +706,17 @@ pub struct AnchorsView {
     /// instead of once per request, and a poller cannot make the server work.
     pub encoded: Vec<u8>,
 }
+
+/// The genesis-file route (lab #850 AD1) — GET only, Annulet nets only: the
+/// bytes whose keccak is the genesis hash. The same path an L1 wallet reads
+/// from the L1 edge (`wallet-network-identity-decision`), so one spelling
+/// covers both; on an Annulet net the node answers it itself, and an edge in
+/// front of the node needs no copy of the file.
+pub const GENESIS_FILE_PATH: &str = "/genesis.qmb";
+
+/// What an L1 node answers on [`GENESIS_FILE_PATH`].
+pub const GENESIS_FILE_NOT_ON_L1: &str =
+    "an L1 node does not serve its genesis file on this listener: the edge serves /genesis.qmb";
 
 /// The genesis-notes route (lab #714, B5) — GET only, Annulet nets only.
 pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
@@ -753,6 +781,10 @@ pub struct FormView {
     /// the one thing about a send the wallet cannot know and the node can say.
     pub sections: qlab_devnet::forms::BodySections,
     pub genesis_notes: Option<Vec<u8>>,
+    /// `/genesis.qmb` (lab #850 AD1): the Annulet genesis file's bytes, so a
+    /// wallet verifies the chain from the bytes it hashed; `None` on an L1
+    /// node, whose edge serves its own `/genesis.qmb`.
+    pub genesis_file: Option<Vec<u8>>,
     /// `/v1/annulet/params` (lab #720): the fee tiers under the genesis hash,
     /// encoded once; `None` on an L1 node.
     pub annulet_params: Option<Vec<u8>>,
@@ -768,6 +800,7 @@ impl Default for FormView {
             form: qlab_devnet::forms::GenesisForm::V4,
             sections: qlab_devnet::forms::BodySections::None,
             genesis_notes: None,
+            genesis_file: None,
             annulet_params: None,
             l2: None,
         }
@@ -1040,8 +1073,22 @@ impl DiscoveryServer {
                         };
                         Ok(snapshot.encoded.clone())
                     }
+                    // Lab #850 AD1: header units (with the seal on an
+                    // Annulet net), from the same projection as `/v1/compact`.
+                    HEADERS_PATH => {
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_headers(&snapshot, wire_form(&form_view), query)
+                    }
                     // Lab #831 W3a-0: which L2 this net bridges, if any.
                     L2_PATH => Ok(form_view.l2.clone().unwrap_or_else(|| L2_NOT_V6.as_bytes().to_vec())),
+                    // Lab #850 AD1: the genesis file itself, on an Annulet node.
+                    GENESIS_FILE_PATH => match &form_view.genesis_file {
+                        Some(bytes) => Ok(bytes.clone()),
+                        None => Err((404, GENESIS_FILE_NOT_ON_L1.to_string())),
+                    },
                     // Lab #714: the genesis notes (a projection of the genesis file).
                     GENESIS_NOTES_PATH => match &form_view.genesis_notes {
                         Some(bytes) => Ok(bytes.clone()),
@@ -1065,21 +1112,29 @@ impl DiscoveryServer {
                     // The payload route carries its arguments in the path, so it
                     // is matched on shape rather than by equality. A path that
                     // is not this shape falls through to the 404 below.
-                    _ => match full_path_args(path) {
-                        Some(args) => {
+                    _ => match (full_path_args(path), body_path_arg(path)) {
+                        (Some(args), _) => {
                             let snapshot = match view.lock() {
                                 Ok(g) => Arc::clone(&g),
                                 Err(p) => Arc::clone(&p.into_inner()),
                             };
                             respond_full(&snapshot, args)
                         }
-                        None => Err((
+                        // Lab #850 AD1: one whole block, same projection.
+                        (None, Some(h)) => {
+                            let snapshot = match view.lock() {
+                                Ok(g) => Arc::clone(&g),
+                                Err(p) => Arc::clone(&p.into_inner()),
+                            };
+                            respond_body(&snapshot, wire_form(&form_view), h)
+                        }
+                        (None, None) => Err((
                             404,
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {COINBASE_PATH}?from=&to=, {EXITS_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
                                  {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {REGISTRY_SLOT_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
-                                 {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
+                                 {FULL_PATH_SHAPE}, {HEADERS_PATH}?from=&to=, {BODY_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
                     },
@@ -1308,6 +1363,121 @@ pub fn respond_full(
             format!("stored discovery does not decode at height {height} tx {tx_index}: {err:?}"),
         ),
     })
+}
+
+/// The served-chain wire form of this node's net (lab #850).
+fn wire_form(form_view: &FormView) -> qlab_p2p::compact::WireForm {
+    qlab_p2p::compact::WireForm { form: form_view.form, sections: form_view.sections }
+}
+
+/// The header unit a stored block is served as: the sealed header on an
+/// Annulet net, the bare header elsewhere. `None` only for an Annulet block
+/// with no seal — the genesis, which no route serves.
+fn header_unit(form: qlab_devnet::forms::GenesisForm, block: &qlab_node::StoredBlock) -> Option<qlab_p2p::codec::WireHeader> {
+    match form {
+        qlab_devnet::forms::GenesisForm::Annulet => block.sealed_header().map(qlab_p2p::codec::WireHeader::Sealed),
+        qlab_devnet::forms::GenesisForm::V4 | qlab_devnet::forms::GenesisForm::V5 => {
+            Some(qlab_p2p::codec::WireHeader::L1(block.header()))
+        }
+    }
+}
+
+/// What a projection without its blocks answers on the two served-chain
+/// routes: a 503 naming the gap, never an empty page that would read as
+/// "no such height".
+fn stored_gap(view: &DiscoveryView) -> Option<(u16, String)> {
+    (view.stored.len() != view.blocks.len()).then(|| {
+        (503, format!("blocks not projected: this view holds {} of {} blocks", view.stored.len(), view.blocks.len()))
+    })
+}
+
+/// The socket-free **`GET /v1/headers?from=&to=`** core (lab #850 AD1): a
+/// contiguous page of header units over `from ..= to`, at most
+/// [`MAX_HEADERS_PAGE`] of them, from the projection `/v1/compact` reads
+/// ([`qlab_p2p::served`] has the wire). An empty page means this node holds
+/// no main-chain height from `from` on — a fact, the same as `/v1/compact`'s.
+///
+/// Refusals: a missing or invalid bound or an inverted range — 400, as on
+/// `/v1/compact`; `from = 0` on an Annulet net — 400, by name, because the
+/// genesis is unsealed and a verifier reads it from the genesis file it
+/// hashed; a projection without its blocks — 503.
+pub fn respond_headers(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+    if to < from {
+        return Err((400, "'to' < 'from'".to_string()));
+    }
+    if wf.form == qlab_devnet::forms::GenesisForm::Annulet && from == 0 {
+        return Err((
+            400,
+            "the Annulet genesis header is unsealed and not served here: read it from the genesis file              (/genesis.qmb) and verify it by its hash; ask from=1"
+                .to_string(),
+        ));
+    }
+    if let Some(gap) = stored_gap(view) {
+        return Err(gap);
+    }
+    let last = to.min(from.saturating_add(MAX_HEADERS_PAGE as u64 - 1));
+    let mut units = Vec::new();
+    for h in from..=last {
+        let Some(block) = view.stored.get(h as usize) else { break };
+        let unit = header_unit(wf.form, block)
+            .ok_or_else(|| (500, format!("height {h} holds an Annulet block with no seal")))?;
+        units.push(unit);
+    }
+    Ok(qlab_p2p::served::encode_headers_page(wf, from, &units))
+}
+
+/// `/v1/block/{h}/body` → `h`, or `None` for any other shape.
+fn body_path_arg(path: &str) -> Option<&str> {
+    match path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice() {
+        ["v1", "block", h, "body"] => Some(h),
+        _ => None,
+    }
+}
+
+/// The socket-free **`GET /v1/block/{h}/body`** core (lab #850 AD1): the
+/// whole block at `h` in the historical-body frame a peer is served
+/// ([`qlab_p2p::node::whole_block_announce`]), from the projection
+/// `/v1/compact` reads. A verifier recomputes the header's
+/// `tx_body_commitment` over it; the bound is
+/// [`qlab_p2p::node::MAX_SERVED_BODY_BYTES`], the node's own for a served body.
+///
+/// Refusals: a non-numeric height — 400; `h = 0` on an Annulet net — 400,
+/// by name (the genesis body is the genesis file's); a height the projection
+/// does not hold — 404, naming the tip; a V6 bundle that cannot be read back
+/// — 503; a projection without its blocks — 503.
+pub fn respond_body(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, h: &str) -> Result<Vec<u8>, (u16, String)> {
+    let height = h.parse::<u64>().map_err(|_| (400, format!("invalid height `{h}`")))?;
+    if wf.form == qlab_devnet::forms::GenesisForm::Annulet && height == 0 {
+        return Err((
+            400,
+            "the Annulet genesis body is the genesis file's notes: read /genesis.qmb and verify it by its hash"
+                .to_string(),
+        ));
+    }
+    if let Some(gap) = stored_gap(view) {
+        return Err(gap);
+    }
+    let Some(block) = view.stored.get(height as usize) else {
+        return Err((
+            404,
+            format!(
+                "no such block: this node's projection holds no main-chain height {height} (tip {})",
+                view.tip_height().map(|t| t.to_string()).unwrap_or_else(|| "none".into())
+            ),
+        ));
+    };
+    let unit = header_unit(wf.form, block)
+        .ok_or_else(|| (500, format!("height {height} holds an Annulet block with no seal")))?;
+    let body = block.try_body().map_err(|e| (503, format!("height {height}: the body cannot be read back: {e}")))?;
+    let ann = qlab_p2p::node::whole_block_announce(unit, body);
+    let bytes = qlab_p2p::served::encode_body_answer(wf, height, &ann)
+        .map_err(|e| (500, format!("height {height}: the body does not encode for this net: {e:?}")))?;
+    if bytes.len() > qlab_p2p::node::MAX_SERVED_BODY_BYTES + 10 {
+        return Err((500, format!("height {height}: a {} B body exceeds the served bound", bytes.len())));
+    }
+    Ok(bytes)
 }
 
 /// Handle one `POST /v1/tx` on its own bounded thread: read the body, decode,
@@ -1674,6 +1844,7 @@ mod tests {
 
     fn a_view() -> DiscoveryView {
         DiscoveryView {
+            stored: Vec::new(),
             exits: Vec::new(),
             blocks: vec![
                 projected(0, 0, vec![]),
@@ -1896,6 +2067,7 @@ mod tests {
     #[test]
     fn serves_the_per_block_nullifier_lists_over_a_real_socket() {
         let view = Arc::new(Mutex::new(Arc::new(DiscoveryView {
+            stored: Vec::new(),
             exits: Vec::new(),
             blocks: vec![
                 projected(0, 0, vec![]),
@@ -1948,6 +2120,7 @@ mod tests {
     fn serves_the_per_block_coinbase_facts_over_a_real_socket() {
         let mine = [0x11u64, 0x22, 0x33, 0x44];
         let view = Arc::new(Mutex::new(Arc::new(DiscoveryView {
+            stored: Vec::new(),
             exits: Vec::new(),
             blocks: vec![
                 projected_mined(0, 0, vec![], [0; 4]), // genesis: no payee
@@ -2327,6 +2500,7 @@ mod tests {
 
         let (committed, payloads) = a_committed_group_with_payloads();
         let view = DiscoveryView {
+            stored: Vec::new(),
             exits: Vec::new(),
             blocks: vec![
                 projected(0, 0, vec![]),
@@ -2371,6 +2545,7 @@ mod tests {
     fn the_payload_route_refuses_by_name_and_never_with_an_empty_list() {
         let (committed, _) = a_committed_group_with_payloads();
         let view = DiscoveryView {
+            stored: Vec::new(),
             exits: Vec::new(),
             blocks: vec![projected(0, 0, vec![]), projected(1, 1, vec![committed])],
         };
@@ -2390,7 +2565,7 @@ mod tests {
         assert_eq!(respond_full(&view, ("1", "x")).expect_err("must refuse").0, 400);
 
         // 🔴 A stored block whose committed region does not decode.
-        let corrupt = DiscoveryView { exits: Vec::new(), blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
+        let corrupt = DiscoveryView { stored: Vec::new(), exits: Vec::new(), blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
         let (code, msg) = respond_full(&corrupt, ("0", "0")).expect_err("must refuse");
         assert_eq!(code, 500, "{msg}");
     }
@@ -2401,7 +2576,7 @@ mod tests {
     /// not read is the absence-reads-as-healthy shape option 3 exists to remove.
     #[test]
     fn undecodable_committed_bytes_are_a_refusal_not_an_empty_group() {
-        let view = DiscoveryView { exits: Vec::new(), blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
+        let view = DiscoveryView { stored: Vec::new(), exits: Vec::new(), blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
         let err = respond(&view, "from=0&to=0").expect_err("must refuse");
         assert_eq!(err.0, 500, "{err:?}");
     }
