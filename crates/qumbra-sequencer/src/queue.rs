@@ -7,7 +7,8 @@
 //!                     <id>/<key> 64 lower-case hex; <check> the first 16 hex
 //!                     digits of Keccak-256 over the record before it
 //! DIR/items/<id>.bin  the artifact's bytes (Keccak-256 = <id>)
-//! DIR/state/<id>      the item's state: "queued\n" (S4 adds planned / landed)
+//! DIR/state/<id>      the item's state, one line: "queued" | "planned <n>" |
+//!                     "landed <height>" | "refused <reason>" (a named reason)
 //! DIR/index.lock      held while an intake runs (O_EXCL)
 //! ```
 //!
@@ -50,31 +51,120 @@ pub const MAX_PENDING_BYTES: u64 = 1024 * crate::server::MAX_ARTIFACT_BYTES as u
 
 const RECORD_VERSION: &str = "1";
 
-/// An item's state.
+/// Why the loop refused an item — a closed catalogue, so a refusal can carry
+/// no value from an artifact by construction (lab #847 S4 pre-review). The
+/// record stores the code; the status route answers the sentence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The chain's wrapper state already holds the claim's `cnf`.
+    CnfOnChain,
+    /// The stored artifact no longer decodes against this chain.
+    Unreadable,
+    /// The native wrapper statement refuses a batch with this item alone in
+    /// question.
+    Statement,
+}
+
+impl Refusal {
+    const ALL: [Refusal; 3] = [Refusal::CnfOnChain, Refusal::Unreadable, Refusal::Statement];
+
+    /// The record's code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::CnfOnChain => "cnf-on-chain",
+            Refusal::Unreadable => "unreadable",
+            Refusal::Statement => "statement",
+        }
+    }
+
+    /// The sentence a reader sees.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Refusal::CnfOnChain => "the chain already holds this claim's cnf",
+            Refusal::Unreadable => "the stored artifact no longer decodes against this chain",
+            Refusal::Statement => "the native wrapper statement refuses it",
+        }
+    }
+
+    fn of_code(s: &str) -> Option<Refusal> {
+        Self::ALL.into_iter().find(|r| r.code() == s)
+    }
+}
+
+/// An item's state. Intake writes `Queued` once, at admission; only the
+/// posting loop (S4) moves an item past it, along [`State::may_become`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Admitted and waiting for a wrapper.
     Queued,
+    /// In the run's bundle `n`, built or posted, not yet seen on chain.
+    Planned(u64),
+    /// In a bundle the chain applied, at this height (observed through
+    /// `/v1/wrapper`'s `last_bundle_id`, never assumed from a POST).
+    Landed(u64),
+    /// Refused at plan time and never retried — a named reason, no value.
+    Refused(Refusal),
 }
 
 impl State {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             State::Queued => "queued",
+            State::Planned(_) => "planned",
+            State::Landed(_) => "landed",
+            State::Refused(_) => "refused",
+        }
+    }
+
+    /// The state record's one line.
+    fn record(&self) -> String {
+        match self {
+            State::Queued => "queued\n".into(),
+            State::Planned(n) => format!("planned {n}\n"),
+            State::Landed(h) => format!("landed {h}\n"),
+            State::Refused(r) => format!("refused {}\n", r.code()),
         }
     }
 
     fn parse(s: &str) -> Option<State> {
-        match s {
-            "queued\n" => Some(State::Queued),
+        let line = s.strip_suffix('\n').filter(|l| !l.contains('\n'))?;
+        let num = |t: &str| t.parse::<u64>().ok().filter(|n| n.to_string() == t);
+        match line.split_once(' ') {
+            None if line == "queued" => Some(State::Queued),
+            Some(("planned", n)) => num(n).map(State::Planned),
+            Some(("landed", h)) => num(h).map(State::Landed),
+            Some(("refused", code)) => Refusal::of_code(code).map(State::Refused),
             _ => None,
         }
     }
 
-    fn pending(self) -> bool {
-        match self {
-            State::Queued => true,
-        }
+    /// Still owed a wrapper: counted against the pending bounds.
+    fn pending(&self) -> bool {
+        matches!(self, State::Queued | State::Planned(_))
+    }
+
+    /// The loop's transitions — and no others. Queued → Planned (drafted);
+    /// Planned → Queued (discarded: Thread/Prev, or the chain moved on);
+    /// Planned → Landed (observed on chain); Queued | Planned → Refused.
+    /// Landed and Refused are terminal: an item never leaves them.
+    pub fn may_become(&self, next: &State) -> bool {
+        matches!(
+            (self, next),
+            (State::Queued, State::Planned(_))
+                | (State::Planned(_), State::Queued)
+                | (State::Planned(_), State::Landed(_))
+                | (State::Queued | State::Planned(_), State::Refused(_))
+        )
+    }
+}
+
+/// Why an item that is `queued` is not being planned, if there is a reason
+/// beyond "its turn has not come" — today, every exit (lab #847 Q4: no V6
+/// exit can be built until the L2 read path exists).
+pub fn held_reason(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Exit => Some("no V6 exit can be built until the L2 read path exists (lab #847 Q4)"),
+        Kind::Claim => None,
     }
 }
 
@@ -184,8 +274,9 @@ impl Queue {
                     return Err(format!("{}: a key already held by item {} — refusing to start", at(), hex32(&other)));
                 }
             }
+            let pending = state.pending();
             let item = Item { id, kind, keys, len: bytes.len() as u64, state };
-            if state.pending() {
+            if pending {
                 q.pending_items += 1;
                 q.pending_bytes += item.len;
             }
@@ -258,6 +349,44 @@ impl Queue {
         self.order.push(c.id);
         self.items.insert(c.id, Item { id: c.id, kind: c.kind, keys: c.keys.clone(), len: bytes.len() as u64, state: State::Queued });
         Ok(())
+    }
+
+    /// Move an item to `state` — the posting loop's write (S4); intake never
+    /// calls it. Only the transitions [`State::may_become`] allows; any other
+    /// is refused by name (Landed and Refused never change). The record is
+    /// rewritten atomically; the index and the keys never change (a landed or
+    /// refused item's keys stay admitted, so a resubmission still replays or
+    /// conflicts).
+    pub fn set_state(&mut self, id: &[u8; 32], state: State) -> Result<(), String> {
+        let path = self.state_path(id);
+        let item = self.items.get_mut(id).ok_or_else(|| format!("no item {}", hex32(id)))?;
+        if !item.state.may_become(&state) {
+            return Err(format!("item {}: {} may not become {}", hex32(id), item.state.name(), state.name()));
+        }
+        write_atomic(&path, state.record().as_bytes())?;
+        match (item.state.pending(), state.pending()) {
+            (true, false) => {
+                self.pending_items -= 1;
+                self.pending_bytes -= item.len;
+            }
+            (false, true) => {
+                self.pending_items += 1;
+                self.pending_bytes += item.len;
+            }
+            _ => {}
+        }
+        item.state = state;
+        Ok(())
+    }
+
+    /// An admitted item's artifact bytes, checked against its id.
+    pub fn artifact(&self, id: &[u8; 32]) -> Result<Vec<u8>, String> {
+        let p = self.item_path(id);
+        let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if crate::intake::id_of(&b) != *id {
+            return Err(format!("{}: does not hash to its id", p.display()));
+        }
+        Ok(b)
     }
 
     /// An item by id.
@@ -368,6 +497,75 @@ mod tests {
         assert!(!d.exists());
         Queue::open(&d).unwrap();
         assert_eq!(Queue::open_existing(&d).unwrap().items().count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The loop's state writes survive a reopen; landing frees the pending
+    /// bound; a landed item's key still replays; a refusal is a named reason
+    /// that survives a reopen; a malformed record is refused.
+    #[test]
+    fn states_round_trip_and_free_the_pending_bound() {
+        let d = dir("states");
+        let c = classify(W3C_CLAIM, &w3c_chain()).unwrap();
+        let mut q = Queue::open(&d).unwrap();
+        q.admit(&c, W3C_CLAIM).unwrap();
+        assert_eq!(q.pending_items, 1);
+        q.set_state(&c.id, State::Planned(3)).unwrap();
+        assert_eq!(q.pending_items, 1, "planned is still owed a wrapper");
+        q.set_state(&c.id, State::Landed(268)).unwrap();
+        assert_eq!((q.pending_items, q.pending_bytes), (0, 0));
+        drop(q);
+        let q = Queue::open(&d).unwrap();
+        assert_eq!(q.item(&c.id).unwrap().state, State::Landed(268));
+        assert_eq!(q.decide(&c, W3C_CLAIM.len() as u64), Decision::Replay { id: c.id, kind: Kind::Claim });
+        assert_eq!(q.artifact(&c.id).unwrap(), W3C_CLAIM);
+        drop(q);
+        let d2 = dir("states-refused");
+        let mut q = Queue::open(&d2).unwrap();
+        q.admit(&c, W3C_CLAIM).unwrap();
+        q.set_state(&c.id, State::Refused(Refusal::Statement)).unwrap();
+        assert_eq!((q.pending_items, q.pending_bytes), (0, 0));
+        drop(q);
+        assert_eq!(Queue::open(&d2).unwrap().item(&c.id).unwrap().state, State::Refused(Refusal::Statement));
+        let _ = std::fs::remove_dir_all(&d2);
+        for bad in ["planned\n", "planned 03\n", "landed x\n", "refused \n", "refused because\n", "queued", "queued\nqueued\n"] {
+            std::fs::write(d.join("state").join(hex32(&c.id)), bad).unwrap();
+            assert!(Queue::open(&d).err().unwrap().contains("unknown state record"), "{bad:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The transition table: only the loop's moves are allowed, and the
+    /// terminal states never change.
+    #[test]
+    fn only_the_loops_transitions_are_allowed() {
+        let d = dir("transitions");
+        let c = classify(W3C_CLAIM, &w3c_chain()).unwrap();
+        let mut q = Queue::open(&d).unwrap();
+        q.admit(&c, W3C_CLAIM).unwrap();
+        let refuse = |q: &mut Queue, s: State| q.set_state(&c.id, s).unwrap_err();
+        assert!(refuse(&mut q, State::Landed(1)).contains("queued may not become landed"));
+        assert!(refuse(&mut q, State::Queued).contains("queued may not become queued"));
+        q.set_state(&c.id, State::Planned(0)).unwrap();
+        assert!(refuse(&mut q, State::Planned(1)).contains("planned may not become planned"));
+        q.set_state(&c.id, State::Queued).unwrap();
+        q.set_state(&c.id, State::Planned(1)).unwrap();
+        q.set_state(&c.id, State::Landed(9)).unwrap();
+        for s in [State::Queued, State::Planned(2), State::Landed(10), State::Refused(Refusal::Statement)] {
+            assert!(refuse(&mut q, s).contains("landed may not become"));
+        }
+        let mut bytes = W3C_CLAIM.to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        let mut c2 = c.clone();
+        c2.id = crate::intake::id_of(&bytes);
+        c2.keys = vec![[1; 32]];
+        q.admit(&c2, &bytes).unwrap();
+        q.set_state(&c2.id, State::Refused(Refusal::CnfOnChain)).unwrap();
+        for s in [State::Queued, State::Planned(3), State::Landed(11), State::Refused(Refusal::Statement)] {
+            assert!(q.set_state(&c2.id, s).unwrap_err().contains("refused may not become"));
+        }
+        assert_eq!(q.item(&c2.id).unwrap().state, State::Refused(Refusal::CnfOnChain));
+        assert_eq!(q.pending_items, 0, "a refused write never moves the counters");
         let _ = std::fs::remove_dir_all(&d);
     }
 

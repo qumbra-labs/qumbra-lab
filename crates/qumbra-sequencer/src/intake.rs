@@ -163,7 +163,7 @@ pub fn classify(bytes: &[u8], chain: &Chain) -> Result<Candidate, String> {
         }
         let cnf = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None }
             .digest_at(PV_CNF)
-            .map_err(|e| format!("claim file refused: its cnf does not read: {e:?}"))?;
+            .map_err(|e| format!("claim file refused: its cnf does not read: {e:?}"))?; // debug-ok: a cnf decode error, no opening
         Ok(Candidate { id, kind: Kind::Claim, keys: vec![digest_to_bytes(&cnf)], proof: Proof::Claim { pvs: file.pvs, proof: file.proof } })
     } else if bytes.starts_with(qlab_l2spend::EXIT_ARTIFACT_MAGIC) {
         // The exit's l2_id is bound through the genesis hash: a V6 genesis
@@ -188,11 +188,11 @@ pub fn verify(c: &Candidate, chain: &Chain) -> Result<(), String> {
             let proof: qlab_consensus::Proof<qlab_consensus::Config> =
                 bincode::deserialize(proof).map_err(|_| "claim file refused: its proof does not decode".to_string())?;
             qlab_l2::claim::verify_claim_u32(pvs, &proof, chain.l2_id, chain.claim_fee_tier)
-                .map_err(|e| format!("claim file refused: its proof does not verify ({e:?})"))
+                .map_err(|e| format!("claim file refused: its proof does not verify ({e:?})")) // debug-ok: a verifier error, no opening
         }
         Proof::Exit(tx) => qumbra_node::verifier::L2Verifier
             .check(tx)
-            .map_err(|e| format!("exit file refused: its proof does not verify ({e:?})")),
+            .map_err(|e| format!("exit file refused: its proof does not verify ({e:?})")), // debug-ok: a verifier error, no opening
     }
 }
 

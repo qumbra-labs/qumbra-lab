@@ -56,10 +56,10 @@ pub fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) -> Resu
     let cfg = qlab_wrapper::verify::version_cfg(CHAIN_VERSION).ok_or("no lane for the chain version")?;
     let mut members = Vec::with_capacity(p.insts.len());
     for (i, inst) in p.insts.iter().enumerate() {
-        log(&format!("member {i} ({:?})", inst.tag()));
+        log(&format!("member {i} ({:?})", inst.tag())); // debug-ok: a member tag, a unit enum
         let t = Instant::now();
         members.push(inst.prove());
-        timings.push((format!("member_{i}_{:?}", inst.tag()), t.elapsed().as_secs_f64()));
+        timings.push((format!("member_{i}_{:?}", inst.tag()), t.elapsed().as_secs_f64())); // debug-ok: a member tag, a unit enum
     }
     log("W: plan, render, scan");
     let t = Instant::now();
@@ -68,7 +68,7 @@ pub fn prove(p: &Plan, timings: &mut Timings, log: &mut dyn FnMut(&str)) -> Resu
     let trace = render(&build_plan(&p.rin, &p.inp, &p.members, &p.wit));
     let pvs = w_pvs(&p.rin, &p.rout, &p.inp, fee_of(&p.members), &p.exit_cmt);
     if let Some((row, phases)) = first_violation(&air, &trace, &pvs) {
-        return Err(format!("W does not hold at row {row}: {phases:?} — not proving"));
+        return Err(format!("W does not hold at row {row}: {phases:?} — not proving")); // debug-ok: constraint phase names from first_violation, no witness values
     }
     timings.push(("w_trace_and_scan".into(), t.elapsed().as_secs_f64()));
     log("W: prove");
@@ -168,7 +168,7 @@ pub fn manifest(p: &Plan, wb: &WireBundle, bytes: &[u8], net: &Hash32, spacing: 
             "self_check_cannot_see": "the self-check is the node's rule over these bytes, but with three inputs the node owns: spacing (last_bundle_height = None — post no sooner than wrapper_spacing_blocks after the previous bundle's block); the chain's real surface (V5/V6 thread from the replayed state file, which can be ahead of the chain); and the finality record (V7 judged against /v1/anchors, the node's local finality — the node may answer 422 until a record covers the absorbed roots; retry)"},
         "absorbed": p.absorbed.iter().map(|a| json!({"root": digest_hex(&a.root), "leaf_count": a.count})).collect::<Vec<_>>(),
         "members": p.members.iter().enumerate().map(|(i, m)| json!({
-            "slot": i, "tag": format!("{:?}", m.tag), "pv_words": m.pvs.len(), "pv_keccak": pv_digest(&m.pvs), "proof_bytes": member_bytes[i],
+            "slot": i, "tag": format!("{:?}", m.tag), "pv_words": m.pvs.len(), "pv_keccak": pv_digest(&m.pvs), "proof_bytes": member_bytes[i], // debug-ok: a member tag, a unit enum
         })).collect::<Vec<_>>(),
         "claimed_burns": p.claimed.iter().map(|b| json!({
             "minted_height": b.height, "leaf_height": qlab_node::coinbase_leaf_appears_at(b.height), "leaf_pos": b.pos, "value": b.note.value,

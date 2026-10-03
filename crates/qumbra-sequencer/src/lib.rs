@@ -22,6 +22,101 @@ pub mod chain;
 pub mod intake;
 pub mod key;
 pub mod members;
+pub mod pass;
 pub mod queue;
 pub mod server;
 pub mod state;
+pub mod work;
+
+#[cfg(test)]
+mod tests {
+    /// Every source of this crate, by name.
+    const SOURCES: [(&str, &str); 12] = [
+        ("bundle.rs", include_str!("bundle.rs")),
+        ("chain.rs", include_str!("chain.rs")),
+        ("intake.rs", include_str!("intake.rs")),
+        ("key.rs", include_str!("key.rs")),
+        ("lib.rs", include_str!("lib.rs")),
+        ("main.rs", include_str!("main.rs")),
+        ("members.rs", include_str!("members.rs")),
+        ("queue.rs", include_str!("queue.rs")),
+        ("server.rs", include_str!("server.rs")),
+        ("state.rs", include_str!("state.rs")),
+        ("pass.rs", include_str!("pass.rs")),
+        ("work.rs", include_str!("work.rs")),
+    ];
+
+    /// A **text lint** (the `f5box_calls_no_rule_knob` shape): outside test
+    /// code no source of this crate Debug-formats a claim file, a
+    /// deposit-sum opening or a plan — `ClaimFile` and `DepEntry` derive
+    /// Debug while holding `v` and `r_v`, and a `Plan` holds both. The
+    /// guarantee is review; this keeps a `{file:?}` from creeping in.
+    #[test]
+    fn no_source_debug_formats_an_opening() {
+        let names = ["file", "files", "dep", "deps", "plan", "p", "claim", "draft"];
+        for (path, text) in SOURCES {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            for n in names {
+                for pat in [format!("{{{n}:?}}"), format!("{{{n}:#?}}"), format!("\", {n})"), format!("\", &{n})")] {
+                    let hit = code.match_indices(&pat).any(|(i, _)| {
+                        // `"…{:?}", p)` only matters after a Debug placeholder.
+                        !pat.starts_with('"') || code[..i].rsplit('\n').next().is_some_and(|line| line.contains(":?}"))
+                    });
+                    assert!(!hit, "{path} Debug-formats `{n}` outside tests ({pat})");
+                }
+            }
+        }
+    }
+
+    /// The name list above catches the obvious spellings; this catches the
+    /// rest: every Debug placeholder outside test code carries a
+    /// `// debug-ok: <why>` marker on its line, so a new one is a reviewed
+    /// one — the reviewer reads the reason, not a guess at the type.
+    #[test]
+    fn every_debug_format_is_marked() {
+        for (path, text) in SOURCES {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            for (i, line) in code.lines().enumerate() {
+                if (line.contains(":?}") || line.contains(":#?}")) && !line.trim_start().starts_with("//") {
+                    let why = line.split("// debug-ok:").nth(1).map(str::trim).unwrap_or("");
+                    assert!(!why.is_empty(), "{path}:{}: a Debug format with no `// debug-ok: <why>`", i + 1);
+                }
+            }
+        }
+    }
+
+    /// Lab #847's Q4 condition, as text: outside tests, the pass's sources
+    /// (`pass.rs`, `work.rs`, `main.rs`) never name an R member and never call
+    /// the general planner — only `plan_claims`, whose members are all C —
+    /// and `work.rs` checks [`crate::members::pass_members_ok`] before proving.
+    #[test]
+    fn the_pass_plans_no_r_member() {
+        for (path, text) in SOURCES.iter().filter(|(p, _)| ["pass.rs", "work.rs", "main.rs"].contains(p)) {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            for bad in ["WTag::R", "Inst::R", "members::plan(", "plan(&", " plan("] {
+                assert!(!code.contains(bad), "{path} names `{bad}` outside tests");
+            }
+        }
+        let work = include_str!("work.rs");
+        let (before, after) = work.split_once("pass_members_ok(&plan.members)?;").expect("work.rs checks the pass's member tags");
+        assert!(before.contains("plan_claims(") && after.contains("prove(&plan,"), "the check sits between planning and proving");
+    }
+
+    /// The binary's `run` drives the one real [`crate::work::RealWork`], whose
+    /// draft calls the real prover, and nothing in the crate outside tests
+    /// defines another `Work` — the stub seam exists only in `pass`'s tests
+    /// (the `f5box_calls_no_rule_knob` shape).
+    #[test]
+    fn run_names_the_real_prover() {
+        let main = include_str!("main.rs");
+        let work = include_str!("work.rs");
+        assert!(main.contains("work::RealWork::open("), "main.rs's run must build RealWork");
+        assert!(work.contains("prove(&plan, &mut timings, &mut log)"), "RealWork must call bundle::prove");
+        for (path, text) in SOURCES {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            let impls = code.matches("impl Work for ").count();
+            let want = usize::from(path == "work.rs");
+            assert_eq!(impls, want, "{path}: {impls} `impl Work` outside tests");
+        }
+    }
+}
