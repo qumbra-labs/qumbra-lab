@@ -64,6 +64,50 @@ pub const GENESIS_FILE_PATH: &str = "/genesis.qmb";
 
 const ANNULET: WireForm = WireForm::plain(GenesisForm::Annulet);
 
+/// The largest genesis file a verified scan will read (lab #850 AD1b). The
+/// gateway testnet's is 11,295 B (53 genesis notes); 1 MiB leaves room for
+/// thousands of genesis notes and registered assets, and is checked by name
+/// here as well as at the transport, so no fetch can hand the verifier more.
+pub const MAX_GENESIS_FILE_BYTES: usize = 1 << 20;
+
+/// Room for an HTTP status line and headers on top of a route's body bound —
+/// the transport's ceiling covers the whole response.
+pub const RESPONSE_HEAD_SLACK: usize = 16 * 1024;
+
+/// A `/v1/headers` answer's largest body: the 10-B prefix, a ≤ 9-B count
+/// varint, and [`MAX_HEADERS_PAGE`] sealed units.
+pub const MAX_HEADERS_ANSWER_BYTES: usize =
+    10 + 9 + MAX_HEADERS_PAGE * qlab_devnet::annulet::SEALED_HEADER_LEN_ANNULET;
+
+/// A `/v1/block/{h}/body` answer's largest body: the 10-B prefix over the
+/// node's own served-body bound.
+pub const MAX_BODY_ANSWER_BYTES: usize = 10 + qlab_p2p::node::MAX_SERVED_BODY_BYTES;
+
+/// A `/v1/registry/{asset}` answer's largest body: the slot route's 676 B is
+/// the widest registry answer; 4 KiB is stated headroom.
+pub const MAX_REGISTRY_ANSWER_BYTES: usize = 4 * 1024;
+
+/// **The whole-response ceiling for each route the verified scan reads**
+/// (lab #850 AD1b): a hostile endpoint cannot stream more than the route can
+/// legitimately carry into the wallet before anything is verified. `None` is
+/// a route whose bound is the transport's general GET cap (the paged scan
+/// routes: `/v1/compact`, `/v1/nullifiers`, `/full`, `/v1/registry/root`).
+pub fn response_ceiling(path: &str) -> Option<usize> {
+    let route = path.split_once('?').map_or(path, |(r, _)| r);
+    let body = if route == GENESIS_FILE_PATH {
+        MAX_GENESIS_FILE_BYTES
+    } else if route == qlab_p2p::served::HEADERS_PATH {
+        MAX_HEADERS_ANSWER_BYTES
+    } else if route.starts_with("/v1/block/") && route.ends_with("/body") {
+        MAX_BODY_ANSWER_BYTES
+    } else if route.starts_with("/v1/registry/") && route != "/v1/registry/root" {
+        MAX_REGISTRY_ANSWER_BYTES
+    } else {
+        return None;
+    };
+    Some(body + RESPONSE_HEAD_SLACK)
+}
+
 /// Why a verified scan was refused — each a reason the endpoint cannot be
 /// believed, never a figure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +116,8 @@ pub enum VerifyRefusal {
     NoPin,
     /// `/genesis.qmb` could not be read.
     GenesisUnavailable { why: String },
+    /// `/genesis.qmb` is longer than [`MAX_GENESIS_FILE_BYTES`].
+    GenesisTooLarge { got: usize },
     /// The bytes served are not the pinned genesis.
     GenesisMismatch { pinned: [u8; 32], fetched: [u8; 32] },
     /// The pinned bytes do not decode, or fail the file's own structure check.
@@ -116,6 +162,9 @@ impl std::fmt::Display for VerifyRefusal {
         match self {
             NoPin => write!(f, "no genesis pin: a verified Annulet scan needs the chain named by its genesis hash"),
             GenesisUnavailable { why } => write!(f, "GET {GENESIS_FILE_PATH}: {why}"),
+            GenesisTooLarge { got } => {
+                write!(f, "{GENESIS_FILE_PATH} is {got} B, over the {MAX_GENESIS_FILE_BYTES} B bound")
+            }
             GenesisMismatch { pinned, fetched } => write!(
                 f,
                 "the endpoint's genesis file hashes to {} but the pin is {} — a different chain",
@@ -175,6 +224,9 @@ where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
     let bytes = fetch(GENESIS_FILE_PATH).map_err(|why| VerifyRefusal::GenesisUnavailable { why })?;
+    if bytes.len() > MAX_GENESIS_FILE_BYTES {
+        return Err(VerifyRefusal::GenesisTooLarge { got: bytes.len() });
+    }
     let fetched = qlab_devnet::hash::keccak256(&bytes);
     if fetched != pin {
         return Err(VerifyRefusal::GenesisMismatch { pinned: pin, fetched });

@@ -721,6 +721,19 @@ pub fn scan_fetch(base_url: &str) -> impl FnMut(&str) -> Result<Vec<u8>, String>
     move |path: &str| http_get(base_url, path).map_err(|e| e.to_string())
 }
 
+/// The **verified Annulet scan's** fetch (lab #850 AD1b): [`scan_fetch`]
+/// with each route's own whole-response ceiling
+/// ([`crate::annulet_verify::response_ceiling`]) in place of the general GET
+/// cap, so `/genesis.qmb`, `/v1/headers`, `/v1/block/{h}/body` and the
+/// registry openings are refused by name past what they can legitimately
+/// carry — before the bytes are buffered, never after.
+#[cfg(feature = "verify")]
+pub fn verified_scan_fetch(base_url: &str) -> impl FnMut(&str) -> Result<Vec<u8>, String> + '_ {
+    move |path: &str| {
+        http_get_limited(base_url, path, crate::annulet_verify::response_ceiling(path)).map_err(|e| e.to_string())
+    }
+}
+
 /// Minimal hand-rolled HTTP/1.1 `POST` over the connect seam, returning
 /// `(status, body)`.
 ///
@@ -824,6 +837,41 @@ mod tests {
             read_response_limited(&mut response_bytes(9_000), None).expect("under the GET body cap");
         assert_eq!(status, 200);
         assert_eq!(body.len(), 9_000);
+    }
+
+    /// **Lab #850 AD1b, one per route**: each verified-scan route's ceiling
+    /// admits an answer at its legitimate maximum body and refuses one byte
+    /// of body past it, by name, before the response is parsed.
+    #[cfg(feature = "verify")]
+    #[test]
+    fn each_verified_route_refuses_a_response_past_its_own_ceiling() {
+        use crate::annulet_verify::{
+            response_ceiling, MAX_BODY_ANSWER_BYTES, MAX_GENESIS_FILE_BYTES, MAX_HEADERS_ANSWER_BYTES,
+            MAX_REGISTRY_ANSWER_BYTES, RESPONSE_HEAD_SLACK,
+        };
+        let head = response_bytes(0).get_ref().len();
+        for (path, body_max) in [
+            ("/genesis.qmb", MAX_GENESIS_FILE_BYTES),
+            ("/v1/headers?from=1&to=256", MAX_HEADERS_ANSWER_BYTES),
+            ("/v1/block/7/body", MAX_BODY_ANSWER_BYTES),
+            ("/v1/registry/1", MAX_REGISTRY_ANSWER_BYTES),
+        ] {
+            let ceiling = response_ceiling(path).expect("a bounded route");
+            assert_eq!(ceiling, body_max + RESPONSE_HEAD_SLACK, "{path}");
+            // The legitimate maximum is admitted.
+            let (_, body) = read_response_limited(&mut response_bytes(body_max), Some(ceiling))
+                .unwrap_or_else(|e| panic!("{path}: the maximum is admitted: {e}"));
+            assert_eq!(body.len(), body_max, "{path}");
+            // An oversized answer — past the whole ceiling — is refused by name.
+            let over = ceiling - head + 1;
+            let err = read_response_limited(&mut response_bytes(over), Some(ceiling))
+                .expect_err("past the ceiling is refused");
+            assert!(err.to_string().contains(&ceiling.to_string()), "{path}: {err}");
+        }
+        // The paged scan routes keep the transport's general cap.
+        for path in ["/v1/compact?from=0&to=9", "/v1/nullifiers?from=0&to=9", "/v1/registry/root", "/v1/block/1/tx/0/full"] {
+            assert_eq!(response_ceiling(path), None, "{path}");
+        }
     }
 
     /// The four classes the server's pinned response wire actually produces,

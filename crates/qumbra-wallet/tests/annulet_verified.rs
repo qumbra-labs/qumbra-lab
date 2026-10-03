@@ -463,3 +463,15 @@ fn the_spend_side_is_reported_unverified() {
     assert!(!v.spends_verified(), "lab #853: the nullifier list is the endpoint's");
     let _ = std::fs::remove_dir_all(&w.dir);
 }
+
+/// Lab #850 AD1b: a genesis file past its bound is refused by name in the
+/// verifier itself, whatever transport handed it over.
+#[test]
+fn an_oversized_genesis_file_is_refused_by_name() {
+    use qumbra_wallet::annulet_verify::{verify_genesis, MAX_GENESIS_FILE_BYTES};
+    let mut fetch = |_: &str| Ok(vec![0u8; MAX_GENESIS_FILE_BYTES + 1]);
+    assert_eq!(
+        verify_genesis(&mut fetch, [0; 32]).err(),
+        Some(VerifyRefusal::GenesisTooLarge { got: MAX_GENESIS_FILE_BYTES + 1 })
+    );
+}
