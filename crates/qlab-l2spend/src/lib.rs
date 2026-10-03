@@ -141,9 +141,20 @@ impl Endpoint for PlainHttp {
 }
 
 /// The served surfaces the assembly reads, over any [`Endpoint`].
+///
+/// [`Served::new`] reads an Annulet node's L2 routes at their own paths;
+/// [`Served::v6`] reads a V6 node's derived L2 index (lab #860 R1), the same
+/// wire under `/v1/l2/` — leaves, nullifiers, the registry opening. The
+/// routes a V6 node does not serve (registry slots, genesis notes, params,
+/// detection, `POST /v1/tx`) are refused by name under it, never fetched.
 pub struct Served<E: Endpoint> {
     pub endpoint: E,
+    /// `""` for an Annulet node, `"/v1/l2"` for a V6 node's index.
+    pub prefix: &'static str,
 }
+
+/// The V6 index's path prefix (lab #860 R1).
+pub const V6_L2_PREFIX: &str = "/v1/l2";
 
 fn served<T>(r: Result<T, String>) -> Result<T, SpendError> {
     r.map_err(SpendError::Served)
@@ -151,31 +162,72 @@ fn served<T>(r: Result<T, String>) -> Result<T, SpendError> {
 
 impl<E: Endpoint> Served<E> {
     pub fn new(endpoint: E) -> Self {
-        Self { endpoint }
+        Self { endpoint, prefix: "" }
+    }
+
+    /// A V6 node's derived L2 index, under [`V6_L2_PREFIX`].
+    pub fn v6(endpoint: E) -> Self {
+        Self { endpoint, prefix: V6_L2_PREFIX }
+    }
+
+    /// Refuse, by name, a route a V6 node does not serve.
+    fn annulet_only(&self, what: &str) -> Result<(), SpendError> {
+        if self.prefix.is_empty() {
+            Ok(())
+        } else {
+            Err(SpendError::Served(format!("{what} is not served by a V6 node's L2 index (lab #860): an Annulet route")))
+        }
     }
 
     /// The whole commitment tree, rebuilt in memory from the served leaves
     /// (nothing is cached: an L1 wallet's `tree-leaves.v1` is never touched).
     pub fn commitment_tree(&self) -> Result<CommitmentTree, SpendError> {
+        self.commitment_tree_to(None)
+    }
+
+    /// The commitment tree of the first `count` served leaves — the tree a
+    /// bundle's surface states (its `c_next`), even when the index has served
+    /// more since. Fewer served than `count` is refused by name.
+    pub fn commitment_tree_at(&self, count: u64) -> Result<CommitmentTree, SpendError> {
+        let tree = self.commitment_tree_to(Some(count))?;
+        if tree.len() < count {
+            return Err(SpendError::Served(format!("the served tree has {} leaves, fewer than the {count} the anchor states", tree.len())));
+        }
+        Ok(tree)
+    }
+
+    fn commitment_tree_to(&self, count: Option<u64>) -> Result<CommitmentTree, SpendError> {
         let mut tree = CommitmentTree::new();
         loop {
-            let body = served(self.endpoint.get(&format!("/v1/tree/leaves?from={}", tree.len())))?;
+            let body = served(self.endpoint.get(&format!("{}/tree/leaves?from={}", self.prefix_or("/v1"), tree.len())))?;
             let page = served(qlab_node::TreeLeaves::from_bytes(&body).map_err(|e| format!("tree leaves: {e:?}")))?;
             if page.leaves.is_empty() {
                 return Ok(tree);
             }
             for leaf in &page.leaves {
+                if count.is_some_and(|c| tree.len() >= c) {
+                    return Ok(tree);
+                }
                 tree.append_bytes(leaf);
             }
-            if tree.len() >= page.total {
+            if tree.len() >= page.total || count.is_some_and(|c| tree.len() >= c) {
                 return Ok(tree);
             }
         }
     }
 
+    /// The route base: the V6 prefix, or `annulet`'s own (`/v1`).
+    fn prefix_or(&self, annulet: &'static str) -> &'static str {
+        if self.prefix.is_empty() {
+            annulet
+        } else {
+            self.prefix
+        }
+    }
+
     /// The registry opening of `asset`, with the root it was computed against.
     pub fn registry(&self, asset: u64) -> Result<RegistryOpening, SpendError> {
-        let body = served(self.endpoint.get(&format!("/v1/registry/{asset}")))?;
+        let body = served(self.endpoint.get(&format!("{}/registry/{asset}", self.prefix_or("/v1"))))?;
         served(decode_registry_opening(&body).map_err(|e| format!("registry {asset}: {e:?}")))
     }
 
@@ -183,12 +235,14 @@ impl<E: Endpoint> Served<E> {
     /// root it was computed against (lab #728 — what a registry write proves
     /// against).
     pub fn registry_slot(&self, asset: u64) -> Result<RegistrySlotOpening, SpendError> {
+        self.annulet_only("a registry slot opening")?;
         let body = served(self.endpoint.get(&format!("/v1/registry/slot/{asset}")))?;
         served(decode_registry_slot(&body).map_err(|e| format!("registry slot {asset}: {e:?}")))
     }
 
     /// The genesis notes, opened, with the served genesis hash.
     pub fn genesis_notes(&self) -> Result<([u8; 32], Vec<L2Note>), SpendError> {
+        self.annulet_only("the genesis notes")?;
         let body = served(self.endpoint.get("/v1/genesis/notes"))?;
         let (hash, notes) = served(decode_genesis_notes(&body).map_err(|e| format!("genesis notes: {e:?}")))?;
         let opened = notes
@@ -201,6 +255,7 @@ impl<E: Endpoint> Served<E> {
     /// The fee tiers (lab #720's `GET /v1/annulet/params`), with the genesis
     /// hash they come from.
     pub fn params(&self) -> Result<qlab_cbserver::registry::AnnuletParams, SpendError> {
+        self.annulet_only("the Annulet fee tiers")?;
         let body = served(self.endpoint.get("/v1/annulet/params"))?;
         served(qlab_cbserver::registry::decode_annulet_params(&body).map_err(|e| format!("params: {e:?}")))
     }
@@ -210,7 +265,7 @@ impl<E: Endpoint> Served<E> {
         let mut spent = std::collections::HashSet::new();
         let mut from = 0u64;
         loop {
-            let body = served(self.endpoint.get(&format!("/v1/nullifiers?from={from}&to={}", u64::MAX)))?;
+            let body = served(self.endpoint.get(&format!("{}/nullifiers?from={from}&to={}", self.prefix_or("/v1"), u64::MAX)))?;
             let page = served(qlab_cbserver::codec::NullifierPage::from_bytes(&body).map_err(|e| format!("nullifiers: {e:?}")))?;
             for b in &page.blocks {
                 spent.extend(b.nullifiers.iter().copied());
@@ -227,6 +282,7 @@ impl<E: Endpoint> Served<E> {
     /// served one. The wallet's own scan (C1) is the driver; this is the
     /// harness's cross-check.
     pub fn detect(&self, dk: &qlab_note::kem::Dk, from: u64, to: u64) -> Result<Vec<L2Note>, SpendError> {
+        self.annulet_only("note detection")?;
         let body = served(self.endpoint.get(&format!("/v1/compact?from={from}&to={to}")))?;
         let blocks = served(qlab_cbserver::codec::decode_compact_response(&body).map_err(|e| format!("compact: {e:?}")))?;
         let mut found = Vec::new();
@@ -249,6 +305,7 @@ impl<E: Endpoint> Served<E> {
 
     /// Submit a transaction on the Annulet tx wire.
     pub fn submit(&self, tx: &TxEntry) -> Result<(), SpendError> {
+        self.annulet_only("POST /v1/tx")?;
         let wire = qlab_p2p::codec::encode_tx_annulet(tx);
         let (status, body) = served(self.endpoint.post("/v1/tx", &wire))?;
         submit_verdict(status, &body)
@@ -934,8 +991,15 @@ pub fn build_p_exit<E: Endpoint, R: rand::CryptoRng>(
     let tree = served.commitment_tree()?;
     let reg0 = served.registry(0)?;
     let ei = exit_instance(&tree, &reg0, input, ask, change_to.rkm, fee, rng)?;
+    Ok(prove_exit(&ei, fee, change_to, rng))
+}
+
+/// Prove an exit instance (the P lane, ≈ 30 GiB) and assemble its entry —
+/// [`build_p_exit`]'s last step, for a caller that built the instance
+/// against a tree and opening it checked itself (lab #860 R3).
+pub fn prove_exit<R: rand::CryptoRng>(ei: &ExitInstance, fee: u64, change_to: &Recipient, rng: &mut R) -> Built {
     let (_, proof) = qlab_l2::prove_p(&ei.inst);
-    Ok(exit_entry(&ei, &proof, fee, change_to, rng))
+    exit_entry(ei, &proof, fee, change_to, rng)
 }
 
 /// The `--out` file's leading bytes: what it is, then its version.
@@ -1317,6 +1381,87 @@ pub fn decode_claim_artifact(bytes: &[u8], expected_genesis: &[u8; 32], expected
 
 #[cfg(test)]
 mod tests {
+
+    /// `commitment_tree_at(n)` stops at `n` leaves across pages, even when
+    /// more are served, and refuses by name when fewer are.
+    #[test]
+    fn the_tree_at_a_count_truncates_and_refuses_a_short_serve() {
+        struct Leaves(Vec<[u8; 32]>);
+        impl Endpoint for Leaves {
+            fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+                let from: u64 = path.rsplit_once("from=").ok_or("no from")?.1.parse().map_err(|_| "from")?;
+                // Two leaves a page, to cross a page boundary.
+                let start = (from as usize).min(self.0.len());
+                let end = (start + 2).min(self.0.len());
+                let page = qlab_node::TreeLeaves { from, total: self.0.len() as u64, leaves: self.0[start..end].to_vec() };
+                Ok(page.to_bytes())
+            }
+            fn post(&self, _: &str, _: &[u8]) -> Result<(u16, Vec<u8>), String> {
+                Err("no".into())
+            }
+        }
+        let leaves: Vec<[u8; 32]> = (1..=5u8).map(|k| [k; 32]).collect();
+        let v6 = Served::v6(Leaves(leaves.clone()));
+        let mut want = CommitmentTree::new();
+        for l in &leaves[..3] {
+            want.append_bytes(l);
+        }
+        let got = v6.commitment_tree_at(3).unwrap();
+        assert_eq!((got.len(), got.root()), (3, want.root()), "three of five, across a page boundary");
+        assert_eq!(v6.commitment_tree().unwrap().len(), 5);
+        assert!(matches!(v6.commitment_tree_at(6), Err(SpendError::Served(ref why)) if why.contains("fewer than the 6")));
+    }
+
+    /// Lab #860 R3: `Served::v6` reads the index's routes under `/v1/l2`
+    /// (leaves, nullifiers, the registry opening), `Served::new` the Annulet
+    /// paths unchanged, and under `v6` every Annulet-only route is refused by
+    /// name without a fetch.
+    #[test]
+    fn served_v6_reads_under_the_l2_prefix_and_refuses_annulet_routes() {
+        use std::cell::RefCell;
+        struct Rec(RefCell<Vec<String>>);
+        impl Endpoint for &Rec {
+            fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+                self.0.borrow_mut().push(path.to_string());
+                Err("recorded".into())
+            }
+            fn post(&self, path: &str, _: &[u8]) -> Result<(u16, Vec<u8>), String> {
+                self.0.borrow_mut().push(format!("POST {path}"));
+                Err("recorded".into())
+            }
+        }
+        let rec = Rec(RefCell::new(Vec::new()));
+        let v6 = Served::v6(&rec);
+        let _ = v6.commitment_tree();
+        let _ = v6.commitment_tree_at(5);
+        let _ = v6.spent_nullifiers();
+        let _ = v6.registry(0);
+        assert_eq!(
+            *rec.0.borrow(),
+            ["/v1/l2/tree/leaves?from=0", "/v1/l2/tree/leaves?from=0", &format!("/v1/l2/nullifiers?from=0&to={}", u64::MAX), "/v1/l2/registry/0"]
+        );
+        rec.0.borrow_mut().clear();
+        let named = |e: Option<SpendError>| matches!(e, Some(SpendError::Served(ref why)) if why.contains("not served by a V6 node"));
+        assert!(named(v6.registry_slot(1).err()), "registry slot");
+        assert!(named(v6.params().err()), "params");
+        assert!(named(v6.genesis_notes().err()), "genesis notes");
+        let dk = qlab_note::kem::generate_keypair(&mut rand::rng()).dk;
+        assert!(named(v6.detect(&dk, 0, 1).err()), "detection");
+        let public = qlab_devnet::body::TxPublic {
+            anchor: [0; 32],
+            nullifiers: vec![],
+            commitments: vec![],
+            bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
+            fee: 0,
+        };
+        let tx = TxEntry { proof: vec![], public, discovery: vec![0], rider: vec![], l2: vec![] };
+        assert!(named(v6.submit(&tx).err()), "POST /v1/tx");
+        assert!(rec.0.borrow().is_empty(), "an Annulet-only route is refused without a fetch");
+        let annulet = Served::new(&rec);
+        let _ = annulet.commitment_tree();
+        let _ = annulet.registry(0);
+        assert_eq!(*rec.0.borrow(), ["/v1/tree/leaves?from=0", "/v1/registry/0"], "the Annulet paths do not move");
+    }
     use super::*;
     use qlab_air::l2::RegistryWitness;
 

@@ -139,6 +139,8 @@ pub mod asset_view;
 pub mod annulet_send;
 #[cfg(feature = "prove")]
 pub mod issuer;
+#[cfg(feature = "prove")]
+pub mod exit_v6;
 pub mod bundle;
 pub mod coinbase;
 pub mod deposit;

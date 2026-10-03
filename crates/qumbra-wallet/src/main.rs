@@ -31,6 +31,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("miner-rkm") => miner_rkm(&args[1..]),
         Some("send") => send(&args[1..]),
         Some("deposit") => deposit(&args[1..]),
+        Some("exit") => exit_v6_cmd(&args[1..]),
         Some("names") => names(&args[1..]),
         Some("issuer") => issuer(&args[1..]),
         Some("ivk") => ivk(&args[1..]),
@@ -449,6 +450,12 @@ fn usage() {
                             write it for the sequencer — the file reveals the deposit amount. The\n\
                             claim opens at the newest valid anchor unless --anchor-count picks\n\
                             another served root; it is taken once a wrapper absorbs that root\n  \
+         qumbra-wallet exit --net v6 --dir DIR --url URL [--node URL] --scan-to N --l2-id N --genesis-hash HEX64\n\
+                            --exit-to ADDR [--amount V] (--out FILE | --plan-only) [--submit --intake IP:PORT]\n\
+                            exit one claim credit WHOLE from the V6 L2 to an L1 address (the P lane, about\n\
+                            30 GiB, local only), anchored to the last landed bundle after checking the\n\
+                            node's L2 index against that bundle's own stated roots; --submit hands the\n\
+                            file to the sequencer's intake, which HOLDS exits until it plans them (R3b)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet ivk export --dir DIR [--i-understand-this-is-a-viewing-key]\n  \
                             the incoming viewing key as hex on stdout, for a scan-only host; writes\n\
@@ -1244,6 +1251,100 @@ fn deposit_claim(args: &[String]) -> Result<(), Box<dyn Error>> {
         out.display(),
         qlab_l2spend::CLAIM_ARTIFACT_VERSION
     );
+    Ok(())
+}
+
+/// `exit --net v6` (lab #860 R3): one claim credit of this wallet, exited
+/// whole from a V6 chain's L2 to an L1 address. The gate is W3a's (`/v1/l2`
+/// must confirm `--l2-id` and `--genesis-hash`); the anchor and its check are
+/// [`qumbra_wallet::exit_v6::plan`]'s, all before the proof (self-consistency
+/// of the node's index and bundle — L1 inclusion is R3c); the file binds
+/// the V6 genesis. `--submit` POSTs it to the sequencer's intake, which holds
+/// exits until the sequencer plans them (R3b).
+fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::exit_v6::{self, EXIT_FEE_V6};
+    match flag(args, "--net") {
+        Some("v6") => {}
+        Some(other) => {
+            return Err(format!("`exit` is the V6 exit (--net v6); --net {other} is refused here — an Annulet exit is `send --net annulet --exit-to`").into())
+        }
+        None => return Err("`exit` requires --net v6 (the V6 bridge's exit; an Annulet exit is `send --net annulet --exit-to`)".into()),
+    }
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("exit requires --url (compact/scan endpoint)")?;
+    let node_url = flag(args, "--node").unwrap_or(url);
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("exit requires --scan-to HEIGHT")?.parse()?;
+    let l2_id: u64 = flag(args, "--l2-id").ok_or("exit requires --l2-id N, which the chain must confirm")?.parse()?;
+    let genesis = flag(args, "--genesis-hash").ok_or("exit requires --genesis-hash HEX64, which the node must confirm")?;
+    let genesis = qumbra_wallet::annulet::parse_genesis_hash(genesis)?;
+    let to = flag(args, "--exit-to").ok_or("exit requires --exit-to ADDR (the L1 address the exit pays)")?;
+    let to = qlab_wallet::address::Address::decode(to).ok_or("--exit-to is not a wallet address (the L1 recipient)")?;
+    let amount: Option<u64> = flag(args, "--amount").map(str::parse).transpose()?;
+    let plan_only = has_flag(args, "--plan-only");
+    let out = flag(args, "--out").map(std::path::Path::new);
+    match out {
+        Some(path) => refuse_out_path(path)?,
+        None if !plan_only => return Err("exit writes the proven exit to --out FILE (or pass --plan-only)".into()),
+        None => {}
+    }
+    let submit = has_flag(args, "--submit");
+    if submit && plan_only {
+        return Err("--submit with --plan-only: a plan proves and writes nothing, so there is nothing to hand over".into());
+    }
+    let intake = match (submit, flag(args, "--intake")) {
+        (true, Some(a)) => Some(a.parse::<std::net::SocketAddr>().map_err(|_| format!("--intake {a} is not an ip:port address"))?),
+        (true, None) => return Err("--submit requires --intake IP:PORT (the sequencer's intake, loopback or a tunnel to it)".into()),
+        (false, Some(_)) => return Err("--intake without --submit: pass --submit to hand the file over".into()),
+        (false, None) => None,
+    };
+
+    // The gate (W3a's rule): the node must bridge exactly this L2 on exactly
+    // this genesis; the claim tier comes from the same answer.
+    let answer = qumbra_wallet::deposit::fetch_l2(node_url)
+        .map_err(|e| format!("the node did not say which L2 its chain bridges ({e}); refusing to build an exit"))?;
+    let route = qumbra_wallet::deposit::check_bridge(&answer, l2_id, &genesis)?;
+    let w = WalletDir::open(&dir)?;
+    let wallet = w.wallet();
+    let gathered = qumbra_wallet::scan::gather(&w, url, 0, scan_to, qlab_devnet::forms::GenesisForm::V5);
+    let served = qlab_l2spend::Served::v6(qumbra_wallet::annulet_send::WalletEndpoint { url: node_url.to_string() });
+    let mut rng = rand::rng();
+    let change_to = qumbra_wallet::annulet_send::me(&w);
+    let plan = exit_v6::plan(&served, &wallet, &gathered.set_aside, l2_id, route.claim_fee_tier, to.rkm_lanes(), &change_to, amount, &mut rng)?;
+    let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    println!(
+        "plan: exit {} bessel — the whole credit of the claim of the deposit at height {} — to L1 {}, fee {EXIT_FEE_V6}",
+        plan.credit.note.value, plan.credit.height, to.short().encode()
+    );
+    println!(
+        "  anchor: bundle {} at height {}, its stated C over {} leaves — the served leaves and the asset-0 registry opening fold to its stated roots",
+        hex(&plan.anchor_id),
+        plan.anchor_height,
+        plan.c_next
+    );
+    println!(
+        "  trust: the L2 index is checked against that bundle, but the anchor bundle's L1 inclusion is NOT verified by \
+         this wallet — a lying node can waste a proof, never funds; nullifier completeness is NOT verified (lab #853): \
+         a credit already spent would be refused by the chain, not here"
+    );
+    println!("  prove:  the P lane, about 30 GiB, on this machine only");
+    println!("  HELD:   the sequencer holds exits until it plans them (lab #860 R3b) — this exit will not land before that");
+    if plan_only {
+        println!("--plan-only: nothing proved or written");
+        return Ok(());
+    }
+    let built = qlab_l2spend::prove_exit(&plan.ei, EXIT_FEE_V6, &change_to, &mut rng);
+    let bytes = qlab_l2spend::encode_exit_artifact(&genesis, &built.tx);
+    let out = out.expect("checked above");
+    write_new_atomically(out, &bytes)?;
+    println!("wrote {}: the proven exit (exit file version {}, bound to this chain's genesis)", out.display(), qlab_l2spend::EXIT_ARTIFACT_VERSION);
+    if let Some(addr) = intake {
+        let (status, body) = qumbra_wallet::net::http_post_bytes(&format!("http://{addr}"), "/v1/intake", &bytes)
+            .map_err(|e| format!("POST /v1/intake did not complete ({e}); the file stays at {}", out.display()))?;
+        match qumbra_wallet::exit_v6::intake_verdict(status, &body) {
+            Ok(line) => println!("{line}"),
+            Err(why) => return Err(format!("{why}; the file stays at {}", out.display()).into()),
+        }
+    }
     Ok(())
 }
 

@@ -2068,6 +2068,7 @@ dependencies = [
  "qlab-note",
  "qlab-p2p",
  "qlab-wallet",
+ "qlab-wrapper",
  "qrcode",
  "qumbra-explorer",
  "qumbra-faucet",
