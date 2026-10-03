@@ -100,11 +100,14 @@ fn run_pass(args: &[String]) -> Result<ExitCode, String> {
             eprintln!("SEQ stopped at a ceiling: {why}");
             Ok(ExitCode::from(3))
         }
-        Outcome::Short { have, need } => {
+        Outcome::Short { have, need, why } => {
             eprintln!(
                 "SEQ not plannable: {have} of the {need} members a wrapper holds (claims, plus one filler per spendable \
                  sequencer note) — `seed` gives the sequencer its first notes"
             );
+            for line in why {
+                eprintln!("SEQ   {line}");
+            }
             Ok(ExitCode::from(4))
         }
     }
