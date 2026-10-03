@@ -176,8 +176,9 @@ pub enum NotDrafted {
     Nothing,
     /// Fewer members than a wrapper holds, counting one filler per
     /// spendable sequencer note — or no claim at all (a wrapper of padding
-    /// is never posted).
-    Short { have: usize, need: usize },
+    /// is never posted). `why` names each claim left out and the fillers'
+    /// shortfall, one line each.
+    Short { have: usize, need: usize, why: Vec<String> },
     /// Items refused at plan time, by id, each with its named reason.
     Refuse(Vec<([u8; 32], Refusal)>),
     /// Not plannable yet for a reason a later poll may clear (no absorbable
@@ -220,8 +221,8 @@ pub enum Outcome {
     Drained { landed: u64 },
     /// A ceiling was reached; the string names what is left.
     Ceiling(String),
-    /// Fewer real members than a wrapper holds.
-    Short { have: usize, need: usize },
+    /// Fewer real members than a wrapper holds, with the reasons by name.
+    Short { have: usize, need: usize, why: Vec<String> },
 }
 
 /// The pending record: the one bundle in flight.
@@ -327,6 +328,8 @@ impl Run<'_> {
         if self.clock.now().saturating_add(self.cfg.poll_secs) > self.deadline {
             return Err(Outcome::Ceiling(format!("--max-wait reached while {what}")));
         }
+        // Never silent: every poll says what it waits for.
+        eprintln!("SEQ waiting: {what}; next poll in {} s", self.cfg.poll_secs);
         self.clock.sleep(self.cfg.poll_secs);
         Ok(())
     }
@@ -489,11 +492,11 @@ pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, wo
         let draft = match r.work.draft(&w, &candidates)? {
             Ok(d) => d,
             Err(NotDrafted::Nothing) => return Ok(Outcome::Drained { landed: r.landed }),
-            Err(NotDrafted::Short { have, need }) => {
+            Err(NotDrafted::Short { have, need, why }) => {
                 if r.landed > 0 || have == 0 {
                     return Ok(Outcome::Drained { landed: r.landed });
                 }
-                return Ok(Outcome::Short { have, need });
+                return Ok(Outcome::Short { have, need, why });
             }
             Err(NotDrafted::Refuse(refused)) => {
                 for (id, why) in refused {
@@ -630,7 +633,7 @@ mod tests {
                 return Ok(Err(NotDrafted::Nothing));
             }
             if c.len() < self.need {
-                return Ok(Err(NotDrafted::Short { have: c.len(), need: self.need }));
+                return Ok(Err(NotDrafted::Short { have: c.len(), need: self.need, why: vec!["fake".into()] }));
             }
             let items: Vec<[u8; 32]> = c.iter().take(self.need).map(|(id, _)| *id).collect();
             let bytes: Vec<u8> = items.iter().flatten().copied().chain(self.committed.len().to_le_bytes()).collect();
@@ -803,7 +806,7 @@ mod tests {
         }
         let mut work = fake(2);
         let out = run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
-        assert_eq!(out, Outcome::Short { have: 1, need: 2 });
+        assert_eq!(out, Outcome::Short { have: 1, need: 2, why: vec!["fake".into()] });
         assert_eq!(q.item(&id).unwrap().state, State::Queued);
         assert!(work.committed.is_empty() && !Pending::path(&cfg.state).exists());
         let _ = std::fs::remove_dir_all(&d);
@@ -816,7 +819,7 @@ mod tests {
         let (d, mut q, id, cfg) = setup("short");
         let node = FakeNode::new(100);
         let mut work = fake(16);
-        assert_eq!(run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap(), Outcome::Short { have: 1, need: 16 });
+        assert_eq!(run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap(), Outcome::Short { have: 1, need: 16, why: vec!["fake".into()] });
         let mut work = FakeWork { refuse: vec![id], ..fake(1) };
         assert_eq!(run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap(), Outcome::Drained { landed: 0 });
         assert_eq!(q.item(&id).unwrap().state, State::Refused(Refusal::CnfOnChain));
@@ -884,7 +887,7 @@ mod tests {
         q.set_state(&id, State::Planned(7)).unwrap();
         let mut work = fake(2);
         let out = run(&cfg, &mut q, &FakeNode::new(100), &FakeClock(Cell::new(0)), &mut work).unwrap();
-        assert_eq!(out, Outcome::Short { have: 1, need: 2 });
+        assert_eq!(out, Outcome::Short { have: 1, need: 2, why: vec!["fake".into()] });
         assert_eq!(q.item(&id).unwrap().state, State::Queued);
         let _ = std::fs::remove_dir_all(&d);
     }

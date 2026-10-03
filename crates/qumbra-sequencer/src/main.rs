@@ -13,7 +13,8 @@
 //!   claims, proves, signs, posts to the operator listener, and records a
 //!   bundle only once `/v1/wrapper` names it. Exit 0 when nothing is left to
 //!   plan and nothing is in flight; 3 at a ceiling (`--max-bundles`,
-//!   `--max-wait`, re-posts), naming what is left; 4 when the plannable
+//!   `--max-wait`, re-posts — a claim waiting for a finality record to cover
+//!   its anchor root is such a wait), naming what is left; 4 when the plannable
 //!   claims plus one filler per spendable sequencer note are fewer than 16, or
 //!   no claim is plannable (S3: the sequencer fills with S self-transfers of
 //!   its own notes; before it holds any — S3b seeds them — a wrapper needs 16
@@ -55,7 +56,8 @@ const USAGE: &str = "usage: qumbra-sequencer intake --genesis FILE --queue DIR -
 /// `--max-bundles` default: one bundle per pass.
 const DEFAULT_MAX_BUNDLES: u64 = 1;
 /// `--max-wait` default: two hours — a spacing floor (48 blocks ≈ 1 h) and
-/// a landing, with room.
+/// a landing, with room. Every wait counts against it, a claim waiting for
+/// a finality record to cover its anchor included; reaching it is exit 3.
 const DEFAULT_MAX_WAIT_SECS: u64 = 7200;
 /// `--poll` default.
 const DEFAULT_POLL_SECS: u64 = 30;
@@ -100,11 +102,14 @@ fn run_pass(args: &[String]) -> Result<ExitCode, String> {
             eprintln!("SEQ stopped at a ceiling: {why}");
             Ok(ExitCode::from(3))
         }
-        Outcome::Short { have, need } => {
+        Outcome::Short { have, need, why } => {
             eprintln!(
                 "SEQ not plannable: {have} of the {need} members a wrapper holds (claims, plus one filler per spendable \
-                 sequencer note) — `seed` gives the sequencer its first notes"
+                 sequencer note):"
             );
+            for line in why {
+                eprintln!("SEQ   {line}");
+            }
             Ok(ExitCode::from(4))
         }
     }
