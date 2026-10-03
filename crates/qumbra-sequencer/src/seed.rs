@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 use qlab_air::claim::{claim_cnf, l1_cm, BurnNote};
 use qlab_cbserver::tree::CommitmentTree;
-use qlab_l2spend::Endpoint;
+use qlab_l2spend::{ClaimError, Endpoint};
 use qlab_ledger::deposits::{SetAside, SetAsideKind};
 use qlab_wallet::seed::MasterSeed;
 use qlab_wallet::Wallet;
@@ -128,7 +128,8 @@ pub fn plan_text(shortfall: usize, pending: usize, claims_to_make: usize, burn: 
     let secs = shortfall as u64 * (L1_PROOF_SECS + BLOCK_SECS) + claims_to_make as u64 * CLAIM_PROOF_SECS;
     format!(
         "seed plan: {pending} deposit(s) already pending; {shortfall} burn(s) of {burn} bessel to make (fee {fee} each), \
-         one per L1 transaction, each mined before the next; {claims_to_make} claim(s) to prove.\n  \
+         one per L1 transaction, each mined before the next (a burn left in flight by an earlier run is waited \
+         for, never burned again); {claims_to_make} claim(s) to prove.\n  \
          funded: {funded_line}\n  \
          budget: {shortfall} L1 proof(s) at ≈ {L1_PROOF_GIB} GiB / ≈ {L1_PROOF_SECS} s, {claims_to_make} claim proof(s) at \
          ≈ {CLAIM_PROOF_GIB} GiB / ≈ {CLAIM_PROOF_SECS} s, one block (≈ {BLOCK_SECS} s) per burn — ≈ {} min wall",
@@ -139,7 +140,7 @@ pub fn plan_text(shortfall: usize, pending: usize, claims_to_make: usize, burn: 
 /// The claim `seed` makes of one pending deposit: the wallet's own burn,
 /// opened under the root at `anchor_count`, `r_v` from the L1 wallet's
 /// `claim_blinds`, credited to the filler wallet with the cnf-bound rseed.
-/// Returns the instance and its `r_v`.
+/// Returns the instance and its `r_v`, or the builder's own refusal.
 pub fn seed_claim(
     tree: &CommitmentTree,
     anchor_count: u64,
@@ -148,7 +149,7 @@ pub fn seed_claim(
     fee: u64,
     wallet: &Wallet,
     keys: &Keys,
-) -> Result<(qlab_air::claim::ClaimInstance, [u64; 4]), String> {
+) -> Result<(qlab_air::claim::ClaimInstance, [u64; 4]), ClaimError> {
     let note = BurnNote {
         value: deposit.note.value,
         rkm: qlab_ledger::deposits::burn_rkm(l2_id),
@@ -158,8 +159,21 @@ pub fn seed_claim(
     let cm = l1_cm(note.value, &note.rkm, &note.rho, &note.rseed);
     let (r_v, _) = wallet.claim_blinds(&cm);
     let credit = keys.seed_credit(&claim_cnf(&cm, &note.rseed));
-    let inst = qlab_l2spend::claim_instance(tree, anchor_count, &note, l2_id, &r_v, &credit, fee).map_err(|e| e.to_string())?;
+    let inst = qlab_l2spend::claim_instance(tree, anchor_count, &note, l2_id, &r_v, &credit, fee)?;
     Ok((inst, r_v))
+}
+
+/// Why a pending deposit was not claimed this run, in words an operator can
+/// act on: only a burn above the newest finalized anchor is a wait — every
+/// other refusal is named as what it is, so nobody waits for an anchor that
+/// would never help.
+pub fn skip_reason(height: u64, e: &ClaimError) -> String {
+    match e {
+        ClaimError::AboveAnchor { .. } => format!(
+            "the deposit at height {height} is not yet under a finalized anchor ({e}) — a rerun claims it once one covers it"
+        ),
+        _ => format!("the deposit at height {height} cannot be claimed: {e}"),
+    }
 }
 
 /// The pending deposits to `l2_id` among `set_aside`, oldest first.
@@ -177,6 +191,36 @@ fn hex(b: &[u8]) -> String {
 /// A claim file's path: one per burn, named by the burn's commitment.
 pub fn claim_path(out: &Path, deposit: &SetAside) -> PathBuf {
     out.join("claims").join(format!("{}.claim", hex(&deposit.cm)))
+}
+
+/// The marker beside a claim file that the intake took it (202 or 409).
+pub fn taken_path(claim: &Path) -> PathBuf {
+    let mut p = claim.as_os_str().to_owned();
+    p.push(".taken");
+    PathBuf::from(p)
+}
+
+/// The claim files under `--out/claims/` not yet marked taken, in name
+/// order — every one is POSTed again on every run until the intake takes it.
+pub fn untaken(out: &Path) -> Result<Vec<PathBuf>, String> {
+    let dir = out.join("claims");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(Vec::new()) };
+    let mut files: Vec<PathBuf> = rd
+        .map(|e| e.map(|e| e.path()).map_err(|e| format!("{}: {e}", dir.display())))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "claim") && !taken_path(p).exists())
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+/// The in-flight burn record: written after the burn is proved and before
+/// it is POSTed (the spend flow's pre-submit hook), holding how many
+/// deposits were pending before it; cleared once the scan shows more. A
+/// rerun that finds it waits for that burn instead of proving another.
+pub fn inflight_path(out: &Path) -> PathBuf {
+    out.join("burn-in-flight")
 }
 
 impl Seed {
@@ -199,9 +243,35 @@ impl Seed {
         (pending(&r.set_aside, self.chain().l2_id), tx.map(|t| t + mined))
     }
 
-    /// The run: plan, burn the shortfall (each mined before the next), then
-    /// claim every pending deposit without a claim file, and hand each to the
-    /// intake.
+    /// Poll until more than `before` deposits are pending, bounded by
+    /// `--max-wait`; the count reached, or a named refusal.
+    fn wait_mined(&self, w: &WalletDir, before: usize, what: &str) -> Result<usize, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.max_wait_secs);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(self.poll_secs));
+            let (now, _) = self.scan(w, self.tip()?);
+            if now.len() > before {
+                return Ok(now.len());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{what} was posted but not seen mined within {} s — rerun `seed` once it is (it waits for it, never \
+                     burning again). If the node dropped it, remove {} and rerun",
+                    self.max_wait_secs,
+                    inflight_path(&self.out).display()
+                ));
+            }
+        }
+    }
+
+    /// The run: wait for a burn a previous run left in flight, plan, burn
+    /// the shortfall (each mined before the next), claim every pending
+    /// deposit without a claim file, and hand every untaken claim file to
+    /// the intake.
+    ///
+    /// A fresh `--out` forgets which claims were made: it re-proves them,
+    /// and the intake answers the repeats 409 (the same cnf) — no harm, only
+    /// the proofs' cost.
     pub fn run(&self) -> Result<(), String> {
         let chain = self.chain();
         let route = qumbra_wallet::deposit::check_bridge(
@@ -210,15 +280,34 @@ impl Seed {
             chain.l2_id,
             &chain.genesis,
         )?;
-        if self.burn <= route.claim_fee_tier {
-            return Err(format!("--burn {} is not above the claim tier {}: its claim would credit nothing", self.burn, route.claim_fee_tier));
+        if route.claim_fee_tier != chain.claim_fee_tier {
+            return Err(format!(
+                "the node's claim tier {} is not the genesis file's {}: refusing to build claims either would refuse",
+                route.claim_fee_tier, chain.claim_fee_tier
+            ));
+        }
+        if self.burn <= chain.claim_fee_tier {
+            return Err(format!("--burn {} is not above the claim tier {}: its claim would credit nothing", self.burn, chain.claim_fee_tier));
         }
         let w = l1_wallet(&self.out.join("l1-wallet"), &self.key)?;
         let wallet = w.wallet();
         let keys = Keys::from_seed(*self.key.filler_seed);
         let fee = qlab_devnet::fees::posted_fee(qlab_devnet::fees::ArityBucket::TwoByTwo);
-        let tip = self.tip()?;
-        let (deposits, funded) = self.scan(&w, tip);
+        let inflight = inflight_path(&self.out);
+        let (mut deposits, mut funded) = self.scan(&w, self.tip()?);
+        if let Ok(text) = std::fs::read_to_string(&inflight) {
+            let before: usize = text.trim().parse().map_err(|_| format!("{}: not a deposit count", inflight.display()))?;
+            if deposits.len() <= before {
+                println!("seed: a burn from an earlier run is in flight ({}); waiting for it before anything else", inflight.display());
+                if !self.plan {
+                    self.wait_mined(&w, before, "the earlier run's burn")?;
+                    (deposits, funded) = self.scan(&w, self.tip()?);
+                }
+            }
+            if deposits.len() > before {
+                let _ = std::fs::remove_file(&inflight);
+            }
+        }
         let short = shortfall(self.count, deposits.len());
         let unclaimed = deposits.iter().filter(|d| !claim_path(&self.out, d).exists()).count();
         println!("seed: L1 wallet address {}", hex(&wallet.address_at_index(0).to_raw_bytes()));
@@ -236,11 +325,15 @@ impl Seed {
             None => return Err("the L1 wallet's spendable figure is UNAVAILABLE (the scan was incomplete): refusing to burn".into()),
         }
         if self.plan {
-            println!("--plan: nothing burned, proved or written");
+            println!(
+                "--plan: nothing burned, proved or posted — only the wallet directory ({}) was created",
+                w.dir.display()
+            );
             return Ok(());
         }
 
-        // The burns, one per transaction, each mined before the next.
+        // The burns, one per transaction, each mined before the next. The
+        // in-flight record goes down after the proof and before the POST.
         let burn_to = qumbra_wallet::deposit::burn_address(&wallet, chain.l2_id);
         let mut have = deposits.len();
         for i in 0..short {
@@ -258,71 +351,60 @@ impl Seed {
                 form: self.genesis.forms().0,
             };
             let mut sink = |s: qumbra_wallet::spend::SendStep| eprintln!("SEED burn {}: {s:?}", i + 1); // debug-ok: SendStep is the flow's progress — counts, roots, timings, the node's answer; no opening
-            qumbra_wallet::spend::execute_opened(&req, &w, &mut sink).map_err(|e| format!("burn {} of {short}: {e}", i + 1))?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.max_wait_secs);
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(self.poll_secs));
-                let (now, _) = self.scan(&w, self.tip()?);
-                if now.len() > have {
-                    have = now.len();
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "burn {} of {short} was accepted but not seen mined within {} s — rerun `seed` once it is: \
-                         it counts the deposits already made",
-                        i + 1,
-                        self.max_wait_secs
-                    ));
-                }
-            }
+            let mut record = |_: &[u8]| crate::state::write_atomic(&inflight, have.to_string().as_bytes());
+            qumbra_wallet::spend::execute_opened_with_pre_submit(&req, &w, &mut sink, &mut record)
+                .map_err(|e| format!("burn {} of {short}: {e}", i + 1))?;
+            have = self.wait_mined(&w, have, &format!("burn {} of {short}", i + 1))?;
+            let _ = std::fs::remove_file(&inflight);
         }
 
         // The claims: every pending deposit without a file.
         let (deposits, _) = self.scan(&w, self.tip()?);
         let todo: Vec<&SetAside> = deposits.iter().filter(|d| !claim_path(&self.out, d).exists()).collect();
-        if todo.is_empty() {
-            println!("seed: every pending deposit has its claim file under {}", self.out.join("claims").display());
-            return Ok(());
-        }
-        std::fs::create_dir_all(self.out.join("claims")).map_err(|e| format!("{}: {e}", self.out.display()))?;
-        let (synced, newest) = qumbra_wallet::sync::sync_and_select(
-            &w.dir,
-            &qumbra_wallet::net::HttpLeafSource::new(self.node.as_str()),
-            &qumbra_wallet::net::HttpAnchorSource::new(self.node.as_str()),
-        )
-        .map_err(|e| format!("the L1 tree or its anchor: {e}"))?;
-        let mut refused = Vec::new();
-        for d in todo {
-            // A burn mined after the newest finalized anchor cannot be opened
-            // under it yet: named, skipped, and claimed by a rerun.
-            let (inst, r_v) = match seed_claim(&synced.tree, newest.count, d, chain.l2_id, route.claim_fee_tier, &wallet, &keys) {
-                Ok(c) => c,
-                Err(e) => {
-                    refused.push(format!(
-                        "the deposit at height {} (not claimed: {e} — rerun once a finalized anchor covers it)",
-                        d.height
-                    ));
-                    continue;
-                }
-            };
-            let proof = qlab_l2spend::prove_claim(&inst);
-            let bytes = qlab_l2spend::encode_claim_artifact(&chain.genesis, chain.l2_id, &inst.pvs, &proof, d.note.value, &r_v);
-            let path = claim_path(&self.out, d);
-            crate::state::write_atomic(&path, &bytes)?;
-            match self.intake {
-                None => println!("seed: wrote {}", path.display()),
-                Some(addr) => match (qlab_l2spend::PlainHttp { addr }).post(INTAKE_PATH, &bytes) {
-                    Ok((202 | 409, _)) => println!("seed: wrote {} and the intake took it", path.display()),
-                    Ok((status, body)) => refused.push(format!("{} ({status}: {})", path.display(), String::from_utf8_lossy(&body))),
-                    Err(e) => refused.push(format!("{} ({e})", path.display())),
-                },
+        let mut problems = Vec::new();
+        if !todo.is_empty() {
+            std::fs::create_dir_all(self.out.join("claims")).map_err(|e| format!("{}: {e}", self.out.display()))?;
+            let (synced, newest) = qumbra_wallet::sync::sync_and_select(
+                &w.dir,
+                &qumbra_wallet::net::HttpLeafSource::new(self.node.as_str()),
+                &qumbra_wallet::net::HttpAnchorSource::new(self.node.as_str()),
+            )
+            .map_err(|e| format!("the L1 tree or its anchor: {e}"))?;
+            for d in todo {
+                let (inst, r_v) = match seed_claim(&synced.tree, newest.count, d, chain.l2_id, chain.claim_fee_tier, &wallet, &keys) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        problems.push(skip_reason(d.height, &e));
+                        continue;
+                    }
+                };
+                let proof = qlab_l2spend::prove_claim(&inst);
+                let bytes = qlab_l2spend::encode_claim_artifact(&chain.genesis, chain.l2_id, &inst.pvs, &proof, d.note.value, &r_v);
+                let path = claim_path(&self.out, d);
+                crate::state::write_atomic(&path, &bytes)?;
+                println!("seed: wrote {}", path.display());
             }
         }
-        if refused.is_empty() {
+
+        // Every claim file not yet taken — this run's and any an earlier run
+        // wrote but never handed over — goes to the intake.
+        if let Some(addr) = self.intake {
+            for path in untaken(&self.out)? {
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                match (qlab_l2spend::PlainHttp { addr }).post(INTAKE_PATH, &bytes) {
+                    Ok((202 | 409, _)) => {
+                        crate::state::write_atomic(&taken_path(&path), b"")?;
+                        println!("seed: the intake took {}", path.display());
+                    }
+                    Ok((status, body)) => problems.push(format!("{} ({status}: {})", path.display(), String::from_utf8_lossy(&body))),
+                    Err(e) => problems.push(format!("{} ({e})", path.display())),
+                }
+            }
+        }
+        if problems.is_empty() {
             Ok(())
         } else {
-            Err(format!("{} claim(s) not handed over — every file written stays in place: {}", refused.len(), refused.join("; ")))
+            Err(format!("{} item(s) not done — every file written stays in place, a rerun retries: {}", problems.len(), problems.join("; ")))
         }
     }
 }
@@ -389,5 +471,31 @@ mod tests {
         assert_eq!((own.value, own.rho), (note.value - 4, claim_cnf(&cm, &note.rseed)));
         assert_eq!(crate::members::own_credit(&inst.pvs, note.value, &Keys::from_seed([2; 32])), None);
         assert!(claim_path(Path::new("/o"), &deposit).ends_with(format!("claims/{}.claim", hex(&deposit.cm))));
+
+        // A burn past the newest finalized anchor is a wait, named as one;
+        // any other refusal is named as what it is, never as a wait.
+        let err = seed_claim(&tree, 1, &deposit, 1, 4, &l1, &keys).err().unwrap();
+        assert_eq!(err, ClaimError::AboveAnchor { pos: 1, anchor_count: 1 });
+        let wait = skip_reason(3, &err);
+        assert!(wait.contains("not yet under a finalized anchor") && wait.contains("rerun"), "{wait}");
+        let below = skip_reason(3, &seed_claim(&tree, 2, &deposit, 1, 50_000, &l1, &keys).err().unwrap());
+        assert!(below.contains("cannot be claimed") && !below.contains("rerun"), "{below}");
+    }
+
+    /// Every claim file not marked taken is handed over again on each run;
+    /// a taken one, or anything that is not a claim file, never is.
+    #[test]
+    fn untaken_claims_are_handed_over_again() {
+        let d = std::env::temp_dir().join(format!("qseq-untaken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(untaken(&d).unwrap(), Vec::<PathBuf>::new(), "no claims dir yet");
+        let c = d.join("claims");
+        std::fs::create_dir_all(&c).unwrap();
+        for f in ["b.claim", "a.claim", "c.claim", "notes.txt"] {
+            std::fs::write(c.join(f), b"x").unwrap();
+        }
+        std::fs::write(taken_path(&c.join("c.claim")), b"").unwrap();
+        assert_eq!(untaken(&d).unwrap(), vec![c.join("a.claim"), c.join("b.claim")]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

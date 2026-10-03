@@ -116,7 +116,7 @@ fn run_seed(args: &[String]) -> Result<(), String> {
     let key = key::load(Path::new(&flag(args, "--key")?), &genesis.wrapper)?;
     let node = flag(args, "--node")?;
     let scan = if args.iter().any(|a| a == "--scan") { flag(args, "--scan")? } else { node.clone() };
-    let intake = if args.iter().any(|a| a == "--intake") { Some(loopback(&flag(args, "--intake")?)?) } else { None };
+    let intake = if args.iter().any(|a| a == "--intake") { Some(qumbra_sequencer::server::loopback_flag("--intake", &flag(args, "--intake")?)?) } else { None };
     let s = qumbra_sequencer::seed::Seed {
         genesis,
         key,

@@ -45,10 +45,15 @@ pub const INTAKE_ROUTE_VERSION: u32 = 1;
 /// A loopback socket address, or a refusal naming why (Q1: intake is
 /// reached through a tunnel, never exposed).
 pub fn loopback(addr: &str) -> Result<SocketAddr, String> {
-    let a: SocketAddr = addr.parse().map_err(|_| format!("--listen {addr:?} is not an ip:port address"))?; // debug-ok: an operator-typed address
+    loopback_flag("--listen", addr)
+}
+
+/// [`loopback`], naming the flag the address came from.
+pub fn loopback_flag(flag: &str, addr: &str) -> Result<SocketAddr, String> {
+    let a: SocketAddr = addr.parse().map_err(|_| format!("{flag} {addr:?} is not an ip:port address"))?; // debug-ok: an operator-typed address
     if !a.ip().is_loopback() {
         return Err(format!(
-            "--listen {addr} is not a loopback address — intake is loopback only; reach it through a tunnel (lab #847 Q1)"
+            "{flag} {addr} is not a loopback address — intake is loopback only; reach it through a tunnel (lab #847 Q1)"
         ));
     }
     Ok(a)
@@ -240,6 +245,7 @@ mod tests {
         assert!(loopback("0.0.0.0:8090").unwrap_err().contains("not a loopback address"));
         assert!(loopback("10.0.0.5:8090").unwrap_err().contains("not a loopback address"));
         assert!(loopback("localhost:8090").unwrap_err().contains("not an ip:port"));
+        assert!(loopback_flag("--intake", "10.0.0.5:8090").unwrap_err().starts_with("--intake 10.0.0.5:8090"));
     }
 
     /// Over a real socket: the 413 is decided from Content-Length alone, a
