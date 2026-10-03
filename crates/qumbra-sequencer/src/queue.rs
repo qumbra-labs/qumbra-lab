@@ -29,6 +29,11 @@
 //!
 //! **Only the posting loop moves an item past `queued`**; intake writes a
 //! state record exactly once, at admission.
+//!
+//! **No directory fsync** (v0): the files and the index are fsynced, their
+//! directory entries are not, so a power loss can lose a just-written file
+//! name. Every such loss is caught at the next open — a record whose item or
+//! state file is missing refuses to start, by name — never read past.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -118,6 +123,22 @@ impl Queue {
         for sub in ["items", "state"] {
             std::fs::create_dir_all(dir.join(sub)).map_err(|e| format!("{}: {e}", dir.join(sub).display()))?;
         }
+        Self::read(dir)
+    }
+
+    /// Open an existing queue without creating anything — for reading it
+    /// (`qumbra-sequencer queue`): a wrong path is refused, never turned into
+    /// an empty queue skeleton.
+    pub fn open_existing(dir: &Path) -> Result<Queue, String> {
+        for sub in ["items", "state"] {
+            if !dir.join(sub).is_dir() {
+                return Err(format!("{}: not a queue directory (no {sub}/)", dir.display()));
+            }
+        }
+        Self::read(dir)
+    }
+
+    fn read(dir: &Path) -> Result<Queue, String> {
         let index = dir.join("index");
         let text = match std::fs::read(&index) {
             Ok(b) => String::from_utf8(b).map_err(|_| format!("{}: not UTF-8 — refusing to start", index.display()))?,
@@ -177,7 +198,12 @@ impl Queue {
     /// Take the directory's run lock (`index.lock`, O_EXCL) — one intake at a
     /// time; held until dropped.
     pub fn lock(dir: &Path) -> Result<StateLock, String> {
-        StateLock::take(&dir.join("index"))
+        StateLock::take(&dir.join("index")).map_err(|_| {
+            format!(
+                "another intake holds {} — if none is running (a crash leaves it behind), remove it and start again",
+                dir.join("index.lock").display()
+            )
+        })
     }
 
     fn item_path(&self, id: &[u8; 32]) -> PathBuf {
@@ -209,6 +235,9 @@ impl Queue {
         if self.decide(c, bytes.len() as u64) != Decision::Fresh {
             return Err("admit: not a fresh candidate".into());
         }
+        // The index invariant (one key, one item) holds within an item too:
+        // a repeated key would make the next open refuse to start.
+        crate::intake::distinct_keys(c.kind, &c.keys)?;
         write_atomic(&self.item_path(&c.id), bytes)?;
         write_atomic(&self.state_path(&c.id), b"queued\n")?;
         let keys: Vec<String> = c.keys.iter().map(hex32).collect();
@@ -317,13 +346,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// One intake per directory.
+    /// An item whose keys repeat is refused at admit too, and leaves the
+    /// queue openable (it would otherwise brick the next start).
+    #[test]
+    fn repeated_keys_never_reach_the_index() {
+        let d = dir("repeat");
+        let mut c = classify(W3C_CLAIM, &w3c_chain()).unwrap();
+        c.keys = vec![c.keys[0], c.keys[0]];
+        let mut q = Queue::open(&d).unwrap();
+        assert!(q.admit(&c, W3C_CLAIM).unwrap_err().contains("names one cnf twice"));
+        drop(q);
+        assert_eq!(Queue::open(&d).unwrap().items().count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Reading a queue never creates one.
+    #[test]
+    fn listing_a_wrong_path_creates_nothing() {
+        let d = dir("nothing");
+        assert!(Queue::open_existing(&d).err().unwrap().contains("not a queue directory"));
+        assert!(!d.exists());
+        Queue::open(&d).unwrap();
+        assert_eq!(Queue::open_existing(&d).unwrap().items().count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// One intake per directory; a held lock says what it is and what to do.
     #[test]
     fn the_lock_is_exclusive() {
         let d = dir("lock");
         Queue::open(&d).unwrap();
         let held = Queue::lock(&d).unwrap();
-        assert!(Queue::lock(&d).is_err());
+        let err = Queue::lock(&d).err().unwrap();
+        assert!(err.contains("another intake holds") && err.contains("index.lock") && err.contains("remove it"), "{err}");
         drop(held);
         assert!(Queue::lock(&d).is_ok());
         let _ = std::fs::remove_dir_all(&d);
