@@ -7,8 +7,9 @@
 //! tests, without proving anything.
 //!
 //! **No pass plans an R member** (lab #847, the Q4 condition of design
-//! `l2-read-path-decision`): a bundle's members are claims, and S3's S
-//! fillers — [`crate::members::PASS_MEMBER_TAGS`]. The node's derived
+//! `l2-read-path-decision`): a bundle's members are claims, at most one
+//! wallet exit P from its exit file (lab #860 R3b), and S3's S fillers —
+//! [`crate::members::PASS_MEMBER_TAGS`]. The node's derived
 //! L2 index (lab #860) cannot follow a registry write from the wire, so one
 //! R member would block every exit until format v2. The real work checks
 //! the tags before proving; `lib.rs` holds the sources to it.
@@ -84,7 +85,7 @@ use std::path::{Path, PathBuf};
 use qlab_node::wrapper_route::WrapperView;
 use serde_json::{json, Value};
 
-use crate::intake::{hex32, parse_hex32, Kind};
+use crate::intake::{hex32, parse_hex32};
 use crate::queue::{Queue, Refusal, State};
 use crate::state::write_atomic;
 
@@ -177,8 +178,8 @@ pub enum NotDrafted {
     /// Nothing queued to plan.
     Nothing,
     /// Fewer members than a wrapper holds, counting one filler per
-    /// spendable sequencer note — or no claim at all (a wrapper of padding
-    /// is never posted). `why` names each claim left out and the fillers'
+    /// spendable sequencer note — or no traffic at all, no claim and no exit
+    /// (a wrapper of padding is never posted). `why` names each claim left out and the fillers'
     /// shortfall, one line each.
     Short { have: usize, need: usize, why: Vec<String> },
     /// Items refused at plan time, by id, each with its named reason.
@@ -480,7 +481,8 @@ pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, wo
         let candidates: Vec<([u8; 32], Vec<u8>)> = r
             .queue
             .items()
-            .filter(|i| i.kind == Kind::Claim && i.state == State::Queued)
+            // Claims and exits alike since lab #860 R3b (nothing is held).
+            .filter(|i| i.state == State::Queued)
             .map(|i| i.id)
             .collect::<Vec<_>>()
             .into_iter()

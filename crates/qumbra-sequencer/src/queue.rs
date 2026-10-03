@@ -63,10 +63,13 @@ pub enum Refusal {
     /// The native wrapper statement refuses a batch with this item alone in
     /// question.
     Statement,
+    /// Lab #860 R3b: an exit whose nullifier is already on the L2 — the
+    /// credit it spends was spent.
+    Spent,
 }
 
 impl Refusal {
-    const ALL: [Refusal; 3] = [Refusal::CnfOnChain, Refusal::Unreadable, Refusal::Statement];
+    const ALL: [Refusal; 4] = [Refusal::CnfOnChain, Refusal::Unreadable, Refusal::Statement, Refusal::Spent];
 
     /// The record's code.
     pub fn code(self) -> &'static str {
@@ -74,6 +77,7 @@ impl Refusal {
             Refusal::CnfOnChain => "cnf-on-chain",
             Refusal::Unreadable => "unreadable",
             Refusal::Statement => "statement",
+            Refusal::Spent => "spent",
         }
     }
 
@@ -83,6 +87,7 @@ impl Refusal {
             Refusal::CnfOnChain => "the chain already holds this claim's cnf",
             Refusal::Unreadable => "the stored artifact no longer decodes against this chain",
             Refusal::Statement => "the native wrapper statement refuses it",
+            Refusal::Spent => "its nullifier is already on the L2",
         }
     }
 
@@ -155,16 +160,6 @@ impl State {
                 | (State::Planned(_), State::Landed(_))
                 | (State::Queued | State::Planned(_), State::Refused(_))
         )
-    }
-}
-
-/// Why an item that is `queued` is not being planned, if there is a reason
-/// beyond "its turn has not come" — today, every exit (lab #847 Q4: no V6
-/// exit can be built until the L2 read path exists).
-pub fn held_reason(kind: Kind) -> Option<&'static str> {
-    match kind {
-        Kind::Exit => Some("no V6 exit can be built until the L2 read path exists (lab #847 Q4)"),
-        Kind::Claim => None,
     }
 }
 

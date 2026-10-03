@@ -312,7 +312,7 @@ fn f5box_the_mix_spends_the_deposit_and_pays_the_exit() {
             Inst::S(i) => (i.anchor, Some(i.registry_root)),
             Inst::P(i) => (i.anchor, Some(i.registry_root)),
             Inst::R(i, _) => (i.anchor, None),
-            Inst::C(_) | Inst::Proven { .. } => continue,
+            Inst::C(_) | Inst::Proven { .. } | Inst::ProvenExit { .. } => continue,
         };
         assert_eq!(anchor, c_in, "slot {slot} anchors at C_in");
         if let Some(root) = regroot {
@@ -401,7 +401,7 @@ fn f5box_built_members_satisfy_their_circuits() {
             Inst::R(i, _) => qlab_air::l2test::satisfied(&i.air, &i.air.generate_trace::<Val>(0), &pvs),
             Inst::S(i) => qlab_air::l2test::satisfied(&i.air, &i.air.generate_trace::<Val>(0), &pvs),
             Inst::C(i) => qlab_air::l2test::satisfied(&i.air, &i.air.generate_trace::<Val>(0), &pvs),
-            Inst::Proven { .. } => unreachable!("f5box builds every member of the mix itself"),
+            Inst::Proven { .. } | Inst::ProvenExit { .. } => unreachable!("f5box builds every member of the mix itself"),
         };
         assert!(verdict.is_ok(), "slot {slot} ({:?}): {verdict:?}", inst.tag());
     }

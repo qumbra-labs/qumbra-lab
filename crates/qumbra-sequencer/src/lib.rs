@@ -105,6 +105,37 @@ mod tests {
         assert!(before.contains("plan_claims(") && after.contains("prove(&plan,"), "the check sits between planning and proving");
     }
 
+    /// Lab #860 R3b: the only P a posting pass carries is a wallet's exit
+    /// file's (`Inst::ProvenExit`). Outside tests, the pass's sources build no
+    /// `Inst::P` of their own (nor glob-import `Inst`'s variants), and the
+    /// members functions `run` reaches — `plan_claims`, `filler`,
+    /// `own_credit` — build a P only as `Inst::ProvenExit`. A text lint, the
+    /// guarantee being review: `pass_members_ok` checks tags, and a P tag
+    /// cannot tell a `ProvenExit` from an `Inst::P`.
+    #[test]
+    fn the_pass_builds_no_p_of_its_own() {
+        let forbidden = ["Inst::P(", "Inst::P (", "Inst::P{", "Inst::P {", "Inst::*"];
+        for (path, text) in SOURCES.iter().filter(|(p, _)| ["pass.rs", "work.rs", "main.rs"].contains(p)) {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            for bad in forbidden {
+                assert!(!code.contains(bad), "{path} names `{bad}` outside tests");
+            }
+        }
+        let members = include_str!("members.rs");
+        let body_of = |name: &str| {
+            let start = members.find(name).unwrap_or_else(|| panic!("{name}"));
+            &members[start..start + members[start..].find("\n}\n").expect("its end")]
+        };
+        for f in ["pub fn plan_claims(", "pub fn filler(", "pub fn own_credit("] {
+            let body = body_of(f);
+            for bad in forbidden {
+                assert!(!body.contains(bad), "{f}… names `{bad}`");
+            }
+        }
+        assert!(body_of("pub fn plan_claims(").contains("Inst::ProvenExit {"), "plan_claims carries the wallet's exit");
+        assert!(!members.contains("use Inst::*") && !members.contains("use self::Inst::*"));
+    }
+
     /// The binary's `run` drives the one real [`crate::work::RealWork`], whose
     /// draft calls the real prover, and nothing in the crate outside tests
     /// defines another `Work` — the stub seam exists only in `pass`'s tests

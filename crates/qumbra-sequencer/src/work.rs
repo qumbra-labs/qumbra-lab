@@ -21,7 +21,7 @@ use crate::bundle::{assemble, manifest, prove, self_check, sign, Timings};
 use crate::chain::{self, Anchor, Http};
 use crate::intake::Chain;
 use crate::key::SequencerKey;
-use crate::members::{first_refused, pass_members_ok, plan_claims, spendable, Keys, PlanError, K};
+use crate::members::{exit_alone_refused, exit_file, first_refused, pass_members_ok, plan_claims, spendable_except, ExitFile, Keys, PlanError, K};
 use crate::pass::{Clock, Draft, NotDrafted, Node, Work};
 use crate::queue::Refusal;
 use crate::state::{owned_json, owned_of, Built, RunState};
@@ -56,6 +56,17 @@ impl Clock for SystemClock {
     fn sleep(&self, secs: u64) {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
+}
+
+/// A queued exit file read again at draft time (R3b): decoded against the
+/// genesis (its proof trial-decoded) — else `Unreadable` — and every
+/// nullifier still a gap in the run state's N — else `Spent`.
+pub fn read_exit(bytes: &[u8], genesis: &[u8; 32], state: &qlab_wprover::f4::native::WState) -> Result<ExitFile, Refusal> {
+    let e = exit_file(bytes, genesis).map_err(|_| Refusal::Unreadable)?;
+    if e.nullifiers.iter().any(|nf| state.l2.n.low_leaf_of(&digest_from_bytes(nf)).is_none()) {
+        return Err(Refusal::Spent);
+    }
+    Ok(e)
 }
 
 /// Why a queued claim is not in this wrapper.
@@ -104,12 +115,15 @@ pub fn select(
     anchors: &[qlab_wprover::f3::native::Digest],
     before: &[qlab_wprover::f3::native::Digest],
     absorbable: &[qlab_wprover::f3::native::Digest],
+    cap: usize,
 ) -> Selection {
     let mut roots = Vec::new();
     let mut take = Vec::new();
     let mut left = Vec::new();
     for (i, anchor) in anchors.iter().enumerate() {
-        if take.len() == K {
+        // `cap` claims at most: K, or K − 1 when an exit takes a traffic slot
+        // (R3b) — claims past it wait, queued, for the next wrapper.
+        if take.len() == cap {
             break;
         }
         if before.contains(anchor) {
@@ -148,11 +162,14 @@ pub fn not_drafted(
     sel: &Selection,
     ids: &[[u8; 32]],
     anchors: &[qlab_wprover::f3::native::Digest],
+    exit: bool,
     notes: usize,
     tip: u64,
     cr: Option<u64>,
 ) -> Option<NotDrafted> {
-    let taken = sel.take.len();
+    // Traffic is the claims taken and the one exit (R3b): a wrapper of one
+    // exit and fillers is a wrapper; one of padding alone never is.
+    let taken = sel.take.len() + usize::from(exit);
     if taken > 0 && taken + notes >= K {
         return None;
     }
@@ -212,10 +229,19 @@ impl Work for RealWork {
         }
         let (state, prev) = self.run.replay()?;
         // Each candidate read again against this chain; refuse, by name, one
-        // that no longer decodes or whose cnf the wrapper state already holds.
+        // that no longer decodes, a claim whose cnf the wrapper state already
+        // holds, an exit whose nullifier is already on the L2 (R3b).
         let mut refused = Vec::new();
         let mut claims = Vec::new();
+        let mut exits: Vec<([u8; 32], ExitFile)> = Vec::new();
         for (id, bytes) in candidates {
+            if bytes.starts_with(qlab_l2spend::EXIT_ARTIFACT_MAGIC) {
+                match read_exit(bytes, &self.chain.genesis, &state) {
+                    Ok(e) => exits.push((*id, e)),
+                    Err(why) => refused.push((*id, why)),
+                }
+                continue;
+            }
             let Ok(file) = qlab_l2spend::decode_claim_artifact(bytes, &self.chain.genesis, self.chain.claim_fee_tier) else {
                 refused.push((*id, Refusal::Unreadable));
                 continue;
@@ -241,13 +267,18 @@ impl Work for RealWork {
         }
         let before: Vec<_> = (0..state.aa.len()).map(|i| state.aa.leaf(i)).collect();
         let anchors: Vec<_> = claims.iter().map(|(_, a, _)| *a).collect();
-        let sel = select(&anchors, &before, &absorbable);
+        // At most one exit a wrapper (R3b), the oldest queued; it takes a
+        // traffic slot, so the claims are capped at K − 1 beside it.
+        let exit = exits.into_iter().next();
+        let sel = select(&anchors, &before, &absorbable, K - usize::from(exit.is_some()));
         // The rest of the wrapper is fillers, one per spendable sequencer
-        // note (S3); a wrapper with no claim is never posted.
+        // note (S3) — never a note the exit itself spends; a wrapper with no
+        // traffic is never posted.
         let keys = Keys::from_seed(*self.key.filler_seed);
-        let notes = spendable(&state, &keys, &self.run.owned).len();
+        let exit_nfs: Vec<[u8; 32]> = exit.as_ref().map_or(Vec::new(), |(_, e)| e.nullifiers.clone());
+        let notes = spendable_except(&state, &keys, &self.run.owned, &exit_nfs).len();
         let ids: Vec<[u8; 32]> = claims.iter().map(|(id, _, _)| *id).collect();
-        if let Some(not) = not_drafted(&sel, &ids, &anchors, notes, w.tip, w.cr) {
+        if let Some(not) = not_drafted(&sel, &ids, &anchors, exit.is_some(), notes, w.tip, w.cr) {
             return Ok(Err(not));
         }
         let Selection { take, mut roots, .. } = sel;
@@ -269,17 +300,30 @@ impl Work for RealWork {
             .collect::<Result<_, _>>()?;
         absorbed.sort_by_key(|a| a.count);
         let absorbed: [Anchor; M_ABS] = absorbed.try_into().map_err(|_| "exactly M_ABS roots".to_string())?;
-        let items: Vec<[u8; 32]> = take.iter().map(|&i| claims[i].0).collect();
+        let mut items: Vec<[u8; 32]> = take.iter().map(|&i| claims[i].0).collect();
         let mut chosen: Vec<_> = claims.into_iter().enumerate().filter(|(i, _)| take.contains(i)).map(|(_, c)| c).collect();
         let files: Vec<_> = chosen.drain(..).map(|(_, _, f)| f).collect();
-        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), &self.run.owned, &keys) {
+        let (exit_id, exit_file) = match exit {
+            Some((id, e)) => (Some(id), Some(e)),
+            None => (None, None),
+        };
+        items.extend(exit_id);
+        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), exit_file.clone(), &self.run.owned, &keys) {
             Ok(p) => p,
             // The statement is native: find the item by elimination and
-            // refuse it by name, so the next draft does not pick it again.
-            Err(PlanError::Wrapper(e)) => match first_refused(&state, &prev, &absorbed, &files, &keys) {
-                Some(i) => return Ok(Err(NotDrafted::Refuse(vec![(items[i], Refusal::Statement)]))),
-                None => return Err(format!("the native wrapper statement refuses the batch, and no single item is to blame: {e}")),
-            },
+            // refuse it by name, so the next draft does not pick it again —
+            // the exit first, on its own (R3b), then the claims by prefix.
+            Err(PlanError::Wrapper(e)) => {
+                if let (Some(id), Some(x)) = (exit_id, &exit_file) {
+                    if exit_alone_refused(&state, &prev, &absorbed, x, &keys) {
+                        return Ok(Err(NotDrafted::Refuse(vec![(id, Refusal::Statement)])));
+                    }
+                }
+                match first_refused(&state, &prev, &absorbed, &files, &keys) {
+                    Some(i) => return Ok(Err(NotDrafted::Refuse(vec![(items[i], Refusal::Statement)]))),
+                    None => return Err(format!("the native wrapper statement refuses the batch, and no single item is to blame: {e}")),
+                }
+            }
             Err(e) => return Err(format!("plan: {e:?}")), // debug-ok: PlanError from plan_claims names counts and roots, no opening
         };
         pass_members_ok(&plan.members)?;
@@ -327,6 +371,53 @@ impl Work for RealWork {
 mod tests {
     use super::*;
 
+    /// Beside an exit the claims are capped at K − 1: sixteen selectable
+    /// claims and a queued exit make a wrapper of fifteen claims and the
+    /// exit; the sixteenth waits, neither taken nor named left out.
+    #[test]
+    fn an_exit_takes_a_claim_slot() {
+        let r = |k: u64| [k, 0, 0, 0];
+        let anchors = vec![r(1); K];
+        let s = select(&anchors, &[r(1)], &[r(2)], K - 1);
+        assert_eq!(s.take, (0..K - 1).collect::<Vec<_>>());
+        assert!(s.left.is_empty(), "the sixteenth is not refused or named — it waits");
+        let ids: Vec<[u8; 32]> = (0..K as u8).map(|k| [k; 32]).collect();
+        assert!(not_drafted(&s, &ids, &anchors, true, 0, 300, Some(290)).is_none(), "15 C + 1 P is a wrapper");
+    }
+
+    /// The draft's answer with an exit: an exit and fifteen notes is a
+    /// wrapper with no claim; an exit and ten notes is short by name.
+    #[test]
+    fn an_exit_is_traffic_in_the_drafts_answer() {
+        let none = Selection { take: vec![], roots: vec![], left: vec![] };
+        assert!(not_drafted(&none, &[], &[], true, 15, 300, Some(290)).is_none());
+        match not_drafted(&none, &[], &[], true, 10, 300, Some(290)) {
+            Some(NotDrafted::Short { have, need, .. }) => assert_eq!((have, need), (11, K)),
+            _ => panic!("an exit and ten notes is short"),
+        }
+        assert!(matches!(not_drafted(&none, &[], &[], false, 16, 300, None), Some(NotDrafted::Short { have: 0, .. })), "no traffic");
+    }
+
+    /// A queued exit read again at draft: unreadable bytes are Unreadable,
+    /// and an exit whose nullifier the run state's N already holds is Spent
+    /// — both by variant.
+    #[test]
+    fn a_queued_exit_already_spent_is_refused_as_spent() {
+        use crate::members::tests::{exit_bytes, seeded};
+        use crate::members::{Inst, Keys};
+        let keys = Keys::from_seed([1; 32]);
+        let (state, prev, owned) = seeded(2, &keys);
+        let g = [0x6b; 32];
+        let bytes = exit_bytes(&state, &keys, &owned[1], &g);
+        let e = read_exit(&bytes, &g, &state).unwrap();
+        assert_eq!(read_exit(b"qumbra:l2-exit\0garbage", &g, &state).err(), Some(Refusal::Unreadable));
+        let mut after = state.clone();
+        let inp = qlab_wprover::f4::native::WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: [[9; 4]; M_ABS], d_batch: 0 };
+        let member = Inst::ProvenExit { pvs: e.pvs.clone(), proof: e.proof.clone(), exit: e.exit }.member();
+        after.apply(&inp, &[member]).unwrap();
+        assert_eq!(read_exit(&bytes, &g, &after).err(), Some(Refusal::Spent));
+    }
+
     /// The predicate: a short is only anchors lagging when the waiting
     /// claims would fill the wrapper with the ones taken and the fillers.
     #[test]
@@ -348,7 +439,7 @@ mod tests {
         // arrival: absorbed, absorbable ×4 new roots, a 5th new root, a root
         // no record covers, and a repeat of an already-taken new root.
         let anchors = [r(1), r(2), r(3), r(4), r(5), r(6), r(9), r(2)];
-        let s = select(&anchors, &before, &absorbable);
+        let s = select(&anchors, &before, &absorbable, K);
         assert_eq!(s.take, vec![0, 1, 2, 3, 4, 7]);
         assert_eq!(s.roots, vec![r(2), r(3), r(4), r(5)]);
         assert_eq!(s.left, vec![(5, LeftOut::NoRootRoom), (6, LeftOut::NotAbsorbable)]);
@@ -377,7 +468,7 @@ mod tests {
             roots: vec![],
             left: vec![(15, LeftOut::NotAbsorbable), (16, LeftOut::NoRootRoom)],
         };
-        match not_drafted(&sel, &ids, &anchors, 0, 220, Some(212)) {
+        match not_drafted(&sel, &ids, &anchors, false, 0, 220, Some(212)) {
             Some(NotDrafted::Wait(w)) => {
                 assert!(w.starts_with("1 claim(s) await a finality record covering their anchor (tip 220, CR 212): claim 0f0f"), "{w}");
                 assert!(!w.contains("exceed"), "only the waiting claims are listed: {w}");
@@ -385,7 +476,7 @@ mod tests {
             _ => panic!("box run 2's shape must wait"),
         }
         let sel = Selection { take: (0..3).collect(), roots: vec![], left: vec![(16, LeftOut::NoRootRoom)] };
-        match not_drafted(&sel, &ids, &anchors, 10, 220, None) {
+        match not_drafted(&sel, &ids, &anchors, false, 10, 220, None) {
             Some(NotDrafted::Short { have, need, why }) => {
                 assert_eq!((have, need), (13, K));
                 assert_eq!(why.len(), 2);
@@ -395,6 +486,6 @@ mod tests {
             _ => panic!("3 claims + 10 notes is short"),
         }
         let full = Selection { take: (0..1).collect(), roots: vec![], left: vec![] };
-        assert!(not_drafted(&full, &ids, &anchors, 15, 220, None).is_none(), "1 claim + 15 notes is a wrapper");
+        assert!(not_drafted(&full, &ids, &anchors, false, 15, 220, None).is_none(), "1 claim + 15 notes is a wrapper");
     }
 }
