@@ -960,6 +960,15 @@ struct PendingRequest {
     kind: PendingKind,
 }
 
+/// A uniform-ish index in `0..n` from one 64-bit draw, **with the modulo
+/// taken in u64** (lab #858 WA3). `draw as usize % n` truncates the draw to
+/// 32 bits first on wasm32, so one rng seed picked different decoys in the
+/// browser than on a 64-bit host — the wasm32 width trap. On a 64-bit target
+/// the cast is the identity and the result is what it always was. `n > 0`.
+fn pick(draw: u64, n: usize) -> usize {
+    (draw % n as u64) as usize
+}
+
 /// The sans-I/O light-client scan state machine (lab issue #350).
 ///
 /// The driver owns the decapsulation key and every scan decision. It performs
@@ -1084,13 +1093,13 @@ impl<N: NotePlaintext> ScanDriver<N> {
                     let mut paths = Vec::new();
                     if let DecoyPolicy::PerMatch { max } = self.config.decoy {
                         let max = max.max(1);
-                        let n_decoys = 1 + (rng.next_u64() as usize % max);
+                        let n_decoys = 1 + pick(rng.next_u64(), max);
                         for _ in 0..n_decoys {
                             if self.tx_space.is_empty() {
                                 break;
                             }
                             let (height, n_txs) =
-                                self.tx_space[rng.next_u64() as usize % self.tx_space.len()];
+                                self.tx_space[pick(rng.next_u64(), self.tx_space.len())];
                             let tx_index = rng.next_u64() % n_txs;
                             paths.push(format!("/v1/block/{height}/tx/{tx_index}/full"));
                         }
@@ -2817,5 +2826,26 @@ mod multi_tests {
         d.supply(Ok(Vec::new()));
         let stray = MultiScanRefusal::Range("multi-scan driver received a response without requesting a path".into());
         assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == stray), "an answer with no Need");
+    }
+
+    /// Lab #858 WA3: the decoy draw's modulo is taken in u64, so a draw with
+    /// high bits picks the same index on wasm32 as on a 64-bit host. The old
+    /// arithmetic on a 32-bit target (`draw as usize`, i.e. the low 32 bits,
+    /// then `%`) picks a different one for this draw; on this 64-bit host the
+    /// new and old arithmetic agree, so no native output moves.
+    #[test]
+    fn the_decoy_pick_takes_its_modulo_in_u64() {
+        let draw: u64 = (1 << 32) | 5; // high bits set
+        let n = 3usize;
+        assert_eq!(super::pick(draw, n), ((1u64 << 32) + 5) as usize % 3);
+        let as_on_wasm32 = (draw as u32 as usize) % n; // the truncating form
+        assert_ne!(super::pick(draw, n), as_on_wasm32, "the high bits count");
+        #[cfg(target_pointer_width = "64")]
+        for d in [0u64, 1, u64::MAX, draw, 0xdead_beef_cafe_f00d] {
+            for n in [1usize, 2, 3, 7, 1000] {
+                assert_eq!(super::pick(d, n), d as usize % n, "unchanged on 64-bit: {d} % {n}");
+                assert!(super::pick(d, n) < n);
+            }
+        }
     }
 }
