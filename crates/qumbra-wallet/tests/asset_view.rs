@@ -62,7 +62,9 @@ fn setup(tag: &str, seed: u8, regulated: bool, lie: Lie) -> (WalletDir, Endpoint
             asset: u64::from(REG),
             issuer_key: [5, 5, 5, 5],
             mode: qlab_air::l2::MODE_REGULATED,
-            freeze_root: CanonicalFreezeTree::from_keys(&[rkm0]).root,
+            // The chain's tree is over each frozen address's KEY
+            // (`freeze_key_of(rkm)`), never the rkm itself.
+            freeze_root: CanonicalFreezeTree::from_rkms(&[rkm0]).root,
             allow_root: [0; 4],
             flags: 0,
         };
@@ -151,7 +153,12 @@ fn a_malformed_list_is_refused_by_name() {
         (list(format!("{},{}", entry2(4, "usdt"), entry2(5, "USDT"))), "repeats another entry's"),
         (list(entry("").replace(r#""ticker":"T""#, r#""ticker":"T T""#)), "`ticker`"),
         (list(entry("").replace(r#""decimals":6"#, r#""decimals":19"#)), "`decimals`"),
-        (list(entry("").replace(r#""name":"N""#, r#""name":"N""#)), "printable"),
+        // A control character, JSON-escaped so the parse succeeds and the
+        // list's own rule refuses it…
+        (list(entry("").replace(r#""name":"N""#, r#""name":"N\u0007""#)), "printable"),
+        // …and the same character raw, which JSON itself forbids: refused
+        // at the parse, by the parser's name for it.
+        (list(entry("").replace(r#""name":"N""#, "\"name\":\"N\u{7}\"")), "control character"),
         (list(entry("").replace(&k, &k.to_uppercase())), "lowercase hex"),
         (format!(r#"{{"v":1,"network":"n","genesis":"{}","testnet":false,"assets":[]}}"#, g.to_uppercase()), "lowercase hex"),
         (format!(r#"{{"v":1,"network":"n","genesis":"{g}","testnet":"yes","assets":[]}}"#), "`testnet` must be a boolean"),
@@ -237,8 +244,10 @@ fn a_regulated_assets_freeze_list_is_checked_only_against_its_own_root() {
     assert_eq!(reg.mode, AssetMode::Regulated);
     assert_eq!(reg.freeze, FreezeStatus::NotChecked, "a freeze root and no list: not checked, never 'not frozen'");
 
+    // A published freeze list is the tree's KEYS — what `asset_view` takes.
+    let key0 = CanonicalFreezeTree::from_rkms(&[rkm0]).keys[0];
     let mut lists = BTreeMap::new();
-    lists.insert(REG, vec![rkm0]);
+    lists.insert(REG, vec![key0]);
     assert_eq!(row(&view(&w, &ep, None, &lists), REG).freeze, FreezeStatus::Frozen);
 
     lists.insert(REG, vec![[3, 3, 3, 3]]);
