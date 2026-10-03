@@ -17,9 +17,9 @@
 //! against that repo's XCTest decode literal. `spendsVerified` is always
 //! present (design D5).
 //!
-//! JSON is built through `serde_json::Value` — `serde_json` is already in this
-//! crate's graph through `qumbra-wallet`'s `verify` feature; `serde`'s derive
-//! is not, so none is added.
+//! JSON is built through `serde_json::Value`. `serde_json` enters this crate's
+//! wasm graph with `qumbra-wallet`'s `verify` feature (new to the graph with
+//! WA2, with `qlab-p2p`); no derive is used.
 
 use std::ffi::{c_char, CStr};
 use std::ptr;

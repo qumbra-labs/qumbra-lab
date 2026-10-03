@@ -44,8 +44,9 @@ rand = "0.10"
 # no RandomX chain (the wasm/iOS graphs must stay clean; features are additive,
 # so native workspace builds still unify to the full wallet).
 qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["verify"] }
-# The Annulet asset view's JSON (lab #858 WA2). Not a new crate in the graph:
-# qumbra-wallet's `verify` feature already carries it. Value-built, no derive.
+# The Annulet asset view's JSON (lab #858 WA2). Named here because this crate
+# encodes with it; the `verify` feature above brings it into the graph anyway.
+# Value-built, no derive.
 serde_json = "1"
 # The name-service types (NameOp, rider codec, fee table, grammar) the generic
 # qmb_name_* surface exposes (lab #659). default-features off for the same
