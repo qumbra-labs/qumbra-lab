@@ -218,6 +218,11 @@ mod tests {
             format!(r#"{{"v":1,"id":"{h}","state":"refused","why":"the chain already holds this claim's cnf"}}"#)
         );
         let _ = std::fs::remove_dir_all(&d2);
+        let (mut i4, d4) = intake("states-spent");
+        i4.post(W3C_CLAIM);
+        i4.queue.set_state(&id, State::Refused(crate::queue::Refusal::Spent)).unwrap();
+        assert_eq!(i4.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"refused","why":"its nullifier is already on the L2"}}"#));
+        let _ = std::fs::remove_dir_all(&d4);
         let (mut i3, d3) = intake("states-queued");
         i3.post(W3C_CLAIM);
         assert_eq!(i3.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"queued"}}"#), "nothing held");

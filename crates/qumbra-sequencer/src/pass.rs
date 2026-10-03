@@ -178,8 +178,8 @@ pub enum NotDrafted {
     /// Nothing queued to plan.
     Nothing,
     /// Fewer members than a wrapper holds, counting one filler per
-    /// spendable sequencer note — or no claim at all (a wrapper of padding
-    /// is never posted). `why` names each claim left out and the fillers'
+    /// spendable sequencer note — or no traffic at all, no claim and no exit
+    /// (a wrapper of padding is never posted). `why` names each claim left out and the fillers'
     /// shortfall, one line each.
     Short { have: usize, need: usize, why: Vec<String> },
     /// Items refused at plan time, by id, each with its named reason.

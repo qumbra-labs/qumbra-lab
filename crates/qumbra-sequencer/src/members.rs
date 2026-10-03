@@ -356,6 +356,9 @@ pub struct ExitFile {
 /// it pays.
 pub fn exit_file(bytes: &[u8], genesis: &[u8; 32]) -> Result<ExitFile, String> {
     let (tx, surface) = qlab_l2spend::decode_exit_artifact(bytes, genesis).map_err(|e| format!("exit file: {e}"))?;
+    // Trial-decode the proof now, so a corrupted store is refused by name
+    // here (Unreadable) rather than panicking at prove time every pass.
+    bincode::deserialize::<Proof<Config>>(&tx.proof).map_err(|_| "exit file: its proof does not decode".to_string())?;
     let terms = surface.vpublic.ok_or("exit file: not a shape-P transaction")?;
     let exit = Exit { rkm: qlab_wrapper::codec::digest_from_bytes(&surface.exit_rkm), v: terms[0].amount };
     Ok(ExitFile { pvs: qlab_l2spend::exit_member_pvs(&tx, &surface), proof: tx.proof.clone(), exit, nullifiers: tx.public.nullifiers.clone() })
@@ -382,6 +385,16 @@ pub fn pass_members_ok(members: &[Member]) -> Result<(), String> {
             PASS_MEMBER_TAGS.map(crate::state::tag_name).join(", ")
         )),
     }
+}
+
+/// [`spendable`], less any note whose nullifier is in `except` — the
+/// nullifiers a queued exit spends (R3b): an operator exiting one of the
+/// sequencer's own notes must not see it drawn as a filler beside the exit,
+/// which would repeat a nullifier and fail the statement with no one to blame.
+pub fn spendable_except(state: &WState, keys: &Keys, owned: &[Owned], except: &[[u8; 32]]) -> Vec<Owned> {
+    let mut out = spendable(state, keys, owned);
+    out.retain(|n| !except.contains(&qlab_wrapper::codec::digest_to_bytes(&derive_input_l2(&keys.input(n)).1)));
+    out
 }
 
 /// The notes in `owned` the next wrapper may spend: in C at its `C_in`,
@@ -466,7 +479,8 @@ pub fn plan_claims(
     if files.is_empty() && exit.is_none() {
         return Err(PlanError::NoTraffic);
     }
-    let notes = spendable(state, keys, owned);
+    let exit_nfs: Vec<[u8; 32]> = exit.as_ref().map_or(Vec::new(), |e| e.nullifiers.clone());
+    let notes = spendable_except(state, keys, owned, &exit_nfs);
     let traffic = files.len() + usize::from(exit.is_some());
     let n_fill = K.saturating_sub(traffic);
     if traffic > K || notes.len() < n_fill {
@@ -881,7 +895,7 @@ pub fn first_refused(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::intake::tests::{w3c_chain, W3C_CLAIM};
     use crate::state::RunState;
@@ -940,7 +954,7 @@ mod tests {
     }
 
     /// `n` sequencer notes in C, as earlier wrappers would have left them.
-    fn seeded(n: usize, keys: &Keys) -> (WState, Surface, Vec<Owned>) {
+    pub(crate) fn seeded(n: usize, keys: &Keys) -> (WState, Surface, Vec<Owned>) {
         let (mut state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
         let owned: Vec<Owned> = (0..n as u64).map(|i| Owned { value: 1_000 * i, rho: [i + 1, 2, 3, 4], rseed: [i + 1, 5, 6, 7] }).collect();
         for o in &owned {
@@ -1023,6 +1037,66 @@ mod tests {
         let ask = qlab_l2spend::ExitAsk { value: n.value, to_rkm: [5, 6, 7, 8] };
         let ei = qlab_l2spend::exit_instance(&state.l2.c, &reg0, &keys.input(n), ask, keys.rkm(), 0, &mut rand::rng()).unwrap();
         ExitFile { pvs: ei.inst.pvs, proof: Vec::new(), exit: Exit { rkm: [5, 6, 7, 8], v: n.value }, nullifiers: Vec::new() }
+    }
+
+    /// A real exit file over `state` spending `n` whole — R3's own codec
+    /// (`exit_entry`, `encode_exit_artifact`) — bound to `genesis`. Its proof
+    /// is a stub: a one-entry deposit-sum proof (sub-second; the bench's W2
+    /// pattern), the right type, never the 30 GiB P.
+    pub(crate) fn exit_bytes(state: &WState, keys: &Keys, n: &Owned, genesis: &[u8; 32]) -> Vec<u8> {
+        let reg = &state.l2.r;
+        let reg0 = qlab_cbserver::registry::RegistryOpening {
+            height: 0,
+            root: reg.root(),
+            leaf: *reg.leaf(0).expect("asset 0's leaf"),
+            witness: reg.witness(0).expect("asset 0's leaf"),
+        };
+        let mut rng = rand::rng();
+        let ask = qlab_l2spend::ExitAsk { value: n.value, to_rkm: [5, 6, 7, 8] };
+        let ei = qlab_l2spend::exit_instance(&state.l2.c, &reg0, &keys.input(n), ask, keys.rkm(), 0, &mut rng).unwrap();
+        let (_, stub) = qlab_wprover::f4::dep::prove_dep(&[DepEntry { v: 1, r_v: [1, 0, 0, 0] }]).unwrap();
+        let change_to = qlab_l2spend::Recipient { rkm: keys.rkm(), ek: qlab_note::kem::generate_keypair(&mut rng).ek };
+        let built = qlab_l2spend::exit_entry(&ei, &stub, 0, &change_to, &mut rng);
+        qlab_l2spend::encode_exit_artifact(genesis, &built.tx)
+    }
+
+    /// `exit_file` reads R3's exit file as the intake does: the member's
+    /// PVs, the exit it pays (rkm and v), its nullifiers — and refuses a file
+    /// for another genesis, and one whose proof does not decode, by name.
+    #[test]
+    fn an_exit_file_reads_back_through_exit_file() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, _, owned) = seeded(2, &keys);
+        let n = owned[1];
+        let g = [0x6b; 32];
+        let bytes = exit_bytes(&state, &keys, &n, &g);
+        let e = exit_file(&bytes, &g).unwrap();
+        assert_eq!(e.exit, Exit { rkm: [5, 6, 7, 8], v: n.value });
+        let nf = qlab_wrapper::codec::digest_to_bytes(&derive_input_l2(&keys.input(&n)).1);
+        assert!(e.nullifiers.contains(&nf), "the spent note's nullifier");
+        assert_eq!(e.pvs.len(), WTag::P.pv_len());
+        assert!(exit_file(&bytes, &[0x6c; 32]).err().unwrap().starts_with("exit file:"), "another genesis");
+        let (tx, _) = qlab_l2spend::decode_exit_artifact(&bytes, &g).unwrap();
+        let mut broken = tx.clone();
+        broken.proof = vec![1, 2, 3];
+        let bad = qlab_l2spend::encode_exit_artifact(&g, &broken);
+        assert_eq!(exit_file(&bad, &g).err(), Some("exit file: its proof does not decode".to_string()));
+    }
+
+    /// An exit of one of the sequencer's own notes: that note is never also
+    /// drawn as a filler beside it (one nullifier, twice) — the other fifteen
+    /// notes fill.
+    #[test]
+    fn a_note_the_exit_spends_is_never_a_filler() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, prev, owned) = seeded(K, &keys);
+        let g = [0x6b; 32];
+        let exiting = owned[K - 1]; // the largest: spendable() would draw it first
+        let exit = exit_file(&exit_bytes(&state, &keys, &exiting, &g), &g).unwrap();
+        let absorbed = [Anchor { count: 0, root: [9; 4] }; M_ABS];
+        let p = plan_claims(&state, &prev, absorbed, Vec::new(), Some(exit), &owned, &keys).unwrap();
+        assert!(!p.spent.contains(&exiting), "the exit's note is not a filler's input");
+        assert_eq!(p.spent.len(), K - 1);
     }
 
     /// Lab #860 R3b: one exit and fifteen fillers is a wrapper — no claim

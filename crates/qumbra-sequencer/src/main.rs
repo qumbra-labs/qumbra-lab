@@ -110,8 +110,8 @@ fn run_pass(args: &[String]) -> Result<ExitCode, String> {
         }
         Outcome::Short { have, need, why } => {
             eprintln!(
-                "SEQ not plannable: {have} of the {need} members a wrapper holds (claims, plus one filler per spendable \
-                 sequencer note):"
+                "SEQ not plannable: {have} of the {need} members a wrapper holds (traffic — claims and at most one exit — \
+                 plus one filler per spendable sequencer note):"
             );
             for line in why {
                 eprintln!("SEQ   {line}");
