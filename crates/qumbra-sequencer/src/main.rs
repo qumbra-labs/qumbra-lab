@@ -52,7 +52,7 @@ fn run(args: &[String]) -> Result<(), String> {
             serve(addr, Intake { chain, queue })
         }
         Some("queue") => {
-            let queue = Queue::open(Path::new(&flag(&args[1..], "--queue")?))?;
+            let queue = Queue::open_existing(Path::new(&flag(&args[1..], "--queue")?))?;
             for item in queue.items() {
                 println!("{} {} {}", hex32(&item.id), item.kind.name(), item.state.name());
             }

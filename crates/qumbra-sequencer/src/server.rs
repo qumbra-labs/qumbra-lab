@@ -204,7 +204,9 @@ mod tests {
     }
 
     /// Over a real socket: the 413 is decided from Content-Length alone, a
-    /// POST round-trips, and the status route answers.
+    /// POST round-trips, a different file on the same cnf is a 409 naming
+    /// the held item, the status route answers — and no response, of any
+    /// kind, carries the deposit amount.
     #[test]
     fn the_listener_answers_over_a_socket() {
         use std::io::Write;
@@ -234,6 +236,19 @@ mod tests {
         let id = hex32(&id_of(W3C_CLAIM));
         let status = req(format!("GET /v1/intake/{id} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").into_bytes());
         assert!(status.contains(r#""state":"queued""#), "{status}");
+        // The last byte is r_v's: the file still decodes, its id moves, its
+        // cnf (from the public values) does not — a 409, decided before any
+        // proof work, naming the item that holds the cnf.
+        let mut twin = W3C_CLAIM.to_vec();
+        *twin.last_mut().unwrap() ^= 1;
+        let mut post = format!("POST /v1/intake HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", twin.len()).into_bytes();
+        post.extend_from_slice(&twin);
+        let conflict = req(post);
+        assert!(conflict.starts_with("HTTP/1.1 409"), "{conflict}");
+        assert!(conflict.contains(&format!(r#""error":"conflict","key":"cnf","existing":"{id}""#)), "{conflict}");
+        for r in [&answer, &status, &conflict] {
+            assert!(!r.contains("50000000") && !r.contains("49999996"), "a response named the amount: {r}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

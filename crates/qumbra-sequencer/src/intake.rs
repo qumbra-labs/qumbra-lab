@@ -22,6 +22,13 @@
 //! the deposit amount — and none of `v`, `r_v` or the artifact's bytes is
 //! ever logged, echoed or answered.
 //!
+//! The refusals interpolate the codecs' and verifiers' own errors
+//! (`ClaimFileError`, `ClaimRefusal`, `ArtifactError` with the tx codec's
+//! `DecodeError`, `L2VerifyError`): every variant carries a length, a
+//! version, a tier, an `l2_id`, a position, a format byte, a `&'static`
+//! reason or the two genesis hashes — none carries `v`, `r_v`, an opening or
+//! the artifact's bytes (audited for lab #847 S2).
+//!
 //! **Safety split.** Intake's dedupe saves plan slots and gives a wallet a
 //! stable id to recover with; it is a convenience. The double-spend guarantee
 //! is the chain's: `WState::apply` refuses a repeated `cnf` or nullifier at
@@ -130,6 +137,19 @@ pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Refuse an item whose dedupe keys repeat — an exit naming one nullifier
+/// twice. Admitting it would put the same key in the index twice under one
+/// item, which [`crate::queue::Queue::open`] (rightly) refuses to start on:
+/// one bad artifact would brick the queue. Kept here for every kind.
+pub fn distinct_keys(kind: Kind, keys: &[[u8; 32]]) -> Result<(), String> {
+    for (i, k) in keys.iter().enumerate() {
+        if keys[..i].contains(k) {
+            return Err(format!("{} file refused: it names one {} twice", kind.name(), kind.key_name()));
+        }
+    }
+    Ok(())
+}
+
 /// Decode an artifact against `chain`: which kind, its id, its keys. Refused
 /// by name for anything that is neither, or that the kind's codec refuses.
 /// The messages name the reason only — never a value from the file.
@@ -146,9 +166,13 @@ pub fn classify(bytes: &[u8], chain: &Chain) -> Result<Candidate, String> {
             .map_err(|e| format!("claim file refused: its cnf does not read: {e:?}"))?;
         Ok(Candidate { id, kind: Kind::Claim, keys: vec![digest_to_bytes(&cnf)], proof: Proof::Claim { pvs: file.pvs, proof: file.proof } })
     } else if bytes.starts_with(qlab_l2spend::EXIT_ARTIFACT_MAGIC) {
+        // The exit's l2_id is bound through the genesis hash: a V6 genesis
+        // names exactly one l2_id (its WrapperParams), so a file built for
+        // this genesis is a file for this chain's L2.
         let (tx, _) =
             qlab_l2spend::decode_exit_artifact(bytes, &chain.genesis).map_err(|e| format!("exit file refused: {e}"))?;
         let keys = tx.public.nullifiers.clone();
+        distinct_keys(Kind::Exit, &keys)?;
         Ok(Candidate { id, kind: Kind::Exit, keys, proof: Proof::Exit(Box::new(tx)) })
     } else {
         Err("neither a claim file nor an exit file (the magic matches neither)".into())
@@ -182,12 +206,34 @@ pub(crate) mod tests {
     /// verifies without proving.
     pub(crate) const W3C_CLAIM: &[u8] = include_bytes!("../tests/fixtures/w3c-deposit.claim");
 
-    /// The chain that file was built on: the V6 rehearsal genesis, L2 1,
-    /// claim tier 4 (its header and the run's /v1/l2).
+    /// The chain that file was built on, pinned as literals (never read back
+    /// out of the fixture, so a swapped file cannot re-pin itself): the V6
+    /// rehearsal genesis, L2 1, claim tier 4 — the W3c run's /v1/l2.
     pub(crate) fn w3c_chain() -> Chain {
-        let mut genesis = [0u8; 32];
-        genesis.copy_from_slice(&W3C_CLAIM[17..49]);
-        Chain { genesis, l2_id: 1, claim_fee_tier: 4 }
+        Chain {
+            genesis: parse_hex32("4f725b2932b06154cdc069016ccf4435bbeaea89ddcfaccdc70ed6c6d367bfd4").unwrap(),
+            l2_id: 1,
+            claim_fee_tier: 4,
+        }
+    }
+
+    /// The fixture is the file tests/fixtures/README.md describes, byte for
+    /// byte: its size and its SHA-256.
+    #[test]
+    fn the_fixture_is_the_pinned_w3c_claim() {
+        use sha2::Digest as _;
+        assert_eq!(W3C_CLAIM.len(), 327_202);
+        assert_eq!(
+            hex32(&sha2::Sha256::digest(W3C_CLAIM).as_slice().try_into().unwrap()),
+            "03ab5f8931734b1806eef058dda24b6adb5f93dc748483041229b6747500879a"
+        );
+    }
+
+    #[test]
+    fn repeated_keys_are_refused_by_name() {
+        assert_eq!(distinct_keys(Kind::Exit, &[[1; 32], [2; 32], [3; 32]]), Ok(()));
+        let err = distinct_keys(Kind::Exit, &[[1; 32], [2; 32], [1; 32]]).unwrap_err();
+        assert_eq!(err, "exit file refused: it names one nullifier twice");
     }
 
     #[test]
