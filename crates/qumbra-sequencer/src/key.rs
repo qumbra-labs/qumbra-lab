@@ -9,7 +9,11 @@
 //!   genesis's `WrapperParams::sequencer_key`, or the run refuses to start;
 //! - the **filler-wallet seed** (`Keccak256(FILLER_DOMAIN ‖ seed)`) — the
 //!   sequencer's own L2 notes and fee unit for S3's fillers, never the run
-//!   seed f5box used (#847 Q3 (iii)).
+//!   seed f5box used (#847 Q3 (iii));
+//! - the **L1-wallet seed** (`Keccak256(L1_WALLET_DOMAIN ‖ seed)`, lab #847
+//!   S3b) — the L1 wallet whose burns `seed` claims to the sequencer. One
+//!   seed, one purpose: it is never the filler seed, so the L1 wallet's
+//!   keys and the L2 notes' keys share nothing.
 //!
 //! **The file must be mode 0600 or 0400** (owner only, never executable), or
 //! it is refused by name — B2's precedent: a signing seed readable by group or
@@ -46,20 +50,34 @@ use qumbra_node::genesis_v6::{rehearsal_sequencer_key, rehearsal_sequencer_seed,
 /// The filler-wallet seed's domain.
 const FILLER_DOMAIN: &[u8] = b"qumbra:sequencer:filler-wallet:v1";
 
+/// The L1-wallet seed's domain (lab #847 S3b).
+const L1_WALLET_DOMAIN: &[u8] = b"qumbra:sequencer:l1-wallet:v1";
+
 /// A loaded, checked sequencer key.
 pub struct SequencerKey {
     pub signer: SigningKey<MlDsa65>,
     /// The seed S3's filler wallet derives its notes from (zeroized on drop).
     pub filler_seed: Zeroizing<[u8; 32]>,
+    /// The seed of the L1 wallet `seed` burns from (zeroized on drop).
+    pub l1_seed: Zeroizing<[u8; 32]>,
     /// Whether this is the public rehearsal key (and so a rehearsal genesis).
     pub rehearsal: bool,
 }
 
-/// The filler-wallet seed of a sequencer seed.
-pub fn filler_seed(seed: &[u8; 32]) -> [u8; 32] {
-    let mut msg = FILLER_DOMAIN.to_vec();
+fn derive(domain: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+    let mut msg = Zeroizing::new(domain.to_vec());
     msg.extend_from_slice(seed);
     qlab_devnet::hash::keccak256(&msg)
+}
+
+/// The filler-wallet seed of a sequencer seed.
+pub fn filler_seed(seed: &[u8; 32]) -> [u8; 32] {
+    derive(FILLER_DOMAIN, seed)
+}
+
+/// The L1-wallet seed of a sequencer seed (lab #847 S3b).
+pub fn l1_seed(seed: &[u8; 32]) -> [u8; 32] {
+    derive(L1_WALLET_DOMAIN, seed)
 }
 
 /// Check `seed` against `params` and derive the keys. Refused, by name, for a
@@ -85,7 +103,12 @@ pub fn from_seed(seed: [u8; 32], params: &WrapperParams) -> Result<SequencerKey,
     if signer.verifying_key().encode().as_slice() != params.sequencer_key.as_slice() {
         return Err("the key file's seed does not derive this genesis's sequencer key — refusing to start".into());
     }
-    Ok(SequencerKey { signer, filler_seed: Zeroizing::new(filler_seed(&seed)), rehearsal: rehearsal_genesis })
+    Ok(SequencerKey {
+        signer,
+        filler_seed: Zeroizing::new(filler_seed(&seed)),
+        l1_seed: Zeroizing::new(l1_seed(&seed)),
+        rehearsal: rehearsal_genesis,
+    })
 }
 
 /// The one sentence every key-file parse or decode failure is reported as.
@@ -168,6 +191,17 @@ mod tests {
         assert_eq!(a, filler_seed(&[0x5e; 32]));
         assert_ne!(a, filler_seed(&[0x5f; 32]));
         assert_ne!(a, [0x5e; 32]);
+    }
+
+    /// The L1-wallet seed (S3b) is its own domain: deterministic, per key,
+    /// never the filler seed nor the signing seed.
+    #[test]
+    fn the_l1_wallet_seed_is_its_own_domain() {
+        let k = from_seed([0x5e; 32], &params_for(key_of([0x5e; 32]))).unwrap();
+        assert_eq!(*k.l1_seed, l1_seed(&[0x5e; 32]));
+        assert_ne!(*k.l1_seed, *k.filler_seed);
+        assert_ne!(*k.l1_seed, [0x5e; 32]);
+        assert_ne!(l1_seed(&[0x5e; 32]), l1_seed(&[0x5f; 32]));
     }
 
     #[cfg(unix)]

@@ -28,6 +28,14 @@ qlab-node = { path = "../qlab-node" }
 qlab-wprover = { path = "../qlab-wprover" }
 qlab-wrapper = { path = "../qlab-wrapper" }
 qumbra-node = { path = "../qumbra-node" }
+# S3b (lab #847): `seed` burns from the sequencer's own L1 wallet through the
+# wallet's shared spend flow and scan, never a second copy. The send flow's
+# two features only — no `randomx`, `host` or `verify` asked for here (the
+# graph already carries randomx through qumbra-node/qlab-devnet's defaults;
+# this dependency neither adds nor removes it).
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["net", "prove"] }
+qlab-wallet = { path = "../qlab-wallet" }
+qlab-ledger = { path = "../qlab-ledger" }
 # The sequencer's signature (lab #785 F5-4b): ML-DSA-65, pinned as the node's.
 ml-dsa = "=0.1.1"
 p3-field = "=0.6.1"
@@ -42,5 +50,6 @@ zeroize = "1.9"
 tiny_http = "=0.12.0"
 
 [dev-dependencies]
+qlab-note = { path = "../qlab-note" }
 # S2: the claim fixture is pinned by its SHA-256 (tests/fixtures/README.md).
 sha2 = "=0.11.0"
