@@ -76,6 +76,12 @@ impl Keys {
         Keys { seed: qlab_devnet::hash::keccak256(seed.as_bytes()) }
     }
 
+    /// From a 32-byte seed — the sequencer's filler wallet (lab #847 S5:
+    /// `key::filler_seed`), never a run seed in the clear.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Keys { seed }
+    }
+
     /// `Keccak256(DOMAIN ‖ seed ‖ label ‖ wrapper ‖ slot)` as four lanes.
     pub fn lanes(&self, label: &str, wrapper: u64, slot: u64) -> Digest {
         let mut msg = DOMAIN.to_vec();

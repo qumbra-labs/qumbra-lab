@@ -20,6 +20,7 @@
 pub mod bundle;
 pub mod chain;
 pub mod intake;
+pub mod key;
 pub mod members;
 pub mod queue;
 pub mod server;
