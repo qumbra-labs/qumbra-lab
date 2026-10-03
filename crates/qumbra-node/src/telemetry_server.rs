@@ -132,6 +132,10 @@ fn ready_body(ready: bool, replay: Option<qlab_node::ReplayPosition>) -> String 
 /// ⇒ 503 with the ledger's reason, `Some(Ok)` ⇒ the payload.
 pub type BridgeSlot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
 
+/// The `/v1/wrapper` slot (lab #847 S0), the bridge slot's twin: `None` ⇒
+/// 404, `Some(Err)` ⇒ 503 with the node's reason, `Some(Ok)` ⇒ the payload.
+pub type WrapperSlot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
+
 /// A running telemetry listener: bound address + worker thread + the shared
 /// snapshot the run loop refreshes + the readiness latch the handover flips.
 pub struct TelemetryServer {
@@ -147,6 +151,9 @@ pub struct TelemetryServer {
     /// V6 node once it has rendered one; `None` ⇒ 404, which readers show as
     /// unavailable — never as zero.
     bridge: BridgeSlot,
+    /// The `/v1/wrapper` payload (lab #847 S0): `Some` only on a V6 node once
+    /// it has rendered one; `None` ⇒ 404.
+    wrapper: WrapperSlot,
     /// `false` from bind until [`Self::mark_ready`]: `/v1/ready` says
     /// `starting` and `/v1/telemetry` 404s. Never cleared — a node is not
     /// un-opened.
@@ -172,12 +179,14 @@ impl TelemetryServer {
         let served = Arc::new(AtomicU64::new(0));
         let snapshot: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let bridge: BridgeSlot = Arc::new(Mutex::new(None));
+        let wrapper: WrapperSlot = Arc::new(Mutex::new(None));
         let ready = Arc::new(AtomicBool::new(false));
 
         let worker = Arc::clone(&server);
         let worker_served = Arc::clone(&served);
         let worker_snapshot = Arc::clone(&snapshot);
         let worker_bridge = Arc::clone(&bridge);
+        let worker_wrapper = Arc::clone(&wrapper);
         let worker_ready = Arc::clone(&ready);
         let thread = std::thread::spawn(move || {
             for request in worker.incoming_requests() {
@@ -235,6 +244,31 @@ impl TelemetryServer {
                     };
                     continue;
                 }
+                if path == qlab_node::wrapper_route::WRAPPER_PATH {
+                    // Lab #847 S0: a pure route addition, the bridge route's
+                    // shape — 404 until ready and on every non-V6 net, 503
+                    // with the node's own reason when it cannot answer.
+                    let body = if worker_ready.load(Ordering::Acquire) {
+                        worker_wrapper.lock().ok().and_then(|b| b.clone())
+                    } else {
+                        None
+                    };
+                    let _ = match body {
+                        Some(Err(why)) => request.respond(
+                            tiny_http::Response::from_string(format!("wrapper state unavailable: {why}")).with_status_code(503),
+                        ),
+                        Some(Ok(body)) => {
+                            let header = tiny_http::Header::from_bytes(CONTENT_TYPE_HEADER, &b"application/json"[..])
+                                .expect("static content type parses");
+                            request.respond(tiny_http::Response::from_data(body).with_header(header))
+                        }
+                        None => request.respond(
+                            tiny_http::Response::from_string("not found: this node serves no wrapper (not a V6 net, or still starting)")
+                                .with_status_code(404),
+                        ),
+                    };
+                    continue;
+                }
                 if path != TELEMETRY_PATH {
                     let _ = request.respond(
                         tiny_http::Response::from_string(format!(
@@ -268,7 +302,7 @@ impl TelemetryServer {
             }
         });
 
-        Ok(TelemetryServer { addr: bound, server, thread: Some(thread), served, snapshot, bridge, ready })
+        Ok(TelemetryServer { addr: bound, server, thread: Some(thread), served, snapshot, bridge, wrapper, ready })
     }
 
     /// The snapshot slot this server serves — the node adopts this `Arc` at
@@ -281,6 +315,11 @@ impl TelemetryServer {
     /// [`Self::snapshot`]; a V6 node fills it, every other node leaves `None`.
     pub(crate) fn bridge(&self) -> BridgeSlot {
         Arc::clone(&self.bridge)
+    }
+
+    /// The `/v1/wrapper` slot (lab #847 S0), adopted like [`Self::bridge`].
+    pub(crate) fn wrapper(&self) -> WrapperSlot {
+        Arc::clone(&self.wrapper)
     }
 
     /// Flip the latch: `/v1/ready` answers `ready`, `/v1/telemetry` serves.
@@ -508,6 +547,33 @@ mod tests {
         let (status, body) = get(addr, BRIDGE_PATH);
         assert!(status.contains(" 503"), "{status}");
         assert!(String::from_utf8_lossy(&body).contains("CounterDecrease"));
+        srv.shutdown();
+    }
+
+    /// Lab #847 S0: `/v1/wrapper` is 404 while its slot is empty (every non-V6
+    /// node, and before readiness), serves the slot's bytes exactly as JSON
+    /// once a V6 node fills it, and answers a node-side refusal as a 503 with
+    /// its reason; the telemetry wire beside it is untouched.
+    #[test]
+    fn the_wrapper_route_is_404_off_v6_and_serves_the_slot_on_v6() {
+        use qlab_node::wrapper_route::{parse, WrapperView, WRAPPER_PATH};
+        let t = sample();
+        let (srv, _) = started_ready(&t);
+        let addr = srv.addr();
+        let (status, _) = get(addr, WRAPPER_PATH);
+        assert!(status.contains(" 404"), "no wrapper off V6: {status}");
+        let view = WrapperView { l2_id: 1, tip: 268, cr: Some(232), last_bundle_height: Some(268), last_bundle_id: Some([7; 32]) };
+        *srv.wrapper().lock().unwrap() = Some(Ok(view.to_body()));
+        let (status, body) = get(addr, WRAPPER_PATH);
+        assert!(status.contains(" 200"), "{status}");
+        assert_eq!(parse(&body), Ok(view));
+        let (status, body) = get(addr, TELEMETRY_PATH);
+        assert!(status.contains(" 200"), "{status}");
+        assert_eq!(Telemetry::from_bytes(&body).unwrap(), t, "the telemetry wire is unchanged beside it");
+        *srv.wrapper().lock().unwrap() = Some(Err("the last bundle's block at height 9 is not on the held main chain".into()));
+        let (status, body) = get(addr, WRAPPER_PATH);
+        assert!(status.contains(" 503"), "{status}");
+        assert!(String::from_utf8_lossy(&body).contains("height 9"));
         srv.shutdown();
     }
 
