@@ -1796,6 +1796,24 @@ where
          spends:   NOT VERIFIED — the subtracted spends are the endpoint's list; a withheld spend leaves a \
          spent note in the figure, so a balance can be OVERSTATED (lab #853)."
     );
+    let cache = match v.cache() {
+        qumbra_wallet::annulet_verify::ChainCache::Unused => "headers: verified from genesis (no record yet)".to_string(),
+        qumbra_wallet::annulet_verify::ChainCache::Resumed { anchor, recorded } if anchor < recorded => format!(
+            "headers: this wallet's verified record holds {recorded}; this endpoint serves only up to {anchor}, \
+             re-checked there — the verified tip is {anchor}"
+        ),
+        qumbra_wallet::annulet_verify::ChainCache::Resumed { anchor, .. } => {
+            format!("headers: resumed from this wallet's verified record at height {anchor}, re-checked against the endpoint")
+        }
+        qumbra_wallet::annulet_verify::ChainCache::Discarded(why) => {
+            format!("headers: RECORD DISCARDED — {why}; re-verified from genesis")
+        }
+    };
+    let cache = match v.cache_write() {
+        Some(why) => format!("{cache}; the record was not written: {why}"),
+        None => cache,
+    };
+    let trust = format!("{trust}\ncache:    {cache}");
     let range = v.range();
     let report = qumbra_wallet::annulet_verify::into_report(v);
     Ok((report, range, trust))

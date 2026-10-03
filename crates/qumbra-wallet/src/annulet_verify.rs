@@ -40,6 +40,23 @@
 //! `false` today. (The output side is the safe direction: a withheld output
 //! only makes a figure smaller.)
 //!
+//! **The verified-header cache** (lab #852, WA0 of #858). Re-verifying every
+//! seal from genesis on every scan costs ~3.4 KB and one ML-DSA-65 verify per
+//! header. So a scan that verified the chain records the verified header
+//! *preimages* (153 B each, seals dropped after admission) in
+//! `<wallet dir>/annulet-chain.<genesis hex>` — keyed by genesis, because the
+//! verified chain is a chain fact, not an endpoint fact — and the next scan
+//! resumes from its tip. The record is **the wallet's own prior
+//! verification**, trusted at the wallet dir's trust level (the seed's class):
+//! on load it is relinked from the genesis header built from the pinned bytes
+//! (prev-hash chain, consecutive heights) with no seal re-verify, and **the
+//! served header at the cached tip is re-checked on every resume**, so a
+//! fabricated-but-linking record, or an endpoint telling another story, meets
+//! a fork at the tip. Either case — [`VerifyRefusal::ChainCacheInvalid`] or
+//! [`VerifyRefusal::CachedTipForked`] — discards the record and re-verifies
+//! from genesis, named in [`VerifiedAnnulet::cache`]; never a silent fallback.
+//! A refused scan never writes the record.
+//!
 //! The result is [`VerifiedAnnulet`], whose only constructor is
 //! [`scan_annulet_verified`]: a balance cannot reach a view model through any
 //! other path.
@@ -157,6 +174,11 @@ pub enum VerifyRefusal {
     RegistryRootMismatch { height: u64 },
     /// A registry opening whose path does not fold to its root.
     RegistryPathMismatch { asset: u16 },
+    /// The verified-header record does not load: the wrong version or
+    /// genesis, a bad length, a header that does not decode, or a broken link.
+    ChainCacheInvalid { why: String },
+    /// The endpoint's header at the recorded tip is not the recorded one.
+    CachedTipForked { height: u64 },
 }
 
 impl std::fmt::Display for VerifyRefusal {
@@ -201,6 +223,12 @@ impl std::fmt::Display for VerifyRefusal {
                 write!(f, "registry opening's root is not the verified header's at height {height}")
             }
             RegistryPathMismatch { asset } => write!(f, "registry opening for asset {asset} does not fold to its root"),
+            ChainCacheInvalid { why } => write!(f, "the verified-header record is invalid ({why}); discarded"),
+            CachedTipForked { height } => write!(
+                f,
+                "the endpoint's header at the recorded tip {height} is not the one this wallet verified (a fork); \
+                 the record is discarded"
+            ),
         }
     }
 }
@@ -269,10 +297,27 @@ pub fn verify_chain<F>(fetch: &mut F, genesis: VerifiedGenesis, up_to: u64) -> R
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let key = genesis.file.sequencer().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     let mut state = ChainState::new_for(GenesisForm::Annulet, genesis.file.genesis_block_header());
-    let mut headers: Vec<BlockHeader> = Vec::new();
-    let mut parent = genesis.header_hash;
+    let mut headers = Vec::new();
+    extend_chain(fetch, &genesis, &mut state, &mut headers, up_to)?;
+    Ok(VerifiedChain { genesis, headers })
+}
+
+/// Admit sealed headers past `headers` (heights `headers.len() + 1 ..`) up to
+/// `up_to` or the endpoint's last — the one admission path, from genesis or
+/// from a resumed record.
+fn extend_chain<F>(
+    fetch: &mut F,
+    genesis: &VerifiedGenesis,
+    state: &mut ChainState,
+    headers: &mut Vec<BlockHeader>,
+    up_to: u64,
+) -> Result<(), VerifyRefusal>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let key = genesis.file.sequencer().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
+    let mut parent = headers.last().map_or(genesis.header_hash, |h| h.header_hash_for(GenesisForm::Annulet));
     loop {
         let from = headers.len() as u64 + 1;
         if from > up_to {
@@ -294,7 +339,7 @@ where
             if s.header.prev != parent {
                 return Err(VerifyRefusal::HeaderFork { height: want });
             }
-            qlab_devnet::validation::validate_sealed_header_annulet(&state, s, &key)
+            qlab_devnet::validation::validate_sealed_header_annulet(state, s, &key)
                 .map_err(|e| VerifyRefusal::HeaderInvalid { height: want, why: format!("{e:?}") })?;
             parent = state
                 .insert_header(s.header)
@@ -305,7 +350,170 @@ where
             break;
         }
     }
+    Ok(())
+}
+
+/// The most headers the record holds: 2^18 × 153 B ≈ 38 MiB. Past it the
+/// record is refused by name on load and not written (a scan then verifies
+/// from genesis, as before the record existed).
+pub const MAX_CACHED_HEADERS: u64 = 1 << 18;
+
+/// The only record version this build reads and writes.
+pub const CHAIN_CACHE_VERSION: u8 = 1;
+
+/// The record's path: one per genesis, in the wallet dir.
+pub fn chain_cache_path(w: &WalletDir, genesis_hash: &[u8; 32]) -> std::path::PathBuf {
+    w.dir.join(format!("annulet-chain.{}", hex(genesis_hash)))
+}
+
+const PREIMAGE_LEN_ANNULET: usize = qlab_devnet::header::HEADER_PREIMAGE_LEN_ANNULET;
+
+/// `ver(1) ‖ genesis(32) ‖ n(u64 LE) ‖ n × 153-B header preimage`.
+fn encode_chain_cache(genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(41 + headers.len() * PREIMAGE_LEN_ANNULET);
+    out.push(CHAIN_CACHE_VERSION);
+    out.extend_from_slice(genesis_hash);
+    out.extend_from_slice(&(headers.len() as u64).to_le_bytes());
+    for h in headers {
+        out.extend_from_slice(&qlab_p2p::codec::encode_header(GenesisForm::Annulet, h));
+    }
+    out
+}
+
+/// Read the record and relink it from the genesis header (no seal
+/// re-verify: it is this wallet's own prior verification). `Ok(None)` when
+/// there is none; `Err(why)` when there is one and it does not load.
+pub fn load_chain_cache(w: &WalletDir, genesis: &VerifiedGenesis) -> Result<Option<Vec<BlockHeader>>, String> {
+    let path = chain_cache_path(w, &genesis.hash);
+    let b = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if b.len() < 41 {
+        return Err("shorter than its prefix".into());
+    }
+    if b[0] != CHAIN_CACHE_VERSION {
+        return Err(format!("version {}; this build reads only {CHAIN_CACHE_VERSION}", b[0]));
+    }
+    if b[1..33] != genesis.hash {
+        return Err("recorded for another genesis".into());
+    }
+    let n = u64::from_le_bytes(b[33..41].try_into().expect("8 bytes"));
+    if n > MAX_CACHED_HEADERS {
+        return Err(format!("{n} headers, over the {MAX_CACHED_HEADERS} bound"));
+    }
+    if (b.len() - 41) as u64 != n * PREIMAGE_LEN_ANNULET as u64 {
+        return Err(format!("{} B of headers for {n} headers", b.len() - 41));
+    }
+    let mut parent = genesis.header_hash;
+    let mut headers = Vec::with_capacity(n as usize);
+    for (i, chunk) in b[41..].chunks_exact(PREIMAGE_LEN_ANNULET).enumerate() {
+        let h = qlab_p2p::codec::decode_header(GenesisForm::Annulet, chunk)
+            .map_err(|e| format!("header {} does not decode: {e:?}", i + 1))?;
+        if h.height != i as u64 + 1 || h.prev != parent {
+            return Err(format!("header {} does not link", i + 1));
+        }
+        parent = h.header_hash_for(GenesisForm::Annulet);
+        headers.push(h);
+    }
+    Ok(Some(headers))
+}
+
+/// Write the record atomically (`<path>.tmp`, fsync, rename).
+fn save_chain_cache(w: &WalletDir, genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Result<(), String> {
+    use std::io::Write;
+    if headers.len() as u64 > MAX_CACHED_HEADERS {
+        return Err(format!("{} headers, over the {MAX_CACHED_HEADERS} bound: not recorded", headers.len()));
+    }
+    let path = chain_cache_path(w, genesis_hash);
+    let tmp = path.with_extension("tmp");
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&encode_chain_cache(genesis_hash, headers))?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// Resume from a loaded record: re-check the endpoint's header at the
+/// anchor (the recorded tip, or `up_to` below it) against the record, then
+/// admit what is past it. An endpoint that serves nothing at the anchor is
+/// behind the record: the chain is clamped to the endpoint's stated tip,
+/// re-checked there the same way — never claimed above what this endpoint
+/// serves.
+fn resume_chain<F>(
+    fetch: &mut F,
+    genesis: VerifiedGenesis,
+    cached: Vec<BlockHeader>,
+    up_to: u64,
+) -> Result<VerifiedChain, VerifyRefusal>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let mut anchor = (cached.len() as u64).min(up_to);
+    if anchor == 0 {
+        return verify_chain(fetch, genesis, up_to);
+    }
+    let served_at = |fetch: &mut F, h: u64| -> Result<Option<BlockHeader>, VerifyRefusal> {
+        let bytes = fetch(&format!("/v1/headers?from={h}&to={h}"))
+            .map_err(|why| VerifyRefusal::HeadersUnavailable { from: h, why })?;
+        let units = decode_headers_page(ANNULET, h, &bytes)
+            .map_err(|e| VerifyRefusal::HeadersMalformed { from: h, why: e.to_string() })?;
+        match units.first() {
+            None => Ok(None),
+            Some(u) => Ok(Some(sealed(u).map_err(|e| VerifyRefusal::HeadersMalformed { from: h, why: e.to_string() })?.header)),
+        }
+    };
+    let served = match served_at(fetch, anchor)? {
+        Some(h) => h,
+        None => {
+            // Behind the record: clamp to the endpoint's own stated tip.
+            let stated = fetch("/v1/registry/root")
+                .ok()
+                .and_then(|b| qlab_cbserver::registry::decode_registry_root(&b).ok())
+                .map(|(height, _)| height)
+                .unwrap_or(0);
+            anchor = stated.min(anchor);
+            if anchor == 0 {
+                return Ok(VerifiedChain { genesis, headers: Vec::new() });
+            }
+            served_at(fetch, anchor)?.ok_or(VerifyRefusal::CachedTipForked { height: anchor })?
+        }
+    };
+    if served != cached[anchor as usize - 1] {
+        return Err(VerifyRefusal::CachedTipForked { height: anchor });
+    }
+    let mut headers: Vec<BlockHeader> = cached;
+    headers.truncate(anchor as usize);
+    let mut state = ChainState::new_for(GenesisForm::Annulet, genesis.file.genesis_block_header());
+    for h in &headers {
+        state.insert_header(*h).map_err(|e| VerifyRefusal::ChainCacheInvalid { why: format!("{e:?}") })?;
+    }
+    if anchor as usize == headers.len() && anchor < up_to {
+        extend_chain(fetch, &genesis, &mut state, &mut headers, up_to)?;
+    }
     Ok(VerifiedChain { genesis, headers })
+}
+
+/// What the verified-header record did for a scan — for the trust line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainCache {
+    /// None was recorded: verified from genesis.
+    Unused,
+    /// Resumed: the record (`recorded` headers) was re-checked at `anchor`
+    /// and the chain admitted past it. `anchor < recorded` with no headers
+    /// past it is an endpoint behind the record: the verified tip is clamped
+    /// to what this endpoint serves.
+    Resumed { anchor: u64, recorded: u64 },
+    /// The record was refused ([`VerifyRefusal::ChainCacheInvalid`] or
+    /// [`VerifyRefusal::CachedTipForked`]), discarded, and the chain
+    /// re-verified from genesis.
+    Discarded(VerifyRefusal),
 }
 
 /// A scan whose every figure is bound to the verified chain. Constructed only
@@ -317,6 +525,10 @@ pub struct VerifiedAnnulet {
     bodies_fetched: u64,
     body_bytes: u64,
     stated_tip: Option<u64>,
+    cache: ChainCache,
+    /// Why the record could not be written, if it could not (the scan
+    /// stands; the next one verifies more).
+    cache_write: Option<String>,
 }
 
 impl VerifiedAnnulet {
@@ -350,6 +562,16 @@ impl VerifiedAnnulet {
         self.stated_tip
     }
 
+    /// What the verified-header record did for this scan.
+    pub fn cache(&self) -> &ChainCache {
+        &self.cache
+    }
+
+    /// Why the record could not be written after this scan, if so.
+    pub fn cache_write(&self) -> Option<&str> {
+        self.cache_write.as_deref()
+    }
+
     /// Bodies fetched to bind notes, and their bytes: the per-hit cost.
     pub fn body_cost(&self) -> (u64, u64) {
         (self.bodies_fetched, self.body_bytes)
@@ -371,7 +593,22 @@ where
 {
     let pin = pin.ok_or(VerifyRefusal::NoPin)?;
     let genesis = verify_genesis(fetch, pin)?;
-    let chain = verify_chain(fetch, genesis, to)?;
+    let recorded = load_chain_cache(w, &genesis);
+    let recorded_len = recorded.as_ref().ok().and_then(|r| r.as_ref().map(Vec::len)).unwrap_or(0);
+    let (chain, cache) = match recorded {
+        Ok(None) => (verify_chain(fetch, genesis, to)?, ChainCache::Unused),
+        Err(why) => (verify_chain(fetch, genesis, to)?, ChainCache::Discarded(VerifyRefusal::ChainCacheInvalid { why })),
+        Ok(Some(cached)) => match resume_chain(fetch, genesis.clone(), cached, to) {
+            Ok(chain) => {
+                let anchor = (recorded_len as u64).min(to).min(chain.tip());
+                (chain, ChainCache::Resumed { anchor, recorded: recorded_len as u64 })
+            }
+            Err(e @ VerifyRefusal::CachedTipForked { .. }) | Err(e @ VerifyRefusal::ChainCacheInvalid { .. }) => {
+                (verify_chain(fetch, genesis, to)?, ChainCache::Discarded(e))
+            }
+            Err(e) => return Err(e),
+        },
+    };
     let to = to.min(chain.tip());
 
     let genesis_notes: Vec<([u8; 32], L2Note)> = chain
@@ -431,7 +668,14 @@ where
         .ok()
         .and_then(|b| qlab_cbserver::registry::decode_registry_root(&b).ok())
         .map(|(height, _)| height);
-    Ok(VerifiedAnnulet { report, chain, range: (from, to), bodies_fetched, body_bytes, stated_tip })
+    // The record is written only now, after every check passed — a refused
+    // scan never writes it — and only when it would grow or was discarded.
+    let grows = chain.headers.len() > recorded_len;
+    let cache_write = match (&cache, grows) {
+        (ChainCache::Discarded(_), _) | (_, true) => save_chain_cache(w, &chain.genesis.hash, &chain.headers).err(),
+        _ => None,
+    };
+    Ok(VerifiedAnnulet { report, chain, range: (from, to), bodies_fetched, body_bytes, stated_tip, cache, cache_write })
 }
 
 /// Step 4: the registry leaf of `asset`, bound to the verified chain — the

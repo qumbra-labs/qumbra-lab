@@ -240,3 +240,150 @@ fn an_oversized_genesis_file_is_refused_by_name() {
         Some(VerifyRefusal::GenesisTooLarge { got: MAX_GENESIS_FILE_BYTES + 1 })
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lab #852 / WA0: the verified-header record
+// ---------------------------------------------------------------------------
+
+use qumbra_wallet::annulet_verify::{chain_cache_path, scan_annulet_verified, ChainCache};
+
+/// Scan `ep` from a recording fetch: the result and every path asked.
+fn scan_recorded(
+    w: &WalletDir,
+    ep: &Endpoint,
+) -> (Result<qumbra_wallet::annulet_verify::VerifiedAnnulet, VerifyRefusal>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut rng = StdRng::seed_from_u64(852);
+    let mut fetch = |p: &str| {
+        paths.push(p.to_string());
+        ep.fetch(p)
+    };
+    let r = scan_annulet_verified(w, &mut fetch, 0, u64::MAX, Some(ep.file.hash()), &mut rng);
+    (r, paths)
+}
+
+fn header_paths(paths: &[String]) -> Vec<&str> {
+    paths.iter().filter(|p| p.starts_with("/v1/headers")).map(String::as_str).collect()
+}
+
+/// Five bodies; an endpoint over the first `n`.
+fn endpoints(w: &WalletDir, seed: u64) -> (Vec<BlockBody>, qlab_node::annulet_genesis::AnnuletGenesisFile) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let a0 = w.wallet().address_at_index(0);
+    let mut b = bodies(w, &mut rng);
+    b.push(BlockBody { txs: vec![pay_tx(&a0, &[note_to(&a0, 1, USDT, 60)], 0x60, &mut rng)], ..BlockBody::default() });
+    b.push(BlockBody { txs: vec![pay_tx(&a0, &[note_to(&a0, 2, USDT, 61)], 0x61, &mut rng)], ..BlockBody::default() });
+    (b, genesis(&a0))
+}
+
+#[test]
+fn a_second_scan_resumes_from_the_record_and_fetches_only_new_headers() {
+    let w = wallet_dir("cache_resume", 0x71);
+    let (b, file) = endpoints(&w, 71);
+    let ep3 = Endpoint::new(file.clone(), &b[..3], None, Lie::None);
+    let (r, paths) = scan_recorded(&w, &ep3);
+    assert_eq!(r.unwrap().cache(), &ChainCache::Unused);
+    assert_eq!(header_paths(&paths), vec!["/v1/headers?from=1&to=256"]);
+    assert!(chain_cache_path(&w, &file.hash()).exists(), "a verified scan records its headers");
+
+    let ep5 = Endpoint::new(file, &b, None, Lie::None);
+    let (r, paths) = scan_recorded(&w, &ep5);
+    let v = r.expect("the resumed scan verifies");
+    assert_eq!(v.cache(), &ChainCache::Resumed { anchor: 3, recorded: 3 });
+    assert_eq!(v.chain().tip(), 5);
+    assert_eq!(
+        header_paths(&paths),
+        vec!["/v1/headers?from=3&to=3", "/v1/headers?from=4&to=259"],
+        "the recorded tip re-checked, then only what is new"
+    );
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+#[test]
+fn a_forked_endpoint_after_a_recorded_scan_discards_the_record_and_re_verifies() {
+    let w = wallet_dir("cache_fork", 0x72);
+    let (b, file) = endpoints(&w, 72);
+    scan_recorded(&w, &Endpoint::new(file.clone(), &b[..3], None, Lie::None)).0.expect("the honest chain verifies");
+    // Another chain from height 3 on: block 3 carries other transactions.
+    let mut other = b.clone();
+    let a0 = w.wallet().address_at_index(0);
+    let mut rng = StdRng::seed_from_u64(7272);
+    other[2] = BlockBody { txs: vec![pay_tx(&a0, &[note_to(&a0, 9, USDT, 90)], 0x70, &mut rng)], ..BlockBody::default() };
+    let (r, paths) = scan_recorded(&w, &Endpoint::new(file, &other[..4], None, Lie::None));
+    let v = r.expect("a fork against the record is re-verified, not a failure");
+    assert_eq!(v.cache(), &ChainCache::Discarded(VerifyRefusal::CachedTipForked { height: 3 }));
+    assert_eq!(v.chain().tip(), 4);
+    assert!(header_paths(&paths).contains(&"/v1/headers?from=1&to=256"), "re-verified from genesis");
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+#[test]
+fn a_tampered_record_is_refused_by_name_and_re_verified() {
+    let w = wallet_dir("cache_tamper", 0x73);
+    let (b, file) = endpoints(&w, 73);
+    let ep = Endpoint::new(file.clone(), &b[..3], None, Lie::None);
+    scan_recorded(&w, &ep).0.unwrap();
+    let path = chain_cache_path(&w, &file.hash());
+    let mut bytes = std::fs::read(&path).unwrap();
+    // A byte inside header 1: header 2 no longer links to it. (A flip in the
+    // last header would link and meet the tip re-check instead — a fork.)
+    bytes[41 + 40] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+    let v = scan_recorded(&w, &ep).0.expect("a bad record is discarded, not fatal");
+    assert!(
+        matches!(v.cache(), ChainCache::Discarded(VerifyRefusal::ChainCacheInvalid { .. })),
+        "{:?}",
+        v.cache()
+    );
+    assert_eq!(v.chain().tip(), 3);
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+#[test]
+fn a_record_of_another_genesis_is_not_this_chains() {
+    let w = wallet_dir("cache_genesis", 0x74);
+    let (b, file) = endpoints(&w, 74);
+    scan_recorded(&w, &Endpoint::new(file.clone(), &b[..3], None, Lie::None)).0.unwrap();
+    // Another genesis (another holder's note): its own file name — unused.
+    let other = genesis(&w.wallet().address_at_index(1));
+    let v = scan_recorded(&w, &Endpoint::new(other.clone(), &b[..3], None, Lie::None)).0.unwrap();
+    assert_eq!(v.cache(), &ChainCache::Unused);
+    // And a record copied under its name is refused by name.
+    std::fs::copy(chain_cache_path(&w, &file.hash()), chain_cache_path(&w, &other.hash())).unwrap();
+    let v = scan_recorded(&w, &Endpoint::new(other, &b[..3], None, Lie::None)).0.unwrap();
+    match v.cache() {
+        ChainCache::Discarded(VerifyRefusal::ChainCacheInvalid { why }) => assert!(why.contains("another genesis"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+#[test]
+fn an_endpoint_behind_the_record_is_clamped_never_over_claimed() {
+    let w = wallet_dir("cache_behind", 0x75);
+    let (b, file) = endpoints(&w, 75);
+    scan_recorded(&w, &Endpoint::new(file.clone(), &b, None, Lie::None)).0.unwrap();
+    let v = scan_recorded(&w, &Endpoint::new(file.clone(), &b[..3], None, Lie::None)).0.unwrap();
+    assert_eq!(v.cache(), &ChainCache::Resumed { anchor: 3, recorded: 5 });
+    assert_eq!(v.chain().tip(), 3, "the verified tip is what this endpoint serves");
+    assert_eq!(v.range(), (0, 3));
+    // The longer record stands for the next endpoint that serves it.
+    let len = std::fs::metadata(chain_cache_path(&w, &file.hash())).unwrap().len();
+    assert_eq!(len, 41 + 5 * 153);
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+#[test]
+fn a_refused_scan_never_writes_the_record() {
+    let w = wallet_dir("cache_refused", 0x76);
+    let mut rng = StdRng::seed_from_u64(76);
+    let file = genesis(&w.wallet().address_at_index(0));
+    let honest = bodies(&w, &mut rng);
+    let mut forged = honest.clone();
+    let a0 = w.wallet().address_at_index(0);
+    forged[1].txs.push(pay_tx(&a0, &[note_to(&a0, 1_000_000, USDT, 99)], 0x60, &mut rng));
+    let ep = Endpoint::new(file.clone(), &honest, Some(&forged), Lie::ForgedNote);
+    assert!(scan_recorded(&w, &ep).0.is_err());
+    assert!(!chain_cache_path(&w, &file.hash()).exists(), "nothing recorded from a refused scan");
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
