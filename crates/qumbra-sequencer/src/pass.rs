@@ -18,9 +18,15 @@
 //! | answer | the pass |
 //! |---|---|
 //! | 202, 409 | posted; poll for its landing |
-//! | 422 naming `Spacing`, 503 | wait one poll, re-post the same bytes |
-//! | 422 otherwise (`Anchor`, `Thread`, `Prev`, …) | discard: items back to `queued`, re-plan from the run state |
-//! | 400 | fatal, named: the bytes alone are wrong, and they are ours |
+//! | 503; 422 `state lagging its chain`, `Spacing {…}`, `Wrapper("Anchor(i)")` | wait one poll, re-post the same bytes (a proved bundle is not thrown away for a wait) |
+//! | 422 `Wrapper("Thread(…)")`, `Wrapper("Prev")` | discard: items back to `queued`, re-plan from the run state |
+//! | 422 anything else, 400, any other status | fatal, named: the pass stops and the bundle stays in flight for the operator |
+//!
+//! The 422 kind is read from the operator route's `refused: <reason>` body
+//! (the reason a `BundleRefusal`'s Debug form, optionally after `refused
+//! before at this tip: `), by its leading token — see [`classify`]. A pass
+//! discards at most [`MAX_DISCARDS`] bundles, waiting one poll before each
+//! re-draft, then ends at a ceiling.
 //!
 //! A posted bundle that does not land is re-posted with the same bytes while
 //! `/v1/wrapper` still shows its predecessor as the last bundle, at most
@@ -34,7 +40,16 @@
 //! `last_bundle_id` is its id, the bundle landed while no pass was watching
 //! (including a crash between the POST and the next write) — it is adopted as
 //! landed. If the chain's last bundle is still the pending one's predecessor,
-//! the same bytes are re-posted. Otherwise it is discarded.
+//! the same bytes are re-posted. Otherwise it is discarded. Then any item
+//! still `Planned` that no pending record names (a crash between writing the
+//! pending record and marking its items is impossible by order, but an older
+//! layout or a hand edit is not) goes back to `queued`, by name.
+//!
+//! Every write is ordered so a crash anywhere replays to a clean end: the
+//! pending record (naming the items) is written before any item is marked;
+//! landing is commit (skipped if the run state already ends with this bundle)
+//! → mark (skipping items already in the target state) → clear the record;
+//! discarding is mark → clear. The record is always cleared last.
 //!
 //! ## Bounds
 //!
@@ -59,8 +74,59 @@ use crate::state::write_atomic;
 /// spacing floor, counted in polls (`WRAPPER_SPACING_BLOCKS_V1` × 2).
 pub const MAX_REPOSTS: u32 = 2 * 48;
 
-/// Bundles kept in `--out` (the newest): a re-post never re-proves.
+/// Bundles kept in `--out` (the newest by number): a re-post never re-proves.
 pub const KEEP_BUNDLES: u64 = 8;
+
+/// Bundles one pass may discard before it ends at a ceiling: a persistent
+/// refusal never becomes a prove-post-discard loop.
+pub const MAX_DISCARDS: u32 = 3;
+
+/// The longest slice of a node's answer echoed into a message.
+pub const MAX_ECHO: usize = 160;
+
+/// A node answer, as it may appear in a message: one line, at most
+/// [`MAX_ECHO`] characters.
+fn clip(body: &str) -> String {
+    let one: String = body.trim().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut out: String = one.chars().take(MAX_ECHO).collect();
+    if one.chars().count() > MAX_ECHO {
+        out.push('…');
+    }
+    out
+}
+
+/// What the pass does with a non-2xx answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// Wait one poll and re-post the same bytes; the reason, named.
+    Wait(&'static str),
+    /// Throw the bundle away and re-plan; the reason, named.
+    Discard(&'static str),
+    /// Stop the pass.
+    Fatal,
+}
+
+/// Read a 422 body's refusal kind: the operator route answers `refused:
+/// <reason>`, the reason `state lagging its chain` or a `BundleRefusal` in
+/// its Debug form, possibly after `refused before at this tip: `. Matched by
+/// the leading token, never by a substring anywhere in the body.
+pub fn classify(body: &str) -> Answer {
+    let Some(r) = body.trim().strip_prefix("refused: ") else { return Answer::Fatal };
+    let r = r.strip_prefix("refused before at this tip: ").unwrap_or(r);
+    if r == "state lagging its chain" {
+        Answer::Wait("the node's state lags its chain")
+    } else if r.starts_with("Spacing {") {
+        Answer::Wait("the spacing floor")
+    } else if r.starts_with("Wrapper(\"Anchor(") {
+        Answer::Wait("an absorbed root not yet covered by a finality record (Anchor)")
+    } else if r.starts_with("Wrapper(\"Thread(") {
+        Answer::Discard("it does not thread from the chain's surface (Thread)")
+    } else if r == "Wrapper(\"Prev\")" {
+        Answer::Discard("its prev is not the chain's surface (Prev)")
+    } else {
+        Answer::Fatal
+    }
+}
 
 /// The node, as the pass sees it.
 pub trait Node {
@@ -102,8 +168,14 @@ pub trait Work {
     /// Draft the next bundle from `candidates` (claim items, arrival order,
     /// with their artifact bytes) against the chain as `w` describes it.
     fn draft(&mut self, w: &WrapperView, candidates: &[([u8; 32], Vec<u8>)]) -> Result<Result<Draft, NotDrafted>, String>;
-    /// Record a landed wrapper (its `built` value) in the run state.
-    fn commit(&mut self, built: &Value) -> Result<(), String>;
+    /// Record a landed wrapper (its `built` value) in the run state — a
+    /// no-op if the run state already ends with bundle `id` (a crash after the
+    /// commit and before the pending record was cleared).
+    fn commit(&mut self, id: &[u8; 32], built: &Value) -> Result<(), String>;
+    /// The next bundle number, persisted before it is returned: monotonic
+    /// over the run's life, so `Planned(n)` and `bundle-<n>.bin` are never
+    /// reused.
+    fn next_number(&mut self) -> Result<u64, String>;
 }
 
 /// The pass's settings.
@@ -206,6 +278,7 @@ struct Run<'a> {
     work: &'a mut dyn Work,
     deadline: u64,
     landed: u64,
+    discards: u32,
 }
 
 /// What happened to the bundle in flight.
@@ -221,15 +294,26 @@ impl Run<'_> {
 
     /// One poll, or the ceiling if the deadline has passed.
     fn wait(&self, what: &str) -> Result<(), Outcome> {
-        if self.clock.now() + self.cfg.poll_secs > self.deadline {
+        if self.clock.now().saturating_add(self.cfg.poll_secs) > self.deadline {
             return Err(Outcome::Ceiling(format!("--max-wait reached while {what}")));
         }
         self.clock.sleep(self.cfg.poll_secs);
         Ok(())
     }
 
-    fn mark(&mut self, items: &[[u8; 32]], state: State) -> Result<(), String> {
+    /// Move `items` to `state`, idempotently: an item already there is
+    /// skipped (a crash mid-mark replays cleanly), and an item a crashed
+    /// discard already put back to `queued` reaches `landed` through
+    /// `Planned(n)` — the only path the transition table allows.
+    fn mark(&mut self, items: &[[u8; 32]], state: State, n: u64) -> Result<(), String> {
         for id in items {
+            let now = self.queue.item(id).map(|i| i.state).ok_or_else(|| format!("no item {}", hex32(id)))?;
+            if now == state {
+                continue;
+            }
+            if now == State::Queued && matches!(state, State::Landed(_)) {
+                self.queue.set_state(id, State::Planned(n))?;
+            }
             self.queue.set_state(id, state)?;
         }
         Ok(())
@@ -237,21 +321,22 @@ impl Run<'_> {
 
     /// The chain's last bundle is `p`'s: record it.
     fn land(&mut self, p: &Pending, height: u64) -> Result<(), String> {
-        self.work.commit(&p.built)?;
-        self.mark(&p.items, State::Landed(height))?;
+        self.work.commit(&p.id, &p.built)?;
+        self.mark(&p.items, State::Landed(height), p.n)?;
         Pending::clear(&self.cfg.state)?;
         eprintln!("SEQ landed bundle {} {} at {height} ({} items)", p.n, hex32(&p.id), p.items.len());
         self.landed += 1;
         // Keep the newest KEEP_BUNDLES; older bytes are never re-posted.
-        if p.n >= KEEP_BUNDLES {
-            let _ = std::fs::remove_file(self.bundle_path(p.n - KEEP_BUNDLES));
+        if let Some(old) = p.n.checked_sub(KEEP_BUNDLES) {
+            let _ = std::fs::remove_file(self.bundle_path(old));
         }
         Ok(())
     }
 
     fn discard(&mut self, p: &Pending, why: &str) -> Result<(), String> {
-        self.mark(&p.items, State::Queued)?;
+        self.mark(&p.items, State::Queued, p.n)?;
         Pending::clear(&self.cfg.state)?;
+        self.discards += 1;
         eprintln!("SEQ discarded bundle {} {}: {why} — its {} items are queued again", p.n, hex32(&p.id), p.items.len());
         Ok(())
     }
@@ -292,27 +377,32 @@ impl Run<'_> {
                 p.save(&self.cfg.state)?;
             }
             let (status, body) = self.node.post(&bytes)?;
-            match status {
-                202 | 409 => posted = true,
-                503 => {
-                    if let Err(o) = self.wait("the node was busy (503)") {
+            let answer = match status {
+                202 | 409 => {
+                    posted = true;
+                    continue;
+                }
+                503 => Answer::Wait("the node was busy (503)"),
+                422 => classify(&body),
+                _ => Answer::Fatal,
+            };
+            match answer {
+                Answer::Wait(why) => {
+                    if let Err(o) = self.wait(why) {
                         return Ok(Err(o));
                     }
                 }
-                422 if body.contains("Spacing") => {
-                    if let Err(o) = self.wait("the spacing floor holds the slot (422 Spacing)") {
-                        return Ok(Err(o));
-                    }
-                }
-                422 => {
-                    self.discard(&p, &format!("the node refused it at this tip ({})", body.trim()))?;
+                Answer::Discard(why) => {
+                    self.discard(&p, why)?;
                     return Ok(Ok(Flight::Discarded));
                 }
-                400 => return Err(format!("the node refused bundle {} as malformed (400): {}", p.n, body.trim())),
-                other => {
-                    if let Err(o) = self.wait(&format!("an unexpected answer ({other})")) {
-                        return Ok(Err(o));
-                    }
+                Answer::Fatal => {
+                    return Err(format!(
+                        "the node refused bundle {} {} ({status}): {} — the bundle stays in flight",
+                        p.n,
+                        hex32(&p.id),
+                        clip(&body)
+                    ))
                 }
             }
         }
@@ -323,18 +413,28 @@ impl Run<'_> {
 pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, work: &mut dyn Work) -> Result<Outcome, String> {
     std::fs::create_dir_all(&cfg.out).map_err(|e| format!("{}: {e}", cfg.out.display()))?;
     let deadline = clock.now().saturating_add(cfg.max_wait_secs);
-    let mut r = Run { cfg, queue, node, clock, work, deadline, landed: 0 };
+    let mut r = Run { cfg, queue, node, clock, work, deadline, landed: 0, discards: 0 };
     // Reconcile what a previous pass left in flight.
-    if let Some(p) = Pending::load(&cfg.state)? {
+    let pending = Pending::load(&cfg.state)?;
+    let named: Vec<[u8; 32]> = pending.as_ref().map_or(Vec::new(), |p| p.items.clone());
+    let orphans: Vec<[u8; 32]> =
+        r.queue.items().filter(|i| matches!(i.state, State::Planned(_)) && !named.contains(&i.id)).map(|i| i.id).collect();
+    for id in orphans {
+        eprintln!("SEQ item {} was planned in no bundle in flight — queued again", hex32(&id));
+        r.queue.set_state(&id, State::Queued)?;
+    }
+    if let Some(p) = pending {
         eprintln!("SEQ reconciling bundle {} {} left in flight", p.n, hex32(&p.id));
         if let Err(o) = r.fly(p)? {
             return Ok(o);
         }
     }
-    let mut next_n = 0u64;
     loop {
         if r.landed >= cfg.max_bundles {
             return Ok(Outcome::Ceiling(format!("--max-bundles {} reached", cfg.max_bundles)));
+        }
+        if r.discards >= MAX_DISCARDS {
+            return Ok(Outcome::Ceiling(format!("{MAX_DISCARDS} bundles discarded in one pass")));
         }
         let candidates: Vec<([u8; 32], Vec<u8>)> = r
             .queue
@@ -348,7 +448,7 @@ pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, wo
         let w = r.node.wrapper()?;
         // Spacing: the next block must be at least `spacing` past the last bundle.
         if let Some(h) = w.last_bundle_height {
-            if w.tip + 1 < h + cfg.spacing && !candidates.is_empty() {
+            if w.tip.saturating_add(1) < h.saturating_add(cfg.spacing) && !candidates.is_empty() {
                 if let Err(o) = r.wait(&format!("the spacing floor ({} blocks after {h})", cfg.spacing)) {
                     return Ok(o);
                 }
@@ -378,18 +478,25 @@ pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, wo
                 continue;
             }
         };
-        // A fresh number: past every bundle file this run has kept.
-        while r.bundle_path(next_n).exists() {
-            next_n += 1;
-        }
+        // Order: number (persisted), bytes, the pending record naming the
+        // items, and only then the items marked — a crash before the mark
+        // leaves a record the next pass reconciles.
+        let n = r.work.next_number()?;
         let id = qlab_devnet::hash::keccak256(&draft.bytes);
-        write_atomic(&r.bundle_path(next_n), &draft.bytes)?;
-        r.mark(&draft.items, State::Planned(next_n))?;
-        let p = Pending { n: next_n, id, prev: w.last_bundle_id, items: draft.items, reposts: 0, built: draft.built };
+        write_atomic(&r.bundle_path(n), &draft.bytes)?;
+        let p = Pending { n, id, prev: w.last_bundle_id, items: draft.items, reposts: 0, built: draft.built };
         p.save(&cfg.state)?;
+        r.mark(&p.items, State::Planned(n), n)?;
         eprintln!("SEQ drafted bundle {} {} ({} items, {} bytes)", p.n, hex32(&p.id), p.items.len(), draft.bytes.len());
-        if let Err(o) = r.fly(p)? {
-            return Ok(o);
+        match r.fly(p)? {
+            Err(o) => return Ok(o),
+            Ok(Flight::Discarded) => {
+                // Never re-draft at once: what refused it may need a block.
+                if let Err(o) = r.wait("re-drafting after a discard") {
+                    return Ok(o);
+                }
+            }
+            Ok(Flight::Landed) => {}
         }
     }
 }
@@ -472,6 +579,12 @@ mod tests {
         need: usize,
         committed: Vec<Value>,
         refuse: Vec<[u8; 32]>,
+        ids: Vec<[u8; 32]>,
+        next: u64,
+    }
+
+    fn fake(need: usize) -> FakeWork {
+        FakeWork { need, committed: Vec::new(), refuse: Vec::new(), ids: Vec::new(), next: 0 }
     }
     impl Work for FakeWork {
         fn draft(&mut self, _w: &WrapperView, c: &[([u8; 32], Vec<u8>)]) -> Result<Result<Draft, NotDrafted>, String> {
@@ -489,10 +602,31 @@ mod tests {
             let bytes: Vec<u8> = items.iter().flatten().copied().chain(self.committed.len().to_le_bytes()).collect();
             Ok(Ok(Draft { built: json!(items.iter().map(hex32).collect::<Vec<_>>()), items, bytes }))
         }
-        fn commit(&mut self, built: &Value) -> Result<(), String> {
+        fn commit(&mut self, id: &[u8; 32], built: &Value) -> Result<(), String> {
+            if self.ids.last() == Some(id) {
+                return Ok(());
+            }
+            self.ids.push(*id);
             self.committed.push(built.clone());
             Ok(())
         }
+        fn next_number(&mut self) -> Result<u64, String> {
+            self.next += 1;
+            Ok(self.next - 1)
+        }
+    }
+
+    /// A second queued item: the claim with one byte of r_v flipped (a new
+    /// id) under a made-up key — the pass never decodes it; FakeWork drafts
+    /// by id.
+    fn twin(q: &mut Queue, k: u8) -> [u8; 32] {
+        let mut bytes = W3C_CLAIM.to_vec();
+        *bytes.last_mut().unwrap() ^= k;
+        let mut c = classify(W3C_CLAIM, &w3c_chain()).unwrap();
+        c.id = crate::intake::id_of(&bytes);
+        c.keys = vec![[k; 32]];
+        q.admit(&c, &bytes).unwrap();
+        c.id
     }
 
     fn setup(name: &str) -> (PathBuf, Queue, [u8; 32], Pass) {
@@ -513,7 +647,7 @@ mod tests {
         let (d, mut q, id, cfg) = setup("happy");
         let node = FakeNode::new(100);
         let clock = FakeClock(Cell::new(0));
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(1);
         let out = run(&cfg, &mut q, &node, &clock, &mut work).unwrap();
         assert_eq!(out, Outcome::Drained { landed: 1 });
         assert_eq!(work.committed.len(), 1);
@@ -530,31 +664,45 @@ mod tests {
     fn the_post_answer_table() {
         let (d, mut q, _, cfg) = setup("answers");
         let node = FakeNode::new(100);
-        node.answers.borrow_mut().extend([(422, "Wrapper(\"Spacing { since: 3, need: 48 }\")".to_string()), (503, "busy".into())]);
+        node.answers.borrow_mut().extend([(422, "refused: Spacing { since: 3, need: 48 }".to_string()), (503, "busy".into())]);
         let clock = FakeClock(Cell::new(0));
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(1);
         assert_eq!(run(&cfg, &mut q, &node, &clock, &mut work).unwrap(), Outcome::Drained { landed: 1 });
         assert_eq!(node.posts.get(), 3, "two waits, then admitted");
         assert_eq!(clock.0.get(), 90, "one poll per wait (Spacing, 503), then one landing poll");
         let _ = std::fs::remove_dir_all(&d);
 
-        let (d, mut q, _, cfg) = setup("discard");
+        // Thread discards — items back to queued, a poll before re-drafting —
+        // and a persistent one ends the pass after MAX_DISCARDS.
+        let (d, mut q, id, cfg) = setup("discard");
         let node = FakeNode::new(100);
-        node.land_after.set(None);
-        node.answers.borrow_mut().push((422, "Wrapper(\"Thread\")".into()));
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
-        let cfg1 = Pass { max_wait_secs: 0, ..cfg };
-        let out = run(&cfg1, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
-        assert!(matches!(out, Outcome::Ceiling(_)), "{out:?}");
-        assert!(work.committed.is_empty());
+        let thread = (422, "refused: Wrapper(\"Thread(\\\"aa\\\")\")".to_string());
+        node.answers.borrow_mut().extend(std::iter::repeat_n(thread, MAX_DISCARDS as usize));
+        let clock = FakeClock(Cell::new(0));
+        let mut work = fake(1);
+        let out = run(&cfg, &mut q, &node, &clock, &mut work).unwrap();
+        assert_eq!(out, Outcome::Ceiling(format!("{MAX_DISCARDS} bundles discarded in one pass")));
+        assert_eq!(q.item(&id).unwrap().state, State::Queued);
+        assert!(work.committed.is_empty() && !Pending::path(&cfg.state).exists());
+        assert_eq!(clock.0.get(), 30 * u64::from(MAX_DISCARDS), "one poll after each discard");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // Anchor is a wait, never a discard: the same bytes go again.
+        let (d, mut q, id, cfg) = setup("anchor");
+        let node = FakeNode::new(100);
+        node.answers.borrow_mut().push((422, "refused: refused before at this tip: Wrapper(\"Anchor(2)\")".into()));
+        let mut work = fake(1);
+        assert_eq!(run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap(), Outcome::Drained { landed: 1 });
+        assert_eq!((node.posts.get(), work.committed.len()), (2, 1));
+        assert!(matches!(q.item(&id).unwrap().state, State::Landed(_)));
         let _ = std::fs::remove_dir_all(&d);
 
         let (d, mut q, _, cfg) = setup("fatal");
         let node = FakeNode::new(100);
-        node.answers.borrow_mut().push((400, "Codec".into()));
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
+        node.answers.borrow_mut().push((400, format!("refused: Codec(\"bad\")\n{}", "x".repeat(500))));
+        let mut work = fake(1);
         let err = run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap_err();
-        assert!(err.contains("malformed (400)"), "{err}");
+        assert!(err.contains("(400): refused: Codec") && !err.contains('\n') && err.contains('…'), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -567,7 +715,7 @@ mod tests {
         let node = FakeNode::new(100);
         node.land_after.set(None);
         let clock = FakeClock(Cell::new(0));
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(1);
         let cfg = Pass { max_wait_secs: u64::MAX / 2, ..cfg };
         let out = run(&cfg, &mut q, &node, &clock, &mut work).unwrap();
         let Outcome::Ceiling(why) = out else { panic!("{out:?}") };
@@ -595,7 +743,7 @@ mod tests {
             v.last_bundle_height = Some(90);
             v.last_bundle_id = Some(bid);
         }
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(1);
         let out = run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
         assert_eq!(out, Outcome::Drained { landed: 1 });
         assert_eq!(node.posts.get(), 0, "adopted, never re-posted");
@@ -619,7 +767,7 @@ mod tests {
             v.last_bundle_height = Some(90);
             v.last_bundle_id = Some([2; 32]);
         }
-        let mut work = FakeWork { need: 2, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(2);
         let out = run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
         assert_eq!(out, Outcome::Short { have: 1, need: 2 });
         assert_eq!(q.item(&id).unwrap().state, State::Queued);
@@ -633,9 +781,9 @@ mod tests {
     fn short_refused_and_empty() {
         let (d, mut q, id, cfg) = setup("short");
         let node = FakeNode::new(100);
-        let mut work = FakeWork { need: 16, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(16);
         assert_eq!(run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap(), Outcome::Short { have: 1, need: 16 });
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: vec![id] };
+        let mut work = FakeWork { refuse: vec![id], ..fake(1) };
         assert_eq!(run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap(), Outcome::Drained { landed: 0 });
         assert_eq!(q.item(&id).unwrap().state, State::Refused(Refusal::CnfOnChain));
         let _ = std::fs::remove_dir_all(&d);
@@ -653,7 +801,7 @@ mod tests {
             v.last_bundle_id = Some([5; 32]);
         }
         node.view.borrow_mut().tip = 100;
-        let mut work = FakeWork { need: 1, committed: Vec::new(), refuse: Vec::new() };
+        let mut work = fake(1);
         // Each read advances the tip by one; 300 s of 30 s polls is ten
         // reads — far short of 48 blocks.
         let cfg = Pass { max_wait_secs: 300, ..cfg };
@@ -661,6 +809,109 @@ mod tests {
         let Outcome::Ceiling(why) = out else { panic!("{out:?}") };
         assert!(why.contains("spacing floor"), "{why}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The 422 table, by leading token only.
+    #[test]
+    fn classify_reads_the_leading_token() {
+        assert_eq!(super::classify("refused: state lagging its chain"), Answer::Wait("the node's state lags its chain"));
+        assert!(matches!(super::classify("refused: Spacing { since: 1, need: 48 }"), Answer::Wait(_)));
+        assert!(matches!(super::classify("refused: Wrapper(\"Anchor(0)\")"), Answer::Wait(_)));
+        assert!(matches!(super::classify("refused: refused before at this tip: Wrapper(\"Anchor(3)\")"), Answer::Wait(_)));
+        assert!(matches!(super::classify("refused: Wrapper(\"Thread(\\\"d\\\")\")"), Answer::Discard(_)));
+        assert!(matches!(super::classify("refused: Wrapper(\"Prev\")"), Answer::Discard(_)));
+        for fatal in ["refused: Counters", "refused: Wrapper(\"WProof\")", "Spacing { since: 1 }", "refused: Wrapper(\"Member(0, \\\"Spacing\\\")\")"] {
+            assert_eq!(super::classify(fatal), Answer::Fatal, "{fatal}");
+        }
+    }
+
+    /// Bundle numbers come from the work's persisted counter: a second pass
+    /// numbers past the first, never reusing 0.
+    #[test]
+    fn numbers_continue_across_passes() {
+        let (d, mut q, _, cfg) = setup("numbers");
+        let node = FakeNode::new(100);
+        let mut work = fake(1);
+        run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
+        let second = twin(&mut q, 1);
+        node.view.borrow_mut().tip += 100;
+        run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
+        assert!(cfg.out.join("bundle-0.bin").exists() && cfg.out.join("bundle-1.bin").exists());
+        assert!(matches!(q.item(&second).unwrap().state, State::Landed(_)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Crash windows, each restarted to a clean end. (a) An item Planned
+    /// that no pending record names goes back to queued.
+    #[test]
+    fn a_planned_orphan_is_queued_again() {
+        let (d, mut q, id, cfg) = setup("orphan");
+        q.set_state(&id, State::Planned(7)).unwrap();
+        let mut work = fake(2);
+        let out = run(&cfg, &mut q, &FakeNode::new(100), &FakeClock(Cell::new(0)), &mut work).unwrap();
+        assert_eq!(out, Outcome::Short { have: 1, need: 2 });
+        assert_eq!(q.item(&id).unwrap().state, State::Queued);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// (b) A crash after the commit: the restart sees the chain name the
+    /// bundle, does not commit it twice, and finishes the marks.
+    /// (c) A crash mid-mark: one item already Landed, one still Planned.
+    #[test]
+    fn a_crash_after_commit_or_mid_mark_replays_once() {
+        let (d, mut q, a, cfg) = setup("midmark");
+        let b = twin(&mut q, 1);
+        std::fs::create_dir_all(&cfg.out).unwrap();
+        let bytes = b"bundle zero".to_vec();
+        let bid = qlab_devnet::hash::keccak256(&bytes);
+        write_atomic(&cfg.out.join("bundle-0.bin"), &bytes).unwrap();
+        Pending { n: 0, id: bid, prev: None, items: vec![a, b], reposts: 0, built: json!("b0") }.save(&cfg.state).unwrap();
+        q.set_state(&a, State::Planned(0)).unwrap();
+        q.set_state(&a, State::Landed(90)).unwrap();
+        q.set_state(&b, State::Planned(0)).unwrap();
+        let node = FakeNode::new(100);
+        {
+            let mut v = node.view.borrow_mut();
+            v.last_bundle_height = Some(90);
+            v.last_bundle_id = Some(bid);
+        }
+        let mut work = FakeWork { ids: vec![bid], committed: vec![json!("b0")], ..fake(2) };
+        let out = run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
+        assert_eq!(out, Outcome::Drained { landed: 1 });
+        assert_eq!(work.committed.len(), 1, "committed once, not again");
+        assert_eq!((q.item(&a).unwrap().state, q.item(&b).unwrap().state), (State::Landed(90), State::Landed(90)));
+        assert!(!Pending::path(&cfg.state).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// (d) A crash mid-discard: one item back to queued, one still planned,
+    /// the record still there. If the chain moved on, the discard finishes;
+    /// if the chain names the bundle after all, both land — the queued one
+    /// through Planned.
+    #[test]
+    fn a_crash_mid_discard_finishes_either_way() {
+        for chain_names_it in [false, true] {
+            let (d, mut q, a, cfg) = setup(if chain_names_it { "middiscard-land" } else { "middiscard" });
+            let b = twin(&mut q, 1);
+            std::fs::create_dir_all(&cfg.out).unwrap();
+            let bytes = b"bundle zero".to_vec();
+            let bid = qlab_devnet::hash::keccak256(&bytes);
+            write_atomic(&cfg.out.join("bundle-0.bin"), &bytes).unwrap();
+            Pending { n: 0, id: bid, prev: None, items: vec![a, b], reposts: 0, built: json!("b0") }.save(&cfg.state).unwrap();
+            q.set_state(&b, State::Planned(0)).unwrap();
+            let node = FakeNode::new(100);
+            {
+                let mut v = node.view.borrow_mut();
+                v.last_bundle_height = Some(90);
+                v.last_bundle_id = Some(if chain_names_it { bid } else { [2; 32] });
+            }
+            let mut work = fake(3);
+            run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
+            let want = if chain_names_it { State::Landed(90) } else { State::Queued };
+            assert_eq!((q.item(&a).unwrap().state, q.item(&b).unwrap().state), (want, want));
+            assert!(!Pending::path(&cfg.state).exists());
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     #[test]

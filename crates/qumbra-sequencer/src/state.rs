@@ -45,6 +45,13 @@ pub struct RunState {
     /// Every note credited to the run, in order; spent ones are skipped by
     /// the planner by their nullifier.
     pub owned: Vec<Owned>,
+    /// Lab #847 S4: the id (Keccak-256 of the bytes) of each bundle the
+    /// sequencer recorded as landed, in order — so a landing replayed after a
+    /// crash is recognised and not recorded twice. Empty for an f5box run.
+    pub ids: Vec<[u8; 32]>,
+    /// Lab #847 S4: the next bundle number the sequencer hands out —
+    /// monotonic over the run's life (drafted bundles included), never reused.
+    pub next_n: u64,
 }
 
 /// The surface a wrapper states, from its statement — `verify_wrapper`'s
@@ -66,7 +73,7 @@ fn hex(b: &[u8]) -> String {
 
 fn unhex32(s: &str) -> Result<[u8; 32], String> {
     if s.len() != 64 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("not 64 hex characters: {s:?}"));
+        return Err(format!("not 64 hex characters: {s:?}")); // debug-ok: a hex string from the state file, an id not an opening
     }
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
@@ -102,7 +109,7 @@ pub fn tag_of(s: &str) -> Result<WTag, String> {
         "P" => Ok(WTag::P),
         "R" => Ok(WTag::R),
         "C" => Ok(WTag::C),
-        o => Err(format!("unknown member tag {o:?}")),
+        o => Err(format!("unknown member tag {o:?}")), // debug-ok: a tag string from the state file
     }
 }
 
@@ -187,14 +194,15 @@ impl Built {
 
 impl RunState {
     pub fn new(genesis: [u8; 32], l2_id: u64, seed: &str) -> Self {
-        RunState { genesis, l2_id, seed: seed.to_string(), bundles: Vec::new(), owned: Vec::new() }
+        RunState { genesis, l2_id, seed: seed.to_string(), bundles: Vec::new(), owned: Vec::new(), ids: Vec::new(), next_n: 0 }
     }
 
     /// Record a wrapper the chain applied, as built (lab #847 S4: the loop
     /// pushes only on an observed inclusion). It credits this run nothing —
     /// a claims-only wrapper's credits are its depositors'.
-    pub fn push_built(&mut self, b: Built) {
+    pub fn push_built(&mut self, id: [u8; 32], b: Built) {
         self.bundles.push(b);
+        self.ids.push(id);
     }
 
     /// Record a built wrapper and its credits.
@@ -211,6 +219,8 @@ impl RunState {
             "seed": self.seed,
             "bundles": self.bundles.iter().map(Built::to_json).collect::<Vec<_>>(),
             "owned": self.owned.iter().map(owned_json).collect::<Vec<_>>(),
+            "ids": self.ids.iter().map(|i| hex(i)).collect::<Vec<_>>(),
+            "next_n": self.next_n,
         })
     }
 
@@ -224,6 +234,15 @@ impl RunState {
             seed: v["seed"].as_str().ok_or("seed")?.to_string(),
             bundles: v["bundles"].as_array().ok_or("bundles")?.iter().map(Built::from_json).collect::<Result<_, _>>()?,
             owned: v["owned"].as_array().ok_or("owned")?.iter().map(owned_of).collect::<Result<_, _>>()?,
+            // Absent in an f5box state file (it records neither).
+            ids: match v.get("ids") {
+                None => Vec::new(),
+                Some(a) => a.as_array().ok_or("ids")?.iter().map(|i| unhex32(i.as_str().ok_or("an id")?)).collect::<Result<_, _>>()?,
+            },
+            next_n: match v.get("next_n") {
+                None => 0,
+                Some(n) => n.as_u64().ok_or("next_n")?,
+            },
         })
     }
 
@@ -251,8 +270,8 @@ impl RunState {
             if b.inp.prev != prev.commitment {
                 return Err(format!("bundle {i} does not thread from its predecessor's surface"));
             }
-            let (rin, wit, rout) = state.apply(&b.inp, &b.members).map_err(|e| format!("bundle {i}: {e:?}"))?;
-            let exit_cmt = check_wrapper_leaf(&rin, &b.inp, &b.members, &wit).map_err(|e| format!("bundle {i}: {e:?}"))?.1;
+            let (rin, wit, rout) = state.apply(&b.inp, &b.members).map_err(|e| format!("bundle {i}: {e:?}"))?; // debug-ok: WError: unit and value-free variants only
+            let exit_cmt = check_wrapper_leaf(&rin, &b.inp, &b.members, &wit).map_err(|e| format!("bundle {i}: {e:?}"))?.1; // debug-ok: WError: unit and value-free variants only
             if exit_chain(&b.exits) != exit_cmt {
                 return Err(format!("bundle {i}: the exit list does not chain to its exit_cmt"));
             }

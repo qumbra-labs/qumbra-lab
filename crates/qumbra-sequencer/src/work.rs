@@ -21,7 +21,7 @@ use crate::bundle::{assemble, prove, self_check, sign, Timings};
 use crate::chain::{self, Anchor, Http};
 use crate::intake::Chain;
 use crate::key::SequencerKey;
-use crate::members::{plan_claims, Keys, PlanError, K};
+use crate::members::{first_refused, plan_claims, Keys, PlanError, K};
 use crate::pass::{Clock, Draft, NotDrafted, Node, Work};
 use crate::queue::Refusal;
 use crate::state::{Built, RunState};
@@ -166,10 +166,15 @@ impl Work for RealWork {
         let mut chosen: Vec<_> = claims.into_iter().enumerate().filter(|(i, _)| take.contains(i)).map(|(_, c)| c).collect();
         let files: Vec<_> = chosen.drain(..).map(|(_, _, f)| f).collect();
         let keys = Keys::from_seed(*self.key.filler_seed);
-        let plan = match plan_claims(&state, &prev, absorbed, files, &keys) {
+        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), &keys) {
             Ok(p) => p,
-            Err(PlanError::Wrapper(e)) => return Err(format!("the native wrapper statement refuses the selected batch: {e}")),
-            Err(e) => return Err(format!("plan: {e:?}")),
+            // The statement is native: find the item by elimination and
+            // refuse it by name, so the next draft does not pick it again.
+            Err(PlanError::Wrapper(e)) => match first_refused(&state, &prev, &absorbed, &files, &keys) {
+                Some(i) => return Ok(Err(NotDrafted::Refuse(vec![(items[i], Refusal::Statement)]))),
+                None => return Err(format!("the native wrapper statement refuses the batch, and no single item is to blame: {e}")),
+            },
+            Err(e) => return Err(format!("plan: {e:?}")), // debug-ok: PlanError from plan_claims names counts and roots, no opening
         };
         let mut timings = Timings::new();
         let mut log = |what: &str| eprintln!("SEQ proving {what}");
@@ -177,13 +182,23 @@ impl Work for RealWork {
         let mut wb = assemble(&plan, self.chain.l2_id, proofs)?;
         sign(&mut wb, &self.key.signer, &self.chain.genesis)?;
         let bytes = wb.encode();
-        let rule = WrapperRule::from_genesis(&self.genesis).map_err(|e| format!("{e:?}"))?;
-        self_check(&rule, &bytes, &prev, &view).map_err(|r| format!("the node's rule refuses the bundle: {r:?}"))?;
+        let rule = WrapperRule::from_genesis(&self.genesis).map_err(|e| format!("{e:?}"))?; // debug-ok: a wrapper-rule genesis error, no key material
+        self_check(&rule, &bytes, &prev, &view).map_err(|r| format!("the node's rule refuses the bundle: {r:?}"))?; // debug-ok: a BundleRefusal, the node's own reason
         Ok(Ok(Draft { items, bytes, built: Built::of(&plan).to_json() }))
     }
 
-    fn commit(&mut self, built: &Value) -> Result<(), String> {
-        self.run.push_built(Built::from_json(built)?);
+    fn commit(&mut self, id: &[u8; 32], built: &Value) -> Result<(), String> {
+        if self.run.ids.last() == Some(id) {
+            return Ok(()); // a landing replayed after a crash: already recorded
+        }
+        self.run.push_built(*id, Built::from_json(built)?);
         self.run.save(&self.state)
+    }
+
+    fn next_number(&mut self) -> Result<u64, String> {
+        let n = self.run.next_n;
+        self.run.next_n = n.checked_add(1).ok_or("the bundle counter overflows")?;
+        self.run.save(&self.state)?;
+        Ok(n)
     }
 }

@@ -15,6 +15,10 @@
 //!   plan and nothing is in flight; 3 at a ceiling (`--max-bundles`,
 //!   `--max-wait`, re-posts), naming what is left; 4 when fewer than 16 claims
 //!   are plannable (fillers land in S3). Resumable: the next pass reconciles.
+//!   `run` takes the queue directory's lock, the same one `intake` holds for
+//!   its whole life — so `run` refuses while an intake serves that directory.
+//!   v0 runs the pass on a copy of the queue (the box rehearsal does), or
+//!   with intake stopped; sharing a live queue is not built.
 //! - `--version`.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,7 +54,7 @@ fn opt_u64(args: &[String], name: &str, default: u64) -> Result<u64, String> {
 
 fn addr(args: &[String], name: &str) -> Result<std::net::SocketAddr, String> {
     let v = flag(args, name)?;
-    v.parse().map_err(|_| format!("{name} {v:?} is not an ip:port address"))
+    v.parse().map_err(|_| format!("{name} {v:?} is not an ip:port address")) // debug-ok: an operator-typed address
 }
 
 /// One posting pass; the exit code names how it ended.
@@ -95,8 +99,8 @@ fn flag(args: &[String], name: &str) -> Result<String, String> {
 
 fn load_genesis(path: &Path) -> Result<GenesisFileV6, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let g = GenesisFileV6::from_bytes(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
-    g.verify_startup(None).map_err(|e| format!("{}: {e:?}", path.display()))?;
+    let g = GenesisFileV6::from_bytes(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))?; // debug-ok: a genesis decode error, no key material
+    g.verify_startup(None).map_err(|e| format!("{}: {e:?}", path.display()))?; // debug-ok: a genesis startup check error, no key material
     Ok(g)
 }
 

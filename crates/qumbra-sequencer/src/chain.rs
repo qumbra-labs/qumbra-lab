@@ -62,11 +62,11 @@ pub struct ChainView {
 /// the served `total` and never pass it, and the coinbase stream must hold
 /// every height `0..=tip`.
 pub fn read(node: &impl Get) -> Result<ChainView, String> {
-    let anchors = AnchorSet::from_bytes(&node.get("/v1/anchors")?).map_err(|e| format!("/v1/anchors: {e:?}"))?;
+    let anchors = AnchorSet::from_bytes(&node.get("/v1/anchors")?).map_err(|e| format!("/v1/anchors: {e:?}"))?; // debug-ok: a served-page decode error, no opening
     let mut tree = CommitmentTree::new();
     loop {
         let body = node.get(&format!("/v1/tree/leaves?from={}", tree.len()))?;
-        let page = TreeLeaves::from_bytes(&body).map_err(|e| format!("/v1/tree/leaves: {e:?}"))?;
+        let page = TreeLeaves::from_bytes(&body).map_err(|e| format!("/v1/tree/leaves: {e:?}"))?; // debug-ok: a served-page decode error, no opening
         if page.from != tree.len() {
             return Err(format!("/v1/tree/leaves: asked from {}, served from {}", tree.len(), page.from));
         }
@@ -87,7 +87,7 @@ pub fn read(node: &impl Get) -> Result<ChainView, String> {
     while (coinbase.len() as u64) <= anchors.tip_height {
         let from = coinbase.len() as u64;
         let body = node.get(&format!("/v1/coinbase?from={from}&to={}", anchors.tip_height))?;
-        let page = CoinbasePage::from_bytes(&body).map_err(|e| format!("/v1/coinbase: {e:?}"))?;
+        let page = CoinbasePage::from_bytes(&body).map_err(|e| format!("/v1/coinbase: {e:?}"))?; // debug-ok: a served-page decode error, no opening
         if page.blocks.is_empty() {
             return Err(format!("/v1/coinbase: an empty page at {from} below the tip {}", anchors.tip_height));
         }
@@ -161,7 +161,7 @@ impl ChainView {
             };
             let cm = n.commitment();
             let pos = *self.by_leaf.get(&cm).ok_or_else(|| {
-                format!("the matured burn minted at {} rebuilds to a commitment in no served leaf (form {form:?})", b.height)
+                format!("the matured burn minted at {} rebuilds to a commitment in no served leaf (form {form:?})", b.height) // debug-ok: a genesis form, a unit enum
             })?;
             let note = qlab_air::claim::BurnNote { value: n.value, rkm: n.rkm, rho: n.rho, rseed: n.rseed };
             out.push(Burn { height: b.height, note, cm, pos });
