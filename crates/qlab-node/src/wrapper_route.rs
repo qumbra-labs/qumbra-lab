@@ -263,8 +263,8 @@ mod tests {
         let cases = [
             (WrapperView { cr: Some(269), ..landed() }, "cr 269 is above the tip"),
             (WrapperView { last_bundle_height: Some(269), ..landed() }, "last_bundle_height 269 is above the tip"),
-            (WrapperView { last_bundle_id: None, ..landed() }, "both present or both null"),
-            (WrapperView { last_bundle_height: None, ..landed() }, "both present or both null"),
+            (WrapperView { last_bundle_id: None, ..landed() }, "must both be present or both null"),
+            (WrapperView { last_bundle_height: None, ..landed() }, "must both be present or both null"),
         ];
         for (view, why) in cases {
             assert!(view.check().unwrap_err().contains(why));
