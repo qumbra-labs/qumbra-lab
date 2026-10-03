@@ -104,6 +104,15 @@ pub const MAX_BODY_ANSWER_BYTES: usize = 10 + qlab_p2p::node::MAX_SERVED_BODY_BY
 /// the widest registry answer; 4 KiB is stated headroom.
 pub const MAX_REGISTRY_ANSWER_BYTES: usize = 4 * 1024;
 
+/// `/v1/l2/index` (lab #860 R1): `{"v":1,"height":…,"bundle_id":"<64 hex>",
+/// "refused":…}` — a reason of a few hundred bytes at most.
+pub const MAX_L2_INDEX_ANSWER_BYTES: usize = 1024;
+
+/// The nullifiers one V6 height can carry: one bundle of K = 16 members, a
+/// transaction member publishing three (two inputs and the fee slot) — 48 —
+/// rounded up for room.
+pub const MAX_L2_NULLIFIERS_PER_HEIGHT: usize = 64;
+
 /// **The whole-response ceiling for each route the verified scan reads**
 /// (lab #850 AD1b): a hostile endpoint cannot stream more than the route can
 /// legitimately carry into the wallet before anything is verified. `None` is
@@ -122,6 +131,17 @@ pub fn response_ceiling(path: &str) -> Option<usize> {
     } else if route.starts_with(crate::v6_bundle::BUNDLE_PATH_PREFIX) {
         // Lab #860 R2: one raw V6 bundle, bounded by the V6 body bound.
         qlab_devnet::body::MAX_V6_BODY_BYTES
+    } else if route == "/v1/l2/index" {
+        // Lab #860 R1: the index's one JSON line (two numbers, a hex id, a reason).
+        MAX_L2_INDEX_ANSWER_BYTES
+    } else if route == "/v1/l2/tree/leaves" {
+        // One page of at most MAX_TREE_LEAVES 32-byte leaves, plus its header.
+        qlab_node::rpc::MAX_TREE_LEAVES * 32 + 64
+    } else if route == "/v1/l2/nullifiers" {
+        // At most MAX_NULLIFIER_BLOCKS heights, each one bundle's nullifiers.
+        qlab_cbserver::codec::MAX_NULLIFIER_BLOCKS * (32 + MAX_L2_NULLIFIERS_PER_HEIGHT * 32) + 64
+    } else if route.starts_with("/v1/l2/registry/") {
+        MAX_REGISTRY_ANSWER_BYTES
     } else {
         return None;
     };
