@@ -3100,6 +3100,28 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// derived acceleration structure, so every indexed answer must remain
     /// identical to the scan it accelerates —
     /// `anchor_set_matches_the_full_chain_recomputation` is the mutation lock.
+    /// **The anchor window's facts** (lab #847 S0b, `/v1/wrapper` v2): every
+    /// commitment root at a height a bundle in the **next** block may absorb
+    /// by age — `tip + 1 − MAX_ANCHOR_AGE_BLOCKS ..= tip` — with the ascending
+    /// heights it was the root at inside that window, newest first (by its
+    /// newest height). These are the facts V7 judges by
+    /// (`v6_anchor_ok(root_heights(root), block_h, recorded)`): a height
+    /// outside the window fails V7's age bound for that block anyway, so the
+    /// verdict over this list equals the verdict over the full index. No
+    /// finality filter here — the record-covered height is V7's, and the
+    /// client applies it.
+    pub fn anchor_window(&self) -> Vec<(Hash32, Vec<u64>)> {
+        let tip = self.chain.tip_height();
+        let floor = (tip + 1).saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
+        let mut by_root: std::collections::HashMap<Hash32, Vec<u64>> = std::collections::HashMap::new();
+        for (&h, root) in self.roots_by_height.range(floor..=tip) {
+            by_root.entry(*root).or_default().push(h);
+        }
+        let mut out: Vec<(Hash32, Vec<u64>)> = by_root.into_iter().collect();
+        out.sort_unstable_by_key(|(_, hs)| std::cmp::Reverse(*hs.last().expect("a root entered with a height")));
+        out
+    }
+
     pub fn valid_anchor_roots(&self) -> Vec<Hash32> {
         let Some(finalized) = self.chain.finalized_height() else {
             return Vec::new(); // nothing finalized => no valid anchors yet
@@ -4598,6 +4620,11 @@ mod tests {
         let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), counter_setup());
         assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(0), None), "the genesis surface");
         assert_eq!(node.last_bundle(), Ok(None), "no bundle yet");
+        // Lab #847 S0b: the anchor window at genesis is the genesis root at
+        // height 0 — the fact a bundle in block 1 would be judged by.
+        let w = node.anchor_window();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].1, vec![0]);
         let (verdicts, state) = bundle_script(&mut node);
         assert!(verdicts[0].is_ok(), "{verdicts:?}");
         assert!(verdicts[1].as_ref().unwrap_err().contains("Spacing { since: 1, need: 3 }"), "{:?}", verdicts[1]);
