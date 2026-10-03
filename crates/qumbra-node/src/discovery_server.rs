@@ -1382,6 +1382,16 @@ fn header_unit(form: qlab_devnet::forms::GenesisForm, block: &qlab_node::StoredB
     }
 }
 
+/// Whether `height` on this form is the genesis a verifier reads from the
+/// genesis **file** (lab #850): the unsealed Annulet genesis, at height 0.
+/// Matched exhaustively (lab #706): an L1 genesis header is served like any.
+fn genesis_is_the_files(form: qlab_devnet::forms::GenesisForm, height: u64) -> bool {
+    match form {
+        qlab_devnet::forms::GenesisForm::Annulet => height == 0,
+        qlab_devnet::forms::GenesisForm::V4 | qlab_devnet::forms::GenesisForm::V5 => false,
+    }
+}
+
 /// What a projection without its blocks answers on the two served-chain
 /// routes: a 503 naming the gap, never an empty page that would read as
 /// "no such height".
@@ -1407,7 +1417,7 @@ pub fn respond_headers(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, qu
     if to < from {
         return Err((400, "'to' < 'from'".to_string()));
     }
-    if wf.form == qlab_devnet::forms::GenesisForm::Annulet && from == 0 {
+    if genesis_is_the_files(wf.form, from) {
         return Err((
             400,
             "the Annulet genesis header is unsealed and not served here: read it from the genesis file              (/genesis.qmb) and verify it by its hash; ask from=1"
@@ -1449,7 +1459,7 @@ fn body_path_arg(path: &str) -> Option<&str> {
 /// — 503; a projection without its blocks — 503.
 pub fn respond_body(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, h: &str) -> Result<Vec<u8>, (u16, String)> {
     let height = h.parse::<u64>().map_err(|_| (400, format!("invalid height `{h}`")))?;
-    if wf.form == qlab_devnet::forms::GenesisForm::Annulet && height == 0 {
+    if genesis_is_the_files(wf.form, height) {
         return Err((
             400,
             "the Annulet genesis body is the genesis file's notes: read /genesis.qmb and verify it by its hash"
