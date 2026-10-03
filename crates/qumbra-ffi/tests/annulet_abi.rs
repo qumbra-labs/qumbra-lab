@@ -230,7 +230,8 @@ fn a2_two_held_assets_open_in_order() {
         asset: u64::from(REG),
         issuer_key: [5, 5, 5, 5],
         mode: qlab_air::l2::MODE_REGULATED,
-        freeze_root: qlab_air::l2p::CanonicalFreezeTree::from_keys(&[rkm0]).root,
+        // The chain's tree is over each frozen address's key (lab PR #874).
+        freeze_root: qlab_air::l2p::CanonicalFreezeTree::from_rkms(&[rkm0]).root,
         allow_root: [0; 4],
         flags: 0,
     };

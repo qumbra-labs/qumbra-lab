@@ -364,7 +364,10 @@ fn asset_view_is_the_pump_of_held_assets_and_asset_view_from() {
         let genesis = other_genesis.unwrap_or(ep.file.hash());
         let list = with_list.then(|| signed(&list_json(&genesis, [9, 9, 9, 9])));
         let rkm0 = w.wallet().rkm(w.wallet().diversifier_at_index(0));
-        let freeze: BTreeMap<u16, Vec<[u64; 4]>> = [(REG, vec![rkm0])].into_iter().collect();
+        // A published freeze list is the tree's keys (lab PR #874), so the
+        // listed case reaches Frozen through the pure body too.
+        let key0 = CanonicalFreezeTree::from_rkms(&[rkm0]).keys[0];
+        let freeze: BTreeMap<u16, Vec<[u64; 4]>> = [(REG, vec![key0])].into_iter().collect();
 
         let mut asked = Vec::new();
         let mut fetch = |p: &str| {
