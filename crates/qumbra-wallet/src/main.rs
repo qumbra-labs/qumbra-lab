@@ -497,9 +497,10 @@ fn usage() {
                 L1-ADDR --amount V --out FILE` builds and proves an exit (lab #831): one\n\
                 asset-0 note redeemed on L2 and paid on L1 to the address, shape P,\n\
                 32 GiB class, proved here only; it is WRITTEN, never submitted — an\n\
-                Annulet net refuses an exit, and a V6 sequencer bundles it. --genesis-hash HEX64 pins the chain: RECOMMENDED\n\
-                against any endpoint you do not trust, because without it the\n\
-                wallet reports whatever Annulet chain the endpoint serves\n\
+                Annulet net refuses an exit, and a V6 sequencer bundles it. --genesis-hash HEX64 pins the chain:\n\
+                REQUIRED for `scan`/`history --net annulet`, which verify the genesis file,\n\
+                every seal and each note's block against it (lab #850) and print no\n\
+                figure otherwise; RECOMMENDED for the others\n\
          --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
                 build was CUT for when it carries the release lane\'s stamp, and to\n\
                 t1 only for an unstamped build; the flag overrides either. A\n\
@@ -1755,11 +1756,12 @@ fn scan_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u6
     Ok(())
 }
 
-/// The Annulet scan both `scan` and `history` read (lab #850 AD1): with
-/// `--genesis-hash`, the **verified** scan — genesis by its bytes, every seal
-/// from genesis to the verified tip, each note's block recomputed — and the
-/// range ends at the verified tip; without it, the endpoint's word, and the
-/// trust line says so beside every figure.
+/// The Annulet scan both `scan` and `history` read (lab #850 AD1): the
+/// **verified** scan — genesis by its bytes, every seal from genesis to the
+/// verified tip, each note's block recomputed — and the range ends at the
+/// verified tip. `--genesis-hash` is required (the #850 ruling, as W3a ruled
+/// for `deposit`): the CLI never prints an Annulet figure from an unverified
+/// scan.
 fn annulet_report<F>(
     w: &WalletDir,
     fetch: &mut F,
@@ -1771,32 +1773,32 @@ fn annulet_report<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    match pin {
-        Some(_) => {
-            eprintln!("net: annulet (from --net; verifying genesis bytes, the seal chain and each note's block)");
-            let v = qumbra_wallet::annulet_verify::scan_annulet_verified(w, fetch, from, to, pin, rng)?;
-            let (bodies, bytes) = v.body_cost();
-            let trust = format!(
-                "trust:    VERIFIED — genesis file hashed to the pin; seals verified 1..={}; {bodies} block body(ies) \
-                 ({bytes} B) recomputed for the notes found. Spends are the endpoint's list (a withheld spend \
-                 is not detected).",
-                v.chain().tip()
-            );
-            let range = v.range();
-            let report = qumbra_wallet::annulet_verify::into_report(v);
-            Ok((report, range, trust))
-        }
-        None => {
-            eprintln!(
-                "net: annulet (from --net; UNVERIFIED — no --genesis-hash, so every figure is the endpoint's word)"
-            );
-            let report = qumbra_wallet::annulet::scan_annulet(w, fetch, from, to, None, rng)?;
-            let trust = "trust:    UNVERIFIED — no --genesis-hash: these figures are the endpoint's word, not a \
-                         chain this wallet checked. Pass --genesis-hash to verify."
-                .to_string();
-            Ok((report, (from, to), trust))
-        }
-    }
+    let Some(pin) = pin else {
+        return Err("--net annulet needs --genesis-hash: an Annulet figure is printed only from a scan \
+                    verified against the chain it names (lab #850)"
+            .into());
+    };
+    eprintln!("net: annulet (from --net; verifying genesis bytes, the seal chain and each note's block)");
+    let v = qumbra_wallet::annulet_verify::scan_annulet_verified(w, fetch, from, to, Some(pin), rng)?;
+    let (bodies, bytes) = v.body_cost();
+    let tip = v.chain().tip();
+    let freshness = match v.stated_tip() {
+        Some(stated) if stated > tip => format!(
+            " The endpoint states tip {stated}: the verified chain is {} header(s) behind it.",
+            stated - tip
+        ),
+        Some(_) => String::new(),
+        None => " The endpoint did not state its tip.".to_string(),
+    };
+    let trust = format!(
+        "trust:    outputs VERIFIED — genesis file hashed to the pin; seals verified 1..={tip}; {bodies} block \
+         body(ies) ({bytes} B) recomputed for the notes found.{freshness}\n\
+         spends:   NOT VERIFIED — the subtracted spends are the endpoint's list; a withheld spend leaves a \
+         spent note in the figure, so a balance can be OVERSTATED (lab #853)."
+    );
+    let range = v.range();
+    let report = qumbra_wallet::annulet_verify::into_report(v);
+    Ok((report, range, trust))
 }
 
 /// `history --net annulet` (lab #831 W1): the same verified scan as

@@ -86,7 +86,12 @@ fn genesis(holder: &Address) -> AnnuletGenesisFile {
 
 /// A sealed chain over `bodies` (height 1, 2, …), as a store.
 fn store(file: &AnnuletGenesisFile, bodies: &[BlockBody]) -> MemChainStore {
-    let key = SequencerKey::from_seed(SEQ_SEED);
+    store_with(file, bodies, SEQ_SEED)
+}
+
+/// [`store`], sealed under the key of `seed`.
+fn store_with(file: &AnnuletGenesisFile, bodies: &[BlockBody], seed: [u8; 32]) -> MemChainStore {
+    let key = SequencerKey::from_seed(seed);
     let g = file.genesis_block_header();
     let ext = AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: file.genesis_header.registry_root };
     let mut chain = MemChainStore::new_for(GenesisForm::Annulet, StoredBlock::annulet_genesis(&g));
@@ -123,6 +128,14 @@ enum Lie {
     ForgedGroup,
     /// The headers stop at height 2 though the node holds 3.
     HeadersShort,
+    /// The page skips height 2.
+    HeaderGap,
+    /// Height 2 onward from another chain (its height 1 differs).
+    HeaderFork,
+    /// Every header sealed by another key.
+    WrongKey,
+    /// The body answer for a hit block carries another chain's header.
+    BodyHeader,
 }
 
 struct Endpoint {
@@ -136,7 +149,11 @@ struct Endpoint {
 impl Endpoint {
     fn new(file: AnnuletGenesisFile, honest: &[BlockBody], forged: Option<&[BlockBody]>, lie: Lie) -> Self {
         let view = view_of(&store(&file, honest));
-        let served = forged.map_or_else(|| view.clone(), |f| view_of(&store(&file, f)));
+        let served = match (lie, forged) {
+            (Lie::WrongKey, _) => view_of(&store_with(&file, honest, [0x0E; 32])),
+            (_, Some(f)) => view_of(&store(&file, f)),
+            (_, None) => view.clone(),
+        };
         Endpoint { file, view, served, lie }
     }
 
@@ -155,8 +172,23 @@ impl Endpoint {
             "/v1/headers" => {
                 let q = if self.lie == Lie::HeadersShort { "from=1&to=2".to_string() } else { query.to_string() };
                 let page = respond_headers(&self.view, AN, &q).map_err(err)?;
-                if self.lie != Lie::BadSeal {
-                    return Ok(page);
+                match self.lie {
+                    Lie::HeaderGap => {
+                        let mut units = qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap();
+                        units.remove(1);
+                        return Ok(qlab_p2p::served::encode_headers_page(AN, 1, &units));
+                    }
+                    Lie::HeaderFork | Lie::WrongKey => {
+                        let mut units = qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap();
+                        let other = respond_headers(&self.served, AN, &q).map_err(err)?;
+                        let other = qlab_p2p::served::decode_headers_page(AN, 1, &other).unwrap();
+                        let keep = if self.lie == Lie::HeaderFork { 1 } else { 0 };
+                        units.truncate(keep);
+                        units.extend(other.into_iter().skip(keep));
+                        return Ok(qlab_p2p::served::encode_headers_page(AN, 1, &units));
+                    }
+                    Lie::BadSeal => {}
+                    _ => return Ok(page),
                 }
                 let mut units = qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap();
                 if let Some(qlab_p2p::codec::WireHeader::Sealed(s)) = units.get_mut(1) {
@@ -166,6 +198,11 @@ impl Endpoint {
             }
             "/v1/compact" => respond(&self.served, query).map_err(err),
             "/v1/nullifiers" => respond_nullifiers(&self.view, query).map_err(err),
+            "/v1/registry/root" => {
+                let leaves = qlab_node::annulet_genesis::registry_leaves(&self.file.registry_genesis);
+                let tree = qlab_cbserver::registry::RegistryTree::from_leaves(&leaves).unwrap();
+                Ok(qlab_cbserver::registry::encode_registry_root(self.view.tip_height().unwrap(), &tree.root()))
+            }
             p if p.starts_with("/v1/registry/") => {
                 let asset: u16 = p.trim_start_matches("/v1/registry/").parse().unwrap();
                 let mut leaves = qlab_node::annulet_genesis::registry_leaves(&self.file.registry_genesis);
@@ -182,6 +219,9 @@ impl Endpoint {
             }
             p if p.ends_with("/body") => {
                 let h = p.split('/').nth(3).unwrap();
+                if self.lie == Lie::BodyHeader {
+                    return respond_body(&self.served, AN, h).map_err(err);
+                }
                 if self.lie != Lie::ForgedNote {
                     return respond_body(&self.view, AN, h).map_err(err);
                 }
@@ -227,6 +267,7 @@ fn an_honest_endpoint_verifies_and_every_figure_is_bound() {
     let v = run(&w, &ep, Some(pin)).expect("an honest endpoint verifies");
     assert_eq!(v.chain().tip(), 3, "every sealed header verified");
     assert_eq!(v.range(), (0, 3), "the range ends at the verified tip, not u64::MAX");
+    assert_eq!(v.stated_tip(), Some(3), "the endpoint's own tip, for the freshness line");
     let index = v.report().index.clone().expect("both halves known");
     assert_eq!(index.balances(), vec![(0, 5), (USDT as u16, 1_000_407)]);
     let (bodies, bytes) = v.body_cost();
@@ -336,6 +377,7 @@ fn the_scanned_tip_is_the_highest_verified_header_not_the_nodes() {
     let v = run(&w, &ep, Some(pin)).expect("a short header stream is a shorter chain, not a lie");
     assert_eq!(v.chain().tip(), 2);
     assert_eq!(v.range(), (0, 2));
+    assert_eq!(v.stated_tip(), Some(3), "the node says 3: one header behind, which the CLI prints");
     let index = v.report().index.clone().unwrap();
     assert_eq!(index.balances(), vec![(0, 5), (USDT as u16, 1_000_400)], "height 3's 7 is not counted");
     let _ = std::fs::remove_dir_all(&w.dir);
@@ -355,5 +397,69 @@ fn the_annulet_genesis_is_not_served_as_a_header_or_a_body() {
     assert_eq!(respond_body(&view, AN, "9").unwrap_err().0, 404);
     let page = respond_headers(&view, AN, "from=1&to=5").unwrap();
     assert!(qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap().is_empty(), "no height above genesis: an empty page");
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// The header-chain refusals (#850 pre-review): a skipped height, a header
+/// that does not extend the verified one below it, and a chain sealed by any
+/// key but the genesis one — each by name.
+#[test]
+fn a_gap_a_fork_and_a_foreign_key_are_refused_by_name() {
+    let w = wallet_dir("chain", 0x59);
+    let mut rng = StdRng::seed_from_u64(9);
+    let a0 = w.wallet().address_at_index(0);
+    let honest = bodies(&w, &mut rng);
+    // Another height 1: a different body, so every header above it differs.
+    let mut other = honest.clone();
+    other[0].txs.push(pay_tx(&a0, &[note_to(&a0, 1, 0, 77)], 0x70, &mut rng));
+
+    let file = genesis(&a0);
+    let pin = file.hash();
+    let ep = Endpoint::new(file.clone(), &honest, None, Lie::HeaderGap);
+    assert_eq!(run(&w, &ep, Some(pin)).err(), Some(VerifyRefusal::HeaderGap { want: 2, got: 3 }));
+
+    let ep = Endpoint::new(file.clone(), &honest, Some(&other), Lie::HeaderFork);
+    assert_eq!(run(&w, &ep, Some(pin)).err(), Some(VerifyRefusal::HeaderFork { height: 2 }));
+
+    let ep = Endpoint::new(file, &honest, None, Lie::WrongKey);
+    match run(&w, &ep, Some(pin)).err() {
+        Some(VerifyRefusal::HeaderInvalid { height: 1, why }) => assert!(why.contains("BadSeal"), "{why}"),
+        other => panic!("expected height 1's foreign seal refused, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// A body answer whose header is not the verified one at its height is
+/// refused before a byte of it is believed.
+#[test]
+fn a_body_under_another_header_is_refused_by_name() {
+    let w = wallet_dir("bodyhdr", 0x5A);
+    let mut rng = StdRng::seed_from_u64(10);
+    let a0 = w.wallet().address_at_index(0);
+    let honest = bodies(&w, &mut rng);
+    let mut other = honest.clone();
+    other[0].txs.push(pay_tx(&a0, &[note_to(&a0, 1, 0, 78)], 0x71, &mut rng));
+    let file = genesis(&a0);
+    let pin = file.hash();
+    // `served` is the other chain only for the body route; compact and full
+    // come from it too, but its height-1 hit is address 1's same note.
+    let ep = Endpoint::new(file, &honest, Some(&other), Lie::BodyHeader);
+    assert!(
+        matches!(run(&w, &ep, Some(pin)).err(), Some(VerifyRefusal::BodyHeaderMismatch { .. })),
+        "a body under a header the wallet did not verify"
+    );
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// The output side is verified, the spend side is not — and the type says so.
+#[test]
+fn the_spend_side_is_reported_unverified() {
+    let w = wallet_dir("spends", 0x5B);
+    let mut rng = StdRng::seed_from_u64(11);
+    let file = genesis(&w.wallet().address_at_index(0));
+    let pin = file.hash();
+    let ep = Endpoint::new(file, &bodies(&w, &mut rng), None, Lie::None);
+    let v = run(&w, &ep, Some(pin)).unwrap();
+    assert!(!v.spends_verified(), "lab #853: the nullifier list is the endpoint's");
     let _ = std::fs::remove_dir_all(&w.dir);
 }

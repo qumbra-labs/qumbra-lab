@@ -30,11 +30,15 @@
 //! 4. **Registry openings by the header.** [`verify_registry_leaf`] binds an
 //!    opening to the verified header at the height it names and folds its path.
 //!
-//! **What it does not verify** (stated, so nobody reads more into "verified"):
-//! the nullifier stream's *completeness*. A node can withhold a spend of this
-//! wallet's note and the note stays in the figure — catching that needs every
-//! body in the range, not one per hit. A withheld output is a missing figure,
-//! never an invented one.
+//! **What it does not verify — the spends** (lab #853; stated, so nobody reads
+//! more into "verified"). The nullifiers subtracted are `/v1/nullifiers`' list,
+//! and nothing proves it complete. A node that **withholds the nullifier of a
+//! spent note leaves that note in the figure: the balance is OVERSTATED** —
+//! money the wallet shows and no longer has. Catching it needs every body from
+//! the oldest owned note to the tip, or a committed nullifier set; one body per
+//! hit cannot. [`VerifiedAnnulet::spends_verified`] says so in the type, and is
+//! `false` today. (The output side is the safe direction: a withheld output
+//! only makes a figure smaller.)
 //!
 //! The result is [`VerifiedAnnulet`], whose only constructor is
 //! [`scan_annulet_verified`]: a balance cannot reach a view model through any
@@ -257,6 +261,7 @@ pub struct VerifiedAnnulet {
     range: (u64, u64),
     bodies_fetched: u64,
     body_bytes: u64,
+    stated_tip: Option<u64>,
 }
 
 impl VerifiedAnnulet {
@@ -273,6 +278,21 @@ impl VerifiedAnnulet {
     /// The heights scanned: `from ..= the verified tip` (or the asked `to`).
     pub fn range(&self) -> (u64, u64) {
         self.range
+    }
+
+    /// Whether the spend side is bound to the chain — **`false`**: the
+    /// nullifier list is the endpoint's, so a withheld spend overstates the
+    /// balance (lab #853). A view model renders this; a shell cannot hide it.
+    pub fn spends_verified(&self) -> bool {
+        false
+    }
+
+    /// The tip the endpoint states (`/v1/registry/root`'s height), beside
+    /// [`VerifiedChain::tip`]: a node serving fewer headers than it claims
+    /// leaves the wallet behind, which is freshness, not a lie. `None` when
+    /// the endpoint did not say.
+    pub fn stated_tip(&self) -> Option<u64> {
+        self.stated_tip
     }
 
     /// Bodies fetched to bind notes, and their bytes: the per-hit cost.
@@ -350,7 +370,13 @@ where
             return Err(forged("the transaction carries no such commitment"));
         }
     }
-    Ok(VerifiedAnnulet { report, chain, range: (from, to), bodies_fetched, body_bytes })
+    // Freshness, not trust: the node's own word on its tip, for the line that
+    // says how far behind the verified chain is.
+    let stated_tip = fetch("/v1/registry/root")
+        .ok()
+        .and_then(|b| qlab_cbserver::registry::decode_registry_root(&b).ok())
+        .map(|(height, _)| height);
+    Ok(VerifiedAnnulet { report, chain, range: (from, to), bodies_fetched, body_bytes, stated_tip })
 }
 
 /// Step 4: the registry leaf of `asset`, bound to the verified chain — the

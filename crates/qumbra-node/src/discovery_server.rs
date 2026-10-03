@@ -2669,6 +2669,40 @@ mod tests {
         srv.shutdown();
     }
 
+    /// **Lab #850 AD1**: an Annulet node serves its genesis file at
+    /// `/genesis.qmb` — 200, the canonical bytes, hashing to the genesis hash
+    /// a wallet pins — and refuses the unsealed genesis on both chain routes.
+    #[test]
+    fn an_annulet_node_serves_its_genesis_file_and_the_bytes_hash_to_the_pin() {
+        use crate::annulet_genesis::{AnnuletGenesisBuild, AnnuletGenesisFile};
+        let file = AnnuletGenesisFile::fixture();
+        let (tx, _rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let srv = DiscoveryServer::start_with_mine(
+            "127.0.0.1:0",
+            Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
+            no_leaves(),
+            no_anchors(),
+            tx,
+            None,
+            Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
+            Arc::new(FormView {
+                form: qlab_devnet::forms::GenesisForm::Annulet,
+                genesis_file: Some(file.to_bytes()),
+                ..FormView::default()
+            }),
+        )
+        .expect("bind");
+        let addr = srv.addr();
+        let (status, body) = get(addr, GENESIS_FILE_PATH);
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(qlab_devnet::hash::keccak256(&body), file.hash(), "the served bytes are the pinned genesis");
+        for path in ["/v1/headers?from=0&to=3", "/v1/block/0/body"] {
+            let (status, _) = get(addr, path);
+            assert!(status.starts_with("HTTP/1.1 400"), "{path} => {status}");
+        }
+        srv.shutdown();
+    }
+
     /// The refresh reuses what it has and replaces what the chain replaced. Driven
     /// against a real `MemChainStore` so fork choice, not the test, decides what
     /// the main chain is.
