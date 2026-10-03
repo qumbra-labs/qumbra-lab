@@ -19,8 +19,11 @@
 //! **What never leaves this module**: the file's text, the seed, and any
 //! parser error (a TOML error can quote the line it failed on — the seed
 //! line). Every key-file failure is one fixed sentence naming no content; the
-//! text, the seed and the derived filler seed are zeroized on drop. The
-//! ML-DSA signing key itself stays in process memory for the pass.
+//! text, the seed and the derived filler seed are zeroized on drop. What is
+//! not: the ML-DSA signing key itself, which stays in process memory for the
+//! pass; the seed's by-value copies on the stack while `from_seed` and
+//! `filler_seed` run; and any earlier buffer `read_to_string` left behind
+//! when it grew the text.
 //!
 //! The parser is B2's `SequencerKeyFile::from_toml`: it accepts unknown keys
 //! and upper-case hex — inherited, and left as B2 has it.
