@@ -95,6 +95,20 @@ jobs:
           RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-wallet --no-default-features --target wasm32-unknown-unknown --locked
           RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-ffi --target wasm32-unknown-unknown --locked
 
+      # lab #858 WA2: the TEST list signer (qumbra-wallet's `test-support`)
+      # must not reach qumbra-ffi's release graph — native/iOS here; wasm32 is
+      # also held by a compile-time assertion in qumbra-ffi's annulet.rs. The
+      # `verify` line is the sentinel: a probe that sees no features at all
+      # fails instead of passing on an empty tree.
+      - name: the test list signer is not in qumbra-ffi's release graph
+        run: |
+          tree=$(cargo tree -e normal,features -p qumbra-ffi -i qumbra-wallet --locked)
+          echo "$tree"
+          echo "$tree" | grep -q 'qumbra-wallet feature "verify"' || { echo "probe broken: no qumbra-wallet feature line"; exit 1; }
+          if echo "$tree" | grep -q 'feature "test-support"'; then
+            echo "qumbra-wallet's test-support reached qumbra-ffi's release graph"; exit 1
+          fi
+
       # Reporting only, NOT failing. The tree has pre-existing warnings
       # (qlab-bench alone generated 37 on 2026-08-01). A gate that is red on
       # its first run teaches everyone to ignore it — the same failure as an
