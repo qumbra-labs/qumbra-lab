@@ -6,7 +6,8 @@
 #   scripts/s6-box.sh RUN_DIR [--bin DIR] [--port-base N] [--count N] [--resume-from TAR]
 #
 # --resume-from TAR restores a RUN_DIR pulled from an earlier box (tar of the
-# run dir, extracted into RUN_DIR's parent when RUN_DIR is empty) and goes on
+# run dir, extracted into RUN_DIR's parent unless RUN_DIR already holds a
+# phase-genesis.done marker — i.e. it was restored or ran before) and goes on
 # from its phase markers: the chain, the wallets, the queue and the seed
 # state carry over, so maturity and finished phases are not paid again.
 # Pid and lock files from the old box are dropped first.
@@ -64,7 +65,7 @@
 #   pass1/run.{time,rss}            the claims-only pass: peak, wall
 #   pass2/run-a.{time,rss}          the filler pass up to the kill
 #   pass2/run-b.{time,rss}          the rerun: reconcile + land, no prove
-#   producer/node.{time,rss}        the producer across the run
+#   producer/node-<n>.time, node.rss  the producer, one time file per start
 # The last line is one verdict.
 set -euo pipefail
 
@@ -90,8 +91,11 @@ done
 if [ -n "$RESUME" ]; then
   [ -r "$RESUME" ] || { echo "--resume-from $RESUME is not readable" >&2; exit 2; }
   if [ ! -e "$RUN/phase-genesis.done" ]; then
-    top=$(tar -tf "$RESUME" | head -1 | cut -d/ -f1)
-    [ "$top" = "$(basename "$RUN")" ] || { echo "$RESUME holds $top/, not $(basename "$RUN")/" >&2; exit 2; }
+    # The whole listing first: `tar | head` under pipefail dies on tar's
+    # SIGPIPE, silently, at the one check meant to refuse by name.
+    listing=$(tar -tf "$RESUME") || { echo "cannot list $RESUME" >&2; exit 2; }
+    top=$(printf '%s\n' "$listing" | sed -n '1s|/.*||p')
+    [ "$top" = "$(basename "$RUN")" ] || { echo "$RESUME holds ${top:-nothing}/, not $(basename "$RUN")/ — refusing" >&2; exit 2; }
     tar -C "$(dirname "$RUN")" -xf "$RESUME" || { echo "extracting $RESUME failed" >&2; exit 2; }
     # The old box's processes are gone: their pid files and lock files are stale.
     find "$RUN" \( -name '*.pid' -o -name '*.timepid' -o -name 'index.lock' -o -name '*.json.lock' \) -type f -delete
@@ -194,9 +198,17 @@ node_config() { # name listen disc tele metr oper mining(true|false) keys(yes|no
 }
 
 start_producer() {
-  local pid
-  pid=$(start_measured "$RUN/producer/node" "$NODE" run --config "$RUN/producer/node.toml" --sample-interval-secs 10)
+  # One time file per start (node-<n>.time): a restart must not overwrite the
+  # first process's peak and wall; out/err/rss stay one append-only file each.
+  local pid n tpid=""
+  n=$(( $(find "$RUN/producer" -maxdepth 1 -name 'node-*.time' | wc -l) + 1 ))
+  /usr/bin/time -v -o "$RUN/producer/node-$n.time" "$NODE" run --config "$RUN/producer/node.toml" --sample-interval-secs 10 \
+    >>"$RUN/producer/node.out" 2>>"$RUN/producer/node.err" &
+  tpid=$!; pid=""
+  for _ in $(seq 1 50); do pid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$pid" ] && break; sleep 0.1; done
   [ -n "$pid" ] || die "the producer did not start (see $RUN/producer/node.err)"
+  echo "$tpid" > "$RUN/producer/node.timepid"
+  sample_rss "$pid" "$RUN/producer/node.rss"
   echo "$pid" > "$RUN/producer/node.pid"; date +%s > "$RUN/producer/node.started"
   log "producer up (pid $pid)"
 }
@@ -324,18 +336,31 @@ if ! is_done fund-notes; then
   SENT=$(cat "$SEED/fund-notes.sent" 2>/dev/null || echo 0)
   NOTE=$((BURN + 100000000))   # one burn, its posted fee, and room
   log "funding $TO_BURN note(s) of $NOTE bessel to $SEQ_ADDR ($SENT already sent)"
+  [ -e "$SEED/fund-notes.started" ] || date +%s > "$SEED/fund-notes.started"
+  FUND_DEADLINE=$(( $(cat "$SEED/fund-notes.started") + 4 * 3600 ))
   while [ "$SENT" -lt "$TO_BURN" ]; do
-    t0=$(tip_of "$RUN/producer/node.out")
+    # Only the wallet's "not … YET" refusals (inputs not finalized or not
+    # mature yet) are waited out; any other refusal ends the run by name.
+    : > "$SEED/fund-try.err"
     until w send --node "$DISC" --scan-to "$(tip_of "$RUN/producer/node.out")" --to "$SEQ_ADDR" --amount "$NOTE" \
-          >>"$SEED/fund.out" 2>>"$SEED/fund.err"; do
+          >>"$SEED/fund.out" 2>"$SEED/fund-try.err"; do
+      cat "$SEED/fund-try.err" >> "$SEED/fund.err"
+      grep -q 'YET' "$SEED/fund-try.err" || die "fund note $((SENT + 1)) refused: $(tail -1 "$SEED/fund-try.err")"
       producer_up || die "the producer exited"
-      wait_log "fund note $((SENT + 1)) not possible yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$SEED/fund.err")"; sleep 60
+      [ "$(date +%s)" -lt "$FUND_DEADLINE" ] || die "funding did not finish within 4 h of its first start"
+      wait_log "fund note $((SENT + 1)) not possible yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$SEED/fund-try.err")"
+      sleep 60
     done
+    cat "$SEED/fund-try.err" >> "$SEED/fund.err"
     SENT=$((SENT + 1)); echo "$SENT" > "$SEED/fund-notes.sent"
     # Mined before the next send: otherwise the next selection reads the same
-    # unmined input. Two blocks past the tip it was built at.
+    # unmined input. Two blocks past the tip at the moment it was accepted,
+    # bounded.
+    t0=$(tip_of "$RUN/producer/node.out"); tip_deadline=$(( $(date +%s) + 1800 ))
     until t=$(tip_of "$RUN/producer/node.out"); [ -n "$t" ] && [ "$t" -ge $(( ${t0:-0} + 2 )) ]; do
-      producer_up || die "the producer exited"; sleep 15
+      producer_up || die "the producer exited"
+      [ "$(date +%s)" -lt "$tip_deadline" ] || die "the tip did not advance two blocks within 30 min of fund note $SENT"
+      sleep 15
     done
     log "fund note $SENT of $TO_BURN sent (tip $(tip_of "$RUN/producer/node.out"))"
   done
@@ -417,7 +442,7 @@ fi
 
 stop_intake
 stop_pid_file "$RUN/producer/node.pid" producer INT
-sleep 2   # GNU time writes node.time as the producer exits
+sleep 2   # GNU time writes node-<n>.time as the producer exits
 # The filler pass's manifest: the highest-numbered bundle (pass 2's), by number.
 M2=$(find "$OUT" -maxdepth 1 -name 'bundle-*.json' | sort -V | tail -1)
 [ -n "$M2" ] || die "no bundle manifest under $OUT"
@@ -428,5 +453,5 @@ s_times=$(jq -r '[.timings_seconds[] | select(.step | test("_S$")) | .seconds] |
 seed_peak=$(for f in "$SEED"/seed-*.time; do peak_kib "$f"; done | sort -n | tail -1)
 seed_wall=$(for f in "$SEED"/seed-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }')
 burn_secs=$(cat "$SEED"/seed-*.err 2>/dev/null | { grep -o 'prove_secs: [0-9.]*' || true; } | awk '{print $2}' | paste -sd' ' -)
-log "measurements: $SEED/seed-*.time, $RUN/pass1/run.time, $RUN/pass2/run-{a,b}.time, $M2, producer/node.time"
-echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$RUN/pass1/run.time") KiB, wall $(wall_s "$RUN/pass1/run.time") s; pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$RUN/pass2/run-a.time") KiB), rerun landed it with no re-prove in $(wall_s "$RUN/pass2/run-b.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(peak_kib "$RUN/producer/node.time") KiB over $(wall_s "$RUN/producer/node.time") s"
+log "measurements: $SEED/seed-*.time, $RUN/pass1/run.time, $RUN/pass2/run-{a,b}.time, $M2, producer/node-*.time"
+echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$RUN/pass1/run.time") KiB, wall $(wall_s "$RUN/pass1/run.time") s; pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$RUN/pass2/run-a.time") KiB), rerun landed it with no re-prove in $(wall_s "$RUN/pass2/run-b.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(for f in "$RUN"/producer/node-*.time; do peak_kib "$f"; done | sort -n | tail -1) KiB over $(for f in "$RUN"/producer/node-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }') s across $(find "$RUN/producer" -maxdepth 1 -name 'node-*.time' | wc -l | tr -d ' ') start(s)"

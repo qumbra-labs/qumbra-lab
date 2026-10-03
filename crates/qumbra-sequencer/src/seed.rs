@@ -222,6 +222,9 @@ pub fn untaken(out: &Path) -> Result<Vec<PathBuf>, String> {
 /// (`OutsideAnchor`). Both are pre-proof and clear with no action once
 /// finality advances; `seed` waits on them. Pinned against the wallet's own
 /// texts by a test, so a reworded refusal fails here, not on the box.
+///
+/// A `BuildRefusal::Other` whose text happened to contain either phrase would
+/// be read as a wait too; none does today, and the wait is bounded anyway.
 pub fn is_finality_wait(why: &str) -> bool {
     why.contains("not spendable YET") || why.contains("not possible YET")
 }
@@ -241,7 +244,15 @@ impl Seed {
 
     /// The node's tip, from `/v1/anchors`.
     fn tip(&self) -> Result<u64, String> {
-        Ok(crate::chain::read(&crate::chain::Http { base: self.node.clone() })?.anchors.tip_height)
+        Ok(self.anchors()?.tip_height)
+    }
+
+    /// `/v1/anchors` alone — the tip and the node's finalized height — not
+    /// the whole tree and coinbase stream `chain::read` fetches.
+    fn anchors(&self) -> Result<qlab_node::AnchorSet, String> {
+        use crate::chain::Get;
+        let body = crate::chain::Http { base: self.node.clone() }.get("/v1/anchors")?;
+        qlab_node::AnchorSet::from_bytes(&body).map_err(|e| format!("/v1/anchors: {e:?}")) // debug-ok: a served-page decode error, no opening
     }
 
     /// Scan the L1 wallet: its pending deposits to this L2, and its
@@ -380,10 +391,10 @@ impl Seed {
                                 self.max_wait_secs
                             ));
                         }
-                        let fin = crate::chain::read(&crate::chain::Http { base: self.node.clone() })
-                            .ok()
-                            .and_then(|v| v.anchors.finalized_height)
-                            .map_or("none".to_string(), |h| h.to_string());
+                        let fin = match self.anchors() {
+                            Ok(a) => a.finalized_height.map_or("none".to_string(), |h| h.to_string()),
+                            Err(e) => format!("unknown ({e})"),
+                        };
                         println!("seed: burn {} of {short} waits for finality (tip {tip}, finalized {fin}): its inputs are not finalized yet", i + 1);
                         std::thread::sleep(std::time::Duration::from_secs(self.poll_secs));
                     }
