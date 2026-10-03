@@ -62,9 +62,9 @@
 #                                   (the L1 proofs), the total wall, and each
 #                                   burn's prove_secs go into the verdict
 #   seq-out/bundle-{0,1}.json       per-member timings (member_i_S/C), bytes
-#   pass1/run.{time,rss}            the claims-only pass: peak, wall
-#   pass2/run-a.{time,rss}          the filler pass up to the kill
-#   pass2/run-b.{time,rss}          the rerun: reconcile + land, no prove
+#   pass1/run-<n>.{time,rss,err}    the claims-only pass, per attempt (short = wait); run.landed names the one that landed
+#   pass2/run-a-<n>.*               the filler pass up to the kill; run-a.drafted names it
+#   pass2/run-b-<n>.*               the rerun: reconcile + land, no prove; run-b.landed
 #   producer/node-<n>.time, node.rss  the producer, one time file per start
 # The last line is one verdict.
 set -euo pipefail
@@ -294,6 +294,35 @@ user_claim() {
 PASS=("$SEQ" run --genesis "$GEN" --queue "$QDIR" --state "$STATE" --node "$DISC" --telemetry "127.0.0.1:$P_TELE"
   --operator "127.0.0.1:$P_OPER" --key "$KEY" --out "$OUT" --max-wait 10800 --poll 30)
 
+# A pass's exit 4 ("short") is a WAIT here, not a failure: a claim enters a
+# wrapper only once its anchor is absorbable — V7 at the next block, the
+# root's heights at or below CR, the height a finality RECORD covers
+# (`/v1/wrapper`'s absorbable(); work.rs's selection) — and a wallet proves
+# its claim against the node's newest LOCALLY finalized root, which runs
+# ahead of CR. Box run 2: the user's claim, proved a minute earlier, was
+# left out and the pass answered 15 of 16. Each attempt keeps its own
+# files (DIR/PREFIX-<n>.*); bounded by 90 min.
+SHORT_WAIT_SECS=5400
+next_attempt() { echo $(( $(find "$1" -maxdepth 1 -name "$2-*.time" 2>/dev/null | wc -l) + 1 )); }
+
+# Run a pass attempt by attempt until it drains (exit 0); the attempt that
+# landed goes in DIR/PREFIX.landed.
+pass_until_landed() {
+  local dir=$1 pre=$2 n rc deadline=$(( $(date +%s) + SHORT_WAIT_SECS ))
+  while :; do
+    n=$(next_attempt "$dir" "$pre")
+    clear_stale_locks
+    rc=0; run_measured "$dir/$pre-$n" "${PASS[@]}" || rc=$?
+    case $rc in
+      0) echo "$n" > "$dir/$pre.landed"; return 0 ;;
+      4) [ "$(date +%s)" -lt "$deadline" ] || die "$pre still short after $((SHORT_WAIT_SECS / 60)) min (see $dir/$pre-$n.err)"
+         wait_log "$pre attempt $n short — a claim's anchor is not absorbable yet: $(tail -1 "$dir/$pre-$n.err")"
+         sleep 60 ;;
+      *) die "$pre attempt $n exited $rc (see $dir/$pre-$n.err)" ;;
+    esac
+  done
+}
+
 # --- genesis -------------------------------------------------------------------------
 if ! is_done genesis; then
   mkdir -p "$NET"
@@ -395,11 +424,10 @@ if ! is_done pass1; then
   user_claim 1
   stop_intake
   mkdir -p "$RUN/pass1"
-  for f in run.out run.err run.rss run.time; do : > "$RUN/pass1/$f"; done   # this attempt's evidence only
-  clear_stale_locks
-  run_measured "$RUN/pass1/run" "${PASS[@]}" || die "pass 1 did not drain (exit $?; see $RUN/pass1/run.err)"
-  grep -q 'SEQ landed bundle' "$RUN/pass1/run.err" || die "pass 1 landed nothing"
-  log "pass 1 landed: $(grep 'SEQ landed bundle' "$RUN/pass1/run.err" | tail -1); peak $(peak_kib "$RUN/pass1/run.time") KiB, wall $(wall_of "$RUN/pass1/run.time")"
+  pass_until_landed "$RUN/pass1" run
+  P1="$RUN/pass1/run-$(cat "$RUN/pass1/run.landed")"
+  grep -q 'SEQ landed bundle' "$P1.err" || die "pass 1 landed nothing"
+  log "pass 1 landed: $(grep 'SEQ landed bundle' "$P1.err" | tail -1); peak $(peak_kib "$P1.time") KiB, wall $(wall_of "$P1.time")"
   start_intake
   done_mark pass1
 fi
@@ -411,31 +439,43 @@ if ! is_done pass2; then
   stop_intake
   mkdir -p "$RUN/pass2"
   if [ ! -e "$RUN/pass2/killed" ]; then
-    for f in run-a.out run-a.err run-a.rss run-a.time; do : > "$RUN/pass2/$f"; done
-    clear_stale_locks
-    /usr/bin/time -v -o "$RUN/pass2/run-a.time" "${PASS[@]}" >>"$RUN/pass2/run-a.out" 2>>"$RUN/pass2/run-a.err" &
-    tpid=$!
-    cpid=""; for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
-    [ -n "$cpid" ] || die "pass 2 did not start"
-    PASS_PID=$cpid
-    sample_rss "$cpid" "$RUN/pass2/run-a.rss"
-    until grep -q 'SEQ drafted bundle' "$RUN/pass2/run-a.err" 2>/dev/null; do
-      kill -0 "$cpid" 2>/dev/null || die "pass 2 ended before drafting (see $RUN/pass2/run-a.err)"
-      sleep 5
+    # run-a, attempt by attempt: a short (exit 4) is waited out as in pass 1;
+    # the attempt that drafts is killed -9.
+    a_deadline=$(( $(date +%s) + SHORT_WAIT_SECS ))
+    while :; do
+      m=$(next_attempt "$RUN/pass2" run-a); A="$RUN/pass2/run-a-$m"
+      clear_stale_locks
+      /usr/bin/time -v -o "$A.time" "${PASS[@]}" >>"$A.out" 2>>"$A.err" &
+      tpid=$!
+      cpid=""; for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
+      [ -n "$cpid" ] || die "pass 2 attempt $m did not start"
+      PASS_PID=$cpid
+      sample_rss "$cpid" "$A.rss"
+      while ! grep -q 'SEQ drafted bundle' "$A.err" 2>/dev/null && kill -0 "$cpid" 2>/dev/null; do sleep 5; done
+      if grep -q 'SEQ drafted bundle' "$A.err" 2>/dev/null; then
+        kill -9 "$cpid" || die "pass 2 (run-a-$m) exited before the kill — see $A.err"
+        wait "$tpid" 2>/dev/null || true
+        PASS_PID=""
+        echo "$m" > "$RUN/pass2/run-a.drafted"
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN/pass2/killed"
+        log "pass 2 KILLED (-9) after: $(grep 'SEQ drafted bundle' "$A.err" | tail -1)"
+        break
+      fi
+      rc=0; wait "$tpid" || rc=$?; PASS_PID=""
+      [ "$rc" = 4 ] || die "pass 2 attempt $m ended before drafting, exit $rc (see $A.err)"
+      [ "$(date +%s)" -lt "$a_deadline" ] || die "pass 2 still short after $((SHORT_WAIT_SECS / 60)) min (see $A.err)"
+      wait_log "pass 2 attempt $m short — a claim's anchor is not absorbable yet: $(tail -1 "$A.err")"
+      sleep 60
     done
-    kill -9 "$cpid" || die "pass 2 (run-a) exited before the kill — see $RUN/pass2/run-a.err"
-    wait "$tpid" 2>/dev/null || true
-    PASS_PID=""
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN/pass2/killed"
-    log "pass 2 KILLED (-9) after: $(grep 'SEQ drafted bundle' "$RUN/pass2/run-a.err" | tail -1)"
   fi
-  for f in run-b.out run-b.err run-b.rss run-b.time; do : > "$RUN/pass2/$f"; done
-  clear_stale_locks   # the -9'd pass left queue/index.lock and the state lock
-  run_measured "$RUN/pass2/run-b" "${PASS[@]}" || die "the rerun did not drain (see $RUN/pass2/run-b.err)"
-  grep -q 'SEQ landed bundle' "$RUN/pass2/run-b.err" || die "the rerun landed nothing"
-  before_land=$(sed -n '1,/SEQ landed bundle/p' "$RUN/pass2/run-b.err" | { grep -c 'SEQ proving' || true; })
+  # The rerun (clear_stale_locks inside: the -9'd pass left queue/index.lock
+  # and the state lock) must land the drafted bundle without proving again.
+  pass_until_landed "$RUN/pass2" run-b
+  B="$RUN/pass2/run-b-$(cat "$RUN/pass2/run-b.landed")"
+  grep -q 'SEQ landed bundle' "$B.err" || die "the rerun landed nothing"
+  before_land=$(cat "$RUN"/pass2/run-b-*.err | sed -n '1,/SEQ landed bundle/p' | { grep -c 'SEQ proving' || true; })
   [ "$before_land" = 0 ] || die "the rerun proved again ($before_land 'SEQ proving' lines before it landed) — the pending record did not carry the bundle"
-  log "pass 2 rerun landed without proving: $(grep 'SEQ landed bundle' "$RUN/pass2/run-b.err" | tail -1)"
+  log "pass 2 rerun landed without proving: $(grep 'SEQ landed bundle' "$B.err" | tail -1)"
   start_intake
   done_mark pass2
 fi
@@ -450,8 +490,11 @@ fillers=$(jq '[.members[] | select(.filler == true)] | length' "$M2")
 n_s=$(jq '[.timings_seconds[] | select(.step | test("_S$"))] | length' "$M2")
 [ "$fillers" = 15 ] && [ "$n_s" = 15 ] || die "$M2 has $fillers filler member(s) and $n_s S proving step(s), not 15 and 15"
 s_times=$(jq -r '[.timings_seconds[] | select(.step | test("_S$")) | .seconds] | "min \(min | . * 100 | round / 100) max \(max | . * 100 | round / 100) mean \(add / length | . * 100 | round / 100)"' "$M2")
+P1V="$RUN/pass1/run-$(cat "$RUN/pass1/run.landed")"
+AV="$RUN/pass2/run-a-$(cat "$RUN/pass2/run-a.drafted")"
+BV="$RUN/pass2/run-b-$(cat "$RUN/pass2/run-b.landed")"
 seed_peak=$(for f in "$SEED"/seed-*.time; do peak_kib "$f"; done | sort -n | tail -1)
 seed_wall=$(for f in "$SEED"/seed-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }')
 burn_secs=$(cat "$SEED"/seed-*.err 2>/dev/null | { grep -o 'prove_secs: [0-9.]*' || true; } | awk '{print $2}' | paste -sd' ' -)
-log "measurements: $SEED/seed-*.time, $RUN/pass1/run.time, $RUN/pass2/run-{a,b}.time, $M2, producer/node-*.time"
-echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$RUN/pass1/run.time") KiB, wall $(wall_s "$RUN/pass1/run.time") s; pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$RUN/pass2/run-a.time") KiB), rerun landed it with no re-prove in $(wall_s "$RUN/pass2/run-b.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(for f in "$RUN"/producer/node-*.time; do peak_kib "$f"; done | sort -n | tail -1) KiB over $(for f in "$RUN"/producer/node-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }') s across $(find "$RUN/producer" -maxdepth 1 -name 'node-*.time' | wc -l | tr -d ' ') start(s)"
+log "measurements: $SEED/seed-*.time, $P1V.time, $AV.time, $BV.time, $M2, producer/node-*.time"
+echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$P1V.time") KiB, wall $(wall_s "$P1V.time") s (attempt $(cat "$RUN/pass1/run.landed")); pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$AV.time") KiB), rerun landed it with no re-prove in $(wall_s "$BV.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(for f in "$RUN"/producer/node-*.time; do peak_kib "$f"; done | sort -n | tail -1) KiB over $(for f in "$RUN"/producer/node-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }') s across $(find "$RUN/producer" -maxdepth 1 -name 'node-*.time' | wc -l | tr -d ' ') start(s)"
