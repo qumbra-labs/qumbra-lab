@@ -235,6 +235,8 @@ fn the_index_body_is_golden_and_read_strictly() {
         r#"{"v":1,"height":07,"bundle_id":null,"refused":null}"#,
         r#"{"v":1,"height":1,"bundle_id":null,"refused":null}"#,
         r#"{"v":1,"height":null,"bundle_id":null,"refused":"a \"quote\""}"#,
+        r#"{"v":1,"height":1,"bundle_id":"zz","refused":null}"#,
+        "{\"v\":1,\"height\":null,\"bundle_id\":null,\"refused\":\"a\u{7}bell\"}",
     ] {
         assert!(parse_l2_index(bad.as_bytes()).is_err(), "{bad}");
     }

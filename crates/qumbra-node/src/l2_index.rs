@@ -18,7 +18,9 @@
 //! the last good bundle and says why ([`IndexRefusal::RegistryWrite`]). Also a
 //! bundle whose bytes do not read back to its id, that does not decode, or
 //! that the fold or the root check refuses. A frozen index still serves what it
-//! has, at its height; it never skips a bundle.
+//! has, at its height; it never skips a bundle. A frozen index is retried
+//! only by a reorg past the freezing block or a restart (a transient
+//! `Unreadable` included): the log does not change under a running node.
 //!
 //! **What it is not.** Persisted: it is derived state, rebuilt from the log on
 //! start (#860 condition (b)). A trust root: the wallet treats it as a hint
@@ -31,7 +33,6 @@ use qlab_devnet::annulet::L2ShapeTag;
 use qlab_note::hash::digest_bytes as h32;
 use qlab_node::Hash32;
 use qlab_wrapper::codec::stated_pvs;
-use qlab_wrapper::hash::M_ABS;
 use qlab_wrapper::verify::{digest_at, roots_at, u64_at};
 use qlab_wrapper::wleaf::{PV_ABS, PV_DB, PV_PREV, PV_RKMS};
 
@@ -168,14 +169,20 @@ impl L2Index {
             absorbed: core::array::from_fn(|i| digest_at(w, PV_ABS + 16 * i)),
             d_batch: u64_at(w, PV_DB),
         };
-        const _: () = assert!(M_ABS > 0);
         if self.state.roots() != roots_at(w, 0) {
             return Err(IndexRefusal::Diverged { height, side: "in" });
         }
         let mut next = self.state.clone();
         next.apply(&inp, &members).map_err(|e| IndexRefusal::Fold { height, why: format!("{e:?}") })?;
-        if next.roots() != roots_at(w, 1) {
+        let out = roots_at(w, 1);
+        if next.roots() != out {
             return Err(IndexRefusal::Diverged { height, side: "out" });
+        }
+        // The served leaves are the folded tree's: their count must be the
+        // stated `c_next`, or what `/v1/l2/tree/leaves` serves is not the
+        // tree W proved.
+        if next.l2.c.len() != out.f3.c_next {
+            return Err(IndexRefusal::Diverged { height, side: "leaves" });
         }
         self.state = next;
         self.bundles.push(IndexedBundle { height, block, id, nullifiers });

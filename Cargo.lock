@@ -1847,6 +1847,7 @@ dependencies = [
  "qlab-air",
  "qlab-consensus",
  "qlab-l2",
+ "qlab-note",
  "serde",
 ]
 

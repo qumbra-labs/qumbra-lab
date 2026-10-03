@@ -2682,10 +2682,6 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         true
     }
 
-    /// Refresh the registry routes' projection (lab #710): on an Annulet node,
-    /// the tree and the applied tip it is served at; on an L1 node, nothing
-    /// (the routes refuse by name). Keyed on the tip: a block's registry
-    /// write (lab #728) moves the tree, and the next refresh serves it.
     /// Re-fold the L2 index for `/v1/l2/…` (lab #860 R1): a V6 net only,
     /// keyed on the tip hash, the bundles past the index folded (or a replay
     /// from genesis after a reorg below it — [`crate::l2_index::L2Index::refresh`]).
@@ -2712,6 +2708,10 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         Arc::clone(&self.l2_index_view.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
+    /// Refresh the registry routes' projection (lab #710): on an Annulet node,
+    /// the tree and the applied tip it is served at; on an L1 node, nothing
+    /// (the routes refuse by name). Keyed on the tip: a block's registry
+    /// write (lab #728) moves the tree, and the next refresh serves it.
     pub fn refresh_registry(&mut self) -> bool {
         let state = self.p2p.node().state();
         let tip = state.chain().tip_height();

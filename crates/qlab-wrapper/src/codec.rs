@@ -497,6 +497,7 @@ impl WireBundle {
         })
     }
 
+    /// The view [`crate::verify::verify_wrapper`] takes.
     pub fn bundle(&self) -> Bundle<'_, &Proof<Config>> {
         Bundle {
             version: self.version,
@@ -750,5 +751,64 @@ mod tests {
         let mut many = b.clone();
         many[at - 1] = (MAX_K + 1) as u8;
         assert_eq!(exit_list(&many), Err(CodecError::TooManyMembers((MAX_K + 1) as u8)));
+    }
+
+    /// The frame `golden_frame` encodes (lab #860 R1): fixed, distinct parts.
+    fn golden_parts() -> (Vec<u32>, Vec<u32>, Vec<u32>, [Exit; 1]) {
+        let w: Vec<u32> = (0..W_PV_LEN as u32).map(|i| i & 0xffff).collect();
+        let dep: Vec<u32> = (0..DEP_PV_LEN as u32).map(|i| 1000 + i).collect();
+        let m: Vec<u32> = (0..WTag::S.pv_len() as u32).map(|i| (7 * i) & 0xffff).collect();
+        (w, dep, m, [Exit { rkm: [1, 2, 3, 4], v: 9 }])
+    }
+
+    /// **A byte golden on the one frame encoder** (lab #860 R1 pre-review):
+    /// `WireBundle::encode` is `encode_frame` over its serialized proofs, and
+    /// the existing tests are decode∘encode round trips, which pass if the
+    /// two drift together. The literal was computed by an independent
+    /// encoder (a Python spelling of the documented layout, hashed with
+    /// OpenSSL's KECCAK-256), not by this code.
+    #[test]
+    fn golden_frame() {
+        let (w, dep, m, exits) = golden_parts();
+        let b = encode_frame(&FrameParts {
+            version: 1,
+            l2_id: 7,
+            w_pvs: &w,
+            w_proof: &[0xAB; 3],
+            dep_pvs: &dep,
+            dep_proof: &[0xCD; 2],
+            members: &[(WTag::S, m.as_slice(), &[0xEF][..])],
+            exits: &exits,
+            sig: &[0u8; SEQUENCER_SIG_LEN],
+        });
+        let hex: String = qlab_note::hash::keccak256(&b).iter().map(|x| format!("{x:02x}")).collect();
+        assert_eq!((b.len(), hex.as_str()), (5578, "0cd822717d774110fac5c12e438972f6ff4eb50906093f2cf6a9a1791c77f8a1"));
+    }
+
+    /// `stated_pvs` reads back exactly the PVs `encode_frame` wrote, never a
+    /// proof; every strict prefix and a trailing byte are refused by name.
+    #[test]
+    fn stated_pvs_reads_the_frame_back_and_refuses_every_prefix() {
+        let (w, dep, m, exits) = golden_parts();
+        let b = encode_frame(&FrameParts {
+            version: 1,
+            l2_id: 7,
+            w_pvs: &w,
+            w_proof: &[0xAB; 3],
+            dep_pvs: &dep,
+            dep_proof: &[0xCD; 2],
+            members: &[(WTag::S, m.as_slice(), &[0xEF][..])],
+            exits: &exits,
+            sig: &[0u8; SEQUENCER_SIG_LEN],
+        });
+        let got = stated_pvs(&b).expect("the frame reads");
+        assert_eq!(got, StatedPvs { version: 1, l2_id: 7, w_pvs: w, members: vec![(WTag::S, m)] });
+        assert_eq!(exit_list(&b), Ok(exits.to_vec()), "the same walk as exit_list");
+        for n in 0..b.len() {
+            assert!(stated_pvs(&b[..n]).is_err(), "prefix {n}");
+        }
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(stated_pvs(&long), Err(CodecError::Trailing));
     }
 }

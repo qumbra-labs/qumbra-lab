@@ -737,7 +737,6 @@ pub const L2_INDEX_ROUTE_VERSION: u32 = 1;
 /// What a node off V6 answers on every `/v1/l2/…` route.
 pub const L2_INDEX_NOT_V6: &str = "not a V6 net: the L2 index is served by a V6 node only";
 
-
 /// The `/v1/l2/index` body, fixed key order —
 /// `{"v":1,"height":N|null,"bundle_id":"<64 hex>"|null,"refused":null|"<reason>"}` —
 /// read strictly by `qlab_ledger::deposits::parse_l2_index`.
@@ -776,15 +775,17 @@ pub fn respond_l2(v: &crate::l2_index::L2IndexView, path: &str, query: &str) -> 
         // Every L1 height the index covers is served — a height carrying no
         // bundle is an empty list, never an absence (the `/v1/nullifiers`
         // contract: an empty page means "no height here").
-        let blocks: Vec<qlab_cbserver::codec::BlockNullifiers> = match v.height {
-            None => Vec::new(),
-            Some(h) => (from..=to.min(h))
-                .map(|height| qlab_cbserver::codec::BlockNullifiers {
-                    height,
-                    nullifiers: v.nullifiers.get(&height).cloned().unwrap_or_default(),
-                })
-                .collect(),
-        };
+        // Lazily, and no further than one page: nothing past
+        // `MAX_NULLIFIER_BLOCKS` heights is cloned.
+        let last = v.height.and_then(|h| (from <= h).then(|| to.min(h)));
+        let blocks = last
+            .into_iter()
+            .flat_map(|last| from..=last)
+            .take(qlab_cbserver::codec::MAX_NULLIFIER_BLOCKS)
+            .map(|height| qlab_cbserver::codec::BlockNullifiers {
+                height,
+                nullifiers: v.nullifiers.get(&height).cloned().unwrap_or_default(),
+            });
         return Ok(qlab_cbserver::codec::NullifierPage::page(blocks, from, to).to_bytes());
     }
     if let Some(a) = path.strip_prefix(L2_REGISTRY_PREFIX) {
