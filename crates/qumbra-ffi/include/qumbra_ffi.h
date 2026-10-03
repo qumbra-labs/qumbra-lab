@@ -589,6 +589,84 @@ char *qmb_name_observe_reveal_over_fetch(const char *state, const char *registry
  * height 0); zero for a v4 net, where the rule boundary gates it. */
 int32_t qmb_name_active(int32_t native, uint64_t tip);
 
+/* --- Annulet asset balances, verified (lab #858 WA2) --------------------- */
+
+/* The verified Annulet asset scan, pumped by the SHELL from any async
+ * transport: genesis by its bytes against pin32, every sealed header, each
+ * owned note's block recomputed, each held asset's registry leaf opened at the
+ * verified tip, then labelled by the signed asset list. One orchestration with
+ * the CLI and the macOS bridge (qumbra_wallet::annulet_driver); this library
+ * does no I/O and owns no storage.
+ *
+ * qmb_annulet_new arguments:
+ *   endpoint_label  a label for where the shell fetches, carried into the view
+ *                   JSON's "endpoint"; NEVER dereferenced here (sans-IO).
+ *   pin32           keccak256 of the network's genesis file: a trust input,
+ *                   never derived from the endpoint it checks.
+ *   indices         the wallet's allocated address indices: at most 1024;
+ *                   NULL only with n_indices == 0.
+ *   rng_seed32      32 bytes the host MUST fill from crypto.getRandomValues
+ *                   (the select ABI's rule).
+ *   record          the verified-header record from the last DONE's
+ *                   qmb_annulet_take_record, or NULL/0. It is a CACHE of
+ *                   verified header preimages, never trust: a tampered or
+ *                   foreign record is discarded and the chain re-verified from
+ *                   genesis — the host sees that only as a longer fetch
+ *                   sequence and a fresh record from qmb_annulet_take_record —
+ *                   so it may keep the record in extension storage with no
+ *                   integrity of its own. At most 41 + 2^18 * 153 bytes.
+ *   list, list_sig, list_key
+ *                   the signed asset list, its signature and the list key —
+ *                   all three or none (NULL/0). The key MUST be a constant in
+ *                   the host's own source (design D3): never fetched, never
+ *                   configurable. Bounds: the list at most 1 MiB, the
+ *                   signature 3309 bytes, the key 1952 bytes. A list that does
+ *                   not verify, or any length over its bound, is refused here:
+ *                   NULL with *err_out set (*err_out is NULL on every other
+ *                   path, success included).
+ *   list_source_commit
+ *                   the qumbra-asset-list commit the list came from, or NULL;
+ *                   carried into "listSourceCommit" when a list labels the view.
+ * NULL on a NULL/invalid argument.
+ *
+ * qmb_annulet_step returns
+ *    1  NEED: *out is the path to fetch (a qmb_string_free string);
+ *    0  DONE: take the view (qmb_annulet_take_view) and the record
+ *       (qmb_annulet_take_record); later steps answer -1;
+ *   -2  REFUSED: *out is {"refusal":"<key>","message":"<why>"} — terminal,
+ *       repeated on every later step. <key> is the snake_case refusal name
+ *       (e.g. "genesis_mismatch", "header_invalid", "forged_note").
+ *       "driver_misuse" is a HOST BUG (a step or an answer out of turn):
+ *       surface it as such, NEVER as a node fault;
+ *   -1  NULL handle or out, or a step after DONE.
+ *
+ * *out is a qmb_string_free string; it is NULL only if the string held a NUL.
+ *
+ * Supplied bytes are COPIED; a NULL body, or one over 64 MiB, is a transport
+ * error by name. A host misuse after DONE does not withdraw a view not yet
+ * taken. The view JSON
+ * always carries "spendsVerified" (design D5: false today, lab #853 — the
+ * shell must say so beside the figures); a balance it cannot stand behind is
+ * {"state":"unavailable"}, never a zero. The record crosses once and is
+ * released with qmb_dealloc(p, len). */
+typedef struct qmb_annulet_t qmb_annulet_t;
+
+qmb_annulet_t *qmb_annulet_new(const qmb_wallet_t *w, const char *endpoint_label,
+                               const uint8_t *pin32, uint64_t from, uint64_t to,
+                               const uint64_t *indices, size_t n_indices,
+                               const uint8_t *rng_seed32,
+                               const uint8_t *record, size_t record_len,
+                               const uint8_t *list, size_t list_len,
+                               const uint8_t *list_sig, size_t sig_len,
+                               const uint8_t *list_key, size_t key_len,
+                               const char *list_source_commit, char **err_out);
+int32_t qmb_annulet_step(qmb_annulet_t *s, char **out);
+void qmb_annulet_supply(qmb_annulet_t *s, const uint8_t *body, size_t len);
+void qmb_annulet_supply_err(qmb_annulet_t *s, const char *reason);
+char *qmb_annulet_take_view(qmb_annulet_t *s);
+uint8_t *qmb_annulet_take_record(qmb_annulet_t *s, size_t *out_len);
+void qmb_annulet_free(qmb_annulet_t *s);
+
 #ifdef __cplusplus
 }
 #endif

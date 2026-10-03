@@ -440,6 +440,11 @@ pub fn chain_cache_path(w: &WalletDir, genesis_hash: &[u8; 32]) -> std::path::Pa
 
 const PREIMAGE_LEN_ANNULET: usize = qlab_devnet::header::HEADER_PREIMAGE_LEN_ANNULET;
 
+/// The largest record this build writes or reads: the 41-B prefix and
+/// [`MAX_CACHED_HEADERS`] preimages — the bound a host-supplied record is
+/// checked against before it is copied (lab #858 WA2).
+pub const MAX_CHAIN_RECORD_BYTES: usize = 41 + MAX_CACHED_HEADERS as usize * PREIMAGE_LEN_ANNULET;
+
 /// `ver(1) ‖ genesis(32) ‖ n(u64 LE) ‖ n × 153-B header preimage` — what a
 /// driver host writes from [`VerifiedAnnulet::record_to_write`].
 pub fn encode_chain_cache(genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Vec<u8> {

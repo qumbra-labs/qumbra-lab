@@ -19,6 +19,7 @@
 //! - **The scan report crosses pre-rendered** ([`report`]) — Swift colors
 //!   words, it never re-derives a verdict.
 
+pub mod annulet;
 pub mod events;
 pub mod ledger_blob;
 pub mod names;
@@ -2894,11 +2895,12 @@ mod tests {
     /// The hand-maintained header and the crate's ABI sources must declare the
     /// same function list. Two source files hold entry points since lab #659
     /// (the Cargo.toml's own "revisit past ~15 functions" line came due): this
-    /// file, and `names.rs` for the `qmb_name_*` surface.
+    /// file, `names.rs` for the `qmb_name_*` surface, and `annulet.rs` for
+    /// the `qmb_annulet_*` surface (lab #858 WA2).
     #[test]
     fn the_header_names_every_exported_function_and_nothing_else() {
         let header = include_str!("../include/qumbra_ffi.h");
-        let src = concat!(include_str!("lib.rs"), include_str!("names.rs"));
+        let src = concat!(include_str!("lib.rs"), include_str!("names.rs"), include_str!("annulet.rs"));
         let exported: Vec<&str> = src
             .lines()
             .filter_map(|l| {
@@ -2925,7 +2927,7 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 6] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t", "qmb_pair_t"];
+                const TYPES: [&str; 7] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t", "qmb_pair_t", "qmb_annulet_t"];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"

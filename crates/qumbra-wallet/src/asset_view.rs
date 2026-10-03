@@ -38,6 +38,7 @@ use qlab_node::annulet_genesis::h32;
 
 use crate::annulet_verify::{VerifiedAnnulet, VerifiedChain};
 use crate::store::WalletDir;
+use qlab_wallet::Wallet;
 
 /// The signature domain: an asset list's signature is over this ‖ its bytes.
 pub const ASSET_LIST_DOMAIN: &[u8] = b"qumbra:asset-list:v1\0";
@@ -154,6 +155,11 @@ pub const ASSET_LIST_TEST_KEY_FINGERPRINT: &str = "a926a297aa958568fa8b4441a2f1c
 /// **Only in a `test-support` build** (#850 AD2 pre-review): the crate's own
 /// dev-dependency and the `ad_goldens` example enable it; a release shell
 /// cannot reach the test signer at all.
+/// Whether this build carries [`test_list_key`] — `false` in every build a
+/// shell ships. `qumbra-ffi` asserts it at compile time for wasm32 (lab #858
+/// WA2), so the test signer cannot leak into the extension's kernel.
+pub const TEST_SUPPORT: bool = cfg!(feature = "test-support");
+
 #[cfg(feature = "test-support")]
 pub mod test_list_key {
     use ml_dsa::{Keypair, MlDsa65, Signer, SigningKey, B32};
@@ -170,6 +176,12 @@ pub mod test_list_key {
     pub fn verifying() -> super::ListKey {
         let enc = signing().verifying_key().encode();
         super::ListKey::from_encoded(enc.as_slice()).expect("a derived key encodes")
+    }
+
+    /// The test verifying key's encoding — what a host passes across the
+    /// ABI as its list key in a fixture (lab #858 WA2).
+    pub fn encoded() -> Vec<u8> {
+        signing().verifying_key().encode().as_slice().to_vec()
     }
 
     /// Sign `list` with the test key — **tests and fixtures only**; the
@@ -486,7 +498,9 @@ fn mode_of(leaf: &RegistryLeaf) -> AssetMode {
 /// **Build the view** from a verified scan: open each held asset's leaf at the
 /// verified tip, label it from `list` (if it is this network's), check
 /// `freeze_lists` (keys per asset, used only when their root is the leaf's),
-/// and render every amount exactly.
+/// and render every amount exactly. Since lab #858 WA2 the pump of
+/// [`held_assets`] + [`check_leaf_at_verified_tip`] + [`asset_view_from`] —
+/// the order a caller-pumped host (`qumbra-ffi`) asks the same leaves in.
 pub fn asset_view<F>(
     w: &WalletDir,
     v: &VerifiedAnnulet,
@@ -497,6 +511,44 @@ pub fn asset_view<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
+    let leaves: Leaves = held_assets(v)
+        .into_iter()
+        .map(|asset| {
+            let answer = fetch(&crate::annulet_verify::registry_leaf_path(asset));
+            (asset, check_leaf_at_verified_tip(v.chain(), asset, answer))
+        })
+        .collect();
+    asset_view_from(&w.wallet(), v, list, freeze_lists, &leaves)
+}
+
+/// Each held asset's leaf, opened at the verified tip (or why not) — what
+/// [`asset_view_from`] reads.
+pub type Leaves = BTreeMap<u16, Result<RegistryLeaf, LeafRefusal>>;
+
+/// The assets whose registry leaf the view opens, in the order it opens them:
+/// every held asset with a figure, asset 0 (the fee unit, no leaf) excepted.
+/// Empty when the scan has no figures.
+pub fn held_assets(v: &VerifiedAnnulet) -> Vec<u16> {
+    let Some(index) = &v.report().index else { return Vec::new() };
+    index
+        .by_asset
+        .iter()
+        .filter(|(&asset, notes)| asset != 0 && !(notes.spendable_value() == 0 && notes.spendable.is_empty()))
+        .map(|(&asset, _)| asset)
+        .collect()
+}
+
+/// [`asset_view`] without the fetch (lab #858 WA2): the view over the leaves
+/// [`held_assets`] named, each already opened by
+/// [`check_leaf_at_verified_tip`]. A held asset missing from `leaves` is a
+/// caller's bug, and reads as a leaf problem — never as a bound leaf.
+pub fn asset_view_from(
+    wallet: &Wallet,
+    v: &VerifiedAnnulet,
+    list: Option<&AssetList>,
+    freeze_lists: &BTreeMap<u16, Vec<[u64; 4]>>,
+    leaves: &Leaves,
+) -> AssetView {
     let report = v.report();
     let genesis_hash = report.genesis_hash;
     let (list_status, list) = match list {
@@ -509,14 +561,14 @@ where
             why: "the scan could not read both this wallet's outputs and the spends over the range".to_string(),
         },
         Some(index) => {
-            let wallet = w.wallet();
             let mut rows = Vec::new();
             for (&asset, notes) in &index.by_asset {
                 let units = notes.spendable_value();
                 if units == 0 && notes.spendable.is_empty() {
                     continue;
                 }
-                let leaf = if asset == 0 { None } else { Some(leaf_at_verified_tip(fetch, v.chain(), asset)) };
+                let missing = Err(LeafRefusal::Unavailable { why: "the host supplied no answer for this leaf".into() });
+                let leaf = if asset == 0 { None } else { Some(leaves.get(&asset).cloned().unwrap_or(missing)) };
                 let leaf_problem = match &leaf {
                     Some(Err(e)) => Some(format!("{e:?}")),
                     _ => None,

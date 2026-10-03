@@ -339,3 +339,55 @@ fn a_leaf_is_bound_by_the_tip_root_whatever_height_the_node_names() {
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 }
+
+/// Lab #858 WA2: `asset_view` is the pump of `held_assets` +
+/// `check_leaf_at_verified_tip` + `asset_view_from`. Over the AD2 fixtures —
+/// listed with a regulated freeze list, no list, another network's list, a
+/// leaf off the verified tip, no spends — the pump's view equals the pure
+/// body fed the same leaves, and the pump fetches exactly the leaf paths
+/// `held_assets` names, in that order (what a caller-pumped host asks).
+#[test]
+fn asset_view_is_the_pump_of_held_assets_and_asset_view_from() {
+    use qumbra_wallet::annulet_verify::registry_leaf_path;
+    use qumbra_wallet::asset_view::{asset_view_from, check_leaf_at_verified_tip, held_assets};
+    type Case<'a> = (&'a str, u8, bool, Lie, bool, Option<[u8; 32]>);
+    let cases: Vec<Case> = vec![
+        ("pump_listed", 0x91, true, Lie::None, true, None),
+        ("pump_nolist", 0x92, true, Lie::None, false, None),
+        ("pump_other", 0x93, false, Lie::None, true, Some([7; 32])),
+        ("pump_leaf", 0x94, false, Lie::RegistryLeaf, true, None),
+        ("pump_nospends", 0x95, false, Lie::NoNullifiers, true, None),
+    ];
+    for (tag, seed, regulated, lie, with_list, other_genesis) in cases {
+        let (w, ep) = setup(tag, seed, regulated, lie);
+        let v = run(&w, &ep, Some(ep.file.hash())).expect("the chain verifies");
+        let genesis = other_genesis.unwrap_or(ep.file.hash());
+        let list = with_list.then(|| signed(&list_json(&genesis, [9, 9, 9, 9])));
+        let rkm0 = w.wallet().rkm(w.wallet().diversifier_at_index(0));
+        // A published freeze list is the tree's keys (lab PR #874), so the
+        // listed case reaches Frozen through the pure body too.
+        let key0 = CanonicalFreezeTree::from_rkms(&[rkm0]).keys[0];
+        let freeze: BTreeMap<u16, Vec<[u64; 4]>> = [(REG, vec![key0])].into_iter().collect();
+
+        let mut asked = Vec::new();
+        let mut fetch = |p: &str| {
+            asked.push(p.to_string());
+            ep.fetch(p)
+        };
+        let pumped = asset_view(&w, &v, list.as_ref(), &freeze, &mut fetch);
+
+        let held = held_assets(&v);
+        assert_eq!(asked, held.iter().map(|&a| registry_leaf_path(a)).collect::<Vec<_>>(), "{tag}: the leaf Needs");
+        let leaves = held
+            .iter()
+            .map(|&a| (a, check_leaf_at_verified_tip(v.chain(), a, ep.fetch(&registry_leaf_path(a)))))
+            .collect();
+        let pure = asset_view_from(&w.wallet(), &v, list.as_ref(), &freeze, &leaves);
+        assert_eq!(pumped, pure, "{tag}");
+        match lie {
+            Lie::NoNullifiers => assert!(held.is_empty(), "{tag}: no figures, no leaves"),
+            _ => assert!(held.contains(&(USDT as u16)), "{tag}: USDT's leaf is asked"),
+        }
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+}

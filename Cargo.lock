@@ -1931,15 +1931,18 @@ version = "0.0.0"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.4.3",
+ "qlab-air",
  "qlab-cbserver",
  "qlab-devnet",
  "qlab-ledger",
  "qlab-node",
  "qlab-note",
+ "qlab-p2p",
  "qlab-wallet",
  "qumbra-node",
  "qumbra-wallet",
  "rand 0.10.2",
+ "serde_json",
  "sha3",
 ]
 
