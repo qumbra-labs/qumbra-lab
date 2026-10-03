@@ -260,7 +260,7 @@ pub fn digest_at(w: &[u32], off: usize) -> Digest {
 fn index_at(w: &[u32], off: usize) -> u64 {
     u64::from(w[off]) | (u64::from(w[off + 1]) << 16)
 }
-fn u64_at(w: &[u32], off: usize) -> u64 {
+pub fn u64_at(w: &[u32], off: usize) -> u64 {
     (0..4).map(|j| u64::from(w[off + j]) << (16 * j)).sum()
 }
 

@@ -325,6 +325,107 @@ pub fn stated_surface_prefix(b: &[u8]) -> Result<Option<Surface>, CodecError> {
     Ok(stated_surface(version, l2_id, &w_pvs))
 }
 
+/// A bundle frame's parts with each proof as its **encoded bytes** — what
+/// [`encode_frame`] writes. [`WireBundle::encode`] is this with its proofs
+/// serialized; lab #860 R1's index fixtures pass placeholder bytes (a node's
+/// L2 index folds PVs only — [`stated_pvs`] never decodes a proof).
+pub struct FrameParts<'a> {
+    pub version: u32,
+    pub l2_id: u64,
+    pub w_pvs: &'a [u32],
+    pub w_proof: &'a [u8],
+    pub dep_pvs: &'a [u32],
+    pub dep_proof: &'a [u8],
+    pub members: &'a [(WTag, &'a [u32], &'a [u8])],
+    pub exits: &'a [Exit],
+    pub sig: &'a [u8; SEQUENCER_SIG_LEN],
+}
+
+/// **The one bundle-frame encoder** (moved out of [`WireBundle::encode`] by
+/// lab #860 R1, byte-identical): `version ‖ l2_id ‖ w_pvs ‖ w_proof ‖ dep_pvs
+/// ‖ dep_proof ‖ n_members ‖ [tag ‖ pvs ‖ proof]* ‖ n_exits ‖ [rkm ‖ v]* ‖ sig`,
+/// each proof `u32 len ‖ bytes`.
+pub fn encode_frame(f: &FrameParts<'_>) -> Vec<u8> {
+    assert_eq!(f.w_pvs.len(), W_PV_LEN, "W's PV count");
+    assert_eq!(f.dep_pvs.len(), DEP_PV_LEN, "the deposit proof's PV count");
+    assert!(f.members.len() <= MAX_K, "members ≤ MAX_K");
+    let n_exits = u8::try_from(f.exits.len()).expect("≤ 255 exits");
+    let mut v = Vec::new();
+    let words = |v: &mut Vec<u8>, w: &[u32]| w.iter().for_each(|x| v.extend_from_slice(&x.to_le_bytes()));
+    let proof = |v: &mut Vec<u8>, p: &[u8]| {
+        v.extend_from_slice(&u32::try_from(p.len()).expect("a proof < 4 GiB").to_le_bytes());
+        v.extend_from_slice(p);
+    };
+    v.extend_from_slice(&f.version.to_le_bytes());
+    v.extend_from_slice(&f.l2_id.to_le_bytes());
+    words(&mut v, f.w_pvs);
+    proof(&mut v, f.w_proof);
+    words(&mut v, f.dep_pvs);
+    proof(&mut v, f.dep_proof);
+    v.push(f.members.len() as u8);
+    for (tag, pvs, p) in f.members {
+        assert_eq!(pvs.len(), tag.pv_len(), "a member's PV count");
+        v.push(tag.byte());
+        words(&mut v, pvs);
+        proof(&mut v, p);
+    }
+    v.push(n_exits);
+    for e in f.exits {
+        v.extend_from_slice(&digest_to_bytes(&e.rkm));
+        v.extend_from_slice(&e.v.to_le_bytes());
+    }
+    v.extend_from_slice(&f.sig[..]);
+    v
+}
+
+/// A bundle's public values, read without decoding a proof (lab #860 R1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatedPvs {
+    pub version: u32,
+    pub l2_id: u64,
+    pub w_pvs: Vec<u32>,
+    pub members: Vec<(WTag, Vec<u32>)>,
+}
+
+/// **The bundle's PVs, no proof decoded** (lab #860 R1) — the frame walked
+/// exactly as [`exit_list`] walks it (member count and tags checked, exits
+/// and signature present, no trailing bytes), so a byte string this accepts
+/// is one [`WireBundle::decode`] reads the same PVs from, or refuses for a
+/// proof. Only for bytes a node already accepted: a node's L2 index folds
+/// these, it verifies nothing.
+pub fn stated_pvs(b: &[u8]) -> Result<StatedPvs, CodecError> {
+    let mut r = Reader { b };
+    let skip_proof = |r: &mut Reader<'_>, what: &'static str| -> Result<(), CodecError> {
+        let len = r.u32(what)? as usize;
+        r.take(len, what).map(|_| ())
+    };
+    let version = r.u32("version")?;
+    let l2_id = r.u64("l2_id")?;
+    let w_pvs = r.words(W_PV_LEN, "w_pvs")?;
+    skip_proof(&mut r, "w_proof")?;
+    r.take(4 * DEP_PV_LEN, "dep_pvs")?;
+    skip_proof(&mut r, "dep_proof")?;
+    let n = r.u8("n_members")?;
+    if n as usize > MAX_K {
+        return Err(CodecError::TooManyMembers(n));
+    }
+    let mut members = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let t = r.u8("member tag")?;
+        let tag = tag_of(t).ok_or(CodecError::UnknownTag(t))?;
+        members.push((tag, r.words(tag.pv_len(), "member pvs")?));
+        skip_proof(&mut r, "member proof")?;
+    }
+    let n_exits = r.u8("n_exits")?;
+    for _ in 0..n_exits {
+        r.digest("exit rkm")?;
+        r.u64("exit v")?;
+    }
+    r.take(SEQUENCER_SIG_LEN, "sequencer_sig")?;
+    r.end()?;
+    Ok(StatedPvs { version, l2_id, w_pvs, members })
+}
+
 /// A decoded bundle: owned proofs, the clear exit list and the signature.
 pub struct WireBundle {
     pub version: u32,
@@ -381,36 +482,19 @@ impl WireBundle {
     /// (a PV vector of the wrong length, more than `MAX_K` members or 255
     /// exits): an encoder bug, never peer input.
     pub fn encode(&self) -> Vec<u8> {
-        assert_eq!(self.w_pvs.len(), W_PV_LEN, "W's PV count");
-        assert_eq!(self.dep_pvs.len(), DEP_PV_LEN, "the deposit proof's PV count");
-        assert!(self.members.len() <= MAX_K, "members ≤ MAX_K");
-        let n_exits = u8::try_from(self.exits.len()).expect("≤ 255 exits");
-        let mut v = Vec::new();
-        let words = |v: &mut Vec<u8>, w: &[u32]| w.iter().for_each(|x| v.extend_from_slice(&x.to_le_bytes()));
-        let proof = |v: &mut Vec<u8>, p: Vec<u8>| {
-            v.extend_from_slice(&u32::try_from(p.len()).expect("a proof < 4 GiB").to_le_bytes());
-            v.extend_from_slice(&p);
-        };
-        v.extend_from_slice(&self.version.to_le_bytes());
-        v.extend_from_slice(&self.l2_id.to_le_bytes());
-        words(&mut v, &self.w_pvs);
-        proof(&mut v, encode_proof(&self.w_proof));
-        words(&mut v, &self.dep_pvs);
-        proof(&mut v, encode_proof(&self.dep_proof));
-        v.push(self.members.len() as u8);
-        for m in &self.members {
-            assert_eq!(m.pvs.len(), m.tag.pv_len(), "a member's PV count");
-            v.push(m.tag.byte());
-            words(&mut v, &m.pvs);
-            proof(&mut v, encode_proof(&m.proof));
-        }
-        v.push(n_exits);
-        for e in &self.exits {
-            v.extend_from_slice(&digest_to_bytes(&e.rkm));
-            v.extend_from_slice(&e.v.to_le_bytes());
-        }
-        v.extend_from_slice(&self.sig[..]);
-        v
+        let members: Vec<(WTag, &[u32], Vec<u8>)> =
+            self.members.iter().map(|m| (m.tag, m.pvs.as_slice(), encode_proof(&m.proof))).collect();
+        encode_frame(&FrameParts {
+            version: self.version,
+            l2_id: self.l2_id,
+            w_pvs: &self.w_pvs,
+            w_proof: &encode_proof(&self.w_proof),
+            dep_pvs: &self.dep_pvs,
+            dep_proof: &encode_proof(&self.dep_proof),
+            members: &members.iter().map(|(t, p, b)| (*t, *p, b.as_slice())).collect::<Vec<_>>(),
+            exits: &self.exits,
+            sig: &self.sig,
+        })
     }
 
     /// The view [`crate::verify::verify_wrapper`] takes.
@@ -667,5 +751,64 @@ mod tests {
         let mut many = b.clone();
         many[at - 1] = (MAX_K + 1) as u8;
         assert_eq!(exit_list(&many), Err(CodecError::TooManyMembers((MAX_K + 1) as u8)));
+    }
+
+    /// The frame `golden_frame` encodes (lab #860 R1): fixed, distinct parts.
+    fn golden_parts() -> (Vec<u32>, Vec<u32>, Vec<u32>, [Exit; 1]) {
+        let w: Vec<u32> = (0..W_PV_LEN as u32).map(|i| i & 0xffff).collect();
+        let dep: Vec<u32> = (0..DEP_PV_LEN as u32).map(|i| 1000 + i).collect();
+        let m: Vec<u32> = (0..WTag::S.pv_len() as u32).map(|i| (7 * i) & 0xffff).collect();
+        (w, dep, m, [Exit { rkm: [1, 2, 3, 4], v: 9 }])
+    }
+
+    /// **A byte golden on the one frame encoder** (lab #860 R1 pre-review):
+    /// `WireBundle::encode` is `encode_frame` over its serialized proofs, and
+    /// the existing tests are decode∘encode round trips, which pass if the
+    /// two drift together. The literal was computed by an independent
+    /// encoder (a Python spelling of the documented layout, hashed with
+    /// OpenSSL's KECCAK-256), not by this code.
+    #[test]
+    fn golden_frame() {
+        let (w, dep, m, exits) = golden_parts();
+        let b = encode_frame(&FrameParts {
+            version: 1,
+            l2_id: 7,
+            w_pvs: &w,
+            w_proof: &[0xAB; 3],
+            dep_pvs: &dep,
+            dep_proof: &[0xCD; 2],
+            members: &[(WTag::S, m.as_slice(), &[0xEF][..])],
+            exits: &exits,
+            sig: &[0u8; SEQUENCER_SIG_LEN],
+        });
+        let hex: String = qlab_note::hash::keccak256(&b).iter().map(|x| format!("{x:02x}")).collect();
+        assert_eq!((b.len(), hex.as_str()), (5578, "0cd822717d774110fac5c12e438972f6ff4eb50906093f2cf6a9a1791c77f8a1"));
+    }
+
+    /// `stated_pvs` reads back exactly the PVs `encode_frame` wrote, never a
+    /// proof; every strict prefix and a trailing byte are refused by name.
+    #[test]
+    fn stated_pvs_reads_the_frame_back_and_refuses_every_prefix() {
+        let (w, dep, m, exits) = golden_parts();
+        let b = encode_frame(&FrameParts {
+            version: 1,
+            l2_id: 7,
+            w_pvs: &w,
+            w_proof: &[0xAB; 3],
+            dep_pvs: &dep,
+            dep_proof: &[0xCD; 2],
+            members: &[(WTag::S, m.as_slice(), &[0xEF][..])],
+            exits: &exits,
+            sig: &[0u8; SEQUENCER_SIG_LEN],
+        });
+        let got = stated_pvs(&b).expect("the frame reads");
+        assert_eq!(got, StatedPvs { version: 1, l2_id: 7, w_pvs: w, members: vec![(WTag::S, m)] });
+        assert_eq!(exit_list(&b), Ok(exits.to_vec()), "the same walk as exit_list");
+        for n in 0..b.len() {
+            assert!(stated_pvs(&b[..n]).is_err(), "prefix {n}");
+        }
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(stated_pvs(&long), Err(CodecError::Trailing));
     }
 }

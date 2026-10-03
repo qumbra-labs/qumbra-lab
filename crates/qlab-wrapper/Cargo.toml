@@ -21,3 +21,8 @@ p3-uni-stark = "=0.6.1"
 # re-encode equality), the same bincode 1 the node's transaction path uses.
 bincode = "1"
 serde = "1"
+
+[dev-dependencies]
+# Lab #860 R1: the frame golden hashes bytes with the workspace's one byte
+# Keccak-256 (qlab-note's, cross-checked against tiny-keccak there). Test-only.
+qlab-note = { path = "../qlab-note" }

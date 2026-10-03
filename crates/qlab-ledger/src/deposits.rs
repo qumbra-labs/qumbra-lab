@@ -60,6 +60,73 @@ impl L2Answer {
     }
 }
 
+/// What a V6 node's `/v1/l2/index` says (lab #860 R1): the L1 height and id
+/// of the last bundle its L2 index folded, and why the index stopped, if it
+/// did. A hint about the index, never a trust root (D3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct L2IndexAnswer {
+    pub height: Option<u64>,
+    pub bundle_id: Option<[u8; 32]>,
+    /// The refusal that froze the index, by name.
+    pub refused: Option<String>,
+}
+
+/// The only `/v1/l2/index` version this build reads.
+pub const L2_INDEX_ROUTE_VERSION: u32 = 1;
+
+/// Read a `/v1/l2/index` body — exactly the node's layout
+/// (`qumbra_node::discovery_server::l2_index_body`), field by field in order:
+/// `{"v":1,"height":N|null,"bundle_id":"<64 hex>"|null,"refused":null|"<reason>"}`.
+/// Anything else, an unknown `v` included, is refused by name. A reason
+/// carries no `"`, `\` or control character (the node scrubs them).
+pub fn parse_l2_index(body: &[u8]) -> Result<L2IndexAnswer, String> {
+    let s = std::str::from_utf8(body).map_err(|_| "/v1/l2/index: not UTF-8".to_string())?;
+    let rest = s.strip_prefix(r#"{"v":"#).ok_or("/v1/l2/index: not a /v1/l2/index answer")?;
+    let (v, rest) = rest.split_once(',').ok_or("/v1/l2/index: truncated after v")?;
+    if v != L2_INDEX_ROUTE_VERSION.to_string() {
+        return Err(format!("/v1/l2/index answered version {v}; this build reads only version {L2_INDEX_ROUTE_VERSION}"));
+    }
+    let rest = rest.strip_prefix(r#""height":"#).ok_or("/v1/l2/index: height missing")?;
+    let (h, rest) = rest.split_once(',').ok_or("/v1/l2/index: truncated after height")?;
+    let height = match h {
+        "null" => None,
+        h if !h.is_empty() && h.bytes().all(|c| c.is_ascii_digit()) && (h.len() == 1 || !h.starts_with('0')) => {
+            Some(h.parse().map_err(|_| format!("/v1/l2/index: height {h} does not fit a u64"))?)
+        }
+        h => return Err(format!("/v1/l2/index: height {h:?} is neither null nor a canonical decimal")),
+    };
+    let rest = rest.strip_prefix(r#""bundle_id":"#).ok_or("/v1/l2/index: bundle_id missing")?;
+    let (bundle_id, rest) = match rest.strip_prefix("null") {
+        Some(rest) => (None, rest),
+        None => {
+            let r = rest.strip_prefix('"').ok_or("/v1/l2/index: bundle_id is neither null nor a string")?;
+            let h = r.get(..64).filter(|h| h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+            let h = h.ok_or("/v1/l2/index: bundle_id is not 64 lower-case hex digits")?;
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).expect("checked hex");
+            }
+            (Some(out), r[64..].strip_prefix('"').ok_or("/v1/l2/index: bundle_id unterminated")?)
+        }
+    };
+    if height.is_some() != bundle_id.is_some() {
+        return Err("/v1/l2/index: height and bundle_id disagree on whether a bundle was folded".into());
+    }
+    let rest = rest.strip_prefix(r#","refused":"#).ok_or("/v1/l2/index: refused missing")?;
+    let refused = match rest {
+        "null}" => None,
+        r => {
+            let reason = r
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix(r#""}"#))
+                .filter(|r| !r.is_empty() && !r.contains(['"', '\\']) && !r.chars().any(char::is_control))
+                .ok_or("/v1/l2/index: refused is neither null nor a plain reason")?;
+            Some(reason.to_string())
+        }
+    };
+    Ok(L2IndexAnswer { height, bundle_id, refused })
+}
+
 /// The only `/v1/l2` version this build reads.
 pub const L2_ROUTE_VERSION: u32 = 1;
 

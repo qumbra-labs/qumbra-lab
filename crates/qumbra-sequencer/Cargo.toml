@@ -19,7 +19,7 @@ test-support = []
 
 [dependencies]
 qlab-air = { path = "../qlab-air" }
-qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false, features = ["l2fold"] }
 qlab-consensus = { path = "../qlab-consensus" }
 qlab-devnet = { path = "../qlab-devnet" }
 qlab-l2 = { path = "../qlab-l2" }

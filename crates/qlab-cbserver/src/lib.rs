@@ -39,6 +39,10 @@ pub mod data;
 pub mod server;
 pub mod registry;
 pub mod tree;
+/// Lab #860 R1: the L2 state fold, behind `l2fold` (it needs qlab-wrapper's
+/// hashes and qlab-devnet's shape tag; the lean graphs leave it off).
+#[cfg(feature = "l2fold")]
+pub mod l2fold;
 
 /// Format version byte that leads every §2 response (spec: "format version byte
 /// leads every response").

@@ -19,6 +19,10 @@ qlab-note = { path = "../qlab-note" }
 qlab-air = { path = "../qlab-air" }
 # Real devnet block/header/chain types for the data source.
 qlab-devnet = { path = "../qlab-devnet", default-features = false, optional = true }
+# Lab #860 R1: the fold's domain-tagged hashes (`qlab_wrapper::hash`).
+# Acyclic: qlab-wrapper depends on qlab-air / qlab-consensus / qlab-l2 / p3,
+# none of which reaches qlab-cbserver.
+qlab-wrapper = { path = "../qlab-wrapper", optional = true }
 # Minimal maintained blocking HTTP/1.1 server (no async runtime). Pinned exactly
 # per bench discipline. Chosen over axum/hyper for a localhost reference server.
 tiny_http = "=0.12.0"
@@ -49,3 +53,7 @@ default = ["devnet", "randomx"]
 devnet = ["dep:qlab-devnet"]
 # qlab-devnet's RandomX chain, for `devnet` users that want it (the default does).
 randomx = ["qlab-devnet?/randomx"]
+# Lab #860 R1: the L2 state fold (`l2fold`) — qlab-wrapper's hashes and the
+# devnet shape tag. Off by default and off for the lean graphs (qumbra-ffi);
+# the node, qlab-wprover and qumbra-sequencer turn it on.
+l2fold = ["devnet", "dep:qlab-wrapper"]

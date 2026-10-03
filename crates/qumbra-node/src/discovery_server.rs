@@ -718,6 +718,91 @@ pub const GENESIS_FILE_PATH: &str = "/genesis.qmb";
 pub const GENESIS_FILE_NOT_ON_L1: &str =
     "an L1 node does not serve its genesis file on this listener: the edge serves /genesis.qmb";
 
+/// The V6 L2 index's routes (lab #860 R1; `l2-read-path-decision` D2) all sit
+/// under this prefix; `/v1/l2` itself is the bridge facts and stays
+/// byte-identical (#860 ASK 3).
+pub const L2_INDEX_PREFIX: &str = "/v1/l2/";
+/// `GET /v1/l2/index` — the index's height, bundle id and refusal.
+pub const L2_INDEX_PATH: &str = "/v1/l2/index";
+/// `GET /v1/l2/tree/leaves?from=` — the C tree's leaves (the `/v1/tree/leaves` wire).
+pub const L2_LEAVES_PATH: &str = "/v1/l2/tree/leaves";
+/// `GET /v1/l2/nullifiers?from=&to=` — N, keyed by the carrying block's L1
+/// height (the `/v1/nullifiers` wire).
+pub const L2_NULLIFIERS_PATH: &str = "/v1/l2/nullifiers";
+/// `GET /v1/l2/registry/{asset}` — an opening at the index's height (the
+/// `/v1/registry/{asset}` wire).
+pub const L2_REGISTRY_PREFIX: &str = "/v1/l2/registry/";
+/// The only `/v1/l2/index` version this build writes.
+pub const L2_INDEX_ROUTE_VERSION: u32 = 1;
+/// What a node off V6 answers on every `/v1/l2/…` route.
+pub const L2_INDEX_NOT_V6: &str = "not a V6 net: the L2 index is served by a V6 node only";
+
+/// The `/v1/l2/index` body, fixed key order —
+/// `{"v":1,"height":N|null,"bundle_id":"<64 hex>"|null,"refused":null|"<reason>"}` —
+/// read strictly by `qlab_ledger::deposits::parse_l2_index`.
+pub fn l2_index_body(v: &crate::l2_index::L2IndexView) -> String {
+    let hex = |b: &Hash32| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        r#"{{"v":{L2_INDEX_ROUTE_VERSION},"height":{},"bundle_id":{},"refused":{}}}"#,
+        v.height.map_or("null".into(), |h| h.to_string()),
+        v.bundle_id.as_ref().map_or("null".into(), |b| format!("\"{}\"", hex(b))),
+        // `L2IndexView::refused` carries no `"`, `\` or control character
+        // (`IndexRefusal::reason` scrubs them), so it needs no escaping and a
+        // strict reader can refuse any.
+        v.refused.as_deref().map_or("null".into(), |r| format!("\"{r}\"")),
+    )
+}
+
+/// The socket-free `/v1/l2/…` core (lab #860 R1). Off V6 every route is a
+/// 400 by name; the wires are the Annulet routes' own encoders.
+pub fn respond_l2(v: &crate::l2_index::L2IndexView, path: &str, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    if !v.v6 {
+        return Err((400, L2_INDEX_NOT_V6.to_string()));
+    }
+    if path == L2_INDEX_PATH {
+        return Ok(l2_index_body(v).into_bytes());
+    }
+    if path == L2_LEAVES_PATH {
+        let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+        return Ok(qlab_node::TreeLeaves::page(&v.leaves, from).to_bytes());
+    }
+    if path == L2_NULLIFIERS_PATH {
+        let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+        let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+        if to < from {
+            return Err((400, "'to' < 'from'".to_string()));
+        }
+        // Every L1 height the index covers is served — a height carrying no
+        // bundle is an empty list, never an absence (the `/v1/nullifiers`
+        // contract: an empty page means "no height here").
+        // Lazily, and no further than one page: nothing past
+        // `MAX_NULLIFIER_BLOCKS` heights is cloned.
+        let last = v.height.and_then(|h| (from <= h).then(|| to.min(h)));
+        let blocks = last
+            .into_iter()
+            .flat_map(|last| from..=last)
+            .take(qlab_cbserver::codec::MAX_NULLIFIER_BLOCKS)
+            .map(|height| qlab_cbserver::codec::BlockNullifiers {
+                height,
+                nullifiers: v.nullifiers.get(&height).cloned().unwrap_or_default(),
+            });
+        return Ok(qlab_cbserver::codec::NullifierPage::page(blocks, from, to).to_bytes());
+    }
+    if let Some(a) = path.strip_prefix(L2_REGISTRY_PREFIX) {
+        let asset = parse_asset_id(a).ok_or((400, format!("invalid asset id `{a}`")))?;
+        let tree = v.registry.as_ref().ok_or((503, "the L2 index holds no registry yet".to_string()))?;
+        return qlab_cbserver::registry::encode_registry_opening(tree, v.height.unwrap_or(0), asset)
+            .ok_or((404, format!("asset {asset} is not registered in the L2 index")));
+    }
+    Err((
+        404,
+        format!(
+            "not found under {L2_INDEX_PREFIX}: try {L2_INDEX_PATH}, {L2_LEAVES_PATH}?from=, \
+             {L2_NULLIFIERS_PATH}?from=&to=, {L2_REGISTRY_PREFIX}{{asset}}"
+        ),
+    ))
+}
+
 /// The genesis-notes route (lab #714, B5) — GET only, Annulet nets only.
 pub const GENESIS_NOTES_PATH: &str = "/v1/genesis/notes";
 
@@ -914,6 +999,34 @@ impl DiscoveryServer {
         registry: Arc<Mutex<Arc<RegistryView>>>,
         form_view: Arc<FormView>,
     ) -> io::Result<Self> {
+        Self::start_with_l2(
+            addr,
+            view,
+            leaves,
+            anchors,
+            submits,
+            mine,
+            registry,
+            form_view,
+            Arc::new(Mutex::new(Arc::new(crate::l2_index::L2IndexView::default()))),
+        )
+    }
+
+    /// [`Self::start_with_mine`] plus the V6 L2 index's routes (lab #860 R1):
+    /// `/v1/l2/index`, `/v1/l2/tree/leaves`, `/v1/l2/nullifiers`,
+    /// `/v1/l2/registry/{asset}`. A default (not-V6) view refuses them by name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_l2(
+        addr: &str,
+        view: Arc<Mutex<Arc<DiscoveryView>>>,
+        leaves: Arc<Mutex<Arc<LeavesView>>>,
+        anchors: Arc<Mutex<Arc<AnchorsView>>>,
+        submits: mpsc::SyncSender<SubmitRequest>,
+        mine: Option<crate::mine_rpc::MineServing>,
+        registry: Arc<Mutex<Arc<RegistryView>>>,
+        form_view: Arc<FormView>,
+        l2_index: Arc<Mutex<Arc<crate::l2_index::L2IndexView>>>,
+    ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
                 "discovery_addr {addr}: {e} (set discovery_addr = \"{DISCOVERY_OFF}\" to serve nothing)"
@@ -1081,6 +1194,14 @@ impl DiscoveryServer {
                             Err(p) => Arc::clone(&p.into_inner()),
                         };
                         respond_headers(&snapshot, wire_form(&form_view), query)
+                    }
+                    // Lab #860 R1: the V6 L2 index, one snapshot per answer.
+                    p if p.starts_with(L2_INDEX_PREFIX) => {
+                        let snapshot = match l2_index.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(e) => Arc::clone(&e.into_inner()),
+                        };
+                        respond_l2(&snapshot, p, query)
                     }
                     // Lab #831 W3a-0: which L2 this net bridges, if any.
                     L2_PATH => Ok(form_view.l2.clone().unwrap_or_else(|| L2_NOT_V6.as_bytes().to_vec())),

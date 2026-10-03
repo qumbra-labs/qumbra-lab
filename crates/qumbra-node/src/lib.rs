@@ -56,6 +56,7 @@ pub mod discovery_server;
 pub mod emission_pins;
 pub mod genesis;
 pub mod genesis_v6;
+pub mod l2_index;
 pub mod looptime;
 pub mod metrics_server;
 pub mod mine;
