@@ -25,9 +25,11 @@
 //!   vPublic = 0. What the wallet cannot open itself (a non-empty freeze tree,
 //!   a Regulated allowlist) is refused by name; its owner is C3.
 //!
-//! **Nothing is written to the wallet dir.** The commitment tree is rebuilt in
-//! memory; no L1 file (`tree-leaves.v1`, `sends.v1`) is read or written on an
-//! Annulet net.
+//! **Only the verified-header record is written to the wallet dir.** The
+//! session's verified scan (lab #869) keeps lab #852 WA0's record of the
+//! headers it verified, as `scan` does; the commitment tree is rebuilt in
+//! memory, and no L1 file (`tree-leaves.v1`, `sends.v1`) is read or written
+//! on an Annulet net.
 
 use std::time::{Duration, Instant};
 
@@ -38,7 +40,8 @@ use qlab_l2spend::{build_p_merge, build_p_with, build_s, build_s_merge, shape_fo
 use qlab_wallet::address::Address;
 use rand::rngs::StdRng;
 
-use crate::annulet::{scan_annulet, AnnuletRefusal};
+use crate::annulet::AnnuletRefusal;
+use crate::annulet_verify::{into_report, scan_annulet_verified};
 use crate::store::WalletDir;
 
 /// The fee tiers a send pays, from the node.
@@ -64,6 +67,10 @@ impl Tiers {
 /// Why a send cannot be planned or made — by name.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendRefusal {
+    /// The verified scan every Annulet write starts from refused the endpoint
+    /// (lab #869 (a)): no pin, or a chain that does not verify. Nothing was
+    /// planned or proved.
+    Verify(crate::annulet_verify::VerifyRefusal),
     /// No single spendable note of `asset` covers the amount (plus the fee,
     /// for asset 0). Notes cannot be merged in 2×2 (lab #720 P4).
     NoSingleNoteCovers { asset: u16, amount: u64, largest: u64 },
@@ -141,6 +148,7 @@ impl std::fmt::Display for SendRefusal {
                 f,
                 "no quotable balance: the scan did not establish both the outputs and the spends"
             ),
+            SendRefusal::Verify(e) => write!(f, "verified Annulet scan refused: {e}"),
             SendRefusal::Form(e) => write!(f, "{e}"),
             SendRefusal::ParamsGenesisMismatch => {
                 write!(f, "the endpoint's /v1/annulet/params name a different genesis than it serves")
@@ -511,8 +519,17 @@ pub struct Session<E: Endpoint> {
     pub genesis_hash: [u8; 32],
 }
 
-/// Verify the form (and pin), read the tariff (checked against the served
-/// genesis), and scan to `scan_to`.
+/// **The verified session** (lab #869 (a)): the genesis by its bytes against
+/// `pin`, every seal to the verified tip, each note's block recomputed
+/// ([`scan_annulet_verified`]) — then the tariff, checked against that
+/// genesis. The index every plan selects from is built only from the verified
+/// scan. `pin` is required: `None` is refused by name
+/// ([`crate::annulet_verify::VerifyRefusal::NoPin`]) before anything is
+/// fetched. Two reads are still the endpoint's word, not the verified chain's:
+/// the spends subtracted (lab #853 — a withheld spend can make a plan pick a
+/// spent note, which the node refuses after the proof: time lost, never money)
+/// and the registry leaf [`send_annulet`] reads for the shape (a lie there
+/// fails the proof, never a balance).
 pub fn open_session<E: Endpoint>(
     w: &WalletDir,
     endpoint: E,
@@ -522,7 +539,8 @@ pub fn open_session<E: Endpoint>(
 ) -> Result<Session<E>, SendRefusal> {
     let served = Served::new(endpoint);
     let mut fetch = |p: &str| served.endpoint.get(p);
-    let report = scan_annulet(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Form)?;
+    let verified = scan_annulet_verified(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Verify)?;
+    let report = into_report(verified);
     let params = served.params()?;
     if params.genesis_hash != report.genesis_hash {
         return Err(SendRefusal::ParamsGenesisMismatch);
@@ -601,6 +619,9 @@ pub fn send_annulet<E: Endpoint>(
     rng: &mut StdRng,
 ) -> Result<SendReport, SendRefusal> {
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
+    // Unverified: the endpoint's word on the leaf, read only to pick the
+    // shape. A lie here fails the proof, never a balance — out of AS-1's
+    // scope (lab #869).
     let leaf = session.served.registry(u64::from(asset))?.leaf;
     let shape = shape_for(&leaf);
     let wallet = w.wallet();
@@ -833,8 +854,10 @@ pub struct WalletEndpoint {
 
 #[cfg(feature = "net")]
 impl Endpoint for WalletEndpoint {
+    /// Every read goes through AD1b's per-route response ceilings, the same
+    /// transport as [`crate::net::verified_scan_fetch`].
     fn get(&self, path: &str) -> Result<Vec<u8>, String> {
-        crate::net::http_get(&self.url, path).map_err(|e| e.to_string())
+        crate::net::http_get_limited(&self.url, path, crate::annulet_verify::response_ceiling(path)).map_err(|e| e.to_string())
     }
     fn post(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         crate::net::http_post_bytes(&self.url, path, body).map_err(|e| e.to_string())

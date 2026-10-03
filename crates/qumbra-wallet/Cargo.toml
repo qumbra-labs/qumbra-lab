@@ -151,7 +151,9 @@ test-support = ["verify"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.
-prove = ["dep:qlab-consensus", "dep:qlab-p2p", "dep:qlab-l2spend"]
+# Lab #869: every Annulet write opens its session on the verified scan, so
+# the prover half carries `verify`.
+prove = ["dep:qlab-consensus", "dep:qlab-p2p", "dep:qlab-l2spend", "verify"]
 # the RandomX C++ chain, via the qlab-devnet/qlab-node passthroughs.
 randomx = ["qlab-devnet/randomx", "qlab-node/randomx", "qlab-p2p?/randomx"]
 # the native-messaging prover host (lab #400 rung): prove + submit behind a

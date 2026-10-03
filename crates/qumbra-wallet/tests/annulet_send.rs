@@ -15,8 +15,12 @@
 //! 5. `T` scans through the other follower and finds 250,000; `W` rescans to
 //!    750,000 of `USDT-test`.
 //!
-//! The wallet dir is left **byte-identical**: the L1 files `tree-leaves.v1`
-//! and `sends.v1` are untouched and nothing is added. 2 S + 2 P real proves.
+//! **P8, as amended (lab #869):** the send changes the wallet dir by at most
+//! the verified-header record. The send opens its session on the verified
+//! scan, which keeps lab #852 WA0's `annulet-chain.<genesis>` record; every
+//! file that was there before — the L1 `tree-leaves.v1` and `sends.v1`
+//! among them — is byte-identical, nothing else is added, and the record
+//! loads as a WA0 record for the pinned genesis. 2 S + 2 P real proves.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -146,7 +150,25 @@ fn an_ordinary_wallet_fee_splits_and_sends_usdt_test_through_a_follower() {
     assert_eq!(report.outputs[1].value, devnet::HOLDER_USDT_VALUE - 250_000);
     let v = net.settle_spends(12, "the split and the send");
     eprintln!("C2: W's fee-split (S) + send (P), sealed and applied on 3 nodes in {:?}", started.elapsed());
-    assert_eq!(snapshot(&w), before, "send --net annulet leaves the wallet dir byte-identical (P8)");
+    // P8 (amended, lab #869): before ⊆ after, byte for byte; the only key
+    // added is the chain record; and it loads as WA0's record for `hash`.
+    let after = snapshot(&w);
+    let record = qumbra_wallet::annulet_verify::chain_cache_path(&w, &hash)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    for (name, bytes) in &before {
+        assert_eq!(after.get(name), Some(bytes), "P8: {name} is byte-identical after the send");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(added, vec![&record], "P8: the send adds only the verified-header record");
+    let genesis = qumbra_wallet::annulet_verify::verify_genesis(&mut qumbra_wallet::net::verified_scan_fetch(&urls[1]), hash)
+        .expect("the pinned genesis verifies");
+    let headers = qumbra_wallet::annulet_verify::load_chain_cache(&w, &genesis)
+        .expect("P8: the record loads")
+        .expect("P8: the record is there");
+    assert!(!headers.is_empty(), "P8: the record holds the headers the session verified");
 
     // 5. T finds it through follower 2; W rescans.
     assert_eq!(balances(&t, &urls[2], v[2].state_tip, hash), vec![(1, 250_000)]);
