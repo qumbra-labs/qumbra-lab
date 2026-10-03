@@ -19,6 +19,10 @@ name = "qumbra-wallet"
 path = "src/main.rs"
 required-features = ["net", "prove", "verify"]
 
+[[example]]
+name = "ad_goldens"
+required-features = ["verify"]
+
 [[bin]]
 name = "qumbra-prover-host"
 path = "src/bin/prover_host.rs"

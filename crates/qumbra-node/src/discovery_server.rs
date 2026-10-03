@@ -2611,6 +2611,64 @@ mod tests {
         }
     }
 
+    /// **Lab #850 AD1, over a real socket**: `/v1/headers` and
+    /// `/v1/block/{h}/body` answer from the same projection as `/v1/compact`,
+    /// stay aligned with it across a refresh, and refuse by name; an L1 node
+    /// names the edge for `/genesis.qmb`.
+    #[test]
+    fn serves_headers_and_whole_bodies_from_the_compact_projection() {
+        use qlab_node::{ChainStore, MemChainStore};
+        use qlab_p2p::served::{decode_body_answer, decode_headers_page};
+        let v4 = qlab_p2p::compact::WireForm::plain(qlab_devnet::forms::GenesisForm::V4);
+
+        let genesis = stored(0, [0; 32], vec![]);
+        let mut prev = genesis.header().header_hash();
+        let mut store = MemChainStore::new(genesis);
+        for h in 1..=2u64 {
+            let b = stored(h, prev, vec![]);
+            prev = b.header().header_hash();
+            store.put_block(b).expect("applies");
+        }
+        let mut view = DiscoveryView::default();
+        assert!(view.refresh(&store));
+        assert_eq!(view.stored.len(), view.blocks.len(), "the blocks ride the same projection");
+        let shared = Arc::new(Mutex::new(Arc::new(view)));
+        let (srv, _rx) = serve(Arc::clone(&shared), no_leaves());
+        let addr = srv.addr();
+
+        let (status, body) = get(addr, "/v1/headers?from=0&to=9");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let units = decode_headers_page(v4, 0, &body).expect("an L1 page decodes");
+        assert_eq!(units.iter().map(|u| u.header().height).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(units[2].header().header_hash(), prev);
+
+        let (status, body) = get(addr, "/v1/block/2/body");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let Ok(ann) = decode_body_answer(v4, 2, &body) else { panic!("a whole body decodes") };
+        assert_eq!(ann.header, units[2].header());
+
+        for (path, code) in [
+            ("/v1/block/9/body", "404"),
+            ("/v1/block/zz/body", "400"),
+            ("/v1/headers?from=1", "400"),
+            ("/v1/headers?from=2&to=1", "400"),
+            ("/genesis.qmb", "404"),
+        ] {
+            let (status, _) = get(addr, path);
+            assert!(status.starts_with(&format!("HTTP/1.1 {code}")), "{path} => {status}");
+        }
+        let (_, body) = get(addr, "/genesis.qmb");
+        assert!(String::from_utf8_lossy(&body).contains("the edge serves /genesis.qmb"));
+
+        // A view built without its blocks (an older literal) is a 503, never
+        // an empty page.
+        let without = DiscoveryView { stored: Vec::new(), ..(**shared.lock().unwrap()).clone() };
+        *shared.lock().unwrap() = Arc::new(without);
+        let (status, _) = get(addr, "/v1/headers?from=0&to=9");
+        assert!(status.starts_with("HTTP/1.1 503"), "{status}");
+        srv.shutdown();
+    }
+
     /// The refresh reuses what it has and replaces what the chain replaced. Driven
     /// against a real `MemChainStore` so fork choice, not the test, decides what
     /// the main chain is.

@@ -227,6 +227,64 @@ pub fn body_of(ann: &BlockAnnounce) -> qlab_devnet::body::BlockBody {
     crate::node::announced_body(ann, ann.prefilled.iter().map(|p| p.tx.clone()).collect())
 }
 
+/// **The golden fixture** (lab #850 AD1): one deterministic sealed header
+/// page and one whole-block body answer, built from fixed seeds, for the
+/// golden-vector tests here and the `ad_goldens` example that computes the
+/// literals. The lane recomputes them; it never trusts the example.
+#[doc(hidden)]
+pub mod fixture {
+    use super::*;
+    use qlab_devnet::annulet::{AnnuletHeaderFields, L2ShapeTag, L2Surface, SequencerKey};
+    use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
+    use qlab_devnet::fees::ArityBucket;
+    use qlab_devnet::header::BlockHeader;
+
+    /// The Annulet wire form.
+    pub const AN: WireForm = WireForm::plain(GenesisForm::Annulet);
+
+    fn ext() -> AnnuletHeaderFields {
+        AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [7; 32] }
+    }
+
+    /// One Annulet transaction with an S surface and a placeholder group.
+    pub fn tx() -> TxEntry {
+        let public = TxPublic {
+            anchor: [0x0A; 32],
+            nullifiers: vec![[0x11; 32], [0x12; 32], [0x13; 32]],
+            commitments: vec![[0x21; 32], [0x22; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1,
+        };
+        let discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&public.commitments);
+        let surface = L2Surface { shape: L2ShapeTag::S, registry_root: [7; 32], vpublic: None, write: None, exit_rkm: [0; 32] };
+        TxEntry { proof: vec![0xAB; 64], public, discovery, rider: TxEntry::absent_rider(), l2: surface.encode() }
+    }
+
+    /// Heights 1 and 2 over a fixed genesis, sealed under seed `[0x5E; 32]`;
+    /// height 2 carries [`tx`].
+    pub fn chain() -> (Vec<WireHeader>, BlockBody) {
+        let key = SequencerKey::from_seed([0x5E; 32]);
+        let g = BlockHeader::genesis_annulet(ext(), [1; 32], 0);
+        let empty = BlockBody::default();
+        let h1 = BlockHeader::child_of_annulet(&g, 10, ext(), qlab_devnet::annulet::body_commitment_annulet(&empty));
+        let body = BlockBody { txs: vec![tx()], ..BlockBody::default() };
+        let h2 = BlockHeader::child_of_annulet(&h1, 20, ext(), qlab_devnet::annulet::body_commitment_annulet(&body));
+        (vec![WireHeader::Sealed(key.seal(h1)), WireHeader::Sealed(key.seal(h2))], body)
+    }
+
+    /// The `/v1/headers?from=1&to=2` answer over [`chain`].
+    pub fn headers_page() -> Vec<u8> {
+        encode_headers_page(AN, 1, &chain().0)
+    }
+
+    /// The `/v1/block/2/body` answer over [`chain`].
+    pub fn body_answer() -> Vec<u8> {
+        let (units, body) = chain();
+        let ann = crate::node::whole_block_announce(units[1].clone(), body);
+        encode_body_answer(AN, 2, &ann).expect("an Annulet body encodes")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +339,31 @@ mod tests {
         bytes[0] = 2;
         assert_eq!(decode_headers_page(AN, 1, &bytes), Err(ServedError::UnknownVersion { got: 2 }));
     }
+
+    /// **Golden vectors, one per route** (lab #850 condition (f)): the keccak
+    /// of each answer over [`fixture::chain`], and its length. Literals from
+    /// the named `ad_goldens` run; this test recomputes them, and if the two
+    /// ever disagree the test is right and the literal changes in a commit
+    /// that says why.
+    #[test]
+    fn golden_headers_page_and_body_answer() {
+        let page = fixture::headers_page();
+        let body = fixture::body_answer();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!((page.len(), hex(&qlab_devnet::hash::keccak256(&page))), (GOLDEN_HEADERS_LEN, GOLDEN_HEADERS_KECCAK.to_string()));
+        assert_eq!((body.len(), hex(&qlab_devnet::hash::keccak256(&body))), (GOLDEN_BODY_LEN, GOLDEN_BODY_KECCAK.to_string()));
+        // And each decodes to the chain it was built from.
+        let (units, b) = fixture::chain();
+        assert_eq!(decode_headers_page(fixture::AN, 1, &page).unwrap(), units);
+        let Ok(ann) = decode_body_answer(fixture::AN, 2, &body) else { panic!("the golden body decodes") };
+        assert_eq!(qlab_devnet::annulet::body_commitment_annulet(&body_of(&ann)), qlab_devnet::annulet::body_commitment_annulet(&b));
+        assert_eq!(ann.header, units[1].header());
+    }
+
+    const GOLDEN_HEADERS_LEN: usize = 6935;
+    const GOLDEN_HEADERS_KECCAK: &str = "32d382f3bc30faa5a0bd1bf6f9df2b251efcc0a3f9d7e0aec18ab36ea29351dd";
+    const GOLDEN_BODY_LEN: usize = 5217;
+    const GOLDEN_BODY_KECCAK: &str = "4475ff1961823112712cfc0df44a25e2b507f817731de9e57f85aa379f11d586";
 
     #[test]
     fn an_l1_unit_has_no_seal_by_name() {
