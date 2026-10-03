@@ -105,6 +105,23 @@ mod tests {
         assert!(before.contains("plan_claims(") && after.contains("prove(&plan,"), "the check sits between planning and proving");
     }
 
+    /// Lab #860 R3b: the only P a posting pass carries is a wallet's exit
+    /// file's (`Inst::ProvenExit`). Outside tests, the pass's sources build no
+    /// `Inst::P(` of their own, and `plan_claims` — the planner `run` calls —
+    /// builds a P only as `Inst::ProvenExit`.
+    #[test]
+    fn the_pass_builds_no_p_of_its_own() {
+        for (path, text) in SOURCES.iter().filter(|(p, _)| ["pass.rs", "work.rs", "main.rs"].contains(p)) {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            assert!(!code.contains("Inst::P("), "{path} builds a P of its own");
+        }
+        let members = include_str!("members.rs");
+        let start = members.find("pub fn plan_claims(").expect("plan_claims");
+        let body = &members[start..start + members[start..].find("\n}\n").expect("its end")];
+        assert!(!body.contains("Inst::P("), "plan_claims builds a P of its own");
+        assert!(body.contains("Inst::ProvenExit {"), "plan_claims carries the wallet's exit");
+    }
+
     /// The binary's `run` drives the one real [`crate::work::RealWork`], whose
     /// draft calls the real prover, and nothing in the crate outside tests
     /// defines another `Work` — the stub seam exists only in `pass`'s tests

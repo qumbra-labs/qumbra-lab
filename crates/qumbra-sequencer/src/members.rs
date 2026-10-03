@@ -174,6 +174,12 @@ pub enum Inst {
     /// (`qumbra-wallet deposit claim`): its public values and its proof, as
     /// `bincode` bytes already verified when the file was taken.
     Proven { pvs: Vec<u32>, proof: Vec<u8> },
+    /// Lab #860 R3b: a wallet's exit proven elsewhere — an exit file
+    /// (`qumbra-wallet exit --net v6`): a shape-P member, its public values,
+    /// its proof as `bincode` bytes (verified when the file was taken), and
+    /// the exit it pays. **The only P a posting pass ever carries**: the
+    /// sequencer plans no P of its own (`lib.rs` pins it).
+    ProvenExit { pvs: Vec<u32>, proof: Vec<u8>, exit: Exit },
 }
 
 impl Inst {
@@ -183,6 +189,7 @@ impl Inst {
             Inst::P(_) => WTag::P,
             Inst::R(..) => WTag::R,
             Inst::C(_) | Inst::Proven { .. } => WTag::C,
+            Inst::ProvenExit { .. } => WTag::P,
         }
     }
 
@@ -192,7 +199,7 @@ impl Inst {
             Inst::P(i) => &i.pvs,
             Inst::R(i, _) => &i.pvs,
             Inst::C(i) => &i.pvs,
-            Inst::Proven { pvs, .. } => pvs,
+            Inst::Proven { pvs, .. } | Inst::ProvenExit { pvs, .. } => pvs,
         }
     }
 
@@ -214,6 +221,7 @@ impl Inst {
             Inst::R(i, _) => qlab_l2::prove_r(i).1,
             Inst::C(i) => qlab_l2::claim::prove_claim(i).1,
             Inst::Proven { proof, .. } => bincode::deserialize(proof).expect("a claim file's proof decoded when it was taken"),
+            Inst::ProvenExit { proof, .. } => bincode::deserialize(proof).expect("an exit file's proof decoded when it was taken"),
         }
     }
 }
@@ -300,21 +308,58 @@ pub enum PlanError {
     /// filler) short of K = 16 — `have` counts both — or more claims than a
     /// wrapper holds (the caller's mistake).
     WrongCount { have: usize, need: usize },
-    /// Lab #847 S3: no claim — a wrapper of padding alone is never planned.
-    NoClaim,
+    /// Lab #847 S3 / #860 R3b: no traffic — no claim and no exit; a
+    /// wrapper of padding alone is never planned.
+    NoTraffic,
 }
 
 /// A wrapper's member count (wrapper version 1's K, lab #785 Q1).
 pub const K: usize = 16;
 
 /// **The member kinds a posting pass may emit** (lab #847, the Q4 condition
-/// of design `l2-read-path-decision`): claims, and S3's S fillers —
-/// **never R**. The node's derived L2 index (lab #860, R1) cannot follow a
-/// registry write from the wire, so one R member would block every exit
-/// until format v2. [`plan`] (f5box's general planner) can still plan R;
-/// the pass never calls it — `lib.rs`'s `the_pass_plans_no_r_member` holds
-/// that — and [`pass_members_ok`] refuses anything else before proving.
-pub const PASS_MEMBER_TAGS: [WTag; 2] = [WTag::C, WTag::S];
+/// of design `l2-read-path-decision`): claims, S3's S fillers, and — since
+/// lab #860 R3b — a wallet's exit as a P **only from its exit file**
+/// ([`Inst::ProvenExit`]; the sequencer plans no P of its own) — **never
+/// R**. The node's derived L2 index (lab #860, R1) cannot follow a registry
+/// write from the wire, so one R member would block every exit until format
+/// v2. [`plan`] (f5box's general planner) can still plan R and P; the pass
+/// never calls it — `lib.rs`'s `the_pass_plans_no_r_member` and
+/// `the_pass_builds_no_p_of_its_own` hold that — and [`pass_members_ok`]
+/// refuses anything else before proving.
+pub const PASS_MEMBER_TAGS: [WTag; 3] = [WTag::C, WTag::S, WTag::P];
+
+/// Whether the native statement refuses `exit` on its own — its member and
+/// its exit, absorbing `absorbed` over `state` (lab #860 R3b's attribution:
+/// a wrapper that fails with an exit in it blames the exit only if the exit
+/// fails alone; otherwise the claims' prefix elimination runs).
+pub fn exit_alone_refused(state: &WState, prev: &Surface, absorbed: &[Anchor; M_ABS], exit: &ExitFile, keys: &Keys) -> bool {
+    let inst = Inst::ProvenExit { pvs: exit.pvs.clone(), proof: exit.proof.clone(), exit: exit.exit };
+    let inp = WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: absorbed.map(|a| a.root), d_batch: 0 };
+    statement(state, &inp, &[inst.member()], &[exit.exit]).is_err()
+}
+
+/// A wallet's exit file, decoded for a wrapper (lab #860 R3b).
+#[derive(Clone)]
+pub struct ExitFile {
+    /// The shape-P member's public values (`exit_member_pvs`).
+    pub pvs: Vec<u32>,
+    /// Its proof, `bincode` bytes.
+    pub proof: Vec<u8>,
+    /// The exit it pays: the L1 `rkm` and the asset-0 redeem value.
+    pub exit: Exit,
+    /// Its nullifiers (served bytes) — what spends it.
+    pub nullifiers: Vec<[u8; 32]>,
+}
+
+/// Decode an exit file against this chain's genesis: exactly the intake's
+/// reading (`decode_exit_artifact`), plus the member W threads and the exit
+/// it pays.
+pub fn exit_file(bytes: &[u8], genesis: &[u8; 32]) -> Result<ExitFile, String> {
+    let (tx, surface) = qlab_l2spend::decode_exit_artifact(bytes, genesis).map_err(|e| format!("exit file: {e}"))?;
+    let terms = surface.vpublic.ok_or("exit file: not a shape-P transaction")?;
+    let exit = Exit { rkm: qlab_wrapper::codec::digest_from_bytes(&surface.exit_rkm), v: terms[0].amount };
+    Ok(ExitFile { pvs: qlab_l2spend::exit_member_pvs(&tx, &surface), proof: tx.proof.clone(), exit, nullifiers: tx.public.nullifiers.clone() })
+}
 
 /// **A filler's fee: 0** (lab #847 S3, ruled 2026-10-03). S, P and R carry no
 /// tariff yet (lab #785 census), and W's fee note sums the **claims'** fees
@@ -414,16 +459,18 @@ pub fn plan_claims(
     prev: &Surface,
     absorbed: [Anchor; M_ABS],
     files: Vec<qlab_l2spend::ClaimFile>,
+    exit: Option<ExitFile>,
     owned: &[Owned],
     keys: &Keys,
 ) -> Result<Plan, PlanError> {
-    if files.is_empty() {
-        return Err(PlanError::NoClaim);
+    if files.is_empty() && exit.is_none() {
+        return Err(PlanError::NoTraffic);
     }
     let notes = spendable(state, keys, owned);
-    let n_fill = K.saturating_sub(files.len());
-    if files.len() > K || notes.len() < n_fill {
-        return Err(PlanError::WrongCount { have: files.len() + notes.len().min(n_fill), need: K });
+    let traffic = files.len() + usize::from(exit.is_some());
+    let n_fill = K.saturating_sub(traffic);
+    if traffic > K || notes.len() < n_fill {
+        return Err(PlanError::WrongCount { have: traffic + notes.len().min(n_fill), need: K });
     }
     let roots = absorbed.map(|a| a.root);
     let mut insts = Vec::with_capacity(K);
@@ -442,28 +489,34 @@ pub fn plan_claims(
         deps.push(DepEntry { v: file.value, r_v: file.r_v });
         insts.push(Inst::Proven { pvs: file.pvs, proof: file.proof });
     }
-    let n_claims = insts.len();
+    // At most one exit P, after the claims (R3b): the wallet's own member,
+    // its exit paid through W's exit list.
+    let exits: Vec<Exit> = exit.iter().map(|e| e.exit).collect();
+    if let Some(e) = exit {
+        insts.push(Inst::ProvenExit { pvs: e.pvs, proof: e.proof, exit: e.exit });
+    }
+    let n_traffic = insts.len();
     let wrapper = state.aa.len() / M_ABS as u64;
     let mut credited = own;
     for (j, n) in notes[..n_fill].iter().enumerate() {
-        let (inst, made) = filler(state, keys, wrapper, n_claims + j, n)?;
+        let (inst, made) = filler(state, keys, wrapper, n_traffic + j, n)?;
         insts.push(inst);
         credited.extend(made);
     }
     let members: Vec<Member> = insts.iter().map(Inst::member).collect();
     let inp = WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: roots, d_batch };
-    let (rin, wit, rout, exit_cmt) = statement(state, &inp, &members, &[])?;
+    let (rin, wit, rout, exit_cmt) = statement(state, &inp, &members, &exits)?;
     // W's fee note: Σ the claims' fees to rkm_seq, ρ and rseed public over
     // `prev` — the sequencer's to spend like any owned note.
     credited.push(Owned { value: qlab_wprover::f4::wleaf::fee_of(&members), rho: fee_rho(&inp.prev), rseed: fee_rseed(&inp.prev) });
-    let mut filler_slots = vec![false; n_claims];
+    let mut filler_slots = vec![false; n_traffic];
     filler_slots.resize(K, true);
     Ok(Plan {
         insts,
         members,
         deps,
         inp,
-        exits: Vec::new(),
+        exits,
         absorbed,
         claimed: Vec::new(),
         spent: notes[..n_fill].to_vec(),
@@ -852,7 +905,7 @@ mod tests {
         let a = anchor_of(&f);
         let keys = Keys::from_seed([1; 32]);
         for n in [K - 1, K + 1] {
-            let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone(); n], &[], &keys).err().unwrap();
+            let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone(); n], None, &[], &keys).err().unwrap();
             assert_eq!(err, PlanError::WrongCount { have: n, need: K });
         }
     }
@@ -865,26 +918,25 @@ mod tests {
         let f = w3c_file();
         let a = anchor_of(&f);
         let other = Anchor { count: 0, root: [7; 4] };
-        let err = plan_claims(&state, &prev, [other; M_ABS], vec![f; K], &[], &Keys::from_seed([1; 32])).err().unwrap();
+        let err = plan_claims(&state, &prev, [other; M_ABS], vec![f; K], None, &[], &Keys::from_seed([1; 32])).err().unwrap();
         assert_eq!(err, PlanError::ClaimAnchorNotAbsorbed { root: a.root });
     }
 
-    /// A pass emits claims and S fillers, never R (nor P): the guard passes
-    /// such a member list and names the first other member.
+    /// A pass emits claims, S fillers and a wallet's exit P — never R: the
+    /// guard passes such a member list and names the first other member.
     #[test]
     fn a_pass_emits_only_its_member_tags() {
-        assert_eq!(PASS_MEMBER_TAGS, [WTag::C, WTag::S]);
+        assert_eq!(PASS_MEMBER_TAGS, [WTag::C, WTag::S, WTag::P]);
         assert!(!PASS_MEMBER_TAGS.contains(&WTag::R));
         let c = Member { tag: WTag::C, pvs: w3c_file().pvs, write: None };
         let mut ok = vec![c.clone(); K];
         ok[9] = Member { tag: WTag::S, ..c.clone() };
+        ok[1] = Member { tag: WTag::P, ..c.clone() };
         assert_eq!(pass_members_ok(&ok), Ok(()));
-        for (t, name) in [(WTag::R, "R"), (WTag::P, "P")] {
-            let mut ms = ok.clone();
-            ms[5] = Member { tag: t, ..c.clone() };
-            let err = pass_members_ok(&ms).unwrap_err();
-            assert!(err.starts_with(&format!("member 5 is {name}:")) && err.contains("only C, S members"), "{err}");
-        }
+        let mut ms = ok.clone();
+        ms[5] = Member { tag: WTag::R, ..c.clone() };
+        let err = pass_members_ok(&ms).unwrap_err();
+        assert!(err.starts_with("member 5 is R:") && err.contains("only C, S, P members"), "{err}");
     }
 
     /// `n` sequencer notes in C, as earlier wrappers would have left them.
@@ -929,11 +981,11 @@ mod tests {
         let (state, prev, owned) = seeded(K - 1, &keys);
         let f = w3c_file();
         let a = anchor_of(&f);
-        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone()], &owned[..K - 2], &keys).err().unwrap();
+        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone()], None, &owned[..K - 2], &keys).err().unwrap();
         assert_eq!(err, PlanError::WrongCount { have: K - 1, need: K });
-        let err = plan_claims(&state, &prev, [a; M_ABS], Vec::new(), &owned, &keys).err().unwrap();
-        assert_eq!(err, PlanError::NoClaim, "never a wrapper of padding alone");
-        let p = plan_claims(&state, &prev, [a; M_ABS], vec![f], &owned, &keys).unwrap();
+        let err = plan_claims(&state, &prev, [a; M_ABS], Vec::new(), None, &owned, &keys).err().unwrap();
+        assert_eq!(err, PlanError::NoTraffic, "never a wrapper of padding alone");
+        let p = plan_claims(&state, &prev, [a; M_ABS], vec![f], None, &owned, &keys).unwrap();
         assert_eq!(p.members.iter().map(|m| m.tag).collect::<Vec<_>>(), [vec![WTag::C], vec![WTag::S; K - 1]].concat());
         assert_eq!(p.filler, [vec![false], vec![true; K - 1]].concat());
         assert_eq!(pass_members_ok(&p.members), Ok(()));
@@ -955,6 +1007,57 @@ mod tests {
         want.sort_by_key(by);
         assert_eq!(got, want, "every credit is the sequencer's to spend");
         assert!(spendable(&after, &keys, &owned).is_empty());
+    }
+
+    /// An exit P built the way the wallet builds it (`exit_instance`, whole
+    /// at fee 0) over `state`, spending `n` — with a stub proof: nothing is
+    /// proved here.
+    fn exit_of(state: &WState, keys: &Keys, n: &Owned) -> ExitFile {
+        let reg = &state.l2.r;
+        let reg0 = qlab_cbserver::registry::RegistryOpening {
+            height: 0,
+            root: reg.root(),
+            leaf: *reg.leaf(0).expect("asset 0's leaf"),
+            witness: reg.witness(0).expect("asset 0's leaf"),
+        };
+        let ask = qlab_l2spend::ExitAsk { value: n.value, to_rkm: [5, 6, 7, 8] };
+        let ei = qlab_l2spend::exit_instance(&state.l2.c, &reg0, &keys.input(n), ask, keys.rkm(), 0, &mut rand::rng()).unwrap();
+        ExitFile { pvs: ei.inst.pvs, proof: Vec::new(), exit: Exit { rkm: [5, 6, 7, 8], v: n.value }, nullifiers: Vec::new() }
+    }
+
+    /// Lab #860 R3b: one exit and fifteen fillers is a wrapper — no claim
+    /// needed. The exit is the one P, before the fillers; W's exit list is
+    /// it, E grows by its value; no traffic at all is refused by name.
+    #[test]
+    fn one_exit_and_fifteen_fillers_is_a_wrapper() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, prev, owned) = seeded(K, &keys);
+        let exiting = owned[K - 1];
+        let exit = exit_of(&state, &keys, &exiting);
+        let absorbed = [Anchor { count: 0, root: [9; 4] }; M_ABS];
+        let p = plan_claims(&state, &prev, absorbed, Vec::new(), Some(exit.clone()), &owned[..K - 1], &keys).unwrap();
+        assert_eq!(p.members.iter().map(|m| m.tag).collect::<Vec<_>>(), [vec![WTag::P], vec![WTag::S; K - 1]].concat());
+        assert_eq!(p.filler, [vec![false], vec![true; K - 1]].concat(), "the exit is traffic, not padding");
+        assert!(matches!(p.insts[0], Inst::ProvenExit { .. }));
+        assert_eq!(p.exits, vec![exit.exit]);
+        assert_eq!(p.exit_cmt, exit_chain(&[exit.exit]));
+        assert_eq!(p.rout.e_cum - p.rin.e_cum, exiting.value, "E grows by the exit");
+        assert_eq!(pass_members_ok(&p.members), Ok(()));
+        assert!(!exit_alone_refused(&state, &prev, &absorbed, &exit, &keys), "an honest exit passes alone");
+        let err = plan_claims(&state, &prev, absorbed, Vec::new(), None, &owned, &keys).err().unwrap();
+        assert_eq!(err, PlanError::NoTraffic);
+    }
+
+    /// The attribution step: an exit the statement refuses on its own — here
+    /// one whose public values name another anchor — is blamed alone.
+    #[test]
+    fn an_exit_the_statement_refuses_is_blamed_alone() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, prev, owned) = seeded(2, &keys);
+        let mut exit = exit_of(&state, &keys, &owned[1]);
+        exit.pvs[0] ^= 1; // the anchor's first word: a root not in CH
+        let absorbed = [Anchor { count: 0, root: [9; 4] }; M_ABS];
+        assert!(exit_alone_refused(&state, &prev, &absorbed, &exit, &keys));
     }
 
     /// Zero-valued notes (one per filler) are drawn last: spendable orders
@@ -1016,7 +1119,7 @@ mod tests {
         let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
         let f = w3c_file();
         let a = anchor_of(&f);
-        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f; K], &[], &Keys::from_seed([1; 32])).err().unwrap();
+        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f; K], None, &[], &Keys::from_seed([1; 32])).err().unwrap();
         assert!(matches!(err, PlanError::Wrapper(_)), "{err:?}");
     }
 }

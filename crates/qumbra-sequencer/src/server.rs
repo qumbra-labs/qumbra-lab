@@ -15,8 +15,8 @@
 //! | 503 `{"v":1,"error":"queue full"}` | the pending queue is at its bound; nothing recorded |
 //!
 //! `GET /v1/intake/<id>` answers `{"v":1,"id":…,"state":…}` with `queued`
-//! (plus `"held":…` when it is not being planned, today every exit — #847
-//! Q4), `planned` (+ `"bundle"`), `landed` (+ `"height"`), `refused`
+//! (claims and exits alike since lab #860 R3b — no item is held),
+//! `planned` (+ `"bundle"`), `landed` (+ `"height"`), `refused`
 //! (+ `"why"`), or `unknown`; a wallet's reader treats a state it does not
 //! know as "not landed".
 //!
@@ -115,13 +115,13 @@ impl Intake {
         let Some(id) = parse_hex32(id) else {
             return (400, format!(r#"{{"v":{v},"error":"an id is 64 lower-case hex digits"}}"#));
         };
-        use crate::queue::{held_reason, State};
+        use crate::queue::State;
         let id_hex = hex32(&id);
         let Some(item) = self.queue.item(&id) else {
             return (200, format!(r#"{{"v":{v},"id":"{id_hex}","state":"unknown"}}"#));
         };
         let extra = match &item.state {
-            State::Queued => held_reason(item.kind).map_or(String::new(), |h| format!(r#","held":{}"#, json_str(h))),
+            State::Queued => String::new(),
             State::Planned(n) => format!(r#","bundle":{n}"#),
             State::Landed(h) => format!(r#","height":{h}"#),
             State::Refused(r) => format!(r#","why":{}"#, json_str(r.sentence())),
@@ -197,11 +197,11 @@ mod tests {
     }
 
     /// The status route follows the loop's writes: planned names its bundle,
-    /// landed its height, refused its reason; an exit's hold reason is the
-    /// Q4 sentence.
+    /// landed its height, refused its reason; queued carries nothing more
+    /// (no item is held since lab #860 R3b).
     #[test]
     fn status_follows_the_loops_states() {
-        use crate::queue::{held_reason, State};
+        use crate::queue::State;
         let (mut i, d) = intake("states");
         i.post(W3C_CLAIM);
         let id = id_of(W3C_CLAIM);
@@ -218,8 +218,10 @@ mod tests {
             format!(r#"{{"v":1,"id":"{h}","state":"refused","why":"the chain already holds this claim's cnf"}}"#)
         );
         let _ = std::fs::remove_dir_all(&d2);
-        assert_eq!(held_reason(crate::intake::Kind::Claim), None);
-        assert!(held_reason(crate::intake::Kind::Exit).unwrap().contains("lab #847 Q4"));
+        let (mut i3, d3) = intake("states-queued");
+        i3.post(W3C_CLAIM);
+        assert_eq!(i3.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"queued"}}"#), "nothing held");
+        let _ = std::fs::remove_dir_all(&d3);
         let _ = std::fs::remove_dir_all(&d);
     }
 

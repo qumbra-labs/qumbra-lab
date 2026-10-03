@@ -17,8 +17,8 @@
 //!   ends the pass short (`--max-wait`, re-posts, discards — a claim waiting
 //!   for a finality record to cover its anchor root is such a wait), naming
 //!   what is left; 4 when the plannable
-//!   claims plus one filler per spendable sequencer note are fewer than 16, or
-//!   no claim is plannable (S3: the sequencer fills with S self-transfers of
+//!   claims (and at most one wallet exit, lab #860 R3b) plus one filler per
+//!   spendable sequencer note are fewer than 16, or there is no traffic (S3: the sequencer fills with S self-transfers of
 //!   its own notes; before it holds any — S3b seeds them — a wrapper needs 16
 //!   real claims). Resumable: the next pass reconciles.
 //!   `run` takes the queue directory's lock, the same one `intake` holds for

@@ -21,7 +21,7 @@ use crate::bundle::{assemble, manifest, prove, self_check, sign, Timings};
 use crate::chain::{self, Anchor, Http};
 use crate::intake::Chain;
 use crate::key::SequencerKey;
-use crate::members::{first_refused, pass_members_ok, plan_claims, spendable, Keys, PlanError, K};
+use crate::members::{exit_alone_refused, exit_file, first_refused, pass_members_ok, plan_claims, spendable, ExitFile, Keys, PlanError, K};
 use crate::pass::{Clock, Draft, NotDrafted, Node, Work};
 use crate::queue::Refusal;
 use crate::state::{owned_json, owned_of, Built, RunState};
@@ -148,11 +148,14 @@ pub fn not_drafted(
     sel: &Selection,
     ids: &[[u8; 32]],
     anchors: &[qlab_wprover::f3::native::Digest],
+    exit: bool,
     notes: usize,
     tip: u64,
     cr: Option<u64>,
 ) -> Option<NotDrafted> {
-    let taken = sel.take.len();
+    // Traffic is the claims taken and the one exit (R3b): a wrapper of one
+    // exit and fillers is a wrapper; one of padding alone never is.
+    let taken = sel.take.len() + usize::from(exit);
     if taken > 0 && taken + notes >= K {
         return None;
     }
@@ -212,10 +215,22 @@ impl Work for RealWork {
         }
         let (state, prev) = self.run.replay()?;
         // Each candidate read again against this chain; refuse, by name, one
-        // that no longer decodes or whose cnf the wrapper state already holds.
+        // that no longer decodes, a claim whose cnf the wrapper state already
+        // holds, an exit whose nullifier is already on the L2 (R3b).
         let mut refused = Vec::new();
         let mut claims = Vec::new();
+        let mut exits: Vec<([u8; 32], ExitFile)> = Vec::new();
         for (id, bytes) in candidates {
+            if bytes.starts_with(qlab_l2spend::EXIT_ARTIFACT_MAGIC) {
+                match exit_file(bytes, &self.chain.genesis) {
+                    Err(_) => refused.push((*id, Refusal::Unreadable)),
+                    Ok(e) if e.nullifiers.iter().any(|nf| state.l2.n.low_leaf_of(&digest_from_bytes(nf)).is_none()) => {
+                        refused.push((*id, Refusal::Spent))
+                    }
+                    Ok(e) => exits.push((*id, e)),
+                }
+                continue;
+            }
             let Ok(file) = qlab_l2spend::decode_claim_artifact(bytes, &self.chain.genesis, self.chain.claim_fee_tier) else {
                 refused.push((*id, Refusal::Unreadable));
                 continue;
@@ -247,7 +262,9 @@ impl Work for RealWork {
         let keys = Keys::from_seed(*self.key.filler_seed);
         let notes = spendable(&state, &keys, &self.run.owned).len();
         let ids: Vec<[u8; 32]> = claims.iter().map(|(id, _, _)| *id).collect();
-        if let Some(not) = not_drafted(&sel, &ids, &anchors, notes, w.tip, w.cr) {
+        // At most one exit a wrapper (R3b), the oldest queued.
+        let exit = exits.into_iter().next();
+        if let Some(not) = not_drafted(&sel, &ids, &anchors, exit.is_some(), notes, w.tip, w.cr) {
             return Ok(Err(not));
         }
         let Selection { take, mut roots, .. } = sel;
@@ -269,17 +286,30 @@ impl Work for RealWork {
             .collect::<Result<_, _>>()?;
         absorbed.sort_by_key(|a| a.count);
         let absorbed: [Anchor; M_ABS] = absorbed.try_into().map_err(|_| "exactly M_ABS roots".to_string())?;
-        let items: Vec<[u8; 32]> = take.iter().map(|&i| claims[i].0).collect();
+        let mut items: Vec<[u8; 32]> = take.iter().map(|&i| claims[i].0).collect();
         let mut chosen: Vec<_> = claims.into_iter().enumerate().filter(|(i, _)| take.contains(i)).map(|(_, c)| c).collect();
         let files: Vec<_> = chosen.drain(..).map(|(_, _, f)| f).collect();
-        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), &self.run.owned, &keys) {
+        let (exit_id, exit_file) = match exit {
+            Some((id, e)) => (Some(id), Some(e)),
+            None => (None, None),
+        };
+        items.extend(exit_id);
+        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), exit_file.clone(), &self.run.owned, &keys) {
             Ok(p) => p,
             // The statement is native: find the item by elimination and
-            // refuse it by name, so the next draft does not pick it again.
-            Err(PlanError::Wrapper(e)) => match first_refused(&state, &prev, &absorbed, &files, &keys) {
-                Some(i) => return Ok(Err(NotDrafted::Refuse(vec![(items[i], Refusal::Statement)]))),
-                None => return Err(format!("the native wrapper statement refuses the batch, and no single item is to blame: {e}")),
-            },
+            // refuse it by name, so the next draft does not pick it again —
+            // the exit first, on its own (R3b), then the claims by prefix.
+            Err(PlanError::Wrapper(e)) => {
+                if let (Some(id), Some(x)) = (exit_id, &exit_file) {
+                    if exit_alone_refused(&state, &prev, &absorbed, x, &keys) {
+                        return Ok(Err(NotDrafted::Refuse(vec![(id, Refusal::Statement)])));
+                    }
+                }
+                match first_refused(&state, &prev, &absorbed, &files, &keys) {
+                    Some(i) => return Ok(Err(NotDrafted::Refuse(vec![(items[i], Refusal::Statement)]))),
+                    None => return Err(format!("the native wrapper statement refuses the batch, and no single item is to blame: {e}")),
+                }
+            }
             Err(e) => return Err(format!("plan: {e:?}")), // debug-ok: PlanError from plan_claims names counts and roots, no opening
         };
         pass_members_ok(&plan.members)?;
@@ -377,7 +407,7 @@ mod tests {
             roots: vec![],
             left: vec![(15, LeftOut::NotAbsorbable), (16, LeftOut::NoRootRoom)],
         };
-        match not_drafted(&sel, &ids, &anchors, 0, 220, Some(212)) {
+        match not_drafted(&sel, &ids, &anchors, false, 0, 220, Some(212)) {
             Some(NotDrafted::Wait(w)) => {
                 assert!(w.starts_with("1 claim(s) await a finality record covering their anchor (tip 220, CR 212): claim 0f0f"), "{w}");
                 assert!(!w.contains("exceed"), "only the waiting claims are listed: {w}");
@@ -385,7 +415,7 @@ mod tests {
             _ => panic!("box run 2's shape must wait"),
         }
         let sel = Selection { take: (0..3).collect(), roots: vec![], left: vec![(16, LeftOut::NoRootRoom)] };
-        match not_drafted(&sel, &ids, &anchors, 10, 220, None) {
+        match not_drafted(&sel, &ids, &anchors, false, 10, 220, None) {
             Some(NotDrafted::Short { have, need, why }) => {
                 assert_eq!((have, need), (13, K));
                 assert_eq!(why.len(), 2);
@@ -395,6 +425,6 @@ mod tests {
             _ => panic!("3 claims + 10 notes is short"),
         }
         let full = Selection { take: (0..1).collect(), roots: vec![], left: vec![] };
-        assert!(not_drafted(&full, &ids, &anchors, 15, 220, None).is_none(), "1 claim + 15 notes is a wrapper");
+        assert!(not_drafted(&full, &ids, &anchors, false, 15, 220, None).is_none(), "1 claim + 15 notes is a wrapper");
     }
 }
