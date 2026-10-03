@@ -121,7 +121,7 @@ impl WrapperView {
     pub fn absorbable(&self) -> Vec<[u8; 32]> {
         self.anchors
             .iter()
-            .filter(|a| qlab_devnet::body::v6_anchor_ok(&a.heights, self.tip + 1, self.cr))
+            .filter(|a| qlab_devnet::body::v6_anchor_ok(&a.heights, self.tip.saturating_add(1), self.cr))
             .map(|a| a.root)
             .collect()
     }
@@ -347,6 +347,18 @@ mod tests {
         assert_eq!(view.absorbable(), vec![[4; 32], [5; 32]]);
         assert_eq!(WrapperView { cr: None, ..view.clone() }.absorbable(), Vec::<[u8; 32]>::new());
         assert_eq!(parse(&view.to_body()).unwrap().absorbable(), vec![[4; 32], [5; 32]]);
+        // A served tip at u64::MAX saturates the next block's height rather
+        // than wrapping it to 0 (which would read every root as from the
+        // future): the root one block back still passes. Checked by value,
+        // so it holds in release, where overflow checks are off.
+        let edge = WrapperView {
+            tip: u64::MAX,
+            cr: Some(u64::MAX - 1),
+            anchors: vec![AnchorFact { root: [7; 32], heights: vec![u64::MAX - 1] }],
+            ..view.clone()
+        };
+        assert_eq!(edge.check(), Ok(()));
+        assert_eq!(edge.absorbable(), vec![[7; 32]]);
     }
 
     /// Every strict prefix of a valid body is refused, never accepted and
