@@ -1,0 +1,28 @@
+[package]
+name = "qlab-wprover"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The proving half of the L2 wrapper (lab #847 S1a): the F3/F4 native
+# statement (`WState`, the L2 state and its trees), the W leaf AIR, and the
+# deposit-sum AIR — everything a sequencer needs to build and prove a bundle.
+# Moved verbatim out of qlab-bench, which keeps its fixtures, CLI modes and
+# console and re-exports these modules at their old paths. The verifying half
+# is qlab-wrapper (F5-1). No fixtures, no IO, no console.
+[dependencies]
+qlab-air = { path = "../qlab-air" }
+qlab-consensus = { path = "../qlab-consensus" }
+qlab-l2 = { path = "../qlab-l2" }
+qlab-wrapper = { path = "../qlab-wrapper" }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+qlab-devnet = { path = "../qlab-devnet" }
+qlab-note = { path = "../qlab-note" }
+# Plonky3, pinned exactly at 0.6.1 — must match qlab-consensus / qlab-bench.
+p3-air = "=0.6.1"
+p3-field = "=0.6.1"
+p3-keccak-air = "=0.6.1"
+p3-matrix = "=0.6.1"
+p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"] }
+p3-uni-stark = "=0.6.1"

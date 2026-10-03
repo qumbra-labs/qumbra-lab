@@ -87,21 +87,21 @@ use crate::f3::native::{
 
 // Lab #785 F5-1: the wrapper-state types and domain-tagged states moved to qlab-wrapper.
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use qlab_wrapper::hash::{
+pub use qlab_wrapper::hash::{
     exit_state, fee_domain_lanes, fee_rho, fee_rseed, fee_seed_state, h4,
     supply_leaf_state, WRoots, WTag, CLAIM_TAG, M_ABS, SUPPLY_DEPTH,
 };
 
 /// The fee note's commitment: an asset-0 L2 note (`qlab_air::l2::l2_cm`).
 /// Back from qlab-wrapper (lab #785 F5-4a, review Y2): only the prover uses it.
-pub(crate) fn fee_note_cm(value: u64, rkm_seq: &Digest, prev: &Digest) -> Digest {
+pub fn fee_note_cm(value: u64, rkm_seq: &Digest, prev: &Digest) -> Digest {
     qlab_air::l2::l2_cm(value, 0, rkm_seq, &fee_rho(prev), &fee_rseed(prev))
 }
 
 /// The `WTag` ↔ `L2ShapeTag` conversion, kept on this side so qlab-wrapper
 /// carries no qlab-devnet edge (lab #785 review Y1). `WTag::byte` writes the
 /// shape bytes out; `wtag_bytes_are_the_shape_tags` pins them equal.
-pub(crate) trait WTagShape {
+pub trait WTagShape {
     fn shape(self) -> Option<L2ShapeTag>;
 }
 
@@ -117,7 +117,7 @@ impl WTagShape for WTag {
 }
 
 /// [`WTag`] of an L2 transaction shape (was `WTag::of`).
-pub(crate) fn wtag_of(tag: L2ShapeTag) -> WTag {
+pub fn wtag_of(tag: L2ShapeTag) -> WTag {
     match tag {
         L2ShapeTag::S => WTag::S,
         L2ShapeTag::P => WTag::P,
@@ -128,20 +128,20 @@ pub(crate) fn wtag_of(tag: L2ShapeTag) -> WTag {
 /// One member of the sequence: its tag and full public-value vector (and an
 /// R write's leaf, as F3).
 #[derive(Clone, Debug)]
-pub(crate) struct Member {
+pub struct Member {
     pub tag: WTag,
     pub pvs: Vec<u32>,
     pub write: Option<RegistryLeaf>,
 }
 
 impl Member {
-    pub(crate) fn tx(t: &TxSurface) -> Self {
+    pub fn tx(t: &TxSurface) -> Self {
         Member { tag: wtag_of(t.tag), pvs: t.pvs.clone(), write: t.write }
     }
     fn as_tx(&self) -> Option<TxSurface> {
         self.tag.shape().map(|tag| TxSurface { tag, pvs: self.pvs.clone(), write: self.write })
     }
-    pub(crate) fn digest_at(&self, off: usize) -> Result<Digest, WError> {
+    pub fn digest_at(&self, off: usize) -> Result<Digest, WError> {
         let c = self.pvs.get(off..off + 16).ok_or(WError::Surface)?;
         if c.iter().any(|x| *x >= 1 << 16) {
             return Err(WError::Surface);
@@ -160,7 +160,7 @@ impl Member {
 
 /// Why a wrapper leaf is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum WError {
+pub enum WError {
     /// An F3 transaction step.
     Tx(StError),
     /// A claim's `cnf` insert (a double claim has no gap).
@@ -193,7 +193,7 @@ pub(crate) enum WError {
 
 /// A claim slot's witnesses.
 #[derive(Clone, Copy)]
-pub(crate) struct ClaimWitness {
+pub struct ClaimWitness {
     pub insert: InsertWitness,
     pub append: AppendWitness,
     /// `A`'s leaf index in `AA` and its path.
@@ -216,14 +216,14 @@ impl std::fmt::Debug for WWitness {
 /// One slot's witnesses.
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum SlotWitness {
+pub enum SlotWitness {
     Tx(TxWitness),
     Claim(ClaimWitness),
 }
 
 /// A wrapper leaf's public inputs besides the members.
 #[derive(Clone, Debug)]
-pub(crate) struct WInputs {
+pub struct WInputs {
     /// The predecessor's surface commitment.
     pub prev: Digest,
     /// The sequencer's raw recipient key (the fee note's `rkm`).
@@ -238,7 +238,7 @@ pub(crate) struct WInputs {
 /// opening in the supply tree. An exit's `rkm` is no witness (lab #785
 /// F5-4d-2): it is the member's `PV_XRKM`, which W captures.
 #[derive(Clone, Copy)]
-pub(crate) struct VpWitness {
+pub struct VpWitness {
     pub old_out: u64,
     pub path: RegistryWitness,
 }
@@ -246,7 +246,7 @@ pub(crate) struct VpWitness {
 /// A slot's F4-2 witnesses: a transaction's anchor opening in `CH` (unused
 /// for a claim) and its two `vPublic` rows (P only).
 #[derive(Clone, Copy)]
-pub(crate) struct SlotExtra {
+pub struct SlotExtra {
     pub anchor_index: u64,
     pub anchor_path: MerkleWitness,
     pub vp: [VpWitness; 2],
@@ -254,7 +254,7 @@ pub(crate) struct SlotExtra {
 
 /// A wrapper leaf's witnesses, in [`check_wrapper_leaf`]'s order.
 #[derive(Clone)]
-pub(crate) struct WWitness {
+pub struct WWitness {
     pub absorbs: [AppendWitness; M_ABS],
     /// `C_in`'s append to `CH`.
     pub hist: AppendWitness,
@@ -265,14 +265,14 @@ pub(crate) struct WWitness {
 
 /// The supply tree: every asset's outstanding, every level materialized.
 #[derive(Clone)]
-pub(crate) struct SupplyTree {
+pub struct SupplyTree {
     out: Vec<u64>,
     levels: Vec<Vec<Digest>>,
 }
 
 impl SupplyTree {
     /// Every leaf `H(asset ‖ 0)`; computed once and cached.
-    pub(crate) fn genesis() -> Self {
+    pub fn genesis() -> Self {
         static G: std::sync::OnceLock<SupplyTree> = std::sync::OnceLock::new();
         G.get_or_init(|| {
             let n = 1usize << SUPPLY_DEPTH;
@@ -286,13 +286,13 @@ impl SupplyTree {
         })
         .clone()
     }
-    pub(crate) fn root(&self) -> Digest {
+    pub fn root(&self) -> Digest {
         self.levels[SUPPLY_DEPTH][0]
     }
-    pub(crate) fn outstanding(&self, asset: u64) -> u64 {
+    pub fn outstanding(&self, asset: u64) -> u64 {
         self.out[asset as usize]
     }
-    pub(crate) fn path(&self, asset: u64) -> RegistryWitness {
+    pub fn path(&self, asset: u64) -> RegistryWitness {
         let mut siblings = [[0u64; 4]; SUPPLY_DEPTH];
         let mut path_bits = [false; SUPPLY_DEPTH];
         for l in 0..SUPPLY_DEPTH {
@@ -302,7 +302,7 @@ impl SupplyTree {
         }
         RegistryWitness { siblings, path_bits }
     }
-    pub(crate) fn set(&mut self, asset: u64, out: u64) {
+    pub fn set(&mut self, asset: u64, out: u64) {
         self.out[asset as usize] = out;
         let mut d = h4(&supply_leaf_state(asset, out));
         let mut i = asset as usize;
@@ -319,7 +319,7 @@ impl SupplyTree {
 /// A P row's `(s, m, vpa)`. Total: a word past a short vector reads 0 (the
 /// native checks refuse a P member of the wrong length first; the plan
 /// generator renders whatever it is given).
-pub(crate) fn vp_row(pvs: &[u32], k: usize) -> (u32, u64, u32) {
+pub fn vp_row(pvs: &[u32], k: usize) -> (u32, u64, u32) {
     let base = qlab_air::l2p::PV_VP1 + 6 * k;
     let at = |i: usize| pvs.get(i).copied().unwrap_or(0);
     let m = (0..4).map(|j| u64::from(at(base + 1 + j) & 0xffff) << (16 * j)).sum();
@@ -329,7 +329,7 @@ pub(crate) fn vp_row(pvs: &[u32], k: usize) -> (u32, u64, u32) {
 /// The wrapper's L2 state: F3's three trees and SD, plus `K`, `AA`, `CH`, the
 /// supply tree and the two counters.
 #[derive(Clone)]
-pub(crate) struct WState {
+pub struct WState {
     pub l2: L2State,
     pub k: IndexedTree,
     pub aa: CommitmentTree,
@@ -340,7 +340,7 @@ pub(crate) struct WState {
 }
 
 impl WState {
-    pub(crate) fn genesis(registry: &[RegistryLeaf]) -> Self {
+    pub fn genesis(registry: &[RegistryLeaf]) -> Self {
         WState {
             l2: L2State::genesis(registry),
             k: IndexedTree::genesis(),
@@ -352,7 +352,7 @@ impl WState {
         }
     }
 
-    pub(crate) fn roots(&self) -> WRoots {
+    pub fn roots(&self) -> WRoots {
         WRoots {
             f3: self.l2.roots(),
             k: self.k.root(),
@@ -375,7 +375,7 @@ impl WState {
     /// proof verifies can still make W unsatisfiable — a P row with `m = 0`
     /// and `vpa ≥ 2^16`, or a `vPublic` mint on asset 0 — and this refuses
     /// exactly those, so a batch it accepts is one W can prove.
-    pub(crate) fn apply(&mut self, inp: &WInputs, members: &[Member]) -> Result<(WRoots, WWitness, WRoots), WError> {
+    pub fn apply(&mut self, inp: &WInputs, members: &[Member]) -> Result<(WRoots, WWitness, WRoots), WError> {
         if members.iter().filter(|m| m.tag == WTag::R).count() > 1 {
             return Err(WError::Capacity);
         }
@@ -481,7 +481,7 @@ fn bits_ok(path: &MerkleWitness, index: u64) -> bool {
 /// `PV_XRKM` by [`tx_member`] when a row exits. Since lab #785 F5-4d-2 the
 /// recipient is the P proof's public value, one per transaction, and W binds
 /// its exit steps to it; nothing here is a free witness any more.
-pub(crate) fn fixture_xrkm(pvs: &[u32]) -> Digest {
+pub fn fixture_xrkm(pvs: &[u32]) -> Digest {
     let off = qlab_air::l2::PV_CM1;
     let mut d: Digest = core::array::from_fn(|l| (0..4).map(|j| u64::from(pvs.get(off + 4 * l + j).copied().unwrap_or(0) & 0xffff) << (16 * j)).sum::<u64>());
     d[0] |= 1;
@@ -490,7 +490,7 @@ pub(crate) fn fixture_xrkm(pvs: &[u32]) -> Digest {
 
 /// Whether P row `(sgn, amt, vpa)` is an exit: P's `e_k` — a redeem of
 /// asset 0 of a nonzero amount (lab #785 F5-4d).
-pub(crate) fn is_exit(sgn: u32, amt: u64, vpa: u32) -> bool {
+pub fn is_exit(sgn: u32, amt: u64, vpa: u32) -> bool {
     sgn == 1 && vpa == 0 && amt != 0
 }
 
@@ -503,7 +503,7 @@ pub(crate) fn is_exit(sgn: u32, amt: u64, vpa: u32) -> bool {
 /// fee note to `C`; add `D_batch` to `D_cum` and the exits to `E_cum`.
 /// Returns the roots out and the batch's `exit_cmt`. The W AIR proves exactly
 /// this.
-pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WWitness) -> Result<(WRoots, Digest), WError> {
+pub fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WWitness) -> Result<(WRoots, Digest), WError> {
     if members.len() != w.slots.len() || members.len() != w.extra.len() {
         return Err(WError::Shape);
     }
@@ -602,14 +602,14 @@ pub(crate) fn check_wrapper_leaf(rin: &WRoots, inp: &WInputs, members: &[Member]
 /// A synthetic claim surface anchored at `a`: fresh `cnf`, `Cv`, `cm2`, the
 /// burn address, and `fee` (four chunks). Range, not semantics, is what W
 /// reads; a real claim proof binds these (F1).
-pub(crate) fn synth_claim(rng: &mut crate::f3::native::Rng, a: &Digest, fee: u64) -> Member {
+pub fn synth_claim(rng: &mut crate::f3::native::Rng, a: &Digest, fee: u64) -> Member {
     synth_claim_open(rng, a, fee).0
 }
 
 /// [`synth_claim`] with its value commitment's opening: `Cv` is
 /// `claim_cv(v, r_v)` for a 40-bit `v ≥ fee` (so a deposit proof over the
 /// fixture's claims exists).
-pub(crate) fn synth_claim_open(rng: &mut crate::f3::native::Rng, a: &Digest, fee: u64) -> (Member, super::dep::DepEntry) {
+pub fn synth_claim_open(rng: &mut crate::f3::native::Rng, a: &Digest, fee: u64) -> (Member, super::dep::DepEntry) {
     use qlab_air::claim::{PV_A, PV_CM2, PV_CNF, PV_CV, PV_FEE, PV_LEN, PV_RKM_BURN};
     let mut pvs = vec![0u32; PV_LEN];
     let cnf = rng.digest();
@@ -628,7 +628,7 @@ pub(crate) fn synth_claim_open(rng: &mut crate::f3::native::Rng, a: &Digest, fee
 /// A transaction member valid against a wrapper whose `C_in` is `c_in`: its
 /// anchor set to `c_in` (so it opens in `CH`) and, for P, its `vPublic` rows
 /// set to `rows` (`(s, m, vpa)` each; `(0, 0, 0)` = no `vPublic`).
-pub(crate) fn tx_member(t: &TxSurface, c_in: &Digest, rows: [(u32, u64, u32); 2]) -> Member {
+pub fn tx_member(t: &TxSurface, c_in: &Digest, rows: [(u32, u64, u32); 2]) -> Member {
     let mut m = Member::tx(t);
     m.pvs[..16].copy_from_slice(&pv_chunks(c_in));
     if m.tag == WTag::P {
@@ -650,7 +650,7 @@ pub(crate) fn tx_member(t: &TxSurface, c_in: &Digest, rows: [(u32, u64, u32); 2]
 }
 
 /// No `vPublic` on either row.
-pub(crate) const NO_VP: [(u32, u64, u32); 2] = [(0, 0, 0); 2];
+pub const NO_VP: [(u32, u64, u32); 2] = [(0, 0, 0); 2];
 
 #[cfg(test)]
 mod tests {
@@ -892,29 +892,5 @@ mod tests {
         t.set(12, 77);
         assert_eq!(p.fold_root(&h4(&supply_leaf_state(12, 77))), t.root());
         assert_eq!(t.path(13).fold_root(&h4(&supply_leaf_state(13, 0))), t.root());
-    }
-
-    /// Review T1: the native refusals of the subtree absorb's alignment and
-    /// of a short P member — each from both paths, the state untouched, no
-    /// panic.
-    #[test]
-    fn f4_native_align_and_short_p_refusals() {
-        use super::super::neg::{wfixture, SEED};
-        let fx = wfixture(&[WTag::S], SEED);
-        let mut rin = fx.rin;
-        rin.aa_next += 1;
-        assert_eq!(check_wrapper_leaf(&rin, &fx.inp, &fx.members, &fx.wit).unwrap_err(), WError::AbsAlign);
-        let mut st = fx.pre.clone();
-        append(&mut st.aa, &[9; 4]);
-        let before = st.roots();
-        assert_eq!(st.apply(&fx.inp, &fx.members).unwrap_err(), WError::AbsAlign);
-        assert_eq!(st.roots(), before, "a refused wrapper leaves the state as it was");
-
-        let fx = wfixture(&[WTag::P], SEED);
-        let mut short = fx.members.clone();
-        short[0].pvs.pop();
-        assert_eq!(check_wrapper_leaf(&fx.rin, &fx.inp, &short, &fx.wit).unwrap_err(), WError::Surface);
-        let mut st = fx.pre.clone();
-        assert_eq!(st.apply(&fx.inp, &short).unwrap_err(), WError::Surface);
     }
 }

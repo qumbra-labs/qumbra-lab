@@ -38,10 +38,10 @@ use qlab_consensus::{Config, Proof, Val};
 use crate::f3::cmp::limbs;
 use crate::f3::leaf::{inv_or_zero, out4};
 use crate::f3::native::{Digest, EMPTY};
-pub(crate) use qlab_wrapper::dep::*;
+pub use qlab_wrapper::dep::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     Cv,
     Chain,
     Pad,
@@ -49,7 +49,7 @@ pub(crate) enum Kind {
 
 /// One perm's input and its registers (constant over its 24 rows).
 #[derive(Clone, Debug)]
-pub(crate) struct DepPerm {
+pub struct DepPerm {
     pub pre: [u64; 25],
     pub kind: Kind,
     pub eix: u32,
@@ -61,7 +61,7 @@ pub(crate) struct DepPerm {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DepPlan {
+pub struct DepPlan {
     pub perms: Vec<DepPerm>,
     pub pad: DepPerm,
     /// `D_batch`'s carries.
@@ -70,7 +70,7 @@ pub(crate) struct DepPlan {
 
 /// The plan for `entries` (unvalidated: a sum past 2^64 still renders; the
 /// AIR refuses it). Entries past `DEP_CAP` are ignored.
-pub(crate) fn dep_plan(entries: &[DepEntry]) -> DepPlan {
+pub fn dep_plan(entries: &[DepEntry]) -> DepPlan {
     let n = entries.len().min(DEP_CAP);
     let (mut cv, mut dig, mut sum, mut ncnt) = (EMPTY, EMPTY, [0u64; 4], 0u32);
     let mut perms = Vec::with_capacity(DEP_PERMS);
@@ -101,7 +101,7 @@ pub(crate) fn dep_plan(entries: &[DepEntry]) -> DepPlan {
 }
 
 /// Render the plan.
-pub(crate) fn dep_render(plan: &DepPlan) -> RowMajorMatrix<Val> {
+pub fn dep_render(plan: &DepPlan) -> RowMajorMatrix<Val> {
     let inputs: Vec<[u64; 25]> = plan.perms.iter().map(|p| p.pre).collect();
     let keccak = generate_trace_rows::<Val>(inputs, 0);
     let height = keccak.values.len() / NUM_KECCAK_COLS;
@@ -142,7 +142,7 @@ pub(crate) fn dep_render(plan: &DepPlan) -> RowMajorMatrix<Val> {
 }
 
 /// Prove the deposit sum of `entries`; `None` if they do not fit.
-pub(crate) fn prove_dep(entries: &[DepEntry]) -> Option<(Vec<u32>, Proof<Config>)> {
+pub fn prove_dep(entries: &[DepEntry]) -> Option<(Vec<u32>, Proof<Config>)> {
     let pvs = dep_pvs(entries)?;
     let trace = dep_render(&dep_plan(entries));
     let proof = p3_uni_stark::prove(&qlab_l2::make_config_l2(), &DepAir::new(), trace, &qlab_l2::public_values(&pvs));
@@ -166,7 +166,7 @@ fn dep_phase_ranges(air: &DepAir) -> Vec<std::ops::Range<usize>> {
 }
 
 /// The lowest failing row and its constraint groups.
-pub(crate) fn dep_first_violation(trace: &RowMajorMatrix<Val>, pvs: &[u32]) -> Option<(usize, Vec<&'static str>)> {
+pub fn dep_first_violation(trace: &RowMajorMatrix<Val>, pvs: &[u32]) -> Option<(usize, Vec<&'static str>)> {
     use p3_air::DebugConstraintBuilder;
     use p3_matrix::dense::RowMajorMatrixView;
     use p3_matrix::stack::ViewPair;
@@ -202,31 +202,9 @@ pub(crate) fn dep_first_violation(trace: &RowMajorMatrix<Val>, pvs: &[u32]) -> O
 }
 
 /// A fixed fixture: `n` entries of 40-bit values (their limb sums carry).
-pub(crate) fn dep_entries(n: usize, seed: u64) -> Vec<DepEntry> {
+pub fn dep_entries(n: usize, seed: u64) -> Vec<DepEntry> {
     let mut rng = crate::f3::native::Rng(seed);
     (0..n).map(|_| DepEntry { v: rng.digest()[0] >> 24, r_v: rng.digest() }).collect()
-}
-
-/// `qlab-bench f4dep --check [--n N]`: an honest deposit trace, scanned in full.
-pub(crate) fn check(args: &[String]) -> Result<(), String> {
-    let n = args.iter().position(|a| a == "--n").and_then(|i| args.get(i + 1)).map_or(Ok(3), |s| s.parse::<usize>()).map_err(|e| e.to_string())?;
-    let entries = dep_entries(n, 0x775_de9);
-    let pvs = dep_pvs(&entries).ok_or("the entries do not fit")?;
-    let t = std::time::Instant::now();
-    let trace = dep_render(&dep_plan(&entries));
-    let gen = t.elapsed();
-    let v = dep_first_violation(&trace, &pvs);
-    println!(
-        "# f4dep --check n={n}: {} rows x {} cols; gen {gen:.2?}, scan {:.2?}; {}",
-        DEP_HEIGHT,
-        DEP_WIDTH,
-        t.elapsed() - gen,
-        match &v {
-            None => "every row holds".to_string(),
-            Some((r, ph)) => format!("VIOLATED at row {r} (perm {}, round {}): {ph:?}", r / 24, r % 24),
-        }
-    );
-    v.map_or(Ok(()), |_| Err("the honest deposit trace does not hold".into()))
 }
 
 #[cfg(test)]

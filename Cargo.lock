@@ -1555,6 +1555,7 @@ dependencies = [
  "qlab-p2p",
  "qlab-pow",
  "qlab-wallet",
+ "qlab-wprover",
  "qlab-wrapper",
  "qumbra-node",
  "rand 0.10.2",
@@ -1808,6 +1809,25 @@ dependencies = [
  "qlab-air",
  "qlab-note",
  "rand 0.10.2",
+]
+
+[[package]]
+name = "qlab-wprover"
+version = "0.0.0"
+dependencies = [
+ "p3-air",
+ "p3-field",
+ "p3-keccak-air",
+ "p3-matrix",
+ "p3-maybe-rayon",
+ "p3-uni-stark",
+ "qlab-air",
+ "qlab-cbserver",
+ "qlab-consensus",
+ "qlab-devnet",
+ "qlab-l2",
+ "qlab-note",
+ "qlab-wrapper",
 ]
 
 [[package]]

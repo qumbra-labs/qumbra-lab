@@ -17,15 +17,19 @@
 pub(crate) mod bench;
 #[cfg(test)]
 mod bundle_node;
-pub(crate) mod dep;
 pub(crate) mod f5box;
 pub(crate) mod gate;
-pub(crate) mod native;
 pub(crate) mod rec;
 pub(crate) mod neg;
 pub(crate) mod ood;
 pub(crate) mod verify;
-pub(crate) mod wleaf;
+// Lab #847 S1a: the native statement, the W leaf AIR and the deposit AIR
+// moved to qlab-wprover; the old paths stay. The deposit AIR's CLI and the
+// one fixture-driven native test stay here.
+pub(crate) use qlab_wprover::f4::{dep, native, wleaf};
+mod depcheck;
+#[cfg(test)]
+mod native_fixture_tests;
 
 /// `qlab-bench f4leaf --check | f4neg … | f5box …`.
 pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
@@ -33,7 +37,7 @@ pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {
         "f4leaf" if args.iter().any(|a| a == "--prove") => bench::prove_run(args),
         "f4leaf" => neg::check(args),
         "f4neg" => neg::run(args),
-        "f4dep" => dep::check(args),
+        "f4dep" => depcheck::check(args),
         "f4census" => rec::run(args),
         "f4gate" => gate::run(args),
         "f4ood" => ood::run(args),
