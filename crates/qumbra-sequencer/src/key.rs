@@ -111,6 +111,36 @@ pub fn from_seed(seed: [u8; 32], params: &WrapperParams) -> Result<SequencerKey,
     })
 }
 
+/// **The rehearsal key file** (lab #847 S6): the public rehearsal seed in
+/// B2's form, written new (never over an existing file) at mode 0600 — for
+/// a rehearsal genesis only, refused by name for any other. The seed is
+/// public by design (`keccak("qumbra:rehearsal-sequencer:v1")`); this exists
+/// so a box run need not compute Keccak in a shell.
+pub fn write_rehearsal(path: &Path, params: &WrapperParams) -> Result<(), String> {
+    if params.sequencer_key != rehearsal_sequencer_key() {
+        return Err("this genesis is not a rehearsal genesis: its sequencer key is not the public rehearsal key — \
+                    a real chain's key file is made by its operator, never here"
+            .into());
+    }
+    let seed = rehearsal_sequencer_seed();
+    let text = Zeroizing::new(
+        SequencerKeyFile {
+            seed_hex: seed.iter().map(|b| format!("{b:02x}")).collect(),
+            note: "the PUBLIC rehearsal sequencer seed (lab #847 S6) — a rehearsal genesis only".into(),
+        }
+        .to_toml(),
+    );
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut f, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// The one sentence every key-file parse or decode failure is reported as.
 const NOT_A_KEY_FILE: &str = "not a sequencer key file: TOML with seed_hex (32 bytes, hex)";
 
@@ -224,6 +254,25 @@ mod tests {
                 assert!(r.err().unwrap().contains(&format!("mode {mode:o}")), "mode {mode:o}");
             }
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The rehearsal key file loads on a rehearsal genesis, is refused for
+    /// any other, and never overwrites a file.
+    #[cfg(unix)]
+    #[test]
+    fn the_rehearsal_key_file_is_for_a_rehearsal_genesis_only() {
+        let d = std::env::temp_dir().join(format!("qseq-key-reh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("sequencer.key");
+        let real = params_for(key_of([0x5e; 32]));
+        assert!(write_rehearsal(&p, &real).err().unwrap().contains("not a rehearsal genesis"));
+        assert!(!p.exists());
+        let rehearsal = params_for(rehearsal_sequencer_key());
+        write_rehearsal(&p, &rehearsal).unwrap();
+        assert!(load(&p, &rehearsal).unwrap().rehearsal, "it loads, mode 0600, as the rehearsal key");
+        assert!(write_rehearsal(&p, &rehearsal).is_err(), "never over an existing file");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -310,7 +310,7 @@ impl Seed {
         }
         let short = shortfall(self.count, deposits.len());
         let unclaimed = deposits.iter().filter(|d| !claim_path(&self.out, d).exists()).count();
-        println!("seed: L1 wallet address {}", hex(&wallet.address_at_index(0).to_raw_bytes()));
+        println!("seed: L1 wallet address {}", wallet.address_at_index(0).encode());
         println!("{}", plan_text(short, deposits.len(), unclaimed + short, self.burn, fee, funded));
         let need = u128::from(self.burn.saturating_add(fee)) * short as u128;
         match funded {
