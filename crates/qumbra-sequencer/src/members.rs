@@ -946,7 +946,14 @@ mod tests {
         assert_eq!(total(&p.credited), total(&owned) + fee);
         let mut after = state.clone();
         after.apply(&p.inp, &p.members).unwrap();
-        assert_eq!(spendable(&after, &keys, &p.credited), p.credited, "every credit is the sequencer's to spend");
+        // `spendable` orders by value (largest first) and `credited` is in plan
+        // order — each filler's [change, zero] — so compare them as sets; the
+        // length still catches a credit that is missing or not spendable.
+        let by = |n: &Owned| (n.value, n.rho, n.rseed);
+        let (mut got, mut want) = (spendable(&after, &keys, &p.credited), p.credited.clone());
+        got.sort_by_key(by);
+        want.sort_by_key(by);
+        assert_eq!(got, want, "every credit is the sequencer's to spend");
         assert!(spendable(&after, &keys, &owned).is_empty());
     }
 
