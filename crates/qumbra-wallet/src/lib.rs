@@ -140,6 +140,7 @@ pub mod driver;
 pub mod envelope;
 pub mod exits;
 pub mod names;
+pub mod v6_bundle;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod qr;
