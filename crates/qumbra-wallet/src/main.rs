@@ -1749,7 +1749,7 @@ fn scan_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to: u6
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
-    let mut fetch = qumbra_wallet::net::scan_fetch(url);
+    let mut fetch = qumbra_wallet::net::verified_scan_fetch(url);
     let (report, range, trust) = annulet_report(w, &mut fetch, from, to, pin, &mut rng)?;
     print!("{}", qumbra_wallet::annulet::render(&report, url, range));
     println!("{trust}");
@@ -1814,7 +1814,7 @@ fn history_annulet_cmd(args: &[String], w: &WalletDir, url: &str, from: u64, to:
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
-    let mut fetch = qumbra_wallet::net::scan_fetch(url);
+    let mut fetch = qumbra_wallet::net::verified_scan_fetch(url);
     let (report, range, trust) = annulet_report(w, &mut fetch, from, to, pin, &mut rng)?;
     let ledger = qumbra_wallet::annulet::history(&report, range);
     print!("{}", qlab_ledger::l2history::render(&ledger, url));
