@@ -15,11 +15,10 @@
 //! and checks the wrapper natively; [`bundle`] proves, signs and judges the
 //! result by the node's own rule; [`state`] keeps the run between bundles;
 //! [`run`] is the command.
-pub(crate) mod bundle;
-pub(crate) mod chain;
-pub(crate) mod members;
+// Lab #847 S1b: the library half moved to qumbra-sequencer; the old paths
+// stay, so `run` and the tests read them unchanged.
+pub(crate) use qumbra_sequencer::{bundle, chain, members, state};
 pub(crate) mod run;
-pub(crate) mod state;
 
 pub(crate) use run::run;
 

@@ -1558,6 +1558,7 @@ dependencies = [
  "qlab-wprover",
  "qlab-wrapper",
  "qumbra-node",
+ "qumbra-sequencer",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -2006,6 +2007,28 @@ dependencies = [
  "tiny-keccak",
  "tiny_http",
  "zeroize",
+]
+
+[[package]]
+name = "qumbra-sequencer"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "ml-dsa",
+ "p3-field",
+ "p3-uni-stark",
+ "qlab-air",
+ "qlab-cbserver",
+ "qlab-consensus",
+ "qlab-devnet",
+ "qlab-l2",
+ "qlab-l2spend",
+ "qlab-node",
+ "qlab-wprover",
+ "qlab-wrapper",
+ "qumbra-node",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

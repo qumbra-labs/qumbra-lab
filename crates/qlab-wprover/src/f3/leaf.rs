@@ -205,6 +205,12 @@ impl Seg {
         }
     }
 
+    /// Never: every segment holds at least one perm (lab #847 S1b; clippy's
+    /// `len_without_is_empty` once the type became `pub`).
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
     /// Whether the segment acts for a transaction of shape `tag`.
     pub fn active(self, tag: L2ShapeTag) -> bool {
         let r = tag == L2ShapeTag::R;

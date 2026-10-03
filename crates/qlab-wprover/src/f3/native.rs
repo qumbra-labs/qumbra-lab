@@ -550,6 +550,10 @@ pub fn check_leaf(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> Result<
 pub struct Rng(pub u64);
 
 impl Rng {
+    // A fixture stream, not an iterator: it never ends, and `Iterator` would
+    // put `Option` on every one of its call sites (clippy's
+    // `should_implement_trait` once the type became `pub`, lab #847 S1b).
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;

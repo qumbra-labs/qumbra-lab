@@ -607,15 +607,16 @@ fn f5box_the_command_line() {
 /// The guarantee itself is structural — `wrapper-test-knobs` is enabled only
 /// by qlab-bench's dev-dependency (resolver 2), so the release `f5box` binary
 /// links a `WrapperRule` without the knobs; this test only keeps a test-build
-/// call from creeping into the command's sources.
+/// call from creeping into the command's sources — which, since lab #847
+/// S1b, include the library half in qumbra-sequencer.
 #[test]
 fn f5box_calls_no_rule_knob() {
     let sources = [
         include_str!("mod.rs"),
-        include_str!("chain.rs"),
-        include_str!("members.rs"),
-        include_str!("state.rs"),
-        include_str!("bundle.rs"),
+        include_str!("../../../../qumbra-sequencer/src/chain.rs"),
+        include_str!("../../../../qumbra-sequencer/src/members.rs"),
+        include_str!("../../../../qumbra-sequencer/src/state.rs"),
+        include_str!("../../../../qumbra-sequencer/src/bundle.rs"),
         include_str!("run.rs"),
     ];
     for text in sources {
