@@ -179,6 +179,10 @@ pub enum VerifyRefusal {
     ChainCacheInvalid { why: String },
     /// The endpoint's header at the recorded tip is not the recorded one.
     CachedTipForked { height: u64 },
+    /// A host misused the caller-pumped driver (lab #858 WA1): a step after
+    /// a terminal step, or an answer with no `Need` outstanding. Never an
+    /// endpoint's fault, and never reached by the synchronous pump.
+    DriverMisuse { why: String },
 }
 
 impl std::fmt::Display for VerifyRefusal {
@@ -229,6 +233,7 @@ impl std::fmt::Display for VerifyRefusal {
                 "the endpoint's header at the recorded tip {height} is not the one this wallet verified (a fork); \
                  the record is discarded"
             ),
+            DriverMisuse { why } => write!(f, "the verified-scan driver was misused: {why}"),
         }
     }
 }

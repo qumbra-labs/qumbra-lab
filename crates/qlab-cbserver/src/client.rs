@@ -740,6 +740,7 @@ pub struct MultiScanDriver {
     outcomes: Vec<(u64, ScanOutcome<qlab_note::l2note::L2Note>)>,
     pending: Option<String>,
     failed: Option<MultiScanRefusal>,
+    completed: bool,
 }
 
 impl MultiScanDriver {
@@ -756,6 +757,7 @@ impl MultiScanDriver {
             outcomes: Vec::new(),
             pending: None,
             failed: None,
+            completed: false,
         }
     }
 
@@ -782,10 +784,16 @@ impl MultiScanDriver {
     }
 
     /// Advance until the scan needs one path not yet fetched, completes, or
-    /// fails.
+    /// fails. `Done` and `Failed` are terminal: a step after `Done` fails by
+    /// name, as [`ScanDriver`]'s does.
     pub fn step(&mut self, rng: &mut StdRng) -> MultiScanStep {
         if let Some(refusal) = &self.failed {
             return MultiScanStep::Failed(refusal.clone());
+        }
+        if self.completed {
+            let refusal = MultiScanRefusal::Range("multi-scan driver already completed".into());
+            self.failed = Some(refusal.clone());
+            return MultiScanStep::Failed(refusal);
         }
         if let Some(path) = &self.pending {
             return MultiScanStep::Need(path.clone());
@@ -800,6 +808,7 @@ impl MultiScanDriver {
         loop {
             let at = self.outcomes.len();
             let Some((index, dk)) = self.keys.get(at) else {
+                self.completed = true;
                 return MultiScanStep::Done(MultiScan {
                     outcomes: std::mem::take(&mut self.outcomes),
                     fetched: std::mem::take(&mut self.fetched),
@@ -830,7 +839,8 @@ impl MultiScanDriver {
         }
     }
 
-    /// Answer the outstanding `Need`.
+    /// Answer the outstanding `Need`. An answer with none outstanding fails
+    /// the driver by name.
     pub fn supply(&mut self, response: Result<Vec<u8>, String>) {
         let Some(path) = self.pending.take() else {
             self.failed = Some(MultiScanRefusal::Range("multi-scan driver received a response without requesting a path".into()));
@@ -2780,5 +2790,32 @@ mod multi_tests {
                 assert_eq!(&asked, fetched, "case {n}: the Needs are the reference's fetches");
             }
         }
+    }
+
+    /// (f) Lab #858 WA1: `Done` and `Failed` are terminal, and misuse fails
+    /// by name — a step after `Done`, an answer with no `Need` outstanding.
+    #[test]
+    fn multi_driver_misuse_fails_by_name() {
+        let r = range();
+        let mut rng = StdRng::seed_from_u64(12);
+        let mut d = MultiScanDriver::new(r.keys(&[0, 1]), 1, 3, OFF);
+        loop {
+            match d.step(&mut rng) {
+                MultiScanStep::Need(p) => d.supply(r.route(&p)),
+                MultiScanStep::Done(m) => {
+                    assert_eq!(m.outcomes.len(), 2);
+                    break;
+                }
+                MultiScanStep::Failed(e) => panic!("{e:?}"),
+            }
+        }
+        let after = MultiScanRefusal::Range("multi-scan driver already completed".into());
+        assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == after), "a step after Done");
+        assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == after), "and it stays failed");
+
+        let mut d = MultiScanDriver::new(r.keys(&[0]), 1, 3, OFF);
+        d.supply(Ok(Vec::new()));
+        let stray = MultiScanRefusal::Range("multi-scan driver received a response without requesting a path".into());
+        assert!(matches!(d.step(&mut rng), MultiScanStep::Failed(e) if e == stray), "an answer with no Need");
     }
 }

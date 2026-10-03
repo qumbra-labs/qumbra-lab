@@ -16,8 +16,9 @@
 //!     repeating until it is answered and no answered path asked again where
 //!     the reference did not ask it again.
 //!
-//! The multi-key scan's own equality (d) is in `qlab-cbserver`
-//! (`multi_driver_is_the_reference_loop`).
+//! The multi-key scan's own equality — the plan's (d) — is in
+//! `qlab-cbserver` (`multi_driver_is_the_reference_loop`, labelled (e) there
+//! after that module's existing (a)–(d)).
 
 mod common;
 
@@ -196,30 +197,63 @@ fn the_driver_is_the_reference_over_the_honest_chain_and_every_lie() {
     other[0].txs.push(pay_tx(&a0, &[note_to(&a0, 1, 0, 77)], 0x70, &mut rng));
     let pre = Pre { seed: SEED, record: None };
 
-    type Case<'a> = (&'a str, Lie, Option<&'a [BlockBody]>, Option<Result<(), VerifyRefusal>>);
-    let cases: Vec<Case> = vec![
-        ("honest", Lie::None, None, Some(Ok(()))),
-        ("genesis_bytes", Lie::GenesisBytes, None, None),
-        ("bad_seal", Lie::BadSeal, None, None),
-        ("forged_note", Lie::ForgedNote, Some(&forged_note), Some(Err(VerifyRefusal::BodyCommitmentMismatch { height: 2 }))),
-        ("forged_group", Lie::ForgedGroup, Some(&forged_group), None),
-        ("headers_short", Lie::HeadersShort, None, Some(Ok(()))),
-        ("header_gap", Lie::HeaderGap, None, Some(Err(VerifyRefusal::HeaderGap { want: 2, got: 3 }))),
-        ("header_fork", Lie::HeaderFork, Some(&other), Some(Err(VerifyRefusal::HeaderFork { height: 2 }))),
-        ("wrong_key", Lie::WrongKey, None, None),
-        ("body_header", Lie::BodyHeader, Some(&other), None),
-        ("no_nullifiers", Lie::NoNullifiers, None, Some(Ok(()))),
+    type Check = fn(&Result<VerifiedAnnulet, VerifyRefusal>);
+    let cases: Vec<(&str, Lie, Option<&[BlockBody]>, Check)> = vec![
+        ("honest", Lie::None, None, |r| {
+            let v = r.as_ref().expect("an honest endpoint verifies");
+            assert_eq!((v.chain().tip(), v.range(), v.stated_tip()), (3, (0, 3), Some(3)));
+            assert_eq!(v.report().index.as_ref().unwrap().balances(), vec![(0, 5), (USDT as u16, 1_000_407)]);
+            assert_eq!(v.body_cost().0, 3, "one body per block with a hit");
+        }),
+        ("genesis_bytes", Lie::GenesisBytes, None, |r| {
+            assert!(matches!(r.as_ref().err(), Some(VerifyRefusal::GenesisMismatch { .. })), "{:?}", r.as_ref().err())
+        }),
+        ("bad_seal", Lie::BadSeal, None, |r| match r.as_ref().err() {
+            Some(VerifyRefusal::HeaderInvalid { height: 2, why }) => assert!(why.contains("BadSeal"), "{why}"),
+            other => panic!("{other:?}"),
+        }),
+        ("forged_note", Lie::ForgedNote, Some(&forged_note), |r| {
+            assert_eq!(r.as_ref().err(), Some(&VerifyRefusal::BodyCommitmentMismatch { height: 2 }))
+        }),
+        ("forged_group", Lie::ForgedGroup, Some(&forged_group), |r| match r.as_ref().err() {
+            Some(VerifyRefusal::ForgedNote { height: 2, tx_index: 0, why }) => assert!(why.contains("no such commitment"), "{why}"),
+            other => panic!("{other:?}"),
+        }),
+        ("headers_short", Lie::HeadersShort, None, |r| {
+            let v = r.as_ref().expect("a short header stream is a shorter chain");
+            assert_eq!((v.chain().tip(), v.range(), v.stated_tip()), (2, (0, 2), Some(3)));
+            assert_eq!(v.report().index.as_ref().unwrap().balances(), vec![(0, 5), (USDT as u16, 1_000_400)]);
+        }),
+        ("header_gap", Lie::HeaderGap, None, |r| {
+            assert_eq!(r.as_ref().err(), Some(&VerifyRefusal::HeaderGap { want: 2, got: 3 }))
+        }),
+        ("header_fork", Lie::HeaderFork, Some(&other), |r| {
+            assert_eq!(r.as_ref().err(), Some(&VerifyRefusal::HeaderFork { height: 2 }))
+        }),
+        ("wrong_key", Lie::WrongKey, None, |r| match r.as_ref().err() {
+            Some(VerifyRefusal::HeaderInvalid { height: 1, why }) => assert!(why.contains("BadSeal"), "{why}"),
+            other => panic!("{other:?}"),
+        }),
+        ("body_header", Lie::BodyHeader, Some(&other), |r| {
+            assert!(matches!(r.as_ref().err(), Some(VerifyRefusal::BodyHeaderMismatch { .. })), "{:?}", r.as_ref().err())
+        }),
+        ("no_nullifiers", Lie::NoNullifiers, None, |r| {
+            let v = r.as_ref().expect("the outputs verify; the spends are a named gap");
+            assert!(v.report().index.is_none(), "no figure without the spends");
+            match &v.report().spent {
+                qlab_ledger::vocab::SpentCoverage::Unavailable { why } => assert!(why.contains("503"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+        }),
     ];
-    for (tag, lie, forged, expect) in cases {
+    for (n, (tag, lie, forged, check)) in cases.into_iter().enumerate() {
         let ep = Endpoint::new(file.clone(), &honest, forged, lie);
         let reference = assert_equivalent(&format!("drv_{tag}"), &pre, &ep, Some(pin));
-        // The cases the AD1 tests pin by value, pinned here too, so an
-        // equivalence of two wrong answers cannot pass.
-        match (expect, &reference.0) {
-            (Some(Ok(())), r) => assert!(r.is_ok(), "{tag}: {r:?}"),
-            (Some(Err(e)), r) => assert_eq!(r.as_ref().err(), Some(&e), "{tag}"),
-            (None, r) => assert!(r.is_err(), "{tag}: a lie must be refused, got {r:?}"),
-        }
+        // Each case pinned by value (AD1's own pins), so an equivalence of
+        // two equal wrong answers cannot pass.
+        let w = fresh(&format!("drv_{tag}_pin{n}"), &pre, Some(pin));
+        check(&run(&w, &ep, Some(pin)));
+        let _ = std::fs::remove_dir_all(&w.dir);
         assert_hand_stepped(&format!("drv_{tag}"), &pre, &ep, pin, &reference);
     }
     // No pin: refused before any fetch, both ways.
@@ -334,5 +368,52 @@ fn the_driver_asks_each_path_once_and_never_reads_the_wallet_dir() {
     assert_eq!(v.cache(), &qumbra_wallet::annulet_verify::ChainCache::Unused, "the record came in as Ok(None)");
     assert!(v.record_to_write().is_some(), "a fresh verification is recorded");
     assert_eq!(std::fs::read(chain_cache_path(&w, &pin)).unwrap(), rec, "the driver wrote nothing");
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// `Done` and `Failed` are terminal, and a host's misuse fails by name —
+/// for the verified driver and for the scan core inside it.
+#[test]
+fn misuse_of_either_driver_fails_by_name() {
+    use qumbra_wallet::annulet::{AnnuletScanCore, CoreStep};
+    const SEED: u8 = 0x84;
+    let w = wallet_dir("drv_misuse", SEED);
+    let mut rng = StdRng::seed_from_u64(84);
+    let file = genesis(&w.wallet().address_at_index(0));
+    let pin = file.hash();
+    let ep = Endpoint::new(file, &bodies(&w, &mut rng), None, Lie::None);
+
+    // The verified driver: a step after Done.
+    let mut d = AnnuletVerifyDriver::new(w.wallet(), w.allocated.clone(), pin, 0, u64::MAX, Ok(None));
+    loop {
+        match d.step(&mut rng) {
+            AnnuletStep::Need(p) => d.supply(ep.fetch(&p)),
+            AnnuletStep::Done(_) => break,
+            AnnuletStep::Failed(e) => panic!("{e}"),
+        }
+    }
+    let after = VerifyRefusal::DriverMisuse { why: "stepped after the scan completed".into() };
+    assert!(matches!(d.step(&mut rng), AnnuletStep::Failed(e) if e == after), "a step after Done");
+    assert!(matches!(d.step(&mut rng), AnnuletStep::Failed(e) if e == after), "and it stays failed");
+    // An answer with no Need outstanding.
+    let mut d = AnnuletVerifyDriver::new(w.wallet(), w.allocated.clone(), pin, 0, u64::MAX, Ok(None));
+    d.supply(Ok(Vec::new()));
+    let stray = VerifyRefusal::DriverMisuse { why: "a response with no Need outstanding".into() };
+    assert!(matches!(d.step(&mut rng), AnnuletStep::Failed(e) if e == stray), "an answer with no Need");
+
+    // The scan core: the same two.
+    let core = || AnnuletScanCore::new(w.wallet(), w.allocated.clone(), 0, 3, pin, Vec::new());
+    let mut c = core();
+    loop {
+        match c.step(&mut rng) {
+            CoreStep::Need(p) => c.supply(ep.fetch(&p)),
+            CoreStep::Done(_) => break,
+            CoreStep::Failed(why) => panic!("{why}"),
+        }
+    }
+    assert!(matches!(c.step(&mut rng), CoreStep::Failed(why) if why == "scan core already completed"));
+    let mut c = core();
+    c.supply(Ok(Vec::new()));
+    assert!(matches!(c.step(&mut rng), CoreStep::Failed(why) if why == "scan core received a response without requesting a path"));
     let _ = std::fs::remove_dir_all(&w.dir);
 }

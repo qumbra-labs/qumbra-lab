@@ -194,16 +194,20 @@ where
         match core.step(rng) {
             CoreStep::Need(path) => core.supply(fetch(&path)),
             CoreStep::Done(report) => return report,
+            CoreStep::Failed(why) => unreachable!("the pump never misuses the scan core: {why}"),
         }
     }
 }
 
-/// One observation from a caller-pumped [`AnnuletScanCore`]. `Done` is
-/// terminal; the core never fails — what it cannot read becomes a row's or
-/// the spends' named gap, as it always has.
+/// One observation from a caller-pumped [`AnnuletScanCore`]. `Done` and
+/// `Failed` are terminal. The scan itself never fails — what it cannot read
+/// becomes a row's or the spends' named gap, as it always has; `Failed` is
+/// only a host's misuse (a step after `Done`, an answer with no `Need`
+/// outstanding), by name.
 pub enum CoreStep {
     Need(String),
     Done(AnnuletReport),
+    Failed(String),
 }
 
 /// **The scan body, caller-pumped** (lab #858 WA1): every allocated address
@@ -221,6 +225,7 @@ pub struct AnnuletScanCore {
     genesis: Vec<([u8; 32], L2Note)>,
     phase: CorePhase,
     pending: Option<String>,
+    failed: Option<String>,
 }
 
 enum CorePhase {
@@ -251,11 +256,14 @@ impl AnnuletScanCore {
     ) -> Self {
         let rows = (!allocated.is_empty())
             .then(|| Box::new(MultiScanDriver::new(scan_keys(&wallet, &allocated), from, to, ScanConfig::default())));
-        AnnuletScanCore { wallet, allocated, from, to, genesis_hash, genesis, phase: CorePhase::Rows(rows), pending: None }
+        AnnuletScanCore { wallet, allocated, from, to, genesis_hash, genesis, phase: CorePhase::Rows(rows), pending: None, failed: None }
     }
 
     /// Advance until the scan needs one path or completes.
     pub fn step(&mut self, rng: &mut StdRng) -> CoreStep {
+        if let Some(why) = &self.failed {
+            return CoreStep::Failed(why.clone());
+        }
         if let Some(path) = &self.pending {
             return CoreStep::Need(path.clone());
         }
@@ -290,14 +298,25 @@ impl AnnuletScanCore {
                     let stream = tally.stream.take().expect("set above or by a page");
                     return CoreStep::Done(self.report(*tally, stream));
                 }
-                CorePhase::Finished => panic!("AnnuletScanCore stepped after Done"),
+                CorePhase::Finished => {
+                    let why = "scan core already completed".to_string();
+                    self.failed = Some(why.clone());
+                    return CoreStep::Failed(why);
+                }
             }
         }
     }
 
-    /// Answer the outstanding `Need`.
+    /// Answer the outstanding `Need`. An answer with none outstanding fails
+    /// the core by name.
     pub fn supply(&mut self, answer: Result<Vec<u8>, String>) {
-        let Some(path) = self.pending.take() else { return };
+        if self.failed.is_some() {
+            return;
+        }
+        let Some(path) = self.pending.take() else {
+            self.failed = Some("scan core received a response without requesting a path".into());
+            return;
+        };
         match &mut self.phase {
             CorePhase::Rows(Some(multi)) => multi.supply(answer),
             CorePhase::Spent { tally, catch } => {

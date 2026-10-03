@@ -171,6 +171,7 @@ impl AnnuletVerifyDriver {
                         self.phase = Phase::Bodies { at: 0, report, post };
                         continue;
                     }
+                    CoreStep::Failed(why) => return self.fail(VerifyRefusal::DriverMisuse { why }),
                 },
                 Phase::Bodies { at, report, post } => match bind_from(at, &report, &post) {
                     Err(e) => return self.fail(e),
@@ -187,7 +188,9 @@ impl AnnuletVerifyDriver {
                     self.phase = Phase::StatedTip { report, post };
                     REGISTRY_ROOT_PATH.to_string()
                 }
-                Phase::Finished => panic!("AnnuletVerifyDriver stepped after a terminal step"),
+                Phase::Finished => {
+                    return self.fail(VerifyRefusal::DriverMisuse { why: "stepped after the scan completed".into() })
+                }
             };
             self.pending = Some(need.clone());
             return AnnuletStep::Need(need);
@@ -195,9 +198,14 @@ impl AnnuletVerifyDriver {
     }
 
     /// Answer the outstanding `Need` — the bytes, or why the transport could
-    /// not get them.
+    /// not get them. An answer with none outstanding fails the driver by name
+    /// ([`VerifyRefusal::DriverMisuse`]); one after a refusal changes nothing.
     pub fn supply(&mut self, answer: Result<Vec<u8>, String>) {
-        if self.failed.is_some() || self.pending.take().is_none() {
+        if self.failed.is_some() {
+            return;
+        }
+        if self.pending.take().is_none() {
+            self.failed = Some(VerifyRefusal::DriverMisuse { why: "a response with no Need outstanding".into() });
             return;
         }
         let outcome = match std::mem::replace(&mut self.phase, Phase::Finished) {
