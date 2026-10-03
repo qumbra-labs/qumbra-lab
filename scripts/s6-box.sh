@@ -311,8 +311,8 @@ next_attempt() { # one past the highest PREFIX-<n>.time — never reuses a numbe
 
 # Run a pass attempt by attempt until one LANDS; that attempt goes in
 # DIR/PREFIX.landed. Landed = its err carries `SEQ landed bundle`, whatever the
-# exit code: 0, or 3 when the pass then stops at its own `--max-bundles 1`
-# ceiling (box run 2's pass 1: landed at 244, exit 3). Exit 3 WITHOUT a
+# exit code: 0 (the --max-bundles cap is exit 0 since Outcome::Capped), or 3
+# from a binary before it (box run 2's pass 1: landed at 244, exit 3). Exit 3 WITHOUT a
 # landing is the real `--max-wait` ceiling and dies by name; exit 4 is a
 # short, waited out; anything else dies. A rerun first looks for an attempt
 # that already landed (newest first) and takes it, so a resumed box never
