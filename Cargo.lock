@@ -2029,6 +2029,8 @@ dependencies = [
  "qumbra-node",
  "serde",
  "serde_json",
+ "sha2",
+ "tiny_http",
 ]
 
 [[package]]

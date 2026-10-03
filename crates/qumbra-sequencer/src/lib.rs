@@ -12,7 +12,15 @@
 //! - [`members`]: the wrapper plan — the sequencer's prefilter.
 //! - [`bundle`]: prove, assemble, sign, self-check, manifest.
 //! - [`state`]: the replayed run state, written atomically under a lock.
+//!
+//! S2 (intake): [`intake`] reads and verifies a wallet's claim or exit file,
+//! [`queue`] holds what was admitted, [`server`] is the loopback listener.
+//! Intake's dedupe is a convenience; the double-spend guarantee is the
+//! chain's (`WState::apply` and the node's bundle rule) — see [`intake`].
 pub mod bundle;
 pub mod chain;
+pub mod intake;
 pub mod members;
+pub mod queue;
+pub mod server;
 pub mod state;
