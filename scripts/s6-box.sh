@@ -58,6 +58,13 @@
 #             rerun must land it WITHOUT proving again (no `SEQ proving`
 #             before `SEQ landed` in its log): the pending record and the
 #             bytes in --out carry it.
+#   exit      (--r3) the user wallet's `exit --net v6 --submit` of its first
+#             claim's credit — the P lane, ≈ 30 GiB; a wait-class refusal
+#             before the proof (no bundle yet, the index moved, not final
+#             yet) is retried, bounded; any other refusal dies by name.
+#   pass3     (--r3) 1 exit P + 15 S fillers, drilled as pass 2 (killed -9
+#             after drafting, landed by its rerun with no re-prove), then
+#             /v1/l2/index read past the landing (a frozen index dies by name).
 #
 # Locks: `intake` and `run` hold `queue/index.lock` and `run` also
 # `seq-state.json.lock` — files created new and removed when the process
@@ -74,6 +81,10 @@
 #   pass1/run-<n>.{time,rss,err}    the claims-only pass, per attempt (short = wait); run.landed names the one that landed
 #   pass2/run-a-<n>.*               the filler pass up to the kill; run-a.drafted names it
 #   pass2/run-b-<n>.*               the rerun: reconcile + land, no prove; run-b.landed
+#   exit/exit-<n>.{time,rss,out,err} (--r3) each exit attempt; exit.proved names
+#                                   the one that proved: the P's wall and peak
+#   pass3/run-a-<n>.*, run-b-<n>.*  (--r3) the exit pass's drill, as pass 2's;
+#                                   pass3/index.height the index after it
 #   producer/node-<n>.time, node.rss  the producer, one time file per start
 # The last line is one verdict.
 set -euo pipefail
@@ -169,7 +180,11 @@ run_measured() {
   local tpid=$! cpid=""
   for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
   [ -n "$cpid" ] && sample_rss "$cpid" "$tag.rss"
+  # Registered for the cleanup trap while it runs (a seed run, a pass, the
+  # wallet's 30 GiB exit proof): a die or a signal never leaves it running.
+  PASS_PID=$cpid
   local rc=0; wait "$tpid" || rc=$?
+  PASS_PID=""
   return $rc
 }
 
@@ -541,19 +556,37 @@ if [ -n "$R3" ] && ! is_done exit; then
   # `exit` refuses (before any proof) until its credit has landed and the
   # index agrees with its bundle; retried, bounded. Each attempt keeps its own
   # files; the one that proves carries the P's wall and peak.
+  # A rerun after a die between the proof and its record: the attempt whose
+  # output says it wrote the file is the one that proved.
+  if [ -e "$EXITF" ] && [ ! -e "$RUN/exit/exit.proved" ]; then
+    for f in $(find "$RUN/exit" -maxdepth 1 -name 'exit-*.out' | grep -E '/exit-[0-9]+\.out$' | sort -V -r); do
+      grep -q '^wrote ' "$f" && { basename "$f" .out | sed 's/^exit-//' > "$RUN/exit/exit.proved"; break; }
+    done
+  fi
   x_deadline=$(( $(date +%s) + 3600 ))
   until [ -e "$EXITF" ]; do
     n=$(next_attempt "$RUN/exit" exit); X="$RUN/exit/exit-$n"
+    tip=$(tip_of "$RUN/producer/node.out")
+    [ -n "$tip" ] || die "no tip in the producer's log to scan the wallet to"
     if run_measured "$X" "$WALLET" exit --net v6 --dir "$WDIR" --url "$DISC" --node "$DISC" \
-         --scan-to "$(tip_of "$RUN/producer/node.out")" --l2-id "$L2_ID" --genesis-hash "$(cat "$NET/genesis.hash")" \
+         --scan-to "$tip" --l2-id "$L2_ID" --genesis-hash "$(cat "$NET/genesis.hash")" \
          --exit-to "$(cat "$WDIR/address")" --out "$EXITF" --submit --intake "127.0.0.1:$P_INT"; then
       echo "$n" > "$RUN/exit/exit.proved"
       break
     fi
     [ -e "$EXITF" ] && { echo "$n" > "$RUN/exit/exit.proved"; break; }   # proved, the POST failed: handed over below
     producer_up || die "the producer exited"
-    [ "$(date +%s)" -lt "$x_deadline" ] || die "the exit was not built within 60 min (see $X.err)"
-    wait_log "exit attempt $n refused before any proof: $(tail -1 "$X.err")"; sleep 60
+    # Only the wait-class refusals are retried: no bundle yet, the index
+    # moved under the read, not final/spendable YET. Anything else — no
+    # credit (both claims landed in passes 1–2, so none is a wait here), a
+    # genesis or flag refusal — dies at once, by name.
+    why=$(tail -1 "$X.err")
+    case "$why" in
+      *"no bundle has landed"*|*"the index moved under this read"*|*YET*) ;;
+      *) die "the exit was refused before any proof: $why (see $X.err)" ;;
+    esac
+    [ "$(date +%s)" -lt "$x_deadline" ] || die "the exit was still waiting after 60 min: $why"
+    wait_log "exit attempt $n waits before any proof: $why"; sleep 60
   done
   # Handed to the intake: the wallet's --submit, or here if its POST failed.
   if ! grep -qE 'the intake took it|already held by the intake' "$RUN"/exit/exit-*.out 2>/dev/null; then
@@ -575,8 +608,12 @@ if [ -n "$R3" ] && ! is_done pass3; then
   lh=$(sed -n 's/.*SEQ landed bundle [0-9]* [0-9a-f]* at \([0-9]*\).*/\1/p' "$RUN/pass3/run-b-$(cat "$RUN/pass3/run-b.landed").err" | tail -1)
   [ -n "$lh" ] || die "pass 3's landing line names no height"
   i_deadline=$(( $(date +%s) + 600 ))
-  until ih=$(curl -s "$DISC/v1/l2/index" | sed -n 's/.*"height":\([0-9]*\).*/\1/p'); [ -n "$ih" ] && [ "$ih" -ge "$lh" ]; do
-    [ "$(date +%s)" -lt "$i_deadline" ] || die "/v1/l2/index did not reach the exit's landing at $lh within 10 min (at ${ih:-nothing})"
+  while :; do
+    idx=$(curl -s -m 10 "$DISC/v1/l2/index" || true)
+    case "$idx" in *'"refused":"'*) die "/v1/l2/index is frozen: $idx" ;; esac
+    ih=$(printf '%s' "$idx" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')
+    [ -n "$ih" ] && [ "$ih" -ge "$lh" ] && break
+    [ "$(date +%s)" -lt "$i_deadline" ] || die "/v1/l2/index did not reach the exit's landing at $lh within 10 min (answer: ${idx:-none})"
     sleep 15
   done
   echo "$ih" > "$RUN/pass3/index.height"
