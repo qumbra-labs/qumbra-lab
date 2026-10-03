@@ -21,7 +21,7 @@ required-features = ["net", "prove", "verify"]
 
 [[example]]
 name = "ad_goldens"
-required-features = ["verify"]
+required-features = ["verify", "test-support"]
 
 [[bin]]
 name = "qumbra-prover-host"
@@ -98,6 +98,9 @@ webpki-roots = { version = "1", optional = true }
 # The prover host's native-messaging frames are JSON (Chrome's contract, not
 # ours). Workspace precedent: qumbra-explorer. Optional, host-gated.
 serde_json = { version = "1", optional = true }
+# Lab #850 (AD2): the signed asset list's ML-DSA-65 signature (exact pin =
+# qlab-devnet's, one ml-dsa rev in the tree). Under `verify` only.
+ml-dsa = { version = "=0.1.1", optional = true }
 
 # The first-spend e2e (issue #276) runs a REAL local devnet: a node the test
 # mines directly and serves over a real socket, the faucet that funds the
@@ -111,6 +114,9 @@ path = "tests/annulet_pilot.rs"
 required-features = ["pilot"]
 
 [dev-dependencies]
+# Lab #850 AD2: the crate's own tests reach `test-support` (the TEST list
+# signer); nothing else does.
+qumbra-wallet = { path = ".", features = ["test-support"] }
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
 qumbra-node = { path = "../qumbra-node" }
@@ -137,7 +143,11 @@ default = ["net", "prove", "randomx", "host", "verify"]
 # qlab-p2p (headers + whole-block frames), no prover. In default for the CLI
 # and the desktop/macOS shells; qumbra-ffi builds this crate with
 # default-features = false, so the iOS/Android/wasm graphs are unchanged.
-verify = ["dep:qlab-p2p"]
+verify = ["dep:qlab-p2p", "dep:ml-dsa", "dep:serde_json"]
+# Lab #850 AD2: the TEST asset-list signer (`asset_view::test_list_key`). Only
+# this crate's own dev-dependency and the `ad_goldens` example enable it, so a
+# release shell cannot compile the test signer in.
+test-support = ["verify"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.

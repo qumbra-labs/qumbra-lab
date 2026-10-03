@@ -2042,6 +2042,7 @@ version = "0.0.0"
 dependencies = [
  "bincode",
  "getrandom 0.4.3",
+ "ml-dsa",
  "p3-field",
  "qlab-air",
  "qlab-cbserver",
@@ -2059,6 +2060,7 @@ dependencies = [
  "qumbra-explorer",
  "qumbra-faucet",
  "qumbra-node",
+ "qumbra-wallet",
  "rand 0.10.2",
  "rustls",
  "serde_json",
