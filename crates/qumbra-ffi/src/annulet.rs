@@ -12,7 +12,8 @@
 //! [`qmb_annulet_supply`] / [`qmb_annulet_supply_err`].
 //!
 //! The view crosses as JSON from [`view_json`], **the shared encoder** (issue
-//! #858 Q2): byte-for-key the macOS bridge's `AssetViewModel`
+//! #858 Q2): key-for-key the macOS bridge's `AssetViewModel` (keys serialize
+//! in another order; both shells decode by key)
 //! (`qumbra-wallet-macos` `rust/src/assets.rs` @ e050024), pinned by a test
 //! against that repo's XCTest decode literal. `spendsVerified` is always
 //! present (design D5).
@@ -26,16 +27,45 @@ use std::ptr;
 
 use qlab_wallet::Wallet;
 use qumbra_wallet::annulet_driver::{AnnuletStep, AnnuletVerifyDriver};
-use qumbra_wallet::annulet_verify::{encode_chain_cache, registry_leaf_path, VerifiedAnnulet, VerifyRefusal};
+use qumbra_wallet::annulet_verify::{
+    encode_chain_cache, registry_leaf_path, VerifiedAnnulet, VerifyRefusal, MAX_CHAIN_RECORD_BYTES,
+};
 use qumbra_wallet::asset_view::{
     asset_view_from, check_leaf_at_verified_tip, held_assets, verify_asset_list, AssetLabel, AssetList, AssetMode,
-    AssetView, Balances, FreezeStatus, Leaves, ListKey, ListStatus,
+    AssetView, Balances, FreezeStatus, Leaves, ListKey, ListStatus, MAX_ASSET_LIST_BYTES,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use serde_json::{json, Value};
 
 use crate::{out_string, set_err, WalletState};
+
+/// The most address indices one scan takes. No other ABI caps this; one
+/// thousand addresses is far past any wallet's allocation, and the bound is
+/// what keeps a host's length from reaching `slice::from_raw_parts` unchecked.
+pub const MAX_ANNULET_INDICES: usize = 1024;
+
+/// An ML-DSA-65 verifying key's encoding — the list key's only legal length.
+pub const LIST_KEY_LEN: usize = 1952;
+
+/// An ML-DSA-65 signature's encoding — the list signature's only legal length.
+pub const LIST_SIG_LEN: usize = 3309;
+
+/// The largest answer `qmb_annulet_supply` copies: the transport's general
+/// GET cap (`qlab_http_framing::DEFAULT_MAX_BODY`, 64 MiB), which bounds every
+/// route ceiling the verified scan names. A longer body is supplied to the
+/// driver as a transport failure, by name.
+pub const MAX_SUPPLY_BYTES: usize = 64 * 1024 * 1024;
+
+// The TEST list signer must not reach the extension's kernel: a wasm32 build
+// of this crate never enables `qumbra-wallet/test-support` (it is a
+// dev-dependency feature, and wasm builds no tests). Checked at compile time,
+// so a leak fails the prefilter's wasm32 check, not a reviewer's eye.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(
+    !qumbra_wallet::asset_view::TEST_SUPPORT,
+    "qumbra-wallet's test-support (the TEST list signer) reached a wasm32 build of qumbra-ffi"
+);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -200,9 +230,17 @@ pub struct AnnuletState {
     record: Option<Vec<u8>>,
 }
 
-/// Bytes from a (pointer, length) pair; `None` for NULL or zero length.
-unsafe fn bytes_opt(p: *const u8, len: usize) -> Option<Vec<u8>> {
-    (!p.is_null() && len > 0).then(|| std::slice::from_raw_parts(p, len).to_vec())
+/// Bytes from a (pointer, length) pair: `None` for NULL or zero length, and
+/// a named refusal over `max` — checked BEFORE the slice is formed, so no
+/// host length reaches `slice::from_raw_parts` unbounded.
+unsafe fn bytes_opt(what: &str, p: *const u8, len: usize, max: usize) -> Result<Option<Vec<u8>>, String> {
+    if p.is_null() || len == 0 {
+        return Ok(None);
+    }
+    if len > max {
+        return Err(format!("{what} is {len} B, over the {max} B bound"));
+    }
+    Ok(Some(std::slice::from_raw_parts(p, len).to_vec()))
 }
 
 /// Start a verified Annulet asset scan. NULL on a NULL/invalid argument, or
@@ -236,7 +274,15 @@ pub unsafe extern "C" fn qmb_annulet_new(
     list_source_commit: *const c_char,
     err_out: *mut *mut c_char,
 ) -> *mut AnnuletState {
-    if w.is_null() || endpoint_label.is_null() || pin32.is_null() || indices.is_null() || rng_seed32.is_null() {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if w.is_null() || endpoint_label.is_null() || pin32.is_null() || rng_seed32.is_null() {
+        return ptr::null_mut();
+    }
+    // `indices` may be NULL only with `n_indices == 0`.
+    if (indices.is_null() && n_indices != 0) || n_indices > MAX_ANNULET_INDICES {
+        set_err(err_out, format!("{n_indices} address indices: at most {MAX_ANNULET_INDICES}, and NULL only with 0"));
         return ptr::null_mut();
     }
     let Ok(endpoint) = CStr::from_ptr(endpoint_label).to_str() else { return ptr::null_mut() };
@@ -248,7 +294,22 @@ pub unsafe extern "C" fn qmb_annulet_new(
             Err(_) => return ptr::null_mut(),
         }
     };
-    let list = match (bytes_opt(list, list_len), bytes_opt(list_sig, sig_len), bytes_opt(list_key, key_len)) {
+    let bounded = (|| {
+        Ok::<_, String>((
+            bytes_opt("the record", record, record_len, MAX_CHAIN_RECORD_BYTES)?,
+            bytes_opt("the asset list", list, list_len, MAX_ASSET_LIST_BYTES)?,
+            bytes_opt("the list signature", list_sig, sig_len, LIST_SIG_LEN)?,
+            bytes_opt("the list key", list_key, key_len, LIST_KEY_LEN)?,
+        ))
+    })();
+    let (record, list, list_sig, list_key) = match bounded {
+        Ok(b) => b,
+        Err(why) => {
+            set_err(err_out, why);
+            return ptr::null_mut();
+        }
+    };
+    let list = match (list, list_sig, list_key) {
         (None, None, None) => None,
         (Some(bytes), Some(sig), Some(key)) => {
             let Some(key) = ListKey::from_encoded(&key) else {
@@ -272,9 +333,9 @@ pub unsafe extern "C" fn qmb_annulet_new(
     pin.copy_from_slice(std::slice::from_raw_parts(pin32, 32));
     let mut seed = [0u8; 32];
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
-    let allocated = std::slice::from_raw_parts(indices, n_indices).to_vec();
+    let allocated = if n_indices == 0 { Vec::new() } else { std::slice::from_raw_parts(indices, n_indices).to_vec() };
     let wallet = (*w).wallet.clone();
-    let driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(bytes_opt(record, record_len)));
+    let driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
     Box::into_raw(Box::new(AnnuletState {
         wallet,
         endpoint: endpoint.to_string(),
@@ -404,6 +465,8 @@ pub unsafe extern "C" fn qmb_annulet_supply(s: *mut AnnuletState, body: *const u
     }
     let answer = if body.is_null() {
         Err("supplied body is NULL".to_string())
+    } else if len > MAX_SUPPLY_BYTES {
+        Err(format!("supplied body is {len} B, over the {MAX_SUPPLY_BYTES} B bound"))
     } else {
         Ok(std::slice::from_raw_parts(body, len).to_vec())
     };
@@ -427,8 +490,9 @@ pub unsafe extern "C" fn qmb_annulet_supply_err(s: *mut AnnuletState, reason: *c
     (*s).supply(Err(reason));
 }
 
-/// The view JSON after DONE — once; NULL before DONE, after a refusal, or on
-/// a second call. Free with `qmb_string_free`.
+/// The view JSON after DONE — once; NULL before DONE, after a refusal before
+/// DONE, or on a second call. A host misuse AFTER DONE does not withdraw a
+/// view not yet taken. Free with `qmb_string_free`.
 ///
 /// # Safety
 /// `s` live (or NULL).

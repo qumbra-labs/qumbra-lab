@@ -155,6 +155,11 @@ pub const ASSET_LIST_TEST_KEY_FINGERPRINT: &str = "a926a297aa958568fa8b4441a2f1c
 /// **Only in a `test-support` build** (#850 AD2 pre-review): the crate's own
 /// dev-dependency and the `ad_goldens` example enable it; a release shell
 /// cannot reach the test signer at all.
+/// Whether this build carries [`test_list_key`] — `false` in every build a
+/// shell ships. `qumbra-ffi` asserts it at compile time for wasm32 (lab #858
+/// WA2), so the test signer cannot leak into the extension's kernel.
+pub const TEST_SUPPORT: bool = cfg!(feature = "test-support");
+
 #[cfg(feature = "test-support")]
 pub mod test_list_key {
     use ml_dsa::{Keypair, MlDsa65, Signer, SigningKey, B32};

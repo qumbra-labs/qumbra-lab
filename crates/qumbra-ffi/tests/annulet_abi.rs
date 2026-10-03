@@ -116,7 +116,13 @@ fn abi(seed: u8, ep: &Endpoint, list: Option<&Signed>, record: Option<&[u8]>) ->
                     assert!(qmb_annulet_take_view(s).is_null(), "the view crosses once");
                     break Ok(serde_json::from_str(&view).unwrap());
                 }
-                -2 => break Err(serde_json::from_str(&take_str(out)).unwrap()),
+                -2 => {
+                    let first = take_str(out);
+                    let mut again: *mut c_char = std::ptr::null_mut();
+                    assert_eq!(qmb_annulet_step(s, &mut again), -2, "a refusal is terminal");
+                    assert_eq!(take_str(again), first, "and repeats itself");
+                    break Err(serde_json::from_str(&first).unwrap());
+                }
                 other => panic!("step returned {other}"),
             }
         };
@@ -207,6 +213,39 @@ fn a_the_abi_is_the_bridges_path_byte_for_key() {
         let leaf_at = a.paths.iter().position(|p| p == "/v1/registry/1").expect("USDT's leaf asked");
         assert_eq!(leaf_at, a.paths.len() - 1, "{tag}: leaves last: {:?}", a.paths);
     }
+}
+
+/// (a) with two held assets: the leaf Needs come last, in `held_assets`
+/// order (1 then 2), through the ABI; and a Regulated leaf with a freeze root
+/// crosses as `regulated` / `not_checked` (no freeze list is fetched in v1).
+#[test]
+fn a2_two_held_assets_open_in_order() {
+    const SEED: u8 = 0xA2;
+    const REG: u16 = 2;
+    let w = wallet_dir("abi_a2", SEED);
+    let mut rng = StdRng::seed_from_u64(0xA2);
+    let a0 = w.wallet().address_at_index(0);
+    let rkm0 = w.wallet().rkm(w.wallet().diversifier_at_index(0));
+    let leaf = qlab_air::l2::RegistryLeaf {
+        asset: u64::from(REG),
+        issuer_key: [5, 5, 5, 5],
+        mode: qlab_air::l2::MODE_REGULATED,
+        freeze_root: qlab_air::l2p::CanonicalFreezeTree::from_keys(&[rkm0]).root,
+        allow_root: [0; 4],
+        flags: 0,
+    };
+    let file = genesis_with(&a0, vec![leaf], vec![note_to(&a0, 50, u64::from(REG), 11)]);
+    let ep = Endpoint::new(file, &bodies(&w, &mut rng), None, Lie::None);
+    let a = abi(SEED, &ep, None, None);
+    assert_same("two_held", &a, &bridge("abi_a2_bridge", SEED, &ep, None, None));
+    let n = a.paths.len();
+    assert_eq!(&a.paths[n - 2..], ["/v1/registry/1", "/v1/registry/2"], "{:?}", a.paths);
+    let v = a.result.unwrap();
+    let reg = v["balances"]["rows"].as_array().unwrap().iter().find(|r| r["asset"] == REG).unwrap().clone();
+    assert_eq!(reg["mode"], "regulated");
+    assert_eq!(reg["freeze"], "not_checked");
+    assert_eq!(reg["spendable"]["baseUnits"], "50");
+    let _ = std::fs::remove_dir_all(&w.dir);
 }
 
 #[test]
@@ -305,7 +344,7 @@ fn d_a_list_is_verified_at_new_and_labels_only_its_network() {
         bad[0] ^= 1;
         let (null, err) = new(&bytes, Some(&bad), &key);
         assert!(null);
-        assert!(err.unwrap().starts_with("the asset list is refused: "));
+        assert_eq!(err.unwrap(), format!("the asset list is refused: {}", qumbra_wallet::asset_view::ListRefusal::BadSignature));
         let (null, err) = new(&bytes, None, &key);
         assert!(null);
         assert!(err.unwrap().contains("all three or none"));
@@ -348,6 +387,25 @@ fn e_misuse_is_a_host_bug_by_name() {
         assert_eq!(r["refusal"], "driver_misuse");
         assert_eq!(qmb_annulet_step(s, &mut out), -2, "a refusal is terminal and repeats");
         qmb_string_free(out);
+        qmb_annulet_free(s);
+
+        // An extra answer inside the leaf phase.
+        let s = mk();
+        loop {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            assert_eq!(qmb_annulet_step(s, &mut out), 1, "the leaf phase comes before DONE");
+            let path = take_str(out);
+            let body = ep.fetch(&path).unwrap();
+            qmb_annulet_supply(s, body.as_ptr(), body.len());
+            if path.starts_with("/v1/registry/") && path != "/v1/registry/root" {
+                qmb_annulet_supply(s, body.as_ptr(), body.len());
+                break;
+            }
+        }
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(qmb_annulet_step(s, &mut out), -2);
+        let r: Value = serde_json::from_str(&take_str(out)).unwrap();
+        assert_eq!(r["refusal"], "driver_misuse", "{r}");
         qmb_annulet_free(s);
 
         // A step after DONE; an answer after DONE.
@@ -470,7 +528,22 @@ fn f_every_view_state_and_the_refusal_carry_the_bridges_keys() {
         assert_eq!(keys(l), label_keys, "{kind}");
     }
     let r = refusal_json(&VerifyRefusal::NoPin);
-    assert_eq!(keys(&r), set(&["refusal", "message"]));
+    assert_eq!(keys(&r), set(&["refusal", "message"]));    // Values the golden does not cover: an unknown mode lane, a frozen row,
+    // and headersBehind only when the endpoint claims more than was verified.
+    let mut row = golden_row();
+    row.mode = AssetMode::Other(7);
+    row.freeze = FreezeStatus::Frozen;
+    let v = view_json("e", &golden_view(ListStatus::NoList, Balances::Figures(vec![row])), (0, 0), None);
+    assert_eq!(v["balances"]["rows"][0]["mode"], "other");
+    assert_eq!(v["balances"]["rows"][0]["modeRaw"], 7);
+    assert_eq!(v["balances"]["rows"][0]["freeze"], "frozen");
+    assert_eq!(v["headersBehind"], 2);
+    for stated in [Some(270), Some(269), None] {
+        let mut view = golden_view(ListStatus::NoList, Balances::Figures(Vec::new()));
+        view.stated_tip = stated;
+        assert_eq!(view_json("e", &view, (0, 0), None)["headersBehind"], Value::Null, "stated {stated:?}");
+    }
+
 }
 
 /// Q2's condition: every refusal's machine key, pinned. The match is
@@ -540,17 +613,133 @@ fn every_refusal_has_its_pinned_key() {
     assert_eq!(seen.len(), 24, "every variant listed once");
 }
 
-/// Condition 2: the TEST list signer is reachable only through this crate's
-/// dev-dependency. The `[dependencies]` entry for `qumbra-wallet` — the one a
-/// release or wasm build resolves — must not name `test-support`, and the
-/// workspace resolver must be "2" (which keeps dev-dependency features out of
-/// a non-test build).
+/// The bounds' constants are the real sizes: the list key and signature are
+/// ML-DSA-65's exact encodings, and the record bound is WA0's.
 #[test]
-fn the_test_list_key_is_not_reachable_from_a_release_build() {
-    let manifest = include_str!("../Cargo.toml");
-    let deps = manifest.split("[dependencies]").nth(1).unwrap().split("\n[").next().unwrap();
-    let wallet = deps.lines().find(|l| l.starts_with("qumbra-wallet")).expect("the dependency");
-    assert!(!wallet.contains("test-support"), "{wallet}");
-    let workspace = include_str!("../../../Cargo.toml");
-    assert!(workspace.contains("resolver = \"2\""), "the workspace resolver keeps dev features out of release builds");
+fn the_bounds_are_the_real_sizes() {
+    use qumbra_ffi::annulet::{LIST_KEY_LEN, LIST_SIG_LEN};
+    assert_eq!(test_list_key::encoded().len(), LIST_KEY_LEN);
+    assert_eq!(test_list_key::sign(b"x").len(), LIST_SIG_LEN);
+    assert_eq!(
+        qumbra_wallet::annulet_verify::MAX_CHAIN_RECORD_BYTES,
+        41 + (qumbra_wallet::annulet_verify::MAX_CACHED_HEADERS as usize) * 153
+    );
+    // This test build does carry the signer (a dev-dependency feature); the
+    // wasm32 build's compile-time assertion in annulet.rs is what keeps it
+    // out of the extension.
+    const { assert!(qumbra_wallet::asset_view::TEST_SUPPORT) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_raw(
+    w: *const qumbra_ffi::WalletState,
+    pin: &[u8; 32],
+    indices: *const u64,
+    n: usize,
+    record: (*const u8, usize),
+    list: (*const u8, usize),
+    sig: (*const u8, usize),
+    key: (*const u8, usize),
+) -> (bool, Option<String>) {
+    unsafe {
+        let endpoint = CString::new(ENDPOINT).unwrap();
+        // A non-NULL sentinel: every path must overwrite it.
+        let mut err: *mut c_char = std::ptr::dangling_mut::<c_char>();
+        let h = qmb_annulet_new(
+            w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices, n, RNG.as_ptr(), record.0, record.1, list.0,
+            list.1, sig.0, sig.1, key.0, key.1, std::ptr::null(), &mut err,
+        );
+        let err = (!err.is_null()).then(|| take_str(err));
+        let null = h.is_null();
+        if !null {
+            qmb_annulet_free(h);
+        }
+        (null, err)
+    }
+}
+
+/// MUST 1: every host length is bounded by name before a slice is formed,
+/// and `*err_out` is written on every path.
+#[test]
+fn every_host_length_is_bounded_by_name() {
+    use qumbra_ffi::annulet::{MAX_ANNULET_INDICES, LIST_KEY_LEN, LIST_SIG_LEN};
+    use qumbra_wallet::annulet_verify::MAX_CHAIN_RECORD_BYTES;
+    use qumbra_wallet::asset_view::MAX_ASSET_LIST_BYTES;
+    const SEED: u8 = 0xF1;
+    let (ep, _) = honest(SEED, 3);
+    let pin = ep.file.hash();
+    let (bytes, sig, key) = list_for(&pin);
+    let none = (std::ptr::null(), 0);
+    let idx = [0u64, 1];
+    let tiny = [0u8; 4];
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        // Success writes NULL over the sentinel; NULL indices with 0 is legal.
+        assert_eq!(new_raw(w, &pin, idx.as_ptr(), 2, none, none, none, none), (false, None));
+        assert_eq!(new_raw(w, &pin, std::ptr::null(), 0, none, none, none, none), (false, None));
+        let over = |(null, err): (bool, Option<String>), needle: &str| {
+            assert!(null);
+            let err = err.expect("named");
+            assert!(err.contains(needle), "{err}");
+        };
+        over(new_raw(w, &pin, std::ptr::null(), 2, none, none, none, none), "NULL only with 0");
+        over(new_raw(w, &pin, idx.as_ptr(), MAX_ANNULET_INDICES + 1, none, none, none, none), "at most 1024");
+        // Over-long lengths over a 4-byte buffer: refused before any read.
+        let big = |n: usize| (tiny.as_ptr(), n);
+        over(new_raw(w, &pin, idx.as_ptr(), 2, big(MAX_CHAIN_RECORD_BYTES + 1), none, none, none), "the record is");
+        let (b, sg, k) = ((bytes.as_ptr(), bytes.len()), (sig.as_ptr(), sig.len()), (key.as_ptr(), key.len()));
+        over(new_raw(w, &pin, idx.as_ptr(), 2, none, big(MAX_ASSET_LIST_BYTES + 1), sg, k), "the asset list is");
+        over(new_raw(w, &pin, idx.as_ptr(), 2, none, b, big(LIST_SIG_LEN + 1), k), "the list signature is");
+        over(new_raw(w, &pin, idx.as_ptr(), 2, none, b, sg, big(LIST_KEY_LEN + 1)), "the list key is");
+        // Every partial triple.
+        for (l, si, ke) in [(b, none, none), (none, sg, none), (none, none, k), (b, sg, none), (b, none, k), (none, sg, k)] {
+            over(new_raw(w, &pin, idx.as_ptr(), 2, none, l, si, ke), "all three or none");
+        }
+        // NULL required arguments: NULL, nothing named, the sentinel cleared.
+        let endpoint = CString::new(ENDPOINT).unwrap();
+        for which in 0..4 {
+            let mut err: *mut c_char = std::ptr::dangling_mut::<c_char>();
+            let h = qmb_annulet_new(
+                if which == 0 { std::ptr::null() } else { w },
+                if which == 1 { std::ptr::null() } else { endpoint.as_ptr() },
+                if which == 2 { std::ptr::null() } else { pin.as_ptr() },
+                0,
+                u64::MAX,
+                idx.as_ptr(),
+                2,
+                if which == 3 { std::ptr::null() } else { RNG.as_ptr() },
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &mut err,
+            );
+            assert!(h.is_null(), "NULL argument {which}");
+            assert!(err.is_null(), "argument {which}: *err_out cleared");
+        }
+        // A supplied body: NULL, or over the bound, is a transport failure by
+        // name — here at the genesis Need.
+        for (body, len, needle) in [(std::ptr::null(), 0, "supplied body is NULL"), (tiny.as_ptr(), qumbra_ffi::annulet::MAX_SUPPLY_BYTES + 1, "over the")] {
+            let null = std::ptr::null();
+            let s = qmb_annulet_new(
+                w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, idx.as_ptr(), 2, RNG.as_ptr(), null, 0, null, 0, null, 0,
+                null, 0, std::ptr::null(), std::ptr::null_mut(),
+            );
+            let mut out: *mut c_char = std::ptr::null_mut();
+            assert_eq!(qmb_annulet_step(s, &mut out), 1);
+            assert_eq!(take_str(out), "/genesis.qmb");
+            qmb_annulet_supply(s, body, len);
+            assert_eq!(qmb_annulet_step(s, &mut out), -2);
+            let r: Value = serde_json::from_str(&take_str(out)).unwrap();
+            assert_eq!(r["refusal"], "genesis_unavailable");
+            assert!(r["message"].as_str().unwrap().contains(needle), "{r}");
+            qmb_annulet_free(s);
+        }
+        qmb_wallet_free(w);
+    }
 }

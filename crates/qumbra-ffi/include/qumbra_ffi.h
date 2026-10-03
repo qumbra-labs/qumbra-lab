@@ -603,21 +603,27 @@ int32_t qmb_name_active(int32_t native, uint64_t tip);
  *                   JSON's "endpoint"; NEVER dereferenced here (sans-IO).
  *   pin32           keccak256 of the network's genesis file: a trust input,
  *                   never derived from the endpoint it checks.
- *   indices         the wallet's allocated address indices.
+ *   indices         the wallet's allocated address indices: at most 1024;
+ *                   NULL only with n_indices == 0.
  *   rng_seed32      32 bytes the host MUST fill from crypto.getRandomValues
  *                   (the select ABI's rule).
  *   record          the verified-header record from the last DONE's
  *                   qmb_annulet_take_record, or NULL/0. It is a CACHE of
  *                   verified header preimages, never trust: a tampered or
- *                   foreign record costs only a full re-verify (refused by
- *                   name inside the view's cache line), so the host may keep
- *                   it in extension storage with no integrity of its own.
+ *                   foreign record is discarded and the chain re-verified from
+ *                   genesis — the host sees that only as a longer fetch
+ *                   sequence and a fresh record from qmb_annulet_take_record —
+ *                   so it may keep the record in extension storage with no
+ *                   integrity of its own. At most 41 + 2^18 * 153 bytes.
  *   list, list_sig, list_key
  *                   the signed asset list, its signature and the list key —
  *                   all three or none (NULL/0). The key MUST be a constant in
  *                   the host's own source (design D3): never fetched, never
- *                   configurable. A list that does not verify is refused here:
- *                   NULL with *err_out set.
+ *                   configurable. Bounds: the list at most 1 MiB, the
+ *                   signature 3309 bytes, the key 1952 bytes. A list that does
+ *                   not verify, or any length over its bound, is refused here:
+ *                   NULL with *err_out set (*err_out is NULL on every other
+ *                   path, success included).
  *   list_source_commit
  *                   the qumbra-asset-list commit the list came from, or NULL;
  *                   carried into "listSourceCommit" when a list labels the view.
@@ -634,7 +640,11 @@ int32_t qmb_name_active(int32_t native, uint64_t tip);
  *       surface it as such, NEVER as a node fault;
  *   -1  NULL handle or out, or a step after DONE.
  *
- * Supplied bytes are COPIED; a NULL body is a transport error. The view JSON
+ * *out is a qmb_string_free string; it is NULL only if the string held a NUL.
+ *
+ * Supplied bytes are COPIED; a NULL body, or one over 64 MiB, is a transport
+ * error by name. A host misuse after DONE does not withdraw a view not yet
+ * taken. The view JSON
  * always carries "spendsVerified" (design D5: false today, lab #853 — the
  * shell must say so beside the figures); a balance it cannot stand behind is
  * {"state":"unavailable"}, never a zero. The record crosses once and is
