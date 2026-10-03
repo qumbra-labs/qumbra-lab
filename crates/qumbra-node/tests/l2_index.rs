@@ -137,8 +137,12 @@ fn a_registry_write_member_freezes_the_index_by_name() {
     let m1 = s_members(&s, &mut rng, 1);
     let b1 = bundle(&mut s, &mut rng, m1);
     let leaf = qlab_air::l2::RegistryLeaf::cloaked(5);
-    let w = synth_write(&mut rng, &s.l2, leaf);
-    let r = Member { tag: qlab_cbserver::l2fold::f4::wtag_of(L2ShapeTag::R), pvs: w.pvs.clone(), write: w.write };
+    // Anchored at the current C root like any member (`tx_member` writes the
+    // anchor lanes): the fold refuses an unanchored member with `TxAnchor`
+    // before the index ever sees the R tag.
+    let r = tx_member(&synth_write(&mut rng, &s.l2, leaf), &s.l2.c.root(), NO_VP);
+    assert_eq!(r.tag, qlab_cbserver::l2fold::f4::wtag_of(L2ShapeTag::R));
+    assert!(r.write.is_some(), "the write rides the member");
     let b2 = bundle(&mut s, &mut rng, vec![r]);
     let mut at = BTreeMap::new();
     at.insert(2, BundleRef::resident(&b1).unwrap());
