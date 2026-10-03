@@ -554,6 +554,17 @@ mod tests {
         for s in [State::Queued, State::Planned(2), State::Landed(10), State::Refused(Refusal::Statement)] {
             assert!(refuse(&mut q, s).contains("landed may not become"));
         }
+        let mut bytes = W3C_CLAIM.to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        let mut c2 = c.clone();
+        c2.id = crate::intake::id_of(&bytes);
+        c2.keys = vec![[1; 32]];
+        q.admit(&c2, &bytes).unwrap();
+        q.set_state(&c2.id, State::Refused(Refusal::CnfOnChain)).unwrap();
+        for s in [State::Queued, State::Planned(3), State::Landed(11), State::Refused(Refusal::Statement)] {
+            assert!(q.set_state(&c2.id, s).unwrap_err().contains("refused may not become"));
+        }
+        assert_eq!(q.item(&c2.id).unwrap().state, State::Refused(Refusal::CnfOnChain));
         assert_eq!(q.pending_items, 0, "a refused write never moves the counters");
         let _ = std::fs::remove_dir_all(&d);
     }

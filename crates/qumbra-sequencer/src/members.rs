@@ -285,7 +285,7 @@ pub fn plan_claims(
     let mut d_batch = 0u64;
     for file in files {
         let member = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None };
-        let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("a claim's anchor: {e:?}")))?;
+        let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("a claim's anchor: {e:?}")))?; // debug-ok: a PV read error, no opening
         let absorbed_before = (0..state.aa.len()).any(|i| state.aa.leaf(i) == anchor);
         if !absorbed_before && !roots.contains(&anchor) {
             return Err(PlanError::ClaimAnchorNotAbsorbed { root: anchor });
@@ -501,7 +501,7 @@ pub fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, ask: &As
                 let seed = SeedOutput { rkm: me, rseed: slot_keys("seed", slot) };
                 let out0 = to_me(change, slot, 0);
                 let inst = build_shape_r_with_witnesses(qlab_l2::LOG_HEIGHT_R, &fee_in, &w, c_in, &out0, TX_FEE, &write, &seed);
-                reg.apply_update(leaf).map_err(|e| PlanError::Wrapper(format!("registry write: {e:?}")))?;
+                reg.apply_update(leaf).map_err(|e| PlanError::Wrapper(format!("registry write: {e:?}")))?; // debug-ok: a registry write error, no opening
                 if change > 0 {
                     credited.push(Owned { value: change, rho: inst.nf, rseed: out0.rseed });
                 }
@@ -523,9 +523,9 @@ pub fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, ask: &As
 /// to the `exit_cmt` it states.
 fn statement(state: &WState, inp: &WInputs, members: &[Member], exits: &[Exit]) -> Result<(WRoots, WWitness, WRoots, Digest), PlanError> {
     let mut st = state.clone();
-    let (rin, wit, rout) = st.apply(inp, members).map_err(|e| PlanError::Wrapper(format!("{e:?}")))?;
+    let (rin, wit, rout) = st.apply(inp, members).map_err(|e| PlanError::Wrapper(format!("{e:?}")))?; // debug-ok: WError: unit and value-free variants only
     let exit_cmt = qlab_wprover::f4::native::check_wrapper_leaf(&rin, inp, members, &wit)
-        .map_err(|e| PlanError::Wrapper(format!("{e:?}")))?
+        .map_err(|e| PlanError::Wrapper(format!("{e:?}")))? // debug-ok: WError: unit and value-free variants only
         .1;
     if exit_chain(exits) != exit_cmt {
         return Err(PlanError::Wrapper("the exit list does not chain to W's exit_cmt".into()));
@@ -629,13 +629,39 @@ pub fn reseal_claim(
 pub fn take_claim_file(state: &WState, base: Plan, file: qlab_l2spend::ClaimFile, keys: &Keys) -> Result<Plan, PlanError> {
     let slot = base.insts.iter().position(|i| matches!(i, Inst::C(_))).ok_or(PlanError::NoClaimSlot)?;
     let member = Member { tag: WTag::C, pvs: file.pvs.clone(), write: None };
-    let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("the claim file's anchor: {e:?}")))?;
+    let anchor = member.digest_at(qlab_air::claim::PV_A).map_err(|e| PlanError::Wrapper(format!("the claim file's anchor: {e:?}")))?; // debug-ok: a PV read error, no opening
     let absorbed_before = (0..state.aa.len()).any(|i| state.aa.leaf(i) == anchor);
     if !absorbed_before && !base.inp.absorbed.contains(&anchor) {
         return Err(PlanError::ClaimAnchorNotAbsorbed { root: anchor });
     }
     let dep = DepEntry { v: file.value, r_v: file.r_v };
     swap_claim(state, base, slot, Inst::Proven { pvs: file.pvs, proof: file.proof }, dep, None, keys)
+}
+
+/// **Which claim the native statement refuses** (lab #847 S4), by
+/// elimination: the statement applies members in order, so the first prefix
+/// `WState::apply` refuses ends at the culprit. `None` when every prefix
+/// applies (the refusal is the whole wrapper's — the leaf check — not one
+/// item's). Native work only, no proving; the inputs are `plan_claims`'s.
+pub fn first_refused(
+    state: &WState,
+    prev: &Surface,
+    absorbed: &[Anchor; M_ABS],
+    files: &[qlab_l2spend::ClaimFile],
+    keys: &Keys,
+) -> Option<usize> {
+    let members: Vec<Member> = files.iter().map(|f| Member { tag: WTag::C, pvs: f.pvs.clone(), write: None }).collect();
+    let roots = absorbed.map(|a| a.root);
+    (1..=members.len())
+        .find(|&n| {
+            // Each prefix carries its own deposit total, as a wrapper of n would.
+            let d_batch = files[..n].iter().try_fold(0u64, |a, f| a.checked_add(f.value));
+            d_batch.is_none_or(|d_batch| {
+                let inp = WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: roots, d_batch };
+                state.clone().apply(&inp, &members[..n]).is_err()
+            })
+        })
+        .map(|n| n - 1)
 }
 
 #[cfg(test)]
@@ -678,6 +704,16 @@ mod tests {
         let other = Anchor { count: 0, root: [7; 4] };
         let err = plan_claims(&state, &prev, [other; M_ABS], vec![f; K], &Keys::from_seed([1; 32])).err().unwrap();
         assert_eq!(err, PlanError::ClaimAnchorNotAbsorbed { root: a.root });
+    }
+
+    /// Elimination names the culprit: with sixteen copies of one claim, the
+    /// first applies and the second repeats its cnf — item 1.
+    #[test]
+    fn elimination_names_the_repeated_claim() {
+        let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
+        let f = w3c_file();
+        let a = anchor_of(&f);
+        assert_eq!(first_refused(&state, &prev, &[a; M_ABS], &vec![f; K], &Keys::from_seed([1; 32])), Some(1));
     }
 
     /// Sixteen copies of one claim get past the cheap checks and reach the

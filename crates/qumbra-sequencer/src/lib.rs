@@ -68,6 +68,23 @@ mod tests {
         }
     }
 
+    /// The name list above catches the obvious spellings; this catches the
+    /// rest: every Debug placeholder outside test code carries a
+    /// `// debug-ok: <why>` marker on its line, so a new one is a reviewed
+    /// one — the reviewer reads the reason, not a guess at the type.
+    #[test]
+    fn every_debug_format_is_marked() {
+        for (path, text) in SOURCES {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            for (i, line) in code.lines().enumerate() {
+                if (line.contains(":?}") || line.contains(":#?}")) && !line.trim_start().starts_with("//") {
+                    let why = line.split("// debug-ok:").nth(1).map(str::trim).unwrap_or("");
+                    assert!(!why.is_empty(), "{path}:{}: a Debug format with no `// debug-ok: <why>`", i + 1);
+                }
+            }
+        }
+    }
+
     /// The binary's `run` drives the one real [`crate::work::RealWork`], whose
     /// draft calls the real prover, and nothing in the crate outside tests
     /// defines another `Work` — the stub seam exists only in `pass`'s tests

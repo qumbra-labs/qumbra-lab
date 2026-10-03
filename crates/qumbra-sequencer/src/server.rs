@@ -45,7 +45,7 @@ pub const INTAKE_ROUTE_VERSION: u32 = 1;
 /// A loopback socket address, or a refusal naming why (Q1: intake is
 /// reached through a tunnel, never exposed).
 pub fn loopback(addr: &str) -> Result<SocketAddr, String> {
-    let a: SocketAddr = addr.parse().map_err(|_| format!("--listen {addr:?} is not an ip:port address"))?;
+    let a: SocketAddr = addr.parse().map_err(|_| format!("--listen {addr:?} is not an ip:port address"))?; // debug-ok: an operator-typed address
     if !a.ip().is_loopback() {
         return Err(format!(
             "--listen {addr} is not a loopback address — intake is loopback only; reach it through a tunnel (lab #847 Q1)"
