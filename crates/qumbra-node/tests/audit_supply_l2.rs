@@ -12,7 +12,7 @@ use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::header::BlockHeader;
 use qlab_node::asset_supply::{AttestDocument, LABEL};
 use qlab_node::{MemNode, NodeState};
-use qumbra_node::annulet_genesis::{registry_leaves, AnnuletGenesisFile};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, registry_leaves, AnnuletGenesisFile};
 use qumbra_node::audit_supply_l2::{
     audit_supply_l2, audit_with_claim, EXIT_CANNOT_RUN, EXIT_CLEAN, EXIT_DIVERGENT,
 };

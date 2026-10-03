@@ -18,7 +18,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use qumbra_node::annulet_genesis::AnnuletGenesisFile;
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, AnnuletGenesisFile};
 use qumbra_node::genesis_v6::GenesisFileV6;
 
 fn bin() -> &'static str {

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_qumbra-faucet")

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use qlab_devnet::annulet::{L2ShapeTag, L2Surface};
 use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::fees::ArityBucket;
-use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_qumbra-node")

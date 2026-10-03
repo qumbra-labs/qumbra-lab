@@ -334,6 +334,13 @@ impl From<GenesisError> for RunError {
         RunError::Genesis(e)
     }
 }
+/// Lab #850: the Annulet genesis file's reads moved to `qlab-node` with their
+/// own error; a node refusal stays the `GenesisError` it always was.
+impl From<crate::annulet_genesis::AnnuletGenesisError> for RunError {
+    fn from(e: crate::annulet_genesis::AnnuletGenesisError) -> Self {
+        RunError::Genesis(e.into())
+    }
+}
 impl From<qlab_node::NodeError> for RunError {
     fn from(e: qlab_node::NodeError) -> Self {
         RunError::Node(e)

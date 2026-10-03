@@ -416,7 +416,7 @@ mod tests {
     /// on the node and in the document alike.
     #[test]
     fn the_devnet_genesis_shows_usdt_test() {
-        use qumbra_node::annulet_genesis::{devnet, registry_leaves, AnnuletGenesisFile};
+        use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, registry_leaves, AnnuletGenesisFile};
         let g = AnnuletGenesisFile::devnet();
         let n = MemNode::in_memory_annulet(
             g.genesis_block_header(),

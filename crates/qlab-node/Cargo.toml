@@ -25,6 +25,11 @@ qlab-devnet = { path = "../qlab-devnet", default-features = false, features = ["
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 # [u64;4] ↔ [u8;32] digest lane conversions (protocol-spec §1 lane-major LE).
 qlab-note = { path = "../qlab-note" }
+# Lab #850 (AD1): the Annulet genesis file moved here from qumbra-node, so a
+# wallet can decode the genesis bytes it verifies — its registry leaves are
+# qlab-air's, its sequencer key ML-DSA-65 (exact pin = qlab-devnet's, one rev).
+qlab-air = { path = "../qlab-air" }
+ml-dsa = "=0.1.1"
 # The closed-form emission curve (frozen B2 constants) — the coinbase(h) =
 # S_atomic(h+1) − S_atomic(h) normative integer emission the block assembler
 # pays out (protocol-spec §6). Pure arithmetic, no chain/crypto deps.

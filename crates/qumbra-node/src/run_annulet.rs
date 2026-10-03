@@ -251,6 +251,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annulet_genesis::AnnuletGenesisBuild;
     use qlab_devnet::pow::KeccakPow;
     use std::path::PathBuf;
 

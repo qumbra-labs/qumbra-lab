@@ -978,7 +978,7 @@ fn audit(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// What the devnet compose runs instead of a genesis ceremony; nothing here
 /// is a secret, and nothing here may be reused on a net that holds value.
 fn genesis_annulet_devnet(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
+    use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
     let out = std::path::PathBuf::from(flag(args, "--out").unwrap_or("."));
     std::fs::create_dir_all(&out)?;
     let g = AnnuletGenesisFile::devnet();
