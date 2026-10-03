@@ -144,5 +144,8 @@ fn an_honest_session_holds_exactly_the_verified_figures() {
     assert_eq!(session.index.balances(), verified.report().index.as_ref().expect("both halves").balances());
     assert_eq!(session.index.balances(), vec![(0, 5), (USDT as u16, 1_000_407)]);
     assert_eq!((session.tiers.s, session.tiers.p, session.tiers.r), (1, 2, 2));
+    // AS-1b: the session carries the verified scan's own flag (lab #853).
+    assert_eq!(session.spends_verified, verified.spends_verified());
+    assert!(!session.spends_verified);
     let _ = std::fs::remove_dir_all(&w.dir);
 }

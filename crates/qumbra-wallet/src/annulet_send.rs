@@ -517,6 +517,10 @@ pub struct Session<E: Endpoint> {
     pub tiers: Tiers,
     pub index: AssetIndex,
     pub genesis_hash: [u8; 32],
+    /// The verified scan's [`crate::annulet_verify::VerifiedAnnulet::spends_verified`]
+    /// (lab #869 AS-1b): **`false`** while the spends subtracted are the
+    /// endpoint's list (lab #853). A shell states this beside every plan.
+    pub spends_verified: bool,
 }
 
 /// **The verified session** (lab #869 (a)): the genesis by its bytes against
@@ -540,6 +544,7 @@ pub fn open_session<E: Endpoint>(
     let served = Served::new(endpoint);
     let mut fetch = |p: &str| served.endpoint.get(p);
     let verified = scan_annulet_verified(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Verify)?;
+    let spends_verified = verified.spends_verified();
     let report = into_report(verified);
     let params = served.params()?;
     if params.genesis_hash != report.genesis_hash {
@@ -547,7 +552,7 @@ pub fn open_session<E: Endpoint>(
     }
     let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p, r: params.fee_tier_r };
     let index = report.index.ok_or(SendRefusal::NoBalance)?;
-    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash })
+    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash, spends_verified })
 }
 
 /// This wallet's receiving [`Recipient`] (address 0: change, split notes).
