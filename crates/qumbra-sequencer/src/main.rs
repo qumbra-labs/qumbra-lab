@@ -29,6 +29,8 @@
 //!   per L1 transaction, then the claims of those burns credited to its
 //!   filler wallet, handed to the intake. `--plan` prints the shortfall, the
 //!   funding and the proof budget and proves nothing. Resumable.
+//! - `rehearsal-key --genesis G --out FILE` — the public rehearsal seed as a
+//!   0600 key file, for a rehearsal genesis only (the S6 box run).
 //! - `--version`.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,6 +49,7 @@ const USAGE: &str = "usage: qumbra-sequencer intake --genesis FILE --queue DIR -
                      --operator IP:PORT --key FILE --out DIR [--max-bundles N] [--max-wait SECS] [--poll SECS]\n       \
                      qumbra-sequencer seed --genesis FILE --key FILE --node URL --out DIR --burn BESSEL [--count N] \
                      [--scan URL] [--intake IP:PORT] [--plan] [--poll SECS] [--max-wait SECS]\n       \
+                     qumbra-sequencer rehearsal-key --genesis FILE --out FILE\n       \
                      qumbra-sequencer --version";
 
 /// `--max-bundles` default: one bundle per pass.
@@ -163,6 +166,14 @@ fn run(args: &[String]) -> Result<(), String> {
             serve(addr, Intake { chain, queue })
         }
         Some("seed") => run_seed(&args[1..]),
+        Some("rehearsal-key") => {
+            let rest = &args[1..];
+            let genesis = load_genesis(Path::new(&flag(rest, "--genesis")?))?;
+            let out = PathBuf::from(flag(rest, "--out")?);
+            key::write_rehearsal(&out, &genesis.wrapper)?;
+            eprintln!("wrote {} (0600): the PUBLIC rehearsal sequencer seed", out.display());
+            Ok(())
+        }
         Some("queue") => {
             let queue = Queue::open_existing(Path::new(&flag(&args[1..], "--queue")?))?;
             for item in queue.items() {
