@@ -2060,6 +2060,7 @@ dependencies = [
  "qumbra-explorer",
  "qumbra-faucet",
  "qumbra-node",
+ "qumbra-wallet",
  "rand 0.10.2",
  "rustls",
  "serde_json",

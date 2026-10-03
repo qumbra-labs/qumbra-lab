@@ -21,7 +21,7 @@ required-features = ["net", "prove", "verify"]
 
 [[example]]
 name = "ad_goldens"
-required-features = ["verify"]
+required-features = ["verify", "test-support"]
 
 [[bin]]
 name = "qumbra-prover-host"
@@ -114,6 +114,9 @@ path = "tests/annulet_pilot.rs"
 required-features = ["pilot"]
 
 [dev-dependencies]
+# Lab #850 AD2: the crate's own tests reach `test-support` (the TEST list
+# signer); nothing else does.
+qumbra-wallet = { path = ".", features = ["test-support"] }
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
 qumbra-node = { path = "../qumbra-node" }
@@ -141,6 +144,10 @@ default = ["net", "prove", "randomx", "host", "verify"]
 # and the desktop/macOS shells; qumbra-ffi builds this crate with
 # default-features = false, so the iOS/Android/wasm graphs are unchanged.
 verify = ["dep:qlab-p2p", "dep:ml-dsa", "dep:serde_json"]
+# Lab #850 AD2: the TEST asset-list signer (`asset_view::test_list_key`). Only
+# this crate's own dev-dependency and the `ad_goldens` example enable it, so a
+# release shell cannot compile the test signer in.
+test-support = ["verify"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.

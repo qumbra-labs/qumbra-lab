@@ -139,6 +139,12 @@ pub enum Lie {
     BodyHeader,
     /// `/v1/nullifiers` does not answer: the spends cannot be read.
     NoNullifiers,
+    /// `/v1/registry/N` answers with another asset's opening.
+    RegistryWrongAsset,
+    /// `/v1/registry/N`'s path has one sibling flipped.
+    RegistryBadPath,
+    /// `/v1/registry/N` names an older height, over the tip's own tree.
+    RegistryOtherHeight,
 }
 
 pub struct Endpoint {
@@ -214,8 +220,19 @@ impl Endpoint {
                     leaves[1].mode = qlab_air::l2::MODE_CLOAKED;
                 }
                 let tree = qlab_cbserver::registry::RegistryTree::from_leaves(&leaves).unwrap();
-                qlab_cbserver::registry::encode_registry_opening(&tree, self.view.tip_height().unwrap(), asset)
-                    .ok_or_else(|| "404".to_string())
+                let tip = self.view.tip_height().unwrap();
+                let (height, asked) = match self.lie {
+                    Lie::RegistryWrongAsset => (tip, 0),
+                    Lie::RegistryOtherHeight => (tip - 1, asset),
+                    _ => (tip, asset),
+                };
+                let mut b = qlab_cbserver::registry::encode_registry_opening(&tree, height, asked)
+                    .ok_or_else(|| "404".to_string())?;
+                if self.lie == Lie::RegistryBadPath {
+                    // The first sibling's first byte (after ver ‖ height ‖ root ‖ 15 lanes).
+                    b[1 + 8 + 32 + 120] ^= 1;
+                }
+                Ok(b)
             }
             p if p.ends_with("/full") => {
                 let parts: Vec<&str> = p.split('/').collect();

@@ -23,6 +23,10 @@
 //!   header, whatever height the node names.
 //! - **Exact money**: amounts are integers in base units; the display string
 //!   is rendered here, never in floating point, never in a shell.
+//! - **What the parser does not judge**: whether a name or ticker *looks
+//!   like* another's (homoglyphs, a "USDT" that is not Tether's). It refuses
+//!   duplicate tickers within a list, case-insensitively; resemblance is the
+//!   list repository's review and CI (AD3), before anything is signed.
 
 use std::collections::BTreeMap;
 
@@ -41,6 +45,12 @@ pub const ASSET_LIST_DOMAIN: &[u8] = b"qumbra:asset-list:v1\0";
 /// The only list version this build reads.
 pub const ASSET_LIST_VERSION: u64 = 1;
 
+/// The largest list this build will verify, in bytes — checked by name
+/// **before** the signature, so an oversized input costs nothing. 1 MiB is
+/// about 4,000 entries at a pretty-printed ~250 B each: generous for any real
+/// network, and far below the 65,535 slots a registry could ever hold.
+pub const MAX_ASSET_LIST_BYTES: usize = 1 << 20;
+
 /// The most decimals a listed asset may declare (u128 base units still
 /// render exactly at 38 digits; 18 is the widest real token convention).
 pub const MAX_DECIMALS: u32 = 18;
@@ -58,8 +68,6 @@ pub struct ListedAsset {
     pub name: String,
     pub ticker: String,
     pub decimals: u32,
-    /// Test money — shown as such on every surface.
-    pub testnet: bool,
 }
 
 /// A verified asset list for one network.
@@ -69,6 +77,11 @@ pub struct AssetList {
     /// The genesis hash this list is for.
     pub genesis: [u8; 32],
     pub assets: BTreeMap<u16, ListedAsset>,
+    /// The network is a test network: every row shown under this list —
+    /// listed or not — is test money. A list is for one genesis, and a
+    /// network is a testnet or it is not, so this is the list's, not an
+    /// entry's (#850 AD2 pre-review).
+    pub testnet: bool,
     /// keccak of the list's bytes — what a settings view shows as "which list".
     pub digest: [u8; 32],
     /// keccak of the encoded verifying key that signed it — "signed by whom".
@@ -78,6 +91,8 @@ pub struct AssetList {
 /// Why an asset list was refused — by name; a refused list is no list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListRefusal {
+    /// Longer than [`MAX_ASSET_LIST_BYTES`]: refused before any work.
+    TooLarge { got: usize },
     /// The signature does not decode, or does not verify under the key.
     BadSignature,
     /// The bytes are not JSON of the list's shape.
@@ -89,6 +104,9 @@ pub enum ListRefusal {
 impl std::fmt::Display for ListRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ListRefusal::TooLarge { got } => {
+                write!(f, "the asset list is {got} B, over the {MAX_ASSET_LIST_BYTES} B bound")
+            }
             ListRefusal::BadSignature => write!(f, "the asset list's signature does not verify under the list key"),
             ListRefusal::Malformed { why } => write!(f, "the asset list is malformed: {why}"),
             ListRefusal::UnknownVersion { got } => {
@@ -121,21 +139,27 @@ impl ListKey {
     }
 }
 
+/// keccak of the TEST list key's encoding (see `test_list_key`, which only a
+/// `test-support` build carries) — public so a settings view can name it if
+/// a fixture list ever reaches one. From the named `ad_goldens` run; the lane
+/// re-derives it.
+pub const ASSET_LIST_TEST_KEY_FINGERPRINT: &str = "a926a297aa958568fa8b4441a2f1c306f6b02634ed89d890f65cab4140d01263";
+
 /// **The TEST list key** (lab #850 condition (e)) — **NOT the production list
 /// key**, and not to be compiled into a release shell as a trusted key: its
 /// seed is in this source file, so anyone can sign a list with it. It exists
 /// so the lane can sign and verify fixture lists; the production key is
 /// Larry's offline ML-DSA-65 key (D3) and swapping it in is his step.
+///
+/// **Only in a `test-support` build** (#850 AD2 pre-review): the crate's own
+/// dev-dependency and the `ad_goldens` example enable it; a release shell
+/// cannot reach the test signer at all.
+#[cfg(feature = "test-support")]
 pub mod test_list_key {
     use ml_dsa::{Keypair, MlDsa65, Signer, SigningKey, B32};
 
     /// The fixed seed the lane re-derives the test pair from.
     pub const ASSET_LIST_TEST_SEED: [u8; 32] = *b"qumbra-asset-list-TEST-key-v1\0\0\0";
-
-    /// keccak of the test verifying key's encoding — pinned so a change of
-    /// derivation is a red test, not a silent new key. From the named
-    /// `ad_goldens` run; the lane recomputes it.
-    pub const ASSET_LIST_TEST_KEY_FINGERPRINT: &str = "a926a297aa958568fa8b4441a2f1c306f6b02634ed89d890f65cab4140d01263";
 
     fn signing() -> SigningKey<MlDsa65> {
         let seed: B32 = ASSET_LIST_TEST_SEED.into();
@@ -161,6 +185,9 @@ pub mod test_list_key {
 /// Verify `sig` over `bytes` under `key`, then parse the list strictly
 /// (unknown keys, duplicate or unordered ids, out-of-range fields refused).
 pub fn verify_asset_list(bytes: &[u8], sig: &[u8], key: &ListKey) -> Result<AssetList, ListRefusal> {
+    if bytes.len() > MAX_ASSET_LIST_BYTES {
+        return Err(ListRefusal::TooLarge { got: bytes.len() });
+    }
     let enc = EncodedSignature::<MlDsa65>::try_from(sig).map_err(|_| ListRefusal::BadSignature)?;
     let sig = Signature::<MlDsa65>::decode(&enc).ok_or(ListRefusal::BadSignature)?;
     let mut msg = ASSET_LIST_DOMAIN.to_vec();
@@ -203,20 +230,24 @@ fn parse_asset_list(bytes: &[u8]) -> Result<AssetList, ListRefusal> {
     use serde_json::Value;
     let v: Value = serde_json::from_slice(bytes).map_err(|e| malformed(e.to_string()))?;
     let obj = v.as_object().ok_or_else(|| malformed("the list is not an object"))?;
-    only_keys(obj, &["v", "network", "genesis", "assets"], "the list")?;
+    // The version first: a later version's new keys are its own business,
+    // and the honest refusal is "a version this build does not read".
     let version = obj.get("v").and_then(Value::as_u64).ok_or_else(|| malformed("`v` must be an integer"))?;
     if version != ASSET_LIST_VERSION {
         return Err(ListRefusal::UnknownVersion { got: version });
     }
+    only_keys(obj, &["v", "network", "genesis", "testnet", "assets"], "the list")?;
+    let testnet = obj.get("testnet").and_then(Value::as_bool).ok_or_else(|| malformed("`testnet` must be a boolean"))?;
     let network = obj.get("network").and_then(Value::as_str).ok_or_else(|| malformed("`network` must be a string"))?;
     let genesis = hex32(obj.get("genesis").and_then(Value::as_str).ok_or_else(|| malformed("`genesis` missing"))?, "`genesis`")?;
     let entries = obj.get("assets").and_then(Value::as_array).ok_or_else(|| malformed("`assets` must be an array"))?;
     let mut assets = BTreeMap::new();
     let mut last: Option<u16> = None;
+    let mut tickers = std::collections::BTreeSet::new();
     for (i, e) in entries.iter().enumerate() {
         let what = format!("asset entry {i}");
         let o = e.as_object().ok_or_else(|| malformed(format!("{what} is not an object")))?;
-        only_keys(o, &["id", "issuer_key", "name", "ticker", "decimals", "testnet"], &what)?;
+        only_keys(o, &["id", "issuer_key", "name", "ticker", "decimals"], &what)?;
         let id = o.get("id").and_then(Value::as_u64).ok_or_else(|| malformed(format!("{what}: `id` missing")))?;
         let id = u16::try_from(id).ok().filter(|&id| id != 0).ok_or_else(|| {
             malformed(format!("{what}: `id` {id} is not 1..=65535 (asset 0 is the fee unit, never listed)"))
@@ -242,13 +273,16 @@ fn parse_asset_list(bytes: &[u8]) -> Result<AssetList, ListRefusal> {
             .and_then(Value::as_u64)
             .filter(|&d| d <= u64::from(MAX_DECIMALS))
             .ok_or_else(|| malformed(format!("{what}: `decimals` must be 0..={MAX_DECIMALS}")))? as u32;
-        let testnet = o.get("testnet").and_then(Value::as_bool).ok_or_else(|| malformed(format!("{what}: `testnet` must be a boolean")))?;
-        assets.insert(id, ListedAsset { id, issuer_key, name: name.to_string(), ticker: ticker.to_string(), decimals, testnet });
+        if !tickers.insert(ticker.to_ascii_lowercase()) {
+            return Err(malformed(format!("{what}: ticker `{ticker}` repeats another entry's (case-insensitive)")));
+        }
+        assets.insert(id, ListedAsset { id, issuer_key, name: name.to_string(), ticker: ticker.to_string(), decimals });
     }
     Ok(AssetList {
         network: network.to_string(),
         genesis,
         assets,
+        testnet,
         digest: qlab_devnet::hash::keccak256(bytes),
         signer: [0; 32],
     })
@@ -478,27 +512,27 @@ where
                 };
                 let bound = leaf.as_ref().and_then(|l| l.as_ref().ok());
                 let listed = list.and_then(|l| l.assets.get(&asset));
-                let (label, decimals, unit, testnet) = match (asset, listed) {
-                    (0, _) => (AssetLabel::FeeUnit, 0, "fee units".to_string(), false),
+                // Test money is the network's property: every row under a
+                // testnet list carries it, listed or not.
+                let testnet = list.is_some_and(|l| l.testnet);
+                let (label, decimals, unit) = match (asset, listed) {
+                    (0, _) => (AssetLabel::FeeUnit, 0, "fee units".to_string()),
                     (_, Some(e)) if bound.is_some_and(|leaf| leaf.issuer_key == e.issuer_key) => (
                         AssetLabel::Listed { name: e.name.clone(), ticker: e.ticker.clone() },
                         e.decimals,
                         e.ticker.clone(),
-                        e.testnet,
                     ),
                     (_, Some(e)) if bound.is_some() => (
                         AssetLabel::IssuerChanged { listed_ticker: e.ticker.clone() },
                         0,
                         format!("base units of asset #{asset}"),
-                        e.testnet,
                     ),
                     (_, Some(e)) => (
                         AssetLabel::Unconfirmed { listed_ticker: e.ticker.clone() },
                         0,
                         format!("base units of asset #{asset}"),
-                        e.testnet,
                     ),
-                    (_, None) => (AssetLabel::Unlisted, 0, format!("base units of asset #{asset}"), false),
+                    (_, None) => (AssetLabel::Unlisted, 0, format!("base units of asset #{asset}")),
                 };
                 let mode = match (asset, bound) {
                     (0, _) => AssetMode::Cloaked,

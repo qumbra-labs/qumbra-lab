@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 use common::*;
 use qlab_air::l2p::CanonicalFreezeTree;
 use qumbra_wallet::asset_view::{
-    asset_view, render_amount, test_list_key, verify_asset_list, AssetLabel, AssetList, AssetMode, AssetRow,
-    AssetView, Balances, FreezeStatus, ListKey, ListRefusal, ListStatus, ASSET_LIST_DOMAIN,
+    asset_view, leaf_at_verified_tip, render_amount, test_list_key, verify_asset_list, AssetLabel, AssetList,
+    AssetMode, AssetRow, AssetView, Balances, FreezeStatus, LeafRefusal, ListKey, ListRefusal, ListStatus,
+    ASSET_LIST_DOMAIN, ASSET_LIST_TEST_KEY_FINGERPRINT, MAX_ASSET_LIST_BYTES,
 };
 use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
@@ -31,10 +32,14 @@ fn lanes_hex(l: [u64; 4]) -> String {
     hex(&qlab_node::annulet_genesis::h32(&l))
 }
 
-/// A list for `genesis` naming USDT-test with `issuer`.
+/// A testnet list for `genesis` naming USDT-test with `issuer`.
 fn list_json(genesis: &[u8; 32], issuer: [u64; 4]) -> Vec<u8> {
+    list_json_with(genesis, issuer, 6)
+}
+
+fn list_json_with(genesis: &[u8; 32], issuer: [u64; 4], decimals: u32) -> Vec<u8> {
     format!(
-        r#"{{"v":1,"network":"annulet-ad1","genesis":"{}","assets":[{{"id":1,"issuer_key":"{}","name":"Tether USD (test)","ticker":"tUSDT","decimals":6,"testnet":true}}]}}"#,
+        r#"{{"v":1,"network":"annulet-ad1","genesis":"{}","testnet":true,"assets":[{{"id":1,"issuer_key":"{}","name":"Tether USD (test)","ticker":"tUSDT","decimals":{decimals}}}]}}"#,
         hex(genesis),
         lanes_hex(issuer)
     )
@@ -91,7 +96,7 @@ fn row(v: &AssetView, asset: u16) -> &AssetRow {
 #[test]
 fn the_test_list_key_is_derived_and_pinned() {
     let k = test_list_key::verifying();
-    assert_eq!(hex(&k.fingerprint()), test_list_key::ASSET_LIST_TEST_KEY_FINGERPRINT);
+    assert_eq!(hex(&k.fingerprint()), ASSET_LIST_TEST_KEY_FINGERPRINT);
     assert_eq!(ASSET_LIST_DOMAIN, b"qumbra:asset-list:v1\0");
 }
 
@@ -103,7 +108,7 @@ fn a_list_verifies_only_under_its_key_and_only_unchanged() {
     assert_eq!(list.genesis, [7; 32]);
     assert_eq!(list.assets[&1].ticker, "tUSDT");
     assert_eq!(list.assets[&1].decimals, 6);
-    assert!(list.assets[&1].testnet);
+    assert!(list.testnet);
     assert_eq!(list.signer, test_list_key::verifying().fingerprint());
 
     let mut tampered = bytes.clone();
@@ -128,20 +133,30 @@ fn a_list_verifies_only_under_its_key_and_only_unchanged() {
 
 #[test]
 fn a_malformed_list_is_refused_by_name() {
-    let g = hex(&[7; 32]);
-    let k = lanes_hex([9, 9, 9, 9]);
-    let entry = |extra: &str| {
-        format!(r#"{{"id":1,"issuer_key":"{k}","name":"N","ticker":"T","decimals":6,"testnet":false{extra}}}"#)
+    // Hex with letters in it, so an uppercase spelling is a different string.
+    let g = hex(&[0xAB; 32]);
+    let k = lanes_hex([0xABCD, 9, 9, 9]);
+    let entry = |extra: &str| format!(r#"{{"id":1,"issuer_key":"{k}","name":"N","ticker":"T","decimals":6{extra}}}"#);
+    let entry2 = |id: u32, ticker: &str| {
+        format!(r#"{{"id":{id},"issuer_key":"{k}","name":"N","ticker":"{ticker}","decimals":6}}"#)
     };
+    let list = |assets: String| format!(r#"{{"v":1,"network":"n","genesis":"{g}","testnet":false,"assets":[{assets}]}}"#);
     let cases: Vec<(String, &str)> = vec![
-        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","assets":[],"extra":1}}"#), "unknown key `extra`"),
-        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","assets":[{}]}}"#, entry(r#","url":"x""#)), "unknown key `url`"),
-        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","assets":[{}]}}"#, entry("").replace(r#""id":1"#, r#""id":0"#)), "asset 0"),
-        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","assets":[{},{}]}}"#, entry(""), entry("")), "strictly ascending"),
-        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","assets":[{}]}}"#, entry("").replace(r#""ticker":"T""#, r#""ticker":"T T""#)), "`ticker`"),
-        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","assets":[{}]}}"#, entry("").replace(r#""decimals":6"#, r#""decimals":19"#)), "`decimals`"),
-        (format!(r#"{{"v":1,"network":"n","genesis":"{}","assets":[]}}"#, g.to_uppercase()), "lowercase hex"),
+        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","testnet":false,"assets":[],"extra":1}}"#), "unknown key `extra`"),
+        (list(entry(r#","testnet":true"#)), "unknown key `testnet`"),
+        (list(entry("").replace(r#""id":1"#, r#""id":0"#)), "asset 0"),
+        (list(entry("").replace(r#""id":1"#, r#""id":65536"#)), "1..=65535"),
+        (list(format!("{},{}", entry(""), entry(""))), "strictly ascending"),
+        (list(format!("{},{}", entry2(5, "A"), entry2(4, "B"))), "strictly ascending"),
+        (list(format!("{},{}", entry2(4, "usdt"), entry2(5, "USDT"))), "repeats another entry's"),
+        (list(entry("").replace(r#""ticker":"T""#, r#""ticker":"T T""#)), "`ticker`"),
+        (list(entry("").replace(r#""decimals":6"#, r#""decimals":19"#)), "`decimals`"),
+        (list(entry("").replace(r#""name":"N""#, r#""name":"N""#)), "printable"),
+        (list(entry("").replace(&k, &k.to_uppercase())), "lowercase hex"),
+        (format!(r#"{{"v":1,"network":"n","genesis":"{}","testnet":false,"assets":[]}}"#, g.to_uppercase()), "lowercase hex"),
+        (format!(r#"{{"v":1,"network":"n","genesis":"{g}","testnet":"yes","assets":[]}}"#), "`testnet` must be a boolean"),
     ];
+
     for (json, want) in cases {
         let b = json.into_bytes();
         match verify_asset_list(&b, &test_list_key::sign(&b), &test_list_key::verifying()).err() {
@@ -149,7 +164,8 @@ fn a_malformed_list_is_refused_by_name() {
             other => panic!("expected Malformed({want}), got {other:?}"),
         }
     }
-    let v2 = format!(r#"{{"v":2,"network":"n","genesis":"{g}","assets":[]}}"#).into_bytes();
+    // v2 is refused as a version, even carrying keys v1 does not know.
+    let v2 = format!(r#"{{"v":2,"network":"n","genesis":"{g}","assets":[],"new_in_v2":1}}"#).into_bytes();
     assert_eq!(
         verify_asset_list(&v2, &test_list_key::sign(&v2), &test_list_key::verifying()).err(),
         Some(ListRefusal::UnknownVersion { got: 2 })
@@ -173,7 +189,7 @@ fn a_listed_testnet_asset_renders_by_name_in_its_decimals() {
     assert_eq!(usdt.spendable.base_units, 1_000_407);
     assert_eq!(usdt.spendable.display, "1.000407");
     assert_eq!(usdt.spendable.unit, "tUSDT");
-    assert!(usdt.testnet);
+    assert!(usdt.testnet, "a testnet list marks its rows");
     assert_eq!(usdt.mode, AssetMode::Hybrid);
     assert_eq!(usdt.freeze, FreezeStatus::NoFreezeList);
     assert_eq!(usdt.leaf_problem, None);
@@ -261,4 +277,56 @@ fn amounts_are_exact_integers_rendered_without_floats() {
     assert_eq!(render_amount(1_000_407, 6), "1.000407");
     assert_eq!(render_amount(123_456_789_000_000, 6), "123,456,789.000000");
     assert_eq!(render_amount(5, 0), "5");
+}
+
+#[test]
+fn an_oversized_list_is_refused_before_its_signature_is_checked() {
+    let big = vec![b' '; MAX_ASSET_LIST_BYTES + 1];
+    assert_eq!(
+        verify_asset_list(&big, b"not even a signature", &test_list_key::verifying()).err(),
+        Some(ListRefusal::TooLarge { got: MAX_ASSET_LIST_BYTES + 1 })
+    );
+}
+
+/// Every row under a testnet list is test money — the unlisted ones too.
+#[test]
+fn an_unlisted_row_under_a_testnet_list_is_test_money() {
+    let (w, ep) = setup("testnet", 0x67, true, Lie::None);
+    let list = signed(&list_json(&ep.file.hash(), [9, 9, 9, 9]));
+    let v = view(&w, &ep, Some(&list), &BTreeMap::new());
+    let reg = row(&v, REG);
+    assert_eq!(reg.label, AssetLabel::Unlisted);
+    assert!(reg.testnet);
+    assert!(row(&v, 0).testnet, "the fee unit of a test network is test money too");
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// 18 decimals end to end: through the parser and into the view.
+#[test]
+fn eighteen_decimals_render_end_to_end() {
+    let (w, ep) = setup("dec18", 0x68, false, Lie::None);
+    let list = signed(&list_json_with(&ep.file.hash(), [9, 9, 9, 9], 18));
+    assert_eq!(list.assets[&1].decimals, 18);
+    let v = view(&w, &ep, Some(&list), &BTreeMap::new());
+    assert_eq!(row(&v, USDT as u16).spendable.display, "0.000000000001000407");
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// The leaf refusals, and the one acceptance the rule turns on: an opening
+/// the node files under another height is still the tip's if its path folds
+/// to the verified tip's root.
+#[test]
+fn a_leaf_is_bound_by_the_tip_root_whatever_height_the_node_names() {
+    for (lie, want) in [
+        (Lie::RegistryWrongAsset, Err(LeafRefusal::WrongAsset { got: 0 })),
+        (Lie::RegistryBadPath, Err(LeafRefusal::PathMismatch)),
+        (Lie::RegistryOtherHeight, Ok(qlab_air::l2::MODE_HYBRID)),
+    ] {
+        let (w, ep) = setup("leafroute", 0x69, false, lie);
+        let v = run(&w, &ep, Some(ep.file.hash())).expect("the chain verifies");
+        let mut fetch = |p: &str| ep.fetch(p);
+        let got = leaf_at_verified_tip(&mut fetch, v.chain(), USDT as u16).map(|l| l.mode);
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
 }
