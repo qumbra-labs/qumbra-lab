@@ -28,8 +28,12 @@
 //!   <out>/<case>/record_out.bin the record qmb_annulet_take_record returned
 //!   <out>/lists/*.json|*.sig    the signed lists the cases use
 //!
-//! Run (a named local run on the ad_goldens rule — the lane recomputes):
+//! Run (a named local run on the ad_goldens rule):
 //!   cargo run -p qumbra-ffi --example annulet_fixtures -- <out> --lab-rev <commit> [--force]
+//! Nothing recomputes an example: regenerate by hand when the kernel's ABI,
+//! its encoder or the fixture changes; the manifest's `--lab-rev` is what the
+//! harness compares against. (The prefilter's `cargo check --workspace
+//! --all-targets` compiles this file, so it cannot rot silently.)
 
 #[path = "../../qumbra-wallet/tests/common/mod.rs"]
 mod common;
