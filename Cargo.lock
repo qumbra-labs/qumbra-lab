@@ -1575,6 +1575,7 @@ dependencies = [
  "qlab-http-framing",
  "qlab-note",
  "qlab-wallet",
+ "qlab-wrapper",
  "rand 0.10.2",
  "tiny_http",
 ]

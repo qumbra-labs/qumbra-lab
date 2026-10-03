@@ -16,7 +16,7 @@ qlab-air = { path = "../qlab-air" }
 qlab-consensus = { path = "../qlab-consensus" }
 qlab-l2 = { path = "../qlab-l2" }
 qlab-wrapper = { path = "../qlab-wrapper" }
-qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false, features = ["l2fold"] }
 qlab-devnet = { path = "../qlab-devnet" }
 qlab-note = { path = "../qlab-note" }
 # Plonky3, pinned exactly at 0.6.1 — must match qlab-consensus / qlab-bench.
