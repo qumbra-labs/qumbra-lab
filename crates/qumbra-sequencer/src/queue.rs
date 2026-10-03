@@ -7,7 +7,8 @@
 //!                     <id>/<key> 64 lower-case hex; <check> the first 16 hex
 //!                     digits of Keccak-256 over the record before it
 //! DIR/items/<id>.bin  the artifact's bytes (Keccak-256 = <id>)
-//! DIR/state/<id>      the item's state: "queued\n" (S4 adds planned / landed)
+//! DIR/state/<id>      the item's state, one line: "queued" | "planned <n>" |
+//!                     "landed <height>" | "refused <why>"
 //! DIR/index.lock      held while an intake runs (O_EXCL)
 //! ```
 //!
@@ -50,31 +51,71 @@ pub const MAX_PENDING_BYTES: u64 = 1024 * crate::server::MAX_ARTIFACT_BYTES as u
 
 const RECORD_VERSION: &str = "1";
 
-/// An item's state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The longest refusal reason a state record carries.
+pub const MAX_WHY: usize = 200;
+
+/// An item's state. Intake writes `Queued` once, at admission; only the
+/// posting loop (S4) moves an item past it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     /// Admitted and waiting for a wrapper.
     Queued,
+    /// In the run's bundle `n`, built or posted, not yet seen on chain.
+    Planned(u64),
+    /// In a bundle the chain applied, at this height (observed through
+    /// `/v1/wrapper`'s `last_bundle_id`, never assumed from a POST).
+    Landed(u64),
+    /// Refused at plan time — the native statement or the member builder
+    /// named it — and never retried. The reason names the refusal only: no
+    /// value from the artifact.
+    Refused(String),
 }
 
 impl State {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             State::Queued => "queued",
+            State::Planned(_) => "planned",
+            State::Landed(_) => "landed",
+            State::Refused(_) => "refused",
+        }
+    }
+
+    /// The state record's one line.
+    fn record(&self) -> String {
+        match self {
+            State::Queued => "queued\n".into(),
+            State::Planned(n) => format!("planned {n}\n"),
+            State::Landed(h) => format!("landed {h}\n"),
+            State::Refused(why) => format!("refused {why}\n"),
         }
     }
 
     fn parse(s: &str) -> Option<State> {
-        match s {
-            "queued\n" => Some(State::Queued),
+        let line = s.strip_suffix('\n').filter(|l| !l.contains('\n'))?;
+        let num = |t: &str| t.parse::<u64>().ok().filter(|n| n.to_string() == t);
+        match line.split_once(' ') {
+            None if line == "queued" => Some(State::Queued),
+            Some(("planned", n)) => num(n).map(State::Planned),
+            Some(("landed", h)) => num(h).map(State::Landed),
+            Some(("refused", why)) if !why.is_empty() && why.len() <= MAX_WHY => Some(State::Refused(why.into())),
             _ => None,
         }
     }
 
-    fn pending(self) -> bool {
-        match self {
-            State::Queued => true,
-        }
+    /// Still owed a wrapper: counted against the pending bounds.
+    fn pending(&self) -> bool {
+        matches!(self, State::Queued | State::Planned(_))
+    }
+}
+
+/// Why an item that is `queued` is not being planned, if there is a reason
+/// beyond "its turn has not come" — today, every exit (lab #847 Q4: no V6
+/// exit can be built until the L2 read path exists).
+pub fn held_reason(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Exit => Some("no V6 exit can be built until the L2 read path exists (lab #847 Q4)"),
+        Kind::Claim => None,
     }
 }
 
@@ -184,8 +225,9 @@ impl Queue {
                     return Err(format!("{}: a key already held by item {} — refusing to start", at(), hex32(&other)));
                 }
             }
+            let pending = state.pending();
             let item = Item { id, kind, keys, len: bytes.len() as u64, state };
-            if state.pending() {
+            if pending {
                 q.pending_items += 1;
                 q.pending_bytes += item.len;
             }
@@ -260,6 +302,35 @@ impl Queue {
         Ok(())
     }
 
+    /// Move an item to `state` — the posting loop's write (S4); intake never
+    /// calls it. The record is rewritten atomically; the index and the keys
+    /// never change (a landed or refused item's keys stay admitted, so a
+    /// resubmission still replays or conflicts). A refusal reason is one line
+    /// of at most [`MAX_WHY`] bytes, or it is refused here.
+    pub fn set_state(&mut self, id: &[u8; 32], state: State) -> Result<(), String> {
+        if let State::Refused(why) = &state {
+            if why.is_empty() || why.len() > MAX_WHY || why.contains('\n') {
+                return Err(format!("a refusal reason is one line of 1..={MAX_WHY} bytes"));
+            }
+        }
+        let path = self.state_path(id);
+        let item = self.items.get_mut(id).ok_or_else(|| format!("no item {}", hex32(id)))?;
+        write_atomic(&path, state.record().as_bytes())?;
+        match (item.state.pending(), state.pending()) {
+            (true, false) => {
+                self.pending_items -= 1;
+                self.pending_bytes -= item.len;
+            }
+            (false, true) => {
+                self.pending_items += 1;
+                self.pending_bytes += item.len;
+            }
+            _ => {}
+        }
+        item.state = state;
+        Ok(())
+    }
+
     /// An item by id.
     pub fn item(&self, id: &[u8; 32]) -> Option<&Item> {
         self.items.get(id)
@@ -295,7 +366,7 @@ mod tests {
         drop(q);
         let q = Queue::open(&d).unwrap();
         let items: Vec<&Item> = q.items().collect();
-        assert_eq!((items.len(), items[0].id, items[0].state, items[0].kind), (1, c.id, State::Queued, Kind::Claim));
+        assert_eq!((items.len(), items[0].id, items[0].state.clone(), items[0].kind), (1, c.id, State::Queued, Kind::Claim));
         assert_eq!(q.decide(&c, W3C_CLAIM.len() as u64), Decision::Replay { id: c.id, kind: Kind::Claim });
         // Different bytes on the same cnf: a conflict naming the held item.
         let mut other = c.clone();
@@ -368,6 +439,40 @@ mod tests {
         assert!(!d.exists());
         Queue::open(&d).unwrap();
         assert_eq!(Queue::open_existing(&d).unwrap().items().count(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The loop's state writes survive a reopen; landing frees the pending
+    /// bound; a landed item's key still replays; a malformed record or an
+    /// over-long reason is refused.
+    #[test]
+    fn states_round_trip_and_free_the_pending_bound() {
+        let d = dir("states");
+        let c = classify(W3C_CLAIM, &w3c_chain()).unwrap();
+        let mut q = Queue::open(&d).unwrap();
+        q.admit(&c, W3C_CLAIM).unwrap();
+        assert_eq!(q.pending_items, 1);
+        q.set_state(&c.id, State::Planned(3)).unwrap();
+        assert_eq!(q.pending_items, 1, "planned is still owed a wrapper");
+        q.set_state(&c.id, State::Landed(268)).unwrap();
+        assert_eq!((q.pending_items, q.pending_bytes), (0, 0));
+        drop(q);
+        let q = Queue::open(&d).unwrap();
+        assert_eq!(q.item(&c.id).unwrap().state, State::Landed(268));
+        assert_eq!(q.decide(&c, W3C_CLAIM.len() as u64), Decision::Replay { id: c.id, kind: Kind::Claim });
+        let mut q = q;
+        assert!(q.set_state(&c.id, State::Refused("x".repeat(MAX_WHY + 1))).is_err());
+        assert!(q.set_state(&c.id, State::Refused("two\nlines".into())).is_err());
+        q.set_state(&c.id, State::Refused("the native statement refuses it: Nullifier".into())).unwrap();
+        drop(q);
+        assert_eq!(
+            Queue::open(&d).unwrap().item(&c.id).unwrap().state,
+            State::Refused("the native statement refuses it: Nullifier".into())
+        );
+        for bad in ["planned\n", "planned 03\n", "landed x\n", "refused \n", "queued", "queued\nqueued\n"] {
+            std::fs::write(d.join("state").join(hex32(&c.id)), bad).unwrap();
+            assert!(Queue::open(&d).err().unwrap().contains("unknown state record"), "{bad:?}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

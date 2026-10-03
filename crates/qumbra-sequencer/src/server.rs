@@ -14,9 +14,11 @@
 //! | 411 / 413 | no `Content-Length`, or one above [`MAX_ARTIFACT_BYTES`] — decided before the body is read |
 //! | 503 `{"v":1,"error":"queue full"}` | the pending queue is at its bound; nothing recorded |
 //!
-//! `GET /v1/intake/<id>` answers `{"v":1,"id":…,"state":"queued"|"unknown"}`
-//! — S4 adds `planned` and `landed`; a wallet's reader treats a state it does
-//! not know as "not landed".
+//! `GET /v1/intake/<id>` answers `{"v":1,"id":…,"state":…}` with `queued`
+//! (plus `"held":…` when it is not being planned, today every exit — #847
+//! Q4), `planned` (+ `"bundle"`), `landed` (+ `"height"`), `refused`
+//! (+ `"why"`), or `unknown`; a wallet's reader treats a state it does not
+//! know as "not landed".
 //!
 //! No answer and no log line carries an artifact's bytes, a `cnf` opening,
 //! `v` or `r_v`: ids, kinds and key *names* only.
@@ -108,8 +110,18 @@ impl Intake {
         let Some(id) = parse_hex32(id) else {
             return (400, format!(r#"{{"v":{v},"error":"an id is 64 lower-case hex digits"}}"#));
         };
-        let state = self.queue.item(&id).map_or("unknown", |i| i.state.name());
-        (200, format!(r#"{{"v":{v},"id":"{}","state":"{state}"}}"#, hex32(&id)))
+        use crate::queue::{held_reason, State};
+        let id_hex = hex32(&id);
+        let Some(item) = self.queue.item(&id) else {
+            return (200, format!(r#"{{"v":{v},"id":"{id_hex}","state":"unknown"}}"#));
+        };
+        let extra = match &item.state {
+            State::Queued => held_reason(item.kind).map_or(String::new(), |h| format!(r#","held":{}"#, json_str(h))),
+            State::Planned(n) => format!(r#","bundle":{n}"#),
+            State::Landed(h) => format!(r#","height":{h}"#),
+            State::Refused(why) => format!(r#","why":{}"#, json_str(why)),
+        };
+        (200, format!(r#"{{"v":{v},"id":"{id_hex}","state":"{}"{extra}}}"#, item.state.name()))
     }
 }
 
@@ -176,6 +188,30 @@ mod tests {
         for body in [i.post(W3C_CLAIM).1, i.status(&id).1] {
             assert!(!body.contains("50000000") && !body.contains("49999996"), "an answer named the amount: {body}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The status route follows the loop's writes: planned names its bundle,
+    /// landed its height, refused its reason; an exit's hold reason is the
+    /// Q4 sentence.
+    #[test]
+    fn status_follows_the_loops_states() {
+        use crate::queue::{held_reason, State};
+        let (mut i, d) = intake("states");
+        i.post(W3C_CLAIM);
+        let id = id_of(W3C_CLAIM);
+        let h = hex32(&id);
+        i.queue.set_state(&id, State::Planned(2)).unwrap();
+        assert_eq!(i.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"planned","bundle":2}}"#));
+        i.queue.set_state(&id, State::Landed(268)).unwrap();
+        assert_eq!(i.status(&h).1, format!(r#"{{"v":1,"id":"{h}","state":"landed","height":268}}"#));
+        i.queue.set_state(&id, State::Refused("the native statement refuses it: Nullifier".into())).unwrap();
+        assert_eq!(
+            i.status(&h).1,
+            format!(r#"{{"v":1,"id":"{h}","state":"refused","why":"the native statement refuses it: Nullifier"}}"#)
+        );
+        assert_eq!(held_reason(crate::intake::Kind::Claim), None);
+        assert!(held_reason(crate::intake::Kind::Exit).unwrap().contains("lab #847 Q4"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
