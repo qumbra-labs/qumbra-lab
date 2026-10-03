@@ -6,6 +6,13 @@
 //! seams live in [`crate::work`]; the state machine is what this module
 //! tests, without proving anything.
 //!
+//! **No pass plans an R member** (lab #847, the Q4 condition of design
+//! `l2-read-path-decision`): a bundle's members are claims, and S fillers
+//! once S3 lands — [`crate::members::PASS_MEMBER_TAGS`]. The node's derived
+//! L2 index (lab #860) cannot follow a registry write from the wire, so one
+//! R member would block every exit until format v2. The real work checks
+//! the tags before proving; `lib.rs` holds the sources to it.
+//!
 //! ## One bundle's life
 //!
 //! `planned` (its items marked `Planned(n)`, the bytes in `--out`, a pending
