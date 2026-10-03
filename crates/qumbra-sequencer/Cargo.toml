@@ -35,6 +35,9 @@ p3-uni-stark = "=0.6.1"
 bincode = "1"
 serde = "1"
 serde_json = "1"
+# S5: the key file's text, its seed and the filler seed are zeroized on drop
+# (already in the workspace: qumbra-wallet, qumbra-prover-service).
+zeroize = "1.9"
 # S2: the intake listener, the node's HTTP server pinned the same.
 tiny_http = "=0.12.0"
 
