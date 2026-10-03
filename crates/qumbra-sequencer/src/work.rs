@@ -21,7 +21,7 @@ use crate::bundle::{assemble, prove, self_check, sign, Timings};
 use crate::chain::{self, Anchor, Http};
 use crate::intake::Chain;
 use crate::key::SequencerKey;
-use crate::members::{first_refused, plan_claims, Keys, PlanError, K};
+use crate::members::{first_refused, pass_members_ok, plan_claims, Keys, PlanError, K};
 use crate::pass::{Clock, Draft, NotDrafted, Node, Work};
 use crate::queue::Refusal;
 use crate::state::{Built, RunState};
@@ -176,6 +176,7 @@ impl Work for RealWork {
             },
             Err(e) => return Err(format!("plan: {e:?}")), // debug-ok: PlanError from plan_claims names counts and roots, no opening
         };
+        pass_members_ok(&plan.members)?;
         let mut timings = Timings::new();
         let mut log = |what: &str| eprintln!("SEQ proving {what}");
         let proofs = prove(&plan, &mut timings, &mut log)?;

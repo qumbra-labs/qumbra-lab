@@ -94,7 +94,7 @@ fn u64_of(v: &Value, what: &str) -> Result<u64, String> {
     v.as_u64().ok_or_else(|| format!("{what} is not a u64"))
 }
 
-fn tag_name(t: WTag) -> &'static str {
+pub(crate) fn tag_name(t: WTag) -> &'static str {
     match t {
         WTag::S => "S",
         WTag::P => "P",

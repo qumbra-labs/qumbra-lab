@@ -85,6 +85,23 @@ mod tests {
         }
     }
 
+    /// Lab #847's Q4 condition, as text: outside tests, the pass's sources
+    /// (`pass.rs`, `work.rs`, `main.rs`) never name an R member and never call
+    /// the general planner — only `plan_claims`, whose members are all C —
+    /// and `work.rs` checks [`crate::members::pass_members_ok`] before proving.
+    #[test]
+    fn the_pass_plans_no_r_member() {
+        for (path, text) in SOURCES.iter().filter(|(p, _)| ["pass.rs", "work.rs", "main.rs"].contains(p)) {
+            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            for bad in ["WTag::R", "Inst::R", "members::plan(", "plan(&", " plan("] {
+                assert!(!code.contains(bad), "{path} names `{bad}` outside tests");
+            }
+        }
+        let work = include_str!("work.rs");
+        let (before, after) = work.split_once("pass_members_ok(&plan.members)?;").expect("work.rs checks the pass's member tags");
+        assert!(before.contains("plan_claims(") && after.contains("prove(&plan,"), "the check sits between planning and proving");
+    }
+
     /// The binary's `run` drives the one real [`crate::work::RealWork`], whose
     /// draft calls the real prover, and nothing in the crate outside tests
     /// defines another `Work` — the stub seam exists only in `pass`'s tests

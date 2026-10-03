@@ -261,6 +261,28 @@ pub enum PlanError {
 /// A wrapper's member count (wrapper version 1's K, lab #785 Q1).
 pub const K: usize = 16;
 
+/// **The member kinds a posting pass may emit** (lab #847, the Q4 condition
+/// of design `l2-read-path-decision`): claims, and S fillers once S3 lands —
+/// **never R**. The node's derived L2 index (lab #860, R1) cannot follow a
+/// registry write from the wire, so one R member would block every exit
+/// until format v2. [`plan`] (f5box's general planner) can still plan R;
+/// the pass never calls it — `lib.rs`'s `the_pass_plans_no_r_member` holds
+/// that — and [`pass_members_ok`] refuses anything else before proving.
+pub const PASS_MEMBER_TAGS: [WTag; 1] = [WTag::C];
+
+/// Every member's tag is one [`PASS_MEMBER_TAGS`] allows; else the first one
+/// that is not, by slot and tag.
+pub fn pass_members_ok(members: &[Member]) -> Result<(), String> {
+    match members.iter().position(|m| !PASS_MEMBER_TAGS.contains(&m.tag)) {
+        None => Ok(()),
+        Some(i) => Err(format!(
+            "member {i} is {}: a posting pass emits only {} members (lab #847 Q4: no R in v0/v1) — not proving",
+            crate::state::tag_name(members[i].tag),
+            PASS_MEMBER_TAGS.map(crate::state::tag_name).join(", ")
+        )),
+    }
+}
+
 /// **Lab #847 S4: a wrapper of wallets' claims only** — every member a claim
 /// file intake verified, in the order given. `absorbed` is the four roots
 /// this wrapper absorbs, oldest first, chosen by the caller (the loop picks
@@ -708,6 +730,22 @@ mod tests {
 
     /// Elimination names the culprit: with sixteen copies of one claim, the
     /// first applies and the second repeats its cnf — item 1.
+    /// A pass emits claims only (S once S3 lands), never R: the guard
+    /// passes a claims-only member list and names the first other member.
+    #[test]
+    fn a_pass_emits_only_its_member_tags() {
+        assert_eq!(PASS_MEMBER_TAGS, [WTag::C]);
+        assert!(!PASS_MEMBER_TAGS.contains(&WTag::R));
+        let c = Member { tag: WTag::C, pvs: w3c_file().pvs, write: None };
+        assert_eq!(pass_members_ok(&vec![c.clone(); K]), Ok(()));
+        for (t, name) in [(WTag::R, "R"), (WTag::S, "S"), (WTag::P, "P")] {
+            let mut ms = vec![c.clone(); K];
+            ms[5] = Member { tag: t, ..c.clone() };
+            let err = pass_members_ok(&ms).unwrap_err();
+            assert!(err.starts_with(&format!("member 5 is {name}:")) && err.contains("only C members"), "{err}");
+        }
+    }
+
     #[test]
     fn elimination_names_the_repeated_claim() {
         let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
