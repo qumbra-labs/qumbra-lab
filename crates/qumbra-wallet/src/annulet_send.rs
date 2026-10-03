@@ -523,11 +523,13 @@ pub struct Session<E: Endpoint> {
 /// `pin`, every seal to the verified tip, each note's block recomputed
 /// ([`scan_annulet_verified`]) — then the tariff, checked against that
 /// genesis. The index every plan selects from is built only from the verified
-/// scan; there is no unverified path into a [`Session`]. `pin` is required: `None` is
-/// refused by name ([`crate::annulet_verify::VerifyRefusal::NoPin`]) before
-/// anything is fetched. The spends subtracted are still the endpoint's list
-/// (lab #853): a withheld spend can make a plan pick a spent note, which the
-/// node refuses after the proof — time lost, never money.
+/// scan. `pin` is required: `None` is refused by name
+/// ([`crate::annulet_verify::VerifyRefusal::NoPin`]) before anything is
+/// fetched. Two reads are still the endpoint's word, not the verified chain's:
+/// the spends subtracted (lab #853 — a withheld spend can make a plan pick a
+/// spent note, which the node refuses after the proof: time lost, never money)
+/// and the registry leaf [`send_annulet`] reads for the shape (a lie there
+/// fails the proof, never a balance).
 pub fn open_session<E: Endpoint>(
     w: &WalletDir,
     endpoint: E,
@@ -617,6 +619,9 @@ pub fn send_annulet<E: Endpoint>(
     rng: &mut StdRng,
 ) -> Result<SendReport, SendRefusal> {
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
+    // Unverified: the endpoint's word on the leaf, read only to pick the
+    // shape. A lie here fails the proof, never a balance — out of AS-1's
+    // scope (lab #869).
     let leaf = session.served.registry(u64::from(asset))?.leaf;
     let shape = shape_for(&leaf);
     let wallet = w.wallet();
