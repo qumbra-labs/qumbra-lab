@@ -1128,13 +1128,21 @@ impl DiscoveryServer {
                             };
                             respond_body(&snapshot, wire_form(&form_view), h)
                         }
+                        // Lab #860 R2: one stored bundle's raw bytes.
+                        (None, None) if path.starts_with(BUNDLE_PATH_PREFIX) => {
+                            let snapshot = match view.lock() {
+                                Ok(g) => Arc::clone(&g),
+                                Err(p) => Arc::clone(&p.into_inner()),
+                            };
+                            respond_bundle(&snapshot, form_view.sections, &path[BUNDLE_PATH_PREFIX.len()..])
+                        }
                         (None, None) => Err((
                             404,
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {COINBASE_PATH}?from=&to=, {EXITS_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
                                  {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {REGISTRY_SLOT_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
-                                 {FULL_PATH_SHAPE}, {HEADERS_PATH}?from=&to=, {BODY_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
+                                 {FULL_PATH_SHAPE}, {HEADERS_PATH}?from=&to=, {BODY_PATH_SHAPE}, {BUNDLE_PATH_PREFIX}{{height}}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
                     },
@@ -1436,6 +1444,54 @@ pub fn respond_headers(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, qu
         units.push(unit);
     }
     Ok(qlab_p2p::served::encode_headers_page(wf, from, &units))
+}
+
+/// `GET /v1/bundle/{height}` (lab #860 R2): the raw bytes of the wrapper
+/// bundle the main-chain block at `height` carries — no prefix, the id is the
+/// integrity check (#860 ASK 5). On the discovery listener; the operator
+/// listener's `POST /v1/bundle` is another socket.
+pub const BUNDLE_PATH_PREFIX: &str = "/v1/bundle/";
+
+/// What a node off V6 answers on [`BUNDLE_PATH_PREFIX`].
+pub const BUNDLE_NOT_V6: &str = "not a V6 net: no block carries a wrapper bundle";
+
+/// The socket-free `GET /v1/bundle/{height}` core (lab #860 R2), from the
+/// projection `/v1/compact` reads ([`DiscoveryView::stored`]).
+///
+/// The bytes come through `BundleRef::bytes`, which re-hashes a log-backed
+/// bundle against its id, so a stored bundle that moved under the node is a
+/// 503 by name, never served. Refusals: off V6 — 400; a non-numeric height —
+/// 400; no such main-chain block, or a block without a bundle — 404, by name;
+/// unreadable — 503; longer than `MAX_V6_BODY_BYTES` — 500 (consensus bounds
+/// a V6 body, so that is a broken invariant).
+pub fn respond_bundle(
+    view: &DiscoveryView,
+    sections: qlab_devnet::forms::BodySections,
+    h: &str,
+) -> Result<Vec<u8>, (u16, String)> {
+    match sections {
+        qlab_devnet::forms::BodySections::V6 => {}
+        qlab_devnet::forms::BodySections::None => return Err((400, BUNDLE_NOT_V6.to_string())),
+    }
+    let height = h.parse::<u64>().map_err(|_| (400, format!("invalid height `{h}`")))?;
+    if let Some(gap) = stored_gap(view) {
+        return Err(gap);
+    }
+    let block = view.stored.get(height as usize).ok_or_else(|| {
+        (
+            404,
+            format!(
+                "no such block: this node's projection holds no main-chain height {height} (tip {})",
+                view.tip_height().map(|t| t.to_string()).unwrap_or_else(|| "none".into())
+            ),
+        )
+    })?;
+    let r = block.bundle_ref().ok_or_else(|| (404, format!("no bundle: the block at height {height} carries none")))?;
+    let bytes = r.bytes().map_err(|e| (503, format!("height {height}: the bundle cannot be read back: {e}")))?;
+    if bytes.len() > qlab_devnet::body::MAX_V6_BODY_BYTES {
+        return Err((500, format!("height {height}: a {} B bundle exceeds the V6 body bound", bytes.len())));
+    }
+    Ok(bytes.to_vec())
 }
 
 /// `/v1/block/{h}/body` → `h`, or `None` for any other shape.
@@ -2710,6 +2766,58 @@ mod tests {
             let (status, _) = get(addr, path);
             assert!(status.starts_with("HTTP/1.1 400"), "{path} => {status}");
         }
+        srv.shutdown();
+    }
+
+    /// **Lab #860 R2**: `GET /v1/bundle/{height}` serves a stored bundle's raw
+    /// bytes (they hash to the block's id), refuses by name, and stays off L1.
+    #[test]
+    fn serves_a_stored_bundle_raw_and_refuses_by_name() {
+        use qlab_node::{BundleRef, ChainStore, MemChainStore, StoredSections};
+        let bytes = b"a wrapper bundle's bytes".to_vec();
+        let genesis = stored(0, [0; 32], vec![]);
+        let mut prev = genesis.header().header_hash();
+        let mut store = MemChainStore::new(genesis);
+        for h in 1..=2u64 {
+            let mut b = stored(h, prev, vec![]);
+            if h == 2 {
+                b.sections = Some(StoredSections { finality: Vec::new(), bundle: BundleRef::resident(&bytes) });
+            }
+            prev = b.header().header_hash();
+            store.put_block(b).expect("applies");
+        }
+        let mut view = DiscoveryView::default();
+        view.refresh(&store);
+        let v6 = qlab_devnet::forms::BodySections::V6;
+        let got = respond_bundle(&view, v6, "2").expect("the bundle at height 2");
+        assert_eq!(got, bytes);
+        assert_eq!(qlab_devnet::hash::keccak256(&got), view.stored[2].bundle_ref().unwrap().id);
+        assert_eq!(respond_bundle(&view, v6, "1").unwrap_err().0, 404, "a block without a bundle");
+        assert_eq!(respond_bundle(&view, v6, "9").unwrap_err().0, 404, "no such block");
+        assert_eq!(respond_bundle(&view, v6, "x").unwrap_err().0, 400);
+        assert_eq!(
+            respond_bundle(&view, qlab_devnet::forms::BodySections::None, "2"),
+            Err((400, BUNDLE_NOT_V6.to_string()))
+        );
+
+        // And over a real socket, on a V6 form view.
+        let (tx, _rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let srv = DiscoveryServer::start_with_mine(
+            "127.0.0.1:0",
+            Arc::new(Mutex::new(Arc::new(view))),
+            no_leaves(),
+            no_anchors(),
+            tx,
+            None,
+            Arc::new(Mutex::new(Arc::new(RegistryView::default()))),
+            Arc::new(FormView { form: qlab_devnet::forms::GenesisForm::V5, sections: v6, ..FormView::default() }),
+        )
+        .expect("bind");
+        let (status, body) = get(srv.addr(), "/v1/bundle/2");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(body, bytes);
+        let (status, _) = get(srv.addr(), "/v1/bundle/1");
+        assert!(status.starts_with("HTTP/1.1 404"), "{status}");
         srv.shutdown();
     }
 
