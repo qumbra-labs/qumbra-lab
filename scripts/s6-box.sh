@@ -40,9 +40,17 @@
 #             before `SEQ landed` in its log): the pending record and the
 #             bytes in --out carry it.
 #
+# Locks: `intake` and `run` hold `queue/index.lock` and `run` also
+# `seq-state.json.lock` — files created new and removed when the process
+# exits cleanly. The intake installs no signal handler, so it is stopped with
+# TERM; a TERM- or -9-killed process leaves its lock file behind, and this
+# script removes it only after the holder's pid is confirmed gone (what the
+# lock's own refusal tells an operator to do).
+#
 # Measures (all under RUN_DIR):
-#   seed/seed.{time,rss}            peak RSS (the L1 proofs), wall; seed.err
-#                                   carries each burn's prove_secs
+#   seed/seed-<n>.{time,rss,err}    one set per seed run: the max peak RSS
+#                                   (the L1 proofs), the total wall, and each
+#                                   burn's prove_secs go into the verdict
 #   seq-out/bundle-{0,1}.json       per-member timings (member_i_S/C), bytes
 #   pass1/run.{time,rss}            the claims-only pass: peak, wall
 #   pass2/run-a.{time,rss}          the filler pass up to the kill
@@ -125,6 +133,8 @@ run_measured() {
 tip_of() { { grep -o 'TELEMETRY tip=[0-9]*' "$1" 2>/dev/null || true; } | tail -1 | cut -d= -f2; }
 peak_kib() { { grep 'Maximum resident' "$1" 2>/dev/null || true; } | awk '{print $NF}'; }
 wall_of() { { grep 'Elapsed (wall clock)' "$1" 2>/dev/null || true; } | awk '{print $NF}'; }
+# GNU time's wall (h:mm:ss or m:ss.ss) in whole seconds; nothing if absent.
+wall_s() { wall_of "$1" | awk -F: '{ s = 0; for (i = 1; i <= NF; i++) s = s * 60 + $i; printf "%d\n", s }'; }
 
 LAST_WAIT=""; LAST_BEAT=0
 wait_log() {
@@ -164,23 +174,54 @@ start_producer() {
 }
 producer_up() { local pid; pid=$(cat "$RUN/producer/node.pid" 2>/dev/null || true); [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
 
-stop_pid_file() { # pidfile what
+stop_pid_file() { # pidfile what signal
   local pid; pid=$(cat "$1" 2>/dev/null || true)
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
-  kill -INT "$pid"
+  # A process signalled in its first second may not have installed its
+  # handler yet (box run 3 of F5-6): never stop one younger than 5 s.
+  local started; started=$(cat "${1%.pid}.started" 2>/dev/null || echo 0)
+  while [ $(( $(date +%s) - started )) -lt 5 ]; do sleep 1; done
+  kill "-$3" "$pid"
   for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-  kill -0 "$pid" 2>/dev/null && die "$2 did not stop on SIGINT within 120 s"
-  log "stopped $2 (pid $pid)"
+  kill -0 "$pid" 2>/dev/null && die "$2 did not stop on SIG$3 within 120 s"
+  log "stopped $2 (pid $pid, SIG$3)"
 }
+
+# The queue (and state) lock files a killed holder left: removed only when no
+# intake or pass is alive.
+clear_stale_locks() {
+  intake_up && return 0
+  [ -n "${PASS_PID:-}" ] && kill -0 "$PASS_PID" 2>/dev/null && return 0
+  for l in "$QDIR/index.lock" "$STATE.lock"; do
+    [ -e "$l" ] && { rm -f "$l"; log "removed the stale lock $l (its holder is gone)"; }
+  done
+  return 0
+}
+stop_intake() { stop_pid_file "$RUN/intake/intake.pid" intake TERM; clear_stale_locks; }
 
 start_intake() {
   mkdir -p "$RUN/intake"
+  clear_stale_locks
   "$SEQ" intake --genesis "$GEN" --queue "$QDIR" --listen "127.0.0.1:$P_INT" >>"$RUN/intake/intake.out" 2>>"$RUN/intake/intake.err" &
-  echo $! > "$RUN/intake/intake.pid"
-  for _ in $(seq 1 30); do curl -s -o /dev/null "http://127.0.0.1:$P_INT/v1/intake/00" && break; sleep 1; done
+  echo $! > "$RUN/intake/intake.pid"; date +%s > "$RUN/intake/intake.started"
+  local up=""
+  for _ in $(seq 1 30); do curl -s -o /dev/null "http://127.0.0.1:$P_INT/v1/intake/00" && { up=1; break; }; sleep 1; done
+  [ -n "$up" ] || die "the intake did not answer within 30 s (see $RUN/intake/intake.err)"
   log "intake up (pid $(cat "$RUN/intake/intake.pid"))"
 }
 intake_up() { local pid; pid=$(cat "$RUN/intake/intake.pid" 2>/dev/null || true); [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+
+# On any exit — a die included — nothing is left burning on the box: a pass
+# in flight and the intake get TERM, the producer INT (its own handler
+# flushes); the samplers end with their processes.
+cleanup() {
+  [ -n "${PASS_PID:-}" ] && kill -TERM "$PASS_PID" 2>/dev/null || true
+  for f in "$RUN/intake/intake.pid:TERM" "$RUN/producer/node.pid:INT"; do
+    local pid; pid=$(cat "${f%%:*}" 2>/dev/null || true)
+    [ -n "$pid" ] && kill "-${f##*:}" "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
 
 w() { "$WALLET" "$@" --net t2 --dir "$WDIR" --url "$DISC"; }
 
@@ -261,26 +302,29 @@ fi
 # --- seed ------------------------------------------------------------------------------------
 if ! is_done seed; then
   for i in $(seq 1 30); do
+    [ -e "$SEED/seed-$i.time" ] && continue   # a rerun of this phase keeps every earlier run's files
     seq_seed --plan > "$SEED/plan-$i.out" 2>"$SEED/plan-$i.err" || true
-    if run_measured "$SEED/seed" "$SEQ" seed --genesis "$GEN" --key "$KEY" --node "$DISC" --out "$SEED" --burn "$BURN" \
+    if run_measured "$SEED/seed-$i" "$SEQ" seed --genesis "$GEN" --key "$KEY" --node "$DISC" --out "$SEED" --burn "$BURN" \
          --count "$COUNT" --intake "127.0.0.1:$P_INT"; then
       break
     fi
     producer_up || die "the producer exited"
-    wait_log "seed run $i not done: $(tail -1 "$SEED/seed.err")"; sleep 60
-    [ "$i" = 30 ] && die "seed did not finish in 30 runs (see $SEED/seed.err)"
+    wait_log "seed run $i not done: $(tail -1 "$SEED/seed-$i.err")"; sleep 60
+    [ "$i" = 30 ] && die "seed did not finish in 30 runs (see $SEED/seed-*.err)"
   done
-  n=$(ls "$SEED"/claims/*.claim.taken 2>/dev/null | wc -l)
+  n=$(find "$SEED/claims" -maxdepth 1 -name '*.claim.taken' 2>/dev/null | wc -l | tr -d ' ')
   [ "$n" -ge "$COUNT" ] || die "the intake holds $n seed claims, not $COUNT"
-  log "seed: $n claims taken; peak $(peak_kib "$SEED/seed.time") KiB over the runs' last; burns: $(grep -c 'Built' "$SEED/seed.err" || true)"
+  log "seed: $n claims taken"
   done_mark seed
 fi
 
 # --- traffic, pass 1 ------------------------------------------------------------------------
 if ! is_done pass1; then
   user_claim 1
-  stop_pid_file "$RUN/intake/intake.pid" intake
+  stop_intake
   mkdir -p "$RUN/pass1"
+  for f in run.out run.err run.rss run.time; do : > "$RUN/pass1/$f"; done   # this attempt's evidence only
+  clear_stale_locks
   run_measured "$RUN/pass1/run" "${PASS[@]}" || die "pass 1 did not drain (exit $?; see $RUN/pass1/run.err)"
   grep -q 'SEQ landed bundle' "$RUN/pass1/run.err" || die "pass 1 landed nothing"
   log "pass 1 landed: $(grep 'SEQ landed bundle' "$RUN/pass1/run.err" | tail -1); peak $(peak_kib "$RUN/pass1/run.time") KiB, wall $(wall_of "$RUN/pass1/run.time")"
@@ -292,22 +336,29 @@ intake_up || start_intake
 # --- pass 2: fillers, and the restart drill ---------------------------------------------------
 if ! is_done pass2; then
   user_claim 2
-  stop_pid_file "$RUN/intake/intake.pid" intake
+  stop_intake
   mkdir -p "$RUN/pass2"
   if [ ! -e "$RUN/pass2/killed" ]; then
+    for f in run-a.out run-a.err run-a.rss run-a.time; do : > "$RUN/pass2/$f"; done
+    clear_stale_locks
     /usr/bin/time -v -o "$RUN/pass2/run-a.time" "${PASS[@]}" >>"$RUN/pass2/run-a.out" 2>>"$RUN/pass2/run-a.err" &
     tpid=$!
     cpid=""; for _ in $(seq 1 50); do cpid=$(pgrep -P "$tpid" | head -1 || true); [ -n "$cpid" ] && break; sleep 0.1; done
     [ -n "$cpid" ] || die "pass 2 did not start"
+    PASS_PID=$cpid
     sample_rss "$cpid" "$RUN/pass2/run-a.rss"
     until grep -q 'SEQ drafted bundle' "$RUN/pass2/run-a.err" 2>/dev/null; do
       kill -0 "$cpid" 2>/dev/null || die "pass 2 ended before drafting (see $RUN/pass2/run-a.err)"
       sleep 5
     done
-    kill -9 "$cpid"; wait "$tpid" 2>/dev/null || true
+    kill -9 "$cpid" || die "pass 2 (run-a) exited before the kill — see $RUN/pass2/run-a.err"
+    wait "$tpid" 2>/dev/null || true
+    PASS_PID=""
     date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN/pass2/killed"
     log "pass 2 KILLED (-9) after: $(grep 'SEQ drafted bundle' "$RUN/pass2/run-a.err" | tail -1)"
   fi
+  for f in run-b.out run-b.err run-b.rss run-b.time; do : > "$RUN/pass2/$f"; done
+  clear_stale_locks   # the -9'd pass left queue/index.lock and the state lock
   run_measured "$RUN/pass2/run-b" "${PASS[@]}" || die "the rerun did not drain (see $RUN/pass2/run-b.err)"
   grep -q 'SEQ landed bundle' "$RUN/pass2/run-b.err" || die "the rerun landed nothing"
   before_land=$(sed -n '1,/SEQ landed bundle/p' "$RUN/pass2/run-b.err" | { grep -c 'SEQ proving' || true; })
@@ -317,11 +368,18 @@ if ! is_done pass2; then
   done_mark pass2
 fi
 
-stop_pid_file "$RUN/intake/intake.pid" intake
-stop_pid_file "$RUN/producer/node.pid" producer
-# The filler pass's manifest: the newest bundle-*.json with an S member.
-M2=$(ls -t "$OUT"/bundle-*.json 2>/dev/null | head -1 || true)
-s_times=$([ -n "$M2" ] && jq -r '[.timings_seconds[] | select(.step | test("_S$")) | .seconds] | "n=\(length) min=\(min) max=\(max) mean=\(add / length)"' "$M2" 2>/dev/null || true)
-fillers=$([ -n "$M2" ] && jq '[.members[] | select(.filler == true)] | length' "$M2" 2>/dev/null || true)
-log "measurements: $SEED/seed.time, $RUN/pass1/run.time, $RUN/pass2/run-{a,b}.time, $OUT/bundle-*.json, producer/node.time"
-echo "S6 BOX VERDICT: PASS — seed $COUNT claims (seed peak $(peak_kib "$SEED/seed.time") KiB); pass 1 (16 C) peak $(peak_kib "$RUN/pass1/run.time") KiB wall $(wall_of "$RUN/pass1/run.time"); pass 2 (1 C + 15 S) killed after drafting and landed by the rerun without re-proving (run-a peak $(peak_kib "$RUN/pass2/run-a.time") KiB); $fillers members marked filler; S member seconds ${s_times:-see $M2}"
+stop_intake
+stop_pid_file "$RUN/producer/node.pid" producer INT
+sleep 2   # GNU time writes node.time as the producer exits
+# The filler pass's manifest: the highest-numbered bundle (pass 2's), by number.
+M2=$(find "$OUT" -maxdepth 1 -name 'bundle-*.json' | sort -V | tail -1)
+[ -n "$M2" ] || die "no bundle manifest under $OUT"
+fillers=$(jq '[.members[] | select(.filler == true)] | length' "$M2")
+n_s=$(jq '[.timings_seconds[] | select(.step | test("_S$"))] | length' "$M2")
+[ "$fillers" = 15 ] && [ "$n_s" = 15 ] || die "$M2 has $fillers filler member(s) and $n_s S proving step(s), not 15 and 15"
+s_times=$(jq -r '[.timings_seconds[] | select(.step | test("_S$")) | .seconds] | "min \(min | . * 100 | round / 100) max \(max | . * 100 | round / 100) mean \(add / length | . * 100 | round / 100)"' "$M2")
+seed_peak=$(for f in "$SEED"/seed-*.time; do peak_kib "$f"; done | sort -n | tail -1)
+seed_wall=$(for f in "$SEED"/seed-*.time; do wall_s "$f"; done | awk '{ s += $1 } END { print s + 0 }')
+burn_secs=$(cat "$SEED"/seed-*.err 2>/dev/null | { grep -o 'prove_secs: [0-9.]*' || true; } | awk '{print $2}' | paste -sd' ' -)
+log "measurements: $SEED/seed-*.time, $RUN/pass1/run.time, $RUN/pass2/run-{a,b}.time, $M2, producer/node.time"
+echo "S6 BOX VERDICT: PASS — seed: $COUNT claims taken, $(ls "$SEED"/seed-*.time | wc -l | tr -d ' ') run(s), max peak $seed_peak KiB, total wall ${seed_wall} s, burn prove_secs [${burn_secs}]; pass 1 (16 C): peak $(peak_kib "$RUN/pass1/run.time") KiB, wall $(wall_s "$RUN/pass1/run.time") s; pass 2 (1 C + 15 S): killed -9 after drafting (run-a peak $(peak_kib "$RUN/pass2/run-a.time") KiB), rerun landed it with no re-prove in $(wall_s "$RUN/pass2/run-b.time") s; $fillers filler members, S seconds $s_times ($M2); producer peak $(peak_kib "$RUN/producer/node.time") KiB over $(wall_s "$RUN/producer/node.time") s"
