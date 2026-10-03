@@ -233,6 +233,10 @@ struct Pending {
     prev: Option<[u8; 32]>,
     items: Vec<[u8; 32]>,
     reposts: u32,
+    /// The work's record of the bundle as built. For the real work it
+    /// carries the sequencer's own `credited` openings (filler outputs, the
+    /// fee note) — the sequencer's data, the same the run state keeps once
+    /// the bundle lands; never a wallet's opening.
     built: Value,
 }
 

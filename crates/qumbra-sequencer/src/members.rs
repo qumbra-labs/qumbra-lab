@@ -261,6 +261,8 @@ pub enum PlanError {
     /// filler) short of K = 16 — `have` counts both — or more claims than a
     /// wrapper holds (the caller's mistake).
     WrongCount { have: usize, need: usize },
+    /// Lab #847 S3: no claim — a wrapper of padding alone is never planned.
+    NoClaim,
 }
 
 /// A wrapper's member count (wrapper version 1's K, lab #785 Q1).
@@ -299,7 +301,10 @@ pub fn pass_members_ok(members: &[Member]) -> Result<(), String> {
 }
 
 /// The notes in `owned` the next wrapper may spend: in C at its `C_in`,
-/// nullifier not yet in N — in `owned`'s order, each once.
+/// nullifier not yet in N — each once, **largest value first** (stable, so
+/// equal values keep `owned`'s order). Every filler mints a zero-valued
+/// note; this keeps those last, so value-bearing notes carry the fillers
+/// and the zero ones are drawn only when nothing else is left.
 pub fn spendable(state: &WState, keys: &Keys, owned: &[Owned]) -> Vec<Owned> {
     let c_count = state.l2.c.len();
     let mut out: Vec<Owned> = Vec::new();
@@ -309,6 +314,7 @@ pub fn spendable(state: &WState, keys: &Keys, owned: &[Owned]) -> Vec<Owned> {
             out.push(*n);
         }
     }
+    out.sort_by_key(|n| std::cmp::Reverse(n.value));
     out
 }
 
@@ -371,6 +377,9 @@ pub fn plan_claims(
     owned: &[Owned],
     keys: &Keys,
 ) -> Result<Plan, PlanError> {
+    if files.is_empty() {
+        return Err(PlanError::NoClaim);
+    }
     let notes = spendable(state, keys, owned);
     let n_fill = K.saturating_sub(files.len());
     if files.len() > K || notes.len() < n_fill {
@@ -880,11 +889,15 @@ mod tests {
         let a = anchor_of(&f);
         let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone()], &owned[..K - 2], &keys).err().unwrap();
         assert_eq!(err, PlanError::WrongCount { have: K - 1, need: K });
+        let err = plan_claims(&state, &prev, [a; M_ABS], Vec::new(), &owned, &keys).err().unwrap();
+        assert_eq!(err, PlanError::NoClaim, "never a wrapper of padding alone");
         let p = plan_claims(&state, &prev, [a; M_ABS], vec![f], &owned, &keys).unwrap();
         assert_eq!(p.members.iter().map(|m| m.tag).collect::<Vec<_>>(), [vec![WTag::C], vec![WTag::S; K - 1]].concat());
         assert_eq!(p.filler, [vec![false], vec![true; K - 1]].concat());
         assert_eq!(pass_members_ok(&p.members), Ok(()));
-        assert_eq!(p.spent, owned);
+        let mut by_value = owned.clone();
+        by_value.reverse();
+        assert_eq!(p.spent, by_value, "largest first");
         assert_eq!(p.credited.len(), 2 * (K - 1) + 1, "two outputs per filler and the fee note");
         let fee = qlab_wprover::f4::wleaf::fee_of(&p.members);
         let total = |ns: &[Owned]| ns.iter().map(|n| n.value).sum::<u64>();
@@ -893,6 +906,20 @@ mod tests {
         after.apply(&p.inp, &p.members).unwrap();
         assert_eq!(spendable(&after, &keys, &p.credited), p.credited, "every credit is the sequencer's to spend");
         assert!(spendable(&after, &keys, &owned).is_empty());
+    }
+
+    /// Zero-valued notes (one per filler) are drawn last: spendable orders
+    /// by value, largest first, stably; a spent or unknown note is never
+    /// offered, nor one listed twice.
+    #[test]
+    fn spendable_draws_zero_notes_last() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, _, owned) = seeded(4, &keys);
+        // owned values: 0, 1000, 2000, 3000; a stranger's note is not in C.
+        let stranger = Owned { value: 9_000, rho: [8; 4], rseed: [8; 4] };
+        let listed = [owned[0], owned[2], stranger, owned[1], owned[3], owned[2]];
+        let got: Vec<u64> = spendable(&state, &keys, &listed).iter().map(|n| n.value).collect();
+        assert_eq!(got, [3_000, 2_000, 1_000, 0]);
     }
 
     /// Elimination names the culprit: with sixteen copies of one claim, the
