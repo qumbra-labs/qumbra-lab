@@ -3,7 +3,13 @@
 # `qumbra-sequencer` end to end, measured. Coordinator-run, on the box only
 # (never a laptop): an L1 proof is ≈ 31 GiB.
 #
-#   scripts/s6-box.sh RUN_DIR [--bin DIR] [--port-base N] [--count N]
+#   scripts/s6-box.sh RUN_DIR [--bin DIR] [--port-base N] [--count N] [--resume-from TAR]
+#
+# --resume-from TAR restores a RUN_DIR pulled from an earlier box (tar of the
+# run dir, extracted into RUN_DIR's parent when RUN_DIR is empty) and goes on
+# from its phase markers: the chain, the wallets, the queue and the seed
+# state carry over, so maturity and finished phases are not paid again.
+# Pid and lock files from the old box are dropped first.
 #
 # RUN_DIR holds everything the run writes and must lie OUTSIDE any git
 # worktree (refused otherwise). Binaries (not built here):
@@ -20,8 +26,11 @@
 #   producer  one producer with all 21 committee keys, the operator listener,
 #             75 s blocks, under time -v + a 1 s VmRSS sampler.
 #   intake    `qumbra-sequencer intake` on loopback over RUN_DIR/queue.
-#   fund      the user wallet sends the sequencer's L1 wallet enough for
-#             COUNT burns (retried until its coinbase has matured).
+#   fund-notes the user wallet sends the sequencer's L1 wallet ONE NOTE PER
+#             BURN still to make (BURN + 1 QMB each), each mined before the
+#             next — so no burn waits on another burn's change finalizing
+#             (run 1 on 2026-10-03 measured ≈ 10 min of finality lag per burn
+#             when every burn spent the last one's change).
 #   seed      `seed --plan`, then `seed` under time -v + sampler: COUNT burns
 #             (one L1 proof each, mined one after another) and COUNT claims
 #             credited to the sequencer, handed to the intake. Rerun until
@@ -68,15 +77,34 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$HERE/target/release"
 PORT=39500
 COUNT=15
+RESUME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin) BIN=$(cd "$2" && pwd); shift 2 ;;
     --port-base) PORT=$2; shift 2 ;;
     --count) COUNT=$2; shift 2 ;;
+    --resume-from) RESUME=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
+if [ -n "$RESUME" ]; then
+  [ -r "$RESUME" ] || { echo "--resume-from $RESUME is not readable" >&2; exit 2; }
+  if [ ! -e "$RUN/phase-genesis.done" ]; then
+    top=$(tar -tf "$RESUME" | head -1 | cut -d/ -f1)
+    [ "$top" = "$(basename "$RUN")" ] || { echo "$RESUME holds $top/, not $(basename "$RUN")/" >&2; exit 2; }
+    tar -C "$(dirname "$RUN")" -xf "$RESUME" || { echo "extracting $RESUME failed" >&2; exit 2; }
+    # The old box's processes are gone: their pid files and lock files are stale.
+    find "$RUN" \( -name '*.pid' -o -name '*.timepid' -o -name 'index.lock' -o -name '*.json.lock' \) -type f -delete
+  fi
+fi
 touch "$RUN/box.log"
+if [ -n "$RESUME" ]; then
+  # The configs written by the first box name absolute paths: the run dir
+  # must be at the same path here (same user, same RUN_DIR).
+  cfg_dir=$(sed -n 's/^data_dir = "\(.*\)\/producer\/data"$/\1/p' "$RUN/producer/node.toml" 2>/dev/null || true)
+  [ -z "$cfg_dir" ] || [ "$cfg_dir" = "$RUN" ] || { echo "the restored configs name $cfg_dir, not $RUN — use RUN_DIR=$cfg_dir" >&2; exit 2; }
+  log "resumed from $RESUME"
+fi
 
 # --- preflight ---------------------------------------------------------------------
 if git -C "$RUN" rev-parse --show-toplevel >/dev/null 2>&1; then
@@ -284,24 +312,43 @@ intake_up || start_intake
 # --- fund: the sequencer's L1 wallet ------------------------------------------------------
 mkdir -p "$SEED"
 seq_seed() { "$SEQ" seed --genesis "$GEN" --key "$KEY" --node "$DISC" --out "$SEED" --burn "$BURN" --count "$COUNT" --intake "127.0.0.1:$P_INT" "$@"; }
-if ! is_done fund; then
+if ! is_done fund-notes; then
   seq_seed --plan > "$SEED/plan-0.out" 2>"$SEED/plan-0.err" || true
   SEQ_ADDR=$({ grep -o 'L1 wallet address [^ ]*' "$SEED/plan-0.out" || true; } | awk '{print $4}')
   [ -n "$SEQ_ADDR" ] || die "seed --plan named no L1 wallet address (see $SEED/plan-0.*)"
   echo "$SEQ_ADDR" > "$SEED/l1-address"
-  FUND=$(( (BURN + 100000000) * COUNT ))   # every burn, its fee, and room
-  until w send --node "$DISC" --scan-to "$(tip_of "$RUN/producer/node.out")" --to "$SEQ_ADDR" --amount "$FUND" \
-        >>"$SEED/fund.out" 2>>"$SEED/fund.err"; do
-    producer_up || die "the producer exited"
-    wait_log "funding not possible yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$SEED/fund.err")"; sleep 60
+  # How many burns are still to make (the plan's own count; a resumed run
+  # already holds some deposits), less the notes this phase already sent.
+  TO_BURN=$({ grep -o '[0-9]* burn(s) of' "$SEED/plan-0.out" || true; } | head -1 | awk '{print $1}')
+  [ -n "$TO_BURN" ] || die "seed --plan named no burn count (see $SEED/plan-0.out)"
+  SENT=$(cat "$SEED/fund-notes.sent" 2>/dev/null || echo 0)
+  NOTE=$((BURN + 100000000))   # one burn, its posted fee, and room
+  log "funding $TO_BURN note(s) of $NOTE bessel to $SEQ_ADDR ($SENT already sent)"
+  while [ "$SENT" -lt "$TO_BURN" ]; do
+    t0=$(tip_of "$RUN/producer/node.out")
+    until w send --node "$DISC" --scan-to "$(tip_of "$RUN/producer/node.out")" --to "$SEQ_ADDR" --amount "$NOTE" \
+          >>"$SEED/fund.out" 2>>"$SEED/fund.err"; do
+      producer_up || die "the producer exited"
+      wait_log "fund note $((SENT + 1)) not possible yet (tip $(tip_of "$RUN/producer/node.out")): $(tail -1 "$SEED/fund.err")"; sleep 60
+    done
+    SENT=$((SENT + 1)); echo "$SENT" > "$SEED/fund-notes.sent"
+    # Mined before the next send: otherwise the next selection reads the same
+    # unmined input. Two blocks past the tip it was built at.
+    until t=$(tip_of "$RUN/producer/node.out"); [ -n "$t" ] && [ "$t" -ge $(( ${t0:-0} + 2 )) ]; do
+      producer_up || die "the producer exited"; sleep 15
+    done
+    log "fund note $SENT of $TO_BURN sent (tip $(tip_of "$RUN/producer/node.out"))"
   done
-  log "sent $FUND bessel to the sequencer's L1 wallet $SEQ_ADDR"
-  done_mark fund
+  done_mark fund-notes
 fi
 
 # --- seed ------------------------------------------------------------------------------------
 if ! is_done seed; then
-  for i in $(seq 1 30); do
+  # Bounded by wall time, not run count (run 1 hit a 30-run cap after three
+  # burns): four hours from the phase's first start, kept across reruns.
+  [ -e "$SEED/seed.started" ] || date +%s > "$SEED/seed.started"
+  SEED_DEADLINE=$(( $(cat "$SEED/seed.started") + 4 * 3600 ))
+  for i in $(seq 1 1000); do
     [ -e "$SEED/seed-$i.time" ] && continue   # a rerun of this phase keeps every earlier run's files
     seq_seed --plan > "$SEED/plan-$i.out" 2>"$SEED/plan-$i.err" || true
     if run_measured "$SEED/seed-$i" "$SEQ" seed --genesis "$GEN" --key "$KEY" --node "$DISC" --out "$SEED" --burn "$BURN" \
@@ -310,7 +357,7 @@ if ! is_done seed; then
     fi
     producer_up || die "the producer exited"
     wait_log "seed run $i not done: $(tail -1 "$SEED/seed-$i.err")"; sleep 60
-    [ "$i" = 30 ] && die "seed did not finish in 30 runs (see $SEED/seed-*.err)"
+    [ "$(date +%s)" -lt "$SEED_DEADLINE" ] || die "seed did not finish within 4 h of its first start (see $SEED/seed-*.err)"
   done
   n=$(find "$SEED/claims" -maxdepth 1 -name '*.claim.taken' 2>/dev/null | wc -l | tr -d ' ')
   [ "$n" -ge "$COUNT" ] || die "the intake holds $n seed claims, not $COUNT"

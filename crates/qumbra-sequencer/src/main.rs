@@ -110,8 +110,9 @@ fn run_pass(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
-/// `seed --max-wait` default, per burn: room for a block or two.
-const DEFAULT_SEED_WAIT_SECS: u64 = 1800;
+/// `seed --max-wait` default, per wait (a burn mined, its inputs finalized):
+/// three hours — the S6 box measured ≈ 10 min of finality lag per burn.
+const DEFAULT_SEED_WAIT_SECS: u64 = 10800;
 
 /// `seed` (S3b): the sequencer's first notes.
 fn run_seed(args: &[String]) -> Result<(), String> {
