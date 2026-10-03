@@ -57,21 +57,21 @@
 //! from genesis, named in [`VerifiedAnnulet::cache`]; never a silent fallback.
 //! A refused scan never writes the record.
 //!
-//! The result is [`VerifiedAnnulet`], whose only constructor is
-//! [`scan_annulet_verified`]: a balance cannot reach a view model through any
-//! other path.
+//! The result is [`VerifiedAnnulet`], whose only constructor is the
+//! caller-pumped [`crate::annulet_driver::AnnuletVerifyDriver`] (lab #858
+//! WA1), and [`scan_annulet_verified`] is its pump: a balance cannot reach a
+//! view model through any other path.
 
-use qlab_devnet::annulet::{body_commitment_annulet, HeaderExt};
+use qlab_devnet::annulet::HeaderExt;
 use qlab_devnet::chain::ChainState;
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_node::annulet_genesis::{h32, AnnuletGenesisFile};
-use qlab_note::l2note::{GenesisPlaintext, L2Note};
 use qlab_p2p::compact::WireForm;
-use qlab_p2p::served::{decode_body_answer, decode_headers_page, sealed, MAX_HEADERS_PAGE};
+use qlab_p2p::served::{decode_headers_page, sealed, MAX_HEADERS_PAGE};
 use rand::rngs::StdRng;
 
-use crate::annulet::{scan_annulet_from, AnnuletReport};
+use crate::annulet::AnnuletReport;
 use crate::store::WalletDir;
 
 /// Where the genesis file is read from: the scan endpoint, same origin — an
@@ -79,7 +79,7 @@ use crate::store::WalletDir;
 /// from the L1 edge (`wallet-network-identity-decision`).
 pub const GENESIS_FILE_PATH: &str = "/genesis.qmb";
 
-const ANNULET: WireForm = WireForm::plain(GenesisForm::Annulet);
+pub(crate) const ANNULET: WireForm = WireForm::plain(GenesisForm::Annulet);
 
 /// The largest genesis file a verified scan will read (lab #850 AD1b). The
 /// gateway testnet's is 11,295 B (53 genesis notes); 1 MiB leaves room for
@@ -255,14 +255,20 @@ where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
     let bytes = fetch(GENESIS_FILE_PATH).map_err(|why| VerifyRefusal::GenesisUnavailable { why })?;
+    genesis_from_bytes(pin, &bytes)
+}
+
+/// Step 1 without the fetch (lab #858 WA1): the genesis file's bytes against
+/// `pin` — bounded, hashed, decoded and checked.
+pub fn genesis_from_bytes(pin: [u8; 32], bytes: &[u8]) -> Result<VerifiedGenesis, VerifyRefusal> {
     if bytes.len() > MAX_GENESIS_FILE_BYTES {
         return Err(VerifyRefusal::GenesisTooLarge { got: bytes.len() });
     }
-    let fetched = qlab_devnet::hash::keccak256(&bytes);
+    let fetched = qlab_devnet::hash::keccak256(bytes);
     if fetched != pin {
         return Err(VerifyRefusal::GenesisMismatch { pinned: pin, fetched });
     }
-    let file = AnnuletGenesisFile::from_bytes(&bytes).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
+    let file = AnnuletGenesisFile::from_bytes(bytes).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     file.verify(None).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     let header_hash = file.genesis_block_header().header_hash_for(GenesisForm::Annulet);
     Ok(VerifiedGenesis { hash: fetched, file, header_hash })
@@ -273,7 +279,7 @@ where
 pub struct VerifiedChain {
     pub genesis: VerifiedGenesis,
     /// `headers[i]` is height `i + 1`.
-    headers: Vec<BlockHeader>,
+    pub(crate) headers: Vec<BlockHeader>,
 }
 
 impl VerifiedChain {
@@ -297,61 +303,122 @@ pub fn verify_chain<F>(fetch: &mut F, genesis: VerifiedGenesis, up_to: u64) -> R
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let mut state = ChainState::new_for(GenesisForm::Annulet, genesis.file.genesis_block_header());
-    let mut headers = Vec::new();
-    extend_chain(fetch, &genesis, &mut state, &mut headers, up_to)?;
-    Ok(VerifiedChain { genesis, headers })
+    let mut walk = ChainWalk::from_genesis(genesis, up_to)?;
+    while let Some((from, path)) = walk.want() {
+        walk.admit(from, fetch(&path))?;
+    }
+    Ok(walk.finish())
 }
 
-/// Admit sealed headers past `headers` (heights `headers.len() + 1 ..`) up to
-/// `up_to` or the endpoint's last — the one admission path, from genesis or
-/// from a resumed record.
-fn extend_chain<F>(
-    fetch: &mut F,
-    genesis: &VerifiedGenesis,
-    state: &mut ChainState,
-    headers: &mut Vec<BlockHeader>,
+/// **The one admission path for sealed headers**, caller-pumped (lab #858
+/// WA1): heights past `headers` (`headers.len() + 1 ..`) up to `up_to` or the
+/// endpoint's last, from genesis or from a resumed record. [`verify_chain`]
+/// and the verified driver are its pumps.
+pub(crate) struct ChainWalk {
+    genesis: VerifiedGenesis,
+    state: ChainState,
+    headers: Vec<BlockHeader>,
+    parent: Hash32,
+    key: ml_dsa::VerifyingKey<ml_dsa::MlDsa65>,
     up_to: u64,
-) -> Result<(), VerifyRefusal>
-where
-    F: FnMut(&str) -> Result<Vec<u8>, String>,
-{
-    let key = genesis.file.sequencer().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
-    let mut parent = headers.last().map_or(genesis.header_hash, |h| h.header_hash_for(GenesisForm::Annulet));
-    loop {
-        let from = headers.len() as u64 + 1;
-        if from > up_to {
-            break;
+    done: bool,
+}
+
+impl ChainWalk {
+    /// A walk from the genesis header.
+    pub(crate) fn from_genesis(genesis: VerifiedGenesis, up_to: u64) -> Result<Self, VerifyRefusal> {
+        let state = ChainState::new_for(GenesisForm::Annulet, genesis.file.genesis_block_header());
+        Self::start(genesis, state, Vec::new(), up_to)
+    }
+
+    /// A walk past `headers`, whose admission `state` already holds.
+    pub(crate) fn start(
+        genesis: VerifiedGenesis,
+        state: ChainState,
+        headers: Vec<BlockHeader>,
+        up_to: u64,
+    ) -> Result<Self, VerifyRefusal> {
+        let key = genesis.file.sequencer().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
+        let parent = headers.last().map_or(genesis.header_hash, |h| h.header_hash_for(GenesisForm::Annulet));
+        Ok(ChainWalk { genesis, state, headers, parent, key, up_to, done: false })
+    }
+
+    /// The next page to read — its first height and path — or `None` once
+    /// the walk is complete.
+    pub(crate) fn want(&self) -> Option<(u64, String)> {
+        let from = self.headers.len() as u64 + 1;
+        if self.done || from > self.up_to {
+            return None;
         }
-        let to = up_to.min(from + MAX_HEADERS_PAGE as u64 - 1);
-        let path = format!("/v1/headers?from={from}&to={to}");
-        let bytes = fetch(&path).map_err(|why| VerifyRefusal::HeadersUnavailable { from, why })?;
+        let to = self.page_end(from);
+        Some((from, format!("/v1/headers?from={from}&to={to}")))
+    }
+
+    fn page_end(&self, from: u64) -> u64 {
+        self.up_to.min(from + MAX_HEADERS_PAGE as u64 - 1)
+    }
+
+    /// Admit the answer to the page [`Self::want`] named at `from`.
+    pub(crate) fn admit(&mut self, from: u64, answer: Result<Vec<u8>, String>) -> Result<(), VerifyRefusal> {
+        let to = self.page_end(from);
+        let bytes = answer.map_err(|why| VerifyRefusal::HeadersUnavailable { from, why })?;
         let units = decode_headers_page(ANNULET, from, &bytes)
             .map_err(|e| VerifyRefusal::HeadersMalformed { from, why: e.to_string() })?;
         let asked = to - from + 1;
         let got = units.len() as u64;
         for unit in &units {
             let s = sealed(unit).map_err(|e| VerifyRefusal::HeadersMalformed { from, why: e.to_string() })?;
-            let want = headers.len() as u64 + 1;
+            let want = self.headers.len() as u64 + 1;
             if s.header.height != want {
                 return Err(VerifyRefusal::HeaderGap { want, got: s.header.height });
             }
-            if s.header.prev != parent {
+            if s.header.prev != self.parent {
                 return Err(VerifyRefusal::HeaderFork { height: want });
             }
-            qlab_devnet::validation::validate_sealed_header_annulet(state, s, &key)
+            qlab_devnet::validation::validate_sealed_header_annulet(&self.state, s, &self.key)
                 .map_err(|e| VerifyRefusal::HeaderInvalid { height: want, why: format!("{e:?}") })?;
-            parent = state
+            self.parent = self
+                .state
                 .insert_header(s.header)
                 .map_err(|e| VerifyRefusal::HeaderInvalid { height: want, why: format!("{e:?}") })?;
-            headers.push(s.header);
+            self.headers.push(s.header);
         }
         if got < asked {
-            break;
+            self.done = true;
         }
+        Ok(())
     }
-    Ok(())
+
+    pub(crate) fn finish(self) -> VerifiedChain {
+        VerifiedChain { genesis: self.genesis, headers: self.headers }
+    }
 }
+
+/// The served header at `height` out of a one-header `/v1/headers` answer:
+/// `None` when the endpoint serves nothing there (it is behind).
+pub(crate) fn served_header_at(height: u64, answer: Result<Vec<u8>, String>) -> Result<Option<BlockHeader>, VerifyRefusal> {
+    let bytes = answer.map_err(|why| VerifyRefusal::HeadersUnavailable { from: height, why })?;
+    let units = decode_headers_page(ANNULET, height, &bytes)
+        .map_err(|e| VerifyRefusal::HeadersMalformed { from: height, why: e.to_string() })?;
+    match units.first() {
+        None => Ok(None),
+        Some(u) => Ok(Some(sealed(u).map_err(|e| VerifyRefusal::HeadersMalformed { from: height, why: e.to_string() })?.header)),
+    }
+}
+
+/// The one-header `/v1/headers` path at `height`.
+pub(crate) fn header_path(height: u64) -> String {
+    format!("/v1/headers?from={height}&to={height}")
+}
+
+/// The height out of a `/v1/registry/root` answer — the endpoint's own word
+/// on its tip; `None` when it did not say.
+pub(crate) fn stated_height(answer: Result<Vec<u8>, String>) -> Option<u64> {
+    answer.ok().and_then(|b| qlab_cbserver::registry::decode_registry_root(&b).ok()).map(|(height, _)| height)
+}
+
+/// The route [`stated_height`] reads.
+pub const REGISTRY_ROOT_PATH: &str = "/v1/registry/root";
 
 /// The most headers the record holds: 2^18 × 153 B ≈ 38 MiB. Past it the
 /// record is refused by name on load and not written (a scan then verifies
@@ -368,8 +435,9 @@ pub fn chain_cache_path(w: &WalletDir, genesis_hash: &[u8; 32]) -> std::path::Pa
 
 const PREIMAGE_LEN_ANNULET: usize = qlab_devnet::header::HEADER_PREIMAGE_LEN_ANNULET;
 
-/// `ver(1) ‖ genesis(32) ‖ n(u64 LE) ‖ n × 153-B header preimage`.
-fn encode_chain_cache(genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Vec<u8> {
+/// `ver(1) ‖ genesis(32) ‖ n(u64 LE) ‖ n × 153-B header preimage` — what a
+/// driver host writes from [`VerifiedAnnulet::record_to_write`].
+pub fn encode_chain_cache(genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Vec<u8> {
     let mut out = Vec::with_capacity(41 + headers.len() * PREIMAGE_LEN_ANNULET);
     out.push(CHAIN_CACHE_VERSION);
     out.extend_from_slice(genesis_hash);
@@ -380,16 +448,31 @@ fn encode_chain_cache(genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Vec<u
     out
 }
 
+/// Read the record's bytes for the chain `genesis_hash` names: `Ok(None)`
+/// when there is none, `Err(why)` when it cannot be read. What a driver host
+/// hands [`crate::annulet_driver::AnnuletVerifyDriver::new`].
+pub fn read_chain_record(w: &WalletDir, genesis_hash: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+    let path = chain_cache_path(w, genesis_hash);
+    match std::fs::read(&path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 /// Read the record and relink it from the genesis header (no seal
 /// re-verify: it is this wallet's own prior verification). `Ok(None)` when
 /// there is none; `Err(why)` when there is one and it does not load.
 pub fn load_chain_cache(w: &WalletDir, genesis: &VerifiedGenesis) -> Result<Option<Vec<BlockHeader>>, String> {
-    let path = chain_cache_path(w, &genesis.hash);
-    let b = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
+    match read_chain_record(w, &genesis.hash)? {
+        None => Ok(None),
+        Some(b) => decode_chain_cache(&b, genesis).map(Some),
+    }
+}
+
+/// The record's bytes, relinked from the genesis header — the load without
+/// the file read.
+pub fn decode_chain_cache(b: &[u8], genesis: &VerifiedGenesis) -> Result<Vec<BlockHeader>, String> {
     if b.len() < 41 {
         return Err("shorter than its prefix".into());
     }
@@ -417,11 +500,11 @@ pub fn load_chain_cache(w: &WalletDir, genesis: &VerifiedGenesis) -> Result<Opti
         parent = h.header_hash_for(GenesisForm::Annulet);
         headers.push(h);
     }
-    Ok(Some(headers))
+    Ok(headers)
 }
 
 /// Write the record atomically (`<path>.tmp`, fsync, rename).
-fn save_chain_cache(w: &WalletDir, genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Result<(), String> {
+pub(crate) fn save_chain_cache(w: &WalletDir, genesis_hash: &[u8; 32], headers: &[BlockHeader]) -> Result<(), String> {
     use std::io::Write;
     if headers.len() as u64 > MAX_CACHED_HEADERS {
         return Err(format!("{} headers, over the {MAX_CACHED_HEADERS} bound: not recorded", headers.len()));
@@ -438,66 +521,6 @@ fn save_chain_cache(w: &WalletDir, genesis_hash: &[u8; 32], headers: &[BlockHead
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", path.display())
     })
-}
-
-/// Resume from a loaded record: re-check the endpoint's header at the
-/// anchor (the recorded tip, or `up_to` below it) against the record, then
-/// admit what is past it. An endpoint that serves nothing at the anchor is
-/// behind the record: the chain is clamped to the endpoint's stated tip,
-/// re-checked there the same way — never claimed above what this endpoint
-/// serves.
-fn resume_chain<F>(
-    fetch: &mut F,
-    genesis: VerifiedGenesis,
-    cached: Vec<BlockHeader>,
-    up_to: u64,
-) -> Result<VerifiedChain, VerifyRefusal>
-where
-    F: FnMut(&str) -> Result<Vec<u8>, String>,
-{
-    let mut anchor = (cached.len() as u64).min(up_to);
-    if anchor == 0 {
-        return verify_chain(fetch, genesis, up_to);
-    }
-    let served_at = |fetch: &mut F, h: u64| -> Result<Option<BlockHeader>, VerifyRefusal> {
-        let bytes = fetch(&format!("/v1/headers?from={h}&to={h}"))
-            .map_err(|why| VerifyRefusal::HeadersUnavailable { from: h, why })?;
-        let units = decode_headers_page(ANNULET, h, &bytes)
-            .map_err(|e| VerifyRefusal::HeadersMalformed { from: h, why: e.to_string() })?;
-        match units.first() {
-            None => Ok(None),
-            Some(u) => Ok(Some(sealed(u).map_err(|e| VerifyRefusal::HeadersMalformed { from: h, why: e.to_string() })?.header)),
-        }
-    };
-    let served = match served_at(fetch, anchor)? {
-        Some(h) => h,
-        None => {
-            // Behind the record: clamp to the endpoint's own stated tip.
-            let stated = fetch("/v1/registry/root")
-                .ok()
-                .and_then(|b| qlab_cbserver::registry::decode_registry_root(&b).ok())
-                .map(|(height, _)| height)
-                .unwrap_or(0);
-            anchor = stated.min(anchor);
-            if anchor == 0 {
-                return Ok(VerifiedChain { genesis, headers: Vec::new() });
-            }
-            served_at(fetch, anchor)?.ok_or(VerifyRefusal::CachedTipForked { height: anchor })?
-        }
-    };
-    if served != cached[anchor as usize - 1] {
-        return Err(VerifyRefusal::CachedTipForked { height: anchor });
-    }
-    let mut headers: Vec<BlockHeader> = cached;
-    headers.truncate(anchor as usize);
-    let mut state = ChainState::new_for(GenesisForm::Annulet, genesis.file.genesis_block_header());
-    for h in &headers {
-        state.insert_header(*h).map_err(|e| VerifyRefusal::ChainCacheInvalid { why: format!("{e:?}") })?;
-    }
-    if anchor as usize == headers.len() && anchor < up_to {
-        extend_chain(fetch, &genesis, &mut state, &mut headers, up_to)?;
-    }
-    Ok(VerifiedChain { genesis, headers })
 }
 
 /// What the verified-header record did for a scan — for the trust line.
@@ -519,16 +542,18 @@ pub enum ChainCache {
 /// A scan whose every figure is bound to the verified chain. Constructed only
 /// by [`scan_annulet_verified`].
 pub struct VerifiedAnnulet {
-    report: AnnuletReport,
-    chain: VerifiedChain,
-    range: (u64, u64),
-    bodies_fetched: u64,
-    body_bytes: u64,
-    stated_tip: Option<u64>,
-    cache: ChainCache,
+    pub(crate) report: AnnuletReport,
+    pub(crate) chain: VerifiedChain,
+    pub(crate) range: (u64, u64),
+    pub(crate) bodies_fetched: u64,
+    pub(crate) body_bytes: u64,
+    pub(crate) stated_tip: Option<u64>,
+    pub(crate) cache: ChainCache,
+    /// Whether the record should be (re)written: it grows, or was discarded.
+    pub(crate) write_record: bool,
     /// Why the record could not be written, if it could not (the scan
     /// stands; the next one verifies more).
-    cache_write: Option<String>,
+    pub(crate) cache_write: Option<String>,
 }
 
 impl VerifiedAnnulet {
@@ -572,6 +597,19 @@ impl VerifiedAnnulet {
         self.cache_write.as_deref()
     }
 
+    /// The verified headers to record after this scan — `Some` exactly when
+    /// the record would grow or was discarded (lab #858 WA1: the driver never
+    /// touches a filesystem; its host writes this and says how it went with
+    /// [`Self::set_cache_write`]).
+    pub fn record_to_write(&self) -> Option<&[BlockHeader]> {
+        self.write_record.then_some(self.chain.headers.as_slice())
+    }
+
+    /// The host's report of the record write: `None` when it was written.
+    pub fn set_cache_write(&mut self, outcome: Option<String>) {
+        self.cache_write = outcome;
+    }
+
     /// Bodies fetched to bind notes, and their bytes: the per-hit cost.
     pub fn body_cost(&self) -> (u64, u64) {
         (self.bodies_fetched, self.body_bytes)
@@ -579,7 +617,9 @@ impl VerifiedAnnulet {
 }
 
 /// **The verified Annulet scan**: steps 1–3 of the module doc, then the
-/// unchanged scan body over the verified range and genesis.
+/// unchanged scan body over the verified range and genesis. Since lab #858
+/// WA1 the pump of [`crate::annulet_driver::AnnuletVerifyDriver`] — the one
+/// orchestration — reading and writing the wallet dir's record around it.
 pub fn scan_annulet_verified<F>(
     w: &WalletDir,
     fetch: &mut F,
@@ -591,91 +631,22 @@ pub fn scan_annulet_verified<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
+    use crate::annulet_driver::{AnnuletStep, AnnuletVerifyDriver};
     let pin = pin.ok_or(VerifyRefusal::NoPin)?;
-    let genesis = verify_genesis(fetch, pin)?;
-    let recorded = load_chain_cache(w, &genesis);
-    let recorded_len = recorded.as_ref().ok().and_then(|r| r.as_ref().map(Vec::len)).unwrap_or(0);
-    let (chain, cache) = match recorded {
-        Ok(None) => (verify_chain(fetch, genesis, to)?, ChainCache::Unused),
-        Err(why) => (verify_chain(fetch, genesis, to)?, ChainCache::Discarded(VerifyRefusal::ChainCacheInvalid { why })),
-        Ok(Some(cached)) => match resume_chain(fetch, genesis.clone(), cached, to) {
-            Ok(chain) => {
-                let anchor = (recorded_len as u64).min(to).min(chain.tip());
-                (chain, ChainCache::Resumed { anchor, recorded: recorded_len as u64 })
-            }
-            Err(e @ VerifyRefusal::CachedTipForked { .. }) | Err(e @ VerifyRefusal::ChainCacheInvalid { .. }) => {
-                (verify_chain(fetch, genesis, to)?, ChainCache::Discarded(e))
-            }
-            Err(e) => return Err(e),
-        },
+    let record = read_chain_record(w, &pin);
+    let mut driver = AnnuletVerifyDriver::new(w.wallet(), w.allocated.clone(), pin, from, to, record);
+    let mut v = loop {
+        match driver.step(rng) {
+            AnnuletStep::Need(path) => driver.supply(fetch(&path)),
+            AnnuletStep::Done(v) => break *v,
+            AnnuletStep::Failed(e) => return Err(e),
+        }
     };
-    let to = to.min(chain.tip());
-
-    let genesis_notes: Vec<([u8; 32], L2Note)> = chain
-        .genesis
-        .file
-        .genesis_notes
-        .iter()
-        .map(|n| {
-            let note = GenesisPlaintext::open(&n.payload).expect("the file's structural check opened every payload");
-            (n.cm, note)
-        })
-        .collect();
-    let report = scan_annulet_from(w, fetch, from, to, chain.genesis.hash, &genesis_notes, rng);
-
-    // Each block with a hit is fetched and bound once, whichever address's
-    // row found it; what is kept is each transaction's commitments.
-    let (mut bodies_fetched, mut body_bytes) = (0u64, 0u64);
-    let mut bound: std::collections::BTreeMap<u64, Vec<Vec<[u8; 32]>>> = std::collections::BTreeMap::new();
-    for owned in &report.owned {
-        let Some(tx_index) = owned.tx_index else {
-            if !genesis_notes.iter().any(|(cm, _)| *cm == owned.cm) {
-                return Err(VerifyRefusal::ForgedGenesisNote { cm: owned.cm });
-            }
-            continue;
-        };
-        let height = owned.height;
-        let forged = |why: &str| VerifyRefusal::ForgedNote { height, tx_index, why: why.to_string() };
-        if h32(&owned.note.commitment()) != owned.cm {
-            return Err(forged("the note does not open to the commitment it was served under"));
-        }
-        if let std::collections::btree_map::Entry::Vacant(slot) = bound.entry(height) {
-            let header = chain.header(height).ok_or_else(|| forged("above the verified tip"))?;
-            let bytes = fetch(&format!("/v1/block/{height}/body"))
-                .map_err(|why| VerifyRefusal::BodyUnavailable { height, why })?;
-            bodies_fetched += 1;
-            body_bytes += bytes.len() as u64;
-            let ann = decode_body_answer(ANNULET, height, &bytes)
-                .map_err(|e| VerifyRefusal::BodyMalformed { height, why: e.to_string() })?;
-            if ann.header != header {
-                return Err(VerifyRefusal::BodyHeaderMismatch { height });
-            }
-            let body = qlab_p2p::served::body_of(&ann);
-            if body_commitment_annulet(&body) != header.tx_body_commitment {
-                return Err(VerifyRefusal::BodyCommitmentMismatch { height });
-            }
-            slot.insert(body.txs.iter().map(|tx| tx.public.commitments.clone()).collect());
-        }
-        let txs = &bound[&height];
-        let cms = txs.get(tx_index as usize).ok_or_else(|| forged("the block has no such transaction"))?;
-        if !cms.contains(&owned.cm) {
-            return Err(forged("the transaction carries no such commitment"));
-        }
+    if let Some(headers) = v.record_to_write() {
+        let outcome = save_chain_cache(w, &v.chain.genesis.hash, headers).err();
+        v.set_cache_write(outcome);
     }
-    // Freshness, not trust: the node's own word on its tip, for the line that
-    // says how far behind the verified chain is.
-    let stated_tip = fetch("/v1/registry/root")
-        .ok()
-        .and_then(|b| qlab_cbserver::registry::decode_registry_root(&b).ok())
-        .map(|(height, _)| height);
-    // The record is written only now, after every check passed — a refused
-    // scan never writes it — and only when it would grow or was discarded.
-    let grows = chain.headers.len() > recorded_len;
-    let cache_write = match (&cache, grows) {
-        (ChainCache::Discarded(_), _) | (_, true) => save_chain_cache(w, &chain.genesis.hash, &chain.headers).err(),
-        _ => None,
-    };
-    Ok(VerifiedAnnulet { report, chain, range: (from, to), bodies_fetched, body_bytes, stated_tip, cache, cache_write })
+    Ok(v)
 }
 
 /// Step 4: the registry leaf of `asset`, bound to the verified chain — the
@@ -689,8 +660,22 @@ pub fn verify_registry_leaf<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let path = format!("/v1/registry/{asset}");
-    let bytes = fetch(&path).map_err(|why| VerifyRefusal::RegistryUnavailable { asset, why })?;
+    check_registry_leaf(chain, asset, fetch(&registry_leaf_path(asset)))
+}
+
+/// Where [`check_registry_leaf`] reads `asset`'s opening.
+pub fn registry_leaf_path(asset: u16) -> String {
+    format!("/v1/registry/{asset}")
+}
+
+/// Step 4 without the fetch (lab #858 WA1): an answer to
+/// [`registry_leaf_path`] bound to the verified chain.
+pub fn check_registry_leaf(
+    chain: &VerifiedChain,
+    asset: u16,
+    answer: Result<Vec<u8>, String>,
+) -> Result<qlab_air::l2::RegistryLeaf, VerifyRefusal> {
+    let bytes = answer.map_err(|why| VerifyRefusal::RegistryUnavailable { asset, why })?;
     let opening = qlab_cbserver::registry::decode_registry_opening(&bytes)
         .map_err(|e| VerifyRefusal::RegistryUnavailable { asset, why: format!("{e:?}") })?;
     if opening.leaf.asset != asset as u64 {

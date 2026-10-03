@@ -314,7 +314,18 @@ pub fn leaf_at_verified_tip<F>(fetch: &mut F, chain: &VerifiedChain, asset: u16)
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let bytes = fetch(&format!("/v1/registry/{asset}")).map_err(|why| LeafRefusal::Unavailable { why })?;
+    check_leaf_at_verified_tip(chain, asset, fetch(&crate::annulet_verify::registry_leaf_path(asset)))
+}
+
+/// [`leaf_at_verified_tip`] without the fetch (lab #858 WA1): an answer to
+/// [`crate::annulet_verify::registry_leaf_path`], opened at the verified tip —
+/// what a caller-pumped host (`qumbra-ffi`) runs on the bytes it fetched.
+pub fn check_leaf_at_verified_tip(
+    chain: &VerifiedChain,
+    asset: u16,
+    answer: Result<Vec<u8>, String>,
+) -> Result<RegistryLeaf, LeafRefusal> {
+    let bytes = answer.map_err(|why| LeafRefusal::Unavailable { why })?;
     let opening = qlab_cbserver::registry::decode_registry_opening(&bytes)
         .map_err(|e| LeafRefusal::Unavailable { why: format!("{e:?}") })?;
     if opening.leaf.asset != u64::from(asset) {
