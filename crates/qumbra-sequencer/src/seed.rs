@@ -129,7 +129,8 @@ pub fn plan_text(shortfall: usize, pending: usize, claims_to_make: usize, burn: 
     format!(
         "seed plan: {pending} deposit(s) already pending; {shortfall} burn(s) of {burn} bessel to make (fee {fee} each), \
          one per L1 transaction, each mined before the next (a burn left in flight by an earlier run is waited \
-         for, never burned again); {claims_to_make} claim(s) to prove.\n  \
+         for, never burned again; a burn whose inputs are not finalized yet waits for finality — fund the wallet \
+         with one note per burn so no burn waits on another's change); {claims_to_make} claim(s) to prove.\n  \
          funded: {funded_line}\n  \
          budget: {shortfall} L1 proof(s) at ≈ {L1_PROOF_GIB} GiB / ≈ {L1_PROOF_SECS} s, {claims_to_make} claim proof(s) at \
          ≈ {CLAIM_PROOF_GIB} GiB / ≈ {CLAIM_PROOF_SECS} s, one block (≈ {BLOCK_SECS} s) per burn — ≈ {} min wall",
@@ -215,6 +216,19 @@ pub fn untaken(out: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// Whether a send refusal is the wallet's "not spendable YET": the money is
+/// held, in notes whose block is not finalized (`BuildRefusal::
+/// NotYetFinalized`), or a selected note is past the finalized anchor
+/// (`OutsideAnchor`). Both are pre-proof and clear with no action once
+/// finality advances; `seed` waits on them. Pinned against the wallet's own
+/// texts by a test, so a reworded refusal fails here, not on the box.
+///
+/// A `BuildRefusal::Other` whose text happened to contain either phrase would
+/// be read as a wait too; none does today, and the wait is bounded anyway.
+pub fn is_finality_wait(why: &str) -> bool {
+    why.contains("not spendable YET") || why.contains("not possible YET")
+}
+
 /// The in-flight burn record: written after the burn is proved and before
 /// it is POSTed (the spend flow's pre-submit hook), holding how many
 /// deposits were pending before it; cleared once the scan shows more. A
@@ -230,7 +244,15 @@ impl Seed {
 
     /// The node's tip, from `/v1/anchors`.
     fn tip(&self) -> Result<u64, String> {
-        Ok(crate::chain::read(&crate::chain::Http { base: self.node.clone() })?.anchors.tip_height)
+        Ok(self.anchors()?.tip_height)
+    }
+
+    /// `/v1/anchors` alone — the tip and the node's finalized height — not
+    /// the whole tree and coinbase stream `chain::read` fetches.
+    fn anchors(&self) -> Result<qlab_node::AnchorSet, String> {
+        use crate::chain::Get;
+        let body = crate::chain::Http { base: self.node.clone() }.get("/v1/anchors")?;
+        qlab_node::AnchorSet::from_bytes(&body).map_err(|e| format!("/v1/anchors: {e:?}")) // debug-ok: a served-page decode error, no opening
     }
 
     /// Scan the L1 wallet: its pending deposits to this L2, and its
@@ -337,23 +359,48 @@ impl Seed {
         let burn_to = qumbra_wallet::deposit::burn_address(&wallet, chain.l2_id);
         let mut have = deposits.len();
         for i in 0..short {
-            let tip = self.tip()?;
-            let req = qumbra_wallet::spend::SendRequest {
-                dir: &w.dir,
-                url: &self.scan,
-                node_url: &self.node,
-                recipient: &burn_to,
-                contact_name: None,
-                amount: self.burn,
-                scan_to: tip,
-                no_submit: false,
-                name_op: None,
-                form: self.genesis.forms().0,
-            };
-            let mut sink = |s: qumbra_wallet::spend::SendStep| eprintln!("SEED burn {}: {s:?}", i + 1); // debug-ok: SendStep is the flow's progress — counts, roots, timings, the node's answer; no opening
-            let mut record = |_: &[u8]| crate::state::write_atomic(&inflight, have.to_string().as_bytes());
-            qumbra_wallet::spend::execute_opened_with_pre_submit(&req, &w, &mut sink, &mut record)
-                .map_err(|e| format!("burn {} of {short}: {e}", i + 1))?;
+            // A burn whose inputs are held but not finalized yet (the
+            // previous burn's change, a fund note in a recent block) is a
+            // wait, not a failure: the wallet refuses it before any proof,
+            // and this polls until finality passes them, bounded by
+            // `--max-wait`.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.max_wait_secs);
+            loop {
+                let tip = self.tip()?;
+                let req = qumbra_wallet::spend::SendRequest {
+                    dir: &w.dir,
+                    url: &self.scan,
+                    node_url: &self.node,
+                    recipient: &burn_to,
+                    contact_name: None,
+                    amount: self.burn,
+                    scan_to: tip,
+                    no_submit: false,
+                    name_op: None,
+                    form: self.genesis.forms().0,
+                };
+                let mut sink = |s: qumbra_wallet::spend::SendStep| eprintln!("SEED burn {}: {s:?}", i + 1); // debug-ok: SendStep is the flow's progress — counts, roots, timings, the node's answer; no opening
+                let mut record = |_: &[u8]| crate::state::write_atomic(&inflight, have.to_string().as_bytes());
+                match qumbra_wallet::spend::execute_opened_with_pre_submit(&req, &w, &mut sink, &mut record) {
+                    Ok(_) => break,
+                    Err(qumbra_wallet::spend::SendError::Refused(why)) if is_finality_wait(&why) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(format!(
+                                "burn {} of {short}: its inputs were still not finalized after {} s — {why}",
+                                i + 1,
+                                self.max_wait_secs
+                            ));
+                        }
+                        let fin = match self.anchors() {
+                            Ok(a) => a.finalized_height.map_or("none".to_string(), |h| h.to_string()),
+                            Err(e) => format!("unknown ({e})"),
+                        };
+                        println!("seed: burn {} of {short} waits for finality (tip {tip}, finalized {fin}): its inputs are not finalized yet", i + 1);
+                        std::thread::sleep(std::time::Duration::from_secs(self.poll_secs));
+                    }
+                    Err(e) => return Err(format!("burn {} of {short}: {e}", i + 1)),
+                }
+            }
             have = self.wait_mined(&w, have, &format!("burn {} of {short}", i + 1))?;
             let _ = std::fs::remove_file(&inflight);
         }
@@ -412,6 +459,22 @@ impl Seed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The finality wait is recognised from the wallet's own refusal texts —
+    /// the two "not YET" ones — and no other refusal is mistaken for it.
+    #[test]
+    fn a_not_yet_final_refusal_is_a_wait() {
+        use qumbra_wallet::send::BuildRefusal;
+        assert!(is_finality_wait(&BuildRefusal::NotYetFinalized { need: 51, finalized_have: 0, total_have: 2_199 }.to_string()));
+        assert!(is_finality_wait(&BuildRefusal::OutsideAnchor { pos: 20, anchor_count: 18 }.to_string()));
+        for other in [
+            BuildRefusal::CannotCover { need: 51, amount: 50, fee: 1, have: 7 },
+            BuildRefusal::NotInTree,
+            BuildRefusal::Other("a recipient with no encapsulation key".into()),
+        ] {
+            assert!(!is_finality_wait(&other.to_string()), "{other}");
+        }
+    }
 
     #[test]
     fn the_shortfall_counts_what_is_already_pending() {
