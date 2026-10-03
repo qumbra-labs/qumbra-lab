@@ -31,9 +31,10 @@
 pub(crate) mod bench;
 pub(crate) mod census;
 pub(crate) mod cmp;
-pub(crate) mod leaf;
 pub(crate) mod neg;
-pub(crate) mod native;
+// Lab #847 S1a: the L2 state and the leaf AIR moved to qlab-wprover; the
+// old paths stay, so every bench mode and test reads them unchanged.
+pub(crate) use qlab_wprover::f3::{leaf, native};
 
 /// `qlab-bench f3census | f3leaf | f3neg | f3vec …`.
 pub(crate) fn run(mode: &str, args: &[String]) -> Result<(), String> {

@@ -51,7 +51,7 @@ use qlab_cbserver::tree::{zeros, CommitmentTree};
 use qlab_devnet::annulet::L2ShapeTag;
 
 // Lab #785 F5-1: the hash-level items moved to qlab-wrapper.
-pub(crate) use qlab_wrapper::hash::{
+pub use qlab_wrapper::hash::{
     nf_leaf_hash, node_pub, sd_chain_byte, sd_domain_lanes, sd_perms, sd_words_byte, Digest, Roots, EMPTY, INDEX_CAP, N_DEPTH, SD_BLOCK_WORDS, SD_LANE_DOMAIN, SD_LANE_FINAL, SD_LANE_INDEX, SD_LANE_MSG,
 };
 use qlab_wrapper::hash::node;
@@ -66,7 +66,7 @@ fn bits_of(index: u64, depth: usize) -> Vec<bool> {
 
 /// Why an insert, or its check, is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum NfError {
+pub enum NfError {
     /// No leaf strictly brackets the key: it is present, or a sentinel.
     NotInGap,
     /// The low leaf does not strictly bracket the key it was opened for.
@@ -84,7 +84,7 @@ pub(crate) enum NfError {
 /// One insert's witness: the low leaf and its path under the running root,
 /// then the append slot's path under the root after the low-leaf rewrite.
 #[derive(Clone, Copy)]
-pub(crate) struct InsertWitness {
+pub struct InsertWitness {
     pub key: Digest,
     pub low_index: u64,
     pub low: (Digest, Digest),
@@ -95,7 +95,7 @@ pub(crate) struct InsertWitness {
 
 /// The nullifier indexed tree, every non-empty node kept per level.
 #[derive(Clone)]
-pub(crate) struct IndexedTree {
+pub struct IndexedTree {
     levels: Vec<HashMap<u64, Digest>>,
     leaves: Vec<(Digest, Digest)>,
     zeros: [[u64; 4]; MERKLE_DEPTH + 1],
@@ -127,7 +127,7 @@ impl IndexedTree {
         *self.levels[lvl].get(&i).unwrap_or(&self.zeros[lvl])
     }
 
-    pub(crate) fn put(&mut self, idx: u64, leaf: (Digest, Digest)) {
+    pub fn put(&mut self, idx: u64, leaf: (Digest, Digest)) {
         if idx as usize == self.leaves.len() {
             self.leaves.push(leaf);
         } else {
@@ -144,7 +144,7 @@ impl IndexedTree {
         }
     }
 
-    pub(crate) fn path(&self, idx: u64) -> MerkleWitness {
+    pub fn path(&self, idx: u64) -> MerkleWitness {
         let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
         let mut path_bits = [false; MERKLE_DEPTH];
         for lvl in 0..N_DEPTH {
@@ -177,7 +177,7 @@ impl IndexedTree {
 }
 
 /// The insert as the leaf proves it: from `(root, next)` to the new pair.
-pub(crate) fn apply_insert(root: &Digest, next: u64, w: &InsertWitness) -> Result<(Digest, u64), NfError> {
+pub fn apply_insert(root: &Digest, next: u64, w: &InsertWitness) -> Result<(Digest, u64), NfError> {
     if next >= INDEX_CAP {
         return Err(NfError::Full);
     }
@@ -207,14 +207,14 @@ pub(crate) fn apply_insert(root: &Digest, next: u64, w: &InsertWitness) -> Resul
 
 /// One append's witness: the slot's path (the same siblings before and after).
 #[derive(Clone, Copy)]
-pub(crate) struct AppendWitness {
+pub struct AppendWitness {
     pub index: u64,
     pub path: MerkleWitness,
 }
 
 /// Why an append is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AppendError {
+pub enum AppendError {
     /// Not at the running next index (an order swap, a skip, a reuse).
     Index,
     /// The path's bits are not the index.
@@ -226,13 +226,13 @@ pub(crate) enum AppendError {
 }
 
 /// Append `cm` to `tree`, returning its witness.
-pub(crate) fn append(tree: &mut CommitmentTree, cm: &Digest) -> AppendWitness {
+pub fn append(tree: &mut CommitmentTree, cm: &Digest) -> AppendWitness {
     let index = tree.append(*cm);
     AppendWitness { index, path: tree.auth_path(index, index + 1) }
 }
 
 /// The append as the leaf proves it.
-pub(crate) fn apply_append(root: &Digest, next: u64, cm: &Digest, w: &AppendWitness) -> Result<(Digest, u64), AppendError> {
+pub fn apply_append(root: &Digest, next: u64, cm: &Digest, w: &AppendWitness) -> Result<(Digest, u64), AppendError> {
     if next >= INDEX_CAP {
         return Err(AppendError::Full);
     }
@@ -255,7 +255,7 @@ pub(crate) fn apply_append(root: &Digest, next: u64, cm: &Digest, w: &AppendWitn
 /// A shape-R write's witness: the replacing leaf, the digest it replaces, and
 /// the slot's path (unchanged by the replacement).
 #[derive(Clone, Copy)]
-pub(crate) struct RegistryWrite {
+pub struct RegistryWrite {
     pub leaf: RegistryLeaf,
     pub old_digest: Digest,
     pub path: RegistryWitness,
@@ -283,7 +283,7 @@ impl std::fmt::Debug for RegistryWrite {
 // ---------------------------------------------------------------------------
 
 /// One step's message: `tag ‖ pv_len ‖ pvs`, each a `u32` word.
-pub(crate) fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
+pub fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
     sd_words_byte(tag.byte(), pvs)
 }
 
@@ -310,12 +310,12 @@ pub(crate) fn sd_words(tag: L2ShapeTag, pvs: &[u32]) -> Vec<u32> {
 /// the node, nullifier-leaf and registry-leaf hashes, whose capacity is zero.
 ///
 /// Returns the blocks' Keccak-f inputs (what the leaf AIR hashes) and the digest.
-pub(crate) fn sd_chain(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> (Vec<[u64; 25]>, Digest) {
+pub fn sd_chain(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> (Vec<[u64; 25]>, Digest) {
     sd_chain_byte(prev, tag.byte(), pvs)
 }
 
 /// One chain step's digest.
-pub(crate) fn sd_step(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> Digest {
+pub fn sd_step(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> Digest {
     sd_chain(prev, tag, pvs).1
 }
 
@@ -327,7 +327,7 @@ pub(crate) fn sd_step(prev: &Digest, tag: L2ShapeTag, pvs: &[u32]) -> Digest {
 /// full public-value vector (C1's export), plus a shape-R write's leaf (not a
 /// PV — bound through `new_root`).
 #[derive(Clone, Debug)]
-pub(crate) struct TxSurface {
+pub struct TxSurface {
     pub tag: L2ShapeTag,
     pub pvs: Vec<u32>,
     pub write: Option<RegistryLeaf>,
@@ -335,7 +335,7 @@ pub(crate) struct TxSurface {
 
 /// Why a transaction or a leaf is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StError {
+pub enum StError {
     Nf(NfError),
     Append(AppendError),
     /// A PV vector of the wrong length for its shape, or a chunk ≥ 2^16.
@@ -400,7 +400,7 @@ impl TxSurface {
 
 /// One transaction's witnesses, in the order [`check_leaf`] consumes them.
 #[derive(Clone, Debug)]
-pub(crate) struct TxWitness {
+pub struct TxWitness {
     pub inserts: Vec<InsertWitness>,
     pub appends: Vec<AppendWitness>,
     pub write: Option<RegistryWrite>,
@@ -408,7 +408,7 @@ pub(crate) struct TxWitness {
 
 /// The L2's state: the three trees and the chain head.
 #[derive(Clone)]
-pub(crate) struct L2State {
+pub struct L2State {
     pub n: IndexedTree,
     pub c: CommitmentTree,
     pub r: RegistryTree,
@@ -490,7 +490,7 @@ impl L2State {
 /// **The leaf's statement, natively:** from `rin`, thread every
 /// transaction's inserts, appends and registry step through the running
 /// roots and chain `SD`; return the roots out. The AIR proves exactly this.
-pub(crate) fn check_leaf(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> Result<Roots, StError> {
+pub fn check_leaf(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> Result<Roots, StError> {
     if txs.len() != wits.len() {
         return Err(StError::Shape);
     }
@@ -547,7 +547,7 @@ pub(crate) fn check_leaf(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> 
 // ---------------------------------------------------------------------------
 
 /// A deterministic stream for fixtures (xorshift64).
-pub(crate) struct Rng(pub u64);
+pub struct Rng(pub u64);
 
 impl Rng {
     pub fn next(&mut self) -> u64 {
@@ -564,7 +564,7 @@ impl Rng {
 /// A synthetic S/P surface against `registry_root`: fresh random nullifiers
 /// and commitments, every other PV a random 16-bit chunk (P's `vPublic` sign
 /// and asset lanes left 0 — range, not semantics, is what F3 reads).
-pub(crate) fn synth_tx(rng: &mut Rng, tag: L2ShapeTag, registry_root: &Digest) -> TxSurface {
+pub fn synth_tx(rng: &mut Rng, tag: L2ShapeTag, registry_root: &Digest) -> TxSurface {
     assert!(tag != L2ShapeTag::R, "synth_tx builds S/P surfaces");
     let len = TxSurface::pv_len(tag);
     let mut pvs: Vec<u32> = (0..len).map(|_| (rng.next() & 0xffff) as u32).collect();
@@ -585,7 +585,7 @@ pub(crate) fn synth_tx(rng: &mut Rng, tag: L2ShapeTag, registry_root: &Digest) -
 }
 
 /// A synthetic shape-R surface writing `leaf` over `state`'s registry.
-pub(crate) fn synth_write(rng: &mut Rng, state: &L2State, leaf: RegistryLeaf) -> TxSurface {
+pub fn synth_write(rng: &mut Rng, state: &L2State, leaf: RegistryLeaf) -> TxSurface {
     use qlab_air::l2r::{PV_ASSET, PV_CM, PV_CM_SEED, PV_NEW_ROOT, PV_NF, PV_OLD_ROOT};
     let mut pvs: Vec<u32> = (0..qlab_air::l2r::PV_LEN).map(|_| (rng.next() & 0xffff) as u32).collect();
     let mut after = state.r.clone();

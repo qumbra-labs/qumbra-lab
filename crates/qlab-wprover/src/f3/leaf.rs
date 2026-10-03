@@ -73,14 +73,14 @@ use super::native::{
     sd_chain, sd_domain_lanes, sd_perms, Digest, Roots, TxSurface, TxWitness, EMPTY, INDEX_CAP, N_DEPTH,
     SD_BLOCK_WORDS, SD_LANE_DOMAIN, SD_LANE_FINAL, SD_LANE_INDEX, SD_LANE_MSG,
 };
-use crate::m4skel::LaneBuilder;
+use qlab_wrapper::lane::LaneBuilder;
 
 // Lab #785 F5-1: the Keccak-lane helpers moved to qlab-wrapper.
-pub(crate) use qlab_wrapper::hash::{keccak_idx, out4, pv_digest, KeccakIdx};
+pub use qlab_wrapper::hash::{keccak_idx, out4, pv_digest, KeccakIdx};
 
 // Lab #785 F5-4a (review Y2 on PR #787): the prover's trace helpers came
 // back from qlab-wrapper, where nothing used them.
-pub(crate) fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
+pub fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
     let mut st = [0u64; 25];
     st[..4].copy_from_slice(lo);
     st[4..8].copy_from_slice(hi);
@@ -89,7 +89,7 @@ pub(crate) fn nf_leaf_state(lo: &Digest, hi: &Digest) -> [u64; 25] {
     st
 }
 
-pub(crate) fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
+pub fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
     let mut st = [0u64; 25];
     st[..4].copy_from_slice(l);
     st[4..8].copy_from_slice(r);
@@ -98,11 +98,11 @@ pub(crate) fn node_state(l: &Digest, r: &Digest) -> [u64; 25] {
     st
 }
 
-pub(crate) fn inv_or_zero(v: Val) -> Val {
+pub fn inv_or_zero(v: Val) -> Val {
     p3_field::Field::try_inverse(&v).unwrap_or(Val::ZERO)
 }
 
-pub(crate) fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
+pub fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
     if bit {
         (*sib, *x)
     } else {
@@ -116,20 +116,20 @@ pub(crate) fn mux(bit: bool, x: &Digest, sib: &Digest) -> (Digest, Digest) {
 
 /// SD blocks per slot: the most any shape needs (S 5, P 6, R 4) — P's exit
 /// recipient (lab #785 F5-4d) took it from 5 to 6.
-pub(crate) const SD_BLOCKS: usize = 6;
+pub const SD_BLOCKS: usize = 6;
 const _: () = assert!(SD_BLOCKS == sd_perms(qlab_air::l2p::PV_LEN));
 /// Nullifier inserts per slot (S/P 3, R 1).
-pub(crate) const INSERTS: usize = 3;
+pub const INSERTS: usize = 3;
 /// Commitment appends per slot (every shape 2).
-pub(crate) const APPENDS: usize = 2;
+pub const APPENDS: usize = 2;
 /// The registry's depth.
-pub(crate) const R_DEPTH: usize = qlab_air::l2::REGISTRY_DEPTH;
+pub const R_DEPTH: usize = qlab_air::l2::REGISTRY_DEPTH;
 
 /// Which update path a pair segment walks. The A perm of a level is the
 /// first path, the B perm the second: `Mid` = (OLD, MID), `New` =
 /// (EMPTY, NEW), `C` = (EMPTY, cm), `R` = (OLD, NEW).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PathId {
+pub enum PathId {
     Mid(usize),
     New(usize),
     C(usize),
@@ -137,7 +137,7 @@ pub(crate) enum PathId {
 }
 
 impl PathId {
-    pub(crate) const fn depth(self) -> usize {
+    pub const fn depth(self) -> usize {
         match self {
             PathId::R => R_DEPTH,
             _ => N_DEPTH,
@@ -149,7 +149,7 @@ impl PathId {
 /// but the last two), `L30` level 30 (N/C only; bit forced 0), `LastA` /
 /// `LastB` the last level's two perms, one segment each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Part {
+pub enum Part {
     Bulk,
     L30,
     LastA,
@@ -158,7 +158,7 @@ pub(crate) enum Part {
 
 /// One segment of the slot program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Seg {
+pub enum Seg {
     Sd(usize),
     LeafOld(usize),
     LeafMid(usize),
@@ -169,15 +169,15 @@ pub(crate) enum Seg {
 }
 
 /// Segments per slot; `PAD` is ring position [`NSEG`].
-pub(crate) const NSEG: usize = SD_BLOCKS + 3 * 11 + 2 * 4 + 4;
+pub const NSEG: usize = SD_BLOCKS + 3 * 11 + 2 * 4 + 4;
 /// The ring's columns: the slot's segments and `PAD`.
-pub(crate) const NSEG_COLS: usize = NSEG + 1;
+pub const NSEG_COLS: usize = NSEG + 1;
 /// The slot's last segment (its end is the slot boundary).
-pub(crate) const LAST_SEG: usize = NSEG - 1;
+pub const LAST_SEG: usize = NSEG - 1;
 
 impl Seg {
     /// The segment's ring position.
-    pub(crate) const fn idx(self) -> usize {
+    pub const fn idx(self) -> usize {
         // The slot's segments after its SD blocks.
         let l = SD_BLOCKS;
         match self {
@@ -197,7 +197,7 @@ impl Seg {
     }
 
     /// Perms in the segment.
-    pub(crate) const fn len(self) -> usize {
+    pub const fn len(self) -> usize {
         match self {
             Seg::Pair(p, Part::Bulk) => 2 * (p.depth() - if matches!(p, PathId::R) { 1 } else { 2 }),
             Seg::Pair(_, Part::L30) => 2,
@@ -206,7 +206,7 @@ impl Seg {
     }
 
     /// Whether the segment acts for a transaction of shape `tag`.
-    pub(crate) fn active(self, tag: L2ShapeTag) -> bool {
+    pub fn active(self, tag: L2ShapeTag) -> bool {
         let r = tag == L2ShapeTag::R;
         match self {
             Seg::Sd(b) => b < sd_perms(pv_len(tag)),
@@ -234,7 +234,7 @@ const fn part_off(p: Part) -> usize {
 }
 
 /// The slot's segments in ring order.
-pub(crate) fn slot_program() -> Vec<Seg> {
+pub fn slot_program() -> Vec<Seg> {
     let mut v: Vec<Seg> = (0..SD_BLOCKS).map(Seg::Sd).collect();
     for i in 0..INSERTS {
         v.push(Seg::LeafOld(i));
@@ -261,7 +261,7 @@ pub(crate) fn slot_program() -> Vec<Seg> {
 }
 
 /// Perms per slot.
-pub(crate) const SLOT_PERMS: usize = 560;
+pub const SLOT_PERMS: usize = 560;
 
 /// Lab #785 F5-4d: the SD bump moves no height — `560·24·k` for k = 4, 8,
 /// 16 rounds to the same powers of two as before.
@@ -270,15 +270,15 @@ const _: () = assert!((8 * SLOT_PERMS * NUM_ROUNDS).next_power_of_two() == 1 << 
 const _: () = assert!((16 * SLOT_PERMS * NUM_ROUNDS).next_power_of_two() == 1 << 18);
 
 /// The first perm of segment `seg` within its slot.
-pub(crate) fn seg_start(seg: Seg) -> usize {
+pub fn seg_start(seg: Seg) -> usize {
     slot_program().iter().take(seg.idx()).map(|s| s.len()).sum()
 }
 
 /// The three shapes in tag-column order.
-pub(crate) const TAGS: [L2ShapeTag; 3] = [L2ShapeTag::S, L2ShapeTag::P, L2ShapeTag::R];
+pub const TAGS: [L2ShapeTag; 3] = [L2ShapeTag::S, L2ShapeTag::P, L2ShapeTag::R];
 
 /// A shape's public-value count.
-pub(crate) fn pv_len(tag: L2ShapeTag) -> usize {
+pub fn pv_len(tag: L2ShapeTag) -> usize {
     match tag {
         L2ShapeTag::S => qlab_air::l2::PV_LEN,
         L2ShapeTag::P => qlab_air::l2p::PV_LEN,
@@ -324,63 +324,63 @@ fn pv_pos(p: usize) -> (usize, usize, usize) {
 // ---------------------------------------------------------------------------
 
 /// The comparator gadget's cells (F3-2a), live only on the gate rows.
-pub(crate) const CMP_OFF: usize = NUM_KECCAK_COLS;
+pub const CMP_OFF: usize = NUM_KECCAK_COLS;
 /// The segment ring (one-hot).
-pub(crate) const SEG_OFF: usize = CMP_OFF + LT_WIDTH;
+pub const SEG_OFF: usize = CMP_OFF + LT_WIDTH;
 /// Perms left in the segment after this one, its zero flag and inverse.
-pub(crate) const REM: usize = SEG_OFF + NSEG_COLS;
-pub(crate) const Z: usize = REM + 1;
-pub(crate) const ZINV: usize = Z + 1;
+pub const REM: usize = SEG_OFF + NSEG_COLS;
+pub const Z: usize = REM + 1;
+pub const ZINV: usize = Z + 1;
 /// Slots left after this one, its zero flag and inverse.
-pub(crate) const LEFT: usize = ZINV + 1;
-pub(crate) const ZL: usize = LEFT + 1;
-pub(crate) const ZLINV: usize = ZL + 1;
+pub const LEFT: usize = ZINV + 1;
+pub const ZL: usize = LEFT + 1;
+pub const ZLINV: usize = ZL + 1;
 /// Within a pair segment, 0 on A perms and 1 on B perms.
-pub(crate) const SIDE: usize = ZLINV + 1;
+pub const SIDE: usize = ZLINV + 1;
 /// The shape tag, one-hot `[S, P, R]`.
-pub(crate) const TAG_OFF: usize = SIDE + 1;
+pub const TAG_OFF: usize = SIDE + 1;
 /// Running state: `N` (16 limbs), `n_next`, `C`, `c_next`, `R`, `SD`.
-pub(crate) const N_OFF: usize = TAG_OFF + 3;
-pub(crate) const NN: usize = N_OFF + 16;
-pub(crate) const C_OFF: usize = NN + 1;
-pub(crate) const CN: usize = C_OFF + 16;
-pub(crate) const R_OFF: usize = CN + 1;
-pub(crate) const SD_OFF: usize = R_OFF + 16;
+pub const N_OFF: usize = TAG_OFF + 3;
+pub const NN: usize = N_OFF + 16;
+pub const C_OFF: usize = NN + 1;
+pub const CN: usize = C_OFF + 16;
+pub const R_OFF: usize = CN + 1;
+pub const SD_OFF: usize = R_OFF + 16;
 /// The slot's surface: three nullifiers, two commitments, the registry root
 /// it reads (S/P) or replaces (R), the new root and the asset (R).
-pub(crate) const NF_OFF: usize = SD_OFF + 16;
-pub(crate) const CM_OFF: usize = NF_OFF + 16 * INSERTS;
-pub(crate) const RT_OFF: usize = CM_OFF + 16 * APPENDS;
-pub(crate) const NRT_OFF: usize = RT_OFF + 16;
-pub(crate) const ASSET: usize = NRT_OFF + 16;
+pub const NF_OFF: usize = SD_OFF + 16;
+pub const CM_OFF: usize = NF_OFF + 16 * INSERTS;
+pub const RT_OFF: usize = CM_OFF + 16 * APPENDS;
+pub const NRT_OFF: usize = RT_OFF + 16;
+pub const ASSET: usize = NRT_OFF + 16;
 /// `LEAF_OLD`'s `hi`, held to `LEAF_NEW`.
-pub(crate) const HI_OFF: usize = ASSET + 1;
+pub const HI_OFF: usize = ASSET + 1;
 /// The two paths' running nodes, the level's sibling and bit, the index
 /// accumulator, `2^level`, and `bit · 2^level`.
-pub(crate) const NA_OFF: usize = HI_OFF + 16;
-pub(crate) const NB_OFF: usize = NA_OFF + 16;
-pub(crate) const SIB_OFF: usize = NB_OFF + 16;
-pub(crate) const BIT: usize = SIB_OFF + 16;
-pub(crate) const ACC: usize = BIT + 1;
-pub(crate) const PW: usize = ACC + 1;
-pub(crate) const BP: usize = PW + 1;
+pub const NA_OFF: usize = HI_OFF + 16;
+pub const NB_OFF: usize = NA_OFF + 16;
+pub const SIB_OFF: usize = NB_OFF + 16;
+pub const BIT: usize = SIB_OFF + 16;
+pub const ACC: usize = BIT + 1;
+pub const PW: usize = ACC + 1;
+pub const BP: usize = PW + 1;
 /// `1 / asset` (R: the asset is nonzero).
-pub(crate) const AINV: usize = BP + 1;
+pub const AINV: usize = BP + 1;
 /// R transactions in earlier slots (at most one per leaf).
-pub(crate) const RCNT: usize = AINV + 1;
+pub const RCNT: usize = AINV + 1;
 /// Materialized per-perm flags, each defined from the ring and the tag.
-pub(crate) const ON: usize = RCNT + 1;
-pub(crate) const KPA: usize = ON + 1;
-pub(crate) const KPB: usize = KPA + 1;
-pub(crate) const KCMP: usize = KPB + 1;
-pub(crate) const KNC: usize = KCMP + 1;
-pub(crate) const KNI: usize = KNC + 1;
-pub(crate) const KR: usize = KNI + 1;
-pub(crate) const W: usize = KR + 1;
-pub(crate) const SDC: usize = W + 1;
-pub(crate) const SDF: usize = SDC + 1;
+pub const ON: usize = RCNT + 1;
+pub const KPA: usize = ON + 1;
+pub const KPB: usize = KPA + 1;
+pub const KCMP: usize = KPB + 1;
+pub const KNC: usize = KCMP + 1;
+pub const KNI: usize = KNC + 1;
+pub const KR: usize = KNI + 1;
+pub const W: usize = KR + 1;
+pub const SDC: usize = W + 1;
+pub const SDF: usize = SDC + 1;
 /// The leaf's width.
-pub(crate) const LEAF_WIDTH: usize = SDF + 1;
+pub const LEAF_WIDTH: usize = SDF + 1;
 /// Lab #785 F5-4d: one SD block more (3,224 → 3,225).
 const _: () = assert!(LEAF_WIDTH == 3_225);
 /// Per-perm columns start here (the ring onward).
@@ -393,18 +393,18 @@ const PLAN_WIDTH: usize = LEAF_WIDTH - PLAN_BASE;
 
 /// One side of the leaf's surface, as 16-bit chunks: `N` 16, `n_next` 2,
 /// `C` 16, `c_next` 2, `R` 16, `SD` 16.
-pub(crate) const PV_N: usize = 0;
-pub(crate) const PV_NN: usize = 16;
-pub(crate) const PV_C: usize = 18;
-pub(crate) const PV_CN: usize = 34;
-pub(crate) const PV_R: usize = 36;
-pub(crate) const PV_SD: usize = 52;
-pub(crate) const PV_SIDE: usize = 68;
+pub const PV_N: usize = 0;
+pub const PV_NN: usize = 16;
+pub const PV_C: usize = 18;
+pub const PV_CN: usize = 34;
+pub const PV_R: usize = 36;
+pub const PV_SD: usize = 52;
+pub const PV_SIDE: usize = 68;
 /// In at 0, out at [`PV_SIDE`].
-pub(crate) const LEAF_PV_LEN: usize = 2 * PV_SIDE;
+pub const LEAF_PV_LEN: usize = 2 * PV_SIDE;
 
 /// The leaf's public values: `rin` then `rout`.
-pub(crate) fn leaf_pvs(rin: &Roots, rout: &Roots) -> Vec<Val> {
+pub fn leaf_pvs(rin: &Roots, rout: &Roots) -> Vec<Val> {
     let mut v = Vec::with_capacity(LEAF_PV_LEN);
     for r in [rin, rout] {
         let d = |v: &mut Vec<Val>, x: &Digest| v.extend(limbs(x).iter().map(|l| Val::from_u32(*l)));
@@ -424,13 +424,13 @@ pub(crate) fn leaf_pvs(rin: &Roots, rout: &Roots) -> Vec<Val> {
 // ---------------------------------------------------------------------------
 
 /// The leaf for `k` transactions.
-pub(crate) struct LeafAir {
+pub struct LeafAir {
     pub k: usize,
     kc: KeccakIdx,
 }
 
 impl LeafAir {
-    pub(crate) fn new(k: usize) -> Self {
+    pub fn new(k: usize) -> Self {
         assert!(k >= 1);
         Self { k, kc: keccak_idx() }
     }
@@ -438,7 +438,7 @@ impl LeafAir {
 
 /// The constraint groups, in emission order; a violated constraint's index
 /// maps back to its group ([`phase_of`]).
-pub(crate) const PHASES: &[&str] = &[
+pub const PHASES: &[&str] = &[
     "keccak",
     "cmp",
     "cmp_idle",
@@ -487,7 +487,7 @@ impl<AB: AirBuilder<F = Val>> Air<AB> for LeafAir {
 
 /// Constraint-index range of every phase, counted on the symbolic builder
 /// (which numbers constraints exactly as the debug scanner does).
-pub(crate) fn phase_ranges(air: &LeafAir) -> Vec<Range<usize>> {
+pub fn phase_ranges(air: &LeafAir) -> Vec<Range<usize>> {
     let layout = AirLayout::from_air::<Val>(air);
     let mut start = 0;
     (0..PHASES.len())
@@ -503,7 +503,7 @@ pub(crate) fn phase_ranges(air: &LeafAir) -> Vec<Range<usize>> {
 }
 
 /// The phase a constraint index belongs to.
-pub(crate) fn phase_of(ranges: &[Range<usize>], constraint: usize) -> &'static str {
+pub fn phase_of(ranges: &[Range<usize>], constraint: usize) -> &'static str {
     PHASES[ranges.iter().position(|r| r.contains(&constraint)).expect("a constraint of the leaf")]
 }
 
@@ -905,7 +905,7 @@ impl LeafAir {
 
 /// What SD block `b`'s preimage limb `(lane, m)` must be, per shape (`None`
 /// = message data or the chaining value, bound elsewhere).
-pub(crate) fn sd_expect(b: usize, lane: usize, m: usize) -> [Option<u32>; 3] {
+pub fn sd_expect(b: usize, lane: usize, m: usize) -> [Option<u32>; 3] {
     let dom = sd_domain_lanes();
     core::array::from_fn(|t| {
         let tag = TAGS[t];
@@ -940,34 +940,34 @@ pub(crate) fn sd_expect(b: usize, lane: usize, m: usize) -> [Option<u32>; 3] {
 /// One perm of the plan: its Keccak-f input and its per-perm columns
 /// (`[PLAN_BASE, LEAF_WIDTH)`).
 #[derive(Clone)]
-pub(crate) struct PermPlan {
+pub struct PermPlan {
     pub pre: [u64; 25],
     pub cols: Vec<Val>,
 }
 
 impl PermPlan {
-    pub(crate) fn get(&self, col: usize) -> Val {
+    pub fn get(&self, col: usize) -> Val {
         self.cols[col - PLAN_BASE]
     }
-    pub(crate) fn set(&mut self, col: usize, v: Val) {
+    pub fn set(&mut self, col: usize, v: Val) {
         self.cols[col - PLAN_BASE] = v;
     }
 }
 
 /// The leaf's plan: every program perm, then the `PAD` perm repeated.
 #[derive(Clone)]
-pub(crate) struct Plan {
+pub struct Plan {
     pub perms: Vec<PermPlan>,
     pub pad: PermPlan,
 }
 
 /// The perm index of segment `seg`'s `i`-th perm in slot `slot`.
-pub(crate) fn perm_at(slot: usize, seg: Seg, i: usize) -> usize {
+pub fn perm_at(slot: usize, seg: Seg, i: usize) -> usize {
     SLOT_PERMS * slot + seg_start(seg) + i
 }
 
 /// The row of a perm's round `r` (0 = step 0, 23 = its last row).
-pub(crate) fn row_of(perm: usize, r: usize) -> usize {
+pub fn row_of(perm: usize, r: usize) -> usize {
     NUM_ROUNDS * perm + r
 }
 
@@ -1006,7 +1006,7 @@ fn put_digest(cols: &mut [Val], at: usize, d: &Digest) {
 /// Build the plan: the machine the AIR constrains, run on the witness
 /// **without validating it** — a malicious witness yields the trace a
 /// prover would submit, refused where the AIR binds it.
-pub(crate) fn build_plan(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> Plan {
+pub fn build_plan(rin: &Roots, txs: &[TxSurface], wits: &[TxWitness]) -> Plan {
     use qlab_air::l2r;
     let k = txs.len();
     assert!(k >= 1 && wits.len() == k);
@@ -1287,7 +1287,7 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, w: &TxWitness) {
 
 /// Render the plan: the Keccak lane, the comparator on its gate rows, the
 /// per-perm columns on every row of their perm.
-pub(crate) fn render(plan: &Plan) -> RowMajorMatrix<Val> {
+pub fn render(plan: &Plan) -> RowMajorMatrix<Val> {
     let inputs: Vec<[u64; 25]> = plan.perms.iter().map(|p| p.pre).collect();
     let keccak = generate_trace_rows::<Val>(inputs, 0);
     let height = keccak.values.len() / NUM_KECCAK_COLS;
@@ -1306,7 +1306,7 @@ pub(crate) fn render(plan: &Plan) -> RowMajorMatrix<Val> {
 }
 
 /// The leaf's height for `k` transactions.
-pub(crate) fn leaf_height(k: usize) -> usize {
+pub fn leaf_height(k: usize) -> usize {
     (k * SLOT_PERMS * NUM_ROUNDS).next_power_of_two()
 }
 
@@ -1319,7 +1319,7 @@ const _: () = assert!(INDEX_CAP == 1 << 30);
 
 /// The constraints violated on `row` (p3-air 0.6.1's debug builder, exactly
 /// as `check_constraints` evaluates a row).
-pub(crate) fn failures_at(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize) -> Vec<usize> {
+pub fn failures_at(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize) -> Vec<usize> {
     use p3_air::DebugConstraintBuilder;
     use p3_matrix::dense::RowMajorMatrixView;
     use p3_matrix::stack::ViewPair;
@@ -1345,7 +1345,7 @@ pub(crate) fn failures_at(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val
 }
 
 /// The phases violated on `row`, deduplicated, in emission order.
-pub(crate) fn phases_at(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize, ranges: &[Range<usize>]) -> Vec<&'static str> {
+pub fn phases_at(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize, ranges: &[Range<usize>]) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = failures_at(air, trace, pvs, row).into_iter().map(|c| phase_of(ranges, c)).collect();
     v.dedup();
     v
@@ -1353,7 +1353,7 @@ pub(crate) fn phases_at(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val],
 
 /// The **lowest** violated row and its phases, or `None` when every row
 /// holds (every row evaluated, in parallel).
-pub(crate) fn first_violation(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Option<(usize, Vec<&'static str>)> {
+pub fn first_violation(air: &LeafAir, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Option<(usize, Vec<&'static str>)> {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use p3_maybe_rayon::prelude::*;
     use p3_matrix::Matrix;

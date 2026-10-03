@@ -51,15 +51,15 @@ use super::native::{fee_seed_state, Member, SlotWitness, WInputs, WRoots, WTag, 
 use crate::f3::cmp::{self, limbs, LT_WIDTH};
 use crate::f3::leaf::{inv_or_zero, mux, nf_leaf_state, node_state, out4, pv_digest};
 use crate::f3::native::{sd_chain_byte, Digest, EMPTY};
-pub(crate) use qlab_wrapper::wleaf::*;
+pub use qlab_wrapper::wleaf::*;
 
 // The trace plan's column span (back from qlab-wrapper in lab #785 F5-4a,
 // review Y2: only the prover's plan uses it).
-pub(crate) const PLAN_BASE: usize = SEG_OFF;
-pub(crate) const PLAN_WIDTH: usize = W_WIDTH - PLAN_BASE;
+pub const PLAN_BASE: usize = SEG_OFF;
+pub const PLAN_WIDTH: usize = W_WIDTH - PLAN_BASE;
 
 /// W's public values.
-pub(crate) fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64, exit_cmt: &Digest) -> Vec<Val> {
+pub fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64, exit_cmt: &Digest) -> Vec<Val> {
     let mut v = Vec::with_capacity(W_PV_LEN);
     let d = |v: &mut Vec<Val>, x: &Digest| v.extend(limbs(x).iter().map(|l| Val::from_u32(*l)));
     let i = |v: &mut Vec<Val>, x: u64| v.extend([Val::from_u32((x & 0xffff) as u32), Val::from_u32((x >> 16) as u32)]);
@@ -94,22 +94,22 @@ pub(crate) fn w_pvs(rin: &WRoots, rout: &WRoots, inp: &WInputs, fee: u64, exit_c
 }
 
 #[derive(Clone)]
-pub(crate) struct PermPlan {
+pub struct PermPlan {
     pub pre: [u64; 25],
     pub cols: Vec<Val>,
 }
 
 impl PermPlan {
-    pub(crate) fn get(&self, col: usize) -> Val {
+    pub fn get(&self, col: usize) -> Val {
         self.cols[col - PLAN_BASE]
     }
-    pub(crate) fn set(&mut self, col: usize, v: Val) {
+    pub fn set(&mut self, col: usize, v: Val) {
         self.cols[col - PLAN_BASE] = v;
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct Plan {
+pub struct Plan {
     pub perms: Vec<PermPlan>,
     pub pad: PermPlan,
 }
@@ -208,7 +208,7 @@ fn limb(x: u64, j: usize) -> u64 {
 }
 
 /// Build W's plan from a witness, without validating it.
-pub(crate) fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WWitness) -> Plan {
+pub fn build_plan(rin: &WRoots, inp: &WInputs, members: &[Member], w: &WWitness) -> Plan {
     let k = members.len();
     assert!(k >= 1 && w.slots.len() == k);
     let prog = program();
@@ -760,7 +760,7 @@ fn step(s: Seg, side: usize, out: Digest, g: &mut Regs, pre: &[u64; 25], view: O
 }
 
 /// Render the plan.
-pub(crate) fn render(plan: &Plan) -> RowMajorMatrix<Val> {
+pub fn render(plan: &Plan) -> RowMajorMatrix<Val> {
     let inputs: Vec<[u64; 25]> = plan.perms.iter().map(|p| p.pre).collect();
     let keccak = generate_trace_rows::<Val>(inputs, 0);
     let height = keccak.values.len() / NUM_KECCAK_COLS;
@@ -778,7 +778,7 @@ pub(crate) fn render(plan: &Plan) -> RowMajorMatrix<Val> {
 }
 
 /// The fee note's value the witness implies (Σ fee over claims).
-pub(crate) fn fee_of(members: &[Member]) -> u64 {
+pub fn fee_of(members: &[Member]) -> u64 {
     members
         .iter()
         .filter(|m| m.tag == WTag::C)
@@ -788,7 +788,7 @@ pub(crate) fn fee_of(members: &[Member]) -> u64 {
 
 const _: () = assert!(CLAIM_TAG == 0x04);
 
-pub(crate) fn failures_at(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize) -> Vec<usize> {
+pub fn failures_at(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize) -> Vec<usize> {
     use p3_air::DebugConstraintBuilder;
     use p3_matrix::dense::RowMajorMatrixView;
     use p3_matrix::stack::ViewPair;
@@ -813,13 +813,13 @@ pub(crate) fn failures_at(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], 
     builder.into_failures().into_iter().map(|f| f.constraint).collect()
 }
 
-pub(crate) fn phases_at(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize, ranges: &[Range<usize>]) -> Vec<&'static str> {
+pub fn phases_at(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val], row: usize, ranges: &[Range<usize>]) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = failures_at(air, trace, pvs, row).into_iter().map(|c| phase_of(ranges, c)).collect();
     v.dedup();
     v
 }
 
-pub(crate) fn first_violation(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Option<(usize, Vec<&'static str>)> {
+pub fn first_violation(air: &WAir, trace: &RowMajorMatrix<Val>, pvs: &[Val]) -> Option<(usize, Vec<&'static str>)> {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use p3_matrix::Matrix;
     use p3_maybe_rayon::prelude::*;

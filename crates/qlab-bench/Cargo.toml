@@ -14,6 +14,9 @@ qlab-consensus = { path = "../qlab-consensus" }
 # measured fixtures from it — one source, never a local copy.
 qlab-l2 = { path = "../qlab-l2" }
 qlab-wrapper = { path = "../qlab-wrapper" }
+# Lab #847 S1a: the wrapper's proving half (F3/F4 native statement, W leaf
+# and deposit AIRs) lives here now; f3.rs/f4.rs re-export it at the old paths.
+qlab-wprover = { path = "../qlab-wprover" }
 # The node's commitment and registry trees (lab #767): F3's native reference
 # builds on them so its roots are the node's roots bit for bit.
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
