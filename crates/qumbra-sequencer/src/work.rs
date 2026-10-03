@@ -15,16 +15,16 @@ use qlab_node::wrapper_route::WrapperView;
 use qlab_wrapper::codec::digest_from_bytes;
 use qumbra_node::bundle::WrapperRule;
 use qumbra_node::genesis_v6::GenesisFileV6;
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::bundle::{assemble, prove, self_check, sign, Timings};
+use crate::bundle::{assemble, manifest, prove, self_check, sign, Timings};
 use crate::chain::{self, Anchor, Http};
 use crate::intake::Chain;
 use crate::key::SequencerKey;
-use crate::members::{first_refused, pass_members_ok, plan_claims, Keys, PlanError, K};
+use crate::members::{first_refused, pass_members_ok, plan_claims, spendable, Keys, PlanError, K};
 use crate::pass::{Clock, Draft, NotDrafted, Node, Work};
 use crate::queue::Refusal;
-use crate::state::{Built, RunState};
+use crate::state::{owned_json, owned_of, Built, RunState};
 use qlab_wprover::f4::native::{Member, WTag, M_ABS};
 
 /// The node: `/v1/wrapper` on its telemetry listener, `POST /v1/bundle` on
@@ -141,8 +141,12 @@ impl Work for RealWork {
                 take.push(i);
             }
         }
-        if take.len() < K {
-            return Ok(Err(NotDrafted::Short { have: take.len(), need: K }));
+        // The rest of the wrapper is fillers, one per spendable sequencer
+        // note (S3); a wrapper with no claim is never posted.
+        let keys = Keys::from_seed(*self.key.filler_seed);
+        let notes = spendable(&state, &keys, &self.run.owned).len();
+        if take.is_empty() || take.len() + notes < K {
+            return Ok(Err(NotDrafted::Short { have: take.len() + notes.min(K - take.len()), need: K }));
         }
         for r in &absorbable {
             if roots.len() == M_ABS {
@@ -165,8 +169,7 @@ impl Work for RealWork {
         let items: Vec<[u8; 32]> = take.iter().map(|&i| claims[i].0).collect();
         let mut chosen: Vec<_> = claims.into_iter().enumerate().filter(|(i, _)| take.contains(i)).map(|(_, c)| c).collect();
         let files: Vec<_> = chosen.drain(..).map(|(_, _, f)| f).collect();
-        let keys = Keys::from_seed(*self.key.filler_seed);
-        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), &keys) {
+        let plan = match plan_claims(&state, &prev, absorbed, files.clone(), &self.run.owned, &keys) {
             Ok(p) => p,
             // The statement is native: find the item by elimination and
             // refuse it by name, so the next draft does not pick it again.
@@ -185,14 +188,27 @@ impl Work for RealWork {
         let bytes = wb.encode();
         let rule = WrapperRule::from_genesis(&self.genesis).map_err(|e| format!("{e:?}"))?; // debug-ok: a wrapper-rule genesis error, no key material
         self_check(&rule, &bytes, &prev, &view).map_err(|r| format!("the node's rule refuses the bundle: {r:?}"))?; // debug-ok: a BundleRefusal, the node's own reason
-        Ok(Ok(Draft { items, bytes, built: Built::of(&plan).to_json() }))
+        let mut built = Built::of(&plan).to_json();
+        built["credited"] = json!(plan.credited.iter().map(owned_json).collect::<Vec<_>>());
+        let mut m = manifest(&plan, &wb, &bytes, &self.chain.genesis, self.genesis.wrapper.wrapper_spacing_blocks, &view, &timings);
+        m["mode"] = json!("sequencer");
+        m["issue"] = json!(847);
+        Ok(Ok(Draft { items, bytes, built, manifest: Some(m) }))
     }
 
     fn commit(&mut self, id: &[u8; 32], built: &Value) -> Result<(), String> {
         if self.run.ids.last() == Some(id) {
             return Ok(()); // a landing replayed after a crash: already recorded
         }
-        self.run.push_built(*id, Built::from_json(built)?);
+        let b = Built::from_json(built)?;
+        // The notes this wrapper made the sequencer (fillers' outputs, the
+        // fee note) are spendable from the next wrapper on.
+        let credited = match built.get("credited") {
+            None => Vec::new(),
+            Some(c) => c.as_array().ok_or("built.credited")?.iter().map(owned_of).collect::<Result<_, _>>()?,
+        };
+        self.run.push_built(*id, b);
+        self.run.owned.extend(credited);
         self.run.save(&self.state)
     }
 

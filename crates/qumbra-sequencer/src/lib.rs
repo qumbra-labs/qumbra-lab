@@ -49,11 +49,12 @@ mod tests {
     /// A **text lint** (the `f5box_calls_no_rule_knob` shape): outside test
     /// code no source of this crate Debug-formats a claim file, a
     /// deposit-sum opening or a plan — `ClaimFile` and `DepEntry` derive
-    /// Debug while holding `v` and `r_v`, and a `Plan` holds both. The
+    /// Debug while holding `v` and `r_v`, and a `Plan` holds both — nor a
+    /// sequencer note (`Owned` derives Debug with its `rho` and `rseed`). The
     /// guarantee is review; this keeps a `{file:?}` from creeping in.
     #[test]
     fn no_source_debug_formats_an_opening() {
-        let names = ["file", "files", "dep", "deps", "plan", "p", "claim", "draft"];
+        let names = ["file", "files", "dep", "deps", "plan", "p", "claim", "draft", "owned", "n", "notes", "credited"];
         for (path, text) in SOURCES {
             let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
             for n in names {

@@ -52,7 +52,7 @@ use qlab_wrapper::verify::Surface;
 use super::chain::{Anchor, Burn, ChainView};
 use qlab_wprover::f3::native::Digest;
 use qlab_wprover::f4::dep::DepEntry;
-use qlab_wprover::f4::native::{Member, WInputs, WState, WTag, WWitness, M_ABS};
+use qlab_wprover::f4::native::{fee_rho, fee_rseed, Member, WInputs, WState, WTag, WWitness, M_ABS};
 
 /// The key schedule's domain.
 const DOMAIN: &[u8] = b"qumbra:f5box:v1";
@@ -215,8 +215,12 @@ pub struct Plan {
     pub claimed: Vec<Burn>,
     /// The owned notes spent, in slot order.
     pub spent: Vec<Owned>,
-    /// The notes this wrapper creates for this run (credits, change).
+    /// The notes this wrapper creates for this run (credits, change; for a
+    /// sequencer wrapper, each filler's two outputs and the fee note).
     pub credited: Vec<Owned>,
+    /// Lab #847 S3: per slot, whether the member is sequencer padding (an S
+    /// filler) rather than traffic — the manifest marks it `filler: true`.
+    pub filler: Vec<bool>,
     pub rin: WRoots,
     pub wit: WWitness,
     pub rout: WRoots,
@@ -253,22 +257,35 @@ pub enum PlanError {
     /// Lab #831 W3c: the claim file opens its burn under a root no wrapper
     /// has absorbed and this one does not absorb.
     ClaimAnchorNotAbsorbed { root: Digest },
-    /// Lab #847 S4: not exactly K = 16 claims — fewer means nothing yet
-    /// fills the rest (fillers land in S3), more is the caller's mistake.
+    /// Lab #847 S4/S3: claims plus spendable sequencer notes (one per
+    /// filler) short of K = 16 — `have` counts both — or more claims than a
+    /// wrapper holds (the caller's mistake).
     WrongCount { have: usize, need: usize },
+    /// Lab #847 S3: no claim — a wrapper of padding alone is never planned.
+    NoClaim,
 }
 
 /// A wrapper's member count (wrapper version 1's K, lab #785 Q1).
 pub const K: usize = 16;
 
 /// **The member kinds a posting pass may emit** (lab #847, the Q4 condition
-/// of design `l2-read-path-decision`): claims, and S fillers once S3 lands —
+/// of design `l2-read-path-decision`): claims, and S3's S fillers —
 /// **never R**. The node's derived L2 index (lab #860, R1) cannot follow a
 /// registry write from the wire, so one R member would block every exit
 /// until format v2. [`plan`] (f5box's general planner) can still plan R;
 /// the pass never calls it — `lib.rs`'s `the_pass_plans_no_r_member` holds
 /// that — and [`pass_members_ok`] refuses anything else before proving.
-pub const PASS_MEMBER_TAGS: [WTag; 1] = [WTag::C];
+pub const PASS_MEMBER_TAGS: [WTag; 2] = [WTag::C, WTag::S];
+
+/// **A filler's fee: 0** (lab #847 S3, ruled 2026-10-03). S, P and R carry no
+/// tariff yet (lab #785 census), and W's fee note sums the **claims'** fees
+/// only — a nonzero S fee under [`FeeSlot::Dummy`] is destroyed with no
+/// recipient, so every filler would burn it from the sequencer's balance.
+/// At 0 a filler moves no value: change = input, a zero second output, both
+/// to `rkm_seq`. **When F6 defines the tx tariff** this becomes the tariff,
+/// paid into F6's fee flow, and the sequencer's notes shrink by it per
+/// filler — the filler budget then needs funding, which this constant hides.
+pub const FILLER_FEE: u64 = 0;
 
 /// Every member's tag is one [`PASS_MEMBER_TAGS`] allows; else the first one
 /// that is not, by slot and tag.
@@ -283,23 +300,90 @@ pub fn pass_members_ok(members: &[Member]) -> Result<(), String> {
     }
 }
 
-/// **Lab #847 S4: a wrapper of wallets' claims only** — every member a claim
-/// file intake verified, in the order given. `absorbed` is the four roots
-/// this wrapper absorbs, oldest first, chosen by the caller (the loop picks
-/// them under the record-covered height); every claim's anchor must be one
-/// of them or a root an earlier wrapper absorbed. Refused by name with
-/// [`PlanError::WrongCount`] for any count but [`K`] (fewer: S3 brings fillers),
-/// and by the native statement exactly as [`plan`] runs it. The sequencer's
-/// fee note goes to `keys` (the filler wallet, lab #847 S5).
+/// The notes in `owned` the next wrapper may spend: in C at its `C_in`,
+/// nullifier not yet in N — each once, **largest value first** (stable, so
+/// equal values keep `owned`'s order). Every filler mints a zero-valued
+/// note; this keeps those last, so value-bearing notes carry the fillers
+/// and the zero ones are drawn only when nothing else is left.
+pub fn spendable(state: &WState, keys: &Keys, owned: &[Owned]) -> Vec<Owned> {
+    let c_count = state.l2.c.len();
+    let mut out: Vec<Owned> = Vec::new();
+    for n in owned {
+        let in_c = state.l2.c.position_of(&n.cm(keys)).is_some_and(|p| p < c_count);
+        if in_c && state.l2.n.low_leaf_of(&derive_input_l2(&keys.input(n)).1).is_some() && !out.contains(n) {
+            out.push(*n);
+        }
+    }
+    out.sort_by_key(|n| std::cmp::Reverse(n.value));
+    out
+}
+
+/// **One filler** (lab #847 S3): an S self-transfer of the owned note `n`,
+/// in `slot` of the wrapper at position `wrapper` — `n` whole to `rkm_seq`
+/// as change, a zero-valued second output to `rkm_seq`, [`FILLER_FEE`]
+/// (0), the #219 dummy in the second input slot. It moves no value and
+/// leaves the sequencer one note richer. Returns the member and the two
+/// notes it creates, both the sequencer's.
+pub fn filler(state: &WState, keys: &Keys, wrapper: u64, slot: usize, n: &Owned) -> Result<(Inst, [Owned; 2]), PlanError> {
+    let lane = |label: &str| keys.lanes(label, wrapper, slot as u64);
+    let reg = &state.l2.r;
+    let (c_in, c_count) = (state.l2.c.root(), state.l2.c.len());
+    let pos = state.l2.c.position_of(&n.cm(keys)).filter(|p| *p < c_count).ok_or(PlanError::Notes { need: 1, have: 0 })?;
+    let real = keys.input(n);
+    let real_w = state.l2.c.auth_path(pos, c_count);
+    let dummy = L2TxInput { sk: lane("filler-dummy-sk"), value: 0, asset: 0, rho: lane("filler-dummy-rho"), rseed: lane("filler-dummy-rseed"), d: [0, 0] };
+    let me = keys.rkm();
+    let change = n.value.checked_sub(FILLER_FEE).ok_or(PlanError::NoteBelowFee { value: n.value })?;
+    let out = |value: u64, label: &str| L2TxOutput { value, asset: 0, rkm: me, rho: [0; 4], rseed: lane(label) };
+    let outputs = [out(change, "filler-out0"), out(0, "filler-out1")];
+    let leaf0 = *reg.leaf(0).expect("asset 0's leaf is in every registry (lab #785 F-A)");
+    let w0 = reg.witness(0).expect("asset 0's leaf is in every registry");
+    let inst = build_bucket_l2_dummy1(
+        qlab_l2::LOG_HEIGHT_S,
+        &real,
+        &real_w,
+        &dummy,
+        &off_tree_witness(),
+        &outputs,
+        FILLER_FEE,
+        c_in,
+        &[leaf0, leaf0],
+        &[w0, w0],
+        reg.root(),
+        &FeeSlot::Dummy { input: dummy_fee_input(&lane("filler-fee-dummy")) },
+    );
+    let nf0 = inst.nf[0];
+    let made = [0, 1].map(|j| Owned { value: outputs[j].value, rho: derive_output_rho(&nf0, j), rseed: outputs[j].rseed });
+    Ok((Inst::S(inst), made))
+}
+
+/// **Lab #847 S4 + S3: a wrapper of wallets' claims, filled to K** — every
+/// claim file intake verified, in the order given, then one [`filler`] per
+/// remaining slot from the sequencer's own spendable notes (`owned`, in
+/// order). `absorbed` is the four roots this wrapper absorbs, oldest first,
+/// chosen by the caller (the loop picks them under the record-covered
+/// height); every claim's anchor must be one of them or a root an earlier
+/// wrapper absorbed. Refused by name with [`PlanError::WrongCount`] when
+/// claims and spendable notes together are short of [`K`], or the claims
+/// alone exceed it, and by the native statement exactly as [`plan`] runs it.
+/// The sequencer's fee note goes to `keys` (the filler wallet, lab #847 S5);
+/// [`Plan::credited`] carries it and each filler's two outputs — the notes
+/// the next wrapper may spend once this one lands.
 pub fn plan_claims(
     state: &WState,
     prev: &Surface,
     absorbed: [Anchor; M_ABS],
     files: Vec<qlab_l2spend::ClaimFile>,
+    owned: &[Owned],
     keys: &Keys,
 ) -> Result<Plan, PlanError> {
-    if files.len() != K {
-        return Err(PlanError::WrongCount { have: files.len(), need: K });
+    if files.is_empty() {
+        return Err(PlanError::NoClaim);
+    }
+    let notes = spendable(state, keys, owned);
+    let n_fill = K.saturating_sub(files.len());
+    if files.len() > K || notes.len() < n_fill {
+        return Err(PlanError::WrongCount { have: files.len() + notes.len().min(n_fill), need: K });
     }
     let roots = absorbed.map(|a| a.root);
     let mut insts = Vec::with_capacity(K);
@@ -316,9 +400,22 @@ pub fn plan_claims(
         deps.push(DepEntry { v: file.value, r_v: file.r_v });
         insts.push(Inst::Proven { pvs: file.pvs, proof: file.proof });
     }
+    let n_claims = insts.len();
+    let wrapper = state.aa.len() / M_ABS as u64;
+    let mut credited = Vec::with_capacity(2 * n_fill + 1);
+    for (j, n) in notes[..n_fill].iter().enumerate() {
+        let (inst, made) = filler(state, keys, wrapper, n_claims + j, n)?;
+        insts.push(inst);
+        credited.extend(made);
+    }
     let members: Vec<Member> = insts.iter().map(Inst::member).collect();
     let inp = WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: roots, d_batch };
     let (rin, wit, rout, exit_cmt) = statement(state, &inp, &members, &[])?;
+    // W's fee note: Σ the claims' fees to rkm_seq, ρ and rseed public over
+    // `prev` — the sequencer's to spend like any owned note.
+    credited.push(Owned { value: qlab_wprover::f4::wleaf::fee_of(&members), rho: fee_rho(&inp.prev), rseed: fee_rseed(&inp.prev) });
+    let mut filler_slots = vec![false; n_claims];
+    filler_slots.resize(K, true);
     Ok(Plan {
         insts,
         members,
@@ -327,8 +424,9 @@ pub fn plan_claims(
         exits: Vec::new(),
         absorbed,
         claimed: Vec::new(),
-        spent: Vec::new(),
-        credited: Vec::new(),
+        spent: notes[..n_fill].to_vec(),
+        credited,
+        filler: filler_slots,
         rin,
         wit,
         rout,
@@ -537,7 +635,8 @@ pub fn plan(state: &WState, prev: &Surface, chain: &Chain, keys: &Keys, ask: &As
     let members: Vec<Member> = insts.iter().map(Inst::member).collect();
     let inp = WInputs { prev: prev.commitment, rkm_seq: me, absorbed: absorbed.map(|a| a.root), d_batch };
     let (rin, wit, rout, exit_cmt) = statement(state, &inp, &members, &exits)?;
-    Ok(Plan { insts, members, deps, inp, exits, absorbed, claimed, spent, credited, rin, wit, rout, exit_cmt })
+    let filler = vec![false; insts.len()];
+    Ok(Plan { insts, members, deps, inp, exits, absorbed, claimed, spent, credited, filler, rin, wit, rout, exit_cmt })
 }
 
 /// The native statement, on a copy of `state`: the sequencer's prefilter —
@@ -711,7 +810,7 @@ mod tests {
         let a = anchor_of(&f);
         let keys = Keys::from_seed([1; 32]);
         for n in [K - 1, K + 1] {
-            let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone(); n], &keys).err().unwrap();
+            let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone(); n], &[], &keys).err().unwrap();
             assert_eq!(err, PlanError::WrongCount { have: n, need: K });
         }
     }
@@ -724,28 +823,107 @@ mod tests {
         let f = w3c_file();
         let a = anchor_of(&f);
         let other = Anchor { count: 0, root: [7; 4] };
-        let err = plan_claims(&state, &prev, [other; M_ABS], vec![f; K], &Keys::from_seed([1; 32])).err().unwrap();
+        let err = plan_claims(&state, &prev, [other; M_ABS], vec![f; K], &[], &Keys::from_seed([1; 32])).err().unwrap();
         assert_eq!(err, PlanError::ClaimAnchorNotAbsorbed { root: a.root });
+    }
+
+    /// A pass emits claims and S fillers, never R (nor P): the guard passes
+    /// such a member list and names the first other member.
+    #[test]
+    fn a_pass_emits_only_its_member_tags() {
+        assert_eq!(PASS_MEMBER_TAGS, [WTag::C, WTag::S]);
+        assert!(!PASS_MEMBER_TAGS.contains(&WTag::R));
+        let c = Member { tag: WTag::C, pvs: w3c_file().pvs, write: None };
+        let mut ok = vec![c.clone(); K];
+        ok[9] = Member { tag: WTag::S, ..c.clone() };
+        assert_eq!(pass_members_ok(&ok), Ok(()));
+        for (t, name) in [(WTag::R, "R"), (WTag::P, "P")] {
+            let mut ms = ok.clone();
+            ms[5] = Member { tag: t, ..c.clone() };
+            let err = pass_members_ok(&ms).unwrap_err();
+            assert!(err.starts_with(&format!("member 5 is {name}:")) && err.contains("only C, S members"), "{err}");
+        }
+    }
+
+    /// `n` sequencer notes in C, as earlier wrappers would have left them.
+    fn seeded(n: usize, keys: &Keys) -> (WState, Surface, Vec<Owned>) {
+        let (mut state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
+        let owned: Vec<Owned> = (0..n as u64).map(|i| Owned { value: 1_000 * i, rho: [i + 1, 2, 3, 4], rseed: [i + 1, 5, 6, 7] }).collect();
+        for o in &owned {
+            qlab_wprover::f3::native::append(&mut state.l2.c, &o.cm(keys));
+        }
+        (state, prev, owned)
+    }
+
+    /// A filler moves no value: its two outputs (change = the input whole, a
+    /// zero) sum to the note it spends, and after the native statement both
+    /// are spendable by the sequencer while the spent note is not — so the
+    /// sequencer's owned total is unchanged and its note count grows by one.
+    #[test]
+    fn a_filler_moves_no_value() {
+        assert_eq!(FILLER_FEE, 0);
+        let keys = Keys::from_seed([1; 32]);
+        let (state, prev, owned) = seeded(2, &keys);
+        let n = owned[1];
+        assert_eq!(n.value, 1_000);
+        let (inst, made) = filler(&state, &keys, 0, 3, &n).unwrap();
+        assert_eq!(made.map(|m| m.value), [1_000, 0]);
+        let m = inst.member();
+        assert_eq!(m.tag, WTag::S);
+        let inp = WInputs { prev: prev.commitment, rkm_seq: keys.rkm(), absorbed: [[9, 9, 9, 9]; M_ABS], d_batch: 0 };
+        let mut after = state.clone();
+        after.apply(&inp, &[m]).unwrap();
+        assert_eq!(spendable(&after, &keys, &[n]), Vec::<Owned>::new(), "the spent note is spent");
+        assert_eq!(spendable(&after, &keys, &made), made.to_vec(), "both outputs are the sequencer's to spend");
+    }
+
+    /// One claim filled to K: fifteen S fillers from fifteen owned notes,
+    /// marked as such; the credits are every filler output plus the fee
+    /// note, all spendable once the wrapper applies, and their total is the
+    /// notes spent plus the claim's fee. One note short is refused by name.
+    #[test]
+    fn one_claim_is_filled_to_k() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, prev, owned) = seeded(K - 1, &keys);
+        let f = w3c_file();
+        let a = anchor_of(&f);
+        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f.clone()], &owned[..K - 2], &keys).err().unwrap();
+        assert_eq!(err, PlanError::WrongCount { have: K - 1, need: K });
+        let err = plan_claims(&state, &prev, [a; M_ABS], Vec::new(), &owned, &keys).err().unwrap();
+        assert_eq!(err, PlanError::NoClaim, "never a wrapper of padding alone");
+        let p = plan_claims(&state, &prev, [a; M_ABS], vec![f], &owned, &keys).unwrap();
+        assert_eq!(p.members.iter().map(|m| m.tag).collect::<Vec<_>>(), [vec![WTag::C], vec![WTag::S; K - 1]].concat());
+        assert_eq!(p.filler, [vec![false], vec![true; K - 1]].concat());
+        assert_eq!(pass_members_ok(&p.members), Ok(()));
+        let mut by_value = owned.clone();
+        by_value.reverse();
+        assert_eq!(p.spent, by_value, "largest first");
+        assert_eq!(p.credited.len(), 2 * (K - 1) + 1, "two outputs per filler and the fee note");
+        let fee = qlab_wprover::f4::wleaf::fee_of(&p.members);
+        let total = |ns: &[Owned]| ns.iter().map(|n| n.value).sum::<u64>();
+        assert_eq!(total(&p.credited), total(&owned) + fee);
+        let mut after = state.clone();
+        after.apply(&p.inp, &p.members).unwrap();
+        assert_eq!(spendable(&after, &keys, &p.credited), p.credited, "every credit is the sequencer's to spend");
+        assert!(spendable(&after, &keys, &owned).is_empty());
+    }
+
+    /// Zero-valued notes (one per filler) are drawn last: spendable orders
+    /// by value, largest first, stably; a spent or unknown note is never
+    /// offered, nor one listed twice.
+    #[test]
+    fn spendable_draws_zero_notes_last() {
+        let keys = Keys::from_seed([1; 32]);
+        let (state, _, owned) = seeded(4, &keys);
+        // owned values: 0, 1000, 2000, 3000; a stranger's note is not in C.
+        let stranger = Owned { value: 9_000, rho: [8; 4], rseed: [8; 4] };
+        let listed = [owned[0], owned[2], stranger, owned[1], owned[3], owned[2]];
+        let got: Vec<u64> = spendable(&state, &keys, &listed).iter().map(|n| n.value).collect();
+        assert_eq!(got, [3_000, 2_000, 1_000, 0]);
     }
 
     /// Elimination names the culprit: with sixteen copies of one claim, the
     /// first applies and the second repeats its cnf — item 1.
-    /// A pass emits claims only (S once S3 lands), never R: the guard
-    /// passes a claims-only member list and names the first other member.
-    #[test]
-    fn a_pass_emits_only_its_member_tags() {
-        assert_eq!(PASS_MEMBER_TAGS, [WTag::C]);
-        assert!(!PASS_MEMBER_TAGS.contains(&WTag::R));
-        let c = Member { tag: WTag::C, pvs: w3c_file().pvs, write: None };
-        assert_eq!(pass_members_ok(&vec![c.clone(); K]), Ok(()));
-        for (t, name) in [(WTag::R, "R"), (WTag::S, "S"), (WTag::P, "P")] {
-            let mut ms = vec![c.clone(); K];
-            ms[5] = Member { tag: t, ..c.clone() };
-            let err = pass_members_ok(&ms).unwrap_err();
-            assert!(err.starts_with(&format!("member 5 is {name}:")) && err.contains("only C members"), "{err}");
-        }
-    }
-
     #[test]
     fn elimination_names_the_repeated_claim() {
         let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
@@ -764,7 +942,7 @@ mod tests {
         let (state, prev) = RunState::new([0; 32], 1, "t").replay().unwrap();
         let f = w3c_file();
         let a = anchor_of(&f);
-        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f; K], &Keys::from_seed([1; 32])).err().unwrap();
+        let err = plan_claims(&state, &prev, [a; M_ABS], vec![f; K], &[], &Keys::from_seed([1; 32])).err().unwrap();
         assert!(matches!(err, PlanError::Wrapper(_)), "{err:?}");
     }
 }

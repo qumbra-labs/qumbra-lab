@@ -7,8 +7,8 @@
 //! tests, without proving anything.
 //!
 //! **No pass plans an R member** (lab #847, the Q4 condition of design
-//! `l2-read-path-decision`): a bundle's members are claims, and S fillers
-//! once S3 lands — [`crate::members::PASS_MEMBER_TAGS`]. The node's derived
+//! `l2-read-path-decision`): a bundle's members are claims, and S3's S
+//! fillers — [`crate::members::PASS_MEMBER_TAGS`]. The node's derived
 //! L2 index (lab #860) cannot follow a registry write from the wire, so one
 //! R member would block every exit until format v2. The real work checks
 //! the tags before proving; `lib.rs` holds the sources to it.
@@ -69,10 +69,10 @@
 //! startup reconcile counts toward that bound but is not followed by a poll
 //! (the chain already moved past it); one reached after a post waits one
 //! poll before re-drafting. A discarded bundle's file is not deleted then:
-//! landing bundle `m` deletes `bundle-(m − KEEP_BUNDLES).bin` and nothing
-//! else, so a discarded `bundle-n.bin` goes when the bundle numbered `n + 8`
-//! lands, and stays if that number is itself discarded — stray bytes in
-//! `--out`, never re-posted, harmless.
+//! landing bundle `m` deletes `bundle-(m − KEEP_BUNDLES).bin` (and its
+//! `.json` manifest) and nothing else, so a discarded `bundle-n.bin` goes
+//! when the bundle numbered `n + 8` lands, and stays if that number is
+//! itself discarded — stray bytes in `--out`, never re-posted, harmless.
 //!
 //! No log line, record or manifest written here carries a claim's `v`, `r_v`
 //! or an opening: items are named by id.
@@ -164,13 +164,19 @@ pub struct Draft {
     pub items: Vec<[u8; 32]>,
     pub bytes: Vec<u8>,
     pub built: Value,
+    /// Written beside the bytes as `bundle-<n>.json` (lab #847 S3: each
+    /// member's tag and whether it is a filler, so an auditor can tell
+    /// traffic from padding), pruned with them.
+    pub manifest: Option<Value>,
 }
 
 /// Why a draft is not made now.
 pub enum NotDrafted {
     /// Nothing queued to plan.
     Nothing,
-    /// Fewer real members than a wrapper holds (fillers land in S3).
+    /// Fewer members than a wrapper holds, counting one filler per
+    /// spendable sequencer note — or no claim at all (a wrapper of padding
+    /// is never posted).
     Short { have: usize, need: usize },
     /// Items refused at plan time, by id, each with its named reason.
     Refuse(Vec<([u8; 32], Refusal)>),
@@ -227,6 +233,10 @@ struct Pending {
     prev: Option<[u8; 32]>,
     items: Vec<[u8; 32]>,
     reposts: u32,
+    /// The work's record of the bundle as built. For the real work it
+    /// carries the sequencer's own `credited` openings (filler outputs, the
+    /// fee note) — the sequencer's data, the same the run state keeps once
+    /// the bundle lands; never a wallet's opening.
     built: Value,
 }
 
@@ -308,6 +318,10 @@ impl Run<'_> {
         self.cfg.out.join(format!("bundle-{n}.bin"))
     }
 
+    fn manifest_path(&self, n: u64) -> PathBuf {
+        self.cfg.out.join(format!("bundle-{n}.json"))
+    }
+
     /// One poll, or the ceiling if the deadline has passed.
     fn wait(&self, what: &str) -> Result<(), Outcome> {
         if self.clock.now().saturating_add(self.cfg.poll_secs) > self.deadline {
@@ -345,6 +359,7 @@ impl Run<'_> {
         // Keep the newest KEEP_BUNDLES; older bytes are never re-posted.
         if let Some(old) = p.n.checked_sub(KEEP_BUNDLES) {
             let _ = std::fs::remove_file(self.bundle_path(old));
+            let _ = std::fs::remove_file(self.manifest_path(old));
         }
         Ok(())
     }
@@ -500,6 +515,9 @@ pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, wo
         let n = r.work.next_number()?;
         let id = qlab_devnet::hash::keccak256(&draft.bytes);
         write_atomic(&r.bundle_path(n), &draft.bytes)?;
+        if let Some(m) = &draft.manifest {
+            write_atomic(&r.manifest_path(n), serde_json::to_string_pretty(m).expect("json").as_bytes())?;
+        }
         let p = Pending { n, id, prev: w.last_bundle_id, items: draft.items, reposts: 0, built: draft.built };
         p.save(&cfg.state)?;
         r.mark(&p.items, State::Planned(n), n)?;
@@ -616,7 +634,7 @@ mod tests {
             }
             let items: Vec<[u8; 32]> = c.iter().take(self.need).map(|(id, _)| *id).collect();
             let bytes: Vec<u8> = items.iter().flatten().copied().chain(self.committed.len().to_le_bytes()).collect();
-            Ok(Ok(Draft { built: json!(items.iter().map(hex32).collect::<Vec<_>>()), items, bytes }))
+            Ok(Ok(Draft { built: json!(items.iter().map(hex32).collect::<Vec<_>>()), manifest: Some(json!({"items": items.len()})), items, bytes }))
         }
         fn commit(&mut self, id: &[u8; 32], built: &Value) -> Result<(), String> {
             if self.ids.last() == Some(id) {
@@ -853,6 +871,7 @@ mod tests {
         node.view.borrow_mut().tip += 100;
         run(&cfg, &mut q, &node, &FakeClock(Cell::new(0)), &mut work).unwrap();
         assert!(cfg.out.join("bundle-0.bin").exists() && cfg.out.join("bundle-1.bin").exists());
+        assert!(cfg.out.join("bundle-0.json").exists() && cfg.out.join("bundle-1.json").exists(), "each manifest beside its bytes");
         assert!(matches!(q.item(&second).unwrap().state, State::Landed(_)));
         let _ = std::fs::remove_dir_all(&d);
     }
