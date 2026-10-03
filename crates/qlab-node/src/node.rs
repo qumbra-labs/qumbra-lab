@@ -2639,6 +2639,25 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.last_bundle_height
     }
 
+    /// **The latest applied bundle** (lab #847 S0): its block's height and its
+    /// id — Keccak-256 of the bundle bytes, the `InvKind::Bundle` id a
+    /// sequencer posted and the template's `bundle_id`. `Ok(None)` before the
+    /// first bundle. The id is read from the held block's `BundleRef` (no
+    /// bytes are read), found by walking back from the tip to
+    /// [`Self::last_bundle_height`]. A height the walk cannot reach, or a block
+    /// there carrying no bundle, is an error naming it — never `None`, which a
+    /// sequencer would read as "nothing has landed".
+    pub fn last_bundle(&self) -> Result<Option<(u64, Hash32)>, String> {
+        let Some(height) = self.last_bundle_height else { return Ok(None) };
+        let block = self
+            .ancestor_at(&self.tip_hash(), height)
+            .ok_or_else(|| format!("the last bundle's block at height {height} is not on the held main chain"))?;
+        let r = block
+            .bundle_ref()
+            .ok_or_else(|| format!("the block at height {height} is the last bundle's, and carries no bundle"))?;
+        Ok(Some((height, r.id)))
+    }
+
     /// The body-section axis this node runs (lab #785).
     pub fn sections(&self) -> BodySections {
         self.sections
@@ -4578,16 +4597,21 @@ mod tests {
     fn v6_bundle_state_folds_and_follows_a_rewind() {
         let mut node = MemNode::in_memory_v6(genesis_block_v6(8, 0), counter_setup());
         assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(0), None), "the genesis surface");
+        assert_eq!(node.last_bundle(), Ok(None), "no bundle yet");
         let (verdicts, state) = bundle_script(&mut node);
         assert!(verdicts[0].is_ok(), "{verdicts:?}");
         assert!(verdicts[1].as_ref().unwrap_err().contains("Spacing { since: 1, need: 3 }"), "{:?}", verdicts[1]);
         assert!(verdicts[2..].iter().all(Result::is_ok), "{verdicts:?}");
         assert_eq!(state, (Some(9), Some(4)));
+        // Lab #847 S0: the last bundle is named by its height and the
+        // Keccak-256 of its bytes (the counter 9's little-endian encoding).
+        assert_eq!(node.last_bundle(), Ok(Some((4, qlab_devnet::hash::keccak256(&9u64.to_le_bytes())))));
 
         let at3 = node.ancestor_at(&node.tip_hash(), 3).unwrap().header().header_hash_for(GenesisForm::V5);
         let block4 = node.ancestor_at(&node.tip_hash(), 4).unwrap().clone();
         node.rewind_to(at3).unwrap();
         assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(5), Some(1)), "back to bundle 1's surface");
+        assert_eq!(node.last_bundle(), Ok(Some((1, qlab_devnet::hash::keccak256(&5u64.to_le_bytes())))), "and to bundle 1's id");
         node.apply_block(block4.header(), block4.body(), &MockVerifier).expect("block 4 re-applies");
         assert_eq!((counter(node.wrapper_surface()), node.last_bundle_height()), (Some(9), Some(4)));
 
@@ -4625,6 +4649,7 @@ mod tests {
         let mut resumed = MemNode::open_v6(&dir, genesis.clone(), counter_setup()).expect("snapshot resume");
         assert_eq!(resumed.recovery_report().snapshot_height, Some(5));
         assert_eq!(resumed.recovery_report().replayed_records, 0, "the snapshot path, nothing folded");
+        assert_eq!(resumed.last_bundle(), Ok(Some((4, qlab_devnet::hash::keccak256(&9u64.to_le_bytes())))), "named on the snapshot path too");
         assert_eq!((resumed.tip_hash(), counter(resumed.wrapper_surface()), resumed.last_bundle_height()), (live_tip, Some(9), Some(4)));
         // Spacing from the re-derived height: a bundle at 6 is 2 after 4.
         let parent = resumed.chain.block(&live_tip).unwrap().header();

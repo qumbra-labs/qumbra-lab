@@ -60,6 +60,7 @@ pub mod rpc;
 mod store;
 pub mod supply;
 pub mod telemetry;
+pub mod wrapper_route;
 
 pub use coinbase::{
     coinbase_leaf_appears_at, coinbase_maturity, coinbase_note, coinbase_note_for,

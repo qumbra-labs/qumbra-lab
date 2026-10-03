@@ -596,6 +596,9 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// telemetry server; filled only on a V6 node (`Err` = the ledger's own
     /// refusal, served with its reason).
     bridge_snapshot: crate::telemetry_server::BridgeSlot,
+    /// The `/v1/wrapper` slot (lab #847 S0), adopted from the telemetry
+    /// server; filled only on a V6 node.
+    wrapper_snapshot: crate::telemetry_server::WrapperSlot,
     /// When the telemetry snapshot was last encoded.
     last_telemetry_render: Instant,
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
@@ -663,6 +666,9 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     bridge_ledger: Option<Mutex<BridgeState>>,
     /// `/v1/l2`'s body on a V6 node (lab #831 W3a-0), `None` elsewhere.
     l2_route: Option<Vec<u8>>,
+    /// The `l2_id` this V6 net's wrapper rule enforces (lab #847 S0), from the
+    /// genesis it opened; `None` off V6 — and then `/v1/wrapper` is 404.
+    wrapper_l2_id: Option<u64>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -1113,6 +1119,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             )),
             _ => None,
         };
+        let wrapper_l2_id = match &genesis {
+            PreparedGenesis::V6(g) => Some(g.wrapper.l2_id),
+            _ => None,
+        };
         let (adapter, net_id, mine_interval, annulet) = match genesis {
             PreparedGenesis::L1(genesis) => {
                 let mut adapter =
@@ -1295,6 +1305,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             metrics_server: None,
             telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
             bridge_snapshot: Arc::new(Mutex::new(None)),
+            wrapper_snapshot: Arc::new(Mutex::new(None)),
             last_telemetry_render: Instant::now(),
             telemetry_server: None,
             discovery_view: Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
@@ -1317,6 +1328,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             supply_ledger: Mutex::new(supply_ledger),
             bridge_ledger,
             l2_route,
+            wrapper_l2_id,
             process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
@@ -2362,6 +2374,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
     pub fn adopt_telemetry_server(&mut self, srv: TelemetryServer) -> std::net::SocketAddr {
         self.telemetry_snapshot = srv.snapshot();
         self.bridge_snapshot = srv.bridge();
+        self.wrapper_snapshot = srv.wrapper();
         self.refresh_telemetry();
         srv.mark_ready();
         let bound = srv.addr();
@@ -2379,6 +2392,32 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
         if let Ok(mut slot) = self.bridge_snapshot.lock() {
             *slot = bridge;
         }
+        let wrapper = self.wrapper_view().map(|r| r.map(|v| v.to_body()));
+        if let Ok(mut slot) = self.wrapper_snapshot.lock() {
+            *slot = wrapper;
+        }
+    }
+
+    /// **What `/v1/wrapper` serves** (lab #847 S0): the applied tip, `CR(tip)`
+    /// and the latest applied bundle, read from the node's state in one
+    /// borrow so the answer never mixes two moments. `None` off V6. An `Err`
+    /// names why the node cannot say which bundle is last; it is served as a
+    /// 503, never as "no bundle yet".
+    pub fn wrapper_view(&self) -> Option<Result<qlab_node::wrapper_route::WrapperView, String>> {
+        let l2_id = self.wrapper_l2_id?;
+        let state = self.p2p.node().state();
+        let last = match state.last_bundle() {
+            Ok(last) => last,
+            Err(why) => return Some(Err(why)),
+        };
+        let view = qlab_node::wrapper_route::WrapperView {
+            l2_id,
+            tip: state.chain().tip_height(),
+            cr: state.recorded_finality(),
+            last_bundle_height: last.map(|(h, _)| h),
+            last_bundle_id: last.map(|(_, id)| id),
+        };
+        Some(view.check().map(|()| view))
     }
 
     /// The bridge rows over the applied main chain (lab #785 F5-4c-1), brought
@@ -4200,6 +4239,21 @@ mod tests {
         );
         let v = reopened.bridge_view().expect("a V6 node serves the bridge").expect("no refusal");
         assert_eq!((v.covered_height, v.d_cum, v.e_cum), (signed_at + 1, 0, 0));
+        // Lab #847 S0: `/v1/wrapper` names the tip, the record-covered height
+        // (8 — the record the node's own block carried, not its local
+        // finality) and no bundle yet; the body round-trips the strict reader.
+        let w = reopened.wrapper_view().expect("a V6 node serves /v1/wrapper").expect("no refusal");
+        assert_eq!(
+            w,
+            qlab_node::wrapper_route::WrapperView {
+                l2_id: genesis.wrapper.l2_id,
+                tip: signed_at + 1,
+                cr: Some(8),
+                last_bundle_height: None,
+                last_bundle_id: None,
+            }
+        );
+        assert_eq!(qlab_node::wrapper_route::parse(&w.to_body()), Ok(w));
         assert!(v.rows.iter().all(|r| r.bridged_in == 0 && r.bridged_out == 0));
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4210,6 +4264,8 @@ mod tests {
         let mut node =
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
+        // Lab #847 S0: an L1 node has no wrapper, so `/v1/wrapper` is 404.
+        assert!(node.wrapper_view().is_none());
 
         // Finalize genesis, then mine three blocks + checkpoint each cadence slot.
         node.try_checkpoint();
