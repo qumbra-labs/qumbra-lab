@@ -1728,6 +1728,8 @@ name = "qlab-node"
 version = "0.0.0"
 dependencies = [
  "bincode",
+ "ml-dsa",
+ "qlab-air",
  "qlab-cbserver",
  "qlab-devnet",
  "qlab-econ",

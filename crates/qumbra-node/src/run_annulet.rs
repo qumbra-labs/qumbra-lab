@@ -44,6 +44,10 @@ pub(super) struct AnnuletRun {
     genesis_notes: Vec<u8>,
     /// `/v1/annulet/params`, encoded once from the genesis file (lab #720).
     params: Vec<u8>,
+    /// `/genesis.qmb` (lab #850 AD1): the genesis file's canonical bytes, the
+    /// ones whose keccak is the genesis hash — what a verifying wallet hashes
+    /// against its pin and reads the sequencer key from.
+    genesis_file: Vec<u8>,
 }
 
 impl AnnuletRun {
@@ -54,6 +58,7 @@ impl AnnuletRun {
             max_empty_slots: file.params.max_empty_slots,
             last_slot: Instant::now(),
             empty_run: 0,
+            genesis_file: file.to_bytes(),
             params: qlab_cbserver::registry::encode_annulet_params(&qlab_cbserver::registry::AnnuletParams {
                 genesis_hash: file.hash(),
                 fee_tier_s: file.params.fee_tier_s,
@@ -169,6 +174,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.annulet.as_ref().map(|a| a.genesis_notes.clone())
     }
 
+    /// The `/genesis.qmb` body (lab #850 AD1): `Some` exactly on an Annulet
+    /// node.
+    pub fn genesis_file_body(&self) -> Option<Vec<u8>> {
+        self.annulet.as_ref().map(|a| a.genesis_file.clone())
+    }
+
     /// The `/v1/annulet/params` body (lab #720): `Some` exactly on an
     /// Annulet node.
     pub fn annulet_params_body(&self) -> Option<Vec<u8>> {
@@ -251,6 +262,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annulet_genesis::AnnuletGenesisBuild;
     use qlab_devnet::pow::KeccakPow;
     use std::path::PathBuf;
 

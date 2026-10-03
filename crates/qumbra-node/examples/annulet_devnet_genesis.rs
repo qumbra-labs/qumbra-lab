@@ -7,6 +7,7 @@
 //! ```
 
 fn main() {
+    use qumbra_node::annulet_genesis::AnnuletGenesisBuild;
     let g = qumbra_node::annulet_genesis::AnnuletGenesisFile::devnet();
     g.verify(None).expect("the devnet genesis verifies");
     println!("annulet devnet genesis: {} bytes, hash {}", g.to_bytes().len(), g.hash_hex());

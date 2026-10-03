@@ -7,6 +7,7 @@
 //! ```
 
 fn main() {
+    use qumbra_node::annulet_genesis::AnnuletGenesisBuild;
     let g = qumbra_node::annulet_genesis::AnnuletGenesisFile::fixture();
     g.verify(None).expect("the fixture verifies");
     println!("annulet fixture genesis: {} bytes, hash {}", g.to_bytes().len(), g.hash_hex());

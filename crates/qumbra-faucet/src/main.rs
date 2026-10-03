@@ -534,7 +534,7 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
 /// and a node that would be the sequencer.
 fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_faucet::annulet::{served, serve_grants, AnnuletFaucet, SpendKey};
-    use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile};
+    use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile};
     let cfg_path = flag(args, "--node-config").ok_or("annulet requires --node-config FILE")?;
     let listen = flag(args, "--listen").unwrap_or("127.0.0.1:8090");
     let node_cfg = NodeConfig::load(cfg_path)?;

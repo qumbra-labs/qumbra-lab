@@ -29,146 +29,36 @@
 //! module defines it — leaf `i` is `RegistryLeaf::hash()` of asset `i`, an
 //! empty slot is the zero digest, interior nodes are `qlab-air`'s Merkle node
 //! hash — and B3's `RegistryTree` must reproduce [`registry_root_of`] exactly.
+//!
+//! **Lab #850 (AD1) moved the file type and its reads to
+//! `qlab_node::annulet_genesis`** (re-exported below, so every path still
+//! resolves), so a wallet can decode the genesis bytes it verifies. What stays
+//! here is the node's: [`load_any`], the sequencer key file, and the fixture
+//! and devnet constructors behind [`AnnuletGenesisBuild`].
 
-use ml_dsa::{EncodedVerifyingKey, MlDsa65, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use qlab_air::l2::RegistryLeaf;
-use qlab_devnet::annulet::{
-    genesis_body_commitment_annulet, AnnuletHeaderFields, GenesisNote, L2FeeTable,
-};
-use qlab_devnet::committee::Validator;
 use qlab_devnet::forms::{GenesisForm, ANNULET_GENESIS_FORMAT_VERSION};
-use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::genesis::{GenesisError, GenesisFile};
 
-/// A registry leaf as the genesis file stores it (lane values, as
-/// [`RegistryLeaf`] holds them; `asset` is the slot index).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegistryLeafRecord {
-    pub asset: u16,
-    pub issuer_key: [u64; 4],
-    pub mode: u64,
-    pub freeze_root: [u64; 4],
-    pub allow_root: [u64; 4],
-    pub flags: u64,
-}
+/// The file type and its reads live in `qlab-node` since lab #850 (AD1), so a
+/// wallet can decode the genesis bytes it verifies; every item is re-exported
+/// here, so no caller's path changed.
+pub use qlab_node::annulet_genesis::{
+    h32, leading_format_version, registry_leaves, registry_root_of, AnnuletGenesisError, AnnuletGenesisFile,
+    AnnuletGenesisHeader, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord,
+};
 
-impl RegistryLeafRecord {
-    /// The record of a circuit leaf (lab #722: test genesis assembly).
-    pub fn of(l: &RegistryLeaf) -> Self {
-        RegistryLeafRecord {
-            asset: u16::try_from(l.asset).expect("a registry index is 16-bit"),
-            issuer_key: l.issuer_key,
-            mode: l.mode,
-            freeze_root: l.freeze_root,
-            allow_root: l.allow_root,
-            flags: l.flags,
+impl From<AnnuletGenesisError> for GenesisError {
+    fn from(e: AnnuletGenesisError) -> Self {
+        match e {
+            AnnuletGenesisError::NotAnnuletGenesis { got } => GenesisError::NotAnnuletGenesis { got },
+            AnnuletGenesisError::Decode(s) => GenesisError::Decode(s),
+            AnnuletGenesisError::BadAnnulet(why) => GenesisError::BadAnnulet(why),
+            AnnuletGenesisError::WrongGenesisHash { got, want } => GenesisError::WrongGenesisHash { got, want },
         }
     }
-
-    /// The circuit's leaf for this record.
-    pub fn leaf(&self) -> RegistryLeaf {
-        RegistryLeaf {
-            asset: self.asset as u64,
-            issuer_key: self.issuer_key,
-            mode: self.mode,
-            freeze_root: self.freeze_root,
-            allow_root: self.allow_root,
-            flags: self.flags,
-        }
-    }
-
-    /// Asset 0's pinned leaf (l2-own-circuit-decision §2.4): the fee asset —
-    /// no issuer, Cloaked, both roots 0.
-    pub fn asset_zero() -> Self {
-        let l = RegistryLeaf::cloaked(0);
-        RegistryLeafRecord {
-            asset: 0,
-            issuer_key: l.issuer_key,
-            mode: l.mode,
-            freeze_root: l.freeze_root,
-            allow_root: l.allow_root,
-            flags: l.flags,
-        }
-    }
-}
-
-/// A genesis fee-unit note: commitment + 128-B discovery payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenesisNoteRecord {
-    pub cm: Hash32,
-    pub payload: Vec<u8>,
-}
-
-impl GenesisNoteRecord {
-    /// A genesis note record: the committed cm and the note's
-    /// `GenesisPlaintext` (lab #722: test genesis assembly).
-    pub fn of(n: &qlab_note::l2note::L2Note) -> Self {
-        GenesisNoteRecord { cm: h32(&n.commitment()), payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec() }
-    }
-}
-
-/// The L2 genesis parameters: the posted fee tiers in fee-unit base units
-/// (lab #706 Q7 — **placeholders** in the fixture, S = 1 / P = 2, pending
-/// C2/B4's tariff) and the sequencer's slot cadence (lab #708 Q5 — genesis
-/// parameters, not code constants: `slot_secs` = 10, an empty block at most
-/// every `max_empty_slots` = 6 slots, the §5 defaults). A real devnet mints
-/// its own values (B6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnnuletParams {
-    pub fee_tier_s: u64,
-    pub fee_tier_p: u64,
-    /// **`fee_tier_r` — a labelled PLACEHOLDER** (lab #728, from A2's
-    /// `qlab_l2::FEE_TIER_R_PLACEHOLDER`): the fee a registry write (shape R)
-    /// pays. Registration is permissionless into 65,536 slots (asset ids are
-    /// 16-bit registry indices; asset 0 is never writable), so **this tier is
-    /// the only price on exhausting the registry** — the pilot's tariff must
-    /// set it; the fixture and devnet values are not that price.
-    pub fee_tier_r: u64,
-    /// The slot length in seconds (lab #708 Q5).
-    pub slot_secs: u64,
-    /// The producer seals an empty block at the latest every this many slots
-    /// with an empty pool (lab #708 Q5).
-    pub max_empty_slots: u64,
-}
-
-impl AnnuletParams {
-    /// As the body rule consumes them.
-    pub fn fee_table(&self) -> L2FeeTable {
-        L2FeeTable { tier_s: self.fee_tier_s, tier_p: self.fee_tier_p, tier_r: self.fee_tier_r }
-    }
-}
-
-/// The Annulet genesis header's recorded fields (the rest are fixed:
-/// height 0, `prev` zero, no PoW fields).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnnuletGenesisHeader {
-    pub timestamp: u64,
-    pub l1_anchor_height: u64,
-    pub l1_anchor_root: Hash32,
-    pub registry_root: Hash32,
-    pub body_commitment: Hash32,
-}
-
-/// The Annulet genesis file. **`format_version` must stay the first field**
-/// — [`load_any`] and both loaders dispatch on the leading `u32`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnnuletGenesisFile {
-    /// Always [`ANNULET_GENESIS_FORMAT_VERSION`] (32).
-    pub format_version: u32,
-    /// Network label — not consensus.
-    pub network: String,
-    pub params: AnnuletParams,
-    /// The single sequencer's ML-DSA-65 verifying key (encoded).
-    pub sequencer_key: Vec<u8>,
-    /// Genesis-registered assets, strictly ascending by `asset`, asset 0
-    /// first and pinned ([`RegistryLeafRecord::asset_zero`]).
-    pub registry_genesis: Vec<RegistryLeafRecord>,
-    /// The fee unit's whole Phase-0 supply (Q5), valid only at height 0.
-    pub genesis_notes: Vec<GenesisNoteRecord>,
-    pub genesis_header: AnnuletGenesisHeader,
 }
 
 /// The sequencer key file's name in a node's data dir (lab #708 Q6): its
@@ -214,11 +104,6 @@ pub enum AnyGenesis {
     Annulet(Box<AnnuletGenesisFile>),
 }
 
-/// The leading `u32` of a genesis file's bytes — its `format_version`.
-pub fn leading_format_version(bytes: &[u8]) -> Option<u32> {
-    bytes.get(..4).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
-}
-
 /// Dispatch a genesis file by its leading `format_version` (Q2).
 pub fn load_any(bytes: &[u8]) -> Result<AnyGenesis, GenesisError> {
     let got = leading_format_version(bytes).ok_or_else(|| GenesisError::Decode("genesis file shorter than its format version".into()))?;
@@ -239,167 +124,18 @@ pub fn load_any(bytes: &[u8]) -> Result<AnyGenesis, GenesisError> {
     }
 }
 
-/// The digest `[u64; 4]` as 32 bytes, lane-major little-endian (the node's
-/// `h32` convention).
-fn h32(d: &[u64; 4]) -> Hash32 {
-    let mut o = [0u8; 32];
-    for (i, lane) in d.iter().enumerate() {
-        o[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
-    }
-    o
+/// The fixture and devnet genesis constructors (lab #850: the file type moved
+/// to `qlab-node`; these stay with the node because the fixture's `fee_tier_r`
+/// is `qlab-l2`'s placeholder, which `qlab-node` does not depend on). Bring the
+/// trait into scope to call `AnnuletGenesisFile::fixture()` / `::devnet()`.
+pub trait AnnuletGenesisBuild: Sized {
+    /// **The B1 fixture** (see the impl).
+    fn fixture() -> Self;
+    /// **The Annulet devnet genesis** (see the impl).
+    fn devnet() -> Self;
 }
 
-
-/// **The registry root** of a genesis registry (B3's contract — see the module
-/// doc): a depth-16 sparse Merkle tree, leaf `i` = `RegistryLeaf::hash()` of
-/// asset `i`, empty slot = the zero digest.
-pub fn registry_root_of(leaves: &[RegistryLeafRecord]) -> [u64; 4] {
-    // Lab #710: one tree — the registry state's own. The fixture genesis
-    // hash pin (unchanged by this delegation) is the byte-identity proof.
-    qlab_cbserver::registry::RegistryTree::from_leaves(&registry_leaves(leaves))
-        .expect("a verified registry genesis has unique assets below 2^16")
-        .root()
-}
-
-/// The genesis registry as the circuit's leaves (lab #710).
-pub fn registry_leaves(leaves: &[RegistryLeafRecord]) -> Vec<RegistryLeaf> {
-    leaves.iter().map(RegistryLeafRecord::leaf).collect()
-}
-
-impl AnnuletGenesisFile {
-    /// Decode, refusing a non-Annulet file **by name** before decoding a byte.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GenesisError> {
-        match leading_format_version(bytes) {
-            Some(ANNULET_GENESIS_FORMAT_VERSION) => {}
-            got => {
-                return Err(GenesisError::NotAnnuletGenesis { got });
-            }
-        }
-        bincode::deserialize(bytes).map_err(|e| GenesisError::Decode(e.to_string()))
-    }
-
-    /// The canonical on-disk bytes (bincode).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("AnnuletGenesisFile is always serializable")
-    }
-
-    /// The genesis hash — keccak256 over the file's bincode, as for L1.
-    pub fn hash(&self) -> Hash32 {
-        qlab_devnet::hash::keccak256(&self.to_bytes())
-    }
-
-    /// Hex of [`Self::hash`].
-    pub fn hash_hex(&self) -> String {
-        crate::genesis::hex_encode(&self.hash())
-    }
-
-    /// Always [`GenesisForm::Annulet`] for a verified file.
-    pub fn form(&self) -> Result<GenesisForm, GenesisError> {
-        match GenesisForm::from_genesis_format_version(self.format_version) {
-            Some(GenesisForm::Annulet) => Ok(GenesisForm::Annulet),
-            Some(GenesisForm::V4) | Some(GenesisForm::V5) | None => {
-                Err(GenesisError::NotAnnuletGenesis { got: Some(self.format_version) })
-            }
-        }
-    }
-
-    /// The sequencer's verifying key, decoded.
-    pub fn sequencer(&self) -> Result<VerifyingKey<MlDsa65>, GenesisError> {
-        let e = EncodedVerifyingKey::<MlDsa65>::try_from(self.sequencer_key.as_slice())
-            .map_err(|_| GenesisError::BadAnnulet("sequencer key does not decode"))?;
-        Ok(VerifyingKey::<MlDsa65>::decode(&e))
-    }
-
-    /// The genesis notes in the form the genesis-body commitment binds.
-    pub fn notes(&self) -> Vec<GenesisNote> {
-        self.genesis_notes.iter().map(|n| GenesisNote { cm: n.cm, payload: n.payload.clone() }).collect()
-    }
-
-    /// The genesis header this file pins.
-    pub fn genesis_block_header(&self) -> BlockHeader {
-        let h = &self.genesis_header;
-        BlockHeader::genesis_annulet(
-            AnnuletHeaderFields {
-                l1_anchor_height: h.l1_anchor_height,
-                l1_anchor_root: h.l1_anchor_root,
-                registry_root: h.registry_root,
-            },
-            h.body_commitment,
-            h.timestamp,
-        )
-    }
-
-    /// Structural verification: the form, the sequencer key, the registry
-    /// (asset 0 pinned first, ascending, roots recomputed), the notes' payload
-    /// width and the genesis header's bindings — and, if `expected_hex` is set,
-    /// the genesis hash.
-    pub fn verify(&self, expected_hex: Option<&str>) -> Result<(), GenesisError> {
-        self.form()?;
-        self.sequencer()?;
-        if self.registry_genesis.first() != Some(&RegistryLeafRecord::asset_zero()) {
-            return Err(GenesisError::BadAnnulet("asset 0's pinned leaf must be the first registry entry"));
-        }
-        if !self.registry_genesis.windows(2).all(|w| w[0].asset < w[1].asset) {
-            return Err(GenesisError::BadAnnulet("registry genesis must be strictly ascending by asset"));
-        }
-        if h32(&registry_root_of(&self.registry_genesis)) != self.genesis_header.registry_root {
-            return Err(GenesisError::BadAnnulet("genesis header registry_root does not match the registry genesis"));
-        }
-        if self.genesis_notes.iter().any(|n| n.payload.len() != qlab_note::l2note::L2_PAYLOAD_LEN) {
-            return Err(GenesisError::BadAnnulet("a genesis note payload is not L2_PAYLOAD_LEN (128) bytes"));
-        }
-        // Lab #714 rule (i): every genesis payload is a GenesisPlaintext that
-        // opens to the note its commitment names.
-        if self.genesis_notes.iter().any(|n| {
-            qlab_note::l2note::GenesisPlaintext::open(&n.payload).is_none_or(|note| h32(&note.commitment()) != n.cm)
-        }) {
-            return Err(GenesisError::BadAnnulet(
-                "a genesis note payload is not a GenesisPlaintext opening to its commitment",
-            ));
-        }
-        if genesis_body_commitment_annulet(&self.notes()) != self.genesis_header.body_commitment {
-            return Err(GenesisError::BadAnnulet("genesis header body_commitment does not bind the genesis notes"));
-        }
-        if let Some(want) = expected_hex {
-            let got = self.hash_hex();
-            if !got.eq_ignore_ascii_case(want) {
-                return Err(GenesisError::WrongGenesisHash { got, want: want.to_string() });
-            }
-        }
-        Ok(())
-    }
-
-    /// Assemble a file from its parts, computing the header's registry root
-    /// and body commitment (so a caller cannot pin an inconsistent header).
-    pub fn assemble(
-        network: &str,
-        params: AnnuletParams,
-        sequencer_seed: [u8; 32],
-        registry_genesis: Vec<RegistryLeafRecord>,
-        genesis_notes: Vec<GenesisNoteRecord>,
-        timestamp: u64,
-    ) -> Self {
-        let sequencer_key = Validator::from_seed(0, sequencer_seed).verifying_key().encode().to_vec();
-        let notes: Vec<GenesisNote> =
-            genesis_notes.iter().map(|n| GenesisNote { cm: n.cm, payload: n.payload.clone() }).collect();
-        let genesis_header = AnnuletGenesisHeader {
-            timestamp,
-            l1_anchor_height: 0,
-            l1_anchor_root: [0u8; 32],
-            registry_root: h32(&registry_root_of(&registry_genesis)),
-            body_commitment: genesis_body_commitment_annulet(&notes),
-        };
-        AnnuletGenesisFile {
-            format_version: ANNULET_GENESIS_FORMAT_VERSION,
-            network: network.to_string(),
-            params,
-            sequencer_key,
-            registry_genesis,
-            genesis_notes,
-            genesis_header,
-        }
-    }
-
+impl AnnuletGenesisBuild for AnnuletGenesisFile {
     /// **The B1 fixture** — deterministic, NOT a devnet (B6 mints that, with
     /// the faucet's real address and its own parameters):
     ///
@@ -412,7 +148,7 @@ impl AnnuletGenesisFile {
     ///   **fixture payload** — the 112-B note plaintext and a zero 16-B tag,
     ///   *not encrypted*: a devnet genesis seals them to the faucet's
     ///   ML-KEM key (B6).
-    pub fn fixture() -> Self {
+    fn fixture() -> Self {
         let params = AnnuletParams {
             fee_tier_s: 1,
             fee_tier_p: 2,
@@ -452,6 +188,44 @@ impl AnnuletGenesisFile {
             params,
             [0x5E; 32],
             vec![RegistryLeafRecord::asset_zero(), asset7],
+            notes,
+            0,
+        )
+    }
+    /// **The Annulet devnet genesis** (lab #716): asset 0 and `USDT-test`
+    /// (Hybrid, dev issuer) registered; [`devnet::STOCK_NOTES`] fee-unit stock
+    /// notes to the faucet and one `USDT-test` note to the dev holder, all as
+    /// `GenesisPlaintext`s. Pinned by `annulet_devnet_genesis_hash_is_pinned`;
+    /// the fixture stays as it is.
+    fn devnet() -> Self {
+        let params = AnnuletParams {
+            fee_tier_s: devnet::FEE_TIER_S,
+            fee_tier_p: devnet::FEE_TIER_P,
+            fee_tier_r: devnet::FEE_TIER_R,
+            slot_secs: 10,
+            max_empty_slots: 6,
+        };
+        let usdt = devnet::usdt_test_leaf();
+        let usdt = RegistryLeafRecord {
+            asset: usdt.asset as u16,
+            issuer_key: usdt.issuer_key,
+            mode: usdt.mode,
+            freeze_root: usdt.freeze_root,
+            allow_root: usdt.allow_root,
+            flags: usdt.flags,
+        };
+        let record = |n: &qlab_note::l2note::L2Note| GenesisNoteRecord {
+            cm: h32(&n.commitment()),
+            payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec(),
+        };
+        let mut notes: Vec<GenesisNoteRecord> =
+            (0..devnet::STOCK_NOTES).map(|i| record(&devnet::stock_note(i))).collect();
+        notes.push(record(&devnet::holder_usdt_note()));
+        Self::assemble(
+            "annulet-devnet",
+            params,
+            devnet::SEQUENCER_SEED,
+            vec![RegistryLeafRecord::asset_zero(), usdt],
             notes,
             0,
         )
@@ -541,50 +315,11 @@ pub mod devnet {
     }
 }
 
-impl AnnuletGenesisFile {
-    /// **The Annulet devnet genesis** (lab #716): asset 0 and `USDT-test`
-    /// (Hybrid, dev issuer) registered; [`devnet::STOCK_NOTES`] fee-unit stock
-    /// notes to the faucet and one `USDT-test` note to the dev holder, all as
-    /// `GenesisPlaintext`s. Pinned by `annulet_devnet_genesis_hash_is_pinned`;
-    /// the fixture stays as it is.
-    pub fn devnet() -> Self {
-        let params = AnnuletParams {
-            fee_tier_s: devnet::FEE_TIER_S,
-            fee_tier_p: devnet::FEE_TIER_P,
-            fee_tier_r: devnet::FEE_TIER_R,
-            slot_secs: 10,
-            max_empty_slots: 6,
-        };
-        let usdt = devnet::usdt_test_leaf();
-        let usdt = RegistryLeafRecord {
-            asset: usdt.asset as u16,
-            issuer_key: usdt.issuer_key,
-            mode: usdt.mode,
-            freeze_root: usdt.freeze_root,
-            allow_root: usdt.allow_root,
-            flags: usdt.flags,
-        };
-        let record = |n: &qlab_note::l2note::L2Note| GenesisNoteRecord {
-            cm: h32(&n.commitment()),
-            payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec(),
-        };
-        let mut notes: Vec<GenesisNoteRecord> =
-            (0..devnet::STOCK_NOTES).map(|i| record(&devnet::stock_note(i))).collect();
-        notes.push(record(&devnet::holder_usdt_note()));
-        Self::assemble(
-            "annulet-devnet",
-            params,
-            devnet::SEQUENCER_SEED,
-            vec![RegistryLeafRecord::asset_zero(), usdt],
-            notes,
-            0,
-        )
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qlab_air::l2::RegistryLeaf;
     use qlab_air::l2::REGISTRY_DEPTH;
 
     /// The consensus node hash, spelled independently of the registry tree
@@ -683,7 +418,7 @@ mod tests {
             let v = l1.format_version;
             assert!(matches!(
                 AnnuletGenesisFile::from_bytes(&l1.to_bytes()),
-                Err(GenesisError::NotAnnuletGenesis { got: Some(g) }) if g == v
+                Err(AnnuletGenesisError::NotAnnuletGenesis { got: Some(g) }) if g == v
             ));
         }
         for v in crate::genesis::PRE_REMINT_FORMAT_VERSIONS {
@@ -691,7 +426,7 @@ mod tests {
             old.format_version = v;
             assert!(matches!(
                 AnnuletGenesisFile::from_bytes(&old.to_bytes()),
-                Err(GenesisError::NotAnnuletGenesis { got: Some(g) }) if g == v
+                Err(AnnuletGenesisError::NotAnnuletGenesis { got: Some(g) }) if g == v
             ));
         }
     }
@@ -701,28 +436,28 @@ mod tests {
         let good = AnnuletGenesisFile::fixture();
         let mut bad_root = good.clone();
         bad_root.genesis_header.registry_root[0] ^= 1;
-        assert!(matches!(bad_root.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("registry_root")));
+        assert!(matches!(bad_root.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("registry_root")));
         let mut bad_note = good.clone();
         bad_note.genesis_notes[2].cm[0] ^= 1;
         // Lab #714 rule (i) catches a note whose payload does not open to its cm.
-        assert!(matches!(bad_note.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("GenesisPlaintext")));
+        assert!(matches!(bad_note.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("GenesisPlaintext")));
         let mut tagged = good.clone();
         let last = tagged.genesis_notes[1].payload.len() - 1;
         tagged.genesis_notes[1].payload[last] = 1;
-        assert!(matches!(tagged.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("GenesisPlaintext")));
+        assert!(matches!(tagged.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("GenesisPlaintext")));
         let mut bad_body = good.clone();
         bad_body.genesis_header.body_commitment[0] ^= 1;
-        assert!(matches!(bad_body.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("body_commitment")));
+        assert!(matches!(bad_body.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("body_commitment")));
         let mut short = good.clone();
         short.genesis_notes[0].payload.pop();
-        assert!(matches!(short.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("128")));
+        assert!(matches!(short.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("128")));
         let mut no_zero = good.clone();
         no_zero.registry_genesis.remove(0);
-        assert!(matches!(no_zero.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("asset 0")));
+        assert!(matches!(no_zero.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("asset 0")));
         let mut key = good.clone();
         key.sequencer_key.truncate(10);
-        assert!(matches!(key.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("sequencer")));
-        assert!(matches!(good.verify(Some("00")), Err(GenesisError::WrongGenesisHash { .. })));
+        assert!(matches!(key.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("sequencer")));
+        assert!(matches!(good.verify(Some("00")), Err(AnnuletGenesisError::WrongGenesisHash { .. })));
     }
 
     /// Lab #728 Q6 — **a demonstration, not a refusal test, because the file
@@ -753,7 +488,7 @@ mod tests {
         let mut file = AnnuletGenesisFile::fixture();
         file.registry_genesis = records.clone();
         file.registry_genesis.push(RegistryLeafRecord::of(&nine));
-        assert!(matches!(file.verify(None), Err(GenesisError::BadAnnulet(m)) if m.contains("strictly ascending")));
+        assert!(matches!(file.verify(None), Err(AnnuletGenesisError::BadAnnulet(m)) if m.contains("strictly ascending")));
     }
 
     /// The registry root is the sparse depth-16 tree it claims to be: a

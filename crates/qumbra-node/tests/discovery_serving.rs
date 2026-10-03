@@ -325,6 +325,7 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
     let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
 
     let view = DiscoveryView {
+        stored: Vec::new(),
         exits: Vec::new(),
         blocks: vec![qlab_node::BlockDiscovery { payload_len: qlab_note::compact::PAYLOAD_LEN,
             height: 1,
@@ -373,6 +374,7 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
     let (tampered_coinbase, tampered_rkm) =
         tampered_body.single_payee_parts().expect("current-cap body");
     let tampered_view = DiscoveryView {
+        stored: Vec::new(),
         exits: Vec::new(),
         blocks: vec![qlab_node::BlockDiscovery { payload_len: qlab_note::compact::PAYLOAD_LEN,
             height: 1,

@@ -1109,6 +1109,12 @@ mod tests {
                 }
                 self.inner.block(hash)
             }
+            fn block_shared(&self, hash: &Hash32) -> Option<std::sync::Arc<StoredBlock>> {
+                if *hash == self.hide {
+                    return None;
+                }
+                self.inner.block_shared(hash)
+            }
             fn contains(&self, hash: &Hash32) -> bool {
                 self.inner.contains(hash)
             }

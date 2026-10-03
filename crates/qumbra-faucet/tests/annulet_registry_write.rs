@@ -20,7 +20,7 @@ use qlab_air::l2p::{issuer_key_of, CanonicalFreezeTree};
 use qlab_note::hash::digest_bytes;
 use qumbra_faucet::annulet::{served, OwnedNote, Recipient, SpendKey};
 use qumbra_faucet::devnet_harness::Net;
-use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile};
 use rand::SeedableRng;
 
 /// The slot the test registers — empty in the devnet genesis.

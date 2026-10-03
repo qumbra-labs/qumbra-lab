@@ -26,7 +26,7 @@ use qlab_devnet::forms::GenesisForm;
 use qlab_note::l2note::L2Note;
 use qumbra_faucet::annulet::{served, AnnuletError, AnnuletFaucet, OwnedNote, Out, Recipient, SpendError, SpendKey};
 use qumbra_faucet::devnet_harness::Net;
-use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile};
 use rand::{Rng, SeedableRng};
 
 #[test]

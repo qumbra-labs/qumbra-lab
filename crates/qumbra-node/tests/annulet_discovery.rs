@@ -20,7 +20,7 @@ use qlab_devnet::pow::KeccakPow;
 use qlab_node::NodeState;
 use qlab_note::hash::digest_bytes;
 use qlab_note::l2note::{GenesisPlaintext, L2Note, L2_PAYLOAD_LEN};
-use qumbra_node::annulet_genesis::{AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::run::{DevnetRehearsalVerifier, RunningNode};
 use rand::SeedableRng;

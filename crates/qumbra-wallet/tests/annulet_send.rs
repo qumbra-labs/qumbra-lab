@@ -26,7 +26,7 @@ use qlab_note::l2note::L2Note;
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qumbra_faucet::annulet::{served, OwnedNote, SpendKey};
 use qumbra_faucet::devnet_harness::Net;
-use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile};
+use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile};
 use qumbra_wallet::annulet::scan_annulet;
 use qumbra_wallet::annulet_send::{send_annulet, SendPlan, WalletEndpoint};
 use qumbra_wallet::store::WalletDir;

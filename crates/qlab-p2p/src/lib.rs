@@ -47,6 +47,7 @@ pub mod peer;
 pub mod punish;
 pub mod ratelimit;
 pub mod sendstall;
+pub mod served;
 pub mod sync;
 pub mod ticktime;
 pub mod transport;

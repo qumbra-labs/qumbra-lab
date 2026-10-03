@@ -126,6 +126,8 @@ mod build_rev_tests {
 }
 
 pub mod annulet;
+#[cfg(feature = "verify")]
+pub mod annulet_verify;
 #[cfg(feature = "prove")]
 pub mod annulet_send;
 #[cfg(feature = "prove")]
