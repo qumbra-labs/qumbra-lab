@@ -63,7 +63,9 @@
 //! Every wait — spacing, a 503, no absorbable root yet, a landing — polls
 //! every `poll_secs` under one deadline per pass (`--max-wait`); `--max-bundles`
 //! bounds how many bundles one pass lands. Hitting either ends the pass with
-//! [`Outcome::Ceiling`] naming what is left (exit 3). Nothing spins silently.
+//! [`Outcome::Ceiling`] naming what is left (exit 3) — except landing the
+//! `--max-bundles` asked for, which is [`Outcome::Capped`] (exit 0, the items
+//! still queued counted). Nothing spins silently.
 //!
 //! Discards are bounded by `MAX_DISCARDS` per pass. One reached during the
 //! startup reconcile counts toward that bound but is not followed by a poll
@@ -219,7 +221,11 @@ pub struct Pass {
 pub enum Outcome {
     /// Nothing left to plan and nothing in flight.
     Drained { landed: u64 },
-    /// A ceiling was reached; the string names what is left.
+    /// The pass landed the `--max-bundles` it was asked for — the requested
+    /// outcome, not a ceiling (exit 0); `left` counts the items still queued.
+    Capped { landed: u64, left: usize },
+    /// A ceiling ended the pass short of its ask (`--max-wait`, re-posts,
+    /// discards); the string names what is left.
     Ceiling(String),
     /// Fewer real members than a wrapper holds, with the reasons by name.
     Short { have: usize, need: usize, why: Vec<String> },
@@ -465,7 +471,8 @@ pub fn run(cfg: &Pass, queue: &mut Queue, node: &dyn Node, clock: &dyn Clock, wo
     }
     loop {
         if r.landed >= cfg.max_bundles {
-            return Ok(Outcome::Ceiling(format!("--max-bundles {} reached", cfg.max_bundles)));
+            let left = r.queue.items().filter(|i| i.state == State::Queued).count();
+            return Ok(Outcome::Capped { landed: r.landed, left });
         }
         if r.discards >= MAX_DISCARDS {
             return Ok(Outcome::Ceiling(format!("{MAX_DISCARDS} bundles discarded in one pass")));
@@ -860,6 +867,21 @@ mod tests {
         for fatal in ["refused: Counters", "refused: Wrapper(\"WProof\")", "Spacing { since: 1 }", "refused: Wrapper(\"Member(0, \\\"Spacing\\\")\")"] {
             assert_eq!(super::classify(fatal), Answer::Fatal, "{fatal}");
         }
+    }
+
+    /// Landing the `--max-bundles` asked for is Capped (exit 0), counting
+    /// what is still queued — not a ceiling.
+    #[test]
+    fn the_bundle_cap_is_the_asked_for_outcome() {
+        let (d, mut q, id, cfg) = setup("capped");
+        let second = twin(&mut q, 1);
+        let cfg1 = Pass { max_bundles: 1, ..cfg };
+        let mut work = fake(1);
+        let out = run(&cfg1, &mut q, &FakeNode::new(100), &FakeClock(Cell::new(0)), &mut work).unwrap();
+        assert_eq!(out, Outcome::Capped { landed: 1, left: 1 });
+        assert!(matches!(q.item(&id).unwrap().state, State::Landed(_)));
+        assert_eq!(q.item(&second).unwrap().state, State::Queued);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Bundle numbers come from the work's persisted counter: a second pass

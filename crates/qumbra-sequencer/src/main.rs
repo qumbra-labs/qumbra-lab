@@ -12,9 +12,11 @@
 //!   [--poll S]` — one on-demand posting pass (S4, Q5): plans the queued
 //!   claims, proves, signs, posts to the operator listener, and records a
 //!   bundle only once `/v1/wrapper` names it. Exit 0 when nothing is left to
-//!   plan and nothing is in flight; 3 at a ceiling (`--max-bundles`,
-//!   `--max-wait`, re-posts — a claim waiting for a finality record to cover
-//!   its anchor root is such a wait), naming what is left; 4 when the plannable
+//!   plan and nothing is in flight, or when the `--max-bundles` asked for have
+//!   landed (naming how many items are still queued); 3 at a ceiling that
+//!   ends the pass short (`--max-wait`, re-posts, discards — a claim waiting
+//!   for a finality record to cover its anchor root is such a wait), naming
+//!   what is left; 4 when the plannable
 //!   claims plus one filler per spendable sequencer note are fewer than 16, or
 //!   no claim is plannable (S3: the sequencer fills with S self-transfers of
 //!   its own notes; before it holds any — S3b seeds them — a wrapper needs 16
@@ -96,6 +98,10 @@ fn run_pass(args: &[String]) -> Result<ExitCode, String> {
     match pass::run(&cfg, &mut queue, &node, &work::SystemClock, &mut w)? {
         Outcome::Drained { landed } => {
             eprintln!("SEQ done: {landed} bundle(s) landed, nothing left to plan");
+            Ok(ExitCode::SUCCESS)
+        }
+        Outcome::Capped { landed, left } => {
+            eprintln!("SEQ done: {landed} bundle(s) landed — the --max-bundles cap; {left} item(s) still queued");
             Ok(ExitCode::SUCCESS)
         }
         Outcome::Ceiling(why) => {
