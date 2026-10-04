@@ -32,9 +32,11 @@ or any consensus property.
 | function | current assignee | responsibility | authority boundary |
 |---|---|---|---|
 | Decision authority and coordinator | **Larry** | Approve phase starts, binding design-spec corrections, authorization primitive, T2 re-mint/activation, deployment, and launch | Sole final decision-maker; model agreement is not approval |
-| Primary implementation owner | **Codex** | Turn the approved task book into scoped branches/PRs; implement code and tests; maintain exact vectors, compatibility evidence, CI, and handoffs | May not silently amend the design spec or self-approve a gate |
-| Independent protocol/security reviewer | **Claude Code** | Attack the specification and immutable PR diff; inspect canonical intent, dummy semantics, domain separation, AIR/public-value binding, wire identity, verifier order, activation, and migration | Does not directly edit the primary implementation branch unless Larry explicitly reassigns ownership |
+| Primary implementation owner | **Claude Code** (reassigned from Codex 2026-10-04; see the note below) | Turn the approved task book into scoped branches/PRs; implement code and tests; maintain exact vectors, compatibility evidence, CI, and handoffs | May not silently amend the design spec or self-approve a gate |
+| Independent protocol/security reviewer | **To be named by Larry** (vacated 2026-10-04 when Claude Code took implementation; must be a model or human other than the implementer) | Attack the specification and immutable PR diff; inspect canonical intent, dummy semantics, domain separation, AIR/public-value binding, wire identity, verifier order, activation, and migration | Does not directly edit the primary implementation branch unless Larry explicitly reassigns ownership |
 | Privacy/TEE red-team | **Grok** | Challenge A-only and A+B privacy statements; inspect witness visibility, `nk`, ingress identity, IP/timing linkability, attestation, revocation, side channels, retention, and failure modes | Advises on privacy/deployment risk; cannot replace protocol review or approve launch |
+
+**Dated reassignment, 2026-10-04.** Larry ruled on lab issue #894 Q4 (16:46, 「Q4 让claude code 来写吧」): primary implementation moves from Codex to Claude Code builder sessions. By §3 the implementer cannot also be the independent reviewer, so that slot is vacant until Larry names a replacement; no Phase 3+ PR may merge without one. The Candidate A/B ruling and every consensus property are unchanged.
 
 Larry may use additional human or model reviewers. Their findings enter the
 same review ledger; they do not dilute the four responsibilities above.
@@ -44,7 +46,7 @@ same review ledger; they do not dilute the four responsibilities above.
 ```mermaid
 flowchart LR
     LARRY["Larry<br/>start / ruling / launch authority"]
-    CODEX["Codex<br/>primary implementation owner"]
+    CODEX["Claude Code<br/>primary implementation owner (2026-10-04)"]
     PR["Scoped branch + PR<br/>tests • vectors • evidence"]
     CLAUDE["Claude Code<br/>independent protocol/security review"]
     GROK["Grok<br/>privacy / TEE red-team"]
