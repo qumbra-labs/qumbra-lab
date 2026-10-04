@@ -17,10 +17,9 @@ block reward when you win one and makes you a full validator of the chain. The w
 > ### ⚠️ T1 IS RETIRED — this guide is for T2
 >
 > 🔴 **T2 was re-launched on 2026-10-03 from genesis `59d9f054…44b1`; `d1dad4ea…e2f3` is
-> retired. No public release pins the new genesis yet.** Every release up to and including
-> `t2-2026.08.25-1` is built from a revision that pins `d1dad4ea…e2f3`, so it cannot join
-> the re-launched T2. A release for `59d9f054` is pending; until it exists, the prebuilt
-> path in §2.1 has nothing current to download.
+> retired.** Use release `t2-2026.10.04-1` or newer — the first that pins the new genesis.
+> Every release up to and including `t2-2026.08.24-1` pins `d1dad4ea…e2f3` and cannot join
+> the re-launched T2.
 >
 > **T1 has shut down.** If you were following the previous version of this guide: stop —
 > its values are dead. T1 balances **do not carry over**; T2 is a fair relaunch from a
@@ -206,10 +205,10 @@ next time we cut one.
   / [#524](https://github.com/qumbra-labs/qumbra-lab/issues/524)) — it starts fine and panics
   the *second* time. `t2-a89dce6` and newer are fixed. If you are already running an earlier
   one, update before something restarts it for you.
-* **Public releases up to and including `t2-2026.08.25-1` pin the retired genesis
+* **Releases up to and including `t2-2026.08.24-1` pin the retired genesis
   `d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3` and cannot join the
-  re-launched T2** (genesis `59d9f054…44b1`, 2026-10-03). A release for `59d9f054` is
-  pending. `--print-net` below shows which genesis a binary pins; it must print `59d9f054…`.
+  re-launched T2** (genesis `59d9f054…44b1`, 2026-10-03). `t2-2026.10.04-1` is the first release that
+  pins it. `--print-net` below shows which genesis a binary pins; it must print `59d9f054…`.
 
 **Ask the binary rather than trusting this page** — it knows which net it was built for:
 
@@ -226,7 +225,7 @@ next time we cut one.
 
 ```sh
 # TAG — set this ONCE from the releases page, then nothing below repeats it.
-TAG=t2-a89dce6                   # or newer; see the three rules above — none published yet pins 59d9f054
+TAG=t2-2026.10.04-1              # or newer; see the three rules above
 PLATFORM=linux-x86_64-glibc      # or macos-arm64, macos-x86_64, …
 
 # 1 — download the archive for your platform and SHA256SUMS from the release page, then:
@@ -460,7 +459,7 @@ seeds. The differences:
 
 ```powershell
 # from the release page: the zip for your platform, and SHA256SUMS
-$TAG = "t2-a89dce6"   # or newer; set once, nothing below repeats it. No release yet pins 59d9f054 (see §2.1)
+$TAG = "t2-2026.10.04-1"   # or newer; set once, nothing below repeats it
 Get-FileHash ".\qumbra-$TAG-windows-x86_64.zip" -Algorithm SHA256
 # compare the printed hash against the matching line in SHA256SUMS — by eye, all 64 chars
 Expand-Archive ".\qumbra-$TAG-windows-x86_64.zip" -DestinationPath .
