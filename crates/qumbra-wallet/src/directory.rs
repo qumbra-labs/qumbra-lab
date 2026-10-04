@@ -29,7 +29,14 @@
 //!
 //! Injected, as [`crate::names::sync_names`] does: every function takes a fetch
 //! (or post) closure, so this module carries no TLS and tests feed it bytes.
-//! `net::http_get_limited` with [`MAX_BUCKET_BYTES`] is the intended GET.
+//! `net::http_get_limited` is the intended GET, with [`MAX_STATS_BYTES`] for
+//! `/stats` and [`MAX_BUCKET_BYTES`] for a bucket — two limits, because a
+//! stats answer is a few dozen bytes and must not be allowed a bucket's 10 MB.
+//!
+//! The upload body is the address's bech32m text, UTF-8, nothing else. The
+//! server parses it as text **whatever the Content-Type says**: the lab's
+//! `net::http_post_bytes` sends `application/octet-stream`, a browser shell
+//! may send `text/plain; charset=utf-8`, and both must work.
 //!
 //! Every route is scoped by the network's genesis file hash (design §1,
 //! "Network scoping"): a raw address binds no network, so one directory table
@@ -43,6 +50,8 @@ pub const BUCKET_VERSION: u8 = 1;
 pub const STATS_VERSION: u64 = 1;
 /// The most prefix bits any query uses (the prefix travels as two bytes).
 pub const MAX_PREFIX_BITS: u8 = 16;
+/// The response ceiling to hand the transport for `/stats`.
+pub const MAX_STATS_BYTES: usize = 1024;
 /// Bucket header: `ver ‖ p ‖ n`.
 pub const BUCKET_HEADER_LEN: usize = 1 + 1 + 4;
 /// The most entries one bucket may carry before the client refuses it. At the
@@ -86,6 +95,9 @@ impl std::fmt::Debug for Resolution {
 pub enum DirectoryError {
     /// The genesis id is not 64 lowercase hex characters.
     BadGenesis,
+    /// A prefix length past [`MAX_PREFIX_BITS`] — a caller bug, refused
+    /// rather than clamped so it cannot hide.
+    BadPrefixBits(u8),
     /// The stats document is not the expected shape or version.
     BadStats(String),
     /// The bucket bytes are malformed (wrong version, `p`, length, an entry
@@ -101,6 +113,7 @@ impl std::fmt::Display for DirectoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DirectoryError::BadGenesis => write!(f, "genesis id must be 64 lowercase hex characters"),
+            DirectoryError::BadPrefixBits(p) => write!(f, "prefix length {p} > {MAX_PREFIX_BITS} bits"),
             DirectoryError::BadStats(m) => write!(f, "address directory stats: {m}"),
             DirectoryError::BadBucket(m) => write!(f, "address directory bucket: {m}"),
             DirectoryError::Fetch(m) => write!(f, "address directory unreachable: {m}"),
@@ -124,16 +137,23 @@ pub fn prefix16(short: &ShortAddress) -> u16 {
     u16::from_be_bytes([short.hash[0], short.hash[1]])
 }
 
+fn check_bits(p: u8) -> Result<(), DirectoryError> {
+    if p > MAX_PREFIX_BITS { Err(DirectoryError::BadPrefixBits(p)) } else { Ok(()) }
+}
+
+/// Only ever called with `p <= MAX_PREFIX_BITS` (every public entry point
+/// runs [`check_bits`] first).
 fn mask(p: u8) -> u16 {
+    debug_assert!(p <= MAX_PREFIX_BITS);
     if p == 0 { 0 } else { u16::MAX << (16 - p as u32) }
 }
 
 /// The bucket path for `short` at `p` bits. The prefix always travels as two
 /// bytes (four hex characters) with every bit past `p` zeroed, so the path
-/// says nothing beyond the `p` bits it is meant to.
+/// says nothing beyond the `p` bits it is meant to. `p > 16` is refused.
 pub fn bucket_path(genesis: &str, short: &ShortAddress, p: u8) -> Result<String, DirectoryError> {
     check_genesis(genesis)?;
-    let p = p.min(MAX_PREFIX_BITS);
+    check_bits(p)?;
     Ok(format!("/v1/{genesis}/bucket/{p}/{:04x}", prefix16(short) & mask(p)))
 }
 
@@ -181,12 +201,13 @@ pub fn parse_stats(body: &[u8]) -> Result<Stats, DirectoryError> {
     Ok(Stats { count, prefix_bits: bits as u8 })
 }
 
-/// Decode one bucket served for `(p, prefix)`. Refuses, by name, a wrong
+/// Decode one bucket served for `(p, prefix)`. Refuses, by name, `p > 16`, a wrong
 /// version, a `p` other than the one asked for, an entry count past
 /// [`MAX_BUCKET_ENTRIES`] (checked before anything is allocated), a length
 /// that is not exactly the header plus `n` entries, an entry that does not
 /// parse as an address, and an entry outside the requested prefix.
 pub fn decode_bucket(bytes: &[u8], p: u8, prefix: u16) -> Result<Vec<Address>, DirectoryError> {
+    check_bits(p)?;
     let bad = |m: String| DirectoryError::BadBucket(m);
     if bytes.len() < BUCKET_HEADER_LEN {
         return Err(bad(format!("{} bytes, shorter than the header", bytes.len())));
@@ -371,7 +392,8 @@ mod tests {
         let p5 = bucket_path(G, &s, 5).unwrap();
         let hex = p5.rsplit('/').next().unwrap();
         assert_eq!(u16::from_str_radix(hex, 16).unwrap(), full & 0xF800);
-        assert_eq!(bucket_path(G, &s, 40).unwrap(), bucket_path(G, &s, 16).unwrap(), "capped at 16");
+        assert_eq!(bucket_path(G, &s, 17), Err(DirectoryError::BadPrefixBits(17)), "refused, not clamped");
+        assert_eq!(bucket_path(G, &s, 255), Err(DirectoryError::BadPrefixBits(255)));
     }
 
     #[test]
@@ -386,13 +408,38 @@ mod tests {
     fn bucket_at_p_matches_and_refuses_foreign_entries() {
         let v = vectors();
         let (a, b) = (&v[0].0, &v[1].0);
-        let p = 16;
         let pa = prefix16(&a.short());
-        let entries = decode_bucket(&bucket(p, &[a]), p, pa).unwrap();
-        assert_eq!(entries.len(), 1);
-        if prefix16(&b.short()) != pa {
-            assert!(matches!(decode_bucket(&bucket(p, &[a, b]), p, pa), Err(DirectoryError::BadBucket(_))));
-        }
+        assert_ne!(prefix16(&b.short()), pa, "precondition: the vectors' prefixes differ");
+        assert_eq!(decode_bucket(&bucket(16, &[a]), 16, pa).unwrap().len(), 1);
+        assert!(matches!(decode_bucket(&bucket(16, &[a, b]), 16, pa), Err(DirectoryError::BadBucket(_))));
+    }
+
+    #[test]
+    fn decode_masks_below_16_bits() {
+        // p = 5: the expected prefix is compared on the top 5 bits only.
+        let v = vectors();
+        let a = &v[0].0;
+        let pa = prefix16(&a.short());
+        let same_top5_other_low = (pa & 0xF800) | (!pa & 0x07FF);
+        assert_eq!(decode_bucket(&bucket(5, &[a]), 5, same_top5_other_low).unwrap().len(), 1);
+        let other_top5 = pa ^ 0x8000;
+        assert!(matches!(decode_bucket(&bucket(5, &[a]), 5, other_top5), Err(DirectoryError::BadBucket(_))));
+        assert_eq!(decode_bucket(&bucket(17, &[a]), 17, 0).err(), Some(DirectoryError::BadPrefixBits(17)));
+    }
+
+    #[test]
+    fn resolve_asks_at_the_capped_p() {
+        let v = vectors();
+        let a = &v[0].0;
+        let s = a.short();
+        let mut seen = Vec::new();
+        let r = resolve(G, &s, 4, |path| {
+            seen.push(path.to_string());
+            Ok(if path.ends_with("/stats") { stats_json(1 << 20, 13) } else { bucket(4, &[a]) })
+        })
+        .unwrap();
+        assert!(matches!(r, Resolution::Found(_)));
+        assert_eq!(seen[1], format!("/v1/{G}/bucket/4/{:04x}", prefix16(&s) & 0xF000));
     }
 
     #[test]
