@@ -57,11 +57,10 @@ ${SUMS}
 
 ## Provenance
 
-- Source revision: \`${LAB_REV}\` (\`qumbra-labs/qumbra-lab\`, private).
+- Source revision: \`${LAB_REV}\` (\`qumbra-labs/qumbra-lab\`, [commit](https://github.com/qumbra-labs/qumbra-lab/commit/${LAB_REV})).
 - Build log, including every assertion below: ${RUN_URL}
-- This tag points at \`${TARGET_SHA}\` in *this* (mirror) repository. **The \`${NET}-\` suffix
-  is the short SOURCE revision, from a different repository's history** — do not read the
-  tag name as a commit here.
+- This tag points at \`${TARGET_SHA}\` in *this* (mirror) repository. **The tag
+  name is the cut date** (\`${NET}-YYYY.MM.DD-N\`), not a commit — the source revision is the line above.
 - Node and wallet carry the revision internally, so you can ask them rather than trust this page:
 
 \`\`\`sh

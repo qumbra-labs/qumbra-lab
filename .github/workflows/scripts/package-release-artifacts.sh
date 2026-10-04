@@ -88,7 +88,7 @@ Qumbra ${NET_LABEL} prebuilt binaries
 
   release tag   : ${TAG}
   net           : ${NET_LABEL}
-  source rev    : ${LAB_REV}          (qumbra-labs/qumbra-lab, private)
+  source rev    : ${LAB_REV}          (qumbra-labs/qumbra-lab)
   platform      : ${PLATFORM}
   toolchain     : $(rustc -V 2>/dev/null || echo "unknown")
   built by      : the release lane, .github/workflows/release-binaries.yml
