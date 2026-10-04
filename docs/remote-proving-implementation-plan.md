@@ -48,7 +48,7 @@ flowchart LR
     LARRY["Larry<br/>start / ruling / launch authority"]
     CODEX["Claude Code<br/>primary implementation owner (2026-10-04)"]
     PR["Scoped branch + PR<br/>tests • vectors • evidence"]
-    CLAUDE["Claude Code<br/>independent protocol/security review"]
+    CLAUDE["Coordinator session (Claude Code)<br/>independent protocol/security review (2026-10-04)"]
     GROK["Grok<br/>privacy / TEE red-team"]
     LEDGER["Finding ledger<br/>fix or reasoned rejection"]
     GATE{"Larry gate"}
