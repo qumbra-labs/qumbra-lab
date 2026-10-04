@@ -199,6 +199,68 @@ pub const L2R_WIDTH: usize = AINV_COL + 1; // 734
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 128
 
+// ---------------------------------------------------------------------------
+// Version 2 — Candidate A authorization (lab #896 seam D; design
+// `remote-proving-authorization-shape-annulet`, ratified for the testnet
+// 2026-10-04, lab #894 Q3). Mirrors shape S's seam B: every v2 column is
+// APPENDED after the v1 layout (734), every v2 constraint sits behind
+// `self.version`, so a v1 instance keeps its columns, constraints, program and
+// `SHAPE_R_DIGEST_V1`.
+//
+// R's one input (the fee spend) drops `ANK` (`nk` enters as a witness at
+// `NFA`) and gains the authorization path before `ARKM`:
+//   NFA → BNF1 → AAUTH → (D−1)×MERKLE → BAUTH → ARKM → ACM → 32×MERKLE → BANCHOR
+// The issuer path (`AISS`, the registry write) is untouched.
+// ---------------------------------------------------------------------------
+
+/// The authorization tree depth (testnet, #894 Q1). Must equal
+/// `qlab-remote-auth` `annulet::D_AUTH` and shape S's `l2::D_AUTH` (seam B);
+/// R-local until B and D are reconciled on main.
+pub const D_AUTH_R: usize = 12;
+
+/// Which program and constraint set an instance carries. R-local twin of
+/// seam B's `l2::L2Version` (reconciled once both are on main).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum L2RVersion {
+    /// Today's shape R, byte-identical (`SHAPE_R_DIGEST_V1` pins it).
+    #[default]
+    V1,
+    /// Candidate A: `nk` witness, auth path, the leaf public value.
+    V2Auth,
+}
+
+/// v2 ring: 32 + 11 = 43 limbs, 172 slots — one period still covers the whole
+/// 2^19 trace (170.7 perms), so R's "no epoch" premise holds in v2.
+const PR_LIMBS_V2: usize = 43;
+pub const PROGRAM_SLOTS_V2: usize = 4 * PR_LIMBS_V2;
+/// v2 role codes. R uses 1–8, 10–12, 14–17 and 23–27, so `NFA` cannot be S's
+/// 23 (R's `AREG_NEW`) — R takes 28. `AAUTH` / `BAUTH` are S's 30 / 31.
+pub const ROLE_NFA_R: u32 = 28;
+pub const ROLE_AAUTH_R: u32 = 30;
+pub const ROLE_BAUTH_R: u32 = 31;
+const SEL_CODES_V2: [u32; 3] = [ROLE_NFA_R, ROLE_AAUTH_R, ROLE_BAUTH_R];
+
+/// 11 ring-extension limbs: the v2 ring is `PR[0..32] ++ XR[0..11]`.
+const XR_OFF: usize = L2R_WIDTH; // 734
+const XR_LIMBS: usize = PR_LIMBS_V2 - PR_LIMBS;
+/// Materialized selectors [NFA, AAUTH, BAUTH].
+const SELV2_OFF: usize = XR_OFF + XR_LIMBS; // 745
+/// Injection flags [NFA, AAUTH] (`bnd · sel`).
+const INJV2_OFF: usize = SELV2_OFF + 3; // 748
+/// `bnd · sel(NFA)`: banks 1 (+nk) and 2 (+ρ).
+const NFAB_COL: usize = INJV2_OFF + 2; // 750
+/// `gperm · sel(AAUTH)`: the leaf close.
+const EGL_CLOSE_COL: usize = NFAB_COL + 1; // 751
+/// Bank `EQL`: the leaf (W0..3 at `AAUTH`) against `PV_LEAF`.
+const EQL_OFF: usize = EGL_CLOSE_COL + 1; // 752: 16
+/// `bnd · sel(BAUTH)`: bank `EQA` takes the root.
+const EGA_POS_COL: usize = EQL_OFF + 16; // 768
+/// Bank `EQA`: root (`a` at `BAUTH`) − `auth_root` (W7..10 at `ARKM`), zero at
+/// ARKM's close (`CL_ARKM`).
+const EQA_OFF: usize = EGA_POS_COL + 1; // 769: 16
+/// The shape-R v2 trace width.
+pub const L2R_WIDTH_V2: usize = EQA_OFF + 16; // 785
+
 /// The new leaf block: `ROLE_AREG`'s injection, the second leaf.
 pub const ROLE_AREG_NEW: u32 = 23;
 /// `MERKLE_W`, old chain: `H(node)` with the running digest from `W4..7`.
@@ -275,6 +337,9 @@ pub const PV_NEW_ROOT: usize = 68;
 pub const PV_ASSET: usize = 84;
 pub const PV_CM_SEED: usize = 85;
 pub const PV_LEN: usize = 101;
+/// v2: the input's public authorization leaf (16 chunks), appended.
+pub const PV_LEAF: usize = 101;
+pub const PV_LEN_V2: usize = 117;
 const PV_BIND: [usize; NBGC] = [PV_ANCHOR, PV_NF, PV_CM, PV_OLD_ROOT, PV_NEW_ROOT, PV_CM_SEED];
 
 /// Build the full public-value vector for a shape-R instance.
@@ -304,6 +369,25 @@ pub fn pv_vec_r(
     out
 }
 
+/// v2 PVs: [`pv_vec_r`] followed by the authorization leaf.
+#[allow(clippy::too_many_arguments)]
+pub fn pv_vec_r_v2(
+    anchor: &[u64; 4],
+    nf: &[u64; 4],
+    cm: &[u64; 4],
+    fee: u64,
+    old_root: &[u64; 4],
+    new_root: &[u64; 4],
+    asset: u64,
+    cm_seed: &[u64; 4],
+    leaf: &[u64; 4],
+) -> Vec<u32> {
+    let mut out = pv_vec_r(anchor, nf, cm, fee, old_root, new_root, asset, cm_seed);
+    out.extend_from_slice(&pv_chunks(leaf));
+    debug_assert_eq!(out.len(), PV_LEN_V2);
+    out
+}
+
 /// Perm slots used by the shape-R program, INCLUDING the leading dummy slot:
 /// 1 + (5 + 32 + 1) + 2 + 3 + 3 + 2 × 16 + 2 + 1 = **82**, at 3072 rows each =
 /// 251,904 rows → 2^18 (262,144), 3.3 spare perm slots.
@@ -313,6 +397,14 @@ pub const SHAPE_R_LOG_HEIGHT: usize = 18;
 const _: () = assert!(SHAPE_R_PERMS * ROWS_PER_PERM <= 1 << SHAPE_R_LOG_HEIGHT);
 // One program period covers the whole trace — the "no epoch" premise.
 const _: () = assert!((1 << SHAPE_R_LOG_HEIGHT) / ROWS_PER_PERM < PROGRAM_SLOTS);
+/// v2 perms: v1's 82 − `ANK` + `AAUTH` + (D−1) `MERKLE` + `BAUTH` = 82 + D =
+/// **94**, 288,768 rows → 2^19 (524,288; 170 perm capacity).
+pub const SHAPE_R_PERMS_V2: usize = SHAPE_R_PERMS + D_AUTH_R;
+pub const SHAPE_R_LOG_HEIGHT_V2: usize = 19;
+const _: () = assert!(SHAPE_R_PERMS_V2 * ROWS_PER_PERM <= 1 << SHAPE_R_LOG_HEIGHT_V2);
+const _: () = assert!(SHAPE_R_PERMS_V2 * ROWS_PER_PERM > 1 << SHAPE_R_LOG_HEIGHT);
+// v2 keeps "one program period covers the whole trace".
+const _: () = assert!((1 << SHAPE_R_LOG_HEIGHT_V2) / ROWS_PER_PERM < PROGRAM_SLOTS_V2);
 
 const fn s_col(d: usize) -> usize {
     S_OFF + d - 1
@@ -362,8 +454,11 @@ impl Default for L2RSlotWitness {
 #[cfg_attr(test, derive(Clone))] // the tests tamper owned copies; non-test build unchanged
 pub struct L2ShapeRAir {
     pub log_height: usize,
-    /// 5-bit role code per program slot.
-    pub program: [u32; PROGRAM_SLOTS],
+    /// v1 (today's R) or v2 (Candidate A authorization).
+    pub version: L2RVersion,
+    /// 5-bit role code per program slot; the program period is its length
+    /// (`PROGRAM_SLOTS` v1, `PROGRAM_SLOTS_V2` v2).
+    pub program: Vec<u32>,
     pub slot_witness: Vec<L2RSlotWitness>,
     /// Public fee (needed to witness the balance carry encodings).
     pub fee: u64,
@@ -376,17 +471,50 @@ impl L2ShapeRAir {
     pub fn chain_only(log_height: usize) -> Self {
         Self {
             log_height,
-            program: [ROLE_DUMMY; PROGRAM_SLOTS],
+            version: L2RVersion::V1,
+            program: vec![ROLE_DUMMY; PROGRAM_SLOTS],
             slot_witness: Vec::new(),
             fee: 0,
             reg: true,
         }
     }
 
+    /// The v2 geometry probe: every slot dummy, v2 width and ring.
+    pub fn chain_only_v2(log_height: usize) -> Self {
+        Self {
+            version: L2RVersion::V2Auth,
+            program: vec![ROLE_DUMMY; PROGRAM_SLOTS_V2],
+            ..Self::chain_only(log_height)
+        }
+    }
+
+    pub fn is_v2(&self) -> bool {
+        self.version == L2RVersion::V2Auth
+    }
+
+    /// Program-ring limbs: 32 (v1) or 43 (v2).
+    fn ring_limbs(&self) -> usize {
+        if self.is_v2() {
+            PR_LIMBS_V2
+        } else {
+            PR_LIMBS
+        }
+    }
+
+    /// Column of ring limb `i`: `PR[0..32]` then (v2) `XR[0..11]`.
+    fn ring_col(i: usize) -> usize {
+        if i < PR_LIMBS {
+            PR_OFF + i
+        } else {
+            XR_OFF + (i - PR_LIMBS)
+        }
+    }
+
     /// Program-ring limb i: slots 4i..4i+4, 5 bits each.
     fn pr_limb(&self, i: usize) -> u32 {
+        let n = self.program.len();
         (0..4)
-            .map(|j| self.program[(4 * i + j) % PROGRAM_SLOTS] << (ROLE_BITS * j))
+            .map(|j| self.program[(4 * i + j) % n] << (ROLE_BITS * j))
             .sum()
     }
 
@@ -416,11 +544,19 @@ const PER_LO2: usize = 40;
 
 impl<F: Field> BaseAir<F> for L2ShapeRAir {
     fn width(&self) -> usize {
-        L2R_WIDTH
+        if self.is_v2() {
+            L2R_WIDTH_V2
+        } else {
+            L2R_WIDTH
+        }
     }
 
     fn num_public_values(&self) -> usize {
-        PV_LEN
+        if self.is_v2() {
+            PV_LEN_V2
+        } else {
+            PV_LEN
+        }
     }
 
     fn num_periodic_columns(&self) -> usize {
@@ -579,9 +715,9 @@ where
                 if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
             );
         }
-        for i in 0..PR_LIMBS {
+        for i in 0..self.ring_limbs() {
             builder.when_first_row().assert_eq(
-                local[PR_OFF + i].clone(),
+                local[Self::ring_col(i)].clone(),
                 AB::Expr::from_u32(self.pr_limb(i)),
             );
         }
@@ -674,14 +810,28 @@ where
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
-            let msg_arkm: AB::Expr = match l {
-                0..=3 => w(l),
-                4 => sel(1),
-                5 => w(5),
-                6 => w(6),
-                7 => sel(0),
-                16 => u63.clone(),
-                _ => AB::Expr::ZERO,
+            let msg_arkm: AB::Expr = if self.is_v2() {
+                // v2: nk ‖ D_R ‖ d ‖ auth_root (W7..10), pad lane 11.
+                match l {
+                    0..=3 => w(l),
+                    4 => sel(1),
+                    5 => w(5),
+                    6 => w(6),
+                    7..=10 => w(l),
+                    11 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                }
+            } else {
+                match l {
+                    0..=3 => w(l),
+                    4 => sel(1),
+                    5 => w(5),
+                    6 => w(6),
+                    7 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                }
             };
             let msg_acm: AB::Expr = match l {
                 0 => w(4),
@@ -753,7 +903,7 @@ where
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
-            let expr = a(l)
+            let mut expr = a(l)
                 + inj(0) * (msg_mrk - a(l))
                 + inj(1) * (msg_ank - a(l))
                 + inj(2) * (msg_arkm - a(l))
@@ -764,6 +914,28 @@ where
                 + inj(7) * (msg_acmout2 - a(l))
                 + (injold.clone() + injnew.clone()) * (msg_areg - a(l))
                 + (mob.clone() + mnb.clone()) * (msg_mw - a(l));
+            if self.is_v2() {
+                // NFA: nk (W9..12) ‖ ρ (W0..3), fixed operand order.
+                let msg_nfa: AB::Expr = match l {
+                    0..=3 => w(l + 9),
+                    4..=7 => w(l - 4),
+                    8 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                };
+                // AAUTH: leaf W0..3, sibling W4..7, ordered by the path bit as
+                // `ROLE_MERKLE` orders the chained digest (merkle_node_state).
+                let msg_aauth: AB::Expr = match l {
+                    0..=3 => pbit.clone() * w(l + 4) + (AB::Expr::ONE - pbit.clone()) * w(l),
+                    4..=7 => pbit.clone() * w(l - 4) + (AB::Expr::ONE - pbit.clone()) * w(l),
+                    8 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                };
+                expr = expr
+                    + local[INJV2_OFF].clone() * (msg_nfa - a(l))
+                    + local[INJV2_OFF + 1].clone() * (msg_aauth - a(l));
+            }
             builder.assert_eq(eff(l), expr);
         }
 
@@ -817,6 +989,35 @@ where
         for off in [BQ_OFF, EQ_OFF, EQ_OFF + 16, EQ3_OFF, CO_OFF, CN_OFF, SB_OFF, IS_OFF] {
             for j in 0..16 {
                 builder.when_first_row().assert_zero(local[off + j].clone());
+            }
+        }
+
+        // --- v2 (Candidate A): selectors, injections, the leaf and root banks ---
+        if self.is_v2() {
+            for (i, code) in SEL_CODES_V2.iter().enumerate() {
+                let lo = local[LO_OFF + (code & 3) as usize].clone();
+                let hi = pair(r(2), r(3), (code >> 2) & 3);
+                let top = if (code >> 4) & 1 == 1 {
+                    r(4)
+                } else {
+                    AB::Expr::ONE - r(4)
+                };
+                builder.assert_eq(local[SELV2_OFF + i].clone(), lo * hi * top);
+            }
+            builder.assert_eq(local[INJV2_OFF].clone(), bnd.clone() * local[SELV2_OFF].clone());
+            builder.assert_eq(local[INJV2_OFF + 1].clone(), bnd.clone() * local[SELV2_OFF + 1].clone());
+            builder.assert_eq(local[NFAB_COL].clone(), bnd.clone() * local[SELV2_OFF].clone());
+            builder.assert_eq(local[EGL_CLOSE_COL].clone(), gperm.clone() * local[SELV2_OFF + 1].clone());
+            builder.assert_eq(local[EGA_POS_COL].clone(), bnd.clone() * local[SELV2_OFF + 2].clone());
+            for j in 0..16 {
+                // The leaf closes against its public value at AAUTH's last row.
+                builder.assert_zero(
+                    local[EGL_CLOSE_COL].clone() * (local[EQL_OFF + j].clone() - pv(PV_LEAF + j)),
+                );
+                // The auth root equals ARKM's `auth_root` lanes.
+                builder.assert_zero(cl(CL_ARKM) * local[EQA_OFF + j].clone());
+                builder.when_first_row().assert_zero(local[EQL_OFF + j].clone());
+                builder.when_first_row().assert_zero(local[EQA_OFF + j].clone());
             }
         }
 
@@ -948,11 +1149,12 @@ where
             );
         }
         let g4 = local[G4_COL].clone();
-        for i in 0..PR_LIMBS {
+        let n_ring = self.ring_limbs();
+        for i in 0..n_ring {
             t.assert_eq(
-                next[PR_OFF + i].clone(),
-                (AB::Expr::ONE - g4.clone()) * local[PR_OFF + i].clone()
-                    + g4.clone() * local[PR_OFF + (i + 1) % PR_LIMBS].clone(),
+                next[Self::ring_col(i)].clone(),
+                (AB::Expr::ONE - g4.clone()) * local[Self::ring_col(i)].clone()
+                    + g4.clone() * local[Self::ring_col((i + 1) % n_ring)].clone(),
             );
         }
         let dpbit = next[PBIT_COL].clone() - local[PBIT_COL].clone();
@@ -1020,17 +1222,30 @@ where
                         + local[BGCAP_COL].clone() * pwk(j) * a(l),
                 );
                 // Bank 1 (nk): +a at NF, −W0..3 at ARKM.
-                t.assert_eq(
-                    next[EQ_OFF + idx].clone(),
-                    local[EQ_OFF + idx].clone() + nfb.clone() * pwk(j) * a(l)
-                        - inj(2) * pwk(j) * w(l),
-                );
+                let mut bank1 = local[EQ_OFF + idx].clone() + nfb.clone() * pwk(j) * a(l)
+                    - inj(2) * pwk(j) * w(l);
                 // Bank 2 (ρ): +W0..3 at NF, −W5..8 at ACM.
-                t.assert_eq(
-                    next[EQ_OFF + 16 + idx].clone(),
-                    local[EQ_OFF + 16 + idx].clone() + nfb.clone() * pwk(j) * w(l)
-                        - inj(3) * pwk(j) * w(5 + l),
-                );
+                let mut bank2 = local[EQ_OFF + 16 + idx].clone() + nfb.clone() * pwk(j) * w(l)
+                    - inj(3) * pwk(j) * w(5 + l);
+                if self.is_v2() {
+                    // NFA: +nk (W9..12) into bank 1, +ρ (W0..3) into bank 2.
+                    bank1 += local[NFAB_COL].clone() * pwk(j) * w(9 + l);
+                    bank2 += local[NFAB_COL].clone() * pwk(j) * w(l);
+                    // EQL: +leaf bits at AAUTH, reset after its close.
+                    t.assert_eq(
+                        next[EQL_OFF + idx].clone(),
+                        (AB::Expr::ONE - local[EGL_CLOSE_COL].clone()) * local[EQL_OFF + idx].clone()
+                            + local[INJV2_OFF + 1].clone() * pwk(j) * w(l),
+                    );
+                    // EQA: +root (a) at BAUTH, −auth_root (W7..10) at ARKM.
+                    t.assert_eq(
+                        next[EQA_OFF + idx].clone(),
+                        local[EQA_OFF + idx].clone() + local[EGA_POS_COL].clone() * pwk(j) * a(l)
+                            - inj(2) * pwk(j) * w(7 + l),
+                    );
+                }
+                t.assert_eq(next[EQ_OFF + idx].clone(), bank1);
+                t.assert_eq(next[EQ_OFF + 16 + idx].clone(), bank2);
                 // Bank 3: the output's ρ lanes W5..8; ARHO's nf W0..3 back out.
                 t.assert_eq(
                     next[EQ3_OFF + idx].clone(),
@@ -1354,7 +1569,8 @@ pub fn build_shape_r_with_witnesses(
     L2ShapeRInstance {
         air: L2ShapeRAir {
             log_height,
-            program,
+            version: L2RVersion::V1,
+            program: program.to_vec(),
             slot_witness: sw,
             fee,
             reg: write.old_leaf.is_none(),
@@ -1370,13 +1586,335 @@ pub fn build_shape_r_with_witnesses(
 }
 
 // ---------------------------------------------------------------------------
+// v2 instances (Candidate A) — R-local twins of seam B's `l2` v2 types,
+// reconciled once both seams are on main.
+// ---------------------------------------------------------------------------
+
+/// The input's authorization witness: the public leaf (`mldsa_leaf(index, vk)`
+/// as four u64 lanes LE), its index and the `D_AUTH_R` siblings, leaf level
+/// first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RAuthPath {
+    pub leaf: [u64; 4],
+    pub leaf_index: u32,
+    pub siblings: [[u64; 4]; D_AUTH_R],
+}
+
+impl RAuthPath {
+    /// `merkle_node_state` per level; bit `k` of `leaf_index` = "current node
+    /// is the right child" (the AIR's `MERKLE` order).
+    pub fn root(&self) -> [u64; 4] {
+        let mut d = self.leaf;
+        for (k, sib) in self.siblings.iter().enumerate() {
+            let st = if (self.leaf_index >> k) & 1 == 1 {
+                crate::reference::merkle_node_state(sib, &d)
+            } else {
+                crate::reference::merkle_node_state(&d, sib)
+            };
+            d = st[..4].try_into().unwrap();
+        }
+        d
+    }
+}
+
+/// The v2 fee input: `nk` replaces `sk`, plus its authorization.
+#[derive(Clone, Debug)]
+pub struct RAuthInput {
+    pub nk: [u64; 4],
+    pub value: u64,
+    pub asset: u64,
+    pub rho: [u64; 4],
+    pub rseed: [u64; 4],
+    pub d: [u64; 2],
+    pub auth: RAuthPath,
+}
+
+/// `nf = H(nk ‖ ρ)`.
+pub fn r_nf_v2(nk: &[u64; 4], rho: &[u64; 4]) -> [u64; 4] {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(nk);
+    st[4..8].copy_from_slice(rho);
+    st[8] = 1;
+    st[16] = 1 << 63;
+    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
+}
+
+/// `rkm = H(nk ‖ D_R ‖ d ‖ auth_root)`, pad lane 11.
+pub fn r_rkm_v2(nk: &[u64; 4], d: &[u64; 2], auth_root: &[u64; 4]) -> [u64; 4] {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(nk);
+    st[4] = 1 << 1;
+    st[5] = d[0];
+    st[6] = d[1];
+    st[7..11].copy_from_slice(auth_root);
+    st[11] = 1;
+    st[16] = 1 << 63;
+    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
+}
+
+/// `(nf, rkm, cm)` for the v2 fee input.
+pub fn derive_input_r_v2(inp: &RAuthInput) -> ([u64; 4], [u64; 4], [u64; 4]) {
+    let nf = r_nf_v2(&inp.nk, &inp.rho);
+    let rkm = r_rkm_v2(&inp.nk, &inp.d, &inp.auth.root());
+    let cm = l2_cm(inp.value, inp.asset, &rkm, &inp.rho, &inp.rseed);
+    (nf, rkm, cm)
+}
+
+/// A v2 shape-R instance with its public leaf.
+#[cfg_attr(test, derive(Clone))]
+pub struct L2ShapeRInstanceV2 {
+    pub inst: L2ShapeRInstance,
+    pub leaf: [u64; 4],
+}
+
+/// Shape R v2 from a caller-supplied commitment-tree witness + anchor —
+/// [`build_shape_r_with_witnesses`] with the fee input's head replaced:
+/// `NFA → BNF1 → AAUTH → (D−1)×MERKLE → BAUTH → ARKM(v2)`; everything after
+/// `ARKM` (the note, the outputs, the seed, the write) is v1's program.
+#[allow(clippy::too_many_arguments)]
+pub fn build_shape_r_v2_with_witnesses(
+    log_height: usize,
+    fee_in: &RAuthInput,
+    fee_witness: &MerkleWitness,
+    anchor: [u64; 4],
+    fee_out: &L2TxOutput,
+    fee: u64,
+    write: &RegistryWrite,
+    seed: &SeedOutput,
+) -> L2ShapeRInstanceV2 {
+    let (nf, _, _) = derive_input_r_v2(fee_in);
+    let auth_root = fee_in.auth.root();
+    let cm_out = l2_cm(fee_out.value, fee_out.asset, &fee_out.rkm, &nf, &fee_out.rseed);
+    let seed_rho = derive_output_rho(&nf, 1);
+    let cm_seed = l2_cm(0, write.new_leaf.asset, &seed.rkm, &seed_rho, &seed.rseed);
+    let old_digest = write.old_leaf.map_or([0u64; 4], |l| l.hash());
+    let new_digest = write.new_leaf.hash();
+    let old_root = write.opening.fold_root(&old_digest);
+    let new_root = write.opening.fold_root(&new_digest);
+
+    let mut program = vec![ROLE_DUMMY; PROGRAM_SLOTS_V2];
+    let mut sw = vec![L2RSlotWitness::default(); PROGRAM_SLOTS_V2];
+    let mut slot = 1usize;
+    let mut put = |role: u32, w: L2RSlotWitness| {
+        program[slot] = role;
+        sw[slot] = w;
+        slot += 1;
+    };
+    let lanes = |f: &dyn Fn(&mut [u64; NW])| {
+        let mut w = L2RSlotWitness::default();
+        f(&mut w.w);
+        w
+    };
+    // The fee input, v2 head: nk ‖ ρ, the auth path, ARKM over auth_root.
+    put(
+        ROLE_NFA_R,
+        lanes(&|w| {
+            w[..4].copy_from_slice(&fee_in.rho);
+            w[9..13].copy_from_slice(&fee_in.nk);
+        }),
+    );
+    put(ROLE_BNF1, L2RSlotWitness::default());
+    let a = &fee_in.auth;
+    let mut w0 = lanes(&|w| {
+        w[..4].copy_from_slice(&a.leaf);
+        w[4..8].copy_from_slice(&a.siblings[0]);
+    });
+    w0.pbit = a.leaf_index & 1 == 1;
+    put(ROLE_AAUTH_R, w0);
+    for k in 1..D_AUTH_R {
+        let mut w = lanes(&|w| w[..4].copy_from_slice(&a.siblings[k]));
+        w.pbit = (a.leaf_index >> k) & 1 == 1;
+        put(ROLE_MERKLE, w);
+    }
+    put(ROLE_BAUTH_R, L2RSlotWitness::default());
+    put(
+        ROLE_ARKM,
+        lanes(&|w| {
+            w[..4].copy_from_slice(&fee_in.nk);
+            w[5] = fee_in.d[0];
+            w[6] = fee_in.d[1];
+            w[7..11].copy_from_slice(&auth_root);
+        }),
+    );
+    put(
+        ROLE_ACM,
+        lanes(&|w| {
+            w[4] = fee_in.value;
+            w[5..9].copy_from_slice(&fee_in.rho);
+            w[9..13].copy_from_slice(&fee_in.rseed);
+            w[13] = fee_in.asset;
+        }),
+    );
+    for (sib, bit) in fee_witness.siblings.iter().zip(fee_witness.path_bits.iter()) {
+        let mut w = lanes(&|w| w[..4].copy_from_slice(sib));
+        w.pbit = *bit;
+        put(ROLE_MERKLE, w);
+    }
+    put(ROLE_BANCHOR, L2RSlotWitness::default());
+    put(
+        ROLE_ACMOUT,
+        lanes(&|w| {
+            w[..4].copy_from_slice(&fee_out.rkm);
+            w[4] = fee_out.value;
+            w[5..9].copy_from_slice(&nf);
+            w[9..13].copy_from_slice(&fee_out.rseed);
+            w[13] = fee_out.asset;
+        }),
+    );
+    put(ROLE_BCM1, L2RSlotWitness::default());
+    put(ROLE_ARHO, lanes(&|w| w[..4].copy_from_slice(&nf)));
+    put(
+        ROLE_ACMOUT2,
+        lanes(&|w| {
+            w[..4].copy_from_slice(&seed.rkm);
+            w[9..13].copy_from_slice(&seed.rseed);
+            w[13] = write.new_leaf.asset;
+        }),
+    );
+    put(ROLE_BCM2, L2RSlotWitness::default());
+    put(ROLE_AISS, lanes(&|w| w[..4].copy_from_slice(&write.isk)));
+    let leaf_lanes = |l: &RegistryLeaf| {
+        lanes(&|w| {
+            w[..4].copy_from_slice(&l.issuer_key);
+            w[4] = l.mode;
+            w[5..9].copy_from_slice(&l.freeze_root);
+            w[9..13].copy_from_slice(&l.allow_root);
+            w[13] = l.asset;
+            w[14] = l.flags;
+        })
+    };
+    put(
+        ROLE_AREG_OLD,
+        write.old_leaf.as_ref().map_or_else(L2RSlotWitness::default, leaf_lanes),
+    );
+    put(ROLE_AREG_NEW, leaf_lanes(&write.new_leaf));
+    let (mut d_old, mut d_new) = (old_digest, new_digest);
+    for lvl in 0..REGISTRY_DEPTH {
+        let (sib, bit) = (write.opening.siblings[lvl], write.opening.path_bits[lvl]);
+        let fold_w = |d: &[u64; 4]| {
+            let mut w = lanes(&|w| {
+                w[..4].copy_from_slice(&sib);
+                w[4..8].copy_from_slice(d);
+            });
+            w.pbit = bit;
+            w
+        };
+        let node = |d: &[u64; 4]| -> [u64; 4] {
+            let st = if bit {
+                crate::reference::merkle_node_state(&sib, d)
+            } else {
+                crate::reference::merkle_node_state(d, &sib)
+            };
+            st[..4].try_into().unwrap()
+        };
+        put(ROLE_MO, fold_w(&d_old));
+        if lvl == REGISTRY_DEPTH - 1 {
+            put(ROLE_BREG_OLD, L2RSlotWitness { pbit: bit, ..Default::default() });
+        }
+        put(ROLE_MN, fold_w(&d_new));
+        d_old = node(&d_old);
+        d_new = node(&d_new);
+    }
+    assert_eq!((d_old, d_new), (old_root, new_root));
+    put(ROLE_BREG_NEW, L2RSlotWitness::default());
+    put(ROLE_BAL, L2RSlotWitness::default());
+    assert_eq!(slot, SHAPE_R_PERMS_V2, "v2 program layout drifted");
+
+    let leaf = fee_in.auth.leaf;
+    let pvs = pv_vec_r_v2(&anchor, &nf, &cm_out, fee, &old_root, &new_root, write.new_leaf.asset, &cm_seed, &leaf);
+    L2ShapeRInstanceV2 {
+        inst: L2ShapeRInstance {
+            air: L2ShapeRAir {
+                log_height,
+                version: L2RVersion::V2Auth,
+                program,
+                slot_witness: sw,
+                fee,
+                reg: write.old_leaf.is_none(),
+            },
+            pvs,
+            anchor,
+            nf,
+            cm_out,
+            old_root,
+            new_root,
+            cm_seed,
+        },
+        leaf,
+    }
+}
+
+/// Fabricated v2 fee input for tests and benches: deterministic lanes and a
+/// synthetic authorization path (the AIR sees only the leaf, path and root).
+pub fn fabricated_r_auth_input(seed: u64, value: u64, leaf_index: u32) -> RAuthInput {
+    let mut x = seed | 1;
+    let mut r = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    RAuthInput {
+        nk: [r(), r(), r(), r()],
+        value,
+        asset: 0,
+        rho: [r(), r(), r(), r()],
+        rseed: [r(), r(), r(), r()],
+        d: [r(), r()],
+        auth: RAuthPath {
+            leaf: [r(), r(), r(), r()],
+            leaf_index,
+            siblings: core::array::from_fn(|_| [r(), r(), r(), r()]),
+        },
+    }
+}
+
+/// The canonical honest v2 R instance at 2^19: a registration of asset 9
+/// (Cloaked) into an empty slot of a one-leaf registry (asset 0), paid by a
+/// 100-unit asset-0 note → 93 out + fee 7.
+pub fn fabricated_shape_r_v2() -> L2ShapeRInstanceV2 {
+    let fee_in = fabricated_r_auth_input(0xd1d1, 100, 2930);
+    let (_, _, cm) = derive_input_r_v2(&fee_in);
+    let (witness, anchor) = fabricated_single_tree(&cm);
+    let fee_out = L2TxOutput {
+        value: 93,
+        asset: 0,
+        rkm: [0x9e1, 0x9e2, 0x9e3, 0x9e4],
+        rho: [0; 4],
+        rseed: [0xaf1, 0xaf2, 0xaf3, 0xaf4],
+    };
+    let write = RegistryWrite {
+        isk: [0; 4],
+        old_leaf: None,
+        new_leaf: RegistryLeaf::cloaked(9),
+        opening: registry_opening(&[RegistryLeaf::cloaked(0)], 9).0,
+    };
+    let seed = SeedOutput { rkm: [0xb01, 0xb02, 0xb03, 0xb04], rseed: [0xc01, 0xc02, 0xc03, 0xc04] };
+    build_shape_r_v2_with_witnesses(SHAPE_R_LOG_HEIGHT_V2, &fee_in, &witness, anchor, &fee_out, 7, &write, &seed)
+}
+
+/// The witness-free v2 shape-R AIR a verifier uses: the canonical v2 program
+/// over the v2 width. `eval` reads only `program` and `version` (`REG` is a
+/// witness column); `reg` is copied for symmetry with the builder.
+pub fn verifier_air_r_v2() -> L2ShapeRAir {
+    let canon = fabricated_shape_r_v2().inst.air;
+    L2ShapeRAir {
+        program: canon.program,
+        reg: canon.reg,
+        ..L2ShapeRAir::chain_only_v2(SHAPE_R_LOG_HEIGHT_V2)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trace generation — l2.rs's fill, mirrored constraint for constraint.
 // ---------------------------------------------------------------------------
 
 impl L2ShapeRAir {
     pub fn generate_trace<F: Field>(&self, extra_capacity_bits: usize) -> RowMajorMatrix<F> {
         let height = 1usize << self.log_height;
-        let size = height * L2R_WIDTH;
+        let width = <Self as BaseAir<F>>::width(self);
+        let v2 = self.is_v2();
+        let size = height * width;
         let mut values = Vec::with_capacity(size << extra_capacity_bits);
 
         let mut s = [0u32; S_SLOTS + 1];
@@ -1385,9 +1923,9 @@ impl L2ShapeRAir {
         let mut r: [u32; 24] = core::array::from_fn(|i| Self::rc_pack((23 + i) % 24));
         let mut pb: [u32; 24] = core::array::from_fn(|i| (i == 0) as u32);
         let mut ph: [u32; 4] = core::array::from_fn(|i| (i == 0) as u32);
-        let mut pr: [u32; PR_LIMBS] = core::array::from_fn(|i| self.pr_limb(i));
+        let mut pr: Vec<u32> = (0..self.ring_limbs()).map(|i| self.pr_limb(i)).collect();
         let mut perm_idx = 0usize;
-        let role_of = |p: usize| self.program[p % PROGRAM_SLOTS];
+        let role_of = |p: usize| self.program[p % self.program.len()];
         let wit = |p: usize| -> L2RSlotWitness {
             if self.slot_witness.is_empty() {
                 L2RSlotWitness::default()
@@ -1398,6 +1936,9 @@ impl L2ShapeRAir {
         let mut cur = wit(0);
         let mut eq = [0i64; 32];
         let mut eq3 = [0i64; 16];
+        // v2: the leaf bank and the auth-root bank.
+        let mut eql = [0i64; 16];
+        let mut eqa = [0i64; 16];
         let mut bq = [0i64; 16];
         let mut bl = [0i64; 4];
         let mut co = [0i64; 16];
@@ -1483,12 +2024,36 @@ impl L2ShapeRAir {
                         16 => z63,
                         _ => 0,
                     },
+                    ROLE_ARKM if v2 => match l {
+                        0..=3 => wbit[l],
+                        4 => z1,
+                        5 => wbit[5],
+                        6 => wbit[6],
+                        7..=10 => wbit[l],
+                        11 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
                     ROLE_ARKM => match l {
                         0..=3 => wbit[l],
                         4 => z1,
                         5 => wbit[5],
                         6 => wbit[6],
                         7 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_NFA_R if v2 => match l {
+                        0..=3 => wbit[l + 9],
+                        4..=7 => wbit[l - 4],
+                        8 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_AAUTH_R if v2 => match l {
+                        0..=3 => pbv * wbit[l + 4] + (1 - pbv) * wbit[l],
+                        4..=7 => pbv * wbit[l - 4] + (1 - pbv) * wbit[l],
+                        8 => z0,
                         16 => z63,
                         _ => 0,
                     },
@@ -1562,7 +2127,7 @@ impl L2ShapeRAir {
             });
 
             let base = values.len();
-            values.resize(base + L2R_WIDTH, F::ZERO);
+            values.resize(base + width, F::ZERO);
             let row = &mut values[base..];
             for l in 0..25 {
                 row[A_OFF + l] = F::from_u32(a[l]);
@@ -1591,7 +2156,7 @@ impl L2ShapeRAir {
                 row[PH_OFF + i] = F::from_u32(*vv);
             }
             for (i, vv) in pr.iter().enumerate() {
-                row[PR_OFF + i] = F::from_u32(*vv);
+                row[Self::ring_col(i)] = F::from_u32(*vv);
             }
             for k in 0..4 * ROLE_BITS {
                 row[D_OFF + k] = F::from_u32((pr[0] >> k) & 1);
@@ -1694,6 +2259,26 @@ impl L2ShapeRAir {
             row[RINV_COL] = rinv;
             row[AINV_COL] = ainv;
 
+            // v2 columns.
+            let (nfab, injaauth, egl_close, ega_pos) = if v2 {
+                let selv2: [u32; 3] = core::array::from_fn(|i| (role_now == SEL_CODES_V2[i]) as u32);
+                for (i, vv) in selv2.iter().enumerate() {
+                    row[SELV2_OFF + i] = F::from_u32(*vv);
+                }
+                let g = (bndv * selv2[0], bndv * selv2[1], gpermv * selv2[1], bndv * selv2[2]);
+                row[INJV2_OFF] = F::from_u32(g.0);
+                row[INJV2_OFF + 1] = F::from_u32(g.1);
+                row[NFAB_COL] = F::from_u32(g.0);
+                row[EGL_CLOSE_COL] = F::from_u32(g.2);
+                row[EGA_POS_COL] = F::from_u32(g.3);
+                for i in 0..16 {
+                    row[EQL_OFF + i] = sgn(eql[i]);
+                    row[EQA_OFF + i] = sgn(eqa[i]);
+                }
+                g
+            } else {
+                (0, 0, 0, 0)
+            };
             // Advance the accumulators.
             {
                 let jc = z / 16;
@@ -1705,12 +2290,25 @@ impl L2ShapeRAir {
                 if bgc_any == 1 {
                     bq = [0i64; 16];
                 }
+                if v2 {
+                    if egl_close == 1 {
+                        eql = [0i64; 16];
+                    }
+                    for l in 0..4 {
+                        eql[4 * l + jc] += injaauth as i64 * wgt * wb(l);
+                    }
+                }
                 for l in 0..4 {
                     let idx = 4 * l + jc;
                     let al = a[l] as i64;
                     bq[idx] += bgcap as i64 * wgt * al;
                     eq[idx] += nfb * wgt * al - injv[2] as i64 * wgt * wb(l);
                     eq[16 + idx] += nfb * wgt * wb(l) - injv[3] as i64 * wgt * wb(5 + l);
+                    if v2 {
+                        eq[idx] += nfab as i64 * wgt * wb(9 + l);
+                        eq[16 + idx] += nfab as i64 * wgt * wb(l);
+                        eqa[idx] += ega_pos as i64 * wgt * al - injv[2] as i64 * wgt * wb(7 + l);
+                    }
                     eq3[idx] += injv[4] as i64 * wgt * wb(5 + l) - injv[6] as i64 * wgt * wb(l);
                     co[idx] += (mnb + injnew * not_reg) * wgt * al - mob * wgt * wb(4 + l);
                     cn[idx] += mob * wgt * al - mnb * wgt * wb(4 + l);
@@ -1785,7 +2383,7 @@ impl L2ShapeRAir {
             }
         }
 
-        RowMajorMatrix::new(values, L2R_WIDTH)
+        RowMajorMatrix::new(values, width)
     }
 
     /// The state materialized at block `q` (the round-q input).
@@ -1830,7 +2428,7 @@ mod tests {
     fn digest(state: &[u64; 25]) -> [u64; 4] {
         state[..4].try_into().unwrap()
     }
-    fn slot_of(program: &[u32; PROGRAM_SLOTS], role: u32, nth: usize) -> usize {
+    fn slot_of(program: &[u32], role: u32, nth: usize) -> usize {
         program.iter().enumerate().filter(|(_, r)| **r == role).map(|(i, _)| i).nth(nth).unwrap()
     }
 
@@ -2267,7 +2865,7 @@ mod tests {
     /// (path bit, sibling), rewrite the MN digests and republish the new root
     /// — a tamper of MN's witness leaves the new fold internally consistent.
     fn republish_new_chain(inst: &mut L2ShapeRInstance) {
-        let p = inst.air.program;
+        let p = inst.air.program.clone();
         let anew = slot_of(&p, ROLE_AREG_NEW, 0);
         let w = inst.air.slot_witness[anew].w;
         let mut d = RegistryLeaf {
@@ -2610,3 +3208,7 @@ pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
     v.sort_by_key(|(_, c)| *c);
     v
 }
+
+#[cfg(test)]
+#[path = "l2r_v2_tests.rs"]
+mod v2_tests;

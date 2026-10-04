@@ -457,3 +457,30 @@ fn l2_v2_geometry_and_degree_p() {
     assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 4);
     assert_eq!(fabricated_bucket_l2p_v2().air.program, air.program, "the verifier program is the builder's");
 }
+
+/// Lab #896 seam D: shape R **v2** (Candidate A authorization) through the
+/// real prover at 2^19, verified by the witness-free v2 AIR; degree still 4;
+/// a tampered authorization leaf is refused. The v1 lane, shape and digest
+/// are untouched (`l2_shape_digests_are_pinned`, `l2_shape_geometry_is_locked`).
+/// Lane budget: one 2^19 R prove (≈ an S v1 prove, ~25 s on r7g).
+#[test]
+fn l2_v2_prove_verify_roundtrip_r() {
+    use qlab_air::l2r::{fabricated_shape_r_v2, verifier_air_r_v2, L2R_WIDTH_V2, PV_LEAF, PV_LEN_V2};
+    let air = verifier_air_r_v2();
+    assert_eq!(<L2ShapeRAir as BaseAir<Val>>::width(&air), L2R_WIDTH_V2);
+    assert_eq!(<L2ShapeRAir as BaseAir<Val>>::num_public_values(&air), PV_LEN_V2);
+    assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 4);
+
+    let inst = fabricated_shape_r_v2().inst;
+    assert_eq!(inst.air.program, air.program, "the verifier program is the builder's");
+    let pvs = public_values(&inst.pvs);
+    let trace = inst.air.generate_trace::<Val>(L2_CFG.log_blowup);
+    assert_eq!(trace.width(), L2R_WIDTH_V2);
+    let proof = p3_uni_stark::prove(&make_config_l2(), &inst.air, trace, &pvs);
+    assert!(p3_uni_stark::verify(&make_config_l2(), &air, &proof, &pvs).is_ok(), "honest v2 R verifies");
+    let mut bad = pvs.clone();
+    bad[PV_LEAF] += Val::ONE;
+    assert!(p3_uni_stark::verify(&make_config_l2(), &air, &proof, &bad).is_err(), "a tampered leaf is refused");
+    // A v2 proof is not a v1 shape-R proof.
+    assert!(!verify_r(&pvs[..Shape::R.pv_len()], &proof));
+}
