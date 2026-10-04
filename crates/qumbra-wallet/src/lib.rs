@@ -145,6 +145,7 @@ pub mod bundle;
 pub mod coinbase;
 pub mod deposit;
 pub mod contacts;
+pub mod directory;
 pub mod driver;
 pub mod envelope;
 pub mod exits;
