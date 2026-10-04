@@ -239,3 +239,76 @@ fn l2r_v2_neg_rho_at_nfa_not_the_note_rho() {
     });
     refused_at_role(&bad, ROLE_ACM, "ρ at NFA");
 }
+
+/// AAUTH's own level-0 path bit (its leaf/sibling mux) flipped: the folded
+/// root moves, so bank EQA refuses at ARKM's close.
+#[test]
+fn l2r_v2_neg_aauth_level_0_path_bit_flipped() {
+    let bad = tampered(|i| {
+        let s = slot_of(&i.air.program, ROLE_AAUTH_R, 0);
+        i.air.slot_witness[s].pbit = !i.air.slot_witness[s].pbit;
+    });
+    refused_at_role(&bad, ROLE_ARKM, "AAUTH level-0 path bit");
+}
+
+/// The v1 `rkm` layout (pad in lane 7, no `auth_root`) does not pass under v2.
+/// (a) ARKM's `auth_root` lanes zeroed — "no root" — refused by EQA at
+/// ARKM's close; (b) a note committed under v1's rkm block does not open:
+/// the AIR derives the v2 rkm, so the anchor no longer matches (whole scan,
+/// the refusal is at BANCHOR).
+#[test]
+fn l2r_v2_neg_v1_layout_rkm() {
+    let bad = tampered(|i| {
+        let s = slot_of(&i.air.program, ROLE_ARKM, 0);
+        i.air.slot_witness[s].w[7..11].copy_from_slice(&[0; 4]);
+    });
+    refused_at_role(&bad, ROLE_ARKM, "ARKM with no auth_root");
+
+    let fee_in = fabricated_r_auth_input(0xd1d1, 100, 2930);
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(&fee_in.nk);
+    st[4] = 1 << 1;
+    st[5] = fee_in.d[0];
+    st[6] = fee_in.d[1];
+    st[7] = 1;
+    st[16] = 1 << 63;
+    let rkm_v1: [u64; 4] = crate::reference::keccak_f(&st)[..4].try_into().unwrap();
+    assert_ne!(rkm_v1, derive_input_r_v2(&fee_in).1);
+    let cm_v1 = l2_cm(fee_in.value, fee_in.asset, &rkm_v1, &fee_in.rho, &fee_in.rseed);
+    let (witness, anchor) = fabricated_single_tree(&cm_v1);
+    let fee_out = L2TxOutput {
+        value: 93,
+        asset: 0,
+        rkm: [0x9e1, 0x9e2, 0x9e3, 0x9e4],
+        rho: [0; 4],
+        rseed: [0xaf1, 0xaf2, 0xaf3, 0xaf4],
+    };
+    let write = RegistryWrite {
+        isk: [0; 4],
+        old_leaf: None,
+        new_leaf: RegistryLeaf::cloaked(9),
+        opening: registry_opening(&[RegistryLeaf::cloaked(0)], 9).0,
+    };
+    let seed = SeedOutput { rkm: [0xb01, 0xb02, 0xb03, 0xb04], rseed: [0xc01, 0xc02, 0xc03, 0xc04] };
+    let v1_note = build_shape_r_v2_with_witnesses(
+        SHAPE_R_LOG_HEIGHT_V2,
+        &fee_in,
+        &witness,
+        anchor,
+        &fee_out,
+        7,
+        &write,
+        &seed,
+    );
+    let trace = v1_note.inst.air.generate_trace::<F>(0);
+    assert!(
+        l2test::first_violation(
+            &v1_note.inst.air,
+            &trace,
+            &pvs_f(&v1_note.inst.pvs),
+            SHAPE_R_PERMS_V2 * ROWS_PER_PERM
+        )
+        .is_some(),
+        "a v1-layout note VERIFIED under v2"
+    );
+}
