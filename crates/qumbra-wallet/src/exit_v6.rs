@@ -418,7 +418,9 @@ mod tests {
             l2_id: 1,
             w_pvs: &pvs,
             w_proof: &[],
-            dep_pvs: &[],
+            // The codec requires a deposit section of its own length (the
+            // frame's reader never interprets it here).
+            dep_pvs: &[0u32; qlab_wrapper::dep::DEP_PV_LEN],
             dep_proof: &[],
             members: &[],
             exits: &[],

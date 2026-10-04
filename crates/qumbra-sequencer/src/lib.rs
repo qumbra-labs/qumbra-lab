@@ -31,6 +31,31 @@ pub mod work;
 
 #[cfg(test)]
 mod tests {
+    /// A source's code before its test module — `mod tests` or `pub(crate)
+    /// mod tests` (a test module other tests reuse fixtures from) alike. A
+    /// split on the private spelling alone read a `pub(crate)` module as
+    /// production code (batch 2026-10-04: members.rs's tests tripped
+    /// `every_debug_format_is_marked`).
+    fn non_test(text: &str) -> &str {
+        ["#[cfg(test)]\nmod tests", "#[cfg(test)]\npub(crate) mod tests"]
+            .iter()
+            .filter_map(|m| text.find(m))
+            .min()
+            .map_or(text, |i| &text[..i])
+    }
+
+    /// Every test module spelling `non_test` cuts at, and no other.
+    #[test]
+    fn non_test_cuts_at_either_test_module_spelling() {
+        assert_eq!(non_test("a\n#[cfg(test)]\nmod tests {}"), "a\n");
+        assert_eq!(non_test("b\n#[cfg(test)]\npub(crate) mod tests {}"), "b\n");
+        assert_eq!(non_test("c"), "c");
+        for (path, text) in SOURCES {
+            let code = non_test(text);
+            assert!(!code.contains("mod tests {"), "{path}: a test module past the cut");
+        }
+    }
+
     /// Every source of this crate, by name.
     const SOURCES: [(&str, &str); 13] = [
         ("bundle.rs", include_str!("bundle.rs")),
@@ -58,7 +83,7 @@ mod tests {
     fn no_source_debug_formats_an_opening() {
         let names = ["file", "files", "dep", "deps", "plan", "p", "claim", "draft", "owned", "n", "notes", "credited"];
         for (path, text) in SOURCES {
-            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            let code = non_test(text);
             for n in names {
                 for pat in [format!("{{{n}:?}}"), format!("{{{n}:#?}}"), format!("\", {n})"), format!("\", &{n})")] {
                     let hit = code.match_indices(&pat).any(|(i, _)| {
@@ -78,7 +103,7 @@ mod tests {
     #[test]
     fn every_debug_format_is_marked() {
         for (path, text) in SOURCES {
-            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            let code = non_test(text);
             for (i, line) in code.lines().enumerate() {
                 if (line.contains(":?}") || line.contains(":#?}")) && !line.trim_start().starts_with("//") {
                     let why = line.split("// debug-ok:").nth(1).map(str::trim).unwrap_or("");
@@ -95,7 +120,7 @@ mod tests {
     #[test]
     fn the_pass_plans_no_r_member() {
         for (path, text) in SOURCES.iter().filter(|(p, _)| ["pass.rs", "work.rs", "main.rs"].contains(p)) {
-            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            let code = non_test(text);
             for bad in ["WTag::R", "Inst::R", "members::plan(", "plan(&", " plan("] {
                 assert!(!code.contains(bad), "{path} names `{bad}` outside tests");
             }
@@ -116,7 +141,7 @@ mod tests {
     fn the_pass_builds_no_p_of_its_own() {
         let forbidden = ["Inst::P(", "Inst::P (", "Inst::P{", "Inst::P {", "Inst::*"];
         for (path, text) in SOURCES.iter().filter(|(p, _)| ["pass.rs", "work.rs", "main.rs"].contains(p)) {
-            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            let code = non_test(text);
             for bad in forbidden {
                 assert!(!code.contains(bad), "{path} names `{bad}` outside tests");
             }
@@ -147,7 +172,7 @@ mod tests {
         assert!(main.contains("work::RealWork::open("), "main.rs's run must build RealWork");
         assert!(work.contains("prove(&plan, &mut timings, &mut log)"), "RealWork must call bundle::prove");
         for (path, text) in SOURCES {
-            let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or(text);
+            let code = non_test(text);
             let impls = code.matches("impl Work for ").count();
             let want = usize::from(path == "work.rs");
             assert_eq!(impls, want, "{path}: {impls} `impl Work` outside tests");
