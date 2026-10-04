@@ -421,6 +421,7 @@ impl AuthTree {
     /// `2^depth` ML-DSA-44 key generations (D12: 0.320 s native on the
     /// 2026-08-24 evidence set).
     pub fn build(auth_master: &Hash32, depth: u8) -> Result<Self, String> {
+        check_depth(depth)?;
         let leaves: Vec<Hash32> = (0..1u32 << depth)
             .map(|i| leaf_key(auth_master, i).descriptor(i).leaf())
             .collect();
@@ -465,6 +466,18 @@ impl AuthTree {
     }
 }
 
+/// Depths outside `1..=24` are refused by name rather than truncated or
+/// overflowed (24 is the selection order's measurable bound).
+fn check_depth(depth: u8) -> Result<(), String> {
+    if depth == 0 || depth > crate::rotation::MAX_MEASURABLE_DEPTH {
+        return Err(format!(
+            "authorization-tree depth {depth} is outside 1..={}",
+            crate::rotation::MAX_MEASURABLE_DEPTH
+        ));
+    }
+    Ok(())
+}
+
 pub fn fold_auth_path(leaf: Hash32, index: u32, path: &[Hash32]) -> Hash32 {
     fold_path_with(TreeVersion::AirMerkle, leaf, index, path)
 }
@@ -475,6 +488,7 @@ pub fn fold_auth_path(leaf: Hash32, index: u32, path: &[Hash32]) -> Hash32 {
 /// of the key and consumed in order. A counter is forbidden (§5). Persist
 /// [`Cursor::next`]; everything else re-derives from `auth_master_g`.
 pub struct Cursor {
+    depth: u8,
     order: Vec<u32>,
     /// `position[index]` = where `index` sits in `order`.
     position: Vec<u32>,
@@ -483,6 +497,7 @@ pub struct Cursor {
 
 impl Cursor {
     pub fn new(auth_master: &Hash32, depth: u8, next: u32) -> Result<Self, String> {
+        check_depth(depth)?;
         let order = selection_order_with(ORDER_DOMAIN, auth_master, depth)?;
         if next as usize > order.len() {
             return Err(format!(
@@ -495,10 +510,16 @@ impl Cursor {
             position[index as usize] = p as u32;
         }
         Ok(Self {
+            depth,
             order,
             position,
             next,
         })
+    }
+
+    /// The tree depth this cursor walks; a dummy drawn against it uses the same.
+    pub fn depth(&self) -> u8 {
+        self.depth
     }
 
     /// The position to persist (fail-closed: persist the advance before the
@@ -541,8 +562,13 @@ pub struct DummySlot {
     pub auth_root: Hash32,
 }
 
-/// Make one dummy slot from 32 bytes of device entropy (the caller draws them
-/// from the OS CSPRNG; never from anything the worker supplies).
+/// Make one dummy slot from 32 bytes of device entropy.
+///
+/// The caller draws **fresh** entropy from the OS CSPRNG **for each dummy
+/// slot**, never from anything the worker supplies. `slot` (the slot's index
+/// in the transaction) enters every derived stream as well, so even a caller
+/// that reuses one entropy value across slots gets different nullifiers, keys
+/// and paths per slot: two dummies of one transaction can never collide.
 ///
 /// `leaf_index` is uniform over the positions of `(sk, g)` that are neither
 /// consumed nor `taken` by this transaction's other slots, so real and dummy
@@ -551,10 +577,11 @@ pub struct DummySlot {
 /// its `auth_root` is in no address's `rkm` and the dummy cannot be upgraded.
 pub fn draw_dummy(
     entropy: &Hash32,
-    depth: u8,
+    slot: u8,
     cursor: &Cursor,
     taken: &[u32],
 ) -> Result<DummySlot, String> {
+    let depth = cursor.depth();
     let size = 1u64 << depth;
     let free = (0..size as u32)
         .filter(|i| !cursor.is_consumed(*i) && !taken.contains(i))
@@ -562,7 +589,7 @@ pub fn draw_dummy(
     if free == 0 {
         return Err("no unconsumed leaf position is left for a dummy".into());
     }
-    let stream = |label: &[u8]| keccak256(&[DUMMY_DOMAIN, entropy, label]);
+    let stream = |label: &[u8]| keccak256(&[DUMMY_DOMAIN, entropy, &[slot], label]);
     let index_seed = stream(b"index");
     let mut counter = 0u64;
     let leaf_index = loop {
@@ -574,7 +601,15 @@ pub fn draw_dummy(
     let key = mldsa::Key::from_seed(stream(b"key"));
     let descriptor = key.descriptor(leaf_index);
     let auth_path: Vec<Hash32> = (0..depth as u32)
-        .map(|level| keccak256(&[DUMMY_DOMAIN, entropy, b"path", &level.to_le_bytes()]))
+        .map(|level| {
+            keccak256(&[
+                DUMMY_DOMAIN,
+                entropy,
+                &[slot],
+                b"path",
+                &level.to_le_bytes(),
+            ])
+        })
         .collect();
     let auth_root = fold_auth_path(descriptor.leaf(), leaf_index, &auth_path);
     Ok(DummySlot {

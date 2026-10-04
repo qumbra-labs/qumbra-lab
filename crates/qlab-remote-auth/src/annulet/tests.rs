@@ -180,6 +180,7 @@ fn an_l1_authorization_never_verifies_an_annulet_intent() {
     let l1_digest = l1.digest();
     // ...and a signature the device made for L1 fails as an Annulet one.
     let (intent, mut section) = signed(Shape::R);
+    assert_ne!(l1_digest, intent.digest().unwrap());
     assert_eq!(section.slots[0].descriptor, l1_key.descriptor(100));
     section.slots[0].signature = l1_key.sign(&l1_digest);
     assert_eq!(
@@ -217,6 +218,12 @@ fn section_lengths_round_trip_and_refusals() {
         let bytes = section.encode().unwrap();
         assert_eq!(bytes.len(), AnnuletAuthSection::encoded_len_for(shape));
         assert_eq!(&bytes[8..16], &intent.valid_until_height.to_le_bytes());
+        // The 16-byte header golden: QRA1 ‖ v2 ‖ ML-DSA-44 ‖ slots ‖ 1_000_256 LE.
+        let golden = match shape {
+            Shape::S | Shape::P => "515241310200010340430f0000000000",
+            Shape::R => "515241310200010140430f0000000000",
+        };
+        assert_eq!(crate::hex(&bytes[..SECTION_HEADER_BYTES]), golden);
         let decoded = AnnuletAuthSection::decode(shape, &bytes).unwrap();
         assert_eq!(decoded, section);
         assert_eq!(decoded.encode().unwrap(), bytes);
@@ -443,7 +450,7 @@ fn dummy_index_avoids_consumed_and_taken_positions_and_covers_the_rest() {
     for e in 0..400u32 {
         let mut entropy = [0u8; 32];
         entropy[..4].copy_from_slice(&e.to_le_bytes());
-        let d = draw_dummy(&entropy, 4, &cursor, &taken).unwrap();
+        let d = draw_dummy(&entropy, 2, &cursor, &taken).unwrap();
         assert!(
             free.contains(&d.leaf_index),
             "dummy drew {} outside the free set",
@@ -467,7 +474,7 @@ fn dummy_index_avoids_consumed_and_taken_positions_and_covers_the_rest() {
 fn dummy_is_device_fixed_and_cannot_be_upgraded() {
     let m = auth_master(&b(0x0d), 0);
     let cursor = Cursor::new(&m, 3, 0).unwrap();
-    let d = draw_dummy(&b(0x01), 3, &cursor, &[]).unwrap();
+    let d = draw_dummy(&b(0x01), 1, &cursor, &[]).unwrap();
     assert_eq!(d.auth_path.len(), 3);
     assert_eq!(
         fold_auth_path(d.descriptor.leaf(), d.leaf_index, &d.auth_path),
@@ -477,18 +484,18 @@ fn dummy_is_device_fixed_and_cannot_be_upgraded() {
     // Its root is in no real tree, so no note of this key can carry it.
     assert_ne!(d.auth_root, AuthTree::build(&m, 3).unwrap().root());
     // Deterministic in the device's entropy, distinct across entropy.
-    let again = draw_dummy(&b(0x01), 3, &cursor, &[]).unwrap();
+    let again = draw_dummy(&b(0x01), 1, &cursor, &[]).unwrap();
     assert_eq!(
         (again.nk, again.rho, again.rseed, again.auth_root),
         (d.nk, d.rho, d.rseed, d.auth_root)
     );
-    let other = draw_dummy(&b(0x02), 3, &cursor, &[]).unwrap();
+    let other = draw_dummy(&b(0x02), 1, &cursor, &[]).unwrap();
     assert_ne!(other.nk, d.nk);
     assert_ne!(other.rho, d.rho);
     // No free position: refused, never a reused index.
     let mut full = Cursor::new(&m, 2, 0).unwrap();
     while full.take().is_some() {}
-    assert!(draw_dummy(&b(0x01), 2, &full, &[]).is_err());
+    assert!(draw_dummy(&b(0x01), 1, &full, &[]).is_err());
 }
 
 #[test]
@@ -497,8 +504,8 @@ fn one_real_and_two_dummy_slots_sign_one_intent() {
     let mut cursor = Cursor::new(&m, 3, 0).unwrap();
     let real_index = cursor.take().unwrap();
     let real_key = leaf_key(&m, real_index);
-    let d2 = draw_dummy(&b(0x21), 3, &cursor, &[real_index]).unwrap();
-    let d3 = draw_dummy(&b(0x22), 3, &cursor, &[real_index, d2.leaf_index]).unwrap();
+    let d2 = draw_dummy(&b(0x21), 1, &cursor, &[real_index]).unwrap();
+    let d3 = draw_dummy(&b(0x22), 2, &cursor, &[real_index, d2.leaf_index]).unwrap();
     let indices = [real_index, d2.leaf_index, d3.leaf_index];
     assert!(indices[0] != indices[1] && indices[1] != indices[2] && indices[0] != indices[2]);
 
@@ -523,4 +530,36 @@ fn one_real_and_two_dummy_slots_sign_one_intent() {
         forged.verify_intent(&intent),
         Err(AuthError::DescriptorMismatch { slot: 2 })
     );
+}
+
+#[test]
+fn dummy_slots_differ_even_when_a_caller_reuses_entropy() {
+    let m = auth_master(&b(0x13), 0);
+    let cursor = Cursor::new(&m, 6, 0).unwrap();
+    let e = b(0x77);
+    let d1 = draw_dummy(&e, 1, &cursor, &[]).unwrap();
+    let d2 = draw_dummy(&e, 2, &cursor, &[d1.leaf_index]).unwrap();
+    assert_ne!(d1.nk, d2.nk);
+    assert_ne!(d1.rho, d2.rho);
+    assert_ne!(d1.rseed, d2.rseed);
+    assert_ne!(d1.descriptor.leaf(), d2.descriptor.leaf());
+    assert_ne!(d1.key.verifying_key_bytes(), d2.key.verifying_key_bytes());
+    assert_ne!(d1.leaf_index, d2.leaf_index);
+    assert_ne!(d1.auth_path, d2.auth_path);
+    // Hence different nullifiers H(nk ‖ ρ) whatever the note-level hash is.
+    assert_ne!((d1.nk, d1.rho), (d2.nk, d2.rho));
+}
+
+#[test]
+fn depths_outside_the_measurable_range_are_refused_by_name() {
+    let m = auth_master(&b(0x15), 0);
+    assert!(Cursor::new(&m, 0, 0).is_err());
+    assert!(Cursor::new(&m, 25, 0).is_err());
+    assert!(AuthTree::build(&m, 0).is_err());
+    assert!(AuthTree::build(&m, 25).is_err());
+    // A dummy always uses its cursor's depth.
+    let c = Cursor::new(&m, 5, 0).unwrap();
+    let d = draw_dummy(&b(0x01), 1, &c, &[]).unwrap();
+    assert_eq!(d.auth_path.len(), 5);
+    assert!(d.leaf_index < 32);
 }
