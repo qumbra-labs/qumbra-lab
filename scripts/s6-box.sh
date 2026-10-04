@@ -20,6 +20,9 @@
 # from its phase markers: the chain, the wallets, the queue and the seed
 # state carry over, so maturity and finished phases are not paid again.
 # Pid and lock files from the old box are dropped first.
+# A resumed run still pays the chain's spacing: the next pass waits until 48
+# blocks have passed since the last landed bundle (R3 box, 2026-10-04: a
+# --r3 resume of the post-pass dir waited ≈ 65 min before pass 3 could post).
 #
 # RUN_DIR holds everything the run writes and must lie OUTSIDE any git
 # worktree (refused otherwise). Binaries (not built here):
