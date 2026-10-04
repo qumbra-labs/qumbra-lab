@@ -210,24 +210,83 @@ fn l2pv2_neg_fee_dummy_leaf_not_under_its_auth_root() {
     );
 }
 
-/// P-specific: an `ARKM2` re-derivation with a different `auth_root` gives a
-/// different `rkm′`, which v1's output-equality window to the first `ARKM`
-/// refuses — the same root is forced into all three derivations. Whole-scan
-/// (the window closes at `ACRED`/`ACM`, two different banks).
+/// P-specific: the first `ARKM2` (after `BREG`) with a different `auth_root`
+/// gives a different `rkm′`. v1's two output-equality windows refuse it at
+/// both of their closes: EQ3 (`rkm@AFKEY − rkm′@ACRED`) at `ACRED`'s close and
+/// the bind bank (`rkm′@ACRED − rkm″@ACM`) at `ACM`'s close.
 #[test]
 fn l2pv2_neg_arkm2_with_another_auth_root() {
     let (bad, t) = tampered(|i| {
         let s = slot_of(&i.air.program, ROLE_ARKM2, 0);
         i.air.slot_witness[s].w[8] ^= 1;
     });
+    let p = &bad.air.program;
+    refused_at(&bad.air, &t, &bad.pvs, close_row(slot_of(p, ROLE_ACRED, 0)), "ARKM2#1 root, EQ3 at ACRED");
+    refused_at(&bad.air, &t, &bad.pvs, close_row(slot_of(p, ROLE_ACM, 0)), "ARKM2#1 root, bind bank at ACM");
+}
+
+/// The second `ARKM2` (after `BALLOW`) with another `auth_root`: `rkm″` moves,
+/// refused by the bind bank's window at `ACM`'s close.
+#[test]
+fn l2pv2_neg_second_arkm2_with_another_auth_root() {
+    let (bad, t) = tampered(|i| {
+        let s = slot_of(&i.air.program, ROLE_ARKM2, 1);
+        i.air.slot_witness[s].w[9] ^= 1;
+    });
+    let row = close_row(slot_of(&bad.air.program, ROLE_ACM, 0));
+    refused_at(&bad.air, &t, &bad.pvs, row, "ARKM2#2 root, bind bank at ACM");
+}
+
+/// A frozen sender under its **v2** key: asset 7's freeze list holds input
+/// 2's v2 `rkm` (so `K = H(rkm_v2 ‖ D_FRZ)` is a key). The adjacent opening
+/// (`key_hi = K`) is the strongest lie; the strict comparison refuses it.
+#[test]
+fn l2pv2_neg_spend_frozen_under_the_v2_key() {
+    let inputs = [fabricated_auth_input(0x1111, 100, 0, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let (_, rkm0, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, rkm1, cm2) = derive_input_l2_v2(&inputs[1]);
+    let frozen7 = PolicyAsset::hybrid(7, [0x7a, 0x7b, 0x7c, 0x7d], false, &[rkm1, [1, 2, 3, 4], [9, 9, 9, 9]]);
+    assert!(frozen7.freeze.opening_for(&rkm1).is_none(), "precondition: the v2 rkm is frozen");
+    let assets = [PolicyAsset::cloaked(0), frozen7.clone()];
+    let (w, anchor) = fabricated_shared_tree(&cm1, &cm2);
+    let leaves = [assets[0].leaf(), assets[1].leaf()];
+    let (rw, root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    let pol0 = assets[0].policy_input_for(&rkm0, rw[0]).unwrap();
+    let k1 = freeze_key_of(&rkm1);
+    let i = (0..frozen7.freeze.leaves.len())
+        .find(|i| frozen7.freeze.opening_at(*i).key_hi == k1)
+        .expect("the predecessor of the frozen key");
+    let pol1 = L2PolicyInput {
+        leaf: frozen7.leaf(),
+        reg_witness: rw[1],
+        freeze: frozen7.freeze.opening_at(i),
+        allow: dummy_allow_witness(),
+        isk: [0x7a, 0x7b, 0x7c, 0x7d],
+    };
+    let mk_out = |seed: u64, value: u64, asset: u64| L2TxOutput {
+        value,
+        asset,
+        rkm: [seed, seed + 1, seed + 2, seed + 3],
+        rho: [seed + 4; 4],
+        rseed: [seed + 5; 4],
+    };
+    let bad = build_bucket_l2p_v2(
+        SHAPE_P_LOG_HEIGHT,
+        &inputs,
+        &[mk_out(0x3333, 90, 0), mk_out(0x4444, 50, 7)],
+        10,
+        &w,
+        anchor,
+        &[pol0, pol1],
+        root,
+        [VPublic::NONE; 2],
+        &FeeSlotV2::Dummy { input: fabricated_auth_input(0xfee0_d00d, 0, 0, 1833) },
+        [0; 4],
+        false,
+    );
+    let t = bad.air.generate_trace::<F>(0);
     assert!(
-        l2test::first_violation(
-            &bad.air,
-            &t,
-            &pvs_f(&bad.pvs),
-            SHAPE_P_PERMS_V2 * ROWS_PER_PERM
-        )
-        .is_some(),
-        "ARKM2 with another auth_root VERIFIED"
+        l2test::first_violation(&bad.air, &t, &pvs_f(&bad.pvs), SHAPE_P_PERMS_V2 * ROWS_PER_PERM).is_some(),
+        "a frozen sender (v2 key) VERIFIED"
     );
 }
