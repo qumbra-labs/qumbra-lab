@@ -19,7 +19,9 @@
 //!
 //! The golden is the macOS XCTest decode literal — `qumbra-wallet-macos`
 //! `Tests/QumbraWalletMacTests/BridgeModelTests.swift` @ e050024,
-//! `assetViewJSON(spendsVerified:)`, copied below with `"false"`.
+//! `assetViewJSON(spendsVerified:)`, copied below with `"false"` — its unit
+//! now "base units of QIA #1001" (lab #881); the macOS literal follows in its
+//! own PR.
 
 #[path = "../../qumbra-wallet/tests/common/mod.rs"]
 mod common;
@@ -440,7 +442,7 @@ const SWIFT_GOLDEN: &str = r#"
          "list":{"state":"no_list"},"listSourceCommit":null,
          "balances":{"state":"figures","rows":[{"asset":1001,"label":{"kind":"unlisted"},"mode":"cloaked",
            "modeRaw":null,"spendable":{"baseUnits":"340282366920938463463374607431768211455",
-           "display":"340,282,366,920,938,463,463,374,607,431,768,211,455","unit":"base units of asset #1001"},
+           "display":"340,282,366,920,938,463,463,374,607,431,768,211,455","unit":"base units of QIA #1001"},
            "spendableNotes":2,"testnet":true,"freeze":"no_freeze_list","leafProblem":null}]}}
 "#;
 
@@ -456,7 +458,7 @@ fn golden_row() -> AssetRow {
         spendable: Amount {
             base_units: u128::MAX,
             display: render_amount(u128::MAX, 0),
-            unit: "base units of asset #1001".into(),
+            unit: "base units of QIA #1001".into(),
         },
         spendable_notes: 2,
         testnet: true,

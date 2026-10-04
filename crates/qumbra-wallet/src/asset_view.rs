@@ -424,7 +424,7 @@ pub struct Amount {
     /// after the point (none for 0 decimals or an unlisted asset).
     pub display: String,
     /// What the figure is in: the ticker, "fee units", or
-    /// "base units of asset #N".
+    /// "base units of QIA #N" (the asset class name, design l2-architecture §6.9).
     pub unit: String,
 }
 
@@ -588,14 +588,14 @@ pub fn asset_view_from(
                     (_, Some(e)) if bound.is_some() => (
                         AssetLabel::IssuerChanged { listed_ticker: e.ticker.clone() },
                         0,
-                        format!("base units of asset #{asset}"),
+                        format!("base units of QIA #{asset}"),
                     ),
                     (_, Some(e)) => (
                         AssetLabel::Unconfirmed { listed_ticker: e.ticker.clone() },
                         0,
-                        format!("base units of asset #{asset}"),
+                        format!("base units of QIA #{asset}"),
                     ),
-                    (_, None) => (AssetLabel::Unlisted, 0, format!("base units of asset #{asset}")),
+                    (_, None) => (AssetLabel::Unlisted, 0, format!("base units of QIA #{asset}")),
                 };
                 let mode = match (asset, bound) {
                     (0, _) => AssetMode::Cloaked,
