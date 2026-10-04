@@ -2910,6 +2910,48 @@ pub fn fabricated_bucket_l2p_v2() -> L2PBucketInstance {
     )
 }
 
+/// Three real slots (lab #896 M): a Cloaked asset-0 input (100) and a Hybrid
+/// asset-7 input (50, freeze tree live), the fee slot a real asset-0 note
+/// worth exactly the fee (`d3 = 0`), all three in one fabricated commitment
+/// tree; outputs 100 (asset 0) + 50 (asset 7), fee 10, no `vPublic` — a
+/// holder spend. The box measurement's P instance.
+pub fn fabricated_bucket_l2p_v2_exact_fee() -> L2PBucketInstance {
+    let inputs = [fabricated_auth_input(0x1111, 100, 0, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let fee_in = fabricated_auth_input(0x9999, 10, 0, 3350);
+    let (_, rkm1, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, rkm2, cm2) = derive_input_l2_v2(&inputs[1]);
+    let (_, _, cm3) = derive_input_l2_v2(&fee_in);
+    let (w, anchor) = crate::l2::fabricated_tree3([&cm1, &cm2, &cm3]);
+    let assets = [PolicyAsset::cloaked(0), PolicyAsset::hybrid(7, [0x7a, 0x7b, 0x7c, 0x7d], false, &[])];
+    let leaves = [assets[0].leaf(), assets[1].leaf()];
+    let (rw, registry_root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    let policy = [
+        assets[0].policy_input_for(&rkm1, rw[0]).expect("input 0 policy"),
+        assets[1].policy_input_for(&rkm2, rw[1]).expect("input 1 policy"),
+    ];
+    let mk_out = |seed: u64, value: u64, asset: u64| L2TxOutput {
+        value,
+        asset,
+        rkm: [seed, seed + 1, seed + 2, seed + 3],
+        rho: [seed + 4; 4],
+        rseed: [seed + 5; 4],
+    };
+    build_bucket_l2p_v2(
+        SHAPE_P_LOG_HEIGHT,
+        &inputs,
+        &[mk_out(0x3333, 100, 0), mk_out(0x4444, 50, 7)],
+        10,
+        &[w[0], w[1]],
+        anchor,
+        &policy,
+        registry_root,
+        [VPublic::NONE; 2],
+        &FeeSlotV2::Exact { input: fee_in, witness: w[2] },
+        [0; 4],
+        false,
+    )
+}
+
 /// The witness-free v2 shape-P AIR a verifier uses.
 pub fn verifier_air_p_v2() -> L2ShapePAir {
     L2ShapePAir {

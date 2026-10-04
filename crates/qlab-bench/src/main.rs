@@ -1007,6 +1007,16 @@ fn main() {
                     std::process::exit(2);
                 }),
             };
+            // Lab #896 M: `--v2` measures the Candidate A shape (`s|p|r` →
+            // `s-v2|p-v2|r-v2`), on the L2 lane unless `--only` says otherwise.
+            let v2 = args.iter().any(|a| a == "--v2");
+            let shape_v2;
+            let (shape, only) = if v2 {
+                shape_v2 = format!("{shape}-v2");
+                (shape_v2.as_str(), only.or(Some("b4/q45")))
+            } else {
+                (shape, only)
+            };
             l2shape::run_l2shape(&power, shape, only, pcs);
             return;
         }

@@ -1,7 +1,7 @@
 //! W3 (lab #700): the L2 circuit family measured — `l2shape` mode.
 //!
 //! ```text
-//! qlab-bench l2shape --shape s|s20|mock118|mock240|p|p19|r [--only <lane substring>] [--power <note>]
+//! qlab-bench l2shape --shape s|s20|mock118|mock240|p|p19|r [--v2] [--only <lane substring>] [--power <note>]
 //! ```
 //!
 //! Same in-process prove/verify pattern as `bucket`: one shape per process,
@@ -32,6 +32,12 @@
 //! - `r`       — shape R real (`qlab_l2::fixture::shape_r`, lab #724), 79 perms
 //!               @ 2^18: the fixture's update of asset 7 (key rotation + a new
 //!               freeze root) with its asset-0 fee spend.
+//! - `--v2`    — lab #896 M: with `--shape s|p|r`, the Candidate A v2 shape at
+//!               its real height (S 194 perms @ 2^20, P 288 @ 2^20, R 94 @ 2^19),
+//!               an honest instance with three real slots (S/P: an exact asset-0
+//!               fee note, `d3 = 0`; R: its real fee spend), proved and verified
+//!               on the L2 lane (b4/q45) unless `--only` names another. The box
+//!               wraps the release binary in `/usr/bin/time -v` for peak RSS.
 //! - `p19`     — **CANARY** (#700's rule: a 2^19 run of the same shape and lane
 //!               before any 2^20): the shape-P AIR at 2^19 in chain-only mode —
 //!               same 804 columns, half the rows; the P program does not fit
@@ -400,6 +406,40 @@ const P3_STATEMENT: &str = "shape P3 — shape S3's merge over two Hybrid asset-
      with freeze non-membership + allowlist (dummy path) openings; slot 3's exact asset-0 \
      fee note (d3 = 0)";
 
+/// Lab #896 M: the v2 statements.
+const S_V2_STATEMENT: &str = "shape S v2 (Candidate A) — 3 real slots: two inputs (asset 0, \
+     asset 7) and an exact asset-0 fee note (d3 = 0); per slot nk as witness (NFA), a depth-12 \
+     authorization path (AAUTH + 11 MERKLE + BAUTH) whose root is absorbed into rkm and whose \
+     leaf is bound to PV_LEAF; registry openings as v1";
+const P_V2_STATEMENT: &str = "shape P v2 (Candidate A) — shape S v2's slots over a Cloaked \
+     asset-0 and a Hybrid asset-7 input (freeze non-membership, allowlist dummy path, AISS), \
+     the auth path before AISS, all three rkm derivations over auth_root; exact asset-0 fee note";
+const R_V2_STATEMENT: &str = "shape R v2 (Candidate A) — a registration of asset 9 paid by a real \
+     asset-0 fee spend whose slot carries nk (NFA) and the depth-12 authorization path";
+
+fn shape_r_v2_under_test() -> ShapeUnderTest {
+    let inst = qlab_air::l2r::fabricated_shape_r_v2().inst;
+    let pvs = qlab_l2::public_values(&inst.pvs);
+    let air = inst.air;
+    let layout = AirLayout::from_air::<Val>(&air);
+    let max_deg = get_max_constraint_degree::<Val, _>(&air, layout);
+    let log_height = air.log_height;
+    let width = <L2ShapeRAir as BaseAir<Val>>::width(&air);
+    let pv_len = <L2ShapeRAir as BaseAir<Val>>::num_public_values(&air);
+    ShapeUnderTest {
+        label: "shape R v2",
+        mock: false,
+        canary: false,
+        program_perms: qlab_air::l2r::SHAPE_R_PERMS_V2,
+        log_height,
+        width,
+        pv_len,
+        max_deg,
+        statement: R_V2_STATEMENT,
+        run: Box::new(move |cfg, pcs| bench_lane(&air, &pvs, cfg, pcs, |b| air.generate_trace::<Val>(b))),
+    }
+}
+
 pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: PcsKind) {
     let sut: ShapeUnderTest = match shape {
         "s" => {
@@ -437,13 +477,31 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: Pcs
             sut
         }
         "r" => shape_r_under_test(),
+        // Lab #896 M: the Candidate A v2 shapes at their real heights, honest
+        // instances with three real slots (S/P: an exact asset-0 fee note,
+        // d3 = 0) and R's real fee spend. One lane (the L2 lane) by default.
+        "s-v2" => {
+            let inst = qlab_air::l2::fabricated_bucket_l2_v2_exact_fee();
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut sut = shape_s_under_test("shape S v2 (3 real slots)", false, qlab_air::l2::SHAPE_S_PERMS_V2, inst.air, pvs);
+            sut.statement = S_V2_STATEMENT;
+            sut
+        }
+        "p-v2" => {
+            let inst = qlab_air::l2p::fabricated_bucket_l2p_v2_exact_fee();
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut sut = shape_p_under_test("shape P v2 (3 real slots)", false, qlab_air::l2p::SHAPE_P_PERMS_V2, inst.air, pvs);
+            sut.statement = P_V2_STATEMENT;
+            sut
+        }
+        "r-v2" => shape_r_v2_under_test(),
         "p19" => {
             let air = L2ShapePAir::chain_only(SHAPE_P_LOG_HEIGHT - 1);
             let pvs = vec![Val::ZERO; <L2ShapePAir as BaseAir<Val>>::num_public_values(&air)];
             shape_p_under_test("CANARY: shape-P AIR chain-only @ 2^19", true, 0, air, pvs)
         }
         other => {
-            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r|s3|p3");
+            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r|s3|p3 (or s|p|r with --v2)");
             std::process::exit(2);
         }
     };
@@ -471,7 +529,7 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: Pcs
          max constraint degree {}, {chunks} quotient chunks, {} public values",
         if shape.starts_with('p') {
             "qlab-air `l2p::L2ShapePAir`"
-        } else if shape == "r" {
+        } else if shape.starts_with('r') {
             "qlab-air `l2r::L2ShapeRAir`"
         } else {
             "qlab-air `l2::L2ShapeSAir`"
@@ -556,6 +614,24 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: Pcs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #896 M: the v2 bench instances are what the box claims they are —
+    /// three real slots for S/P (`d3 = 0`), the real heights and PV lengths.
+    /// Builders only (hashes, no trace, no prove).
+    #[test]
+    fn l2shape_v2_instances_are_the_measured_statement() {
+        let s = qlab_air::l2::fabricated_bucket_l2_v2_exact_fee();
+        assert!(!s.air.d3 && !s.air.dv, "S v2: three real slots");
+        assert_eq!(s.air.log_height, 20);
+        assert_eq!(s.pvs.len(), qlab_air::l2::PV_LEN_V2);
+        let p = qlab_air::l2p::fabricated_bucket_l2p_v2_exact_fee();
+        assert!(!p.air.d3 && !p.air.dv, "P v2: three real slots");
+        assert_eq!(p.air.log_height, 20);
+        assert_eq!(p.pvs.len(), qlab_air::l2p::PV_LEN_V2);
+        let r = qlab_air::l2r::fabricated_shape_r_v2().inst;
+        assert_eq!(r.air.log_height, 19);
+        assert_eq!(r.pvs.len(), qlab_air::l2r::PV_LEN_V2);
+    }
 
     /// Every lane clears the capacity proxy `make_config_with` asserts, and
     /// the b8 lane's query count is the bracketed derivation in `B8_CFG`.

@@ -2451,6 +2451,41 @@ pub fn fabricated_bucket_l2_v2() -> L2BucketInstanceV2 {
     )
 }
 
+/// Three real slots (lab #896 M): inputs 100 (asset 0) + 50 (asset 7), the
+/// fee slot a real asset-0 note worth exactly the fee (`FeeSlotV2::Exact`,
+/// `d3 = 0`), all three in one fabricated commitment tree; outputs 100
+/// (asset 0) + 50 (asset 7), fee 10. The box measurement's S instance.
+pub fn fabricated_bucket_l2_v2_exact_fee() -> L2BucketInstanceV2 {
+    let inputs = [fabricated_auth_input(0x1111, 100, 0, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let fee_in = fabricated_auth_input(0x9999, 10, 0, 3350);
+    let (_, _, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, _, cm2) = derive_input_l2_v2(&inputs[1]);
+    let (_, _, cm3) = derive_input_l2_v2(&fee_in);
+    let (w, anchor) = fabricated_tree3([&cm1, &cm2, &cm3]);
+    let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)];
+    let (rw, registry_root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    let mk_out = |seed: u64, value: u64, asset: u64| L2TxOutput {
+        value,
+        asset,
+        rkm: [seed, seed + 1, seed + 2, seed + 3],
+        rho: [seed + 4; 4],
+        rseed: [seed + 5; 4],
+    };
+    build_bucket_l2_v2(
+        SHAPE_S_LOG_HEIGHT_V2,
+        &inputs,
+        &[mk_out(0x3333, 100, 0), mk_out(0x4444, 50, 7)],
+        10,
+        &[w[0], w[1]],
+        anchor,
+        &leaves,
+        &rw,
+        registry_root,
+        &FeeSlotV2::Exact { input: fee_in, witness: w[2] },
+        false,
+    )
+}
+
 /// The witness-free v2 shape-S AIR a verifier uses: the canonical v2 program
 /// over the v2 width. `eval` reads only `program` and `version`.
 pub fn verifier_air_s_v2() -> L2ShapeSAir {
