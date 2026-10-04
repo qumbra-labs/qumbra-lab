@@ -12,6 +12,17 @@ const ORDER_DOMAIN: &[u8] = b"qumbra:remote-auth:mldsa44-order:spike-v1";
 pub const MAX_MEASURABLE_DEPTH: u8 = 24;
 
 pub fn selection_order(address_seed: &Hash32, depth: u8) -> Result<Vec<u32>, String> {
+    selection_order_with(ORDER_DOMAIN, address_seed, depth)
+}
+
+/// The same Fisher–Yates construction under a caller-chosen stream domain.
+/// The Annulet cursor (`annulet::Cursor`) uses its own `v1` domain, seeded
+/// per key and generation rather than per address.
+pub fn selection_order_with(
+    domain: &[u8],
+    address_seed: &Hash32,
+    depth: u8,
+) -> Result<Vec<u32>, String> {
     if depth == 0 || depth > MAX_MEASURABLE_DEPTH {
         return Err(format!(
             "ML-DSA rotation depth must be in 1..={MAX_MEASURABLE_DEPTH}"
@@ -21,19 +32,24 @@ pub fn selection_order(address_seed: &Hash32, depth: u8) -> Result<Vec<u32>, Str
     let mut order: Vec<u32> = (0..count as u32).collect();
     let mut counter = 0u64;
     for upper in (2..=count).rev() {
-        let index = draw_below(address_seed, &mut counter, upper as u64) as usize;
+        let index = draw_below(domain, address_seed, &mut counter, upper as u64) as usize;
         order.swap(upper - 1, index);
     }
     Ok(order)
 }
 
-fn draw_below(address_seed: &Hash32, counter: &mut u64, upper: u64) -> u64 {
+pub(crate) fn draw_below(
+    domain: &[u8],
+    address_seed: &Hash32,
+    counter: &mut u64,
+    upper: u64,
+) -> u64 {
     debug_assert!(upper > 0);
     // Lemire's multiply-and-reject mapping is uniform over [0, upper) when the
     // input is uniform over all u64 values. Keccak supplies the private stream.
     let threshold = upper.wrapping_neg() % upper;
     loop {
-        let block = keccak256(&[ORDER_DOMAIN, address_seed, &counter.to_le_bytes()]);
+        let block = keccak256(&[domain, address_seed, &counter.to_le_bytes()]);
         *counter = counter
             .checked_add(1)
             .expect("a practical address tree cannot exhaust the u64 stream");
