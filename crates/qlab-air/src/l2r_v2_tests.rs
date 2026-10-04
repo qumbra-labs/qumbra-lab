@@ -10,6 +10,7 @@ use p3_koala_bear::KoalaBear;
 use p3_matrix::{dense::RowMajorMatrix, Matrix};
 
 use super::*;
+use crate::l2::l2_nf;
 use crate::l2test;
 
 type F = KoalaBear;
@@ -90,7 +91,7 @@ fn l2r_v2_v1_geometry_is_unchanged() {
     assert_eq!(L2R_WIDTH, 734);
     assert_eq!(PV_LEN, 101);
     let v1 = L2ShapeRAir::chain_only(SHAPE_R_LOG_HEIGHT);
-    assert_eq!(v1.version, L2RVersion::V1);
+    assert_eq!(v1.version, L2Version::V1);
     assert_eq!(v1.program.len(), PROGRAM_SLOTS);
     assert_eq!(<L2ShapeRAir as BaseAir<F>>::width(&v1), L2R_WIDTH);
     assert_eq!(<L2ShapeRAir as BaseAir<F>>::num_public_values(&v1), PV_LEN);
@@ -98,7 +99,7 @@ fn l2r_v2_v1_geometry_is_unchanged() {
 
 #[test]
 fn l2r_v2_geometry() {
-    assert_eq!(D_AUTH_R, 12);
+    assert_eq!(D_AUTH, 12);
     assert_eq!(SHAPE_R_PERMS_V2, 94);
     assert_eq!(SHAPE_R_LOG_HEIGHT_V2, 19);
     assert_eq!(PROGRAM_SLOTS_V2, 172);
@@ -115,9 +116,9 @@ fn l2r_v2_geometry() {
     assert!(!p.contains(&ROLE_NF), "v2 NF is NFA");
     assert_eq!(p.iter().filter(|r| **r == ROLE_AAUTH_R).count(), 1);
     let a = slot_of(p, ROLE_AAUTH_R, 0);
-    assert!(p[a + 1..a + D_AUTH_R].iter().all(|r| *r == ROLE_MERKLE));
-    assert_eq!(p[a + D_AUTH_R], ROLE_BAUTH_R);
-    assert_eq!(p[a + D_AUTH_R + 1], ROLE_ARKM);
+    assert!(p[a + 1..a + D_AUTH].iter().all(|r| *r == ROLE_MERKLE));
+    assert_eq!(p[a + D_AUTH], ROLE_BAUTH_R);
+    assert_eq!(p[a + D_AUTH + 1], ROLE_ARKM);
     assert_eq!(inst.pvs.len(), PV_LEN_V2);
 }
 
@@ -136,7 +137,7 @@ fn l2r_v2_host_mirrors() {
     let inp = fabricated_r_auth_input(7, 5, 0b101);
     let p = &inp.auth;
     let mut d = p.leaf;
-    for k in 0..D_AUTH_R {
+    for k in 0..D_AUTH {
         let st = if (p.leaf_index >> k) & 1 == 1 {
             crate::reference::merkle_node_state(&p.siblings[k], &d)
         } else {
@@ -148,13 +149,13 @@ fn l2r_v2_host_mirrors() {
     let mut other = inp.clone();
     other.auth.siblings[3][1] ^= 1;
     assert_ne!(
-        derive_input_r_v2(&inp).1,
-        derive_input_r_v2(&other).1,
+        derive_input_l2_v2(&inp).1,
+        derive_input_l2_v2(&other).1,
         "rkm binds the tree"
     );
     assert_eq!(
-        derive_input_r_v2(&inp).0,
-        derive_input_r_v2(&other).0,
+        derive_input_l2_v2(&inp).0,
+        derive_input_l2_v2(&other).0,
         "nf does not see the tree"
     );
 }
@@ -220,7 +221,7 @@ fn l2r_v2_neg_nk_at_nfa_not_the_nk_in_rkm() {
         i.air.slot_witness[s].w[9..13].copy_from_slice(&nk);
         let mut rho = [0u64; 4];
         rho.copy_from_slice(&i.air.slot_witness[s].w[..4]);
-        i.pvs[PV_NF..PV_NF + 16].copy_from_slice(&pv_chunks(&r_nf_v2(&nk, &rho)));
+        i.pvs[PV_NF..PV_NF + 16].copy_from_slice(&pv_chunks(&l2_nf(&nk, &rho)));
     });
     refused_at_role(&bad, ROLE_ARKM, "nk at NFA");
 }
@@ -235,7 +236,7 @@ fn l2r_v2_neg_rho_at_nfa_not_the_note_rho() {
         i.air.slot_witness[s].w[1] ^= 1;
         let mut rho = [0u64; 4];
         rho.copy_from_slice(&i.air.slot_witness[s].w[..4]);
-        i.pvs[PV_NF..PV_NF + 16].copy_from_slice(&pv_chunks(&r_nf_v2(&nk, &rho)));
+        i.pvs[PV_NF..PV_NF + 16].copy_from_slice(&pv_chunks(&l2_nf(&nk, &rho)));
     });
     refused_at_role(&bad, ROLE_ACM, "ρ at NFA");
 }
@@ -273,7 +274,7 @@ fn l2r_v2_neg_v1_layout_rkm() {
     st[7] = 1;
     st[16] = 1 << 63;
     let rkm_v1: [u64; 4] = crate::reference::keccak_f(&st)[..4].try_into().unwrap();
-    assert_ne!(rkm_v1, derive_input_r_v2(&fee_in).1);
+    assert_ne!(rkm_v1, derive_input_l2_v2(&fee_in).1);
     let cm_v1 = l2_cm(fee_in.value, fee_in.asset, &rkm_v1, &fee_in.rho, &fee_in.rseed);
     let (witness, anchor) = fabricated_single_tree(&cm_v1);
     let fee_out = L2TxOutput {

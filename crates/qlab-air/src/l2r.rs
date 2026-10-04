@@ -97,6 +97,7 @@ use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
 
 use crate::l2::{
+    derive_input_l2_v2, L2AuthInput, L2AuthPath, L2Version, D_AUTH,
     derive_input_l2, l2_cm, L2TxInput, L2TxOutput, RegistryLeaf, RegistryWitness, ASSET_BITS,
     REGISTRY_DEPTH, ROLE_ACM, ROLE_ACMOUT, ROLE_ANK, ROLE_AREG, ROLE_ARHO, ROLE_ARKM, ROLE_BAL,
     ROLE_BANCHOR, ROLE_BCM1, ROLE_BCM2, ROLE_BNF1, ROLE_BREG, ROLE_DUMMY, ROLE_MERKLE, ROLE_NF,
@@ -212,22 +213,6 @@ pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 128
 //   NFA → BNF1 → AAUTH → (D−1)×MERKLE → BAUTH → ARKM → ACM → 32×MERKLE → BANCHOR
 // The issuer path (`AISS`, the registry write) is untouched.
 // ---------------------------------------------------------------------------
-
-/// The authorization tree depth (testnet, #894 Q1). Must equal
-/// `qlab-remote-auth` `annulet::D_AUTH` and shape S's `l2::D_AUTH` (seam B);
-/// R-local until B and D are reconciled on main.
-pub const D_AUTH_R: usize = 12;
-
-/// Which program and constraint set an instance carries. R-local twin of
-/// seam B's `l2::L2Version` (reconciled once both are on main).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum L2RVersion {
-    /// Today's shape R, byte-identical (`SHAPE_R_DIGEST_V1` pins it).
-    #[default]
-    V1,
-    /// Candidate A: `nk` witness, auth path, the leaf public value.
-    V2Auth,
-}
 
 /// v2 ring: 32 + 11 = 43 limbs, 172 slots — one period still covers the whole
 /// 2^19 trace (170.7 perms), so R's "no epoch" premise holds in v2.
@@ -399,7 +384,7 @@ const _: () = assert!(SHAPE_R_PERMS * ROWS_PER_PERM <= 1 << SHAPE_R_LOG_HEIGHT);
 const _: () = assert!((1 << SHAPE_R_LOG_HEIGHT) / ROWS_PER_PERM < PROGRAM_SLOTS);
 /// v2 perms: v1's 82 − `ANK` + `AAUTH` + (D−1) `MERKLE` + `BAUTH` = 82 + D =
 /// **94**, 288,768 rows → 2^19 (524,288; 170 perm capacity).
-pub const SHAPE_R_PERMS_V2: usize = SHAPE_R_PERMS + D_AUTH_R;
+pub const SHAPE_R_PERMS_V2: usize = SHAPE_R_PERMS + D_AUTH;
 pub const SHAPE_R_LOG_HEIGHT_V2: usize = 19;
 const _: () = assert!(SHAPE_R_PERMS_V2 * ROWS_PER_PERM <= 1 << SHAPE_R_LOG_HEIGHT_V2);
 const _: () = assert!(SHAPE_R_PERMS_V2 * ROWS_PER_PERM > 1 << SHAPE_R_LOG_HEIGHT);
@@ -455,7 +440,7 @@ impl Default for L2RSlotWitness {
 pub struct L2ShapeRAir {
     pub log_height: usize,
     /// v1 (today's R) or v2 (Candidate A authorization).
-    pub version: L2RVersion,
+    pub version: L2Version,
     /// 5-bit role code per program slot; the program period is its length
     /// (`PROGRAM_SLOTS` v1, `PROGRAM_SLOTS_V2` v2).
     pub program: Vec<u32>,
@@ -471,7 +456,7 @@ impl L2ShapeRAir {
     pub fn chain_only(log_height: usize) -> Self {
         Self {
             log_height,
-            version: L2RVersion::V1,
+            version: L2Version::V1,
             program: vec![ROLE_DUMMY; PROGRAM_SLOTS],
             slot_witness: Vec::new(),
             fee: 0,
@@ -482,14 +467,14 @@ impl L2ShapeRAir {
     /// The v2 geometry probe: every slot dummy, v2 width and ring.
     pub fn chain_only_v2(log_height: usize) -> Self {
         Self {
-            version: L2RVersion::V2Auth,
+            version: L2Version::V2Auth,
             program: vec![ROLE_DUMMY; PROGRAM_SLOTS_V2],
             ..Self::chain_only(log_height)
         }
     }
 
     pub fn is_v2(&self) -> bool {
-        self.version == L2RVersion::V2Auth
+        self.version == L2Version::V2Auth
     }
 
     /// Program-ring limbs: 32 (v1) or 43 (v2).
@@ -1569,7 +1554,7 @@ pub fn build_shape_r_with_witnesses(
     L2ShapeRInstance {
         air: L2ShapeRAir {
             log_height,
-            version: L2RVersion::V1,
+            version: L2Version::V1,
             program: program.to_vec(),
             slot_witness: sw,
             fee,
@@ -1590,75 +1575,6 @@ pub fn build_shape_r_with_witnesses(
 // reconciled once both seams are on main.
 // ---------------------------------------------------------------------------
 
-/// The input's authorization witness: the public leaf (`mldsa_leaf(index, vk)`
-/// as four u64 lanes LE), its index and the `D_AUTH_R` siblings, leaf level
-/// first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RAuthPath {
-    pub leaf: [u64; 4],
-    pub leaf_index: u32,
-    pub siblings: [[u64; 4]; D_AUTH_R],
-}
-
-impl RAuthPath {
-    /// `merkle_node_state` per level; bit `k` of `leaf_index` = "current node
-    /// is the right child" (the AIR's `MERKLE` order).
-    pub fn root(&self) -> [u64; 4] {
-        let mut d = self.leaf;
-        for (k, sib) in self.siblings.iter().enumerate() {
-            let st = if (self.leaf_index >> k) & 1 == 1 {
-                crate::reference::merkle_node_state(sib, &d)
-            } else {
-                crate::reference::merkle_node_state(&d, sib)
-            };
-            d = st[..4].try_into().unwrap();
-        }
-        d
-    }
-}
-
-/// The v2 fee input: `nk` replaces `sk`, plus its authorization.
-#[derive(Clone, Debug)]
-pub struct RAuthInput {
-    pub nk: [u64; 4],
-    pub value: u64,
-    pub asset: u64,
-    pub rho: [u64; 4],
-    pub rseed: [u64; 4],
-    pub d: [u64; 2],
-    pub auth: RAuthPath,
-}
-
-/// `nf = H(nk ‖ ρ)`.
-pub fn r_nf_v2(nk: &[u64; 4], rho: &[u64; 4]) -> [u64; 4] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(nk);
-    st[4..8].copy_from_slice(rho);
-    st[8] = 1;
-    st[16] = 1 << 63;
-    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
-}
-
-/// `rkm = H(nk ‖ D_R ‖ d ‖ auth_root)`, pad lane 11.
-pub fn r_rkm_v2(nk: &[u64; 4], d: &[u64; 2], auth_root: &[u64; 4]) -> [u64; 4] {
-    let mut st = [0u64; 25];
-    st[..4].copy_from_slice(nk);
-    st[4] = 1 << 1;
-    st[5] = d[0];
-    st[6] = d[1];
-    st[7..11].copy_from_slice(auth_root);
-    st[11] = 1;
-    st[16] = 1 << 63;
-    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
-}
-
-/// `(nf, rkm, cm)` for the v2 fee input.
-pub fn derive_input_r_v2(inp: &RAuthInput) -> ([u64; 4], [u64; 4], [u64; 4]) {
-    let nf = r_nf_v2(&inp.nk, &inp.rho);
-    let rkm = r_rkm_v2(&inp.nk, &inp.d, &inp.auth.root());
-    let cm = l2_cm(inp.value, inp.asset, &rkm, &inp.rho, &inp.rseed);
-    (nf, rkm, cm)
-}
 
 /// A v2 shape-R instance with its public leaf.
 #[cfg_attr(test, derive(Clone))]
@@ -1674,7 +1590,7 @@ pub struct L2ShapeRInstanceV2 {
 #[allow(clippy::too_many_arguments)]
 pub fn build_shape_r_v2_with_witnesses(
     log_height: usize,
-    fee_in: &RAuthInput,
+    fee_in: &L2AuthInput,
     fee_witness: &MerkleWitness,
     anchor: [u64; 4],
     fee_out: &L2TxOutput,
@@ -1682,7 +1598,7 @@ pub fn build_shape_r_v2_with_witnesses(
     write: &RegistryWrite,
     seed: &SeedOutput,
 ) -> L2ShapeRInstanceV2 {
-    let (nf, _, _) = derive_input_r_v2(fee_in);
+    let (nf, _, _) = derive_input_l2_v2(fee_in);
     let auth_root = fee_in.auth.root();
     let cm_out = l2_cm(fee_out.value, fee_out.asset, &fee_out.rkm, &nf, &fee_out.rseed);
     let seed_rho = derive_output_rho(&nf, 1);
@@ -1721,7 +1637,7 @@ pub fn build_shape_r_v2_with_witnesses(
     });
     w0.pbit = a.leaf_index & 1 == 1;
     put(ROLE_AAUTH_R, w0);
-    for k in 1..D_AUTH_R {
+    for k in 1..D_AUTH {
         let mut w = lanes(&|w| w[..4].copy_from_slice(&a.siblings[k]));
         w.pbit = (a.leaf_index >> k) & 1 == 1;
         put(ROLE_MERKLE, w);
@@ -1826,7 +1742,7 @@ pub fn build_shape_r_v2_with_witnesses(
         inst: L2ShapeRInstance {
             air: L2ShapeRAir {
                 log_height,
-                version: L2RVersion::V2Auth,
+                version: L2Version::V2Auth,
                 program,
                 slot_witness: sw,
                 fee,
@@ -1846,7 +1762,7 @@ pub fn build_shape_r_v2_with_witnesses(
 
 /// Fabricated v2 fee input for tests and benches: deterministic lanes and a
 /// synthetic authorization path (the AIR sees only the leaf, path and root).
-pub fn fabricated_r_auth_input(seed: u64, value: u64, leaf_index: u32) -> RAuthInput {
+pub fn fabricated_r_auth_input(seed: u64, value: u64, leaf_index: u32) -> L2AuthInput {
     let mut x = seed | 1;
     let mut r = move || {
         x ^= x << 13;
@@ -1854,14 +1770,14 @@ pub fn fabricated_r_auth_input(seed: u64, value: u64, leaf_index: u32) -> RAuthI
         x ^= x << 17;
         x
     };
-    RAuthInput {
+    L2AuthInput {
         nk: [r(), r(), r(), r()],
         value,
         asset: 0,
         rho: [r(), r(), r(), r()],
         rseed: [r(), r(), r(), r()],
         d: [r(), r()],
-        auth: RAuthPath {
+        auth: L2AuthPath {
             leaf: [r(), r(), r(), r()],
             leaf_index,
             siblings: core::array::from_fn(|_| [r(), r(), r(), r()]),
@@ -1874,7 +1790,7 @@ pub fn fabricated_r_auth_input(seed: u64, value: u64, leaf_index: u32) -> RAuthI
 /// 100-unit asset-0 note → 93 out + fee 7.
 pub fn fabricated_shape_r_v2() -> L2ShapeRInstanceV2 {
     let fee_in = fabricated_r_auth_input(0xd1d1, 100, 2930);
-    let (_, _, cm) = derive_input_r_v2(&fee_in);
+    let (_, _, cm) = derive_input_l2_v2(&fee_in);
     let (witness, anchor) = fabricated_single_tree(&cm);
     let fee_out = L2TxOutput {
         value: 93,
