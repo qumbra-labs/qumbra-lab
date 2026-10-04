@@ -204,7 +204,7 @@ fn mock_instance(perms: usize, log_height: usize) -> (L2ShapeSAir, Vec<Val>) {
     while sw.len() < PROGRAM_SLOTS {
         sw.push(qlab_air::l2::L2SlotWitness::default());
     }
-    air.program = program;
+    air.program = program.to_vec();
     air.slot_witness = sw;
     // Row 1 pays the fee from input 1; output 1 balances input 2 in row 2.
     air.sel_o1a = true;
