@@ -1,4 +1,9 @@
-//! Research-only Candidate A authorization spike (lab issue #630).
+//! Candidate A authorization (lab issue #630 spike; lab #896 Phase 3).
+//!
+//! **The `annulet` module is not research:** it is the Annulet shape ratified
+//! for the testnet (design PR #363, lab #894 Q3, 2026-10-04) and Phase 3 seam A
+//! of lab #896. Everything else below is the Phase 1 spike, kept unchanged
+//! with its vectors.
 //!
 //! This crate compares a FIPS 204 ML-DSA-44 stateless leaf with the RFC 8391
 //! `WOTSP-SHA2_256` leaf under one exact intent, two-slot shape, and canonical
@@ -10,6 +15,7 @@
 //! secret while a remote worker receives proving material. Every node must be
 //! able to reject a worker-modified intent before doing STARK verification.
 
+pub mod annulet;
 pub mod codec;
 pub mod intent;
 pub mod mldsa;
