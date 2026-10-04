@@ -75,7 +75,7 @@ use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
 
 use crate::l2::{
-    derive_input_l2_v2, fabricated_auth_input, FeeSlotV2, L2AuthInput, L2Version, D_AUTH, ROLE_AAUTH, ROLE_BAUTH, ROLE_NFA,
+    derive_input_l2_v2, fabricated_auth_input, FeeSlotV2, L2AuthInput, L2Version, D_AUTH, ROLE_AAUTH, ROLE_BAUTH, ROLE_NFA, SEL_CODES_V2,
     derive_input_l2, fabricated_registry_tree, l2_cm, L2TxInput, L2TxOutput, RegistryLeaf,
     RegistryWitness, ASSET_BITS, MODE_CLOAKED, MODE_HYBRID, MODE_REGULATED, PV_ANCHOR, PV_CM1,
     PV_CM2, PV_FEE, PV_NF1, PV_NF2, PV_REGROOT, REGISTRY_DEPTH, ROLE_ACM, ROLE_ACMOUT, ROLE_ANK,
@@ -274,7 +274,6 @@ pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 252
 /// v2 program ring: 63 + 9 = 72 limbs, 288 slots (all 288 used at D12).
 const PR_LIMBS_V2: usize = 72;
 pub const PROGRAM_SLOTS_V2: usize = 4 * PR_LIMBS_V2;
-const SEL_CODES_V2: [u32; 3] = [ROLE_NFA, ROLE_AAUTH, ROLE_BAUTH];
 const XR_OFF: usize = L2P_WIDTH; // 804
 const XR_LIMBS: usize = PR_LIMBS_V2 - PR_LIMBS;
 const SELV2_OFF: usize = XR_OFF + XR_LIMBS; // 813
