@@ -443,3 +443,17 @@ fn l2_v2_prove_verify_roundtrip_s() {
     // A v2 proof is not a v1 shape-S proof.
     assert!(!verify_s(&pvs[..Shape::S.pv_len()], &proof));
 }
+
+/// Lab #896 seam C: shape P **v2** geometry and degree, read off the
+/// witness-free v2 AIR. No prove here: v1 P already peaks at 29.85 GiB at q45
+/// (lab #785) and v2 is 53 columns wider — the P v2 prove + memory figure is
+/// the coordinator's call (seam W's box measurement, or a dedicated lane).
+#[test]
+fn l2_v2_geometry_and_degree_p() {
+    use qlab_air::l2p::{fabricated_bucket_l2p_v2, verifier_air_p_v2, L2P_WIDTH_V2, PV_LEN_V2};
+    let air = verifier_air_p_v2();
+    assert_eq!(<L2ShapePAir as BaseAir<Val>>::width(&air), L2P_WIDTH_V2);
+    assert_eq!(<L2ShapePAir as BaseAir<Val>>::num_public_values(&air), PV_LEN_V2);
+    assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 4);
+    assert_eq!(fabricated_bucket_l2p_v2().air.program, air.program, "the verifier program is the builder's");
+}
