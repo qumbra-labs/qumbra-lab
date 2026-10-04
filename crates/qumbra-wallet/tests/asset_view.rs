@@ -214,7 +214,7 @@ fn an_issuer_the_list_does_not_pin_withholds_the_name_and_keeps_the_balance() {
     let usdt = row(&v, USDT as u16);
     assert_eq!(usdt.label, AssetLabel::IssuerChanged { listed_ticker: "tUSDT".into() });
     assert_eq!(usdt.spendable.display, "1,000,407", "raw base units: decimals are not trusted for this issuer");
-    assert_eq!(usdt.spendable.unit, "base units of asset #1");
+    assert_eq!(usdt.spendable.unit, "base units of QIA #1");
     let _ = std::fs::remove_dir_all(&w.dir);
 }
 
@@ -224,7 +224,7 @@ fn without_this_networks_list_every_asset_is_unlisted() {
     let v = view(&w, &ep, None, &BTreeMap::new());
     assert_eq!(v.list, ListStatus::NoList);
     assert_eq!(row(&v, USDT as u16).label, AssetLabel::Unlisted);
-    assert_eq!(row(&v, USDT as u16).spendable.unit, "base units of asset #1");
+    assert_eq!(row(&v, USDT as u16).spendable.unit, "base units of QIA #1");
     assert!(!row(&v, USDT as u16).testnet);
 
     let other = signed(&list_json(&[0xEE; 32], [9, 9, 9, 9]));
