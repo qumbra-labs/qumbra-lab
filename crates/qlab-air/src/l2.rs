@@ -250,7 +250,7 @@ pub const ROLE_NFA: u32 = 23;
 pub const ROLE_AAUTH: u32 = 30;
 /// Auth-root capture: no injection; bank `EQA` takes `a[0..4]` (the root).
 pub const ROLE_BAUTH: u32 = 31;
-const SEL_CODES_V2: [u32; 3] = [ROLE_NFA, ROLE_AAUTH, ROLE_BAUTH];
+pub(crate) const SEL_CODES_V2: [u32; 3] = [ROLE_NFA, ROLE_AAUTH, ROLE_BAUTH];
 
 /// 9 ring-extension limbs: the v2 ring is `PR[0..40] ++ XR[0..9]`.
 const XR_OFF: usize = L2_WIDTH; // 721

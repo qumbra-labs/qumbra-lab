@@ -75,6 +75,7 @@ use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
 
 use crate::l2::{
+    derive_input_l2_v2, fabricated_auth_input, FeeSlotV2, L2AuthInput, L2Version, D_AUTH, ROLE_AAUTH, ROLE_BAUTH, ROLE_NFA, SEL_CODES_V2,
     derive_input_l2, fabricated_registry_tree, l2_cm, L2TxInput, L2TxOutput, RegistryLeaf,
     RegistryWitness, ASSET_BITS, MODE_CLOAKED, MODE_HYBRID, MODE_REGULATED, PV_ANCHOR, PV_CM1,
     PV_CM2, PV_FEE, PV_NF1, PV_NF2, PV_REGROOT, REGISTRY_DEPTH, ROLE_ACM, ROLE_ACMOUT, ROLE_ANK,
@@ -257,6 +258,36 @@ const _: () = assert!(L2P_WIDTH == 804, "the F5-4d census: 798 + 6");
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 4 * PR_LIMBS; // 252
 
+// ---------------------------------------------------------------------------
+// Version 2 — Candidate A authorization (lab #896 seam C), shape S's v2
+// (`l2.rs`, seam B) carried to P. Every v2 column APPENDED after 804; every
+// v2 term behind `self.version`, so v1 and `SHAPE_P_DIGEST_V1` are unchanged.
+//
+// Per input chain the auth path goes BEFORE `AISS` (whose digest `ARKM`'s
+// boundary captures into the bind bank, so the two stay adjacent):
+//   NFA → BNF_k → AAUTH → (D−1)×MERKLE → BAUTH → AISS → ARKM → AFKEY → …
+// All three `rkm` derivations (`ARKM`, `ARKM2` ×2) use v2's message (they
+// share `inj(2)`); the second and third are bound to the first by output
+// equality as in v1, so the same `auth_root` is forced into each.
+// ---------------------------------------------------------------------------
+
+/// v2 program ring: 63 + 9 = 72 limbs, 288 slots (all 288 used at D12).
+const PR_LIMBS_V2: usize = 72;
+pub const PROGRAM_SLOTS_V2: usize = 4 * PR_LIMBS_V2;
+const XR_OFF: usize = L2P_WIDTH; // 804
+const XR_LIMBS: usize = PR_LIMBS_V2 - PR_LIMBS;
+const SELV2_OFF: usize = XR_OFF + XR_LIMBS; // 813
+const SEV2_OFF: usize = SELV2_OFF + 3; // 816
+const INJV2_OFF: usize = SEV2_OFF + 3; // 819
+const EGN_COL: usize = INJV2_OFF + 2; // 821
+const EGL_POS_COL: usize = EGN_COL + 1; // 822
+const EGL_CLOSE_COL: usize = EGL_POS_COL + 1; // 823
+const EQL_OFF: usize = EGL_CLOSE_COL + 1; // 824: 16
+const EGA_POS_COL: usize = EQL_OFF + 16; // 840
+const EQA_OFF: usize = EGA_POS_COL + 1; // 841: 16
+/// The shape-P v2 trace width.
+pub const L2P_WIDTH_V2: usize = EQA_OFF + 16; // 857
+
 // Role codes 0..=16 are `l2.rs`'s (re-exported through the imports above);
 // 17..=22 are shape P's.
 /// `issuer_key = H(isk ‖ D_I)`: isk = W0..4, D_I at lane 4 bit 7, pad at lane 5.
@@ -340,6 +371,11 @@ pub const PV_NF3: usize = 112;
 /// transaction (ruling Q-4d-1): both exit rows pay it.
 pub const PV_XRKM: usize = 128;
 pub const PV_LEN: usize = 144;
+/// v2: each slot's public authorization leaf (16 chunks each), appended.
+pub const PV_LEAF1: usize = 144;
+pub const PV_LEAF2: usize = 160;
+pub const PV_LEAF3: usize = 176;
+pub const PV_LEN_V2: usize = 192;
 const fn pv_vp_sign(k: usize) -> usize {
     PV_VP1 + 6 * k
 }
@@ -460,7 +496,10 @@ impl Default for L2PSlotWitness {
 #[cfg_attr(test, derive(Clone))] // the test fan-out needs owned copies; non-test build unchanged
 pub struct L2ShapePAir {
     pub log_height: usize,
-    pub program: [u32; PROGRAM_SLOTS],
+    /// v1 (today's P3) or v2 (Candidate A authorization).
+    pub version: L2Version,
+    /// Role per program slot; the period is the length (252 v1, 288 v2).
+    pub program: Vec<u32>,
     pub slot_witness: Vec<L2PSlotWitness>,
     pub fee: u64,
     pub dv: bool,
@@ -489,7 +528,8 @@ impl L2ShapePAir {
     pub fn chain_only(log_height: usize) -> Self {
         Self {
             log_height,
-            program: [ROLE_DUMMY; PROGRAM_SLOTS],
+            version: L2Version::V1,
+            program: vec![ROLE_DUMMY; PROGRAM_SLOTS],
             slot_witness: Vec::new(),
             fee: 0,
             dv: false,
@@ -507,9 +547,38 @@ impl L2ShapePAir {
         }
     }
 
+    /// The v2 geometry probe: every slot dummy, v2 width and ring.
+    pub fn chain_only_v2(log_height: usize) -> Self {
+        Self {
+            version: L2Version::V2Auth,
+            program: vec![ROLE_DUMMY; PROGRAM_SLOTS_V2],
+            ..Self::chain_only(log_height)
+        }
+    }
+
+    pub fn is_v2(&self) -> bool {
+        self.version == L2Version::V2Auth
+    }
+
+    fn ring_limbs(&self) -> usize {
+        if self.is_v2() {
+            PR_LIMBS_V2
+        } else {
+            PR_LIMBS
+        }
+    }
+
+    fn ring_col(i: usize) -> usize {
+        if i < PR_LIMBS {
+            PR_OFF + i
+        } else {
+            XR_OFF + (i - PR_LIMBS)
+        }
+    }
+
     fn pr_limb(&self, i: usize) -> u32 {
         (0..4)
-            .map(|j| self.program[(4 * i + j) % PROGRAM_SLOTS] << (ROLE_BITS * j))
+            .map(|j| self.program[(4 * i + j) % self.program.len()] << (ROLE_BITS * j))
             .sum()
     }
 
@@ -535,11 +604,19 @@ const PER_LO16: usize = 39;
 
 impl<F: Field> BaseAir<F> for L2ShapePAir {
     fn width(&self) -> usize {
-        L2P_WIDTH
+        if self.is_v2() {
+            L2P_WIDTH_V2
+        } else {
+            L2P_WIDTH
+        }
     }
 
     fn num_public_values(&self) -> usize {
-        PV_LEN
+        if self.is_v2() {
+            PV_LEN_V2
+        } else {
+            PV_LEN
+        }
     }
 
     fn num_periodic_columns(&self) -> usize {
@@ -693,9 +770,9 @@ where
                 if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
             );
         }
-        for i in 0..PR_LIMBS {
+        for i in 0..self.ring_limbs() {
             builder.when_first_row().assert_eq(
-                local[PR_OFF + i].clone(),
+                local[Self::ring_col(i)].clone(),
                 AB::Expr::from_u32(self.pr_limb(i)),
             );
         }
@@ -791,14 +868,29 @@ where
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
-            let msg_arkm: AB::Expr = match l {
-                0..=3 => w(l),
-                4 => sel(1),
-                5 => w(5),
-                6 => w(6),
-                7 => sel(0),
-                16 => u63.clone(),
-                _ => AB::Expr::ZERO,
+            let msg_arkm: AB::Expr = if self.is_v2() {
+                // v2: nk ‖ D_R ‖ d ‖ auth_root, pad lane 11 — for ARKM and both
+                // ARKM2s (one injection class).
+                match l {
+                    0..=3 => w(l),
+                    4 => sel(1),
+                    5 => w(5),
+                    6 => w(6),
+                    7..=10 => w(l),
+                    11 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                }
+            } else {
+                match l {
+                    0..=3 => w(l),
+                    4 => sel(1),
+                    5 => w(5),
+                    6 => w(6),
+                    7 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                }
             };
             let msg_acm: AB::Expr = match l {
                 0 => w(4),
@@ -870,7 +962,7 @@ where
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
-            let expr = a(l)
+            let mut expr = a(l)
                 + inj(0) * (msg_mrk - a(l))
                 + inj(1) * (msg_ank - a(l))
                 + inj(2) * (msg_arkm - a(l))
@@ -883,6 +975,27 @@ where
                 + inj(INJ_AFRZ) * (msg_afrz - a(l))
                 + inj(INJ_ACRED) * (msg_acred - a(l))
                 + inj(INJ_AFKEY) * (msg_afkey - a(l));
+            if self.is_v2() {
+                // NFA: nk (W9..12) ‖ ρ (W0..3); AAUTH: leaf W0..3 / sibling
+                // W4..7 by the path bit (shape S v2's messages verbatim).
+                let msg_nfa: AB::Expr = match l {
+                    0..=3 => w(l + 9),
+                    4..=7 => w(l - 4),
+                    8 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                };
+                let msg_aauth: AB::Expr = match l {
+                    0..=3 => pbit.clone() * w(l + 4) + (AB::Expr::ONE - pbit.clone()) * w(l),
+                    4..=7 => pbit.clone() * w(l - 4) + (AB::Expr::ONE - pbit.clone()) * w(l),
+                    8 => sel(0),
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                };
+                expr = expr
+                    + local[INJV2_OFF].clone() * (msg_nfa - a(l))
+                    + local[INJV2_OFF + 1].clone() * (msg_aauth - a(l));
+            }
             builder.assert_eq(eff(l), expr);
         }
 
@@ -1365,6 +1478,62 @@ where
             );
         }
 
+        // --- v2 (Candidate A): selectors, injections, the leaf and root banks ---
+        if self.is_v2() {
+            for (i, code) in SEL_CODES_V2.iter().enumerate() {
+                let lo = local[LO_OFF + (code & 3) as usize].clone();
+                let hi = pair(r(2), r(3), (code >> 2) & 3);
+                let top = if (code >> 4) & 1 == 1 {
+                    r(4)
+                } else {
+                    AB::Expr::ONE - r(4)
+                };
+                builder.assert_eq(local[SELV2_OFF + i].clone(), lo * hi * top);
+                builder.assert_eq(
+                    local[SEV2_OFF + i].clone(),
+                    local[SELV2_OFF + i].clone() * ep.clone(),
+                );
+            }
+            builder.assert_eq(
+                local[INJV2_OFF].clone(),
+                bnd.clone() * local[SELV2_OFF].clone(),
+            );
+            builder.assert_eq(
+                local[INJV2_OFF + 1].clone(),
+                bnd.clone() * local[SELV2_OFF + 1].clone(),
+            );
+            builder.assert_eq(local[EGN_COL].clone(), bnd.clone() * local[SEV2_OFF].clone());
+            builder.assert_eq(
+                local[EGL_POS_COL].clone(),
+                bnd.clone() * local[SEV2_OFF + 1].clone(),
+            );
+            builder.assert_eq(
+                local[EGL_CLOSE_COL].clone(),
+                gperm.clone() * local[SEV2_OFF + 1].clone(),
+            );
+            builder.assert_eq(
+                local[EGA_POS_COL].clone(),
+                bnd.clone() * local[SEV2_OFF + 2].clone(),
+            );
+            let l1 = local[LATCH_COL].clone();
+            let l3 = local[L3_COL].clone();
+            for j in 0..16 {
+                let target = (AB::Expr::ONE - l1.clone() - l3.clone()) * pv(PV_LEAF1 + j)
+                    + l1.clone() * pv(PV_LEAF2 + j)
+                    + l3.clone() * pv(PV_LEAF3 + j);
+                builder.assert_zero(
+                    local[EGL_CLOSE_COL].clone()
+                        * (local[EQL_OFF + j].clone() - target * ep.clone()),
+                );
+                builder.when_first_row().assert_zero(local[EQL_OFF + j].clone());
+                // The auth root equals the first ARKM's `auth_root` lanes:
+                // bank EQA is zero at ARKM's close (`EG[2]`, ARKM only — the
+                // ARKM2s carry no bank-1 legs and no EQA leg).
+                builder.assert_zero(local[EG_OFF + 2].clone() * local[EQA_OFF + j].clone());
+                builder.when_first_row().assert_zero(local[EQA_OFF + j].clone());
+            }
+        }
+
         // --- Transition constraints ---
         let mut t = builder.when_transition();
 
@@ -1391,11 +1560,12 @@ where
             );
         }
         let g4 = local[G4_COL].clone();
-        for i in 0..PR_LIMBS {
+        let n_ring = self.ring_limbs();
+        for i in 0..n_ring {
             t.assert_eq(
-                next[PR_OFF + i].clone(),
-                (AB::Expr::ONE - g4.clone()) * local[PR_OFF + i].clone()
-                    + g4.clone() * local[PR_OFF + (i + 1) % PR_LIMBS].clone(),
+                next[Self::ring_col(i)].clone(),
+                (AB::Expr::ONE - g4.clone()) * local[Self::ring_col(i)].clone()
+                    + g4.clone() * local[Self::ring_col((i + 1) % n_ring)].clone(),
             );
         }
         t.assert_zero(
@@ -1577,20 +1747,34 @@ where
         for l in 0..4 {
             for j in 0..4 {
                 let idx = 4 * l + j;
-                t.assert_eq(
-                    next[EQ_OFF + idx].clone(),
-                    local[EQ_OFF + idx].clone()
-                        + local[EG_OFF].clone() * pwk(j) * local[A_OFF + l].clone()
-                        - local[EG_OFF + 1].clone() * pwk(j) * local[W_OFF + l].clone()
-                        + local[EGB_COL].clone() * alw.clone() * pwk(j) * local[A_OFF + l].clone()
-                        - local[INJRE_COL].clone() * alw.clone() * pwk(j) * local[W_OFF + 9 + l].clone(),
-                );
-                t.assert_eq(
-                    next[EQ_OFF + 16 + idx].clone(),
-                    local[EQ_OFF + 16 + idx].clone()
-                        + local[EG_OFF + 3].clone() * pwk(j) * local[W_OFF + l].clone()
-                        - local[EG_OFF + 4].clone() * pwk(j) * local[W_OFF + 5 + l].clone(),
-                );
+                let mut bank1 = local[EQ_OFF + idx].clone()
+                    + local[EG_OFF].clone() * pwk(j) * local[A_OFF + l].clone()
+                    - local[EG_OFF + 1].clone() * pwk(j) * local[W_OFF + l].clone()
+                    + local[EGB_COL].clone() * alw.clone() * pwk(j) * local[A_OFF + l].clone()
+                    - local[INJRE_COL].clone() * alw.clone() * pwk(j) * local[W_OFF + 9 + l].clone();
+                let mut bank2 = local[EQ_OFF + 16 + idx].clone()
+                    + local[EG_OFF + 3].clone() * pwk(j) * local[W_OFF + l].clone()
+                    - local[EG_OFF + 4].clone() * pwk(j) * local[W_OFF + 5 + l].clone();
+                if self.is_v2() {
+                    // NFA: +nk (W9..12) into bank 1, +ρ (W0..3) into bank 2.
+                    bank1 += local[EGN_COL].clone() * pwk(j) * local[W_OFF + 9 + l].clone();
+                    bank2 += local[EGN_COL].clone() * pwk(j) * local[W_OFF + l].clone();
+                }
+                t.assert_eq(next[EQ_OFF + idx].clone(), bank1);
+                t.assert_eq(next[EQ_OFF + 16 + idx].clone(), bank2);
+                if self.is_v2() {
+                    t.assert_eq(
+                        next[EQL_OFF + idx].clone(),
+                        (AB::Expr::ONE - local[EGL_CLOSE_COL].clone()) * local[EQL_OFF + idx].clone()
+                            + local[EGL_POS_COL].clone() * pwk(j) * local[W_OFF + l].clone(),
+                    );
+                    t.assert_eq(
+                        next[EQA_OFF + idx].clone(),
+                        local[EQA_OFF + idx].clone()
+                            + local[EGA_POS_COL].clone() * pwk(j) * local[A_OFF + l].clone()
+                            - local[EG_OFF + 1].clone() * pwk(j) * local[W_OFF + 7 + l].clone(),
+                    );
+                }
             }
         }
         // The comparison flags advance from every M row (gate `mrow` alone —
@@ -2347,7 +2531,8 @@ pub fn build_bucket_l2p_exit_with_witnesses(
     L2PBucketInstance {
         air: L2ShapePAir {
             log_height,
-            program,
+            version: L2Version::V1,
+            program: program.to_vec(),
             slot_witness: sw,
             fee,
             dv: false,
@@ -2461,10 +2646,284 @@ pub fn build_bucket_l2p_dummy1_fabricated(
 // the shape-P columns.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// v2 instances (Candidate A) — lab #896 seam C
+// ---------------------------------------------------------------------------
+
+/// v2 perm slots: v1's 252, minus `ANK` per chain, plus `AAUTH`, `D_AUTH − 1`
+/// `MERKLE` and `BAUTH` per chain = 252 + 3·D_AUTH = **288** at D12 → 2^20
+/// (341 perm capacity), the 288-slot ring exactly full.
+pub const SHAPE_P_PERMS_V2: usize = SHAPE_P_PERMS + 3 * D_AUTH;
+const _: () = assert!(SHAPE_P_PERMS_V2 <= PROGRAM_SLOTS_V2);
+const _: () = assert!(SHAPE_P_PERMS_V2 * crate::l2::ROWS_PER_PERM <= 1 << SHAPE_P_LOG_HEIGHT);
+
+/// Build a v2 shape-P instance. As [`build_bucket_l2p_exit_with_witnesses`],
+/// with v2 inputs (`nk` + auth path) and a device-made fee slot; `dv`
+/// declares input slot 2 a dummy (it still proves its leaf under its own
+/// throwaway `auth_root`). The policy openings must be keyed by the v2 `rkm`
+/// (`derive_input_l2_v2(..).1`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_bucket_l2p_v2(
+    log_height: usize,
+    inputs: &[L2AuthInput; 2],
+    outputs: &[L2TxOutput; 2],
+    fee: u64,
+    witnesses: &[MerkleWitness; 2],
+    anchor: [u64; 4],
+    policy: &[L2PolicyInput; 2],
+    registry_root: [u64; 4],
+    vp: [VPublic; 2],
+    fee_slot: &FeeSlotV2,
+    xrkm: [u64; 4],
+    dv: bool,
+) -> L2PBucketInstance {
+    if dv {
+        assert_eq!(inputs[1].value, 0, "a dummy input slot contributes 0 to the balance");
+        assert_eq!(inputs[1].asset, 0, "a dummy input slot carries asset 0 (#700)");
+    }
+    let fee_in = fee_slot.input();
+    let (nf1, _, _) = derive_input_l2_v2(&inputs[0]);
+    let (nf2, _, _) = derive_input_l2_v2(&inputs[1]);
+    let (nf3, _, _) = derive_input_l2_v2(fee_in);
+    let out_rho = [derive_output_rho(&nf1, 0), derive_output_rho(&nf1, 1)];
+    let cmo1 = l2_cm(outputs[0].value, outputs[0].asset, &outputs[0].rkm, &out_rho[0], &outputs[0].rseed);
+    let cmo2 = l2_cm(outputs[1].value, outputs[1].asset, &outputs[1].rkm, &out_rho[1], &outputs[1].rseed);
+
+    let mut program = vec![ROLE_DUMMY; PROGRAM_SLOTS_V2];
+    let mut sw = vec![L2PSlotWitness::default(); PROGRAM_SLOTS_V2];
+    let mut slot = 1usize;
+    let path = |program: &mut Vec<u32>, sw: &mut Vec<L2PSlotWitness>, slot: &mut usize, sibs: &[[u64; 4]], bits: &[bool]| {
+        for (sib, bit) in sibs.iter().zip(bits.iter()) {
+            program[*slot] = ROLE_MERKLE;
+            sw[*slot].w[..4].copy_from_slice(sib);
+            sw[*slot].pbit = *bit;
+            *slot += 1;
+        }
+    };
+    // NFA → bnf → AAUTH → (D−1)×MERKLE → BAUTH.
+    let nfa_auth = |program: &mut Vec<u32>, sw: &mut Vec<L2PSlotWitness>, slot: &mut usize, inp: &L2AuthInput, bnf: u32| {
+        program[*slot] = ROLE_NFA;
+        sw[*slot].w[..4].copy_from_slice(&inp.rho);
+        sw[*slot].w[9..13].copy_from_slice(&inp.nk);
+        *slot += 1;
+        program[*slot] = bnf;
+        *slot += 1;
+        let a = &inp.auth;
+        program[*slot] = ROLE_AAUTH;
+        sw[*slot].w[..4].copy_from_slice(&a.leaf);
+        sw[*slot].w[4..8].copy_from_slice(&a.siblings[0]);
+        sw[*slot].pbit = a.leaf_index & 1 == 1;
+        *slot += 1;
+        for k in 1..D_AUTH {
+            program[*slot] = ROLE_MERKLE;
+            sw[*slot].w[..4].copy_from_slice(&a.siblings[k]);
+            sw[*slot].pbit = (a.leaf_index >> k) & 1 == 1;
+            *slot += 1;
+        }
+        program[*slot] = ROLE_BAUTH;
+        *slot += 1;
+    };
+    // ARKM / ARKM2 with the v2 message: nk, d, auth_root.
+    let arkm = |program: &mut Vec<u32>, sw: &mut Vec<L2PSlotWitness>, slot: &mut usize, inp: &L2AuthInput, role: u32| {
+        program[*slot] = role;
+        sw[*slot].w[..4].copy_from_slice(&inp.nk);
+        sw[*slot].w[5] = inp.d[0];
+        sw[*slot].w[6] = inp.d[1];
+        sw[*slot].w[7..11].copy_from_slice(&inp.auth.root());
+        *slot += 1;
+    };
+    for (k, bnf) in [ROLE_BNF1, ROLE_BNF2].into_iter().enumerate() {
+        let (inp, pol, witness) = (&inputs[k], &policy[k], &witnesses[k]);
+        nfa_auth(&mut program, &mut sw, &mut slot, inp, bnf);
+        program[slot] = ROLE_AISS;
+        sw[slot].w[..4].copy_from_slice(&pol.isk);
+        slot += 1;
+        arkm(&mut program, &mut sw, &mut slot, inp, ROLE_ARKM);
+        program[slot] = ROLE_AFKEY;
+        slot += 1;
+        program[slot] = ROLE_AFRZ;
+        sw[slot].w[..4].copy_from_slice(&pol.freeze.key_lo);
+        sw[slot].w[5..9].copy_from_slice(&pol.freeze.key_hi);
+        slot += 1;
+        path(&mut program, &mut sw, &mut slot, &pol.freeze.witness.siblings, &pol.freeze.witness.path_bits);
+        program[slot] = ROLE_AREG;
+        sw[slot].w[..4].copy_from_slice(&pol.leaf.issuer_key);
+        sw[slot].w[4] = pol.leaf.mode;
+        sw[slot].w[5..9].copy_from_slice(&pol.leaf.freeze_root);
+        sw[slot].w[9..13].copy_from_slice(&pol.leaf.allow_root);
+        sw[slot].w[13] = pol.leaf.asset;
+        sw[slot].w[14] = pol.leaf.flags;
+        slot += 1;
+        path(&mut program, &mut sw, &mut slot, &pol.reg_witness.siblings, &pol.reg_witness.path_bits);
+        program[slot] = ROLE_BREG;
+        slot += 1;
+        arkm(&mut program, &mut sw, &mut slot, inp, ROLE_ARKM2);
+        program[slot] = ROLE_ACRED;
+        slot += 1;
+        path(&mut program, &mut sw, &mut slot, &pol.allow.siblings, &pol.allow.path_bits);
+        program[slot] = ROLE_BALLOW;
+        slot += 1;
+        arkm(&mut program, &mut sw, &mut slot, inp, ROLE_ARKM2);
+        program[slot] = ROLE_ACM;
+        sw[slot].w[4] = inp.value;
+        sw[slot].w[5..9].copy_from_slice(&inp.rho);
+        sw[slot].w[9..13].copy_from_slice(&inp.rseed);
+        sw[slot].w[13] = inp.asset;
+        slot += 1;
+        path(&mut program, &mut sw, &mut slot, &witness.siblings, &witness.path_bits);
+        program[slot] = ROLE_BANCHOR;
+        slot += 1;
+    }
+    // The fee chain: no policy (asset 0 is forced).
+    nfa_auth(&mut program, &mut sw, &mut slot, fee_in, ROLE_BNF3);
+    arkm(&mut program, &mut sw, &mut slot, fee_in, ROLE_ARKM);
+    program[slot] = ROLE_ACMF;
+    sw[slot].w[4] = fee_in.value;
+    sw[slot].w[5..9].copy_from_slice(&fee_in.rho);
+    sw[slot].w[9..13].copy_from_slice(&fee_in.rseed);
+    sw[slot].w[13] = fee_in.asset;
+    slot += 1;
+    let fw = fee_slot.witness();
+    path(&mut program, &mut sw, &mut slot, &fw.siblings, &fw.path_bits);
+    program[slot] = ROLE_BANCHOR;
+    slot += 1;
+    for (j, (o, bcm)) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]).enumerate() {
+        if j == 1 {
+            program[slot] = ROLE_ARHO;
+            sw[slot].w[5..9].copy_from_slice(&nf1);
+            slot += 1;
+        }
+        program[slot] = ROLE_ACMOUT;
+        sw[slot].w[4] = o.value;
+        sw[slot].w[..4].copy_from_slice(&o.rkm);
+        sw[slot].w[5..9].copy_from_slice(&out_rho[j]);
+        sw[slot].w[9..13].copy_from_slice(&o.rseed);
+        sw[slot].w[13] = o.asset;
+        slot += 1;
+        program[slot] = bcm;
+        slot += 1;
+    }
+    program[slot] = ROLE_BAL;
+    slot += 1;
+    program[slot] = ROLE_END;
+    slot += 1;
+    assert_eq!(slot, SHAPE_P_PERMS_V2, "v2 program layout drifted");
+
+    let a1 = inputs[0].asset;
+    let hy = [policy[0].leaf.mode == MODE_HYBRID, policy[1].leaf.mode == MODE_HYBRID];
+    let rg = [policy[0].leaf.mode == MODE_REGULATED, policy[1].leaf.mode == MODE_REGULATED];
+    let ropen = [
+        policy[0].leaf.flags & FLAG_REDEEM_OPEN != 0,
+        policy[1].leaf.flags & FLAG_REDEEM_OPEN != 0,
+    ];
+    let vpa = [
+        if vp[0].amount != 0 { inputs[0].asset } else { 0 },
+        if vp[1].amount != 0 { inputs[1].asset } else { 0 },
+    ];
+    let mut pvs = pv_vec_l2p(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &vp, &vpa, &nf3, &xrkm);
+    for leaf in [&inputs[0].auth.leaf, &inputs[1].auth.leaf, &fee_in.auth.leaf] {
+        pvs.extend_from_slice(&pv_chunks(leaf));
+    }
+    debug_assert_eq!(pvs.len(), PV_LEN_V2);
+    L2PBucketInstance {
+        air: L2ShapePAir {
+            log_height,
+            version: L2Version::V2Auth,
+            program,
+            slot_witness: sw,
+            fee,
+            dv,
+            sel_o1a: outputs[0].asset == a1,
+            sel_o2a: outputs[1].asset == a1,
+            sel_f1: a1 == 0,
+            sel_q: a1 == inputs[1].asset,
+            hy,
+            rg,
+            ropen,
+            vp,
+            d3: fee_slot.is_dummy(),
+            asset: [inputs[0].asset, inputs[1].asset],
+            xrkm,
+        },
+        pvs,
+        anchor,
+        registry_root,
+        nf: [nf1, nf2],
+        cm_out: [cmo1, cmo2],
+        nf3,
+    }
+}
+
+/// [`build_bucket_l2p_v2`] against fabricated commitment and registry trees,
+/// policy openings keyed by each input's v2 `rkm`, a device-made dummy fee
+/// slot. Panics if an input is frozen or (Regulated) not allowlisted.
+pub fn build_bucket_l2p_v2_fabricated(
+    inputs: &[L2AuthInput; 2],
+    outputs: &[L2TxOutput; 2],
+    fee: u64,
+    assets: &[PolicyAsset; 2],
+    vp: [VPublic; 2],
+) -> L2PBucketInstance {
+    let (_, rkm1, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, rkm2, cm2) = derive_input_l2_v2(&inputs[1]);
+    let (witnesses, anchor) = fabricated_shared_tree(&cm1, &cm2);
+    let leaves = [assets[0].leaf(), assets[1].leaf()];
+    let (rw, registry_root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    let policy = [
+        assets[0].policy_input_for(&rkm1, rw[0]).expect("input 0: rkm frozen or not allowlisted"),
+        assets[1].policy_input_for(&rkm2, rw[1]).expect("input 1: rkm frozen or not allowlisted"),
+    ];
+    build_bucket_l2p_v2(
+        SHAPE_P_LOG_HEIGHT,
+        inputs,
+        outputs,
+        fee,
+        &witnesses,
+        anchor,
+        &policy,
+        registry_root,
+        vp,
+        &FeeSlotV2::Dummy { input: fabricated_auth_input(0xfee0_d00d, 0, 0, 1833) },
+        [0; 4],
+        false,
+    )
+}
+
+/// The canonical honest v2 P instance: asset 0 (Cloaked) 100 + asset 7
+/// (Hybrid, issuer key set, nothing frozen) 50 in, 90 + 50 out, fee 10, no
+/// `vPublic` — a holder spend, the only P a shared prover may take (2b §2).
+pub fn fabricated_bucket_l2p_v2() -> L2PBucketInstance {
+    let inputs = [fabricated_auth_input(0x1111, 100, 0, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let mk_out = |seed: u64, value: u64, asset: u64| L2TxOutput {
+        value,
+        asset,
+        rkm: [seed, seed + 1, seed + 2, seed + 3],
+        rho: [seed + 4; 4],
+        rseed: [seed + 5; 4],
+    };
+    build_bucket_l2p_v2_fabricated(
+        &inputs,
+        &[mk_out(0x3333, 90, 0), mk_out(0x4444, 50, 7)],
+        10,
+        &[PolicyAsset::cloaked(0), PolicyAsset::hybrid(7, [0x7a, 0x7b, 0x7c, 0x7d], false, &[])],
+        [VPublic::NONE; 2],
+    )
+}
+
+/// The witness-free v2 shape-P AIR a verifier uses.
+pub fn verifier_air_p_v2() -> L2ShapePAir {
+    L2ShapePAir {
+        program: fabricated_bucket_l2p_v2().air.program,
+        ..L2ShapePAir::chain_only_v2(SHAPE_P_LOG_HEIGHT)
+    }
+}
+
 impl L2ShapePAir {
     pub fn generate_trace<F: Field>(&self, extra_capacity_bits: usize) -> RowMajorMatrix<F> {
         let height = 1usize << self.log_height;
-        let size = height * L2P_WIDTH;
+        let width = <Self as BaseAir<F>>::width(self);
+        let v2 = self.is_v2();
+        let size = height * width;
         let mut values = Vec::with_capacity(size << extra_capacity_bits);
 
         let mut s = [0u32; S_SLOTS + 1];
@@ -2473,9 +2932,9 @@ impl L2ShapePAir {
         let mut r: [u32; 24] = core::array::from_fn(|i| Self::rc_pack((23 + i) % 24));
         let mut pb: [u32; 24] = core::array::from_fn(|i| (i == 0) as u32);
         let mut ph: [u32; 4] = core::array::from_fn(|i| (i == 0) as u32);
-        let mut pr: [u32; PR_LIMBS] = core::array::from_fn(|i| self.pr_limb(i));
+        let mut pr: Vec<u32> = (0..self.ring_limbs()).map(|i| self.pr_limb(i)).collect();
         let mut perm_idx = 0usize;
-        let role_of = |p: usize| self.program[p % PROGRAM_SLOTS];
+        let role_of = |p: usize| self.program[p % self.program.len()];
         let wit = |p: usize| -> L2PSlotWitness {
             if self.slot_witness.is_empty() {
                 L2PSlotWitness::default()
@@ -2496,6 +2955,8 @@ impl L2ShapePAir {
         let d3v: u32 = self.d3 as u32;
         let mut fb = [0i64; 4];
         let mut eq3 = [0i64; 16];
+        let mut eql = [0i64; 16];
+        let mut eqa = [0i64; 16];
         let mut om: u32 = 0;
         let mut ac = [0i64; 6];
         let sel2: [u32; 4] = [
@@ -2604,12 +3065,36 @@ impl L2ShapePAir {
                         16 => z63,
                         _ => 0,
                     },
+                    ROLE_ARKM | ROLE_ARKM2 if v2 => match l {
+                        0..=3 => wbit[l],
+                        4 => z1,
+                        5 => wbit[5],
+                        6 => wbit[6],
+                        7..=10 => wbit[l],
+                        11 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
                     ROLE_ARKM | ROLE_ARKM2 => match l {
                         0..=3 => wbit[l],
                         4 => z1,
                         5 => wbit[5],
                         6 => wbit[6],
                         7 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_NFA if v2 => match l {
+                        0..=3 => wbit[l + 9],
+                        4..=7 => wbit[l - 4],
+                        8 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_AAUTH if v2 => match l {
+                        0..=3 => pbv * wbit[l + 4] + (1 - pbv) * wbit[l],
+                        4..=7 => pbv * wbit[l - 4] + (1 - pbv) * wbit[l],
+                        8 => z0,
                         16 => z63,
                         _ => 0,
                     },
@@ -2714,7 +3199,7 @@ impl L2ShapePAir {
             }
 
             let base = values.len();
-            values.resize(base + L2P_WIDTH, F::ZERO);
+            values.resize(base + width, F::ZERO);
             let row = &mut values[base..];
             for l in 0..25 {
                 row[A_OFF + l] = F::from_u32(a[l]);
@@ -2742,7 +3227,7 @@ impl L2ShapePAir {
                 row[PH_OFF + i] = F::from_u32(*vv);
             }
             for (i, vv) in pr.iter().enumerate() {
-                row[PR_OFF + i] = F::from_u32(*vv);
+                row[Self::ring_col(i)] = F::from_u32(*vv);
             }
             for k in 0..4 * ROLE_BITS {
                 row[D_OFF + k] = F::from_u32((pr[0] >> k) & 1);
@@ -2973,6 +3458,33 @@ impl L2ShapePAir {
             for l in 0..25 {
                 row[EFF_OFF + l] = F::from_u32(eff[l]);
             }
+            // v2 columns.
+            let (egn, egl_pos, egl_close, ega_pos) = if v2 {
+                let selv2: [u32; 3] = core::array::from_fn(|i| (role_now == SEL_CODES_V2[i]) as u32);
+                for (i, vv) in selv2.iter().enumerate() {
+                    row[SELV2_OFF + i] = F::from_u32(*vv);
+                    row[SEV2_OFF + i] = F::from_u32(*vv * ep);
+                }
+                row[INJV2_OFF] = F::from_u32(bndv * selv2[0]);
+                row[INJV2_OFF + 1] = F::from_u32(bndv * selv2[1]);
+                let gates = (
+                    bndv * selv2[0] * ep,
+                    bndv * selv2[1] * ep,
+                    gpermv * selv2[1] * ep,
+                    bndv * selv2[2] * ep,
+                );
+                row[EGN_COL] = F::from_u32(gates.0);
+                row[EGL_POS_COL] = F::from_u32(gates.1);
+                row[EGL_CLOSE_COL] = F::from_u32(gates.2);
+                row[EGA_POS_COL] = F::from_u32(gates.3);
+                for i in 0..16 {
+                    row[EQL_OFF + i] = sgnf(eql[i]);
+                    row[EQA_OFF + i] = sgnf(eqa[i]);
+                }
+                gates
+            } else {
+                (0, 0, 0, 0)
+            };
             // Advance the accumulators.
             {
                 let jc = z / 16;
@@ -2988,6 +3500,12 @@ impl L2ShapePAir {
                     eq[16 + idx] += epi
                         * (g_e2pos * wgt * wbit[l] as i64
                             - g_e2neg * wgt * wbit[5 + l] as i64);
+                    if v2 {
+                        eq[idx] += egn as i64 * wgt * wbit[9 + l] as i64;
+                        eq[16 + idx] += egn as i64 * wgt * wbit[l] as i64;
+                        eqa[idx] += ega_pos as i64 * wgt * a[l] as i64
+                            - eg1 as i64 * wgt * wbit[7 + l] as i64;
+                    }
                     bq[idx] += (bgcap as i64) * wgt * a[l] as i64
                         + (eg1 as i64) * (1 - l3 as i64) * wgt * a[l] as i64
                         - (injre as i64) * wgt * wbit[l] as i64
@@ -3012,6 +3530,14 @@ impl L2ShapePAir {
                 }
                 if g3close == 1 || close_cred == 1 {
                     eq3 = [0i64; 16];
+                }
+                if v2 {
+                    if egl_close == 1 {
+                        eql = [0i64; 16];
+                    }
+                    for l in 0..4 {
+                        eql[4 * l + jc] += egl_pos as i64 * wgt * wbit[l] as i64;
+                    }
                 }
                 for l in 0..4 {
                     let idx = 4 * l + jc;
@@ -3081,7 +3607,7 @@ impl L2ShapePAir {
             }
         }
 
-        RowMajorMatrix::new(values, L2P_WIDTH)
+        RowMajorMatrix::new(values, width)
     }
 
     /// The state materialized at block `q` (the round-q input).
@@ -3133,7 +3659,7 @@ mod tests {
     fn digest(state: &[u64; 25]) -> [u64; 4] {
         state[..4].try_into().unwrap()
     }
-    fn slot_of(program: &[u32; PROGRAM_SLOTS], role: u32, nth: usize) -> usize {
+    fn slot_of(program: &[u32], role: u32, nth: usize) -> usize {
         program.iter().enumerate().filter(|(_, r)| **r == role).map(|(i, _)| i).nth(nth).unwrap()
     }
 
@@ -3373,7 +3899,7 @@ mod tests {
         sw[5].w[5] = inp.d[0];
         sw[5].w[6] = inp.d[1];
         program[6] = ROLE_AFKEY;
-        let air = L2ShapePAir { log_height: 15, program, slot_witness: sw, ..L2ShapePAir::chain_only(15) };
+        let air = L2ShapePAir { log_height: 15, program: program.to_vec(), slot_witness: sw, ..L2ShapePAir::chain_only(15) };
         let trace = air.generate_trace::<F>(0);
         assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 2)), issuer_key_of(&ISK7), "AISS");
         assert_eq!(digest(&L2ShapePAir::extract_state(&trace, 24 * 3)), rkm, "ARKM2 = rkm");
@@ -3410,7 +3936,7 @@ mod tests {
             program[2] = ROLE_AFRZ;
             sw[2].w[..4].copy_from_slice(&lo);
             sw[2].w[5..9].copy_from_slice(&hi);
-            let air = L2ShapePAir { log_height: 13, program, slot_witness: sw, ..L2ShapePAir::chain_only(13) };
+            let air = L2ShapePAir { log_height: 13, program: program.to_vec(), slot_witness: sw, ..L2ShapePAir::chain_only(13) };
             let trace = air.generate_trace::<F>(0);
             let row = 2 * ROWS_PER_PERM_LOCAL + 63; // AFRZ's boundary, z = 63
             let at = |blk: usize| trace.values[row * L2P_WIDTH + CMP_OFF + CMP_BLOCK * blk + CMP_C + 2];
@@ -3617,7 +4143,7 @@ mod tests {
         assert_eq!(&p[at + fee.len()..SHAPE_P_PERMS], &tail[..]);
     }
 
-    fn p_spare_slots_are_dummy(p: &[u32; PROGRAM_SLOTS]) -> bool {
+    fn p_spare_slots_are_dummy(p: &[u32]) -> bool {
         p[SHAPE_P_PERMS..].iter().all(|r| *r == ROLE_DUMMY)
     }
 
@@ -4773,3 +5299,7 @@ pub fn audit_pv_inputs(pvs: &[u32]) -> Vec<usize> {
     }
     v
 }
+
+#[cfg(test)]
+#[path = "l2p_v2_tests.rs"]
+mod v2_tests;
