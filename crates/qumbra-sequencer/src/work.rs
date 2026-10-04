@@ -173,6 +173,11 @@ pub fn not_drafted(
     if taken > 0 && taken + notes >= K {
         return None;
     }
+    // No traffic and no claim left out: there is nothing to draft — not a
+    // short wrapper of padding alone (whatever the notes).
+    if taken == 0 && sel.left.is_empty() {
+        return Some(NotDrafted::Nothing);
+    }
     let line = |(i, why): &(usize, LeftOut)| why.sentence(&ids[*i], &anchors[*i]);
     let waiting: Vec<String> = sel.left.iter().filter(|(_, why)| *why == LeftOut::NotAbsorbable).map(line).collect();
     if only_anchors_lag(taken, waiting.len(), notes) {
@@ -395,7 +400,7 @@ mod tests {
             Some(NotDrafted::Short { have, need, .. }) => assert_eq!((have, need), (11, K)),
             _ => panic!("an exit and ten notes is short"),
         }
-        assert!(matches!(not_drafted(&none, &[], &[], false, 16, 300, None), Some(NotDrafted::Short { have: 0, .. })), "no traffic");
+        assert!(matches!(not_drafted(&none, &[], &[], false, 16, 300, None), Some(NotDrafted::Nothing)), "no traffic: nothing to draft");
     }
 
     /// A queued exit read again at draft: unreadable bytes are Unreadable,
