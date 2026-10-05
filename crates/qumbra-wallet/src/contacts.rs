@@ -24,9 +24,11 @@ pub struct Contact {
 
 impl Contact {
     pub fn decoded(&self) -> Address {
-        // Every construction and load path validates through Address::decode.
-        // Keeping the invariant private makes this infallible to callers.
-        Address::decode(&self.address).expect("validated contact address")
+        // Every construction and load path validates through
+        // Address::decode_any. Keeping the invariant private makes this
+        // infallible to callers. Either version (lab #896 G): the send path
+        // checks it for its net.
+        Address::decode_any(&self.address).expect("validated contact address")
     }
 
     pub fn short(&self) -> String {
@@ -127,7 +129,7 @@ impl ContactBook {
 
     pub fn add(dir: &Path, name: &str, address: &str) -> Result<Contact, ContactError> {
         validate_name(name)?;
-        let decoded = Address::decode(address).ok_or(ContactError::InvalidAddress)?;
+        let decoded = Address::decode_any(address).ok_or(ContactError::InvalidAddress)?;
         let mut book = Self::load(dir)?;
         if book.contacts.iter().any(|contact| contact.name == name) {
             return Err(ContactError::DuplicateName(name.to_string()));
@@ -245,7 +247,7 @@ fn parse(path: &Path, text: &str) -> Result<ContactBook, ContactError> {
                     name = Some(decoded);
                 }
                 "address" if address.is_none() => {
-                    let decoded = Address::decode(value)
+                    let decoded = Address::decode_any(value)
                         .ok_or_else(|| bad("address is not a valid full qaddr1… address".into()))?;
                     address = Some(decoded.encode());
                 }

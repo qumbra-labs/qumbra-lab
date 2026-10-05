@@ -266,7 +266,9 @@ fn parse_fields(s: &str) -> Result<Parsed<'_>, UriError> {
         Some(q) => (&rest[..q], Some(&rest[q + 1..])),
         None => (rest, None),
     };
-    let address = match Address::decode(addr_part) {
+    // Either address version (lab #896 G): a URI carries the address; the
+    // send path checks the version for its net.
+    let address = match Address::decode_any(addr_part) {
         Some(a) => a,
         None if ShortAddress::decode(addr_part).is_some() => {
             return Err(UriError::ShortAddressUnpayable)

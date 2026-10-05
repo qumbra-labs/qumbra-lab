@@ -1,6 +1,7 @@
 //! **The Annulet devnet harness** (B6's, promoted in C2 — lab #720): a
-//! sequencer and two followers on real TCP loopback, running the real
-//! `L2Verifier`, driven by one thread that runs each node's loop step and
+//! sequencer and two followers on real TCP loopback, running the real L2
+//! verifier the genesis selects (`L2Verifier`, or `L2VerifierV2` on a
+//! Candidate A genesis — lab #896 G), driven by one thread that runs each node's loop step and
 //! seals whenever the producer's pool is non-empty. Test support: the faucet's
 //! journey and the wallet's send test run on the same three nodes.
 #![doc(hidden)]
@@ -15,9 +16,16 @@ use qlab_node::NodeState as _;
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::run::RunningNode;
-use qumbra_node::verifier::L2Verifier;
+use qumbra_node::verifier::{select_verifier, NodeVerifier};
 
-pub type Node = RunningNode<KeccakPow, L2Verifier>;
+pub type Node = RunningNode<KeccakPow, NodeVerifier>;
+
+/// The real L2 verifier for `g`'s authorization axis — what `qumbra-node`
+/// itself selects.
+fn verifier_for(g: &AnnuletGenesisFile) -> NodeVerifier {
+    let axis = g.l2_auth().expect("an Annulet genesis names its axis");
+    select_verifier(false, qlab_devnet::forms::GenesisForm::Annulet, axis).0
+}
 
 fn config(base: &std::path::Path, g: &AnnuletGenesisFile, dial: Option<&str>) -> NodeConfig {
     NodeConfig {
@@ -104,12 +112,12 @@ impl Net {
         let (g2, bases2, views2, stop2) = (g.clone(), bases.clone(), views.clone(), stop.clone());
         let driver = std::thread::spawn(move || {
             let producer: Node =
-                RunningNode::start_annulet(&config(&bases2[0], &g2, None), &g2, KeccakPow, L2Verifier).expect("producer");
+                RunningNode::start_annulet(&config(&bases2[0], &g2, None), &g2, KeccakPow, verifier_for(&g2)).expect("producer");
             assert!(producer.is_sequencer());
             let dial = producer.listen_addr().to_string();
             let mut nodes = vec![producer];
             for base in &bases2[1..] {
-                let f: Node = RunningNode::start_annulet(&config(base, &g2, Some(&dial)), &g2, KeccakPow, L2Verifier)
+                let f: Node = RunningNode::start_annulet(&config(base, &g2, Some(&dial)), &g2, KeccakPow, verifier_for(&g2))
                     .expect("follower");
                 assert!(!f.is_sequencer());
                 nodes.push(f);

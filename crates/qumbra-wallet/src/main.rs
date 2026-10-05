@@ -20,6 +20,15 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
+    // Lab #896 G: `--valid-for N` — the blocks past the verified tip a
+    // Candidate A transaction may land (default 256); a run refuses it by
+    // name above the consensus cap.
+    if let Some(n) = flag(args, "--valid-for") {
+        let n: u64 = n.parse().map_err(|_| "--valid-for must be a whole number of blocks")?;
+        qumbra_wallet::annulet_v2::set_valid_for(n);
+    } else if has_flag(args, "--valid-for") {
+        return Err("--valid-for needs a number of blocks".into());
+    }
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(&args[1..]),
         Some("restore") => restore(&args[1..]),
@@ -35,6 +44,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("names") => names(&args[1..]),
         Some("issuer") => issuer(&args[1..]),
         Some("ivk") => ivk(&args[1..]),
+        Some("migrate") => migrate_cmd(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -414,7 +424,15 @@ fn usage() {
                             --label fold into it; --qr renders it as a terminal QR, --qr-svg\n\
                             writes it as an SVG file. The qs1… fingerprint is always printed\n\
                             beside a URI/QR: a QR that merely scans is NOT a verified address —\n\
-                            confirm the fingerprint with the payee out of band\n  \
+                            confirm the fingerprint with the payee out of band\n\
+                            --candidate-a shows the Candidate A (version 2) address of the\n\
+                            journal's active generation (lab #896)\n  \
+         qumbra-wallet migrate --net annulet --url URL --scan-to H --genesis-hash HEX --dir DIR [--open-next]\n\
+                            Candidate A: set up the auth journal (a restored wallet never resumes a\n\
+                            generation), open a new one with --open-next, sweep older generations\n\
+                            once their wait on this net has passed\n\
+                            Candidate A writes (send, issuer, migrate) take --valid-for N: blocks\n\
+                            past the tip the transaction may land (default 256, at most 1,152)\n  \
          qumbra-wallet contact add NAME QADDR --dir DIR  save a full address under a local name\n  \
          qumbra-wallet contact list --dir DIR            show NAME → qs1… (short)\n  \
          qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
@@ -752,6 +770,23 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
     let qr_svg = flag(args, "--qr-svg");
     let uri_mode =
         has_flag(args, "--uri") || qr || qr_svg.is_some() || amount_qmb.is_some() || label.is_some();
+    // Lab #896 G: a Candidate A net's addresses (version 2) bind the active
+    // generation's auth_root, read from the journal. No journal yet means a
+    // restored or new-to-Candidate-A wallet: `migrate` sets it up first, so a
+    // restored wallet never hands out a generation it may have used.
+    let v2_root = if has_flag(args, "--candidate-a") {
+        let journal = qumbra_wallet::auth_journal::AuthJournal::load(&dir)?.ok_or(
+            "this wallet has no auth journal yet: run `qumbra-wallet migrate --net annulet --scan-url URL \
+             --genesis-hash HEX` once on the Candidate A net (a restored wallet must not resume a generation)",
+        )?;
+        Some(journal.active().auth_root)
+    } else {
+        None
+    };
+    let addr_at = |i: u64| match &v2_root {
+        Some(root) => wallet.address_candidate_a_at_index(i, root),
+        None => wallet.address_at_index(i),
+    };
 
     // A payment request is for exactly one address: --new/--index pick it,
     // otherwise URI mode falls back to the wallet's canonical index 0.
@@ -767,12 +802,12 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let Some(idx) = picked else {
         for idx in &w.allocated {
-            println!("[{idx}] {}", wallet.address_at_index(*idx).encode());
+            println!("[{idx}] {}", addr_at(*idx).encode());
         }
         return Ok(());
     };
 
-    let addr = wallet.address_at_index(idx);
+    let addr = addr_at(idx);
     let known = if w.allocated.contains(&idx) { "" } else { " (NOT in this wallet's allocated set — valid, but scans here won't cover it until allocated)" };
     println!("address [{idx}]{known}:");
     println!("  {}", addr.encode());
@@ -1047,6 +1082,10 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         ),
     };
     let amount = resolve_send_amount(uri_amount, amount_flag)?;
+    // Lab #896 G (QG1): URIs, contacts and the directory carry either
+    // address version; this L1 send pays only version 1. A Candidate A
+    // address here would make a note nobody can spend — refused by name.
+    recipient.require_version(qlab_wallet::address::ADDRESS_VERSION)?;
     // Lab #831 W3 (Q2): only `deposit` burns, and only sealed to this wallet's
     // own key — the burn address of the L2 this chain bridges (as the node
     // names it) reaching `send` (pasted, a contact, a URI, a name) is refused
@@ -1744,7 +1783,8 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
             let wait = std::time::Duration::from_secs(120);
             let report = if verb == "mint" {
                 let to = flag(args, "--to").ok_or("issuer mint requires --to ADDRESS")?;
-                let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
+                // Either version (lab #896 G): the mint checks it against the net.
+                let to = qlab_wallet::address::Address::decode_any(to).ok_or("--to is not a wallet address")?;
                 qumbra_wallet::issuer::issuer_mint(&w, endpoint, asset()?, amount, &to, &keys, scan_to, pin, wait, &mut rng)?
             } else {
                 qumbra_wallet::issuer::redeem(&w, endpoint, asset()?, amount, &keys, scan_to, pin, wait, &mut rng)?
@@ -1788,7 +1828,8 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map_err(|_| "--asset must be a registry index below 65536")?;
     let amount: u64 = flag(args, "--amount").ok_or("send requires --amount")?.parse()?;
     let to = flag(args, "--to").ok_or("send --net annulet requires --to ADDRESS")?;
-    let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
+    // Either version (lab #896 G): `send_annulet` checks it against the net.
+    let to = qlab_wallet::address::Address::decode_any(to).ok_or("--to is not a wallet address")?;
     let pin = Some(required_pin(args, "send --net annulet")?);
     // Lab #722: the asset issuer's published freeze-key list, when it has one.
     let freeze_keys = match flag(args, "--freeze-list") {
@@ -1838,6 +1879,49 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         report.outputs[1].value,
         report.plan.total_fee()
     );
+    Ok(())
+}
+
+/// `migrate` (lab #896 G, design 2b §9): on a Candidate A net, set up the
+/// authorization journal (a restored wallet migrates: it never resumes a
+/// generation), optionally open a new generation (`--open-next`), and sweep
+/// every sweep-only generation whose wait on this net has passed.
+fn migrate_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("migrate requires --url (the node's discovery server)")?;
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("migrate requires --scan-to HEIGHT")?.parse()?;
+    let pin = Some(required_pin(args, "migrate")?);
+    let w = WalletDir::open(&dir)?;
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
+    let r = qumbra_wallet::annulet_v2::migrate(
+        &w,
+        endpoint,
+        scan_to,
+        pin,
+        has_flag(args, "--open-next"),
+        std::time::Duration::from_secs(120),
+        &mut rng,
+    )?;
+    if r.initialized {
+        println!("auth journal created (a restored or new wallet: no generation is resumed)");
+    }
+    println!("active generation: {}", r.active);
+    for (g, txs) in &r.swept {
+        println!("swept generation {g}: {txs} transaction(s) to generation {}", r.active);
+    }
+    for (g, h) in &r.waiting {
+        println!("generation {g} waits on this net until height {h} (earlier authorizations must expire first)");
+    }
+    for g in &r.retired {
+        println!("generation {g} retired (nothing left to spend)");
+    }
+    for g in &r.asset0_left {
+        println!("generation {g}: its asset-0 notes paid this sweep's fees and move on the next `migrate`");
+    }
     Ok(())
 }
 

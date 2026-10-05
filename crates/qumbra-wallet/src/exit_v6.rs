@@ -148,7 +148,7 @@ pub fn claim_credit(wallet: &Wallet, deposit: &SetAside, l2_id: u64, tier: u64) 
     let rkm = wallet.rkm(wallet.diversifier_at_index(0));
     let note = L2Note { value, asset: 0, rkm, rho: claim_cnf(&cm, &deposit.note.rseed), rseed };
     let cm2 = qlab_air::l2::l2_cm(value, 0, &rkm, &note.rho, &note.rseed);
-    Some(OwnedL2Note { note, asset: 0, div_index: 0, height: deposit.height, tx_index: Some(deposit.tx_index), cm: digest_bytes(&cm2) })
+    Some(OwnedL2Note { note, asset: 0, div_index: 0, height: deposit.height, tx_index: Some(deposit.tx_index), generation: None, cm: digest_bytes(&cm2) })
 }
 
 /// The credits of this wallet's pending deposits to `l2_id`, oldest first.

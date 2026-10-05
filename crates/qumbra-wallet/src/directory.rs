@@ -229,7 +229,9 @@ pub fn decode_bucket(bytes: &[u8], p: u8, prefix: u16) -> Result<Vec<Address>, D
     let m = mask(p);
     let mut out = Vec::with_capacity(n);
     for (i, raw) in bytes[BUCKET_HEADER_LEN..].chunks_exact(Address::RAW_LEN).enumerate() {
-        let addr = Address::from_raw_bytes(raw).ok_or_else(|| bad(format!("entry {i} is not an address")))?;
+        // A carrier (lab #896 G): a directory entry may be either address
+        // version; the send path that uses it checks the version for its net.
+        let addr = Address::from_raw_bytes_any(raw).ok_or_else(|| bad(format!("entry {i} is not an address")))?;
         if prefix16(&addr.short()) & m != prefix & m {
             return Err(bad(format!("entry {i} is outside the requested prefix")));
         }
@@ -348,6 +350,30 @@ mod tests {
             _ => panic!("expected Found"),
         }
         assert_eq!(seen, vec![format!("/v1/{G}/stats"), format!("/v1/{G}/bucket/0/0000")]);
+    }
+
+    /// Lab #896 G (QG1): a Candidate A (version 2) address built from a
+    /// production vector rides the bucket and resolves byte for byte; its
+    /// `qs1…` differs from the version-1 vector's, because the short form
+    /// hashes the version byte.
+    #[test]
+    fn a_version_2_entry_resolves_byte_for_byte() {
+        let v = vectors();
+        let base = &v[1].0;
+        let v2 = Address::new_candidate_a(base.diversifier, base.rkm_lanes(), &base.encapsulation_key().unwrap());
+        assert_ne!(v2.short().encode(), v[1].1, "a different short form from the v1 vector");
+        let target = v2.short();
+        let r = resolve(G, &target, 16, |path| {
+            Ok(if path.ends_with("/stats") { stats_json(4, 0) } else { bucket(0, &[&v[0].0, &v2, &v[1].0, &v[2].0]) })
+        })
+        .unwrap();
+        match r {
+            Resolution::Found(a) => {
+                assert_eq!(a.to_raw_bytes(), v2.to_raw_bytes());
+                assert_eq!(a.version, qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A);
+            }
+            _ => panic!("expected Found"),
+        }
     }
 
     #[test]
