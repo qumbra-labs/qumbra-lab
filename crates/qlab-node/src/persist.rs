@@ -297,6 +297,11 @@ impl From<&LogRecord> for WireRecord {
 /// logged), and on an L1 block carrying an L2 surface: the L1 layouts have
 /// no place for a surface (`StoredTx.l2` is `serde(skip)`), so writing one
 /// would drop it silently.
+///
+/// # Errors
+///
+/// An L1 block carrying an auth section (lab #896 E3), for the same reason,
+/// and a bundle that cannot be read back.
 fn to_wire(rec: &LogRecord) -> io::Result<WireRecord> {
     {
         if let LogRecord::Block(b) = rec {
@@ -352,10 +357,14 @@ fn to_wire(rec: &LogRecord) -> io::Result<WireRecord> {
                 b.txs.iter().all(|t| t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT),
                 "an L2 surface has no L1 log record (lab #708)"
             );
-            assert!(
-                b.txs.iter().all(|t| t.auth == qlab_devnet::annulet::L2_AUTH_ABSENT),
-                "an auth section has no L1 log record (lab #896 E2)"
-            );
+            // Lab #896 E3: refused by name rather than asserted — this is
+            // the write path, and the refusal leaves the log untouched.
+            if b.txs.iter().any(|t| t.auth != qlab_devnet::annulet::L2_AUTH_ABSENT) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an L1 block carries an auth section, which no L1 log record holds (lab #896 E2); not written",
+                ));
+            }
         }
         Ok(match rec {
             LogRecord::Finalize(h) => WireRecord::Finalize(*h),
@@ -1963,6 +1972,22 @@ mod tests {
         fs::write(dir.join(BLOCK_LOG), f).unwrap();
         let err = read_records(&dir).expect_err("an auth-free variant 5 is refused");
         assert!(err.to_string().contains("with no auth section"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #896 E3: an L1 block carrying an auth section is refused on the
+    /// write path by name, and nothing reaches the log.
+    #[test]
+    fn an_l1_block_with_an_auth_section_is_refused_on_write_by_name() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i896-e3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut block = a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec());
+        block.txs[0].auth = vec![0x5A; 77];
+        let err = append_record(&dir, &LogRecord::Block(block)).expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("auth section"), "{err}");
+        assert!(!dir.join(BLOCK_LOG).exists(), "nothing was written");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -114,85 +114,23 @@ pub enum L2VerifyError {
     ProofShape { what: &'static str, got: usize, want: usize },
     /// The proof does not verify against the declared surface.
     ProofInvalid,
+    /// Lab #896 E3: an auth section on a transaction judged as v1 — a v1
+    /// Annulet net carries none (its wire decoder already refuses the tail;
+    /// this is the same rule for a transaction that did not come off the wire).
+    AuthOnV1Net,
+    /// Lab #896 E3: a Candidate A net's transaction with no auth section.
+    AuthMissing,
+    /// Lab #896 E3: the auth section does not decode for the surface's shape.
+    AuthMalformed,
 }
 
 impl L2Verifier {
     /// Judge one transaction, naming the refusal.
     pub fn check(&self, entry: &TxEntry) -> Result<(), L2VerifyError> {
-        use qlab_devnet::annulet::{L2ShapeTag, L2Surface};
-        let surface = match L2Surface::decode(&entry.l2) {
-            Ok(Some(s)) => s,
-            Ok(None) => return Err(L2VerifyError::NoSurface),
-            Err(_) => return Err(L2VerifyError::SurfaceMalformed),
-        };
-        let p = &entry.public;
-        // Lab #728 Q2: every Annulet surface declares the 2×2 bucket; the
-        // shape gates the counts.
-        let arity_ok = p.bucket == ArityBucket::TwoByTwo
-            && match surface.shape {
-                L2ShapeTag::S | L2ShapeTag::P => p.nullifiers.len() == 3 && p.commitments.len() == 2,
-                L2ShapeTag::R => p.nullifiers.len() == 1 && p.commitments.len() == 2,
-            };
-        if !arity_ok {
-            return Err(match surface.shape {
-                L2ShapeTag::S | L2ShapeTag::P => L2VerifyError::WrongArity,
-                L2ShapeTag::R => L2VerifyError::RegistryWriteArity,
-            });
+        if entry.auth != qlab_devnet::annulet::L2_AUTH_ABSENT {
+            return Err(L2VerifyError::AuthOnV1Net);
         }
-        let proof = decode_proof_strict(&entry.proof)?;
-        let (anchor, root) = (digest_words(&p.anchor), digest_words(&surface.registry_root));
-        if surface.shape == L2ShapeTag::R {
-            // Shape R (lab #728): one input, two outputs — the fee change and
-            // A3's seed (lab #731) — the write's roots and the written slot
-            // (the new leaf's asset lane). The leaf itself is not a public
-            // value — the node binds it by applying it to its own tree and
-            // requiring `new_root`.
-            let Some(w) = surface.write else { return Err(L2VerifyError::SurfaceMalformed) };
-            check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_R)?;
-            let pvs = qlab_l2::pv_vec_r(
-                &anchor,
-                &digest_words(&p.nullifiers[0]),
-                &digest_words(&p.commitments[0]),
-                p.fee,
-                &root,
-                &digest_words(&w.new_root),
-                w.asset(),
-                &digest_words(&p.commitments[1]),
-            );
-            let verified = qlab_l2::verify_r(&qlab_l2::public_values(&pvs), &proof);
-            return verified.then_some(()).ok_or(L2VerifyError::ProofInvalid);
-        }
-        let (nf1, nf2, cm1, cm2) = (
-            digest_words(&p.nullifiers[0]),
-            digest_words(&p.nullifiers[1]),
-            digest_words(&p.commitments[0]),
-            digest_words(&p.commitments[1]),
-        );
-        // A4: slot 3's nullifier (the fee input's, or a dummy's fresh one).
-        let nf3 = digest_words(&p.nullifiers[2]);
-        let verified = match (surface.shape, surface.vpublic) {
-            (L2ShapeTag::S, None) => {
-                check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_S)?;
-                let pvs = qlab_l2::pv_vec_s(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &nf3);
-                qlab_l2::verify_s(&qlab_l2::public_values(&pvs), &proof)
-            }
-            (L2ShapeTag::P, Some(terms)) => {
-                check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_P)?;
-                // Lab #785 F5-4d: the exit recipient from the surface. The PV
-                // vector is built here from 16-bit chunks (`pv_chunks`), so
-                // every recipient word is < 2^16 by construction — the range
-                // P's non-zero test relies on (ruling (e)).
-                let xrkm = digest_words(&surface.exit_rkm);
-                let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms), &nf3, &xrkm);
-                qlab_l2::verify_p(&qlab_l2::public_values(&pvs), &proof)
-            }
-            // A canonical surface pairs S with no vPublic and P with some; R
-            // returned above.
-            (L2ShapeTag::S, Some(_)) | (L2ShapeTag::P, None) | (L2ShapeTag::R, _) => {
-                return Err(L2VerifyError::SurfaceMalformed)
-            }
-        };
-        verified.then_some(()).ok_or(L2VerifyError::ProofInvalid)
+        check_l2(entry, Version::V1)
     }
 }
 
@@ -200,6 +138,175 @@ impl TxVerifier for L2Verifier {
     fn verify_tx(&self, entry: &TxEntry) -> bool {
         self.check(entry).is_ok()
     }
+}
+
+/// **The Candidate A L2 verifier** (lab #896 E3): [`L2Verifier`]'s rules
+/// under the **v2** shapes — `qlab_l2::v2`'s witness-free AIRs, at the v2
+/// trace heights, with each authorization slot's leaf appended to the v1
+/// public values. The leaves are read from the transaction's auth section
+/// (`qlab-remote-auth` `AnnuletAuthSection`), so the proof is bound to the
+/// leaves the section declares, as it is to the declared surface.
+///
+/// A net runs one version, chosen by its genesis (`L2AuthForm`), so this is a
+/// separate type rather than a mode of [`L2Verifier`] — E1's rule for the v2
+/// entries: a v1 caller cannot reach it by accident. Each refuses the other
+/// version's transactions by name ([`L2VerifyError::AuthOnV1Net`],
+/// [`L2VerifyError::AuthMissing`]), so a wrongly chosen verifier fails
+/// closed. The signatures over the intent are not checked here (seam F).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct L2VerifierV2;
+
+impl L2VerifierV2 {
+    /// Judge one transaction, naming the refusal.
+    pub fn check(&self, entry: &TxEntry) -> Result<(), L2VerifyError> {
+        if entry.auth == qlab_devnet::annulet::L2_AUTH_ABSENT {
+            return Err(L2VerifyError::AuthMissing);
+        }
+        check_l2(entry, Version::V2Auth(&entry.auth))
+    }
+}
+
+impl TxVerifier for L2VerifierV2 {
+    fn verify_tx(&self, entry: &TxEntry) -> bool {
+        self.check(entry).is_ok()
+    }
+}
+
+/// Which shape version [`check_l2`] judges under; v2 carries the auth
+/// section's bytes.
+#[derive(Clone, Copy)]
+enum Version<'a> {
+    V1,
+    V2Auth(&'a [u8]),
+}
+
+/// The auth section's slot leaves as `[u64; 4]` lanes (u64 LE — the AIR's
+/// and `AirMerkle`'s convention), decoded for `shape`'s slot count.
+fn auth_leaves(shape: qlab_devnet::annulet::L2ShapeTag, bytes: &[u8]) -> Result<Vec<[u64; 4]>, L2VerifyError> {
+    use qlab_devnet::annulet::L2ShapeTag;
+    use qlab_remote_auth::annulet::{AnnuletAuthSection, Shape};
+    let shape = match shape {
+        L2ShapeTag::S => Shape::S,
+        L2ShapeTag::P => Shape::P,
+        L2ShapeTag::R => Shape::R,
+    };
+    let section = AnnuletAuthSection::decode(shape, bytes).map_err(|_| L2VerifyError::AuthMalformed)?;
+    Ok(section.slots.iter().map(|slot| digest_words(&slot.descriptor.leaf())).collect())
+}
+
+/// Append each leaf's 16 chunks — the v2 PV tail (`qlab_l2::v2::pv_leaf`).
+fn with_leaves(mut pvs: Vec<u32>, leaves: &[[u64; 4]]) -> Vec<u32> {
+    for leaf in leaves {
+        pvs.extend_from_slice(&qlab_air::narrow::pv_chunks(leaf));
+    }
+    pvs
+}
+
+/// The shared body of [`L2Verifier::check`] and [`L2VerifierV2::check`].
+fn check_l2(entry: &TxEntry, version: Version<'_>) -> Result<(), L2VerifyError> {
+    use qlab_devnet::annulet::{L2ShapeTag, L2Surface};
+    let surface = match L2Surface::decode(&entry.l2) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(L2VerifyError::NoSurface),
+        Err(_) => return Err(L2VerifyError::SurfaceMalformed),
+    };
+    let p = &entry.public;
+    // Lab #728 Q2: every Annulet surface declares the 2×2 bucket; the
+    // shape gates the counts.
+    let arity_ok = p.bucket == ArityBucket::TwoByTwo
+        && match surface.shape {
+            L2ShapeTag::S | L2ShapeTag::P => p.nullifiers.len() == 3 && p.commitments.len() == 2,
+            L2ShapeTag::R => p.nullifiers.len() == 1 && p.commitments.len() == 2,
+        };
+    if !arity_ok {
+        return Err(match surface.shape {
+            L2ShapeTag::S | L2ShapeTag::P => L2VerifyError::WrongArity,
+            L2ShapeTag::R => L2VerifyError::RegistryWriteArity,
+        });
+    }
+    // v2: the auth section's leaves, decoded before the proof (the
+    // cheaper refusal first). The slot count is the shape's, so
+    // `with_leaves` yields exactly v2's PV length.
+    let leaves = match version {
+        Version::V1 => None,
+        Version::V2Auth(bytes) => Some(auth_leaves(surface.shape, bytes)?),
+    };
+    let proof = decode_proof_strict(&entry.proof)?;
+    let (anchor, root) = (digest_words(&p.anchor), digest_words(&surface.registry_root));
+    if surface.shape == L2ShapeTag::R {
+        // Shape R (lab #728): one input, two outputs — the fee change and
+        // A3's seed (lab #731) — the write's roots and the written slot
+        // (the new leaf's asset lane). The leaf itself is not a public
+        // value — the node binds it by applying it to its own tree and
+        // requiring `new_root`.
+        let Some(w) = surface.write else { return Err(L2VerifyError::SurfaceMalformed) };
+        let log_height = match leaves {
+            None => qlab_l2::LOG_HEIGHT_R,
+            Some(_) => qlab_l2::v2::log_height(qlab_l2::Shape::R),
+        };
+        check_proof_shape(&proof, log_height)?;
+        let pvs = qlab_l2::pv_vec_r(
+            &anchor,
+            &digest_words(&p.nullifiers[0]),
+            &digest_words(&p.commitments[0]),
+            p.fee,
+            &root,
+            &digest_words(&w.new_root),
+            w.asset(),
+            &digest_words(&p.commitments[1]),
+        );
+        let verified = match &leaves {
+            None => qlab_l2::verify_r(&qlab_l2::public_values(&pvs), &proof),
+            Some(l) => qlab_l2::v2::verify_r_u32(&with_leaves(pvs, l), &proof),
+        };
+        return verified.then_some(()).ok_or(L2VerifyError::ProofInvalid);
+    }
+    let (nf1, nf2, cm1, cm2) = (
+        digest_words(&p.nullifiers[0]),
+        digest_words(&p.nullifiers[1]),
+        digest_words(&p.commitments[0]),
+        digest_words(&p.commitments[1]),
+    );
+    // A4: slot 3's nullifier (the fee input's, or a dummy's fresh one).
+    let nf3 = digest_words(&p.nullifiers[2]);
+    let verified = match (surface.shape, surface.vpublic) {
+        (L2ShapeTag::S, None) => {
+            let pvs = qlab_l2::pv_vec_s(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &nf3);
+            match &leaves {
+                None => {
+                    check_proof_shape(&proof, qlab_l2::LOG_HEIGHT_S)?;
+                    qlab_l2::verify_s(&qlab_l2::public_values(&pvs), &proof)
+                }
+                Some(l) => {
+                    check_proof_shape(&proof, qlab_l2::v2::log_height(qlab_l2::Shape::S))?;
+                    qlab_l2::v2::verify_s_u32(&with_leaves(pvs, l), &proof)
+                }
+            }
+        }
+        (L2ShapeTag::P, Some(terms)) => {
+            let log_height = match leaves {
+                None => qlab_l2::LOG_HEIGHT_P,
+                Some(_) => qlab_l2::v2::log_height(qlab_l2::Shape::P),
+            };
+            check_proof_shape(&proof, log_height)?;
+            // Lab #785 F5-4d: the exit recipient from the surface. The PV
+            // vector is built here from 16-bit chunks (`pv_chunks`), so
+            // every recipient word is < 2^16 by construction — the range
+            // P's non-zero test relies on (ruling (e)).
+            let xrkm = digest_words(&surface.exit_rkm);
+            let pvs = qlab_l2::pv_vec_p(&anchor, &nf1, &nf2, &cm1, &cm2, p.fee, &root, &vpublic(&terms), &vpublic_assets(&terms), &nf3, &xrkm);
+            match &leaves {
+                None => qlab_l2::verify_p(&qlab_l2::public_values(&pvs), &proof),
+                Some(l) => qlab_l2::v2::verify_p_u32(&with_leaves(pvs, l), &proof),
+            }
+        }
+        // A canonical surface pairs S with no vPublic and P with some; R
+        // returned above.
+        (L2ShapeTag::S, Some(_)) | (L2ShapeTag::P, None) | (L2ShapeTag::R, _) => {
+            return Err(L2VerifyError::SurfaceMalformed)
+        }
+    };
+    verified.then_some(()).ok_or(L2VerifyError::ProofInvalid)
 }
 
 /// A surface's vPublic terms as the P AIR's public values read them.
@@ -252,6 +359,8 @@ pub enum NodeVerifier {
     Consensus(ConsensusVerifier),
     /// The real L2 verifier (the Annulet default, lab #712).
     L2(L2Verifier),
+    /// The Candidate A L2 verifier (an `L2AuthForm::CandidateA` genesis, lab #896 E3).
+    L2V2(L2VerifierV2),
     /// The rehearsal stand-in (accepts everything) — `--rehearsal-verifier`.
     Rehearsal(DevnetRehearsalVerifier),
 }
@@ -261,6 +370,7 @@ impl TxVerifier for NodeVerifier {
         match self {
             NodeVerifier::Consensus(v) => v.verify_tx(entry),
             NodeVerifier::L2(v) => v.verify_tx(entry),
+            NodeVerifier::L2V2(v) => v.verify_tx(entry),
             NodeVerifier::Rehearsal(v) => v.verify_tx(entry),
         }
     }
@@ -273,8 +383,17 @@ impl TxVerifier for NodeVerifier {
 ///
 /// Lab #712: the real verifier is the default on **both** forms — the L2
 /// verifier on an Annulet genesis — and rehearsal is never implied.
-pub fn select_verifier(rehearsal: bool, form: qlab_devnet::forms::GenesisForm) -> (NodeVerifier, String) {
-    use qlab_devnet::forms::GenesisForm;
+///
+/// Lab #896 E3: `l2_auth` is the genesis's L2 authorization axis; on an
+/// Annulet genesis `CandidateA` selects [`L2VerifierV2`]. Every caller states
+/// it, so no Annulet caller gets the v1 verifier on a v2 net by default. An L1
+/// form has no axis (`None`; anything else is refused at genesis load).
+pub fn select_verifier(
+    rehearsal: bool,
+    form: qlab_devnet::forms::GenesisForm,
+    l2_auth: qlab_devnet::forms::L2AuthForm,
+) -> (NodeVerifier, String) {
+    use qlab_devnet::forms::{GenesisForm, L2AuthForm};
     if rehearsal {
         (
             NodeVerifier::Rehearsal(DevnetRehearsalVerifier),
@@ -286,6 +405,14 @@ pub fn select_verifier(rehearsal: bool, form: qlab_devnet::forms::GenesisForm) -
     } else {
         match form {
             GenesisForm::V4 | GenesisForm::V5 => {}
+            GenesisForm::Annulet if l2_auth == L2AuthForm::CandidateA => {
+                return (
+                    NodeVerifier::L2V2(L2VerifierV2),
+                    "verifier: real L2 verifier active, Candidate A v2 shapes (qlab_l2::v2::verify_s / \
+                     verify_p / verify_r under make_config_l2, the L2 lane, b4/q45; leaves from the auth section)."
+                        .to_string(),
+                );
+            }
             GenesisForm::Annulet => {
                 return (
                     NodeVerifier::L2(L2Verifier),
@@ -468,7 +595,7 @@ mod tests {
         let entry = real_tx_entry(inst, proof);
         assert!(ConsensusVerifier.verify_tx(&entry), "real proof must verify via ConsensusVerifier");
         // And via the dispatched default.
-        let (v, log) = select_verifier(false, qlab_devnet::forms::GenesisForm::V4);
+        let (v, log) = select_verifier(false, qlab_devnet::forms::GenesisForm::V4, qlab_devnet::forms::L2AuthForm::None);
         assert!(matches!(v, NodeVerifier::Consensus(_)));
         assert!(log.contains("real M3 consensus verifier"));
         assert!(v.verify_tx(&entry));
@@ -513,13 +640,13 @@ mod tests {
     #[test]
     fn rehearsal_flag_is_opt_in_and_logs_loudly() {
         // Default = real verifier; log states so and carries NO rehearsal warning.
-        let (def, deflog) = select_verifier(false, qlab_devnet::forms::GenesisForm::V4);
+        let (def, deflog) = select_verifier(false, qlab_devnet::forms::GenesisForm::V4, qlab_devnet::forms::L2AuthForm::None);
         assert!(matches!(def, NodeVerifier::Consensus(_)));
         assert!(deflog.contains("real M3 consensus verifier"));
         assert!(!deflog.to_uppercase().contains("REHEARSAL"));
 
         // Opt-in = rehearsal; log is a loud, unmissable warning.
-        let (reh, rehlog) = select_verifier(true, qlab_devnet::forms::GenesisForm::V4);
+        let (reh, rehlog) = select_verifier(true, qlab_devnet::forms::GenesisForm::V4, qlab_devnet::forms::L2AuthForm::None);
         assert!(matches!(reh, NodeVerifier::Rehearsal(_)));
         assert!(rehlog.contains("REHEARSAL VERIFIER ACTIVE"));
         assert!(rehlog.contains("NOT cryptographically verified"));
@@ -616,13 +743,13 @@ mod tests {
                 crate::discovery_server::MAX_TX_WIRE_BYTES_ANNULET
             );
         }
-        let (v, log) = select_verifier(false, qlab_devnet::forms::GenesisForm::Annulet);
+        let (v, log) = select_verifier(false, qlab_devnet::forms::GenesisForm::Annulet, qlab_devnet::forms::L2AuthForm::None);
         assert!(matches!(v, NodeVerifier::L2(_)));
         assert!(log.contains("real L2 verifier"), "{log}");
         assert!(!log.to_uppercase().contains("REHEARSAL"));
         assert!(v.verify_tx(&s_entry()));
         // Rehearsal stays a loud opt-in on the Annulet form too.
-        let (r, rlog) = select_verifier(true, qlab_devnet::forms::GenesisForm::Annulet);
+        let (r, rlog) = select_verifier(true, qlab_devnet::forms::GenesisForm::Annulet, qlab_devnet::forms::L2AuthForm::None);
         assert!(matches!(r, NodeVerifier::Rehearsal(_)));
         assert!(rlog.contains("REHEARSAL VERIFIER ACTIVE"));
     }
@@ -751,5 +878,177 @@ mod tests {
             Some(pin) => assert_eq!(hex, pin, "the L1 constraints digest moved — a revision event"),
             None => panic!("L1_CONSTRAINTS_DIGEST is PENDING — computed {hex} ({n} constraints)"),
         }
+    }
+
+    // ------------------------------------------------ lab #896 E3: Candidate A (v2)
+
+    /// One real v2 shape-S proof (2^20) over the fabricated v2 instance —
+    /// shared by every v2 test here (one prove per lane run).
+    fn s_v2_proof() -> &'static (qlab_air::l2::L2BucketInstanceV2, Proof<Config>) {
+        static P: std::sync::OnceLock<(qlab_air::l2::L2BucketInstanceV2, Proof<Config>)> = std::sync::OnceLock::new();
+        P.get_or_init(|| {
+            let inst = qlab_air::l2::fabricated_bucket_l2_v2();
+            let (_pvs, proof) = qlab_l2::v2::prove_s(&inst.air, &inst.pvs);
+            (inst, proof)
+        })
+    }
+
+    /// An auth section carrying `leaves` (slot order). Keys and signatures are
+    /// zero-filled at their widths: E3 binds the leaves to the proof, and the
+    /// signatures over the intent are seam F's.
+    fn auth_section(leaves: &[[u64; 4]]) -> Vec<u8> {
+        use qlab_remote_auth::annulet::{AnnuletAuthSection, AuthSlot};
+        use qlab_remote_auth::{intent::AuthDescriptor, mldsa};
+        AnnuletAuthSection {
+            valid_until_height: 0,
+            slots: leaves
+                .iter()
+                .enumerate()
+                .map(|(i, l)| AuthSlot {
+                    descriptor: AuthDescriptor::MlDsa44 { leaf_index: i as u32, leaf: h32(l) },
+                    verifying_key: vec![0; mldsa::VERIFYING_KEY_BYTES],
+                    signature: vec![0; mldsa::SIGNATURE_BYTES],
+                })
+                .collect(),
+        }
+        .encode()
+        .expect("a well-formed section")
+    }
+
+    fn s_v2_entry() -> TxEntry {
+        let (i, proof) = s_v2_proof();
+        let mut e = l2_entry(&i.anchor, &[i.nf[0], i.nf[1]], &i.nf[2], &i.cm_out, &i.registry_root, 10, qlab_devnet::annulet::L2ShapeTag::S, None, proof);
+        e.auth = auth_section(&i.leaves);
+        e
+    }
+
+    /// A v2 transaction verifies under the v2 verifier with the leaves its
+    /// auth section declares; each declared leaf, tampered, is refused by the
+    /// STARK (the leaves are bound like the surface).
+    #[test]
+    fn the_v2_verifier_accepts_a_real_v2_s_proof_and_binds_every_leaf() {
+        assert_eq!(L2VerifierV2.check(&s_v2_entry()), Ok(()));
+        let (i, _) = s_v2_proof();
+        for k in 0..3 {
+            let mut leaves = i.leaves;
+            leaves[k][0] ^= 1;
+            let mut e = s_v2_entry();
+            e.auth = auth_section(&leaves);
+            assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::ProofInvalid), "leaf {k}");
+        }
+        // Slot order is bound: the first two leaves swapped.
+        let mut e = s_v2_entry();
+        e.auth = auth_section(&[i.leaves[1], i.leaves[0], i.leaves[2]]);
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::ProofInvalid), "slot order");
+        // The v1 surface binding still holds under v2.
+        let mut e = s_v2_entry();
+        e.public.fee += 1;
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::ProofInvalid), "fee");
+        let mut e = s_v2_entry();
+        e.public.nullifiers[2][0] ^= 1;
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::ProofInvalid), "fee-slot nullifier");
+    }
+
+    /// Cross-version refusal, each by name: a net runs one version.
+    #[test]
+    fn each_l2_verifier_refuses_the_other_versions_transactions_by_name() {
+        // v2 on a v1 net: the auth section alone refuses it, before the proof.
+        assert_eq!(L2Verifier.check(&s_v2_entry()), Err(L2VerifyError::AuthOnV1Net));
+        // A v2 proof stripped of its section is not a v1 proof (2^20 ≠ 2^19).
+        let mut e = s_v2_entry();
+        e.auth = qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec();
+        assert_eq!(
+            L2Verifier.check(&e),
+            Err(L2VerifyError::ProofShape {
+                what: "degree_bits",
+                got: qlab_l2::v2::log_height(qlab_l2::Shape::S) + qlab_consensus::IS_ZK,
+                want: qlab_l2::LOG_HEIGHT_S + qlab_consensus::IS_ZK,
+            })
+        );
+        // v1 on a v2 net: no section is refused by name ...
+        assert_eq!(L2VerifierV2.check(&s_entry()), Err(L2VerifyError::AuthMissing));
+        // ... and a v1 proof given a section fails on the v2 structure.
+        let (i, _) = s_v2_proof();
+        let mut e = s_entry();
+        e.auth = auth_section(&i.leaves);
+        assert_eq!(
+            L2VerifierV2.check(&e),
+            Err(L2VerifyError::ProofShape {
+                what: "degree_bits",
+                got: qlab_l2::LOG_HEIGHT_S + qlab_consensus::IS_ZK,
+                want: qlab_l2::v2::log_height(qlab_l2::Shape::S) + qlab_consensus::IS_ZK,
+            })
+        );
+    }
+
+    /// A section that does not decode for the surface's shape is refused
+    /// before the proof is read.
+    #[test]
+    fn the_v2_verifier_refuses_a_malformed_auth_section_by_name() {
+        let (i, _) = s_v2_proof();
+        let mut e = s_v2_entry();
+        e.auth = auth_section(&i.leaves[..1]);
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::AuthMalformed), "R's one slot on an S surface");
+        let mut e = s_v2_entry();
+        e.auth.pop();
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::AuthMalformed), "truncated");
+        let mut e = s_v2_entry();
+        e.auth.push(0);
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::AuthMalformed), "trailing byte");
+        let mut e = s_v2_entry();
+        e.auth[0] ^= 1;
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::AuthMalformed), "magic");
+        // The proof is not read first: garbage proof bytes still name the section.
+        let mut e = s_v2_entry();
+        e.auth.pop();
+        e.proof = vec![0xff; 8];
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::AuthMalformed), "section before proof");
+    }
+
+    /// The node's v2 PV vector is the AIR crate's: v1's PVs then the leaves,
+    /// at `qlab_l2::v2::pv_leaf` and of `pv_len` — host-only, all three shapes.
+    #[test]
+    fn the_v2_pv_vector_is_the_air_crates_layout() {
+        use qlab_l2::{v2, Shape};
+        let w = |k: u64| [k, k + 1, k + 2, k + 3];
+        let leaves = [w(100), w(200), w(300)];
+        let s = with_leaves(qlab_l2::pv_vec_s(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &w(8)), &leaves);
+        assert_eq!(s, qlab_air::l2::pv_vec_l2_v2(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &w(8), &leaves));
+        let r = with_leaves(qlab_l2::pv_vec_r(&w(1), &w(2), &w(3), 4, &w(5), &w(6), 7, &w(8)), &leaves[..1]);
+        assert_eq!(r, qlab_air::l2r::pv_vec_r_v2(&w(1), &w(2), &w(3), 4, &w(5), &w(6), 7, &w(8), &leaves[0]));
+        // A redeem row, so the P accept path's vPublic mapping is in the comparison.
+        let t = [
+            qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 0x0001_0002_0003_0004, asset: 9 },
+            qlab_devnet::annulet::VPublicTerm::NONE,
+        ];
+        let p = with_leaves(
+            qlab_l2::pv_vec_p(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &vpublic(&t), &vpublic_assets(&t), &w(8), &w(9)),
+            &leaves,
+        );
+        assert_eq!(
+            p,
+            qlab_air::l2p::pv_vec_l2p_v2(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &vpublic(&t), &vpublic_assets(&t), &w(8), &w(9), &leaves)
+        );
+        for (shape, pvs) in [(Shape::S, &s), (Shape::P, &p), (Shape::R, &r)] {
+            assert_eq!(pvs.len(), v2::pv_len(shape), "{shape:?}");
+            for (k, leaf) in leaves.iter().enumerate().take(v2::auth_slots(shape)) {
+                let at = v2::pv_leaf(shape, k);
+                assert_eq!(&pvs[at..at + 16], &qlab_air::narrow::pv_chunks(leaf), "{shape:?} leaf {k}");
+            }
+        }
+    }
+
+    /// The genesis axis selects the verifier: Candidate A → v2, `None` → v1.
+    #[test]
+    fn select_verifier_follows_the_l2_authorization_axis() {
+        use qlab_devnet::forms::{GenesisForm, L2AuthForm};
+        let (v, log) = select_verifier(false, GenesisForm::Annulet, L2AuthForm::CandidateA);
+        assert!(matches!(v, NodeVerifier::L2V2(_)));
+        assert!(log.contains("Candidate A"), "{log}");
+        let (v, _) = select_verifier(false, GenesisForm::Annulet, L2AuthForm::None);
+        assert!(matches!(v, NodeVerifier::L2(_)));
+        // Rehearsal stays an explicit opt-in on either axis.
+        let (v, _) = select_verifier(true, GenesisForm::Annulet, L2AuthForm::CandidateA);
+        assert!(matches!(v, NodeVerifier::Rehearsal(_)));
     }
 }
