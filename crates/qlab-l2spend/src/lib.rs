@@ -36,6 +36,9 @@ use qlab_note::l2note::{GenesisPlaintext, L2Note, L2_PAYLOAD_LEN};
 use qlab_note::wire::RecipientBundle;
 use rand::Rng;
 
+/// Lab #896 seam E4: the v2 (Candidate A) builders and the Annulet intent.
+pub mod v2;
+
 /// Why a spend could not be assembled or was not admitted — by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendError {

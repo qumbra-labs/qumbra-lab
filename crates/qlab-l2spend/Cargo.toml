@@ -20,5 +20,8 @@ qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
 qlab-p2p = { path = "../qlab-p2p", default-features = false }
 qlab-node = { path = "../qlab-node", default-features = false }
+# Lab #896 seam E4: the v2 builders build the Annulet intent and the
+# single-party signer uses the authorization keys (Candidate A).
+qlab-remote-auth = { path = "../qlab-remote-auth" }
 bincode = "1"
 rand = "0.10"
