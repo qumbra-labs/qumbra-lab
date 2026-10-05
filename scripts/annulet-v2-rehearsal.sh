@@ -277,6 +277,12 @@ balance0 A2; a2_after=$BAL
 sleep 30
 [ "$a2_after" -gt 0 ] || fail 4 "A2 holds nothing after the sweep (it held $a2_before)"
 [ "$a2_after" -le "$a2_before" ] || fail 4 "the sweep grew A2's balance ($a2_before → $a2_after)"
+# The sweeps consumed leaves of 0 and 1 above the positions A2 restored at.
+for g in 0 1; do
+  was=$(sed -n '2,$p' "$RUN/A-auth.v1.at-restore" | awk -v g=$g '$1 == g {print $2}')
+  now=$(positions A2 | awk -v g=$g '$1 == g {print $2}')
+  [ -n "$now" ] && [ "$now" -ge "$was" ] || fail 4 "generation $g: A2 is at $now after the sweep, below the restored $was"
+done
 "$WALLET" backup --dir "$RUN/wallets/A2" --reveal 2>/dev/null \
   | "$WALLET" restore --dir "$RUN/wallets/A3" >"$RUN/wallets/A3.restore.out" 2>/dev/null || die "restore A3"
 wcmd A3 migrate "${ANN[@]}" --scan-to "$FAR" || fail 4 "A3 migrate: $(tail -2 "$LAST_ERR")"
