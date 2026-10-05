@@ -54,6 +54,17 @@ pub fn valid_for() -> u64 {
     VALID_FOR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A validity in `1..=MAX_AUTH_VALIDITY_BLOCKS`, or refused by name — every
+/// run (an ordinary send, an issuer write, a sweep) checks it.
+pub fn check_validity(validity: u64) -> Result<(), SendRefusal> {
+    if validity == 0 || validity > MAX_AUTH_VALIDITY_BLOCKS {
+        return Err(SendRefusal::Auth(format!(
+            "a validity of {validity} blocks is outside 1..={MAX_AUTH_VALIDITY_BLOCKS} (the consensus cap)"
+        )));
+    }
+    Ok(())
+}
+
 /// The leaves an ordinary send must leave unconsumed in its generation:
 /// one per spendable note plus two, so the generation can always still be
 /// swept. A hard floor ahead of Phase 4's reserve (`2 × unspent + 16`,
@@ -86,11 +97,7 @@ impl AuthRun {
     /// wallet with no journal is a restored (or new-to-Candidate-A) one: it
     /// is migrated first ([`restore_journal`]).
     pub fn open<E: Endpoint>(w: &WalletDir, session: &Session<E>, validity: u64) -> Result<Self, SendRefusal> {
-        if validity == 0 || validity > MAX_AUTH_VALIDITY_BLOCKS {
-            return Err(SendRefusal::Auth(format!(
-                "a validity of {validity} blocks is outside 1..={MAX_AUTH_VALIDITY_BLOCKS} (the consensus cap)"
-            )));
-        }
+        check_validity(validity)?;
         let lock = AuthLock::acquire(&w.dir)?;
         let wallet = w.wallet();
         let journal = match AuthJournal::load(&w.dir)? {
@@ -113,6 +120,7 @@ impl AuthRun {
         session: &Session<E>,
         validity: u64,
     ) -> Result<Self, SendRefusal> {
+        check_validity(validity)?;
         let keys = LocalAuth::new(&wallet.auth_secret(), g, next).map_err(SendRefusal::Auth)?;
         if keys.auth_root() != journal.get(g)?.auth_root {
             return Err(SendRefusal::Auth(format!(
@@ -127,7 +135,7 @@ impl AuthRun {
             keys,
             genesis_hash: session.genesis_hash,
             genesis_format: session.l2_auth.annulet_genesis_format_version(),
-            valid_until: session.tip + validity,
+            valid_until: session.tip.saturating_add(validity),
         })
     }
 
@@ -392,7 +400,7 @@ pub fn restore_journal(
             return Err(JournalError::ProbeExhausted { probed }.into());
         }
         Some(g_star) => {
-            let gate = SweepGate { genesis: *genesis, not_before_height: gate_tip + MAX_AUTH_VALIDITY_BLOCKS };
+            let gate = SweepGate { genesis: *genesis, not_before_height: gate_tip.saturating_add(MAX_AUTH_VALIDITY_BLOCKS) };
             let mut gens = Vec::new();
             for g in 0..=g_star {
                 let notes: Vec<&OwnedL2Note> = owned.iter().filter(|n| n.generation == Some(g)).collect();
@@ -564,29 +572,44 @@ pub fn verified_body<E: Endpoint>(session: &Session<E>, height: u64) -> Result<q
         .endpoint
         .get(&format!("/v1/block/{height}/body"))
         .map_err(|why| SendRefusal::Auth(format!("block {height}'s body is unavailable: {why}")))?;
-    let ann = qlab_p2p::served::decode_body_answer(session.chain.genesis.wire(), height, &bytes)
+    bind_body(&header, session.chain.genesis.l2_auth, height, &bytes)
+}
+
+/// [`verified_body`]'s binding of served `bytes` to the verified `header`:
+/// the chain's frame, the header itself, the counts (before the commitment's
+/// byte asserts), then the recomputed `tx_body_commitment`.
+pub fn bind_body(
+    header: &qlab_devnet::header::BlockHeader,
+    l2_auth: qlab_devnet::forms::L2AuthForm,
+    height: u64,
+    bytes: &[u8],
+) -> Result<qlab_devnet::body::BlockBody, SendRefusal> {
+    let wire = qlab_p2p::compact::WireForm {
+        form: qlab_devnet::forms::GenesisForm::Annulet,
+        sections: qlab_devnet::forms::BodySections::None,
+        l2_auth,
+    };
+    let ann = qlab_p2p::served::decode_body_answer(wire, height, bytes)
         .map_err(|e| SendRefusal::Auth(format!("block {height}'s body does not decode: {e}")))?;
-    if ann.header != header {
+    if ann.header != *header {
         return Err(SendRefusal::Auth(format!("block {height}'s served header is not the verified one")));
     }
     let body = qlab_p2p::served::body_of(&ann);
     crate::annulet_verify::check_body_counts(height, &body).map_err(SendRefusal::Verify)?;
-    if qlab_devnet::annulet::body_commitment_annulet_for(&body, session.chain.genesis.l2_auth) != header.tx_body_commitment {
+    if qlab_devnet::annulet::body_commitment_annulet_for(&body, l2_auth) != header.tx_body_commitment {
         return Err(SendRefusal::Auth(format!("block {height}'s body is not the one its verified header commits to")));
     }
     Ok(body)
 }
 
-/// Every slot `(leaf_index, leaf)` of a transaction's auth section, or none
-/// when it carries no readable one.
-fn slots_of(tx: &qlab_devnet::body::TxEntry) -> Vec<(u32, [u8; 32])> {
+/// Every slot `(leaf_index, leaf)` of a transaction's auth section, or
+/// `None` when it carries no readable one.
+fn slots_of(tx: &qlab_devnet::body::TxEntry) -> Option<Vec<(u32, [u8; 32])>> {
     use qlab_devnet::annulet::L2Surface;
     use qlab_remote_auth::annulet::AnnuletAuthSection;
-    let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { return Vec::new() };
-    match AnnuletAuthSection::decode(qlab_devnet::annulet::auth_shape(surface.shape), &tx.auth) {
-        Ok(section) => section.slots.iter().map(|s| (s.descriptor.leaf_index(), s.descriptor.leaf())).collect(),
-        Err(_) => Vec::new(),
-    }
+    let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { return None };
+    let section = AnnuletAuthSection::decode(qlab_devnet::annulet::auth_shape(surface.shape), &tx.auth).ok()?;
+    Some(section.slots.iter().map(|s| (s.descriptor.leaf_index(), s.descriptor.leaf())).collect())
 }
 
 /// The `(leaf_index, leaf)` of every slot of every landed transaction that
@@ -606,7 +629,12 @@ pub fn landed_slots<E: Endpoint>(
     for (h, nfs) in heights {
         for tx in verified_body(session, h)?.txs {
             if tx.public.nullifiers.iter().any(|nf| nfs.contains(nf)) {
-                out.extend(slots_of(&tx));
+                // A spend of ours with no readable section would silently
+                // lower the sweep floor: refused by name, never skipped.
+                let slots = slots_of(&tx).ok_or_else(|| {
+                    SendRefusal::Auth(format!("a landed spend of this wallet at height {h} has no readable auth section"))
+                })?;
+                out.extend(slots);
             }
         }
     }
@@ -625,7 +653,9 @@ pub fn landed_generations<E: Endpoint>(session: &Session<E>, wallet: &Wallet) ->
     let mut used = std::collections::BTreeSet::new();
     for h in 1..=session.chain.tip() {
         for tx in verified_body(session, h)?.txs {
-            for (index, leaf) in slots_of(&tx) {
+            // Not ours to judge here: a transaction with no readable section
+            // has no leaf of any generation of this wallet.
+            for (index, leaf) in slots_of(&tx).unwrap_or_default() {
                 if (index as usize) >= (1usize << D_AUTH) {
                     continue;
                 }
@@ -693,7 +723,10 @@ pub fn migrate<E: Endpoint>(
     };
     if open_next {
         let next_g = journal.generations().iter().map(|r| r.g).max().expect("non-empty") + 1;
-        let gate = SweepGate { genesis: session.genesis_hash, not_before_height: session.gate_tip + MAX_AUTH_VALIDITY_BLOCKS };
+        let gate = SweepGate {
+            genesis: session.genesis_hash,
+            not_before_height: session.gate_tip.saturating_add(MAX_AUTH_VALIDITY_BLOCKS),
+        };
         journal.open_next(&lock, &w.dir, generation_root(&wallet, next_g), gate)?;
     }
     let active_root = journal.active().auth_root;
@@ -732,7 +765,7 @@ pub fn migrate<E: Endpoint>(
                 continue;
             }
             Err(JournalError::SweepNoGate { .. }) => {
-                let h = session.gate_tip + MAX_AUTH_VALIDITY_BLOCKS;
+                let h = session.gate_tip.saturating_add(MAX_AUTH_VALIDITY_BLOCKS);
                 j.add_gate(&lock, &w.dir, g, SweepGate { genesis: session.genesis_hash, not_before_height: h })?;
                 report.waiting.push((g, h));
                 continue;
@@ -759,7 +792,9 @@ pub fn migrate<E: Endpoint>(
             txs += plan.steps.len();
             run_plan_v2(w, &mut run, &session, &plan, &to_active, &to_active, &[], split_wait, rng)?;
         }
-        // Asset 0, note by note, each paying its own S fee. A note the fee
+        // Asset 0, note by note, each paying its own S fee. No up-front budget
+        // check here: each note takes one leaf, and a generation that runs out
+        // fails by name (`Exhausted`) at that note, nothing half-signed. A note the fee
         // would consume whole is left (dust) and reported by the next scan.
         // Note: the planner above may have spent some asset-0 notes as fees;
         // the session's index predates that, so a fresh scan is the next
@@ -995,6 +1030,49 @@ mod tests {
         v1.generation = None;
         assert!(one_generation(&[&v1], 0).is_err(), "a v1 note under v2 keys");
         let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// The body binding refuses, by name and without proving anything: a
+    /// served body whose auth byte was changed (its commitment no longer the
+    /// verified header's), and a transaction listing 256 nullifiers (the count
+    /// refusal, before the commitment's byte assert could run).
+    #[test]
+    fn a_served_body_is_bound_to_its_verified_header() {
+        use qlab_devnet::annulet::{body_commitment_annulet_for, AnnuletHeaderFields, SequencerKey};
+        use qlab_devnet::body::BlockBody;
+        use qlab_devnet::forms::L2AuthForm;
+        use qlab_devnet::header::BlockHeader;
+        use qlab_p2p::codec::WireHeader;
+        use qlab_p2p::compact::WireForm;
+        let axis = L2AuthForm::CandidateA;
+        let ext = AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [7; 32] };
+        let key = SequencerKey::from_seed([0x5E; 32]);
+        let genesis = BlockHeader::genesis_annulet(ext, [1; 32], 0);
+        let mut tx = qlab_p2p::served::fixture::tx();
+        tx.auth = vec![0xA7; 40];
+        let body = BlockBody { txs: vec![tx.clone()], ..BlockBody::default() };
+        let header = BlockHeader::child_of_annulet(&genesis, 10, ext, body_commitment_annulet_for(&body, axis));
+        let answer = |body: BlockBody| {
+            let ann = qlab_p2p::node::whole_block_announce(WireHeader::Sealed(key.seal(header)), body);
+            qlab_p2p::served::encode_body_answer(WireForm::ANNULET_AUTH, 1, &ann).expect("encodes")
+        };
+        let bound = bind_body(&header, axis, 1, &answer(body.clone())).expect("the honest body binds");
+        assert_eq!(body_commitment_annulet_for(&bound, axis), header.tx_body_commitment);
+        assert_eq!(bound.txs[0].auth, tx.auth, "the auth section rides the served body");
+
+        let mut tampered = tx.clone();
+        tampered.auth[3] ^= 1;
+        let refused = bind_body(&header, axis, 1, &answer(BlockBody { txs: vec![tampered], ..BlockBody::default() }));
+        assert!(matches!(&refused, Err(SendRefusal::Auth(why)) if why.contains("commits to")), "{:?}", refused.err());
+
+        let mut wide = tx.clone();
+        wide.public.nullifiers = (0..256u32).map(|i| [i as u8; 32]).collect();
+        let refused = bind_body(&header, axis, 1, &answer(BlockBody { txs: vec![wide], ..BlockBody::default() }));
+        assert!(
+            matches!(&refused, Err(SendRefusal::Verify(crate::annulet_verify::VerifyRefusal::BodyMalformed { why, .. })) if why.contains("255")),
+            "{:?}",
+            refused.err()
+        );
     }
 
     /// A Candidate A address is version 2 and binds the generation's root.

@@ -26,6 +26,8 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
     if let Some(n) = flag(args, "--valid-for") {
         let n: u64 = n.parse().map_err(|_| "--valid-for must be a whole number of blocks")?;
         qumbra_wallet::annulet_v2::set_valid_for(n);
+    } else if has_flag(args, "--valid-for") {
+        return Err("--valid-for needs a number of blocks".into());
     }
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(&args[1..]),
