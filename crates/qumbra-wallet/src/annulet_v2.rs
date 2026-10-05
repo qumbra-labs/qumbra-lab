@@ -1034,8 +1034,11 @@ mod tests {
 
     /// The body binding refuses, by name and without proving anything: a
     /// served body whose auth byte was changed (its commitment no longer the
-    /// verified header's), and a transaction listing 256 nullifiers (the count
-    /// refusal, before the commitment's byte assert could run).
+    /// verified header's), and a transaction listing 256 nullifiers — refused
+    /// by the served frame's decoder (lab #911's per-transaction cap) before a
+    /// body is built. `check_body_counts` stays locked on an in-memory body
+    /// (one that never crossed the wire), before the commitment's byte assert
+    /// could run.
     #[test]
     fn a_served_body_is_bound_to_its_verified_header() {
         use qlab_devnet::annulet::{body_commitment_annulet_for, AnnuletHeaderFields, SequencerKey};
@@ -1067,11 +1070,19 @@ mod tests {
 
         let mut wide = tx.clone();
         wide.public.nullifiers = (0..256u32).map(|i| [i as u8; 32]).collect();
-        let refused = bind_body(&header, axis, 1, &answer(BlockBody { txs: vec![wide], ..BlockBody::default() }));
+        let wide_body = BlockBody { txs: vec![wide], ..BlockBody::default() };
+        let refused = bind_body(&header, axis, 1, &answer(wide_body.clone()));
         assert!(
-            matches!(&refused, Err(SendRefusal::Verify(crate::annulet_verify::VerifyRefusal::BodyMalformed { why, .. })) if why.contains("255")),
+            matches!(&refused, Err(SendRefusal::Auth(why)) if why.contains("TooManyEntries")),
             "{:?}",
             refused.err()
+        );
+        assert!(
+            matches!(
+                crate::annulet_verify::check_body_counts(1, &wide_body),
+                Err(crate::annulet_verify::VerifyRefusal::BodyMalformed { why, .. }) if why.contains("255")
+            ),
+            "the in-memory count check still refuses 256"
         );
     }
 
