@@ -1623,6 +1623,7 @@ dependencies = [
  "qlab-air",
  "qlab-note",
  "qlab-pow",
+ "qlab-remote-auth",
  "serde",
  "tiny-keccak",
 ]

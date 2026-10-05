@@ -650,10 +650,102 @@ pub fn with_surface(mut tx: TxEntry, surface: &L2Surface) -> TxEntry {
     tx
 }
 
+// ------------------------------------------- the Candidate A intent (lab #896 E4)
+
+/// The `qlab-remote-auth` shape of an L2 shape tag. A total match rather than
+/// `Shape::from_tag(tag.byte())`: no decoded value can reach a panic here, and
+/// `intent_shape_tags_agree_with_seam_a` locks the two tag spaces together.
+pub fn auth_shape(tag: L2ShapeTag) -> qlab_remote_auth::annulet::Shape {
+    use qlab_remote_auth::annulet::Shape;
+    match tag {
+        L2ShapeTag::S => Shape::S,
+        L2ShapeTag::P => Shape::P,
+        L2ShapeTag::R => Shape::R,
+    }
+}
+
+/// Why [`intent_for`] could not rebuild an intent from a transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentError {
+    /// The transaction carries no L2 surface (`[0x00]`): not an Annulet spend.
+    NoSurface,
+    /// The surface does not decode canonically.
+    Surface(L2SurfaceError),
+    /// The discovery group does not decode at the Annulet width.
+    Discovery(qlab_note::compact::CodecError),
+    /// An Annulet transaction commits exactly two outputs.
+    Commitments { got: usize },
+    /// The rebuilt intent's slot counts do not fit its shape.
+    Auth(qlab_remote_auth::annulet::AuthError),
+}
+
+/// **The Annulet intent of `tx`** (design 2b §4, §6), rebuilt from the
+/// transaction's decoded values, never from its bytes as submitted:
+/// - `surface_hash` = Keccak-256 of `L2Surface::encode()` of the decoded
+///   surface (a non-canonical surface does not decode);
+/// - `discovery_hash` = Keccak-256 of the discovery group decoded at the
+///   Annulet payload width and re-encoded;
+/// - `shape` and `registry_root` from the decoded surface; anchor,
+///   nullifiers (slot order), commitments, bucket (its wire discriminant)
+///   and fee from `tx.public`;
+/// - `genesis_format` / `genesis_hash`, `valid_until_height` and the slot
+///   descriptors from the caller: the net's genesis, and the section's
+///   header and descriptors (the node) or the builder's (the device).
+///
+/// `tx.auth` and `tx.proof` are not read: the device signs before the
+/// section exists, and the proof is bound through the PVs (the descriptors'
+/// leaves, the fields above).
+pub fn intent_for(
+    tx: &TxEntry,
+    genesis_format: u32,
+    genesis_hash: &Hash32,
+    valid_until_height: u64,
+    auth: &[qlab_remote_auth::intent::AuthDescriptor],
+) -> Result<qlab_remote_auth::annulet::AnnuletIntent, IntentError> {
+    use qlab_note::compact::{decode_committed_discovery_with_width, encode_committed_discovery_with_width};
+    use qlab_note::l2note::L2_PAYLOAD_LEN;
+    let surface = L2Surface::decode(&tx.l2).map_err(IntentError::Surface)?.ok_or(IntentError::NoSurface)?;
+    let shape = auth_shape(surface.shape);
+    let (recipients, payloads) =
+        decode_committed_discovery_with_width(&tx.discovery, L2_PAYLOAD_LEN).map_err(IntentError::Discovery)?;
+    let discovery = encode_committed_discovery_with_width(&recipients, &payloads, L2_PAYLOAD_LEN);
+    let commitments: [Hash32; 2] = tx.public.commitments.as_slice().try_into().map_err(|_| IntentError::Commitments {
+        got: tx.public.commitments.len(),
+    })?;
+    let intent = qlab_remote_auth::annulet::AnnuletIntent {
+        genesis_format,
+        genesis_hash: *genesis_hash,
+        shape,
+        anchor: tx.public.anchor,
+        nullifiers: tx.public.nullifiers.clone(),
+        commitments,
+        bucket: tx.public.bucket.wire_discriminant(),
+        valid_until_height,
+        fee: tx.public.fee,
+        registry_root: surface.registry_root,
+        surface_hash: qlab_remote_auth::keccak256(&[&surface.encode()]),
+        discovery_hash: qlab_remote_auth::keccak256(&[&discovery]),
+        auth: auth.to_vec(),
+    };
+    intent.validate_shape().map_err(IntentError::Auth)?;
+    Ok(intent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::body::TxPublic;
+
+    /// Lab #896 E4: the L2 shape tags and seam A's agree byte for byte, so
+    /// [`auth_shape`]'s match and `Shape::from_tag` cannot drift.
+    #[test]
+    fn intent_shape_tags_agree_with_seam_a() {
+        use qlab_remote_auth::annulet::Shape;
+        for tag in [L2ShapeTag::S, L2ShapeTag::P, L2ShapeTag::R] {
+            assert_eq!(Shape::from_tag(tag.byte()), Some(auth_shape(tag)), "{tag:?}");
+            assert_eq!(auth_shape(tag).tag(), tag.byte(), "{tag:?}");
+        }
+    }
 
     struct OkProof;
     impl TxVerifier for OkProof {

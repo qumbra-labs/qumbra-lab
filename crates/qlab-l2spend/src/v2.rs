@@ -21,22 +21,18 @@ use qlab_air::l2p::{L2PolicyInput, VPublic};
 use qlab_air::narrow::{off_tree_witness, pv_chunks, MerkleWitness};
 use qlab_cbserver::registry::{RegistryOpening, RegistrySlotOpening};
 use qlab_cbserver::tree::CommitmentTree;
-use qlab_devnet::annulet::{
-    L2ShapeTag, L2Surface, L2SurfaceError, RegistryWriteSurface, VPublicTerm,
-};
+use qlab_devnet::annulet::{L2ShapeTag, L2Surface, RegistryWriteSurface, VPublicTerm};
 use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::fees::ArityBucket;
-use qlab_note::compact::{
-    decode_committed_discovery_with_width, encode_committed_discovery_with_width, CodecError,
-};
+use qlab_note::compact::encode_committed_discovery_with_width;
 use qlab_note::hash::{digest_bytes, digest_from_bytes};
 use qlab_note::l2note::{L2Note, L2_PAYLOAD_LEN};
 use qlab_remote_auth::annulet::{
-    self, auth_master, draw_dummy, leaf_key, AnnuletAuthSection, AnnuletIntent, AuthError,
-    AuthTree, Cursor,
+    auth_master, draw_dummy, leaf_key, AnnuletAuthSection, AnnuletIntent, AuthError, AuthTree,
+    Cursor,
 };
 use qlab_remote_auth::intent::AuthDescriptor;
-use qlab_remote_auth::{keccak256, mldsa, Hash32};
+use qlab_remote_auth::{mldsa, Hash32};
 
 use crate::{
     discovery_for, entry, l2_outputs, output_notes, policy_input, random_d4, Endpoint, Out,
@@ -167,6 +163,14 @@ fn assemble_s_v2<R: rand::CryptoRng>(
         !(dv && matches!(fee_in, FeeIn::Exact(_))),
         "an exact slot-3 fee note is built with two real inputs"
     );
+    // `build_bucket_l2_v2` asserts this; the device supplies the dummy, so it
+    // is refused here by name rather than reaching that panic.
+    if dv && (inputs[1].value != 0 || inputs[1].asset != 0) {
+        return Err(SpendError::DummyNotEmpty {
+            value: inputs[1].value,
+            asset: inputs[1].asset,
+        });
+    }
     if regs[0].root != regs[1].root {
         return Err(SpendError::RegistryMoved);
     }
@@ -506,79 +510,9 @@ fn assemble_r_v2<R: rand::CryptoRng>(
 
 // ---------------------------------------------------------------- the intent
 
-/// Why [`intent_for`] could not rebuild an intent from a transaction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IntentError {
-    /// The transaction carries no L2 surface (`[0x00]`): not an Annulet spend.
-    NoSurface,
-    /// The surface does not decode canonically.
-    Surface(L2SurfaceError),
-    /// The discovery group does not decode at the Annulet width.
-    Discovery(CodecError),
-    /// An Annulet transaction commits exactly two outputs.
-    Commitments { got: usize },
-    /// The rebuilt intent's slot counts do not fit its shape.
-    Auth(AuthError),
-}
-
-/// **The Annulet intent of `tx`** (design 2b §4, §6), rebuilt from the
-/// transaction's decoded values, never from its bytes as submitted:
-/// - `surface_hash` = Keccak-256 of `L2Surface::encode()` of the decoded
-///   surface (a non-canonical surface does not decode);
-/// - `discovery_hash` = Keccak-256 of the discovery group decoded at the
-///   Annulet payload width and re-encoded;
-/// - `shape` and `registry_root` from the decoded surface; anchor,
-///   nullifiers (slot order), commitments, bucket (its wire discriminant)
-///   and fee from `tx.public`;
-/// - `genesis_format` / `genesis_hash`, `valid_until_height` and the slot
-///   descriptors from the caller: the net's genesis, and the section's
-///   header and descriptors (the node) or the builder's (the device).
-///
-/// `tx.auth` and `tx.proof` are not read: the device signs before the
-/// section exists, and the proof is bound through the PVs (the descriptors'
-/// leaves, the fields above).
-pub fn intent_for(
-    tx: &TxEntry,
-    genesis_format: u32,
-    genesis_hash: &Hash32,
-    valid_until_height: u64,
-    auth: &[AuthDescriptor],
-) -> Result<AnnuletIntent, IntentError> {
-    let surface = L2Surface::decode(&tx.l2)
-        .map_err(IntentError::Surface)?
-        .ok_or(IntentError::NoSurface)?;
-    let shape =
-        annulet::Shape::from_tag(surface.shape.byte()).expect("the L2 shape tags are seam A's");
-    let (recipients, payloads) =
-        decode_committed_discovery_with_width(&tx.discovery, L2_PAYLOAD_LEN)
-            .map_err(IntentError::Discovery)?;
-    let discovery = encode_committed_discovery_with_width(&recipients, &payloads, L2_PAYLOAD_LEN);
-    let commitments: [Hash32; 2] =
-        tx.public
-            .commitments
-            .as_slice()
-            .try_into()
-            .map_err(|_| IntentError::Commitments {
-                got: tx.public.commitments.len(),
-            })?;
-    let intent = AnnuletIntent {
-        genesis_format,
-        genesis_hash: *genesis_hash,
-        shape,
-        anchor: tx.public.anchor,
-        nullifiers: tx.public.nullifiers.clone(),
-        commitments,
-        bucket: tx.public.bucket.wire_discriminant(),
-        valid_until_height,
-        fee: tx.public.fee,
-        registry_root: surface.registry_root,
-        surface_hash: keccak256(&[&surface.encode()]),
-        discovery_hash: keccak256(&[&discovery]),
-        auth: auth.to_vec(),
-    };
-    intent.validate_shape().map_err(IntentError::Auth)?;
-    Ok(intent)
-}
+// `intent_for` lives in `qlab-devnet::annulet` (below the node's consensus
+// points, which cannot depend on this crate); re-exported for the device side.
+pub use qlab_devnet::annulet::{intent_for, IntentError};
 
 /// Put the signed section into `tx.auth` (replacing the absent marker).
 pub fn attach(tx: &mut TxEntry, section: &AnnuletAuthSection) -> Result<(), AuthError> {

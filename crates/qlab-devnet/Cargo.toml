@@ -24,6 +24,11 @@ qlab-air = { path = "../qlab-air" }
 # previous home) depends on this crate. Still no prover and no IO here; serde
 # is reachable ONLY behind the off-by-default `serde` feature below (lab #660).
 qlab-note = { path = "../qlab-note" }
+# Lab #896 E4: `annulet::intent_for` — the Candidate A intent the node rebuilds
+# at its consensus points (mempool, `validate_body_annulet`), below them so
+# neither depends on the builder crate. Its dependencies are ml-dsa (already
+# here, same `=` pin), sha2 and tiny-keccak; no prover, no IO.
+qlab-remote-auth = { path = "../qlab-remote-auth" }
 
 # Lab #660: derives for `name_registry`'s types, so qlab-node's `names.bin`
 # sidecar can keep serializing them after the registry replay moved here.

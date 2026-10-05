@@ -62,6 +62,9 @@ pub enum SpendError {
     /// A4: slot 3's fee note must be asset 0 and worth exactly the fee — it
     /// is spent whole and the 3×2 shapes have no fee change.
     FeeNoteNotExact { value: u64, asset: u64, fee: u64 },
+    /// Lab #896 E4: an input slot declared the dummy (`dv`) carries value or
+    /// an asset; the dummy contributes nothing to the balance and is asset 0.
+    DummyNotEmpty { value: u64, asset: u64 },
 }
 
 impl std::fmt::Display for SpendError {
@@ -93,6 +96,10 @@ impl std::fmt::Display for SpendError {
                 f,
                 "slot 3's fee note is {value} of asset {asset}; it must be exactly {fee} of asset 0 \
                  (spent whole — the 3×2 shapes have no fee change)"
+            ),
+            SpendError::DummyNotEmpty { value, asset } => write!(
+                f,
+                "the dummy input slot holds {value} of asset {asset}; a dummy slot is 0 of asset 0"
             ),
         }
     }

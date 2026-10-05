@@ -7,14 +7,18 @@
 //! the negatives re-use the proof and cost one ML-DSA verify each.
 //!
 //! Lane: three proves (≈ 25 s / 50 s / 60 s on r7g for R / S / P) plus three
-//! `2^D_AUTH` authorization trees: about +3–4 Graviton min.
+//! `2^D_AUTH` authorization trees: about +3–4 Graviton min. The fixtures
+//! assume the serial runner the suite uses (`--test-threads=1`): run in
+//! parallel, the three proves would peak together at about 75 GiB.
 
 use std::sync::OnceLock;
 
 use qlab_air::l2::{RegistryLeaf, MODE_HYBRID};
 use qlab_air::l2p::CanonicalFreezeTree;
 use qlab_cbserver::registry::RegistryTree;
+use qlab_devnet::annulet::L2SurfaceError;
 use qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION;
+use qlab_remote_auth::annulet;
 use rand::SeedableRng;
 
 use super::*;
@@ -467,5 +471,53 @@ fn sign_locally_refuses_a_slot_it_cannot_sign() {
     assert_eq!(
         sign_locally(&s.intent, &owner, &[]).unwrap_err(),
         AuthError::LeafMismatch { slot: 2 }
+    );
+}
+
+/// A dummy slot (`dv`) that carries value is refused by name before anything
+/// is built — `build_bucket_l2_v2` would otherwise assert on device input.
+#[test]
+fn a_non_empty_dummy_slot_is_refused_by_name() {
+    let mut rng = rng(0xd0d);
+    let mut local = LocalAuth::new(&[0x52; 32], 0, 0).expect("depth D_AUTH");
+    let a = real(&mut local, 0x300, 100, 0);
+    let b = real(&mut local, 0x400, 50, 7);
+    let tree = tree_of(&[&a]);
+    let reg =
+        RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)]).unwrap();
+    let regs = [opening(&reg, 0), opening(&reg, 7)];
+    let (dummy, _) = local
+        .dummy(&[0xd6; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
+        .unwrap();
+    let outs = [
+        Out {
+            to: recipient(0x33, &mut rng),
+            value: 90,
+            asset: 0,
+        },
+        Out {
+            to: recipient(0x34, &mut rng),
+            value: 0,
+            asset: 0,
+        },
+    ];
+    let err = assemble_s_v2(
+        &tree,
+        &regs,
+        [&a, &b],
+        true,
+        FeeIn::Dummy(&dummy),
+        &outs,
+        10,
+        &mut rng,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(
+        err,
+        SpendError::DummyNotEmpty {
+            value: 50,
+            asset: 7
+        }
     );
 }
