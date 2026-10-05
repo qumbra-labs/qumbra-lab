@@ -752,6 +752,23 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
     let qr_svg = flag(args, "--qr-svg");
     let uri_mode =
         has_flag(args, "--uri") || qr || qr_svg.is_some() || amount_qmb.is_some() || label.is_some();
+    // Lab #896 G: a Candidate A net's addresses (version 2) bind the active
+    // generation's auth_root, read from the journal. No journal yet means a
+    // restored or new-to-Candidate-A wallet: `migrate` sets it up first, so a
+    // restored wallet never hands out a generation it may have used.
+    let v2_root = if has_flag(args, "--candidate-a") {
+        let journal = qumbra_wallet::auth_journal::AuthJournal::load(&dir)?.ok_or(
+            "this wallet has no auth journal yet: run `qumbra-wallet migrate --net annulet --scan-url URL \
+             --genesis-hash HEX` once on the Candidate A net (a restored wallet must not resume a generation)",
+        )?;
+        Some(journal.active().auth_root)
+    } else {
+        None
+    };
+    let addr_at = |i: u64| match &v2_root {
+        Some(root) => wallet.address_candidate_a_at_index(i, root),
+        None => wallet.address_at_index(i),
+    };
 
     // A payment request is for exactly one address: --new/--index pick it,
     // otherwise URI mode falls back to the wallet's canonical index 0.
@@ -767,12 +784,12 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let Some(idx) = picked else {
         for idx in &w.allocated {
-            println!("[{idx}] {}", wallet.address_at_index(*idx).encode());
+            println!("[{idx}] {}", addr_at(*idx).encode());
         }
         return Ok(());
     };
 
-    let addr = wallet.address_at_index(idx);
+    let addr = addr_at(idx);
     let known = if w.allocated.contains(&idx) { "" } else { " (NOT in this wallet's allocated set — valid, but scans here won't cover it until allocated)" };
     println!("address [{idx}]{known}:");
     println!("  {}", addr.encode());

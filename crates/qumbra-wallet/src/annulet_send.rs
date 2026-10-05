@@ -886,6 +886,16 @@ pub fn exit_annulet<E: Endpoint>(
     rng: &mut StdRng,
 ) -> Result<(ExitPlan, qlab_l2spend::Built, [u8; 32]), SendRefusal> {
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
+    // Lab #896 G: a Candidate A note cannot leave by this path. An exit
+    // file is for the V6 sequencer, whose members stay v1 (seam W ruled
+    // (A)): a v2 note opens only under the v2 shapes, which V6 refuses.
+    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+        return Err(SendRefusal::Auth(
+            "this net's exits need V6 to accept Candidate A members first (lab #896 W, gate (B)): the V6 \
+             bridge takes v1 members only, and a Candidate A note opens only under the v2 shapes"
+                .into(),
+        ));
+    }
     let plan = plan_exit(&session.index, value, to.rkm_lanes(), session.tiers)?;
     if !on_plan(&plan) {
         return Err(SendRefusal::PlanDeclined);
