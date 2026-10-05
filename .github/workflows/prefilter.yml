@@ -72,6 +72,54 @@ jobs:
       - name: cargo check --workspace --all-targets
         run: cargo check --workspace --all-targets --locked
 
+      # The lab's lints on its own sources. Each test named here READS the
+      # workspace's .rs files (or manifests, or workflows) as text and asserts a
+      # coding rule on them; none proves, mines, spawns a binary or opens a
+      # socket, so each runs in well under a second. They are listed here
+      # because they once cost a lane for nothing: PR #909's 100-minute Graviton
+      # run existed to catch `genesis_form_is_matched_exhaustively_everywhere`
+      # (lab #706), a 0.16-second scan. A rule a scanner states should fail
+      # here, in minutes, not on the lane.
+      #
+      # This does not contradict the header's "does NOT run tests", for the
+      # reason the shell-suites job below gives: it is not a filtered subset of
+      # the cargo suite reported as a pass. It is a short list, by name, of
+      # lints that happen to be written as tests, and it claims nothing about
+      # the suite. Like shell-suites, each entry is a deliberate line in a diff
+      # and never a glob: a new scanner is added here by hand.
+      #
+      # COST: not the scans, the test BUILD. `cargo check` above does not
+      # produce test binaries, so each crate here pays one dev-profile test
+      # build (codegen, not metadata). The first measurement of that cost is
+      # this PR's own prefilter run. The cache above holds target/, so later
+      # runs on a warm cache should pay only the incremental part.
+      - name: source-scan tests (the lab's lints on its own sources)
+        run: |
+          # qlab-node, lab #559: outside qlab-node no production code calls a v4-only coinbase derivation (+ its exemption list cannot go stale)
+          cargo test -p qlab-node --test coinbase_derivation_guard --locked -- --test-threads=1
+          # qlab-node, lab #785 F5-5c: blocks.log is opened append-only, named only at its doors, in every production source
+          cargo test -p qlab-node --lib --locked -- --test-threads=1 blocks_log_is_append_only_in_every_production_source
+          # qumbra-node, lab #706: GenesisForm is matched exhaustively everywhere, never == / != / a catch-all arm (+ the scanner's own self-test)
+          cargo test -p qumbra-node --test genesis_form_exhaustive --locked -- --test-threads=1
+          # qumbra-node, lab #238 (and #145): every ctrlc declaration is the workspace entry, which keeps `termination`
+          cargo test -p qumbra-node --test ctrlc_pairing --locked -- --test-threads=1
+          # qumbra-node, lab #785: no source calls the wrapper rule's test knobs; the knobs sit directly under their feature gate
+          cargo test -p qumbra-node --lib --locked -- --test-threads=1 --exact bundle::tests::no_production_source_calls_a_test_knob
+          # qumbra-node, lab #785: the test-knob feature is named in exactly two manifests
+          cargo test -p qumbra-node --lib --locked -- --test-threads=1 --exact bundle::tests::only_two_manifests_name_the_test_knobs
+          # qumbra-node, lab #785: no workflow, script or deploy recipe switches the knobs on or builds with every feature
+          cargo test -p qumbra-node --lib --locked -- --test-threads=1 --exact bundle::tests::no_workflow_or_script_enables_the_test_knobs
+          # qlab-devnet, lab #303: the exact-emission module's code contains no float token (the rule clippy states but the bar never runs)
+          cargo test -p qlab-devnet --lib --locked -- --test-threads=1 --exact emission_exact::tests::the_module_source_contains_no_float
+          # qlab-p2p, lab #86 / #289: node.rs has exactly one dial call site (one path, one cap, one backoff)
+          cargo test -p qlab-p2p --lib --locked -- --test-threads=1 the_node_has_exactly_one_dial_call_site
+          # qlab-bench, lab #847: no f5box source (incl. its qumbra-sequencer half) calls the wrapper rule's test knobs
+          cargo test -p qlab-bench --bin qlab-bench --locked -- --test-threads=1 --exact f4::f5box::tests::f5box_calls_no_rule_knob
+          # qumbra-sequencer, lab #847 S4: no source Debug-formats an opening; every Debug placeholder carries a debug-ok marker
+          cargo test -p qumbra-sequencer --lib --locked -- --test-threads=1 tests::non_test_cuts_at_either_test_module_spelling tests::no_source_debug_formats_an_opening tests::every_debug_format_is_marked
+          # qumbra-sequencer, lab #847 Q4 / #860 R3b: the pass plans no R member and builds no P of its own; the binary names the one real prover
+          cargo test -p qumbra-sequencer --lib --locked -- --test-threads=1 tests::the_pass_plans_no_r_member tests::the_pass_builds_no_p_of_its_own tests::run_names_the_real_prover
+
       # lab #740: the L2-E1 pilot scenario sits behind `--features pilot` so the
       # workspace suite does not compile it (it runs as its own `verify-pilot`
       # job on the Graviton lane). The step above therefore never sees it; this
