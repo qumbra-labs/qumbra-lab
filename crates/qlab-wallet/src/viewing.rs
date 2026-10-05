@@ -113,6 +113,16 @@ impl Fvk {
         Address::new(d, self.rkm(d), &kp.ek)
     }
 
+    /// Lab #896 G: the **Candidate A** address at diversifier `d` under the
+    /// generation whose authorization-tree root is `auth_root`: `rkm =
+    /// H(nk ‖ D_R ‖ d ‖ auth_root)`, version 2. A viewing-key capability, like
+    /// [`Self::address`]: `auth_root` is public to whoever holds it, not a
+    /// spend secret.
+    pub fn address_candidate_a(&self, d: Diversifier, auth_root: &Lanes) -> Address {
+        let kp = diversified_keypair(&self.div_seed, &d);
+        Address::new_candidate_a(d, crate::keys::derive_rkm_v2(&self.nk, &d.lanes(), auth_root), &kp.ek)
+    }
+
     /// Detect + decrypt incoming notes at diversifier `d`.
     pub fn scan(&self, d: &Diversifier, outputs: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote> {
         let kp = diversified_keypair(&self.div_seed, d);
@@ -305,6 +315,25 @@ impl Wallet {
     pub fn address(&self, d: Diversifier) -> Address {
         let kp = self.diversified_keypair(&d);
         Address::new(d, self.rkm(d), &kp.ek)
+    }
+
+    /// Lab #896 G: the Candidate A address at diversifier `d` for the
+    /// generation whose tree root is `auth_root` (see
+    /// [`Fvk::address_candidate_a`]).
+    pub fn address_candidate_a(&self, d: Diversifier, auth_root: &Lanes) -> Address {
+        self.fvk().address_candidate_a(d, auth_root)
+    }
+
+    /// [`Self::address_candidate_a`] at managed `index`.
+    pub fn address_candidate_a_at_index(&self, index: u64, auth_root: &Lanes) -> Address {
+        self.address_candidate_a(self.diversifier_at_index(index), auth_root)
+    }
+
+    /// Lab #896 G: the 32 bytes `auth_master(sk, g)` hashes (design 2b §2:
+    /// `sk`'s lanes, little-endian). A spend secret — every generation's
+    /// authorization keys derive from it — returned only for that derivation.
+    pub fn auth_secret(&self) -> [u8; 32] {
+        qlab_note::hash::digest_bytes(&self.sk.sk_lanes())
     }
 
     /// The managed diversifier for `index` (issue #43): `d = H(div_seed ‖ index)`.

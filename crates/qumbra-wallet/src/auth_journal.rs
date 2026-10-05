@@ -1,0 +1,363 @@
+//! Lab #896 seam G: the **authorization journal** `auth.v1` — the wallet's
+//! Candidate A leaf state (design `remote-proving-authorization-shape-annulet`
+//! §5, §9).
+//!
+//! One record per generation `g` of this wallet's key: the cursor position
+//! `next` (seam A's only persisted cursor state), the generation's
+//! authorization-tree root (what its v2 addresses bind, cached so a scan
+//! does not rebuild the 2^D tree) and its state:
+//!
+//! - **`active`** — exactly one; the only generation new addresses come from;
+//! - **`sweep`** — after a restore (§9): its notes may only be swept to the
+//!   active generation, and not before `not_before_height` (the restore tip
+//!   plus `MAX_AUTH_VALIDITY_BLOCKS`), by which height every authorization
+//!   exported before the loss has expired;
+//! - **`retired`** — nothing left to spend.
+//!
+//! **Fail-closed.** A leaf is taken by persisting `next + 1` — written to a
+//! temporary file, fsync'd, renamed over `auth.v1` — **before** anything is
+//! signed with it. A crash after the write wastes a position and never reuses
+//! one. **One writer:** every take holds [`AuthLock`], an OS file lock on
+//! `auth.lock`; the OS drops it when the process exits, crash included, so a
+//! stale lock cannot outlive its holder.
+//!
+//! The journal is per key, not per net: one `(sk, g)` cursor serves every net
+//! the seed is used on, so no leaf is ever used twice, anywhere.
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
+
+/// The journal file in the wallet directory.
+pub const AUTH_FILE: &str = "auth.v1";
+/// The lock file every take holds.
+pub const AUTH_LOCK_FILE: &str = "auth.lock";
+const AUTH_HEADER: &str = "qumbra-wallet auth v1";
+
+/// A generation's state (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenState {
+    Active,
+    Sweep { not_before_height: u64 },
+    Retired,
+}
+
+/// One generation's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Generation {
+    pub g: u32,
+    /// The cursor position: positions `< next` are consumed.
+    pub next: u32,
+    /// The generation's authorization-tree root, as lanes.
+    pub auth_root: [u64; 4],
+    pub state: GenState,
+}
+
+/// Why the journal could not be read, written or used — by name.
+#[derive(Debug)]
+pub enum JournalError {
+    Io(io::Error),
+    /// The file is not a journal this wallet wrote: a bad header, a malformed
+    /// record, two active generations, or none.
+    Malformed(String),
+    /// Another process holds `auth.lock` (a second `qumbra-wallet` on this
+    /// wallet). The OS releases it when that process exits.
+    Locked,
+    /// The generation has no unconsumed leaf: migrate to the next one.
+    Exhausted { g: u32 },
+    /// No such generation in the journal.
+    UnknownGeneration { g: u32 },
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JournalError::Io(e) => write!(f, "{AUTH_FILE}: {e}"),
+            JournalError::Malformed(why) => write!(f, "{AUTH_FILE} is malformed: {why}"),
+            JournalError::Locked => write!(
+                f,
+                "another qumbra-wallet process holds this wallet's {AUTH_LOCK_FILE}; wait for it to finish \
+                 (the lock is released when that process exits)"
+            ),
+            JournalError::Exhausted { g } => write!(
+                f,
+                "generation {g} has no unused authorization left; run `qumbra-wallet migrate` to move its \
+                 notes to a new generation"
+            ),
+            JournalError::UnknownGeneration { g } => write!(f, "generation {g} is not in {AUTH_FILE}"),
+        }
+    }
+}
+
+impl std::error::Error for JournalError {}
+
+impl From<io::Error> for JournalError {
+    fn from(e: io::Error) -> Self {
+        JournalError::Io(e)
+    }
+}
+
+/// The OS file lock every take holds; dropped (and released) with the value,
+/// and by the OS when the process ends however it ends.
+#[derive(Debug)]
+pub struct AuthLock {
+    _file: File,
+}
+
+impl AuthLock {
+    /// Take the lock, or [`JournalError::Locked`] if another process has it.
+    pub fn acquire(dir: &Path) -> Result<AuthLock, JournalError> {
+        let file = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(AUTH_LOCK_FILE))?;
+        match file.try_lock() {
+            Ok(()) => Ok(AuthLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(JournalError::Locked),
+            Err(std::fs::TryLockError::Error(e)) => Err(JournalError::Io(e)),
+        }
+    }
+}
+
+/// The journal (module doc).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthJournal {
+    gens: Vec<Generation>,
+}
+
+impl AuthJournal {
+    /// A fresh wallet's journal: generation 0 active at position 0.
+    pub fn fresh(auth_root_0: [u64; 4]) -> Self {
+        AuthJournal { gens: vec![Generation { g: 0, next: 0, auth_root: auth_root_0, state: GenState::Active }] }
+    }
+
+    /// A journal from explicit records (restore). Checked like a loaded one.
+    pub fn from_generations(gens: Vec<Generation>) -> Result<Self, JournalError> {
+        let j = AuthJournal { gens };
+        j.check()?;
+        Ok(j)
+    }
+
+    pub fn generations(&self) -> &[Generation] {
+        &self.gens
+    }
+
+    /// The one active generation.
+    pub fn active(&self) -> &Generation {
+        self.gens.iter().find(|r| r.state == GenState::Active).expect("checked: exactly one active generation")
+    }
+
+    pub fn get(&self, g: u32) -> Result<&Generation, JournalError> {
+        self.gens.iter().find(|r| r.g == g).ok_or(JournalError::UnknownGeneration { g })
+    }
+
+    fn get_mut(&mut self, g: u32) -> Result<&mut Generation, JournalError> {
+        self.gens.iter_mut().find(|r| r.g == g).ok_or(JournalError::UnknownGeneration { g })
+    }
+
+    /// Record that generation `g`'s cursor now stands at `next` and persist
+    /// it — the fail-closed step, run **before** the taken leaf signs
+    /// anything. Requires the lock; never moves a cursor backwards.
+    pub fn advance(&mut self, _lock: &AuthLock, dir: &Path, g: u32, next: u32) -> Result<(), JournalError> {
+        let r = self.get_mut(g)?;
+        if next < r.next {
+            return Err(JournalError::Malformed(format!(
+                "generation {g}'s cursor would move back from {} to {next}",
+                r.next
+            )));
+        }
+        r.next = next;
+        self.save(dir)
+    }
+
+    /// Mark generation `g` retired (nothing left to spend), and persist.
+    pub fn retire(&mut self, _lock: &AuthLock, dir: &Path, g: u32) -> Result<(), JournalError> {
+        let r = self.get_mut(g)?;
+        if r.state == GenState::Active {
+            return Err(JournalError::Malformed(format!("generation {g} is active and cannot be retired")));
+        }
+        r.state = GenState::Retired;
+        self.save(dir)
+    }
+
+    /// Open generation `g` as the new active one, the previous active one
+    /// becoming sweep-only from `not_before_height` (a manual migration), and
+    /// persist.
+    pub fn open_next(
+        &mut self,
+        _lock: &AuthLock,
+        dir: &Path,
+        auth_root: [u64; 4],
+        not_before_height: u64,
+    ) -> Result<u32, JournalError> {
+        let g = self.gens.iter().map(|r| r.g).max().expect("checked: non-empty") + 1;
+        for r in &mut self.gens {
+            if r.state == GenState::Active {
+                r.state = GenState::Sweep { not_before_height };
+            }
+        }
+        self.gens.push(Generation { g, next: 0, auth_root, state: GenState::Active });
+        self.save(dir)?;
+        Ok(g)
+    }
+
+    /// Load `auth.v1`, or `None` if the wallet has none (a restored or pre-G
+    /// wallet: the first Candidate A command migrates, §9).
+    pub fn load(dir: &Path) -> Result<Option<Self>, JournalError> {
+        let text = match std::fs::read_to_string(dir.join(AUTH_FILE)) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Self::parse(&text).map(Some)
+    }
+
+    /// Write `auth.v1` atomically: a temporary file at mode 0600, fsync,
+    /// rename, then fsync the directory so the rename itself is durable.
+    pub fn save(&self, dir: &Path) -> Result<(), JournalError> {
+        let tmp = dir.join(format!("{AUTH_FILE}.tmp"));
+        {
+            let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(self.render().as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, dir.join(AUTH_FILE))?;
+        #[cfg(unix)]
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn render(&self) -> String {
+        let mut out = format!("{AUTH_HEADER}\n");
+        for r in &self.gens {
+            let root: String = r.auth_root.iter().map(|w| format!("{w:016x}")).collect();
+            let state = match r.state {
+                GenState::Active => "active".to_string(),
+                GenState::Sweep { not_before_height } => format!("sweep {not_before_height}"),
+                GenState::Retired => "retired".to_string(),
+            };
+            out.push_str(&format!("{} {} {root} {state}\n", r.g, r.next));
+        }
+        out
+    }
+
+    fn parse(text: &str) -> Result<Self, JournalError> {
+        let bad = |why: String| JournalError::Malformed(why);
+        let mut lines = text.lines();
+        if lines.next() != Some(AUTH_HEADER) {
+            return Err(bad(format!("the first line is not `{AUTH_HEADER}`")));
+        }
+        let mut gens = Vec::new();
+        for (i, line) in lines.enumerate() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let num = |s: &str| s.parse::<u64>().map_err(|_| bad(format!("record {i}: `{s}` is not a number")));
+            let (g, next, root, state) = match f.as_slice() {
+                [g, n, root, "active"] => (num(g)?, num(n)?, *root, GenState::Active),
+                [g, n, root, "sweep", h] => (num(g)?, num(n)?, *root, GenState::Sweep { not_before_height: num(h)? }),
+                [g, n, root, "retired"] => (num(g)?, num(n)?, *root, GenState::Retired),
+                _ => return Err(bad(format!("record {i} is not `g next root state`"))),
+            };
+            if root.len() != 64 {
+                return Err(bad(format!("record {i}: the root is not 64 hex digits")));
+            }
+            let mut auth_root = [0u64; 4];
+            for (k, w) in auth_root.iter_mut().enumerate() {
+                *w = u64::from_str_radix(&root[16 * k..16 * k + 16], 16)
+                    .map_err(|_| bad(format!("record {i}: the root is not hex")))?;
+            }
+            let g = u32::try_from(g).map_err(|_| bad(format!("record {i}: generation out of range")))?;
+            let next = u32::try_from(next).map_err(|_| bad(format!("record {i}: position out of range")))?;
+            gens.push(Generation { g, next, auth_root, state });
+        }
+        Self::from_generations(gens)
+    }
+
+    fn check(&self) -> Result<(), JournalError> {
+        let actives = self.gens.iter().filter(|r| r.state == GenState::Active).count();
+        if actives != 1 {
+            return Err(JournalError::Malformed(format!("{actives} active generations, not exactly one")));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for r in &self.gens {
+            if !seen.insert(r.g) {
+                return Err(JournalError::Malformed(format!("generation {} appears twice", r.g)));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("qumbra-auth-journal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_journal_round_trips_through_its_file_at_mode_0600() {
+        let dir = tmpdir("rt");
+        assert!(AuthJournal::load(&dir).unwrap().is_none(), "no file: a restored wallet");
+        let mut j = AuthJournal::fresh([1, 2, 3, u64::MAX]);
+        let lock = AuthLock::acquire(&dir).unwrap();
+        j.advance(&lock, &dir, 0, 7).unwrap();
+        let g1 = j.open_next(&lock, &dir, [9, 9, 9, 9], 1_200).unwrap();
+        assert_eq!(g1, 1);
+        let back = AuthJournal::load(&dir).unwrap().unwrap();
+        assert_eq!(back, j);
+        assert_eq!(back.active().g, 1);
+        assert_eq!(back.get(0).unwrap().state, GenState::Sweep { not_before_height: 1_200 });
+        assert_eq!(back.get(0).unwrap().next, 7);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(AUTH_FILE)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cursor_never_moves_back_and_retiring_the_active_one_is_refused() {
+        let dir = tmpdir("back");
+        let lock = AuthLock::acquire(&dir).unwrap();
+        let mut j = AuthJournal::fresh([0; 4]);
+        j.advance(&lock, &dir, 0, 5).unwrap();
+        assert!(matches!(j.advance(&lock, &dir, 0, 4), Err(JournalError::Malformed(_))));
+        assert!(matches!(j.retire(&lock, &dir, 0), Err(JournalError::Malformed(_))));
+        assert!(matches!(j.advance(&lock, &dir, 3, 1), Err(JournalError::UnknownGeneration { g: 3 })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_journal_is_refused_by_name() {
+        for text in [
+            "not the header\n",
+            "qumbra-wallet auth v1\n0 0 00 active\n",
+            "qumbra-wallet auth v1\n",
+            &format!("qumbra-wallet auth v1\n0 0 {z} active\n1 0 {z} active\n", z = "0".repeat(64)),
+            &format!("qumbra-wallet auth v1\n0 0 {z} retired\n0 1 {z} active\n", z = "0".repeat(64)),
+            &format!("qumbra-wallet auth v1\n0 x {z} active\n", z = "0".repeat(64)),
+        ] {
+            assert!(matches!(AuthJournal::parse(text), Err(JournalError::Malformed(_))), "{text:?}");
+        }
+    }
+
+    /// One writer: a second lock on the same wallet is refused by name while
+    /// the first is held, and taken again once it is dropped.
+    #[test]
+    fn a_second_writer_is_refused_while_the_lock_is_held() {
+        let dir = tmpdir("lock");
+        let first = AuthLock::acquire(&dir).unwrap();
+        assert!(matches!(AuthLock::acquire(&dir), Err(JournalError::Locked)));
+        drop(first);
+        assert!(AuthLock::acquire(&dir).is_ok(), "released with its holder");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -126,6 +126,8 @@ mod build_rev_tests {
 }
 
 pub mod annulet;
+/// Lab #896 G: the Candidate A authorization journal (`auth.v1`).
+pub mod auth_journal;
 #[cfg(feature = "verify")]
 pub mod annulet_driver;
 #[cfg(feature = "verify")]
