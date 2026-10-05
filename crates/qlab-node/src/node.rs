@@ -814,6 +814,8 @@ fn check_stored_binding_with(
         body.finality = s.finality.clone();
         body.bundle = bundle.map(<[u8]>::to_vec).unwrap_or_default();
     }
+    // Lab #911: no commitment is computed over a count above a byte.
+    qlab_devnet::body::check_tx_entry_counts(&body).map_err(NodeError::Body)?;
     let got = match (form, sections) {
         (GenesisForm::V5, BodySections::V6) => body.commitment_v6(),
         (_, BodySections::V6) => unreachable!("BodySections::V6 exists only beside GenesisForm::V5 (forms.rs)"),

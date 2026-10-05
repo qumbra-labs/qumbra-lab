@@ -810,6 +810,10 @@ pub enum BodyError {
     /// nullifiers — two inputs and the fee input, A4 — and two commitments),
     /// or does not declare the 2×2 bucket.
     L2WrongArity { index: usize },
+    /// Lab #911: a transaction lists more nullifiers or commitments than one
+    /// byte counts (255) — refused before the body commitment, which writes
+    /// each count in a byte, could be computed over it.
+    TxEntriesOverByte { index: usize },
     /// An Annulet body names a coinbase payee — the L2 has no block reward.
     CoinbaseOnAnnulet { got: usize },
     /// An Annulet transaction's discovery payload `entry` carries an all-zero
@@ -1033,6 +1037,8 @@ pub fn check_body_binding_above(
             cap: COINBASE_PAYEE_CAP_V5_AT_BIRTH,
         });
     }
+    // Lab #911: the transactions' counts, by the same rule.
+    check_tx_entry_counts(body)?;
     let got = body.commitment_above(boundary, header.height);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch {
@@ -1062,6 +1068,7 @@ pub fn check_body_binding_v5_above(
             cap,
         });
     }
+    check_tx_entry_counts(body)?;
     let got = body.commitment_v5_above(boundary, header.height);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch {
@@ -1096,6 +1103,21 @@ pub fn check_body_binding_v5_above(
 /// That is the exact shipped rule while `NAME_RULE_BOUNDARY_HEIGHT` is `None`
 /// and for every pre-boundary height once it is set; the armed node threads
 /// its registry through [`validate_body_with_names`] instead.
+/// Lab #911: every transaction lists at most 255 nullifiers and 255
+/// commitments — the bound each body commitment's one-byte count needs.
+/// Every validation funnel runs it **before** the commitment, so the
+/// commitment's count asserts are unreachable from a peer's body.
+pub fn check_tx_entry_counts(body: &BlockBody) -> Result<(), BodyError> {
+    match body
+        .txs
+        .iter()
+        .position(|tx| tx.public.nullifiers.len() > u8::MAX as usize || tx.public.commitments.len() > u8::MAX as usize)
+    {
+        Some(index) => Err(BodyError::TxEntriesOverByte { index }),
+        None => Ok(()),
+    }
+}
+
 pub fn validate_body<V, F>(
     header: &BlockHeader,
     body: &BlockBody,
@@ -1351,6 +1373,7 @@ pub fn check_body_binding_v6(header: &BlockHeader, body: &BlockBody) -> Result<(
             cap: COINBASE_PAYEE_CAP_V6,
         });
     }
+    check_tx_entry_counts(body)?;
     let pre = body.preimage_v6();
     if pre.len() > MAX_V6_BODY_BYTES {
         return Err(BodyError::BodyTooLarge { got: pre.len(), cap: MAX_V6_BODY_BYTES });
@@ -1836,6 +1859,22 @@ mod tests {
             .collect();
         let n = qlab_note::compact::contents_entry_count(&bundles);
         encode_committed_discovery(&bundles, &vec![vec![0u8; PAYLOAD_LEN]; n])
+    }
+
+    /// Lab #911: every L1 binding function refuses a transaction with more
+    /// than 255 nullifiers or commitments by name before hashing — the v5 and
+    /// v6 preimages write each count in one byte and assert it.
+    #[test]
+    fn every_binding_refuses_a_count_above_a_byte_before_hashing() {
+        let mut wide = good_tx(1);
+        wide.public.nullifiers = (0..256u32).map(|i| [i as u8; 32]).collect();
+        let body = BlockBody::new(vec![good_tx(2), wide], Vec::new());
+        let hdr = header_for(&BlockBody::new(vec![], Vec::new()));
+        let want = Err(BodyError::TxEntriesOverByte { index: 1 });
+        assert_eq!(check_body_binding(&hdr, &body), want);
+        assert_eq!(check_body_binding_v5(&hdr, &body), want);
+        assert_eq!(check_body_binding_v6(&hdr, &body), want);
+        assert_eq!(validate_body_v5(&hdr, &body, &MockVerifier, is_final, &names::EmptyNameView), want);
     }
 
     #[test]

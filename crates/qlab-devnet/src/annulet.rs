@@ -517,6 +517,8 @@ where
     if !body.coinbase_payees.is_empty() {
         return Err(BodyError::CoinbaseOnAnnulet { got: body.coinbase_payees.len() });
     }
+    // Lab #911: the counts before the commitment, which writes each in a byte.
+    crate::body::check_tx_entry_counts(body)?;
     let got = body_commitment_annulet_for(body, auth.form);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch { expected: header.tx_body_commitment, got });
@@ -853,6 +855,34 @@ pub fn auth_validity_ok(valid_until_height: Option<u64>, height: u64) -> bool {
 mod tests {
     use super::*;
     use crate::body::TxPublic;
+
+    /// Lab #911: a body whose transaction lists 256 nullifiers (or
+    /// commitments) is refused by name before the commitment — on both
+    /// axes — and never reaches the commitment's one-byte count assert.
+    #[test]
+    fn a_tx_with_256_entries_is_refused_before_the_commitment() {
+        let tx = |nf: usize, cm: usize| {
+            let mut t = l2_tx(1, &s_surface());
+            t.public.nullifiers = (0..nf).map(|i| [i as u8; 32]).collect();
+            t.public.commitments = (0..cm).map(|i| [i as u8 ^ 0x55; 32]).collect();
+            t
+        };
+        for (nf, cm) in [(256, 2), (3, 256)] {
+            let body = BlockBody { txs: vec![l2_tx(9, &s_surface()), tx(nf, cm)], ..BlockBody::default() };
+            assert_eq!(crate::body::check_tx_entry_counts(&body), Err(BodyError::TxEntriesOverByte { index: 1 }));
+            let header = header_for(&BlockBody::default());
+            for ctx in [AuthContext::NONE, AuthContext::candidate_a([0x6E; 32])] {
+                assert_eq!(
+                    validate_body_annulet_for(&header, &body, &OkProof, |r| *r == FINAL, &FEES, &ctx),
+                    Err(BodyError::TxEntriesOverByte { index: 1 }),
+                    "{nf}/{cm} on {:?}",
+                    ctx.form
+                );
+            }
+        }
+        let fine = BlockBody { txs: vec![tx(255, 255)], ..BlockBody::default() };
+        assert_eq!(crate::body::check_tx_entry_counts(&fine), Ok(()), "255 is a byte");
+    }
 
     /// Lab #896 F (QF2): the validity cap is a consensus constant with its
     /// own literal. It equals the anchor window today; a change to either is
