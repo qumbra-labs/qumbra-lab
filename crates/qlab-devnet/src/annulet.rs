@@ -493,19 +493,22 @@ where
     V: TxVerifier,
     F: Fn(&Hash32) -> bool,
 {
-    validate_body_annulet_for(header, body, verifier, is_anchor_final, fees, L2AuthForm::None)
+    validate_body_annulet_for(header, body, verifier, is_anchor_final, fees, &AuthContext::NONE)
 }
 
 /// [`validate_body_annulet`] under the net's [`L2AuthForm`] (lab #896 E2):
-/// the header binds [`body_commitment_annulet_for`]. The auth section's
-/// presence and signatures are seam F's checks, not this function's yet.
+/// the header binds [`body_commitment_annulet_for`]. Lab #896 F: every
+/// transaction passes [`check_auth`] at `header.height` after its cheap
+/// checks and before its proof (2b §6) — under any injected verifier, so a
+/// block carrying an unauthorized transaction is invalid even if every STARK
+/// verifies.
 pub fn validate_body_annulet_for<V, F>(
     header: &BlockHeader,
     body: &BlockBody,
     verifier: &V,
     is_anchor_final: F,
     fees: &L2FeeTable,
-    auth: L2AuthForm,
+    auth: &AuthContext,
 ) -> Result<(), BodyError>
 where
     V: TxVerifier,
@@ -514,7 +517,7 @@ where
     if !body.coinbase_payees.is_empty() {
         return Err(BodyError::CoinbaseOnAnnulet { got: body.coinbase_payees.len() });
     }
-    let got = body_commitment_annulet_for(body, auth);
+    let got = body_commitment_annulet_for(body, auth.form);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch { expected: header.tx_body_commitment, got });
     }
@@ -561,6 +564,7 @@ where
             }
         }
         check_tx_discovery_annulet(i, tx)?;
+        check_auth(tx, auth, header.height).map_err(|refusal| BodyError::L2AuthRefused { index: i, refusal })?;
         if !verifier.verify_tx(tx) {
             return Err(BodyError::ProofInvalid { index: i });
         }
@@ -731,10 +735,145 @@ pub fn intent_for(
     Ok(intent)
 }
 
+// ------------------------------------------- the authorization check (lab #896 F)
+
+/// **The validity cap** (2b §10 item 9, ruled in seam F): a transaction whose
+/// `valid_until_height` is more than this many blocks past the height it
+/// lands at is refused ([`AuthRefusal::ValidityTooFar`]). The §9 restore wait
+/// — no signing with a restored generation until the tip passes the restore
+/// height plus this cap — rests on it, so it is consensus, not wallet policy.
+///
+/// It equals the anchor window ([`crate::params_devnet::MAX_ANCHOR_AGE_BLOCKS`])
+/// today — the span a signed transaction can already survive on a busy
+/// chain — but is its own literal: a change to the anchor window must not
+/// move it silently. Pinned by `max_auth_validity_blocks_is_frozen`.
+pub const MAX_AUTH_VALIDITY_BLOCKS: u64 = 1_152;
+
+/// What [`check_auth`] needs from the net: its L2 authorization axis and, on a
+/// Candidate A net, the genesis hash the intent binds —
+/// `AnnuletGenesisFile::hash()`, the pinned `expected_genesis_hash` (lab #896
+/// QF1; never the genesis block hash). The intent's `genesis_format` follows
+/// from the axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthContext {
+    pub form: L2AuthForm,
+    pub genesis_hash: Hash32,
+}
+
+impl AuthContext {
+    /// A v1 net: no auth section, nothing to bind.
+    pub const NONE: Self = Self { form: L2AuthForm::None, genesis_hash: [0; 32] };
+
+    /// A Candidate A net under the genesis file hash `genesis_hash`.
+    pub const fn candidate_a(genesis_hash: Hash32) -> Self {
+        Self { form: L2AuthForm::CandidateA, genesis_hash }
+    }
+
+    /// The intent's `genesis_format`: the axis's genesis `format_version`.
+    pub fn genesis_format(&self) -> u32 {
+        self.form.annulet_genesis_format_version()
+    }
+}
+
+/// Why [`check_auth`] refused a transaction — by name (2b §6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthRefusal {
+    /// An auth section on a v1 (`L2AuthForm::None`) net.
+    AuthOnV1Net,
+    /// No auth section on a Candidate A net: it is mandatory for every S/P/R.
+    AuthMissing,
+    /// The section does not decode for the surface's shape (`Malformed`,
+    /// `Scheme`, `SlotCount`).
+    Malformed(qlab_remote_auth::annulet::AuthError),
+    /// The landing height is above the section's `valid_until_height`.
+    Expired { valid_until_height: u64, height: u64 },
+    /// `valid_until_height` exceeds the landing height plus
+    /// [`MAX_AUTH_VALIDITY_BLOCKS`].
+    ValidityTooFar { valid_until_height: u64, limit: u64 },
+    /// The intent could not be rebuilt from the transaction.
+    Intent(IntentError),
+    /// A slot's leaf or signature does not verify over the rebuilt intent
+    /// (`LeafMismatch`, `BadSignature`).
+    Unauthorized(qlab_remote_auth::annulet::AuthError),
+}
+
+/// **The authorization check** (lab #896 F; 2b §6), shared by mempool
+/// admission and the body rule, at landing height `height`. In order:
+/// presence against the axis; the section decoded for the surface's shape;
+/// `Expired` and the validity cap (before any signature); the intent rebuilt
+/// by [`intent_for`] from the transaction's decoded values and the section's
+/// own header and descriptors; then `verify_intent` (leaves, then the
+/// ML-DSA signatures — the expensive step, last).
+///
+/// Returns the section's `valid_until_height` on a Candidate A net (the pool
+/// keeps it for eviction), `None` on a v1 net.
+///
+/// The node builds the intent from the section's own descriptors and
+/// header, so `DescriptorMismatch` / `ValidityMismatch` cannot arise here.
+pub fn check_auth(tx: &TxEntry, ctx: &AuthContext, height: u64) -> Result<Option<u64>, AuthRefusal> {
+    let present = tx.auth != L2_AUTH_ABSENT;
+    match (ctx.form, present) {
+        (L2AuthForm::None, false) => return Ok(None),
+        (L2AuthForm::None, true) => return Err(AuthRefusal::AuthOnV1Net),
+        (L2AuthForm::CandidateA, false) => return Err(AuthRefusal::AuthMissing),
+        (L2AuthForm::CandidateA, true) => {}
+    }
+    let surface = L2Surface::decode(&tx.l2)
+        .map_err(|e| AuthRefusal::Intent(IntentError::Surface(e)))?
+        .ok_or(AuthRefusal::Intent(IntentError::NoSurface))?;
+    let section = qlab_remote_auth::annulet::AnnuletAuthSection::decode(auth_shape(surface.shape), &tx.auth)
+        .map_err(AuthRefusal::Malformed)?;
+    let valid_until_height = section.valid_until_height;
+    if height > valid_until_height {
+        return Err(AuthRefusal::Expired { valid_until_height, height });
+    }
+    let limit = height.saturating_add(MAX_AUTH_VALIDITY_BLOCKS);
+    if valid_until_height > limit {
+        return Err(AuthRefusal::ValidityTooFar { valid_until_height, limit });
+    }
+    let descriptors: Vec<_> = section.slots.iter().map(|s| s.descriptor).collect();
+    let intent = intent_for(tx, ctx.genesis_format(), &ctx.genesis_hash, valid_until_height, &descriptors)
+        .map_err(AuthRefusal::Intent)?;
+    section.verify_intent(&intent).map_err(AuthRefusal::Unauthorized)?;
+    Ok(Some(valid_until_height))
+}
+
+/// The pool's and the sequencer's bounds check on a cached
+/// `valid_until_height` at landing height `height`: both of [`check_auth`]'s
+/// height rules, without the signatures. A tip that drops (a rewind) can put
+/// a pooled transaction past the cap as well as past its expiry.
+pub fn auth_validity_ok(valid_until_height: Option<u64>, height: u64) -> bool {
+    match valid_until_height {
+        None => true,
+        Some(v) => height <= v && v <= height.saturating_add(MAX_AUTH_VALIDITY_BLOCKS),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::body::TxPublic;
+
+    /// Lab #896 F (QF2): the validity cap is a consensus constant with its
+    /// own literal. It equals the anchor window today; a change to either is
+    /// a separate decision, and the §9 restore wait rests on this one.
+    #[test]
+    fn max_auth_validity_blocks_is_frozen() {
+        assert_eq!(MAX_AUTH_VALIDITY_BLOCKS, 1_152);
+        assert_eq!(MAX_AUTH_VALIDITY_BLOCKS, crate::params_devnet::MAX_ANCHOR_AGE_BLOCKS, "equal today, by decision");
+    }
+
+    /// The cached-window check the pool and the sequencer run: both bounds,
+    /// inclusive, and a v1 tx (no window) always passes.
+    #[test]
+    fn auth_validity_ok_checks_both_bounds() {
+        assert!(auth_validity_ok(None, u64::MAX));
+        assert!(auth_validity_ok(Some(10), 10));
+        assert!(!auth_validity_ok(Some(10), 11), "expired");
+        assert!(auth_validity_ok(Some(10 + MAX_AUTH_VALIDITY_BLOCKS), 10));
+        assert!(!auth_validity_ok(Some(11 + MAX_AUTH_VALIDITY_BLOCKS), 10), "past the cap (a dropped tip)");
+        assert!(auth_validity_ok(Some(u64::MAX), u64::MAX - 1), "no overflow at the top");
+    }
 
     /// Lab #896 E4: the L2 shape tags and seam A's agree byte for byte, so
     /// [`auth_shape`]'s match and `Shape::from_tag` cannot drift.

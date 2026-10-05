@@ -1196,7 +1196,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     pow,
                     verifier,
                     sim,
-                    file.l2_auth()?,
+                    file.auth_context()?,
                 )?;
                 let run = annulet::AnnuletRun::new(file, sequencer);
                 qlab_devnet::jprintln!("{}", run.role_line());
@@ -3916,6 +3916,9 @@ fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
         MempoolError::RedeemExceedsOutstanding { .. } => "redeem-exceeds-outstanding",
         MempoolError::RegistryWriteAlreadyPooled => "registry-write-already-pooled",
         MempoolError::RegistryWriteInvalid => "registry-write-invalid",
+        MempoolError::AuthRefused(qlab_devnet::annulet::AuthRefusal::Expired { .. }) => "auth-expired",
+        MempoolError::AuthRefused(qlab_devnet::annulet::AuthRefusal::ValidityTooFar { .. }) => "auth-validity-too-far",
+        MempoolError::AuthRefused(_) => "auth-refused",
     }
 }
 

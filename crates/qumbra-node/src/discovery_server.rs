@@ -462,6 +462,14 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
                 "refused: the registry write's leaf does not reach its declared root on this registry (lab #728)"
                     .to_string(),
             ),
+            // Lab #896 F: the authorization check, named. The validity window
+            // is judged against this node's tip (409: re-sign or retry); the
+            // rest is the transaction's own fault (400).
+            MempoolError::AuthRefused(r) => match r {
+                qlab_devnet::annulet::AuthRefusal::Expired { .. }
+                | qlab_devnet::annulet::AuthRefusal::ValidityTooFar { .. } => (409, format!("refused: auth {r:?}")),
+                _ => (400, format!("refused: auth {r:?}")),
+            },
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
             // wrapping; reaching here means that mapping broke.
             MempoolError::DuplicateTx => {

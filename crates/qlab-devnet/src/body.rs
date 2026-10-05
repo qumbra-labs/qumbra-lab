@@ -820,6 +820,9 @@ pub enum BodyError {
     /// the block's parent's (lab #712, the §5 ruling): its registry openings
     /// were computed against another registry state.
     L2RegistryRootStale { index: usize },
+    /// Lab #896 F: an Annulet transaction's authorization is refused (2b §6)
+    /// — checked after its cheap checks and before its proof.
+    L2AuthRefused { index: usize, refusal: crate::annulet::AuthRefusal },
     /// A registry write (shape R, lab #728) that is not 1 nullifier / 1
     /// commitment — R spends one fee note and makes one.
     L2RegistryWriteArity { index: usize },

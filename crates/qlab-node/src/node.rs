@@ -526,8 +526,9 @@ pub(crate) struct AnnuletSetup {
     /// The genesis notes' per-asset issuance (lab #728 Q7), recomputed from
     /// their public plaintexts with each commitment checked.
     genesis_supply: BTreeMap<u16, i128>,
-    /// The L2 authorization axis the genesis selected (lab #896 E2).
-    l2_auth: L2AuthForm,
+    /// The L2 authorization axis the genesis selected (lab #896 E2), with
+    /// the genesis file hash a Candidate A intent binds (F).
+    auth: qlab_devnet::annulet::AuthContext,
 }
 
 impl AnnuletSetup {
@@ -558,7 +559,7 @@ impl AnnuletSetup {
             registry,
             genesis_cms: genesis_notes.iter().map(|n| n.cm).collect(),
             genesis_supply,
-            l2_auth: L2AuthForm::None,
+            auth: qlab_devnet::annulet::AuthContext::NONE,
         })
     }
 }
@@ -869,6 +870,12 @@ pub trait NodeState {
     ) -> Option<Result<Hash32, crate::registry_store::RegistryError>> {
         None
     }
+    /// The authorization context admission checks against (lab #896 F).
+    /// Defaults to the v1 context, under which any auth section is refused
+    /// (`AuthOnV1Net`): a state that does not say fails closed.
+    fn annulet_auth_context(&self) -> qlab_devnet::annulet::AuthContext {
+        qlab_devnet::annulet::AuthContext::NONE
+    }
     /// The fork-choice tip height.
     fn tip_height(&self) -> u64;
     /// The fork-choice tip hash.
@@ -1015,8 +1022,9 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
     /// The L2 authorization axis (lab #896 E2): `CandidateA` only on an
     /// Annulet node whose genesis is format 33; it keys the body commitment
-    /// domain and the tx wire's auth section.
-    l2_auth: L2AuthForm,
+    /// domain and the tx wire's auth section. On a Candidate A net it also
+    /// carries the genesis file hash every intent binds (lab #896 F).
+    auth: qlab_devnet::annulet::AuthContext,
     /// The asset registry (lab #710): `Some` exactly on an Annulet node,
     /// bound to every header's `registry_root`. Moved only by a block's
     /// registry write (shape R, lab #728), in `apply_state` — so it is chain
@@ -1122,7 +1130,7 @@ impl MemNode {
         fees: qlab_devnet::annulet::L2FeeTable,
         registry: &[crate::registry_store::RegistryLeaf],
     ) -> Result<Self, NodeError> {
-        Self::open_annulet_with_auth(dir, genesis_header, genesis_notes, fees, registry, L2AuthForm::None)
+        Self::open_annulet_with_auth(dir, genesis_header, genesis_notes, fees, registry, qlab_devnet::annulet::AuthContext::NONE)
     }
 
     /// [`Self::open_annulet`] on the genesis's L2 authorization axis (lab
@@ -1134,15 +1142,15 @@ impl MemNode {
         genesis_notes: &[qlab_devnet::annulet::GenesisNote],
         fees: qlab_devnet::annulet::L2FeeTable,
         registry: &[crate::registry_store::RegistryLeaf],
-        l2_auth: L2AuthForm,
+        auth: qlab_devnet::annulet::AuthContext,
     ) -> Result<Self, NodeError> {
         assert_eq!(
             genesis_header.tx_body_commitment,
-            qlab_devnet::annulet::genesis_body_commitment_annulet_for(genesis_notes, l2_auth),
+            qlab_devnet::annulet::genesis_body_commitment_annulet_for(genesis_notes, auth.form),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
         let mut setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
-        setup.l2_auth = l2_auth;
+        setup.auth = auth;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
         let node = Self::open_inner(GenesisForm::Annulet, BodySections::None, dir, genesis, Some(setup), None)?;
@@ -1332,7 +1340,7 @@ impl MemNode {
                     // one way a corrupted log record enters unchecked. It stays
                     // FIRST: a tampered record is refused outright, and must not
                     // be mistaken for the rewind below.
-                    check_stored_binding_for(node.form, node.sections, node.l2_auth, b)?;
+                    check_stored_binding_for(node.form, node.sections, node.auth.form, b)?;
                     // Issue #162: the log is append-only but the applied chain is
                     // no longer append-only, so a prefix record whose parent is not
                     // the running tip is the live node's rewind, replayed here at
@@ -1592,7 +1600,7 @@ impl MemNode {
             // The binding is still checked (issue #77): this path skips
             // `apply_state`, so it would otherwise be the one door a corrupted
             // log record enters by.
-            if let Err(e) = check_stored_binding_for(node.form, node.sections, node.l2_auth, block) {
+            if let Err(e) = check_stored_binding_for(node.form, node.sections, node.auth.form, block) {
                 // Named here (F5-5c pre-review Y6): the fall-through to a full
                 // replay would otherwise hide the cause until it refuses.
                 qlab_devnet::jprintln!("SNAPSHOT resume: block {} does not bind ({e}); falling back", block.header.height);
@@ -1931,7 +1939,7 @@ impl MemNode {
             (GenesisForm::Annulet, Some(setup)) => {
                 let mut node = Self::from_bound_genesis(form, sections, genesis, dir);
                 node.annulet_fees = Some(setup.fees);
-                node.l2_auth = setup.l2_auth;
+                node.auth = setup.auth;
                 node.registry_genesis = Some(setup.registry.clone());
                 node.registry = Some(setup.registry);
                 // Lab #728 Q7: the genesis notes' issuance is outstanding from
@@ -1995,7 +2003,7 @@ impl MemNode {
             surface: Vec::new(),
             last_bundle_height: None,
             annulet_fees: None,
-            l2_auth: L2AuthForm::None,
+            auth: qlab_devnet::annulet::AuthContext::NONE,
             registry: None,
             registry_genesis: None,
             genesis_supply: BTreeMap::new(),
@@ -2020,7 +2028,7 @@ impl MemNode {
         fees: qlab_devnet::annulet::L2FeeTable,
         registry: &[crate::registry_store::RegistryLeaf],
     ) -> MemNode {
-        Self::in_memory_annulet_with_auth(genesis_header, genesis_notes, fees, registry, L2AuthForm::None)
+        Self::in_memory_annulet_with_auth(genesis_header, genesis_notes, fees, registry, qlab_devnet::annulet::AuthContext::NONE)
     }
 
     /// [`Self::in_memory_annulet`] on the genesis's L2 authorization axis
@@ -2030,16 +2038,16 @@ impl MemNode {
         genesis_notes: &[qlab_devnet::annulet::GenesisNote],
         fees: qlab_devnet::annulet::L2FeeTable,
         registry: &[crate::registry_store::RegistryLeaf],
-        l2_auth: L2AuthForm,
+        auth: qlab_devnet::annulet::AuthContext,
     ) -> MemNode {
         assert_eq!(
             genesis_header.tx_body_commitment,
-            qlab_devnet::annulet::genesis_body_commitment_annulet_for(genesis_notes, l2_auth),
+            qlab_devnet::annulet::genesis_body_commitment_annulet_for(genesis_notes, auth.form),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
         let mut setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)
             .unwrap_or_else(|e| panic!("the Annulet genesis must bind its registry (lab #710): {e}"));
-        setup.l2_auth = l2_auth;
+        setup.auth = auth;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         MemNode::from_genesis_with(GenesisForm::Annulet, BodySections::None, genesis, None, Some(setup))
     }
@@ -2403,7 +2411,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         }
         self.check_registry_parent(&header, &body)?;
         let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
-        qlab_devnet::annulet::validate_body_annulet_for(&header, &body, verifier, anchor_ok, &fees, self.l2_auth)
+        qlab_devnet::annulet::validate_body_annulet_for(&header, &body, verifier, anchor_ok, &fees, &self.auth)
             .map_err(NodeError::Body)?;
         let block = StoredBlock::from_sealed_parts(sealed, &body);
         let hash = self.apply_state(&block)?;
@@ -2471,7 +2479,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             registry: self.registry_genesis.clone()?,
             genesis_cms: self.annulet_genesis_cms.clone(),
             genesis_supply: self.genesis_supply.clone(),
-            l2_auth: self.l2_auth,
+            auth: self.auth,
         })
     }
 
@@ -2711,7 +2719,13 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
 
     /// The L2 authorization axis this node runs (lab #896 E2).
     pub fn l2_auth_form(&self) -> L2AuthForm {
-        self.l2_auth
+        self.auth.form
+    }
+
+    /// The authorization context (lab #896 F): the axis and, on a Candidate
+    /// A net, the genesis file hash the intent binds.
+    pub fn auth_context(&self) -> qlab_devnet::annulet::AuthContext {
+        self.auth
     }
 
     /// The ancestor at exactly `height` of the block whose parent hash is `from`,
@@ -2762,7 +2776,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // bytes as they are, log bytes re-hashed — for this check and the fold
         // below; one that cannot be read back is a persistence error by name.
         let bundle_bytes = block.bundle_ref().map(|r| r.bytes()).transpose().map_err(NodeError::Io)?;
-        check_stored_binding_with(self.form, self.sections, self.l2_auth, block, bundle_bytes.as_deref())?;
+        check_stored_binding_with(self.form, self.sections, self.auth.form, block, bundle_bytes.as_deref())?;
         // Lab #785: a V6 block's record height, decoded before any mutation. A
         // live block was validated in full before reaching here; a logged one
         // that no longer decodes is a corrupt log, named rather than skipped.
@@ -3213,6 +3227,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
     }
     fn annulet_registry_root(&self) -> Option<Hash32> {
         self.registry_root_bytes()
+    }
+    fn annulet_auth_context(&self) -> qlab_devnet::annulet::AuthContext {
+        self.auth
     }
     fn annulet_registry_write_root(
         &self,
