@@ -442,6 +442,11 @@ fn l2_v2_prove_verify_roundtrip_s() {
     assert!(p3_uni_stark::verify(&make_config_l2(), &air, &proof, &bad).is_err(), "a tampered leaf is refused");
     // A v2 proof is not a v1 shape-S proof.
     assert!(!verify_s(&pvs[..Shape::S.pv_len()], &proof));
+    // E1: the qlab-l2 v2 entry accepts it, typed and untyped, and refuses a
+    // tampered leaf the same way.
+    assert!(v2::verify_s(&pvs, &proof), "v2::verify_s accepts the honest proof");
+    assert!(v2::verify_s_u32(&inst.pvs, &proof));
+    assert!(!v2::verify_s(&bad, &proof));
 }
 
 /// Lab #896 seam C: shape P **v2** geometry and degree, read off the
@@ -483,4 +488,48 @@ fn l2_v2_prove_verify_roundtrip_r() {
     assert!(p3_uni_stark::verify(&make_config_l2(), &air, &proof, &bad).is_err(), "a tampered leaf is refused");
     // A v2 proof is not a v1 shape-R proof.
     assert!(!verify_r(&pvs[..Shape::R.pv_len()], &proof));
+    assert!(v2::verify_r(&pvs, &proof), "v2::verify_r accepts the honest proof");
+    assert!(v2::verify_r_u32(&inst.pvs, &proof));
+    assert!(!v2::verify_r(&bad, &proof));
+}
+
+/// Lab #896 E1: the v2 shape identities. Geometry read off the v2 verifier
+/// AIRs agrees with `v2::*`; the v2 digests are deterministic, pairwise
+/// distinct, and never equal a v1 pin (different domain). The hex pins land
+/// in a follow-up commit from an `l2_goldens` run (#724 precedent).
+#[test]
+fn l2_v2_shape_identities() {
+    for shape in [Shape::S, Shape::P, Shape::R] {
+        let (w, pv) = match shape {
+            Shape::S => {
+                let a = v2::verifier_air_s();
+                (<L2ShapeSAir as BaseAir<Val>>::width(&a), <L2ShapeSAir as BaseAir<Val>>::num_public_values(&a))
+            }
+            Shape::P => {
+                let a = v2::verifier_air_p();
+                (<L2ShapePAir as BaseAir<Val>>::width(&a), <L2ShapePAir as BaseAir<Val>>::num_public_values(&a))
+            }
+            Shape::R => {
+                let a = v2::verifier_air_r();
+                (<L2ShapeRAir as BaseAir<Val>>::width(&a), <L2ShapeRAir as BaseAir<Val>>::num_public_values(&a))
+            }
+        };
+        assert_eq!((w, pv), (v2::width(shape), v2::pv_len(shape)), "{shape:?}");
+        assert_eq!(v2::canonical_program(shape).iter().filter(|r| **r != qlab_air::l2::ROLE_DUMMY).count(), v2::perms(shape) - 1);
+        let bits = v2::audit_pv_bits(shape);
+        assert_eq!(bits.len(), v2::pv_len(shape));
+        for k in 0..v2::auth_slots(shape) {
+            assert!(bits[v2::pv_leaf(shape, k)..v2::pv_leaf(shape, k) + 16].iter().all(|b| *b == 16));
+        }
+        assert_eq!(v2::pv_leaf(shape, v2::auth_slots(shape) - 1) + 16, v2::pv_len(shape), "leaves are the tail");
+    }
+    let d: Vec<String> = [Shape::S, Shape::P, Shape::R].iter().map(|s| digest::hex(&digest::shape_digest_v2(*s))).collect();
+    let again: Vec<String> = [Shape::S, Shape::P, Shape::R].iter().map(|s| digest::hex(&digest::shape_digest_v2(*s))).collect();
+    assert_eq!(d, again, "v2 digests are deterministic");
+    assert!(d[0] != d[1] && d[1] != d[2] && d[0] != d[2]);
+    for v1 in [SHAPE_S_DIGEST_V1, SHAPE_P_DIGEST_V1, SHAPE_R_DIGEST_V1] {
+        assert!(!d.iter().any(|x| x == v1), "a v2 digest equals a v1 pin");
+    }
+    // The v2 typed entries refuse a v1-length PV vector before any proof work.
+    assert!(!pv_u32_in_range(&vec![0; Shape::S.pv_len()], &v2::audit_pv_bits(Shape::S)));
 }
