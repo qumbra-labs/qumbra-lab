@@ -89,6 +89,24 @@ pub enum DecodeError {
     /// nets only) is empty or the explicit absent marker `[0x00]`: absence is
     /// spelled by omission on this wire, so one transaction has one encoding.
     BadAuthSection,
+    /// Lab #911: a transaction lists more nullifiers or commitments than one
+    /// byte counts (255). Every body commitment that encodes a count writes
+    /// it in one byte, so such a transaction is refused here, at the wire,
+    /// before anything could hash it.
+    TooManyEntries { what: &'static str, got: usize },
+}
+
+/// Lab #911: the most nullifiers, and the most commitments, one transaction
+/// may list on any wire form — a body commitment counts each in one byte.
+pub const MAX_TX_ENTRIES: usize = u8::MAX as usize;
+
+/// A per-transaction count, refused above [`MAX_TX_ENTRIES`] by name.
+fn tx_count(r: &mut Reader<'_>, what: &'static str) -> Result<usize, DecodeError> {
+    let got = r.varint()? as usize;
+    if got > MAX_TX_ENTRIES {
+        return Err(DecodeError::TooManyEntries { what, got });
+    }
+    Ok(got)
 }
 
 impl From<CodecError> for DecodeError {
@@ -698,12 +716,12 @@ fn decode_tx_through_discovery(
     buf_len: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, TxPublic), DecodeError> {
     let anchor = r.hash32("tx.anchor")?;
-    let n_nf = r.varint()? as usize;
+    let n_nf = tx_count(r, "tx.nullifiers")?;
     let mut nullifiers = Vec::with_capacity(n_nf.min(buf_len / 32));
     for _ in 0..n_nf {
         nullifiers.push(r.hash32("tx.nf")?);
     }
-    let n_cm = r.varint()? as usize;
+    let n_cm = tx_count(r, "tx.commitments")?;
     let mut commitments = Vec::with_capacity(n_cm.min(buf_len / 32));
     for _ in 0..n_cm {
         commitments.push(r.hash32("tx.cm")?);
@@ -725,12 +743,12 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
     // issue #275 an HTTP body too): cap each pre-allocation by what the remaining
     // bytes could actually hold, so a tiny payload claiming 2^60 entries is a
     // truncation refusal on its first read and never a giant allocation.
-    let n_nf = r.varint()? as usize;
+    let n_nf = tx_count(&mut r, "tx.nullifiers")?;
     let mut nullifiers = Vec::with_capacity(n_nf.min(buf.len() / 32));
     for _ in 0..n_nf {
         nullifiers.push(r.hash32("tx.nf")?);
     }
-    let n_cm = r.varint()? as usize;
+    let n_cm = tx_count(&mut r, "tx.commitments")?;
     let mut commitments = Vec::with_capacity(n_cm.min(buf.len() / 32));
     for _ in 0..n_cm {
         commitments.push(r.hash32("tx.cm")?);
@@ -982,6 +1000,31 @@ pub fn decode_headers(form: GenesisForm, buf: &[u8]) -> Result<Vec<BlockHeader>,
 mod tests {
     use super::*;
     use qlab_devnet::committee::devnet_committee;
+
+    /// Lab #911: a transaction listing more than 255 nullifiers or
+    /// commitments is refused at decode by name, on the L1 wire and on both
+    /// Annulet axes; 255 still decodes.
+    #[test]
+    fn a_count_above_a_byte_is_refused_at_decode() {
+        use qlab_devnet::forms::L2AuthForm;
+        let base = crate::served::fixture::tx();
+        let wide = |nf: usize, cm: usize| {
+            let mut t = base.clone();
+            t.public.nullifiers = (0..nf).map(|i| [i as u8; 32]).collect();
+            t.public.commitments = (0..cm).map(|i| [i as u8 ^ 0x5A; 32]).collect();
+            t
+        };
+        for (t, what) in [(wide(256, 2), "tx.nullifiers"), (wide(3, 256), "tx.commitments")] {
+            let want = Err(DecodeError::TooManyEntries { what, got: 256 });
+            let an = encode_tx_annulet(&t);
+            assert_eq!(decode_tx_annulet(&an).map(|_| ()), want, "annulet v1 {what}");
+            assert_eq!(decode_tx_annulet_with(&an, L2AuthForm::CandidateA).map(|_| ()), want, "candidate a {what}");
+            let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..t };
+            assert_eq!(decode_tx(&encode_tx(&l1)).map(|_| ()), want, "l1 {what}");
+        }
+        let edge = wide(255, 255);
+        assert_eq!(decode_tx_annulet(&encode_tx_annulet(&edge)).map(|t| t.public.nullifiers.len()), Ok(255));
+    }
 
     /// Lab #785 F5-3: the finality record carried in a V6 block body is the
     /// `Checkpoint` / `CheckpointVotes` gossip body **byte for byte**. The two

@@ -2777,6 +2777,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::L2ExitWithoutBridge { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
             | BodyError::GenesisPlaintextInBody { .. }
+            // Lab #911: a count over a byte — the transaction's own bytes say so.
+            | BodyError::TxEntriesOverByte { .. }
             // Lab #896 F: the authorization check reads the transaction, the
             // block's own height and the genesis every node shares.
             | BodyError::L2AuthRefused { .. } => BodyFault::Intrinsic("bad body"),
