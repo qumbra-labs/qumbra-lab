@@ -134,6 +134,15 @@ fn genesis_form(g: &AnyGenesis) -> Result<qlab_devnet::forms::GenesisForm, Box<d
     })
 }
 
+/// The genesis's L2 authorization axis (lab #896 E3): a Candidate A Annulet
+/// genesis is observed under the v2 verifier; L1 has none.
+fn genesis_l2_auth(g: &AnyGenesis) -> Result<qlab_devnet::forms::L2AuthForm, Box<dyn Error>> {
+    Ok(match g {
+        AnyGenesis::L1(_) | AnyGenesis::V6(_) => qlab_devnet::forms::L2AuthForm::None,
+        AnyGenesis::Annulet(g) => g.l2_auth()?,
+    })
+}
+
 /// Per asset, the genesis issuance (lab #726): recomputed from an Annulet
 /// genesis's public plaintext notes, each commitment checked; empty on L1.
 fn genesis_issuance(g: &AnyGenesis) -> Result<std::collections::BTreeMap<u16, u128>, Box<dyn Error>> {
@@ -200,7 +209,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let (cfg, node_cfg, genesis) = load(cfg_path)?;
 
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis_form(&genesis)?);
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, genesis_form(&genesis)?, genesis_l2_auth(&genesis)?);
     let mut node = match &genesis {
         AnyGenesis::L1(g) => RunningNode::start(&node_cfg, g, RandomXPow::new(), verifier)?,
         AnyGenesis::V6(g) => RunningNode::start_v6(&node_cfg, g, RandomXPow::new(), verifier)?,

@@ -291,7 +291,8 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     };
 
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form);
+    // An L1 genesis (an Annulet one is refused above): no L2 authorization axis.
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form, qlab_devnet::forms::L2AuthForm::None);
 
     let limits = FaucetLimits {
         ticket_policy: if svc.tickets_required() {

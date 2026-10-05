@@ -146,6 +146,11 @@ qlab-l2 = { path = "../qlab-l2" }
 # beyond qlab-l2's (qlab-air, qlab-consensus) — and, as with qlab-l2, only
 # this binary crate takes it: qlab-devnet and qlab-node keep opaque bytes.
 qlab-wrapper = { path = "../qlab-wrapper" }
+# Lab #896 E3: the Candidate A auth section's decoder (`AnnuletAuthSection`),
+# whose slot leaves are the v2 proofs' leaf public values. Its dependencies
+# (ml-dsa at the committee code's `=` pin, sha2, tiny-keccak) are already in
+# this crate's graph.
+qlab-remote-auth = { path = "../qlab-remote-auth" }
 
 [dev-dependencies]
 # Lab #860 R1: the L2 index tests build real bundle frames over the fold's

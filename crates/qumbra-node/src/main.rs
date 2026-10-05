@@ -532,12 +532,14 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
     // Lab #712: the real verifier for the loaded form — the L2 verifier on an
     // Annulet genesis (B2's rehearsal-only interim is retired).
-    let form = match &genesis {
-        qumbra_node::annulet_genesis::AnyGenesis::L1(g) => g.form()?,
-        qumbra_node::annulet_genesis::AnyGenesis::V6(g) => g.forms().0,
-        qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => g.form()?,
+    // Lab #896 E3: and the L2 authorization axis — a Candidate A genesis
+    // runs the v2 verifier.
+    let (form, l2_auth) = match &genesis {
+        qumbra_node::annulet_genesis::AnyGenesis::L1(g) => (g.form()?, qlab_devnet::forms::L2AuthForm::None),
+        qumbra_node::annulet_genesis::AnyGenesis::V6(g) => (g.forms().0, qlab_devnet::forms::L2AuthForm::None),
+        qumbra_node::annulet_genesis::AnyGenesis::Annulet(g) => (g.form()?, g.l2_auth()?),
     };
-    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form);
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier, form, l2_auth);
     // Lab #300: bracket every pre-banner stage that can plausibly be expensive,
     // so a stall names the stage it is in instead of presenting as silence. The
     // RandomX constructor is lazy today (the ~256 MiB cache builds at first
