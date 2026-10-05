@@ -31,6 +31,10 @@ required-features = ["host"]
 [dependencies]
 # Key hierarchy, non-BIP-39 mnemonic (golden-frozen), diversified addresses.
 qlab-wallet = { path = "../qlab-wallet" }
+# Lab #896 G: the Candidate A authorization keys — auth_master, the AIR-form
+# tree (each generation's auth_root) and the cursor. ml-dsa at the committee
+# code's `=` pin, sha2, tiny-keccak; no prover.
+qlab-remote-auth = { path = "../qlab-remote-auth" }
 # The ledger, extracted so non-CLI shells can render it too (lab #407). This
 # crate supplies the fee table the ledger asks for via its `fee_for` seam.
 qlab-ledger = { path = "../qlab-ledger" }

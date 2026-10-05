@@ -37,6 +37,28 @@ pub const AUTH_FILE: &str = "auth.v1";
 pub const AUTH_LOCK_FILE: &str = "auth.lock";
 const AUTH_HEADER: &str = "qumbra-wallet auth v1";
 
+/// How many generations a wallet with no journal (restored, or new to
+/// Candidate A) tries when it scans (§9: "scan generations 0, 1, …"). Each
+/// costs one authorization-tree build (≈ 0.32 s natively at D12); a wallet
+/// whose highest generation with notes is the last one tried is refused by
+/// name ([`JournalError::ProbeExhausted`]) rather than guessed past.
+pub const PROBE_GENERATIONS: u32 = 8;
+
+/// Generation `g`'s authorization-tree root for `wallet`: the tree over
+/// `auth_master(sk, g)` at `D_AUTH` (design 2b §2), as lanes — what its v2
+/// addresses bind.
+pub fn generation_root(wallet: &qlab_wallet::Wallet, g: u32) -> [u64; 4] {
+    use qlab_remote_auth::annulet::{auth_master, AuthTree, D_AUTH};
+    let master = auth_master(&wallet.auth_secret(), g);
+    let tree = AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth");
+    qlab_note::hash::digest_from_bytes(&tree.root())
+}
+
+/// The probe set: generations `0 .. PROBE_GENERATIONS` with their roots.
+pub fn probe_roots(wallet: &qlab_wallet::Wallet) -> Vec<(u32, [u64; 4])> {
+    (0..PROBE_GENERATIONS).map(|g| (g, generation_root(wallet, g))).collect()
+}
+
 /// A sweep gate: on the net with genesis hash `genesis`, nothing of the
 /// generation is signed before `not_before_height`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +106,8 @@ pub enum JournalError {
     SweepNoGate { g: u32 },
     /// Generation `g` is not sweep-only (active or retired).
     NotSweepOnly { g: u32 },
+    /// A journal-less scan found notes in the last generation it probed.
+    ProbeExhausted { probed: u32 },
 }
 
 impl std::fmt::Display for JournalError {
@@ -113,6 +137,12 @@ impl std::fmt::Display for JournalError {
                  records this net's wait"
             ),
             JournalError::NotSweepOnly { g } => write!(f, "generation {g} is not sweep-only"),
+            JournalError::ProbeExhausted { probed } => write!(
+                f,
+                "this wallet has notes in generation {}, the last of the {probed} a restore probes; it cannot \
+                 tell which generation is current, so it signs nothing",
+                probed - 1
+            ),
         }
     }
 }

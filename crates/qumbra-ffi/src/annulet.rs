@@ -173,6 +173,7 @@ pub fn refusal_key(r: &VerifyRefusal) -> &'static str {
     use VerifyRefusal::*;
     match r {
         NoPin => "no_pin",
+        AuthJournal { .. } => "auth_journal",
         GenesisUnavailable { .. } => "genesis_unavailable",
         GenesisTooLarge { .. } => "genesis_too_large",
         GenesisMismatch { .. } => "genesis_mismatch",

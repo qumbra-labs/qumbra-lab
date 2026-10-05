@@ -558,6 +558,7 @@ fn every_refusal_has_its_pinned_key() {
     let s = String::new;
     let all = [
         NoPin,
+        AuthJournal { why: s() },
         GenesisUnavailable { why: s() },
         GenesisTooLarge { got: 0 },
         GenesisMismatch { pinned: [0; 32], fetched: [0; 32] },
@@ -586,6 +587,7 @@ fn every_refusal_has_its_pinned_key() {
     for r in &all {
         let pinned = match r {
             NoPin => "no_pin",
+            AuthJournal { .. } => "auth_journal",
             GenesisUnavailable { .. } => "genesis_unavailable",
             GenesisTooLarge { .. } => "genesis_too_large",
             GenesisMismatch { .. } => "genesis_mismatch",
@@ -613,7 +615,7 @@ fn every_refusal_has_its_pinned_key() {
         assert_eq!(refusal_key(r), pinned);
         assert!(seen.insert(pinned), "{pinned} twice");
     }
-    assert_eq!(seen.len(), 24, "every variant listed once");
+    assert_eq!(seen.len(), 25, "every variant listed once");
 }
 
 /// The bounds' constants are the real sizes: the list key and signature are

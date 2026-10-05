@@ -98,9 +98,20 @@ pub struct AnnuletVerifyDriver {
     pending: Option<String>,
     failed: Option<VerifyRefusal>,
     done: Option<Box<VerifiedAnnulet>>,
+    /// Lab #896 G: the generations a Candidate A scan owns notes under —
+    /// the journal's when the wallet has one ([`Self::with_generations`]),
+    /// else the probe set, built only once the genesis says Candidate A.
+    generations: Option<Vec<(u32, [u64; 4])>>,
 }
 
 impl AnnuletVerifyDriver {
+    /// Lab #896 G: the wallet's known generations (its journal's). Used only
+    /// if the pinned genesis is a Candidate A one; a v1 net scans as before.
+    pub fn with_generations(mut self, generations: Vec<(u32, [u64; 4])>) -> Self {
+        self.generations = Some(generations);
+        self
+    }
+
     /// `record` is the verified-header record's bytes for the chain `pin`
     /// names — `Ok(None)` when there is none, `Err(why)` when it could not be
     /// read ([`crate::annulet_verify::read_chain_record`]).
@@ -123,6 +134,7 @@ impl AnnuletVerifyDriver {
             phase: Phase::Genesis,
             pending: None,
             failed: None,
+            generations: None,
             done: None,
         }
     }
@@ -349,14 +361,22 @@ impl AnnuletVerifyDriver {
                 (n.cm, note)
             })
             .collect();
-        let core = Box::new(AnnuletScanCore::new(
+        let mut core = AnnuletScanCore::new(
             self.wallet.clone(),
             self.allocated.clone(),
             self.from,
             to,
             chain.genesis.hash,
             genesis_notes.clone(),
-        ));
+        );
+        if chain.genesis.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+            let generations = match &self.generations {
+                Some(g) if !g.is_empty() => g.clone(),
+                _ => crate::auth_journal::probe_roots(&self.wallet),
+            };
+            core = core.with_generations(generations);
+        }
+        let core = Box::new(core);
         let post = Post {
             chain,
             cache,

@@ -154,6 +154,9 @@ pub fn response_ceiling(path: &str) -> Option<usize> {
 pub enum VerifyRefusal {
     /// No genesis pin: there is no verified scan of an unnamed chain.
     NoPin,
+    /// Lab #896 G: the wallet's authorization journal (`auth.v1`) could not
+    /// be read — the scan will not guess which generations are the wallet's.
+    AuthJournal { why: String },
     /// `/genesis.qmb` could not be read.
     GenesisUnavailable { why: String },
     /// `/genesis.qmb` is longer than [`MAX_GENESIS_FILE_BYTES`].
@@ -210,6 +213,7 @@ impl std::fmt::Display for VerifyRefusal {
         use VerifyRefusal::*;
         match self {
             NoPin => write!(f, "no genesis pin: a verified Annulet scan needs the chain named by its genesis hash"),
+            AuthJournal { why } => write!(f, "the authorization journal could not be read: {why}"),
             GenesisUnavailable { why } => write!(f, "GET {GENESIS_FILE_PATH}: {why}"),
             GenesisTooLarge { got } => {
                 write!(f, "{GENESIS_FILE_PATH} is {got} B, over the {MAX_GENESIS_FILE_BYTES} B bound")
@@ -682,6 +686,13 @@ where
     let pin = pin.ok_or(VerifyRefusal::NoPin)?;
     let record = read_chain_record(w, &pin);
     let mut driver = AnnuletVerifyDriver::new(w.wallet(), w.allocated.clone(), pin, from, to, record);
+    // Lab #896 G: the journal's generations, when the wallet has one (a
+    // Candidate A net only reads them; a v1 net ignores them).
+    match crate::auth_journal::AuthJournal::load(&w.dir) {
+        Ok(Some(j)) => driver = driver.with_generations(j.generations().iter().map(|r| (r.g, r.auth_root)).collect()),
+        Ok(None) => {}
+        Err(e) => return Err(VerifyRefusal::AuthJournal { why: e.to_string() }),
+    }
     let mut v = loop {
         match driver.step(rng) {
             AnnuletStep::Need(path) => driver.supply(fetch(&path)),
