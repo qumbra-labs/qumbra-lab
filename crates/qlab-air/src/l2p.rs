@@ -441,6 +441,30 @@ pub fn pv_vec_l2p(
     out
 }
 
+/// v2: [`pv_vec_l2p`] followed by the three slots' authorization leaves.
+#[allow(clippy::too_many_arguments)]
+pub fn pv_vec_l2p_v2(
+    anchor: &[u64; 4],
+    nf1: &[u64; 4],
+    nf2: &[u64; 4],
+    cm1: &[u64; 4],
+    cm2: &[u64; 4],
+    fee: u64,
+    registry_root: &[u64; 4],
+    vp: &[VPublic; 2],
+    vpa: &[u64; 2],
+    nf3: &[u64; 4],
+    xrkm: &[u64; 4],
+    leaves: &[[u64; 4]; 3],
+) -> Vec<u32> {
+    let mut out = pv_vec_l2p(anchor, nf1, nf2, cm1, cm2, fee, registry_root, vp, vpa, nf3, xrkm);
+    for leaf in leaves {
+        out.extend_from_slice(&pv_chunks(leaf));
+    }
+    debug_assert_eq!(out.len(), PV_LEN_V2);
+    out
+}
+
 /// Freeze-tree depth (l2-own-circuit-decision §3.2; an L2 parameter).
 pub const FREEZE_DEPTH: usize = 20;
 /// Allowlist depth (§3.4; an L2 parameter).
@@ -2820,11 +2844,8 @@ pub fn build_bucket_l2p_v2(
         if vp[0].amount != 0 { inputs[0].asset } else { 0 },
         if vp[1].amount != 0 { inputs[1].asset } else { 0 },
     ];
-    let mut pvs = pv_vec_l2p(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &vp, &vpa, &nf3, &xrkm);
-    for leaf in [&inputs[0].auth.leaf, &inputs[1].auth.leaf, &fee_in.auth.leaf] {
-        pvs.extend_from_slice(&pv_chunks(leaf));
-    }
-    debug_assert_eq!(pvs.len(), PV_LEN_V2);
+    let leaves = [inputs[0].auth.leaf, inputs[1].auth.leaf, fee_in.auth.leaf];
+    let pvs = pv_vec_l2p_v2(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &vp, &vpa, &nf3, &xrkm, &leaves);
     L2PBucketInstance {
         air: L2ShapePAir {
             log_height,

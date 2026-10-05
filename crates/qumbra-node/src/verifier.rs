@@ -1016,10 +1016,18 @@ mod tests {
         assert_eq!(s, qlab_air::l2::pv_vec_l2_v2(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &w(8), &leaves));
         let r = with_leaves(qlab_l2::pv_vec_r(&w(1), &w(2), &w(3), 4, &w(5), &w(6), 7, &w(8)), &leaves[..1]);
         assert_eq!(r, qlab_air::l2r::pv_vec_r_v2(&w(1), &w(2), &w(3), 4, &w(5), &w(6), 7, &w(8), &leaves[0]));
-        let t = [qlab_devnet::annulet::VPublicTerm::NONE; 2];
+        // A redeem row, so the P accept path's vPublic mapping is in the comparison.
+        let t = [
+            qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 0x0001_0002_0003_0004, asset: 9 },
+            qlab_devnet::annulet::VPublicTerm::NONE,
+        ];
         let p = with_leaves(
             qlab_l2::pv_vec_p(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &vpublic(&t), &vpublic_assets(&t), &w(8), &w(9)),
             &leaves,
+        );
+        assert_eq!(
+            p,
+            qlab_air::l2p::pv_vec_l2p_v2(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &vpublic(&t), &vpublic_assets(&t), &w(8), &w(9), &leaves)
         );
         for (shape, pvs) in [(Shape::S, &s), (Shape::P, &p), (Shape::R, &r)] {
             assert_eq!(pvs.len(), v2::pv_len(shape), "{shape:?}");

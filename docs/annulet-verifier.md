@@ -14,8 +14,9 @@ B4 makes the node verify every Annulet transaction's proof against its **declare
    - This step is also what separates an L1 proof from an L2 one: both decode as `Proof<Config>`, and only their structure differs.
 5. **`verify_s` / `verify_p`** run against PVs rebuilt from the declared surface (`ProofInvalid`). For shape P, each `VPublicTerm {redeem, amount, asset}` becomes `VPublic{redeem, amount}` plus the revealed asset.
 
-**The default:** `select_verifier(rehearsal, form)`.
+**The default:** `select_verifier(rehearsal, form, l2_auth)`.
 - On an Annulet genesis the real `L2Verifier` is the default. B2's rehearsal-only interim is retired: M10-T0-4's rule, real verifier before any public net.
+- On a Candidate A Annulet genesis (`L2AuthForm::CandidateA`, format 33) it is `L2VerifierV2` (lab #896 E3): the v2 shapes, with each auth-section slot's leaf appended to the PVs. Each verifier refuses the other version's transactions by name (`AuthOnV1Net`, `AuthMissing`); a section that does not decode for the shape is `AuthMalformed`, before the proof is read.
 - `--rehearsal-verifier` stays a loud ⚠️ opt-in on both forms.
 - `ConsensusVerifier` refuses any transaction carrying an L2 surface.
 
