@@ -80,7 +80,7 @@ impl AuthRun {
         Self::for_generation(lock, journal, &wallet, g, next, session, validity)
     }
 
-    fn for_generation<E: Endpoint>(
+    pub(crate) fn for_generation<E: Endpoint>(
         lock: AuthLock,
         journal: AuthJournal,
         wallet: &Wallet,
@@ -443,4 +443,170 @@ pub fn run_plan_v2<E: Endpoint>(
         }
     }
     Ok(made.into_iter().map(|m| m.expect("every step ran")).collect())
+}
+
+/// The `(leaf_index, leaf)` of every slot of every landed transaction that
+/// spent one of `spent` (generation `g`'s spent notes with their heights) —
+/// read from the served bodies, whose Candidate A frame carries each
+/// transaction's auth section. [`landed_next`] keeps the real slots.
+pub fn landed_slots<E: Endpoint>(
+    served: &Served<E>,
+    wallet: &Wallet,
+    spent: &[(OwnedL2Note, u64)],
+) -> Result<Vec<(u32, [u8; 32])>, SendRefusal> {
+    use qlab_devnet::annulet::L2Surface;
+    use qlab_remote_auth::annulet::AnnuletAuthSection;
+    let mut heights: std::collections::BTreeMap<u64, Vec<[u8; 32]>> = std::collections::BTreeMap::new();
+    for (n, h) in spent {
+        heights.entry(*h).or_default().push(n.nullifier(wallet));
+    }
+    let mut out = Vec::new();
+    for (h, nfs) in heights {
+        let bytes = served
+            .endpoint
+            .get(&format!("/v1/block/{h}/body"))
+            .map_err(|why| SendRefusal::Auth(format!("block {h}'s body is unavailable: {why}")))?;
+        let ann = qlab_p2p::served::decode_body_answer(qlab_p2p::compact::WireForm::ANNULET_AUTH, h, &bytes)
+            .map_err(|e| SendRefusal::Auth(format!("block {h}'s body does not decode: {e}")))?;
+        for tx in qlab_p2p::served::body_of(&ann).txs {
+            if !tx.public.nullifiers.iter().any(|nf| nfs.contains(nf)) {
+                continue;
+            }
+            let shape = match L2Surface::decode(&tx.l2) {
+                Ok(Some(s)) => qlab_devnet::annulet::auth_shape(s.shape),
+                _ => return Err(SendRefusal::Auth(format!("a landed spend at height {h} has no surface"))),
+            };
+            let section = AnnuletAuthSection::decode(shape, &tx.auth)
+                .map_err(|e| SendRefusal::Auth(format!("a landed spend at height {h} has no readable auth section: {e:?}")))?; // debug-ok
+            out.extend(section.slots.iter().map(|s| (s.descriptor.leaf_index(), s.descriptor.leaf())));
+        }
+    }
+    Ok(out)
+}
+
+/// What [`migrate`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrateReport {
+    /// The journal was created by this run (a restored or new wallet).
+    pub initialized: bool,
+    /// The active generation after the run.
+    pub active: u32,
+    /// Generations swept by this run, with the transactions each took.
+    pub swept: Vec<(u32, usize)>,
+    /// Generations that must wait: `(g, not_before_height)`.
+    pub waiting: Vec<(u32, u64)>,
+    /// Generations retired by this run (nothing left to spend).
+    pub retired: Vec<u32>,
+}
+
+/// **`migrate`** (§9): set the journal up if the wallet has none (restore →
+/// migrate); with `open_next`, open a new active generation, the old one
+/// becoming sweep-only on this net from `tip + MAX_AUTH_VALIDITY_BLOCKS`;
+/// then sweep every sweep-only generation whose gate on this net has passed
+/// to the active generation's address 0 — non-zero assets first through the
+/// ordinary planner (fee notes from the swept generation), then each asset-0
+/// note on its own (paying its own fee). A sweep's cursor starts above every
+/// position the generation's landed spends used ([`landed_next`]).
+#[allow(clippy::too_many_arguments)]
+pub fn migrate<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    scan_to: u64,
+    pin: Option<[u8; 32]>,
+    open_next: bool,
+    split_wait: std::time::Duration,
+    rng: &mut StdRng,
+) -> Result<MigrateReport, SendRefusal> {
+    use crate::annulet_send::{open_session, plan_send};
+    let session = open_session(w, endpoint, scan_to, pin, rng)?;
+    if session.l2_auth != qlab_devnet::forms::L2AuthForm::CandidateA {
+        return Err(SendRefusal::Auth("migrate is for a Candidate A net; this one is not".into()));
+    }
+    let wallet = w.wallet();
+    let lock = AuthLock::acquire(&w.dir)?;
+    let (mut journal, initialized) = match AuthJournal::load(&w.dir)? {
+        Some(j) => (j, false),
+        None => (restore_journal(&lock, w, &wallet, &session.owned, &session.genesis_hash, session.tip)?, true),
+    };
+    if open_next {
+        let next_g = journal.generations().iter().map(|r| r.g).max().expect("non-empty") + 1;
+        let gate = SweepGate { genesis: session.genesis_hash, not_before_height: session.tip + MAX_AUTH_VALIDITY_BLOCKS };
+        journal.open_next(&lock, &w.dir, generation_root(&wallet, next_g), gate)?;
+    }
+    let active_root = journal.active().auth_root;
+    let to_active = me_v2(&wallet, &active_root);
+    let mut report = MigrateReport { initialized, active: journal.active().g, swept: Vec::new(), waiting: Vec::new(), retired: Vec::new() };
+    let sweeps: Vec<u32> = journal
+        .generations()
+        .iter()
+        .filter(|r| matches!(r.state, GenState::Sweep { .. }))
+        .map(|r| r.g)
+        .collect();
+    drop(lock);
+    for g in sweeps {
+        // Each generation under the lock, on the journal as it is on disk now.
+        let lock = AuthLock::acquire(&w.dir)?;
+        let mut j = AuthJournal::load(&w.dir)?.expect("written above");
+        let index = session.index.only_generation(g);
+        let spendable: Vec<OwnedL2Note> = index.by_asset.values().flat_map(|n| n.spendable.iter().cloned()).collect();
+        if spendable.is_empty() {
+            j.retire(&lock, &w.dir, g)?;
+            report.retired.push(g);
+            continue;
+        }
+        match j.sweep_allowed(g, &session.genesis_hash, session.tip) {
+            Ok(()) => {}
+            Err(JournalError::SweepNotYet { not_before_height, .. }) => {
+                report.waiting.push((g, not_before_height));
+                continue;
+            }
+            Err(JournalError::SweepNoGate { .. }) => {
+                let h = session.tip + MAX_AUTH_VALIDITY_BLOCKS;
+                j.add_gate(&lock, &w.dir, g, SweepGate { genesis: session.genesis_hash, not_before_height: h })?;
+                report.waiting.push((g, h));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        // The cursor above every landed own leaf of g.
+        let spent: Vec<(OwnedL2Note, u64)> = index.by_asset.values().flat_map(|n| n.spent.iter().cloned()).collect();
+        let landed = landed_slots(&session.served, &wallet, &spent)?;
+        let floor = landed_next(&wallet, g, &landed);
+        let next = j.get(g)?.next.max(floor);
+        j.advance(&lock, &w.dir, g, next)?;
+        let mut run = AuthRun::for_generation(lock, j, &wallet, g, next, &session, DEFAULT_VALIDITY_BLOCKS)?;
+        let mut txs = 0usize;
+        // Non-zero assets: the planner, paying the active generation.
+        for (&asset, notes) in &index.by_asset {
+            if asset == 0 || notes.spendable.is_empty() {
+                continue;
+            }
+            let amount: u64 = notes.spendable.iter().map(|n| n.note.value).sum();
+            let leaf = session.served.registry(u64::from(asset))?.leaf;
+            let shape = qlab_l2spend::shape_for(&leaf);
+            let plan = plan_send(&index, asset, amount, shape, session.tiers)?;
+            txs += plan.steps.len();
+            run_plan_v2(w, &mut run, &session, &plan, &to_active, &to_active, &[], split_wait, rng)?;
+        }
+        // Asset 0, note by note, each paying its own S fee. A note the fee
+        // would consume whole is left (dust) and reported by the next scan.
+        // Note: the planner above may have spent some asset-0 notes as fees;
+        // the session's index predates that, so a fresh scan is the next
+        // migrate's job — this pass sweeps only notes it did not just spend.
+        if index.by_asset.keys().all(|a| *a == 0) {
+            for n in index.spendable(0) {
+                if n.note.value <= session.tiers.s {
+                    continue;
+                }
+                let outs = [
+                    Out { to: to_active.clone(), value: n.note.value - session.tiers.s, asset: 0 },
+                    Out { to: to_active.clone(), value: 0, asset: 0 },
+                ];
+                spend_v2(w, &mut run, &session.served, L2ShapeTag::S, V2Spend::One(n), &outs, session.tiers.s, &PolicyContext::default(), rng)?;
+                txs += 1;
+            }
+        }
+        report.swept.push((g, txs));
+    }
+    Ok(report)
 }

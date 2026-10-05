@@ -35,6 +35,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("names") => names(&args[1..]),
         Some("issuer") => issuer(&args[1..]),
         Some("ivk") => ivk(&args[1..]),
+        Some("migrate") => migrate_cmd(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -414,7 +415,13 @@ fn usage() {
                             --label fold into it; --qr renders it as a terminal QR, --qr-svg\n\
                             writes it as an SVG file. The qs1… fingerprint is always printed\n\
                             beside a URI/QR: a QR that merely scans is NOT a verified address —\n\
-                            confirm the fingerprint with the payee out of band\n  \
+                            confirm the fingerprint with the payee out of band\n\
+                            --candidate-a shows the Candidate A (version 2) address of the\n\
+                            journal's active generation (lab #896)\n  \
+         qumbra-wallet migrate --net annulet --url URL --scan-to H --genesis-hash HEX --dir DIR [--open-next]\n\
+                            Candidate A: set up the auth journal (a restored wallet never resumes a\n\
+                            generation), open a new one with --open-next, sweep older generations\n\
+                            once their wait on this net has passed\n  \
          qumbra-wallet contact add NAME QADDR --dir DIR  save a full address under a local name\n  \
          qumbra-wallet contact list --dir DIR            show NAME → qs1… (short)\n  \
          qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
@@ -1860,6 +1867,46 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         report.outputs[1].value,
         report.plan.total_fee()
     );
+    Ok(())
+}
+
+/// `migrate` (lab #896 G, design 2b §9): on a Candidate A net, set up the
+/// authorization journal (a restored wallet migrates: it never resumes a
+/// generation), optionally open a new generation (`--open-next`), and sweep
+/// every sweep-only generation whose wait on this net has passed.
+fn migrate_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("migrate requires --url (the node's discovery server)")?;
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("migrate requires --scan-to HEIGHT")?.parse()?;
+    let pin = Some(required_pin(args, "migrate")?);
+    let w = WalletDir::open(&dir)?;
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    let endpoint = qumbra_wallet::annulet_send::WalletEndpoint { url: url.to_string() };
+    let r = qumbra_wallet::annulet_v2::migrate(
+        &w,
+        endpoint,
+        scan_to,
+        pin,
+        has_flag(args, "--open-next"),
+        std::time::Duration::from_secs(120),
+        &mut rng,
+    )?;
+    if r.initialized {
+        println!("auth journal created (a restored or new wallet: no generation is resumed)");
+    }
+    println!("active generation: {}", r.active);
+    for (g, txs) in &r.swept {
+        println!("swept generation {g}: {txs} transaction(s) to generation {}", r.active);
+    }
+    for (g, h) in &r.waiting {
+        println!("generation {g} waits on this net until height {h} (earlier authorizations must expire first)");
+    }
+    for g in &r.retired {
+        println!("generation {g} retired (nothing left to spend)");
+    }
     Ok(())
 }
 
