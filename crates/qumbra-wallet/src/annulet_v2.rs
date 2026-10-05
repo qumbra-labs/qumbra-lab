@@ -694,3 +694,136 @@ pub fn build_registry_write_v2<E: Endpoint>(
     run.sign(&mut built.tx, &built.auth.clone(), &[])?;
     Ok(built)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+
+    fn wallet_dir(tag: &str, seed: u8) -> WalletDir {
+        let dir = std::env::temp_dir().join(format!("qmb_g_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        WalletDir::create(&dir, MasterSeed::from_entropy([seed; ENTROPY_LEN])).unwrap()
+    }
+
+    /// A note of generation `g` at address 0 (only its generation and value
+    /// matter to the journal's restore rule).
+    fn note_of(w: &Wallet, g: u32, value: u64, k: u8) -> OwnedL2Note {
+        let root = generation_root(w, g);
+        let rkm = w.address_candidate_a_at_index(0, &root).rkm_lanes();
+        let note = qlab_note::l2note::L2Note { value, asset: 0, rkm, rho: [k as u64; 4], rseed: [k as u64 + 1; 4] };
+        OwnedL2Note::from_genesis_v2(w, 0, [k; 32], note, &[(g, root)]).expect("its own v2 note")
+    }
+
+    /// The journal's cached root is the tree `LocalAuth` signs with: the
+    /// address a wallet hands out is the one its keys can spend.
+    #[test]
+    fn generation_root_is_local_auths() {
+        let w = wallet_dir("root", 3);
+        let wallet = w.wallet();
+        for g in [0u32, 1] {
+            let la = LocalAuth::new(&wallet.auth_secret(), g, 0).unwrap();
+            assert_eq!(generation_root(&wallet, g), la.auth_root(), "generation {g}");
+        }
+        assert_ne!(generation_root(&wallet, 0), generation_root(&wallet, 1));
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// A v2 note is owned only under its own generation's root, and the
+    /// generation is recorded; `only_generation` keeps exactly its notes.
+    #[test]
+    fn notes_are_owned_per_generation() {
+        let w = wallet_dir("own", 4);
+        let wallet = w.wallet();
+        let n1 = note_of(&wallet, 1, 5, 1);
+        assert_eq!(n1.generation, Some(1));
+        let root0 = generation_root(&wallet, 0);
+        assert!(
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [1; 32], n1.note, &[(0, root0)]).is_err(),
+            "not generation 0's"
+        );
+        assert!(OwnedL2Note::from_genesis(&wallet, 0, [1; 32], n1.note).is_err(), "not a v1 note");
+        let set = qlab_ledger::spent::SpentSet::from_parts(Some((0, 0)), Vec::<(u64, [u8; 32])>::new());
+        let index = qlab_ledger::assets::AssetIndex::build(&wallet, vec![note_of(&wallet, 0, 7, 2), n1], &set);
+        assert_eq!(index.only_generation(1).spendable(0).len(), 1);
+        assert_eq!(index.only_generation(1).spendable(0)[0].note.value, 5);
+        assert_eq!(index.only_generation(0).spendable(0)[0].note.value, 7);
+        assert!(index.only_generation(2).spendable(0).is_empty());
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// §9: a restored wallet never resumes. Notes in generations 0 and 2 →
+    /// generation 3 active; 0 and 2 sweep-only on this net from tip + cap;
+    /// generation 1 (no notes) is not recorded. No notes at all → generation
+    /// 0, fresh. Notes in the last probed generation → refused by name.
+    #[test]
+    fn restore_opens_the_generation_above_every_one_with_notes() {
+        let w = wallet_dir("restore", 5);
+        let wallet = w.wallet();
+        let lock = AuthLock::acquire(&w.dir).unwrap();
+        let genesis = [0x33; 32];
+        let owned = [note_of(&wallet, 0, 1, 1), note_of(&wallet, 2, 1, 2)];
+        let j = restore_journal(&lock, &w, &wallet, &owned, &genesis, 500).unwrap();
+        assert_eq!(j.active().g, 3);
+        assert_eq!(j.active().next, 0);
+        assert_eq!(j.active().auth_root, generation_root(&wallet, 3));
+        let gate = vec![SweepGate { genesis, not_before_height: 500 + MAX_AUTH_VALIDITY_BLOCKS }];
+        assert_eq!(j.get(0).unwrap().state, GenState::Sweep { gates: gate.clone() });
+        assert_eq!(j.get(2).unwrap().state, GenState::Sweep { gates: gate });
+        assert!(j.get(1).is_err(), "a generation with no notes is not recorded");
+        assert_eq!(AuthJournal::load(&w.dir).unwrap(), Some(j), "persisted");
+        std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
+
+        let fresh = restore_journal(&lock, &w, &wallet, &[], &genesis, 500).unwrap();
+        assert_eq!(fresh.active().g, 0, "no notes: nothing was ever exported");
+        assert_eq!(fresh.generations().len(), 1);
+
+        let last = crate::auth_journal::PROBE_GENERATIONS - 1;
+        let edge = [note_of(&wallet, last, 1, 9)];
+        assert!(matches!(
+            restore_journal(&lock, &w, &wallet, &edge, &genesis, 500),
+            Err(SendRefusal::Auth(why)) if why.contains("last of the")
+        ));
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// The sweep cursor restarts above the highest **position** a landed own
+    /// leaf holds in the private permutation — not above the highest leaf
+    /// index. A slot whose leaf is not the generation's (a dummy's) is
+    /// ignored.
+    #[test]
+    fn landed_next_is_a_permutation_position() {
+        use qlab_remote_auth::annulet::{auth_master, AuthTree, Cursor};
+        let w = wallet_dir("landed", 6);
+        let wallet = w.wallet();
+        let master = auth_master(&wallet.auth_secret(), 0);
+        let tree = AuthTree::build(&master, D_AUTH).unwrap();
+        let mut c = Cursor::new(&master, D_AUTH, 0).unwrap();
+        let drawn: Vec<u32> = (0..5).map(|_| c.take().unwrap()).collect();
+        assert_eq!(landed_next(&wallet, 0, &[]), 0);
+        // Positions 1 and 3 landed (out of order), plus a dummy slot.
+        let landed = [
+            (drawn[3], tree.leaf(drawn[3])),
+            (drawn[1], tree.leaf(drawn[1])),
+            (drawn[0], [0xEE; 32]),
+        ];
+        assert_eq!(landed_next(&wallet, 0, &landed), 4, "position 3 + 1, whatever the indices");
+        // Only position 1 landed: the cursor restarts at 2.
+        assert_eq!(landed_next(&wallet, 0, &[(drawn[1], tree.leaf(drawn[1]))]), 2);
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// A Candidate A address is version 2 and binds the generation's root.
+    #[test]
+    fn me_v2_pays_the_generations_address_0() {
+        let w = wallet_dir("me", 7);
+        let wallet = w.wallet();
+        let root = generation_root(&wallet, 0);
+        let r = me_v2(&wallet, &root);
+        let a = wallet.address_candidate_a_at_index(0, &root);
+        assert_eq!(a.version, qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A);
+        assert_eq!(r.rkm, a.rkm_lanes());
+        assert_ne!(r.rkm, wallet.address_at_index(0).rkm_lanes(), "not the v1 address");
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+}
