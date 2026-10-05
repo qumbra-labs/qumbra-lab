@@ -596,7 +596,7 @@ pub(crate) fn run_detaudit(args: &[String]) {
                 other => bad_fixture("s3v2", other),
             };
             let pvs = qlab_l2::public_values(&inst.pvs);
-            run!("s3v2", &inst.air, pvs, qlab_air::l2::audit_program(&inst.air), qlab_air::l2::witness_manifest_v2(), qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::S), qlab_air::l2::audit_col_regions_v2(), Vec::new());
+            run!("s3v2", &inst.air, pvs, qlab_air::l2::audit_program(&inst.air), qlab_air::l2::witness_manifest_v2(), qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::S), qlab_air::l2::audit_col_regions_v2(), qlab_l2::v2::audit_leaf_pv_inputs(qlab_l2::Shape::S));
         }
         ("p3v2", f) => {
             let inst = match f {
@@ -610,7 +610,11 @@ pub(crate) fn run_detaudit(args: &[String]) {
                 println!("  premise (collision resistance): nk and auth_root @ ARKM′/″ declared sources (l2p::audit_cr_premise_v2)");
                 manifest.extend(qlab_air::l2p::audit_cr_premise_v2());
             }
-            run!("p3v2", &inst.air, pvs, qlab_air::l2p::audit_program(&inst.air), manifest, qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::P), qlab_air::l2p::audit_col_regions_v2(), if flag("--no-pv-inputs") { Vec::new() } else { qlab_air::l2p::audit_pv_inputs(&inst.pvs) });
+            // The leaf PVs are verifier-supplied whatever `--no-pv-inputs`
+            // drops (that flag removes i758 §3's codec premise only).
+            let mut pv_in = if flag("--no-pv-inputs") { Vec::new() } else { qlab_air::l2p::audit_pv_inputs(&inst.pvs) };
+            pv_in.extend(qlab_l2::v2::audit_leaf_pv_inputs(qlab_l2::Shape::P));
+            run!("p3v2", &inst.air, pvs, qlab_air::l2p::audit_program(&inst.air), manifest, qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::P), qlab_air::l2p::audit_col_regions_v2(), pv_in);
         }
         ("rv2", f) => {
             let inst = match f {
@@ -618,7 +622,7 @@ pub(crate) fn run_detaudit(args: &[String]) {
                 other => bad_fixture("rv2", other),
             };
             let pvs = qlab_l2::public_values(&inst.pvs);
-            run!("rv2", &inst.air, pvs, qlab_air::l2r::audit_program(&inst.air), qlab_air::l2r::witness_manifest_v2(), qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::R), qlab_air::l2r::audit_col_regions_v2(), Vec::new());
+            run!("rv2", &inst.air, pvs, qlab_air::l2r::audit_program(&inst.air), qlab_air::l2r::witness_manifest_v2(), qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::R), qlab_air::l2r::audit_col_regions_v2(), qlab_l2::v2::audit_leaf_pv_inputs(qlab_l2::Shape::R));
         }
         (other, _) => {
             eprintln!("detaudit: unknown --air `{other}`; expected claim|narrow|s3|p3|r|s3v2|p3v2|rv2");

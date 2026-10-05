@@ -578,3 +578,41 @@ fn l2_v2_shape_digests_are_pinned() {
         assert_eq!((digest::hex(&c).as_str(), count), (constr, n), "{shape:?} v2 constraints");
     }
 }
+
+/// Lab #896 seam T (census premise): the leaf PVs the census takes as
+/// verifier-supplied are exactly each slot's `pv_leaf(shape, k) .. + 16` — the
+/// AIR's own leaf constants, inside the v2 PV vector, disjoint across slots —
+/// and on the fabricated instances they hold the slot's leaf, chunked as the
+/// node chunks it. So the premise cannot drift from the AIR.
+#[test]
+fn the_census_leaf_premise_is_exactly_the_airs_leaf_pvs() {
+    use qlab_air::narrow::pv_chunks;
+    let expect = |starts: &[usize]| -> Vec<usize> { starts.iter().flat_map(|&s| s..s + 16).collect() };
+    let cases = [
+        (Shape::S, vec![qlab_air::l2::PV_LEAF1, qlab_air::l2::PV_LEAF2, qlab_air::l2::PV_LEAF3]),
+        (Shape::P, vec![qlab_air::l2p::PV_LEAF1, qlab_air::l2p::PV_LEAF2, qlab_air::l2p::PV_LEAF3]),
+        (Shape::R, vec![qlab_air::l2r::PV_LEAF]),
+    ];
+    for (shape, starts) in cases {
+        let got = v2::audit_leaf_pv_inputs(shape);
+        assert_eq!(starts.len(), v2::auth_slots(shape), "{shape:?}: one leaf per auth slot");
+        assert_eq!(got, expect(&starts), "{shape:?}: the premise is the AIR's leaf PVs");
+        for (k, start) in starts.iter().enumerate() {
+            assert_eq!(v2::pv_leaf(shape, k), *start, "{shape:?} slot {k}");
+        }
+        let mut sorted = got.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), got.len(), "{shape:?}: no PV named twice");
+        assert!(got.iter().all(|&i| i < v2::pv_len(shape)), "{shape:?}: inside the v2 PV vector");
+    }
+    // The values: each slot's leaf sits at its premise PVs.
+    let s = qlab_air::l2::fabricated_bucket_l2_v2();
+    for (k, leaf) in s.leaves.iter().enumerate() {
+        let at = v2::pv_leaf(Shape::S, k);
+        assert_eq!(s.pvs[at..at + 16], pv_chunks(leaf), "S slot {k}");
+    }
+    let r = qlab_air::l2r::fabricated_shape_r_v2();
+    let at = v2::pv_leaf(Shape::R, 0);
+    assert_eq!(r.inst.pvs[at..at + 16], pv_chunks(&r.leaf), "R");
+}

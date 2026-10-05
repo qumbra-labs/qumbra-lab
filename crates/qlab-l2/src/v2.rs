@@ -85,6 +85,17 @@ pub fn audit_pv_bits(shape: Shape) -> Vec<u32> {
     b
 }
 
+/// The census premise for the authorization leaves (lab #896 seam T, fold
+/// after the 2026-10-05 box census): every slot's leaf PVs,
+/// `pv_leaf(shape, k) .. + 16` for `k < auth_slots(shape)`, are
+/// **verifier-supplied** — the node fills them from the transaction's auth
+/// section, so they are statement inputs, not values the AIR derives. The leaf
+/// cell at `AAUTH` stays a witness copy, which the census must find determined
+/// from these PVs through bank `EQL`.
+pub fn audit_leaf_pv_inputs(shape: Shape) -> Vec<usize> {
+    (0..auth_slots(shape)).flat_map(|k| pv_leaf(shape, k)..pv_leaf(shape, k) + 16).collect()
+}
+
 /// The canonical v2 program of `shape`, read off the fabricated v2 builders
 /// (every v2 builder emits the same program; the verifier AIR reads only it).
 pub fn canonical_program(shape: Shape) -> &'static [u32] {
