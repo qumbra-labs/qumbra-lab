@@ -116,6 +116,9 @@ pub enum SendRefusal {
     RegistryRaced(String),
     /// An exit could not be assembled (lab #831 W2) — by name, before proving.
     Exit(qlab_l2spend::ExitError),
+    /// Lab #896 G: the Candidate A layer refused — the journal, the keys,
+    /// the validity, a generation mix, or signing — by name.
+    Auth(String),
 }
 
 impl std::fmt::Display for SendRefusal {
@@ -184,6 +187,7 @@ impl std::fmt::Display for SendRefusal {
                  gone ({node}); re-read the slot and write again"
             ),
             SendRefusal::Exit(e) => write!(f, "{e}"),
+            SendRefusal::Auth(why) => write!(f, "Candidate A: {why}"),
             SendRefusal::SplitNotIncluded { waited_secs } => write!(
                 f,
                 "the fee-split was admitted but its note was not in the served tree after {waited_secs} s; \
@@ -497,7 +501,7 @@ pub struct SendReport {
     pub shape: L2ShapeTag,
 }
 
-fn wait_in_tree<E: Endpoint>(served: &Served<E>, cm: &[u64; 4], timeout: Duration) -> Result<(), SendRefusal> {
+pub(crate) fn wait_in_tree<E: Endpoint>(served: &Served<E>, cm: &[u64; 4], timeout: Duration) -> Result<(), SendRefusal> {
     let start = Instant::now();
     loop {
         if served.commitment_tree()?.position_of(cm).is_some() {
@@ -521,6 +525,13 @@ pub struct Session<E: Endpoint> {
     /// (lab #869 AS-1b): **`false`** while the spends subtracted are the
     /// endpoint's list (lab #853). A shell states this beside every plan.
     pub spends_verified: bool,
+    /// Lab #896 G: the net's L2 authorization axis, from the pinned genesis.
+    pub l2_auth: qlab_devnet::forms::L2AuthForm,
+    /// Lab #896 G: the verified tip — the validity window is set from it.
+    pub tip: u64,
+    /// Lab #896 G: every note the verified scan made the wallet's, spent or
+    /// not (a restore reads their generations).
+    pub owned: Vec<OwnedL2Note>,
 }
 
 /// **The verified session** (lab #869 (a)): the genesis by its bytes against
@@ -545,14 +556,17 @@ pub fn open_session<E: Endpoint>(
     let mut fetch = |p: &str| served.endpoint.get(p);
     let verified = scan_annulet_verified(w, &mut fetch, 0, scan_to, pin, rng).map_err(SendRefusal::Verify)?;
     let spends_verified = verified.spends_verified();
+    let l2_auth = verified.chain().genesis.l2_auth;
+    let tip = verified.chain().tip();
     let report = into_report(verified);
     let params = served.params()?;
     if params.genesis_hash != report.genesis_hash {
         return Err(SendRefusal::ParamsGenesisMismatch);
     }
     let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p, r: params.fee_tier_r };
+    let owned = report.owned.clone();
     let index = report.index.ok_or(SendRefusal::NoBalance)?;
-    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash, spends_verified })
+    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash, spends_verified, l2_auth, tip, owned })
 }
 
 /// This wallet's receiving [`Recipient`] (address 0: change, split notes).
@@ -630,13 +644,45 @@ pub fn send_annulet<E: Endpoint>(
     let leaf = session.served.registry(u64::from(asset))?.leaf;
     let shape = shape_for(&leaf);
     let wallet = w.wallet();
+    // Lab #896 G (QG1): the recipient's address version must be the net's —
+    // a note to the other derivation could never be spent.
+    let candidate_a = session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA;
+    let want = if candidate_a {
+        qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A
+    } else {
+        qlab_wallet::address::ADDRESS_VERSION
+    };
+    to.require_version(want).map_err(|e| SendRefusal::Auth(e.to_string()))?;
+    let recipient = recipient_of(to).ok_or(SendRefusal::Spend(SpendError::Served("the recipient address has no valid ek".into())))?;
+    if candidate_a {
+        // Lab #896 G: the active generation's notes, its keys, its address.
+        let mut run = crate::annulet_v2::AuthRun::open(w, &session, crate::annulet_v2::DEFAULT_VALIDITY_BLOCKS)?;
+        let change = crate::annulet_v2::me_v2(&wallet, &run.auth_root());
+        if shape == L2ShapeTag::P && qlab_air::l2p::CanonicalFreezeTree::from_keys(freeze_keys).is_frozen(&change.rkm) {
+            return Err(SendRefusal::Spend(SpendError::Frozen { asset: u64::from(asset) }));
+        }
+        let index = session.index.only_generation(run.generation);
+        let plan = plan_send(&index, asset, amount, shape, session.tiers)?;
+        if !on_plan(&plan) {
+            return Err(SendRefusal::PlanDeclined);
+        }
+        let made = crate::annulet_v2::run_plan_v2(
+            w, &mut run, &session, &plan, &recipient, &change, freeze_keys, split_wait, rng,
+        )?;
+        let split_fee_note = plan
+            .steps
+            .iter()
+            .position(|s| matches!(s.kind, StepKind::FeeSplit { .. }))
+            .map(|i| made[i].0[0]);
+        let (outputs, shape) = *made.last().expect("a plan ends in its payment");
+        return Ok(SendReport { plan, split_fee_note, outputs, shape });
+    }
     if shape == L2ShapeTag::P
         && qlab_air::l2p::CanonicalFreezeTree::from_keys(freeze_keys).is_frozen(&wallet.rkm(wallet.diversifier_at_index(0)))
     {
         return Err(SendRefusal::Spend(SpendError::Frozen { asset: u64::from(asset) }));
     }
     let plan = plan_send(&session.index, asset, amount, shape, session.tiers)?;
-    let recipient = recipient_of(to).ok_or(SendRefusal::Spend(SpendError::Served("the recipient address has no valid ek".into())))?;
     if !on_plan(&plan) {
         return Err(SendRefusal::PlanDeclined);
     }

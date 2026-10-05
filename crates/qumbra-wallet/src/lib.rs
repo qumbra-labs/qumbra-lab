@@ -139,6 +139,9 @@ pub mod annulet_verify;
 pub mod asset_view;
 #[cfg(feature = "prove")]
 pub mod annulet_send;
+/// Lab #896 G: Candidate A sends (v2 shapes, the wallet's own signatures).
+#[cfg(feature = "prove")]
+pub mod annulet_v2;
 #[cfg(feature = "prove")]
 pub mod issuer;
 #[cfg(feature = "prove")]

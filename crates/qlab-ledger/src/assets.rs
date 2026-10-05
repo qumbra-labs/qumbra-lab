@@ -204,6 +204,23 @@ pub struct AssetIndex {
 }
 
 impl AssetIndex {
+    /// Lab #896 G: the index restricted to one Candidate A generation's
+    /// notes (spendable and spent) — a transaction spends one generation
+    /// (design 2b §5, one key per transaction).
+    pub fn only_generation(&self, g: u32) -> Self {
+        let keep = |n: &OwnedL2Note| n.generation == Some(g);
+        let by_asset = self
+            .by_asset
+            .iter()
+            .map(|(a, notes)| {
+                let spendable = notes.spendable.iter().filter(|n| keep(n)).cloned().collect();
+                let spent = notes.spent.iter().filter(|(n, _)| keep(n)).cloned().collect();
+                (*a, AssetNotes { spendable, spent })
+            })
+            .collect();
+        AssetIndex { by_asset }
+    }
+
     pub fn build(wallet: &Wallet, notes: Vec<OwnedL2Note>, spent: &SpentSet) -> Self {
         let mut by_asset: BTreeMap<u16, AssetNotes> = BTreeMap::new();
         for note in notes {

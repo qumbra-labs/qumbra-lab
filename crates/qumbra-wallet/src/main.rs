@@ -1792,7 +1792,8 @@ fn send_annulet_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map_err(|_| "--asset must be a registry index below 65536")?;
     let amount: u64 = flag(args, "--amount").ok_or("send requires --amount")?.parse()?;
     let to = flag(args, "--to").ok_or("send --net annulet requires --to ADDRESS")?;
-    let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
+    // Either version (lab #896 G): `send_annulet` checks it against the net.
+    let to = qlab_wallet::address::Address::decode_any(to).ok_or("--to is not a wallet address")?;
     let pin = Some(required_pin(args, "send --net annulet")?);
     // Lab #722: the asset issuer's published freeze-key list, when it has one.
     let freeze_keys = match flag(args, "--freeze-list") {
