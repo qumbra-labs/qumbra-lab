@@ -192,6 +192,13 @@ fn rank_and_confirm(census: &mut Census<Val>, rep: &Report, confirm: bool, confi
         ranked.sort_by_key(|(_, _, n, root)| (!*root, std::cmp::Reverse(*n)));
         let show: Vec<_> = ranked.iter().take(6).map(|(b, _, n, r)| format!("col{}@role{}:{n}{}", b.0, b.1, if *r { "(root)" } else { "" })).collect();
         println!("  flag {k}: single-cell ranking {}", show.join(" "));
+        // A ranking pin that ran out of budget leaves none for a confirm:
+        // the flag is unconfirmed, said once (above), and the next one runs.
+        if census.timed_out() {
+            census.set_scope(None);
+            census.set_deadline(None);
+            continue;
+        }
         if !confirm {
             continue;
         }
