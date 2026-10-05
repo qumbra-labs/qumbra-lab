@@ -69,6 +69,7 @@ fn node(id: u64, hub: &Arc<InProcHub>, key: &SequencerKey) -> Node {
 
 fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
     let mut t = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor,

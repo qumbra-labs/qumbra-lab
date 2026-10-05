@@ -35,7 +35,7 @@
 //! already applies to a body it serves a peer; the reader refuses a longer
 //! one before decoding.
 
-use qlab_devnet::forms::{BodySections, GenesisForm};
+use qlab_devnet::forms::{BodySections, GenesisForm, L2AuthForm};
 
 use crate::codec::{decode_wire_headers, encode_wire_headers, DecodeError, WireHeader};
 use crate::compact::{decode_announce_for, encode_announce_for, AnnounceEncodeError, BlockAnnounce, WireForm};
@@ -54,12 +54,15 @@ pub const MAX_HEADERS_PAGE: usize = 256;
 
 /// The wire-form byte: which header units and which body frame follow.
 pub fn wire_form_byte(wf: WireForm) -> u8 {
-    match (wf.form, wf.sections) {
-        (GenesisForm::V4, BodySections::None) => 1,
-        (GenesisForm::V5, BodySections::None) => 2,
-        (GenesisForm::Annulet, BodySections::None) => 3,
-        (GenesisForm::V5, BodySections::V6) => 4,
-        (form, sections) => panic!("no served wire form for {form:?} with {sections:?} (lab #850)"),
+    match (wf.form, wf.sections, wf.l2_auth) {
+        (GenesisForm::V4, BodySections::None, L2AuthForm::None) => 1,
+        (GenesisForm::V5, BodySections::None, L2AuthForm::None) => 2,
+        (GenesisForm::Annulet, BodySections::None, L2AuthForm::None) => 3,
+        (GenesisForm::V5, BodySections::V6, L2AuthForm::None) => 4,
+        // Lab #896 E2: the Candidate A Annulet — node-to-node bodies carry
+        // each transaction's auth section, so its frame is its own form.
+        (GenesisForm::Annulet, BodySections::None, L2AuthForm::CandidateA) => 5,
+        (form, sections, auth) => panic!("no served wire form for {form:?} with {sections:?} / {auth:?} (lab #850)"),
     }
 }
 
@@ -69,6 +72,7 @@ fn wire_form_of(b: u8) -> Option<WireForm> {
         2 => Some(WireForm::plain(GenesisForm::V5)),
         3 => Some(WireForm::plain(GenesisForm::Annulet)),
         4 => Some(WireForm::V6),
+        5 => Some(WireForm::ANNULET_AUTH),
         _ => None,
     }
 }
@@ -257,7 +261,7 @@ pub mod fixture {
         };
         let discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&public.commitments);
         let surface = L2Surface { shape: L2ShapeTag::S, registry_root: [7; 32], vpublic: None, write: None, exit_rkm: [0; 32] };
-        TxEntry { proof: vec![0xAB; 64], public, discovery, rider: TxEntry::absent_rider(), l2: surface.encode() }
+        TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), proof: vec![0xAB; 64], public, discovery, rider: TxEntry::absent_rider(), l2: surface.encode() }
     }
 
     /// Heights 1 and 2 over a fixed genesis, sealed under seed `[0x5E; 32]`;

@@ -54,6 +54,7 @@ pub const L2_SURFACE_ABSENT: &[u8] = &[0x00];
 
 use crate::body::{BlockBody, BodyError, TxEntry, TxVerifier};
 use crate::fees::ArityBucket;
+use crate::forms::L2AuthForm;
 use crate::hash::keccak256;
 use crate::header::{BlockHeader, Hash32};
 
@@ -331,6 +332,46 @@ pub fn body_commitment_annulet(body: &BlockBody) -> Hash32 {
     keccak256(&buf)
 }
 
+/// The canonical "no auth section" bytes (lab #896 E2): absence is `[0x00]`,
+/// as for the L2 surface. On the tx wire absence is spelled by omission.
+pub const L2_AUTH_ABSENT: &[u8] = &[0x00];
+
+/// Domain of the Candidate A Annulet body preimage (lab #896 E2): v1's
+/// per-transaction region with the auth section committed after the surface.
+pub const BODY_PREIMAGE_DOMAIN_ANNULET_V2: &[u8] = b"qumbra:body:annulet:v2";
+
+/// The Annulet body commitment under the net's [`L2AuthForm`]: v1's
+/// [`body_commitment_annulet`] byte for byte on `None`; on `CandidateA`, the
+/// v2 domain with `[proof, discovery, l2, auth]` length-prefixed per tx.
+pub fn body_commitment_annulet_for(body: &BlockBody, auth: L2AuthForm) -> Hash32 {
+    match auth {
+        L2AuthForm::None => body_commitment_annulet(body),
+        L2AuthForm::CandidateA => {
+            let mut buf = BODY_PREIMAGE_DOMAIN_ANNULET_V2.to_vec();
+            for tx in &body.txs {
+                buf.extend_from_slice(&tx.public.anchor);
+                assert!(tx.public.nullifiers.len() <= u8::MAX as usize);
+                buf.push(tx.public.nullifiers.len() as u8);
+                for nf in &tx.public.nullifiers {
+                    buf.extend_from_slice(nf);
+                }
+                assert!(tx.public.commitments.len() <= u8::MAX as usize);
+                buf.push(tx.public.commitments.len() as u8);
+                for cm in &tx.public.commitments {
+                    buf.extend_from_slice(cm);
+                }
+                buf.push(tx.public.bucket.wire_discriminant());
+                buf.extend_from_slice(&tx.public.fee.to_le_bytes());
+                for field in [&tx.proof, &tx.discovery, &tx.l2, &tx.auth] {
+                    buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+                    buf.extend_from_slice(field);
+                }
+            }
+            keccak256(&buf)
+        }
+    }
+}
+
 /// One fee-unit note the Annulet genesis mints to the faucet (lab #706 Q5):
 /// its commitment and its 128-B discovery payload
 /// (`qlab_note::l2note::L2_PAYLOAD_LEN`).
@@ -342,6 +383,29 @@ pub struct GenesisNote {
 
 /// Domain of the Annulet **genesis** body commitment.
 pub const GENESIS_BODY_DOMAIN_ANNULET: &[u8] = b"qumbra:body:annulet:genesis:v1";
+
+/// Domain of the Candidate A Annulet **genesis** body commitment (lab #896 E2).
+pub const GENESIS_BODY_DOMAIN_ANNULET_V2: &[u8] = b"qumbra:body:annulet:genesis:v2";
+
+/// [`genesis_body_commitment_annulet`] under the net's [`L2AuthForm`]: v1's
+/// bytes on `None`; on `CandidateA` the v2 genesis domain over the empty
+/// body's v2 commitment, then the same notes.
+pub fn genesis_body_commitment_annulet_for(notes: &[GenesisNote], auth: L2AuthForm) -> Hash32 {
+    match auth {
+        L2AuthForm::None => genesis_body_commitment_annulet(notes),
+        L2AuthForm::CandidateA => {
+            let mut buf = GENESIS_BODY_DOMAIN_ANNULET_V2.to_vec();
+            buf.extend_from_slice(&body_commitment_annulet_for(&BlockBody::default(), L2AuthForm::CandidateA));
+            buf.extend_from_slice(&(notes.len() as u32).to_le_bytes());
+            for n in notes {
+                assert_eq!(n.payload.len(), qlab_note::l2note::L2_PAYLOAD_LEN, "genesis note payload width");
+                buf.extend_from_slice(&n.cm);
+                buf.extend_from_slice(&n.payload);
+            }
+            keccak256(&buf)
+        }
+    }
+}
 
 /// The Annulet genesis body commitment: the empty body's Annulet commitment,
 /// then the genesis notes (`count u32 ‖ [cm ‖ payload]×N`). Genesis notes are
@@ -429,10 +493,28 @@ where
     V: TxVerifier,
     F: Fn(&Hash32) -> bool,
 {
+    validate_body_annulet_for(header, body, verifier, is_anchor_final, fees, L2AuthForm::None)
+}
+
+/// [`validate_body_annulet`] under the net's [`L2AuthForm`] (lab #896 E2):
+/// the header binds [`body_commitment_annulet_for`]. The auth section's
+/// presence and signatures are seam F's checks, not this function's yet.
+pub fn validate_body_annulet_for<V, F>(
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+    fees: &L2FeeTable,
+    auth: L2AuthForm,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    F: Fn(&Hash32) -> bool,
+{
     if !body.coinbase_payees.is_empty() {
         return Err(BodyError::CoinbaseOnAnnulet { got: body.coinbase_payees.len() });
     }
-    let got = body_commitment_annulet(body);
+    let got = body_commitment_annulet_for(body, auth);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch { expected: header.tx_body_commitment, got });
     }
@@ -608,6 +690,7 @@ mod tests {
         };
         let discovery = placeholder_discovery_annulet(&public.commitments);
         TxEntry {
+            auth: crate::annulet::L2_AUTH_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public,
             discovery,

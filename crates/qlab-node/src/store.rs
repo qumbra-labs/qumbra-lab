@@ -123,10 +123,20 @@ pub struct StoredTx {
     /// Absent is `[0x00]`, as on `TxEntry`.
     #[serde(skip, default = "l2_absent")]
     pub l2: Vec<u8>,
+    /// The transaction's auth section (lab #896 E2) — **in-memory only**, the
+    /// `l2` discipline: never written by an L1 layout or by the v1 Annulet
+    /// record (variant 3); the Candidate A Annulet record (variant 5) writes
+    /// it explicitly. Absent is `[0x00]`, as on `TxEntry`.
+    #[serde(skip, default = "auth_absent")]
+    pub auth: Vec<u8>,
 }
 
 fn l2_absent() -> Vec<u8> {
     qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec()
+}
+
+fn auth_absent() -> Vec<u8> {
+    qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec()
 }
 
 /// What an Annulet block carries beyond the L1 stored mirror (lab #708 Q2):
@@ -165,6 +175,7 @@ impl From<&TxEntry> for StoredTx {
     /// asserts every L1 log record surface-free — not here.
     fn from(t: &TxEntry) -> Self {
         Self { l2: t.l2.clone(),
+            auth: t.auth.clone(),
             anchor: t.public.anchor,
             nullifiers: t.public.nullifiers.clone(),
             commitments: t.public.commitments.clone(),
@@ -179,7 +190,7 @@ impl From<&TxEntry> for StoredTx {
 
 impl From<&StoredTx> for TxEntry {
     fn from(s: &StoredTx) -> Self {
-        TxEntry { l2: s.l2.clone(),
+        TxEntry { auth: s.auth.clone(), l2: s.l2.clone(),
             proof: s.proof.clone(),
             discovery: s.discovery.clone(),
             rider: s.rider.clone(),

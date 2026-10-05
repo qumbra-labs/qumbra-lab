@@ -244,6 +244,14 @@ pub struct TxEntry {
     /// ([`crate::annulet::L2_SURFACE_ABSENT`]). Never in an L1 preimage or on
     /// the L1 wire; L1 validation refuses a non-absent surface by name.
     pub l2: Vec<u8>,
+    /// The transaction's **authorization section** (lab #896 E2; design
+    /// `remote-proving-authorization-shape-annulet` §7): `qlab-remote-auth`'s
+    /// `AnnuletAuthSection` bytes, under the `l2` discipline — **absence is
+    /// `[0x00]`** ([`crate::annulet::L2_AUTH_ABSENT`]). Only a Candidate A
+    /// Annulet net (`L2AuthForm::CandidateA`) carries one: it is committed
+    /// by `body_commitment_annulet_for` and travels presence-conditionally on
+    /// the Annulet tx wire. Never in an L1 preimage or on the L1 wire.
+    pub auth: Vec<u8>,
 }
 
 impl TxEntry {
@@ -256,6 +264,7 @@ impl TxEntry {
         payloads: &[Vec<u8>],
     ) -> Self {
         Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
+            auth: Self::absent_auth(),
             proof,
             public,
             discovery: encode_committed_discovery(recipients, payloads),
@@ -268,7 +277,7 @@ impl TxEntry {
     /// using this outside a fixture.
     pub fn with_placeholder_discovery(proof: Vec<u8>, public: TxPublic) -> Self {
         let discovery = placeholder_discovery(&public.commitments);
-        Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof, public, discovery, rider: Self::absent_rider() }
+        Self { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), auth: Self::absent_auth(), proof, public, discovery, rider: Self::absent_rider() }
     }
 
     /// The canonical encoding of "this transaction attaches no discovery",
@@ -282,6 +291,12 @@ impl TxEntry {
     /// see [`TxEntry::rider`] and [`crate::names::RIDER_ABSENT`].
     pub fn absent_rider() -> Vec<u8> {
         crate::names::RIDER_ABSENT.to_vec()
+    }
+
+    /// The canonical encoding of "this transaction carries no auth section"
+    /// — see [`TxEntry::auth`] and [`crate::annulet::L2_AUTH_ABSENT`].
+    pub fn absent_auth() -> Vec<u8> {
+        crate::annulet::L2_AUTH_ABSENT.to_vec()
     }
 
     /// This transaction with `op` as its name rider (registration paths).
@@ -1798,7 +1813,7 @@ mod tests {
             fee: posted_fee(ArityBucket::TwoByTwo),
         };
         let discovery = placeholder_discovery(&public.commitments);
-        TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
+        TxEntry { auth: crate::annulet::L2_AUTH_ABSENT.to_vec(), l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
     }
 
     fn ct_pattern(base: u8) -> [u8; CT_LEN] {
@@ -2132,7 +2147,7 @@ mod tests {
     /// A fixed body with every field pinned — the input to the golden vector.
     fn golden_body() -> BlockBody {
         BlockBody::from_single_payee(
-            vec![TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
+            vec![TxEntry { auth: crate::annulet::L2_AUTH_ABSENT.to_vec(), l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: vec![0xAB, 0xCD, 0xEF],
                 public: TxPublic {
                     anchor: [0x11; 32],
@@ -2682,7 +2697,7 @@ mod tests {
         );
 
         // And it passes the consensus rule it exists to pass.
-        let tx = TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
+        let tx = TxEntry { auth: crate::annulet::L2_AUTH_ABSENT.to_vec(), l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: FINAL_ANCHOR,
@@ -2700,7 +2715,7 @@ mod tests {
     #[test]
     fn discovery_round_trips_and_the_empty_body_does_not_collide_with_v1() {
         let cms = vec![[0x44u8; 32], [0x55u8; 32]];
-        let tx = TxEntry { l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
+        let tx = TxEntry { auth: crate::annulet::L2_AUTH_ABSENT.to_vec(), l2: crate::annulet::L2_SURFACE_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: FINAL_ANCHOR,

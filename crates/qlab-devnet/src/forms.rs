@@ -80,6 +80,58 @@ pub enum BodySections {
     V6,
 }
 
+/// The **L2 authorization** axis beside [`GenesisForm::Annulet`] (lab #896
+/// seam E2; design `remote-proving-authorization-shape-annulet` §7). A net
+/// runs exactly one: `None` is today's Annulet (v1 shapes, no auth section),
+/// `CandidateA` is the v2 shapes with each transaction's ML-DSA-44 auth
+/// section on the wire and in the body commitment. Read only where Annulet
+/// transactions and bodies are encoded, committed, stored or carried — the
+/// [`BodySections`] precedent: an axis, never a fourth form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum L2AuthForm {
+    /// No auth section: every L1 net and the v1 Annulet (format 32).
+    #[default]
+    None,
+    /// Candidate A (format 33): the v2 shapes + the auth section.
+    CandidateA,
+}
+
+/// Genesis format **33**: the Candidate A Annulet, `(Annulet, L2AuthForm::CandidateA)`.
+/// The axis lives in the genesis file's leading `format_version` — part of the
+/// bytes its hash covers — so the genesis hash an intent binds fixes it. Like
+/// format 10 it is not a bare form ([`GenesisForm::from_genesis_format_version`]
+/// says `None`); [`annulet_forms_of_genesis_format_version`] maps it.
+pub const ANNULET_AUTH_GENESIS_FORMAT_VERSION: u32 = 33;
+
+/// The form **and** L2 authorization axis an Annulet genesis `format_version`
+/// selects: 32 → `(Annulet, None)`, 33 → `(Annulet, CandidateA)`; anything
+/// else is not an Annulet genesis.
+pub fn annulet_forms_of_genesis_format_version(v: u32) -> Option<(GenesisForm, L2AuthForm)> {
+    match v {
+        ANNULET_GENESIS_FORMAT_VERSION => Some((GenesisForm::Annulet, L2AuthForm::None)),
+        ANNULET_AUTH_GENESIS_FORMAT_VERSION => Some((GenesisForm::Annulet, L2AuthForm::CandidateA)),
+        _ => None,
+    }
+}
+
+impl L2AuthForm {
+    /// The Annulet genesis `format_version` this axis is keyed to (32 or 33).
+    pub fn annulet_genesis_format_version(self) -> u32 {
+        match self {
+            L2AuthForm::None => ANNULET_GENESIS_FORMAT_VERSION,
+            L2AuthForm::CandidateA => ANNULET_AUTH_GENESIS_FORMAT_VERSION,
+        }
+    }
+
+    /// The name `--print-net` / `check` print.
+    pub fn label(self) -> &'static str {
+        match self {
+            L2AuthForm::None => "none",
+            L2AuthForm::CandidateA => "candidate-a",
+        }
+    }
+}
+
 /// Genesis format **10**: the V6 net (lab #785 F5-3), `(V5, BodySections::V6)`.
 pub const V6_GENESIS_FORMAT_VERSION: u32 = 10;
 

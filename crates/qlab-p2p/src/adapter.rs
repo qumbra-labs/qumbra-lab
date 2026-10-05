@@ -2241,6 +2241,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         self.sections
     }
 
+    /// The L2 authorization axis of the node underneath (lab #896 E2).
+    pub fn l2_auth_form(&self) -> qlab_devnet::forms::L2AuthForm {
+        self.state.l2_auth_form()
+    }
+
     /// The checkpoint height of the retained record material (lab #785
     /// ruling Q3), `None` before any local finalization. A V6 template's
     /// content depends on it, so the template cache keys on it (PR #792
@@ -2944,7 +2949,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     }
 
     fn wire_form(&self) -> crate::compact::WireForm {
-        crate::compact::WireForm { form: self.rules.form, sections: self.sections }
+        crate::compact::WireForm { form: self.rules.form, sections: self.sections, l2_auth: self.state.l2_auth_form() }
     }
 
     fn genesis_block_hash(&self) -> Hash32 {

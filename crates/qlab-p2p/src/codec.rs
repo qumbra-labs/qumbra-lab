@@ -12,7 +12,7 @@ use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::committee::{Checkpoint, MemberSig, Vote};
 use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::fees::ArityBucket;
-use qlab_devnet::forms::GenesisForm;
+use qlab_devnet::forms::{GenesisForm, L2AuthForm};
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{
     AggregateProofSlot, BlockHeader, EpochSupplyAttestation, Hash32, HEADER_PREIMAGE_LEN_V4,
@@ -85,6 +85,10 @@ pub enum DecodeError {
     /// An Annulet transaction's L2-surface section is absent or does not
     /// decode canonically (lab #706).
     BadL2Surface,
+    /// An Annulet transaction's auth-section tail (lab #896 E2, Candidate A
+    /// nets only) is empty or the explicit absent marker `[0x00]`: absence is
+    /// spelled by omission on this wire, so one transaction has one encoding.
+    BadAuthSection,
 }
 
 impl From<CodecError> for DecodeError {
@@ -369,10 +373,18 @@ pub fn encode_tx_for(form: GenesisForm, tx: &TxEntry) -> Vec<u8> {
 }
 
 /// Decode a transaction under this net's form ([`encode_tx_for`]'s inverse).
+/// The L2 authorization axis is `None` here: a v1 Annulet net's decoder,
+/// which refuses an auth tail as trailing bytes (lab #896 E2).
 pub fn decode_tx_for(form: GenesisForm, buf: &[u8]) -> Result<TxEntry, DecodeError> {
+    decode_tx_for_auth(form, L2AuthForm::None, buf)
+}
+
+/// [`decode_tx_for`] under the net's L2 authorization axis (lab #896 E2):
+/// only a Candidate A Annulet net reads the auth-section tail.
+pub fn decode_tx_for_auth(form: GenesisForm, auth: L2AuthForm, buf: &[u8]) -> Result<TxEntry, DecodeError> {
     match form {
         GenesisForm::V4 | GenesisForm::V5 => decode_tx(buf),
-        GenesisForm::Annulet => decode_tx_annulet(buf),
+        GenesisForm::Annulet => decode_tx_annulet_with(buf, auth),
     }
 }
 
@@ -620,18 +632,44 @@ pub fn encode_tx_annulet(tx: &TxEntry) -> Vec<u8> {
 
 /// The Annulet wire's bytes without [`encode_tx_annulet`]'s input asserts —
 /// for [`tx_id`], which must be total over locally-built input.
+///
+/// Lab #896 E2: the **auth section** follows the surface, PRESENCE-CONDITIONAL
+/// (the name rider's rule on the L1 wire): an auth-free transaction encodes
+/// byte-identically to a v1 Annulet transaction, so the v1 wire, its goldens
+/// and relay do not move; absence is spelled by omission. Only a Candidate A
+/// net's decoder ([`decode_tx_annulet_with`]) reads the tail — on a v1 net it
+/// is trailing bytes, refused as today.
 fn annulet_wire_bytes(tx: &TxEntry) -> Vec<u8> {
-    let l1 = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), ..tx.clone() };
+    let l1 = TxEntry {
+        l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
+        ..tx.clone()
+    };
     let mut out = encode_tx(&l1);
     write_varint(&mut out, tx.l2.len() as u64);
     out.extend_from_slice(&tx.l2);
+    if tx.auth != qlab_devnet::annulet::L2_AUTH_ABSENT {
+        write_varint(&mut out, tx.auth.len() as u64);
+        out.extend_from_slice(&tx.auth);
+    }
     out
 }
 
 /// Decode an Annulet transaction ([`encode_tx_annulet`]'s inverse). The
 /// surface section is required and must decode canonically as a present
 /// surface; an absent marker is refused (one encoding per transaction).
+///
+/// This is the **v1** (`L2AuthForm::None`) decoder: an auth-section tail is
+/// trailing bytes and refused — never accepted-then-ignored (lab #896 E2).
 pub fn decode_tx_annulet(buf: &[u8]) -> Result<TxEntry, DecodeError> {
+    decode_tx_annulet_with(buf, L2AuthForm::None)
+}
+
+/// [`decode_tx_annulet`] under the net's L2 authorization axis (lab #896 E2).
+/// On `CandidateA` an optional `varint len ‖ auth` tail follows the surface;
+/// an explicit absent marker there is refused ([`DecodeError::BadAuthSection`]).
+/// The section's own structure and signatures are seam F's, not the codec's.
+pub fn decode_tx_annulet_with(buf: &[u8], auth_form: L2AuthForm) -> Result<TxEntry, DecodeError> {
     let mut r = Reader::new(buf);
     let (proof, discovery, public) = decode_tx_through_discovery(&mut r, buf.len())?;
     let l2_len = r.varint()? as usize;
@@ -640,8 +678,17 @@ pub fn decode_tx_annulet(buf: &[u8]) -> Result<TxEntry, DecodeError> {
         Ok(Some(_)) => {}
         Ok(None) | Err(_) => return Err(DecodeError::BadL2Surface),
     }
+    let mut auth = qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec();
+    if auth_form == L2AuthForm::CandidateA && r.remaining() > 0 {
+        let n = r.varint()? as usize;
+        let bytes = r.rest(n, "tx.auth")?;
+        if bytes.is_empty() || bytes == qlab_devnet::annulet::L2_AUTH_ABSENT {
+            return Err(DecodeError::BadAuthSection);
+        }
+        auth = bytes;
+    }
     r.finish()?;
-    Ok(TxEntry { proof, discovery, public, rider: TxEntry::absent_rider(), l2 })
+    Ok(TxEntry { auth, proof, discovery, public, rider: TxEntry::absent_rider(), l2 })
 }
 
 /// The tx wire's fields through the discovery group — shared by the L1 and
@@ -709,7 +756,7 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
         TxEntry::absent_rider()
     };
     r.finish()?;
-    Ok(TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+    Ok(TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
         proof,
         discovery,
         public: TxPublic { anchor, nullifiers, commitments, bucket, fee },
@@ -741,6 +788,14 @@ pub fn tx_id(tx: &TxEntry) -> Hash32 {
 /// 2026-10-02: the explorer panicked on the first sealed L2 transaction).
 pub fn canonical_tx_wire(tx: &TxEntry) -> Vec<u8> {
     if tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT {
+        // Lab #896 E2: the L1 wire has no auth section, so an L1 tx carrying
+        // one would hash as if it had none — unreachable for a decoded tx.
+        // `debug_assert!` by ruling: loud in debug, never a release-mode panic
+        // inside a wire/id function (refusal is by construction).
+        debug_assert!(
+            tx.auth == qlab_devnet::annulet::L2_AUTH_ABSENT,
+            "an auth section has no L1 tx wire (lab #896 E2)"
+        );
         encode_tx(tx)
     } else {
         annulet_wire_bytes(tx)
@@ -1146,6 +1201,7 @@ mod tests {
     fn annulet_tx() -> TxEntry {
         use qlab_devnet::annulet::{L2ShapeTag, L2Surface, VPublicTerm};
         TxEntry {
+            auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
             proof: vec![0xAB; 40],
             public: TxPublic {
                 anchor: [0x0F; 32],

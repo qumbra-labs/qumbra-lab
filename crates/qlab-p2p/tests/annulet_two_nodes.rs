@@ -54,6 +54,7 @@ fn adapter(key: &SequencerKey) -> NodeAdapter<KeccakPow, MockProofVerifier> {
 
 fn s_tx(anchor: Hash32, nf: u8) -> TxEntry {
     let mut t = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor,

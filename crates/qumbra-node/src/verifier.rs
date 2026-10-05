@@ -573,6 +573,7 @@ mod tests {
         proof: &Proof<Config>,
     ) -> TxEntry {
         TxEntry {
+            auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
             proof: bincode::serialize(proof).expect("serialize proof"),
             public: TxPublic {
                 anchor: h32(anchor),

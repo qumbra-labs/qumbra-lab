@@ -167,6 +167,7 @@ fn the_binary_runs_an_annulet_devnet_genesis_as_producer_under_the_l2_verifier()
     // POST /v1/tx speaks the Annulet tx wire: a well-formed L2 transaction
     // with a garbage proof gets past the decode and is refused by a later check.
     let tx = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: vec![0u8; 64],
         public: TxPublic {
             anchor: [0x11; 32],

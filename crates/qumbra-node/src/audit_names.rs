@@ -326,7 +326,7 @@ mod tests {
     }
 
     fn tx(op: Option<&NameOp>, fee: u64) -> StoredTx {
-        StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        StoredTx { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
             anchor: [0x0F; 32],
             nullifiers: vec![[1; 32]],
             commitments: vec![[2; 32]],

@@ -23,10 +23,10 @@ use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{
-    decode_tx_for, decode_wire_header, encode_tx_for, encode_wire_header, header_msg_len, tx_id, DecodeError,
+    decode_tx_for_auth, decode_wire_header, encode_tx_for, encode_wire_header, header_msg_len, tx_id, DecodeError,
     Reader, WireHeader,
 };
-use qlab_devnet::forms::{BodySections, GenesisForm};
+use qlab_devnet::forms::{BodySections, GenesisForm, L2AuthForm};
 
 /// The key the **body** codecs are selected by (lab #785 F5-3b-2): the genesis
 /// form plus the body-section axis. Only bodies differ on V6, so header and
@@ -37,16 +37,23 @@ use qlab_devnet::forms::{BodySections, GenesisForm};
 pub struct WireForm {
     pub form: GenesisForm,
     pub sections: BodySections,
+    /// The L2 authorization axis (lab #896 E2): `CandidateA` only on the
+    /// Candidate A Annulet, whose tx wire may carry an auth-section tail.
+    pub l2_auth: L2AuthForm,
 }
 
 impl WireForm {
-    /// A net without body sections — every V4, V5 and Annulet net.
+    /// A net without body sections or an auth axis — every V4, V5 and v1 Annulet net.
     pub const fn plain(form: GenesisForm) -> Self {
-        WireForm { form, sections: BodySections::None }
+        WireForm { form, sections: BodySections::None, l2_auth: L2AuthForm::None }
     }
 
     /// The V6 net: `(V5, BodySections::V6)`.
-    pub const V6: WireForm = WireForm { form: GenesisForm::V5, sections: BodySections::V6 };
+    pub const V6: WireForm = WireForm { form: GenesisForm::V5, sections: BodySections::V6, l2_auth: L2AuthForm::None };
+
+    /// The Candidate A Annulet net (lab #896 E2): `(Annulet, L2AuthForm::CandidateA)`.
+    pub const ANNULET_AUTH: WireForm =
+        WireForm { form: GenesisForm::Annulet, sections: BodySections::None, l2_auth: L2AuthForm::CandidateA };
 }
 
 impl From<GenesisForm> for WireForm {
@@ -406,7 +413,7 @@ fn decode_announce_inner(payee_boundary: Option<u64>, wf: WireForm, buf: &[u8]) 
         let index = r.varint()? as u32;
         let tx_len = r.varint()? as usize;
         let tx_bytes = r.rest(tx_len, "announce.prefilled.tx")?;
-        prefilled.push(PrefilledTx { index, tx: decode_tx_for(form, &tx_bytes)? });
+        prefilled.push(PrefilledTx { index, tx: decode_tx_for_auth(form, wf.l2_auth, &tx_bytes)? });
     }
     r.finish()?;
     Ok(BlockAnnounce { header, nonce, coinbase_payees, short_ids, prefilled, seal, finality, bundle })
@@ -467,6 +474,13 @@ pub fn decode_block_txn(buf: &[u8]) -> Result<BlockTxn, DecodeError> {
 
 /// Decode a `BlockTxn` under this net's tx wire (lab #708).
 pub fn decode_block_txn_for(form: GenesisForm, buf: &[u8]) -> Result<BlockTxn, DecodeError> {
+    decode_block_txn_for_wire(WireForm::plain(form), buf)
+}
+
+/// [`decode_block_txn_for`] under the whole wire form (lab #896 E2): a
+/// Candidate A Annulet net reads each transaction's auth-section tail.
+pub fn decode_block_txn_for_wire(wf: WireForm, buf: &[u8]) -> Result<BlockTxn, DecodeError> {
+    let form = wf.form;
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("bt.block_hash")?;
     let n = r.varint()? as usize;
@@ -476,7 +490,7 @@ pub fn decode_block_txn_for(form: GenesisForm, buf: &[u8]) -> Result<BlockTxn, D
     for _ in 0..n {
         let tx_len = r.varint()? as usize;
         let tx_bytes = r.rest(tx_len, "bt.tx")?;
-        txs.push(decode_tx_for(form, &tx_bytes)?);
+        txs.push(decode_tx_for_auth(form, wf.l2_auth, &tx_bytes)?);
     }
     r.finish()?;
     Ok(BlockTxn { block_hash, txs })
@@ -801,6 +815,7 @@ mod tests {
 
     fn golden_l1_tx() -> TxEntry {
         TxEntry {
+            auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
             proof: b"pf".to_vec(),
             public: TxPublic {
                 anchor: [0x01; 32],

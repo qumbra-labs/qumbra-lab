@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use qlab_devnet::forms::{BodySections, GenesisForm};
+use qlab_devnet::forms::{BodySections, GenesisForm, L2AuthForm};
 use qlab_devnet::body::{validate_body_with_names, BlockBody, BodyError, TxVerifier};
 use qlab_devnet::chain::{FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::committee::Checkpoint;
@@ -526,6 +526,8 @@ pub(crate) struct AnnuletSetup {
     /// The genesis notes' per-asset issuance (lab #728 Q7), recomputed from
     /// their public plaintexts with each commitment checked.
     genesis_supply: BTreeMap<u16, i128>,
+    /// The L2 authorization axis the genesis selected (lab #896 E2).
+    l2_auth: L2AuthForm,
 }
 
 impl AnnuletSetup {
@@ -551,7 +553,13 @@ impl AnnuletSetup {
                 Ok((asset, v))
             })
             .collect::<Result<_, NodeError>>()?;
-        Ok(Self { fees, registry, genesis_cms: genesis_notes.iter().map(|n| n.cm).collect(), genesis_supply })
+        Ok(Self {
+            fees,
+            registry,
+            genesis_cms: genesis_notes.iter().map(|n| n.cm).collect(),
+            genesis_supply,
+            l2_auth: L2AuthForm::None,
+        })
     }
 }
 
@@ -764,7 +772,7 @@ fn hex8(h: &Hash32) -> String {
 /// binary above the boundary (v2 bytes at a v3 height) is refused here —
 /// loudly, naming the height — rather than silently starting fresh.
 fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
-    check_stored_binding_for(GenesisForm::V4, BodySections::None, block)
+    check_stored_binding_for(GenesisForm::V4, BodySections::None, L2AuthForm::None, block)
 }
 
 /// [`check_stored_binding`] under an explicit genesis form (lab #470 4a): the
@@ -778,10 +786,11 @@ fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
 fn check_stored_binding_for(
     form: GenesisForm,
     sections: BodySections,
+    l2_auth: L2AuthForm,
     block: &StoredBlock,
 ) -> Result<(), NodeError> {
     let bundle = block.bundle_ref().map(|r| r.bytes()).transpose().map_err(NodeError::Io)?;
-    check_stored_binding_with(form, sections, block, bundle.as_deref())
+    check_stored_binding_with(form, sections, l2_auth, block, bundle.as_deref())
 }
 
 /// [`check_stored_binding_for`] over a bundle the caller has already read
@@ -790,6 +799,7 @@ fn check_stored_binding_for(
 fn check_stored_binding_with(
     form: GenesisForm,
     sections: BodySections,
+    l2_auth: L2AuthForm,
     block: &StoredBlock,
     bundle: Option<&[u8]>,
 ) -> Result<(), NodeError> {
@@ -809,8 +819,9 @@ fn check_stored_binding_with(
         (GenesisForm::V4, _) => body.commitment_at(block.header.height),
         (GenesisForm::V5, _) => body.commitment_v5_at(block.header.height),
         // Lab #708: the Annulet body commitment (B1). Genesis never passes this
-        // funnel (it is bound at construction, over its genesis notes).
-        (GenesisForm::Annulet, _) => qlab_devnet::annulet::body_commitment_annulet(&body),
+        // funnel (it is bound at construction, over its genesis notes). Lab
+        // #896 E2: a Candidate A net commits under the v2 domain.
+        (GenesisForm::Annulet, _) => qlab_devnet::annulet::body_commitment_annulet_for(&body, l2_auth),
     };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
@@ -1002,6 +1013,10 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     last_bundle_height: Option<u64>,
     /// The L2 fee table (lab #708) — `Some` exactly on an Annulet node.
     annulet_fees: Option<qlab_devnet::annulet::L2FeeTable>,
+    /// The L2 authorization axis (lab #896 E2): `CandidateA` only on an
+    /// Annulet node whose genesis is format 33; it keys the body commitment
+    /// domain and the tx wire's auth section.
+    l2_auth: L2AuthForm,
     /// The asset registry (lab #710): `Some` exactly on an Annulet node,
     /// bound to every header's `registry_root`. Moved only by a block's
     /// registry write (shape R, lab #728), in `apply_state` — so it is chain
@@ -1107,12 +1122,27 @@ impl MemNode {
         fees: qlab_devnet::annulet::L2FeeTable,
         registry: &[crate::registry_store::RegistryLeaf],
     ) -> Result<Self, NodeError> {
+        Self::open_annulet_with_auth(dir, genesis_header, genesis_notes, fees, registry, L2AuthForm::None)
+    }
+
+    /// [`Self::open_annulet`] on the genesis's L2 authorization axis (lab
+    /// #896 E2): the genesis and every block body commit under that axis's
+    /// domain.
+    pub fn open_annulet_with_auth(
+        dir: impl AsRef<Path>,
+        genesis_header: BlockHeader,
+        genesis_notes: &[qlab_devnet::annulet::GenesisNote],
+        fees: qlab_devnet::annulet::L2FeeTable,
+        registry: &[crate::registry_store::RegistryLeaf],
+        l2_auth: L2AuthForm,
+    ) -> Result<Self, NodeError> {
         assert_eq!(
             genesis_header.tx_body_commitment,
-            qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
+            qlab_devnet::annulet::genesis_body_commitment_annulet_for(genesis_notes, l2_auth),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
-        let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
+        let mut setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)?;
+        setup.l2_auth = l2_auth;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         let dir = dir.as_ref();
         let node = Self::open_inner(GenesisForm::Annulet, BodySections::None, dir, genesis, Some(setup), None)?;
@@ -1302,7 +1332,7 @@ impl MemNode {
                     // one way a corrupted log record enters unchecked. It stays
                     // FIRST: a tampered record is refused outright, and must not
                     // be mistaken for the rewind below.
-                    check_stored_binding_for(node.form, node.sections, b)?;
+                    check_stored_binding_for(node.form, node.sections, node.l2_auth, b)?;
                     // Issue #162: the log is append-only but the applied chain is
                     // no longer append-only, so a prefix record whose parent is not
                     // the running tip is the live node's rewind, replayed here at
@@ -1562,7 +1592,7 @@ impl MemNode {
             // The binding is still checked (issue #77): this path skips
             // `apply_state`, so it would otherwise be the one door a corrupted
             // log record enters by.
-            if let Err(e) = check_stored_binding_for(node.form, node.sections, block) {
+            if let Err(e) = check_stored_binding_for(node.form, node.sections, node.l2_auth, block) {
                 // Named here (F5-5c pre-review Y6): the fall-through to a full
                 // replay would otherwise hide the cause until it refuses.
                 qlab_devnet::jprintln!("SNAPSHOT resume: block {} does not bind ({e}); falling back", block.header.height);
@@ -1901,6 +1931,7 @@ impl MemNode {
             (GenesisForm::Annulet, Some(setup)) => {
                 let mut node = Self::from_bound_genesis(form, sections, genesis, dir);
                 node.annulet_fees = Some(setup.fees);
+                node.l2_auth = setup.l2_auth;
                 node.registry_genesis = Some(setup.registry.clone());
                 node.registry = Some(setup.registry);
                 // Lab #728 Q7: the genesis notes' issuance is outstanding from
@@ -1964,6 +1995,7 @@ impl MemNode {
             surface: Vec::new(),
             last_bundle_height: None,
             annulet_fees: None,
+            l2_auth: L2AuthForm::None,
             registry: None,
             registry_genesis: None,
             genesis_supply: BTreeMap::new(),
@@ -1988,13 +2020,26 @@ impl MemNode {
         fees: qlab_devnet::annulet::L2FeeTable,
         registry: &[crate::registry_store::RegistryLeaf],
     ) -> MemNode {
+        Self::in_memory_annulet_with_auth(genesis_header, genesis_notes, fees, registry, L2AuthForm::None)
+    }
+
+    /// [`Self::in_memory_annulet`] on the genesis's L2 authorization axis
+    /// (lab #896 E2).
+    pub fn in_memory_annulet_with_auth(
+        genesis_header: BlockHeader,
+        genesis_notes: &[qlab_devnet::annulet::GenesisNote],
+        fees: qlab_devnet::annulet::L2FeeTable,
+        registry: &[crate::registry_store::RegistryLeaf],
+        l2_auth: L2AuthForm,
+    ) -> MemNode {
         assert_eq!(
             genesis_header.tx_body_commitment,
-            qlab_devnet::annulet::genesis_body_commitment_annulet(genesis_notes),
+            qlab_devnet::annulet::genesis_body_commitment_annulet_for(genesis_notes, l2_auth),
             "the Annulet genesis must bind its genesis notes (lab #706)"
         );
-        let setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)
+        let mut setup = AnnuletSetup::bound_to(&genesis_header, genesis_notes, fees, registry)
             .unwrap_or_else(|e| panic!("the Annulet genesis must bind its registry (lab #710): {e}"));
+        setup.l2_auth = l2_auth;
         let genesis = StoredBlock::annulet_genesis(&genesis_header);
         MemNode::from_genesis_with(GenesisForm::Annulet, BodySections::None, genesis, None, Some(setup))
     }
@@ -2358,7 +2403,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         }
         self.check_registry_parent(&header, &body)?;
         let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
-        qlab_devnet::annulet::validate_body_annulet(&header, &body, verifier, anchor_ok, &fees)
+        qlab_devnet::annulet::validate_body_annulet_for(&header, &body, verifier, anchor_ok, &fees, self.l2_auth)
             .map_err(NodeError::Body)?;
         let block = StoredBlock::from_sealed_parts(sealed, &body);
         let hash = self.apply_state(&block)?;
@@ -2426,6 +2471,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             registry: self.registry_genesis.clone()?,
             genesis_cms: self.annulet_genesis_cms.clone(),
             genesis_supply: self.genesis_supply.clone(),
+            l2_auth: self.l2_auth,
         })
     }
 
@@ -2663,6 +2709,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.sections
     }
 
+    /// The L2 authorization axis this node runs (lab #896 E2).
+    pub fn l2_auth_form(&self) -> L2AuthForm {
+        self.l2_auth
+    }
+
     /// The ancestor at exactly `height` of the block whose parent hash is `from`,
     /// found by walking `prev` through the chain store. `None` if the walk leaves
     /// the store or `height` is above `from`'s own height.
@@ -2711,7 +2762,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // bytes as they are, log bytes re-hashed — for this check and the fold
         // below; one that cannot be read back is a persistence error by name.
         let bundle_bytes = block.bundle_ref().map(|r| r.bytes()).transpose().map_err(NodeError::Io)?;
-        check_stored_binding_with(self.form, self.sections, block, bundle_bytes.as_deref())?;
+        check_stored_binding_with(self.form, self.sections, self.l2_auth, block, bundle_bytes.as_deref())?;
         // Lab #785: a V6 block's record height, decoded before any mutation. A
         // live block was validated in full before reaching here; a logged one
         // that no longer decodes is a corrupt log, named rather than skipped.
@@ -4289,10 +4340,10 @@ mod tests {
             BlockHeader::child_of_for(GenesisForm::V5, &genesis5.header(), 75, 8, body.commitment_v6());
         let block = StoredBlock::from_parts(&header, &body);
         assert!(matches!(
-            check_stored_binding_for(GenesisForm::V5, BodySections::None, &block),
+            check_stored_binding_for(GenesisForm::V5, BodySections::None, L2AuthForm::None, &block),
             Err(NodeError::Body(BodyError::SectionOnForm { .. }))
         ));
-        assert!(check_stored_binding_for(GenesisForm::V5, BodySections::V6, &block).is_ok());
+        assert!(check_stored_binding_for(GenesisForm::V5, BodySections::V6, L2AuthForm::None, &block).is_ok());
     }
 
     /// A V6 genesis binds `commitment_v6`, and a V5 node refuses a V6

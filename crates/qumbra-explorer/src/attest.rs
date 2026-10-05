@@ -267,6 +267,7 @@ mod tests {
 
     fn p_tx(n: &MemNode, nf: u8, redeem: bool, amount: u64) -> TxEntry {
         let mut t = TxEntry {
+            auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
             proof: b"ok".to_vec(),
             public: TxPublic {
                 anchor: n.commitment_root(),

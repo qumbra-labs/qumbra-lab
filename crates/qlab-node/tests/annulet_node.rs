@@ -47,6 +47,7 @@ fn node() -> (MemNode, BlockHeader) {
 
 fn s_tx(node: &MemNode, nf: u8) -> TxEntry {
     let mut t = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor: node.commitment_root(),
