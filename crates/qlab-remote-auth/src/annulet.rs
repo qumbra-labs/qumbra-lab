@@ -624,5 +624,9 @@ pub fn draw_dummy(
     })
 }
 
+/// Lab #896 seams G/H: the authorization journal (`auth.v1`) — a key's
+/// per-generation cursor positions, persisted fail-closed under one writer.
+pub mod journal;
+
 #[cfg(test)]
 mod tests;
