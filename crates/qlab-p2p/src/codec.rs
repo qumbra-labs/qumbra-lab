@@ -790,7 +790,9 @@ pub fn canonical_tx_wire(tx: &TxEntry) -> Vec<u8> {
     if tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT {
         // Lab #896 E2: the L1 wire has no auth section, so an L1 tx carrying
         // one would hash as if it had none — unreachable for a decoded tx.
-        assert!(
+        // `debug_assert!` by ruling: loud in debug, never a release-mode panic
+        // inside a wire/id function (refusal is by construction).
+        debug_assert!(
             tx.auth == qlab_devnet::annulet::L2_AUTH_ABSENT,
             "an auth section has no L1 tx wire (lab #896 E2)"
         );
