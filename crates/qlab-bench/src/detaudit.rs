@@ -587,8 +587,41 @@ pub(crate) fn run_detaudit(args: &[String]) {
             let pvs = qlab_l2::public_values(&inst.pvs);
             run!("r", &inst.air, pvs, qlab_air::l2r::audit_program(&inst.air), qlab_air::l2r::witness_manifest(), qlab_air::l2r::audit_pv_bits(), qlab_air::l2r::audit_col_regions(), Vec::new());
         }
+        // Lab #896 seam T: the v2 (Candidate A) shapes — the fabricated v2
+        // instances, the dummy-fee `house` and the exact-fee `exact` (d3 = 0).
+        ("s3v2", f) => {
+            let inst = match f {
+                "house" => qlab_air::l2::fabricated_bucket_l2_v2(),
+                "exact" => qlab_air::l2::fabricated_bucket_l2_v2_exact_fee(),
+                other => bad_fixture("s3v2", other),
+            };
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            run!("s3v2", &inst.air, pvs, qlab_air::l2::audit_program(&inst.air), qlab_air::l2::witness_manifest_v2(), qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::S), qlab_air::l2::audit_col_regions_v2(), Vec::new());
+        }
+        ("p3v2", f) => {
+            let inst = match f {
+                "house" => qlab_air::l2p::fabricated_bucket_l2p_v2(),
+                "exact" => qlab_air::l2p::fabricated_bucket_l2p_v2_exact_fee(),
+                other => bad_fixture("p3v2", other),
+            };
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut manifest = qlab_air::l2p::witness_manifest_v2();
+            if flag("--cr-premise") {
+                println!("  premise (collision resistance): nk and auth_root @ ARKM′/″ declared sources (l2p::audit_cr_premise_v2)");
+                manifest.extend(qlab_air::l2p::audit_cr_premise_v2());
+            }
+            run!("p3v2", &inst.air, pvs, qlab_air::l2p::audit_program(&inst.air), manifest, qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::P), qlab_air::l2p::audit_col_regions_v2(), if flag("--no-pv-inputs") { Vec::new() } else { qlab_air::l2p::audit_pv_inputs(&inst.pvs) });
+        }
+        ("rv2", f) => {
+            let inst = match f {
+                "house" => qlab_air::l2r::fabricated_shape_r_v2().inst,
+                other => bad_fixture("rv2", other),
+            };
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            run!("rv2", &inst.air, pvs, qlab_air::l2r::audit_program(&inst.air), qlab_air::l2r::witness_manifest_v2(), qlab_l2::v2::audit_pv_bits(qlab_l2::Shape::R), qlab_air::l2r::audit_col_regions_v2(), Vec::new());
+        }
         (other, _) => {
-            eprintln!("detaudit: unknown --air `{other}`; expected claim|narrow|s3|p3|r");
+            eprintln!("detaudit: unknown --air `{other}`; expected claim|narrow|s3|p3|r|s3v2|p3v2|rv2");
             std::process::exit(2);
         }
     }

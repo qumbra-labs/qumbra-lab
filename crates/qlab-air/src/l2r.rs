@@ -3044,6 +3044,27 @@ pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
     ]
 }
 
+/// Lab #896 seam T: shape R **v2**'s witness manifest — v1's without `ANK`
+/// and `NF` (the fee input's), plus `NFA_R` (28) taking the fee input's `nk`
+/// (W9..12) and ρ (W0..3) as inputs, `AAUTH_R`'s leaf a copy via `EQL` and
+/// its sibling/bit inputs, and `ARKM`'s `auth_root` (W7..10) a copy via
+/// `EQA`.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest_v2() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::ManifestEntry as M;
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    let mut m: Vec<_> = witness_manifest().into_iter().filter(|e| e.role != ROLE_ANK && e.role != ROLE_NF).collect();
+    m.extend([
+        M::input(ROLE_NFA_R, w(9..13), "fee.nk"),
+        M::input(ROLE_NFA_R, w(0..4), "fee.rho"),
+        M::copy(ROLE_AAUTH_R, w(0..4), "auth.leaf"),
+        M::input(ROLE_AAUTH_R, w(4..8), "auth.sibling"),
+        M::input(ROLE_AAUTH_R, vec![PBIT_COL], "auth.bit"),
+        M::copy(ROLE_ARKM, w(7..11), "fee.auth_root"),
+    ]);
+    m
+}
+
 /// Shape R's program as the census reads it.
 #[cfg(any(test, feature = "audit"))]
 pub fn audit_program(air: &L2ShapeRAir) -> crate::detaudit::Program {
@@ -3121,6 +3142,25 @@ pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
         ("RINV_COL", RINV_COL),
         ("AINV_COL", AINV_COL),
     ];
+    v.sort_by_key(|(_, c)| *c);
+    v
+}
+
+/// Lab #896 seam T: v1's regions plus every column v2 appends, up to
+/// [`L2R_WIDTH_V2`].
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions_v2() -> Vec<(&'static str, usize)> {
+    let mut v = audit_col_regions();
+    v.extend([
+        ("XR_OFF", XR_OFF),
+        ("SELV2_OFF", SELV2_OFF),
+        ("INJV2_OFF", INJV2_OFF),
+        ("NFAB_COL", NFAB_COL),
+        ("EGL_CLOSE_COL", EGL_CLOSE_COL),
+        ("EQL_OFF", EQL_OFF),
+        ("EGA_POS_COL", EGA_POS_COL),
+        ("EQA_OFF", EQA_OFF),
+    ]);
     v.sort_by_key(|(_, c)| *c);
     v
 }
