@@ -102,9 +102,11 @@ fn usage() {
            --launch                         T2 ceremony path: committee keys from OS randomness.\n      \
                                             Requires --t2. Hash is NOT reproducible.\n      \
            --difficulty N                   launch-only; default stays the current placeholder\n  \
-         qumbra-node genesis annulet-devnet [--out DIR] [--sequencer-data-dir DIR]\n      \
+         qumbra-node genesis annulet-devnet [--v2 | --rehearsal] [--out DIR] [--sequencer-data-dir DIR]\n      \
                                             write the Annulet DEVNET genesis (pinned hash, dev keys);\n      \
-                                            with --sequencer-data-dir, also its DEV sequencer key file\n  \
+                                            with --sequencer-data-dir, also its DEV sequencer key file.\n      \
+                                            --v2: the Candidate A devnet (format 33); --rehearsal: its\n      \
+                                            one-second-slot rehearsal genesis (lab #896 H)\n  \
          qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475). Finds or\n      \
                                             CREATES a wallet (its mnemonic is printed ONCE and the\n      \
                                             run waits for you to confirm), downloads + verifies\n      \
@@ -984,15 +986,23 @@ fn audit(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// request, the devnet's dev sequencer key file into a producer's data dir.
 /// What the devnet compose runs instead of a genesis ceremony; nothing here
 /// is a secret, and nothing here may be reused on a net that holds value.
+///
+/// `--v2` writes the Candidate A devnet (lab #896 H, format 33) and
+/// `--rehearsal` its one-second-slot rehearsal genesis; both share the v1
+/// devnet's dev keys.
 fn genesis_annulet_devnet(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
     let out = std::path::PathBuf::from(flag(args, "--out").unwrap_or("."));
     std::fs::create_dir_all(&out)?;
-    let g = AnnuletGenesisFile::devnet();
+    let (which, g) = match (has_flag(args, "--v2"), has_flag(args, "--rehearsal")) {
+        (false, false) => ("annulet devnet", AnnuletGenesisFile::devnet()),
+        (true, false) => ("annulet devnet v2", AnnuletGenesisFile::devnet_v2()),
+        (_, true) => ("annulet devnet v2 rehearsal", AnnuletGenesisFile::devnet_v2_rehearsal()),
+    };
     g.verify(None)?;
     let path = out.join("genesis.qmb");
     std::fs::write(&path, g.to_bytes())?;
-    println!("annulet devnet genesis: {} ({} bytes)", path.display(), g.to_bytes().len());
+    println!("{which} genesis: {} ({} bytes)", path.display(), g.to_bytes().len());
     println!("genesis hash: {}", g.hash_hex());
     if let Some(dir) = flag(args, "--sequencer-data-dir") {
         let dir = std::path::PathBuf::from(dir);
