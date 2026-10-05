@@ -597,8 +597,8 @@ fn the_census_leaf_premise_is_exactly_the_airs_leaf_pvs() {
         let got = v2::audit_leaf_pv_inputs(shape);
         assert_eq!(starts.len(), v2::auth_slots(shape), "{shape:?}: one leaf per auth slot");
         assert_eq!(got, expect(&starts), "{shape:?}: the premise is the AIR's leaf PVs");
-        for k in 0..v2::auth_slots(shape) {
-            assert_eq!(v2::pv_leaf(shape, k), starts[k], "{shape:?} slot {k}");
+        for (k, start) in starts.iter().enumerate() {
+            assert_eq!(v2::pv_leaf(shape, k), *start, "{shape:?} slot {k}");
         }
         let mut sorted = got.clone();
         sorted.sort_unstable();
