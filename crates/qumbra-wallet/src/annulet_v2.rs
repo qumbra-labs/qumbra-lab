@@ -380,19 +380,22 @@ pub fn build_spend_v2<E: Endpoint>(
 /// as for v1, notes at diversifier indices the restored wallet has not
 /// allocated are not scanned (the wallet's existing restore limitation).
 ///
-/// The swept generations' cursors restart **above** every position a landed
-/// spend used — rebuilt by [`landed_next`] when the sweep runs; until then
-/// the journal holds them at 0 and the sweep gate keeps them unsigned.
+/// Every used generation's cursor is recorded **above** every position its
+/// landed spends used ([`landed_next`] over the slots `used` carries for it),
+/// so the journal a restore writes states the positions the chain shows. A
+/// generation with notes is sweep-only; a used one with none left is
+/// retired, its position kept (a leaf of it is never drawn again). The sweep
+/// still takes `max(journal, landed_next)` as its floor.
 pub fn restore_journal(
     lock: &AuthLock,
     w: &WalletDir,
     wallet: &Wallet,
     owned: &[OwnedL2Note],
-    used: &std::collections::BTreeSet<u32>,
+    used: &LandedByGeneration,
     genesis: &[u8; 32],
     gate_tip: u64,
 ) -> Result<AuthJournal, SendRefusal> {
-    let top = owned.iter().filter_map(|n| n.generation).chain(used.iter().copied()).max();
+    let top = owned.iter().filter_map(|n| n.generation).chain(used.keys().copied()).max();
     let probed = crate::auth_journal::PROBE_GENERATIONS;
     let journal = match top {
         None => AuthJournal::fresh(generation_root(wallet, 0)),
@@ -403,15 +406,16 @@ pub fn restore_journal(
             let gate = SweepGate { genesis: *genesis, not_before_height: gate_tip.saturating_add(MAX_AUTH_VALIDITY_BLOCKS) };
             let mut gens = Vec::new();
             for g in 0..=g_star {
-                let notes: Vec<&OwnedL2Note> = owned.iter().filter(|n| n.generation == Some(g)).collect();
-                if notes.is_empty() {
+                let has_notes = owned.iter().any(|n| n.generation == Some(g));
+                let landed = used.get(&g);
+                if !has_notes && landed.is_none() {
                     continue;
                 }
                 gens.push(Generation {
                     g,
-                    next: 0,
+                    next: landed.map_or(0, |slots| landed_next(wallet, g, slots)),
                     auth_root: generation_root(wallet, g),
-                    state: GenState::Sweep { gates: vec![gate] },
+                    state: if has_notes { GenState::Sweep { gates: vec![gate] } } else { GenState::Retired },
                 });
             }
             gens.push(Generation { g: g_star + 1, next: 0, auth_root: generation_root(wallet, g_star + 1), state: GenState::Active });
@@ -641,16 +645,20 @@ pub fn landed_slots<E: Endpoint>(
     Ok(out)
 }
 
+/// A wallet's landed slots `(leaf_index, leaf)` per generation.
+pub type LandedByGeneration = std::collections::BTreeMap<u32, Vec<(u32, [u8; 32])>>;
+
 /// The probe generations (`0 .. PROBE_GENERATIONS`) whose leaves appear in
-/// any landed transaction on the verified chain — hash compares against each
-/// generation's tree, no decryption; a dummy's leaf never matches. One
-/// verified body per block, so a restore reads the whole chain once.
-pub fn landed_generations<E: Endpoint>(session: &Session<E>, wallet: &Wallet) -> Result<std::collections::BTreeSet<u32>, SendRefusal> {
+/// any landed transaction on the verified chain, each with the slots that
+/// matched it — hash compares against each generation's tree, no
+/// decryption; a dummy's leaf never matches. One verified body per block, so
+/// a restore reads the whole chain once.
+pub fn landed_generations<E: Endpoint>(session: &Session<E>, wallet: &Wallet) -> Result<LandedByGeneration, SendRefusal> {
     use qlab_remote_auth::annulet::{auth_master, AuthTree};
     let trees: Vec<(u32, AuthTree)> = (0..crate::auth_journal::PROBE_GENERATIONS)
         .map(|g| (g, AuthTree::build(&auth_master(&wallet.auth_secret(), g), D_AUTH).expect("D_AUTH is a valid depth")))
         .collect();
-    let mut used = std::collections::BTreeSet::new();
+    let mut used = LandedByGeneration::new();
     for h in 1..=session.chain.tip() {
         for tx in verified_body(session, h)?.txs {
             // Not ours to judge here: a transaction with no readable section
@@ -661,7 +669,7 @@ pub fn landed_generations<E: Endpoint>(session: &Session<E>, wallet: &Wallet) ->
                 }
                 for (g, tree) in &trees {
                     if tree.leaf(index) == leaf {
-                        used.insert(*g);
+                        used.entry(*g).or_default().push((index, leaf));
                     }
                 }
             }
@@ -947,8 +955,10 @@ mod tests {
 
     /// §9: a restored wallet never resumes. Notes in generations 0 and 2 →
     /// generation 3 active; 0 and 2 sweep-only on this net from tip + cap;
-    /// generation 1 (no notes) is not recorded. No notes at all → generation
-    /// 0, fresh. Notes in the last probed generation → refused by name.
+    /// generation 1 (no notes, no landed leaf) is not recorded. No notes at
+    /// all → generation 0, fresh. A generation seen through landed leaves is
+    /// recorded at its landed floor (retired when it holds no note). Notes in
+    /// the last probed generation → refused by name.
     #[test]
     fn restore_opens_the_generation_above_every_one_with_notes() {
         let w = wallet_dir("restore", 5);
@@ -956,7 +966,7 @@ mod tests {
         let lock = AuthLock::acquire(&w.dir).unwrap();
         let genesis = [0x33; 32];
         let owned = [note_of(&wallet, 0, 1, 1), note_of(&wallet, 2, 1, 2)];
-        let none = std::collections::BTreeSet::new();
+        let none = LandedByGeneration::new();
         let j = restore_journal(&lock, &w, &wallet, &owned, &none, &genesis, 500).unwrap();
         assert_eq!(j.active().g, 3);
         assert_eq!(j.active().next, 0);
@@ -974,12 +984,25 @@ mod tests {
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
         // A generation seen only through its landed leaves (its notes at an
-        // unallocated address) is used too: notes in 0, leaves landed in 4
-        // → generation 5 active.
-        let leaves_in_4: std::collections::BTreeSet<u32> = [4].into();
-        let j = restore_journal(&lock, &w, &wallet, &owned[..1], &leaves_in_4, &genesis, 500).unwrap();
+        // unallocated address, or spent) is used too: notes in 0 with two
+        // landed leaves, three leaves landed in 4 → generation 5 active; 0
+        // sweep-only and 4 retired, each at its landed floor — not 0.
+        let leaves = |g: u32, n: usize| -> Vec<(u32, [u8; 32])> {
+            let mut la = LocalAuth::new(&wallet.auth_secret(), g, 0).unwrap();
+            (0..n)
+                .map(|_| {
+                    let p = la.take().unwrap();
+                    (p.leaf_index, qlab_note::hash::digest_bytes(&p.leaf))
+                })
+                .collect()
+        };
+        let landed: LandedByGeneration = [(0, leaves(0, 2)), (4, leaves(4, 3))].into();
+        let j = restore_journal(&lock, &w, &wallet, &owned[..1], &landed, &genesis, 500).unwrap();
         assert_eq!(j.active().g, 5, "the generation above every used one");
-        assert!(j.get(4).is_err(), "no note of 4 to sweep, so it is not recorded");
+        assert_eq!((j.get(0).unwrap().next, j.get(4).unwrap().next), (2, 3), "the landed floors");
+        assert!(matches!(j.get(0).unwrap().state, GenState::Sweep { .. }));
+        assert_eq!(j.get(4).unwrap().state, GenState::Retired, "no note of 4 to sweep: retired at its floor");
+        assert!(j.get(1).is_err());
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
         let last = crate::auth_journal::PROBE_GENERATIONS - 1;

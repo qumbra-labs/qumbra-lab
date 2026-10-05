@@ -776,8 +776,9 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
     // restored wallet never hands out a generation it may have used.
     let v2_root = if has_flag(args, "--candidate-a") {
         let journal = qumbra_wallet::auth_journal::AuthJournal::load(&dir)?.ok_or(
-            "this wallet has no auth journal yet: run `qumbra-wallet migrate --net annulet --scan-url URL \
-             --genesis-hash HEX` once on the Candidate A net (a restored wallet must not resume a generation)",
+            "this wallet has no auth journal yet: run `qumbra-wallet migrate --net annulet --url URL \
+             --scan-to H --genesis-hash HEX --dir DIR` once on the Candidate A net (a restored wallet must not \
+             resume a generation)",
         )?;
         Some(journal.active().auth_root)
     } else {
