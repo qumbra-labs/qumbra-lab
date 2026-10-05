@@ -8,10 +8,13 @@
 //! does not rebuild the 2^D tree) and its state:
 //!
 //! - **`active`** — exactly one; the only generation new addresses come from;
-//! - **`sweep`** — after a restore (§9): its notes may only be swept to the
-//!   active generation, and not before `not_before_height` (the restore tip
-//!   plus `MAX_AUTH_VALIDITY_BLOCKS`), by which height every authorization
-//!   exported before the loss has expired;
+//! - **`sweep`** — after a restore or a migration (§9): its notes may only be
+//!   swept to the active generation, and on each net not before that net's
+//!   gate height (the tip there plus `MAX_AUTH_VALIDITY_BLOCKS`), by which
+//!   every authorization exported before has expired. A gate is a height on
+//!   **one** net, recorded with that net's genesis hash: a seed's positions
+//!   are shared across nets, its heights are not, so a net with no gate
+//!   recorded is refused by name until one is;
 //! - **`retired`** — nothing left to spend.
 //!
 //! **Fail-closed.** A leaf is taken by persisting `next + 1` — written to a
@@ -34,16 +37,24 @@ pub const AUTH_FILE: &str = "auth.v1";
 pub const AUTH_LOCK_FILE: &str = "auth.lock";
 const AUTH_HEADER: &str = "qumbra-wallet auth v1";
 
-/// A generation's state (module doc).
+/// A sweep gate: on the net with genesis hash `genesis`, nothing of the
+/// generation is signed before `not_before_height`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SweepGate {
+    pub genesis: [u8; 32],
+    pub not_before_height: u64,
+}
+
+/// A generation's state (module doc).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenState {
     Active,
-    Sweep { not_before_height: u64 },
+    Sweep { gates: Vec<SweepGate> },
     Retired,
 }
 
 /// One generation's record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Generation {
     pub g: u32,
     /// The cursor position: positions `< next` are consumed.
@@ -67,6 +78,12 @@ pub enum JournalError {
     Exhausted { g: u32 },
     /// No such generation in the journal.
     UnknownGeneration { g: u32 },
+    /// A sweep of generation `g` before its gate height on this net.
+    SweepNotYet { g: u32, not_before_height: u64, tip: u64 },
+    /// A sweep of generation `g` on a net no gate was recorded for.
+    SweepNoGate { g: u32 },
+    /// Generation `g` is not sweep-only (active or retired).
+    NotSweepOnly { g: u32 },
 }
 
 impl std::fmt::Display for JournalError {
@@ -85,6 +102,17 @@ impl std::fmt::Display for JournalError {
                  notes to a new generation"
             ),
             JournalError::UnknownGeneration { g } => write!(f, "generation {g} is not in {AUTH_FILE}"),
+            JournalError::SweepNotYet { g, not_before_height, tip } => write!(
+                f,
+                "generation {g} may be swept on this net from height {not_before_height} (the tip is {tip}): \
+                 authorizations exported before the restore or migration must expire first"
+            ),
+            JournalError::SweepNoGate { g } => write!(
+                f,
+                "generation {g} has no sweep gate on this net: run `qumbra-wallet migrate` here first, which \
+                 records this net's wait"
+            ),
+            JournalError::NotSweepOnly { g } => write!(f, "generation {g} is not sweep-only"),
         }
     }
 }
@@ -177,25 +205,42 @@ impl AuthJournal {
         self.save(dir)
     }
 
-    /// Open generation `g` as the new active one, the previous active one
-    /// becoming sweep-only from `not_before_height` (a manual migration), and
-    /// persist.
-    pub fn open_next(
-        &mut self,
-        _lock: &AuthLock,
-        dir: &Path,
-        auth_root: [u64; 4],
-        not_before_height: u64,
-    ) -> Result<u32, JournalError> {
+    /// Open the next generation as the active one, the previous active one
+    /// becoming sweep-only with a gate at `gate` (a migration), and persist.
+    pub fn open_next(&mut self, _lock: &AuthLock, dir: &Path, auth_root: [u64; 4], gate: SweepGate) -> Result<u32, JournalError> {
         let g = self.gens.iter().map(|r| r.g).max().expect("checked: non-empty") + 1;
         for r in &mut self.gens {
             if r.state == GenState::Active {
-                r.state = GenState::Sweep { not_before_height };
+                r.state = GenState::Sweep { gates: vec![gate] };
             }
         }
         self.gens.push(Generation { g, next: 0, auth_root, state: GenState::Active });
         self.save(dir)?;
         Ok(g)
+    }
+
+    /// Record a sweep gate for generation `g` on `gate.genesis`'s net —
+    /// another net this seed is used on — and persist. A gate already
+    /// recorded for that net is kept (the earlier wait is the one that
+    /// covers what was exported before it).
+    pub fn add_gate(&mut self, _lock: &AuthLock, dir: &Path, g: u32, gate: SweepGate) -> Result<(), JournalError> {
+        let r = self.get_mut(g)?;
+        let GenState::Sweep { gates } = &mut r.state else { return Err(JournalError::NotSweepOnly { g }) };
+        if !gates.iter().any(|x| x.genesis == gate.genesis) {
+            gates.push(gate);
+        }
+        self.save(dir)
+    }
+
+    /// May generation `g` sign a sweep on the net `genesis` at tip `tip`?
+    pub fn sweep_allowed(&self, g: u32, genesis: &[u8; 32], tip: u64) -> Result<(), JournalError> {
+        let r = self.get(g)?;
+        let GenState::Sweep { gates } = &r.state else { return Err(JournalError::NotSweepOnly { g }) };
+        let gate = gates.iter().find(|x| &x.genesis == genesis).ok_or(JournalError::SweepNoGate { g })?;
+        if tip < gate.not_before_height {
+            return Err(JournalError::SweepNotYet { g, not_before_height: gate.not_before_height, tip });
+        }
+        Ok(())
     }
 
     /// Load `auth.v1`, or `None` if the wallet has none (a restored or pre-G
@@ -233,9 +278,15 @@ impl AuthJournal {
         let mut out = format!("{AUTH_HEADER}\n");
         for r in &self.gens {
             let root: String = r.auth_root.iter().map(|w| format!("{w:016x}")).collect();
-            let state = match r.state {
+            let state = match &r.state {
                 GenState::Active => "active".to_string(),
-                GenState::Sweep { not_before_height } => format!("sweep {not_before_height}"),
+                GenState::Sweep { gates } => {
+                    let g: Vec<String> = gates
+                        .iter()
+                        .map(|x| format!("{}:{}", x.genesis.iter().map(|b| format!("{b:02x}")).collect::<String>(), x.not_before_height))
+                        .collect();
+                    format!("sweep {}", g.join(","))
+                }
                 GenState::Retired => "retired".to_string(),
             };
             out.push_str(&format!("{} {} {root} {state}\n", r.g, r.next));
@@ -255,11 +306,26 @@ impl AuthJournal {
             let num = |s: &str| s.parse::<u64>().map_err(|_| bad(format!("record {i}: `{s}` is not a number")));
             let (g, next, root, state) = match f.as_slice() {
                 [g, n, root, "active"] => (num(g)?, num(n)?, *root, GenState::Active),
-                [g, n, root, "sweep", h] => (num(g)?, num(n)?, *root, GenState::Sweep { not_before_height: num(h)? }),
+                [g, n, root, "sweep", gates] => {
+                    let mut out = Vec::new();
+                    for gate in gates.split(',') {
+                        let (hash, h) = gate.split_once(':').ok_or_else(|| bad(format!("record {i}: a gate is not `genesis:height`")))?;
+                        if hash.len() != 64 || !hash.is_ascii() {
+                            return Err(bad(format!("record {i}: a gate's genesis is not 64 hex digits")));
+                        }
+                        let mut genesis = [0u8; 32];
+                        for (k, b) in genesis.iter_mut().enumerate() {
+                            *b = u8::from_str_radix(&hash[2 * k..2 * k + 2], 16)
+                                .map_err(|_| bad(format!("record {i}: a gate's genesis is not hex")))?;
+                        }
+                        out.push(SweepGate { genesis, not_before_height: num(h)? });
+                    }
+                    (num(g)?, num(n)?, *root, GenState::Sweep { gates: out })
+                }
                 [g, n, root, "retired"] => (num(g)?, num(n)?, *root, GenState::Retired),
                 _ => return Err(bad(format!("record {i} is not `g next root state`"))),
             };
-            if root.len() != 64 {
+            if root.len() != 64 || !root.is_ascii() {
                 return Err(bad(format!("record {i}: the root is not 64 hex digits")));
             }
             let mut auth_root = [0u64; 4];
@@ -307,12 +373,19 @@ mod tests {
         let mut j = AuthJournal::fresh([1, 2, 3, u64::MAX]);
         let lock = AuthLock::acquire(&dir).unwrap();
         j.advance(&lock, &dir, 0, 7).unwrap();
-        let g1 = j.open_next(&lock, &dir, [9, 9, 9, 9], 1_200).unwrap();
+        let net_a = SweepGate { genesis: [0xA1; 32], not_before_height: 1_200 };
+        let g1 = j.open_next(&lock, &dir, [9, 9, 9, 9], net_a).unwrap();
+        j.add_gate(&lock, &dir, 0, SweepGate { genesis: [0xB2; 32], not_before_height: 40 }).unwrap();
         assert_eq!(g1, 1);
         let back = AuthJournal::load(&dir).unwrap().unwrap();
         assert_eq!(back, j);
         assert_eq!(back.active().g, 1);
-        assert_eq!(back.get(0).unwrap().state, GenState::Sweep { not_before_height: 1_200 });
+        assert_eq!(
+            back.get(0).unwrap().state,
+            GenState::Sweep {
+                gates: vec![net_a, SweepGate { genesis: [0xB2; 32], not_before_height: 40 }]
+            }
+        );
         assert_eq!(back.get(0).unwrap().next, 7);
         #[cfg(unix)]
         {
@@ -344,9 +417,33 @@ mod tests {
             &format!("qumbra-wallet auth v1\n0 0 {z} active\n1 0 {z} active\n", z = "0".repeat(64)),
             &format!("qumbra-wallet auth v1\n0 0 {z} retired\n0 1 {z} active\n", z = "0".repeat(64)),
             &format!("qumbra-wallet auth v1\n0 x {z} active\n", z = "0".repeat(64)),
+            &format!("qumbra-wallet auth v1\n0 0 {z} active\n1 0 {z} sweep \n", z = "0".repeat(64)),
+            &format!("qumbra-wallet auth v1\n0 0 {z} active\n1 0 {z} sweep {w}:5\n", z = "0".repeat(64), w = "é".repeat(32)),
+            &format!("qumbra-wallet auth v1\n0 0 {r} active\n", r = "é".repeat(32)),
         ] {
             assert!(matches!(AuthJournal::parse(text), Err(JournalError::Malformed(_))), "{text:?}");
         }
+    }
+
+    /// A sweep gate is a height on one net: refused before it, allowed at it,
+    /// and refused by name on a net with no gate recorded.
+    #[test]
+    fn a_sweep_gate_is_per_net() {
+        let dir = tmpdir("gate");
+        let lock = AuthLock::acquire(&dir).unwrap();
+        let mut j = AuthJournal::fresh([0; 4]);
+        let (a, b) = ([0xA1; 32], [0xB2; 32]);
+        j.open_next(&lock, &dir, [1; 4], SweepGate { genesis: a, not_before_height: 100 }).unwrap();
+        assert!(matches!(j.sweep_allowed(0, &a, 99), Err(JournalError::SweepNotYet { g: 0, not_before_height: 100, tip: 99 })));
+        assert!(j.sweep_allowed(0, &a, 100).is_ok());
+        assert!(matches!(j.sweep_allowed(0, &b, 10_000), Err(JournalError::SweepNoGate { g: 0 })));
+        assert!(matches!(j.sweep_allowed(1, &a, 10_000), Err(JournalError::NotSweepOnly { g: 1 })));
+        j.add_gate(&lock, &dir, 0, SweepGate { genesis: b, not_before_height: 7 }).unwrap();
+        assert!(j.sweep_allowed(0, &b, 7).is_ok());
+        // An existing gate is kept: the earlier wait covers what was exported before it.
+        j.add_gate(&lock, &dir, 0, SweepGate { genesis: a, not_before_height: 5 }).unwrap();
+        assert!(j.sweep_allowed(0, &a, 99).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One writer: a second lock on the same wallet is refused by name while
