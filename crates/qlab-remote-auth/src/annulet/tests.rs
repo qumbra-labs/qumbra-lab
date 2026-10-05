@@ -563,3 +563,15 @@ fn depths_outside_the_measurable_range_are_refused_by_name() {
     assert_eq!(d.auth_path.len(), 5);
     assert!(d.leaf_index < 32);
 }
+
+/// The leaf-derivation cross-lock (lab #896 E1): `qlab-l2`'s v2 shape digest
+/// recomputes `mldsa_leaf` (its dependencies exclude this crate) and pins the
+/// same vector. Computed independently (pycryptodome Keccak-256).
+#[test]
+fn mldsa_leaf_known_answer_is_cross_locked_with_qlab_l2() {
+    let vk: Vec<u8> = (0..1_312u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        crate::hex(&mldsa_leaf(2885, &vk)),
+        "75fb38f8035a154def1393c47fe147d3e40a700983ab2bd12a3facc7af0292ea"
+    );
+}

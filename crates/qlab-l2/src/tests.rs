@@ -548,3 +548,14 @@ fn l2_v2_shape_identities() {
     // The v2 typed entries refuse a v1-length PV vector before any proof work.
     assert!(!pv_u32_in_range(&vec![0; Shape::S.pv_len()], &v2::audit_pv_bits(Shape::S)));
 }
+
+/// The leaf-derivation cross-lock (lab #896 E1): this vector is also
+/// hard-coded in `qlab-remote-auth`'s annulet tests. Computed independently
+/// (pycryptodome Keccak-256).
+#[test]
+fn l2_v2_mldsa_leaf_known_answer_is_cross_locked() {
+    assert_eq!(
+        digest::hex(&digest::mldsa_leaf_known_answer()),
+        "75fb38f8035a154def1393c47fe147d3e40a700983ab2bd12a3facc7af0292ea"
+    );
+}

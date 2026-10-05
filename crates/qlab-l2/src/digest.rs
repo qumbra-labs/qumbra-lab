@@ -244,6 +244,14 @@ pub fn constants_digest_v2(shape: Shape) -> [u8; 32] {
     // index LE ‖ vk) (`qlab-remote-auth` `tree.rs`), recomputed here because
     // this crate's dependencies are pinned to air + consensus; a fixed index
     // and a fixed 1,312-byte key pattern.
+    h.bytes(&mldsa_leaf_known_answer());
+    h.finish()
+}
+
+/// `mldsa_leaf(2885, vk)` with `vk[i] = i mod 251` (1,312 bytes). The same
+/// hex is hard-coded in this crate's tests and in `qlab-remote-auth`'s, so a
+/// drift of either copy of the derivation fails loudly.
+pub fn mldsa_leaf_known_answer() -> [u8; 32] {
     let vk: Vec<u8> = (0..1_312u32).map(|i| (i % 251) as u8).collect();
     let mut k = Keccak::v256();
     k.update(MLDSA_LEAF_DOMAIN);
@@ -251,8 +259,7 @@ pub fn constants_digest_v2(shape: Shape) -> [u8; 32] {
     k.update(&vk);
     let mut leaf = [0u8; 32];
     k.finalize(&mut leaf);
-    h.bytes(&leaf);
-    h.finish()
+    leaf
 }
 
 /// `qlab-remote-auth` `tree.rs`'s leaf domain, mirrored for the v2 constants.
