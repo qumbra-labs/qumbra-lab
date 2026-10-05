@@ -147,6 +147,11 @@ fn rank_and_confirm(census: &mut Census<Val>, rep: &Report, confirm: bool, confi
         // Scope the pins' elimination sweeps to this component (± a perm).
         let rpp = census.rows_per_perm();
         census.set_scope(Some(c.min_row.saturating_sub(rpp)..c.max_row + rpp + 1));
+        // The budget binds inside each pin and replay too, not only between
+        // attempts (the 2026-10-05/06 box: one attempt on a 19.5M-cell flag
+        // ran > 3 h past a 900 s budget).
+        let deadline = t0 + budget;
+        census.set_deadline(Some(deadline));
         // Candidates: the orientation roots (never a witness copy) when there
         // are any, else the largest buckets. A root resolving ≥ 90 % of the
         // component ends the ranking — it is the freedom's source.
@@ -171,6 +176,10 @@ fn rank_and_confirm(census: &mut Census<Val>, rep: &Report, confirm: bool, confi
             let snap = census.snapshot();
             let resolved = census.pin_cells_with(&[cell], false).len();
             census.restore(snap);
+            if census.timed_out() {
+                println!("  flag {k}: budget exhausted inside a ranking pin ({} s)", budget.as_secs());
+                break;
+            }
             ranked.push(((col, role), cell, resolved, pool.contains(&(col, role))));
             if resolved * 10 >= c.cells * 9 {
                 break;
@@ -183,6 +192,13 @@ fn rank_and_confirm(census: &mut Census<Val>, rep: &Report, confirm: bool, confi
         ranked.sort_by_key(|(_, _, n, root)| (!*root, std::cmp::Reverse(*n)));
         let show: Vec<_> = ranked.iter().take(6).map(|(b, _, n, r)| format!("col{}@role{}:{n}{}", b.0, b.1, if *r { "(root)" } else { "" })).collect();
         println!("  flag {k}: single-cell ranking {}", show.join(" "));
+        // A ranking pin that ran out of budget leaves none for a confirm:
+        // the flag is unconfirmed, said once (above), and the next one runs.
+        if census.timed_out() {
+            census.set_scope(None);
+            census.set_deadline(None);
+            continue;
+        }
         if !confirm {
             continue;
         }
@@ -214,7 +230,17 @@ fn rank_and_confirm(census: &mut Census<Val>, rep: &Report, confirm: bool, confi
                     }
                 }
                 // Flip a boolean root (0 ↔ 1); nudge anything else by one.
-                let rep = census.repair(&[cell], |v| if v == Val::ZERO { Val::ONE } else if v == Val::ONE { Val::ZERO } else { v + Val::ONE }, &resolved);
+                let flip = |v: Val| if v == Val::ZERO { Val::ONE } else if v == Val::ONE { Val::ZERO } else { v + Val::ONE };
+                let rep = if census.timed_out() { None } else { census.repair_until(&[cell], flip, &resolved, Some(deadline)) };
+                let Some(rep) = rep else {
+                    println!(
+                        "  flag {k}: budget exhausted inside a confirm attempt ({} s, {} replayed) — unconfirmed",
+                        budget.as_secs(),
+                        resolved.len()
+                    );
+                    census.restore(snap);
+                    break 'cells;
+                };
                 let bad = census.violations(&rep, 5);
                 let moved: Vec<usize> = (0..rep.pvs.len()).filter(|i| rep.pvs[*i] != census.pvs()[*i]).collect();
                 if !bad.is_empty() && !with_elim {
@@ -246,7 +272,11 @@ fn rank_and_confirm(census: &mut Census<Val>, rep: &Report, confirm: bool, confi
             }
         }
         census.set_scope(None);
+        census.set_deadline(None);
     }
+    // A flag left by `continue` (no confirm, nothing ranked) must not leave
+    // its deadline on the census for what runs next (L2b's pins).
+    census.set_deadline(None);
 }
 
 /// Lab #758 R14 — P3's digest-bound and bank-bound copies probed directly:

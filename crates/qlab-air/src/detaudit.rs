@@ -490,6 +490,14 @@ pub struct Census<F> {
     /// What enumeration saw: (row, public values involved, solutions) for
     /// every group it could decide, unique or not.
     pub enum_log: Vec<EnumOutcome>,
+    /// A confirm's wall-clock budget ([`Census::set_deadline`]): checked
+    /// inside the fixpoint and the elimination sweep, so one pin cannot run
+    /// unbounded past it (the 2026-10-05/06 box: a 19.5M-cell flag ran > 3 h
+    /// past a 900 s budget, which was checked only between attempts).
+    deadline: Option<std::time::Instant>,
+    /// Set when `deadline` passed during a pin: the pin's result is partial
+    /// and the attempt is unconfirmed.
+    timed_out: bool,
 }
 
 /// One enumerated group's outcome (lab #758 R11).
@@ -691,6 +699,8 @@ impl<F: PrimeField32> Census<F> {
             stuck: Vec::new(),
             enums: Vec::new(),
             enum_log: Vec::new(),
+            deadline: None,
+            timed_out: false,
         };
         s.find_booleans();
         for row in 0..rows {
@@ -848,6 +858,9 @@ impl<F: PrimeField32> Census<F> {
     /// Worklist fixpoint. `seed`: the instances to start from (an
     /// incremental pin); `None` = the sweep of every instance.
     fn fixpoint(&mut self, seed: Option<Vec<(u32, u32)>>) {
+        if self.past_deadline() {
+            return;
+        }
         let nc = self.constraints.len();
         let mut queued = vec![0u64; (nc * self.rows).div_ceil(64)];
         let mut queue: std::collections::VecDeque<(u32, u32)> = Default::default();
@@ -863,16 +876,21 @@ impl<F: PrimeField32> Census<F> {
                 }
             }
         }
+        let mut popped = 0usize;
         loop {
             // Drain the queue first, then advance the sweep one row.
             while let Some((c, r)) = queue.pop_front() {
+                popped += 1;
+                if popped.is_multiple_of(65_536) && self.past_deadline() {
+                    return;
+                }
                 let q = r as usize * nc + c as usize;
                 queued[q / 64] &= !(1 << (q % 64));
                 for v in self.process(c as usize, r as usize, &mut scratch) {
                     self.enqueue_dependents(v, sweep_row, &mut queue, &mut queued);
                 }
             }
-            if !sweep || sweep_row >= self.rows {
+            if !sweep || sweep_row >= self.rows || self.past_deadline() {
                 break;
             }
             for c in 0..nc {
@@ -1550,6 +1568,10 @@ impl<F: PrimeField32> Census<F> {
         let mut direct: Vec<Var> = Vec::new();
         let scope = self.scope.start..self.scope.end.min(self.rows);
         'sweep: for row in scope {
+            // Dropping the rest of a sweep only loses information (sound).
+            if row.is_multiple_of(1024) && self.past_deadline() {
+                return Vec::new();
+            }
             for c in 0..self.constraints.len() {
                 if self.vars_of(c, row).iter().all(|v| self.is_det(*v)) {
                     continue;
@@ -1961,6 +1983,26 @@ impl<F: PrimeField32> Census<F> {
         (cells, resolved)
     }
 
+    /// Give later pins a wall-clock `deadline` (`None`: unbounded, the
+    /// census's own run) and clear [`Census::timed_out`]. A pin that passes
+    /// it stops where it is — its result is partial, never a verdict.
+    pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.deadline = deadline;
+        self.timed_out = false;
+    }
+
+    /// Whether a pin since [`Census::set_deadline`] passed the deadline.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    fn past_deadline(&mut self) -> bool {
+        if self.deadline.is_some_and(|d| std::time::Instant::now() > d) {
+            self.timed_out = true;
+        }
+        self.timed_out
+    }
+
     /// Scope later elimination sweeps to `rows` (a component's rows, padded
     /// by a perm each side); `None` restores the whole window.
     pub fn set_scope(&mut self, rows: Option<Range<usize>>) {
@@ -1997,6 +2039,9 @@ impl<F: PrimeField32> Census<F> {
         self.fixpoint(Some(seed));
         if eliminate {
             loop {
+                if self.timed_out {
+                    break;
+                }
                 let new = self.eliminate();
                 if new.is_empty() {
                     break;
@@ -2586,6 +2631,8 @@ impl<F: PrimeField32> Census<F> {
             stuck: Vec::new(),
             enums: Vec::new(),
             enum_log: Vec::new(),
+            deadline: None,
+            timed_out: false,
         }
     }
 }
@@ -3040,6 +3087,36 @@ mod tests {
         let (_, rep) = census(false, true, Some(vec![16; 5]));
         assert!(flag_with(&rep, toy::S).is_none(), "the tied copy as a source pins y, hence s — a copy declared an input masks the freedom");
         assert!(flag_with(&rep, toy::C2).is_some());
+    }
+
+    /// A confirm's deadline binds inside a pin and a replay (the 2026-10-05/06
+    /// box: one attempt ran > 3 h past its 900 s budget, checked only between
+    /// attempts): past it, a pin stops and says so, and the replay gives up;
+    /// cleared, the same pin resolves what it did before.
+    #[test]
+    fn detaudit_deadline_binds_inside_a_pin_and_a_replay() {
+        let (mut c, _) = census(false, false, Some(vec![16; 5]));
+        let cell = c.undetermined_in(toy::S as u32, 0)[0];
+        let snap = c.snapshot();
+        let full = c.pin_cells(&[cell]);
+        c.restore(snap);
+        assert!(!c.timed_out() && !full.is_empty(), "unbounded, the pin resolves its cone");
+
+        let past = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.set_deadline(Some(past));
+        let snap = c.snapshot();
+        let partial = c.pin_cells(&[cell]);
+        c.restore(snap);
+        assert!(c.timed_out(), "a pin past its deadline says so");
+        assert!(partial.len() < full.len(), "and stops short ({} of {})", partial.len(), full.len());
+        assert!(c.repair_until(&[cell], |v| F::ONE - v, &full, Some(past)).is_none(), "the replay gives up");
+
+        c.set_deadline(None);
+        assert!(!c.timed_out(), "clearing the deadline clears the flag");
+        let snap = c.snapshot();
+        assert_eq!(c.pin_cells(&[cell]).len(), full.len(), "the same pin, unbounded again");
+        c.restore(snap);
     }
 
     /// With the freedom pinned, the copy's bank is over the class cap (the
