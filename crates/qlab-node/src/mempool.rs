@@ -736,11 +736,14 @@ impl Mempool {
         //     any injected verifier. Nothing above has written any state, so a
         //     copy refused here leaves no trace under its (auth-excluding) id
         //     and cannot block the honest copy.
-        let valid_until_height = if state.genesis_form() == GenesisForm::Annulet {
-            qlab_devnet::annulet::check_auth(&entry, &state.annulet_auth_context(), prospective_height)
-                .map_err(MempoolError::AuthRefused)?
-        } else {
-            None
+        let valid_until_height = match state.genesis_form() {
+            GenesisForm::Annulet => {
+                qlab_devnet::annulet::check_auth(&entry, &state.annulet_auth_context(), prospective_height)
+                    .map_err(MempoolError::AuthRefused)?
+            }
+            // No L2 surface and no auth section on the L1 forms (the L1 wire
+            // cannot carry one), so there is nothing to authorize here.
+            GenesisForm::V4 | GenesisForm::V5 => None,
         };
 
         // 8. Proof verify — last, the only non-trivial cost (consensus §1).
