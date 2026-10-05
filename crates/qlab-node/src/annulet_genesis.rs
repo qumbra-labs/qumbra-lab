@@ -24,10 +24,13 @@ use serde::{Deserialize, Serialize};
 
 use qlab_air::l2::RegistryLeaf;
 use qlab_devnet::annulet::{
-    genesis_body_commitment_annulet, AnnuletHeaderFields, GenesisNote, L2FeeTable,
+    genesis_body_commitment_annulet_for, AnnuletHeaderFields, GenesisNote, L2FeeTable,
 };
 use qlab_devnet::committee::Validator;
-use qlab_devnet::forms::{GenesisForm, ANNULET_GENESIS_FORMAT_VERSION};
+use qlab_devnet::forms::{
+    annulet_forms_of_genesis_format_version, GenesisForm, L2AuthForm, ANNULET_AUTH_GENESIS_FORMAT_VERSION,
+    ANNULET_GENESIS_FORMAT_VERSION,
+};
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 /// Why an Annulet genesis file was refused. Each variant is the one
@@ -180,7 +183,10 @@ pub struct AnnuletGenesisHeader {
 /// — [`load_any`] and both loaders dispatch on the leading `u32`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnuletGenesisFile {
-    /// Always [`ANNULET_GENESIS_FORMAT_VERSION`] (32).
+    /// [`ANNULET_GENESIS_FORMAT_VERSION`] (32), or
+    /// [`ANNULET_AUTH_GENESIS_FORMAT_VERSION`] (33) on a Candidate A net (lab
+    /// #896 E2): the L2 authorization axis is committed here, in the bytes
+    /// the genesis hash covers.
     pub format_version: u32,
     /// Network label — not consensus.
     pub network: String,
@@ -231,7 +237,7 @@ impl AnnuletGenesisFile {
     /// Decode, refusing a non-Annulet file **by name** before decoding a byte.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AnnuletGenesisError> {
         match leading_format_version(bytes) {
-            Some(ANNULET_GENESIS_FORMAT_VERSION) => {}
+            Some(ANNULET_GENESIS_FORMAT_VERSION | ANNULET_AUTH_GENESIS_FORMAT_VERSION) => {}
             got => {
                 return Err(AnnuletGenesisError::NotAnnuletGenesis { got });
             }
@@ -256,12 +262,20 @@ impl AnnuletGenesisFile {
 
     /// Always [`GenesisForm::Annulet`] for a verified file.
     pub fn form(&self) -> Result<GenesisForm, AnnuletGenesisError> {
-        match GenesisForm::from_genesis_format_version(self.format_version) {
+        match annulet_forms_of_genesis_format_version(self.format_version).map(|(f, _)| f) {
             Some(GenesisForm::Annulet) => Ok(GenesisForm::Annulet),
             Some(GenesisForm::V4) | Some(GenesisForm::V5) | None => {
                 Err(AnnuletGenesisError::NotAnnuletGenesis { got: Some(self.format_version) })
             }
         }
+    }
+
+    /// The L2 authorization axis this genesis selects (lab #896 E2): format
+    /// 32 is [`L2AuthForm::None`], 33 is [`L2AuthForm::CandidateA`].
+    pub fn l2_auth(&self) -> Result<L2AuthForm, AnnuletGenesisError> {
+        annulet_forms_of_genesis_format_version(self.format_version)
+            .map(|(_, auth)| auth)
+            .ok_or(AnnuletGenesisError::NotAnnuletGenesis { got: Some(self.format_version) })
     }
 
     /// The sequencer's verifying key, decoded.
@@ -295,7 +309,7 @@ impl AnnuletGenesisFile {
     /// width and the genesis header's bindings — and, if `expected_hex` is set,
     /// the genesis hash.
     pub fn verify(&self, expected_hex: Option<&str>) -> Result<(), AnnuletGenesisError> {
-        self.form()?;
+        let l2_auth = self.l2_auth()?;
         self.sequencer()?;
         if self.registry_genesis.first() != Some(&RegistryLeafRecord::asset_zero()) {
             return Err(AnnuletGenesisError::BadAnnulet("asset 0's pinned leaf must be the first registry entry"));
@@ -318,7 +332,7 @@ impl AnnuletGenesisFile {
                 "a genesis note payload is not a GenesisPlaintext opening to its commitment",
             ));
         }
-        if genesis_body_commitment_annulet(&self.notes()) != self.genesis_header.body_commitment {
+        if genesis_body_commitment_annulet_for(&self.notes(), l2_auth) != self.genesis_header.body_commitment {
             return Err(AnnuletGenesisError::BadAnnulet("genesis header body_commitment does not bind the genesis notes"));
         }
         if let Some(want) = expected_hex {
@@ -340,6 +354,28 @@ impl AnnuletGenesisFile {
         genesis_notes: Vec<GenesisNoteRecord>,
         timestamp: u64,
     ) -> Self {
+        Self::assemble_with_auth(
+            network,
+            params,
+            sequencer_seed,
+            registry_genesis,
+            genesis_notes,
+            timestamp,
+            L2AuthForm::None,
+        )
+    }
+
+    /// [`Self::assemble`] on an L2 authorization axis (lab #896 E2): the
+    /// format version and the genesis body domain follow `l2_auth`.
+    pub fn assemble_with_auth(
+        network: &str,
+        params: AnnuletParams,
+        sequencer_seed: [u8; 32],
+        registry_genesis: Vec<RegistryLeafRecord>,
+        genesis_notes: Vec<GenesisNoteRecord>,
+        timestamp: u64,
+        l2_auth: L2AuthForm,
+    ) -> Self {
         let sequencer_key = Validator::from_seed(0, sequencer_seed).verifying_key().encode().to_vec();
         let notes: Vec<GenesisNote> =
             genesis_notes.iter().map(|n| GenesisNote { cm: n.cm, payload: n.payload.clone() }).collect();
@@ -348,10 +384,10 @@ impl AnnuletGenesisFile {
             l1_anchor_height: 0,
             l1_anchor_root: [0u8; 32],
             registry_root: h32(&registry_root_of(&registry_genesis)),
-            body_commitment: genesis_body_commitment_annulet(&notes),
+            body_commitment: genesis_body_commitment_annulet_for(&notes, l2_auth),
         };
         AnnuletGenesisFile {
-            format_version: ANNULET_GENESIS_FORMAT_VERSION,
+            format_version: l2_auth.annulet_genesis_format_version(),
             network: network.to_string(),
             params,
             sequencer_key,

@@ -57,7 +57,7 @@ pub fn pay_tx(addr: &Address, notes: &[L2Note], nf: u8, rng: &mut StdRng) -> TxE
         fee: 1,
     };
     let surface = L2Surface { shape: L2ShapeTag::S, registry_root: [0; 32], vpublic: None, write: None, exit_rkm: [0; 32] };
-    TxEntry { proof: vec![0xAB; 64], public, discovery, rider: TxEntry::absent_rider(), l2: surface.encode() }
+    TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), proof: vec![0xAB; 64], public, discovery, rider: TxEntry::absent_rider(), l2: surface.encode() }
 }
 
 /// The genesis file: asset 0 and USDT-test (asset 1) registered, one USDT

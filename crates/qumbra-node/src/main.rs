@@ -848,6 +848,11 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     let pf = qumbra_node::run::preflight_any(&config, &genesis)?;
     println!("qumbra-node check: OK ({cfg_path})");
     println!("  genesis hash: {}", pf.genesis_hash);
+    // Lab #896 E2: the L2 authorization axis the genesis commits (format 32
+    // or 33), said where the operator checks which net a file is.
+    if let qumbra_node::annulet_genesis::AnyGenesis::Annulet(file) = &genesis {
+        println!("  l2 auth:      {}", file.l2_auth()?.label());
+    }
     println!(
         "  committee:    N={} quorum={}",
         pf.committee_size, pf.quorum

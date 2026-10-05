@@ -181,6 +181,40 @@ enum WireRecord {
     /// move and a pre-V6 binary refuses a section-carrying record through the
     /// ordinary record-does-not-decode path.
     BlockV6(V6WireBlock),
+    /// Variant 5 — a **Candidate A Annulet** block carrying at least one auth
+    /// section (lab #896 E2): variant 3's layout with each transaction's auth
+    /// bytes. Additive, like variants 2–4: a block whose transactions all lack
+    /// a section is written as variant 3, the same bytes a v1 Annulet net
+    /// writes, so `FORMAT_VERSION` does not move and a pre-E2 binary refuses
+    /// an auth-carrying record through the ordinary record-does-not-decode path.
+    AnnuletBlockV2(AnnuletV2WireBlock),
+}
+
+/// The Candidate A Annulet block record (lab #896 E2): [`AnnuletWireBlock`]'s
+/// fields, its transactions with their auth sections.
+#[derive(Serialize, Deserialize)]
+struct AnnuletV2WireBlock {
+    header: crate::store::StoredHeader,
+    l1_anchor_height: u64,
+    l1_anchor_root: Hash32,
+    registry_root: Hash32,
+    sig: Vec<u8>,
+    txs: Vec<AnnuletV2WireTx>,
+}
+
+/// One transaction of an [`AnnuletV2WireBlock`].
+#[derive(Serialize, Deserialize)]
+struct AnnuletV2WireTx {
+    anchor: Hash32,
+    nullifiers: Vec<Hash32>,
+    commitments: Vec<Hash32>,
+    bucket_actions: u32,
+    fee: u64,
+    proof: Vec<u8>,
+    discovery: Vec<u8>,
+    l2: Vec<u8>,
+    /// The auth section bytes (`AnnuletAuthSection::encode`), or `[0x00]`.
+    auth: Vec<u8>,
 }
 
 /// The V6 block record (lab #785 F5-3b), explicit mirrors like
@@ -268,6 +302,30 @@ fn to_wire(rec: &LogRecord) -> io::Result<WireRecord> {
         if let LogRecord::Block(b) = rec {
             if let Some(a) = &b.annulet {
                 let sig = a.sig.as_ref().expect("an Annulet log record carries its seal (lab #708)");
+                if b.txs.iter().any(|t| t.auth != qlab_devnet::annulet::L2_AUTH_ABSENT) {
+                    return Ok(WireRecord::AnnuletBlockV2(AnnuletV2WireBlock {
+                        header: b.header.clone(),
+                        l1_anchor_height: a.ext.l1_anchor_height,
+                        l1_anchor_root: a.ext.l1_anchor_root,
+                        registry_root: a.ext.registry_root,
+                        sig: sig.to_vec(),
+                        txs: b
+                            .txs
+                            .iter()
+                            .map(|t| AnnuletV2WireTx {
+                                anchor: t.anchor,
+                                nullifiers: t.nullifiers.clone(),
+                                commitments: t.commitments.clone(),
+                                bucket_actions: t.bucket_actions,
+                                fee: t.fee,
+                                proof: t.proof.clone(),
+                                discovery: t.discovery.clone(),
+                                l2: t.l2.clone(),
+                                auth: t.auth.clone(),
+                            })
+                            .collect(),
+                    }));
+                }
                 return Ok(WireRecord::AnnuletBlock(AnnuletWireBlock {
                     header: b.header.clone(),
                     l1_anchor_height: a.ext.l1_anchor_height,
@@ -293,6 +351,10 @@ fn to_wire(rec: &LogRecord) -> io::Result<WireRecord> {
             assert!(
                 b.txs.iter().all(|t| t.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT),
                 "an L2 surface has no L1 log record (lab #708)"
+            );
+            assert!(
+                b.txs.iter().all(|t| t.auth == qlab_devnet::annulet::L2_AUTH_ABSENT),
+                "an auth section has no L1 log record (lab #896 E2)"
             );
         }
         Ok(match rec {
@@ -357,6 +419,43 @@ fn bundle_offset(record_end: u64, len: usize) -> u64 {
     record_end - len as u64
 }
 
+/// Variant 5 back to a block: [`annulet_record_to_block`] with each
+/// transaction's auth section.
+fn annulet_v2_record_to_block(a: AnnuletV2WireBlock) -> StoredBlock {
+    let sig: Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]> =
+        Box::new(a.sig.as_slice().try_into().expect("seal length checked at read (check_record_shape)"));
+    StoredBlock {
+        header: a.header,
+        txs: a
+            .txs
+            .into_iter()
+            .map(|t| crate::store::StoredTx {
+                anchor: t.anchor,
+                nullifiers: t.nullifiers,
+                commitments: t.commitments,
+                bucket_actions: t.bucket_actions,
+                fee: t.fee,
+                proof: t.proof,
+                discovery: t.discovery,
+                rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+                l2: t.l2,
+                auth: t.auth,
+            })
+            .collect(),
+        coinbase: 0,
+        coinbase_rkm: [0; 4],
+        sections: None,
+        annulet: Some(crate::store::AnnuletStoredSeal {
+            ext: qlab_devnet::annulet::AnnuletHeaderFields {
+                l1_anchor_height: a.l1_anchor_height,
+                l1_anchor_root: a.l1_anchor_root,
+                registry_root: a.registry_root,
+            },
+            sig: Some(sig),
+        }),
+    }
+}
+
 fn annulet_record_to_block(a: AnnuletWireBlock) -> StoredBlock {
     let sig: Box<[u8; qlab_devnet::annulet::ANNULET_SIG_LEN]> =
         Box::new(a.sig.as_slice().try_into().expect("seal length checked at read (check_record_shape)"));
@@ -375,6 +474,7 @@ fn annulet_record_to_block(a: AnnuletWireBlock) -> StoredBlock {
                 discovery: t.discovery,
                 rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
                 l2: t.l2,
+                auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
             })
             .collect(),
         coinbase: 0,
@@ -406,6 +506,7 @@ fn log_record(rec: WireRecord, at: Option<(&std::sync::Arc<Path>, u64)>) -> LogR
             WireRecord::Finalize(h) => LogRecord::Finalize(h),
             WireRecord::BlockV4(b) => LogRecord::Block(b),
             WireRecord::AnnuletBlock(a) => LogRecord::Block(annulet_record_to_block(a)),
+            WireRecord::AnnuletBlockV2(a) => LogRecord::Block(annulet_v2_record_to_block(a)),
             WireRecord::BlockV6(v) => LogRecord::Block(StoredBlock {
                 annulet: None,
                 header: v.header,
@@ -414,6 +515,7 @@ fn log_record(rec: WireRecord, at: Option<(&std::sync::Arc<Path>, u64)>) -> LogR
                     .into_iter()
                     .map(|t| crate::store::StoredTx {
                         l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+                        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
                         anchor: t.anchor,
                         nullifiers: t.nullifiers,
                         commitments: t.commitments,
@@ -444,7 +546,7 @@ fn log_record(rec: WireRecord, at: Option<(&std::sync::Arc<Path>, u64)>) -> LogR
                 txs: l
                     .txs
                     .into_iter()
-                    .map(|t| crate::store::StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+                    .map(|t| crate::store::StoredTx { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                         anchor: t.anchor,
                         nullifiers: t.nullifiers,
                         commitments: t.commitments,
@@ -647,6 +749,32 @@ fn check_record_buckets(rec: &WireRecord, record_index: usize) -> io::Result<()>
                          not {}. This datadir is corrupt — re-sync it; do not start against it.",
                         b.sig.len(),
                         qlab_devnet::annulet::ANNULET_SIG_LEN
+                    ),
+                ));
+            }
+            check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
+        }
+        WireRecord::AnnuletBlockV2(b) => {
+            // Lab #896 E2: the seal width as variant 3; and variant 5 is
+            // written only for a block carrying an auth section — one with
+            // none is a second spelling of a variant-3 record, refused by name.
+            if b.sig.len() != qlab_devnet::annulet::ANNULET_SIG_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{BLOCK_LOG}: record {record_index} is an Annulet (auth) block whose seal is {} bytes, \
+                         not {}. This datadir is corrupt — re-sync it; do not start against it.",
+                        b.sig.len(),
+                        qlab_devnet::annulet::ANNULET_SIG_LEN
+                    ),
+                ));
+            }
+            if b.txs.iter().all(|t| t.auth == qlab_devnet::annulet::L2_AUTH_ABSENT) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{BLOCK_LOG}: record {record_index} is an Annulet (auth) block with no auth section. \
+                         This datadir is corrupt — re-sync it; do not start against it."
                     ),
                 ));
             }
@@ -1104,7 +1232,7 @@ mod tests {
                 nonce: 7,
                 tx_body_commitment: h(0x22),
             },
-            txs: vec![crate::store::StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+            txs: vec![crate::store::StoredTx { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 anchor: h(0x33),
                 nullifiers: vec![h(0x44)],
                 commitments: vec![h(0x55)],
@@ -1174,6 +1302,7 @@ mod tests {
         header.nonce = 99;
         header.tx_body_commitment = [0x22; 32];
         let tx = TxEntry {
+            auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
             proof: vec![0xAB; 5],
             public: TxPublic {
                 anchor: [0x0A; 32],
@@ -1294,6 +1423,7 @@ mod tests {
                 tx_body_commitment: [0x22; 32],
             },
             txs: vec![crate::store::StoredTx {
+                auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
                 anchor: [0x01; 32],
                 nullifiers: vec![[0x02; 32], [0x03; 32]],
                 commitments: vec![[0x04; 32], [0x05; 32]],
@@ -1758,6 +1888,69 @@ mod tests {
         fs::write(dir.join(BLOCK_LOG), f).unwrap();
         let err = read_records(&dir).expect_err("a short seal is refused");
         assert!(err.to_string().contains("seal is 100 bytes"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #896 E2: an Annulet block with no auth section is written as
+    /// variant 3 byte for byte (the golden above is that lock); one carrying a
+    /// section is variant 5 and round-trips with it, `FORMAT_VERSION` unmoved.
+    #[test]
+    fn an_auth_carrying_annulet_block_is_variant_5_and_round_trips() {
+        let plain = annulet_golden_block();
+        let v1_bytes = bincode::serialize(&WireRecord::from(&LogRecord::Block(plain.clone()))).unwrap();
+        assert_eq!(&v1_bytes[..4], &3u32.to_le_bytes(), "auth-free stays variant 3");
+
+        let mut signed = plain.clone();
+        signed.txs[0].auth = vec![0x5A; 77];
+        let bytes = bincode::serialize(&WireRecord::from(&LogRecord::Block(signed.clone()))).unwrap();
+        assert_eq!(&bytes[..4], &5u32.to_le_bytes());
+        assert_eq!(FORMAT_VERSION, 3);
+        match LogRecord::from(bincode::deserialize::<WireRecord>(&bytes).unwrap()) {
+            LogRecord::Block(b) => {
+                assert_eq!(b.txs[0].auth, vec![0x5A; 77]);
+                assert_eq!(b.txs[0].l2, signed.txs[0].l2);
+                assert_eq!(b.txs[0].rider, qlab_devnet::names::RIDER_ABSENT.to_vec());
+                assert_eq!(b.annulet, signed.annulet);
+                assert_eq!(b.header(), signed.header());
+            }
+            LogRecord::Finalize(_) => panic!("a block record"),
+        }
+        // The auth section reaches the body (and so the v2 commitment).
+        assert_eq!(signed.body().txs[0].auth, vec![0x5A; 77]);
+    }
+
+    /// A variant-5 record with no auth section is a second spelling of a
+    /// variant-3 record: refused by name at read.
+    #[test]
+    fn a_variant_5_record_with_no_auth_section_is_refused_by_name() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i896-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rec = WireRecord::AnnuletBlockV2(AnnuletV2WireBlock {
+            header: annulet_golden_block().header,
+            l1_anchor_height: 0,
+            l1_anchor_root: [0; 32],
+            registry_root: [0; 32],
+            sig: vec![0xA5; qlab_devnet::annulet::ANNULET_SIG_LEN],
+            txs: vec![AnnuletV2WireTx {
+                anchor: [1; 32],
+                nullifiers: Vec::new(),
+                commitments: Vec::new(),
+                bucket_actions: 4,
+                fee: 1,
+                proof: Vec::new(),
+                discovery: Vec::new(),
+                l2: vec![1],
+                auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
+            }],
+        });
+        let bytes = bincode::serialize(&rec).unwrap();
+        let mut f = Vec::new();
+        f.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        f.extend_from_slice(&bytes);
+        fs::write(dir.join(BLOCK_LOG), f).unwrap();
+        let err = read_records(&dir).expect_err("an auth-free variant 5 is refused");
+        assert!(err.to_string().contains("with no auth section"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

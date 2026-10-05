@@ -113,6 +113,10 @@ pub fn load_any(bytes: &[u8]) -> Result<AnyGenesis, GenesisError> {
     if got == qlab_devnet::forms::V6_GENESIS_FORMAT_VERSION {
         return Ok(AnyGenesis::V6(Box::new(crate::genesis_v6::GenesisFileV6::from_bytes(bytes)?)));
     }
+    // Lab #896 E2: format 33 is the Candidate A Annulet — not a bare form.
+    if got == qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION {
+        return Ok(AnyGenesis::Annulet(Box::new(AnnuletGenesisFile::from_bytes(bytes)?)));
+    }
     match GenesisForm::from_genesis_format_version(got) {
         Some(GenesisForm::V4) | Some(GenesisForm::V5) => {
             Ok(AnyGenesis::L1(Box::new(GenesisFile::from_bytes(bytes)?)))

@@ -1186,7 +1186,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // 3, final = tip), no committee, no punishment ledger, no halt.
             PreparedGenesis::Annulet { file, sequencer } => {
                 let _ = (committee, rules);
-                let adapter = NodeAdapter::open_annulet(
+                let adapter = NodeAdapter::open_annulet_with_auth(
                     &config.data_dir,
                     file.genesis_block_header(),
                     &file.notes(),
@@ -1196,6 +1196,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     pow,
                     verifier,
                     sim,
+                    file.l2_auth()?,
                 )?;
                 let run = annulet::AnnuletRun::new(file, sequencer);
                 qlab_devnet::jprintln!("{}", run.role_line());
@@ -2531,6 +2532,7 @@ qumbra_chain_form{{form=\"annulet\",finality=\"operator\"}} 1\n"
                 genesis_file: self.genesis_file_body(),
                 annulet_params: self.annulet_params_body(),
                 l2: self.l2_route.clone(),
+                l2_auth: self.p2p.node().l2_auth_form(),
             }),
             Arc::clone(&self.l2_index_view),
         )?;
@@ -8670,7 +8672,7 @@ mod tests {
                 // A group binding a DIFFERENT commitment: §4 rule 2 must refuse it.
                 placeholder_discovery(&[[0xEE; 32]])
             };
-            TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+            TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: b"rehearsal-accepts-anything".to_vec(),
                 public: TxPublic {
                     anchor,

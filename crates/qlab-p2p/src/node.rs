@@ -2650,7 +2650,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     fn on_tx(&mut self, from: PeerId, payload: &[u8]) {
         // Lab #708: the tx wire is the net's (an Annulet tx carries its surface).
-        let tx = match crate::codec::decode_tx_for(self.node.genesis_form(), payload) {
+        let tx = match crate::codec::decode_tx_for_auth(self.node.genesis_form(), self.node.wire_form().l2_auth, payload) {
             Ok(t) => t,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
@@ -3399,7 +3399,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
 
     fn on_block_txn(&mut self, from: PeerId, payload: &[u8]) {
-        let bt = match crate::compact::decode_block_txn_for(self.node.genesis_form(), payload) {
+        let bt = match crate::compact::decode_block_txn_for_wire(self.node.wire_form(), payload) {
             Ok(b) => b,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);

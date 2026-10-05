@@ -2153,7 +2153,7 @@ mod tests {
             // the same rider from the saved salt and record.
             let build = builds.get();
             builds.set(build + 1);
-            let tx = TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+            let tx = TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                 proof: vec![build],
                 public: TxPublic {
                     anchor: [0x11; 32],

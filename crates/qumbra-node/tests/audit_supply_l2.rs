@@ -38,6 +38,7 @@ fn ext(g: &AnnuletGenesisFile) -> AnnuletHeaderFields {
 /// A P transaction carrying `terms`, mock-proved, at the P tier.
 fn p_tx(n: &MemNode, g: &AnnuletGenesisFile, nf: u8, terms: [VPublicTerm; 2]) -> TxEntry {
     let mut t = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor: n.commitment_root(),

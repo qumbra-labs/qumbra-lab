@@ -876,6 +876,9 @@ pub struct FormView {
     /// `/v1/l2` (lab #831 W3a-0): [`l2_route_body`] on a V6 node, encoded
     /// once; `None` everywhere else, answered as [`L2_NOT_V6`].
     pub l2: Option<Vec<u8>>,
+    /// The L2 authorization axis (lab #896 E2): keys the submit decoder and
+    /// the served wire form; `None` everywhere but a Candidate A net.
+    pub l2_auth: qlab_devnet::forms::L2AuthForm,
 }
 
 impl Default for FormView {
@@ -888,6 +891,7 @@ impl Default for FormView {
             genesis_file: None,
             annulet_params: None,
             l2: None,
+            l2_auth: qlab_devnet::forms::L2AuthForm::None,
         }
     }
 }
@@ -1111,6 +1115,7 @@ impl DiscoveryServer {
                         Arc::clone(&inflight),
                         form_view.form,
                         form_view.sections,
+                        form_view.l2_auth,
                     );
                     continue;
                 }
@@ -1496,7 +1501,7 @@ pub fn respond_full(
 
 /// The served-chain wire form of this node's net (lab #850).
 fn wire_form(form_view: &FormView) -> qlab_p2p::compact::WireForm {
-    qlab_p2p::compact::WireForm { form: form_view.form, sections: form_view.sections }
+    qlab_p2p::compact::WireForm { form: form_view.form, sections: form_view.sections, l2_auth: form_view.l2_auth }
 }
 
 /// The header unit a stored block is served as: the sealed header on an
@@ -1676,6 +1681,7 @@ fn spawn_submit_handler(
     inflight: Arc<AtomicUsize>,
     form: qlab_devnet::forms::GenesisForm,
     sections: qlab_devnet::forms::BodySections,
+    l2_auth: qlab_devnet::forms::L2AuthForm,
 ) {
     // Claim a slot before spawning; the refusal must not cost a thread either.
     if inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_SUBMITS {
@@ -1690,7 +1696,7 @@ fn spawn_submit_handler(
     }
     std::thread::spawn(move || {
         let mut request = request;
-        let (code, body) = submit_verdict(&mut request, &submits, form, sections);
+        let (code, body) = submit_verdict(&mut request, &submits, form, sections, l2_auth);
         let _ = request
             .respond(tiny_http::Response::from_string(body).with_status_code(code));
         inflight.fetch_sub(1, Ordering::AcqRel);
@@ -1892,6 +1898,7 @@ fn submit_verdict(
     submits: &mpsc::SyncSender<SubmitRequest>,
     form: qlab_devnet::forms::GenesisForm,
     sections: qlab_devnet::forms::BodySections,
+    l2_auth: qlab_devnet::forms::L2AuthForm,
 ) -> (u16, String) {
     // 1. The body, bounded BEFORE it is read: a declared oversize is refused on
     //    the header, an undeclared one on the byte that crosses the cap.
@@ -1916,7 +1923,7 @@ fn submit_verdict(
 
     // 2. Decode — the same canonical wire the P2P layer speaks, same decoder,
     //    keyed on the form (lab #716: an Annulet tx carries its L2 surface).
-    let tx = match qlab_p2p::codec::decode_tx_for(form, &body) {
+    let tx = match qlab_p2p::codec::decode_tx_for_auth(form, l2_auth, &body) {
         Ok(tx) => tx,
         Err(e) => return (400, format!("refused: decode {e:?}")),
     };
@@ -2496,7 +2503,7 @@ mod tests {
             fee: qlab_devnet::fees::posted_fee(qlab_devnet::fees::ArityBucket::TwoByTwo),
         };
         let discovery = qlab_devnet::body::placeholder_discovery(&public.commitments);
-        let tx = qlab_devnet::body::TxEntry { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: qlab_devnet::body::TxEntry::absent_rider() };
+        let tx = qlab_devnet::body::TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(), proof: b"ok".to_vec(), public, discovery, rider: qlab_devnet::body::TxEntry::absent_rider() };
         qlab_p2p::codec::encode_tx(&tx)
     }
 
@@ -2782,7 +2789,7 @@ mod tests {
             },
             txs: discovery
                 .into_iter()
-                .map(|d| StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+                .map(|d| StoredTx { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
                     anchor: [0; 32],
                     nullifiers: vec![],
                     commitments: vec![],

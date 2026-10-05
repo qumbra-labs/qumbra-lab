@@ -101,12 +101,17 @@ pub fn audit_with_claim(
     genesis: &AnnuletGenesisFile,
     claimed: Option<&AttestDocument>,
 ) -> Result<SupplyReport, SupplyAuditError> {
-    let node = MemNode::open_annulet(
+    let l2_auth = genesis.l2_auth().map_err(|e| SupplyAuditError::UnreadableLog {
+        path: data_dir.to_path_buf(),
+        reason: format!("the genesis names no L2 authorization axis: {e}"),
+    })?;
+    let node = MemNode::open_annulet_with_auth(
         data_dir,
         genesis.genesis_block_header(),
         &genesis.notes(),
         genesis.params.fee_table(),
         &registry_leaves(&genesis.registry_genesis),
+        l2_auth,
     )
     .map_err(|e| SupplyAuditError::UnreadableLog {
         path: data_dir.to_path_buf(),

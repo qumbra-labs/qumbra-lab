@@ -26,10 +26,11 @@
 use super::*;
 use ml_dsa::{MlDsa65, VerifyingKey};
 use qlab_devnet::annulet::{
-    body_commitment_annulet, AnnuletHeaderFields, GenesisNote, HeaderExt, L2FeeTable, SealedHeader,
+    body_commitment_annulet_for, AnnuletHeaderFields, GenesisNote, HeaderExt, L2FeeTable, SealedHeader,
     SequencerKey,
 };
 use qlab_devnet::committee::{Committee, CommitteeState};
+use qlab_devnet::forms::L2AuthForm;
 use qlab_devnet::validation::validate_sealed_header_annulet;
 use qlab_node::ChainStore as _;
 
@@ -52,7 +53,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         verifier: V,
         sim: SimConfig,
     ) -> Self {
-        let state = MemNode::in_memory_annulet(genesis_header, genesis_notes, fees, registry);
+        Self::annulet_with_auth(
+            genesis_header,
+            genesis_notes,
+            fees,
+            registry,
+            sequencer_key,
+            pow,
+            verifier,
+            sim,
+            L2AuthForm::None,
+        )
+    }
+
+    /// [`Self::annulet`] on the genesis's L2 authorization axis (lab #896 E2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn annulet_with_auth(
+        genesis_header: BlockHeader,
+        genesis_notes: &[GenesisNote],
+        fees: L2FeeTable,
+        registry: &[qlab_node::registry_store::RegistryLeaf],
+        sequencer_key: VerifyingKey<MlDsa65>,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+        l2_auth: L2AuthForm,
+    ) -> Self {
+        let state = MemNode::in_memory_annulet_with_auth(genesis_header, genesis_notes, fees, registry, l2_auth);
         let committee = EpochCommittee::genesis(
             EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
             CommitteeState::new(Committee::from_keys(Vec::new()), 0),
@@ -83,8 +110,37 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         verifier: V,
         sim: SimConfig,
     ) -> Result<Self, NodeError> {
+        Self::open_annulet_with_auth(
+            dir,
+            genesis_header,
+            genesis_notes,
+            fees,
+            registry,
+            sequencer_key,
+            pow,
+            verifier,
+            sim,
+            L2AuthForm::None,
+        )
+    }
+
+    /// [`Self::open_annulet`] on the genesis's L2 authorization axis (lab
+    /// #896 E2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_annulet_with_auth(
+        dir: impl AsRef<std::path::Path>,
+        genesis_header: BlockHeader,
+        genesis_notes: &[GenesisNote],
+        fees: L2FeeTable,
+        registry: &[qlab_node::registry_store::RegistryLeaf],
+        sequencer_key: VerifyingKey<MlDsa65>,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+        l2_auth: L2AuthForm,
+    ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
-        let state = MemNode::open_annulet(&dir, genesis_header, genesis_notes, fees, registry)?;
+        let state = MemNode::open_annulet_with_auth(&dir, genesis_header, genesis_notes, fees, registry, l2_auth)?;
         let committee = EpochCommittee::genesis(
             EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
             CommitteeState::new(Committee::from_keys(Vec::new()), 0),
@@ -214,7 +270,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             registry_root,
         };
         let header =
-            BlockHeader::child_of_annulet(&parent, timestamp.max(parent.timestamp), ext, body_commitment_annulet(&body));
+            BlockHeader::child_of_annulet(
+            &parent,
+            timestamp.max(parent.timestamp),
+            ext,
+            body_commitment_annulet_for(&body, self.state.l2_auth_form()),
+        );
         let sealed = key.seal(header);
         match self.ingest_sealed_block(&sealed, body.clone()) {
             IngestOutcome::Accepted => Ok((sealed, body)),

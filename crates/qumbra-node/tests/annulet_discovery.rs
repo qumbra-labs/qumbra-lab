@@ -76,6 +76,7 @@ fn an_annulet_output_is_served_by_projection_and_opened_by_the_wallet_side() {
     assert!(out.payloads.iter().all(|p| p.len() == L2_PAYLOAD_LEN));
     let state = node.p2p().node().state();
     let tx = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: b"ok".to_vec(),
         public: TxPublic {
             anchor: state.commitment_root(),

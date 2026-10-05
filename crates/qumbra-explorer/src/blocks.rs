@@ -267,7 +267,7 @@ mod tests {
     }
 
     fn stored_tx(seed: u8) -> StoredTx {
-        StoredTx { l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
+        StoredTx { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), l2: qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec(),
             anchor: h32(seed),
             nullifiers: vec![h32(seed ^ 0x40), h32(seed ^ 0x41)],
             commitments: vec![h32(seed ^ 0x80), h32(seed ^ 0x81)],

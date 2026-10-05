@@ -494,6 +494,7 @@ fn entry(
     discovery: Vec<u8>,
 ) -> TxEntry {
     TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: bincode::serialize(proof).expect("a proof serializes"),
         public: TxPublic {
             anchor: digest_bytes(anchor),
@@ -686,6 +687,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
         exit_rkm: [0; 32],
     };
     let tx = TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
         proof: bincode::serialize(&proof).expect("a proof serializes"),
         public: TxPublic {
             anchor: digest_bytes(&anchor),
@@ -1454,7 +1456,7 @@ mod tests {
             bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
             fee: 0,
         };
-        let tx = TxEntry { proof: vec![], public, discovery: vec![0], rider: vec![], l2: vec![] };
+        let tx = TxEntry { auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(), proof: vec![], public, discovery: vec![0], rider: vec![], l2: vec![] };
         assert!(named(v6.submit(&tx).err()), "POST /v1/tx");
         assert!(rec.0.borrow().is_empty(), "an Annulet-only route is refused without a fetch");
         let annulet = Served::new(&rec);

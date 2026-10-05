@@ -957,9 +957,10 @@ impl GenesisFile {
     /// An Annulet genesis (leading `format_version` 32) is refused **by name**
     /// before decoding (lab #706) — never misparsed as an L1 file.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GenesisError> {
-        if crate::annulet_genesis::leading_format_version(bytes)
-            == Some(qlab_devnet::forms::ANNULET_GENESIS_FORMAT_VERSION)
-        {
+        if matches!(
+            crate::annulet_genesis::leading_format_version(bytes),
+            Some(qlab_devnet::forms::ANNULET_GENESIS_FORMAT_VERSION | qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION)
+        ) {
             return Err(GenesisError::AnnuletGenesisNotServed);
         }
         // Lab #785 F5-3c: a V6 file's leading bytes ARE a `GenesisFile` (its
