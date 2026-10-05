@@ -1772,7 +1772,8 @@ fn issuer(args: &[String]) -> Result<(), Box<dyn Error>> {
             let wait = std::time::Duration::from_secs(120);
             let report = if verb == "mint" {
                 let to = flag(args, "--to").ok_or("issuer mint requires --to ADDRESS")?;
-                let to = qlab_wallet::address::Address::decode(to).ok_or("--to is not a wallet address")?;
+                // Either version (lab #896 G): the mint checks it against the net.
+                let to = qlab_wallet::address::Address::decode_any(to).ok_or("--to is not a wallet address")?;
                 qumbra_wallet::issuer::issuer_mint(&w, endpoint, asset()?, amount, &to, &keys, scan_to, pin, wait, &mut rng)?
             } else {
                 qumbra_wallet::issuer::redeem(&w, endpoint, asset()?, amount, &keys, scan_to, pin, wait, &mut rng)?

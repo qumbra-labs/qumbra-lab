@@ -132,20 +132,25 @@ impl AuthRun {
         self.keys.dummy(&entropy, slot, taken).map_err(SendRefusal::Auth)
     }
 
-    /// Rebuild the intent, sign every slot, attach the section, submit.
-    fn sign_and_submit<E: Endpoint>(
+    /// Rebuild the intent from `tx`, sign every slot, attach the section.
+    /// Nothing is submitted here.
+    pub(crate) fn sign(
         &self,
-        served: &Served<E>,
-        mut built: BuiltV2,
+        tx: &mut qlab_devnet::body::TxEntry,
+        auth: &[qlab_remote_auth::intent::AuthDescriptor],
         dummies: &[&qlab_remote_auth::mldsa::Key],
-    ) -> Result<BuiltV2, SendRefusal> {
-        let intent = intent_for(&built.tx, self.genesis_format, &self.genesis_hash, self.valid_until, &built.auth)
+    ) -> Result<(), SendRefusal> {
+        let intent = intent_for(tx, self.genesis_format, &self.genesis_hash, self.valid_until, auth)
             .map_err(|e| SendRefusal::Auth(format!("the intent does not rebuild: {e:?}")))?; // debug-ok: a named codec error, no opening
         let section = sign_locally(&intent, &self.keys, dummies)
             .map_err(|e| SendRefusal::Auth(format!("signing refused: {e:?}")))?; // debug-ok: a named auth error, no key
-        attach(&mut built.tx, &section).map_err(|e| SendRefusal::Auth(format!("the section does not encode: {e:?}")))?; // debug-ok
-        served.submit(&built.tx)?;
-        Ok(built)
+        attach(tx, &section).map_err(|e| SendRefusal::Auth(format!("the section does not encode: {e:?}"))) // debug-ok
+    }
+
+    /// Take one leaf of the run's generation for a single real slot (a
+    /// registry write's fee input), persisted before anything is proved.
+    pub(crate) fn take_one(&mut self, dir: &std::path::Path) -> Result<L2AuthPath, SendRefusal> {
+        Ok(self.take(dir, 1)?.remove(0))
     }
 }
 
@@ -195,6 +200,28 @@ pub fn spend_v2<E: Endpoint>(
     ctx: &PolicyContext,
     rng: &mut StdRng,
 ) -> Result<BuiltV2, SendRefusal> {
+    let built = build_spend_v2(w, run, served, shape, spend, outs, fee, [ctx, &PolicyContext::default()], [VPublic::NONE; 2], rng)?;
+    served.submit(&built.tx)?;
+    Ok(built)
+}
+
+/// Build, prove and sign one Candidate A S or P spend, **not** submitted (an
+/// issuer service records an attempt before it leaves the machine). `ctx`
+/// and `vp` are the two rows' policy contexts and `vPublic` (P only; a
+/// `TwoAndFee` P uses `ctx[0]` for both rows, as v1's merge does).
+#[allow(clippy::too_many_arguments)]
+pub fn build_spend_v2<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    served: &Served<E>,
+    shape: L2ShapeTag,
+    spend: V2Spend<'_>,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    rng: &mut StdRng,
+) -> Result<BuiltV2, SendRefusal> {
     let wallet = w.wallet();
     let notes: Vec<&OwnedL2Note> = match &spend {
         V2Spend::One(a) => vec![*a],
@@ -216,41 +243,28 @@ pub fn spend_v2<E: Endpoint>(
         (L2ShapeTag::S, V2Spend::One(_)) => {
             let (d2, k2) = run.dummy(1, &taken)?;
             let (d3, k3) = run.dummy(2, &[taken.as_slice(), &[d2.auth.leaf_index]].concat())?;
-            let b = build_s_v2(served, [&real[0], &d2], true, FeeIn::Dummy(&d3), outs, fee, rng)?;
-            return run.sign_and_submit(served, b, &[&k2, &k3]);
+            let mut b = build_s_v2(served, [&real[0], &d2], true, FeeIn::Dummy(&d3), outs, fee, rng)?;
+            run.sign(&mut b.tx, &b.auth.clone(), &[&k2, &k3])?;
+            return Ok(b);
         }
         (L2ShapeTag::S, V2Spend::Two(_)) => {
             let (d3, k3) = run.dummy(2, &taken)?;
-            let b = build_s_v2(served, [&real[0], &real[1]], false, FeeIn::Dummy(&d3), outs, fee, rng)?;
-            return run.sign_and_submit(served, b, &[&k3]);
+            let mut b = build_s_v2(served, [&real[0], &real[1]], false, FeeIn::Dummy(&d3), outs, fee, rng)?;
+            run.sign(&mut b.tx, &b.auth.clone(), &[&k3])?;
+            return Ok(b);
         }
         (L2ShapeTag::S, V2Spend::TwoAndFee(..)) => {
             build_s_v2(served, [&real[0], &real[1]], false, FeeIn::Exact(&real[2]), outs, fee, rng)?
         }
         (L2ShapeTag::P, V2Spend::Two(_)) => {
             let (d3, k3) = run.dummy(2, &taken)?;
-            let b = build_p_v2(
-                served,
-                [&real[0], &real[1]],
-                FeeIn::Dummy(&d3),
-                outs,
-                fee,
-                [ctx, &PolicyContext::default()],
-                [VPublic::NONE; 2],
-                rng,
-            )?;
-            return run.sign_and_submit(served, b, &[&k3]);
+            let mut b = build_p_v2(served, [&real[0], &real[1]], FeeIn::Dummy(&d3), outs, fee, ctx, vp, rng)?;
+            run.sign(&mut b.tx, &b.auth.clone(), &[&k3])?;
+            return Ok(b);
         }
-        (L2ShapeTag::P, V2Spend::TwoAndFee(..)) => build_p_v2(
-            served,
-            [&real[0], &real[1]],
-            FeeIn::Exact(&real[2]),
-            outs,
-            fee,
-            [ctx, ctx],
-            [VPublic::NONE; 2],
-            rng,
-        )?,
+        (L2ShapeTag::P, V2Spend::TwoAndFee(..)) => {
+            build_p_v2(served, [&real[0], &real[1]], FeeIn::Exact(&real[2]), outs, fee, [ctx[0], ctx[0]], vp, rng)?
+        }
         (L2ShapeTag::P, V2Spend::One(_)) => {
             return Err(SendRefusal::Spend(SpendError::Served(
                 "a one-input shape-P spend has no v2 builder (P proves two real inputs)".into(),
@@ -260,7 +274,9 @@ pub fn spend_v2<E: Endpoint>(
             return Err(SendRefusal::Spend(SpendError::Served("shape R is a registry write, not a spend".into())))
         }
     };
-    run.sign_and_submit(served, built, &[])
+    let mut built = built;
+    run.sign(&mut built.tx, &built.auth.clone(), &[])?;
+    Ok(built)
 }
 
 /// **Restore → migrate** (§9) for a wallet with no `auth.v1`: the
@@ -609,4 +625,72 @@ pub fn migrate<E: Endpoint>(
         report.swept.push((g, txs));
     }
     Ok(report)
+}
+
+// ---------------------------------------------------------------- issuer
+
+/// **An exact-`tariff` asset-0 fee note of the run's generation** (v1's
+/// `exact_fee_note`): one held, or split off a larger one (shape S, its own
+/// fee), waited for in the served tree.
+pub fn exact_fee_note_v2<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    session: &Session<E>,
+    tariff: u64,
+    split_wait: std::time::Duration,
+    rng: &mut StdRng,
+) -> Result<(OwnedL2Note, Option<qlab_note::l2note::L2Note>), SendRefusal> {
+    let index = session.index.only_generation(run.generation);
+    if let Some(fee) = index.spendable(0).iter().find(|n| n.note.value == tariff) {
+        return Ok((fee.clone(), None));
+    }
+    let split_needs = tariff + session.tiers.s;
+    let source = index
+        .spendable(0)
+        .iter()
+        .filter(|n| n.note.value >= split_needs)
+        .min_by_key(|n| n.note.value)
+        .cloned()
+        .ok_or(SendRefusal::NoFeeSource { tariff, split_needs })?;
+    let wallet = w.wallet();
+    let root = run.auth_root();
+    let own = me_v2(&wallet, &root);
+    let outs = [
+        Out { to: own.clone(), value: tariff, asset: 0 },
+        Out { to: own, value: source.note.value - tariff - session.tiers.s, asset: 0 },
+    ];
+    let split = spend_v2(w, run, &session.served, L2ShapeTag::S, V2Spend::One(&source), &outs, session.tiers.s, &PolicyContext::default(), rng)?;
+    let made = split.outputs[0];
+    crate::annulet_send::wait_in_tree(&session.served, &made.commitment(), split_wait)?;
+    let owned = OwnedL2Note::from_genesis_v2(&wallet, 0, qlab_note::hash::digest_bytes(&made.commitment()), made, &[(run.generation, root)])
+        .expect("the split paid the run generation's address 0");
+    Ok((owned, Some(made)))
+}
+
+/// **A Candidate A registry write** (v1's `registry_write`): the smallest
+/// active-generation asset-0 note of at least the R tariff pays; one leaf is
+/// taken for its one slot; built, signed and **not** submitted.
+pub fn build_registry_write_v2<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    session: &Session<E>,
+    leaf: qlab_air::l2::RegistryLeaf,
+    isk: [u64; 4],
+    rng: &mut StdRng,
+) -> Result<qlab_l2spend::v2::BuiltRV2, SendRefusal> {
+    let tariff = session.tiers.r;
+    let index = session.index.only_generation(run.generation);
+    let fee = index
+        .spendable(0)
+        .iter()
+        .filter(|n| n.note.value >= tariff)
+        .min_by_key(|n| n.note.value)
+        .cloned()
+        .ok_or(SendRefusal::NoRegistryFeeNote { tariff })?;
+    let wallet = w.wallet();
+    let path = run.take_one(&w.dir)?;
+    let change = me_v2(&wallet, &run.auth_root());
+    let mut built = qlab_l2spend::v2::build_r_v2(&session.served, &real_input(&wallet, &fee, path), &change, tariff, leaf, isk, rng)?;
+    run.sign(&mut built.tx, &built.auth.clone(), &[])?;
+    Ok(built)
 }

@@ -361,6 +361,16 @@ fn registry_write<E: Endpoint>(
     isk: [u64; 4],
     rng: &mut StdRng,
 ) -> Result<RegistryReport, SendRefusal> {
+    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+        // Lab #896 G: the active generation's fee note and keys.
+        let mut run = crate::annulet_v2::AuthRun::open(w, session, crate::annulet_v2::DEFAULT_VALIDITY_BLOCKS)?;
+        let built = crate::annulet_v2::build_registry_write_v2(w, &mut run, session, leaf, isk, rng)?;
+        return match session.served.submit(&built.tx) {
+            Ok(()) => Ok(RegistryReport { leaf, new_root: built.new_root, change: built.output, seed: built.seed }),
+            Err(SpendError::Refused(node)) if is_registry_race(&node) => Err(SendRefusal::RegistryRaced(node)),
+            Err(e) => Err(e.into()),
+        };
+    }
     let tariff = session.tiers.r;
     let fee = session
         .index
@@ -610,6 +620,13 @@ pub fn prepare_mint<E: Endpoint>(
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
     let leaf = session.served.registry(u64::from(asset))?.leaf;
     let isk = isk_from(w, isk, asset, &leaf.issuer_key)?.ok_or(SendRefusal::NotTheIssuer { asset })?;
+    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+        to.require_version(qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A).map_err(|e| SendRefusal::Auth(e.to_string()))?;
+        let recipient = recipient_of(to).ok_or(SendRefusal::Issuer("the recipient address has no valid ek".into()))?;
+        let ctx = PolicyContext { freeze_keys: freeze_keys.to_vec(), isk, ..Default::default() };
+        return prepare_issue_v2(w, session, asset, None, recipient, ctx, VPublic::mint(amount), split_wait, rng);
+    }
+    to.require_version(qlab_wallet::address::ADDRESS_VERSION).map_err(|e| SendRefusal::Auth(e.to_string()))?;
     let base = session.index.spendable(asset).iter().min_by_key(|n| n.note.value).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?;
     let recipient = recipient_of(to).ok_or(SendRefusal::Issuer("the recipient address has no valid ek".into()))?;
     let (fee, split) = exact_fee_note(w, &session, session.tiers.p, split_wait, rng)?;
@@ -672,6 +689,11 @@ pub fn prepare_redeem<E: Endpoint>(
         None if redeem_open => [0; 4],
         None => return Err(SendRefusal::NotTheIssuer { asset }),
     };
+    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+        let ctx = PolicyContext { freeze_keys: freeze_keys.to_vec(), isk, ..Default::default() };
+        let me2 = crate::annulet_v2::me_v2(&w.wallet(), &active_root(w)?);
+        return prepare_issue_v2(w, session, asset, Some(amount), me2, ctx, VPublic::redeem(amount), split_wait, rng);
+    }
     let note = session
         .index
         .spendable(asset)
@@ -695,6 +717,67 @@ pub fn prepare_redeem<E: Endpoint>(
         rng,
     )?;
     let rearmed = rearmed(w, &built.outputs, asset);
+    Ok(PreparedIssue { session, tx: built.tx, outputs: built.outputs, split_fee_note: split, rearmed })
+}
+
+/// The active generation's root, from the journal (lab #896 G).
+fn active_root(w: &WalletDir) -> Result<[u64; 4], SendRefusal> {
+    let j = crate::auth_journal::AuthJournal::load(&w.dir)?
+        .ok_or_else(|| SendRefusal::Auth("no auth journal yet: run `qumbra-wallet migrate` first".into()))?;
+    Ok(j.active().auth_root)
+}
+
+/// Lab #896 G: a Candidate A mint (`redeem == None`: on the smallest note of
+/// the asset, returned whole to this wallet, `amount` to `recipient`) or
+/// redeem (`Some(amount)`: from the smallest note covering it, the rest back
+/// to this wallet), each with an exact-tariff P fee note of the active
+/// generation — built, signed, **not** submitted ([`PreparedIssue`]).
+#[allow(clippy::too_many_arguments)]
+fn prepare_issue_v2<E: Endpoint>(
+    w: &WalletDir,
+    session: Session<E>,
+    asset: u16,
+    redeem: Option<u64>,
+    recipient: qlab_l2spend::Recipient,
+    ctx: PolicyContext,
+    vp: VPublic,
+    split_wait: Duration,
+    rng: &mut StdRng,
+) -> Result<PreparedIssue<E>, SendRefusal> {
+    use crate::annulet_v2::{build_spend_v2, exact_fee_note_v2, me_v2, AuthRun, V2Spend, DEFAULT_VALIDITY_BLOCKS};
+    let mut run = AuthRun::open(w, &session, DEFAULT_VALIDITY_BLOCKS)?;
+    let index = session.index.only_generation(run.generation);
+    let a = u64::from(asset);
+    let base = match redeem {
+        None => index.spendable(asset).iter().min_by_key(|n| n.note.value).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?,
+        Some(amount) => index
+            .spendable(asset)
+            .iter()
+            .filter(|n| n.note.value >= amount)
+            .min_by_key(|n| n.note.value)
+            .cloned()
+            .ok_or(SendRefusal::NoSingleNoteCovers { asset, amount, largest: 0 })?,
+    };
+    let (fee, split) = exact_fee_note_v2(w, &mut run, &session, session.tiers.p, split_wait, rng)?;
+    let wallet = w.wallet();
+    let me2 = me_v2(&wallet, &run.auth_root());
+    let outs = match redeem {
+        None => [Out { to: recipient, value: vp.amount, asset: a }, Out { to: me2.clone(), value: base.note.value, asset: a }],
+        Some(amount) => [Out { to: me2.clone(), value: base.note.value - amount, asset: a }, Out { to: me2.clone(), value: 0, asset: 0 }],
+    };
+    let built = build_spend_v2(
+        w,
+        &mut run,
+        &session.served,
+        qlab_devnet::annulet::L2ShapeTag::P,
+        V2Spend::Two([&base, &fee]),
+        &outs,
+        session.tiers.p,
+        [&ctx, &PolicyContext::default()],
+        [vp, VPublic::NONE],
+        rng,
+    )?;
+    let rearmed = built.outputs.iter().any(|n| n.asset == a && n.rkm == me2.rkm);
     Ok(PreparedIssue { session, tx: built.tx, outputs: built.outputs, split_fee_note: split, rearmed })
 }
 
