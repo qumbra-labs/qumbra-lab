@@ -1047,6 +1047,10 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         ),
     };
     let amount = resolve_send_amount(uri_amount, amount_flag)?;
+    // Lab #896 G (QG1): URIs, contacts and the directory carry either
+    // address version; this L1 send pays only version 1. A Candidate A
+    // address here would make a note nobody can spend — refused by name.
+    recipient.require_version(qlab_wallet::address::ADDRESS_VERSION)?;
     // Lab #831 W3 (Q2): only `deposit` burns, and only sealed to this wallet's
     // own key — the burn address of the L2 this chain bridges (as the node
     // names it) reaching `send` (pasted, a contact, a URI, a name) is refused

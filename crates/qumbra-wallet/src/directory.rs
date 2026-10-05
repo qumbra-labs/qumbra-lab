@@ -229,7 +229,9 @@ pub fn decode_bucket(bytes: &[u8], p: u8, prefix: u16) -> Result<Vec<Address>, D
     let m = mask(p);
     let mut out = Vec::with_capacity(n);
     for (i, raw) in bytes[BUCKET_HEADER_LEN..].chunks_exact(Address::RAW_LEN).enumerate() {
-        let addr = Address::from_raw_bytes(raw).ok_or_else(|| bad(format!("entry {i} is not an address")))?;
+        // A carrier (lab #896 G): a directory entry may be either address
+        // version; the send path that uses it checks the version for its net.
+        let addr = Address::from_raw_bytes_any(raw).ok_or_else(|| bad(format!("entry {i} is not an address")))?;
         if prefix16(&addr.short()) & m != prefix & m {
             return Err(bad(format!("entry {i} is outside the requested prefix")));
         }

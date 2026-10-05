@@ -70,6 +70,24 @@ pub fn derive_rkm(nk: &Lanes, d: &[u64; 2]) -> Lanes {
     digest[..4].try_into().expect("state has >= 4 lanes")
 }
 
+/// Lab #896 G: the **Candidate A** `rkm = H(nk ‖ D_R ‖ d ‖ auth_root)` — one
+/// block, `auth_root` (the generation's authorization-tree root) in lanes
+/// 7..11 and the pad moved to lane 11 (design 2b §10 decided 1). The v2 AIRs
+/// open exactly this; `derive_rkm_v2_is_the_airs` cross-locks it to
+/// `qlab_air::l2::l2_rkm_v2`.
+pub fn derive_rkm_v2(nk: &Lanes, d: &[u64; 2], auth_root: &Lanes) -> Lanes {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(nk);
+    st[4] = D_R_MARKER;
+    st[5] = d[0];
+    st[6] = d[1];
+    st[7..11].copy_from_slice(auth_root);
+    st[11] = 1;
+    st[16] = 1 << 63;
+    let digest = keccak_f(&st);
+    digest[..4].try_into().expect("state has >= 4 lanes")
+}
+
 /// `nf = H(nk ‖ ρ)`. State: `st[0..4]=nk`, `st[4..8]=ρ`, pad10*1 at bit 512
 /// (`st[8]=1`) and bit 1087 (`st[16]=1<<63`) — the same wiring as a Merkle
 /// node `H(left ‖ right)`. Byte-identical to `build_bucket`'s `nf_in` packing
@@ -162,6 +180,18 @@ impl SpendingKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #896 G: the wallet's v2 `rkm` is the v2 AIRs' (`l2_rkm_v2`), and
+    /// differs from v1's for the same `nk` and `d` — and from another root.
+    #[test]
+    fn derive_rkm_v2_is_the_airs() {
+        let nk = [3u64, 1, 4, 1];
+        let d = [5u64, 9];
+        let root = [2u64, 6, 5, 3];
+        assert_eq!(derive_rkm_v2(&nk, &d, &root), qlab_air::l2::l2_rkm_v2(&nk, &d, &root));
+        assert_ne!(derive_rkm_v2(&nk, &d, &root), derive_rkm(&nk, &d));
+        assert_ne!(derive_rkm_v2(&nk, &d, &root), derive_rkm_v2(&nk, &d, &[2, 6, 5, 4]));
+    }
     use qlab_air::narrow::{build_bucket, TxInput, TxOutput};
     use qlab_air::reference::{keccak_f, merkle_node_state};
     use qlab_note::note::note_commitment;

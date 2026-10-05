@@ -37,6 +37,14 @@ use crate::keys::Lanes;
 /// byte layout is unchanged); a bump to mark the `d`-dependent-`rkm` semantic
 /// change is a coordinator interop call (see the module docs / PR handoff).
 pub const ADDRESS_VERSION: u8 = 1;
+/// Lab #896 G (QG1): the raw-address version of a **Candidate A** Annulet
+/// address, whose `rkm` absorbs the generation's `auth_root`
+/// (`H(nk ‖ D_R ‖ d ‖ auth_root)`). The byte layout is version 1's, so nothing
+/// but this byte says which derivation made the `rkm` — and a note paid to
+/// the wrong one is spendable by nobody. Version 1 stays the L1 and v1
+/// Annulet (format 32) address; version 2 is valid only on a format-33 net.
+/// Every decoder that predates it refuses it ([`Address::from_raw_bytes`]).
+pub const ADDRESS_VERSION_CANDIDATE_A: u8 = 2;
 /// Diversifier width in bytes (128-bit; ample headroom over Sapling's 88-bit).
 pub const DIV_LEN: usize = 16;
 /// `rkm` width on the wire (little-endian lanes of the `[u64; 4]`).
@@ -102,6 +110,24 @@ impl Address {
         }
     }
 
+    /// A Candidate A address (lab #896 G): `rkm` is the generation's
+    /// `H(nk ‖ D_R ‖ d ‖ auth_root)`; version [`ADDRESS_VERSION_CANDIDATE_A`].
+    pub fn new_candidate_a(diversifier: Diversifier, rkm: Lanes, ek: &Ek) -> Self {
+        Self { version: ADDRESS_VERSION_CANDIDATE_A, ..Self::new(diversifier, rkm, ek) }
+    }
+
+    /// Refuse this address unless it is version `want`, by name (lab #896
+    /// G): the send paths call it with their net's version, so a string
+    /// carried in from a URI, a contact or the directory can never pay a
+    /// derivation the net does not open.
+    pub fn require_version(&self, want: u8) -> Result<(), AddressVersionError> {
+        if self.version == want {
+            Ok(())
+        } else {
+            Err(AddressVersionError { got: self.version, want })
+        }
+    }
+
     /// The `rkm` as `[u64; 4]` lanes (the form the note commitment consumes).
     pub fn rkm_lanes(&self) -> Lanes {
         digest_from_bytes(&self.rkm)
@@ -123,13 +149,23 @@ impl Address {
         out
     }
 
-    /// Parse raw bytes. `None` on a length or version mismatch.
+    /// Parse raw bytes. `None` on a length or version mismatch: only
+    /// version 1 ([`ADDRESS_VERSION`]) — every L1 and v1 Annulet path, which
+    /// must never pay a Candidate A address. See [`Self::from_raw_bytes_any`].
     pub fn from_raw_bytes(b: &[u8]) -> Option<Address> {
+        Self::from_raw_bytes_any(b).filter(|a| a.version == ADDRESS_VERSION)
+    }
+
+    /// Parse raw bytes of either known version (1 or
+    /// [`ADDRESS_VERSION_CANDIDATE_A`]), keeping the version (lab #896 G).
+    /// For the carriers — the directory, URIs, contacts — which hand the
+    /// address to a send path that checks [`Self::require_version`].
+    pub fn from_raw_bytes_any(b: &[u8]) -> Option<Address> {
         if b.len() != Self::RAW_LEN {
             return None;
         }
         let version = b[0];
-        if version != ADDRESS_VERSION {
+        if version != ADDRESS_VERSION && version != ADDRESS_VERSION_CANDIDATE_A {
             return None; // unknown format version
         }
         let mut off = 1;
@@ -157,11 +193,17 @@ impl Address {
     /// Decode a bech32m address string. `None` on a wrong HRP, bad checksum, or
     /// malformed payload.
     pub fn decode(s: &str) -> Option<Address> {
+        Self::decode_any(s).filter(|a| a.version == ADDRESS_VERSION)
+    }
+
+    /// [`Self::decode`] accepting either known version (lab #896 G); see
+    /// [`Self::from_raw_bytes_any`].
+    pub fn decode_any(s: &str) -> Option<Address> {
         let (hrp, payload) = crate::bech32m::decode(s)?;
         if hrp != ADDR_HRP {
             return None;
         }
-        Address::from_raw_bytes(&payload)
+        Address::from_raw_bytes_any(&payload)
     }
 
     /// The short-address hash commitment of this address:
@@ -176,6 +218,31 @@ impl Address {
         ShortAddress { hash }
     }
 }
+
+/// An address of the wrong version for the net it would pay (lab #896 G).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddressVersionError {
+    pub got: u8,
+    pub want: u8,
+}
+
+impl std::fmt::Display for AddressVersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = |v: u8| match v {
+            ADDRESS_VERSION => "an L1 / v1 Annulet address (version 1)",
+            ADDRESS_VERSION_CANDIDATE_A => "a Candidate A Annulet address (version 2)",
+            _ => "an unknown address version",
+        };
+        write!(
+            f,
+            "this is {}, but this net pays only {}: a note to it could never be spent",
+            what(self.got),
+            what(self.want)
+        )
+    }
+}
+
+impl std::error::Error for AddressVersionError {}
 
 /// The compact user-facing handle: a hash commitment of the full address.
 /// Resolving it back to the full address requires a resolution layer (network
@@ -230,7 +297,8 @@ impl AddressBook {
     /// (defensive: a stored entry must still hash to the queried short address).
     pub fn resolve(&self, short: &ShortAddress) -> Option<Address> {
         let raw = self.map.get(&short.hash)?;
-        let addr = Address::from_raw_bytes(raw)?;
+        // A carrier (lab #896 G): either version; the send path checks it.
+        let addr = Address::from_raw_bytes_any(raw)?;
         if addr.short() != *short {
             return None; // commitment mismatch — refuse
         }
@@ -345,5 +413,48 @@ mod tests {
         d1[0] = 1;
         let a1 = Address { diversifier: Diversifier(d1), ..a0.clone() };
         assert_ne!(a0.short(), a1.short(), "diversifier changes the short address");
+    }
+
+    /// Lab #896 G (QG1): a Candidate A address round-trips through the
+    /// version-aware decoders only; every version-1 decoder refuses it, and
+    /// the version is what `require_version` names.
+    #[test]
+    fn candidate_a_addresses_are_version_2_and_refused_by_v1_decoders() {
+        let v1 = sample_address(7, [1u8; DIV_LEN]);
+        let v2 = Address::new_candidate_a(v1.diversifier, v1.rkm_lanes(), &v1.encapsulation_key().unwrap());
+        assert_eq!(v2.version, ADDRESS_VERSION_CANDIDATE_A);
+        let raw = v2.to_raw_bytes();
+        assert_eq!(raw.len(), Address::RAW_LEN, "the layout is version 1's");
+        assert_eq!(raw[0], 2);
+        assert!(Address::from_raw_bytes(&raw).is_none(), "a v1 decoder refuses v2");
+        assert!(Address::decode(&v2.encode()).is_none());
+        let back = Address::decode_any(&v2.encode()).expect("the version-aware decoder takes it");
+        assert_eq!(back.to_raw_bytes(), raw);
+        assert_eq!(Address::decode_any(&v1.encode()).unwrap().version, ADDRESS_VERSION);
+        assert_eq!(back.require_version(ADDRESS_VERSION_CANDIDATE_A), Ok(()));
+        assert_eq!(
+            back.require_version(ADDRESS_VERSION),
+            Err(AddressVersionError { got: 2, want: 1 })
+        );
+        assert_eq!(v1.require_version(ADDRESS_VERSION_CANDIDATE_A), Err(AddressVersionError { got: 1, want: 2 }));
+        let mut unknown = raw.clone();
+        unknown[0] = 3;
+        assert!(Address::from_raw_bytes_any(&unknown).is_none(), "an unknown version is still refused");
+    }
+
+    /// The short form hashes the raw bytes, version byte included: a v1 and a
+    /// v2 address with the same `d`/`rkm`/`ek` have different short forms,
+    /// and the local resolver returns the v2 address byte for byte.
+    #[test]
+    fn the_short_form_carries_the_version() {
+        let v1 = sample_address(8, [2u8; DIV_LEN]);
+        let v2 = Address::new_candidate_a(v1.diversifier, v1.rkm_lanes(), &v1.encapsulation_key().unwrap());
+        assert_ne!(v1.short(), v2.short());
+        let mut book = AddressBook::new();
+        let short = book.register(&v2);
+        assert_eq!(short, v2.short());
+        let resolved = book.resolve(&short).expect("the book resolves its own entry");
+        assert_eq!(resolved.to_raw_bytes(), v2.to_raw_bytes());
+        assert_eq!(resolved.version, ADDRESS_VERSION_CANDIDATE_A);
     }
 }
