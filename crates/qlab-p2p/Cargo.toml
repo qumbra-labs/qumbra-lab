@@ -52,3 +52,5 @@ randomx = ["qlab-devnet/randomx", "qlab-node/randomx", "qlab-pow/randomx", "qlab
 [dev-dependencies]
 # Deterministic committee keys + compact-block fixtures for gossip/relay tests.
 qlab-note = { path = "../qlab-note" }
+# Lab #896 F: the Candidate A tests sign real auth sections (ML-DSA-44).
+qlab-remote-auth = { path = "../qlab-remote-auth" }

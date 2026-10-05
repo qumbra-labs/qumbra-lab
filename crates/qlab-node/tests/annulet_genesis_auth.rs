@@ -125,7 +125,7 @@ fn a_node_opens_on_its_genesis_axis() {
         &notes,
         fees,
         &leaves,
-        L2AuthForm::CandidateA,
+        qlab_devnet::annulet::AuthContext::candidate_a(g.hash()),
     );
     assert_eq!(node.l2_auth_form(), L2AuthForm::CandidateA);
     let v1 = genesis(L2AuthForm::None);

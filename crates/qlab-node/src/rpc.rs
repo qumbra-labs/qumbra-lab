@@ -577,6 +577,9 @@ pub enum RejectReason {
     RegistryWriteAlreadyPooled,
     /// A registry write the block rule would refuse (lab #728) — additive.
     RegistryWriteInvalid,
+    /// The authorization check refused the tx (lab #896 F) — additive,
+    /// reachable only on an Annulet net.
+    AuthRefused,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
     // commitment tree's append schedule, so an immature spend has no witness against
     // any acceptable anchor and cannot reach a refusal reason at all. A wallet that wants
@@ -792,6 +795,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             Err(MempoolError::RegistryWriteInvalid) => {
                 SubmitOutcome::Rejected(RejectReason::RegistryWriteInvalid)
             }
+            Err(MempoolError::AuthRefused(_)) => SubmitOutcome::Rejected(RejectReason::AuthRefused),
         }
     }
 

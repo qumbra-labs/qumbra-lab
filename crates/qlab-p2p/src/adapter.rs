@@ -632,6 +632,12 @@ const _: () = assert!(
 /// judgement about the object or its sender.
 pub const STATE_LAG_REASON: &str = "state lag: this node's applied state is behind its chain";
 
+/// What a tx refusal says when its auth validity window does not cover this
+/// node's next height (lab #896 F): `Expired` or `ValidityTooFar` judge the
+/// tx against this node's tip, and an honest peer one block ahead or behind
+/// can hold the other verdict — so it is `Ignored`, never scored (#134).
+pub const AUTH_WINDOW_REASON: &str = "auth validity window: judged against this node's tip";
+
 /// What a body refusal says when this node **could not judge** the anchor rule
 /// (issue #134). Named for the same reason [`STATE_LAG_REASON`] is: it is a node
 /// declaring its own view unable to answer, which is a different statement from
@@ -2770,7 +2776,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // Lab #785 F5-4d: an exit on the Annulet — the surface alone says so.
             | BodyError::L2ExitWithoutBridge { .. }
             // Lab #714: a genesis plaintext past height 0 — the bytes alone say so.
-            | BodyError::GenesisPlaintextInBody { .. } => BodyFault::Intrinsic("bad body"),
+            | BodyError::GenesisPlaintextInBody { .. }
+            // Lab #896 F: the authorization check reads the transaction, the
+            // block's own height and the genesis every node shares.
+            | BodyError::L2AuthRefused { .. } => BodyFault::Intrinsic("bad body"),
             // Lab #785 F5-3b, the V6 form. A section on the wrong form reads
             // the pair alone. The finality record and the V6
             // anchor rule read the block's OWN ancestry (CR(parent), ancestor
@@ -2937,6 +2946,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // Lab #728: judged against this pool — not a peer fault.
             MempoolError::RegistryWriteAlreadyPooled => "registry write already pooled",
             MempoolError::RegistryWriteInvalid => "registry write invalid",
+            // Lab #896 F: the authorization check, by name. The two height
+            // refusals never reach here from a peer (`ingest_tx` maps them
+            // to `Ignored`); the rest read only the tx and the genesis.
+            MempoolError::AuthRefused(r) => {
+                use qlab_devnet::annulet::AuthRefusal as A;
+                match r {
+                    A::AuthOnV1Net => "auth section on a v1 net",
+                    A::AuthMissing => "auth section missing",
+                    A::Malformed(_) => "auth section malformed",
+                    A::Expired { .. } => "auth expired",
+                    A::ValidityTooFar { .. } => "auth validity beyond the cap",
+                    A::Intent(_) => "auth intent not rebuilt",
+                    A::Unauthorized(_) => "auth signature refused",
+                }
+            }
         }
     }
 }
@@ -3611,6 +3635,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
             Ok(_) => IngestOutcome::Accepted,
             Err(TxSubmitRefusal::StateLagging) => IngestOutcome::Ignored(STATE_LAG_REASON),
             Err(TxSubmitRefusal::Pool(MempoolError::DuplicateTx)) => IngestOutcome::Duplicate,
+            Err(TxSubmitRefusal::Pool(MempoolError::AuthRefused(
+                qlab_devnet::annulet::AuthRefusal::Expired { .. } | qlab_devnet::annulet::AuthRefusal::ValidityTooFar { .. },
+            ))) => IngestOutcome::Ignored(AUTH_WINDOW_REASON),
             Err(TxSubmitRefusal::Pool(e)) => IngestOutcome::Rejected(Self::reject_reason(&e)),
         }
     }

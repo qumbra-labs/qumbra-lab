@@ -101,7 +101,7 @@ pub fn audit_with_claim(
     genesis: &AnnuletGenesisFile,
     claimed: Option<&AttestDocument>,
 ) -> Result<SupplyReport, SupplyAuditError> {
-    let l2_auth = genesis.l2_auth().map_err(|e| SupplyAuditError::UnreadableLog {
+    let auth = genesis.auth_context().map_err(|e| SupplyAuditError::UnreadableLog {
         path: data_dir.to_path_buf(),
         reason: format!("the genesis names no L2 authorization axis: {e}"),
     })?;
@@ -111,7 +111,7 @@ pub fn audit_with_claim(
         &genesis.notes(),
         genesis.params.fee_table(),
         &registry_leaves(&genesis.registry_genesis),
-        l2_auth,
+        auth,
     )
     .map_err(|e| SupplyAuditError::UnreadableLog {
         path: data_dir.to_path_buf(),

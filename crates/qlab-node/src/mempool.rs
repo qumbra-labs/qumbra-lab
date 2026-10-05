@@ -202,6 +202,8 @@ pub enum MempoolError {
     /// template can mine and nothing evicts. The mempool must run the same
     /// rider rules the block does, exactly as it already does for discovery.
     RiderInvalid(BodyError),
+    /// Lab #896 F: the authorization check refused the transaction (2b §6).
+    AuthRefused(qlab_devnet::annulet::AuthRefusal),
     /// The STARK proof does not verify against the public surface.
     ProofInvalid,
 }
@@ -243,6 +245,12 @@ pub struct MempoolTx {
     /// because the two consumers below run per pooled tx per block, and because
     /// re-decoding would be a second decoder to keep in step with the first.
     pub name_op: Option<qlab_devnet::names::NameOp>,
+    /// Lab #896 F: the auth section's `valid_until_height`, as
+    /// [`qlab_devnet::annulet::check_auth`] returned it at admission (`None`
+    /// on a v1 net). A cache of the section header, like `name_op` of the
+    /// rider: eviction and assembly re-check the height bounds with it and
+    /// never re-decode.
+    pub valid_until_height: Option<u64>,
 }
 
 /// A surface's signed vPublic terms, `(asset, ±amount)` (lab #712).
@@ -723,6 +731,21 @@ impl Mempool {
             }
         }
 
+        // 7½. Lab #896 F: the authorization check (2b §6) — after every
+        //     cheap check and before the proof, at the landing height, under
+        //     any injected verifier. Nothing above has written any state, so a
+        //     copy refused here leaves no trace under its (auth-excluding) id
+        //     and cannot block the honest copy.
+        let valid_until_height = match state.genesis_form() {
+            GenesisForm::Annulet => {
+                qlab_devnet::annulet::check_auth(&entry, &state.annulet_auth_context(), prospective_height)
+                    .map_err(MempoolError::AuthRefused)?
+            }
+            // No L2 surface and no auth section on the L1 forms (the L1 wire
+            // cannot carry one), so there is nothing to authorize here.
+            GenesisForm::V4 | GenesisForm::V5 => None,
+        };
+
         // 8. Proof verify — last, the only non-trivial cost (consensus §1).
         if !verifier.verify_tx(&entry) {
             return Err(MempoolError::ProofInvalid);
@@ -736,7 +759,7 @@ impl Mempool {
         // The decoded op rides with the tx (lab #387): assembly's per-template
         // name dedup and the eviction re-check both need to know which pooled
         // txs carry a rider, and neither may re-decode to find out.
-        self.txs.insert(id, MempoolTx { txid: id, entry, weight, name_op: op });
+        self.txs.insert(id, MempoolTx { txid: id, entry, weight, name_op: op, valid_until_height });
         Ok(id)
     }
 
@@ -826,6 +849,9 @@ impl Mempool {
                 tx.entry.public.nullifiers.iter().any(|nf| spent.contains(nf))
                     || !state.is_valid_anchor(&tx.entry.public.anchor)
                     || annulet_root_stale(&tx.entry, state)
+                    // Lab #896 F: expired (or, after a rewind, past the cap)
+                    // at the next landing height.
+                    || !qlab_devnet::annulet::auth_validity_ok(tx.valid_until_height, state.tip_height() + 1)
             })
             .map(|tx| tx.txid)
             .collect();
@@ -900,6 +926,12 @@ impl Mempool {
         // that merely lost a race.
         let mut pending_names: HashSet<Vec<u8>> = HashSet::new();
         for tx in candidates {
+            // Lab #896 F: never a transaction the block's own body rule would
+            // refuse at this height — expired, or past the cap after a rewind
+            // dropped the tip. Eviction normally removed it already.
+            if !qlab_devnet::annulet::auth_validity_ok(tx.valid_until_height, height) {
+                continue;
+            }
             // Only a Reveal claims a name. A Renew of a name revealed earlier in
             // the same block is legal (`check_op`: any payer, N4) and a Commit
             // reveals nothing, so neither is skipped here — the rule mirrors

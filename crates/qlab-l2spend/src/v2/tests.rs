@@ -312,6 +312,14 @@ fn round_trip(f: &Signed) {
         "the node's intent is the device's (auth is not an input)"
     );
     assert_eq!(section.verify_intent(&intent), Ok(()));
+    // Lab #896 F: the consensus check both funnels run accepts the real
+    // proof's transaction as built and signed, at its last valid height.
+    let ctx = qlab_devnet::annulet::AuthContext::candidate_a(GENESIS_HASH);
+    let last = section.valid_until_height;
+    assert_eq!(
+        qlab_devnet::annulet::check_auth(&f.tx, &ctx, last),
+        Ok(Some(last))
+    );
 }
 
 #[test]

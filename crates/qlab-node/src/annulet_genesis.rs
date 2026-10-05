@@ -278,6 +278,16 @@ impl AnnuletGenesisFile {
             .ok_or(AnnuletGenesisError::NotAnnuletGenesis { got: Some(self.format_version) })
     }
 
+    /// The authorization context its intents bind (lab #896 F): the axis
+    /// and this file's hash — the pinned genesis hash, never the genesis
+    /// block hash (QF1).
+    pub fn auth_context(&self) -> Result<qlab_devnet::annulet::AuthContext, AnnuletGenesisError> {
+        Ok(match self.l2_auth()? {
+            L2AuthForm::None => qlab_devnet::annulet::AuthContext::NONE,
+            L2AuthForm::CandidateA => qlab_devnet::annulet::AuthContext::candidate_a(self.hash()),
+        })
+    }
+
     /// The sequencer's verifying key, decoded.
     pub fn sequencer(&self) -> Result<VerifyingKey<MlDsa65>, AnnuletGenesisError> {
         let e = EncodedVerifyingKey::<MlDsa65>::try_from(self.sequencer_key.as_slice())

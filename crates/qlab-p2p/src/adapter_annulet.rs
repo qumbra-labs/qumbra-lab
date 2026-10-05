@@ -30,7 +30,6 @@ use qlab_devnet::annulet::{
     SequencerKey,
 };
 use qlab_devnet::committee::{Committee, CommitteeState};
-use qlab_devnet::forms::L2AuthForm;
 use qlab_devnet::validation::validate_sealed_header_annulet;
 use qlab_node::ChainStore as _;
 
@@ -62,7 +61,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             pow,
             verifier,
             sim,
-            L2AuthForm::None,
+            qlab_devnet::annulet::AuthContext::NONE,
         )
     }
 
@@ -77,9 +76,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         pow: P,
         verifier: V,
         sim: SimConfig,
-        l2_auth: L2AuthForm,
+        auth: qlab_devnet::annulet::AuthContext,
     ) -> Self {
-        let state = MemNode::in_memory_annulet_with_auth(genesis_header, genesis_notes, fees, registry, l2_auth);
+        let state = MemNode::in_memory_annulet_with_auth(genesis_header, genesis_notes, fees, registry, auth);
         let committee = EpochCommittee::genesis(
             EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
             CommitteeState::new(Committee::from_keys(Vec::new()), 0),
@@ -120,7 +119,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             pow,
             verifier,
             sim,
-            L2AuthForm::None,
+            qlab_devnet::annulet::AuthContext::NONE,
         )
     }
 
@@ -137,10 +136,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         pow: P,
         verifier: V,
         sim: SimConfig,
-        l2_auth: L2AuthForm,
+        auth: qlab_devnet::annulet::AuthContext,
     ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
-        let state = MemNode::open_annulet_with_auth(&dir, genesis_header, genesis_notes, fees, registry, l2_auth)?;
+        let state = MemNode::open_annulet_with_auth(&dir, genesis_header, genesis_notes, fees, registry, auth)?;
         let committee = EpochCommittee::genesis(
             EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
             CommitteeState::new(Committee::from_keys(Vec::new()), 0),
