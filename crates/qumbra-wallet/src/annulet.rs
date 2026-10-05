@@ -226,6 +226,9 @@ pub struct AnnuletScanCore {
     phase: CorePhase,
     pending: Option<String>,
     failed: Option<String>,
+    /// Lab #896 G: on a Candidate A net, the generations whose `rkm` a note
+    /// may carry ([`Self::with_generations`]); empty on a v1 net.
+    generations: Vec<(u32, [u64; 4])>,
 }
 
 enum CorePhase {
@@ -256,7 +259,43 @@ impl AnnuletScanCore {
     ) -> Self {
         let rows = (!allocated.is_empty())
             .then(|| Box::new(MultiScanDriver::new(scan_keys(&wallet, &allocated), from, to, ScanConfig::default())));
-        AnnuletScanCore { wallet, allocated, from, to, genesis_hash, genesis, phase: CorePhase::Rows(rows), pending: None, failed: None }
+        AnnuletScanCore {
+            wallet,
+            allocated,
+            from,
+            to,
+            genesis_hash,
+            genesis,
+            phase: CorePhase::Rows(rows),
+            pending: None,
+            failed: None,
+            generations: Vec::new(),
+        }
+    }
+
+    /// Lab #896 G: scan a Candidate A net — a note is the wallet's at index
+    /// `i` if its `rkm` is `H(nk ‖ D_R ‖ d_i ‖ auth_root_g)` for one of
+    /// `generations`. Detection is unchanged (the ML-KEM key is per address
+    /// index, not per generation); only the ownership check moves. Must be
+    /// non-empty: an empty list would silently scan as v1.
+    pub fn with_generations(mut self, generations: Vec<(u32, [u64; 4])>) -> Self {
+        assert!(!generations.is_empty(), "a Candidate A scan needs at least one generation");
+        self.generations = generations;
+        self
+    }
+
+    /// Whether `note` (at `idx`) is the wallet's under this scan's derivation.
+    fn owns(&self, idx: u64, cm: [u8; 32], note: L2Note) -> Option<Result<OwnedL2Note, qlab_ledger::assets::AssetError>> {
+        let wallet = &self.wallet;
+        if self.generations.is_empty() {
+            (wallet.rkm(wallet.diversifier_at_index(idx)) == note.rkm)
+                .then(|| OwnedL2Note::from_genesis(wallet, idx, cm, note))
+        } else {
+            match OwnedL2Note::from_genesis_v2(wallet, idx, cm, note, &self.generations) {
+                Err(qlab_ledger::assets::AssetError::NotThisAddress { .. }) => None,
+                other => Some(other),
+            }
+        }
     }
 
     /// Advance until the scan needs one path or completes.
@@ -337,11 +376,10 @@ impl AnnuletScanCore {
         let mut refused = Vec::new();
         for (cm, note) in &self.genesis {
             for &idx in &self.allocated {
-                if wallet.rkm(wallet.diversifier_at_index(idx)) == note.rkm {
-                    match OwnedL2Note::from_genesis(wallet, idx, *cm, *note) {
-                        Ok(n) => owned.push(n),
-                        Err(e) => refused.push(format!("genesis note: {e}")),
-                    }
+                match self.owns(idx, *cm, *note) {
+                    Some(Ok(n)) => owned.push(n),
+                    Some(Err(e)) => refused.push(format!("genesis note: {e}")),
+                    None => {}
                 }
             }
         }
@@ -349,7 +387,12 @@ impl AnnuletScanCore {
         for row in &rows {
             if let Ok(outcome) = &row.scan {
                 for located in &outcome.notes {
-                    match OwnedL2Note::from_located(wallet, row.index, located) {
+                    let owned_note = if self.generations.is_empty() {
+                        OwnedL2Note::from_located(wallet, row.index, located)
+                    } else {
+                        OwnedL2Note::from_located_v2(wallet, row.index, located, &self.generations)
+                    };
+                    match owned_note {
                         Ok(n) => owned.push(n),
                         Err(e) => refused.push(format!("height {} tx {}: {e}", located.height, located.tx_index)),
                     }

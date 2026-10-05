@@ -40,7 +40,15 @@ pub struct OwnedL2Note {
     pub tx_index: Option<u64>,
     /// The committed commitment (from the served stream, not recomputed).
     pub cm: [u8; 32],
+    /// Lab #896 G: the Candidate A generation whose `auth_root` the note's
+    /// `rkm` absorbs; `None` for a v1 note (`rkm = H(nk ‖ D_R ‖ d)`). A v2
+    /// note is spent only under that generation's authorization tree.
+    pub generation: Option<u32>,
 }
+
+/// Lab #896 G: the generations a Candidate A wallet receives under — each
+/// generation `g` with its authorization-tree root (`auth_root`, lanes).
+pub type GenerationRoots = [(u32, [u64; 4])];
 
 /// Why a served note could not become an [`OwnedL2Note`] — by name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +80,49 @@ fn asset_u16(asset: u64) -> Result<u16, AssetError> {
 }
 
 impl OwnedL2Note {
+    /// Lab #896 G: a note a Candidate A scan opened at address `div_index`,
+    /// owned if its `rkm` is `H(nk ‖ D_R ‖ d ‖ auth_root_g)` for one of
+    /// `generations`; the matching `g` is recorded.
+    pub fn from_located_v2(
+        wallet: &Wallet,
+        div_index: u64,
+        located: &LocatedNote<L2Note>,
+        generations: &GenerationRoots,
+    ) -> Result<Self, AssetError> {
+        Self::checked_v2(wallet, div_index, located.detected.note, located.height, Some(located.tx_index), located.cm, generations)
+    }
+
+    /// Lab #896 G: [`Self::from_genesis`] on a Candidate A net.
+    pub fn from_genesis_v2(
+        wallet: &Wallet,
+        div_index: u64,
+        cm: [u8; 32],
+        note: L2Note,
+        generations: &GenerationRoots,
+    ) -> Result<Self, AssetError> {
+        Self::checked_v2(wallet, div_index, note, 0, None, cm, generations)
+    }
+
+    fn checked_v2(
+        wallet: &Wallet,
+        div_index: u64,
+        note: L2Note,
+        height: u64,
+        tx_index: Option<u64>,
+        cm: [u8; 32],
+        generations: &GenerationRoots,
+    ) -> Result<Self, AssetError> {
+        let asset = asset_u16(note.asset)?;
+        let d = wallet.diversifier_at_index(div_index).lanes();
+        let nk = wallet.nk();
+        let generation = generations
+            .iter()
+            .find(|(_, root)| qlab_wallet::keys::derive_rkm_v2(&nk, &d, root) == note.rkm)
+            .map(|(g, _)| *g)
+            .ok_or(AssetError::NotThisAddress { div_index })?;
+        Ok(Self { note, asset, div_index, height, tx_index, cm, generation: Some(generation) })
+    }
+
     /// A note an L2 scan opened at address `div_index`.
     pub fn from_located(
         wallet: &Wallet,
@@ -99,7 +150,7 @@ impl OwnedL2Note {
         if wallet.rkm(wallet.diversifier_at_index(div_index)) != note.rkm {
             return Err(AssetError::NotThisAddress { div_index });
         }
-        Ok(Self { note, asset, div_index, height, tx_index, cm })
+        Ok(Self { note, asset, div_index, height, tx_index, cm, generation: None })
     }
 
     /// The circuit input spending this note — the wallet's `sk`, the note's
