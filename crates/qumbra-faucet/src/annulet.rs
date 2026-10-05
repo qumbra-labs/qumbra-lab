@@ -108,6 +108,16 @@ pub enum AnnuletError {
     /// stock on this chain: its used leaves are unknown, so it refuses to
     /// sign rather than risk reusing one.
     JournalLost { spent: usize },
+    /// A Candidate A faucet with no journal, started without `fresh`: the
+    /// chain it reads may simply not be synced yet (a lost data dir loses the
+    /// journal and the follower's chain together), so an empty spent set
+    /// proves nothing. Only an operator who knows this key never spent on
+    /// this chain may start it fresh.
+    JournalMissing,
+    /// The journal's cursor is behind the chain: `spent` of the key's stock
+    /// notes are spent on chain, each one leaf, but the journal says only
+    /// `next` leaves were taken — a stale or restored-from-backup journal.
+    JournalBehind { next: u32, spent: usize },
     /// The journal in the faucet's directory is not this key's
     /// generation-0 journal.
     JournalForeign(String),
@@ -138,6 +148,18 @@ impl std::fmt::Display for AnnuletError {
                 f,
                 "the faucet has no authorization journal, but {spent} of its stock note(s) are already spent on \
                  this chain: the leaves they used are unknown, so the faucet refuses to sign (lab #896 H)"
+            ),
+            AnnuletError::JournalMissing => write!(
+                f,
+                "the faucet has no authorization journal; start it with --fresh-journal ONLY on a chain where \
+                 this key has never spent (a missing journal on a chain it has spent on would reuse leaves) \
+                 (lab #896 H)"
+            ),
+            AnnuletError::JournalBehind { next, spent } => write!(
+                f,
+                "the authorization journal is behind the chain: it has taken {next} leaf/leaves but {spent} of \
+                 the faucet's stock note(s) are spent on chain — a stale or restored journal; refusing to sign \
+                 (lab #896 H)"
             ),
             AnnuletError::JournalForeign(why) => write!(f, "the authorization journal is not this faucet's: {why}"),
             AnnuletError::Auth(why) => write!(f, "authorization: {why}"),
@@ -207,9 +229,13 @@ impl AnnuletFaucet {
     /// the faucet drops).
     ///
     /// Refuses by name: another holder of the lock; a journal that is not
-    /// this key's generation-0 journal; and a missing journal when any of
-    /// the key's stock is already spent on chain (its used leaves would be
-    /// unknown).
+    /// this key's generation-0 journal; a journal whose cursor is behind the
+    /// key's spends on chain (each grant takes one leaf); a missing journal
+    /// when any of the key's stock is already spent on chain; and a missing
+    /// journal without `fresh` — the operator's explicit word that this key
+    /// has never spent on this chain, because the follower may not have
+    /// synced yet and an empty spent set proves nothing.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_v2(
         served: Served,
         key: SpendKey,
@@ -218,6 +244,7 @@ impl AnnuletFaucet {
         dir: &Path,
         genesis_hash: [u8; 32],
         genesis_format: u32,
+        fresh: bool,
     ) -> Result<Self, AnnuletError> {
         std::fs::create_dir_all(dir).map_err(JournalError::Io)?;
         let lock = AuthLock::acquire(dir)?;
@@ -229,6 +256,7 @@ impl AnnuletFaucet {
         let (_, genesis) = served.genesis_notes()?;
         let mine: Vec<L2Note> = genesis.into_iter().filter(|n| n.rkm == rkm && n.asset == 0).collect();
         let nf = |n: &L2Note| digest_bytes(&qlab_air::l2::l2_nf(&nk, &n.rho));
+        let used = mine.iter().filter(|n| spent.contains(&nf(n))).count();
         let journal = match AuthJournal::load(dir)? {
             Some(j) => {
                 let g0 = j.get(0).map_err(|e| AnnuletError::JournalForeign(e.to_string()))?;
@@ -237,12 +265,17 @@ impl AnnuletFaucet {
                         "its generation 0 is not this key's tree, or another generation is active".into(),
                     ));
                 }
+                if (j.active().next as usize) < used {
+                    return Err(AnnuletError::JournalBehind { next: j.active().next, spent: used });
+                }
                 j
             }
             None => {
-                let used = mine.iter().filter(|n| spent.contains(&nf(n))).count();
                 if used > 0 {
                     return Err(AnnuletError::JournalLost { spent: used });
+                }
+                if !fresh {
+                    return Err(AnnuletError::JournalMissing);
                 }
                 let j = AuthJournal::fresh(root);
                 j.save(dir)?;

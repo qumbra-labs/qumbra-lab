@@ -101,8 +101,10 @@ fn usage() {
          qumbra-faucet ticket --config FILE --id N issue one single-use grant ticket\n  \
          qumbra-faucet check --config FILE         validate the deployment; bind nothing, mine nothing\n  \
          qumbra-faucet run --config FILE           run the keyless node + the HTTP listener\n  \
-         qumbra-faucet annulet --node-config FILE [--listen ADDR]\n                                            \
-         the Annulet devnet faucet: a keyless follower + genesis-stock grants (lab #716)\n"
+         qumbra-faucet annulet --node-config FILE [--listen ADDR] [--fresh-journal]\n                                            \
+         the Annulet devnet faucet: a keyless follower + genesis-stock grants (lab #716).\n                                            \
+         On a Candidate A genesis, --fresh-journal starts a new auth.v1 — ONLY on a chain where\n                                            \
+         the faucet key has never spent (lab #896 H)\n"
     );
 }
 
@@ -525,6 +527,10 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
     }
 }
 
+/// The Candidate A faucet's journal directory, inside the node's data dir
+/// (lab #896 H).
+const FAUCET_AUTH_DIR: &str = "faucet-auth";
+
 /// **The Annulet devnet faucet** (lab #716): a keyless follower in process,
 /// its discovery endpoint as the faucet's served source, and one grant per
 /// genesis stock note over `POST /v1/annulet/grant`.
@@ -533,10 +539,6 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
 /// `qumbra-faucet run`), any genesis other than the devnet's (the only
 /// Annulet faucet key is the devnet's **dev** key, public by construction),
 /// and a node that would be the sequencer.
-/// The Candidate A faucet's journal directory, inside the node's data dir
-/// (lab #896 H).
-const FAUCET_AUTH_DIR: &str = "faucet-auth";
-
 fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_faucet::annulet::{served, serve_grants, AnnuletFaucet, SpendKey};
     use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile};
@@ -593,6 +595,7 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
             &node_cfg.data_dir.join(FAUCET_AUTH_DIR),
             genesis.hash(),
             genesis.format_version,
+            has_flag(args, "--fresh-journal"),
         )?,
     };
     let stock = faucet.stock_left();

@@ -477,10 +477,13 @@ mod tests {
     const DEVNET_GENESIS_HASH: &str = "00c70e55c95e8f6519e956884bf6ffc56476fe1b3cd196983a46e1f4221d7e03";
 
     /// The Candidate A devnet and rehearsal genesis hashes (lab #896 H, QH1):
-    /// printed by `annulet_devnet_v2_genesis_hash_is_pinned` on the lane,
-    /// then pinned here from that output (print-then-pin). `None` until then.
-    const DEVNET_V2_GENESIS_HASH: Option<&str> = None;
-    const DEVNET_V2_REHEARSAL_GENESIS_HASH: Option<&str> = None;
+    /// from `qumbra-node genesis annulet-devnet --v2` / `--rehearsal` at
+    /// b3daa761, each run twice in fresh processes, byte-identical (5,241 B
+    /// and 5,251 B; coordinator-run, `logs/h-pins-20261005/pins.log`).
+    const DEVNET_V2_GENESIS_HASH: Option<&str> =
+        Some("2bd53cd149cd5e8b43917b468c82249dd41c1602814b1f24ef39e61cafb3d13a");
+    const DEVNET_V2_REHEARSAL_GENESIS_HASH: Option<&str> =
+        Some("e21a7b089927dbede8171744675830bd60f8f3b854617421a9fcf8e4728fee97");
 
     fn opened(g: &AnnuletGenesisFile) -> Vec<qlab_note::l2note::L2Note> {
         g.genesis_notes
@@ -506,7 +509,10 @@ mod tests {
             let a = build();
             assert_eq!(a.to_bytes(), build().to_bytes(), "{name}: deterministic");
             println!("{name}: {} bytes, hash {}", a.to_bytes().len(), a.hash_hex());
-            a.verify(pin).expect("verifies (and pins itself once pinned)");
+            let pin = pin.expect("pinned");
+            a.verify(Some(pin)).expect("verifies and pins itself");
+            assert_eq!(a.hash_hex(), pin, "{name}");
+            assert_eq!(a.to_bytes().len(), if name == "devnet_v2" { 5_241 } else { 5_251 }, "{name}");
             assert_eq!(a.format_version, ANNULET_AUTH_GENESIS_FORMAT_VERSION, "{name}");
             assert_eq!(leading_format_version(&a.to_bytes()), Some(ANNULET_AUTH_GENESIS_FORMAT_VERSION), "{name}");
             assert_eq!(a.l2_auth().unwrap(), L2AuthForm::CandidateA, "{name}");
