@@ -1604,12 +1604,32 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0u8; 32]); // anchor
         write_varint(&mut bytes, 1u64 << 60); // n_nf, a lie
-        assert!(matches!(decode_tx(&bytes), Err(DecodeError::Truncated { .. })));
+        // Lab #911: a claim above the per-transaction cap is refused by name
+        // at the count, before anything is allocated or read.
+        assert!(matches!(
+            decode_tx(&bytes),
+            Err(DecodeError::TooManyEntries { what: "tx.nullifiers", got }) if got as u64 == 1u64 << 60
+        ));
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0u8; 32]); // anchor
         write_varint(&mut bytes, 0); // n_nf
         write_varint(&mut bytes, 1u64 << 60); // n_cm, the same lie one field later
+        assert!(matches!(decode_tx(&bytes), Err(DecodeError::TooManyEntries { what: "tx.commitments", .. })));
+
+        // A count under the cap that the bytes cannot hold is still refused as
+        // truncated — the original property: no allocation sized by a claim
+        // the payload does not back.
+        for n_nf in [1u64, MAX_TX_ENTRIES as u64] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&[0u8; 32]); // anchor
+            write_varint(&mut bytes, n_nf); // within the cap, no nullifier bytes follow
+            assert!(matches!(decode_tx(&bytes), Err(DecodeError::Truncated { .. })), "n_nf = {n_nf}");
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 32]); // anchor
+        write_varint(&mut bytes, 0); // n_nf
+        write_varint(&mut bytes, MAX_TX_ENTRIES as u64); // n_cm within the cap, no bytes
         assert!(matches!(decode_tx(&bytes), Err(DecodeError::Truncated { .. })));
     }
 
