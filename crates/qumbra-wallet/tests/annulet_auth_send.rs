@@ -15,7 +15,10 @@
 //! Then the served Candidate A body is read back: the transaction's own auth
 //! section gives the landed leaves, and `landed_next` over them is the cursor
 //! position `W`'s journal recorded — the input of a restore's sweep floor,
-//! checked against a real body.
+//! checked against a real body. Two no-prove locks ride along: a version-1
+//! recipient on this net is refused by name before any planning, and
+//! `migrate --open-next` afterwards opens generation 1 and leaves generation
+//! 0 waiting on this net until tip + 1,152.
 use std::time::Duration;
 
 use qlab_air::l2::RegistryLeaf;
@@ -24,8 +27,8 @@ use qlab_note::l2note::L2Note;
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qumbra_faucet::devnet_harness::Net;
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord};
-use qumbra_wallet::annulet_send::{send_annulet, SendPlan, WalletEndpoint};
-use qumbra_wallet::annulet_v2::{landed_next, landed_slots};
+use qumbra_wallet::annulet_send::{open_session, send_annulet, SendPlan, SendRefusal, WalletEndpoint};
+use qumbra_wallet::annulet_v2::{landed_next, landed_slots, migrate};
 use qumbra_wallet::auth_journal::{generation_root, AuthJournal};
 use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
@@ -90,9 +93,30 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
     let urls: Vec<String> = net.served.iter().map(|a| format!("http://{a}")).collect();
     assert_eq!(balances(&w, &urls[1], 0, hash), vec![(0, tier_s as u128), (ASSET, 110)]);
 
+    // A version-1 recipient on this format-33 net is refused by name, before
+    // anything is planned or proved.
+    let mut rng = StdRng::seed_from_u64(896);
+    let refused = send_annulet(
+        &w,
+        WalletEndpoint { url: urls[1].clone() },
+        ASSET,
+        100,
+        &t.wallet().address_at_index(0),
+        0,
+        Some(hash),
+        &[],
+        Duration::from_secs(60),
+        &mut |_: &SendPlan| panic!("no plan for a v1 recipient"),
+        &mut rng,
+    );
+    assert!(
+        matches!(&refused, Err(SendRefusal::Auth(why)) if why.contains("version 1") && why.contains("new address")),
+        "{:?}",
+        refused.err().map(|e| e.to_string())
+    );
+
     // W sends 100 of asset 7 to T's v2 address through follower 1.
     let t_addr = t.wallet().address_candidate_a_at_index(0, &generation_root(&t.wallet(), 0));
-    let mut rng = StdRng::seed_from_u64(896);
     let report = send_annulet(
         &w,
         WalletEndpoint { url: urls[1].clone() },
@@ -124,9 +148,11 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
     assert_eq!(balances(&t, &urls[2], v[2].state_tip, hash), vec![(ASSET, 100)]);
     assert_eq!(balances(&w, &urls[1], v[1].state_tip, hash), vec![(0, 0), (ASSET, 10)]);
 
-    // The served Candidate A body carries the transaction's auth section:
-    // its real leaves give back the journal's position.
-    let served = qlab_l2spend::Served::new(WalletEndpoint { url: urls[1].clone() });
+    // The served Candidate A body — bound to the verified header — carries
+    // the transaction's auth section: its real leaves give back the journal's
+    // position.
+    let session = open_session(&w, WalletEndpoint { url: urls[1].clone() }, v[1].state_tip, Some(hash), &mut rng)
+        .expect("a verified session");
     let wallet = w.wallet();
     let root0 = generation_root(&wallet, 0);
     let spent: Vec<_> = notes
@@ -137,9 +163,33 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
             (owned, v[1].state_tip)
         })
         .collect();
-    let slots = landed_slots(&served, &wallet, &spent).expect("the landed body reads back");
+    let slots = landed_slots(&session, &wallet, &spent).expect("the landed body reads back, verified");
     assert_eq!(slots.len(), 3, "one S: three slots");
     assert_eq!(landed_next(&wallet, 0, &slots), 3, "the restore floor is the journal's position");
+
+    // `migrate --open-next` on this net: generation 1 opens, generation 0
+    // (holding the change) waits until tip + 1,152 — nothing is proved.
+    let tip = v[1].state_tip;
+    let report = migrate(
+        &w,
+        WalletEndpoint { url: urls[1].clone() },
+        tip,
+        Some(hash),
+        true,
+        Duration::from_secs(60),
+        &mut rng,
+    )
+    .expect("migrate --open-next");
+    assert_eq!(report.active, 1);
+    // The gate is an upper bound on the real tip at this moment: the
+    // harness may have sealed empty slot blocks since `tip` was read.
+    assert_eq!(report.waiting.len(), 1, "{:?}", report.waiting);
+    assert_eq!(report.waiting[0].0, 0);
+    assert!(report.waiting[0].1 >= tip + qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS, "{:?}", report.waiting);
+    assert!(report.swept.is_empty() && report.retired.is_empty());
+    let journal = AuthJournal::load(&w.dir).unwrap().unwrap();
+    assert_eq!(journal.active().g, 1);
+    assert_eq!(journal.get(0).unwrap().next, 3, "generation 0 consumed nothing more");
 
     for d in [&w.dir, &t.dir] {
         let _ = std::fs::remove_dir_all(d);

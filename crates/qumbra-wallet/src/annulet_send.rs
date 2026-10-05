@@ -532,6 +532,15 @@ pub struct Session<E: Endpoint> {
     /// Lab #896 G: every note the verified scan made the wallet's, spent or
     /// not (a restore reads their generations).
     pub owned: Vec<OwnedL2Note>,
+    /// Lab #896 G: the verified header chain — every body a Candidate A
+    /// write reads (a sweep floor, a restore's used generations) is bound
+    /// to it.
+    pub chain: crate::annulet_verify::VerifiedChain,
+    /// Lab #896 G: an upper bound on the real tip for a restore's sweep
+    /// gate: the larger of the verified tip and the endpoint's stated tip (a
+    /// stated tip lied higher only delays a sweep; one lied lower is floored
+    /// by the verified tip).
+    pub gate_tip: u64,
 }
 
 /// **The verified session** (lab #869 (a)): the genesis by its bytes against
@@ -558,6 +567,8 @@ pub fn open_session<E: Endpoint>(
     let spends_verified = verified.spends_verified();
     let l2_auth = verified.chain().genesis.l2_auth;
     let tip = verified.chain().tip();
+    let chain = verified.chain().clone();
+    let gate_tip = tip.max(verified.stated_tip().unwrap_or(0));
     let report = into_report(verified);
     let params = served.params()?;
     if params.genesis_hash != report.genesis_hash {
@@ -566,7 +577,7 @@ pub fn open_session<E: Endpoint>(
     let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p, r: params.fee_tier_r };
     let owned = report.owned.clone();
     let index = report.index.ok_or(SendRefusal::NoBalance)?;
-    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash, spends_verified, l2_auth, tip, owned })
+    Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash, spends_verified, l2_auth, tip, owned, chain, gate_tip })
 }
 
 /// This wallet's receiving [`Recipient`] (address 0: change, split notes).
@@ -656,13 +667,17 @@ pub fn send_annulet<E: Endpoint>(
     let recipient = recipient_of(to).ok_or(SendRefusal::Spend(SpendError::Served("the recipient address has no valid ek".into())))?;
     if candidate_a {
         // Lab #896 G: the active generation's notes, its keys, its address.
-        let mut run = crate::annulet_v2::AuthRun::open(w, &session, crate::annulet_v2::DEFAULT_VALIDITY_BLOCKS)?;
+        let mut run = crate::annulet_v2::AuthRun::open(w, &session, crate::annulet_v2::valid_for())?;
         let change = crate::annulet_v2::me_v2(&wallet, &run.auth_root());
         if shape == L2ShapeTag::P && qlab_air::l2p::CanonicalFreezeTree::from_keys(freeze_keys).is_frozen(&change.rkm) {
             return Err(SendRefusal::Spend(SpendError::Frozen { asset: u64::from(asset) }));
         }
         let index = session.index.only_generation(run.generation);
         let plan = plan_send(&index, asset, amount, shape, session.tiers)?;
+        // The leaves the plan takes, and the floor that keeps the generation
+        // sweepable — refused before anything is proved.
+        let notes = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+        run.check_budget(crate::annulet_v2::plan_slots(&plan), Some(notes))?;
         if !on_plan(&plan) {
             return Err(SendRefusal::PlanDeclined);
         }

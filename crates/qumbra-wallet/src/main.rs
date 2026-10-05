@@ -20,6 +20,13 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
+    // Lab #896 G: `--valid-for N` — the blocks past the verified tip a
+    // Candidate A transaction may land (default 256); a run refuses it by
+    // name above the consensus cap.
+    if let Some(n) = flag(args, "--valid-for") {
+        let n: u64 = n.parse().map_err(|_| "--valid-for must be a whole number of blocks")?;
+        qumbra_wallet::annulet_v2::set_valid_for(n);
+    }
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(&args[1..]),
         Some("restore") => restore(&args[1..]),
@@ -421,7 +428,9 @@ fn usage() {
          qumbra-wallet migrate --net annulet --url URL --scan-to H --genesis-hash HEX --dir DIR [--open-next]\n\
                             Candidate A: set up the auth journal (a restored wallet never resumes a\n\
                             generation), open a new one with --open-next, sweep older generations\n\
-                            once their wait on this net has passed\n  \
+                            once their wait on this net has passed\n\
+                            Candidate A writes (send, issuer, migrate) take --valid-for N: blocks\n\
+                            past the tip the transaction may land (default 256, at most 1,152)\n  \
          qumbra-wallet contact add NAME QADDR --dir DIR  save a full address under a local name\n  \
          qumbra-wallet contact list --dir DIR            show NAME → qs1… (short)\n  \
          qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
@@ -1907,6 +1916,9 @@ fn migrate_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     for g in &r.retired {
         println!("generation {g} retired (nothing left to spend)");
+    }
+    for g in &r.asset0_left {
+        println!("generation {g}: its asset-0 notes paid this sweep's fees and move on the next `migrate`");
     }
     Ok(())
 }

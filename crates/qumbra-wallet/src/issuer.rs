@@ -363,7 +363,9 @@ fn registry_write<E: Endpoint>(
 ) -> Result<RegistryReport, SendRefusal> {
     if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
         // Lab #896 G: the active generation's fee note and keys.
-        let mut run = crate::annulet_v2::AuthRun::open(w, session, crate::annulet_v2::DEFAULT_VALIDITY_BLOCKS)?;
+        let mut run = crate::annulet_v2::AuthRun::open(w, session, crate::annulet_v2::valid_for())?;
+        let notes = session.index.only_generation(run.generation).by_asset.values().map(|n| n.spendable.len() as u32).sum();
+        run.check_budget(1, Some(notes))?;
         let built = crate::annulet_v2::build_registry_write_v2(w, &mut run, session, leaf, isk, rng)?;
         return match session.served.submit(&built.tx) {
             Ok(()) => Ok(RegistryReport { leaf, new_root: built.new_root, change: built.output, seed: built.seed }),
@@ -744,9 +746,12 @@ fn prepare_issue_v2<E: Endpoint>(
     split_wait: Duration,
     rng: &mut StdRng,
 ) -> Result<PreparedIssue<E>, SendRefusal> {
-    use crate::annulet_v2::{build_spend_v2, exact_fee_note_v2, me_v2, AuthRun, V2Spend, DEFAULT_VALIDITY_BLOCKS};
-    let mut run = AuthRun::open(w, &session, DEFAULT_VALIDITY_BLOCKS)?;
+    use crate::annulet_v2::{build_spend_v2, exact_fee_note_v2, me_v2, valid_for, AuthRun, V2Spend};
+    let mut run = AuthRun::open(w, &session, valid_for())?;
     let index = session.index.only_generation(run.generation);
+    // At most a fee split (1) and the P (2): checked before anything is taken.
+    let notes = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+    run.check_budget(3, Some(notes))?;
     let a = u64::from(asset);
     let base = match redeem {
         None => index.spendable(asset).iter().min_by_key(|n| n.note.value).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?,
@@ -756,7 +761,11 @@ fn prepare_issue_v2<E: Endpoint>(
             .filter(|n| n.note.value >= amount)
             .min_by_key(|n| n.note.value)
             .cloned()
-            .ok_or(SendRefusal::NoSingleNoteCovers { asset, amount, largest: 0 })?,
+            .ok_or(SendRefusal::NoSingleNoteCovers {
+                asset,
+                amount,
+                largest: index.spendable(asset).iter().map(|n| n.note.value).max().unwrap_or(0),
+            })?,
     };
     let (fee, split) = exact_fee_note_v2(w, &mut run, &session, session.tiers.p, split_wait, rng)?;
     let wallet = w.wallet();

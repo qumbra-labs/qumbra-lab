@@ -316,6 +316,24 @@ pub fn genesis_from_bytes(pin: [u8; 32], bytes: &[u8]) -> Result<VerifiedGenesis
     Ok(VerifiedGenesis { hash: fetched, file, header_hash, l2_auth })
 }
 
+/// Lab #896 G: refuse, by name, an endpoint body whose transaction lists
+/// more than 255 nullifiers or commitments — the body commitment encodes
+/// each count in one byte and asserts it, so such a body must never reach
+/// it from a served answer.
+pub(crate) fn check_body_counts(height: u64, body: &qlab_devnet::body::BlockBody) -> Result<(), VerifyRefusal> {
+    let over = body
+        .txs
+        .iter()
+        .any(|tx| tx.public.nullifiers.len() > u8::MAX as usize || tx.public.commitments.len() > u8::MAX as usize);
+    if over {
+        return Err(VerifyRefusal::BodyMalformed {
+            height,
+            why: "a transaction lists more than 255 nullifiers or commitments".into(),
+        });
+    }
+    Ok(())
+}
+
 /// A header chain verified from the genesis file to its tip.
 #[derive(Clone, Debug)]
 pub struct VerifiedChain {

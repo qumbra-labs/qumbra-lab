@@ -39,6 +39,27 @@ use crate::store::WalletDir;
 pub const DEFAULT_VALIDITY_BLOCKS: u64 = 256;
 const _: () = assert!(DEFAULT_VALIDITY_BLOCKS <= MAX_AUTH_VALIDITY_BLOCKS);
 
+/// The validity this process signs with: [`DEFAULT_VALIDITY_BLOCKS`] unless
+/// the CLI's `--valid-for N` set it ([`set_valid_for`]) for this one command.
+static VALID_FOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(DEFAULT_VALIDITY_BLOCKS);
+
+/// Set the validity this process's Candidate A writes sign with (the CLI's
+/// `--valid-for`). Checked against the consensus cap when a run opens.
+pub fn set_valid_for(blocks: u64) {
+    VALID_FOR.store(blocks, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The validity a run signs with now.
+pub fn valid_for() -> u64 {
+    VALID_FOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The leaves an ordinary send must leave unconsumed in its generation:
+/// one per spendable note plus two, so the generation can always still be
+/// swept. A hard floor ahead of Phase 4's reserve (`2 × unspent + 16`,
+/// design 2b §9), which replaces it.
+pub const SWEEP_FLOOR_EXTRA: u32 = 2;
+
 /// A refusal of the Candidate A layer, folded into [`SendRefusal`].
 impl From<JournalError> for SendRefusal {
     fn from(e: JournalError) -> Self {
@@ -74,7 +95,10 @@ impl AuthRun {
         let wallet = w.wallet();
         let journal = match AuthJournal::load(&w.dir)? {
             Some(j) => j,
-            None => restore_journal(&lock, w, &wallet, &session.owned, &session.genesis_hash, session.tip)?,
+            None => {
+                let used = landed_generations(session, &wallet)?;
+                restore_journal(&lock, w, &wallet, &session.owned, &used, &session.genesis_hash, session.gate_tip)?
+            }
         };
         let (g, next) = (journal.active().g, journal.active().next);
         Self::for_generation(lock, journal, &wallet, g, next, session, validity)
@@ -90,11 +114,12 @@ impl AuthRun {
         validity: u64,
     ) -> Result<Self, SendRefusal> {
         let keys = LocalAuth::new(&wallet.auth_secret(), g, next).map_err(SendRefusal::Auth)?;
-        assert_eq!(
-            keys.auth_root(),
-            journal.get(g)?.auth_root,
-            "the journal's cached root is the generation's tree"
-        );
+        if keys.auth_root() != journal.get(g)?.auth_root {
+            return Err(SendRefusal::Auth(format!(
+                "auth.v1's root for generation {g} is not this wallet's tree: the journal was edited or belongs to \
+                 another seed — refusing to sign with it"
+            )));
+        }
         Ok(AuthRun {
             lock,
             journal,
@@ -110,6 +135,38 @@ impl AuthRun {
     /// addresses bind.
     pub fn auth_root(&self) -> [u64; 4] {
         self.keys.auth_root()
+    }
+
+    /// Unconsumed leaves left in the run's generation.
+    pub fn remaining(&self) -> u32 {
+        (1u32 << D_AUTH) - self.keys.next()
+    }
+
+    /// Refuse, before anything is taken, a run that needs `needed` real
+    /// slots when fewer remain; and for an ordinary send (`keep = Some(n)`,
+    /// `n` the generation's spendable notes) one that would leave fewer than
+    /// `n + SWEEP_FLOOR_EXTRA`, so the generation can still be swept.
+    pub fn check_budget(&self, needed: u32, keep: Option<u32>) -> Result<(), SendRefusal> {
+        let remaining = self.remaining();
+        if needed > remaining {
+            return Err(SendRefusal::Auth(format!(
+                "this needs {needed} authorizations and generation {} has {remaining} left; run `qumbra-wallet \
+                 migrate --open-next`",
+                self.generation
+            )));
+        }
+        if let Some(notes) = keep {
+            let floor = notes.saturating_add(SWEEP_FLOOR_EXTRA);
+            if remaining - needed < floor {
+                return Err(SendRefusal::Auth(format!(
+                    "generation {} would keep {} authorizations, below the {floor} needed to sweep its {notes} \
+                     note(s); run `qumbra-wallet migrate --open-next` and send from the new generation",
+                    self.generation,
+                    remaining - needed
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Take one leaf per real slot and **persist the advance** before the
@@ -174,6 +231,32 @@ pub fn me_v2(wallet: &Wallet, auth_root: &[u64; 4]) -> Recipient {
     Recipient { rkm: addr.rkm_lanes(), ek: addr.encapsulation_key().expect("the wallet's own address has an ek") }
 }
 
+/// Every input of one transaction is of generation `g` — the run's keys
+/// (design 2b §5: one key per transaction), refused by name otherwise.
+pub fn one_generation(notes: &[&OwnedL2Note], g: u32) -> Result<(), SendRefusal> {
+    match notes.iter().find(|n| n.generation != Some(g)) {
+        None => Ok(()),
+        Some(n) => Err(SendRefusal::Auth(format!(
+            "a note of generation {:?} cannot be spent beside generation {g}'s keys (one key per transaction)",
+            n.generation
+        ))),
+    }
+}
+
+/// The real slots — leaves — a plan takes: a fee split 1, a merge 3, a
+/// payment 1, 2 or 3 by its inputs and fee note.
+pub fn plan_slots(plan: &crate::annulet_send::SendPlan) -> u32 {
+    use crate::annulet_send::StepKind;
+    plan.steps
+        .iter()
+        .map(|s| match &s.kind {
+            StepKind::FeeSplit { .. } => 1,
+            StepKind::Merge { .. } => 3,
+            StepKind::Pay { inputs, fee } => inputs.len() as u32 + u32::from(fee.is_some()),
+        })
+        .sum()
+}
+
 /// The shape-S / shape-P transaction a v1 call made, in v2 terms: which
 /// slots are real inputs (all of the run's generation) and what slot 3 is.
 pub enum V2Spend<'a> {
@@ -228,14 +311,7 @@ pub fn build_spend_v2<E: Endpoint>(
         V2Spend::Two(xs) => xs.to_vec(),
         V2Spend::TwoAndFee(xs, f) => vec![xs[0], xs[1], *f],
     };
-    for n in &notes {
-        if n.generation != Some(run.generation) {
-            return Err(SendRefusal::Auth(format!(
-                "a note of generation {:?} cannot be spent beside generation {}'s keys (one key per transaction)",
-                n.generation, run.generation
-            )));
-        }
-    }
+    one_generation(&notes, run.generation)?;
     let paths = run.take(&w.dir, notes.len())?;
     let taken: Vec<u32> = paths.iter().map(|p| p.leaf_index).collect();
     let real: Vec<L2AuthInput> = notes.iter().zip(paths).map(|(n, p)| real_input(&wallet, n, p)).collect();
@@ -279,14 +355,22 @@ pub fn build_spend_v2<E: Endpoint>(
     Ok(built)
 }
 
-/// **Restore → migrate** (§9) for a wallet with no `auth.v1`: the
-/// generations its verified scan found notes in (`owned`, spent or not) are
-/// never resumed. The highest generation with notes is `g*`; `g* + 1` opens
-/// as the active one; every generation `≤ g*` with unspent notes becomes
-/// sweep-only, gated on this net at `tip + MAX_AUTH_VALIDITY_BLOCKS` (by
-/// which every authorization exported before the loss has expired), and
-/// every generation with only spent notes retires. A wallet with no notes at
-/// all has exported nothing, so it starts at generation 0.
+/// **Restore → migrate** (§9) for a wallet with no `auth.v1`: no generation
+/// it has used is ever resumed. A generation is **used** if the verified
+/// scan found a note of it (`owned`, spent or not) or if a landed
+/// transaction carries one of its leaves (`used`, from
+/// [`landed_generations`] — this catches a generation whose notes sit at
+/// addresses the restored wallet has not allocated). `g*` is the highest used
+/// generation; `g* + 1` opens as the active one; every used generation with
+/// notes becomes sweep-only, gated on this net at `gate_tip +
+/// MAX_AUTH_VALIDITY_BLOCKS` (`gate_tip` an upper bound on the real tip, by
+/// which every authorization exported before the loss has expired). A wallet
+/// with no used generation starts at generation 0.
+///
+/// **What stays undetectable, inherently:** a generation that exported an
+/// authorization which never landed, and holds no note this scan sees. And,
+/// as for v1, notes at diversifier indices the restored wallet has not
+/// allocated are not scanned (the wallet's existing restore limitation).
 ///
 /// The swept generations' cursors restart **above** every position a landed
 /// spend used — rebuilt by [`landed_next`] when the sweep runs; until then
@@ -296,10 +380,11 @@ pub fn restore_journal(
     w: &WalletDir,
     wallet: &Wallet,
     owned: &[OwnedL2Note],
+    used: &std::collections::BTreeSet<u32>,
     genesis: &[u8; 32],
-    tip: u64,
+    gate_tip: u64,
 ) -> Result<AuthJournal, SendRefusal> {
-    let top = owned.iter().filter_map(|n| n.generation).max();
+    let top = owned.iter().filter_map(|n| n.generation).chain(used.iter().copied()).max();
     let probed = crate::auth_journal::PROBE_GENERATIONS;
     let journal = match top {
         None => AuthJournal::fresh(generation_root(wallet, 0)),
@@ -307,7 +392,7 @@ pub fn restore_journal(
             return Err(JournalError::ProbeExhausted { probed }.into());
         }
         Some(g_star) => {
-            let gate = SweepGate { genesis: *genesis, not_before_height: tip + MAX_AUTH_VALIDITY_BLOCKS };
+            let gate = SweepGate { genesis: *genesis, not_before_height: gate_tip + MAX_AUTH_VALIDITY_BLOCKS };
             let mut gens = Vec::new();
             for g in 0..=g_star {
                 let notes: Vec<&OwnedL2Note> = owned.iter().filter(|n| n.generation == Some(g)).collect();
@@ -386,6 +471,9 @@ pub fn run_plan_v2<E: Endpoint>(
     let s_tier = session.tiers.s;
     let a = u64::from(plan.asset);
     let ctx = PolicyContext { freeze_keys: freeze_keys.to_vec(), ..Default::default() };
+    // Every leaf the plan takes, before step 1: a split must not land and
+    // leave the payment without one.
+    run.check_budget(plan_slots(plan), None)?;
     let own_root = run.auth_root();
     let own = me_v2(&wallet, &own_root);
     let gens = [(run.generation, own_root)];
@@ -461,43 +549,95 @@ pub fn run_plan_v2<E: Endpoint>(
     Ok(made.into_iter().map(|m| m.expect("every step ran")).collect())
 }
 
+/// The body of block `height`, **bound to the verified header**: decoded in
+/// the Candidate A frame, its header the verified one, its counts within the
+/// commitment's bytes, and its `tx_body_commitment` recomputed. A sweep
+/// floor or a restore's used generations rest on it, so an endpoint's word
+/// is never enough.
+pub fn verified_body<E: Endpoint>(session: &Session<E>, height: u64) -> Result<qlab_devnet::body::BlockBody, SendRefusal> {
+    let header = session
+        .chain
+        .header(height)
+        .ok_or_else(|| SendRefusal::Auth(format!("height {height} is above the verified tip")))?;
+    let bytes = session
+        .served
+        .endpoint
+        .get(&format!("/v1/block/{height}/body"))
+        .map_err(|why| SendRefusal::Auth(format!("block {height}'s body is unavailable: {why}")))?;
+    let ann = qlab_p2p::served::decode_body_answer(session.chain.genesis.wire(), height, &bytes)
+        .map_err(|e| SendRefusal::Auth(format!("block {height}'s body does not decode: {e}")))?;
+    if ann.header != header {
+        return Err(SendRefusal::Auth(format!("block {height}'s served header is not the verified one")));
+    }
+    let body = qlab_p2p::served::body_of(&ann);
+    crate::annulet_verify::check_body_counts(height, &body).map_err(SendRefusal::Verify)?;
+    if qlab_devnet::annulet::body_commitment_annulet_for(&body, session.chain.genesis.l2_auth) != header.tx_body_commitment {
+        return Err(SendRefusal::Auth(format!("block {height}'s body is not the one its verified header commits to")));
+    }
+    Ok(body)
+}
+
+/// Every slot `(leaf_index, leaf)` of a transaction's auth section, or none
+/// when it carries no readable one.
+fn slots_of(tx: &qlab_devnet::body::TxEntry) -> Vec<(u32, [u8; 32])> {
+    use qlab_devnet::annulet::L2Surface;
+    use qlab_remote_auth::annulet::AnnuletAuthSection;
+    let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { return Vec::new() };
+    match AnnuletAuthSection::decode(qlab_devnet::annulet::auth_shape(surface.shape), &tx.auth) {
+        Ok(section) => section.slots.iter().map(|s| (s.descriptor.leaf_index(), s.descriptor.leaf())).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The `(leaf_index, leaf)` of every slot of every landed transaction that
-/// spent one of `spent` (generation `g`'s spent notes with their heights) —
-/// read from the served bodies, whose Candidate A frame carries each
-/// transaction's auth section. [`landed_next`] keeps the real slots.
+/// spent one of `spent` (a generation's spent notes with their heights),
+/// read from **verified** bodies ([`verified_body`]). [`landed_next`] keeps
+/// the real slots.
 pub fn landed_slots<E: Endpoint>(
-    served: &Served<E>,
+    session: &Session<E>,
     wallet: &Wallet,
     spent: &[(OwnedL2Note, u64)],
 ) -> Result<Vec<(u32, [u8; 32])>, SendRefusal> {
-    use qlab_devnet::annulet::L2Surface;
-    use qlab_remote_auth::annulet::AnnuletAuthSection;
     let mut heights: std::collections::BTreeMap<u64, Vec<[u8; 32]>> = std::collections::BTreeMap::new();
     for (n, h) in spent {
         heights.entry(*h).or_default().push(n.nullifier(wallet));
     }
     let mut out = Vec::new();
     for (h, nfs) in heights {
-        let bytes = served
-            .endpoint
-            .get(&format!("/v1/block/{h}/body"))
-            .map_err(|why| SendRefusal::Auth(format!("block {h}'s body is unavailable: {why}")))?;
-        let ann = qlab_p2p::served::decode_body_answer(qlab_p2p::compact::WireForm::ANNULET_AUTH, h, &bytes)
-            .map_err(|e| SendRefusal::Auth(format!("block {h}'s body does not decode: {e}")))?;
-        for tx in qlab_p2p::served::body_of(&ann).txs {
-            if !tx.public.nullifiers.iter().any(|nf| nfs.contains(nf)) {
-                continue;
+        for tx in verified_body(session, h)?.txs {
+            if tx.public.nullifiers.iter().any(|nf| nfs.contains(nf)) {
+                out.extend(slots_of(&tx));
             }
-            let shape = match L2Surface::decode(&tx.l2) {
-                Ok(Some(s)) => qlab_devnet::annulet::auth_shape(s.shape),
-                _ => return Err(SendRefusal::Auth(format!("a landed spend at height {h} has no surface"))),
-            };
-            let section = AnnuletAuthSection::decode(shape, &tx.auth)
-                .map_err(|e| SendRefusal::Auth(format!("a landed spend at height {h} has no readable auth section: {e:?}")))?; // debug-ok
-            out.extend(section.slots.iter().map(|s| (s.descriptor.leaf_index(), s.descriptor.leaf())));
         }
     }
     Ok(out)
+}
+
+/// The probe generations (`0 .. PROBE_GENERATIONS`) whose leaves appear in
+/// any landed transaction on the verified chain — hash compares against each
+/// generation's tree, no decryption; a dummy's leaf never matches. One
+/// verified body per block, so a restore reads the whole chain once.
+pub fn landed_generations<E: Endpoint>(session: &Session<E>, wallet: &Wallet) -> Result<std::collections::BTreeSet<u32>, SendRefusal> {
+    use qlab_remote_auth::annulet::{auth_master, AuthTree};
+    let trees: Vec<(u32, AuthTree)> = (0..crate::auth_journal::PROBE_GENERATIONS)
+        .map(|g| (g, AuthTree::build(&auth_master(&wallet.auth_secret(), g), D_AUTH).expect("D_AUTH is a valid depth")))
+        .collect();
+    let mut used = std::collections::BTreeSet::new();
+    for h in 1..=session.chain.tip() {
+        for tx in verified_body(session, h)?.txs {
+            for (index, leaf) in slots_of(&tx) {
+                if (index as usize) >= (1usize << D_AUTH) {
+                    continue;
+                }
+                for (g, tree) in &trees {
+                    if tree.leaf(index) == leaf {
+                        used.insert(*g);
+                    }
+                }
+            }
+        }
+    }
+    Ok(used)
 }
 
 /// What [`migrate`] did.
@@ -513,6 +653,10 @@ pub struct MigrateReport {
     pub waiting: Vec<(u32, u64)>,
     /// Generations retired by this run (nothing left to spend).
     pub retired: Vec<u32>,
+    /// Swept generations whose asset-0 notes this run left: a generation
+    /// holding other assets too sweeps those first (their fees come from its
+    /// asset-0 notes), and its asset 0 on the next `migrate`.
+    pub asset0_left: Vec<u32>,
 }
 
 /// **`migrate`** (§9): set the journal up if the wallet has none (restore →
@@ -542,16 +686,26 @@ pub fn migrate<E: Endpoint>(
     let lock = AuthLock::acquire(&w.dir)?;
     let (mut journal, initialized) = match AuthJournal::load(&w.dir)? {
         Some(j) => (j, false),
-        None => (restore_journal(&lock, w, &wallet, &session.owned, &session.genesis_hash, session.tip)?, true),
+        None => {
+            let used = landed_generations(&session, &wallet)?;
+            (restore_journal(&lock, w, &wallet, &session.owned, &used, &session.genesis_hash, session.gate_tip)?, true)
+        }
     };
     if open_next {
         let next_g = journal.generations().iter().map(|r| r.g).max().expect("non-empty") + 1;
-        let gate = SweepGate { genesis: session.genesis_hash, not_before_height: session.tip + MAX_AUTH_VALIDITY_BLOCKS };
+        let gate = SweepGate { genesis: session.genesis_hash, not_before_height: session.gate_tip + MAX_AUTH_VALIDITY_BLOCKS };
         journal.open_next(&lock, &w.dir, generation_root(&wallet, next_g), gate)?;
     }
     let active_root = journal.active().auth_root;
     let to_active = me_v2(&wallet, &active_root);
-    let mut report = MigrateReport { initialized, active: journal.active().g, swept: Vec::new(), waiting: Vec::new(), retired: Vec::new() };
+    let mut report = MigrateReport {
+        initialized,
+        active: journal.active().g,
+        swept: Vec::new(),
+        waiting: Vec::new(),
+        retired: Vec::new(),
+        asset0_left: Vec::new(),
+    };
     let sweeps: Vec<u32> = journal
         .generations()
         .iter()
@@ -562,7 +716,8 @@ pub fn migrate<E: Endpoint>(
     for g in sweeps {
         // Each generation under the lock, on the journal as it is on disk now.
         let lock = AuthLock::acquire(&w.dir)?;
-        let mut j = AuthJournal::load(&w.dir)?.expect("written above");
+        let mut j = AuthJournal::load(&w.dir)?
+            .ok_or_else(|| SendRefusal::Auth("auth.v1 disappeared while migrating".into()))?;
         let index = session.index.only_generation(g);
         let spendable: Vec<OwnedL2Note> = index.by_asset.values().flat_map(|n| n.spendable.iter().cloned()).collect();
         if spendable.is_empty() {
@@ -577,7 +732,7 @@ pub fn migrate<E: Endpoint>(
                 continue;
             }
             Err(JournalError::SweepNoGate { .. }) => {
-                let h = session.tip + MAX_AUTH_VALIDITY_BLOCKS;
+                let h = session.gate_tip + MAX_AUTH_VALIDITY_BLOCKS;
                 j.add_gate(&lock, &w.dir, g, SweepGate { genesis: session.genesis_hash, not_before_height: h })?;
                 report.waiting.push((g, h));
                 continue;
@@ -586,11 +741,11 @@ pub fn migrate<E: Endpoint>(
         }
         // The cursor above every landed own leaf of g.
         let spent: Vec<(OwnedL2Note, u64)> = index.by_asset.values().flat_map(|n| n.spent.iter().cloned()).collect();
-        let landed = landed_slots(&session.served, &wallet, &spent)?;
+        let landed = landed_slots(&session, &wallet, &spent)?;
         let floor = landed_next(&wallet, g, &landed);
         let next = j.get(g)?.next.max(floor);
         j.advance(&lock, &w.dir, g, next)?;
-        let mut run = AuthRun::for_generation(lock, j, &wallet, g, next, &session, DEFAULT_VALIDITY_BLOCKS)?;
+        let mut run = AuthRun::for_generation(lock, j, &wallet, g, next, &session, valid_for())?;
         let mut txs = 0usize;
         // Non-zero assets: the planner, paying the active generation.
         for (&asset, notes) in &index.by_asset {
@@ -609,6 +764,9 @@ pub fn migrate<E: Endpoint>(
         // Note: the planner above may have spent some asset-0 notes as fees;
         // the session's index predates that, so a fresh scan is the next
         // migrate's job — this pass sweeps only notes it did not just spend.
+        if !index.by_asset.keys().all(|a| *a == 0) && !index.spendable(0).is_empty() {
+            report.asset0_left.push(g);
+        }
         if index.by_asset.keys().all(|a| *a == 0) {
             for n in index.spendable(0) {
                 if n.note.value <= session.tiers.s {
@@ -763,7 +921,8 @@ mod tests {
         let lock = AuthLock::acquire(&w.dir).unwrap();
         let genesis = [0x33; 32];
         let owned = [note_of(&wallet, 0, 1, 1), note_of(&wallet, 2, 1, 2)];
-        let j = restore_journal(&lock, &w, &wallet, &owned, &genesis, 500).unwrap();
+        let none = std::collections::BTreeSet::new();
+        let j = restore_journal(&lock, &w, &wallet, &owned, &none, &genesis, 500).unwrap();
         assert_eq!(j.active().g, 3);
         assert_eq!(j.active().next, 0);
         assert_eq!(j.active().auth_root, generation_root(&wallet, 3));
@@ -774,14 +933,24 @@ mod tests {
         assert_eq!(AuthJournal::load(&w.dir).unwrap(), Some(j), "persisted");
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
-        let fresh = restore_journal(&lock, &w, &wallet, &[], &genesis, 500).unwrap();
+        let fresh = restore_journal(&lock, &w, &wallet, &[], &none, &genesis, 500).unwrap();
         assert_eq!(fresh.active().g, 0, "no notes: nothing was ever exported");
         assert_eq!(fresh.generations().len(), 1);
+        std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
+
+        // A generation seen only through its landed leaves (its notes at an
+        // unallocated address) is used too: notes in 0, leaves landed in 4
+        // → generation 5 active.
+        let leaves_in_4: std::collections::BTreeSet<u32> = [4].into();
+        let j = restore_journal(&lock, &w, &wallet, &owned[..1], &leaves_in_4, &genesis, 500).unwrap();
+        assert_eq!(j.active().g, 5, "the generation above every used one");
+        assert!(j.get(4).is_err(), "no note of 4 to sweep, so it is not recorded");
+        std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
         let last = crate::auth_journal::PROBE_GENERATIONS - 1;
         let edge = [note_of(&wallet, last, 1, 9)];
         assert!(matches!(
-            restore_journal(&lock, &w, &wallet, &edge, &genesis, 500),
+            restore_journal(&lock, &w, &wallet, &edge, &none, &genesis, 500),
             Err(SendRefusal::Auth(why)) if why.contains("last of the")
         ));
         let _ = std::fs::remove_dir_all(&w.dir);
@@ -810,6 +979,21 @@ mod tests {
         assert_eq!(landed_next(&wallet, 0, &landed), 4, "position 3 + 1, whatever the indices");
         // Only position 1 landed: the cursor restarts at 2.
         assert_eq!(landed_next(&wallet, 0, &[(drawn[1], tree.leaf(drawn[1]))]), 2);
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// One key per transaction: a note of another generation (or a v1
+    /// note) beside the run's generation is refused by name.
+    #[test]
+    fn a_mixed_generation_spend_is_refused_by_name() {
+        let w = wallet_dir("mix", 8);
+        let wallet = w.wallet();
+        let (a, b) = (note_of(&wallet, 0, 3, 1), note_of(&wallet, 1, 3, 2));
+        assert!(one_generation(&[&a], 0).is_ok());
+        assert!(matches!(one_generation(&[&a, &b], 0), Err(SendRefusal::Auth(why)) if why.contains("one key per transaction")));
+        let mut v1 = a.clone();
+        v1.generation = None;
+        assert!(one_generation(&[&v1], 0).is_err(), "a v1 note under v2 keys");
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 

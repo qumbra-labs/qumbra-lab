@@ -246,6 +246,7 @@ where
                 return Err(VerifyRefusal::BodyHeaderMismatch { height });
             }
             let body = qlab_p2p::served::body_of(&ann);
+            crate::annulet_verify::check_body_counts(height, &body)?;
             if body_commitment_annulet_for(&body, chain.genesis.l2_auth) != header.tx_body_commitment {
                 return Err(VerifyRefusal::BodyCommitmentMismatch { height });
             }
