@@ -65,6 +65,10 @@ qlab-p2p = { path = "../qlab-p2p" }
 # assembly the wallet shares (promoted to qlab-l2spend in C2, lab #720).
 qlab-air = { path = "../qlab-air" }
 qlab-l2spend = { path = "../qlab-l2spend" }
+# Lab #896 H (QH2): on a Candidate A genesis the faucet signs its own grants
+# with the dev key's generation-0 leaves and keeps their cursor in the same
+# `auth.v1` journal the wallet uses. Already in the graph via qlab-l2spend.
+qlab-remote-auth = { path = "../qlab-remote-auth" }
 # TOML service config, same posture and same `=`-free pin as the node's.
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

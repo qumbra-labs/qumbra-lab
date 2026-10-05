@@ -1915,6 +1915,7 @@ dependencies = [
  "qlab-node",
  "qlab-note",
  "qlab-p2p",
+ "qlab-remote-auth",
  "qlab-wallet",
  "qumbra-node",
  "rand 0.10.2",

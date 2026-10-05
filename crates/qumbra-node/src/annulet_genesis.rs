@@ -137,6 +137,10 @@ pub trait AnnuletGenesisBuild: Sized {
     fn fixture() -> Self;
     /// **The Annulet devnet genesis** (see the impl).
     fn devnet() -> Self;
+    /// **The Candidate A devnet genesis** (lab #896 H; see the impl).
+    fn devnet_v2() -> Self;
+    /// **The Candidate A rehearsal genesis** (lab #896 H; see the impl).
+    fn devnet_v2_rehearsal() -> Self;
 }
 
 impl AnnuletGenesisBuild for AnnuletGenesisFile {
@@ -234,6 +238,59 @@ impl AnnuletGenesisBuild for AnnuletGenesisFile {
             0,
         )
     }
+    /// **The Candidate A devnet genesis** (lab #896 H, QH1): [`Self::devnet`]
+    /// on the authorization axis — format 33, the genesis body under the
+    /// Candidate A domain — with the same parameters, registry and stock, but
+    /// every note paid to a **v2** `rkm` (`H(nk ‖ D_R ‖ d ‖ auth_root)`, the
+    /// dev key's generation-0 tree: [`devnet::rkm_v2`]). The v1 devnet and
+    /// fixture are untouched. Pinned by `annulet_devnet_v2_genesis_hash_is_pinned`.
+    fn devnet_v2() -> Self {
+        devnet_v2_with("annulet-devnet-v2", 10, 6)
+    }
+    /// **The Candidate A rehearsal genesis** (lab #896 H, QH3): [`Self::devnet_v2`]
+    /// with `slot_secs` 1 and `max_empty_slots` 1 — a block every second, so
+    /// the box rehearsal's 1,152-block sweep gate passes in about twenty
+    /// minutes instead of hours. Its own network name and hash; nothing else
+    /// differs.
+    fn devnet_v2_rehearsal() -> Self {
+        devnet_v2_with("annulet-devnet-v2-rehearsal", 1, 1)
+    }
+}
+
+/// The Candidate A devnet at the given slot parameters (lab #896 H).
+fn devnet_v2_with(network: &str, slot_secs: u64, max_empty_slots: u64) -> AnnuletGenesisFile {
+    let params = AnnuletParams {
+        fee_tier_s: devnet::FEE_TIER_S,
+        fee_tier_p: devnet::FEE_TIER_P,
+        fee_tier_r: devnet::FEE_TIER_R,
+        slot_secs,
+        max_empty_slots,
+    };
+    let usdt = devnet::usdt_test_leaf();
+    let usdt = RegistryLeafRecord {
+        asset: usdt.asset as u16,
+        issuer_key: usdt.issuer_key,
+        mode: usdt.mode,
+        freeze_root: usdt.freeze_root,
+        allow_root: usdt.allow_root,
+        flags: usdt.flags,
+    };
+    let record = |n: &qlab_note::l2note::L2Note| GenesisNoteRecord {
+        cm: h32(&n.commitment()),
+        payload: qlab_note::l2note::GenesisPlaintext::of(n).0.to_vec(),
+    };
+    let mut notes: Vec<GenesisNoteRecord> =
+        (0..devnet::STOCK_NOTES).map(|i| record(&devnet::stock_note_v2(i))).collect();
+    notes.push(record(&devnet::holder_usdt_note_v2()));
+    AnnuletGenesisFile::assemble_with_auth(
+        network,
+        params,
+        devnet::SEQUENCER_SEED,
+        vec![RegistryLeafRecord::asset_zero(), usdt],
+        notes,
+        0,
+        qlab_devnet::forms::L2AuthForm::CandidateA,
+    )
 }
 
 /// **The Annulet devnet's dev keys and stock** (lab #716, B6) — **devnet
@@ -317,6 +374,53 @@ pub mod devnet {
             rseed: [0x401D_5EED, 4, 5, 6],
         }
     }
+
+    // ------------------------------------------------ Candidate A (lab #896 H)
+
+    /// A dev key's authorization secret, by the wallet's own rule
+    /// (`qlab_wallet::Wallet::auth_secret`: the `sk` lanes as bytes), so a
+    /// wallet holding a dev key derives the same trees.
+    pub fn auth_secret(sk: [u64; 4]) -> [u8; 32] {
+        qlab_note::hash::digest_bytes(&sk)
+    }
+
+    /// A dev key's `nk` (the circuit's `H(sk ‖ D_N)`).
+    pub fn nk(sk: [u64; 4]) -> [u64; 4] {
+        qlab_air::l2::derive_input_l2(&L2TxInput { sk, value: 0, asset: 0, rho: [0; 4], rseed: [0; 4], d: [0; 2] }).0
+    }
+
+    /// A dev key's generation-0 authorization root, built once per process
+    /// (each build is a `2^D_AUTH`-leaf ML-DSA tree).
+    pub fn auth_root_g0(sk: [u64; 4]) -> [u64; 4] {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static ROOTS: OnceLock<Mutex<HashMap<[u64; 4], [u64; 4]>>> = OnceLock::new();
+        let roots = ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(r) = roots.lock().unwrap_or_else(|p| p.into_inner()).get(&sk) {
+            return *r;
+        }
+        let r = qlab_remote_auth::annulet::journal::generation_root(&auth_secret(sk), 0);
+        roots.lock().unwrap_or_else(|p| p.into_inner()).insert(sk, r);
+        r
+    }
+
+    /// A dev key's Candidate A receiving `rkm` at generation 0
+    /// (`H(nk ‖ D_R ‖ d ‖ auth_root)`, the v2 circuit's derivation).
+    pub fn rkm_v2(sk: [u64; 4], d: [u64; 2]) -> [u64; 4] {
+        qlab_air::l2::l2_rkm_v2(&nk(sk), &d, &auth_root_g0(sk))
+    }
+
+    /// Stock note `i` of the Candidate A devnet: [`stock_note`] paid to the
+    /// faucet's v2 `rkm`.
+    pub fn stock_note_v2(i: u64) -> L2Note {
+        L2Note { rkm: rkm_v2(FAUCET_SK, FAUCET_D), ..stock_note(i) }
+    }
+
+    /// The Candidate A devnet's `USDT-test` note: [`holder_usdt_note`] paid
+    /// to the holder's v2 `rkm`.
+    pub fn holder_usdt_note_v2() -> L2Note {
+        L2Note { rkm: rkm_v2(HOLDER_SK, HOLDER_D), ..holder_usdt_note() }
+    }
 }
 
 
@@ -371,6 +475,95 @@ mod tests {
     /// in lab #728 when `fee_tier_r` joined `AnnuletParams` — it was
     /// `831de12f…e9ef`, 5,230 B; now 5,238 B).
     const DEVNET_GENESIS_HASH: &str = "00c70e55c95e8f6519e956884bf6ffc56476fe1b3cd196983a46e1f4221d7e03";
+
+    /// The Candidate A devnet and rehearsal genesis hashes (lab #896 H, QH1):
+    /// from `qumbra-node genesis annulet-devnet --v2` / `--rehearsal` at
+    /// b3daa761, each run twice in fresh processes, byte-identical (5,241 B
+    /// and 5,251 B; coordinator-run, `logs/h-pins-20261005/pins.log`).
+    const DEVNET_V2_GENESIS_HASH: Option<&str> =
+        Some("2bd53cd149cd5e8b43917b468c82249dd41c1602814b1f24ef39e61cafb3d13a");
+    const DEVNET_V2_REHEARSAL_GENESIS_HASH: Option<&str> =
+        Some("e21a7b089927dbede8171744675830bd60f8f3b854617421a9fcf8e4728fee97");
+
+    fn opened(g: &AnnuletGenesisFile) -> Vec<qlab_note::l2note::L2Note> {
+        g.genesis_notes
+            .iter()
+            .map(|n| qlab_note::l2note::GenesisPlaintext::open(&n.payload).expect("a genesis payload opens"))
+            .collect()
+    }
+
+    /// The Candidate A devnet genesis: format 33, deterministic (each
+    /// construction built twice), verifies on the Candidate A axis, its
+    /// registry and parameters the v1 devnet's, every note the v1 devnet's
+    /// but for a v2 `rkm` — and the rehearsal differs from it in the slot
+    /// parameters and network name only.
+    #[test]
+    fn annulet_devnet_v2_genesis_hash_is_pinned() {
+        // Read from the constant, never a literal (lab #747).
+        use qlab_devnet::forms::{L2AuthForm, ANNULET_AUTH_GENESIS_FORMAT_VERSION};
+        let v1 = AnnuletGenesisFile::devnet();
+        for (name, build, pin) in [
+            ("devnet_v2", AnnuletGenesisFile::devnet_v2 as fn() -> AnnuletGenesisFile, DEVNET_V2_GENESIS_HASH),
+            ("devnet_v2_rehearsal", AnnuletGenesisFile::devnet_v2_rehearsal, DEVNET_V2_REHEARSAL_GENESIS_HASH),
+        ] {
+            let a = build();
+            assert_eq!(a.to_bytes(), build().to_bytes(), "{name}: deterministic");
+            println!("{name}: {} bytes, hash {}", a.to_bytes().len(), a.hash_hex());
+            let pin = pin.expect("pinned");
+            a.verify(Some(pin)).expect("verifies and pins itself");
+            assert_eq!(a.hash_hex(), pin, "{name}");
+            assert_eq!(a.to_bytes().len(), if name == "devnet_v2" { 5_241 } else { 5_251 }, "{name}");
+            assert_eq!(a.format_version, ANNULET_AUTH_GENESIS_FORMAT_VERSION, "{name}");
+            assert_eq!(leading_format_version(&a.to_bytes()), Some(ANNULET_AUTH_GENESIS_FORMAT_VERSION), "{name}");
+            assert_eq!(a.l2_auth().unwrap(), L2AuthForm::CandidateA, "{name}");
+            assert_eq!(a.registry_genesis, v1.registry_genesis, "{name}: the v1 devnet's registry");
+            assert_eq!(
+                (a.params.fee_tier_s, a.params.fee_tier_p, a.params.fee_tier_r),
+                (v1.params.fee_tier_s, v1.params.fee_tier_p, v1.params.fee_tier_r),
+                "{name}: the v1 devnet's fee tiers"
+            );
+            assert_eq!(a.genesis_notes.len(), v1.genesis_notes.len(), "{name}");
+            for (n, (got, old)) in opened(&a).iter().zip(opened(&v1)).enumerate() {
+                assert_ne!(got.rkm, old.rkm, "{name}: note {n} is paid to a v2 rkm");
+                assert_eq!(qlab_note::l2note::L2Note { rkm: old.rkm, ..*got }, old, "{name}: note {n} differs in rkm only");
+            }
+        }
+        let (d, r) = (AnnuletGenesisFile::devnet_v2(), AnnuletGenesisFile::devnet_v2_rehearsal());
+        assert_eq!((d.params.slot_secs, d.params.max_empty_slots), (10, 6));
+        assert_eq!((r.params.slot_secs, r.params.max_empty_slots), (1, 1));
+        assert_eq!(d.genesis_notes, r.genesis_notes, "the rehearsal mints the same notes");
+        assert_ne!(d.hash_hex(), r.hash_hex());
+        // The stock is the faucet's and the USDT-test note the holder's, at
+        // generation 0 of their dev keys' trees.
+        let faucet = devnet::rkm_v2(devnet::FAUCET_SK, devnet::FAUCET_D);
+        let opened = opened(&d);
+        assert!(opened[..devnet::STOCK_NOTES as usize].iter().all(|n| n.rkm == faucet && n.asset == 0));
+        assert_eq!(opened[devnet::STOCK_NOTES as usize].rkm, devnet::rkm_v2(devnet::HOLDER_SK, devnet::HOLDER_D));
+    }
+
+    /// The dev keys' v2 `rkm` is the wallet's own derivation — `auth_secret`
+    /// the wallet's rule, the root the shared `generation_root`, the hash the
+    /// circuit's — so a wallet holding a dev key finds these notes.
+    #[test]
+    fn the_dev_keys_v2_rkm_is_the_circuits_over_the_shared_generation_root() {
+        let sk = devnet::FAUCET_SK;
+        assert_eq!(devnet::nk(sk), qlab_air::l2::derive_input_l2(&qlab_air::l2::L2TxInput {
+            sk, value: 0, asset: 0, rho: [0; 4], rseed: [0; 4], d: devnet::FAUCET_D }).0, "nk does not depend on d");
+        let root = qlab_remote_auth::annulet::journal::generation_root(&devnet::auth_secret(sk), 0);
+        assert_eq!(devnet::auth_root_g0(sk), root);
+        assert_eq!(devnet::auth_root_g0(sk), root, "the cached root is the built one");
+        assert_ne!(root, qlab_remote_auth::annulet::journal::generation_root(&devnet::auth_secret(sk), 1));
+        // The journal's lane spelling is the note layer's (`digest_from_bytes`),
+        // which the AIR and `LocalAuth::auth_root` read the tree root through.
+        use qlab_remote_auth::annulet::{auth_master, AuthTree, D_AUTH};
+        let tree = AuthTree::build(&auth_master(&devnet::auth_secret(sk), 0), D_AUTH).unwrap();
+        assert_eq!(root, qlab_note::hash::digest_from_bytes(&tree.root()));
+        assert_eq!(
+            devnet::rkm_v2(sk, devnet::FAUCET_D),
+            qlab_air::l2::l2_rkm_v2(&devnet::nk(sk), &devnet::FAUCET_D, &root)
+        );
+        assert_ne!(devnet::rkm_v2(sk, devnet::FAUCET_D), devnet::rkm(sk, devnet::FAUCET_D), "v2 is not v1");
+    }
 
     #[test]
     /// Also the byte-identity proof of lab #710's delegation: `registry_root_of`

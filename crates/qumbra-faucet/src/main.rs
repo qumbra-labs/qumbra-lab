@@ -101,8 +101,10 @@ fn usage() {
          qumbra-faucet ticket --config FILE --id N issue one single-use grant ticket\n  \
          qumbra-faucet check --config FILE         validate the deployment; bind nothing, mine nothing\n  \
          qumbra-faucet run --config FILE           run the keyless node + the HTTP listener\n  \
-         qumbra-faucet annulet --node-config FILE [--listen ADDR]\n                                            \
-         the Annulet devnet faucet: a keyless follower + genesis-stock grants (lab #716)\n"
+         qumbra-faucet annulet --node-config FILE [--listen ADDR] [--fresh-journal]\n                                            \
+         the Annulet devnet faucet: a keyless follower + genesis-stock grants (lab #716).\n                                            \
+         On a Candidate A genesis, --fresh-journal starts a new auth.v1 — ONLY on a chain where\n                                            \
+         the faucet key has never spent (lab #896 H)\n"
     );
 }
 
@@ -525,6 +527,10 @@ fn log_serve_report(report: &qumbra_faucet::service::ServeReport) {
     }
 }
 
+/// The Candidate A faucet's journal directory, inside the node's data dir
+/// (lab #896 H).
+const FAUCET_AUTH_DIR: &str = "faucet-auth";
+
 /// **The Annulet devnet faucet** (lab #716): a keyless follower in process,
 /// its discovery endpoint as the faucet's served source, and one grant per
 /// genesis stock note over `POST /v1/annulet/grant`.
@@ -547,18 +553,23 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         AnyGenesis::Annulet(g) => g,
     };
-    if genesis.hash() != AnnuletGenesisFile::devnet().hash() {
-        return Err("this Annulet genesis is not the devnet genesis; the Annulet faucet holds only the \
-                    devnet dev key (lab #716)"
+    // The devnet genesis files the dev key is minted into: v1, and the
+    // Candidate A devnet and its rehearsal twin (lab #896 H).
+    let devnets = [
+        AnnuletGenesisFile::devnet().hash(),
+        AnnuletGenesisFile::devnet_v2().hash(),
+        AnnuletGenesisFile::devnet_v2_rehearsal().hash(),
+    ];
+    if !devnets.contains(&genesis.hash()) {
+        return Err("this Annulet genesis is not the devnet genesis (v1, Candidate A, or its rehearsal); \
+                    the Annulet faucet holds only the devnet dev key (lab #716, lab #896 H)"
             .into());
     }
-    // An Annulet net has no PoW; the engine parameter is unused on it.
-    let mut node = RunningNode::start_annulet(
-        &node_cfg,
-        &genesis,
-        qlab_devnet::pow::KeccakPow,
-        qumbra_node::verifier::L2Verifier,
-    )?;
+    let l2_auth = genesis.l2_auth()?;
+    // An Annulet net has no PoW; the engine parameter is unused on it. The
+    // verifier is the node's own pick for the genesis axis.
+    let (verifier, _) = qumbra_node::verifier::select_verifier(false, genesis.form()?, l2_auth);
+    let mut node = RunningNode::start_annulet(&node_cfg, &genesis, qlab_devnet::pow::KeccakPow, verifier)?;
     if node.is_sequencer() {
         return Err("the faucet's node would be the sequencer (a sequencer key file is in its data dir); \
                     the faucet runs a keyless follower"
@@ -570,13 +581,23 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     node.refresh_registry();
     let key = SpendKey { sk: devnet::FAUCET_SK, d: devnet::FAUCET_D };
     let change = qlab_note::kem::generate_keypair(&mut rand::rng());
-    let faucet = AnnuletFaucet::start(
-        served(discovery),
-        genesis.form()?,
-        key,
-        change.ek,
-        genesis.params.fee_tier_s,
-    )?;
+    let faucet = match l2_auth {
+        qlab_devnet::forms::L2AuthForm::None => {
+            AnnuletFaucet::start(served(discovery), genesis.form()?, key, change.ek, genesis.params.fee_tier_s)?
+        }
+        // Lab #896 H (QH2): grants signed with the dev key's generation-0
+        // leaves; the cursor in `<data dir>/faucet-auth/auth.v1`.
+        qlab_devnet::forms::L2AuthForm::CandidateA => AnnuletFaucet::start_v2(
+            served(discovery),
+            key,
+            change.ek,
+            genesis.params.fee_tier_s,
+            &node_cfg.data_dir.join(FAUCET_AUTH_DIR),
+            genesis.hash(),
+            genesis.format_version,
+            has_flag(args, "--fresh-journal"),
+        )?,
+    };
     let stock = faucet.stock_left();
     let bound = serve_grants(listen, Arc::new(std::sync::Mutex::new(faucet)))?;
     qlab_devnet::jprintln!("qumbra-faucet annulet running (lab #716)");

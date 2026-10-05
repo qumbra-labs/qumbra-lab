@@ -270,6 +270,17 @@ impl<E: Endpoint> Served<E> {
         served(qlab_cbserver::registry::decode_annulet_params(&body).map_err(|e| format!("params: {e:?}")))
     }
 
+    /// The node's own word on its tip (`GET /v1/registry/root`'s height) —
+    /// what a signer that trusts the node it runs sets a validity window from
+    /// (lab #896 H: the faucet over its in-process follower). A wallet reading
+    /// someone else's node takes its tip from a verified scan instead.
+    pub fn stated_tip(&self) -> Result<u64, SpendError> {
+        self.annulet_only("the stated tip")?;
+        let body = served(self.endpoint.get("/v1/registry/root"))?;
+        let (height, _) = served(qlab_cbserver::registry::decode_registry_root(&body).map_err(|e| format!("registry root: {e:?}")))?;
+        Ok(height)
+    }
+
     /// Every nullifier the chain has published (`/v1/nullifiers`, paged).
     pub fn spent_nullifiers(&self) -> Result<std::collections::HashSet<[u8; 32]>, SpendError> {
         let mut spent = std::collections::HashSet::new();
