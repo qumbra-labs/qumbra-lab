@@ -235,7 +235,8 @@ impl std::fmt::Display for AddressVersionError {
         };
         write!(
             f,
-            "this is {}, but this net pays only {}: a note to it could never be spent",
+            "this is {}, but this net pays only {}: a note to it could never be spent — \
+             ask the payee for a new address on this net",
             what(self.got),
             what(self.want)
         )

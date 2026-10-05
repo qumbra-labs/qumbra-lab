@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use qlab_devnet::annulet::body_commitment_annulet;
+use qlab_devnet::annulet::body_commitment_annulet_for;
 use qlab_devnet::chain::ChainState;
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::BlockHeader;
@@ -39,7 +39,7 @@ use rand::rngs::StdRng;
 use crate::annulet::{AnnuletReport, AnnuletScanCore, CoreStep};
 use crate::annulet_verify::{
     decode_chain_cache, genesis_from_bytes, header_path, served_header_at, stated_height, ChainCache, ChainWalk,
-    VerifiedAnnulet, VerifiedChain, VerifiedGenesis, VerifyRefusal, ANNULET, GENESIS_FILE_PATH, REGISTRY_ROOT_PATH,
+    VerifiedAnnulet, VerifiedChain, VerifiedGenesis, VerifyRefusal, GENESIS_FILE_PATH, REGISTRY_ROOT_PATH,
 };
 
 /// One observation from a caller-pumped [`AnnuletVerifyDriver`]. `Done` and
@@ -217,7 +217,7 @@ impl AnnuletVerifyDriver {
                 let from = walk.want().expect("a Need was outstanding").0;
                 walk.admit(from, answer).map(|()| self.phase = Phase::Walk { walk, how })
             }
-            Phase::ResumeAt { genesis, cached, anchor, clamped } => match served_header_at(anchor, answer) {
+            Phase::ResumeAt { genesis, cached, anchor, clamped } => match served_header_at(genesis.wire(), anchor, answer) {
                 Err(e) => Err(e),
                 Ok(None) if !clamped => {
                     self.phase = Phase::ResumeRoot { genesis, cached, anchor };
@@ -429,13 +429,13 @@ fn bind_body(post: &mut Post, height: u64, answer: Result<Vec<u8>, String>) -> R
     let bytes = answer.map_err(|why| VerifyRefusal::BodyUnavailable { height, why })?;
     post.bodies_fetched += 1;
     post.body_bytes += bytes.len() as u64;
-    let ann = decode_body_answer(ANNULET, height, &bytes)
+    let ann = decode_body_answer(post.chain.genesis.wire(), height, &bytes)
         .map_err(|e| VerifyRefusal::BodyMalformed { height, why: e.to_string() })?;
     if ann.header != header {
         return Err(VerifyRefusal::BodyHeaderMismatch { height });
     }
     let body = qlab_p2p::served::body_of(&ann);
-    if body_commitment_annulet(&body) != header.tx_body_commitment {
+    if body_commitment_annulet_for(&body, post.chain.genesis.l2_auth) != header.tx_body_commitment {
         return Err(VerifyRefusal::BodyCommitmentMismatch { height });
     }
     post.bound.insert(height, body.txs.iter().map(|tx| tx.public.commitments.clone()).collect());

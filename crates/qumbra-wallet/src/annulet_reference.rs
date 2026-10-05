@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 
 use qlab_cbserver::client::{light_client_scan_l2_multi_with_reference, MultiScanRefusal, ScanConfig};
-use qlab_devnet::annulet::body_commitment_annulet;
+use qlab_devnet::annulet::body_commitment_annulet_for;
 use qlab_devnet::chain::ChainState;
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::BlockHeader;
@@ -27,7 +27,7 @@ use rand::rngs::StdRng;
 use crate::annulet::{AnnuletReport, AnnuletRow};
 use crate::annulet_verify::{
     load_chain_cache, save_chain_cache, ChainCache, VerifiedAnnulet, VerifiedChain, VerifiedGenesis, VerifyRefusal,
-    ANNULET, GENESIS_FILE_PATH, MAX_GENESIS_FILE_BYTES,
+    GENESIS_FILE_PATH, MAX_GENESIS_FILE_BYTES,
 };
 use crate::store::WalletDir;
 
@@ -47,7 +47,8 @@ where
     let file = AnnuletGenesisFile::from_bytes(&bytes).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     file.verify(None).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     let header_hash = file.genesis_block_header().header_hash_for(GenesisForm::Annulet);
-    Ok(VerifiedGenesis { hash: fetched, file, header_hash })
+    let l2_auth = file.l2_auth().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
+    Ok(VerifiedGenesis { hash: fetched, file, header_hash, l2_auth })
 }
 
 /// Step 2: verify every sealed header from height 1 up to `up_to` (or the
@@ -85,7 +86,7 @@ where
         let to = up_to.min(from + MAX_HEADERS_PAGE as u64 - 1);
         let path = format!("/v1/headers?from={from}&to={to}");
         let bytes = fetch(&path).map_err(|why| VerifyRefusal::HeadersUnavailable { from, why })?;
-        let units = decode_headers_page(ANNULET, from, &bytes)
+        let units = decode_headers_page(genesis.wire(), from, &bytes)
             .map_err(|e| VerifyRefusal::HeadersMalformed { from, why: e.to_string() })?;
         let asked = to - from + 1;
         let got = units.len() as u64;
@@ -134,7 +135,7 @@ where
     let served_at = |fetch: &mut F, h: u64| -> Result<Option<BlockHeader>, VerifyRefusal> {
         let bytes = fetch(&format!("/v1/headers?from={h}&to={h}"))
             .map_err(|why| VerifyRefusal::HeadersUnavailable { from: h, why })?;
-        let units = decode_headers_page(ANNULET, h, &bytes)
+        let units = decode_headers_page(genesis.wire(), h, &bytes)
             .map_err(|e| VerifyRefusal::HeadersMalformed { from: h, why: e.to_string() })?;
         match units.first() {
             None => Ok(None),
@@ -239,13 +240,13 @@ where
                 .map_err(|why| VerifyRefusal::BodyUnavailable { height, why })?;
             bodies_fetched += 1;
             body_bytes += bytes.len() as u64;
-            let ann = decode_body_answer(ANNULET, height, &bytes)
+            let ann = decode_body_answer(chain.genesis.wire(), height, &bytes)
                 .map_err(|e| VerifyRefusal::BodyMalformed { height, why: e.to_string() })?;
             if ann.header != header {
                 return Err(VerifyRefusal::BodyHeaderMismatch { height });
             }
             let body = qlab_p2p::served::body_of(&ann);
-            if body_commitment_annulet(&body) != header.tx_body_commitment {
+            if body_commitment_annulet_for(&body, chain.genesis.l2_auth) != header.tx_body_commitment {
                 return Err(VerifyRefusal::BodyCommitmentMismatch { height });
             }
             slot.insert(body.txs.iter().map(|tx| tx.public.commitments.clone()).collect());

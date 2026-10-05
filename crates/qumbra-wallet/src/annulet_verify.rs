@@ -64,7 +64,7 @@
 
 use qlab_devnet::annulet::HeaderExt;
 use qlab_devnet::chain::ChainState;
-use qlab_devnet::forms::GenesisForm;
+use qlab_devnet::forms::{GenesisForm, L2AuthForm};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_node::annulet_genesis::{h32, AnnuletGenesisFile};
 use qlab_p2p::compact::WireForm;
@@ -78,8 +78,6 @@ use crate::store::WalletDir;
 /// Annulet node answers it itself, and the path is the one an L1 wallet reads
 /// from the L1 edge (`wallet-network-identity-decision`).
 pub const GENESIS_FILE_PATH: &str = "/genesis.qmb";
-
-pub(crate) const ANNULET: WireForm = WireForm::plain(GenesisForm::Annulet);
 
 /// The largest genesis file a verified scan will read (lab #850 AD1b). The
 /// gateway testnet's is 11,295 B (53 genesis notes); 1 MiB leaves room for
@@ -274,6 +272,18 @@ pub struct VerifiedGenesis {
     pub file: AnnuletGenesisFile,
     /// The genesis header's hash: height 1's `prev`.
     pub header_hash: Hash32,
+    /// The net's L2 authorization axis, read from the file's
+    /// `format_version` (lab #896 G, QG3): the pin covers the format, so it
+    /// fixes the axis.
+    pub l2_auth: L2AuthForm,
+}
+
+impl VerifiedGenesis {
+    /// The served wire form of this net's headers and bodies (byte 3 on a
+    /// v1 Annulet, 5 on a Candidate A one).
+    pub fn wire(&self) -> WireForm {
+        WireForm { form: GenesisForm::Annulet, sections: qlab_devnet::forms::BodySections::None, l2_auth: self.l2_auth }
+    }
 }
 
 /// Step 1: fetch the genesis file, hash it against `pin`, decode and check it.
@@ -298,7 +308,8 @@ pub fn genesis_from_bytes(pin: [u8; 32], bytes: &[u8]) -> Result<VerifiedGenesis
     let file = AnnuletGenesisFile::from_bytes(bytes).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     file.verify(None).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     let header_hash = file.genesis_block_header().header_hash_for(GenesisForm::Annulet);
-    Ok(VerifiedGenesis { hash: fetched, file, header_hash })
+    let l2_auth = file.l2_auth().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
+    Ok(VerifiedGenesis { hash: fetched, file, header_hash, l2_auth })
 }
 
 /// A header chain verified from the genesis file to its tip.
@@ -389,7 +400,7 @@ impl ChainWalk {
     pub(crate) fn admit(&mut self, from: u64, answer: Result<Vec<u8>, String>) -> Result<(), VerifyRefusal> {
         let to = self.page_end(from);
         let bytes = answer.map_err(|why| VerifyRefusal::HeadersUnavailable { from, why })?;
-        let units = decode_headers_page(ANNULET, from, &bytes)
+        let units = decode_headers_page(self.genesis.wire(), from, &bytes)
             .map_err(|e| VerifyRefusal::HeadersMalformed { from, why: e.to_string() })?;
         let asked = to - from + 1;
         let got = units.len() as u64;
@@ -423,9 +434,13 @@ impl ChainWalk {
 
 /// The served header at `height` out of a one-header `/v1/headers` answer:
 /// `None` when the endpoint serves nothing there (it is behind).
-pub(crate) fn served_header_at(height: u64, answer: Result<Vec<u8>, String>) -> Result<Option<BlockHeader>, VerifyRefusal> {
+pub(crate) fn served_header_at(
+    wire: WireForm,
+    height: u64,
+    answer: Result<Vec<u8>, String>,
+) -> Result<Option<BlockHeader>, VerifyRefusal> {
     let bytes = answer.map_err(|why| VerifyRefusal::HeadersUnavailable { from: height, why })?;
-    let units = decode_headers_page(ANNULET, height, &bytes)
+    let units = decode_headers_page(wire, height, &bytes)
         .map_err(|e| VerifyRefusal::HeadersMalformed { from: height, why: e.to_string() })?;
     match units.first() {
         None => Ok(None),
