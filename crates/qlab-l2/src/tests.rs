@@ -559,3 +559,22 @@ fn l2_v2_mldsa_leaf_known_answer_is_cross_locked() {
         "75fb38f8035a154def1393c47fe147d3e40a700983ab2bd12a3facc7af0292ea"
     );
 }
+
+/// Lab #896 E1: the v2 shape digests are pinned (from the M box's
+/// `l2_goldens` run at `7228a83f`). Constants, constraints (and their count)
+/// and the whole digest, so a move names its half.
+#[test]
+fn l2_v2_shape_digests_are_pinned() {
+    for (shape, pin) in [
+        (Shape::S, v2::SHAPE_S_DIGEST_V2),
+        (Shape::P, v2::SHAPE_P_DIGEST_V2),
+        (Shape::R, v2::SHAPE_R_DIGEST_V2),
+    ] {
+        assert_eq!(digest::hex(&digest::shape_digest_v2(shape)), pin, "{shape:?} shape digest v2 — a moved digest is a freeze event");
+    }
+    for (shape, consts, constr, n) in v2::PINS_V2 {
+        assert_eq!(digest::hex(&digest::constants_digest_v2(shape)), consts, "{shape:?} v2 constants");
+        let (c, count) = digest::constraints_digest_v2(shape);
+        assert_eq!((digest::hex(&c).as_str(), count), (constr, n), "{shape:?} v2 constraints");
+    }
+}
