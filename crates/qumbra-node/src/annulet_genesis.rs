@@ -496,7 +496,8 @@ mod tests {
     /// parameters and network name only.
     #[test]
     fn annulet_devnet_v2_genesis_hash_is_pinned() {
-        use qlab_devnet::forms::L2AuthForm;
+        // Read from the constant, never a literal (lab #747).
+        use qlab_devnet::forms::{L2AuthForm, ANNULET_AUTH_GENESIS_FORMAT_VERSION};
         let v1 = AnnuletGenesisFile::devnet();
         for (name, build, pin) in [
             ("devnet_v2", AnnuletGenesisFile::devnet_v2 as fn() -> AnnuletGenesisFile, DEVNET_V2_GENESIS_HASH),
@@ -506,8 +507,8 @@ mod tests {
             assert_eq!(a.to_bytes(), build().to_bytes(), "{name}: deterministic");
             println!("{name}: {} bytes, hash {}", a.to_bytes().len(), a.hash_hex());
             a.verify(pin).expect("verifies (and pins itself once pinned)");
-            assert_eq!(a.format_version, 33, "{name}");
-            assert_eq!(leading_format_version(&a.to_bytes()), Some(33), "{name}");
+            assert_eq!(a.format_version, ANNULET_AUTH_GENESIS_FORMAT_VERSION, "{name}");
+            assert_eq!(leading_format_version(&a.to_bytes()), Some(ANNULET_AUTH_GENESIS_FORMAT_VERSION), "{name}");
             assert_eq!(a.l2_auth().unwrap(), L2AuthForm::CandidateA, "{name}");
             assert_eq!(a.registry_genesis, v1.registry_genesis, "{name}: the v1 devnet's registry");
             assert_eq!(
