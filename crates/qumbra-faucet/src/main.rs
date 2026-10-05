@@ -559,8 +559,8 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
         AnnuletGenesisFile::devnet_v2_rehearsal().hash(),
     ];
     if !devnets.contains(&genesis.hash()) {
-        return Err("this Annulet genesis is not a devnet genesis; the Annulet faucet holds only the \
-                    devnet dev key (lab #716, lab #896 H)"
+        return Err("this Annulet genesis is not the devnet genesis (v1, Candidate A, or its rehearsal); \
+                    the Annulet faucet holds only the devnet dev key (lab #716, lab #896 H)"
             .into());
     }
     let l2_auth = genesis.l2_auth()?;
