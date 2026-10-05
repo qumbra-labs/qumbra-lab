@@ -1905,6 +1905,18 @@ mod tests {
         let bytes = bincode::serialize(&WireRecord::from(&LogRecord::Block(signed.clone()))).unwrap();
         assert_eq!(&bytes[..4], &5u32.to_le_bytes());
         assert_eq!(FORMAT_VERSION, 3);
+        // Pinned: an independent Python bincode-1.x encoder (`e2_goldens.py`,
+        // quoted in the PR), calibrated first against the variant-3 golden
+        // above (3,745 B, keccak 7c378193…) — variant 3's bytes with tag 5 and
+        // each tx's `u64 len ‖ auth` appended.
+        assert_eq!(bytes.len(), 3830);
+        assert_eq!(
+            to_hex(&qlab_devnet::hash::keccak256(&bytes)),
+            "86a102aa599a3cdca0a3b7640623cd706b17066bebbfd14956455af2bb2a7c2c"
+        );
+        let mut tail = "4d00000000000000".to_string(); // 77 as a u64 length
+        tail.push_str(&"5a".repeat(77));
+        assert!(to_hex(&bytes).ends_with(&tail));
         match LogRecord::from(bincode::deserialize::<WireRecord>(&bytes).unwrap()) {
             LogRecord::Block(b) => {
                 assert_eq!(b.txs[0].auth, vec![0x5A; 77]);

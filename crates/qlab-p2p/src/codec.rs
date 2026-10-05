@@ -788,6 +788,12 @@ pub fn tx_id(tx: &TxEntry) -> Hash32 {
 /// 2026-10-02: the explorer panicked on the first sealed L2 transaction).
 pub fn canonical_tx_wire(tx: &TxEntry) -> Vec<u8> {
     if tx.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT {
+        // Lab #896 E2: the L1 wire has no auth section, so an L1 tx carrying
+        // one would hash as if it had none — unreachable for a decoded tx.
+        assert!(
+            tx.auth == qlab_devnet::annulet::L2_AUTH_ABSENT,
+            "an auth section has no L1 tx wire (lab #896 E2)"
+        );
         encode_tx(tx)
     } else {
         annulet_wire_bytes(tx)

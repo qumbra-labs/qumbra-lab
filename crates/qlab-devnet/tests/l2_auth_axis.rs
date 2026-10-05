@@ -118,3 +118,67 @@ fn a_v1_and_a_v2_genesis_body_with_equal_notes_differ() {
         genesis_body_commitment_annulet(&[])
     );
 }
+
+/// The v2 domains pinned to hex. Each value was computed by an independent
+/// Python Keccak-256 rebuild of the preimage (domain ‖ fields, u64-LE length
+/// prefixes; `e2_goldens.py`, quoted in the PR), calibrated first against
+/// main's `GOLDEN_ANNULET_EMPTY_BODY` / `_EMPTY_GENESIS` — not read back from
+/// this code.
+#[test]
+fn the_v2_commitments_are_pinned() {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    // Every byte of the fixture is literal: no placeholder discovery.
+    let tx = TxEntry {
+        auth: vec![0x5A; 48],
+        proof: vec![0xAB; 40],
+        public: TxPublic {
+            anchor: [0x0F; 32],
+            nullifiers: vec![[1; 32], [2; 32]],
+            commitments: vec![[3; 32], [4; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 2,
+        },
+        discovery: vec![0x00],
+        rider: TxEntry::absent_rider(),
+        l2: vec![0x01, 0x02],
+    };
+    let body = BlockBody::new(vec![tx], Vec::new());
+    assert_eq!(
+        hex(&body_commitment_annulet_for(
+            &BlockBody::default(),
+            L2AuthForm::CandidateA
+        )),
+        GOLDEN_E2_BODY_V2_EMPTY
+    );
+    assert_eq!(
+        hex(&body_commitment_annulet_for(&body, L2AuthForm::CandidateA)),
+        GOLDEN_E2_BODY_V2_ONE_TX
+    );
+    let note = GenesisNote {
+        cm: [9; 32],
+        payload: vec![7; 128],
+    };
+    assert_eq!(
+        hex(&genesis_body_commitment_annulet_for(
+            &[],
+            L2AuthForm::CandidateA
+        )),
+        GOLDEN_E2_GENESIS_V2_EMPTY
+    );
+    assert_eq!(
+        hex(&genesis_body_commitment_annulet_for(
+            &[note],
+            L2AuthForm::CandidateA
+        )),
+        GOLDEN_E2_GENESIS_V2_ONE_NOTE
+    );
+}
+
+const GOLDEN_E2_BODY_V2_EMPTY: &str =
+    "c1057215d437bbdfcf224edbf1fdfb125395c9d5de9355c098bc28eb1da8b07f";
+const GOLDEN_E2_BODY_V2_ONE_TX: &str =
+    "1e513a3f01e7979788dfa5e21d7727cb61d910fa6a5eca73affbf075c15cde98";
+const GOLDEN_E2_GENESIS_V2_EMPTY: &str =
+    "ecd8c51071014eabe7715f9591e32f52f71533a3f19ba88325c09894ff182567";
+const GOLDEN_E2_GENESIS_V2_ONE_NOTE: &str =
+    "7c478b0a8816ea4d03f012d39ec48f97c6c498fc0d5359991159e0e041ad3cb4";
