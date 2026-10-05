@@ -290,3 +290,33 @@ fn l2pv2_neg_spend_frozen_under_the_v2_key() {
         "a frozen sender (v2 key) VERIFIED"
     );
 }
+
+/// Lab #896 seam T: the v2 census tables are well formed, with no census
+/// run: every manifest column lies inside the v2 width; every role it names
+/// occurs in the canonical v2 program (and `ANK` / `NF`, gone from v2, are
+/// neither named nor in the program); every column v2 appends falls in a
+/// region v2 names; the v1 tables are untouched.
+#[test]
+fn v2_census_tables_are_well_formed() {
+    let program = fabricated_bucket_l2p_v2().air.program;
+    let man = witness_manifest_v2();
+    for e in &man {
+        assert!(e.cols.iter().all(|&c| c < L2P_WIDTH_V2), "{}: a column outside the v2 width", e.field);
+        assert!(
+            e.role == crate::detaudit::ANY_ROLE || program.contains(&e.role),
+            "{}: role {} is not in the v2 program",
+            e.field,
+            e.role
+        );
+    }
+    assert!(!man.iter().any(|e| e.role == ROLE_ANK || e.role == ROLE_NF), "no ANK / NF entry in v2");
+    assert!(!program.contains(&ROLE_ANK) && !program.contains(&ROLE_NF), "the v2 program has no ANK / NF");
+    let regions = audit_col_regions_v2();
+    for col in L2P_WIDTH..L2P_WIDTH_V2 {
+        let (name, start) = regions.iter().rev().find(|(_, s)| *s <= col).expect("a region");
+        assert!(*start >= L2P_WIDTH, "v2 column {col} falls in the v1 region {name}");
+    }
+    assert!(audit_col_regions().iter().all(|(_, s)| *s < L2P_WIDTH), "the v1 regions are v1's");
+    assert!(witness_manifest().iter().any(|e| e.role == ROLE_ANK), "the v1 manifest keeps ANK");
+    assert!(witness_manifest().iter().all(|e| e.cols.iter().all(|&c| c < L2P_WIDTH)), "the v1 manifest is v1-wide");
+}

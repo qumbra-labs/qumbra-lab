@@ -5182,6 +5182,30 @@ pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
     m
 }
 
+/// Lab #896 seam T: shape P **v2**'s witness manifest — v1's without `ANK`
+/// and `NF`, plus shape S v2's entries (`NFA`'s `nk`/ρ inputs, `AAUTH`'s
+/// leaf copy and sibling/bit inputs, the first `ARKM`'s `auth_root` copy via
+/// `EQA`). The two `ARKM2`s' `auth_root` is a **copy**, as their `nk` is: both
+/// are bound to the first `ARKM` only through the output equality, so the
+/// census treats them alike — determined only under the collision-resistance
+/// premise ([`audit_cr_premise_v2`]), exactly as lab #758 ran v1.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest_v2() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::ManifestEntry as M;
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    let mut m: Vec<_> = witness_manifest().into_iter().filter(|e| e.role != ROLE_ANK && e.role != ROLE_NF).collect();
+    m.extend([
+        M::input(ROLE_NFA, w(9..13), "input.nk"),
+        M::input(ROLE_NFA, w(0..4), "input.rho"),
+        M::copy(ROLE_AAUTH, w(0..4), "auth.leaf"),
+        M::input(ROLE_AAUTH, w(4..8), "auth.sibling"),
+        M::input(ROLE_AAUTH, vec![PBIT_COL], "auth.bit"),
+        M::copy(ROLE_ARKM, w(7..11), "input.auth_root"),
+        M::copy(ROLE_ARKM2, w(7..11), "input.auth_root"),
+    ]);
+    m
+}
+
 /// Shape P3's program as the census reads it.
 #[cfg(any(test, feature = "audit"))]
 pub fn audit_program(air: &L2ShapePAir) -> crate::detaudit::Program {
@@ -5285,6 +5309,27 @@ pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
     v
 }
 
+/// Lab #896 seam T: v1's regions plus every column v2 appends, up to
+/// [`L2P_WIDTH_V2`].
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions_v2() -> Vec<(&'static str, usize)> {
+    let mut v = audit_col_regions();
+    v.extend([
+        ("XR_OFF", XR_OFF),
+        ("SELV2_OFF", SELV2_OFF),
+        ("SEV2_OFF", SEV2_OFF),
+        ("INJV2_OFF", INJV2_OFF),
+        ("EGN_COL", EGN_COL),
+        ("EGL_POS_COL", EGL_POS_COL),
+        ("EGL_CLOSE_COL", EGL_CLOSE_COL),
+        ("EQL_OFF", EQL_OFF),
+        ("EGA_POS_COL", EGA_POS_COL),
+        ("EQA_OFF", EQA_OFF),
+    ]);
+    v.sort_by_key(|(_, c)| *c);
+    v
+}
+
 /// The census's verifier-supplied public values (lab #758): **only** a
 /// `vPublic` row's `redeem` and `vpa` when that row's amount is zero. There
 /// the AIR reads them only through `Σm·(vpa − asset)`, `s·m` and
@@ -5320,6 +5365,16 @@ pub fn audit_cmp_cells() -> crate::detaudit::ManifestEntry {
 pub fn audit_cr_premise() -> Vec<crate::detaudit::ManifestEntry> {
     let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
     vec![crate::detaudit::ManifestEntry::input(ROLE_ARKM2, w(0..4), "input.nk @ ARKM′/″ (CR premise)")]
+}
+
+/// Lab #896 seam T: v1's collision-resistance premise plus the v2 lanes it
+/// covers — `auth_root` at `ARKM′/″`, bound only through the same output.
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_cr_premise_v2() -> Vec<crate::detaudit::ManifestEntry> {
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    let mut v = audit_cr_premise();
+    v.push(crate::detaudit::ManifestEntry::input(ROLE_ARKM2, w(7..11), "input.auth_root @ ARKM′/″ (CR premise)"));
+    v
 }
 
 /// A **diagnostic** premise (lab #758 R15): the output-row selectors

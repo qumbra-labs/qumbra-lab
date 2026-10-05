@@ -4175,6 +4175,30 @@ pub fn witness_manifest() -> Vec<crate::detaudit::ManifestEntry> {
     m
 }
 
+/// Lab #896 seam T: shape S **v2**'s witness manifest — v1's without `ANK`
+/// and `NF` (gone from the v2 program: the witness is `nk`, design 2b §2),
+/// plus: `NFA` takes `nk` (W9..12) and ρ (W0..3) as statement inputs;
+/// `AAUTH`'s leaf (W0..3) is a **copy**, tied to `PV_LEAF*` by bank `EQL`,
+/// its sibling (W4..7) and path bit inputs; `ARKM`'s `auth_root` (W7..10) is
+/// a **copy**, tied to `BAUTH`'s root by bank `EQA`. `BAUTH` declares nothing
+/// (its root is derived). The auth path's levels 1..D−1 are `MERKLE` rows,
+/// already declared.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest_v2() -> Vec<crate::detaudit::ManifestEntry> {
+    use crate::detaudit::ManifestEntry as M;
+    let w = |r: core::ops::Range<usize>| r.map(|i| W_OFF + i).collect::<Vec<_>>();
+    let mut m: Vec<_> = witness_manifest().into_iter().filter(|e| e.role != ROLE_ANK && e.role != ROLE_NF).collect();
+    m.extend([
+        M::input(ROLE_NFA, w(9..13), "input.nk"),
+        M::input(ROLE_NFA, w(0..4), "input.rho"),
+        M::copy(ROLE_AAUTH, w(0..4), "auth.leaf"),
+        M::input(ROLE_AAUTH, w(4..8), "auth.sibling"),
+        M::input(ROLE_AAUTH, vec![PBIT_COL], "auth.bit"),
+        M::copy(ROLE_ARKM, w(7..11), "input.auth_root"),
+    ]);
+    m
+}
+
 /// Shape S3's program as the census reads it.
 #[cfg(any(test, feature = "audit"))]
 pub fn audit_program(air: &L2ShapeSAir) -> crate::detaudit::Program {
@@ -4255,6 +4279,27 @@ pub fn audit_col_regions() -> Vec<(&'static str, usize)> {
         ("D3_COL", D3_COL),
         ("L3D3_COL", L3D3_COL),
     ];
+    v.sort_by_key(|(_, c)| *c);
+    v
+}
+
+/// Lab #896 seam T: v1's regions plus every column v2 appends, up to
+/// [`L2_WIDTH_V2`].
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions_v2() -> Vec<(&'static str, usize)> {
+    let mut v = audit_col_regions();
+    v.extend([
+        ("XR_OFF", XR_OFF),
+        ("SELV2_OFF", SELV2_OFF),
+        ("SEV2_OFF", SEV2_OFF),
+        ("INJV2_OFF", INJV2_OFF),
+        ("EGN_COL", EGN_COL),
+        ("EGL_POS_COL", EGL_POS_COL),
+        ("EGL_CLOSE_COL", EGL_CLOSE_COL),
+        ("EQL_OFF", EQL_OFF),
+        ("EGA_POS_COL", EGA_POS_COL),
+        ("EQA_OFF", EQA_OFF),
+    ]);
     v.sort_by_key(|(_, c)| *c);
     v
 }
