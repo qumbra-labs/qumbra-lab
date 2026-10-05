@@ -123,6 +123,9 @@ pub fn verifier_air_r() -> l2r::L2ShapeRAir {
 
 // ---------------------------------------------------------------- prove
 
+// The v2 `prove_*` take `(air, u32 PVs)` rather than an instance type: the
+// three v2 builders return three different instance structs.
+
 /// Prove a v2 shape-S instance (its AIR and `u32` PVs) under the L2 lane.
 pub fn prove_s(air: &l2::L2ShapeSAir, pvs: &[u32]) -> (Vec<Val>, Proof<Config>) {
     assert!(

@@ -222,6 +222,11 @@ fn l2_prove_verify_roundtrip_p() {
     bad[PV_VP2 + 1] += Val::ONE;
     assert!(!verify_p(&bad, &proof), "a mint claimed after the fact is refused");
     assert!(!verify_s(&pvs[..Shape::S.pv_len()], &proof), "a P proof is not an S proof");
+    // E1: a v1 P proof is not a v2 P proof, at either PV length.
+    assert!(!v2::verify_p(&pvs, &proof));
+    let mut long = pvs.clone();
+    long.resize(v2::pv_len(Shape::P), Val::ZERO);
+    assert!(!v2::verify_p(&long, &proof), "a v1 P proof with zero leaves is not a v2 proof");
 }
 
 /// Shape R through the real prover under the L2 lane — the
@@ -447,6 +452,9 @@ fn l2_v2_prove_verify_roundtrip_s() {
     assert!(v2::verify_s(&pvs, &proof), "v2::verify_s accepts the honest proof");
     assert!(v2::verify_s_u32(&inst.pvs, &proof));
     assert!(!v2::verify_s(&bad, &proof));
+    // The reverse direction without a new prove: the v2 entry refuses the
+    // v1-length vector, and the v1 entry the v2-length one (above).
+    assert!(!v2::verify_s(&pvs[..Shape::S.pv_len()], &proof));
 }
 
 /// Lab #896 seam C: shape P **v2** geometry and degree, read off the
@@ -491,6 +499,7 @@ fn l2_v2_prove_verify_roundtrip_r() {
     assert!(v2::verify_r(&pvs, &proof), "v2::verify_r accepts the honest proof");
     assert!(v2::verify_r_u32(&inst.pvs, &proof));
     assert!(!v2::verify_r(&bad, &proof));
+    assert!(!v2::verify_r(&pvs[..Shape::R.pv_len()], &proof));
 }
 
 /// Lab #896 E1: the v2 shape identities. Geometry read off the v2 verifier
@@ -515,6 +524,12 @@ fn l2_v2_shape_identities() {
             }
         };
         assert_eq!((w, pv), (v2::width(shape), v2::pv_len(shape)), "{shape:?}");
+        let fresh = match shape {
+            Shape::S => qlab_air::l2::fabricated_bucket_l2_v2().air.program,
+            Shape::P => qlab_air::l2p::fabricated_bucket_l2p_v2().air.program,
+            Shape::R => qlab_air::l2r::fabricated_shape_r_v2().inst.air.program,
+        };
+        assert_eq!(v2::canonical_program(shape), &fresh[..], "{shape:?}: canonical = freshly built");
         assert_eq!(v2::canonical_program(shape).iter().filter(|r| **r != qlab_air::l2::ROLE_DUMMY).count(), v2::perms(shape) - 1);
         let bits = v2::audit_pv_bits(shape);
         assert_eq!(bits.len(), v2::pv_len(shape));

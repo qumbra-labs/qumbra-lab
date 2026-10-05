@@ -204,6 +204,32 @@ pub fn constants_digest_v2(shape: Shape) -> [u8; 32] {
         .usize(l2::ROWS_PER_PERM)
         .usize(v2::pv_len(shape))
         .usize(l2::D_AUTH);
+    // The base PV layout, exactly as v1 pins it, then the leaf offsets.
+    if shape == Shape::R {
+        h.words(&[
+            l2r::PV_ANCHOR as u64,
+            l2r::PV_NF as u64,
+            l2r::PV_CM as u64,
+            l2r::PV_FEE as u64,
+            l2r::PV_OLD_ROOT as u64,
+            l2r::PV_NEW_ROOT as u64,
+            l2r::PV_ASSET as u64,
+            l2r::PV_CM_SEED as u64,
+        ]);
+    } else {
+        h.words(&[
+            l2::PV_ANCHOR as u64,
+            l2::PV_NF1 as u64,
+            l2::PV_NF2 as u64,
+            l2::PV_CM1 as u64,
+            l2::PV_CM2 as u64,
+            l2::PV_FEE as u64,
+            l2::PV_REGROOT as u64,
+        ]);
+    }
+    if shape == Shape::P {
+        h.words(&[l2p::PV_VP1 as u64, l2p::PV_VP2 as u64]);
+    }
     let leaves: Vec<u64> = (0..v2::auth_slots(shape)).map(|k| v2::pv_leaf(shape, k) as u64).collect();
     h.words(&leaves);
     let program: Vec<u64> = v2::canonical_program(shape).iter().map(|r| *r as u64).collect();
@@ -214,8 +240,23 @@ pub fn constants_digest_v2(shape: Shape) -> [u8; 32] {
     h.words(&l2::l2_nf(&o, &r));
     h.words(&l2::l2_rkm_v2(&o, &[9, 10], &r));
     h.words(&qlab_air::reference::merkle_node_state(&o, &r)[..4]);
+    // The leaf PVs' derivation: `mldsa_leaf(index, vk)` = Keccak-256(D_LEAF ‖
+    // index LE ‖ vk) (`qlab-remote-auth` `tree.rs`), recomputed here because
+    // this crate's dependencies are pinned to air + consensus; a fixed index
+    // and a fixed 1,312-byte key pattern.
+    let vk: Vec<u8> = (0..1_312u32).map(|i| (i % 251) as u8).collect();
+    let mut k = Keccak::v256();
+    k.update(MLDSA_LEAF_DOMAIN);
+    k.update(&2885u32.to_le_bytes());
+    k.update(&vk);
+    let mut leaf = [0u8; 32];
+    k.finalize(&mut leaf);
+    h.bytes(&leaf);
     h.finish()
 }
+
+/// `qlab-remote-auth` `tree.rs`'s leaf domain, mirrored for the v2 constants.
+const MLDSA_LEAF_DOMAIN: &[u8] = b"qumbra:remote-auth:mldsa44-leaf:v1";
 
 /// Digest (ii), v2: the symbolic constraint set of the v2 verifier AIR.
 pub fn constraints_digest_v2(shape: Shape) -> ([u8; 32], usize) {
