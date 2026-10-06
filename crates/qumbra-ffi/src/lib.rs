@@ -60,6 +60,18 @@ use report::DivScan;
 pub struct WalletState {
     seed: MasterSeed,
     wallet: Wallet,
+    /// Lab #896 (extension #68 D2): each Candidate A generation's
+    /// authorization-tree root, built once per handle — a build is 4,096
+    /// ML-DSA-44 key generations, seconds under wasm.
+    roots: std::sync::Mutex<std::collections::BTreeMap<u32, [u64; 4]>>,
+}
+
+impl WalletState {
+    /// Generation `g`'s authorization-tree root (cached).
+    fn generation_root(&self, g: u32) -> [u64; 4] {
+        let mut roots = self.roots.lock().unwrap_or_else(|p| p.into_inner());
+        *roots.entry(g).or_insert_with(|| qumbra_wallet::auth_journal::generation_root(&self.wallet, g))
+    }
 }
 
 /// The HD account, same constant and same reasoning as the CLI's.
@@ -67,7 +79,7 @@ const HD_ACCOUNT: u32 = 0;
 
 fn into_handle(seed: MasterSeed) -> *mut WalletState {
     let wallet = Wallet::from_master_seed(&seed, HD_ACCOUNT);
-    Box::into_raw(Box::new(WalletState { seed, wallet }))
+    Box::into_raw(Box::new(WalletState { seed, wallet, roots: Default::default() }))
 }
 
 fn out_string(s: String) -> *mut c_char {
@@ -268,6 +280,70 @@ pub unsafe extern "C" fn qmb_wallet_address_short(
         return ptr::null_mut();
     }
     out_string((*w).wallet.address_at_index(index).short().encode())
+}
+
+/// Lab #896 (extension #68 D2): the **Candidate A** (version 2) full address
+/// at a diversifier index, bound to authorization generation `generation`'s
+/// tree root — what a format-33 Annulet net pays. A pure derivation from the
+/// seed: a receive-only wallet needs no journal for it. The first call per
+/// generation builds the tree (cached on the handle).
+///
+/// # Safety
+/// `w` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_wallet_address_v2(w: *const WalletState, index: u64, generation: u32) -> *mut c_char {
+    if w.is_null() {
+        return ptr::null_mut();
+    }
+    let root = (*w).generation_root(generation);
+    out_string((*w).wallet.address_candidate_a_at_index(index, &root).encode())
+}
+
+/// The short form (`qs1…`) of [`qmb_wallet_address_v2`].
+///
+/// # Safety
+/// `w` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_wallet_address_v2_short(w: *const WalletState, index: u64, generation: u32) -> *mut c_char {
+    if w.is_null() {
+        return ptr::null_mut();
+    }
+    let root = (*w).generation_root(generation);
+    out_string((*w).wallet.address_candidate_a_at_index(index, &root).short().encode())
+}
+
+/// Lab #896 (extension #68 D2): parse a full address of **any** version —
+/// `{"version":N,"canonical":"qaddr1…","short":"qs1…"}` — so a shell reads
+/// the version from the kernel and never re-implements address rules.
+/// Whether that version is payable on a given net is the caller's question
+/// (version 1: L1 and v1 Annulet nets; version 2: Candidate A nets). NULL +
+/// `err_out` on an undecodable string, by name.
+///
+/// # Safety
+/// `s` NUL-terminated UTF-8; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_address_parse_any(s: *const c_char, err_out: *mut *mut c_char) -> *mut c_char {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if s.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let Ok(text) = CStr::from_ptr(s).to_str() else {
+        set_err(err_out, "the address is not UTF-8".into());
+        return ptr::null_mut();
+    };
+    let Some(addr) = qlab_wallet::address::Address::decode_any(text.trim()) else {
+        set_err(err_out, "not a Qumbra address: it does not decode as a full qaddr1… address of any version".into());
+        return ptr::null_mut();
+    };
+    let json = serde_json::json!({
+        "version": addr.version,
+        "canonical": addr.encode(),
+        "short": addr.short().encode(),
+    });
+    out_string(json.to_string())
 }
 
 /// Fetch one scan path — **the transport the shell owns**.

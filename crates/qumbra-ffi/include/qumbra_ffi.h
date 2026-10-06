@@ -65,6 +65,23 @@ char *qmb_wallet_address(const qmb_wallet_t *w, uint64_t index);
 /* Short address (qs1…) — the human-facing default. */
 char *qmb_wallet_address_short(const qmb_wallet_t *w, uint64_t index);
 
+/* Lab #896 (extension #68 D2): the Candidate A (VERSION 2) address at a
+ * diversifier index, bound to authorization generation `generation` — what a
+ * format-33 Annulet net pays (a receive-only wallet passes 0). A pure
+ * derivation from the seed; no journal. The first call per generation builds
+ * that generation's tree (4,096 ML-DSA-44 keys: seconds under wasm), cached
+ * on the handle. Full form and short (qs1…) form. */
+char *qmb_wallet_address_v2(const qmb_wallet_t *w, uint64_t index, uint32_t generation);
+char *qmb_wallet_address_v2_short(const qmb_wallet_t *w, uint64_t index, uint32_t generation);
+
+/* Parse a full qaddr1… address of ANY version:
+ *   {"version":N,"canonical":"qaddr1…","short":"qs1…"}
+ * Version 1 is payable on L1 and v1 Annulet nets, version 2 on Candidate A
+ * (format-33) nets; which one a net takes is the caller's question — read the
+ * version here, never re-implement the rule. NULL + *err_out (by name) when
+ * the string is not a full address; *err_out is NULL on success. */
+char *qmb_address_parse_any(const char *s, char **err_out);
+
 /* The full address as a QR code in SVG (#342's renderer, EC-L). Show the
  * qs1… fingerprint BESIDE it: a QR that merely scans is not a verified
  * address. NULL + *err_out if the payload cannot fit. */
@@ -660,6 +677,27 @@ qmb_annulet_t *qmb_annulet_new(const qmb_wallet_t *w, const char *endpoint_label
                                const uint8_t *list_sig, size_t sig_len,
                                const uint8_t *list_key, size_t key_len,
                                const char *list_source_commit, char **err_out);
+
+/* Lab #896 (extension #68 D2): qmb_annulet_new plus the AUTHORIZATION
+ * GENERATIONS a Candidate A (format-33) scan owns notes under: n_generations
+ * u32s (4-byte aligned), at most 8, no generation twice; NULL/0 means [0], the
+ * receive-only wallet's one generation.
+ * Same pump protocol and the same handle. Each listed generation's tree is
+ * built at this call, once per wallet handle (seconds under wasm), whatever
+ * the net; a v1 net's scan does not use them. An out-of-bound list is NULL
+ * with *err_out set. qmb_annulet_new itself is unchanged (on a Candidate A
+ * net it probes generations 0..8). */
+qmb_annulet_t *qmb_annulet_new_v2(const qmb_wallet_t *w, const char *endpoint_label,
+                                  const uint8_t *pin32, uint64_t from, uint64_t to,
+                                  const uint64_t *indices, size_t n_indices,
+                                  const uint8_t *rng_seed32,
+                                  const uint8_t *record, size_t record_len,
+                                  const uint8_t *list, size_t list_len,
+                                  const uint8_t *list_sig, size_t sig_len,
+                                  const uint8_t *list_key, size_t key_len,
+                                  const char *list_source_commit,
+                                  const uint32_t *generations, size_t n_generations,
+                                  char **err_out);
 int32_t qmb_annulet_step(qmb_annulet_t *s, char **out);
 void qmb_annulet_supply(qmb_annulet_t *s, const uint8_t *body, size_t len);
 void qmb_annulet_supply_err(qmb_annulet_t *s, const char *reason);

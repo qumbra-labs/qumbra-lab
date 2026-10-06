@@ -27,6 +27,14 @@
 //!   <out>/<case>/record_in.bin  the record fed to qmb_annulet_new (if any)
 //!   <out>/<case>/record_out.bin the record qmb_annulet_take_record returned
 //!   <out>/lists/*.json|*.sig    the signed lists the cases use
+//!   <out>/addresses.json        lab #896 (extension #68 D2): the v1 and
+//!                               Candidate A (v2) address vectors of one
+//!                               fixture wallet, and qmb_address_parse_any
+//!                               of each, all through the ABI
+//!
+//! Cases whose `entry` is `qmb_annulet_new_v2` (lab #896) run on a
+//! **format-33** genesis with the case's `generations`; every other case is
+//! `qmb_annulet_new`, unchanged.
 //!
 //! Run (a named local run on the ad_goldens rule):
 //!   cargo run -p qumbra-ffi --example annulet_fixtures -- <out> --lab-rev <commit> [--force]
@@ -44,10 +52,13 @@ use std::path::{Path, PathBuf};
 use common::*;
 use qlab_devnet::body::BlockBody;
 use qumbra_ffi::annulet::{
-    qmb_annulet_free, qmb_annulet_new, qmb_annulet_step, qmb_annulet_supply, qmb_annulet_supply_err,
-    qmb_annulet_take_record, qmb_annulet_take_view,
+    qmb_annulet_free, qmb_annulet_new, qmb_annulet_new_v2, qmb_annulet_step, qmb_annulet_supply,
+    qmb_annulet_supply_err, qmb_annulet_take_record, qmb_annulet_take_view,
 };
-use qumbra_ffi::{qmb_dealloc, qmb_string_free, qmb_wallet_free, qmb_wallet_from_entropy};
+use qumbra_ffi::{
+    qmb_address_parse_any, qmb_dealloc, qmb_string_free, qmb_wallet_address, qmb_wallet_address_short,
+    qmb_wallet_address_v2, qmb_wallet_address_v2_short, qmb_wallet_free, qmb_wallet_from_entropy,
+};
 use qumbra_wallet::asset_view::test_list_key;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -91,7 +102,7 @@ struct Recorded {
 
 /// One scan through the ABI, pumped like a host, recording every Need and
 /// its answer into `dir`.
-fn pump(dir: &Path, seed: u8, ep: &Endpoint, list: Option<&Signed>, record: Option<&[u8]>) -> Recorded {
+fn pump(dir: &Path, seed: u8, ep: &Endpoint, list: Option<&Signed>, record: Option<&[u8]>, gens: Option<&[u32]>) -> Recorded {
     let key = test_list_key::encoded();
     unsafe {
         let w = qmb_wallet_from_entropy([seed; 32].as_ptr());
@@ -105,10 +116,16 @@ fn pump(dir: &Path, seed: u8, ep: &Endpoint, list: Option<&Signed>, record: Opti
         };
         let (rp, rl) = record.map_or((std::ptr::null(), 0), |r| (r.as_ptr(), r.len()));
         let mut err: *mut c_char = std::ptr::null_mut();
-        let s = qmb_annulet_new(
-            w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), rp, rl, lp, ll, sp, sl,
-            kp, kl, commit.as_ptr(), &mut err,
-        );
+        let s = match gens {
+            None => qmb_annulet_new(
+                w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), rp, rl, lp, ll, sp,
+                sl, kp, kl, commit.as_ptr(), &mut err,
+            ),
+            Some(g) => qmb_annulet_new_v2(
+                w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), rp, rl, lp, ll, sp,
+                sl, kp, kl, commit.as_ptr(), g.as_ptr(), g.len(), &mut err,
+            ),
+        };
         assert!(!s.is_null(), "qmb_annulet_new refused: {}", if err.is_null() { "NULL".into() } else { take_str(err) });
         let mut transcript = Vec::new();
         let expect = loop {
@@ -157,6 +174,8 @@ struct Case<'a> {
     /// "none", "listed" or "other_network" — and the list file it names.
     list: (&'a str, Option<(&'a Signed, &'a str)>),
     record_in: Option<Vec<u8>>,
+    /// `Some`: the case runs `qmb_annulet_new_v2` with these generations.
+    generations: Option<&'a [u32]>,
 }
 
 fn write_case(out: &Path, c: &Case) -> Option<Vec<u8>> {
@@ -165,7 +184,7 @@ fn write_case(out: &Path, c: &Case) -> Option<Vec<u8>> {
     if let Some(r) = &c.record_in {
         std::fs::write(dir.join("record_in.bin"), r).unwrap();
     }
-    let rec = pump(&dir, c.seed, c.ep, c.list.1.map(|(l, _)| l), c.record_in.as_deref());
+    let rec = pump(&dir, c.seed, c.ep, c.list.1.map(|(l, _)| l), c.record_in.as_deref(), c.generations);
     if let Some(r) = &rec.record {
         std::fs::write(dir.join("record_out.bin"), r).unwrap();
     }
@@ -173,6 +192,9 @@ fn write_case(out: &Path, c: &Case) -> Option<Vec<u8>> {
         "case": c.name,
         "wallet": { "entropy": hex(&[c.seed; 32]), "seedVersion": "from_entropy", "indices": [0, 1] },
         "pin": hex(&c.ep.file.hash()),
+        "format": c.ep.file.format_version,
+        "entry": if c.generations.is_some() { "qmb_annulet_new_v2" } else { "qmb_annulet_new" },
+        "generations": c.generations,
         "list": c.list.0,
         "listFile": c.list.1.map(|(_, f)| f),
         "recordIn": c.record_in.as_ref().map(|_| "record_in.bin"),
@@ -184,6 +206,34 @@ fn write_case(out: &Path, c: &Case) -> Option<Vec<u8>> {
     println!("{:<16} {} Needs → {}", c.name, case["transcript"].as_array().unwrap().len(),
         if rec.expect.get("refusal").is_some() { format!("refusal {}", rec.expect["refusal"]["refusal"]) } else { "view".into() });
     rec.record
+}
+
+/// The address vectors of fixture wallet `seed`, all through the ABI: index 0
+/// at v1 and at Candidate A generation 0 (full + short), and
+/// `qmb_address_parse_any` of both full forms.
+fn write_addresses(out: &Path, seed: u8) {
+    unsafe {
+        let w = qmb_wallet_from_entropy([seed; 32].as_ptr());
+        let v1 = take_str(qmb_wallet_address(w, 0));
+        let v1s = take_str(qmb_wallet_address_short(w, 0));
+        let v2 = take_str(qmb_wallet_address_v2(w, 0, 0));
+        let v2s = take_str(qmb_wallet_address_v2_short(w, 0, 0));
+        let parse = |a: &str| -> Value {
+            let c = CString::new(a).unwrap();
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let p = qmb_address_parse_any(c.as_ptr(), &mut err);
+            assert!(!p.is_null(), "parse_any refused a wallet address");
+            serde_json::from_str(&take_str(p)).unwrap()
+        };
+        let doc = json!({
+            "wallet": { "entropy": hex(&[seed; 32]), "seedVersion": "from_entropy" },
+            "v1": { "index": 0, "address": v1, "short": v1s, "parseAny": parse(&v1) },
+            "v2": { "index": 0, "generation": 0, "address": v2, "short": v2s, "parseAny": parse(&v2) },
+        });
+        std::fs::write(out.join("addresses.json"), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        qmb_wallet_free(w);
+    }
+    println!("addresses.json   v1 + v2 (generation 0)");
 }
 
 fn main() {
@@ -244,12 +294,12 @@ fn main() {
         names.push(c.name.to_string());
         write_case(&out, &c)
     };
-    run(Case { name: "honest", seed: A, ep: &honest3, list: ("none", None), record_in: None });
-    run(Case { name: "listed", seed: A, ep: &honest3, list: ("listed", Some((&listed, "lists/listed"))), record_in: None });
-    run(Case { name: "other_network", seed: A, ep: &honest3, list: ("other_network", Some((&other, "lists/other_network"))), record_in: None });
-    run(Case { name: "no_nullifiers", seed: A, ep: &no_nf, list: ("none", None), record_in: None });
+    run(Case { name: "honest", seed: A, ep: &honest3, list: ("none", None), record_in: None, generations: None });
+    run(Case { name: "listed", seed: A, ep: &honest3, list: ("listed", Some((&listed, "lists/listed"))), record_in: None, generations: None });
+    run(Case { name: "other_network", seed: A, ep: &honest3, list: ("other_network", Some((&other, "lists/other_network"))), record_in: None, generations: None });
+    run(Case { name: "no_nullifiers", seed: A, ep: &no_nf, list: ("none", None), record_in: None, generations: None });
     for (name, ep) in &lies {
-        run(Case { name, seed: B, ep, list: ("listed", Some((&listed_b, "lists/listed_b"))), record_in: None });
+        run(Case { name, seed: B, ep, list: ("listed", Some((&listed_b, "lists/listed_b"))), record_in: None, generations: None });
     }
 
     // The record: scan 1 on three bodies, scan 2 on five fed scan 1's record,
@@ -265,24 +315,46 @@ fn main() {
     let file_c = genesis(&c0);
     let ep3 = Endpoint::new(file_c.clone(), &cb[..3], None, Lie::None);
     let ep5 = Endpoint::new(file_c.clone(), &cb, None, Lie::None);
-    let first = run(Case { name: "record_first", seed: C, ep: &ep3, list: ("none", None), record_in: None }).expect("a first scan records");
-    run(Case { name: "record_resume", seed: C, ep: &ep5, list: ("none", None), record_in: Some(first.clone()) });
+    let first = run(Case { name: "record_first", seed: C, ep: &ep3, list: ("none", None), record_in: None, generations: None }).expect("a first scan records");
+    run(Case { name: "record_resume", seed: C, ep: &ep5, list: ("none", None), record_in: Some(first.clone()), generations: None });
     let mut tampered = first.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
-    run(Case { name: "record_tampered", seed: C, ep: &ep5, list: ("none", None), record_in: Some(tampered) });
+    run(Case { name: "record_tampered", seed: C, ep: &ep5, list: ("none", None), record_in: Some(tampered), generations: None });
 
-    for w in [wa, wb, wc] {
+    // Lab #896 (extension #68 D2): Candidate A, receive-only. A format-33
+    // genesis pays 1,000,000 USDT-test to wallet D's v2 address 0 (generation
+    // 0); height 1 pays it 5 fee units, height 2 another 7 USDT-test.
+    const D: u8 = 0xD2;
+    let wd = wallet_dir("wa3a_d", D);
+    let d2 = wd.wallet().address_candidate_a_at_index(0, &qumbra_wallet::auth_journal::generation_root(&wd.wallet(), 0));
+    let mut rng = StdRng::seed_from_u64(D as u64);
+    let db = vec![
+        BlockBody { txs: vec![pay_tx(&d2, &[note_to(&d2, 5, 0, 20)], 0x30, &mut rng)], ..BlockBody::default() },
+        BlockBody { txs: vec![pay_tx(&d2, &[note_to(&d2, 7, USDT, 21)], 0x31, &mut rng)], ..BlockBody::default() },
+    ];
+    let file_d = genesis_v2(&d2, Vec::new());
+    assert_eq!(file_d.format_version, qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION);
+    let ep_d = Endpoint::new(file_d.clone(), &db, None, Lie::None);
+    let listed_d = list_for(&file_d.hash());
+    std::fs::write(out.join("lists").join("listed_d.json"), &listed_d.0).unwrap();
+    std::fs::write(out.join("lists").join("listed_d.sig"), &listed_d.1).unwrap();
+    run(Case { name: "v2_receive", seed: D, ep: &ep_d, list: ("listed", Some((&listed_d, "lists/listed_d"))), record_in: None, generations: Some(&[0]) });
+    run(Case { name: "v2_other_generation", seed: D, ep: &ep_d, list: ("none", None), record_in: None, generations: Some(&[1]) });
+    write_addresses(&out, D);
+
+    for w in [wa, wb, wc, wd] {
         let _ = std::fs::remove_dir_all(&w.dir);
     }
     let manifest = json!({
-        "what": "lab #858 WA3a — Annulet fixture transcripts, recorded from the real ABI pump. FIXTURE seeds only.",
+        "what": "lab #858 WA3a + lab #896 (extension #68 D2) — Annulet fixture transcripts, recorded from the real ABI pump; v2_* cases on a format-33 genesis via qmb_annulet_new_v2. FIXTURE seeds only.",
         "labRev": lab_rev,
         "rngSeed": hex(&RNG),
         "endpointLabel": ENDPOINT,
         "listSourceCommit": COMMIT,
         "testListKey": hex(&test_list_key::encoded()),
         "cases": names,
+        "addresses": "addresses.json",
     });
     std::fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
     println!("wrote {} cases to {}", manifest["cases"].as_array().unwrap().len(), out.display());

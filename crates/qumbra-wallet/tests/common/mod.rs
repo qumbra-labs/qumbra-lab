@@ -5,11 +5,11 @@
 #![allow(dead_code)]
 
 use qlab_devnet::annulet::{
-    body_commitment_annulet, AnnuletHeaderFields, L2ShapeTag, L2Surface, SequencerKey,
+    body_commitment_annulet_for, AnnuletHeaderFields, L2ShapeTag, L2Surface, SequencerKey,
 };
 use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
 use qlab_devnet::fees::ArityBucket;
-use qlab_devnet::forms::GenesisForm;
+use qlab_devnet::forms::{GenesisForm, L2AuthForm};
 use qlab_devnet::header::BlockHeader;
 use qlab_node::annulet_genesis::{h32, AnnuletGenesisFile, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord};
 use qlab_node::{ChainStore, MemChainStore, StoredBlock};
@@ -85,6 +85,36 @@ pub fn genesis_with(holder: &Address, extra: Vec<qlab_air::l2::RegistryLeaf>, no
     AnnuletGenesisFile::assemble("annulet-ad1", params, SEQ_SEED, leaves, records, 0)
 }
 
+/// Lab #896 (extension #68 D2): [`genesis_with`] on the **Candidate A** axis
+/// (format 33): the same registry and the same holder note, so `holder` is a
+/// version-2 address on a Candidate A net.
+pub fn genesis_v2(holder: &Address, notes: Vec<L2Note>) -> AnnuletGenesisFile {
+    let v1 = genesis_with(holder, Vec::new(), notes);
+    AnnuletGenesisFile::assemble_with_auth(
+        "annulet-ad1-v2",
+        v1.params,
+        SEQ_SEED,
+        v1.registry_genesis,
+        v1.genesis_notes,
+        0,
+        L2AuthForm::CandidateA,
+    )
+}
+
+/// The file's authorization axis (v1 when it does not name one).
+pub fn auth_of(file: &AnnuletGenesisFile) -> L2AuthForm {
+    file.l2_auth().unwrap_or(L2AuthForm::None)
+}
+
+/// The served wire form for `file`'s net: [`AN`] on v1, the Candidate A form
+/// on a format-33 net.
+pub fn wire_of(file: &AnnuletGenesisFile) -> WireForm {
+    match auth_of(file) {
+        L2AuthForm::CandidateA => WireForm::ANNULET_AUTH,
+        L2AuthForm::None => AN,
+    }
+}
+
 /// A sealed chain over `bodies` (height 1, 2, …), as a store.
 pub fn store(file: &AnnuletGenesisFile, bodies: &[BlockBody]) -> MemChainStore {
     store_with(file, bodies, SEQ_SEED)
@@ -98,7 +128,7 @@ pub fn store_with(file: &AnnuletGenesisFile, bodies: &[BlockBody], seed: [u8; 32
     let mut chain = MemChainStore::new_for(GenesisForm::Annulet, StoredBlock::annulet_genesis(&g));
     let mut parent = g;
     for (i, body) in bodies.iter().enumerate() {
-        let h = BlockHeader::child_of_annulet(&parent, 10 * (i as u64 + 1), ext, body_commitment_annulet(body));
+        let h = BlockHeader::child_of_annulet(&parent, 10 * (i as u64 + 1), ext, body_commitment_annulet_for(body, auth_of(file)));
         chain.put_block(StoredBlock::from_sealed_parts(&key.seal(h), body)).unwrap();
         parent = h;
     }
@@ -149,6 +179,8 @@ pub enum Lie {
 
 pub struct Endpoint {
     pub file: AnnuletGenesisFile,
+    /// The served wire form, from the file's axis ([`wire_of`]).
+    pub wire: WireForm,
     pub view: DiscoveryView,
     /// What `/v1/compact`, `/full` and (for `ForgedNote`) `/body` serve.
     pub served: DiscoveryView,
@@ -163,7 +195,7 @@ impl Endpoint {
             (_, Some(f)) => view_of(&store(&file, f)),
             (_, None) => view.clone(),
         };
-        Endpoint { file, view, served, lie }
+        Endpoint { wire: wire_of(&file), file, view, served, lie }
     }
 
     pub fn fetch(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -180,30 +212,30 @@ impl Endpoint {
             }
             "/v1/headers" => {
                 let q = if self.lie == Lie::HeadersShort { "from=1&to=2".to_string() } else { query.to_string() };
-                let page = respond_headers(&self.view, AN, &q).map_err(err)?;
+                let page = respond_headers(&self.view, self.wire, &q).map_err(err)?;
                 match self.lie {
                     Lie::HeaderGap => {
-                        let mut units = qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap();
+                        let mut units = qlab_p2p::served::decode_headers_page(self.wire, 1, &page).unwrap();
                         units.remove(1);
-                        return Ok(qlab_p2p::served::encode_headers_page(AN, 1, &units));
+                        return Ok(qlab_p2p::served::encode_headers_page(self.wire, 1, &units));
                     }
                     Lie::HeaderFork | Lie::WrongKey => {
-                        let mut units = qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap();
-                        let other = respond_headers(&self.served, AN, &q).map_err(err)?;
-                        let other = qlab_p2p::served::decode_headers_page(AN, 1, &other).unwrap();
+                        let mut units = qlab_p2p::served::decode_headers_page(self.wire, 1, &page).unwrap();
+                        let other = respond_headers(&self.served, self.wire, &q).map_err(err)?;
+                        let other = qlab_p2p::served::decode_headers_page(self.wire, 1, &other).unwrap();
                         let keep = if self.lie == Lie::HeaderFork { 1 } else { 0 };
                         units.truncate(keep);
                         units.extend(other.into_iter().skip(keep));
-                        return Ok(qlab_p2p::served::encode_headers_page(AN, 1, &units));
+                        return Ok(qlab_p2p::served::encode_headers_page(self.wire, 1, &units));
                     }
                     Lie::BadSeal => {}
                     _ => return Ok(page),
                 }
-                let mut units = qlab_p2p::served::decode_headers_page(AN, 1, &page).unwrap();
+                let mut units = qlab_p2p::served::decode_headers_page(self.wire, 1, &page).unwrap();
                 if let Some(qlab_p2p::codec::WireHeader::Sealed(s)) = units.get_mut(1) {
                     s.sig[0] ^= 1;
                 }
-                Ok(qlab_p2p::served::encode_headers_page(AN, 1, &units))
+                Ok(qlab_p2p::served::encode_headers_page(self.wire, 1, &units))
             }
             // Lab #869: what `open_session` reads after the verified scan.
             "/v1/annulet/params" => Ok(qlab_cbserver::registry::encode_annulet_params(&qlab_cbserver::registry::AnnuletParams {
@@ -248,19 +280,19 @@ impl Endpoint {
             p if p.ends_with("/body") => {
                 let h = p.split('/').nth(3).unwrap();
                 if self.lie == Lie::BodyHeader {
-                    return respond_body(&self.served, AN, h).map_err(err);
+                    return respond_body(&self.served, self.wire, h).map_err(err);
                 }
                 if self.lie != Lie::ForgedNote {
-                    return respond_body(&self.view, AN, h).map_err(err);
+                    return respond_body(&self.view, self.wire, h).map_err(err);
                 }
                 // The forged body under the real sealed header.
-                let real = respond_body(&self.view, AN, h).map_err(err)?;
+                let real = respond_body(&self.view, self.wire, h).map_err(err)?;
                 let height: u64 = h.parse().unwrap();
-                let header = qlab_p2p::served::decode_body_answer(AN, height, &real).ok().unwrap().header;
-                let forged = respond_body(&self.served, AN, h).map_err(err)?;
-                let mut ann = qlab_p2p::served::decode_body_answer(AN, height, &forged).ok().unwrap();
+                let header = qlab_p2p::served::decode_body_answer(self.wire, height, &real).ok().unwrap().header;
+                let forged = respond_body(&self.served, self.wire, h).map_err(err)?;
+                let mut ann = qlab_p2p::served::decode_body_answer(self.wire, height, &forged).ok().unwrap();
                 ann.header = header;
-                Ok(qlab_p2p::served::encode_body_answer(AN, height, &ann).unwrap())
+                Ok(qlab_p2p::served::encode_body_answer(self.wire, height, &ann).unwrap())
             }
             other => Err(format!("404 {other}")),
         }
