@@ -8,13 +8,16 @@
 
 > **Dated note, 2026-10-06 (lab #896 seam T). The verdicts below stand as of R16; this records what changed since.**
 >
-> 1. **P3 house, with every public value an output (`--no-pv-inputs --cr-premise`, the setting of §2's P3 house figure), now has 28 undetermined public values, not the four in §0/§2.** The four are still there: each row's `redeem` and `vpa` while its amount is 0. The 24 new ones are the fee, row 1's amount and the exit recipient. All 24 come from one enumeration group the engine skips for size: the per-row constraints of P's asset-0 exit edge, added by F5-4d (lab PR #797) after R16. The group is the same on v1 and v2. Under the codec premise of §3, all 28 are determined (measured on `p3v2`, whose group is the same).
-> 2. **Candidate A (`s3v2`, `p3v2`, `rv2`, lab #896) adds no undetermined public value beyond v1's under the same premise set.** The v2 runs also take each slot's authorization-leaf public values as verifier-supplied, because the node fills them from the transaction's auth section. Under the codec and collision-resistance premises, S, P and R have 0 undetermined public values. With every public value an output, `p3v2` has the same 28 as v1.
+> 1. **P3 house, with every public value an output (`--no-pv-inputs --cr-premise`, the setting of §2's P3 house figure), now has 28 undetermined public values, not the four in §0/§2.** The four are still there: each row's `redeem` and `vpa` while its amount is 0. The 24 new ones are the fee, row 1's amount and the exit recipient. All 24 come from one enumeration group: the per-row constraints of P's asset-0 exit edge, added by F5-4d (lab PR #797) after R16. The group is the same on v1 and v2.
+>    - The R16 engine refuses the group on its equation cap.
+>    - The current engine (lab PR #919) admits it but does not decide it: in its first case, unknowns are read only jointly, never one at a time. The group is undecided by the census. These runs neither show nor exclude a second in-range solution.
+>    - What reaches 0 is §3's premise set as the runs that use it take it: the collision-resistance premise **and** §3's zero-amount pair declared inputs, plus on v2 the verifier-supplied leaf public values. `p3v2` has 0 undetermined public values under that set (census 2026-10-05). Under the collision-resistance premise alone, the 28 stay undetermined on v1 and v2.
+> 2. **Candidate A (`s3v2`, `p3v2`, `rv2`, lab #896) adds no undetermined public value beyond v1's under the same premise set.** The v2 runs also take each slot's authorization-leaf public values as verifier-supplied, because the node fills them from the transaction's auth section. With the leaf public values supplied on all three, and P also under the collision-resistance premise with the zero-amount pair declared inputs, S, P and R have 0 undetermined public values. With every public value an output, `p3v2` has the same 28 as v1.
 > 3. **Engine since R16:**
 >    - lab PR #918: a confirm's budget is enforced inside each pin and replay, not only between attempts;
 >    - lab PR #919: enumeration admits wider groups with few booleans, and the skipped-group log prints the real boolean count instead of a hard-coded 0.
 >
->    On v1 P3 house, both are determination-neutral: the old and new engines give the same result cell for cell. Neither decides the exit-edge group above.
+>    On v1 P3 house, both are determination-neutral: the old and new engines give the same result cell for cell. Neither decides the exit-edge group above (item 1).
 
 ## 0. Summary
 
