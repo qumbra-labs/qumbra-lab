@@ -6,6 +6,16 @@
 >
 > **Runs used pre-publication revisions of this engine.** The census engine (`qlab-air/src/detaudit*`) at the R16 revision is identical to this PR's apart from one assertion message; the bench adds the lane guard and a `DETAUDIT_CONFIRM_COL` confirm filter (R18c only). Line numbers cited for `l2p.rs` and other files are this PR's.
 
+> **Dated note, 2026-10-06 (lab #896 seam T). The verdicts below stand as of R16; this records what changed since.**
+>
+> 1. **P3 house, with every public value an output (`--no-pv-inputs --cr-premise`, the setting of §2's P3 house figure), now has 28 undetermined public values, not the four in §0/§2.** The four are still there: each row's `redeem` and `vpa` while its amount is 0. The 24 new ones are the fee, row 1's amount and the exit recipient. All 24 come from one enumeration group the engine skips for size: the per-row constraints of P's asset-0 exit edge, added by F5-4d (lab PR #797) after R16. The group is the same on v1 and v2. Under the codec premise of §3, all 28 are determined (measured on `p3v2`, whose group is the same).
+> 2. **Candidate A (`s3v2`, `p3v2`, `rv2`, lab #896) adds no undetermined public value beyond v1's under the same premise set.** The v2 runs also take each slot's authorization-leaf public values as verifier-supplied, because the node fills them from the transaction's auth section. Under the codec and collision-resistance premises, S, P and R have 0 undetermined public values. With every public value an output, `p3v2` has the same 28 as v1.
+> 3. **Engine since R16:**
+>    - lab PR #918: a confirm's budget is enforced inside each pin and replay, not only between attempts;
+>    - lab PR #919: enumeration admits wider groups with few booleans, and the skipped-group log prints the real boolean count instead of a hard-coded 0.
+>
+>    On v1 P3 house, both are determination-neutral: the old and new engines give the same result cell for cell. Neither decides the exit-edge group above.
+
 ## 0. Summary
 
 Every verdict below cites the **R16 closing sweep**: runs R16a–d, every run `--confirm`, budget 900 (S3 merge 1500), every exit 0. The one exception is the P3 merge-with-vPublic row, which cites R17 and R18: the same engine, with two added fixtures.
