@@ -680,7 +680,8 @@ qmb_annulet_t *qmb_annulet_new(const qmb_wallet_t *w, const char *endpoint_label
 
 /* Lab #896 (extension #68 D2): qmb_annulet_new plus the AUTHORIZATION
  * GENERATIONS a Candidate A (format-33) scan owns notes under: n_generations
- * u32s, at most 8; NULL/0 means [0], the receive-only wallet's one generation.
+ * u32s (4-byte aligned), at most 8, no generation twice; NULL/0 means [0], the
+ * receive-only wallet's one generation.
  * Same pump protocol and the same handle. Each listed generation's tree is
  * built at this call, once per wallet handle (seconds under wasm), whatever
  * the net; a v1 net's scan does not use them. An out-of-bound list is NULL

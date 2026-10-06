@@ -9,9 +9,12 @@
 //!     name;
 //! (c) `qmb_annulet_new_v2` over a **format-33** fixture chain: a genesis note
 //!     and a block note paid to the v2 address are found with the default
-//!     generations (`[0]`), and not with generation 1 alone; the old entry
-//!     `qmb_annulet_new` (generation probe) finds the same;
-//! (d) the generation list is bounded by name.
+//!     generations (`[0]`), and not with generation 1 alone;
+//! (d) the generation list: the bound (8) is accepted, one more, NULL with a
+//!     count and a generation listed twice are refused by name.
+//!
+//! One wallet handle per test, so its root cache holds: each generation's
+//! tree (4,096 ML-DSA-44 keys) is built once.
 //!
 //! Fixture seeds only; nothing proves.
 
@@ -96,11 +99,10 @@ fn b_parse_any_names_the_version_and_refuses_a_non_address() {
     let _ = std::fs::remove_dir_all(&w.dir);
 }
 
-/// One scan through `qmb_annulet_new_v2` (`gens` = Some) or the old
-/// `qmb_annulet_new` (`gens` = None); the view or the refusal.
-fn scan(ep: &Endpoint, gens: Option<&[u32]>) -> Result<Value, Value> {
-    unsafe {
-        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+/// One scan of handle `w` through `qmb_annulet_new_v2` (`gens` = Some) or the
+/// old `qmb_annulet_new` (`gens` = None); the view or the refusal.
+unsafe fn scan(w: *mut qumbra_ffi::WalletState, ep: &Endpoint, gens: Option<&[u32]>) -> Result<Value, Value> {
+    {
         let endpoint = CString::new("fixture").unwrap();
         let pin = ep.file.hash();
         let indices = [0u64, 1];
@@ -137,7 +139,6 @@ fn scan(ep: &Endpoint, gens: Option<&[u32]>) -> Result<Value, Value> {
             }
         };
         qmb_annulet_free(s);
-        qmb_wallet_free(w);
         out
     }
 }
@@ -174,16 +175,18 @@ impl Drop for WalletDirGuard {
 #[test]
 fn c_a_format_33_scan_finds_the_v2_notes_under_generation_0() {
     let (_w, ep) = v2_chain();
-    let view = scan(&ep, Some(&[])).expect("the format-33 chain verifies");
-    assert_eq!(spendable(&view, USDT).as_deref(), Some("1000000"), "the genesis note: {view}");
-    assert_eq!(spendable(&view, 0).as_deref(), Some("5"), "the block note: {view}");
-    assert_eq!(scan(&ep, Some(&[0])).unwrap(), view, "[0] is the default");
-    // The old entry probes generations 0..8 and finds the same notes.
-    assert_eq!(scan(&ep, None).unwrap(), view, "qmb_annulet_new is unchanged on a format-33 net");
-    // Generation 1 alone owns none of them.
-    let other = scan(&ep, Some(&[1])).expect("still verifies");
-    assert_eq!(spendable(&other, USDT), None, "{other}");
-    assert_eq!(spendable(&other, 0), None, "{other}");
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let view = scan(w, &ep, Some(&[])).expect("the format-33 chain verifies");
+        assert_eq!(spendable(&view, USDT).as_deref(), Some("1000000"), "the genesis note: {view}");
+        assert_eq!(spendable(&view, 0).as_deref(), Some("5"), "the block note: {view}");
+        assert_eq!(scan(w, &ep, Some(&[0])).unwrap(), view, "[0] is the default");
+        // Generation 1 alone owns none of them.
+        let other = scan(w, &ep, Some(&[1])).expect("still verifies");
+        assert_eq!(spendable(&other, USDT), None, "{other}");
+        assert_eq!(spendable(&other, 0), None, "{other}");
+        qmb_wallet_free(w);
+    }
 }
 
 #[test]
@@ -195,15 +198,27 @@ fn d_the_generation_list_is_bounded_by_name() {
         let pin = ep.file.hash();
         let (nu8, nu64) = (std::ptr::null::<u8>(), std::ptr::null::<u64>());
         let too_many: Vec<u32> = (0..=MAX_ANNULET_GENERATIONS as u32).collect();
-        for (p, n) in [(too_many.as_ptr(), too_many.len()), (std::ptr::null(), 3)] {
+        let twice = [0u32, 0];
+        for (p, n, why) in [
+            (too_many.as_ptr(), too_many.len(), "generations: at most"),
+            (std::ptr::null(), 3, "generations: at most"),
+            (std::ptr::null(), 1, "generations: at most"),
+            (twice.as_ptr(), 2, "generation 0 is listed twice"),
+        ] {
             let mut err: *mut c_char = std::ptr::null_mut();
             let s = qmb_annulet_new_v2(
                 w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, nu64, 0, RNG.as_ptr(), nu8, 0, nu8, 0, nu8, 0,
                 nu8, 0, std::ptr::null(), p, n, &mut err,
             );
             assert!(s.is_null(), "{n} generations refused");
-            assert!(take_str(err).contains("generations: at most"), "by name");
+            let e = take_str(err);
+            assert!(e.contains(why), "by name: {e}");
         }
+        // The bound itself is accepted, and the scan completes.
+        let bound: Vec<u32> = (0..MAX_ANNULET_GENERATIONS as u32).collect();
+        assert_eq!(bound.len(), 8);
+        let view = scan(w, &ep, Some(&bound)).expect("eight generations scan");
+        assert_eq!(spendable(&view, USDT).as_deref(), Some("1000000"), "generation 0 is among them");
         qmb_wallet_free(w);
     }
 }

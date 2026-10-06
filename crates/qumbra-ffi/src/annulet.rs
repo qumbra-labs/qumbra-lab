@@ -295,8 +295,8 @@ pub const MAX_ANNULET_GENERATIONS: usize = qumbra_wallet::auth_journal::PROBE_GE
 /// `0 .. MAX_ANNULET_GENERATIONS`.
 ///
 /// # Safety
-/// As [`qmb_annulet_new`]; `generations` `n_generations` readable u32s, or
-/// NULL with 0.
+/// As [`qmb_annulet_new`]; `generations` `n_generations` readable u32s,
+/// 4-byte aligned, or NULL with 0.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn qmb_annulet_new_v2(
@@ -333,6 +333,11 @@ pub unsafe extern "C" fn qmb_annulet_new_v2(
     }
     let gens: Vec<u32> =
         if n_generations == 0 { vec![0] } else { std::slice::from_raw_parts(generations, n_generations).to_vec() };
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(g) = gens.iter().find(|g| !seen.insert(**g)) {
+        set_err(err_out, format!("generation {g} is listed twice"));
+        return ptr::null_mut();
+    }
     annulet_new(
         w, endpoint_label, pin32, from, to, indices, n_indices, rng_seed32, record, record_len, list, list_len,
         list_sig, sig_len, list_key, key_len, list_source_commit, Some(&gens), err_out,
