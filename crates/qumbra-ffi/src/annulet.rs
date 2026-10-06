@@ -275,6 +275,92 @@ pub unsafe extern "C" fn qmb_annulet_new(
     list_source_commit: *const c_char,
     err_out: *mut *mut c_char,
 ) -> *mut AnnuletState {
+    annulet_new(
+        w, endpoint_label, pin32, from, to, indices, n_indices, rng_seed32, record, record_len, list, list_len,
+        list_sig, sig_len, list_key, key_len, list_source_commit, None, err_out,
+    )
+}
+
+/// The most authorization generations [`qmb_annulet_new_v2`] scans — the
+/// wallet's own probe bound (`PROBE_GENERATIONS`).
+pub const MAX_ANNULET_GENERATIONS: usize = qumbra_wallet::auth_journal::PROBE_GENERATIONS as usize;
+
+/// Lab #896 (extension #68 D2): [`qmb_annulet_new`] with the **authorization
+/// generations** a Candidate A (format-33) scan owns notes under: `n` u32s,
+/// at most [`MAX_ANNULET_GENERATIONS`]; NULL/0 means `[0]` — the receive-only
+/// wallet's one generation. Same pump protocol. Each listed generation's
+/// tree is built here, once per wallet handle (seconds under wasm), whatever
+/// the net; a v1 net's scan does not use them. [`qmb_annulet_new`] is
+/// unchanged: on a Candidate A net it probes generations
+/// `0 .. MAX_ANNULET_GENERATIONS`.
+///
+/// # Safety
+/// As [`qmb_annulet_new`]; `generations` `n_generations` readable u32s, or
+/// NULL with 0.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn qmb_annulet_new_v2(
+    w: *const WalletState,
+    endpoint_label: *const c_char,
+    pin32: *const u8,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+    record: *const u8,
+    record_len: usize,
+    list: *const u8,
+    list_len: usize,
+    list_sig: *const u8,
+    sig_len: usize,
+    list_key: *const u8,
+    key_len: usize,
+    list_source_commit: *const c_char,
+    generations: *const u32,
+    n_generations: usize,
+    err_out: *mut *mut c_char,
+) -> *mut AnnuletState {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if (generations.is_null() && n_generations != 0) || n_generations > MAX_ANNULET_GENERATIONS {
+        set_err(
+            err_out,
+            format!("{n_generations} generations: at most {MAX_ANNULET_GENERATIONS}, and NULL only with 0"),
+        );
+        return ptr::null_mut();
+    }
+    let gens: Vec<u32> =
+        if n_generations == 0 { vec![0] } else { std::slice::from_raw_parts(generations, n_generations).to_vec() };
+    annulet_new(
+        w, endpoint_label, pin32, from, to, indices, n_indices, rng_seed32, record, record_len, list, list_len,
+        list_sig, sig_len, list_key, key_len, list_source_commit, Some(&gens), err_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn annulet_new(
+    w: *const WalletState,
+    endpoint_label: *const c_char,
+    pin32: *const u8,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+    record: *const u8,
+    record_len: usize,
+    list: *const u8,
+    list_len: usize,
+    list_sig: *const u8,
+    sig_len: usize,
+    list_key: *const u8,
+    key_len: usize,
+    list_source_commit: *const c_char,
+    generations: Option<&[u32]>,
+    err_out: *mut *mut c_char,
+) -> *mut AnnuletState {
     if !err_out.is_null() {
         *err_out = ptr::null_mut();
     }
@@ -336,7 +422,11 @@ pub unsafe extern "C" fn qmb_annulet_new(
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
     let allocated = if n_indices == 0 { Vec::new() } else { std::slice::from_raw_parts(indices, n_indices).to_vec() };
     let wallet = (*w).wallet.clone();
-    let driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
+    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
+    if let Some(gens) = generations {
+        let roots = gens.iter().map(|&g| (g, (*w).generation_root(g))).collect();
+        driver = driver.with_generations(roots);
+    }
     Box::into_raw(Box::new(AnnuletState {
         wallet,
         endpoint: endpoint.to_string(),
