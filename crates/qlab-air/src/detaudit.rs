@@ -445,6 +445,26 @@ fn solve_ranged(a: &[i64], r: &[u64], t: i64) -> Option<Vec<u64>> {
 const ENUM_MAX_DEPS: usize = 16;
 const ENUM_MAX_EQS: usize = 12;
 const ENUM_MAX_BITS: usize = 12;
+/// A group with few boolean unknowns may be wider (lab #896 seam T, after the
+/// 2026-10-06 box): its case split is at most `2^ENUM_FEW_BITS` cases, so
+/// the equation count — not the case count — is the only cost, and a wide
+/// near-linear group (shape P's per-row exit edge, 21 equations, which put
+/// row 1's amount and the exit recipient past the old cap) is decided rather
+/// than skipped. Deciding more groups only adds determinations: each is
+/// still sound on a subset of the AIR's equations.
+const ENUM_FEW_BITS: usize = 4;
+const ENUM_MAX_EQS_FEW_BITS: usize = 32;
+/// Wide groups (past `ENUM_MAX_EQS`) tried per enumeration pass. A public
+/// value is read on every row, so an ambiguous wide group would otherwise be
+/// re-tried on each of a million rows; once its public values are settled
+/// later rows' groups shrink, and the first rows decide what can be decided.
+const ENUM_WIDE_PER_PASS: usize = 256;
+
+/// Whether enumeration takes a group of `eqs` equations and `bools` boolean
+/// unknowns.
+fn enum_admits(eqs: usize, bools: usize) -> bool {
+    bools <= ENUM_MAX_BITS && (eqs <= ENUM_MAX_EQS || (bools <= ENUM_FEW_BITS && eqs <= ENUM_MAX_EQS_FEW_BITS))
+}
 /// Solutions kept per group for the log.
 pub const ENUM_KEEP: usize = 8;
 
@@ -1130,6 +1150,7 @@ impl<F: PrimeField32> Census<F> {
         // One row at a time: a public value is read on every row, and a
         // group spanning rows would be one giant group; per row, each group
         // is a subset of the AIR's equations — sound for uniqueness.
+        let mut wide_tried = 0usize;
         let mut at = 0;
         while at < stuck.len() {
             let row = stuck[at].1;
@@ -1168,17 +1189,33 @@ impl<F: PrimeField32> Census<F> {
                 groups.entry(root).or_default().push(k);
             }
             for (_, members) in groups {
-                if members.len() > ENUM_MAX_EQS {
-                    let pvs: Vec<u32> = members.iter().flat_map(|k| inst[*k].1.iter()).filter_map(|v| if let Var::Pub(i) = v { Some(*i) } else { None }).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-                    if self.enum_log.iter().filter(|o| o.undecided.is_some()).count() < 32 {
-                        self.enum_log.push(EnumOutcome { row: row as usize, pvs, bools: 0, eqs: members.len(), solutions: 0, pvs_free: Vec::new(), pv_values: Vec::new(), undecided: Some(format!("{} equations > cap {ENUM_MAX_EQS}", members.len())) });
-                    }
-                    continue;
-                }
                 let eqs: Vec<(u32, u32)> = members.iter().map(|k| inst[*k].0).collect();
                 let mut vars: Vec<Var> = members.iter().flat_map(|k| inst[*k].1.iter().copied()).filter(|v| !self.is_det(*v)).collect();
                 vars.sort_unstable_by_key(|v| self.idx(*v));
                 vars.dedup();
+                // The boolean count is measured before the cap, so a skipped
+                // group's log line states it (it used to print 0).
+                let n_bools = vars.iter().filter(|v| self.range_of(**v) == Some(1)).count();
+                let wide = members.len() > ENUM_MAX_EQS;
+                let budget_spent = wide && wide_tried >= ENUM_WIDE_PER_PASS;
+                if wide && !budget_spent {
+                    wide_tried += 1;
+                }
+                if !enum_admits(members.len(), n_bools) || budget_spent {
+                    let pvs: Vec<u32> = members.iter().flat_map(|k| inst[*k].1.iter()).filter_map(|v| if let Var::Pub(i) = v { Some(*i) } else { None }).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                    if self.enum_log.iter().filter(|o| o.undecided.is_some()).count() < 32 {
+                        let why = if budget_spent {
+                            format!("{} equations: the pass's {ENUM_WIDE_PER_PASS} wide groups are spent", members.len())
+                        } else {
+                            format!(
+                                "{} equations, {n_bools} booleans: over the caps ({ENUM_MAX_EQS} equations; {ENUM_MAX_EQS_FEW_BITS} with ≤ {ENUM_FEW_BITS} booleans)",
+                                members.len()
+                            )
+                        };
+                        self.enum_log.push(EnumOutcome { row: row as usize, pvs, bools: n_bools, eqs: members.len(), solutions: 0, pvs_free: Vec::new(), pv_values: Vec::new(), undecided: Some(why) });
+                    }
+                    continue;
+                }
                 if vars.is_empty() {
                     continue;
                 }
@@ -3087,6 +3124,26 @@ mod tests {
         let (_, rep) = census(false, true, Some(vec![16; 5]));
         assert!(flag_with(&rep, toy::S).is_none(), "the tied copy as a source pins y, hence s — a copy declared an input masks the freedom");
         assert!(flag_with(&rep, toy::C2).is_some());
+    }
+
+    /// The enumeration caps: v1's (≤ 12 equations, ≤ 12 booleans) still
+    /// admit what they did; a wide group is admitted only with ≤ 4 booleans
+    /// (shape P's 21-equation exit-edge group); nothing past 32 equations or
+    /// 12 booleans.
+    #[test]
+    fn detaudit_enum_caps_admit_wide_few_boolean_groups_only() {
+        for (eqs, bools, ok) in [
+            (12, 12, true),
+            (12, 13, false),
+            (13, 5, false),
+            (21, 0, true),
+            (21, 4, true),
+            (32, 4, true),
+            (33, 0, false),
+            (21, 5, false),
+        ] {
+            assert_eq!(enum_admits(eqs, bools), ok, "{eqs} equations, {bools} booleans");
+        }
     }
 
     /// A confirm's deadline binds inside a pin and a replay (the 2026-10-05/06
