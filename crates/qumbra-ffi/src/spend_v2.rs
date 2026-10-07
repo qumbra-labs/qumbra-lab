@@ -56,7 +56,8 @@ use qlab_remote_auth::annulet::AnnuletIntent;
 use qlab_remote_auth::mldsa;
 use qlab_wallet::Wallet;
 use qumbra_wallet::annulet_plan::{plan_send, plan_slots, real_input, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA};
-use qumbra_wallet::annulet_verify::VerifiedAnnulet;
+use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
+use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, label_of, render_amount, AssetLabel, AssetList};
 use qumbra_wallet::auth_journal::AuthJournal;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -93,20 +94,53 @@ pub struct SpendBasis {
     form: L2AuthForm,
     tip: u64,
     spends_verified: bool,
+    /// The verified header chain: a registry leaf the review names is
+    /// bound to its tip (lab #924 PR 3c).
+    chain: VerifiedChain,
+    /// The asset list the scan was given and verified (`verify_asset_list`
+    /// at `qmb_annulet_new_v2`) — the review's only source of names and
+    /// decimals. Never a host-supplied name table.
+    list: Option<AssetList>,
 }
 
 impl SpendBasis {
     /// The basis of a finished verified scan, or `None` when it established
     /// no index.
-    pub(crate) fn of(v: &VerifiedAnnulet) -> Option<Self> {
+    pub(crate) fn of(v: &VerifiedAnnulet, list: Option<&AssetList>) -> Option<Self> {
         Some(SpendBasis {
             index: v.report().index.clone()?,
             genesis_hash: v.chain().genesis.hash,
             form: v.chain().genesis.l2_auth,
             tip: v.chain().tip(),
             spends_verified: v.spends_verified(),
+            chain: v.chain().clone(),
+            list: list.cloned(),
         })
     }
+
+    /// The list, if it is this network's.
+    fn own_list(&self) -> Option<&AssetList> {
+        self.list.as_ref().filter(|l| l.genesis == self.genesis_hash)
+    }
+
+    /// The review's line naming the list (its short id) or its absence.
+    fn list_line(&self) -> String {
+        match (&self.list, self.own_list()) {
+            (_, Some(l)) => format!(
+                "asset list: {} {}, signed by {}{}",
+                l.network,
+                short(&l.digest),
+                short(&l.signer),
+                if l.testnet { " — a test network: test money" } else { "" }
+            ),
+            (Some(l), None) => format!("asset list: for another network ({}), ignored — assets shown by id", short(&l.genesis)),
+            (None, None) => "asset list: none — assets shown by id, in base units".to_string(),
+        }
+    }
+}
+
+fn short(b: &[u8; 32]) -> String {
+    b[..4].iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// # Safety
@@ -271,6 +305,43 @@ struct Review {
     own_rkm: [u64; 4],
     to_short: String,
     spends_verified: bool,
+    names: Names,
+}
+
+/// How the review names the spend's asset (lab #924 PR 3c).
+#[derive(Clone)]
+struct Names {
+    asset: u16,
+    label: (AssetLabel, u32, String),
+    list_line: String,
+    list_short: Option<String>,
+}
+
+impl Names {
+    /// `units` of `asset`, as the list and the bound leaf allow.
+    fn amount(&self, units: u64, asset: u64) -> String {
+        if asset == 0 {
+            return format!("{} fee units", render_amount(u128::from(units), 0));
+        }
+        if asset != u64::from(self.asset) {
+            return format!("{units} base units of asset {asset} (not this spend's asset)");
+        }
+        let (label, decimals, unit) = &self.label;
+        let figure = render_amount(u128::from(units), *decimals);
+        match label {
+            AssetLabel::Listed { name, .. } => format!("{figure} {unit} ({name})"),
+            AssetLabel::IssuerChanged { listed_ticker } => format!(
+                "{figure} base units of asset {asset} (listed as {listed_ticker}, but its issuer key changed: name withheld)"
+            ),
+            AssetLabel::Unconfirmed { listed_ticker } => format!(
+                "{figure} base units of asset {asset} (listed as {listed_ticker}; its issuer could not be confirmed: name withheld)"
+            ),
+            AssetLabel::Unlisted | AssetLabel::FeeUnit => match &self.list_short {
+                Some(id) => format!("{figure} base units of asset {asset} (not on list {id})"),
+                None => format!("{figure} base units of asset {asset} (no list for this network)"),
+            },
+        }
+    }
 }
 
 enum Phase {
@@ -346,6 +417,22 @@ impl SpendHandle {
         } else {
             let opening = served.registry(u64::from(self.asset)).map_err(|e| miss(e.to_string()))?;
             shape_for(&opening.leaf)
+        };
+        // The payment asset's name, from the verified list, only while its
+        // leaf — bound to the verified tip — carries the listed issuer key.
+        let bound = match self.asset {
+            0 => None,
+            a => {
+                let answer = self.answers.get(&registry_leaf_path(a)).cloned().unwrap_or_else(|| Err("not read".into()));
+                check_leaf_at_verified_tip(&b.chain, a, answer).ok()
+            }
+        };
+        let listed = b.own_list().and_then(|l| l.assets.get(&self.asset));
+        let names = Names {
+            asset: self.asset,
+            label: label_of(self.asset, listed, bound.as_ref()),
+            list_line: b.list_line(),
+            list_short: b.own_list().map(|l| short(&l.digest)),
         };
         if shape == L2ShapeTag::R {
             return Err(Attempt::Refused("shape R is a registry write, not a spend".into()));
@@ -483,6 +570,7 @@ impl SpendHandle {
             own_rkm: own.rkm,
             to_short: self.to_short.clone(),
             spends_verified: b.spends_verified,
+            names,
         };
         Ok(Prepared { prepared, intent, dummies, paths, review })
     }
@@ -801,13 +889,6 @@ pub unsafe extern "C" fn qmb_spend_v2_refusal(s: *const SpendHandle) -> *mut c_c
     }
 }
 
-fn amount_text(value: u64, asset: u64) -> String {
-    if asset == 0 {
-        format!("{} QMB", qlab_wallet::uri::bessel_to_qmb(value))
-    } else {
-        format!("{value} of asset {asset}")
-    }
-}
 
 /// Render the review **from the intent bytes to be signed**: refused unless
 /// they are this handle's pending intent; an output is stated only after its
@@ -824,7 +905,7 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
         }
     }
     let r = &t.review;
-    let mut out = String::new();
+    let mut out = format!("{}\n", r.names.list_line);
     if r.kind == "payment" {
         out.push_str(&format!("step {} of {}: the payment\n", r.step, r.steps));
     } else {
@@ -852,12 +933,12 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
         }
     }
     for (asset, value) in &to_payee {
-        out.push_str(&format!("send {} to {}\n", amount_text(*value, *asset), r.to_short));
+        out.push_str(&format!("send {} to {}\n", r.names.amount(*value, *asset), r.to_short));
     }
     for (asset, value) in to_self.iter().filter(|(_, v)| *v > 0) {
-        out.push_str(&format!("{} returns to this wallet\n", amount_text(*value, *asset)));
+        out.push_str(&format!("{} returns to this wallet\n", r.names.amount(*value, *asset)));
     }
-    out.push_str(&format!("fee: {}\n", amount_text(i.fee, 0)));
+    out.push_str(&format!("fee: {}\n", r.names.amount(i.fee, 0)));
     out.push_str(&format!("valid until block {}\n", i.valid_until_height));
     if !r.spends_verified {
         // Design D5: stated beside every plan while it holds.
@@ -867,6 +948,14 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
 }
 
 /// The review of `intent` (from `qmb_spend_v2_intent`), or NULL + `err_out`.
+///
+/// **Names** (lab #924 PR 3c): the first line names the asset list by its
+/// short id (or says there is none, or that it is another network's). The
+/// spend's asset is named only from that list — the one the scan verified at
+/// `qmb_annulet_new_v2`, never a host-supplied table — and only while its
+/// registry leaf, bound to the verified tip, carries the listed issuer key;
+/// otherwise its raw base units, saying why ("not on list <id>", "name
+/// withheld"). Asset 0 is the fee unit.
 ///
 /// # Safety
 /// `s` live; `intent` `len` readable bytes; `err_out` NULL or writable.
