@@ -152,6 +152,37 @@ impl SpendWitness {
         )
     }
 
+    /// Overwrite the witness's private lanes — every slot's `nk`, value,
+    /// asset, `rho`, `rseed`, `d`, the outputs' openings, a P row's `isk` —
+    /// with zeros the compiler may not elide. For a holder of the witness
+    /// that is done with it (a [`crate::bundle::ProvingBundle`] on drop).
+    pub fn wipe(&mut self) {
+        use zeroize::Zeroize;
+        let fee_input = match &mut self.fee_slot {
+            FeeSlotV2::Exact { input, .. } | FeeSlotV2::Dummy { input } => input,
+        };
+        for i in self.inputs.iter_mut().chain(std::iter::once(fee_input)) {
+            i.nk.zeroize();
+            i.value.zeroize();
+            i.asset.zeroize();
+            i.rho.zeroize();
+            i.rseed.zeroize();
+            i.d.zeroize();
+        }
+        for o in &mut self.outputs {
+            o.value.zeroize();
+            o.asset.zeroize();
+            o.rkm.zeroize();
+            o.rho.zeroize();
+            o.rseed.zeroize();
+        }
+        if let ShapeWitness::P { policy, .. } = &mut self.shape {
+            for row in policy.iter_mut() {
+                row.isk.zeroize();
+            }
+        }
+    }
+
     /// The instance's public values, without proving.
     pub fn pvs(&self) -> Vec<u32> {
         self.statement().pvs
@@ -226,7 +257,7 @@ pub enum FeeIn<'a> {
 }
 
 /// A v2 input's note commitment.
-fn cm_of_v2(input: &L2AuthInput) -> [u64; 4] {
+pub(crate) fn cm_of_v2(input: &L2AuthInput) -> [u64; 4] {
     derive_input_l2_v2(input).2
 }
 
@@ -320,7 +351,7 @@ pub fn prepare_s_v2<E: Endpoint, R: rand::CryptoRng>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assemble_s_v2<R: rand::CryptoRng>(
+pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
     tree: &CommitmentTree,
     regs: &[RegistryOpening; 2],
     inputs: [&L2AuthInput; 2],
@@ -440,7 +471,7 @@ pub fn prepare_p_v2<E: Endpoint, R: rand::CryptoRng>(
 
 /// The policies from the openings (keyed by each input's v2 `rkm`), then P.
 #[allow(clippy::too_many_arguments)]
-fn policies_then_p_v2<R: rand::CryptoRng>(
+pub(crate) fn policies_then_p_v2<R: rand::CryptoRng>(
     tree: &CommitmentTree,
     regs: &[RegistryOpening; 2],
     inputs: [&L2AuthInput; 2],

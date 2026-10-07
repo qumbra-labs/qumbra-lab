@@ -39,6 +39,7 @@ use qlab_devnet::forms::L2AuthForm;
 use qlab_devnet::names::RIDER_ABSENT;
 use qlab_note::hash::digest_bytes;
 use qlab_remote_auth::annulet::AnnuletAuthSection;
+use qlab_remote_auth::Hash32;
 
 use crate::v2::{ShapeWitness, SpendWitness};
 
@@ -232,8 +233,9 @@ impl ProvingBundle {
     /// names (the node's own rebuild, `qlab_devnet::annulet::intent_for`). A
     /// signed but unprovable bundle is refused here, by name, before the
     /// prove. The validity height is not judged: the worker does not know the
-    /// tip; the node does.
-    pub fn check(&self, ctx: &AuthContext) -> Result<(), BundleError> {
+    /// tip; the node does. Returns the verified intent's digest — what the
+    /// section signs, and the prover service's idempotency key.
+    pub fn check(&self, ctx: &AuthContext) -> Result<Hash32, BundleError> {
         let w = &self.witness;
         let surface = decoded_surface(&self.tx)?;
         if let Some(terms) = surface.vpublic {
@@ -300,7 +302,9 @@ impl ProvingBundle {
         section
             .verify_intent(&intent)
             .map_err(|e| BundleError::Unauthorized(format!("{e:?}")))?; // debug-ok
-        Ok(())
+        intent
+            .digest()
+            .map_err(|e| BundleError::Unauthorized(format!("{e:?}"))) // debug-ok: a named auth error
     }
 
     /// Check ([`Self::check`]), then prove: the transaction with its proof.
@@ -409,6 +413,14 @@ fn openings_resolve(w: &SpendWitness) -> Result<(), BundleError> {
         return Err(BundleError::StatementMismatch("a registry opening"));
     }
     Ok(())
+}
+
+/// A bundle's witness is wiped when the bundle drops: a prover holds it
+/// only as long as it proves (lab #924).
+impl Drop for ProvingBundle {
+    fn drop(&mut self) {
+        self.witness.wipe();
+    }
 }
 
 /// An issuer operation never becomes a bundle.

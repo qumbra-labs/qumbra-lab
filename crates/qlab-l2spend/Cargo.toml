@@ -25,3 +25,10 @@ qlab-node = { path = "../qlab-node", default-features = false }
 qlab-remote-auth = { path = "../qlab-remote-auth" }
 bincode = "1"
 rand = "0.10"
+# Lab #924: a proving bundle's witness is wiped when it drops.
+zeroize = "1.9"
+
+[features]
+# Lab #924: `qlab_l2spend::fixtures` (honest signed S/P bundles) for other
+# crates' tests. Dev-dependencies only; never in a release build.
+fixtures = []

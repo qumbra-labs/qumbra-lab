@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod annulet;
+pub mod token;
+
 use qlab_wallet::uri::{b64url_decode, b64url_encode};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -119,22 +122,8 @@ impl Config {
             ));
         }
 
-        let listen_text =
-            std::env::var("QUMBRA_PROVER_LISTEN").unwrap_or_else(|_| "127.0.0.1:8087".to_string());
-        let listen: SocketAddr = listen_text
-            .parse()
-            .map_err(|_| "QUMBRA_PROVER_LISTEN is not an IP socket address".to_string())?;
-        if !listen.ip().is_loopback()
-            && std::env::var("QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN").as_deref()
-                != Ok(NON_LOOPBACK_ACK)
-        {
-            return Err(format!(
-                "non-loopback listen requires QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN={NON_LOOPBACK_ACK}"
-            ));
-        }
-
-        let insecure_http = std::env::var("QUMBRA_PROVER_ALLOW_INSECURE_NODE_HTTP").as_deref()
-            == Ok(INSECURE_NODE_HTTP_ACK);
+        let listen = listen_from_env()?;
+        let insecure_http = insecure_node_http_allowed();
         let scan_url = validate_base_url(
             "QUMBRA_PROVER_SCAN_URL",
             &env_required("QUMBRA_PROVER_SCAN_URL")?,
@@ -262,6 +251,30 @@ fn read_api_token() -> Result<Vec<u8>, String> {
         ));
     }
     Ok(token)
+}
+
+/// The listen address both modes share, refused off loopback without the
+/// ingress acknowledgement.
+pub fn listen_from_env() -> Result<SocketAddr, String> {
+    let listen_text =
+        std::env::var("QUMBRA_PROVER_LISTEN").unwrap_or_else(|_| "127.0.0.1:8087".to_string());
+    let listen: SocketAddr = listen_text
+        .parse()
+        .map_err(|_| "QUMBRA_PROVER_LISTEN is not an IP socket address".to_string())?;
+    if !listen.ip().is_loopback()
+        && std::env::var("QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN").as_deref()
+            != Ok(NON_LOOPBACK_ACK)
+    {
+        return Err(format!(
+            "non-loopback listen requires QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN={NON_LOOPBACK_ACK}"
+        ));
+    }
+    Ok(listen)
+}
+
+/// Whether node URLs may be plain HTTP (a private, valueless setup).
+pub fn insecure_node_http_allowed() -> bool {
+    std::env::var("QUMBRA_PROVER_ALLOW_INSECURE_NODE_HTTP").as_deref() == Ok(INSECURE_NODE_HTTP_ACK)
 }
 
 fn validate_base_url(name: &str, value: &str, insecure_http: bool) -> Result<String, String> {

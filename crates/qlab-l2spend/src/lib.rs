@@ -40,6 +40,9 @@ use rand::Rng;
 pub mod v2;
 /// Lab #924 5A-D1: the proving bundle a device hands a prover elsewhere.
 pub mod bundle;
+/// Lab #924: honest S/P spends for tests (`fixtures` feature or `cfg(test)`).
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 
 /// Why a spend could not be assembled or was not admitted — by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
