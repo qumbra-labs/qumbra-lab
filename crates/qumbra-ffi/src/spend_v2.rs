@@ -324,21 +324,21 @@ impl Names {
             return format!("{} fee units", render_amount(u128::from(units), 0));
         }
         if asset != u64::from(self.asset) {
-            return format!("{units} base units of asset {asset} (not this spend's asset)");
+            return format!("{units} base units of QIA #{asset} (not this spend's asset)");
         }
         let (label, decimals, unit) = &self.label;
         let figure = render_amount(u128::from(units), *decimals);
         match label {
             AssetLabel::Listed { name, .. } => format!("{figure} {unit} ({name})"),
             AssetLabel::IssuerChanged { listed_ticker } => format!(
-                "{figure} base units of asset {asset} (listed as {listed_ticker}, but its issuer key changed: name withheld)"
+                "{figure} {unit} (listed as {listed_ticker}, but its issuer key changed: name withheld)"
             ),
             AssetLabel::Unconfirmed { listed_ticker } => format!(
-                "{figure} base units of asset {asset} (listed as {listed_ticker}; its issuer could not be confirmed: name withheld)"
+                "{figure} {unit} (listed as {listed_ticker}; its issuer could not be confirmed: name withheld)"
             ),
             AssetLabel::Unlisted | AssetLabel::FeeUnit => match &self.list_short {
-                Some(id) => format!("{figure} base units of asset {asset} (not on list {id})"),
-                None => format!("{figure} base units of asset {asset} (no list for this network)"),
+                Some(id) => format!("{figure} {unit} (not on list {id})"),
+                None => format!("{figure} {unit} (no list for this network)"),
             },
         }
     }
