@@ -1776,6 +1776,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-prover-token"
+version = "0.0.0"
+dependencies = [
+ "qlab-remote-auth",
+ "qlab-wallet",
+]
+
+[[package]]
 name = "qlab-remote-auth"
 version = "0.0.0"
 dependencies = [
@@ -2025,6 +2033,7 @@ dependencies = [
  "qlab-l2",
  "qlab-l2spend",
  "qlab-p2p",
+ "qlab-prover-token",
  "qlab-remote-auth",
  "qlab-wallet",
  "qumbra-wallet",

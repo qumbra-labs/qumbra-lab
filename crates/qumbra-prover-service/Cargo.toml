@@ -22,6 +22,8 @@ qlab-devnet = { path = "../qlab-devnet", default-features = false }
 qlab-l2spend = { path = "../qlab-l2spend" }
 qlab-p2p = { path = "../qlab-p2p", default-features = false }
 qlab-remote-auth = { path = "../qlab-remote-auth" }
+# Lab #924 PR 3e: the token code, re-exported as `token`.
+qlab-prover-token = { path = "../qlab-prover-token" }
 
 [target.'cfg(unix)'.dependencies]
 # The worker child's core-dump limit and the scratch's tmpfs check.
