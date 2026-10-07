@@ -15,7 +15,8 @@
 //! signer for callers that hold their own key (tests, faucet, sequencer).
 
 use qlab_air::l2::{
-    derive_input_l2_v2, FeeSlotV2, L2AuthInput, L2AuthPath, L2TxOutput, RegistryLeaf, D_AUTH,
+    derive_input_l2_v2, FeeSlotV2, L2AuthInput, L2AuthPath, L2TxOutput, RegistryLeaf, RegistryWitness,
+    D_AUTH,
 };
 use qlab_air::l2p::{L2PolicyInput, VPublic};
 use qlab_air::narrow::{off_tree_witness, pv_chunks, MerkleWitness};
@@ -35,7 +36,7 @@ use qlab_remote_auth::intent::AuthDescriptor;
 use qlab_remote_auth::{mldsa, Hash32};
 
 use crate::{
-    discovery_for, entry, l2_outputs, output_notes, policy_input, random_d4, Endpoint, Out,
+    discovery_for, l2_outputs, unproved_entry, output_notes, policy_input, random_d4, Endpoint, Out,
     PolicyContext, Recipient, Served, SpendError,
 };
 
@@ -60,6 +61,158 @@ pub struct BuiltRV2 {
     pub output: L2Note,
     pub seed: L2Note,
     pub new_root: [u8; 32],
+}
+
+/// **Lab #924 5A-D1: a v2 S/P spend before its proof** — what the device
+/// computes (every field the intent binds) and the witness a prover needs.
+/// [`prove_prepared`] completes it; `qlab_l2spend::bundle` carries it to a
+/// prover that is not this process.
+pub struct PreparedV2 {
+    /// The transaction with its `proof` empty and its `auth` absent.
+    pub tx: TxEntry,
+    pub pvs: Vec<u32>,
+    pub auth: Vec<AuthDescriptor>,
+    pub outputs: [L2Note; 2],
+    pub shape: L2ShapeTag,
+    pub witness: SpendWitness,
+}
+
+/// The shape-specific part of a [`SpendWitness`].
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ShapeWitness {
+    /// Shape S: the two registry openings and `dv`.
+    S { reg_leaves: [RegistryLeaf; 2], reg_witnesses: [RegistryWitness; 2], dv: bool },
+    /// Shape P: the two rows' policy inputs and `vPublic` terms.
+    P { policy: [L2PolicyInput; 2], vp: [VPublic; 2] },
+}
+
+/// **Everything the AIR's instance is built from** for one v2 S/P spend —
+/// no key material: `nk` (not `sk`), each slot's public authorization leaf
+/// and path, the openings, the outputs the device drew, the fee. A P row's
+/// `isk` is here only while the witness stays on the device; the bundle
+/// encoding has no field for it.
+#[derive(Clone)]
+pub struct SpendWitness {
+    pub inputs: [L2AuthInput; 2],
+    pub witnesses: [MerkleWitness; 2],
+    pub outputs: [L2TxOutput; 2],
+    pub fee: u64,
+    pub anchor: [u64; 4],
+    pub registry_root: [u64; 4],
+    pub fee_slot: FeeSlotV2,
+    pub shape: ShapeWitness,
+}
+
+impl SpendWitness {
+    /// The shape this witness proves.
+    pub fn shape_tag(&self) -> L2ShapeTag {
+        match self.shape {
+            ShapeWitness::S { .. } => L2ShapeTag::S,
+            ShapeWitness::P { .. } => L2ShapeTag::P,
+        }
+    }
+
+    fn instance_s(&self) -> qlab_air::l2::L2BucketInstanceV2 {
+        let ShapeWitness::S { reg_leaves, reg_witnesses, dv } = &self.shape else {
+            unreachable!("instance_s on a shape-S witness")
+        };
+        qlab_air::l2::build_bucket_l2_v2(
+            qlab_l2::v2::log_height(qlab_l2::Shape::S),
+            &self.inputs,
+            &self.outputs,
+            self.fee,
+            &self.witnesses,
+            self.anchor,
+            reg_leaves,
+            reg_witnesses,
+            self.registry_root,
+            &self.fee_slot,
+            *dv,
+        )
+    }
+
+    fn instance_p(&self) -> qlab_air::l2p::L2PBucketInstance {
+        let ShapeWitness::P { policy, vp } = &self.shape else {
+            unreachable!("instance_p on a shape-P witness")
+        };
+        qlab_air::l2p::build_bucket_l2p_v2(
+            qlab_l2::v2::log_height(qlab_l2::Shape::P),
+            &self.inputs,
+            &self.outputs,
+            self.fee,
+            &self.witnesses,
+            self.anchor,
+            policy,
+            self.registry_root,
+            *vp,
+            &self.fee_slot,
+            [0; 4],
+            false,
+        )
+    }
+
+    /// The instance's public values, without proving.
+    pub fn pvs(&self) -> Vec<u32> {
+        self.statement().pvs
+    }
+
+    /// What the instance states, without proving: its PVs, anchor, three
+    /// nullifiers (the inputs', then slot 3's) and two output commitments.
+    pub fn statement(&self) -> WitnessStatement {
+        match self.shape {
+            ShapeWitness::S { .. } => {
+                let i = self.instance_s();
+                WitnessStatement { pvs: i.pvs, anchor: i.anchor, nullifiers: i.nf, commitments: i.cm_out }
+            }
+            ShapeWitness::P { .. } => {
+                let i = self.instance_p();
+                WitnessStatement {
+                    pvs: i.pvs,
+                    anchor: i.anchor,
+                    nullifiers: [i.nf[0], i.nf[1], i.nf3],
+                    commitments: i.cm_out,
+                }
+            }
+        }
+    }
+
+    /// Prove the instance: its public values and the serialized proof.
+    pub fn prove(&self) -> (Vec<u32>, Vec<u8>) {
+        let (pvs, proof) = match self.shape {
+            ShapeWitness::S { .. } => {
+                let inst = self.instance_s();
+                let (_, proof) = qlab_l2::v2::prove_s(&inst.air, &inst.pvs);
+                (inst.pvs, proof)
+            }
+            ShapeWitness::P { .. } => {
+                let inst = self.instance_p();
+                let (_, proof) = qlab_l2::v2::prove_p(&inst.air, &inst.pvs);
+                (inst.pvs, proof)
+            }
+        };
+        (pvs, bincode::serialize(&proof).expect("a proof serializes"))
+    }
+}
+
+/// What a [`SpendWitness`] states ([`SpendWitness::statement`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WitnessStatement {
+    pub pvs: Vec<u32>,
+    pub anchor: [u64; 4],
+    pub nullifiers: [[u64; 4]; 3],
+    pub commitments: [[u64; 4]; 2],
+}
+
+/// **Lab #924: prove a [`PreparedV2`] here.** The proof goes into the
+/// prepared transaction, nothing else changes — the instance rebuilt from the
+/// witness must state the prepared PVs (asserted: one process built both).
+pub fn prove_prepared(p: PreparedV2) -> BuiltV2 {
+    let (pvs, proof) = p.witness.prove();
+    assert_eq!(pvs, p.pvs, "the witness proves the PVs the prepared transaction states");
+    let mut tx = p.tx;
+    tx.proof = proof;
+    BuiltV2 { tx, pvs: p.pvs, auth: p.auth, outputs: p.outputs, shape: p.shape }
 }
 
 /// Slot 3 of a v2 S/P spend, as the device made it: an exact-fee asset-0
@@ -140,6 +293,24 @@ pub fn build_s_v2<E: Endpoint, R: rand::CryptoRng>(
     fee: u64,
     rng: &mut R,
 ) -> Result<BuiltV2, SpendError> {
+    Ok(prove_prepared(prepare_s_v2(served, inputs, dv, fee_in, outs, fee, rng)?))
+}
+
+/// **Lab #924 5A-D1: the device half of [`build_s_v2`].** Everything the
+/// transaction states — anchor, nullifiers, output commitments, fee, surface,
+/// discovery — and the PVs, with the proof left empty; the witness a prover
+/// needs travels in [`PreparedV2::witness`]. Draws from `rng` exactly as
+/// [`build_s_v2`] does (outputs, then discovery): the prove between them
+/// draws nothing from it.
+pub fn prepare_s_v2<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: [&L2AuthInput; 2],
+    dv: bool,
+    fee_in: FeeIn,
+    outs: &[Out; 2],
+    fee: u64,
+    rng: &mut R,
+) -> Result<PreparedV2, SpendError> {
     let tree = served.commitment_tree()?;
     let regs = [
         served.registry(inputs[0].asset)?,
@@ -158,7 +329,7 @@ fn assemble_s_v2<R: rand::CryptoRng>(
     outs: &[Out; 2],
     fee: u64,
     rng: &mut R,
-) -> Result<BuiltV2, SpendError> {
+) -> Result<PreparedV2, SpendError> {
     assert!(
         !(dv && matches!(fee_in, FeeIn::Exact(_))),
         "an exact slot-3 fee note is built with two real inputs"
@@ -185,20 +356,21 @@ fn assemble_s_v2<R: rand::CryptoRng>(
             witness_of_v2(tree, inputs[1])?
         },
     ];
-    let inst = qlab_air::l2::build_bucket_l2_v2(
-        qlab_l2::v2::log_height(qlab_l2::Shape::S),
-        &[inputs[0].clone(), inputs[1].clone()],
-        &outputs,
+    let witness = SpendWitness {
+        inputs: [inputs[0].clone(), inputs[1].clone()],
+        witnesses,
+        outputs,
         fee,
-        &witnesses,
         anchor,
-        &[regs[0].leaf, regs[1].leaf],
-        &[regs[0].witness, regs[1].witness],
-        regs[0].root,
-        &fee_slot,
-        dv,
-    );
-    let (_, proof) = qlab_l2::v2::prove_s(&inst.air, &inst.pvs);
+        registry_root: regs[0].root,
+        fee_slot: fee_slot.clone(),
+        shape: ShapeWitness::S {
+            reg_leaves: [regs[0].leaf, regs[1].leaf],
+            reg_witnesses: [regs[0].witness, regs[1].witness],
+            dv,
+        },
+    };
+    let inst = witness.instance_s();
     let auth = descriptors(
         qlab_l2::Shape::S,
         &[&inputs[0].auth, &inputs[1].auth, &fee_slot.input().auth],
@@ -214,22 +386,14 @@ fn assemble_s_v2<R: rand::CryptoRng>(
         exit_rkm: [0; 32],
     };
     let nf = [inst.nf[0], inst.nf[1]];
-    let tx = entry(
-        &proof,
-        &anchor,
-        &nf,
-        &inst.nf[2],
-        &inst.cm_out,
-        fee,
-        surface,
-        discovery,
-    );
-    Ok(BuiltV2 {
+    let tx = unproved_entry(&anchor, &nf, &inst.nf[2], &inst.cm_out, fee, surface, discovery);
+    Ok(PreparedV2 {
         tx,
         pvs: inst.pvs,
         auth,
         outputs: notes,
         shape: L2ShapeTag::S,
+        witness,
     })
 }
 
@@ -249,6 +413,23 @@ pub fn build_p_v2<E: Endpoint, R: rand::CryptoRng>(
     vp: [VPublic; 2],
     rng: &mut R,
 ) -> Result<BuiltV2, SpendError> {
+    Ok(prove_prepared(prepare_p_v2(served, inputs, fee_in, outs, fee, ctx, vp, rng)?))
+}
+
+/// **Lab #924 5A-D1: the device half of [`build_p_v2`]** — as
+/// [`prepare_s_v2`]. An issuer row (a non-zero `isk` or `vPublic`) prepares
+/// as before but never leaves the device: its witness does not encode.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_p_v2<E: Endpoint, R: rand::CryptoRng>(
+    served: &Served<E>,
+    inputs: [&L2AuthInput; 2],
+    fee_in: FeeIn,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    rng: &mut R,
+) -> Result<PreparedV2, SpendError> {
     let tree = served.commitment_tree()?;
     let regs = [
         served.registry(inputs[0].asset)?,
@@ -269,7 +450,7 @@ fn policies_then_p_v2<R: rand::CryptoRng>(
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
     rng: &mut R,
-) -> Result<BuiltV2, SpendError> {
+) -> Result<PreparedV2, SpendError> {
     if regs[0].root != regs[1].root {
         return Err(SpendError::RegistryMoved);
     }
@@ -302,28 +483,21 @@ fn assemble_p_v2<R: rand::CryptoRng>(
     registry_root: [u64; 4],
     vp: [VPublic; 2],
     rng: &mut R,
-) -> Result<BuiltV2, SpendError> {
+) -> Result<PreparedV2, SpendError> {
     let anchor = tree.root();
     let outputs = l2_outputs(outs, rng);
     let fee_slot = fee_slot_v2(tree, fee_in, fee)?;
-    let inst = qlab_air::l2p::build_bucket_l2p_v2(
-        qlab_l2::v2::log_height(qlab_l2::Shape::P),
-        &[inputs[0].clone(), inputs[1].clone()],
-        &outputs,
+    let witness = SpendWitness {
+        inputs: [inputs[0].clone(), inputs[1].clone()],
+        witnesses: [witness_of_v2(tree, inputs[0])?, witness_of_v2(tree, inputs[1])?],
+        outputs,
         fee,
-        &[
-            witness_of_v2(tree, inputs[0])?,
-            witness_of_v2(tree, inputs[1])?,
-        ],
         anchor,
-        &policy,
         registry_root,
-        vp,
-        &fee_slot,
-        [0; 4],
-        false,
-    );
-    let (_, proof) = qlab_l2::v2::prove_p(&inst.air, &inst.pvs);
+        fee_slot: fee_slot.clone(),
+        shape: ShapeWitness::P { policy, vp },
+    };
+    let inst = witness.instance_p();
     let auth = descriptors(
         qlab_l2::Shape::P,
         &[&inputs[0].auth, &inputs[1].auth, &fee_slot.input().auth],
@@ -349,22 +523,14 @@ fn assemble_p_v2<R: rand::CryptoRng>(
         write: None,
         exit_rkm: [0; 32],
     };
-    let tx = entry(
-        &proof,
-        &anchor,
-        &inst.nf,
-        &inst.nf3,
-        &inst.cm_out,
-        fee,
-        surface,
-        discovery,
-    );
-    Ok(BuiltV2 {
+    let tx = unproved_entry(&anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery);
+    Ok(PreparedV2 {
         tx,
         pvs: inst.pvs,
         auth,
         outputs: notes,
         shape: L2ShapeTag::P,
+        witness,
     })
 }
 
@@ -641,4 +807,4 @@ pub fn sign_locally(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

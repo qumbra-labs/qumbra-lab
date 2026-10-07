@@ -38,6 +38,8 @@ use rand::Rng;
 
 /// Lab #896 seam E4: the v2 (Candidate A) builders and the Annulet intent.
 pub mod v2;
+/// Lab #924 5A-D1: the proving bundle a device hands a prover elsewhere.
+pub mod bundle;
 
 /// Why a spend could not be assembled or was not admitted — by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +503,34 @@ fn l2_outputs<R: Rng>(outs: &[Out; 2], rng: &mut R) -> [L2TxOutput; 2] {
         rho: [0; 4],
         rseed: random_d4(rng),
     })
+}
+
+/// [`entry`] before the proof (lab #924): the same transaction with an empty
+/// `proof`, for a prover elsewhere to fill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn unproved_entry(
+    anchor: &[u64; 4],
+    nf: &[[u64; 4]; 2],
+    nf3: &[u64; 4],
+    cm_out: &[[u64; 4]; 2],
+    fee: u64,
+    surface: L2Surface,
+    discovery: Vec<u8>,
+) -> TxEntry {
+    TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
+        proof: Vec::new(),
+        public: TxPublic {
+            anchor: digest_bytes(anchor),
+            nullifiers: nf.iter().chain(std::iter::once(nf3)).map(digest_bytes).collect(),
+            commitments: cm_out.iter().map(digest_bytes).collect(),
+            bucket: ArityBucket::TwoByTwo,
+            fee,
+        },
+        discovery,
+        rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+        l2: surface.encode(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
