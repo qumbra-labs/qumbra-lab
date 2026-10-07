@@ -75,3 +75,50 @@ fn the_worker_subcommand_refuses_without_its_protocol_tag() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty(), "nothing is answered without the tag");
 }
+
+/// F1: the child sets itself not-dumpable after exec (the kernel resets the
+/// flag on `execve`), and runs with no core file. A not-dumpable process's
+/// `/proc/<pid>` files belong to root; its core limit reads 0.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_child_is_not_dumpable_and_writes_no_core() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qumbra-prover-service"))
+        .arg("annulet-worker")
+        .env_clear()
+        .env(
+            "QUMBRA_PROVER_WORKER_PROTOCOL",
+            qumbra_prover_service::annulet::ANNULET_WORKER_PROTOCOL,
+        )
+        .env("QUMBRA_PROVER_ANNULET_GENESIS_HASH", "6e".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The child hardens itself first, then blocks reading its bundle.
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = child.id();
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let core = limits
+        .lines()
+        .find(|l| l.starts_with("Max core file size"))
+        .unwrap();
+    assert!(core.split_whitespace().nth(4) == Some("0"), "{core}");
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: a plain syscall.
+    if unsafe { libc::geteuid() } != 0 {
+        let owner = std::fs::metadata(format!("/proc/{pid}/environ"))
+            .unwrap()
+            .uid();
+        assert_eq!(
+            owner, 0,
+            "a not-dumpable process's /proc files belong to root"
+        );
+    } else {
+        eprintln!(
+            "running as root: the /proc ownership check cannot tell; the core limit was checked"
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -415,6 +415,14 @@ fn openings_resolve(w: &SpendWitness) -> Result<(), BundleError> {
     Ok(())
 }
 
+/// A bundle's witness is wiped when the bundle drops: a prover holds it
+/// only as long as it proves (lab #924).
+impl Drop for ProvingBundle {
+    fn drop(&mut self) {
+        self.witness.wipe();
+    }
+}
+
 /// An issuer operation never becomes a bundle.
 fn holder_only(w: &SpendWitness) -> Result<(), BundleError> {
     if let ShapeWitness::P { policy, vp } = &w.shape {

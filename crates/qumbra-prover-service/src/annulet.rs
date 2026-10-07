@@ -33,12 +33,12 @@
 //! are counted per code under a short hash of the token id, so abuse shows
 //! without naming the user.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qlab_devnet::annulet::{AuthContext, L2ShapeTag};
@@ -46,7 +46,7 @@ use qlab_devnet::body::TxEntry;
 use qlab_devnet::forms::L2AuthForm;
 use qlab_l2spend::bundle::{BundleError, ProvingBundle};
 use qlab_remote_auth::{keccak256, Hash32};
-use rand::Rng;
+use rand::TryRng;
 use serde::Serialize;
 use zeroize::Zeroize;
 
@@ -71,6 +71,8 @@ pub const MAX_ANNULET_JOBS: usize = 64;
 pub const DEFAULT_PER_DAY: u16 = 20;
 /// Allowance for submission after the prove, in the validity estimate.
 pub const SUBMIT_SLACK_SECS: u64 = 60;
+/// How long an admitted upload may take to arrive (80 KiB at 3 KiB/s).
+pub const ANNULET_UPLOAD_DEADLINE: Duration = Duration::from_secs(30);
 /// The worker child's protocol tag.
 pub const ANNULET_WORKER_PROTOCOL: &str = "qumbra-prover-annulet-worker-v1";
 
@@ -347,7 +349,11 @@ struct State {
     jobs: HashMap<String, Job>,
     by_intent: HashMap<Hash32, String>,
     usage: HashMap<[u8; 16], (u64, u16)>,
-    queue: VecDeque<String>,
+    /// The live queue: the dispatcher pulls from its front; a cancel takes
+    /// its job out at once, so a cancelled job holds no slot (lab #924 F2).
+    pending: VecDeque<WorkItem>,
+    /// Tokens with an upload being read (one at a time per token).
+    reading: HashSet<[u8; 16]>,
     refusals: BTreeMap<(String, &'static str), u64>,
 }
 
@@ -390,8 +396,27 @@ struct Inner {
     config: Arc<AnnuletConfig>,
     tokens: RwLock<TokenKeys>,
     state: Arc<Mutex<State>>,
-    work: mpsc::SyncSender<WorkItem>,
+    work: Arc<Condvar>,
     now: fn() -> u64,
+}
+
+/// A token admitted to upload (steps 1–2 passed): it holds the token's one
+/// reading slot until dropped, so a slow upload occupies its own token only.
+pub struct Admission {
+    claims: Claims,
+    state: Arc<Mutex<State>>,
+}
+
+impl Admission {
+    pub fn claims(&self) -> &Claims {
+        &self.claims
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        lock(&self.state).reading.remove(&self.claims.token_id);
+    }
 }
 
 fn unix_now() -> u64 {
@@ -439,19 +464,19 @@ impl AnnuletApi {
     ) -> Self {
         let tokens = std::mem::take(&mut config.tokens);
         let config = Arc::new(config);
-        let (work, receiver) = mpsc::sync_channel(config.queue_capacity);
+        let work = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(State::default()));
         let inner = Arc::new(Inner {
             config: Arc::clone(&config),
             tokens: RwLock::new(tokens),
             state: Arc::clone(&state),
-            work,
+            work: Arc::clone(&work),
             now,
         });
         let s = Arc::clone(&state);
         std::thread::Builder::new()
             .name("annulet-dispatch".into())
-            .spawn(move || dispatch(s, receiver, prover, submitter))
+            .spawn(move || dispatch(s, work, prover, submitter))
             .expect("the Annulet dispatcher starts");
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -492,13 +517,14 @@ impl AnnuletApi {
         })
     }
 
-    /// **Steps 1–2**: the token, then its quota and in-flight job — before
-    /// the body is read.
-    pub fn authorize(&self, authorization: Option<&str>) -> Result<Claims, ApiError> {
+    /// **Steps 1–2**: the token, then its quota, its in-flight job and its
+    /// one reading slot — before the body is read. The slot is held until
+    /// the returned [`Admission`] drops.
+    pub fn authorize(&self, authorization: Option<&str>) -> Result<Admission, ApiError> {
         let claims = self.authorize_only(authorization)?;
         let mut state = lock(&self.inner.state);
         state.cleanup(self.inner.config.result_ttl);
-        if state.in_flight(&claims.token_id) {
+        if state.in_flight(&claims.token_id) || state.reading.contains(&claims.token_id) {
             state.refuse(token_tag(&claims.token_id), "token-busy");
             return Err(err(429, "token-busy"));
         }
@@ -506,16 +532,27 @@ impl AnnuletApi {
             state.refuse(token_tag(&claims.token_id), "quota-exhausted");
             return Err(err(429, "quota-exhausted"));
         }
-        Ok(claims)
+        state.reading.insert(claims.token_id);
+        Ok(Admission {
+            claims,
+            state: Arc::clone(&self.inner.state),
+        })
+    }
+
+    /// Count a refusal the HTTP layer made after admission (`415`, `413`,
+    /// an upload past its deadline) under the token's tag.
+    pub fn count_refusal(&self, claims: &Claims, code: &'static str) {
+        lock(&self.inner.state).refuse(token_tag(&claims.token_id), code);
     }
 
     /// **Steps 3–5 and the job**: the bundle's bytes (already bounded by the
     /// caller's read), decoded and checked, then queued.
     pub fn submit(
         &self,
-        claims: &Claims,
+        admission: &Admission,
         mut bundle: Vec<u8>,
     ) -> Result<(AnnuletJobView, bool), ApiError> {
+        let claims = &admission.claims;
         let who = token_tag(&claims.token_id);
         let refuse = |e: ApiError| {
             lock(&self.inner.state).refuse(who.clone(), e.code);
@@ -538,7 +575,7 @@ impl AnnuletApi {
         };
         let tx_wire = qlab_p2p::codec::encode_tx_annulet(parsed.tx());
         let shape = parsed.shape();
-        drop(parsed);
+        drop(parsed); // its witness is wiped on drop
 
         let mut state = lock(&self.inner.state);
         let ttl = self.inner.config.result_ttl;
@@ -562,7 +599,7 @@ impl AnnuletApi {
                 state.by_intent.remove(&intent);
             } else {
                 bundle.zeroize();
-                return Ok((view(&cap, job, &state.queue, ttl), false));
+                return Ok((view(&cap, job, &state.pending, ttl), false));
             }
         }
         // The race between `authorize` and here: re-check under the lock.
@@ -583,9 +620,19 @@ impl AnnuletApi {
             bundle.zeroize();
             return Err(err(503, "retained-job-limit"));
         }
+        // Live queued jobs only: a cancelled one has already left.
+        if state.pending.len() >= self.inner.config.queue_capacity {
+            state.refuse(who, "prover-busy");
+            bundle.zeroize();
+            return Err(err(503, "prover-busy"));
+        }
         let cap = loop {
             let mut b = [0u8; 32];
-            rand::rng().fill_bytes(&mut b);
+            // The capability straight from the OS, not a userspace generator.
+            if rand::rngs::SysRng.try_fill_bytes(&mut b).is_err() {
+                bundle.zeroize();
+                return Err(err(503, "entropy-unavailable"));
+            }
             let c = hex(&b);
             if !state.jobs.contains_key(&c) {
                 break c;
@@ -593,19 +640,12 @@ impl AnnuletApi {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let bundle_bytes = bundle.len();
-        match self.inner.work.try_send(WorkItem {
+        state.pending.push_back(WorkItem {
             cap: cap.clone(),
             bundle,
             cancel: Arc::clone(&cancel),
-        }) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(mut item))
-            | Err(mpsc::TrySendError::Disconnected(mut item)) => {
-                item.bundle.zeroize();
-                state.refuse(who, "prover-busy");
-                return Err(err(503, "prover-busy"));
-            }
-        }
+        });
+        self.inner.work.notify_one();
         state.jobs.insert(
             cap.clone(),
             Job {
@@ -619,10 +659,9 @@ impl AnnuletApi {
             },
         );
         state.by_intent.insert(intent, cap.clone());
-        state.queue.push_back(cap.clone());
         state.usage.insert(claims.token_id, (day, used + 1));
         let job = state.jobs.get(&cap).expect("just inserted");
-        Ok((view(&cap, job, &state.queue, ttl), true))
+        Ok((view(&cap, job, &state.pending, ttl), true))
     }
 
     /// A job by its capability.
@@ -631,7 +670,7 @@ impl AnnuletApi {
         let mut state = lock(&self.inner.state);
         state.cleanup(self.inner.config.result_ttl);
         let job = state.jobs.get(cap).ok_or(err(404, "job-not-found"))?;
-        Ok(view(cap, job, &state.queue, self.inner.config.result_ttl))
+        Ok(view(cap, job, &state.pending, self.inner.config.result_ttl))
     }
 
     /// Cancel a queued or proving job; a submitting or finished one is left
@@ -646,8 +685,14 @@ impl AnnuletApi {
             job.phase = Phase::Cancelled;
             job.updated = Instant::now();
         }
+        // A queued job leaves the queue now, freeing its slot.
+        if let Some(i) = state.pending.iter().position(|w| w.cap == cap) {
+            if let Some(mut item) = state.pending.remove(i) {
+                item.bundle.zeroize();
+            }
+        }
         let job = state.jobs.get(cap).expect("present");
-        Ok(view(cap, job, &state.queue, self.inner.config.result_ttl))
+        Ok(view(cap, job, &state.pending, self.inner.config.result_ttl))
     }
 
     /// The service's pins and sizing, for a client to check before it uploads.
@@ -697,7 +742,7 @@ fn valid_cap(cap: &str) -> Result<(), ApiError> {
     }
 }
 
-fn view(cap: &str, job: &Job, queue: &VecDeque<String>, ttl: Duration) -> AnnuletJobView {
+fn view(cap: &str, job: &Job, queue: &VecDeque<WorkItem>, ttl: Duration) -> AnnuletJobView {
     let (state, tx_id, refusal) = match &job.phase {
         Phase::Queued => ("queued", None, None),
         Phase::Proving => ("proving", None, None),
@@ -711,7 +756,7 @@ fn view(cap: &str, job: &Job, queue: &VecDeque<String>, ttl: Duration) -> Annule
         protocol_version: ANNULET_PROTOCOL_VERSION,
         job_url: format!("/v2/annulet/jobs/{cap}"),
         state,
-        queue_position: queue.iter().position(|c| c == cap).map(|i| i + 1),
+        queue_position: queue.iter().position(|w| w.cap == cap).map(|i| i + 1),
         tx_id,
         refusal,
         expires_in_secs: job
@@ -733,6 +778,10 @@ pub fn proof_added(bundle_tx_wire: &[u8], proved_wire: &[u8]) -> Result<TxEntry,
     {
         return Err("proof-mismatch");
     }
+    // The bytes submitted are exactly the canonical encoding of what decoded.
+    if qlab_p2p::codec::encode_tx_annulet(&tx) != proved_wire {
+        return Err("proof-mismatch");
+    }
     let mut stripped = tx.clone();
     stripped.proof = Vec::new();
     if qlab_p2p::codec::encode_tx_annulet(&stripped) != bundle_tx_wire {
@@ -743,15 +792,23 @@ pub fn proof_added(bundle_tx_wire: &[u8], proved_wire: &[u8]) -> Result<TxEntry,
 
 fn dispatch(
     state: Arc<Mutex<State>>,
-    receiver: mpsc::Receiver<WorkItem>,
+    work: Arc<Condvar>,
     prover: Arc<dyn AnnuletProver>,
     submitter: Arc<dyn Submitter>,
 ) {
-    while let Ok(mut item) = receiver.recv() {
+    loop {
         let queued_at;
+        let mut item;
         {
             let mut s = lock(&state);
-            s.queue.retain(|c| *c != item.cap);
+            item = loop {
+                if let Some(next) = s.pending.pop_front() {
+                    break next;
+                }
+                s = work
+                    .wait(s)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            };
             let Some(job) = s.jobs.get_mut(&item.cap) else {
                 item.bundle.zeroize();
                 continue;
@@ -912,11 +969,26 @@ impl AnnuletProver for AnnuletProcessProver {
             .stderr(Stdio::null());
         no_core_dumps(&mut command);
         let mut child = command.spawn().map_err(|_| "worker-spawn-failed")?;
-        if write_framed(&mut child, bundle).is_err() {
+        // The bundle (≤ 80 KiB) can exceed a pipe's buffer: write it from
+        // its own thread so the timeout below covers a child that stalls
+        // before reading.
+        let Some(mut stdin) = child.stdin.take() else {
             terminate(&mut child);
             return Err("worker-input-failed");
-        }
-        let stdout = child.stdout.take().ok_or("worker-output-missing")?;
+        };
+        let mut input = Vec::with_capacity(4 + bundle.len());
+        input.extend_from_slice(&(bundle.len() as u32).to_le_bytes());
+        input.extend_from_slice(bundle);
+        let writer = std::thread::spawn(move || {
+            let ok = stdin.write_all(&input).and_then(|()| stdin.flush()).is_ok();
+            input.zeroize();
+            ok
+        });
+        let Some(stdout) = child.stdout.take() else {
+            terminate(&mut child);
+            let _ = writer.join();
+            return Err("worker-output-missing");
+        };
         let reader = std::thread::spawn(move || read_framed(stdout));
         let started = Instant::now();
         loop {
@@ -932,6 +1004,10 @@ impl AnnuletProver for AnnuletProcessProver {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    if !writer.join().unwrap_or(false) {
+                        let _ = reader.join();
+                        return Err("worker-input-failed");
+                    }
                     let out = reader.join().map_err(|_| "worker-output-invalid")?;
                     return match (status.success(), out) {
                         (true, Ok((0, payload))) => Ok(payload),
@@ -950,12 +1026,14 @@ impl AnnuletProver for AnnuletProcessProver {
     }
 }
 
-/// `ulimit -c 0` for the child, and on Linux not dumpable at all.
+/// `ulimit -c 0` for the child, set between fork and exec. (Not-dumpable
+/// does not survive `execve` — the kernel resets it for a non-setuid exec —
+/// so the child sets that itself, first thing: [`harden_process`].)
 #[cfg(unix)]
 fn no_core_dumps(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: the closure runs in the forked child before exec and calls only
-    // async-signal-safe functions (`setrlimit`, `prctl`), allocating nothing.
+    // `setrlimit`, async-signal-safe, allocating nothing.
     unsafe {
         command.pre_exec(|| {
             let none = libc::rlimit {
@@ -963,10 +1041,6 @@ fn no_core_dumps(command: &mut Command) {
                 rlim_max: 0,
             };
             if libc::setrlimit(libc::RLIMIT_CORE, &none) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -977,15 +1051,30 @@ fn no_core_dumps(command: &mut Command) {
 #[cfg(not(unix))]
 fn no_core_dumps(_: &mut Command) {}
 
-fn write_framed(child: &mut Child, bytes: &[u8]) -> std::io::Result<()> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("worker stdin absent"))?;
-    let len = u32::try_from(bytes.len()).map_err(|_| std::io::Error::other("length"))?;
-    stdin.write_all(&len.to_le_bytes())?;
-    stdin.write_all(bytes)?;
-    stdin.flush()
+/// **This process holds witnesses**: no core file, and on Linux not
+/// dumpable — no same-uid `ptrace`, no readable `/proc/<pid>/mem`. Called
+/// by the server at startup and by the worker child before it reads its
+/// bundle (lab #924 F1).
+pub fn harden_process() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a plain syscall on a stack value.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+            return Err("RLIMIT_CORE could not be set to 0".into());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall; PR_SET_DUMPABLE takes no pointer.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err("PR_SET_DUMPABLE could not be cleared".into());
+        }
+    }
+    Ok(())
 }
 
 fn terminate(child: &mut Child) {
@@ -1058,6 +1147,7 @@ pub fn annulet_worker_once(
     let tx = bundle
         .prove(&AuthContext::candidate_a(*genesis_hash))
         .map_err(|_| "bundle-refused")?;
+    drop(bundle); // its witness is wiped on drop
     let wire = qlab_p2p::codec::encode_tx_annulet(&tx);
     if wire.len() > MAX_ANNULET_TX_BYTES {
         return Err("proof-refused");

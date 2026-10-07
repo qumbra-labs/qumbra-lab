@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use qumbra_prover_service::annulet::{
-    annulet_worker_once, frame, AnnuletApi, AnnuletConfig, AnnuletProcessProver, HttpSubmitter,
-    ANNULET_WORKER_PROTOCOL, MAX_ANNULET_BUNDLE_BYTES,
+    annulet_worker_once, frame, harden_process, AnnuletApi, AnnuletConfig, AnnuletProcessProver,
+    HttpSubmitter, ANNULET_UPLOAD_DEADLINE, ANNULET_WORKER_PROTOCOL, MAX_ANNULET_BUNDLE_BYTES,
 };
 use qumbra_prover_service::token;
 use qumbra_prover_service::{
@@ -90,6 +90,8 @@ fn server_entry() -> Result<(), String> {
     };
     let annulet = match AnnuletConfig::from_env()? {
         Some(config) => {
+            // This process will hold witnesses.
+            harden_process()?;
             let prover = Arc::new(AnnuletProcessProver {
                 executable: std::env::current_exe()
                     .map_err(|_| "cannot resolve the prover-service executable".to_string())?,
@@ -202,7 +204,7 @@ fn route(request: tiny_http::Request, l1: Option<(&Api, &Config)>, annulet: Opti
     }
 }
 
-fn handle_annulet(mut request: tiny_http::Request, api: &AnnuletApi) {
+fn handle_annulet(request: tiny_http::Request, api: &AnnuletApi) {
     let raw_url = request.url().to_string();
     if raw_url.contains('?') {
         respond_error(
@@ -236,62 +238,74 @@ fn handle_annulet(mut request: tiny_http::Request, api: &AnnuletApi) {
             if method != tiny_http::Method::Post {
                 return respond_method(request, "POST");
             }
-            // Token, quota and in-flight first: nothing is read before them.
-            let claims = match api.authorize(unique_header(&request, "Authorization")) {
-                Ok(c) => c,
+            // Token, quota, in-flight and the token's one reading slot first:
+            // nothing is read before them.
+            let admission = match api.authorize(unique_header(&request, "Authorization")) {
+                Ok(a) => a,
                 Err(e) => return respond_error(request, e),
+            };
+            let claims = *admission.claims();
+            let refuse = |request: tiny_http::Request, status: u16, code: &'static str| {
+                api.count_refusal(&claims, code);
+                respond_error(request, ApiError { status, code });
             };
             if !unique_header(&request, "Content-Type")
                 .is_some_and(|v| v.eq_ignore_ascii_case("application/octet-stream"))
             {
-                return respond_error(
-                    request,
-                    ApiError {
-                        status: 415,
-                        code: "content-type-required",
-                    },
-                );
+                return refuse(request, 415, "content-type-required");
             }
             if request
                 .body_length()
                 .is_none_or(|n| n > MAX_ANNULET_BUNDLE_BYTES)
             {
-                return respond_error(
-                    request,
-                    ApiError {
-                        status: 413,
-                        code: "bundle-too-large",
-                    },
-                );
+                return refuse(request, 413, "bundle-too-large");
             }
-            let mut body = Vec::new();
-            if request
-                .as_reader()
-                .take(MAX_ANNULET_BUNDLE_BYTES as u64 + 1)
-                .read_to_end(&mut body)
-                .is_err()
-            {
-                use zeroize::Zeroize;
-                body.zeroize();
-                return respond_error(
-                    request,
-                    ApiError {
-                        status: 400,
-                        code: "request-unreadable",
-                    },
-                );
+            // tiny_http has no socket timeout: read on a thread of its own and
+            // wait for it under a deadline. The admission travels with the
+            // read, so the token's reading slot stays taken until the
+            // connection really ends — a slow upload holds its own token only,
+            // and this handler's slot frees at the deadline.
+            let (done, finished) = std::sync::mpsc::channel();
+            let reader = std::thread::Builder::new()
+                .name("annulet-upload".into())
+                .spawn(move || {
+                    let mut request = request;
+                    let mut body = Vec::with_capacity(MAX_ANNULET_BUNDLE_BYTES + 1);
+                    let ok = request
+                        .as_reader()
+                        .take(MAX_ANNULET_BUNDLE_BYTES as u64 + 1)
+                        .read_to_end(&mut body)
+                        .is_ok();
+                    if let Err(std::sync::mpsc::SendError((_, _, _, mut body))) =
+                        done.send((request, admission, ok, body))
+                    {
+                        use zeroize::Zeroize;
+                        body.zeroize();
+                    }
+                });
+            if reader.is_err() {
+                api.count_refusal(&claims, "ingress-busy");
+                return;
             }
-            match api.submit(&claims, body) {
-                Ok((view, created)) => {
-                    let location = view.job_url.clone();
-                    respond_json(
-                        request,
-                        if created { 202 } else { 200 },
-                        &view,
-                        Some(&location),
-                    );
+            match finished.recv_timeout(ANNULET_UPLOAD_DEADLINE) {
+                Ok((request, admission, true, body)) => match api.submit(&admission, body) {
+                    Ok((view, created)) => {
+                        let location = view.job_url.clone();
+                        respond_json(
+                            request,
+                            if created { 202 } else { 200 },
+                            &view,
+                            Some(&location),
+                        );
+                    }
+                    Err(e) => respond_error(request, e),
+                },
+                Ok((request, _admission, false, mut body)) => {
+                    use zeroize::Zeroize;
+                    body.zeroize();
+                    refuse(request, 400, "request-unreadable");
                 }
-                Err(e) => respond_error(request, e),
+                Err(_) => api.count_refusal(&claims, "upload-deadline"),
             }
         }
         _ => {
@@ -736,6 +750,8 @@ fn worker_once() -> Result<Vec<u8>, &'static str> {
 }
 
 fn annulet_worker_entry() -> Result<(), String> {
+    // Before anything is read: not dumpable (exec reset it) and no core file.
+    harden_process()?;
     if std::env::var("QUMBRA_PROVER_WORKER_PROTOCOL").as_deref() != Ok(ANNULET_WORKER_PROTOCOL) {
         return Err("internal worker protocol is absent".into());
     }

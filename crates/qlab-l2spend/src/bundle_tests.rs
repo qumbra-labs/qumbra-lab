@@ -499,3 +499,28 @@ fn the_issuer_secret_is_unrepresentable() {
         ShapeWitness::S { .. } => panic!("a P bundle decodes as P"),
     }
 }
+
+/// A bundle's witness is wiped when it drops; [`SpendWitness::wipe`]
+/// zeroes every private lane (lab #924, the prover's side).
+#[test]
+fn a_wiped_witness_holds_no_private_lane() {
+    let mut w = bundle_p().witness().clone();
+    w.wipe();
+    let fee = w.fee_slot.input();
+    for i in w.inputs.iter().chain(std::iter::once(fee)) {
+        assert_eq!(
+            (i.nk, i.value, i.asset, i.rho, i.rseed, i.d),
+            ([0; 4], 0, 0, [0; 4], [0; 4], [0; 2])
+        );
+    }
+    for o in &w.outputs {
+        assert_eq!(
+            (o.value, o.asset, o.rkm, o.rho, o.rseed),
+            (0, 0, [0; 4], [0; 4], [0; 4])
+        );
+    }
+    let ShapeWitness::P { policy, .. } = &w.shape else {
+        panic!("a P witness")
+    };
+    assert!(policy.iter().all(|p| p.isk == [0; 4]));
+}

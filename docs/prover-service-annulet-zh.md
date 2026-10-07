@@ -27,7 +27,7 @@ L1 的 `WitnessBundle` 模式（`/v1/jobs`）保持不变。它现在只在设�
 **准入顺序。** 每一次拒绝都有明确的名字，第 5 步通过之前不会派生任何进程，也不会入队：
 
 1. token：签名、有效期窗口、net、吊销 → `401`，错误码为 `unauthorized`、`token-malformed`、`token-key-unknown`、`token-signature-invalid`、`token-window-invalid`、`token-expired`、`token-wrong-net` 或 `token-revoked`。
-2. 该 token 唯一的 in-flight job 及其每日配额 → `429`，错误码为 `token-busy` 或 `quota-exhausted`。只有**已准入**的 job 才计入配额。
+2. 该 token 唯一的 in-flight job、唯一一个正在读取的上传，以及每日配额 → `429`,错误码为 `token-busy` 或 `quota-exhausted`。只有**已准入**的 job 才计入配额。已准入的上传必须在 30 s 内传完。超时后处理线程放弃(记为 `upload-deadline`),但该 token 的读取名额要等连接真正断开才释放，所以慢速上传只拖住它自己的 token。
 3. 字节上限，有界读取 → `413` `bundle-too-large`。
 4. 解码 → `400` `bundle-malformed`，或 `403` `issuer-shape`。
 5. 在本 net 上运行 bundle 的 lock → `422`，错误码为 `statement-mismatch`、`unauthorized-section`、`proof-present` 或 `auth-missing`。
@@ -78,9 +78,12 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 证明一次只跑一个，每个都在全新的 `annulet-worker` 子进程中运行：
 
 - 环境变量被清空，只保留协议标签和 genesis hash，因此子进程没有 URL，也没有 token；
-- 关闭 core dump（`RLIMIT_CORE = 0`，Linux 上还有 `PR_SET_DUMPABLE = 0`）；
+- 关闭 core dump：`RLIMIT_CORE = 0` 在 fork 与 exec 之间设置。Linux 上，子进程 exec 之后的第一件事是自己清掉 `PR_SET_DUMPABLE`(内核在 `execve` 时会重置这个标志)。此后同 uid 的进程既不能 `ptrace` 它，也读不了 `/proc/<pid>/mem`。服务进程启动时也对自己做同样的处理，因为它同样持有 bundle;
 - 工作目录和 `TMPDIR` 都是 tmpfs scratch；
-- stderr 被关闭。
+- stderr 被关闭；
+- bundle 由单独的线程写进子进程的 stdin,因为 80 KiB 可能超过管道缓冲区。这样子进程若在读取前卡住，证明超时也能覆盖到。
+
+两个进程丢弃解码后的 bundle 时都会擦除其中的 witness。
 
 子进程会重新运行 bundle 的 lock 并证明。随后服务端检查返回的结果是否恰好是 bundle 的交易加上一个非空证明、别无其他（否则 job 以 `proof-mismatch` 失败），通过之后才提交。
 
@@ -95,6 +98,6 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 - **主机：** r7g.2xlarge（64 GiB，arm64）。一次 P prove 的峰值约为 32 GiB。
 - **容器：** `mem_limit` 约 58g，无 swap，`ulimits: core: 0`，在 `/scratch` 挂载一个 tmpfs（1g），根文件系统只读。
 - **环境变量：** 上文列出的变量。该 net 为 format 33；genesis hash 从 deploy 仓库取。node URL 必须指向一个接受 `POST /v1/tx` 的节点。
-- **Ingress：** TLS 和限流（Caddy），外加 non-loopback 确认项。安全组开放 443，因为扩展直接调用该服务。
+- **Ingress:** TLS、限流和请求头大小上限(Caddy),外加 non-loopback 确认项。安全组开放 443,因为扩展直接调用该服务。**`/v2/annulet/jobs/<cap>` 不要进 ingress 的访问日志**,或者只记路径前缀：这个 URL 里的 capability 就是该任务的秘密。
 - **由运维人员持有、不放在机器上：** issuer seed。
 - **需要运维手动完成的步骤：** 主机及其安全组的 Terraform apply、DNS、保管 issuer seed，以及手动启停主机。

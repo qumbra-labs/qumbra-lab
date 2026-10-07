@@ -27,7 +27,7 @@ The L1 `WitnessBundle` mode (`/v1/jobs`) is unchanged. It now runs only when its
 **Admission order.** Every refusal is by name, and nothing is spawned or queued before step 5 passes:
 
 1. The token: signature, validity window, net, revocation → `401` with `unauthorized`, `token-malformed`, `token-key-unknown`, `token-signature-invalid`, `token-window-invalid`, `token-expired`, `token-wrong-net` or `token-revoked`.
-2. The token's single in-flight job and its daily quota → `429` with `token-busy` or `quota-exhausted`. Only **admitted** jobs count against the quota.
+2. The token's single in-flight job, its single upload being read, and its daily quota → `429` with `token-busy` or `quota-exhausted`. Only **admitted** jobs count against the quota. An admitted upload must arrive within 30 s. Past that the handler gives up (counted as `upload-deadline`), but the token's reading slot stays taken until the connection actually ends, so a slow upload holds up only its own token.
 3. The byte ceiling, read bounded → `413` `bundle-too-large`.
 4. Decode → `400` `bundle-malformed`, or `403` `issuer-shape`.
 5. The bundle's lock, run on this net → `422` with `statement-mismatch`, `unauthorized-section`, `proof-present` or `auth-missing`.
@@ -78,9 +78,12 @@ The Annulet mode is on exactly when `QUMBRA_PROVER_ANNULET_GENESIS_HASH` is set.
 Proofs run one at a time, each in a fresh `annulet-worker` child process:
 
 - the environment is cleared except for the protocol tag and the genesis hash, so the child has no URL and no token;
-- core dumps are off (`RLIMIT_CORE = 0`, and `PR_SET_DUMPABLE = 0` on Linux);
+- core dumps are off: `RLIMIT_CORE = 0` is set between fork and exec. On Linux the child also clears `PR_SET_DUMPABLE` itself, first thing after exec (the kernel resets that flag on `execve`). After that, a same-uid process cannot `ptrace` it or read `/proc/<pid>/mem`. The server does the same to itself at startup, because it holds bundles too;
 - the working directory and `TMPDIR` are the tmpfs scratch;
-- stderr is closed.
+- stderr is closed;
+- the bundle is written to the child's stdin from its own thread, because 80 KiB can exceed a pipe's buffer. The prove timeout therefore also covers a child that stalls before reading.
+
+Both processes wipe the decoded bundle's witness when they drop it.
 
 The child re-runs the bundle's lock and proves. The server then checks that the answer is the bundle's transaction plus a non-empty proof and nothing else (otherwise the job fails with `proof-mismatch`), and only then submits it.
 
@@ -95,6 +98,6 @@ The child re-runs the bundle's lock and proves. The server then checks that the 
 - **Host:** r7g.2xlarge (64 GiB, arm64). One P prove peaks at about 32 GiB.
 - **Container:** `mem_limit` about 58g, no swap, `ulimits: core: 0`, a tmpfs mounted at `/scratch` (1g), read-only root filesystem.
 - **Env:** the variables above. The net is format 33; take the genesis hash from the deploy repo. The node URL must point at a node that accepts `POST /v1/tx`.
-- **Ingress:** TLS and rate limiting (Caddy), plus the non-loopback acknowledgement. Security group 443 is open, because the extension calls the service directly.
+- **Ingress:** TLS, rate limiting and a request-header size cap (Caddy), plus the non-loopback acknowledgement. Security group 443 is open, because the extension calls the service directly. **Keep `/v2/annulet/jobs/<cap>` out of the ingress access log**, or log only the path prefix: the capability in that URL is the job's secret.
 - **Operator-held, not on the box:** the issuer seed.
 - **Manual operator steps:** the Terraform apply for the host and its security group, DNS, keeping the issuer seed, and starting and stopping the host by hand.

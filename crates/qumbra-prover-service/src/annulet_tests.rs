@@ -167,8 +167,8 @@ fn admit(
     auth: &str,
     bundle: &ProvingBundle,
 ) -> Result<(AnnuletJobView, bool), ApiError> {
-    let claims = api.authorize(Some(auth))?;
-    api.submit(&claims, bundle.encode())
+    let admission = api.authorize(Some(auth))?;
+    api.submit(&admission, bundle.encode())
 }
 
 #[test]
@@ -324,8 +324,13 @@ fn a_bundle_is_refused_by_name_before_it_is_queued() {
     let prover = FakeProver::new(Answer::Honest, false);
     let a = api(Arc::clone(&prover), Arc::default());
     let t = token(6, GENESIS_HASH, 0);
-    let claims = a.authorize(Some(&t)).unwrap();
-    let code = |bytes: Vec<u8>| a.submit(&claims, bytes).err().map(|e| (e.status, e.code));
+    let admission = a.authorize(Some(&t)).unwrap();
+    let claims = *admission.claims();
+    let code = |bytes: Vec<u8>| {
+        a.submit(&admission, bytes)
+            .err()
+            .map(|e| (e.status, e.code))
+    };
     assert_eq!(code(Vec::new()), Some((413, "bundle-too-large")));
     assert_eq!(
         code(vec![0; MAX_ANNULET_BUNDLE_BYTES + 1]),
@@ -443,17 +448,56 @@ fn the_queue_is_bounded_and_a_queued_job_cancels() {
         "a busy refusal is not an admitted job"
     );
 
-    assert_eq!(a.cancel(cap_of(&queued)).unwrap().state, "cancelled");
+    // F2: a cancelled queued job leaves the queue at once — the next
+    // token's upload is admitted while the first job still proves.
+    let cancelled = a.cancel(cap_of(&queued)).unwrap();
+    assert_eq!(
+        (cancelled.state, cancelled.queue_position),
+        ("cancelled", None)
+    );
+    let (next, created) = admit(&a, &token(11, GENESIS_HASH, 0), z).unwrap();
+    assert!(created);
+    assert_eq!((next.state, next.queue_position), ("queued", Some(1)));
     prover.release();
     wait(&a, &running, &["submitted"]);
-    std::thread::sleep(Duration::from_millis(100));
+    wait(&a, &next, &["submitted"]);
     assert_eq!(
         *prover.calls.lock().unwrap(),
-        1,
+        2,
         "the cancelled job was never proved"
     );
     assert_eq!(a.get(cap_of(&queued)).unwrap().state, "cancelled");
-    assert_eq!(node.got.lock().unwrap().len(), 1);
+    assert_eq!(node.got.lock().unwrap().len(), 2);
+}
+
+/// F3: an admitted upload holds its token's one reading slot until the
+/// admission drops; the HTTP layer's refusals count under the token's tag.
+#[test]
+fn an_upload_holds_its_token_s_reading_slot() {
+    let a = api(FakeProver::new(Answer::Honest, false), Arc::default());
+    let t = token(16, GENESIS_HASH, 0);
+    let reading = a.authorize(Some(&t)).unwrap();
+    assert_eq!(
+        a.authorize(Some(&t)).err().map(|e| (e.status, e.code)),
+        Some((429, "token-busy"))
+    );
+    assert!(
+        a.authorize(Some(&token(17, GENESIS_HASH, 0))).is_ok(),
+        "other tokens are not held up"
+    );
+    a.count_refusal(reading.claims(), "upload-deadline");
+    drop(reading);
+    assert!(
+        a.authorize(Some(&t)).is_ok(),
+        "the slot frees when the read ends"
+    );
+    let tag = token_tag(&[16; 16]);
+    let counts = a.drain_refusals();
+    assert!(
+        counts.contains(&((tag.clone(), "upload-deadline"), 1)),
+        "{counts:?}"
+    );
+    assert!(counts.contains(&((tag, "token-busy"), 1)), "{counts:?}");
 }
 
 #[test]
