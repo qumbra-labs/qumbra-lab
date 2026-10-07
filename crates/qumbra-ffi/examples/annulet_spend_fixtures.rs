@@ -23,6 +23,9 @@
 //!   <out>/<case>/spend/NNN.bin     the spend's answers, transcript order
 //!   <out>/<case>/journal_before.txt, journal_after.txt   auth.v1 text
 //!   <out>/<case>/intent.bin, review.txt, bundle.bin      the kernel's output
+//!   <out>/<case>/list.json, list.sig  the asset list the scan was given (a
+//!                                  case with one; signed with the TEST list
+//!                                  key — `test-support`, dev-only)
 //!   <out>/SHA256SUMS               every file above, `sha256sum -c` form
 //!
 //! Run (a named local run, no prove):
@@ -96,8 +99,29 @@ fn chain() -> (Endpoint, String, String) {
     (ep, payee, AuthJournal::fresh(root).to_text())
 }
 
+/// (bytes, signature) of a TEST-signed list naming USDT-test on `genesis`
+/// under the genesis issuer key.
+fn list_for(genesis: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+    let issuer = hex(&qlab_node::annulet_genesis::h32(&[9, 9, 9, 9]));
+    let bytes = format!(
+        r#"{{"v":1,"network":"annulet-ad1","genesis":"{}","testnet":true,"assets":[{{"id":1,"issuer_key":"{issuer}","name":"Tether USD (test)","ticker":"tUSDT","decimals":6}}]}}"#,
+        hex(genesis)
+    )
+    .into_bytes();
+    let sig = qumbra_wallet::asset_view::test_list_key::sign(&bytes);
+    (bytes, sig)
+}
+
 /// One whole spend through the ABI, recorded into `dir`.
-unsafe fn case(dir: &Path, ep: &Endpoint, payee: &str, journal: &str, asset: u16, amount: u64) -> Value {
+unsafe fn case(
+    dir: &Path,
+    ep: &Endpoint,
+    payee: &str,
+    journal: &str,
+    asset: u16,
+    amount: u64,
+    list: Option<&(Vec<u8>, Vec<u8>)>,
+) -> Value {
     for sub in ["scan", "spend"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
@@ -108,9 +132,18 @@ unsafe fn case(dir: &Path, ep: &Endpoint, payee: &str, journal: &str, asset: u16
     let indices = [0u64, 1];
     let null = ptr::null();
     let mut err: *mut c_char = ptr::null_mut();
+    let key = qumbra_wallet::asset_view::test_list_key::encoded();
+    let (lp, ll, sp, sl, kp, kl) = match list {
+        Some((b, s)) => {
+            std::fs::write(dir.join("list.json"), b).unwrap();
+            std::fs::write(dir.join("list.sig"), s).unwrap();
+            (b.as_ptr(), b.len(), s.as_ptr(), s.len(), key.as_ptr(), key.len())
+        }
+        None => (null, 0, null, 0, null, 0),
+    };
     let s = qmb_annulet_new_v2(
-        w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, null, 0, null, 0,
-        null, 0, ptr::null(), ptr::null(), 0, &mut err,
+        w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl, kp,
+        kl, ptr::null(), ptr::null(), 0, &mut err,
     );
     assert!(!s.is_null());
     let mut scan = Vec::new();
@@ -181,6 +214,7 @@ unsafe fn case(dir: &Path, ep: &Endpoint, payee: &str, journal: &str, asset: u16
     std::fs::write(dir.join("bundle.bin"), &bundle).unwrap();
     json!({
         "request": { "to": payee, "asset": asset, "amount": amount.to_string(), "valid_for": VALID_FOR },
+        "list": list.map(|_| json!({ "bytes": "list.json", "sig": "list.sig" })),
         "scan": scan,
         "spend": spend,
         "files": {
@@ -242,9 +276,11 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     let (ep, payee, journal) = chain();
     let mut cases = serde_json::Map::new();
-    for (name, asset, amount) in [("s_asset0", 0u16, 10u64), ("p_usdt", USDT as u16, 1_000)] {
+    let usdt_list = list_for(&ep.file.hash());
+    for (name, asset, amount, list) in [("s_asset0", 0u16, 10u64, None), ("p_usdt", USDT as u16, 1_000, Some(&usdt_list))] {
         let dir = out.join(name);
-        let c = unsafe { case(&dir, &ep, &payee, &journal, asset, amount) };
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = unsafe { case(&dir, &ep, &payee, &journal, asset, amount, list) };
         std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
         println!("{name:<10} {} scan + {} spend reads → bundle {} B", c["scan"].as_array().unwrap().len(), c["spend"].as_array().unwrap().len(), c["bundle_len"]);
         cases.insert(name.into(), json!(name));
@@ -261,6 +297,7 @@ fn main() {
         "spend_seed": hex(&SPEND_SEED),
         "dummy_entropy": hex(&DUMMIES),
         "indices": [0, 1],
+        "list_key": hex(&qumbra_wallet::asset_view::test_list_key::encoded()),
         "cases": cases,
     });
     std::fs::write(out.join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();

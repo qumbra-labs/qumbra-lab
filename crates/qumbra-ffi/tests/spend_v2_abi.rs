@@ -92,16 +92,39 @@ fn chain(tag: &str) -> Fixture {
 
 /// The verified scan through the ABI, then its basis.
 unsafe fn basis(w: *mut WalletState, ep: &Endpoint) -> *mut SpendBasis {
+    basis_with(w, ep, None)
+}
+
+/// A TEST-signed asset list for `genesis` naming `asset` with `issuer` lanes.
+fn list(genesis: &[u8; 32], asset: u16, issuer: [u64; 4]) -> (Vec<u8>, Vec<u8>) {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let bytes = format!(
+        r#"{{"v":1,"network":"annulet-ad1","genesis":"{}","testnet":true,"assets":[{{"id":{asset},"issuer_key":"{}","name":"Tether USD (test)","ticker":"tUSDT","decimals":6}}]}}"#,
+        hex(genesis),
+        hex(&qlab_node::annulet_genesis::h32(&issuer))
+    )
+    .into_bytes();
+    let sig = qumbra_wallet::asset_view::test_list_key::sign(&bytes);
+    (bytes, sig)
+}
+
+/// [`basis`] with the scan given `list` (bytes, signature) under the TEST key.
+unsafe fn basis_with(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>, Vec<u8>)>) -> *mut SpendBasis {
+    let key = qumbra_wallet::asset_view::test_list_key::encoded();
+    let (lp, ll, sp, sl, kp, kl) = match list {
+        Some((b, s)) => (b.as_ptr(), b.len(), s.as_ptr(), s.len(), key.as_ptr(), key.len()),
+        None => (ptr::null(), 0, ptr::null(), 0, ptr::null(), 0),
+    };
     let endpoint = CString::new("fixture").unwrap();
     let pin = ep.file.hash();
     let indices = [0u64, 1];
     let null = ptr::null();
     let mut err: *mut c_char = ptr::null_mut();
     let s = qmb_annulet_new_v2(
-        w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, null, 0, null, 0,
-        null, 0, ptr::null(), ptr::null(), 0, &mut err,
+        w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl,
+        kp, kl, ptr::null(), ptr::null(), 0, &mut err,
     );
-    assert!(!s.is_null());
+    assert!(!s.is_null(), "{}", if err.is_null() { String::new() } else { take_str(err) });
     loop {
         let mut out: *mut c_char = ptr::null_mut();
         match qmb_annulet_step(s, &mut out) {
@@ -211,9 +234,20 @@ fn next_of(journal: &str) -> u32 {
 
 /// One whole spend; the bundle and the review.
 unsafe fn send(f: &Fixture, asset: u16, amount: u64, slots: u32, shape: L2ShapeTag) -> (ProvingBundle, String) {
+    send_with(f, asset, amount, slots, shape, None)
+}
+
+unsafe fn send_with(
+    f: &Fixture,
+    asset: u16,
+    amount: u64,
+    slots: u32,
+    shape: L2ShapeTag,
+    list: Option<&(Vec<u8>, Vec<u8>)>,
+) -> (ProvingBundle, String) {
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
     let a = auth(w, &f.fresh).unwrap();
-    let s = spend(basis(w, &f.ep), &f.payee, asset, amount, 96).unwrap();
+    let s = spend(basis_with(w, &f.ep, list), &f.payee, asset, amount, 96).unwrap();
     let paths = pump(a, s, &f.ep, 0).expect("READY");
     assert!(paths.iter().any(|p| p == "/v1/annulet/params"), "{paths:?}");
     assert!(paths.iter().any(|p| p.starts_with("/v1/tree/leaves")), "{paths:?}");
@@ -242,7 +276,10 @@ fn a_an_s_payment_of_asset_0_is_a_bundle_the_prover_accepts() {
     assert!(text.contains("step 1 of 1: the payment"), "{text}");
     assert!(text.contains(&format!("to {short}")), "{text}");
     assert!(text.contains("returns to this wallet"), "{text}");
-    assert!(text.contains("fee: ") && text.contains("valid until block "), "{text}");
+    assert!(text.contains("send 10 fee units to "), "{text}");
+    assert!(text.contains("39 fee units returns to this wallet"), "{text}");
+    assert!(text.contains("fee: 1 fee units") && text.contains("valid until block "), "{text}");
+    assert!(text.starts_with("asset list: none"), "{text}");
     assert!(!text.contains("leaf") && !text.contains("anchor"), "{text}");
 }
 
@@ -251,8 +288,9 @@ fn b_a_p_payment_of_the_hybrid_asset_takes_its_note_and_an_exact_fee_note() {
     let f = chain("sv2_b");
     let (b, text) = unsafe { send(&f, USDT as u16, 1_000, 2, L2ShapeTag::P) };
     assert_eq!(b.tx().public.fee, 2, "the P tier");
-    assert!(text.contains("send 1000 of asset 1 to "), "{text}");
-    assert!(text.contains("999000 of asset 1 returns to this wallet"), "{text}");
+    assert!(text.contains("send 1,000 base units of asset 1 (no list for this network) to "), "{text}");
+    assert!(text.contains("999,000 base units of asset 1 (no list for this network) returns to this wallet"), "{text}");
+    assert!(text.contains("fee: 2 fee units"), "{text}");
 }
 
 #[test]
@@ -457,5 +495,33 @@ fn i_every_export_answers_null_by_name_or_as_a_no_op() {
         assert!(take_str(err).contains("NULL"));
         qmb_spend_v2_free(ptr::null_mut());
         qmb_spend_basis_free(ptr::null_mut());
+    }
+}
+
+/// Lab #924 PR 3c: the review names an asset only from the verified list,
+/// and only while its leaf (bound to the verified tip) carries the listed
+/// issuer key; otherwise the raw base units, saying why.
+#[test]
+fn j_the_review_names_the_asset_from_the_verified_list_only() {
+    let f = chain("sv2_j");
+    let genesis = f.ep.file.hash();
+    unsafe {
+        // Listed, issuer as on chain: name, ticker and decimals.
+        let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&genesis, USDT as u16, [9; 4])));
+        assert!(text.starts_with("asset list: annulet-ad1 "), "{text}");
+        assert!(text.contains("— a test network: test money"), "{text}");
+        assert!(text.contains("send 0.001000 tUSDT (Tether USD (test)) to "), "{text}");
+        assert!(text.contains("0.999000 tUSDT (Tether USD (test)) returns to this wallet"), "{text}");
+        assert!(text.contains("fee: 2 fee units"), "{text}");
+        // Listed under another issuer key: the name is withheld.
+        let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&genesis, USDT as u16, [8; 4])));
+        assert!(text.contains("send 1,000 base units of asset 1 (listed as tUSDT, but its issuer key changed: name withheld)"), "{text}");
+        // The list does not carry asset 1: not on list <short id>.
+        let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&genesis, 7, [9; 4])));
+        assert!(text.contains("send 1,000 base units of asset 1 (not on list "), "{text}");
+        // A list for another network: ignored.
+        let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&[0x11; 32], USDT as u16, [9; 4])));
+        assert!(text.starts_with("asset list: for another network (11111111), ignored"), "{text}");
+        assert!(text.contains("(no list for this network)"), "{text}");
     }
 }
