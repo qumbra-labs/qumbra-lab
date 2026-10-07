@@ -27,9 +27,13 @@
 //!                                  case with one; signed with the TEST list
 //!                                  key — `test-support`, dev-only)
 //!   <out>/<case>/auth/NNN.bin      the open-time check's bodies (PR 3b)
-//!   <out>/<auth case>/             first / restore / stale-check cases:
-//!                                  journal_in.txt, journal_out.txt, case.json
-//!                                  (status, refusal, wall ms)
+//!   <out>/<auth case>/             first / restore / stale-check / revive /
+//!                                  rotated cases: journal_in.txt,
+//!                                  journal_out.txt, case.json (status,
+//!                                  refusal, the basis summary, wall ms); the
+//!                                  scan names the journal's generations
+//!                                  (restore and first: the probe 0..8)
+//!   <out>/check_stale/then_restore/  the restore the STALE status asks for
 //!   <out>/SHA256SUMS               every file above, `sha256sum -c` form
 //!
 //! Run (a named local run, no prove):
@@ -47,12 +51,13 @@ use qlab_devnet::body::BlockBody;
 use qumbra_ffi::annulet::{qmb_annulet_free, qmb_annulet_new_v2, qmb_annulet_step, qmb_annulet_supply, qmb_annulet_supply_err, qmb_annulet_take_basis};
 use qumbra_ffi::spend_v2::{
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
-    qmb_auth_check_supply_err, qmb_auth_first_new, qmb_auth_restore_new, qmb_spend_basis_free, AuthHandle, SpendBasis,
+    qmb_auth_check_supply_err, qmb_auth_first_new, qmb_auth_open_next, qmb_auth_restore_new, qmb_spend_basis_free,
+    qmb_spend_basis_summary, AuthHandle, SpendBasis,
     qmb_auth_free, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_v2_free, qmb_spend_v2_intent,
     qmb_spend_v2_new, qmb_spend_v2_step, qmb_spend_v2_supply, qmb_spend_v2_supply_err,
 };
 use qumbra_ffi::{qmb_dealloc, qmb_string_free, qmb_wallet_free, qmb_wallet_from_entropy};
-use qumbra_wallet::auth_journal::{generation_root, AuthJournal};
+use qumbra_wallet::auth_journal::{generation_root, AuthJournal, GenState, Generation};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use serde_json::{json, Value};
@@ -63,6 +68,8 @@ const RNG: [u8; 32] = [0x59; 32];
 const SPEND_SEED: [u8; 32] = [0x5A; 32];
 const DUMMIES: [u8; 64] = [0x5B; 64];
 const VALID_FOR: u64 = 96;
+/// The generations a restore or first scans: it has no journal to name them.
+const PROBE: [u32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -109,6 +116,19 @@ fn chain(extra: Option<qlab_devnet::body::TxEntry>) -> (Endpoint, String, String
     (ep, payee, AuthJournal::fresh(root).to_text())
 }
 
+/// The fixture wallet's two-generation journal: generation 0 (cursor 0) in
+/// `g0`, generation 1 active and fresh.
+fn journal_of(g0: GenState) -> String {
+    let w = wallet_dir("spend_fixtures_journal", SEED);
+    let wallet = w.wallet();
+    let gens = vec![
+        Generation { g: 0, next: 0, auth_root: generation_root(&wallet, 0), state: g0 },
+        Generation { g: 1, next: 0, auth_root: generation_root(&wallet, 1), state: GenState::Active },
+    ];
+    let _ = std::fs::remove_dir_all(&w.dir);
+    AuthJournal::from_generations(gens).unwrap().to_text()
+}
+
 /// (bytes, signature) of a TEST-signed list naming USDT-test on `genesis`
 /// under the genesis issuer key.
 fn list_for(genesis: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
@@ -123,7 +143,13 @@ fn list_for(genesis: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// The verified scan through the ABI, recorded into `dir/scan`: its basis.
-unsafe fn scan_basis(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint, list: Option<&(Vec<u8>, Vec<u8>)>) -> (*mut SpendBasis, Vec<Value>) {
+unsafe fn scan_basis(
+    dir: &Path,
+    w: *mut qumbra_ffi::WalletState,
+    ep: &Endpoint,
+    list: Option<&(Vec<u8>, Vec<u8>)>,
+    gens: &[u32],
+) -> (*mut SpendBasis, Vec<Value>) {
     std::fs::create_dir_all(dir.join("scan")).unwrap();
     let endpoint = CString::new("fixture").unwrap();
     let pin = ep.file.hash();
@@ -141,7 +167,7 @@ unsafe fn scan_basis(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint,
     };
     let s = qmb_annulet_new_v2(
         w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl, kp,
-        kl, ptr::null(), ptr::null(), 0, &mut err,
+        kl, ptr::null(), gens.as_ptr(), gens.len(), &mut err,
     );
     assert!(!s.is_null());
     let mut scan = Vec::new();
@@ -168,7 +194,8 @@ unsafe fn scan_basis(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint,
 
 /// Which open the auth phase runs.
 enum Open<'a> {
-    Check(&'a str),
+    /// The journal and the generation to open.
+    Check(&'a str, u32),
     First,
     Restore,
 }
@@ -190,9 +217,9 @@ unsafe fn auth_phase(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint,
     let started = std::time::Instant::now();
     let mut err: *mut c_char = ptr::null_mut();
     let c = match open {
-        Open::Check(journal) => {
+        Open::Check(journal, g) => {
             let j = CString::new(journal).unwrap();
-            qmb_auth_check_new(w, j.as_ptr(), basis, 0, &mut err)
+            qmb_auth_check_new(w, j.as_ptr(), basis, g, &mut err)
         }
         Open::First => qmb_auth_first_new(w, basis, &mut err),
         Open::Restore => qmb_auth_restore_new(w, basis, &mut err),
@@ -227,7 +254,13 @@ unsafe fn auth_phase(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint,
 unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&str>) -> Value {
     std::fs::create_dir_all(dir).unwrap();
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
-    let (basis, scan) = scan_basis(dir, w, ep, None);
+    // The host scans every generation its journal names; with none, the probe.
+    let gens: Vec<u32> = match journal_in {
+        Some(j) => AuthJournal::from_text(j).unwrap().generations().iter().map(|g| g.g).collect(),
+        None => PROBE.to_vec(),
+    };
+    let (basis, scan) = scan_basis(dir, w, ep, None, &gens);
+    let summary: Value = serde_json::from_str(&take_str(qmb_spend_basis_summary(basis))).unwrap();
     let o = auth_phase(dir, w, ep, basis, open);
     qmb_spend_basis_free(basis);
     if let Some(a) = o.a {
@@ -246,6 +279,8 @@ unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&s
         "status": o.status,
         "keys": o.a.is_some(),
         "refusal": o.refusal,
+        "scan_generations": gens,
+        "basis": summary,
         "scan": scan,
         "auth": o.transcript,
         "wall_ms_native": o.millis,
@@ -265,9 +300,9 @@ unsafe fn case(
     std::fs::create_dir_all(dir.join("spend")).unwrap();
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
     let mut err: *mut c_char = ptr::null_mut();
-    let (basis, scan) = scan_basis(dir, w, ep, list);
+    let (basis, scan) = scan_basis(dir, w, ep, list, &[0]);
     // The keys: the open-time check of the account's journal.
-    let opened = auth_phase(dir, w, ep, basis, Open::Check(journal));
+    let opened = auth_phase(dir, w, ep, basis, Open::Check(journal, 0));
     let a = opened.a.expect("the fresh journal opens");
     let checked = opened.journal.clone().expect("a checked journal");
     let to = CString::new(payee).unwrap();
@@ -397,14 +432,43 @@ fn main() {
         .clone();
     landed.proof = vec![0xAB; 64];
     let (spent, _, _) = chain(Some(landed));
+    // retired_revive: generation 0 retired while it still holds the
+    // chain's notes, generation 1 active → check(0) revives it (F9).
+    let retired = journal_of(GenState::Retired);
+    // rotated_balance: open_next on the fresh journal (generation 0 becomes
+    // sweep-only behind a gate, 1 active) while 0 holds every note.
+    let rotated = unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let scratch = out.join("rotated_balance/open_next");
+        let (b, _) = scan_basis(&scratch, w, &ep, None, &[0]);
+        let j = CString::new(journal.as_str()).unwrap();
+        let mut o: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_auth_open_next(w, j.as_ptr(), b, &mut o), 0, "{}", take_str(o));
+        qmb_spend_basis_free(b);
+        qmb_wallet_free(w);
+        std::fs::remove_dir_all(&scratch).unwrap();
+        take_str(o)
+    };
     for (name, chain_ep, open, journal_in) in [
         ("first_unspent", &ep, Open::First, None),
         ("restore_spent", &spent, Open::Restore, None),
-        ("check_stale", &spent, Open::Check(&journal), Some(journal.as_str())),
+        ("check_stale", &spent, Open::Check(&journal, 0), Some(journal.as_str())),
         ("first_spent", &spent, Open::First, None),
+        ("retired_revive", &ep, Open::Check(&retired, 0), Some(retired.as_str())),
+        ("rotated_balance", &ep, Open::Check(&rotated, 0), Some(rotated.as_str())),
     ] {
         let dir = out.join(name);
-        let c = unsafe { auth_case(&dir, chain_ep, open, journal_in) };
+        let mut c = unsafe { auth_case(&dir, chain_ep, open, journal_in) };
+        if name == "check_stale" {
+            // What STALE asks of the host: persist journal_out, tell the
+            // user, run the restore.
+            let then = unsafe { auth_case(&dir.join("then_restore"), chain_ep, Open::Restore, None) };
+            println!("  then_restore status {} keys {} {} ms", then["status"], then["keys"], then["wall_ms_native"]);
+            c["then_restore"] = then;
+        }
+        if name == "rotated_balance" {
+            c["journal_in_made_by"] = json!("qmb_auth_open_next on the fresh journal, basis scanned at [0] on the unspent chain");
+        }
         std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
         println!("{name:<14} status {} keys {} {} ms{}", c["status"], c["keys"], c["wall_ms_native"], c["refusal"].as_str().map(|r| format!(" — {r}")).unwrap_or_default());
         cases.insert(name.into(), json!(name));
@@ -445,7 +509,7 @@ fn main() {
         let holder = p.wallet().address_candidate_a_at_index(0, &generation_root(&p.wallet(), 0));
         let _ = std::fs::remove_dir_all(&p.dir);
         let empty = Endpoint::new(genesis_v2(&holder, Vec::new()), &[], None, Lie::None);
-        let (basis, _) = scan_basis(&dir, w, &empty, None);
+        let (basis, _) = scan_basis(&dir, w, &empty, None, &PROBE);
         let o = auth_phase(&dir, w, &empty, basis, Open::First);
         qmb_spend_basis_free(basis);
         if let Some(a) = o.a {
@@ -469,7 +533,7 @@ fn main() {
     // The seeds below are PUBLIC TEST CONSTANTS of this fixture, written so the
     // harness can replay the run — never a real wallet's, never to fund one.
     let manifest = json!({
-        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check) on a format-33 genesis. FIXTURE seeds only.",
+        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance) on a format-33 genesis. FIXTURE seeds only.",
         "lab_rev": rev,
         "wallet_entropy": hex(&[SEED; 32]),
         "payee_entropy": hex(&[PAYEE; 32]),

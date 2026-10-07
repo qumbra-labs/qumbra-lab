@@ -31,7 +31,7 @@ use qumbra_ffi::spend_v2::{
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
     qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
     qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_refusal, qmb_spend_v2_step, qmb_spend_v2_supply,
-    qmb_spend_v2_supply_err, AuthHandle, CheckHandle, SpendBasis, SpendHandle, QMB_AUTH_CHECKED, QMB_AUTH_JOURNAL_REPLACED,
+    qmb_spend_v2_supply_err, AuthHandle, CheckHandle, SpendBasis, SpendHandle, QMB_AUTH_CHECKED, QMB_AUTH_JOURNAL_STALE,
     QMB_AUTH_RESTORED, QMB_AUTH_SWEEP_WAITING,
 };
 use qumbra_ffi::{qmb_dealloc, qmb_string_free, qmb_wallet_free, qmb_wallet_from_entropy, WalletState};
@@ -89,13 +89,24 @@ fn chain_lying(tag: &str, lie: Lie) -> Fixture {
 /// the endpoint serves the last block's body as an empty one under its real
 /// header (the bodies route lies; the scan's routes see no note of ours).
 fn chain_full(tag: &str, lie: Lie, extra: Vec<BlockBody>, forge_last: bool) -> Fixture {
+    chain_built(tag, lie, extra, forge_last, false)
+}
+
+/// [`chain_full`]; with `g1_note` the genesis also pays 30 fee units to the
+/// wallet's generation-1 address 0 (an address only `open_next` hands out).
+fn chain_built(tag: &str, lie: Lie, extra: Vec<BlockBody>, forge_last: bool, g1_note: bool) -> Fixture {
     let w = wallet_dir(tag, SEED);
     let wallet = w.wallet();
     let root = generation_root(&wallet, 0);
     let a2 = wallet.address_candidate_a_at_index(0, &root);
     let mut rng = StdRng::seed_from_u64(0x4B);
     let body = BlockBody { txs: vec![pay_tx(&a2, &[note_to(&a2, 5, 0, 20)], 0x30, &mut rng)], ..BlockBody::default() };
-    let file = genesis_v2(&a2, vec![note_to(&a2, 50, 0, 30), note_to(&a2, 2, 0, 40)]);
+    let mut genesis_notes = vec![note_to(&a2, 50, 0, 30), note_to(&a2, 2, 0, 40)];
+    if g1_note {
+        let g1 = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 1));
+        genesis_notes.push(note_to(&g1, 30, 0, 50));
+    }
+    let file = genesis_v2(&a2, genesis_notes);
     let mut honest = vec![body];
     honest.extend(extra);
     let ep = if forge_last {
@@ -132,6 +143,18 @@ fn list(genesis: &[u8; 32], asset: u16, issuer: [u64; 4]) -> (Vec<u8>, Vec<u8>) 
 
 /// [`basis`] with the scan given `list` (bytes, signature) under the TEST key.
 unsafe fn basis_with(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>, Vec<u8>)>) -> *mut SpendBasis {
+    basis_full(w, ep, list, &[])
+}
+
+/// Every probe generation — what a restore or a first scans.
+const PROBE: [u32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// [`basis`] scanning `gens` (empty: the default `[0]`).
+unsafe fn basis_g(w: *mut WalletState, ep: &Endpoint, gens: &[u32]) -> *mut SpendBasis {
+    basis_full(w, ep, None, gens)
+}
+
+unsafe fn basis_full(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>, Vec<u8>)>, gens: &[u32]) -> *mut SpendBasis {
     let key = qumbra_wallet::asset_view::test_list_key::encoded();
     let (lp, ll, sp, sl, kp, kl) = match list {
         Some((b, s)) => (b.as_ptr(), b.len(), s.as_ptr(), s.len(), key.as_ptr(), key.len()),
@@ -144,7 +167,7 @@ unsafe fn basis_with(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>,
     let mut err: *mut c_char = ptr::null_mut();
     let s = qmb_annulet_new_v2(
         w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl,
-        kp, kl, ptr::null(), ptr::null(), 0, &mut err,
+        kp, kl, ptr::null(), if gens.is_empty() { ptr::null() } else { gens.as_ptr() }, gens.len(), &mut err,
     );
     assert!(!s.is_null(), "{}", if err.is_null() { String::new() } else { take_str(err) });
     loop {
@@ -173,15 +196,19 @@ struct Opened {
     a: *mut AuthHandle,
     journal: String,
     status: i32,
+    /// The body paths the check asked for, in order.
+    paths: Vec<String>,
 }
 
 /// Pump a check (or restore) handle over `ep`'s bodies and finish it.
 unsafe fn finish_check(w: *mut WalletState, c: *mut CheckHandle, ep: &Endpoint, fail_at: Option<u64>) -> Result<Opened, String> {
+    let mut paths = Vec::new();
     loop {
         let mut out: *mut c_char = ptr::null_mut();
         match qmb_auth_check_step(c, &mut out) {
             1 => {
                 let path = take_str(out);
+                paths.push(path.clone());
                 let h: u64 = path.split('/').nth(3).unwrap().parse().unwrap();
                 if fail_at == Some(h) {
                     qmb_auth_check_supply_err(c, CString::new("connection reset").unwrap().as_ptr());
@@ -206,12 +233,14 @@ unsafe fn finish_check(w: *mut WalletState, c: *mut CheckHandle, ep: &Endpoint, 
     if a.is_null() {
         return Err(format!("{} [status {status}] {journal}", take_str(err)));
     }
-    Ok(Opened { a, journal, status })
+    Ok(Opened { a, journal, status, paths })
 }
 
 /// The checked open of `journal`'s generation `g` over `ep`'s verified chain.
 unsafe fn open_g(w: *mut WalletState, ep: &Endpoint, journal: &str, g: u32) -> Result<Opened, String> {
-    let b = basis(w, ep);
+    // The host scans every generation of the journal (the header's rule).
+    let gens: Vec<u32> = AuthJournal::from_text(journal).map(|j| j.generations().iter().map(|r| r.g).collect()).unwrap_or_default();
+    let b = basis_g(w, ep, &gens);
     let j = CString::new(journal).unwrap();
     let mut err: *mut c_char = ptr::null_mut();
     let c = qmb_auth_check_new(w, j.as_ptr(), b, g, &mut err);
@@ -665,30 +694,40 @@ fn genesis_hex(f: &Fixture) -> String {
     f.ep.file.hash().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The journal that saw the take is checked: unchanged but for its
-/// `checked` line (v2 text); a journal older than the landed leaf is
-/// replaced — its generation sweep-only above the leaf, the next one active.
+/// The journal that saw the take is checked, pumping only the blocks after
+/// its `checked_to`; one checked past the tip is walked from height 1; a
+/// journal older than the landed leaf is STALE — no keys, its cursor raised
+/// and returned to persist — and a restore then takes over.
 #[test]
 fn k_the_open_check_finds_a_journal_older_than_the_chain() {
     let (f, persisted) = spent_chain();
     unsafe {
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        // The take's journal was checked on the source chain through height 1.
+        assert!(persisted.contains(&format!("checked 0 {}:1", genesis_hex(f))), "{persisted}");
         let ok = open_g(w, &f.ep, persisted, 0).unwrap();
+        assert_eq!(ok.paths, vec!["/v1/block/2/body".to_string()], "only what is past checked_to");
         assert_eq!(ok.status, QMB_AUTH_CHECKED);
-        assert!(ok.journal.starts_with("qumbra-wallet auth v2\n"), "{}", ok.journal);
         assert!(ok.journal.contains(&format!("checked 0 {}:2", genesis_hex(f))), "{}", ok.journal);
         assert_eq!(next_of(&ok.journal), 1);
         qmb_auth_free(ok.a);
+        // Checked past the verified tip (an edited backup): walked from 1.
+        let beyond = persisted.replace(&format!("{}:1", genesis_hex(f)), &format!("{}:99", genesis_hex(f)));
+        let again = open_g(w, &f.ep, &beyond, 0).unwrap();
+        assert_eq!(again.paths.first().map(String::as_str), Some("/v1/block/1/body"));
+        qmb_auth_free(again.a);
 
-        let stale = open_g(w, &f.ep, &f.fresh, 0).unwrap();
-        assert_eq!(stale.status, QMB_AUTH_JOURNAL_REPLACED);
-        let j = AuthJournal::from_text(&stale.journal).unwrap();
-        assert_eq!(j.active().g, 1, "the next generation opens");
-        let g0 = j.get(0).unwrap();
-        assert_eq!(g0.next, 1, "raised above the landed leaf");
-        assert!(matches!(g0.state, qumbra_wallet::auth_journal::GenState::Sweep { .. }));
-        assert_eq!(next_of(&take_str(qmb_auth_journal(stale.a))), 1);
-        qmb_auth_free(stale.a);
+        let stale = open_g(w, &f.ep, &f.fresh, 0).err().unwrap();
+        assert!(stale.contains(&format!("[status {QMB_AUTH_JOURNAL_STALE}]")), "{stale}");
+        assert!(stale.contains("then run qmb_auth_restore_new"), "{stale}");
+        let returned = stale.split_once("] ").unwrap().1;
+        let j = AuthJournal::from_text(returned).unwrap();
+        assert_eq!((j.active().g, j.get(0).unwrap().next), (0, 1), "raised, not rotated: {returned}");
+        // Then the restore: generation 0 sweep-only, generation 1 active.
+        let r = first_or_restore(w, &f.ep, true).unwrap();
+        assert_eq!(r.status, QMB_AUTH_RESTORED);
+        assert_eq!(AuthJournal::from_text(&r.journal).unwrap().active().g, 1);
+        qmb_auth_free(r.a);
         qmb_wallet_free(w);
     }
 }
@@ -700,7 +739,7 @@ fn l_restore_never_resumes_a_used_generation() {
     let (f, _) = spent_chain();
     unsafe {
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
-        let b = basis(w, &f.ep);
+        let b = basis_g(w, &f.ep, &PROBE);
         let mut err: *mut c_char = ptr::null_mut();
         let c = qmb_auth_restore_new(w, b, &mut err);
         qmb_spend_basis_free(b);
@@ -719,7 +758,17 @@ fn l_restore_never_resumes_a_used_generation() {
 #[test]
 fn m_a_missing_or_lying_body_refuses_the_open() {
     let f = chain("sv2_m");
-    let lying = chain_full("sv2_m_lie", Lie::None, vec![BlockBody::default()], true);
+    // Block 2 carries a payment to the payee; the endpoint serves it empty
+    // under its real header — the commitment cannot match.
+    let lying = {
+        let payee = wallet_dir("sv2_m_lie_payee", PAYEE);
+        let pw = payee.wallet();
+        let to = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0));
+        let _ = std::fs::remove_dir_all(&payee.dir);
+        let mut rng = StdRng::seed_from_u64(0x4D);
+        let paid = BlockBody { txs: vec![pay_tx(&to, &[note_to(&to, 3, 0, 60)], 0x60, &mut rng)], ..BlockBody::default() };
+        chain_full("sv2_m_lie", Lie::None, vec![paid], true)
+    };
     unsafe {
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
         let b = basis(w, &f.ep);
@@ -730,7 +779,7 @@ fn m_a_missing_or_lying_body_refuses_the_open() {
         let why = finish_check(w, c, &f.ep, Some(1)).err().unwrap();
         assert!(why.contains("block 1's body is unavailable: connection reset"), "{why}");
         let why = open_g(w, &lying.ep, &lying.fresh, 0).err().unwrap();
-        assert!(why.contains("block 2's body"), "{why}");
+        assert!(why.contains("block 2's body is not the one its verified header commits to"), "{why}");
         qmb_wallet_free(w);
     }
 }
@@ -787,7 +836,7 @@ fn n_open_next_then_the_sweep_gate_and_its_target() {
 
 /// Run `first` (or restore) on `ep` for handle `w`.
 unsafe fn first_or_restore(w: *mut WalletState, ep: &Endpoint, restore: bool) -> Result<Opened, String> {
-    let b = basis(w, ep);
+    let b = basis_g(w, ep, &PROBE);
     let mut err: *mut c_char = ptr::null_mut();
     let c = if restore { qmb_auth_restore_new(w, b, &mut err) } else { qumbra_ffi::spend_v2::qmb_auth_first_new(w, b, &mut err) };
     qmb_spend_basis_free(b);
@@ -830,6 +879,9 @@ fn p_first_fresh_is_only_for_a_seed_born_here() {
         let fresh = take_str(out);
         assert_eq!(next_of(&fresh), 0);
         assert!(fresh.starts_with("qumbra-wallet auth v1\n"), "{fresh}");
+        // Once: the mark is consumed.
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, &mut out), -1);
+        assert!(take_str(out).contains("use qmb_auth_first_new or qmb_auth_restore_new"));
 
         // The same seed through the three outside doors: refused by name.
         let mut entropy = [0u8; 32];
@@ -891,4 +943,123 @@ fn q_the_header_pins_the_open_statuses() {
     assert_eq!(from_header, from_src);
     assert_eq!(QMB_AUTH_CHECKED, 0);
     assert_eq!(QMB_AUTH_RESTORED, 3);
+}
+
+/// A chain on which BOTH generations signed: generation 0 at height 2, then
+/// (after `open_next`) generation 1 at height 3 — the lost-device case a
+/// stale journal hides. Built once.
+fn two_gen_chain() -> &'static Fixture {
+    static F: std::sync::OnceLock<Fixture> = std::sync::OnceLock::new();
+    F.get_or_init(|| unsafe {
+        let src = chain_built("sv2_two_src", Lie::None, Vec::new(), false, true);
+        let (tx_a, j_a) = landed_spend(&src);
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let b = basis_g(w, &src.ep, &[0]);
+        let j = CString::new(j_a).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_auth_open_next(w, j.as_ptr(), b, &mut out), 0);
+        qmb_spend_basis_free(b);
+        let j_b = take_str(out);
+        let g1 = open_g(w, &src.ep, &j_b, 1).unwrap();
+        let s = spend(basis_g(w, &src.ep, &[0, 1]), &src.payee, 0, 10, 96).unwrap();
+        pump(g1.a, s, &src.ep, 0).unwrap();
+        let journal = take(g1.a, s).unwrap();
+        let i = intent(s);
+        let mut tx_b = ProvingBundle::decode(&sign(g1.a, s, &i, &journal).unwrap()).unwrap().tx().clone();
+        tx_b.proof = vec![0xAB; 64];
+        qmb_spend_v2_free(s);
+        qmb_auth_free(g1.a);
+        qmb_wallet_free(w);
+        let body = |tx| BlockBody { txs: vec![tx], ..BlockBody::default() };
+        chain_built("sv2_two", Lie::None, vec![body(tx_a), body(tx_b)], false, true)
+    })
+}
+
+/// F8: both generations used. A stale generation-0 journal is STALE (no
+/// keys); the restore walks every probe generation: generation 0 and 1
+/// sweep-only above their landed leaves, generation 2 active. `first` is
+/// refused.
+#[test]
+fn r_a_stale_journal_hides_a_later_generation_the_restore_finds() {
+    let f = two_gen_chain();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let stale = open_g(w, &f.ep, &f.fresh, 0).err().unwrap();
+        assert!(stale.contains(&format!("[status {QMB_AUTH_JOURNAL_STALE}]")), "{stale}");
+        let r = first_or_restore(w, &f.ep, true).unwrap();
+        assert_eq!(r.status, QMB_AUTH_RESTORED);
+        let j = AuthJournal::from_text(&r.journal).unwrap();
+        assert_eq!(j.active().g, 2, "{}", r.journal);
+        for g in [0, 1] {
+            let rec = j.get(g).unwrap();
+            assert_eq!(rec.next, 1, "generation {g} above its landed leaf: {}", r.journal);
+            assert!(!matches!(rec.state, qumbra_wallet::auth_journal::GenState::Active), "{}", r.journal);
+        }
+        qmb_auth_free(r.a);
+        let why = first_or_restore(w, &f.ep, false).err().unwrap();
+        assert!(why.contains("use restore"), "{why}");
+        qmb_wallet_free(w);
+    }
+}
+
+/// F7: a note at generation 1 (an address only `open_next` makes) means a
+/// journal existed — `first` is refused even with nothing landed.
+#[test]
+fn s_first_refuses_a_seed_that_opened_a_later_generation() {
+    let f = chain_built("sv2_s", Lie::None, Vec::new(), false, true);
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let why = first_or_restore(w, &f.ep, false).err().unwrap();
+        assert!(why.contains("this seed opened generation 1") && why.contains("use restore"), "{why}");
+        qmb_wallet_free(w);
+    }
+}
+
+/// F9: a generation never dies for receiving. A retired generation that
+/// holds a note is revived — sweep-only with a NEW gate, SWEEP_WAITING, the
+/// journal returned; a retired one holding nothing is refused. A sweep-only
+/// generation may not pay its own (non-active) address either.
+#[test]
+fn t_a_retired_generation_that_receives_is_revived() {
+    let f = chain("sv2_t");
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let g0 = AuthJournal::from_text(&f.fresh).unwrap().get(0).unwrap().clone();
+        let g1 = qumbra_wallet::auth_journal::Generation {
+            g: 1,
+            next: 0,
+            auth_root: generation_root(&wallet_dir("sv2_t_root", SEED).wallet(), 1),
+            state: qumbra_wallet::auth_journal::GenState::Active,
+        };
+        use qumbra_wallet::auth_journal::{GenState, Generation};
+        let retired = AuthJournal::from_generations(vec![Generation { state: GenState::Retired, ..g0.clone() }, g1.clone()]).unwrap().to_text();
+        let waiting = open_g(w, &f.ep, &retired, 0).err().unwrap();
+        assert!(waiting.contains(&format!("[status {QMB_AUTH_SWEEP_WAITING}]")), "{waiting}");
+        let revived = AuthJournal::from_text(waiting.split_once("] ").unwrap().1).unwrap();
+        match &revived.get(0).unwrap().state {
+            GenState::Sweep { gates } => assert!(gates[0].not_before_height > 1152, "a new gate: {gates:?}"),
+            other => panic!("revived as {other:?}"),
+        }
+        // Nothing held at generation 1: a retired 1 is refused.
+        let empty_retired = AuthJournal::from_generations(vec![g0.clone(), Generation { state: GenState::Retired, ..g1.clone() }]).unwrap().to_text();
+        let why = open_g(w, &f.ep, &empty_retired, 1).err().unwrap();
+        assert!(why.contains("retired and holds nothing"), "{why}");
+        // Past its gate, the sweep may not pay its own generation-0 address.
+        let gate = qumbra_wallet::auth_journal::SweepGate { genesis: f.ep.file.hash(), not_before_height: 0 };
+        let open_gate = AuthJournal::from_generations(vec![Generation { state: GenState::Sweep { gates: vec![gate] }, ..g0 }, g1])
+            .unwrap()
+            .to_text();
+        let sweep = open_g(w, &f.ep, &open_gate, 0).unwrap();
+        let own_g0 = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 0));
+        let s = spend(basis_g(w, &f.ep, &[0, 1]), &own_g0, 0, 10, 96).unwrap();
+        assert!(pump(sweep.a, s, &f.ep, 0).unwrap_err().contains("sweep-only"));
+        qmb_spend_v2_free(s);
+        // ... and pays the active generation's address.
+        let active = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 1));
+        let s = spend(basis_g(w, &f.ep, &[0, 1]), &active, 0, 10, 96).unwrap();
+        pump(sweep.a, s, &f.ep, 0).unwrap();
+        qmb_spend_v2_free(s);
+        qmb_auth_free(sweep.a);
+        qmb_wallet_free(w);
+    }
 }

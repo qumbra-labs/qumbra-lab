@@ -70,7 +70,7 @@ pub struct WalletState {
     /// only in this in-memory handle and is never serialized: a seed reopened
     /// (`qmb_wallet_from_parts`), restored or passed in (`_from_entropy`) never
     /// carries it. `qmb_auth_first_fresh` accepts only such a handle.
-    pub(crate) born_here: bool,
+    pub(crate) born_here: std::sync::atomic::AtomicBool,
 }
 
 impl WalletState {
@@ -86,7 +86,7 @@ const HD_ACCOUNT: u32 = 0;
 
 fn into_handle(seed: MasterSeed) -> *mut WalletState {
     let wallet = Wallet::from_master_seed(&seed, HD_ACCOUNT);
-    Box::into_raw(Box::new(WalletState { seed, wallet, roots: Default::default(), born_here: false }))
+    Box::into_raw(Box::new(WalletState { seed, wallet, roots: Default::default(), born_here: Default::default() }))
 }
 
 fn out_string(s: String) -> *mut c_char {
@@ -134,7 +134,7 @@ pub extern "C" fn qmb_wallet_new_fresh() -> *mut WalletState {
     }
     let h = into_handle(MasterSeed::from_entropy(entropy));
     // SAFETY: `into_handle` returned a live, uniquely owned handle.
-    unsafe { (*h).born_here = true };
+    unsafe { (*h).born_here.store(true, std::sync::atomic::Ordering::Release) };
     h
 }
 

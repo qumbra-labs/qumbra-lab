@@ -709,6 +709,10 @@ void qmb_annulet_free(qmb_annulet_t *s);
 typedef struct qmb_spend_basis_t qmb_spend_basis_t;
 qmb_spend_basis_t *qmb_annulet_take_basis(qmb_annulet_t *s);
 void qmb_spend_basis_free(qmb_spend_basis_t *b);
+/* Lab #924 PR 3b: the basis as JSON {genesis, tip, gate_tip, spends_verified,
+ * owned: [{asset, value, div_index, height, tx_index, cm, generation}]} —
+ * generation null for a v1 note. No key material. Free with qmb_string_free. */
+char *qmb_spend_basis_summary(const qmb_spend_basis_t *b);
 
 /* ---------------------------------------------------------------------------
  * Candidate A spends (lab #924 PR 3, the 4b kernel): the device half of a
@@ -749,13 +753,27 @@ typedef struct qmb_spend_v2_t qmb_spend_v2_t;
  * c = qmb_auth_restore_new(w, basis)    no journal: an imported or lost seed
  * c = qmb_auth_first_new(w, basis)      no journal EVER persisted for this
  *     account (see below); refused if any leaf of the seed has landed
+ *     (restore and first have no journal to name generations: build their
+ *     basis from a scan over the probe generations 0..8, so a note paid to
+ *     a later generation is seen; the check walks the same 8 trees)
  * loop qmb_auth_check_step(c, &out): 1 NEED -> GET *out (a block body), then
  *      qmb_auth_check_supply / _supply_err;  0 READY;  -2 REFUSED (*out why)
  * a = qmb_auth_check_finish(w, c, &journal, &status, &err)  PERSIST *journal
- *     status: QMB_AUTH_CHECKED, _JOURNAL_REPLACED (the journal was older than
- *     the chain: a new generation and NEW ADDRESSES — the shell must tell the
- *     user), _SWEEP_FLOOR_RAISED, _RESTORED, _SWEEP_WAITING (NULL keys),
- *     _FIRST.
+ *     status: QMB_AUTH_CHECKED; _JOURNAL_STALE (NULL keys: the journal is
+ *     older than the chain — persist the returned journal (its cursor raised
+ *     above the landed leaves), TELL THE USER, then run qmb_auth_restore_new);
+ *     _SWEEP_FLOOR_RAISED; _RESTORED; _SWEEP_WAITING (NULL keys); _FIRST.
+ * A journal checked past the verified tip (a node rolled back, an edited
+ * backup) is walked again from height 1.
+ *
+ * A generation never dies for RECEIVING: the host must scan EVERY generation
+ * of the journal (active, sweep and retired — pass them to
+ * qmb_annulet_new_v2), not only [0]. A sweep-only generation may be swept
+ * indefinitely once past its gate, notes arrived after the rotation
+ * included. A RETIRED generation that holds a note again is opened with
+ * qmb_auth_check_new(…, g): finish revives it — sweep-only with a NEW gate
+ * (gate_tip + 1152) — and returns QMB_AUTH_SWEEP_WAITING with the journal to
+ * persist. A retired generation holding nothing is refused.
  * "Landed" is judged from verified bodies, each bound to its verified header,
  * never from a node's nullifier list. Undetectable, inherently: a journal
  * older than leaves signed but not landed (in flight or expired) takes those
@@ -771,10 +789,10 @@ typedef struct qmb_spend_v2_t qmb_spend_v2_t;
  * crypto.getRandomValues) — the one exception to "the platform sources all
  * entropy" — so the handle can attest its birth (in memory only, never
  * serialized). qmb_auth_first_fresh(w, &journal) then gives generation 0
- * offline; any handle from _from_entropy / _restore / _from_parts is refused
- * by name. Persist the seed with qmb_wallet_seed_* as for any wallet. */
+ * offline, ONCE per handle (the mark is consumed); any handle from
+ * _from_entropy / _restore / _from_parts is refused by name. Persist the seed with qmb_wallet_seed_* as for any wallet. */
 #define QMB_AUTH_CHECKED 0
-#define QMB_AUTH_JOURNAL_REPLACED 1
+#define QMB_AUTH_JOURNAL_STALE 1
 #define QMB_AUTH_SWEEP_FLOOR_RAISED 2
 #define QMB_AUTH_RESTORED 3
 #define QMB_AUTH_SWEEP_WAITING 4
