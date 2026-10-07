@@ -288,8 +288,8 @@ fn b_a_p_payment_of_the_hybrid_asset_takes_its_note_and_an_exact_fee_note() {
     let f = chain("sv2_b");
     let (b, text) = unsafe { send(&f, USDT as u16, 1_000, 2, L2ShapeTag::P) };
     assert_eq!(b.tx().public.fee, 2, "the P tier");
-    assert!(text.contains("send 1,000 base units of asset 1 (no list for this network) to "), "{text}");
-    assert!(text.contains("999,000 base units of asset 1 (no list for this network) returns to this wallet"), "{text}");
+    assert!(text.contains("send 1,000 base units of QIA #1 (no list for this network) to "), "{text}");
+    assert!(text.contains("999,000 base units of QIA #1 (no list for this network) returns to this wallet"), "{text}");
     assert!(text.contains("fee: 2 fee units"), "{text}");
 }
 
@@ -515,10 +515,10 @@ fn j_the_review_names_the_asset_from_the_verified_list_only() {
         assert!(text.contains("fee: 2 fee units"), "{text}");
         // Listed under another issuer key: the name is withheld.
         let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&genesis, USDT as u16, [8; 4])));
-        assert!(text.contains("send 1,000 base units of asset 1 (listed as tUSDT, but its issuer key changed: name withheld)"), "{text}");
+        assert!(text.contains("send 1,000 base units of QIA #1 (listed as tUSDT, but its issuer key changed: name withheld)"), "{text}");
         // The list does not carry asset 1: not on list <short id>.
         let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&genesis, 7, [9; 4])));
-        assert!(text.contains("send 1,000 base units of asset 1 (not on list "), "{text}");
+        assert!(text.contains("send 1,000 base units of QIA #1 (not on list "), "{text}");
         // A list for another network: ignored.
         let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&[0x11; 32], USDT as u16, [9; 4])));
         assert!(text.starts_with("asset list: for another network (11111111), ignored"), "{text}");
