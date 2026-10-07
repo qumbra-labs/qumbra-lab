@@ -9,15 +9,15 @@
 use std::sync::OnceLock;
 
 use qlab_air::l2::D_AUTH;
-use qlab_devnet::annulet::{AuthContext, L2ShapeTag, L2_AUTH_ABSENT};
+use qlab_devnet::annulet::{AuthContext, L2ShapeTag, L2Surface, VPublicTerm, L2_AUTH_ABSENT};
 use qlab_devnet::body::TxEntry;
 use qlab_l2::Shape;
-use qlab_remote_auth::annulet::{auth_master, leaf_seed, DUMMY_DOMAIN};
+use qlab_remote_auth::annulet::{auth_master, leaf_key, leaf_seed, DUMMY_DOMAIN};
 use qlab_remote_auth::{keccak256, Hash32};
 
 use super::*;
 use crate::v2::tests::{fixture_s, prepared_p, prepared_s, sign, GENESIS_HASH};
-use crate::v2::ShapeWitness;
+use crate::v2::{ShapeWitness, SpendWitness};
 
 const CTX: AuthContext = AuthContext::candidate_a(GENESIS_HASH);
 
@@ -39,6 +39,7 @@ fn bundle_of(
 ) -> ProvingBundle {
     let (p, local, key) = prepared;
     let witness = p.witness;
+    assert_eq!(witness.pvs(), p.pvs, "the witness states the prepared PVs");
     let signed = sign(p.tx, p.pvs, p.auth, shape, &local, &[&key]);
     ProvingBundle::new(signed.tx, witness).expect("an honest holder spend is a bundle")
 }
@@ -63,7 +64,7 @@ fn without_proof(tx: &TxEntry) -> TxEntry {
     tx
 }
 
-/// The node's header bytes before the witness: domain, version, shape, the
+/// The header bytes before the witness: domain, version, shape, the
 /// tx length and the tx.
 fn witness_offset(b: &ProvingBundle) -> usize {
     BUNDLE_DOMAIN.len() + 2 + 1 + 4 + qlab_p2p::codec::encode_tx_annulet(b.tx()).len()
@@ -89,6 +90,19 @@ fn a_bundle_round_trips_whole() {
         back.check(&CTX)
             .expect("an honest bundle passes the worker's lock");
     }
+}
+
+/// F3: the P split at statement level, without proving — prepare, sign,
+/// bundle, encode, decode: the lock passes and the PVs are the prepared ones
+/// ([`bundle_of`] asserts the witness states them).
+#[test]
+fn the_p_split_states_the_prepared_pvs() {
+    let b = bundle_p();
+    let back = ProvingBundle::decode(&b.encode()).expect("a P bundle decodes");
+    assert_eq!(back.witness().pvs(), b.witness().pvs());
+    assert_eq!(back.witness().pvs().len(), qlab_l2::v2::pv_len(Shape::P));
+    back.check(&CTX)
+        .expect("an honest P bundle passes the lock");
 }
 
 /// B4: the split path — prepare, sign, bundle, encode, decode, prove — is
@@ -169,7 +183,7 @@ fn an_issuer_operation_is_refused_by_name() {
 #[test]
 fn the_lock_refuses_a_mismatch_before_proving() {
     let b = bundle_s();
-    let tamper = |f: &dyn Fn(&mut crate::v2::SpendWitness)| {
+    let tamper = |f: &dyn Fn(&mut SpendWitness)| {
         let mut w = b.witness().clone();
         f(&mut w);
         ProvingBundle::new(b.tx().clone(), w)
@@ -198,6 +212,28 @@ fn the_lock_refuses_a_mismatch_before_proving() {
         Some(BundleError::StatementMismatch("registry root"))
     );
 
+    // F2: openings that do not resolve, though the statement matches.
+    assert_eq!(
+        tamper(&|w| w.witnesses[0].siblings[3][0] ^= 1),
+        Some(BundleError::StatementMismatch("a commitment opening"))
+    );
+    assert_eq!(
+        tamper(
+            &|w| if let ShapeWitness::S { reg_witnesses, .. } = &mut w.shape {
+                reg_witnesses[0].siblings[0][0] ^= 1
+            }
+        ),
+        Some(BundleError::StatementMismatch("a registry opening"))
+    );
+    // The dummy fee slot's leaf (off-tree, outside every nullifier) is not
+    // the one the section signs for.
+    assert_eq!(
+        tamper(&|w| if let FeeSlotV2::Dummy { input } = &mut w.fee_slot {
+            input.auth.leaf[0] ^= 1
+        }),
+        Some(BundleError::StatementMismatch("authorization leaves"))
+    );
+
     // Another net's genesis: the intent rebuilds to other bytes.
     let other = b.check(&AuthContext::candidate_a([0x6f; 32])).err();
     assert!(
@@ -212,6 +248,17 @@ fn the_lock_refuses_a_mismatch_before_proving() {
         .check(&CTX)
         .err();
     assert!(matches!(sig, Some(BundleError::Unauthorized(_))), "{sig:?}");
+    // A modified discovery payload: the intent covers it.
+    let mut tx = b.tx().clone();
+    *tx.discovery.last_mut().unwrap() ^= 1;
+    let disc = ProvingBundle::new(tx, b.witness().clone())
+        .unwrap()
+        .check(&CTX)
+        .err();
+    assert!(
+        matches!(disc, Some(BundleError::Unauthorized(_))),
+        "{disc:?}"
+    );
     // `prove` runs the same lock first.
     assert_eq!(
         ProvingBundle::new(b.tx().clone(), {
@@ -223,6 +270,112 @@ fn the_lock_refuses_a_mismatch_before_proving() {
         .prove(&CTX)
         .err(),
         Some(BundleError::StatementMismatch("fee"))
+    );
+}
+
+/// F2: the transaction's surface is the one the witness implies — a P
+/// surface with a non-zero `vPublic` term is an issuer operation, any other
+/// difference a mismatch; and the surface's shape is the witness's.
+#[test]
+fn the_surface_is_the_witness_s() {
+    let b = bundle_p();
+    let surface = L2Surface::decode(&b.tx().l2).unwrap().unwrap();
+    let with = |s: L2Surface| {
+        let mut tx = b.tx().clone();
+        tx.l2 = s.encode();
+        ProvingBundle::new(tx, b.witness().clone())
+            .and_then(|x| x.check(&CTX))
+            .err()
+    };
+    let minted = with(L2Surface {
+        vpublic: Some([
+            VPublicTerm {
+                redeem: false,
+                amount: 1,
+                asset: 7,
+            },
+            VPublicTerm::NONE,
+        ]),
+        ..surface
+    });
+    assert!(
+        matches!(minted, Some(BundleError::IssuerShape(_))),
+        "{minted:?}"
+    );
+    assert_eq!(
+        with(L2Surface {
+            exit_rkm: [1; 32],
+            ..surface
+        }),
+        Some(BundleError::StatementMismatch("surface"))
+    );
+    let s_shaped = with(L2Surface {
+        shape: L2ShapeTag::S,
+        vpublic: None,
+        ..surface
+    });
+    assert!(
+        matches!(s_shaped, Some(BundleError::Malformed(_))),
+        "{s_shaped:?}"
+    );
+}
+
+/// F1: a dummy slot carrying a value, an asset or a `d` is refused by name
+/// — at `new` and through `decode` — before the instance builder's asserts
+/// could panic the worker.
+#[test]
+fn a_dummy_slot_with_contents_is_refused() {
+    let b = bundle_s();
+    let refused = |f: &dyn Fn(&mut SpendWitness)| {
+        let mut w = b.witness().clone();
+        f(&mut w);
+        match ProvingBundle::new(b.tx().clone(), w) {
+            Err(BundleError::Malformed(why)) => why,
+            other => panic!("not refused as malformed: {:?}", other.err()),
+        }
+    };
+    // Slot 2 declared a dummy (`dv`) while it holds the real 50 of asset 7.
+    assert!(
+        refused(&|w| if let ShapeWitness::S { dv, .. } = &mut w.shape {
+            *dv = true
+        })
+        .contains("dv")
+    );
+    for f in [
+        (&|i: &mut L2AuthInput| i.value = 1) as &dyn Fn(&mut L2AuthInput),
+        &|i| i.asset = 7,
+        &|i| i.d[1] = 1,
+    ] {
+        assert!(
+            refused(&|w| if let FeeSlotV2::Dummy { input } = &mut w.fee_slot {
+                f(input)
+            })
+            .contains("dummy fee slot")
+        );
+    }
+
+    // Through the wire: the `dv` bit is an S bundle's last byte.
+    let bytes = b.encode();
+    let mut dv = bytes.clone();
+    *dv.last_mut().unwrap() = 1;
+    assert!(
+        matches!(ProvingBundle::decode(&dv).err(), Some(BundleError::Malformed(why)) if why.contains("dv"))
+    );
+    // The dummy fee slot's value: after two inputs, two openings, two
+    // outputs, the fee, anchor, registry root and the slot's tag, past nk.
+    let input_len = 32 + 8 + 8 + 32 + 32 + 16 + 32 + 4 + 32 * D_AUTH;
+    let merkle_len = 32 * qlab_air::narrow::MERKLE_DEPTH + qlab_air::narrow::MERKLE_DEPTH;
+    let tag_at = witness_offset(b) + 2 * input_len + 2 * merkle_len + 2 * 112 + 8 + 32 + 32;
+    assert_eq!(bytes[tag_at], 1, "the offset is the fee slot's Dummy tag");
+    let value_at = tag_at + 1 + 32;
+    assert_eq!(
+        u64::from_le_bytes(bytes[value_at..value_at + 8].try_into().unwrap()),
+        0
+    );
+    let mut valued = bytes.clone();
+    valued[value_at] = 5;
+    assert!(
+        matches!(ProvingBundle::decode(&valued).err(), Some(BundleError::Malformed(why)) if why.contains("dummy fee slot"))
     );
 }
 
@@ -294,6 +447,13 @@ fn the_bundle_carries_no_secret() {
             ("dummy entropy", entropy),
         ];
         for i in &w.inputs {
+            // The seed scanned is the one behind the slot's leaf.
+            let key = leaf_key(&master, i.auth.leaf_index);
+            assert_eq!(
+                qlab_note::hash::digest_from_bytes(&key.descriptor(i.auth.leaf_index).leaf()),
+                i.auth.leaf,
+                "the scan names the real slot's leaf seed"
+            );
             secrets.push((
                 "a real slot's leaf seed",
                 leaf_seed(&master, i.auth.leaf_index),
@@ -329,7 +489,7 @@ fn the_bundle_carries_no_secret() {
 #[test]
 fn the_issuer_secret_is_unrepresentable() {
     let _encode: fn(&ProvingBundle) -> Vec<u8> = ProvingBundle::encode;
-    let _put: fn(&mut Vec<u8>, &crate::v2::SpendWitness) = put_witness;
+    let _put: fn(&mut Vec<u8>, &SpendWitness) = put_witness;
     let back = ProvingBundle::decode(&bundle_p().encode()).unwrap();
     match &back.witness().shape {
         ShapeWitness::P { policy, vp } => {

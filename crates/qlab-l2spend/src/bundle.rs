@@ -24,16 +24,19 @@
 //! the outer wall, this decoder the inner one.
 
 use qlab_air::l2::{
-    FeeSlotV2, L2AuthInput, L2AuthPath, L2TxOutput, RegistryLeaf, RegistryWitness, D_AUTH,
-    REGISTRY_DEPTH,
+    derive_input_l2_v2, FeeSlotV2, L2AuthInput, L2AuthPath, L2TxOutput, RegistryLeaf,
+    RegistryWitness, D_AUTH, REGISTRY_DEPTH,
 };
 use qlab_air::l2p::{FreezeOpening, L2PolicyInput, PolicyWitness, VPublic, POLICY_DEPTH};
 use qlab_air::narrow::{MerkleWitness, MERKLE_DEPTH};
 use qlab_devnet::annulet::{
-    auth_shape, intent_for, AuthContext, L2ShapeTag, L2Surface, L2_AUTH_ABSENT,
+    auth_shape, intent_for, AuthContext, L2ShapeTag, L2Surface, VPublicTerm, L2_AUTH_ABSENT,
+    L2_SURFACE_ABSENT,
 };
 use qlab_devnet::body::TxEntry;
+use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::forms::L2AuthForm;
+use qlab_devnet::names::RIDER_ABSENT;
 use qlab_note::hash::digest_bytes;
 use qlab_remote_auth::annulet::AnnuletAuthSection;
 
@@ -115,7 +118,18 @@ impl ProvingBundle {
         if tx.auth == L2_AUTH_ABSENT || tx.auth.is_empty() {
             return Err(BundleError::AuthMissing);
         }
+        if tx.rider != RIDER_ABSENT {
+            return Err(BundleError::Malformed(
+                "a name rider on an Annulet transaction".into(),
+            ));
+        }
+        if decoded_surface(&tx)?.shape != witness.shape_tag() {
+            return Err(BundleError::Malformed(
+                "the surface's shape is not the witness's".into(),
+            ));
+        }
         holder_only(&witness)?;
+        dummies_are_empty(&witness)?;
         Ok(ProvingBundle { tx, witness })
     }
 
@@ -207,20 +221,41 @@ impl ProvingBundle {
         ProvingBundle::new(tx, witness)
     }
 
-    /// **The worker's lock, before any proving** (lab #924 B3): the witness
-    /// must state exactly the transaction's public fields — anchor,
-    /// nullifiers, commitments, registry root, fee, a P transaction's zero
-    /// `vPublic` — and the section must verify against the intent rebuilt
-    /// from the transaction on the net `ctx` names (the node's own rebuild,
-    /// `qlab_devnet::annulet::intent_for`). The validity height is not judged
-    /// here: the worker does not know the tip; the node does.
+    /// **The worker's lock, before any proving** (lab #924 B3): the
+    /// transaction's surface must be the one the witness implies (shape,
+    /// registry root, a P transaction's `vPublic` terms all zero, no write, no
+    /// exit), the witness must state exactly the transaction's anchor,
+    /// nullifiers, commitments and fee, its openings must resolve — each
+    /// in-tree slot's commitment (through its authorization root) to the
+    /// anchor, each registry leaf to the registry root — and the section must
+    /// verify against the intent rebuilt from the transaction on the net `ctx`
+    /// names (the node's own rebuild, `qlab_devnet::annulet::intent_for`). A
+    /// signed but unprovable bundle is refused here, by name, before the
+    /// prove. The validity height is not judged: the worker does not know the
+    /// tip; the node does.
     pub fn check(&self, ctx: &AuthContext) -> Result<(), BundleError> {
-        let st = self.witness.statement();
+        let w = &self.witness;
+        let surface = decoded_surface(&self.tx)?;
+        if let Some(terms) = surface.vpublic {
+            if terms.iter().any(|t| t.amount != 0) {
+                return Err(BundleError::IssuerShape("a non-zero vPublic term".into()));
+            }
+        }
+        if surface.registry_root != digest_bytes(&w.registry_root) {
+            return Err(BundleError::StatementMismatch("registry root"));
+        }
+        if surface != expected_surface(w) {
+            return Err(BundleError::StatementMismatch("surface"));
+        }
+        let st = w.statement();
         let p = &self.tx.public;
+        if p.bucket != ArityBucket::TwoByTwo {
+            return Err(BundleError::StatementMismatch("arity bucket"));
+        }
         if p.anchor != digest_bytes(&st.anchor) {
             return Err(BundleError::StatementMismatch("anchor"));
         }
-        if p.nullifiers.iter().ne(st
+        if !p.nullifiers.iter().eq(st
             .nullifiers
             .iter()
             .map(digest_bytes)
@@ -229,7 +264,7 @@ impl ProvingBundle {
         {
             return Err(BundleError::StatementMismatch("nullifiers"));
         }
-        if p.commitments.iter().ne(st
+        if !p.commitments.iter().eq(st
             .commitments
             .iter()
             .map(digest_bytes)
@@ -238,25 +273,13 @@ impl ProvingBundle {
         {
             return Err(BundleError::StatementMismatch("output commitments"));
         }
-        if p.fee != self.witness.fee {
+        if p.fee != w.fee {
             return Err(BundleError::StatementMismatch("fee"));
         }
-        let surface = L2Surface::decode(&self.tx.l2)
-            .ok()
-            .flatten()
-            .ok_or(BundleError::StatementMismatch("surface"))?;
-        if surface.registry_root != digest_bytes(&self.witness.registry_root) {
-            return Err(BundleError::StatementMismatch("registry root"));
-        }
-        if let Some(terms) = surface.vpublic {
-            if terms.iter().any(|t| t.amount != 0) {
-                return Err(BundleError::IssuerShape("a non-zero vPublic term".into()));
-            }
-        }
+        openings_resolve(w)?;
         let section = AnnuletAuthSection::decode(auth_shape(surface.shape), &self.tx.auth)
             .map_err(|e| BundleError::Unauthorized(format!("{e:?}")))?; // debug-ok: a named auth error
-                                                                        // The section's leaves are the slots' leaves the witness proves.
-        let leaves = self.slot_paths();
+        let leaves = self.slot_paths(); // the section's leaves must be these
         if section.slots.len() != leaves.len()
             || section.slots.iter().zip(&leaves).any(|(s, p)| {
                 s.descriptor.leaf_index() != p.leaf_index
@@ -298,6 +321,94 @@ impl ProvingBundle {
             &w.fee_slot.input().auth,
         ]
     }
+}
+
+/// The transaction's L2 surface, or a refusal by name (absent or not
+/// decoding: no Annulet S/P transaction).
+fn decoded_surface(tx: &TxEntry) -> Result<L2Surface, BundleError> {
+    if tx.l2 == L2_SURFACE_ABSENT {
+        return Err(BundleError::Malformed("no L2 surface".into()));
+    }
+    L2Surface::decode(&tx.l2)
+        .ok()
+        .flatten()
+        .ok_or_else(|| BundleError::Malformed("the transaction's surface".into()))
+}
+
+/// The surface a holder spend under `w` carries — what the v2 builders write.
+fn expected_surface(w: &SpendWitness) -> L2Surface {
+    L2Surface {
+        shape: w.shape_tag(),
+        registry_root: digest_bytes(&w.registry_root),
+        vpublic: match w.shape {
+            ShapeWitness::S { .. } => None,
+            ShapeWitness::P { .. } => Some([VPublicTerm::NONE; 2]),
+        },
+        write: None,
+        exit_rkm: [0; 32],
+    }
+}
+
+/// **The AIR's input preconditions, refused by name** (lab #924 F1): a
+/// dummy slot — slot 2 under `dv`, a dummy fee slot — is value 0, asset 0,
+/// `d = 0`, as the device draws it. The instance builder asserts the first
+/// two for slot 2; a bundle that reached it would panic the worker.
+fn dummies_are_empty(w: &SpendWitness) -> Result<(), BundleError> {
+    let empty = |i: &L2AuthInput| i.value == 0 && i.asset == 0 && i.d == [0, 0];
+    if let ShapeWitness::S { dv: true, .. } = w.shape {
+        if !empty(&w.inputs[1]) {
+            return Err(BundleError::Malformed(
+                "a dummy input slot (dv) with a value, an asset or a d".into(),
+            ));
+        }
+    }
+    if let FeeSlotV2::Dummy { input } = &w.fee_slot {
+        if !empty(input) {
+            return Err(BundleError::Malformed(
+                "a dummy fee slot with a value, an asset or a d".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The openings resolve (lab #924 F2), natively: each in-tree slot's
+/// commitment — which binds its `rkm`, so its authorization root, so its
+/// leaf and path — folds to the anchor, and each row's registry leaf (of the
+/// row's asset) folds to the registry root. Dummy slots are off-tree.
+fn openings_resolve(w: &SpendWitness) -> Result<(), BundleError> {
+    let cm = |i: &L2AuthInput| derive_input_l2_v2(i).2;
+    let dv = matches!(w.shape, ShapeWitness::S { dv: true, .. });
+    let mut in_tree = vec![(&w.inputs[0], &w.witnesses[0])];
+    if !dv {
+        in_tree.push((&w.inputs[1], &w.witnesses[1]));
+    }
+    if let FeeSlotV2::Exact { input, witness } = &w.fee_slot {
+        in_tree.push((input, witness));
+    }
+    if in_tree.iter().any(|(i, m)| m.fold_root(&cm(i)) != w.anchor) {
+        return Err(BundleError::StatementMismatch("a commitment opening"));
+    }
+    let rows: [(&RegistryLeaf, &RegistryWitness); 2] = match &w.shape {
+        ShapeWitness::S {
+            reg_leaves,
+            reg_witnesses,
+            ..
+        } => [
+            (&reg_leaves[0], &reg_witnesses[0]),
+            (&reg_leaves[1], &reg_witnesses[1]),
+        ],
+        ShapeWitness::P { policy, .. } => [
+            (&policy[0].leaf, &policy[0].reg_witness),
+            (&policy[1].leaf, &policy[1].reg_witness),
+        ],
+    };
+    if rows.iter().zip(&w.inputs).any(|((leaf, rw), i)| {
+        leaf.asset != i.asset || rw.fold_root(&leaf.hash()) != w.registry_root
+    }) {
+        return Err(BundleError::StatementMismatch("a registry opening"));
+    }
+    Ok(())
 }
 
 /// An issuer operation never becomes a bundle.
