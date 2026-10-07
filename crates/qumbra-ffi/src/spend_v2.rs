@@ -58,7 +58,8 @@ use qlab_wallet::Wallet;
 use qumbra_wallet::annulet_plan::{plan_send, plan_slots, real_input, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA};
 use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
 use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, label_of, render_amount, AssetLabel, AssetList};
-use qumbra_wallet::auth_journal::AuthJournal;
+use qumbra_wallet::annulet_landed::{bind_body, landed_in, landed_next_with, restore_generations_with, GenTree, LandedByGeneration};
+use qumbra_wallet::auth_journal::{AuthJournal, GenState, JournalError, SweepGate};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use zeroize::Zeroize;
@@ -97,6 +98,12 @@ pub struct SpendBasis {
     /// The verified header chain: a registry leaf the review names is
     /// bound to its tip (lab #924 PR 3c).
     chain: VerifiedChain,
+    /// Every note the scan made the wallet's (a restore reads their
+    /// generations).
+    owned: Vec<OwnedL2Note>,
+    /// An upper bound on the real tip for a sweep gate: the larger of the
+    /// verified tip and the endpoint's stated tip (the CLI's `gate_tip`).
+    gate_tip: u64,
     /// The asset list the scan was given and verified (`verify_asset_list`
     /// at `qmb_annulet_new_v2`) — the review's only source of names and
     /// decimals. Never a host-supplied name table.
@@ -114,6 +121,8 @@ impl SpendBasis {
             tip: v.chain().tip(),
             spends_verified: v.spends_verified(),
             chain: v.chain().clone(),
+            owned: v.report().owned.clone(),
+            gate_tip: v.chain().tip().max(v.stated_tip().unwrap_or(0)),
             list: list.cloned(),
         })
     }
@@ -171,6 +180,12 @@ pub struct AuthHandle {
     journal: AuthJournal,
     generation: u32,
     keys: LocalAuth,
+    /// The generation is sweep-only: it may pay only this wallet's active
+    /// generation (lab #924 PR 3b).
+    sweep_only: bool,
+    /// This wallet's active-generation address 0, re-derived from the
+    /// wallet (never taken from a string): what a sweep must pay.
+    active_rkm: [u64; 4],
 }
 
 unsafe fn text_arg<'a>(what: &str, p: *const c_char, max: usize) -> Result<&'a str, String> {
@@ -184,52 +199,507 @@ unsafe fn text_arg<'a>(what: &str, p: *const c_char, max: usize) -> Result<&'a s
     Ok(s)
 }
 
-/// Open the journal's **active** generation: its keys are built here and
-/// must have the root the journal records (the CLI's own check — a journal
-/// edited or from another seed is refused before anything is signed).
-///
-/// **The host is trusted for the journal's freshness** (pilot scope): a
-/// shell that hands an OLDER `auth.v1` text — a restored backup, a stale
-/// copy — makes this kernel take leaves already spent, which it cannot see.
-/// Lab #924 PR 3b's restore adds the cross-check against the chain's landed
-/// slots (`landed_next`) at open; until then the shell must pass the text it
-/// last persisted.
+/// The keys of generation `g` of `journal`, checked: its root is the
+/// wallet's, the active generation's root is re-derived from the wallet and
+/// must be the journal's, and a retired generation has none.
+fn open_handle(w: &WalletState, journal: AuthJournal, g: u32) -> Result<AuthHandle, String> {
+    let rec = journal.get(g).map_err(|e| format!("auth.v1: {e}"))?.clone();
+    if rec.state == GenState::Retired {
+        return Err(format!("generation {g} is retired: nothing of it is spent again"));
+    }
+    let wallet = w.wallet.clone();
+    let keys = LocalAuth::new(&wallet.auth_secret(), g, rec.next)?;
+    if keys.auth_root() != rec.auth_root {
+        return Err(format!(
+            "auth.v1's root for generation {g} is not this wallet's tree: the journal was edited or belongs to another \
+             seed — refusing to sign with it"
+        ));
+    }
+    let active = journal.active().clone();
+    let active_root = w.generation_root(active.g);
+    if active_root != active.auth_root {
+        return Err(format!("auth.v1's active generation {} is not this wallet's tree", active.g));
+    }
+    let active_rkm = wallet.address_candidate_a_at_index(0, &active_root).rkm_lanes();
+    Ok(AuthHandle {
+        wallet,
+        journal,
+        generation: g,
+        keys,
+        sweep_only: matches!(rec.state, GenState::Sweep { .. }),
+        active_rkm,
+    })
+}
+
+// ---------------------------------------------------------- the open check
+
+/// `qmb_auth_check_finish`: the journal's landed check passed; nothing but
+/// `checked_to` moved.
+pub const QMB_AUTH_CHECKED: i32 = 0;
+/// The journal was older than the chain (a landed leaf above its cursor):
+/// the generation is now sweep-only and the next one active — **new
+/// addresses**. The shell must persist the returned journal and **tell the
+/// user** (a backup older than the wallet's spends was restored).
+pub const QMB_AUTH_JOURNAL_REPLACED: i32 = 1;
+/// A sweep-only generation's cursor was raised to its landed floor.
+pub const QMB_AUTH_SWEEP_FLOOR_RAISED: i32 = 2;
+/// A restore wrote the journal (no generation used: generation 0, fresh).
+pub const QMB_AUTH_RESTORED: i32 = 3;
+/// A sweep-only generation may not sweep yet (its gate on this net is not
+/// reached, or was just recorded): no keys; the journal is returned.
+pub const QMB_AUTH_SWEEP_WAITING: i32 = 4;
+/// `qmb_auth_first_new` wrote this account's first journal: generation 0,
+/// fresh, active (no leaf of any probe generation has landed).
+pub const QMB_AUTH_FIRST: i32 = 5;
+
+enum CheckMode {
+    Check { g: u32, journal: AuthJournal },
+    Restore,
+    First,
+}
+
+/// The open-time check (lab #924 PR 3b): every verified body above the
+/// journal's `checked_to` on this net, each bound to its verified header,
+/// each slot's leaf matched against the generation's own tree — "landed" is
+/// judged here, never taken from a node's nullifier list.
+pub struct CheckHandle {
+    mode: CheckMode,
+    basis: SpendBasis,
+    trees: Vec<GenTree>,
+    landed: LandedByGeneration,
+    at: u64,
+    asked: bool,
+    refused: Option<String>,
+}
+
+unsafe fn check_handle(
+    w: *const WalletState,
+    basis: *const SpendBasis,
+    build: impl FnOnce(&WalletState, &SpendBasis) -> Result<(CheckMode, Vec<GenTree>, u64), String>,
+    err_out: *mut *mut c_char,
+) -> *mut CheckHandle {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if w.is_null() || basis.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let b = (*basis).clone();
+    if b.form != L2AuthForm::CandidateA {
+        set_err(err_out, "this net is not a Candidate A net".into());
+        return ptr::null_mut();
+    }
+    match build(&*w, &b) {
+        Ok((mode, trees, from)) => Box::into_raw(Box::new(CheckHandle {
+            mode,
+            basis: b,
+            trees,
+            landed: LandedByGeneration::new(),
+            at: from,
+            asked: false,
+            refused: None,
+        })),
+        Err(e) => {
+            set_err(err_out, e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// **Open generation `generation` of `journal_text`, checked against the
+/// chain**: pump `qmb_auth_check_step` / `_supply` / `_supply_err` over the
+/// verified bodies above the journal's `checked_to` on `basis`'s net (the
+/// scan's verified chain; `basis` is read, not consumed), then
+/// `qmb_auth_check_finish`. The only way to keys: an unchecked open does
+/// not exist.
 ///
 /// # Safety
-/// `w` live; `journal_text` NUL-terminated UTF-8; `err_out` NULL or writable.
+/// `w`, `basis` live; `journal_text` NUL-terminated UTF-8; `err_out` NULL or writable.
 #[no_mangle]
-pub unsafe extern "C" fn qmb_auth_open(
+pub unsafe extern "C" fn qmb_auth_check_new(
     w: *const WalletState,
     journal_text: *const c_char,
+    basis: *const SpendBasis,
+    generation: u32,
+    err_out: *mut *mut c_char,
+) -> *mut CheckHandle {
+    check_handle(
+        w,
+        basis,
+        |ws, b| {
+            let text = text_arg("the journal", journal_text, MAX_JOURNAL_TEXT)?;
+            let journal = AuthJournal::from_text(text).map_err(|e| format!("auth.v1: {e}"))?;
+            let rec = journal.get(generation).map_err(|e| format!("auth.v1: {e}"))?;
+            if rec.state == GenState::Retired {
+                return Err(format!("generation {generation} is retired: nothing of it is spent again"));
+            }
+            let tree = GenTree::build(&ws.wallet, generation);
+            if tree.root() != rec.auth_root {
+                return Err(format!("auth.v1's root for generation {generation} is not this wallet's tree"));
+            }
+            let from = journal.checked_to(generation, &b.genesis_hash) + 1;
+            Ok((CheckMode::Check { g: generation, journal }, vec![tree], from))
+        },
+        err_out,
+    )
+}
+
+/// **Restore**: a wallet with no `auth.v1` (restored from its seed, or new
+/// to Candidate A). The same pump over every verified body from height 1,
+/// matched against the probe generations' trees (8 trees: seconds natively,
+/// much longer under wasm); `qmb_auth_check_finish` writes the journal — a
+/// seed that never spent gets generation 0, fresh.
+///
+/// # Safety
+/// `w`, `basis` live; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_restore_new(
+    w: *const WalletState,
+    basis: *const SpendBasis,
+    err_out: *mut *mut c_char,
+) -> *mut CheckHandle {
+    check_handle(
+        w,
+        basis,
+        |ws, _| {
+            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| GenTree::build(&ws.wallet, g)).collect();
+            Ok((CheckMode::Restore, trees, 1))
+        },
+        err_out,
+    )
+}
+
+/// **The first journal of an account that has never had one** (lab #924
+/// PR 3b): the restore's pump (every verified body, the probe generations'
+/// trees); at finish, refused by name if any probe generation has a landed
+/// leaf ("this seed has signed: use restore"), else **generation 0, fresh,
+/// active** (`QMB_AUTH_FIRST`) — its notes spendable at once.
+///
+/// **The host's premise:** `first` is only for an account whose host has
+/// never persisted an `auth.v1` for it. If a journal ever existed — even one
+/// deleted since — the host must use `qmb_auth_restore_new`. The residual
+/// risk is the CLI's: a signature exported elsewhere that never landed; for
+/// an account created under a receive-only kernel, no device could sign.
+///
+/// # Safety
+/// `w`, `basis` live; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_first_new(
+    w: *const WalletState,
+    basis: *const SpendBasis,
+    err_out: *mut *mut c_char,
+) -> *mut CheckHandle {
+    check_handle(
+        w,
+        basis,
+        |ws, _| {
+            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| GenTree::build(&ws.wallet, g)).collect();
+            Ok((CheckMode::First, trees, 1))
+        },
+        err_out,
+    )
+}
+
+/// **The first journal of a wallet born in this process**
+/// (`qmb_wallet_new_fresh`): generation 0, fresh, active — offline, no body
+/// read, because a seed drawn here has signed nowhere. Returns 0 with
+/// `*out_journal` the `auth.v1` text to persist, or -1 with `*out_journal`
+/// why: a handle from `qmb_wallet_from_entropy`, `qmb_wallet_restore` or
+/// `qmb_wallet_from_parts` is refused by name — its seed came from outside
+/// and may have signed (use `qmb_auth_first_new` or `qmb_auth_restore_new`).
+///
+/// # Safety
+/// `w` live; `out_journal` writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_first_fresh(w: *const WalletState, out_journal: *mut *mut c_char) -> i32 {
+    if w.is_null() || out_journal.is_null() {
+        return -1;
+    }
+    let ws = &*w;
+    if !ws.born_here {
+        *out_journal = out_string(
+            "an imported, restored or reopened seed (qmb_wallet_from_entropy / _restore / _from_parts): it may have \
+             signed elsewhere — use qmb_auth_first_new or qmb_auth_restore_new"
+                .into(),
+        );
+        return -1;
+    }
+    *out_journal = out_string(AuthJournal::fresh(ws.generation_root(0)).to_text());
+    0
+}
+
+/// Pump the check: `1` NEED (`*out` the body path), `0` READY (finish),
+/// `-2` REFUSED (`*out` why; terminal), `-1` misuse.
+///
+/// # Safety
+/// `c` live; `out` writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_step(c: *mut CheckHandle, out: *mut *mut c_char) -> i32 {
+    if c.is_null() || out.is_null() {
+        return -1;
+    }
+    *out = ptr::null_mut();
+    let c = &mut *c;
+    if let Some(why) = &c.refused {
+        *out = out_string(why.clone());
+        return -2;
+    }
+    if c.asked {
+        return -1;
+    }
+    if c.at > c.basis.chain.tip() {
+        return 0;
+    }
+    c.asked = true;
+    *out = out_string(format!("/v1/block/{}/body", c.at));
+    1
+}
+
+/// Answer the outstanding NEED with the body.
+///
+/// # Safety
+/// `c` live (or NULL); `body` `len` readable bytes (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_supply(c: *mut CheckHandle, body: *const u8, len: usize) {
+    if c.is_null() {
+        return;
+    }
+    let answer = if body.is_null() {
+        Err("the host supplied no body".to_string())
+    } else if len > MAX_SUPPLY_BYTES {
+        Err(format!("a {len}-byte answer, over the {MAX_SUPPLY_BYTES} B bound"))
+    } else {
+        Ok(std::slice::from_raw_parts(body, len))
+    };
+    check_supply(&mut *c, answer);
+}
+
+/// Answer the outstanding NEED with a transport failure: the check is
+/// refused (a body this check needs is not optional; retry later — the
+/// journal's `checked_to` keeps finished work).
+///
+/// # Safety
+/// `c` live (or NULL); `reason` NUL-terminated UTF-8 (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_supply_err(c: *mut CheckHandle, reason: *const c_char) {
+    if c.is_null() {
+        return;
+    }
+    let why = if reason.is_null() {
+        "transport failure".to_string()
+    } else {
+        CStr::from_ptr(reason).to_string_lossy().chars().take(256).collect()
+    };
+    check_supply(&mut *c, Err(why));
+}
+
+fn check_supply(c: &mut CheckHandle, answer: Result<&[u8], String>) {
+    if c.refused.is_some() {
+        return;
+    }
+    if !c.asked {
+        c.refused = Some("a response with no NEED outstanding".into());
+        return;
+    }
+    c.asked = false;
+    let h = c.at;
+    let bound = answer.map_err(|why| format!("block {h}'s body is unavailable: {why}")).and_then(|bytes| {
+        let header = c.basis.chain.header(h).ok_or_else(|| format!("height {h} is above the verified tip"))?;
+        bind_body(&header, c.basis.form, h, bytes).map_err(|e| format!("block {h}'s body {e}"))
+    });
+    match bound {
+        Ok(body) => {
+            for t in &c.trees {
+                let hits = landed_in(&t.tree, &body);
+                if !hits.is_empty() {
+                    c.landed.entry(t.g).or_default().extend(hits);
+                }
+            }
+            c.at += 1;
+        }
+        Err(why) => c.refused = Some(why),
+    }
+}
+
+/// **Finish the check** (READY only): the keys, and the journal the shell
+/// must persist (`*out_journal`; always set when a handle or WAITING
+/// returns). `*out_status` is one of `QMB_AUTH_*`:
+/// - CHECKED: the cursor is at or above every landed leaf; `checked_to`
+///   moves to the verified tip.
+/// - JOURNAL_REPLACED (an active generation whose cursor is below a landed
+///   leaf — the journal is older than the chain): the CLI's restore rule —
+///   the generation's cursor rises above its landed leaves, it becomes
+///   sweep-only (gated on this net at `gate_tip + 1152`), and the next
+///   generation opens active; the keys returned are the new one's. **Tell the
+///   user**: new addresses; sharing shows the latest.
+/// - SWEEP_FLOOR_RAISED / SWEEP_WAITING for a sweep-only generation.
+/// - RESTORED for a restore.
+///
+/// **Undetectable, inherently**: a journal older than leaves that were taken
+/// and signed but have not landed (in flight, or expired unlanded). Those
+/// leaves are taken again — the same leaf signs a second, different
+/// transaction: a **double use** of the leaf. ML-DSA-44 is a many-time
+/// scheme, so neither transaction is forged or put at risk; what breaks is
+/// the design's one-leaf-one-use rule and the unlinkability it buys (the
+/// two transactions share a leaf). Leaves taken but never signed only waste
+/// positions. The shell avoids both by always passing the journal it last
+/// persisted.
+///
+/// # Safety
+/// `w`, `c` live; `out_journal`, `out_status` writable; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_finish(
+    w: *const WalletState,
+    c: *mut CheckHandle,
+    out_journal: *mut *mut c_char,
+    out_status: *mut i32,
     err_out: *mut *mut c_char,
 ) -> *mut AuthHandle {
     if !err_out.is_null() {
         *err_out = ptr::null_mut();
     }
-    if w.is_null() {
-        set_err(err_out, "NULL wallet".into());
+    if w.is_null() || c.is_null() || out_journal.is_null() || out_status.is_null() {
+        set_err(err_out, "NULL argument".into());
         return ptr::null_mut();
     }
-    let opened = (|| {
-        let text = text_arg("the journal", journal_text, MAX_JOURNAL_TEXT)?;
-        let journal = AuthJournal::from_text(text).map_err(|e| format!("auth.v1: {e}"))?;
-        let active = journal.active().clone();
-        let wallet = (*w).wallet.clone();
-        let keys = LocalAuth::new(&wallet.auth_secret(), active.g, active.next)?;
-        if keys.auth_root() != active.auth_root {
-            return Err(format!(
-                "auth.v1's root for generation {} is not this wallet's tree: the journal was edited or belongs to \
-                 another seed — refusing to sign with it",
-                active.g
-            ));
+    *out_journal = ptr::null_mut();
+    *out_status = -1;
+    let (ws, c) = (&*w, &mut *c);
+    if let Some(why) = &c.refused {
+        set_err(err_out, why.clone());
+        return ptr::null_mut();
+    }
+    if c.asked || c.at <= c.basis.chain.tip() {
+        set_err(err_out, "finish: the check is not READY".into());
+        return ptr::null_mut();
+    }
+    let b = &c.basis;
+    let tip = b.chain.tip();
+    let gate = SweepGate {
+        genesis: b.genesis_hash,
+        not_before_height: b.gate_tip.saturating_add(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS),
+    };
+    let finished: Result<(AuthJournal, u32, i32), String> = (|| match std::mem::replace(&mut c.mode, CheckMode::Restore) {
+        CheckMode::Check { g, mut journal } => {
+            let t = &c.trees[0];
+            let floor = landed_next_with(&t.master, &t.tree, c.landed.get(&g).map_or(&[][..], |v| v.as_slice()));
+            let rec = journal.get(g).map_err(|e| e.to_string())?.clone();
+            let raised = floor > rec.next;
+            if raised {
+                journal.advance_mem(g, floor).map_err(|e| e.to_string())?;
+            }
+            journal.set_checked_mem(g, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
+            match rec.state {
+                GenState::Active if raised => {
+                    let next_g = journal.generations().iter().map(|r| r.g).max().expect("non-empty") + 1;
+                    let new = journal.open_next_mem(ws.generation_root(next_g), gate);
+                    journal.set_checked_mem(new, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
+                    Ok((journal, new, QMB_AUTH_JOURNAL_REPLACED))
+                }
+                GenState::Active => Ok((journal, g, QMB_AUTH_CHECKED)),
+                GenState::Sweep { .. } => match journal.sweep_allowed(g, &b.genesis_hash, b.chain.tip()) {
+                    Ok(()) => Ok((journal, g, if raised { QMB_AUTH_SWEEP_FLOOR_RAISED } else { QMB_AUTH_CHECKED })),
+                    Err(JournalError::SweepNoGate { .. }) => {
+                        journal.add_gate_mem(g, gate).map_err(|e| e.to_string())?;
+                        Ok((journal, g, QMB_AUTH_SWEEP_WAITING))
+                    }
+                    Err(JournalError::SweepNotYet { .. }) => Ok((journal, g, QMB_AUTH_SWEEP_WAITING)),
+                    Err(e) => Err(e.to_string()),
+                },
+                GenState::Retired => Err(format!("generation {g} is retired")),
+            }
         }
-        Ok(AuthHandle { wallet, journal, generation: active.g, keys })
+        CheckMode::First => {
+            if let Some((g, _)) = c.landed.iter().find(|(_, slots)| !slots.is_empty()) {
+                return Err(format!(
+                    "this seed has signed (a leaf of generation {g} has landed on this net): use restore"
+                ));
+            }
+            let mut journal = AuthJournal::fresh(c.trees[0].root());
+            journal.set_checked_mem(0, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
+            Ok((journal, 0, QMB_AUTH_FIRST))
+        }
+        CheckMode::Restore => {
+            let mut journal = restore_generations_with(&c.trees, &b.owned, &c.landed, &b.genesis_hash, b.gate_tip)
+                .map_err(|e| format!("restore: {e}"))?;
+            let gens: Vec<u32> = journal.generations().iter().map(|r| r.g).collect();
+            for g in gens {
+                journal.set_checked_mem(g, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
+            }
+            let active = journal.active().g;
+            Ok((journal, active, QMB_AUTH_RESTORED))
+        }
     })();
-    match opened {
+    c.refused = Some("this check was finished".into());
+    let (journal, g, status) = match finished {
+        Ok(x) => x,
+        Err(e) => {
+            set_err(err_out, e);
+            return ptr::null_mut();
+        }
+    };
+    *out_journal = out_string(journal.to_text());
+    *out_status = status;
+    if status == QMB_AUTH_SWEEP_WAITING {
+        set_err(err_out, format!("generation {g} may not sweep yet on this net: its gate is not reached"));
+        return ptr::null_mut();
+    }
+    match open_handle(ws, journal, g) {
         Ok(h) => Box::into_raw(Box::new(h)),
         Err(e) => {
             set_err(err_out, e);
             ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `c` live (or NULL); never used after.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_free(c: *mut CheckHandle) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+
+/// **Migrate** (`migrate --open-next`): open the next generation as active;
+/// the active one becomes sweep-only on `basis`'s net from `gate_tip +
+/// 1152`. Returns 0 with `*out_journal` the new journal text to persist (new
+/// addresses: sharing shows the latest), or -1 with `*out_journal` why.
+///
+/// # Safety
+/// `w`, `basis` live; `journal_text` NUL-terminated UTF-8; `out_journal` writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_open_next(
+    w: *const WalletState,
+    journal_text: *const c_char,
+    basis: *const SpendBasis,
+    out_journal: *mut *mut c_char,
+) -> i32 {
+    if w.is_null() || basis.is_null() || out_journal.is_null() {
+        return -1;
+    }
+    let done = (|| {
+        let text = text_arg("the journal", journal_text, MAX_JOURNAL_TEXT)?;
+        let mut journal = AuthJournal::from_text(text).map_err(|e| format!("auth.v1: {e}"))?;
+        let b = &*basis;
+        let next_g = journal.generations().iter().map(|r| r.g).max().expect("non-empty") + 1;
+        let gate = SweepGate {
+            genesis: b.genesis_hash,
+            not_before_height: b.gate_tip.saturating_add(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS),
+        };
+        journal.open_next_mem((*w).generation_root(next_g), gate);
+        Ok::<_, String>(journal.to_text())
+    })();
+    match done {
+        Ok(text) => {
+            *out_journal = out_string(text);
+            0
+        }
+        Err(e) => {
+            *out_journal = out_string(e);
+            -1
         }
     }
 }
@@ -470,6 +940,14 @@ impl SpendHandle {
         if paths.is_none() {
             budget(auth, &index, &plan)?;
         }
+        // A sweep-only generation pays only this wallet's active generation,
+        // its address re-derived from the wallet (lab #924 PR 3b).
+        if auth.sweep_only && self.to.rkm != auth.active_rkm {
+            return Err(Attempt::Refused(format!(
+                "generation {} is sweep-only: it may pay only this wallet's active generation's address",
+                auth.generation
+            )));
+        }
         let step = plan.steps.first().expect("a plan has its payment");
         let held = |s: &Src| match s {
             Src::Held(n) => Ok(n.clone()),
@@ -510,7 +988,8 @@ impl SpendHandle {
                 StepKind::Pay { inputs, fee } => {
                     let outs = [
                         Out { to: self.to.clone(), value: step.outputs[0], asset: a },
-                        Out { to: own.clone(), value: step.outputs[1], asset: a },
+                        // A sweep's change goes to the active generation too.
+                        Out { to: if auth.sweep_only { self.to.clone() } else { own.clone() }, value: step.outputs[1], asset: a },
                     ];
                     match (fee, inputs.as_slice()) {
                         (None, [one]) => (Kind::One, vec![held(one)?], outs, step.fee, L2ShapeTag::S, "payment"),
@@ -610,6 +1089,10 @@ fn budget(auth: &AuthHandle, index: &AssetIndex, plan: &SendPlan) -> Result<(), 
             "this needs {needed} authorizations and generation {} has {remaining} left; open the next generation",
             auth.generation
         )));
+    }
+    if auth.sweep_only {
+        // A sweep empties the generation: no floor to keep (the CLI's rule).
+        return Ok(());
     }
     let notes: u32 = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
     let floor = notes.saturating_add(SWEEP_FLOOR_EXTRA);

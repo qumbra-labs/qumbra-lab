@@ -363,6 +363,11 @@ impl AuthJournal {
     /// through `height`. Never moves back (a lower height is kept as is).
     pub fn set_checked_mem(&mut self, g: u32, genesis: &Hash32, height: u64) -> Result<(), JournalError> {
         self.get(g)?;
+        if height == 0 {
+            // Checked through the genesis: nothing to record (absent = 0), so
+            // a journal checked on an empty chain stays the v1 text.
+            return Ok(());
+        }
         let e = self.checked.entry((g, *genesis)).or_insert(0);
         *e = (*e).max(height);
         Ok(())

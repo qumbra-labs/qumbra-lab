@@ -160,3 +160,75 @@ pub fn restore_generations(
         }
     }
 }
+
+/// One generation's master and tree, built once and reused (a restore over
+/// [`crate::auth_journal::PROBE_GENERATIONS`] of them is the expensive part;
+/// lab #924 PR 3b).
+pub struct GenTree {
+    pub g: u32,
+    pub master: Hash32,
+    pub tree: AuthTree,
+}
+
+impl GenTree {
+    pub fn build(wallet: &Wallet, g: u32) -> Self {
+        let master = auth_master(&wallet.auth_secret(), g);
+        let tree = AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth");
+        GenTree { g, master, tree }
+    }
+
+    /// The tree's root as lanes — what the generation's addresses bind.
+    pub fn root(&self) -> [u64; 4] {
+        let root = self.tree.root();
+        core::array::from_fn(|i| u64::from_le_bytes(root[i * 8..i * 8 + 8].try_into().expect("8 bytes")))
+    }
+}
+
+impl Drop for GenTree {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.master.zeroize();
+    }
+}
+
+/// [`restore_generations`] over trees already built (`trees` holds every
+/// generation the restore may name: the probe set). The same journal, with
+/// no tree built twice.
+pub fn restore_generations_with(
+    trees: &[GenTree],
+    owned: &[OwnedL2Note],
+    used: &LandedByGeneration,
+    genesis: &Hash32,
+    gate_tip: u64,
+) -> Result<AuthJournal, JournalError> {
+    let of = |g: u32| trees.iter().find(|t| t.g == g).ok_or(JournalError::ProbeExhausted { probed: trees.len() as u32 });
+    let top = owned.iter().filter_map(|n| n.generation).chain(used.keys().copied()).max();
+    let probed = crate::auth_journal::PROBE_GENERATIONS;
+    match top {
+        None => Ok(AuthJournal::fresh(of(0)?.root())),
+        Some(g_star) if g_star + 1 >= probed => Err(JournalError::ProbeExhausted { probed }),
+        Some(g_star) => {
+            let gate = SweepGate {
+                genesis: *genesis,
+                not_before_height: gate_tip.saturating_add(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS),
+            };
+            let mut gens = Vec::new();
+            for g in 0..=g_star {
+                let has_notes = owned.iter().any(|n| n.generation == Some(g));
+                let landed = used.get(&g);
+                if !has_notes && landed.is_none() {
+                    continue;
+                }
+                let t = of(g)?;
+                gens.push(Generation {
+                    g,
+                    next: landed.map_or(0, |slots| landed_next_with(&t.master, &t.tree, slots)),
+                    auth_root: t.root(),
+                    state: if has_notes { GenState::Sweep { gates: vec![gate] } } else { GenState::Retired },
+                });
+            }
+            gens.push(Generation { g: g_star + 1, next: 0, auth_root: of(g_star + 1)?.root(), state: GenState::Active });
+            AuthJournal::from_generations(gens)
+        }
+    }
+}
