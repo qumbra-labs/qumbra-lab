@@ -38,6 +38,8 @@ use rand::Rng;
 
 /// Lab #896 seam E4: the v2 (Candidate A) builders and the Annulet intent.
 pub mod v2;
+/// Lab #924 5A-D1: the proving bundle a device hands a prover elsewhere.
+pub mod bundle;
 
 /// Why a spend could not be assembled or was not admitted — by name.
 #[derive(Debug, Clone, PartialEq, Eq)]

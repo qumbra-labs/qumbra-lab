@@ -153,9 +153,26 @@ impl SpendWitness {
 
     /// The instance's public values, without proving.
     pub fn pvs(&self) -> Vec<u32> {
+        self.statement().pvs
+    }
+
+    /// What the instance states, without proving: its PVs, anchor, three
+    /// nullifiers (the inputs', then slot 3's) and two output commitments.
+    pub fn statement(&self) -> WitnessStatement {
         match self.shape {
-            ShapeWitness::S { .. } => self.instance_s().pvs,
-            ShapeWitness::P { .. } => self.instance_p().pvs,
+            ShapeWitness::S { .. } => {
+                let i = self.instance_s();
+                WitnessStatement { pvs: i.pvs, anchor: i.anchor, nullifiers: i.nf, commitments: i.cm_out }
+            }
+            ShapeWitness::P { .. } => {
+                let i = self.instance_p();
+                WitnessStatement {
+                    pvs: i.pvs,
+                    anchor: i.anchor,
+                    nullifiers: [i.nf[0], i.nf[1], i.nf3],
+                    commitments: i.cm_out,
+                }
+            }
         }
     }
 
@@ -175,6 +192,15 @@ impl SpendWitness {
         };
         (pvs, bincode::serialize(&proof).expect("a proof serializes"))
     }
+}
+
+/// What a [`SpendWitness`] states ([`SpendWitness::statement`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WitnessStatement {
+    pub pvs: Vec<u32>,
+    pub anchor: [u64; 4],
+    pub nullifiers: [[u64; 4]; 3],
+    pub commitments: [[u64; 4]; 2],
 }
 
 /// **Lab #924: prove a [`PreparedV2`] here.** The proof goes into the
