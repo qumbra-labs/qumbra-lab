@@ -139,6 +139,17 @@ impl SpendBasis {
     }
 }
 
+/// A leaf refusal, by name, for the review.
+fn leaf_refusal_text(e: &qumbra_wallet::asset_view::LeafRefusal) -> String {
+    use qumbra_wallet::asset_view::LeafRefusal as L;
+    match e {
+        L::Unavailable { why } => format!("the endpoint did not serve the asset's registry leaf ({why})"),
+        L::WrongAsset { got } => format!("the endpoint answered with asset {got}'s leaf"),
+        L::PathMismatch => "the endpoint's registry path does not fold to its root".into(),
+        L::NotAtVerifiedTip => "the endpoint's registry root is not the verified tip's".into(),
+    }
+}
+
 fn short(b: &[u8; 32]) -> String {
     b[..4].iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -313,6 +324,9 @@ struct Review {
 struct Names {
     asset: u16,
     label: (AssetLabel, u32, String),
+    /// Why the asset's leaf could not be bound to the verified tip, by name:
+    /// an endpoint's lie is told apart from data not yet served.
+    leaf_problem: Option<String>,
     list_line: String,
     list_short: Option<String>,
 }
@@ -324,7 +338,7 @@ impl Names {
             return format!("{} fee units", render_amount(u128::from(units), 0));
         }
         if asset != u64::from(self.asset) {
-            return format!("{units} base units of QIA #{asset} (not this spend's asset)");
+            return format!("{} base units of QIA #{asset} (not this spend's asset)", render_amount(u128::from(units), 0));
         }
         let (label, decimals, unit) = &self.label;
         let figure = render_amount(u128::from(units), *decimals);
@@ -334,7 +348,8 @@ impl Names {
                 "{figure} {unit} (listed as {listed_ticker}, but its issuer key changed: name withheld)"
             ),
             AssetLabel::Unconfirmed { listed_ticker } => format!(
-                "{figure} {unit} (listed as {listed_ticker}; its issuer could not be confirmed: name withheld)"
+                "{figure} {unit} (listed as {listed_ticker}; its issuer could not be confirmed: {}; name withheld)",
+                self.leaf_problem.as_deref().unwrap_or("the leaf was not bound")
             ),
             AssetLabel::Unlisted | AssetLabel::FeeUnit => match &self.list_short {
                 Some(id) => format!("{figure} {unit} (not on list {id})"),
@@ -423,14 +438,22 @@ impl SpendHandle {
         let bound = match self.asset {
             0 => None,
             a => {
+                // Unreachable: `served.registry` above already required this
+                // answer. Kept so a missing one can never read as bound.
                 let answer = self.answers.get(&registry_leaf_path(a)).cloned().unwrap_or_else(|| Err("not read".into()));
-                check_leaf_at_verified_tip(&b.chain, a, answer).ok()
+                Some(check_leaf_at_verified_tip(&b.chain, a, answer))
             }
         };
         let listed = b.own_list().and_then(|l| l.assets.get(&self.asset));
+        let leaf_problem = match &bound {
+            Some(Err(e)) => Some(leaf_refusal_text(e)),
+            _ => None,
+        };
+        let bound = bound.and_then(Result::ok);
         let names = Names {
             asset: self.asset,
             label: label_of(self.asset, listed, bound.as_ref()),
+            leaf_problem,
             list_line: b.list_line(),
             list_short: b.own_list().map(|l| short(&l.digest)),
         };
@@ -955,7 +978,11 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
 /// `qmb_annulet_new_v2`, never a host-supplied table — and only while its
 /// registry leaf, bound to the verified tip, carries the listed issuer key;
 /// otherwise its raw base units, saying why ("not on list <id>", "name
-/// withheld"). Asset 0 is the fee unit.
+/// withheld" with the leaf's refusal by name). Asset 0 is the fee unit.
+///
+/// **The trust premise:** names come from the list the host's key verified
+/// at `qmb_annulet_new_v2`. This kernel does not pin the list signer; a shell
+/// must compile in the production list key.
 ///
 /// # Safety
 /// `s` live; `intent` `len` readable bytes; `err_out` NULL or writable.

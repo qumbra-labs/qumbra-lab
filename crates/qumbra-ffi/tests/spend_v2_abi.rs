@@ -75,6 +75,11 @@ impl Drop for WalletDirGuard {
 /// 1,000,000 USDT-test (Hybrid: shape P), 50 fee units and an exact P-tier
 /// fee note (2); height 1 pays it 5 more fee units.
 fn chain(tag: &str) -> Fixture {
+    chain_lying(tag, Lie::None)
+}
+
+/// [`chain`] served by an endpoint that tells `lie`.
+fn chain_lying(tag: &str, lie: Lie) -> Fixture {
     let w = wallet_dir(tag, SEED);
     let wallet = w.wallet();
     let root = generation_root(&wallet, 0);
@@ -82,7 +87,7 @@ fn chain(tag: &str) -> Fixture {
     let mut rng = StdRng::seed_from_u64(0x4B);
     let body = BlockBody { txs: vec![pay_tx(&a2, &[note_to(&a2, 5, 0, 20)], 0x30, &mut rng)], ..BlockBody::default() };
     let file = genesis_v2(&a2, vec![note_to(&a2, 50, 0, 30), note_to(&a2, 2, 0, 40)]);
-    let ep = Endpoint::new(file, &[body], None, Lie::None);
+    let ep = Endpoint::new(file, &[body], None, lie);
     let payee = wallet_dir(&format!("{tag}_payee"), PAYEE);
     let pw = payee.wallet();
     let to = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0)).encode();
@@ -523,5 +528,27 @@ fn j_the_review_names_the_asset_from_the_verified_list_only() {
         let (_, text) = send_with(&f, USDT as u16, 1_000, 2, L2ShapeTag::P, Some(&list(&[0x11; 32], USDT as u16, [9; 4])));
         assert!(text.starts_with("asset list: for another network (11111111), ignored"), "{text}");
         assert!(text.contains("(no list for this network)"), "{text}");
+    }
+    // An endpoint that serves the listed issuer key on a registry path that
+    // does not fold to its root: the name is withheld, and the review says
+    // why — a lie told apart from data not yet served.
+    let lying = chain_lying("sv2_j_lie", Lie::RegistryBadPath);
+    let genesis = lying.ep.file.hash();
+    let w = unsafe { qmb_wallet_from_entropy([SEED; 32].as_ptr()) };
+    unsafe {
+        let a = auth(w, &lying.fresh).unwrap();
+        let s = spend(basis_with(w, &lying.ep, Some(&list(&genesis, USDT as u16, [9; 4]))), &lying.payee, USDT as u16, 1_000, 96)
+            .unwrap();
+        pump(a, s, &lying.ep, 0).expect("READY: the opening decodes");
+        take(a, s).unwrap();
+        let text = review(s, &intent(s)).unwrap();
+        assert!(!text.contains("tUSDT ("), "no name: {text}");
+        assert!(
+            text.contains("(listed as tUSDT; its issuer could not be confirmed: the endpoint's registry path does not fold to its root; name withheld)"),
+            "{text}"
+        );
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+        qmb_wallet_free(w);
     }
 }
