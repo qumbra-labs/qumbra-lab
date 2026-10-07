@@ -19,6 +19,16 @@
 //! recipient on this net is refused by name before any planning, and
 //! `migrate --open-next` afterwards opens generation 1 and leaves generation
 //! 0 waiting on this net until tip + 1,152.
+//!
+//! Lab #924 seam G rides along without a prove: before the send, an issuer
+//! operation is refused by `prepare_v2` before any leaf is taken; a holder S
+//! over the same notes is prepared and signed into a `ProvingBundle` with its
+//! three leaves persisted before anything is proved, passes the worker's
+//! lock, and `assemble_v2` refuses a prover's transaction that is not the
+//! bundle's plus a proof. That bundle is then abandoned (three leaves wasted,
+//! never reused) and the send itself — `build_spend_v2`, which routes a holder
+//! spend through the same prepare → bundle lock → prove → assemble chain —
+//! takes the next three.
 use std::time::Duration;
 
 use qlab_air::l2::RegistryLeaf;
@@ -28,7 +38,13 @@ use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qumbra_faucet::devnet_harness::Net;
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord};
 use qumbra_wallet::annulet_send::{open_session, send_annulet, SendPlan, SendRefusal, WalletEndpoint};
-use qumbra_wallet::annulet_v2::{landed_next, landed_slots, migrate};
+use qlab_air::l2p::VPublic;
+use qlab_devnet::annulet::L2ShapeTag;
+use qlab_l2spend::bundle::ProvingBundle;
+use qlab_l2spend::{Out, PolicyContext};
+use qumbra_wallet::annulet_v2::{
+    assemble_v2, landed_next, landed_slots, me_v2, migrate, prepare_v2, valid_for, AuthRun, V2Spend,
+};
 use qumbra_wallet::auth_journal::{generation_root, AuthJournal};
 use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
@@ -115,6 +131,89 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
         refused.err().map(|e| e.to_string())
     );
 
+    // Seam G without a prove (lab #924 F4/F5).
+    {
+        let session = open_session(&w, WalletEndpoint { url: urls[1].clone() }, 0, Some(hash), &mut rng)
+            .expect("a verified session");
+        let wallet = w.wallet();
+        let root0 = generation_root(&wallet, 0);
+        let owned: Vec<_> = notes
+            .iter()
+            .map(|n| {
+                qlab_ledger::assets::OwnedL2Note::from_genesis_v2(
+                    &wallet,
+                    0,
+                    qumbra_node::annulet_genesis::h32(&n.commitment()),
+                    *n,
+                    &[(0, root0)],
+                )
+                .expect("W's genesis note")
+            })
+            .collect();
+        let mut run = AuthRun::open(&w, &session, valid_for()).expect("generation 0");
+        let me = me_v2(&wallet, &run.auth_root());
+        let outs = [
+            Out { to: me.clone(), value: 100, asset: ASSET as u64 },
+            Out { to: me, value: 10, asset: ASSET as u64 },
+        ];
+        let none = PolicyContext::default();
+        let issuer = PolicyContext { isk: [7; 4], ..PolicyContext::default() };
+        let next = || AuthJournal::load(&w.dir).unwrap().unwrap().get(0).unwrap().next;
+        for (ctx, vp) in [([&issuer, &none], [VPublic::NONE; 2]), ([&none, &none], [VPublic::mint(1), VPublic::NONE])] {
+            let r = prepare_v2(
+                &w,
+                &mut run,
+                &session.served,
+                L2ShapeTag::S,
+                V2Spend::TwoAndFee([&owned[0], &owned[1]], &owned[2]),
+                &outs,
+                tier_s,
+                ctx,
+                vp,
+                &mut rng,
+            );
+            assert!(matches!(&r, Err(SendRefusal::Auth(why)) if why.contains("issuer")), "{:?}", r.err().map(|e| e.to_string()));
+        }
+        assert_eq!(next(), 0, "an issuer refusal takes no leaf");
+        let prepared = prepare_v2(
+            &w,
+            &mut run,
+            &session.served,
+            L2ShapeTag::S,
+            V2Spend::TwoAndFee([&owned[0], &owned[1]], &owned[2]),
+            &outs,
+            tier_s,
+            [&none, &none],
+            [VPublic::NONE; 2],
+            &mut rng,
+        )
+        .expect("a holder S prepares and signs");
+        assert_eq!(next(), 3, "the three leaves are persisted before anything is proved");
+        assert!(prepared.bundle.tx().proof.is_empty());
+        let back = ProvingBundle::decode(&prepared.bundle.encode()).expect("the bundle decodes");
+        back.check(&run.auth_context()).expect("the worker's lock passes");
+
+        // `assemble_v2` takes back only the bundle's transaction plus a proof.
+        let take_back = |f: &dyn Fn(&mut qlab_devnet::body::TxEntry)| {
+            let mut tx = prepared.bundle.tx().clone();
+            tx.proof = vec![1];
+            f(&mut tx);
+            assemble_v2(prepared.clone(), tx)
+        };
+        let refused = |r: Result<_, SendRefusal>, what: &str| {
+            assert!(matches!(&r, Err(SendRefusal::Auth(why)) if why.contains("not submitted")), "{what}");
+        };
+        refused(take_back(&|t| t.proof.clear()), "an empty proof");
+        refused(take_back(&|t| *t.discovery.last_mut().unwrap() ^= 1), "another discovery byte");
+        refused(take_back(&|t| t.public.fee += 1), "another fee");
+        refused(take_back(&|t| *t.auth.last_mut().unwrap() ^= 1), "another section");
+        refused(take_back(&|t| t.rider = vec![1, 0]), "a rider");
+        refused(take_back(&|t| t.l2 = qlab_devnet::annulet::L2_SURFACE_ABSENT.to_vec()), "no surface");
+        let built = take_back(&|_| ()).expect("the bundle's transaction plus a proof");
+        assert_eq!(built.tx.proof, vec![1], "assemble adds nothing; the node verifies the proof");
+        // Abandoned: never submitted.
+    }
+
     // W sends 100 of asset 7 to T's v2 address through follower 1.
     let t_addr = t.wallet().address_candidate_a_at_index(0, &generation_root(&t.wallet(), 0));
     let report = send_annulet(
@@ -139,10 +238,11 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
     assert_eq!((report.outputs[0].value, report.outputs[1].value), (100, 10));
     let v = net.settle_spends(3, "the Candidate A send");
 
-    // The journal took exactly the three real slots, persisted.
+    // The journal took exactly the three real slots, persisted — after the
+    // abandoned bundle's three.
     let journal = AuthJournal::load(&w.dir).unwrap().expect("W's journal");
     assert_eq!(journal.active().g, 0);
-    assert_eq!(journal.get(0).unwrap().next, 3, "two asset-7 inputs and the fee note");
+    assert_eq!(journal.get(0).unwrap().next, 6, "two asset-7 inputs and the fee note, after the bundle's three");
 
     // T finds 100 under its own generation 0; W's change is 10.
     assert_eq!(balances(&t, &urls[2], v[2].state_tip, hash), vec![(ASSET, 100)]);
@@ -165,7 +265,7 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
         .collect();
     let slots = landed_slots(&session, &wallet, &spent).expect("the landed body reads back, verified");
     assert_eq!(slots.len(), 3, "one S: three slots");
-    assert_eq!(landed_next(&wallet, 0, &slots), 3, "the restore floor is the journal's position");
+    assert_eq!(landed_next(&wallet, 0, &slots), 6, "the restore floor is the journal's position");
 
     // `migrate --open-next` on this net: generation 1 opens, generation 0
     // (holding the change) waits until tip + 1,152 — nothing is proved.
@@ -189,7 +289,7 @@ fn a_candidate_a_send_is_proved_signed_admitted_and_sealed() {
     assert!(report.swept.is_empty() && report.retired.is_empty());
     let journal = AuthJournal::load(&w.dir).unwrap().unwrap();
     assert_eq!(journal.active().g, 1);
-    assert_eq!(journal.get(0).unwrap().next, 3, "generation 0 consumed nothing more");
+    assert_eq!(journal.get(0).unwrap().next, 6, "generation 0 consumed nothing more");
 
     for d in [&w.dir, &t.dir] {
         let _ = std::fs::remove_dir_all(d);

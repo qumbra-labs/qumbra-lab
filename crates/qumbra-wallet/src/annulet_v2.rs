@@ -21,7 +21,7 @@
 //!    covers the proof);
 //! 5. the prover fills the proof — in this process, or (lab #924 seam G
 //!    split) a worker handed a [`ProvingBundle`] ([`prepare_v2`] →
-//!    [`prove_bundle`] → [`assemble_and_submit`]) — and the transaction is
+//!    [`prove_bundle_v2`] → [`assemble_and_submit`]) — and the transaction is
 //!    submitted.
 
 use qlab_air::l2::{L2AuthInput, L2AuthPath};
@@ -98,6 +98,7 @@ pub struct AuthRun {
     keys: LocalAuth,
     genesis_hash: [u8; 32],
     genesis_format: u32,
+    auth_ctx: AuthContext,
     /// The last height the run's transactions may land at.
     pub valid_until: u64,
 }
@@ -145,6 +146,7 @@ impl AuthRun {
             keys,
             genesis_hash: session.genesis_hash,
             genesis_format: session.l2_auth.annulet_genesis_format_version(),
+            auth_ctx: AuthContext { form: session.l2_auth, genesis_hash: session.genesis_hash },
             valid_until: session.tip.saturating_add(validity),
         })
     }
@@ -153,6 +155,11 @@ impl AuthRun {
     /// addresses bind.
     pub fn auth_root(&self) -> [u64; 4] {
         self.keys.auth_root()
+    }
+
+    /// The net this run signs for, as a prover's lock checks it.
+    pub fn auth_context(&self) -> AuthContext {
+        self.auth_ctx
     }
 
     /// Unconsumed leaves left in the run's generation.
@@ -309,8 +316,13 @@ pub fn spend_v2<E: Endpoint>(
 /// Build, prove and sign one Candidate A S or P spend, **not** submitted (an
 /// issuer service records an attempt before it leaves the machine). `ctx`
 /// and `vp` are the two rows' policy contexts and `vPublic` (P only; a
-/// `TwoAndFee` P uses `ctx[0]` for both rows, as v1's merge does). The
-/// in-process path: [`prepare_signed`], then the proof in this process.
+/// `TwoAndFee` P uses `ctx[0]` for both rows, as v1's merge does).
+///
+/// A holder spend runs the seam G chain in this process — [`prepare_v2`],
+/// [`prove_bundle_v2`] (the bundle's lock, then the proof), [`assemble_v2`]
+/// — so the CLI path checks what a remote prover checks. An issuer
+/// operation ([`is_issuer_operation`]) never becomes a bundle: it is
+/// prepared, signed and proved here directly.
 #[allow(clippy::too_many_arguments)]
 pub fn build_spend_v2<E: Endpoint>(
     w: &WalletDir,
@@ -324,7 +336,19 @@ pub fn build_spend_v2<E: Endpoint>(
     vp: [VPublic; 2],
     rng: &mut StdRng,
 ) -> Result<BuiltV2, SendRefusal> {
-    Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?))
+    if is_issuer_operation(ctx, vp) {
+        return Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?));
+    }
+    let prepared = prepare_v2(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?;
+    let proved = prove_bundle_v2(&prepared.bundle, &run.auth_context())?;
+    assemble_v2(prepared, proved)
+}
+
+/// An issuer operation: a P row with an issuer secret, or a non-zero
+/// `vPublic` term. It is not delegated (design "Issuer authority is out of
+/// scope for delegation"; lab #924 5A-D3).
+pub fn is_issuer_operation(ctx: [&PolicyContext; 2], vp: [VPublic; 2]) -> bool {
+    ctx.iter().any(|c| c.isk != [0; 4]) || vp.iter().any(|v| v.amount != 0 || v.redeem)
 }
 
 /// **Lab #924 seam G, the device half**: everything [`build_spend_v2`] does
@@ -332,8 +356,8 @@ pub fn build_spend_v2<E: Endpoint>(
 /// transaction prepared and **signed** — handed out as a [`ProvingBundle`]
 /// for a prover that is not this process. A holder spend only: an issuer
 /// operation (a P row with an issuer secret or a non-zero `vPublic`) is
-/// refused by the bundle and stays on [`build_spend_v2`]. The leaves are
-/// spent either way; a refused bundle wastes them, never reuses them.
+/// refused **before any leaf is taken** and stays on [`build_spend_v2`]'s
+/// in-process path.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_v2<E: Endpoint>(
     w: &WalletDir,
@@ -347,6 +371,11 @@ pub fn prepare_v2<E: Endpoint>(
     vp: [VPublic; 2],
     rng: &mut StdRng,
 ) -> Result<PreparedSpendV2, SendRefusal> {
+    if is_issuer_operation(ctx, vp) {
+        return Err(SendRefusal::Auth(
+            "an issuer operation (an issuer secret or a non-zero vPublic) is not delegated to a prover".into(),
+        ));
+    }
     let p = prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?;
     let bundle = ProvingBundle::new(p.tx, p.witness).map_err(|e| SendRefusal::Auth(e.to_string()))?;
     Ok(PreparedSpendV2 { bundle, pvs: p.pvs, auth: p.auth, outputs: p.outputs, shape: p.shape })
@@ -354,6 +383,7 @@ pub fn prepare_v2<E: Endpoint>(
 
 /// A prepared, signed spend: the bundle a prover is handed and what the
 /// device keeps to accept the proved transaction back.
+#[derive(Clone)]
 pub struct PreparedSpendV2 {
     pub bundle: ProvingBundle,
     pub pvs: Vec<u32>,
@@ -365,7 +395,7 @@ pub struct PreparedSpendV2 {
 /// **The worker half**: the bundle's lock ([`ProvingBundle::check`] — the
 /// witness states the transaction and the section verifies on the net `ctx`
 /// names), then the proof. The proved transaction, nothing else changed.
-pub fn prove_bundle(bundle: &ProvingBundle, ctx: &AuthContext) -> Result<TxEntry, SendRefusal> {
+pub fn prove_bundle_v2(bundle: &ProvingBundle, ctx: &AuthContext) -> Result<TxEntry, SendRefusal> {
     bundle.prove(ctx).map_err(|e| SendRefusal::Auth(e.to_string()))
 }
 
@@ -374,6 +404,13 @@ pub fn prove_bundle(bundle: &ProvingBundle, ctx: &AuthContext) -> Result<TxEntry
 /// signed section included — before it is submitted. (The node verifies the
 /// proof against the PVs the section's intent binds.)
 pub fn assemble_v2(prepared: PreparedSpendV2, proved: TxEntry) -> Result<BuiltV2, SendRefusal> {
+    // The wire encoder asserts a surface and no rider: refuse a prover's
+    // transaction without them by name, before encoding it.
+    if proved.rider != qlab_devnet::names::RIDER_ABSENT || proved.l2 == qlab_devnet::annulet::L2_SURFACE_ABSENT {
+        return Err(SendRefusal::Auth(
+            "the prover returned a transaction with a rider or without its surface — not submitted".into(),
+        ));
+    }
     let mut stripped = proved.clone();
     stripped.proof = Vec::new();
     if proved.proof.is_empty()
