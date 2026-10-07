@@ -14,15 +14,25 @@
 //!    advance is **persisted to `auth.v1` before anything is proved or
 //!    signed** (fail-closed, under the journal's lock);
 //! 3. dummy slots are drawn from fresh OS entropy and consume nothing;
-//! 4. the v2 builder proves; `intent_for` rebuilds the intent from the
-//!    transaction (valid until the verified tip + [`DEFAULT_VALIDITY_BLOCKS`]);
-//!    `sign_locally` signs every slot; the section is attached and the
-//!    transaction submitted.
+//! 4. the v2 builder prepares the transaction, its proof still empty;
+//!    `intent_for` rebuilds the intent from it (valid until the verified
+//!    tip plus [`DEFAULT_VALIDITY_BLOCKS`]); `sign_locally` signs every slot and the
+//!    section is attached — **signed before it is proved** (the intent never
+//!    covers the proof);
+//! 5. the prover fills the proof — in this process, or (lab #924 seam G
+//!    split) a worker handed a [`ProvingBundle`] ([`prepare_v2`] →
+//!    [`prove_bundle`] → [`assemble_and_submit`]) — and the transaction is
+//!    submitted.
 
 use qlab_air::l2::{L2AuthInput, L2AuthPath};
 use qlab_air::l2p::VPublic;
-use qlab_devnet::annulet::{L2ShapeTag, MAX_AUTH_VALIDITY_BLOCKS};
-use qlab_l2spend::v2::{attach, build_p_v2, build_s_v2, intent_for, sign_locally, BuiltV2, FeeIn, LocalAuth};
+use qlab_devnet::annulet::{AuthContext, L2ShapeTag, MAX_AUTH_VALIDITY_BLOCKS};
+use qlab_devnet::body::TxEntry;
+use qlab_l2spend::bundle::ProvingBundle;
+use qlab_l2spend::v2::{
+    attach, intent_for, prepare_p_v2, prepare_s_v2, prove_prepared, sign_locally, BuiltV2, FeeIn, LocalAuth,
+    PreparedV2,
+};
 use qlab_l2spend::{Endpoint, Out, PolicyContext, Recipient, Served, SpendError};
 use qlab_ledger::assets::OwnedL2Note;
 use qlab_remote_auth::annulet::D_AUTH;
@@ -299,7 +309,8 @@ pub fn spend_v2<E: Endpoint>(
 /// Build, prove and sign one Candidate A S or P spend, **not** submitted (an
 /// issuer service records an attempt before it leaves the machine). `ctx`
 /// and `vp` are the two rows' policy contexts and `vPublic` (P only; a
-/// `TwoAndFee` P uses `ctx[0]` for both rows, as v1's merge does).
+/// `TwoAndFee` P uses `ctx[0]` for both rows, as v1's merge does). The
+/// in-process path: [`prepare_signed`], then the proof in this process.
 #[allow(clippy::too_many_arguments)]
 pub fn build_spend_v2<E: Endpoint>(
     w: &WalletDir,
@@ -313,6 +324,93 @@ pub fn build_spend_v2<E: Endpoint>(
     vp: [VPublic; 2],
     rng: &mut StdRng,
 ) -> Result<BuiltV2, SendRefusal> {
+    Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?))
+}
+
+/// **Lab #924 seam G, the device half**: everything [`build_spend_v2`] does
+/// but the proof — leaves taken and persisted, dummies drawn, the
+/// transaction prepared and **signed** — handed out as a [`ProvingBundle`]
+/// for a prover that is not this process. A holder spend only: an issuer
+/// operation (a P row with an issuer secret or a non-zero `vPublic`) is
+/// refused by the bundle and stays on [`build_spend_v2`]. The leaves are
+/// spent either way; a refused bundle wastes them, never reuses them.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_v2<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    served: &Served<E>,
+    shape: L2ShapeTag,
+    spend: V2Spend<'_>,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    rng: &mut StdRng,
+) -> Result<PreparedSpendV2, SendRefusal> {
+    let p = prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?;
+    let bundle = ProvingBundle::new(p.tx, p.witness).map_err(|e| SendRefusal::Auth(e.to_string()))?;
+    Ok(PreparedSpendV2 { bundle, pvs: p.pvs, auth: p.auth, outputs: p.outputs, shape: p.shape })
+}
+
+/// A prepared, signed spend: the bundle a prover is handed and what the
+/// device keeps to accept the proved transaction back.
+pub struct PreparedSpendV2 {
+    pub bundle: ProvingBundle,
+    pub pvs: Vec<u32>,
+    pub auth: Vec<qlab_remote_auth::intent::AuthDescriptor>,
+    pub outputs: [qlab_note::l2note::L2Note; 2],
+    pub shape: L2ShapeTag,
+}
+
+/// **The worker half**: the bundle's lock ([`ProvingBundle::check`] — the
+/// witness states the transaction and the section verifies on the net `ctx`
+/// names), then the proof. The proved transaction, nothing else changed.
+pub fn prove_bundle(bundle: &ProvingBundle, ctx: &AuthContext) -> Result<TxEntry, SendRefusal> {
+    bundle.prove(ctx).map_err(|e| SendRefusal::Auth(e.to_string()))
+}
+
+/// **The device's acceptance**: `proved` must be the bundle's transaction
+/// with a proof added and nothing else changed — every other wire byte, the
+/// signed section included — before it is submitted. (The node verifies the
+/// proof against the PVs the section's intent binds.)
+pub fn assemble_v2(prepared: PreparedSpendV2, proved: TxEntry) -> Result<BuiltV2, SendRefusal> {
+    let mut stripped = proved.clone();
+    stripped.proof = Vec::new();
+    if proved.proof.is_empty()
+        || qlab_p2p::codec::encode_tx_annulet(&stripped) != qlab_p2p::codec::encode_tx_annulet(prepared.bundle.tx())
+    {
+        return Err(SendRefusal::Auth(
+            "the prover returned a transaction other than the bundle's with a proof added — not submitted".into(),
+        ));
+    }
+    Ok(BuiltV2 { tx: proved, pvs: prepared.pvs, auth: prepared.auth, outputs: prepared.outputs, shape: prepared.shape })
+}
+
+/// [`assemble_v2`], then submit.
+pub fn assemble_and_submit<E: Endpoint>(
+    served: &Served<E>,
+    prepared: PreparedSpendV2,
+    proved: TxEntry,
+) -> Result<BuiltV2, SendRefusal> {
+    let built = assemble_v2(prepared, proved)?;
+    served.submit(&built.tx)?;
+    Ok(built)
+}
+
+/// Take, draw the dummies, prepare and sign: the proof still empty.
+#[allow(clippy::too_many_arguments)]
+fn prepare_signed<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    served: &Served<E>,
+    shape: L2ShapeTag,
+    spend: V2Spend<'_>,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    rng: &mut StdRng,
+) -> Result<PreparedV2, SendRefusal> {
     let wallet = w.wallet();
     let notes: Vec<&OwnedL2Note> = match &spend {
         V2Spend::One(a) => vec![*a],
@@ -323,32 +421,27 @@ pub fn build_spend_v2<E: Endpoint>(
     let paths = run.take(&w.dir, notes.len())?;
     let taken: Vec<u32> = paths.iter().map(|p| p.leaf_index).collect();
     let real: Vec<L2AuthInput> = notes.iter().zip(paths).map(|(n, p)| real_input(&wallet, n, p)).collect();
-    let built = match (shape, &spend) {
+    let (mut prepared, keys) = match (shape, &spend) {
         (L2ShapeTag::S, V2Spend::One(_)) => {
             let (d2, k2) = run.dummy(1, &taken)?;
             let (d3, k3) = run.dummy(2, &[taken.as_slice(), &[d2.auth.leaf_index]].concat())?;
-            let mut b = build_s_v2(served, [&real[0], &d2], true, FeeIn::Dummy(&d3), outs, fee, rng)?;
-            run.sign(&mut b.tx, &b.auth.clone(), &[&k2, &k3])?;
-            return Ok(b);
+            (prepare_s_v2(served, [&real[0], &d2], true, FeeIn::Dummy(&d3), outs, fee, rng)?, vec![k2, k3])
         }
         (L2ShapeTag::S, V2Spend::Two(_)) => {
             let (d3, k3) = run.dummy(2, &taken)?;
-            let mut b = build_s_v2(served, [&real[0], &real[1]], false, FeeIn::Dummy(&d3), outs, fee, rng)?;
-            run.sign(&mut b.tx, &b.auth.clone(), &[&k3])?;
-            return Ok(b);
+            (prepare_s_v2(served, [&real[0], &real[1]], false, FeeIn::Dummy(&d3), outs, fee, rng)?, vec![k3])
         }
         (L2ShapeTag::S, V2Spend::TwoAndFee(..)) => {
-            build_s_v2(served, [&real[0], &real[1]], false, FeeIn::Exact(&real[2]), outs, fee, rng)?
+            (prepare_s_v2(served, [&real[0], &real[1]], false, FeeIn::Exact(&real[2]), outs, fee, rng)?, vec![])
         }
         (L2ShapeTag::P, V2Spend::Two(_)) => {
             let (d3, k3) = run.dummy(2, &taken)?;
-            let mut b = build_p_v2(served, [&real[0], &real[1]], FeeIn::Dummy(&d3), outs, fee, ctx, vp, rng)?;
-            run.sign(&mut b.tx, &b.auth.clone(), &[&k3])?;
-            return Ok(b);
+            (prepare_p_v2(served, [&real[0], &real[1]], FeeIn::Dummy(&d3), outs, fee, ctx, vp, rng)?, vec![k3])
         }
-        (L2ShapeTag::P, V2Spend::TwoAndFee(..)) => {
-            build_p_v2(served, [&real[0], &real[1]], FeeIn::Exact(&real[2]), outs, fee, [ctx[0], ctx[0]], vp, rng)?
-        }
+        (L2ShapeTag::P, V2Spend::TwoAndFee(..)) => (
+            prepare_p_v2(served, [&real[0], &real[1]], FeeIn::Exact(&real[2]), outs, fee, [ctx[0], ctx[0]], vp, rng)?,
+            vec![],
+        ),
         (L2ShapeTag::P, V2Spend::One(_)) => {
             return Err(SendRefusal::Spend(SpendError::Served(
                 "a one-input shape-P spend has no v2 builder (P proves two real inputs)".into(),
@@ -358,9 +451,9 @@ pub fn build_spend_v2<E: Endpoint>(
             return Err(SendRefusal::Spend(SpendError::Served("shape R is a registry write, not a spend".into())))
         }
     };
-    let mut built = built;
-    run.sign(&mut built.tx, &built.auth.clone(), &[])?;
-    Ok(built)
+    let dummies: Vec<&qlab_remote_auth::mldsa::Key> = keys.iter().collect();
+    run.sign(&mut prepared.tx, &prepared.auth.clone(), &dummies)?;
+    Ok(prepared)
 }
 
 /// **Restore → migrate** (§9) for a wallet with no `auth.v1`: no generation
