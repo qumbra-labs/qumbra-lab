@@ -283,8 +283,8 @@ fn a_an_s_payment_of_asset_0_is_a_bundle_the_prover_accepts() {
     assert!(text.contains("returns to this wallet"), "{text}");
     assert!(text.contains("send 10 fee units to "), "{text}");
     assert!(text.contains("39 fee units returns to this wallet"), "{text}");
-    assert!(text.contains("fee: 1 fee units") && text.contains("valid until block "), "{text}");
-    assert!(text.starts_with("asset list: none"), "{text}");
+    assert!(text.contains("fee: 1 fee unit\n") && text.contains("valid until block "), "{text}");
+    assert!(text.starts_with("asset list: none — every asset is unlisted; amounts in base units\n"), "{text}");
     assert!(!text.contains("leaf") && !text.contains("anchor"), "{text}");
 }
 
