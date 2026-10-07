@@ -226,7 +226,7 @@ pub enum FeeIn<'a> {
 }
 
 /// A v2 input's note commitment.
-fn cm_of_v2(input: &L2AuthInput) -> [u64; 4] {
+pub(crate) fn cm_of_v2(input: &L2AuthInput) -> [u64; 4] {
     derive_input_l2_v2(input).2
 }
 
@@ -320,7 +320,7 @@ pub fn prepare_s_v2<E: Endpoint, R: rand::CryptoRng>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assemble_s_v2<R: rand::CryptoRng>(
+pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
     tree: &CommitmentTree,
     regs: &[RegistryOpening; 2],
     inputs: [&L2AuthInput; 2],
@@ -440,7 +440,7 @@ pub fn prepare_p_v2<E: Endpoint, R: rand::CryptoRng>(
 
 /// The policies from the openings (keyed by each input's v2 `rkm`), then P.
 #[allow(clippy::too_many_arguments)]
-fn policies_then_p_v2<R: rand::CryptoRng>(
+pub(crate) fn policies_then_p_v2<R: rand::CryptoRng>(
     tree: &CommitmentTree,
     regs: &[RegistryOpening; 2],
     inputs: [&L2AuthInput; 2],
