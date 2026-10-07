@@ -811,6 +811,14 @@ qmb_auth_t *qmb_auth_check_finish(const qmb_wallet_t *w, qmb_auth_check_t *c, ch
                                   char **err_out);
 void qmb_auth_check_free(qmb_auth_check_t *c);
 int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, char **out_journal);
+/* Lab #924 PR 3d: is new_text a monotone advance of stored_text? Run it
+ * before overwriting a stored journal with a kernel's output. 1 yes (an
+ * unchanged journal included); 0 no, *out_why the first rule broken (a
+ * generation missing or its root changed, a cursor or checked height moving
+ * back, a state going backwards, a sweep gate lowered or gone); -1 a text is
+ * NULL or does not parse. No handle, no key material; out_why may be NULL
+ * (set to NULL on 1); free it with qmb_string_free. */
+int32_t qmb_auth_journal_advances(const char *stored_text, const char *new_text, char **out_why);
 int32_t qmb_auth_open_next(const qmb_wallet_t *w, const char *journal_text, const qmb_spend_basis_t *basis,
                            char **out_journal);
 char *qmb_auth_journal(const qmb_auth_t *a);

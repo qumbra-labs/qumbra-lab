@@ -28,6 +28,7 @@ use qlab_devnet::body::BlockBody;
 use qlab_l2spend::bundle::ProvingBundle;
 use qumbra_ffi::annulet::{qmb_annulet_free, qmb_annulet_new_v2, qmb_annulet_step, qmb_annulet_supply, qmb_annulet_supply_err, qmb_annulet_take_basis};
 use qumbra_ffi::spend_v2::{
+    qmb_auth_journal_advances,
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
     qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
     qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_refusal, qmb_spend_v2_step, qmb_spend_v2_supply,
@@ -943,6 +944,26 @@ fn q_the_header_pins_the_open_statuses() {
     assert_eq!(from_header, from_src);
     assert_eq!(QMB_AUTH_CHECKED, 0);
     assert_eq!(QMB_AUTH_RESTORED, 3);
+    // PR 3d's ABI door over `advances_from` (its rules: qlab-remote-auth's
+    // `a_journal_only_advances`): 1 / 0 / -1, NULL-safe.
+    let before = AuthJournal::fresh([1, 2, 3, 4]);
+    let mut after = before.clone();
+    after.advance_mem(0, 3).unwrap();
+    let (b, a) = (CString::new(before.to_text()).unwrap(), CString::new(after.to_text()).unwrap());
+    let junk = CString::new("not a journal").unwrap();
+    unsafe {
+        let mut why: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_auth_journal_advances(b.as_ptr(), b.as_ptr(), &mut why), 1);
+        assert!(why.is_null());
+        assert_eq!(qmb_auth_journal_advances(b.as_ptr(), a.as_ptr(), &mut why), 1);
+        assert_eq!(qmb_auth_journal_advances(a.as_ptr(), b.as_ptr(), &mut why), 0);
+        assert!(take_str(why).contains("cursor moves back"));
+        assert_eq!(qmb_auth_journal_advances(ptr::null(), a.as_ptr(), &mut why), -1);
+        assert!(take_str(why).contains("stored journal is NULL"));
+        assert_eq!(qmb_auth_journal_advances(a.as_ptr(), junk.as_ptr(), &mut why), -1);
+        assert!(take_str(why).contains("new journal does not parse"));
+        assert_eq!(qmb_auth_journal_advances(a.as_ptr(), b.as_ptr(), ptr::null_mut()), 0, "out_why may be NULL");
+    }
 }
 
 /// A chain on which BOTH generations signed: generation 0 at height 2, then

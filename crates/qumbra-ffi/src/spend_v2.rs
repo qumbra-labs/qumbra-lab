@@ -451,6 +451,44 @@ pub unsafe extern "C" fn qmb_auth_first_new(
     )
 }
 
+/// Lab #924 PR 3d: whether `new_text` is a monotone advance of
+/// `stored_text` (`AuthJournal::advances_from`) — the check a shell that keeps
+/// the journal as text runs before it overwrites what it stored. 1: it is
+/// (an unchanged journal included); 0: it is not, `*out_why` the first rule
+/// broken; -1: a text is NULL or does not parse, `*out_why` which. A pure
+/// function of the two texts: no handle, no key material. `out_why` may be
+/// NULL; on 1 it is set to NULL.
+///
+/// # Safety
+/// The texts NULL or NUL-terminated; `out_why` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_journal_advances(stored_text: *const c_char, new_text: *const c_char, out_why: *mut *mut c_char) -> i32 {
+    if !out_why.is_null() {
+        *out_why = ptr::null_mut();
+    }
+    let parse = |p: *const c_char, which: &str| -> Result<AuthJournal, String> {
+        if p.is_null() {
+            return Err(format!("the {which} journal is NULL"));
+        }
+        let text = CStr::from_ptr(p).to_str().map_err(|_| format!("the {which} journal is not UTF-8"))?;
+        AuthJournal::from_text(text).map_err(|e| format!("the {which} journal does not parse: {e}"))
+    };
+    let (stored, new) = match (parse(stored_text, "stored"), parse(new_text, "new")) {
+        (Ok(s), Ok(n)) => (s, n),
+        (Err(e), _) | (_, Err(e)) => {
+            set_err(out_why, e);
+            return -1;
+        }
+    };
+    match new.advances_from(&stored) {
+        Ok(()) => 1,
+        Err(why) => {
+            set_err(out_why, why);
+            0
+        }
+    }
+}
+
 /// **The first journal of a wallet born in this process**
 /// (`qmb_wallet_new_fresh`): generation 0, fresh, active — offline, no body
 /// read, because a seed drawn here has signed nowhere. **Once per handle**:
