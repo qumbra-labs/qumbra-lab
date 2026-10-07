@@ -4,6 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use qumbra_prover_service::annulet::{
+    annulet_worker_once, frame, AnnuletApi, AnnuletConfig, AnnuletProcessProver, HttpSubmitter,
+    ANNULET_WORKER_PROTOCOL, MAX_ANNULET_BUNDLE_BYTES,
+};
+use qumbra_prover_service::token;
 use qumbra_prover_service::{
     Api, ApiError, Config, SecretBytes, SubmitRequest, Worker, WorkerConfig, WorkerOutcome,
     MAX_ARTIFACT_BYTES, MAX_BUNDLE_BYTES, MAX_MAX_UPSTREAM_BYTES, MAX_REQUEST_BYTES,
@@ -18,10 +23,13 @@ const MAX_WORKER_ERROR_BYTES: usize = 64;
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
         Some("worker") => worker_entry(),
+        Some("annulet-worker") => annulet_worker_entry(),
+        Some("mint-token") => mint_token_entry(),
+        Some("token-key") => token_key_entry(),
         Some("healthcheck") => healthcheck_entry(),
         Some("--help" | "-h") => {
             println!(
-                "qumbra-prover-service\n\nRun with fail-closed QUMBRA_PROVER_* configuration.\nThe worker subcommand is internal. This build is VALUELESS-EXPERIMENT ONLY."
+                "qumbra-prover-service\n\nRun with fail-closed QUMBRA_PROVER_* configuration.\nModes: the Annulet prover (QUMBRA_PROVER_ANNULET_*) and the L1 valueless experiment\n(QUMBRA_PROVER_VALUELESS_EXPERIMENT), each off unless configured.\n\n  mint-token --seed-file F --key-id N --genesis-hash H --days D [--per-day N]\n  token-key  --seed-file F --key-id N\n\nThe worker and annulet-worker subcommands are internal."
             );
             Ok(())
         }
@@ -66,14 +74,43 @@ fn healthcheck_entry() -> Result<(), String> {
 }
 
 fn server_entry() -> Result<(), String> {
-    let config = Arc::new(Config::from_env()?);
-    let worker = Arc::new(ProcessWorker {
-        executable: std::env::current_exe()
-            .map_err(|_| "cannot resolve the prover-service executable".to_string())?,
-        config: config.worker_config(),
-    });
-    let api = Api::new(Arc::clone(&config), worker);
-    let server = tiny_http::Server::http(config.listen)
+    let listen = qumbra_prover_service::listen_from_env()?;
+    // The L1 path exists only behind its own valueless acknowledgement.
+    let l1 = match std::env::var_os("QUMBRA_PROVER_VALUELESS_EXPERIMENT") {
+        Some(_) => {
+            let config = Arc::new(Config::from_env()?);
+            let worker = Arc::new(ProcessWorker {
+                executable: std::env::current_exe()
+                    .map_err(|_| "cannot resolve the prover-service executable".to_string())?,
+                config: config.worker_config(),
+            });
+            Some((Api::new(Arc::clone(&config), worker), config))
+        }
+        None => None,
+    };
+    let annulet = match AnnuletConfig::from_env()? {
+        Some(config) => {
+            let prover = Arc::new(AnnuletProcessProver {
+                executable: std::env::current_exe()
+                    .map_err(|_| "cannot resolve the prover-service executable".to_string())?,
+                genesis_hash: config.genesis_hash,
+                scratch: config.scratch.clone(),
+                timeout: config.prove_timeout,
+            });
+            let submitter = Arc::new(HttpSubmitter {
+                node_url: config.node_url.clone(),
+                relay_url: config.relay_url.clone(),
+            });
+            Some(AnnuletApi::new(config, prover, submitter))
+        }
+        None => None,
+    };
+    if l1.is_none() && annulet.is_none() {
+        return Err(
+            "no mode configured: set QUMBRA_PROVER_ANNULET_GENESIS_HASH (and the Annulet configuration) or the L1 valueless experiment".into(),
+        );
+    }
+    let server = tiny_http::Server::http(listen)
         .map_err(|_| "prover listener could not bind".to_string())?;
     let bound = server
         .server_addr()
@@ -87,7 +124,13 @@ fn server_entry() -> Result<(), String> {
     let inflight = Arc::new(AtomicUsize::new(0));
 
     eprintln!(
-        "qumbra-prover-service: listening on {bound}; mode=valueless-current-witness-v1; build={}",
+        "qumbra-prover-service: listening on {bound}; modes={}{}; build={}",
+        if annulet.is_some() { "annulet-v1 " } else { "" },
+        if l1.is_some() {
+            "valueless-current-witness-v1"
+        } else {
+            ""
+        },
         qumbra_prover_service::build_revision()
     );
     while !stopping.load(Ordering::Acquire) {
@@ -108,19 +151,171 @@ fn server_entry() -> Result<(), String> {
             );
             continue;
         }
-        let api = api.clone();
-        let config = Arc::clone(&config);
+        let l1 = l1.clone();
+        let annulet = annulet.clone();
         let handler_count = Arc::clone(&inflight);
         std::thread::Builder::new()
             .name("prover-http".into())
             .spawn(move || {
-                handle_http(request, &api, &config);
+                route(
+                    request,
+                    l1.as_ref().map(|(a, c)| (a, &**c)),
+                    annulet.as_ref(),
+                );
                 handler_count.fetch_sub(1, Ordering::AcqRel);
             })
             .map_err(|_| "HTTP handler thread could not start".to_string())?;
     }
     eprintln!("qumbra-prover-service: stopping admission");
     Ok(())
+}
+
+/// `/v2/annulet/*` to the Annulet API when configured; everything else to
+/// the L1 handler, unchanged, when that mode is configured.
+fn route(request: tiny_http::Request, l1: Option<(&Api, &Config)>, annulet: Option<&AnnuletApi>) {
+    let path = request.url().split('?').next().unwrap_or("").to_string();
+    if let (Some(api), true) = (annulet, path.starts_with("/v2/annulet/")) {
+        handle_annulet(request, api);
+        return;
+    }
+    match l1 {
+        Some((api, config)) => handle_http(request, api, config),
+        None if path == "/healthz" => {
+            if *request.method() != tiny_http::Method::Get {
+                respond_method(request, "GET");
+            } else {
+                respond_json(
+                    request,
+                    200,
+                    &qumbra_prover_service::HealthView { alive: true },
+                    None,
+                );
+            }
+        }
+        None => respond_error(
+            request,
+            ApiError {
+                status: 404,
+                code: "not-found",
+            },
+        ),
+    }
+}
+
+fn handle_annulet(mut request: tiny_http::Request, api: &AnnuletApi) {
+    let raw_url = request.url().to_string();
+    if raw_url.contains('?') {
+        respond_error(
+            request,
+            ApiError {
+                status: 404,
+                code: "not-found",
+            },
+        );
+        return;
+    }
+    let path = raw_url.as_str();
+    let method = request.method().clone();
+    match path {
+        "/v2/annulet/info" => {
+            if method != tiny_http::Method::Get {
+                return respond_method(request, "GET");
+            }
+            respond_json(request, 200, &api.info(), None);
+        }
+        "/v2/annulet/quota" => {
+            if method != tiny_http::Method::Get {
+                return respond_method(request, "GET");
+            }
+            match api.authorize_only(unique_header(&request, "Authorization")) {
+                Ok(claims) => respond_json(request, 200, &api.quota(&claims), None),
+                Err(e) => respond_error(request, e),
+            }
+        }
+        "/v2/annulet/jobs" => {
+            if method != tiny_http::Method::Post {
+                return respond_method(request, "POST");
+            }
+            // Token, quota and in-flight first: nothing is read before them.
+            let claims = match api.authorize(unique_header(&request, "Authorization")) {
+                Ok(c) => c,
+                Err(e) => return respond_error(request, e),
+            };
+            if !unique_header(&request, "Content-Type")
+                .is_some_and(|v| v.eq_ignore_ascii_case("application/octet-stream"))
+            {
+                return respond_error(
+                    request,
+                    ApiError {
+                        status: 415,
+                        code: "content-type-required",
+                    },
+                );
+            }
+            if request
+                .body_length()
+                .is_none_or(|n| n > MAX_ANNULET_BUNDLE_BYTES)
+            {
+                return respond_error(
+                    request,
+                    ApiError {
+                        status: 413,
+                        code: "bundle-too-large",
+                    },
+                );
+            }
+            let mut body = Vec::new();
+            if request
+                .as_reader()
+                .take(MAX_ANNULET_BUNDLE_BYTES as u64 + 1)
+                .read_to_end(&mut body)
+                .is_err()
+            {
+                use zeroize::Zeroize;
+                body.zeroize();
+                return respond_error(
+                    request,
+                    ApiError {
+                        status: 400,
+                        code: "request-unreadable",
+                    },
+                );
+            }
+            match api.submit(&claims, body) {
+                Ok((view, created)) => {
+                    let location = view.job_url.clone();
+                    respond_json(
+                        request,
+                        if created { 202 } else { 200 },
+                        &view,
+                        Some(&location),
+                    );
+                }
+                Err(e) => respond_error(request, e),
+            }
+        }
+        _ => {
+            // The job URL is the capability: no token.
+            let Some(cap) = path.strip_prefix("/v2/annulet/jobs/") else {
+                return respond_error(
+                    request,
+                    ApiError {
+                        status: 404,
+                        code: "not-found",
+                    },
+                );
+            };
+            let result = match method {
+                tiny_http::Method::Get => api.get(cap),
+                tiny_http::Method::Delete => api.cancel(cap),
+                _ => return respond_method(request, "GET, DELETE"),
+            };
+            match result {
+                Ok(view) => respond_json(request, 200, &view, None),
+                Err(e) => respond_error(request, e),
+            }
+        }
+    }
 }
 
 fn handle_http(mut request: tiny_http::Request, api: &Api, config: &Config) {
@@ -538,6 +733,130 @@ fn worker_once() -> Result<Vec<u8>, &'static str> {
         return Err("artifact-too-large");
     }
     Ok(artifact.wire_bytes)
+}
+
+fn annulet_worker_entry() -> Result<(), String> {
+    if std::env::var("QUMBRA_PROVER_WORKER_PROTOCOL").as_deref() != Ok(ANNULET_WORKER_PROTOCOL) {
+        return Err("internal worker protocol is absent".into());
+    }
+    let genesis_hash: [u8; 32] = std::env::var("QUMBRA_PROVER_ANNULET_GENESIS_HASH")
+        .ok()
+        .and_then(|h| hex32_decode(&h))
+        .ok_or("internal worker protocol is absent")?;
+    let answer = match std::panic::catch_unwind(|| {
+        annulet_worker_once(std::io::stdin().lock(), &genesis_hash)
+    }) {
+        Ok(Ok(wire)) => frame(0, &wire),
+        Ok(Err(code)) => frame(1, code.as_bytes()),
+        Err(_) => frame(1, b"worker-protocol-refused"),
+    };
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&answer)
+        .and_then(|()| stdout.flush())
+        .map_err(|_| "worker stdout closed".to_string())
+}
+
+fn hex32_decode(h: &str) -> Option<[u8; 32]> {
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `--name value` pairs, each at most once.
+fn flags(args: &[String]) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut it = args.iter();
+    while let Some(k) = it.next() {
+        let name = k
+            .strip_prefix("--")
+            .ok_or(format!("unexpected argument {k}"))?;
+        let v = it.next().ok_or(format!("--{name} needs a value"))?;
+        if out.insert(name.to_string(), v.clone()).is_some() {
+            return Err(format!("--{name} given twice"));
+        }
+    }
+    Ok(out)
+}
+
+/// The issuer seed: 64 hex characters in a file, never on the command line.
+fn read_seed(f: &std::collections::HashMap<String, String>) -> Result<[u8; 32], String> {
+    let path = f.get("seed-file").ok_or("--seed-file is required")?;
+    let text =
+        std::fs::read_to_string(path).map_err(|_| "the seed file could not be read".to_string())?;
+    hex32_decode(text.trim()).ok_or_else(|| "the seed file must hold 64 hex characters".to_string())
+}
+
+fn token_key_entry() -> Result<(), String> {
+    let f = flags(&std::env::args().skip(2).collect::<Vec<_>>())?;
+    let seed = read_seed(&f)?;
+    let key_id: u8 = f
+        .get("key-id")
+        .ok_or("--key-id is required")?
+        .parse()
+        .map_err(|_| "--key-id is 0..=255")?;
+    let vk = token::verifying_key(&seed);
+    println!(
+        "{key_id} {}",
+        vk.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    Ok(())
+}
+
+fn mint_token_entry() -> Result<(), String> {
+    use rand::Rng;
+    let f = flags(&std::env::args().skip(2).collect::<Vec<_>>())?;
+    let seed = read_seed(&f)?;
+    let key_id: u8 = f
+        .get("key-id")
+        .ok_or("--key-id is required")?
+        .parse()
+        .map_err(|_| "--key-id is 0..=255")?;
+    let genesis_hash = f
+        .get("genesis-hash")
+        .and_then(|h| hex32_decode(h))
+        .ok_or("--genesis-hash is 64 hex")?;
+    let days: u64 = f
+        .get("days")
+        .ok_or("--days is required")?
+        .parse()
+        .map_err(|_| "--days is a number")?;
+    if !(1..=token::MAX_TOKEN_DAYS).contains(&days) {
+        return Err(format!("--days is 1..={}", token::MAX_TOKEN_DAYS));
+    }
+    let per_day: u16 = match f.get("per-day") {
+        Some(n) => n.parse().map_err(|_| "--per-day is 0..=65535")?,
+        None => 0,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "the clock is before 1970")?
+        .as_secs();
+    let mut token_id = [0u8; 16];
+    rand::rng().fill_bytes(&mut token_id);
+    let claims = token::Claims {
+        key_id,
+        token_id,
+        genesis_hash,
+        not_before: now.saturating_sub(300),
+        not_after: now + days * 86_400 - 300,
+        per_day,
+    };
+    let minted = token::mint(&seed, &claims).map_err(str::to_string)?;
+    eprintln!(
+        "token id {}",
+        token_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    println!("{minted}");
+    Ok(())
 }
 
 fn write_worker_response(kind: u8, payload: &[u8]) -> Result<(), String> {

@@ -16,3 +16,18 @@ subtle = "2.6"
 tiny_http = "=0.12.0"
 tiny-keccak = { version = "2", features = ["keccak"] }
 zeroize = "1.9"
+# Lab #924 5A-D3/D4: the Annulet mode — bundles, tokens, the proved tx's wire.
+qlab-air = { path = "../qlab-air" }
+qlab-devnet = { path = "../qlab-devnet", default-features = false }
+qlab-l2spend = { path = "../qlab-l2spend" }
+qlab-p2p = { path = "../qlab-p2p", default-features = false }
+qlab-remote-auth = { path = "../qlab-remote-auth" }
+
+[target.'cfg(unix)'.dependencies]
+# The worker child's core-dump limit and the scratch's tmpfs check.
+libc = "0.2"
+
+[dev-dependencies]
+qlab-l2spend = { path = "../qlab-l2spend", features = ["fixtures"] }
+qlab-l2 = { path = "../qlab-l2" }
+bincode = "1"

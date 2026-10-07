@@ -161,20 +161,33 @@ pub fn prepared_p() -> (PreparedV2, LocalAuth, mldsa::Key) {
 /// [`prepared_s`] or [`prepared_p`], signed as the device signs it, as a
 /// [`ProvingBundle`] — what a prover is handed.
 pub fn signed_bundle(shape: L2ShapeTag) -> ProvingBundle {
-    let (mut p, local, key) = match shape {
+    signed_bundles(shape, &[VALID_UNTIL]).remove(0)
+}
+
+/// The same prepared spend signed once per validity height: one bundle per
+/// height, each a distinct intent (tests that need several jobs).
+pub fn signed_bundles(shape: L2ShapeTag, valid_until: &[u64]) -> Vec<ProvingBundle> {
+    let (p, local, key) = match shape {
         L2ShapeTag::S => prepared_s(),
         L2ShapeTag::P => prepared_p(),
         L2ShapeTag::R => panic!("shape R is never a bundle"),
     };
-    let intent = intent_for(
-        &p.tx,
-        ANNULET_AUTH_GENESIS_FORMAT_VERSION,
-        &GENESIS_HASH,
-        VALID_UNTIL,
-        &p.auth,
-    )
-    .expect("an honest tx has an intent");
-    let section = sign_locally(&intent, &local, &[&key]).expect("every slot is ours or a dummy's");
-    attach(&mut p.tx, &section).expect("a signed section encodes");
-    ProvingBundle::new(p.tx, p.witness).expect("an honest holder spend is a bundle")
+    valid_until
+        .iter()
+        .map(|until| {
+            let mut tx = p.tx.clone();
+            let intent = intent_for(
+                &tx,
+                ANNULET_AUTH_GENESIS_FORMAT_VERSION,
+                &GENESIS_HASH,
+                *until,
+                &p.auth,
+            )
+            .expect("an honest tx has an intent");
+            let section =
+                sign_locally(&intent, &local, &[&key]).expect("every slot is ours or a dummy's");
+            attach(&mut tx, &section).expect("a signed section encodes");
+            ProvingBundle::new(tx, p.witness.clone()).expect("an honest holder spend is a bundle")
+        })
+        .collect()
 }

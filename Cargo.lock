@@ -2012,7 +2012,15 @@ dependencies = [
 name = "qumbra-prover-service"
 version = "0.0.0"
 dependencies = [
+ "bincode",
  "ctrlc",
+ "libc",
+ "qlab-air",
+ "qlab-devnet",
+ "qlab-l2",
+ "qlab-l2spend",
+ "qlab-p2p",
+ "qlab-remote-auth",
  "qlab-wallet",
  "qumbra-wallet",
  "rand 0.10.2",
