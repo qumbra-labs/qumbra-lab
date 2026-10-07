@@ -751,6 +751,11 @@ pub unsafe extern "C" fn qmb_auth_take(a: *mut AuthHandle, s: *mut SpendHandle, 
                 review: p.review,
             }));
         }
+        // Defensive, and reachable only by an internal inconsistency: the
+        // final attempt replays the dry run's cached answers with the very
+        // leaves it peeked, and the budget is not re-judged. Left untested
+        // (no test-only seam in a release export, lab #924 PR 3 ruling);
+        // the advanced journal is still returned — the leaves are spent.
         Err(Attempt::Need(path) | Attempt::Refused(path)) => {
             h.phase = Phase::Refused(format!("after the take: {path}"));
         }
