@@ -816,8 +816,13 @@ int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, char **out_journal);
  * unchanged journal included); 0 no, *out_why the first rule broken (a
  * generation missing or its root changed, a cursor or checked height moving
  * back, a state going backwards, a sweep gate lowered or gone); -1 a text is
- * NULL or does not parse. No handle, no key material; out_why may be NULL
- * (set to NULL on 1); free it with qmb_string_free. */
+ * NULL, over 64 KiB or does not parse. No handle, no key material; out_why
+ * may be NULL (set to NULL on 1); free it with qmb_string_free.
+ * Two cases are judged 0 on purpose (conservative): a restore over a journal
+ * that names other nets drops their gates and checked heights; a restore
+ * after the node rolled back records a checked height below the stored one.
+ * Show the reason, keep the stored journal, and restore again once the tip
+ * is past the stored checked height. */
 int32_t qmb_auth_journal_advances(const char *stored_text, const char *new_text, char **out_why);
 int32_t qmb_auth_open_next(const qmb_wallet_t *w, const char *journal_text, const qmb_spend_basis_t *basis,
                            char **out_journal);

@@ -455,7 +455,8 @@ pub unsafe extern "C" fn qmb_auth_first_new(
 /// `stored_text` (`AuthJournal::advances_from`) — the check a shell that keeps
 /// the journal as text runs before it overwrites what it stored. 1: it is
 /// (an unchanged journal included); 0: it is not, `*out_why` the first rule
-/// broken; -1: a text is NULL or does not parse, `*out_why` which. A pure
+/// broken; -1: a text is NULL, over [`MAX_JOURNAL_TEXT`] or does not parse,
+/// `*out_why` which. A pure
 /// function of the two texts: no handle, no key material. `out_why` may be
 /// NULL; on 1 it is set to NULL.
 ///
@@ -467,10 +468,7 @@ pub unsafe extern "C" fn qmb_auth_journal_advances(stored_text: *const c_char, n
         *out_why = ptr::null_mut();
     }
     let parse = |p: *const c_char, which: &str| -> Result<AuthJournal, String> {
-        if p.is_null() {
-            return Err(format!("the {which} journal is NULL"));
-        }
-        let text = CStr::from_ptr(p).to_str().map_err(|_| format!("the {which} journal is not UTF-8"))?;
+        let text = text_arg(&format!("the {which} journal"), p, MAX_JOURNAL_TEXT)?;
         AuthJournal::from_text(text).map_err(|e| format!("the {which} journal does not parse: {e}"))
     };
     let (stored, new) = match (parse(stored_text, "stored"), parse(new_text, "new")) {

@@ -963,6 +963,9 @@ fn q_the_header_pins_the_open_statuses() {
         assert_eq!(qmb_auth_journal_advances(a.as_ptr(), junk.as_ptr(), &mut why), -1);
         assert!(take_str(why).contains("new journal does not parse"));
         assert_eq!(qmb_auth_journal_advances(a.as_ptr(), b.as_ptr(), ptr::null_mut()), 0, "out_why may be NULL");
+        let huge = CString::new(before.to_text() + &"#".repeat(64 * 1024)).unwrap();
+        assert_eq!(qmb_auth_journal_advances(b.as_ptr(), huge.as_ptr(), &mut why), -1);
+        assert!(take_str(why).contains("the new journal is"), "bounded before parsing");
     }
 }
 
