@@ -40,8 +40,9 @@ use qlab_wallet::Wallet;
 use rand::rngs::StdRng;
 
 use crate::annulet_send::{SendRefusal, Session};
-use crate::auth_journal::{generation_root, AuthJournal, AuthLock, GenState, Generation, JournalError, SweepGate};
+use crate::auth_journal::{generation_root, AuthJournal, AuthLock, GenState, JournalError, SweepGate};
 use crate::store::WalletDir;
+pub use crate::annulet_landed::{landed_next, restore_generations, slots_of, LandedByGeneration};
 
 /// The validity a Candidate A transaction is signed with: it may land up to
 /// this many blocks past the verified tip (design 2b §10 decided 4, Phase 4's
@@ -498,64 +499,12 @@ pub fn restore_journal(
     genesis: &[u8; 32],
     gate_tip: u64,
 ) -> Result<AuthJournal, SendRefusal> {
-    let top = owned.iter().filter_map(|n| n.generation).chain(used.keys().copied()).max();
-    let probed = crate::auth_journal::PROBE_GENERATIONS;
-    let journal = match top {
-        None => AuthJournal::fresh(generation_root(wallet, 0)),
-        Some(g_star) if g_star + 1 >= probed => {
-            return Err(JournalError::ProbeExhausted { probed }.into());
-        }
-        Some(g_star) => {
-            let gate = SweepGate { genesis: *genesis, not_before_height: gate_tip.saturating_add(MAX_AUTH_VALIDITY_BLOCKS) };
-            let mut gens = Vec::new();
-            for g in 0..=g_star {
-                let has_notes = owned.iter().any(|n| n.generation == Some(g));
-                let landed = used.get(&g);
-                if !has_notes && landed.is_none() {
-                    continue;
-                }
-                gens.push(Generation {
-                    g,
-                    next: landed.map_or(0, |slots| landed_next(wallet, g, slots)),
-                    auth_root: generation_root(wallet, g),
-                    state: if has_notes { GenState::Sweep { gates: vec![gate] } } else { GenState::Retired },
-                });
-            }
-            gens.push(Generation { g: g_star + 1, next: 0, auth_root: generation_root(wallet, g_star + 1), state: GenState::Active });
-            AuthJournal::from_generations(gens)?
-        }
-    };
+    let journal = restore_generations(wallet, owned, used, genesis, gate_tip)?;
     journal.save(&w.dir)?;
     let _ = lock;
     Ok(journal)
 }
 
-/// The cursor position above every leaf of generation `g` that this
-/// wallet's **landed** spends used: `max(position) + 1` over the real slots
-/// (a slot whose descriptor leaf is the generation tree's leaf at its index;
-/// dummies live in their own throwaway trees), or 0 if none. The cursor is a
-/// private permutation, so this is a position, not a leaf index.
-pub fn landed_next(wallet: &Wallet, g: u32, landed_slots: &[(u32, [u8; 32])]) -> u32 {
-    use qlab_remote_auth::annulet::{auth_master, AuthTree, Cursor};
-    let master = auth_master(&wallet.auth_secret(), g);
-    let tree = AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth");
-    let mine: Vec<u32> = landed_slots
-        .iter()
-        .filter(|(index, leaf)| (*index as usize) < (1usize << D_AUTH) && tree.leaf(*index) == *leaf)
-        .map(|(index, _)| *index)
-        .collect();
-    if mine.is_empty() {
-        return 0;
-    }
-    // Walk the permutation until every landed leaf has been drawn.
-    let mut cursor = Cursor::new(&master, D_AUTH, 0).expect("position 0");
-    let mut left: std::collections::BTreeSet<u32> = mine.into_iter().collect();
-    while !left.is_empty() {
-        let index = cursor.take().expect("every leaf index is in the permutation");
-        left.remove(&index);
-    }
-    cursor.next()
-}
 
 /// The root of generation `g` for `wallet` — re-exported for the CLI.
 pub fn root_of(wallet: &Wallet, g: u32) -> [u64; 4] {
@@ -682,42 +631,21 @@ pub fn verified_body<E: Endpoint>(session: &Session<E>, height: u64) -> Result<q
     bind_body(&header, session.chain.genesis.l2_auth, height, &bytes)
 }
 
-/// [`verified_body`]'s binding of served `bytes` to the verified `header`:
-/// the chain's frame, the header itself, the counts (before the commitment's
-/// byte asserts), then the recomputed `tx_body_commitment`.
+/// [`verified_body`]'s binding of served `bytes` to the verified `header`
+/// ([`crate::annulet_landed::bind_body`], refusals in this module's terms).
 pub fn bind_body(
     header: &qlab_devnet::header::BlockHeader,
     l2_auth: qlab_devnet::forms::L2AuthForm,
     height: u64,
     bytes: &[u8],
 ) -> Result<qlab_devnet::body::BlockBody, SendRefusal> {
-    let wire = qlab_p2p::compact::WireForm {
-        form: qlab_devnet::forms::GenesisForm::Annulet,
-        sections: qlab_devnet::forms::BodySections::None,
-        l2_auth,
-    };
-    let ann = qlab_p2p::served::decode_body_answer(wire, height, bytes)
-        .map_err(|e| SendRefusal::Auth(format!("block {height}'s body does not decode: {e}")))?;
-    if ann.header != *header {
-        return Err(SendRefusal::Auth(format!("block {height}'s served header is not the verified one")));
-    }
-    let body = qlab_p2p::served::body_of(&ann);
-    crate::annulet_verify::check_body_counts(height, &body).map_err(SendRefusal::Verify)?;
-    if qlab_devnet::annulet::body_commitment_annulet_for(&body, l2_auth) != header.tx_body_commitment {
-        return Err(SendRefusal::Auth(format!("block {height}'s body is not the one its verified header commits to")));
-    }
-    Ok(body)
+    use crate::annulet_landed::BodyRefusal;
+    crate::annulet_landed::bind_body(header, l2_auth, height, bytes).map_err(|e| match e {
+        BodyRefusal::Counts(v) => SendRefusal::Verify(v),
+        other => SendRefusal::Auth(format!("block {height}'s body {other}")),
+    })
 }
 
-/// Every slot `(leaf_index, leaf)` of a transaction's auth section, or
-/// `None` when it carries no readable one.
-fn slots_of(tx: &qlab_devnet::body::TxEntry) -> Option<Vec<(u32, [u8; 32])>> {
-    use qlab_devnet::annulet::L2Surface;
-    use qlab_remote_auth::annulet::AnnuletAuthSection;
-    let Ok(Some(surface)) = L2Surface::decode(&tx.l2) else { return None };
-    let section = AnnuletAuthSection::decode(qlab_devnet::annulet::auth_shape(surface.shape), &tx.auth).ok()?;
-    Some(section.slots.iter().map(|s| (s.descriptor.leaf_index(), s.descriptor.leaf())).collect())
-}
 
 /// The `(leaf_index, leaf)` of every slot of every landed transaction that
 /// spent one of `spent` (a generation's spent notes with their heights),
@@ -748,8 +676,6 @@ pub fn landed_slots<E: Endpoint>(
     Ok(out)
 }
 
-/// A wallet's landed slots `(leaf_index, leaf)` per generation.
-pub type LandedByGeneration = std::collections::BTreeMap<u32, Vec<(u32, [u8; 32])>>;
 
 /// The probe generations (`0 .. PROBE_GENERATIONS`) whose leaves appear in
 /// any landed transaction on the verified chain, each with the slots that

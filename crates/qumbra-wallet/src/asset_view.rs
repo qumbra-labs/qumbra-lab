@@ -495,6 +495,34 @@ fn mode_of(leaf: &RegistryLeaf) -> AssetMode {
     }
 }
 
+/// **How an asset is named and scaled** (D1/D2): asset 0 is the fee unit;
+/// a listed asset keeps its name and decimals only while its leaf — bound to
+/// the verified tip — carries the listed issuer key; otherwise the name is
+/// withheld and the amount is raw base units. `listed` is this network's
+/// list entry, if any. The one rule the view and the spend review
+/// (`qumbra-ffi`, lab #924) both render by.
+pub fn label_of(asset: u16, listed: Option<&ListedAsset>, bound: Option<&RegistryLeaf>) -> (AssetLabel, u32, String) {
+    match (asset, listed) {
+        (0, _) => (AssetLabel::FeeUnit, 0, "fee units".to_string()),
+        (_, Some(e)) if bound.is_some_and(|leaf| leaf.issuer_key == e.issuer_key) => (
+            AssetLabel::Listed { name: e.name.clone(), ticker: e.ticker.clone() },
+            e.decimals,
+            e.ticker.clone(),
+        ),
+        (_, Some(e)) if bound.is_some() => (
+            AssetLabel::IssuerChanged { listed_ticker: e.ticker.clone() },
+            0,
+            format!("base units of QIA #{asset}"),
+        ),
+        (_, Some(e)) => (
+            AssetLabel::Unconfirmed { listed_ticker: e.ticker.clone() },
+            0,
+            format!("base units of QIA #{asset}"),
+        ),
+        (_, None) => (AssetLabel::Unlisted, 0, format!("base units of QIA #{asset}")),
+    }
+}
+
 /// **Build the view** from a verified scan: open each held asset's leaf at the
 /// verified tip, label it from `list` (if it is this network's), check
 /// `freeze_lists` (keys per asset, used only when their root is the leaf's),
@@ -578,25 +606,7 @@ pub fn asset_view_from(
                 // Test money is the network's property: every row under a
                 // testnet list carries it, listed or not.
                 let testnet = list.is_some_and(|l| l.testnet);
-                let (label, decimals, unit) = match (asset, listed) {
-                    (0, _) => (AssetLabel::FeeUnit, 0, "fee units".to_string()),
-                    (_, Some(e)) if bound.is_some_and(|leaf| leaf.issuer_key == e.issuer_key) => (
-                        AssetLabel::Listed { name: e.name.clone(), ticker: e.ticker.clone() },
-                        e.decimals,
-                        e.ticker.clone(),
-                    ),
-                    (_, Some(e)) if bound.is_some() => (
-                        AssetLabel::IssuerChanged { listed_ticker: e.ticker.clone() },
-                        0,
-                        format!("base units of QIA #{asset}"),
-                    ),
-                    (_, Some(e)) => (
-                        AssetLabel::Unconfirmed { listed_ticker: e.ticker.clone() },
-                        0,
-                        format!("base units of QIA #{asset}"),
-                    ),
-                    (_, None) => (AssetLabel::Unlisted, 0, format!("base units of QIA #{asset}")),
-                };
+                let (label, decimals, unit) = label_of(asset, listed, bound);
                 let mode = match (asset, bound) {
                     (0, _) => AssetMode::Cloaked,
                     (_, Some(leaf)) => mode_of(leaf),

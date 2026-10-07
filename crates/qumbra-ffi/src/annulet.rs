@@ -517,7 +517,7 @@ impl AnnuletState {
         let json = view_json(&self.endpoint, &view, v.body_cost(), self.list_source_commit.as_deref());
         self.view = Some(json.to_string());
         self.record = v.record_to_write().map(|headers| encode_chain_cache(&v.chain().genesis.hash, headers));
-        self.basis = crate::spend_v2::SpendBasis::of(v);
+        self.basis = crate::spend_v2::SpendBasis::of(v, self.list.as_ref());
         self.phase = Phase::Done;
     }
 }

@@ -709,6 +709,10 @@ void qmb_annulet_free(qmb_annulet_t *s);
 typedef struct qmb_spend_basis_t qmb_spend_basis_t;
 qmb_spend_basis_t *qmb_annulet_take_basis(qmb_annulet_t *s);
 void qmb_spend_basis_free(qmb_spend_basis_t *b);
+/* Lab #924 PR 3b: the basis as JSON {genesis, tip, gate_tip, spends_verified,
+ * owned: [{asset, value, div_index, height, tx_index, cm, generation}]} —
+ * generation null for a v1 note. No key material. Free with qmb_string_free. */
+char *qmb_spend_basis_summary(const qmb_spend_basis_t *b);
 
 /* ---------------------------------------------------------------------------
  * Candidate A spends (lab #924 PR 3, the 4b kernel): the device half of a
@@ -716,7 +720,7 @@ void qmb_spend_basis_free(qmb_spend_basis_t *b);
  * proved by the prover service, which can add a proof and nothing else.
  *
  * Order (each step refused by name):
- *   a = qmb_auth_open(w, journal_text)       the auth.v1 text the shell stores
+ *   a = (the checked open below; PR 3b)       the auth.v1 text the shell stores
  *   s = qmb_spend_v2_new(basis, to, asset, amount, valid_for, seed32,
  *                        dummy_entropy64)     basis consumed; entropy from
  *                                             crypto.getRandomValues; valid_for
@@ -737,16 +741,78 @@ void qmb_spend_basis_free(qmb_spend_basis_t *b);
  * qmb_string_free. A plan of several steps (fee splits, merges) is one
  * transaction per spend handle: wait for it to land, rescan, start again.
  *
- * The HOST is trusted for the journal's freshness (pilot scope): passing an
- * older auth.v1 text to qmb_auth_open (a restored backup, a stale copy)
- * makes the kernel re-take leaves already spent, which it cannot see. Always
- * pass the text last persisted. (Lab #924 PR 3b's restore adds a check
- * against the chain's landed slots at open.)
+ * The open-time check (below) refuses or replaces a journal older than the
+ * chain's landed leaves; what it cannot see is stated there.
  * ------------------------------------------------------------------------- */
 typedef struct qmb_auth_t qmb_auth_t;
 typedef struct qmb_spend_v2_t qmb_spend_v2_t;
 
-qmb_auth_t *qmb_auth_open(const qmb_wallet_t *w, const char *journal_text, char **err_out);
+/* Lab #924 PR 3b: keys only through the open-time check — no unchecked open.
+ * c = qmb_auth_check_new(w, journal_text, basis, generation)  the journal's
+ *     generation, checked against the chain (basis is read, not consumed)
+ * c = qmb_auth_restore_new(w, basis)    no journal: an imported or lost seed
+ * c = qmb_auth_first_new(w, basis)      no journal EVER persisted for this
+ *     account (see below); refused if any leaf of the seed has landed
+ *     (restore and first have no journal to name generations: build their
+ *     basis from a scan over the probe generations 0..8, so a note paid to
+ *     a later generation is seen; the check walks the same 8 trees)
+ * loop qmb_auth_check_step(c, &out): 1 NEED -> GET *out (a block body), then
+ *      qmb_auth_check_supply / _supply_err;  0 READY;  -2 REFUSED (*out why)
+ * a = qmb_auth_check_finish(w, c, &journal, &status, &err)  PERSIST *journal
+ *     status: QMB_AUTH_CHECKED; _JOURNAL_STALE (NULL keys: the journal is
+ *     older than the chain — persist the returned journal (its cursor raised
+ *     above the landed leaves), TELL THE USER, then run qmb_auth_restore_new);
+ *     _SWEEP_FLOOR_RAISED; _RESTORED; _SWEEP_WAITING (NULL keys); _FIRST.
+ * A journal checked past the verified tip (a node rolled back, an edited
+ * backup) is walked again from height 1.
+ *
+ * A generation never dies for RECEIVING: the host must scan EVERY generation
+ * of the journal (active, sweep and retired — pass them to
+ * qmb_annulet_new_v2), not only [0]. A sweep-only generation may be swept
+ * indefinitely once past its gate, notes arrived after the rotation
+ * included. A RETIRED generation that holds a note again is opened with
+ * qmb_auth_check_new(…, g): finish revives it — sweep-only with a NEW gate
+ * (gate_tip + 1152) — and returns QMB_AUTH_SWEEP_WAITING with the journal to
+ * persist. A retired generation holding nothing is refused.
+ * "Landed" is judged from verified bodies, each bound to its verified header,
+ * never from a node's nullifier list. Undetectable, inherently: a journal
+ * older than leaves signed but not landed (in flight or expired) takes those
+ * leaves again — a DOUBLE USE of a leaf (linkable; not a funds risk).
+ *
+ * first: ONLY for an account whose host has never persisted an auth.v1 for
+ * it. If a journal ever existed — even one deleted since — use restore. The
+ * residual risk is the CLI's: a signature exported elsewhere that never
+ * landed; for an account created under a receive-only kernel, no device
+ * could sign.
+ *
+ * qmb_wallet_new_fresh() draws the seed IN THE KERNEL (getrandom; under wasm
+ * crypto.getRandomValues) — the one exception to "the platform sources all
+ * entropy" — so the handle can attest its birth (in memory only, never
+ * serialized). qmb_auth_first_fresh(w, &journal) then gives generation 0
+ * offline, ONCE per handle (the mark is consumed); any handle from
+ * _from_entropy / _restore / _from_parts is refused by name. Persist the seed with
+ * qmb_wallet_seed_version and qmb_wallet_seed_entropy, as for any wallet. */
+#define QMB_AUTH_CHECKED 0
+#define QMB_AUTH_JOURNAL_STALE 1
+#define QMB_AUTH_SWEEP_FLOOR_RAISED 2
+#define QMB_AUTH_RESTORED 3
+#define QMB_AUTH_SWEEP_WAITING 4
+#define QMB_AUTH_FIRST 5
+typedef struct qmb_auth_check_t qmb_auth_check_t;
+qmb_wallet_t *qmb_wallet_new_fresh(void);
+qmb_auth_check_t *qmb_auth_check_new(const qmb_wallet_t *w, const char *journal_text, const qmb_spend_basis_t *basis,
+                                     uint32_t generation, char **err_out);
+qmb_auth_check_t *qmb_auth_restore_new(const qmb_wallet_t *w, const qmb_spend_basis_t *basis, char **err_out);
+qmb_auth_check_t *qmb_auth_first_new(const qmb_wallet_t *w, const qmb_spend_basis_t *basis, char **err_out);
+int32_t qmb_auth_check_step(qmb_auth_check_t *c, char **out);
+void qmb_auth_check_supply(qmb_auth_check_t *c, const uint8_t *body, size_t len);
+void qmb_auth_check_supply_err(qmb_auth_check_t *c, const char *reason);
+qmb_auth_t *qmb_auth_check_finish(const qmb_wallet_t *w, qmb_auth_check_t *c, char **out_journal, int32_t *out_status,
+                                  char **err_out);
+void qmb_auth_check_free(qmb_auth_check_t *c);
+int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, char **out_journal);
+int32_t qmb_auth_open_next(const qmb_wallet_t *w, const char *journal_text, const qmb_spend_basis_t *basis,
+                           char **out_journal);
 char *qmb_auth_journal(const qmb_auth_t *a);
 void qmb_auth_free(qmb_auth_t *a);
 

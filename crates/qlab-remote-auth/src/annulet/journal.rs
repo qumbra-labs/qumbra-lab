@@ -37,11 +37,21 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::Hash32;
+
 /// The journal file in the wallet directory.
 pub const AUTH_FILE: &str = "auth.v1";
 /// The lock file every take holds.
 pub const AUTH_LOCK_FILE: &str = "auth.lock";
 const AUTH_HEADER: &str = "qumbra-wallet auth v1";
+/// Lab #924 PR 3b: a journal that records how far each generation's landed
+/// leaves were checked, per net (`checked <g> <genesis>:<height>` lines).
+/// Written only when it has such a line, so a journal without one is the v1
+/// text byte for byte; both are read.
+const AUTH_HEADER_V2: &str = "qumbra-wallet auth v2";
+/// Generations a journal may name: `0 .. 2^16` (lab #924 PR 3b). Far past
+/// any wallet's; it keeps `max + 1` from wrapping.
+pub const MAX_GENERATIONS: u32 = 1 << 16;
 
 /// How many generations a wallet with no journal (restored, or new to
 /// Candidate A) tries when it scans (§9: "scan generations 0, 1, …"). Each
@@ -188,17 +198,24 @@ impl AuthLock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthJournal {
     gens: Vec<Generation>,
+    /// Lab #924 PR 3b: `(generation, genesis) → height` up to which the
+    /// generation's landed leaves on that net were matched against its tree
+    /// (the open-time `landed_next` check). Absent = 0.
+    checked: std::collections::BTreeMap<(u32, Hash32), u64>,
 }
 
 impl AuthJournal {
     /// A fresh wallet's journal: generation 0 active at position 0.
     pub fn fresh(auth_root_0: [u64; 4]) -> Self {
-        AuthJournal { gens: vec![Generation { g: 0, next: 0, auth_root: auth_root_0, state: GenState::Active }] }
+        AuthJournal {
+            gens: vec![Generation { g: 0, next: 0, auth_root: auth_root_0, state: GenState::Active }],
+            checked: Default::default(),
+        }
     }
 
     /// A journal from explicit records (restore). Checked like a loaded one.
     pub fn from_generations(gens: Vec<Generation>) -> Result<Self, JournalError> {
-        let j = AuthJournal { gens };
+        let j = AuthJournal { gens, checked: Default::default() };
         j.check()?;
         Ok(j)
     }
@@ -248,6 +265,19 @@ impl AuthJournal {
         self.save(dir)
     }
 
+    /// Lab #924 PR 3b: a **retired** generation that receives a note again
+    /// (an address of it was published and is still paid) becomes sweep-only
+    /// with `gate` — a new gate, since only now is there something to move.
+    /// A generation never dies for receiving: it may always be swept out.
+    pub fn revive_mem(&mut self, g: u32, gate: SweepGate) -> Result<(), JournalError> {
+        let r = self.get_mut(g)?;
+        if r.state != GenState::Retired {
+            return Err(JournalError::Malformed(format!("generation {g} is not retired")));
+        }
+        r.state = GenState::Sweep { gates: vec![gate] };
+        Ok(())
+    }
+
     /// [`Self::retire`] in memory.
     pub fn retire_mem(&mut self, g: u32) -> Result<(), JournalError> {
         let r = self.get_mut(g)?;
@@ -261,21 +291,29 @@ impl AuthJournal {
     /// Open the next generation as the active one, the previous active one
     /// becoming sweep-only with a gate at `gate` (a migration), and persist.
     pub fn open_next(&mut self, _lock: &AuthLock, dir: &Path, auth_root: [u64; 4], gate: SweepGate) -> Result<u32, JournalError> {
-        let g = self.open_next_mem(auth_root, gate);
+        let g = self.open_next_mem(auth_root, gate)?;
         self.save(dir)?;
         Ok(g)
     }
 
     /// [`Self::open_next`] in memory.
-    pub fn open_next_mem(&mut self, auth_root: [u64; 4], gate: SweepGate) -> u32 {
-        let g = self.gens.iter().map(|r| r.g).max().expect("checked: non-empty") + 1;
+    pub fn open_next_mem(&mut self, auth_root: [u64; 4], gate: SweepGate) -> Result<u32, JournalError> {
+        let g = self
+            .gens
+            .iter()
+            .map(|r| r.g)
+            .max()
+            .expect("checked: non-empty")
+            .checked_add(1)
+            .filter(|g| *g < MAX_GENERATIONS)
+            .ok_or_else(|| JournalError::Malformed(format!("no generation past {}", MAX_GENERATIONS - 1)))?;
         for r in &mut self.gens {
             if r.state == GenState::Active {
                 r.state = GenState::Sweep { gates: vec![gate] };
             }
         }
         self.gens.push(Generation { g, next: 0, auth_root, state: GenState::Active });
-        g
+        Ok(g)
     }
 
     /// Record a sweep gate for generation `g` on `gate.genesis`'s net —
@@ -339,6 +377,26 @@ impl AuthJournal {
         Ok(())
     }
 
+    /// How far generation `g`'s landed leaves on the net `genesis` have been
+    /// checked (0: never).
+    pub fn checked_to(&self, g: u32, genesis: &Hash32) -> u64 {
+        self.checked.get(&(g, *genesis)).copied().unwrap_or(0)
+    }
+
+    /// Record that generation `g`'s landed leaves on `genesis` are checked
+    /// through `height`. Never moves back (a lower height is kept as is).
+    pub fn set_checked_mem(&mut self, g: u32, genesis: &Hash32, height: u64) -> Result<(), JournalError> {
+        self.get(g)?;
+        if height == 0 {
+            // Checked through the genesis: nothing to record (absent = 0), so
+            // a journal checked on an empty chain stays the v1 text.
+            return Ok(());
+        }
+        let e = self.checked.entry((g, *genesis)).or_insert(0);
+        *e = (*e).max(height);
+        Ok(())
+    }
+
     /// The `auth.v1` text, exactly as [`Self::save`] writes it — what a shell
     /// that keeps no files (the browser extension) stores under its own lock.
     pub fn to_text(&self) -> String {
@@ -351,7 +409,8 @@ impl AuthJournal {
     }
 
     fn render(&self) -> String {
-        let mut out = format!("{AUTH_HEADER}\n");
+        let header = if self.checked.is_empty() { AUTH_HEADER } else { AUTH_HEADER_V2 };
+        let mut out = format!("{header}\n");
         for r in &self.gens {
             let root: String = r.auth_root.iter().map(|w| format!("{w:016x}")).collect();
             let state = match &r.state {
@@ -367,17 +426,43 @@ impl AuthJournal {
             };
             out.push_str(&format!("{} {} {root} {state}\n", r.g, r.next));
         }
+        for ((g, genesis), h) in &self.checked {
+            out.push_str(&format!("checked {g} {}:{h}\n", genesis.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        }
         out
     }
 
     fn parse(text: &str) -> Result<Self, JournalError> {
         let bad = |why: String| JournalError::Malformed(why);
         let mut lines = text.lines();
-        if lines.next() != Some(AUTH_HEADER) {
-            return Err(bad(format!("the first line is not `{AUTH_HEADER}`")));
-        }
+        let v2 = match lines.next() {
+            Some(AUTH_HEADER) => false,
+            Some(AUTH_HEADER_V2) => true,
+            _ => return Err(bad(format!("the first line is neither `{AUTH_HEADER}` nor `{AUTH_HEADER_V2}`"))),
+        };
         let mut gens = Vec::new();
+        let mut checked = std::collections::BTreeMap::new();
         for (i, line) in lines.enumerate() {
+            if let Some(rest) = line.strip_prefix("checked ") {
+                if !v2 {
+                    return Err(bad(format!("record {i}: a `checked` line in a v1 journal")));
+                }
+                let (g, at) = rest.split_once(' ').ok_or_else(|| bad(format!("record {i}: `checked g genesis:height`")))?;
+                let (hash, h) = at.split_once(':').ok_or_else(|| bad(format!("record {i}: `checked g genesis:height`")))?;
+                // Canonical only: digits, lowercase hex — the text re-renders
+                // byte for byte or it does not load.
+                let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
+                let genesis = hex32(hash).ok_or_else(|| bad(format!("record {i}: the genesis is not 64 lowercase hex digits")))?;
+                if !digits(g) || !digits(h) {
+                    return Err(bad(format!("record {i}: `checked {g} …:{h}` is not canonical decimal")));
+                }
+                let g: u32 = g.parse().map_err(|_| bad(format!("record {i}: `{g}` is not a generation")))?;
+                let h: u64 = h.parse().map_err(|_| bad(format!("record {i}: `{h}` is not a height")))?;
+                if checked.insert((g, genesis), h).is_some() {
+                    return Err(bad(format!("record {i}: generation {g} checked twice on one net")));
+                }
+                continue;
+            }
             let f: Vec<&str> = line.split(' ').collect();
             let num = |s: &str| s.parse::<u64>().map_err(|_| bad(format!("record {i}: `{s}` is not a number")));
             let (g, next, root, state) = match f.as_slice() {
@@ -413,7 +498,15 @@ impl AuthJournal {
             let next = u32::try_from(next).map_err(|_| bad(format!("record {i}: position out of range")))?;
             gens.push(Generation { g, next, auth_root, state });
         }
-        Self::from_generations(gens)
+        let mut j = Self::from_generations(gens)?;
+        if let Some((g, _)) = checked.keys().find(|(g, _)| j.get(*g).is_err()) {
+            return Err(bad(format!("a `checked` line names generation {g}, which has no record")));
+        }
+        if v2 && checked.is_empty() {
+            return Err(bad("a v2 journal with no `checked` line (a writer emits v1 then)".into()));
+        }
+        j.checked = checked;
+        Ok(j)
     }
 
     fn check(&self) -> Result<(), JournalError> {
@@ -423,6 +516,9 @@ impl AuthJournal {
         }
         let mut seen = std::collections::BTreeSet::new();
         for r in &self.gens {
+            if r.g >= MAX_GENERATIONS {
+                return Err(JournalError::Malformed(format!("generation {} is past {}", r.g, MAX_GENERATIONS - 1)));
+            }
             if !seen.insert(r.g) {
                 return Err(JournalError::Malformed(format!("generation {} appears twice", r.g)));
             }
@@ -431,9 +527,56 @@ impl AuthJournal {
     }
 }
 
+fn hex32(s: &str) -> Option<Hash32> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (k, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * k..2 * k + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #924 PR 3b: a journal with no `checked` line is the v1 text byte
+    /// for byte; one with lines is v2 and round-trips; the parser refuses a
+    /// `checked` line in v1, an unknown generation, a duplicate, and an
+    /// empty v2.
+    #[test]
+    fn the_checked_lines_are_v2_and_v1_stays_byte_identical() {
+        let net = [0x33; 32];
+        let mut j = AuthJournal::fresh([1, 2, 3, 4]);
+        let v1 = j.to_text();
+        assert!(v1.starts_with("qumbra-wallet auth v1\n"));
+        assert_eq!(AuthJournal::from_text(&v1).unwrap(), j);
+        assert_eq!(j.checked_to(0, &net), 0);
+        j.set_checked_mem(0, &net, 40).unwrap();
+        j.set_checked_mem(0, &net, 30).unwrap();
+        assert_eq!(j.checked_to(0, &net), 40, "never moves back");
+        assert!(j.set_checked_mem(5, &net, 1).is_err(), "no such generation");
+        let v2 = j.to_text();
+        assert!(v2.starts_with("qumbra-wallet auth v2\n") && v2.ends_with(&format!("checked 0 {}:40\n", "33".repeat(32))), "{v2}");
+        assert_eq!(AuthJournal::from_text(&v2).unwrap(), j);
+        let bad = [
+            v1.clone() + &format!("checked 0 {}:1\n", "33".repeat(32)),
+            v2.replace("checked 0 ", "checked 7 "),
+            v2.clone() + &format!("checked 0 {}:9\n", "33".repeat(32)),
+            v1.replacen("auth v1", "auth v2", 1),
+            v2.replace(":40", ":x"),
+            v2.replace(":40", ":+40"),
+            v2.replace(":40", ":040"),
+            v2.replace("checked 0 ", "checked +0 "),
+            v2.replace(&"33".repeat(32), &"3A".repeat(32)),
+            v1.replacen("\n0 0 ", "\n65536 0 ", 1),
+        ];
+        for text in bad {
+            assert!(AuthJournal::from_text(&text).is_err(), "{text}");
+        }
+    }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("qumbra-auth-journal-{tag}-{}", std::process::id()));

@@ -65,6 +65,12 @@ pub struct WalletState {
     /// authorization-tree root, built once per handle — a build is 4,096
     /// ML-DSA-44 key generations, seconds under wasm.
     roots: std::sync::Mutex<std::collections::BTreeMap<u32, [u64; 4]>>,
+    /// Lab #924 PR 3b: this handle's seed was drawn **here**, by
+    /// [`qmb_wallet_new_fresh`] — so it cannot have signed anywhere. Lives
+    /// only in this in-memory handle and is never serialized: a seed reopened
+    /// (`qmb_wallet_from_parts`), restored or passed in (`_from_entropy`) never
+    /// carries it. `qmb_auth_first_fresh` accepts only such a handle.
+    pub(crate) born_here: std::sync::atomic::AtomicBool,
 }
 
 impl WalletState {
@@ -80,7 +86,7 @@ const HD_ACCOUNT: u32 = 0;
 
 fn into_handle(seed: MasterSeed) -> *mut WalletState {
     let wallet = Wallet::from_master_seed(&seed, HD_ACCOUNT);
-    Box::into_raw(Box::new(WalletState { seed, wallet, roots: Default::default() }))
+    Box::into_raw(Box::new(WalletState { seed, wallet, roots: Default::default(), born_here: Default::default() }))
 }
 
 fn out_string(s: String) -> *mut c_char {
@@ -107,6 +113,29 @@ pub unsafe extern "C" fn qmb_wallet_from_entropy(entropy32: *const u8) -> *mut W
     let mut entropy = [0u8; ENTROPY_LEN];
     entropy.copy_from_slice(std::slice::from_raw_parts(entropy32, ENTROPY_LEN));
     into_handle(MasterSeed::from_entropy(entropy))
+}
+
+/// **A new wallet whose seed this kernel draws** (lab #924 PR 3b): 32 bytes
+/// from the OS CSPRNG (`getrandom`; under wasm the browser's
+/// `crypto.getRandomValues`, as the host's own draw would be). The one
+/// exception to "the platform sources all entropy" — it exists so the
+/// handle can attest its own birth: it carries a mark, in memory only, that
+/// lets `qmb_auth_first_fresh` give it generation 0 without reading the
+/// chain (a seed born here has signed nowhere). Persist the seed as for any
+/// wallet, with `qmb_wallet_seed_version` / `qmb_wallet_seed_entropy` (and
+/// back it up with `qmb_wallet_reveal_mnemonic`); the kernel keeps nothing.
+/// NULL if the OS RNG fails.
+#[no_mangle]
+pub extern "C" fn qmb_wallet_new_fresh() -> *mut WalletState {
+    use rand::TryRng;
+    let mut entropy = [0u8; ENTROPY_LEN];
+    if rand::rngs::SysRng.try_fill_bytes(&mut entropy).is_err() {
+        return ptr::null_mut();
+    }
+    let h = into_handle(MasterSeed::from_entropy(entropy));
+    // SAFETY: `into_handle` returned a live, uniquely owned handle.
+    unsafe { (*h).born_here.store(true, std::sync::atomic::Ordering::Release) };
+    h
 }
 
 /// Restore from a Qumbra mnemonic. NULL + `err_out` on refusal — and the
@@ -3004,9 +3033,9 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 10] = [
+                const TYPES: [&str; 11] = [
                     "qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t", "qmb_pair_t", "qmb_annulet_t",
-                    "qmb_spend_basis_t", "qmb_auth_t", "qmb_spend_v2_t",
+                    "qmb_spend_basis_t", "qmb_auth_t", "qmb_spend_v2_t", "qmb_auth_check_t",
                 ];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
