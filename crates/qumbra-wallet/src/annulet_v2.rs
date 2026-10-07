@@ -75,11 +75,7 @@ pub fn check_validity(validity: u64) -> Result<(), SendRefusal> {
     Ok(())
 }
 
-/// The leaves an ordinary send must leave unconsumed in its generation:
-/// one per spendable note plus two, so the generation can always still be
-/// swept. A hard floor ahead of Phase 4's reserve (`2 × unspent + 16`,
-/// design 2b §9), which replaces it.
-pub const SWEEP_FLOOR_EXTRA: u32 = 2;
+pub use crate::annulet_plan::SWEEP_FLOOR_EXTRA;
 
 /// A refusal of the Candidate A layer, folded into [`SendRefusal`].
 impl From<JournalError> for SendRefusal {
@@ -236,18 +232,7 @@ impl AuthRun {
     }
 }
 
-/// A real input: `note` (this wallet's, generation `g`) with the leaf `path`.
-pub fn real_input(wallet: &Wallet, note: &OwnedL2Note, path: L2AuthPath) -> L2AuthInput {
-    L2AuthInput {
-        nk: wallet.nk(),
-        value: note.note.value,
-        asset: note.note.asset,
-        rho: note.note.rho,
-        rseed: note.note.rseed,
-        d: wallet.diversifier_at_index(note.div_index).lanes(),
-        auth: path,
-    }
-}
+pub use crate::annulet_plan::real_input;
 
 /// This wallet's change recipient on a Candidate A net: address 0 of the
 /// active generation.
@@ -268,19 +253,7 @@ pub fn one_generation(notes: &[&OwnedL2Note], g: u32) -> Result<(), SendRefusal>
     }
 }
 
-/// The real slots — leaves — a plan takes: a fee split 1, a merge 3, a
-/// payment 1, 2 or 3 by its inputs and fee note.
-pub fn plan_slots(plan: &crate::annulet_send::SendPlan) -> u32 {
-    use crate::annulet_send::StepKind;
-    plan.steps
-        .iter()
-        .map(|s| match &s.kind {
-            StepKind::FeeSplit { .. } => 1,
-            StepKind::Merge { .. } => 3,
-            StepKind::Pay { inputs, fee } => inputs.len() as u32 + u32::from(fee.is_some()),
-        })
-        .sum()
-}
+pub use crate::annulet_plan::plan_slots;
 
 /// The shape-S / shape-P transaction a v1 call made, in v2 terms: which
 /// slots are real inputs (all of the run's generation) and what slot 3 is.

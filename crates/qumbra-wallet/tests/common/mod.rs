@@ -185,6 +185,9 @@ pub struct Endpoint {
     /// What `/v1/compact`, `/full` and (for `ForgedNote`) `/body` serve.
     pub served: DiscoveryView,
     pub lie: Lie,
+    /// Lab #924: the commitment tree's leaves in order — the genesis notes,
+    /// then each honest body's output commitments — for `/v1/tree/leaves`.
+    pub leaves: Vec<[u8; 32]>,
 }
 
 impl Endpoint {
@@ -195,7 +198,13 @@ impl Endpoint {
             (_, Some(f)) => view_of(&store(&file, f)),
             (_, None) => view.clone(),
         };
-        Endpoint { wire: wire_of(&file), file, view, served, lie }
+        let leaves = file
+            .genesis_notes
+            .iter()
+            .map(|r| r.cm)
+            .chain(honest.iter().flat_map(|b| b.txs.iter().flat_map(|t| t.public.commitments.iter().copied())))
+            .collect();
+        Endpoint { wire: wire_of(&file), file, view, served, lie, leaves }
     }
 
     pub fn fetch(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -245,6 +254,10 @@ impl Endpoint {
                 fee_tier_r: self.file.params.fee_tier_r,
             })),
             "/v1/compact" => respond(&self.served, query).map_err(err),
+            "/v1/tree/leaves" => {
+                let from: u64 = query.strip_prefix("from=").and_then(|f| f.parse().ok()).ok_or("400 from")?;
+                Ok(qlab_node::TreeLeaves::page(&self.leaves, from).to_bytes())
+            }
             "/v1/nullifiers" if self.lie == Lie::NoNullifiers => Err("503 unavailable: state lag".into()),
             "/v1/nullifiers" => respond_nullifiers(&self.view, query).map_err(err),
             "/v1/registry/root" => {

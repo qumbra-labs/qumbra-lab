@@ -409,3 +409,28 @@ fn a_non_empty_dummy_slot_is_refused_by_name() {
         }
     );
 }
+
+/// Lab #924: the device half's shape constants come from `qlab-air` (no
+/// prover in its graph); they are the prover's own.
+#[test]
+fn the_device_half_s_shape_constants_are_the_prover_s() {
+    for (tag, shape) in [
+        (L2ShapeTag::S, qlab_l2::Shape::S),
+        (L2ShapeTag::P, qlab_l2::Shape::P),
+        (L2ShapeTag::R, qlab_l2::Shape::R),
+    ] {
+        assert_eq!(
+            log_height_v2(tag),
+            qlab_l2::v2::log_height(shape),
+            "{tag:?}"
+        );
+        for k in 0..qlab_l2::v2::auth_slots(shape) {
+            assert_eq!(
+                pv_leaf_v2(tag, k),
+                qlab_l2::v2::pv_leaf(shape, k),
+                "{tag:?} slot {k}"
+            );
+        }
+    }
+    const { assert!(crate::PROVER_LINKED) };
+}

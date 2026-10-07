@@ -25,6 +25,7 @@ pub mod ledger_blob;
 pub mod names;
 pub mod pairing;
 pub mod report;
+pub mod spend_v2;
 // MERGED INERT (lab #568 step 2): the resume artifact's codec and its tests.
 // Nothing consumes it yet — the `qmb_scan_*` resume arguments are step 3, and
 // they remove this attribute. Landing the codec alone is deliberate, the shape
@@ -2976,7 +2977,7 @@ mod tests {
     #[test]
     fn the_header_names_every_exported_function_and_nothing_else() {
         let header = include_str!("../include/qumbra_ffi.h");
-        let src = concat!(include_str!("lib.rs"), include_str!("names.rs"), include_str!("annulet.rs"));
+        let src = concat!(include_str!("lib.rs"), include_str!("names.rs"), include_str!("annulet.rs"), include_str!("spend_v2.rs"));
         let exported: Vec<&str> = src
             .lines()
             .filter_map(|l| {
@@ -3003,7 +3004,10 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 7] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t", "qmb_pair_t", "qmb_annulet_t"];
+                const TYPES: [&str; 10] = [
+                    "qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t", "qmb_pair_t", "qmb_annulet_t",
+                    "qmb_spend_basis_t", "qmb_auth_t", "qmb_spend_v2_t",
+                ];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"

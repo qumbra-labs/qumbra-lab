@@ -224,6 +224,13 @@ impl AuthJournal {
     /// it — the fail-closed step, run **before** the taken leaf signs
     /// anything. Requires the lock; never moves a cursor backwards.
     pub fn advance(&mut self, _lock: &AuthLock, dir: &Path, g: u32, next: u32) -> Result<(), JournalError> {
+        self.advance_mem(g, next)?;
+        self.save(dir)
+    }
+
+    /// [`Self::advance`] in memory, for a shell that persists the text itself
+    /// under its own lock ([`Self::to_text`]; lab #924).
+    pub fn advance_mem(&mut self, g: u32, next: u32) -> Result<(), JournalError> {
         let r = self.get_mut(g)?;
         if next < r.next {
             return Err(JournalError::Malformed(format!(
@@ -232,22 +239,35 @@ impl AuthJournal {
             )));
         }
         r.next = next;
-        self.save(dir)
+        Ok(())
     }
 
     /// Mark generation `g` retired (nothing left to spend), and persist.
     pub fn retire(&mut self, _lock: &AuthLock, dir: &Path, g: u32) -> Result<(), JournalError> {
+        self.retire_mem(g)?;
+        self.save(dir)
+    }
+
+    /// [`Self::retire`] in memory.
+    pub fn retire_mem(&mut self, g: u32) -> Result<(), JournalError> {
         let r = self.get_mut(g)?;
         if r.state == GenState::Active {
             return Err(JournalError::Malformed(format!("generation {g} is active and cannot be retired")));
         }
         r.state = GenState::Retired;
-        self.save(dir)
+        Ok(())
     }
 
     /// Open the next generation as the active one, the previous active one
     /// becoming sweep-only with a gate at `gate` (a migration), and persist.
     pub fn open_next(&mut self, _lock: &AuthLock, dir: &Path, auth_root: [u64; 4], gate: SweepGate) -> Result<u32, JournalError> {
+        let g = self.open_next_mem(auth_root, gate);
+        self.save(dir)?;
+        Ok(g)
+    }
+
+    /// [`Self::open_next`] in memory.
+    pub fn open_next_mem(&mut self, auth_root: [u64; 4], gate: SweepGate) -> u32 {
         let g = self.gens.iter().map(|r| r.g).max().expect("checked: non-empty") + 1;
         for r in &mut self.gens {
             if r.state == GenState::Active {
@@ -255,8 +275,7 @@ impl AuthJournal {
             }
         }
         self.gens.push(Generation { g, next: 0, auth_root, state: GenState::Active });
-        self.save(dir)?;
-        Ok(g)
+        g
     }
 
     /// Record a sweep gate for generation `g` on `gate.genesis`'s net —
@@ -264,12 +283,18 @@ impl AuthJournal {
     /// recorded for that net is kept (the earlier wait is the one that
     /// covers what was exported before it).
     pub fn add_gate(&mut self, _lock: &AuthLock, dir: &Path, g: u32, gate: SweepGate) -> Result<(), JournalError> {
+        self.add_gate_mem(g, gate)?;
+        self.save(dir)
+    }
+
+    /// [`Self::add_gate`] in memory.
+    pub fn add_gate_mem(&mut self, g: u32, gate: SweepGate) -> Result<(), JournalError> {
         let r = self.get_mut(g)?;
         let GenState::Sweep { gates } = &mut r.state else { return Err(JournalError::NotSweepOnly { g }) };
         if !gates.iter().any(|x| x.genesis == gate.genesis) {
             gates.push(gate);
         }
-        self.save(dir)
+        Ok(())
     }
 
     /// May generation `g` sign a sweep on the net `genesis` at tip `tip`?
@@ -312,6 +337,17 @@ impl AuthJournal {
         #[cfg(unix)]
         File::open(dir)?.sync_all()?;
         Ok(())
+    }
+
+    /// The `auth.v1` text, exactly as [`Self::save`] writes it — what a shell
+    /// that keeps no files (the browser extension) stores under its own lock.
+    pub fn to_text(&self) -> String {
+        self.render()
+    }
+
+    /// Parse `auth.v1` text, checked as [`Self::load`] checks a file.
+    pub fn from_text(text: &str) -> Result<Self, JournalError> {
+        Self::parse(text)
     }
 
     fn render(&self) -> String {

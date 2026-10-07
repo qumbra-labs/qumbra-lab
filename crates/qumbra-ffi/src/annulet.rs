@@ -229,6 +229,9 @@ pub struct AnnuletState {
     reported: bool,
     view: Option<String>,
     record: Option<Vec<u8>>,
+    /// Lab #924 PR 3: what a Candidate A spend plans from — the verified
+    /// scan's index, kept at DONE for [`qmb_annulet_take_basis`].
+    basis: Option<crate::spend_v2::SpendBasis>,
 }
 
 /// Bytes from a (pointer, length) pair: `None` for NULL or zero length, and
@@ -442,6 +445,7 @@ unsafe fn annulet_new(
         reported: false,
         view: None,
         record: None,
+        basis: None,
     }))
 }
 
@@ -513,6 +517,7 @@ impl AnnuletState {
         let json = view_json(&self.endpoint, &view, v.body_cost(), self.list_source_commit.as_deref());
         self.view = Some(json.to_string());
         self.record = v.record_to_write().map(|headers| encode_chain_cache(&v.chain().genesis.hash, headers));
+        self.basis = crate::spend_v2::SpendBasis::of(v);
         self.phase = Phase::Done;
     }
 }
@@ -623,6 +628,28 @@ pub unsafe extern "C" fn qmb_annulet_take_record(s: *mut AnnuletState, out_len: 
             *out_len = 0;
             ptr::null_mut()
         }
+    }
+}
+
+/// Lab #924 PR 3: after DONE, the verified scan's **spend basis** — the
+/// per-asset index of this wallet's spendable notes (each generation's),
+/// the pinned genesis, the verified tip — as a handle for
+/// `qmb_spend_v2_new`. Once; NULL before DONE, on a second call, or when the
+/// scan established no index (the outputs and the spends were not both
+/// known). A spend plans only from this: notes never cross the ABI as host
+/// JSON. Free with `qmb_spend_basis_free` (or hand it to `qmb_spend_v2_new`,
+/// which consumes it).
+///
+/// # Safety
+/// `s` live (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_annulet_take_basis(s: *mut AnnuletState) -> *mut crate::spend_v2::SpendBasis {
+    if s.is_null() {
+        return ptr::null_mut();
+    }
+    match (*s).basis.take() {
+        Some(b) => Box::into_raw(Box::new(b)),
+        None => ptr::null_mut(),
     }
 }
 

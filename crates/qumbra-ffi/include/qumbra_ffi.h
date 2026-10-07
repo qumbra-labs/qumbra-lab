@@ -704,6 +704,65 @@ void qmb_annulet_supply_err(qmb_annulet_t *s, const char *reason);
 char *qmb_annulet_take_view(qmb_annulet_t *s);
 uint8_t *qmb_annulet_take_record(qmb_annulet_t *s, size_t *out_len);
 void qmb_annulet_free(qmb_annulet_t *s);
+/* Lab #924 PR 3: after DONE, the scan's spend basis (once; NULL if the scan
+ * established no index). Consumed by qmb_spend_v2_new, or freed. */
+typedef struct qmb_spend_basis_t qmb_spend_basis_t;
+qmb_spend_basis_t *qmb_annulet_take_basis(qmb_annulet_t *s);
+void qmb_spend_basis_free(qmb_spend_basis_t *b);
+
+/* ---------------------------------------------------------------------------
+ * Candidate A spends (lab #924 PR 3, the 4b kernel): the device half of a
+ * remote-proved send. The prover is NOT linked; the bundle this exports is
+ * proved by the prover service, which can add a proof and nothing else.
+ *
+ * Order (each step refused by name):
+ *   a = qmb_auth_open(w, journal_text)       the auth.v1 text the shell stores
+ *   s = qmb_spend_v2_new(basis, to, asset, amount, valid_for, seed32,
+ *                        dummy_entropy64)     basis consumed; entropy from
+ *                                             crypto.getRandomValues; valid_for
+ *                                             from the service's
+ *                                             recommended_valid_for_blocks
+ *   loop qmb_spend_v2_step(a, s, &out):  1 NEED -> GET *out, then
+ *        qmb_spend_v2_supply / _supply_err;  0 READY;  -2 REFUSED (*out why)
+ *   qmb_auth_take(a, s, &journal)            leaves taken; PERSIST *journal,
+ *                                             then READ IT BACK
+ *   i = qmb_spend_v2_intent(s, &len)         the exact bytes to be signed
+ *   qmb_intent_review(s, i, len, &err)       the review, from those bytes
+ *   b = qmb_intent_sign(a, s, i, len, read_back_journal, &blen, &err)
+ *                                             the ProvingBundle bytes (POST to
+ *                                             /v2/annulet/jobs). ONCE: the
+ *                                             handle is spent after this call,
+ *                                             refused or not.
+ * Byte returns are released with qmb_dealloc(p, len); strings with
+ * qmb_string_free. A plan of several steps (fee splits, merges) is one
+ * transaction per spend handle: wait for it to land, rescan, start again.
+ *
+ * The HOST is trusted for the journal's freshness (pilot scope): passing an
+ * older auth.v1 text to qmb_auth_open (a restored backup, a stale copy)
+ * makes the kernel re-take leaves already spent, which it cannot see. Always
+ * pass the text last persisted. (Lab #924 PR 3b's restore adds a check
+ * against the chain's landed slots at open.)
+ * ------------------------------------------------------------------------- */
+typedef struct qmb_auth_t qmb_auth_t;
+typedef struct qmb_spend_v2_t qmb_spend_v2_t;
+
+qmb_auth_t *qmb_auth_open(const qmb_wallet_t *w, const char *journal_text, char **err_out);
+char *qmb_auth_journal(const qmb_auth_t *a);
+void qmb_auth_free(qmb_auth_t *a);
+
+qmb_spend_v2_t *qmb_spend_v2_new(qmb_spend_basis_t *basis, const char *to, uint16_t asset, uint64_t amount,
+                                 uint64_t valid_for, const uint8_t *seed32, const uint8_t *dummy_entropy64,
+                                 char **err_out);
+int32_t qmb_spend_v2_step(const qmb_auth_t *a, qmb_spend_v2_t *s, char **out);
+void qmb_spend_v2_supply(qmb_spend_v2_t *s, const uint8_t *body, size_t len);
+void qmb_spend_v2_supply_err(qmb_spend_v2_t *s, const char *reason);
+int32_t qmb_auth_take(qmb_auth_t *a, qmb_spend_v2_t *s, char **out_journal);
+uint8_t *qmb_spend_v2_intent(const qmb_spend_v2_t *s, size_t *out_len);
+char *qmb_spend_v2_refusal(const qmb_spend_v2_t *s);
+char *qmb_intent_review(const qmb_spend_v2_t *s, const uint8_t *intent, size_t len, char **err_out);
+uint8_t *qmb_intent_sign(const qmb_auth_t *a, qmb_spend_v2_t *s, const uint8_t *intent, size_t len,
+                         const char *persisted_journal, size_t *out_len, char **err_out);
+void qmb_spend_v2_free(qmb_spend_v2_t *s);
 
 #ifdef __cplusplus
 }

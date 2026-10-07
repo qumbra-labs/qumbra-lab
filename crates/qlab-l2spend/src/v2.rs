@@ -118,7 +118,7 @@ impl SpendWitness {
             unreachable!("instance_s on a shape-S witness")
         };
         qlab_air::l2::build_bucket_l2_v2(
-            qlab_l2::v2::log_height(qlab_l2::Shape::S),
+            log_height_v2(L2ShapeTag::S),
             &self.inputs,
             &self.outputs,
             self.fee,
@@ -137,7 +137,7 @@ impl SpendWitness {
             unreachable!("instance_p on a shape-P witness")
         };
         qlab_air::l2p::build_bucket_l2p_v2(
-            qlab_l2::v2::log_height(qlab_l2::Shape::P),
+            log_height_v2(L2ShapeTag::P),
             &self.inputs,
             &self.outputs,
             self.fee,
@@ -208,6 +208,7 @@ impl SpendWitness {
         }
     }
 
+    #[cfg(feature = "prove")]
     /// Prove the instance: its public values and the serialized proof.
     pub fn prove(&self) -> (Vec<u32>, Vec<u8>) {
         let (pvs, proof) = match self.shape {
@@ -235,6 +236,7 @@ pub struct WitnessStatement {
     pub commitments: [[u64; 4]; 2],
 }
 
+#[cfg(feature = "prove")]
 /// **Lab #924: prove a [`PreparedV2`] here.** The proof goes into the
 /// prepared transaction, nothing else changes — the instance rebuilt from the
 /// witness must state the prepared PVs (asserted: one process built both).
@@ -302,16 +304,38 @@ fn descriptor(path: &L2AuthPath, pvs: &[u32], at: usize) -> AuthDescriptor {
     }
 }
 
-fn descriptors(shape: qlab_l2::Shape, paths: &[&L2AuthPath], pvs: &[u32]) -> Vec<AuthDescriptor> {
+fn descriptors(shape: L2ShapeTag, paths: &[&L2AuthPath], pvs: &[u32]) -> Vec<AuthDescriptor> {
     paths
         .iter()
         .enumerate()
-        .map(|(k, p)| descriptor(p, pvs, qlab_l2::v2::pv_leaf(shape, k)))
+        .map(|(k, p)| descriptor(p, pvs, pv_leaf_v2(shape, k)))
         .collect()
+}
+
+/// A v2 shape's trace height, straight from `qlab-air` — the device half
+/// builds without the prover (lab #924); `qlab_l2::v2::log_height` states
+/// the same, pinned equal under `prove`.
+pub(crate) const fn log_height_v2(shape: L2ShapeTag) -> usize {
+    match shape {
+        L2ShapeTag::S => qlab_air::l2::SHAPE_S_LOG_HEIGHT_V2,
+        L2ShapeTag::P => qlab_air::l2p::SHAPE_P_LOG_HEIGHT,
+        L2ShapeTag::R => qlab_air::l2r::SHAPE_R_LOG_HEIGHT_V2,
+    }
+}
+
+/// Slot `k`'s leaf offset in a v2 shape's PVs, from `qlab-air` (as
+/// [`log_height_v2`]: equal to `qlab_l2::v2::pv_leaf`, pinned under `prove`).
+pub(crate) const fn pv_leaf_v2(shape: L2ShapeTag, k: usize) -> usize {
+    match shape {
+        L2ShapeTag::S => qlab_air::l2::PV_LEAF1 + 16 * k,
+        L2ShapeTag::P => qlab_air::l2p::PV_LEAF1 + 16 * k,
+        L2ShapeTag::R => qlab_air::l2r::PV_LEAF,
+    }
 }
 
 // ---------------------------------------------------------------- shape S
 
+#[cfg(feature = "prove")]
 /// **A v2 shape-S spend** (Cloaked assets): `inputs` are the device's two
 /// slot inputs; with `dv` the second is a device-made dummy (value 0, asset
 /// 0, off-tree) and only the first is real. Proves at 2^20.
@@ -403,7 +427,7 @@ pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
     };
     let inst = witness.instance_s();
     let auth = descriptors(
-        qlab_l2::Shape::S,
+        L2ShapeTag::S,
         &[&inputs[0].auth, &inputs[1].auth, &fee_slot.input().auth],
         &inst.pvs,
     );
@@ -430,6 +454,7 @@ pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
 
 // ---------------------------------------------------------------- shape P
 
+#[cfg(feature = "prove")]
 /// **A v2 shape-P spend** of two real inputs, each input's policy built from
 /// its served opening and [`PolicyContext`] against the input's **v2** `rkm`,
 /// and a `vPublic` per row (as v1's `build_p_with`). Proves at 2^20.
@@ -530,7 +555,7 @@ fn assemble_p_v2<R: rand::CryptoRng>(
     };
     let inst = witness.instance_p();
     let auth = descriptors(
-        qlab_l2::Shape::P,
+        L2ShapeTag::P,
         &[&inputs[0].auth, &inputs[1].auth, &fee_slot.input().auth],
         &inst.pvs,
     );
@@ -567,6 +592,7 @@ fn assemble_p_v2<R: rand::CryptoRng>(
 
 // ---------------------------------------------------------------- shape R
 
+#[cfg(feature = "prove")]
 /// **A v2 shape-R registry write**: v1's `build_r` with the fee input a v2
 /// input (one slot). Proves at 2^19.
 pub fn build_r_v2<E: Endpoint, R: rand::CryptoRng>(
@@ -583,6 +609,7 @@ pub fn build_r_v2<E: Endpoint, R: rand::CryptoRng>(
     assemble_r_v2(&tree, &slot, fee_input, change, fee, new_leaf, isk, rng)
 }
 
+#[cfg(feature = "prove")]
 #[allow(clippy::too_many_arguments)]
 fn assemble_r_v2<R: rand::CryptoRng>(
     tree: &CommitmentTree,
@@ -620,7 +647,7 @@ fn assemble_r_v2<R: rand::CryptoRng>(
         rseed: random_d4(rng),
     };
     let v2 = qlab_air::l2r::build_shape_r_v2_with_witnesses(
-        qlab_l2::v2::log_height(qlab_l2::Shape::R),
+        log_height_v2(L2ShapeTag::R),
         fee_input,
         &witness_of_v2(tree, fee_input)?,
         anchor,
@@ -635,7 +662,7 @@ fn assemble_r_v2<R: rand::CryptoRng>(
     }
     assert_eq!(v2.leaf, fee_input.auth.leaf, "R's leaf is the fee input's");
     let (_, proof) = qlab_l2::v2::prove_r(&inst.air, &inst.pvs);
-    let auth = descriptors(qlab_l2::Shape::R, &[&fee_input.auth], &inst.pvs);
+    let auth = descriptors(L2ShapeTag::R, &[&fee_input.auth], &inst.pvs);
     // As v1: the change takes the nullifier as its ρ, the seed output 1's.
     let note = L2Note {
         value: out.value,
@@ -751,6 +778,14 @@ impl LocalAuth {
     /// The cursor position to persist.
     pub fn next(&self) -> u32 {
         self.cursor.next()
+    }
+
+    /// The paths of the next `n` leaves, **not** consumed — for a dry run
+    /// that learns what a spend needs before anything is taken (lab #924).
+    /// `None` past the generation's end.
+    pub fn peek(&self, n: usize) -> Option<Vec<L2AuthPath>> {
+        let mut cursor = Cursor::new(&self.master, D_AUTH as u8, self.cursor.next()).ok()?;
+        (0..n).map(|_| cursor.take().map(|i| self.path(i))).collect()
     }
 
     /// Consume the next leaf for a real slot and return its path, or `None`

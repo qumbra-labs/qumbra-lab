@@ -126,6 +126,8 @@ mod build_rev_tests {
 }
 
 pub mod annulet;
+/// The Annulet send planner (lean; lab #924).
+pub mod annulet_plan;
 /// Lab #896 G: the Candidate A authorization journal (`auth.v1`).
 pub mod auth_journal;
 #[cfg(feature = "verify")]
