@@ -505,7 +505,6 @@ fn l2_outputs<R: Rng>(outs: &[Out; 2], rng: &mut R) -> [L2TxOutput; 2] {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// [`entry`] before the proof (lab #924): the same transaction with an empty
 /// `proof`, for a prover elsewhere to fill.
 #[allow(clippy::too_many_arguments)]
@@ -534,6 +533,7 @@ pub(crate) fn unproved_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry(
     proof: &qlab_l2::Proof<qlab_l2::Config>,
     anchor: &[u64; 4],

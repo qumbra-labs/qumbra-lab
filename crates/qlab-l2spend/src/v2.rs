@@ -79,6 +79,7 @@ pub struct PreparedV2 {
 
 /// The shape-specific part of a [`SpendWitness`].
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ShapeWitness {
     /// Shape S: the two registry openings and `dv`.
     S { reg_leaves: [RegistryLeaf; 2], reg_witnesses: [RegistryWitness; 2], dv: bool },
@@ -806,4 +807,4 @@ pub fn sign_locally(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -23,14 +23,14 @@ use rand::SeedableRng;
 
 use super::*;
 
-const GENESIS_HASH: Hash32 = [0x6e; 32];
-const VALID_UNTIL: u64 = 4_096;
+pub(crate) const GENESIS_HASH: Hash32 = [0x6e; 32];
+pub(crate) const VALID_UNTIL: u64 = 4_096;
 
 /// An honest v2 spend, signed and attached, with what the builder knew.
-struct Signed {
-    tx: TxEntry,
-    pvs: Vec<u32>,
-    auth: Vec<AuthDescriptor>,
+pub(crate) struct Signed {
+    pub(crate) tx: TxEntry,
+    pub(crate) pvs: Vec<u32>,
+    pub(crate) auth: Vec<AuthDescriptor>,
     intent: AnnuletIntent,
     shape: qlab_l2::Shape,
 }
@@ -79,7 +79,7 @@ fn recipient<R: rand::CryptoRng>(seed: u64, rng: &mut R) -> Recipient {
 }
 
 /// Sign `tx` as the device would and attach the section.
-fn sign(
+pub(crate) fn sign(
     mut tx: TxEntry,
     pvs: Vec<u32>,
     auth: Vec<AuthDescriptor>,
@@ -112,44 +112,52 @@ fn sign(
 }
 
 /// S: 100 (asset 0) + 50 (Cloaked asset 7) → 90 + 50, fee 10, slot 3 a
-/// device-made dummy.
-fn fixture_s() -> &'static Signed {
+/// device-made dummy. Prepared only — no proof — with the signer and the
+/// dummy's key: the bundle tests (lab #924) prepare it again and compare.
+pub(crate) fn prepared_s() -> (PreparedV2, LocalAuth, mldsa::Key) {
+    let mut rng = rng(0x5e4);
+    let mut local = LocalAuth::new(&[0x51; 32], 0, 0).expect("depth D_AUTH");
+    let a = real(&mut local, 0x100, 100, 0);
+    let b = real(&mut local, 0x200, 50, 7);
+    let tree = tree_of(&[&a, &b]);
+    let reg =
+        RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)]).unwrap();
+    let regs = [opening(&reg, 0), opening(&reg, 7)];
+    let (dummy, key) = local
+        .dummy(&[0xd5; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
+        .unwrap();
+    let outs = [
+        Out {
+            to: recipient(0x31, &mut rng),
+            value: 90,
+            asset: 0,
+        },
+        Out {
+            to: recipient(0x32, &mut rng),
+            value: 50,
+            asset: 7,
+        },
+    ];
+    let prepared = assemble_s_v2(
+        &tree,
+        &regs,
+        [&a, &b],
+        false,
+        FeeIn::Dummy(&dummy),
+        &outs,
+        10,
+        &mut rng,
+    )
+    .unwrap();
+    (prepared, local, key)
+}
+
+/// [`prepared_s`], proved in process ([`prove_prepared`]) and signed.
+pub(crate) fn fixture_s() -> &'static Signed {
     static F: OnceLock<Signed> = OnceLock::new();
     F.get_or_init(|| {
-        let mut rng = rng(0x5e4);
-        let mut local = LocalAuth::new(&[0x51; 32], 0, 0).expect("depth D_AUTH");
-        let a = real(&mut local, 0x100, 100, 0);
-        let b = real(&mut local, 0x200, 50, 7);
-        let tree = tree_of(&[&a, &b]);
-        let reg = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)])
-            .unwrap();
-        let regs = [opening(&reg, 0), opening(&reg, 7)];
-        let (dummy, key) = local
-            .dummy(&[0xd5; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
-            .unwrap();
-        let outs = [
-            Out {
-                to: recipient(0x31, &mut rng),
-                value: 90,
-                asset: 0,
-            },
-            Out {
-                to: recipient(0x32, &mut rng),
-                value: 50,
-                asset: 7,
-            },
-        ];
-        let built = assemble_s_v2(
-            &tree,
-            &regs,
-            [&a, &b],
-            false,
-            FeeIn::Dummy(&dummy),
-            &outs,
-            10,
-            &mut rng,
-        )
-        .unwrap();
+        let (prepared, local, key) = prepared_s();
+        let built = prove_prepared(prepared);
         assert_eq!(built.shape, L2ShapeTag::S);
         sign(
             built.tx,
@@ -163,53 +171,60 @@ fn fixture_s() -> &'static Signed {
 }
 
 /// P: 100 (asset 0) + 50 of Hybrid asset 7 (empty freeze list) → 90 + 50,
-/// fee 10, slot 3 a device-made dummy, `vPublic` none.
+/// fee 10, slot 3 a device-made dummy, `vPublic` none. Prepared only.
+pub(crate) fn prepared_p() -> (PreparedV2, LocalAuth, mldsa::Key) {
+    let mut rng = rng(0x5e5);
+    let mut local = LocalAuth::new(&[0x52; 32], 0, 0).expect("depth D_AUTH");
+    let a = real(&mut local, 0x300, 100, 0);
+    let b = real(&mut local, 0x400, 50, 7);
+    let tree = tree_of(&[&a, &b]);
+    let hybrid = RegistryLeaf {
+        asset: 7,
+        issuer_key: qlab_air::l2p::issuer_key_of(&[7; 4]),
+        mode: MODE_HYBRID,
+        freeze_root: CanonicalFreezeTree::from_rkms(&[]).root,
+        allow_root: [0; 4],
+        flags: 0,
+    };
+    let reg = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), hybrid]).unwrap();
+    let regs = [opening(&reg, 0), opening(&reg, 7)];
+    let (dummy, key) = local
+        .dummy(&[0xd6; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
+        .unwrap();
+    let outs = [
+        Out {
+            to: recipient(0x41, &mut rng),
+            value: 90,
+            asset: 0,
+        },
+        Out {
+            to: recipient(0x42, &mut rng),
+            value: 50,
+            asset: 7,
+        },
+    ];
+    let ctx = PolicyContext::default();
+    let prepared = policies_then_p_v2(
+        &tree,
+        &regs,
+        [&a, &b],
+        FeeIn::Dummy(&dummy),
+        &outs,
+        10,
+        [&ctx, &ctx],
+        [VPublic::NONE; 2],
+        &mut rng,
+    )
+    .unwrap();
+    (prepared, local, key)
+}
+
+/// [`prepared_p`], proved in process and signed.
 fn fixture_p() -> &'static Signed {
     static F: OnceLock<Signed> = OnceLock::new();
     F.get_or_init(|| {
-        let mut rng = rng(0x5e5);
-        let mut local = LocalAuth::new(&[0x52; 32], 0, 0).expect("depth D_AUTH");
-        let a = real(&mut local, 0x300, 100, 0);
-        let b = real(&mut local, 0x400, 50, 7);
-        let tree = tree_of(&[&a, &b]);
-        let hybrid = RegistryLeaf {
-            asset: 7,
-            issuer_key: qlab_air::l2p::issuer_key_of(&[7; 4]),
-            mode: MODE_HYBRID,
-            freeze_root: CanonicalFreezeTree::from_rkms(&[]).root,
-            allow_root: [0; 4],
-            flags: 0,
-        };
-        let reg = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), hybrid]).unwrap();
-        let regs = [opening(&reg, 0), opening(&reg, 7)];
-        let (dummy, key) = local
-            .dummy(&[0xd6; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
-            .unwrap();
-        let outs = [
-            Out {
-                to: recipient(0x41, &mut rng),
-                value: 90,
-                asset: 0,
-            },
-            Out {
-                to: recipient(0x42, &mut rng),
-                value: 50,
-                asset: 7,
-            },
-        ];
-        let ctx = PolicyContext::default();
-        let built = policies_then_p_v2(
-            &tree,
-            &regs,
-            [&a, &b],
-            FeeIn::Dummy(&dummy),
-            &outs,
-            10,
-            [&ctx, &ctx],
-            [VPublic::NONE; 2],
-            &mut rng,
-        )
-        .unwrap();
+        let (prepared, local, key) = prepared_p();
+        let built = prove_prepared(prepared);
         assert_eq!(built.shape, L2ShapeTag::P);
         sign(
             built.tx,

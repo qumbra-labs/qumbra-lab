@@ -23,10 +23,15 @@
 //! length prefix did not first bound; the prover service's byte ceiling is
 //! the outer wall, this decoder the inner one.
 
-use qlab_air::l2::{FeeSlotV2, L2AuthInput, L2AuthPath, L2TxOutput, RegistryLeaf, RegistryWitness, D_AUTH, REGISTRY_DEPTH};
+use qlab_air::l2::{
+    FeeSlotV2, L2AuthInput, L2AuthPath, L2TxOutput, RegistryLeaf, RegistryWitness, D_AUTH,
+    REGISTRY_DEPTH,
+};
 use qlab_air::l2p::{FreezeOpening, L2PolicyInput, PolicyWitness, VPublic, POLICY_DEPTH};
 use qlab_air::narrow::{MerkleWitness, MERKLE_DEPTH};
-use qlab_devnet::annulet::{auth_shape, intent_for, AuthContext, L2ShapeTag, L2Surface, L2_AUTH_ABSENT};
+use qlab_devnet::annulet::{
+    auth_shape, intent_for, AuthContext, L2ShapeTag, L2Surface, L2_AUTH_ABSENT,
+};
 use qlab_devnet::body::TxEntry;
 use qlab_devnet::forms::L2AuthForm;
 use qlab_note::hash::digest_bytes;
@@ -70,13 +75,22 @@ impl std::fmt::Display for BundleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BundleError::Malformed(why) => write!(f, "not a proving bundle: {why}"),
-            BundleError::IssuerShape(why) => write!(f, "an issuer operation is not delegated: {why}"),
-            BundleError::ProofPresent => write!(f, "the bundle's transaction already carries a proof"),
-            BundleError::AuthMissing => write!(f, "the bundle's transaction carries no authorization section"),
+            BundleError::IssuerShape(why) => {
+                write!(f, "an issuer operation is not delegated: {why}")
+            }
+            BundleError::ProofPresent => {
+                write!(f, "the bundle's transaction already carries a proof")
+            }
+            BundleError::AuthMissing => write!(
+                f,
+                "the bundle's transaction carries no authorization section"
+            ),
             BundleError::StatementMismatch(what) => {
                 write!(f, "the witness does not state the transaction's {what}")
             }
-            BundleError::Unauthorized(why) => write!(f, "the authorization section does not verify: {why}"),
+            BundleError::Unauthorized(why) => {
+                write!(f, "the authorization section does not verify: {why}")
+            }
         }
     }
 }
@@ -127,7 +141,10 @@ impl ProvingBundle {
         w.extend_from_slice(&BUNDLE_VERSION.to_le_bytes());
         w.push(shape_code(self.shape()));
         let tx = qlab_p2p::codec::encode_tx_annulet(&self.tx);
-        assert!(tx.len() <= MAX_BUNDLE_TX_BYTES, "a v2 S/P transaction fits the bound");
+        assert!(
+            tx.len() <= MAX_BUNDLE_TX_BYTES,
+            "a v2 S/P transaction fits the bound"
+        );
         w.extend_from_slice(&(tx.len() as u32).to_le_bytes());
         w.extend_from_slice(&tx);
         put_witness(&mut w, &self.witness);
@@ -143,34 +160,49 @@ impl ProvingBundle {
         }
         let version = u16::from_le_bytes(r.take(2, "version")?.try_into().expect("2 bytes"));
         if version != BUNDLE_VERSION {
-            return Err(BundleError::Malformed(format!("version {version}, expected {BUNDLE_VERSION}")));
+            return Err(BundleError::Malformed(format!(
+                "version {version}, expected {BUNDLE_VERSION}"
+            )));
         }
         let shape = match r.u8("shape")? {
             0 => L2ShapeTag::S,
             1 => L2ShapeTag::P,
-            2 => return Err(BundleError::IssuerShape("shape R (a registry write)".into())),
+            2 => {
+                return Err(BundleError::IssuerShape(
+                    "shape R (a registry write)".into(),
+                ))
+            }
             other => return Err(BundleError::Malformed(format!("shape code {other}"))),
         };
         let tx_len = r.u32("tx length")? as usize;
         if tx_len > MAX_BUNDLE_TX_BYTES {
-            return Err(BundleError::Malformed(format!("a {tx_len}-byte transaction, over {MAX_BUNDLE_TX_BYTES}")));
+            return Err(BundleError::Malformed(format!(
+                "a {tx_len}-byte transaction, over {MAX_BUNDLE_TX_BYTES}"
+            )));
         }
         let tx_bytes = r.take(tx_len, "tx")?;
         let tx = qlab_p2p::codec::decode_tx_annulet_with(tx_bytes, L2AuthForm::CandidateA)
             .map_err(|e| BundleError::Malformed(format!("the transaction: {e:?}")))?; // debug-ok: a named codec error
         if tx.public.nullifiers.len() != 3 || tx.public.commitments.len() != 2 {
-            return Err(BundleError::Malformed("an S/P transaction states 3 nullifiers and 2 commitments".into()));
+            return Err(BundleError::Malformed(
+                "an S/P transaction states 3 nullifiers and 2 commitments".into(),
+            ));
         }
         let surface = L2Surface::decode(&tx.l2)
             .ok()
             .flatten()
             .ok_or_else(|| BundleError::Malformed("the transaction's surface".into()))?;
         if surface.shape != shape {
-            return Err(BundleError::Malformed("the surface's shape is not the bundle's".into()));
+            return Err(BundleError::Malformed(
+                "the surface's shape is not the bundle's".into(),
+            ));
         }
         let witness = get_witness(&mut r, shape)?;
         if r.at != bytes.len() {
-            return Err(BundleError::Malformed(format!("{} trailing bytes", bytes.len() - r.at)));
+            return Err(BundleError::Malformed(format!(
+                "{} trailing bytes",
+                bytes.len() - r.at
+            )));
         }
         ProvingBundle::new(tx, witness)
     }
@@ -188,10 +220,22 @@ impl ProvingBundle {
         if p.anchor != digest_bytes(&st.anchor) {
             return Err(BundleError::StatementMismatch("anchor"));
         }
-        if p.nullifiers.iter().ne(st.nullifiers.iter().map(digest_bytes).collect::<Vec<_>>().iter()) {
+        if p.nullifiers.iter().ne(st
+            .nullifiers
+            .iter()
+            .map(digest_bytes)
+            .collect::<Vec<_>>()
+            .iter())
+        {
             return Err(BundleError::StatementMismatch("nullifiers"));
         }
-        if p.commitments.iter().ne(st.commitments.iter().map(digest_bytes).collect::<Vec<_>>().iter()) {
+        if p.commitments.iter().ne(st
+            .commitments
+            .iter()
+            .map(digest_bytes)
+            .collect::<Vec<_>>()
+            .iter())
+        {
             return Err(BundleError::StatementMismatch("output commitments"));
         }
         if p.fee != self.witness.fee {
@@ -211,19 +255,28 @@ impl ProvingBundle {
         }
         let section = AnnuletAuthSection::decode(auth_shape(surface.shape), &self.tx.auth)
             .map_err(|e| BundleError::Unauthorized(format!("{e:?}")))?; // debug-ok: a named auth error
-        // The section's leaves are the slots' leaves the witness proves.
+                                                                        // The section's leaves are the slots' leaves the witness proves.
         let leaves = self.slot_paths();
         if section.slots.len() != leaves.len()
             || section.slots.iter().zip(&leaves).any(|(s, p)| {
-                s.descriptor.leaf_index() != p.leaf_index || s.descriptor.leaf() != digest_bytes(&p.leaf)
+                s.descriptor.leaf_index() != p.leaf_index
+                    || s.descriptor.leaf() != digest_bytes(&p.leaf)
             })
         {
             return Err(BundleError::StatementMismatch("authorization leaves"));
         }
         let descriptors: Vec<_> = section.slots.iter().map(|s| s.descriptor).collect();
-        let intent = intent_for(&self.tx, ctx.genesis_format(), &ctx.genesis_hash, section.valid_until_height, &descriptors)
-            .map_err(|e| BundleError::Unauthorized(format!("the intent does not rebuild: {e:?}")))?; // debug-ok
-        section.verify_intent(&intent).map_err(|e| BundleError::Unauthorized(format!("{e:?}")))?; // debug-ok
+        let intent = intent_for(
+            &self.tx,
+            ctx.genesis_format(),
+            &ctx.genesis_hash,
+            section.valid_until_height,
+            &descriptors,
+        )
+        .map_err(|e| BundleError::Unauthorized(format!("the intent does not rebuild: {e:?}")))?; // debug-ok
+        section
+            .verify_intent(&intent)
+            .map_err(|e| BundleError::Unauthorized(format!("{e:?}")))?; // debug-ok
         Ok(())
     }
 
@@ -239,7 +292,11 @@ impl ProvingBundle {
 
     fn slot_paths(&self) -> [&L2AuthPath; 3] {
         let w = &self.witness;
-        [&w.inputs[0].auth, &w.inputs[1].auth, &w.fee_slot.input().auth]
+        [
+            &w.inputs[0].auth,
+            &w.inputs[1].auth,
+            &w.fee_slot.input().auth,
+        ]
     }
 }
 
@@ -247,7 +304,9 @@ impl ProvingBundle {
 fn holder_only(w: &SpendWitness) -> Result<(), BundleError> {
     if let ShapeWitness::P { policy, vp } = &w.shape {
         if policy.iter().any(|p| p.isk != [0; 4]) {
-            return Err(BundleError::IssuerShape("a P row with an issuer secret".into()));
+            return Err(BundleError::IssuerShape(
+                "a P row with an issuer secret".into(),
+            ));
         }
         if vp.iter().any(|v| v.amount != 0 || v.redeem) {
             return Err(BundleError::IssuerShape("a non-zero vPublic term".into()));
@@ -337,7 +396,11 @@ fn put_witness(w: &mut Vec<u8>, s: &SpendWitness) {
         }
     }
     match &s.shape {
-        ShapeWitness::S { reg_leaves, reg_witnesses, dv } => {
+        ShapeWitness::S {
+            reg_leaves,
+            reg_witnesses,
+            dv,
+        } => {
             reg_leaves.iter().for_each(|l| put_leaf(w, l));
             reg_witnesses.iter().for_each(|r| put_reg_witness(w, r));
             put_bool(w, *dv);
@@ -373,19 +436,30 @@ impl<'a> Rd<'a> {
         Ok(self.take(1, what)?[0])
     }
     fn u32(&mut self, what: &str) -> Result<u32, BundleError> {
-        Ok(u32::from_le_bytes(self.take(4, what)?.try_into().expect("4 bytes")))
+        Ok(u32::from_le_bytes(
+            self.take(4, what)?.try_into().expect("4 bytes"),
+        ))
     }
     fn u64(&mut self, what: &str) -> Result<u64, BundleError> {
-        Ok(u64::from_le_bytes(self.take(8, what)?.try_into().expect("8 bytes")))
+        Ok(u64::from_le_bytes(
+            self.take(8, what)?.try_into().expect("8 bytes"),
+        ))
     }
     fn lanes(&mut self, what: &str) -> Result<[u64; 4], BundleError> {
-        Ok([self.u64(what)?, self.u64(what)?, self.u64(what)?, self.u64(what)?])
+        Ok([
+            self.u64(what)?,
+            self.u64(what)?,
+            self.u64(what)?,
+            self.u64(what)?,
+        ])
     }
     fn bool(&mut self, what: &str) -> Result<bool, BundleError> {
         match self.u8(what)? {
             0 => Ok(false),
             1 => Ok(true),
-            other => Err(BundleError::Malformed(format!("{what}: {other} is not a bit"))),
+            other => Err(BundleError::Malformed(format!(
+                "{what}: {other} is not a bit"
+            ))),
         }
     }
     fn auth_input(&mut self) -> Result<L2AuthInput, BundleError> {
@@ -398,13 +472,27 @@ impl<'a> Rd<'a> {
         let leaf = self.lanes("auth leaf")?;
         let leaf_index = self.u32("leaf index")?;
         if (leaf_index as u64) >> D_AUTH != 0 {
-            return Err(BundleError::Malformed(format!("leaf index {leaf_index} is past depth {D_AUTH}")));
+            return Err(BundleError::Malformed(format!(
+                "leaf index {leaf_index} is past depth {D_AUTH}"
+            )));
         }
         let mut siblings = [[0u64; 4]; D_AUTH];
         for s in siblings.iter_mut() {
             *s = self.lanes("auth sibling")?;
         }
-        Ok(L2AuthInput { nk, value, asset, rho, rseed, d, auth: L2AuthPath { leaf, leaf_index, siblings } })
+        Ok(L2AuthInput {
+            nk,
+            value,
+            asset,
+            rho,
+            rseed,
+            d,
+            auth: L2AuthPath {
+                leaf,
+                leaf_index,
+                siblings,
+            },
+        })
     }
     fn merkle(&mut self) -> Result<MerkleWitness, BundleError> {
         let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
@@ -415,7 +503,10 @@ impl<'a> Rd<'a> {
         for b in path_bits.iter_mut() {
             *b = self.bool("merkle path bit")?;
         }
-        Ok(MerkleWitness { siblings, path_bits })
+        Ok(MerkleWitness {
+            siblings,
+            path_bits,
+        })
     }
     fn output(&mut self) -> Result<L2TxOutput, BundleError> {
         Ok(L2TxOutput {
@@ -445,7 +536,10 @@ impl<'a> Rd<'a> {
         for b in path_bits.iter_mut() {
             *b = self.bool("registry path bit")?;
         }
-        Ok(RegistryWitness { siblings, path_bits })
+        Ok(RegistryWitness {
+            siblings,
+            path_bits,
+        })
     }
     fn policy_witness(&mut self, what: &str) -> Result<PolicyWitness, BundleError> {
         let mut siblings = [[0u64; 4]; POLICY_DEPTH];
@@ -456,7 +550,10 @@ impl<'a> Rd<'a> {
         for b in path_bits.iter_mut() {
             *b = self.bool(what)?;
         }
-        Ok(PolicyWitness { siblings, path_bits })
+        Ok(PolicyWitness {
+            siblings,
+            path_bits,
+        })
     }
 }
 
@@ -468,8 +565,13 @@ fn get_witness(r: &mut Rd<'_>, shape: L2ShapeTag) -> Result<SpendWitness, Bundle
     let anchor = r.lanes("anchor")?;
     let registry_root = r.lanes("registry root")?;
     let fee_slot = match r.u8("fee slot")? {
-        0 => FeeSlotV2::Exact { input: r.auth_input()?, witness: r.merkle()? },
-        1 => FeeSlotV2::Dummy { input: r.auth_input()? },
+        0 => FeeSlotV2::Exact {
+            input: r.auth_input()?,
+            witness: r.merkle()?,
+        },
+        1 => FeeSlotV2::Dummy {
+            input: r.auth_input()?,
+        },
         other => return Err(BundleError::Malformed(format!("fee slot code {other}"))),
     };
     let shape = match shape {
@@ -477,7 +579,11 @@ fn get_witness(r: &mut Rd<'_>, shape: L2ShapeTag) -> Result<SpendWitness, Bundle
             let reg_leaves = [r.leaf()?, r.leaf()?];
             let reg_witnesses = [r.reg_witness()?, r.reg_witness()?];
             let dv = r.bool("dv")?;
-            ShapeWitness::S { reg_leaves, reg_witnesses, dv }
+            ShapeWitness::S {
+                reg_leaves,
+                reg_witnesses,
+                dv,
+            }
         }
         L2ShapeTag::P => {
             let mut row = || -> Result<L2PolicyInput, BundleError> {
@@ -487,14 +593,36 @@ fn get_witness(r: &mut Rd<'_>, shape: L2ShapeTag) -> Result<SpendWitness, Bundle
                 let key_hi = r.lanes("freeze key")?;
                 let witness = r.policy_witness("freeze sibling")?;
                 let allow = r.policy_witness("allow sibling")?;
-                Ok(L2PolicyInput { leaf, reg_witness, freeze: FreezeOpening { key_lo, key_hi, witness }, allow, isk: [0; 4] })
+                Ok(L2PolicyInput {
+                    leaf,
+                    reg_witness,
+                    freeze: FreezeOpening {
+                        key_lo,
+                        key_hi,
+                        witness,
+                    },
+                    allow,
+                    isk: [0; 4],
+                })
             };
             let policy = [row()?, row()?];
-            ShapeWitness::P { policy, vp: [VPublic::NONE; 2] }
+            ShapeWitness::P {
+                policy,
+                vp: [VPublic::NONE; 2],
+            }
         }
         L2ShapeTag::R => unreachable!("refused at the shape byte"),
     };
-    Ok(SpendWitness { inputs, witnesses, outputs, fee, anchor, registry_root, fee_slot, shape })
+    Ok(SpendWitness {
+        inputs,
+        witnesses,
+        outputs,
+        fee,
+        anchor,
+        registry_root,
+        fee_slot,
+        shape,
+    })
 }
 
 #[cfg(test)]
