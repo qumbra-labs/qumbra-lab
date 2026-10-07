@@ -23,6 +23,7 @@
 //!   <out>/<case>/spend/NNN.bin     the spend's answers, transcript order
 //!   <out>/<case>/journal_before.txt, journal_after.txt   auth.v1 text
 //!   <out>/<case>/intent.bin, review.txt, bundle.bin      the kernel's output
+//!   <out>/SHA256SUMS               every file above, `sha256sum -c` form
 //!
 //! Run (a named local run, no prove):
 //!   cargo run -p qumbra-ffi --example annulet_spend_fixtures -- <out> --lab-rev <commit> [--force]
@@ -191,13 +192,52 @@ unsafe fn case(dir: &Path, ep: &Endpoint, payee: &str, journal: &str, asset: u16
     })
 }
 
+/// `--force` removes `<out>`: never `/`, the home directory, the working
+/// directory or one of its ancestors, and only a directory this example
+/// wrote (it holds `manifest.json`).
+fn guarded_remove(out: &Path) {
+    let abs = std::fs::canonicalize(out).expect("canonical <out>");
+    let cwd = std::fs::canonicalize(".").expect("canonical cwd");
+    let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| std::fs::canonicalize(h).ok());
+    assert!(abs.parent().is_some(), "refusing to remove {}", abs.display());
+    assert!(!cwd.starts_with(&abs), "refusing to remove {} (the working directory or an ancestor)", abs.display());
+    assert!(home.as_deref() != Some(abs.as_path()), "refusing to remove the home directory");
+    assert!(abs.join("manifest.json").is_file(), "refusing to remove {}: not a fixtures directory", abs.display());
+    std::fs::remove_dir_all(&abs).unwrap();
+}
+
+/// `sha256sum -c` lines for every file under `root`, sorted.
+fn sha256sums(root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    files.sort();
+    files
+        .iter()
+        .map(|p| {
+            let rel = p.strip_prefix(root).unwrap().display().to_string();
+            format!("{}  {rel}\n", hex(&Sha256::digest(std::fs::read(p).unwrap())))
+        })
+        .collect()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = PathBuf::from(args.first().expect("usage: <out> --lab-rev <commit> [--force]"));
     let rev = args.iter().position(|a| a == "--lab-rev").and_then(|i| args.get(i + 1)).expect("--lab-rev <commit>");
     if out.exists() {
         assert!(args.iter().any(|a| a == "--force"), "{} exists (use --force)", out.display());
-        std::fs::remove_dir_all(&out).unwrap();
+        guarded_remove(&out);
     }
     std::fs::create_dir_all(&out).unwrap();
     let (ep, payee, journal) = chain();
@@ -209,6 +249,8 @@ fn main() {
         println!("{name:<10} {} scan + {} spend reads → bundle {} B", c["scan"].as_array().unwrap().len(), c["spend"].as_array().unwrap().len(), c["bundle_len"]);
         cases.insert(name.into(), json!(name));
     }
+    // The seeds below are PUBLIC TEST CONSTANTS of this fixture, written so the
+    // harness can replay the run — never a real wallet's, never to fund one.
     let manifest = json!({
         "what": "lab #924 PR 3 — Candidate A spend fixtures, recorded from the real ABI (scan → basis → auth → spend → take → intent → review → sign) on a format-33 genesis. FIXTURE seeds only.",
         "lab_rev": rev,
@@ -222,4 +264,6 @@ fn main() {
         "cases": cases,
     });
     std::fs::write(out.join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let sums = sha256sums(&out);
+    std::fs::write(out.join("SHA256SUMS"), sums).unwrap();
 }

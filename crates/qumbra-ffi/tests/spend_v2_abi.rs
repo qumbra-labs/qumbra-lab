@@ -341,3 +341,121 @@ fn f_another_seed_s_journal_a_v1_recipient_and_a_zero_validity_are_refused() {
         qmb_wallet_free(w);
     }
 }
+
+/// A journal of generation 0 standing at `next`.
+fn journal_at(f: &Fixture, next: u32) -> String {
+    let mut j = AuthJournal::from_text(&f.fresh).unwrap();
+    j.advance_mem(0, next).unwrap();
+    j.to_text()
+}
+
+#[test]
+fn g_the_signature_refuses_another_tree_s_journal_and_a_bad_call_still_spends() {
+    let f = chain("sv2_g");
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let a = auth(w, &f.fresh).unwrap();
+        // Another wallet's journal, its cursor well past this take: the root decides.
+        let other = wallet_dir("sv2_g_other", PAYEE);
+        let mut foreign = AuthJournal::fresh(generation_root(&other.wallet(), 0));
+        let _ = std::fs::remove_dir_all(&other.dir);
+        foreign.advance_mem(0, 100).unwrap();
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        assert!(take(a, s).unwrap_err().contains("not READY"), "no take while pumping");
+        pump(a, s, &f.ep, 0).unwrap();
+        let journal = take(a, s).unwrap();
+        // A stray answer after READY is ignored: the prepared spend survives.
+        qmb_spend_v2_supply(s, b"x".as_ptr(), 1);
+        qmb_spend_v2_supply_err(s, CString::new("late").unwrap().as_ptr());
+        let i = intent(s);
+        assert!(review(s, &i).is_ok(), "still prepared");
+        let why = sign(a, s, &i, &foreign.to_text()).unwrap_err();
+        assert!(why.contains("does not show this take"), "{why}");
+        assert!(sign(a, s, &i, &journal).unwrap_err().contains("once already"));
+        qmb_spend_v2_free(s);
+
+        // Refused for its bytes: spent all the same.
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        pump(a, s, &f.ep, 0).unwrap();
+        let journal = take(a, s).unwrap();
+        let i = intent(s);
+        assert!(sign(a, s, &i[1..], &journal).unwrap_err().contains("not the bytes"));
+        assert!(sign(a, s, &i, &journal).unwrap_err().contains("once already"));
+        qmb_spend_v2_free(s);
+
+        // A NULL argument: spent all the same.
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        pump(a, s, &f.ep, 0).unwrap();
+        let journal = take(a, s).unwrap();
+        let i = intent(s);
+        let j = CString::new(journal.clone()).unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let mut len = 0usize;
+        assert!(qmb_intent_sign(a, s, ptr::null(), 0, j.as_ptr(), &mut len, &mut err).is_null());
+        assert!(take_str(err).contains("NULL"));
+        assert!(sign(a, s, &i, &journal).unwrap_err().contains("once already"));
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+        qmb_wallet_free(w);
+    }
+}
+
+/// F1: the budget is judged before the take. At exactly the floor the spend
+/// goes through (its own leaves do not count against it after the take);
+/// one leaf less is refused before anything is taken.
+#[test]
+fn h_the_budget_boundary_is_judged_before_the_take() {
+    let f = chain("sv2_h");
+    // Four spendable notes in generation 0: floor = 4 + 2; one leaf needed.
+    let at_floor = 4096 - (1 + 4 + 2);
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let a = auth(w, &journal_at(&f, at_floor)).unwrap();
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        pump(a, s, &f.ep, 0).expect("exactly at the floor: READY");
+        let journal = take(a, s).unwrap();
+        assert_eq!(next_of(&journal), at_floor + 1);
+        let i = intent(s);
+        sign(a, s, &i, &journal).expect("the take's own leaf does not refuse it");
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+
+        let below = journal_at(&f, at_floor + 1);
+        let a = auth(w, &below).unwrap();
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        let why = pump(a, s, &f.ep, 0).unwrap_err();
+        assert!(why.contains("below the 6 needed to sweep"), "{why}");
+        assert_eq!(next_of(&take_str(qmb_auth_journal(a))), at_floor + 1, "no leaf consumed");
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+        qmb_wallet_free(w);
+    }
+}
+
+#[test]
+fn i_every_export_answers_null_by_name_or_as_a_no_op() {
+    unsafe {
+        let mut err: *mut c_char = ptr::null_mut();
+        let j = CString::new("x").unwrap();
+        assert!(qmb_auth_open(ptr::null(), j.as_ptr(), &mut err).is_null());
+        assert!(take_str(err).contains("NULL"));
+        assert!(qmb_auth_journal(ptr::null()).is_null());
+        qmb_auth_free(ptr::null_mut());
+        let to = CString::new("x").unwrap();
+        assert!(qmb_spend_v2_new(ptr::null_mut(), to.as_ptr(), 0, 1, 1, SPEND_SEED.as_ptr(), DUMMIES.as_ptr(), &mut err).is_null());
+        assert!(take_str(err).contains("NULL"));
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_spend_v2_step(ptr::null(), ptr::null_mut(), &mut out), -1);
+        qmb_spend_v2_supply(ptr::null_mut(), ptr::null(), 0);
+        qmb_spend_v2_supply_err(ptr::null_mut(), ptr::null());
+        assert_eq!(qmb_auth_take(ptr::null_mut(), ptr::null_mut(), &mut out), -1);
+        assert!(qmb_spend_v2_intent(ptr::null(), &mut 0usize).is_null());
+        assert!(qmb_spend_v2_refusal(ptr::null()).is_null());
+        assert!(qmb_intent_review(ptr::null(), ptr::null(), 0, &mut err).is_null());
+        assert!(take_str(err).contains("NULL"));
+        assert!(qmb_intent_sign(ptr::null(), ptr::null_mut(), ptr::null(), 0, ptr::null(), &mut 0usize, &mut err).is_null());
+        assert!(take_str(err).contains("NULL"));
+        qmb_spend_v2_free(ptr::null_mut());
+        qmb_spend_basis_free(ptr::null_mut());
+    }
+}

@@ -736,6 +736,12 @@ void qmb_spend_basis_free(qmb_spend_basis_t *b);
  * Byte returns are released with qmb_dealloc(p, len); strings with
  * qmb_string_free. A plan of several steps (fee splits, merges) is one
  * transaction per spend handle: wait for it to land, rescan, start again.
+ *
+ * The HOST is trusted for the journal's freshness (pilot scope): passing an
+ * older auth.v1 text to qmb_auth_open (a restored backup, a stale copy)
+ * makes the kernel re-take leaves already spent, which it cannot see. Always
+ * pass the text last persisted. (Lab #924 PR 3b's restore adds a check
+ * against the chain's landed slots at open.)
  * ------------------------------------------------------------------------- */
 typedef struct qmb_auth_t qmb_auth_t;
 typedef struct qmb_spend_v2_t qmb_spend_v2_t;

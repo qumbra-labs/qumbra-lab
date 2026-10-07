@@ -1950,6 +1950,7 @@ dependencies = [
  "qumbra-wallet",
  "rand 0.10.2",
  "serde_json",
+ "sha2",
  "sha3",
  "zeroize",
 ]

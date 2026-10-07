@@ -143,6 +143,13 @@ unsafe fn text_arg<'a>(what: &str, p: *const c_char, max: usize) -> Result<&'a s
 /// must have the root the journal records (the CLI's own check — a journal
 /// edited or from another seed is refused before anything is signed).
 ///
+/// **The host is trusted for the journal's freshness** (pilot scope): a
+/// shell that hands an OLDER `auth.v1` text — a restored backup, a stale
+/// copy — makes this kernel take leaves already spent, which it cannot see.
+/// Lab #924 PR 3b's restore adds the cross-check against the chain's landed
+/// slots (`landed_next`) at open; until then the shell must pass the text it
+/// last persisted.
+///
 /// # Safety
 /// `w` live; `journal_text` NUL-terminated UTF-8; `err_out` NULL or writable.
 #[no_mangle]
@@ -227,14 +234,6 @@ impl Endpoint for &Replay<'_> {
     }
 }
 
-/// One output, as the review states it.
-#[derive(Clone, Copy)]
-struct ReviewOut {
-    value: u64,
-    asset: u64,
-    to_payee: bool,
-}
-
 /// A prepared transaction waiting for its signature.
 struct Signable {
     prepared: PreparedV2,
@@ -266,7 +265,10 @@ struct Review {
     step: usize,
     steps: usize,
     kind: &'static str,
-    outputs: [ReviewOut; 2],
+    /// Whom an output may pay, by `rkm`: the payee (a payment only) and
+    /// this wallet. The review states each output from its prepared note.
+    payee_rkm: Option<[u64; 4]>,
+    own_rkm: [u64; 4],
     to_short: String,
     spends_verified: bool,
 }
@@ -352,7 +354,12 @@ impl SpendHandle {
         // The active generation's notes, its keys, its address (the CLI's rule).
         let index = b.index.only_generation(auth.generation);
         let plan = plan_send(&index, self.asset, self.amount, shape, tiers).map_err(|e| Attempt::Refused(e.to_string()))?;
-        budget(auth, &index, &plan)?;
+        // The budget is judged before the take; after it the cursor has moved
+        // by this step's own leaves, and the plan's whole count would refuse
+        // a transaction whose leaves are already spent.
+        if paths.is_none() {
+            budget(auth, &index, &plan)?;
+        }
         let step = plan.steps.first().expect("a plan has its payment");
         let held = |s: &Src| match s {
             Src::Held(n) => Ok(n.clone()),
@@ -468,15 +475,12 @@ impl SpendHandle {
         };
         let intent = intent_for(&prepared.tx, b.form.annulet_genesis_format_version(), &b.genesis_hash, self.valid_until, &prepared.auth)
             .map_err(|e| Attempt::Refused(format!("the intent does not rebuild: {e:?}")))?; // debug-ok: a named codec error
-        let to_payee = label == "payment";
         let review = Review {
             step: 1,
             steps: plan.steps.len(),
             kind: label,
-            outputs: [
-                ReviewOut { value: outs[0].value, asset: outs[0].asset, to_payee },
-                ReviewOut { value: outs[1].value, asset: outs[1].asset, to_payee: false },
-            ],
+            payee_rkm: (label == "payment").then_some(self.to.rkm),
+            own_rkm: own.rkm,
             to_short: self.to_short.clone(),
             spends_verified: b.spends_verified,
         };
@@ -675,11 +679,16 @@ pub unsafe extern "C" fn qmb_spend_v2_supply_err(s: *mut SpendHandle, reason: *c
 }
 
 fn supply(h: &mut SpendHandle, answer: Result<Vec<u8>, String>) {
+    // Only a pumping spend takes answers. After READY a stray one is
+    // ignored: it must never cost a prepared (and leaf-spending) transaction.
+    if !matches!(h.phase, Phase::Pumping) {
+        return;
+    }
     match h.asked.take() {
-        Some(path) if matches!(h.phase, Phase::Pumping) => {
+        Some(path) => {
             h.answers.insert(path, answer);
         }
-        _ => h.phase = Phase::Refused("a response with no NEED outstanding".into()),
+        None => h.phase = Phase::Refused("a response with no NEED outstanding".into()),
     }
 }
 
@@ -819,14 +828,22 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
             r.step, r.steps, r.kind
         ));
     }
-    // Per-asset totals, by where they go.
+    // Per-asset totals, by where they go — each from the prepared note that
+    // opens the intent's commitment, its `rkm` matched to the payee or to
+    // this wallet before it is named.
     let mut to_payee: Vec<(u64, u64)> = Vec::new();
     let mut to_self: Vec<(u64, u64)> = Vec::new();
-    for o in &r.outputs {
-        let bucket = if o.to_payee { &mut to_payee } else { &mut to_self };
-        match bucket.iter_mut().find(|(a, _)| *a == o.asset) {
-            Some((_, v)) => *v += o.value,
-            None => bucket.push((o.asset, o.value)),
+    for (k, note) in t.prepared.outputs.iter().enumerate() {
+        let bucket = if Some(note.rkm) == r.payee_rkm {
+            &mut to_payee
+        } else if note.rkm == r.own_rkm {
+            &mut to_self
+        } else {
+            return Err(format!("output {k} pays neither the payee nor this wallet"));
+        };
+        match bucket.iter_mut().find(|(a, _)| *a == note.asset) {
+            Some((_, v)) => *v += note.value,
+            None => bucket.push((note.asset, note.value)),
         }
     }
     for (asset, value) in &to_payee {
@@ -880,8 +897,9 @@ pub unsafe extern "C" fn qmb_intent_review(
 /// stands at or past the take for this generation. Then attach, build the
 /// [`ProvingBundle`] and run its lock (`check`, the prover's own) on this
 /// net; the bundle's bytes are the export, released with
-/// `qmb_dealloc(p, len)`. **Once**: whatever the outcome, the handle is spent
-/// and its witness and paths wiped. NULL + `err_out` on refusal, by name.
+/// `qmb_dealloc(p, len)`. **Once**: whatever the outcome — a NULL argument
+/// included — the handle is spent and its witness and paths wiped. NULL +
+/// `err_out` on refusal, by name.
 ///
 /// # Safety
 /// `a`, `s` live; `intent` `len` readable bytes; `persisted_journal`
@@ -900,28 +918,31 @@ pub unsafe extern "C" fn qmb_intent_sign(
     if !err_out.is_null() {
         *err_out = ptr::null_mut();
     }
-    if a.is_null() || s.is_null() || intent.is_null() || out_len.is_null() {
-        set_err(err_out, "NULL argument".into());
+    if s.is_null() {
+        set_err(err_out, "NULL spend".into());
         return ptr::null_mut();
     }
-    *out_len = 0;
-    let (auth, h) = (&*a, &mut *s);
+    // One call spends the handle, whatever its arguments: the phase goes to
+    // Spent before anything else is looked at.
+    let h = &mut *s;
     let mut t = match std::mem::replace(&mut h.phase, Phase::Spent) {
         Phase::Taken(t) => t,
         other => {
-            let why = match &other {
+            let why = match other {
                 Phase::Spent => "this spend was signed (or refused at the signature) once already".to_string(),
-                Phase::Refused(why) => why.clone(),
+                Phase::Refused(why) => why,
                 _ => "nothing to sign: take the leaves first".to_string(),
             };
-            if !matches!(other, Phase::Spent) {
-                h.phase = other;
-            }
             set_err(err_out, why);
             return ptr::null_mut();
         }
     };
-    let signed = sign(auth, h, &t, std::slice::from_raw_parts(intent, len), persisted_journal);
+    let signed = if a.is_null() || intent.is_null() || out_len.is_null() {
+        Err("NULL argument".to_string())
+    } else {
+        *out_len = 0;
+        sign(&*a, h, &t, std::slice::from_raw_parts(intent, len), persisted_journal)
+    };
     t.wipe();
     drop(t);
     match signed {

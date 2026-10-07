@@ -68,7 +68,9 @@ chacha20poly1305 = "=0.11.0"
 # Lab #924 PR 3 (4b): the Candidate A device half — prepare, the local
 # signer, the proving bundle — WITHOUT the prover (`default-features = false`
 # drops qlab-l2spend's `prove`: no qlab-l2, no STARK crate in the wasm/iOS
-# graphs; asserted at compile time in src/spend_v2.rs). qlab-air for the slot
+# graphs; asserted at compile time in src/spend_v2.rs — on wasm32 ONLY: an
+# iOS/native build carries no such guard and relies on this line's
+# `default-features = false`). qlab-air for the slot
 # input types, qlab-remote-auth for the intent and the dummy keys — both
 # already in this crate's lean graph.
 qlab-l2spend = { path = "../qlab-l2spend", default-features = false }
@@ -85,6 +87,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 # The select-ABI success path needs a real funded chain and the deployed
 # serving surface — native tests only; wasm/iOS release builds never see these.
 [dev-dependencies]
+# Lab #924: the spend fixtures example writes SHA256SUMS.
+sha2 = "0.11"
 qumbra-node = { path = "../qumbra-node" }
 qlab-devnet = { path = "../qlab-devnet" }
 # Lab #858 WA2: tests/annulet_abi.rs runs qumbra-wallet's own lying-endpoint
