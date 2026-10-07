@@ -307,6 +307,7 @@ impl ProvingBundle {
             .map_err(|e| BundleError::Unauthorized(format!("{e:?}"))) // debug-ok: a named auth error
     }
 
+    #[cfg(feature = "prove")]
     /// Check ([`Self::check`]), then prove: the transaction with its proof.
     /// The proof is the only thing this adds.
     pub fn prove(&self, ctx: &AuthContext) -> Result<TxEntry, BundleError> {

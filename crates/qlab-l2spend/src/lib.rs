@@ -16,6 +16,14 @@
 //!   empty-freeze opening the wallet can rebuild itself ([`policy_for_transfer`]).
 //!   A non-empty freeze tree or a Regulated asset needs the issuer's witnesses
 //!   (C3) and is refused by name.
+//! - **The prover is a feature** (`prove`, on by default; lab #924). Without
+//!   it the crate is the device half only — served reads, `prepare_*_v2`, the
+//!   local signer, the [`bundle`] — which the browser/iOS kernel builds with
+//!   no STARK crate in its graph ([`PROVER_LINKED`]).
+
+// Without `prove`, the v1 builders' and the R path's helpers and imports go
+// unused; they stay one copy, compiled with the prover.
+#![cfg_attr(not(feature = "prove"), allow(dead_code, unused_imports))]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -35,6 +43,10 @@ use qlab_note::kem::Ek;
 use qlab_note::l2note::{GenesisPlaintext, L2Note, L2_PAYLOAD_LEN};
 use qlab_note::wire::RecipientBundle;
 use rand::Rng;
+
+/// Whether this build links the prover (`prove`). A kernel that must not
+/// carry it asserts `!PROVER_LINKED` at compile time.
+pub const PROVER_LINKED: bool = cfg!(feature = "prove");
 
 /// Lab #896 seam E4: the v2 (Candidate A) builders and the Annulet intent.
 pub mod v2;
@@ -536,6 +548,7 @@ pub(crate) fn unproved_entry(
     }
 }
 
+#[cfg(feature = "prove")]
 #[allow(clippy::too_many_arguments)]
 fn entry(
     proof: &qlab_l2::Proof<qlab_l2::Config>,
@@ -565,6 +578,7 @@ fn entry(
     }
 }
 
+#[cfg(feature = "prove")]
 /// **A shape-S spend** (Cloaked assets): one or two real inputs; with one,
 /// the second slot is a dummy (value 0, asset 0, a fresh ρ so its nullifier
 /// never repeats). Proves (≈ 7 GB, seconds).
@@ -578,6 +592,7 @@ pub fn build_s<E: Endpoint, R: rand::CryptoRng>(
     build_s_slot(served, inputs, outs, fee, None, rng)
 }
 
+#[cfg(feature = "prove")]
 /// **A4's merge on shape S** (`d3 = 0`): two real inputs — two notes of one
 /// Cloaked asset, typically — and `fee_note`, an asset-0 note worth exactly
 /// `fee`, in slot 3. The rows carry no fee.
@@ -592,6 +607,7 @@ pub fn build_s_merge<E: Endpoint, R: rand::CryptoRng>(
     build_s_slot(served, &inputs, outs, fee, Some(fee_note), rng)
 }
 
+#[cfg(feature = "prove")]
 fn build_s_slot<E: Endpoint, R: rand::CryptoRng>(
     served: &Served<E>,
     inputs: &[&L2TxInput],
@@ -668,6 +684,7 @@ pub struct BuiltR {
     pub new_root: [u8; 32],
 }
 
+#[cfg(feature = "prove")]
 /// **A shape-R registry write** (lab #728): `new_leaf` replaces registry slot
 /// `new_leaf.asset` — a **registration** when the served slot is empty
 /// (permissionless; `isk` is not read), an **update** when it holds a leaf
@@ -757,6 +774,7 @@ pub fn build_r<E: Endpoint, R: rand::CryptoRng>(
     Ok(BuiltR { tx, output: note, seed: seed_note, new_root })
 }
 
+#[cfg(feature = "prove")]
 /// **A shape-P transfer** (vPublic = 0) of two real inputs — a policy-asset
 /// note and an asset-0 fee note, typically — with each input's policy built
 /// by [`policy_for_transfer`] from the served opening. Proves (≈ 15 GB).
@@ -770,6 +788,7 @@ pub fn build_p<E: Endpoint, R: rand::CryptoRng>(
     build_p_with(served, inputs, outs, fee, [&PolicyContext::default(), &PolicyContext::default()], [VPublic::NONE; 2], rng)
 }
 
+#[cfg(feature = "prove")]
 /// **A shape-P spend with issuance** (lab #722): each input's policy from
 /// its [`PolicyContext`], and a `vPublic` per row — `VPublic::mint(v)` /
 /// `VPublic::redeem(v)` on the row of the asset being issued or burned (the
@@ -787,6 +806,7 @@ pub fn build_p_with<E: Endpoint, R: rand::CryptoRng>(
     build_p_slot(served, inputs, outs, fee, ctx, vp, None, rng)
 }
 
+#[cfg(feature = "prove")]
 /// **A4's merge on shape P** (`d3 = 0`, vPublic = 0): two real inputs — two
 /// notes of one policy asset, typically, each with its own policy context —
 /// and `fee_note`, an asset-0 note worth exactly `fee`, in slot 3.
@@ -802,6 +822,7 @@ pub fn build_p_merge<E: Endpoint, R: rand::CryptoRng>(
     build_p_slot(served, inputs, outs, fee, ctx, [VPublic::NONE; 2], Some(fee_note), rng)
 }
 
+#[cfg(feature = "prove")]
 #[allow(clippy::too_many_arguments)]
 fn build_p_slot<E: Endpoint, R: rand::CryptoRng>(
     served: &Served<E>,
@@ -824,6 +845,7 @@ fn build_p_slot<E: Endpoint, R: rand::CryptoRng>(
     prove_p_slot(&tree, inputs, outs, fee, policy, regs[0].root, vp, &fee_slot, rng)
 }
 
+#[cfg(feature = "prove")]
 /// **The P assembly below the policy check** (lab #722): prove against the
 /// given policy inputs and `registry_root` as they are. The wallet never calls
 /// this directly — [`build_p_with`] builds the policies from served data and
@@ -844,6 +866,7 @@ pub fn prove_p_with_policies<R: rand::CryptoRng>(
     prove_p_slot(tree, inputs, outs, fee, policy, registry_root, vp, &fee_slot, rng)
 }
 
+#[cfg(feature = "prove")]
 #[allow(clippy::too_many_arguments)]
 fn prove_p_slot<R: rand::CryptoRng>(
     tree: &CommitmentTree,
@@ -946,6 +969,7 @@ pub struct ExitInstance {
     pub ask: ExitAsk,
 }
 
+#[cfg(feature = "prove")]
 /// **The exit's instance** — pure, no endpoint, no prove: the one assembly
 /// the wallet proves ([`build_p_exit`]) and the lane hands to a wrapper as a
 /// member (`qlab-bench`'s f5box tests). Shape P, one real asset-0 input on
@@ -1008,6 +1032,7 @@ pub fn exit_instance<R: Rng>(
     Ok(ExitInstance { inst, outputs, ask })
 }
 
+#[cfg(feature = "prove")]
 /// The exit's transaction entry from its instance and its proof: the outputs
 /// (both to `change_to`) with their discovery, the P surface carrying the
 /// redeem term and the recipient (`exit_rkm` = the proof's `PV_XRKM`).
@@ -1032,6 +1057,7 @@ pub fn exit_entry<R: rand::CryptoRng>(
     Built { tx: entry(proof, &inst.anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery), outputs: notes, shape: L2ShapeTag::P }
 }
 
+#[cfg(feature = "prove")]
 /// **An exit, proved** (P on the hiding lane: the 32 GiB class — 30.04 GiB
 /// peak measured at F5-4d-3). Reads the commitment tree and the asset-0
 /// opening from `served`; never submits: an Annulet net refuses an exit by
@@ -1050,6 +1076,7 @@ pub fn build_p_exit<E: Endpoint, R: rand::CryptoRng>(
     Ok(prove_exit(&ei, fee, change_to, rng))
 }
 
+#[cfg(feature = "prove")]
 /// Prove an exit instance (the P lane, ≈ 30 GiB) and assemble its entry —
 /// [`build_p_exit`]'s last step, for a caller that built the instance
 /// against a tree and opening it checked itself (lab #860 R3).
@@ -1164,6 +1191,7 @@ fn words(h: &[u8; 32]) -> [u64; 4] {
     core::array::from_fn(|i| u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().expect("8 bytes")))
 }
 
+#[cfg(feature = "prove")]
 /// **The P public values a decoded exit declares** — what a wrapper threads
 /// as the member and what its proof is verified against: the node's own
 /// surface-to-PV mapping (`qumbra-node`'s `L2Verifier`, `pv_vec_p`) over the
@@ -1228,6 +1256,7 @@ impl std::fmt::Display for ClaimError {
 
 impl std::error::Error for ClaimError {}
 
+#[cfg(feature = "prove")]
 /// **A deposit claim's instance** — pure, no endpoint, no prove: the one
 /// assembly the wallet proves (`deposit claim`) and the lane hands to a
 /// wrapper as a member (`qlab-bench`'s f5box tests). The burn note
@@ -1276,6 +1305,7 @@ pub fn claim_instance(
     ))
 }
 
+#[cfg(feature = "prove")]
 /// **A claim, proved** — the hiding claim lane, ≈ 3.17 GiB / ≈ 10 s
 /// measured (l2-architecture §4.1's build update): laptop-class, local only.
 pub fn prove_claim(inst: &qlab_air::claim::ClaimInstance) -> qlab_l2::Proof<qlab_l2::Config> {
@@ -1352,6 +1382,7 @@ pub fn claim_fee_of(pvs: &[u32]) -> u64 {
     pv_word(pvs, qlab_air::claim::PV_FEE, 4)
 }
 
+#[cfg(feature = "prove")]
 /// The claim file: magic ‖ version ‖ genesis (32) ‖ l2_id (u64 LE) ‖ PV count
 /// (u32 LE) ‖ PVs (u32 LE each) ‖ proof length (u32 LE) ‖ proof ‖ value (u64
 /// LE) ‖ r_v (four u64 LE). The genesis binds it to one chain; the PVs carry
