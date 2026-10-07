@@ -132,6 +132,9 @@ pub mod annulet_plan;
 pub mod auth_journal;
 #[cfg(feature = "verify")]
 pub mod annulet_driver;
+/// What a Candidate A wallet's authorizations did on chain (lean; lab #924 PR 3b).
+#[cfg(feature = "verify")]
+pub mod annulet_landed;
 #[cfg(feature = "verify")]
 #[doc(hidden)]
 pub mod annulet_reference;
