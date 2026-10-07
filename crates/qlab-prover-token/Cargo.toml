@@ -5,14 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Lab #924 PR 3e: the token code moved out of qumbra-prover-service; its tests
-# stayed there and run through the prover's re-export, so this lib has no
-# test binary or doc-test set of its own (the lane's expected-set count
-# follows these two flags).
-[lib]
-test = false
-doctest = false
-
 [dependencies]
 qlab-remote-auth = { path = "../qlab-remote-auth" }
 qlab-wallet = { path = "../qlab-wallet" }
