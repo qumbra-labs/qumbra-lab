@@ -1939,16 +1939,19 @@ dependencies = [
  "qlab-air",
  "qlab-cbserver",
  "qlab-devnet",
+ "qlab-l2spend",
  "qlab-ledger",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",
+ "qlab-remote-auth",
  "qlab-wallet",
  "qumbra-node",
  "qumbra-wallet",
  "rand 0.10.2",
  "serde_json",
  "sha3",
+ "zeroize",
 ]
 
 [[package]]

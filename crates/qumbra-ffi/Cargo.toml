@@ -65,6 +65,16 @@ qlab-node = { path = "../qlab-node", default-features = false }
 # artifact digest CANNOT be discharged shell-side; see src/pairing.rs.
 sha3 = "0.11.0"
 chacha20poly1305 = "=0.11.0"
+# Lab #924 PR 3 (4b): the Candidate A device half — prepare, the local
+# signer, the proving bundle — WITHOUT the prover (`default-features = false`
+# drops qlab-l2spend's `prove`: no qlab-l2, no STARK crate in the wasm/iOS
+# graphs; asserted at compile time in src/spend_v2.rs). qlab-air for the slot
+# input types, qlab-remote-auth for the intent and the dummy keys — both
+# already in this crate's lean graph.
+qlab-l2spend = { path = "../qlab-l2spend", default-features = false }
+qlab-air = { path = "../qlab-air" }
+qlab-remote-auth = { path = "../qlab-remote-auth" }
+zeroize = "1.9"
 
 # wasm32 (the browser-extension shell): getrandom needs the JS backend wired
 # explicitly (crypto.getRandomValues). Build with

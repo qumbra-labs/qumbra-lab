@@ -4,7 +4,9 @@
 //! [`crate::annulet_send`] (lab #924) so the browser kernel, which builds
 //! without the prover, plans exactly as the CLI does; the CLI re-exports it.
 
+use qlab_air::l2::{L2AuthInput, L2AuthPath};
 use qlab_devnet::annulet::L2ShapeTag;
+use qlab_wallet::Wallet;
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
 
 /// The fee tiers a send pays, from the node.
@@ -344,3 +346,35 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
     Ok(SendPlan { asset, amount, steps })
 }
 
+
+/// A real input: `note` (this wallet's, generation `g`) with the leaf `path`.
+pub fn real_input(wallet: &Wallet, note: &OwnedL2Note, path: L2AuthPath) -> L2AuthInput {
+    L2AuthInput {
+        nk: wallet.nk(),
+        value: note.note.value,
+        asset: note.note.asset,
+        rho: note.note.rho,
+        rseed: note.note.rseed,
+        d: wallet.diversifier_at_index(note.div_index).lanes(),
+        auth: path,
+    }
+}
+
+/// The leaves an ordinary send must leave unconsumed in its generation:
+/// one per spendable note plus two, so the generation can always still be
+/// swept. A hard floor ahead of Phase 4's reserve (`2 × unspent + 16`,
+/// design 2b §9), which replaces it.
+pub const SWEEP_FLOOR_EXTRA: u32 = 2;
+
+/// The real slots — leaves — a plan takes: a fee split 1, a merge 3, a
+/// payment 1, 2 or 3 by its inputs and fee note.
+pub fn plan_slots(plan: &SendPlan) -> u32 {
+    plan.steps
+        .iter()
+        .map(|s| match &s.kind {
+            StepKind::FeeSplit { .. } => 1,
+            StepKind::Merge { .. } => 3,
+            StepKind::Pay { inputs, fee } => inputs.len() as u32 + u32::from(fee.is_some()),
+        })
+        .sum()
+}

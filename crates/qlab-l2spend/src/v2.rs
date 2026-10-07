@@ -780,6 +780,14 @@ impl LocalAuth {
         self.cursor.next()
     }
 
+    /// The paths of the next `n` leaves, **not** consumed — for a dry run
+    /// that learns what a spend needs before anything is taken (lab #924).
+    /// `None` past the generation's end.
+    pub fn peek(&self, n: usize) -> Option<Vec<L2AuthPath>> {
+        let mut cursor = Cursor::new(&self.master, D_AUTH as u8, self.cursor.next()).ok()?;
+        (0..n).map(|_| cursor.take().map(|i| self.path(i))).collect()
+    }
+
     /// Consume the next leaf for a real slot and return its path, or `None`
     /// when the generation is exhausted.
     pub fn take(&mut self) -> Option<L2AuthPath> {
