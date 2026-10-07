@@ -504,6 +504,34 @@ fn l2_outputs<R: Rng>(outs: &[Out; 2], rng: &mut R) -> [L2TxOutput; 2] {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// [`entry`] before the proof (lab #924): the same transaction with an empty
+/// `proof`, for a prover elsewhere to fill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn unproved_entry(
+    anchor: &[u64; 4],
+    nf: &[[u64; 4]; 2],
+    nf3: &[u64; 4],
+    cm_out: &[[u64; 4]; 2],
+    fee: u64,
+    surface: L2Surface,
+    discovery: Vec<u8>,
+) -> TxEntry {
+    TxEntry {
+        auth: qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec(),
+        proof: Vec::new(),
+        public: TxPublic {
+            anchor: digest_bytes(anchor),
+            nullifiers: nf.iter().chain(std::iter::once(nf3)).map(digest_bytes).collect(),
+            commitments: cm_out.iter().map(digest_bytes).collect(),
+            bucket: ArityBucket::TwoByTwo,
+            fee,
+        },
+        discovery,
+        rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+        l2: surface.encode(),
+    }
+}
+
 fn entry(
     proof: &qlab_l2::Proof<qlab_l2::Config>,
     anchor: &[u64; 4],
