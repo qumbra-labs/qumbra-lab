@@ -636,6 +636,17 @@ impl VerifiedAnnulet {
         &self.chain
     }
 
+    /// The verified net's L2 authorization axis — [`L2AuthForm::CandidateA`]
+    /// on a format-33 genesis, [`L2AuthForm::None`] on format 32 — read from
+    /// the genesis file the scan verified against the pin (lab #896; macOS
+    /// #60 D2: a shell asks this before deriving an address or planning a
+    /// send, never infers it from its own net table). The same value is
+    /// `chain().genesis.l2_auth`; a pre-scan check on raw genesis bytes is
+    /// `AnnuletGenesisFile::from_bytes(b)?.l2_auth()`.
+    pub fn l2_auth(&self) -> L2AuthForm {
+        self.chain.genesis.l2_auth
+    }
+
     /// The heights scanned: `from ..= the verified tip` (or the asked `to`).
     pub fn range(&self) -> (u64, u64) {
         self.range
@@ -700,16 +711,45 @@ pub fn scan_annulet_verified<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
+    scan_annulet_verified_with_generations(w, fetch, from, to, pin, &[], rng)
+}
+
+/// [`scan_annulet_verified`] with the **authorization generations** a
+/// Candidate A (format-33) scan owns notes under, as `(g, auth_root(g))`
+/// (`crate::auth_journal::generation_root`) — lab #896, the Rust-API twin of
+/// `qmb_annulet_new_v2` (macOS #60 D2). A non-empty list is used as given
+/// (a receive-only wallet passes generation 0 alone); an empty list is
+/// [`scan_annulet_verified`]'s own rule — the wallet's journal when it has
+/// one, else the driver's probe. A v1 net does not read them. The record is
+/// read and written exactly as [`scan_annulet_verified`] does.
+pub fn scan_annulet_verified_with_generations<F>(
+    w: &WalletDir,
+    fetch: &mut F,
+    from: u64,
+    to: u64,
+    pin: Option<[u8; 32]>,
+    generations: &[(u32, [u64; 4])],
+    rng: &mut StdRng,
+) -> Result<VerifiedAnnulet, VerifyRefusal>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
     use crate::annulet_driver::{AnnuletStep, AnnuletVerifyDriver};
     let pin = pin.ok_or(VerifyRefusal::NoPin)?;
     let record = read_chain_record(w, &pin);
     let mut driver = AnnuletVerifyDriver::new(w.wallet(), w.allocated.clone(), pin, from, to, record);
-    // Lab #896 G: the journal's generations, when the wallet has one (a
-    // Candidate A net only reads them; a v1 net ignores them).
-    match crate::auth_journal::AuthJournal::load(&w.dir) {
-        Ok(Some(j)) => driver = driver.with_generations(j.generations().iter().map(|r| (r.g, r.auth_root)).collect()),
-        Ok(None) => {}
-        Err(e) => return Err(VerifyRefusal::AuthJournal { why: e.to_string() }),
+    if !generations.is_empty() {
+        driver = driver.with_generations(generations.to_vec());
+    } else {
+        // Lab #896 G: the journal's generations, when the wallet has one (a
+        // Candidate A net only reads them; a v1 net ignores them).
+        match crate::auth_journal::AuthJournal::load(&w.dir) {
+            Ok(Some(j)) => {
+                driver = driver.with_generations(j.generations().iter().map(|r| (r.g, r.auth_root)).collect())
+            }
+            Ok(None) => {}
+            Err(e) => return Err(VerifyRefusal::AuthJournal { why: e.to_string() }),
+        }
     }
     let mut v = loop {
         match driver.step(rng) {
