@@ -134,7 +134,7 @@ impl SpendBasis {
                 if l.testnet { " — a test network: test money" } else { "" }
             ),
             (Some(l), None) => format!("asset list: for another network ({}), ignored — assets shown by id", short(&l.genesis)),
-            (None, None) => "asset list: none — assets shown by id, in base units".to_string(),
+            (None, None) => "asset list: none — every asset is unlisted; amounts in base units".to_string(),
         }
     }
 }
@@ -335,7 +335,7 @@ impl Names {
     /// `units` of `asset`, as the list and the bound leaf allow.
     fn amount(&self, units: u64, asset: u64) -> String {
         if asset == 0 {
-            return format!("{} fee units", render_amount(u128::from(units), 0));
+            return format!("{} fee unit{}", render_amount(u128::from(units), 0), if units == 1 { "" } else { "s" });
         }
         if asset != u64::from(self.asset) {
             return format!("{} base units of QIA #{asset} (not this spend's asset)", render_amount(u128::from(units), 0));
