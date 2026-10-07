@@ -790,7 +790,8 @@ typedef struct qmb_spend_v2_t qmb_spend_v2_t;
  * entropy" — so the handle can attest its birth (in memory only, never
  * serialized). qmb_auth_first_fresh(w, &journal) then gives generation 0
  * offline, ONCE per handle (the mark is consumed); any handle from
- * _from_entropy / _restore / _from_parts is refused by name. Persist the seed with qmb_wallet_seed_* as for any wallet. */
+ * _from_entropy / _restore / _from_parts is refused by name. Persist the seed with
+ * qmb_wallet_seed_version and qmb_wallet_seed_entropy, as for any wallet. */
 #define QMB_AUTH_CHECKED 0
 #define QMB_AUTH_JOURNAL_STALE 1
 #define QMB_AUTH_SWEEP_FLOOR_RAISED 2
