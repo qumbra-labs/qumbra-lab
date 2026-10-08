@@ -455,6 +455,119 @@ fn l2_v2_prove_verify_roundtrip_s() {
     // The reverse direction without a new prove: the v2 entry refuses the
     // v1-length vector, and the v1 entry the v2-length one (above).
     assert!(!v2::verify_s(&pvs[..Shape::S.pv_len()], &proof));
+    // Lab #937: a v2 proof is not a v3 proof — at v2's PV length, and with
+    // a third commitment appended (zero, or a real one).
+    assert!(!v3::verify_s(&pvs, &proof), "a v2 S proof at v2 length is not v3");
+    let mut long = pvs.clone();
+    long.resize(v3::pv_len(Shape::S), Val::ZERO);
+    assert!(!v3::verify_s(&long, &proof), "a v2 S proof with cm3 = 0 is not v3");
+    let v3_pvs = public_values(&qlab_air::l2::fabricated_bucket_l2_v3().pvs);
+    long[v3::pv_cm3(Shape::S)..].copy_from_slice(&v3_pvs[v3::pv_cm3(Shape::S)..]);
+    assert!(!v3::verify_s(&long, &proof), "a v2 S proof with a real cm3 is not v3");
+}
+
+/// Lab #937: shape S **v3** through the real prover at 2^20, verified by the
+/// witness-free v3 AIR; degree still 4; a tampered `cm3` is refused; a v3
+/// proof is not a v2 proof (the v2 → v3 direction rides on
+/// `l2_v2_prove_verify_roundtrip_s`'s proof). Lane budget: one 2^20 S prove
+/// (≈ the v2 S prove).
+#[test]
+fn l2_v3_prove_verify_roundtrip_s() {
+    use qlab_air::l2::{fabricated_bucket_l2_v3, verifier_air_s_v3, L2_WIDTH_V3, PV_CM3, PV_LEN_V3};
+    let air = verifier_air_s_v3();
+    assert_eq!(<L2ShapeSAir as BaseAir<Val>>::width(&air), L2_WIDTH_V3);
+    assert_eq!(<L2ShapeSAir as BaseAir<Val>>::num_public_values(&air), PV_LEN_V3);
+    assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 4);
+
+    let inst = fabricated_bucket_l2_v3();
+    assert_eq!(inst.air.program, air.program, "the verifier program is the builder's");
+    let (pvs, proof) = v3::prove_s(&inst.air, &inst.pvs);
+    assert!(v3::verify_s(&pvs, &proof), "v3::verify_s accepts the honest proof");
+    assert!(v3::verify_s_u32(&inst.pvs, &proof));
+    let mut bad = pvs.clone();
+    bad[PV_CM3] += Val::ONE;
+    assert!(!v3::verify_s(&bad, &proof), "a tampered cm3 is refused");
+    let mut swapped = pvs.clone();
+    let (c2, c3) = (pvs[qlab_air::l2::PV_CM2..qlab_air::l2::PV_FEE].to_vec(), pvs[PV_CM3..].to_vec());
+    swapped[qlab_air::l2::PV_CM2..qlab_air::l2::PV_FEE].copy_from_slice(&c3);
+    swapped[PV_CM3..].copy_from_slice(&c2);
+    assert!(!v3::verify_s(&swapped, &proof), "cm2/cm3 swapped are refused");
+    // A v3 proof is not a v2 (nor v1) proof, at any of their lengths.
+    assert!(!v2::verify_s(&pvs[..v2::pv_len(Shape::S)], &proof), "a v3 S proof is not v2");
+    assert!(!v2::verify_s(&pvs, &proof));
+    assert!(!verify_s(&pvs[..Shape::S.pv_len()], &proof), "a v3 S proof is not v1");
+}
+
+/// Lab #937: shape P **v3** geometry and degree, read off the witness-free
+/// v3 AIR. No prove here, as for P v2 (`l2_v2_geometry_and_degree_p`): the
+/// P v3 prove and memory figure is the rig measurement before the freeze.
+#[test]
+fn l2_v3_geometry_and_degree_p() {
+    use qlab_air::l2p::{fabricated_bucket_l2p_v3, verifier_air_p_v3, L2P_WIDTH_V3, PV_LEN_V3};
+    let air = verifier_air_p_v3();
+    assert_eq!(<L2ShapePAir as BaseAir<Val>>::width(&air), L2P_WIDTH_V3);
+    assert_eq!(<L2ShapePAir as BaseAir<Val>>::num_public_values(&air), PV_LEN_V3);
+    assert_eq!(get_max_constraint_degree::<Val, _>(&air, AirLayout::from_air::<Val>(&air)), 4);
+    assert_eq!(fabricated_bucket_l2p_v3().air.program, air.program, "the verifier program is the builder's");
+}
+
+/// Lab #937: the v3 shape digests are pinned (from `l2_goldens` at
+/// `991defb4`). Constants, constraints (and their count) and the whole
+/// digest, so a move names its half.
+#[test]
+fn l2_v3_shape_digests_are_pinned() {
+    for (shape, pin) in [(Shape::S, v3::SHAPE_S_DIGEST_V3), (Shape::P, v3::SHAPE_P_DIGEST_V3)] {
+        assert_eq!(digest::hex(&digest::shape_digest_v3(shape)), pin, "{shape:?} shape digest v3 — a moved digest is a freeze event");
+    }
+    for (shape, consts, constr, n) in v3::PINS_V3 {
+        assert_eq!(digest::hex(&digest::constants_digest_v3(shape)), consts, "{shape:?} v3 constants");
+        let (c, count) = digest::constraints_digest_v3(shape);
+        assert_eq!((digest::hex(&c).as_str(), count), (constr, n), "{shape:?} v3 constraints");
+    }
+}
+
+/// Lab #937: the v3 shape identities (S and P). Geometry read off the v3
+/// verifier AIRs agrees with `v3::*`; `cm3` is the PV tail after v2's leaves;
+/// the v3 digests are deterministic, distinct, and equal no v1 or v2 pin.
+/// The hex pins land from an `l2_goldens` run (print-then-pin, lab #724).
+#[test]
+fn l2_v3_shape_identities() {
+    for shape in [Shape::S, Shape::P] {
+        let (w, pv) = match shape {
+            Shape::S => {
+                let a = v3::verifier_air_s();
+                (<L2ShapeSAir as BaseAir<Val>>::width(&a), <L2ShapeSAir as BaseAir<Val>>::num_public_values(&a))
+            }
+            _ => {
+                let a = v3::verifier_air_p();
+                (<L2ShapePAir as BaseAir<Val>>::width(&a), <L2ShapePAir as BaseAir<Val>>::num_public_values(&a))
+            }
+        };
+        assert_eq!((w, pv), (v3::width(shape), v3::pv_len(shape)), "{shape:?}");
+        assert_eq!(v3::pv_cm3(shape), v2::pv_len(shape), "{shape:?}: cm3 follows v2's PVs");
+        assert_eq!(v3::pv_cm3(shape) + 16, v3::pv_len(shape), "{shape:?}: cm3 is the tail");
+        let fresh = match shape {
+            Shape::S => qlab_air::l2::fabricated_bucket_l2_v3().air.program,
+            _ => qlab_air::l2p::fabricated_bucket_l2p_v3().air.program,
+        };
+        assert_eq!(v3::canonical_program(shape), &fresh[..], "{shape:?}: canonical = freshly built");
+        assert_eq!(v3::canonical_program(shape).iter().filter(|r| **r != qlab_air::l2::ROLE_DUMMY).count(), v3::perms(shape) - 1);
+        let bits = v3::audit_pv_bits(shape);
+        assert_eq!(bits.len(), v3::pv_len(shape));
+        assert_eq!(bits[..v2::pv_len(shape)], v2::audit_pv_bits(shape)[..]);
+        assert!(bits[v3::pv_cm3(shape)..].iter().all(|b| *b == 16));
+        assert_eq!(v3::audit_leaf_pv_inputs(shape), v2::audit_leaf_pv_inputs(shape));
+    }
+    let d: Vec<String> = [Shape::S, Shape::P].iter().map(|s| digest::hex(&digest::shape_digest_v3(*s))).collect();
+    let again: Vec<String> = [Shape::S, Shape::P].iter().map(|s| digest::hex(&digest::shape_digest_v3(*s))).collect();
+    assert_eq!(d, again, "v3 digests are deterministic");
+    assert_ne!(d[0], d[1]);
+    for old in [SHAPE_S_DIGEST_V1, SHAPE_P_DIGEST_V1, SHAPE_R_DIGEST_V1, v2::SHAPE_S_DIGEST_V2, v2::SHAPE_P_DIGEST_V2, v2::SHAPE_R_DIGEST_V2] {
+        assert!(!d.iter().any(|x| x == old), "a v3 digest equals a v1/v2 pin");
+    }
+    // The v3 typed entries refuse a v2-length PV vector before any proof work.
+    assert!(!pv_u32_in_range(&vec![0; v2::pv_len(Shape::S)], &v3::audit_pv_bits(Shape::S)));
+    assert!(!pv_u32_in_range(&vec![0; v2::pv_len(Shape::P)], &v3::audit_pv_bits(Shape::P)));
 }
 
 /// Lab #896 seam C: shape P **v2** geometry and degree, read off the

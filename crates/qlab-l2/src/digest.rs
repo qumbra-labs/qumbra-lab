@@ -291,6 +291,81 @@ pub fn shape_digest_v2(shape: Shape) -> [u8; 32] {
     h.finish()
 }
 
+// ---------------------------------------------------------------------------
+// v3 (lab #937): S and P with a third output, under their own domain.
+// ---------------------------------------------------------------------------
+
+/// The v3 shape-digest domain: a v3 digest can never equal a v1 or v2 one.
+pub const SHAPE_DIGEST_DOMAIN_V3: &[u8] = b"qumbra:l2:shape:v3";
+
+/// Digest (i), v3: v3 geometry, v2's PV layout and leaf offsets, `PV_CM3`,
+/// the canonical v3 program, the shared tail, v2's host-mirror known answers
+/// and ρ′₂'s (`H(nf₀ ‖ 9)`). S and P only.
+pub fn constants_digest_v3(shape: Shape) -> [u8; 32] {
+    use crate::{v2, v3};
+    let mut h = H::new(b"qumbra:l2:shape:v3:constants");
+    h.u64(tag(shape))
+        .usize(v3::width(shape))
+        .usize(v3::log_height(shape))
+        .usize(v3::perms(shape))
+        .usize(l2::ROWS_PER_PERM)
+        .usize(v3::pv_len(shape))
+        .usize(l2::D_AUTH);
+    h.words(&[
+        l2::PV_ANCHOR as u64,
+        l2::PV_NF1 as u64,
+        l2::PV_NF2 as u64,
+        l2::PV_CM1 as u64,
+        l2::PV_CM2 as u64,
+        l2::PV_FEE as u64,
+        l2::PV_REGROOT as u64,
+    ]);
+    if shape == Shape::P {
+        h.words(&[l2p::PV_VP1 as u64, l2p::PV_VP2 as u64]);
+    }
+    let leaves: Vec<u64> = (0..v2::auth_slots(shape)).map(|k| v2::pv_leaf(shape, k) as u64).collect();
+    h.words(&leaves);
+    h.usize(v3::pv_cm3(shape));
+    let program: Vec<u64> = v3::canonical_program(shape).iter().map(|r| *r as u64).collect();
+    h.words(&program);
+    constants_tail(&mut h, shape);
+    let o = [1u64, 2, 3, 4];
+    let r = [5u64, 6, 7, 8];
+    h.words(&l2::l2_nf(&o, &r));
+    h.words(&l2::l2_rkm_v2(&o, &[9, 10], &r));
+    h.words(&qlab_air::reference::merkle_node_state(&o, &r)[..4]);
+    h.bytes(&mldsa_leaf_known_answer());
+    // v3's new domain: ρ′₂ = H(nf₀ ‖ 9).
+    h.words(&l2::derive_output_rho_l2(&o, 2));
+    h.finish()
+}
+
+/// Digest (ii), v3: the symbolic constraint set of the v3 verifier AIR.
+pub fn constraints_digest_v3(shape: Shape) -> ([u8; 32], usize) {
+    std::thread::Builder::new()
+        .name("l2-constraints-digest-v3".into())
+        .stack_size(512 << 20)
+        .spawn(move || {
+            let d = b"qumbra:l2:shape:v3:constraints";
+            match shape {
+                Shape::S => constraints_digest_with_domain(d, &crate::v3::verifier_air_s()),
+                Shape::P => constraints_digest_with_domain(d, &crate::v3::verifier_air_p()),
+                Shape::R => panic!("shape R has no v3"),
+            }
+        })
+        .expect("spawn the digest thread")
+        .join()
+        .expect("the digest thread panicked")
+}
+
+/// The v3 shape digest: `Keccak-256(v3 domain ‖ tag ‖ constants_v3 ‖ constraints_v3)`.
+pub fn shape_digest_v3(shape: Shape) -> [u8; 32] {
+    let (c, _) = constraints_digest_v3(shape);
+    let mut h = H::new(SHAPE_DIGEST_DOMAIN_V3);
+    h.u64(tag(shape)).bytes(&constants_digest_v3(shape)).bytes(&c);
+    h.finish()
+}
+
 /// Content hash of one symbolic node; `memo` caches by address within one walk.
 fn node_hash(
     e: &SymbolicExpression<Val>,

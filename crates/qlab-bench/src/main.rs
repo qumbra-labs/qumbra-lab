@@ -1009,11 +1009,18 @@ fn main() {
             };
             // Lab #896 M: `--v2` measures the Candidate A shape (`s|p|r` →
             // `s-v2|p-v2|r-v2`), on the L2 lane unless `--only` says otherwise.
+            // Lab #937: `--v3` measures the three-output shapes (`s|p` →
+            // `s-v3|p-v3`), on the L2 lane unless `--only` says otherwise.
             let v2 = args.iter().any(|a| a == "--v2");
-            let shape_v2;
-            let (shape, only) = if v2 {
-                shape_v2 = format!("{shape}-v2");
-                (shape_v2.as_str(), only.or(Some("b4/q45")))
+            let v3 = args.iter().any(|a| a == "--v3");
+            if v2 && v3 {
+                eprintln!("l2shape: `--v2` and `--v3` are exclusive");
+                std::process::exit(2);
+            }
+            let shape_vn;
+            let (shape, only) = if v2 || v3 {
+                shape_vn = format!("{shape}-{}", if v3 { "v3" } else { "v2" });
+                (shape_vn.as_str(), only.or(Some("b4/q45")))
             } else {
                 (shape, only)
             };

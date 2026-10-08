@@ -235,6 +235,9 @@ pub enum L2Version {
     V1,
     /// Candidate A: `nk` witness, auth path, leaf public values.
     V2Auth,
+    /// v2 plus a third output (lab #937 D1 route 1): every S/P transaction
+    /// carries exactly three outputs. Shapes S and P only; R stays v2.
+    V3,
 }
 
 /// v2 program ring: 40 + 9 = 49 limbs, 196 slots (194 used at D12).
@@ -274,6 +277,37 @@ const EGA_POS_COL: usize = EQL_OFF + 16; // 757
 const EQA_OFF: usize = EGA_POS_COL + 1; // 758: 16
 /// The shape-S v2 trace width.
 pub const L2_WIDTH_V2: usize = EQA_OFF + 16; // 774
+
+// ---------------------------------------------------------------------------
+// Version 3 — the third output (lab #937, D1 route 1: Larry 2026-10-08). v2's
+// program, columns and constraints, plus one output span appended to the tail:
+//   ACMOUT → BCM1 → ARHO → ACMOUT → BCM2 → ARHO → ACMOUT → BCM2 → BAL → END
+// The second `ARHO` absorbs `D_P = 9` (ρ′₂ = H(nf₀ ‖ 9)); the second `BCM2`
+// closes against `PV_CM3`. Both are told apart from the first by `OM2`, set at
+// the first `BCM2` close. No new role code. Every v3 column is APPENDED after
+// the v2 layout; v1 and v2 keep their exact columns, constraints and digests.
+// ---------------------------------------------------------------------------
+
+/// v3 program ring: v2's 49 limbs + 1 = 50, 200 slots (197 used at D12).
+const PR_LIMBS_V3: usize = PR_LIMBS_V2 + 1;
+/// v3 program period.
+pub const PROGRAM_SLOTS_V3: usize = 4 * PR_LIMBS_V3;
+/// The v3 ring's 50th limb.
+const XR3_COL: usize = L2_WIDTH_V2; // 774
+/// `OM2` — 0 through the first `BCM2` close, 1 after it. Selects the second
+/// `ARHO`'s domain (8 → 9) and the second `BCM2`'s target (`PV_CM2` →
+/// `PV_CM3`), and splits `OM`'s output span into outputs 2 and 3.
+const OM2_COL: usize = XR3_COL + 1; // 775
+/// `INJ4E · OM · OM2` — output 3's capture gate (v3's `AG[o2]` takes `1 − OM2`).
+const AG_O3_COL: usize = OM2_COL + 1; // 776
+/// Output 3's asset, captured and held like `AC[o2]`.
+const AC_O3_COL: usize = AG_O3_COL + 1; // 777
+/// `o3a` — output 3 is accounted in row 1; bool, constant, bound to the assets.
+const SEL_O3A_COL: usize = AC_O3_COL + 1; // 778
+/// `AG[o3] · o3a`, materialized like `SG`.
+const SG3_COL: usize = SEL_O3A_COL + 1; // 779
+/// The shape-S v3 trace width.
+pub const L2_WIDTH_V3: usize = SG3_COL + 1; // 780
 
 // Role codes. 0..=14 are `narrow.rs`'s, kept identical so a reader of one file
 // reads the other; 15 and 16 are shape S's. 5-bit codes leave 17..=31 for
@@ -363,6 +397,9 @@ pub const PV_LEAF1: usize = 116;
 pub const PV_LEAF2: usize = 132;
 pub const PV_LEAF3: usize = 148;
 pub const PV_LEN_V2: usize = 164;
+/// v3: the third output commitment (16 chunks), appended.
+pub const PV_CM3: usize = 164;
+pub const PV_LEN_V3: usize = 180;
 
 /// Build the full public-value vector for a shape-S instance.
 #[allow(clippy::too_many_arguments)]
@@ -407,6 +444,24 @@ pub fn pv_vec_l2_v2(
         out.extend_from_slice(&pv_chunks(leaf));
     }
     debug_assert_eq!(out.len(), PV_LEN_V2);
+    out
+}
+
+/// v3: [`pv_vec_l2_v2`] followed by the third output commitment.
+#[allow(clippy::too_many_arguments)]
+pub fn pv_vec_l2_v3(
+    anchor: &[u64; 4],
+    nf1: &[u64; 4],
+    nf2: &[u64; 4],
+    cm_out: &[[u64; 4]; 3],
+    fee: u64,
+    registry_root: &[u64; 4],
+    nf3: &[u64; 4],
+    leaves: &[[u64; 4]; 3],
+) -> Vec<u32> {
+    let mut out = pv_vec_l2_v2(anchor, nf1, nf2, &cm_out[0], &cm_out[1], fee, registry_root, nf3, leaves);
+    out.extend_from_slice(&pv_chunks(&cm_out[2]));
+    debug_assert_eq!(out.len(), PV_LEN_V3);
     out
 }
 
@@ -490,6 +545,8 @@ pub struct L2ShapeSAir {
     /// A4: slot 3 (the dedicated fee input) is a dummy — the fee is charged
     /// to a row by `f1` — rather than an asset-0 note worth exactly the fee.
     pub d3: bool,
+    /// v3: output 2 (the third) is accounted in row 1. Ignored below v3.
+    pub sel_o3a: bool,
 }
 
 impl L2ShapeSAir {
@@ -507,6 +564,7 @@ impl L2ShapeSAir {
             sel_f1: true,
             sel_q: true,
             d3: true,
+            sel_o3a: true,
         }
     }
 
@@ -519,25 +577,43 @@ impl L2ShapeSAir {
         }
     }
 
-    pub fn is_v2(&self) -> bool {
-        self.version == L2Version::V2Auth
-    }
-
-    /// Program-ring limbs: 40 (v1) or 49 (v2).
-    fn ring_limbs(&self) -> usize {
-        if self.is_v2() {
-            PR_LIMBS_V2
-        } else {
-            PR_LIMBS
+    /// The v3 geometry probe: every slot dummy, v3 width and ring.
+    pub fn chain_only_v3(log_height: usize) -> Self {
+        Self {
+            version: L2Version::V3,
+            program: vec![ROLE_DUMMY; PROGRAM_SLOTS_V3],
+            ..Self::chain_only(log_height)
         }
     }
 
-    /// Column of ring limb `i`: `PR[0..40]` then (v2) `XR[0..9]`.
+    /// Carries the Candidate A authorization columns (v2 and v3).
+    pub fn is_v2(&self) -> bool {
+        matches!(self.version, L2Version::V2Auth | L2Version::V3)
+    }
+
+    /// Carries the third output (v3).
+    pub fn is_v3(&self) -> bool {
+        self.version == L2Version::V3
+    }
+
+    /// Program-ring limbs: 40 (v1), 49 (v2) or 50 (v3).
+    fn ring_limbs(&self) -> usize {
+        match self.version {
+            L2Version::V1 => PR_LIMBS,
+            L2Version::V2Auth => PR_LIMBS_V2,
+            L2Version::V3 => PR_LIMBS_V3,
+        }
+    }
+
+    /// Column of ring limb `i`: `PR[0..40]`, then (v2) `XR[0..9]`, then (v3)
+    /// `XR3`.
     fn ring_col(i: usize) -> usize {
         if i < PR_LIMBS {
             PR_OFF + i
-        } else {
+        } else if i < PR_LIMBS_V2 {
             XR_OFF + (i - PR_LIMBS)
+        } else {
+            XR3_COL
         }
     }
 
@@ -574,18 +650,18 @@ const PER_LO16: usize = 39;
 
 impl<F: Field> BaseAir<F> for L2ShapeSAir {
     fn width(&self) -> usize {
-        if self.is_v2() {
-            L2_WIDTH_V2
-        } else {
-            L2_WIDTH
+        match self.version {
+            L2Version::V1 => L2_WIDTH,
+            L2Version::V2Auth => L2_WIDTH_V2,
+            L2Version::V3 => L2_WIDTH_V3,
         }
     }
 
     fn num_public_values(&self) -> usize {
-        if self.is_v2() {
-            PV_LEN_V2
-        } else {
-            PV_LEN
+        match self.version {
+            L2Version::V1 => PV_LEN,
+            L2Version::V2Auth => PV_LEN_V2,
+            L2Version::V3 => PV_LEN_V3,
         }
     }
 
@@ -894,6 +970,9 @@ where
             };
             let msg_arho: AB::Expr = match l {
                 0..=3 => w(l + 5),
+                // v3: `D_P` is 8 for ρ′₁ and 9 (bit 0 added) for ρ′₂ — the
+                // second `ARHO` runs after the first `BCM2` close (`OM2`).
+                4 if self.is_v3() => sel(2) + local[OM2_COL].clone() * sel(0),
                 4 => sel(2),
                 5 => sel(0),
                 16 => u63.clone(),
@@ -1031,8 +1110,15 @@ where
         let pv_base: [usize; NBGC] = [PV_ANCHOR, PV_NF1, PV_NF2, PV_CM1, PV_CM2, PV_REGROOT, PV_NF3];
         for (x, base) in pv_base.iter().enumerate() {
             for j in 0..16 {
+                // v3: the second `BCM2` (after `OM2` is set) binds output 3.
+                let target = if x == 4 && self.is_v3() {
+                    let om2 = local[OM2_COL].clone();
+                    (AB::Expr::ONE - om2.clone()) * pv(base + j) + om2 * pv(PV_CM3 + j)
+                } else {
+                    pv(base + j)
+                };
                 let close = local[BGC_OFF + x].clone()
-                    * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone());
+                    * (local[BQ_OFF + j].clone() - target * ep.clone());
                 // #219: `L·dv` relaxes the ANCHOR close and nothing else — the
                 // registry bind of a dummy slot still fires (it opens asset 0's
                 // leaf, which is pinned at genesis). A4: `L3·d3` relaxes the fee
@@ -1111,10 +1197,20 @@ where
             local[AG_OFF + AG_O1].clone(),
             local[INJ4E_COL].clone() * (AB::Expr::ONE - om.clone()),
         );
-        builder.assert_eq(
-            local[AG_OFF + AG_O2].clone(),
-            local[INJ4E_COL].clone() * om.clone(),
-        );
+        if self.is_v3() {
+            // v3: `OM`'s span holds outputs 2 and 3; `OM2` splits it.
+            let om2 = local[OM2_COL].clone();
+            builder.assert_eq(
+                local[AG_OFF + AG_O2].clone(),
+                local[INJ4E_COL].clone() * om.clone() * (AB::Expr::ONE - om2.clone()),
+            );
+            builder.assert_eq(local[AG_O3_COL].clone(), local[INJ4E_COL].clone() * om.clone() * om2);
+        } else {
+            builder.assert_eq(
+                local[AG_OFF + AG_O2].clone(),
+                local[INJ4E_COL].clone() * om.clone(),
+            );
+        }
         builder.assert_eq(
             local[AG_OFF + AG_R1].clone(),
             local[INJRE_COL].clone() * (AB::Expr::ONE - latch.clone()),
@@ -1159,11 +1255,15 @@ where
         // Balance closes. Under `¬q` (CQ[1]): row 1 pays `f1·fee`, row 2 pays
         // `(1 − f1)·fee`, each on its own chain. Under `q` (CQ[0]): the two
         // rows are summed and pay the whole fee once, on row 1's carries.
+        // Carries are 3-bit encodings of `c + 2` (v1/v2: at most three
+        // debits per row — two outputs and the fee — so `c ≥ −2`). v3 adds a
+        // fourth debit (`c ≥ −3`): its encoding is `c + 3`.
+        let carry_bias = if self.is_v3() { AB::Expr::from_u32(3) } else { two.clone() };
         let carry = |off: usize, j: usize| -> AB::Expr {
             local[off + 3 * j].clone()
                 + local[off + 3 * j + 1].clone() * two.clone()
                 + local[off + 3 * j + 2].clone() * two.clone() * two.clone()
-                - two.clone()
+                - carry_bias.clone()
         };
         let close = local[BLCLOSE_COL].clone();
         let close_q = local[CQ_OFF].clone();
@@ -1216,6 +1316,12 @@ where
         builder.assert_zero(
             close.clone() * (AB::Expr::ONE - o2a) * (ac(AG_O2) - ac(AG_IN2)),
         );
+        if self.is_v3() {
+            let o3a = local[SEL_O3A_COL].clone();
+            let ac3 = local[AC_O3_COL].clone();
+            builder.assert_zero(close.clone() * o3a.clone() * (ac3.clone() - ac(AG_IN1)));
+            builder.assert_zero(close.clone() * (AB::Expr::ONE - o3a) * (ac3 - ac(AG_IN2)));
+        }
         // The row that pays the fee is asset 0 — only when a row pays it (d3).
         builder.assert_zero(close.clone() * d3.clone() * f1.clone() * ac(AG_IN1));
         builder.assert_zero(close.clone() * d3.clone() * (AB::Expr::ONE - f1) * ac(AG_IN2));
@@ -1331,6 +1437,20 @@ where
             }
         }
 
+        // --- v3: the third output's selector, gate and marker ---
+        if self.is_v3() {
+            builder.assert_bool(local[SEL_O3A_COL].clone());
+            builder.assert_eq(
+                local[SG3_COL].clone(),
+                local[AG_O3_COL].clone() * local[SEL_O3A_COL].clone(),
+            );
+            builder.assert_bool(local[OM2_COL].clone());
+            builder.when_first_row().assert_zero(local[OM2_COL].clone());
+            builder.when_first_row().assert_zero(local[AC_O3_COL].clone());
+            // The 16-bit asset bound and the capture already cover every
+            // `ACMOUT` through `INJ4E`.
+        }
+
         // --- Transition constraints ---
         let mut t = builder.when_transition();
 
@@ -1435,24 +1555,25 @@ where
         for j in 0..4 {
             let pw = per[35 + j].clone();
             let v = local[W_OFF + 4].clone();
-            t.assert_eq(
-                next[BL_OFF + j].clone(),
-                local[BL_OFF + j].clone()
-                    + local[AG_OFF + AG_IN1].clone() * pw.clone() * v.clone()
-                    - local[SG_OFF].clone() * pw.clone() * v.clone()
-                    - local[SG_OFF + 1].clone() * pw.clone() * v.clone(),
-            );
-            t.assert_eq(
-                next[BL2_OFF + j].clone(),
-                local[BL2_OFF + j].clone()
-                    + local[AG_OFF + AG_IN2].clone() * pw.clone() * v.clone()
-                    - (local[AG_OFF + AG_O1].clone() - local[SG_OFF].clone())
-                        * pw.clone()
-                        * v.clone()
-                    - (local[AG_OFF + AG_O2].clone() - local[SG_OFF + 1].clone())
-                        * pw
-                        * v,
-            );
+            let mut row1 = local[BL_OFF + j].clone()
+                + local[AG_OFF + AG_IN1].clone() * pw.clone() * v.clone()
+                - local[SG_OFF].clone() * pw.clone() * v.clone()
+                - local[SG_OFF + 1].clone() * pw.clone() * v.clone();
+            let mut row2 = local[BL2_OFF + j].clone()
+                + local[AG_OFF + AG_IN2].clone() * pw.clone() * v.clone()
+                - (local[AG_OFF + AG_O1].clone() - local[SG_OFF].clone())
+                    * pw.clone()
+                    * v.clone()
+                - (local[AG_OFF + AG_O2].clone() - local[SG_OFF + 1].clone())
+                    * pw.clone()
+                    * v.clone();
+            if self.is_v3() {
+                // v3: output 3 debits row 1 under `o3a`, row 2 otherwise.
+                row1 -= local[SG3_COL].clone() * pw.clone() * v.clone();
+                row2 -= (local[AG_O3_COL].clone() - local[SG3_COL].clone()) * pw * v;
+            }
+            t.assert_eq(next[BL_OFF + j].clone(), row1);
+            t.assert_eq(next[BL2_OFF + j].clone(), row2);
         }
         // Asset capture-and-hold: chunk 0 of W13 under the six gates.
         for k in 0..6 {
@@ -1468,6 +1589,21 @@ where
             t.assert_eq(next[SEL2_OFF + k].clone(), local[SEL2_OFF + k].clone());
         }
         t.assert_eq(next[QINV_COL].clone(), local[QINV_COL].clone());
+        if self.is_v3() {
+            // Output 3's asset: capture-and-hold. `o3a`: constant. `OM2`: set
+            // at the first `BCM2` close (bank-bind gate `BGC[bcm2]`), held.
+            t.assert_eq(
+                next[AC_O3_COL].clone(),
+                local[AC_O3_COL].clone()
+                    + local[AG_O3_COL].clone() * per[35].clone() * local[W_OFF + 13].clone(),
+            );
+            t.assert_eq(next[SEL_O3A_COL].clone(), local[SEL_O3A_COL].clone());
+            let om2 = local[OM2_COL].clone();
+            t.assert_eq(
+                next[OM2_COL].clone(),
+                om2.clone() + (AB::Expr::ONE - om2) * local[BGC_OFF + 4].clone(),
+            );
+        }
         // A4: the fee bank (+v at the fee input), the fee chain's latch (set at
         // `BNF3`'s close, reset at the next `BANCHOR` close), `d3` constant.
         for j in 0..4 {
@@ -2041,6 +2177,7 @@ pub fn build_bucket_l2_with_witnesses(
             sel_f1,
             sel_q,
             d3: fee_slot.is_dummy(),
+            sel_o3a: false,
         },
         pvs,
         anchor,
@@ -2254,6 +2391,80 @@ pub fn build_bucket_l2_v2(
     fee_slot: &FeeSlotV2,
     dv: bool,
 ) -> L2BucketInstanceV2 {
+    let b = build_bucket_l2_auth(
+        L2Version::V2Auth,
+        log_height,
+        inputs,
+        outputs,
+        fee,
+        witnesses,
+        anchor,
+        reg_leaves,
+        reg_witnesses,
+        registry_root,
+        fee_slot,
+        dv,
+    );
+    L2BucketInstanceV2 {
+        air: b.air,
+        pvs: b.pvs,
+        anchor,
+        registry_root,
+        nf: b.nf,
+        cm_out: [b.cm_out[0], b.cm_out[1]],
+        leaves: b.leaves,
+    }
+}
+
+/// The output ρ′ⱼ derivation for v1–v3: `ρ′₀ = nf₀`, `ρ′₁ = H(nf₀ ‖ 8)` (the
+/// frozen [`derive_output_rho`]), and (v3) `ρ′₂ = H(nf₀ ‖ 9)` — the same block
+/// with bit 0 of the domain lane set, as the second `ARHO` absorbs it.
+pub fn derive_output_rho_l2(nf0: &[u64; 4], j: usize) -> [u64; 4] {
+    assert!(j < 3, "an L2 transaction has at most three outputs");
+    if j < 2 {
+        return derive_output_rho(nf0, j);
+    }
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(nf0);
+    st[4] = (1 << 3) | 1; // D_P = 9 — see `msg_arho` under v3
+    st[5] = 1; // pad10*1 start at bit 320
+    st[16] = 1 << 63;
+    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
+}
+
+/// What [`build_bucket_l2_auth`] returns; the v2/v3 builders wrap it.
+struct AuthBuild {
+    air: L2ShapeSAir,
+    pvs: Vec<u32>,
+    nf: [[u64; 4]; 3],
+    cm_out: Vec<[u64; 4]>,
+    leaves: [[u64; 4]; 3],
+}
+
+/// The v2/v3 builder: the input chains are identical; the output tail has one
+/// span per output (`ARHO` before every output but the first; `BCM1` closes
+/// output 0, `BCM2` every later one).
+#[allow(clippy::too_many_arguments)]
+fn build_bucket_l2_auth(
+    version: L2Version,
+    log_height: usize,
+    inputs: &[L2AuthInput; 2],
+    outputs: &[L2TxOutput],
+    fee: u64,
+    witnesses: &[MerkleWitness; 2],
+    anchor: [u64; 4],
+    reg_leaves: &[RegistryLeaf; 2],
+    reg_witnesses: &[RegistryWitness; 2],
+    registry_root: [u64; 4],
+    fee_slot: &FeeSlotV2,
+    dv: bool,
+) -> AuthBuild {
+    let (n_out, period, perms) = match version {
+        L2Version::V2Auth => (2, PROGRAM_SLOTS_V2, SHAPE_S_PERMS_V2),
+        L2Version::V3 => (3, PROGRAM_SLOTS_V3, SHAPE_S_PERMS_V3),
+        L2Version::V1 => panic!("v1 has its own builder"),
+    };
+    assert_eq!(outputs.len(), n_out, "{version:?} carries exactly {n_out} outputs");
     if dv {
         assert_eq!(inputs[1].value, 0, "a dummy input slot contributes 0 to the balance");
         assert_eq!(inputs[1].asset, 0, "a dummy input slot carries asset 0 (#700)");
@@ -2262,12 +2473,15 @@ pub fn build_bucket_l2_v2(
     let (nf1, _, _) = derive_input_l2_v2(&inputs[0]);
     let (nf2, _, _) = derive_input_l2_v2(&inputs[1]);
     let (nf3, _, _) = derive_input_l2_v2(fee_in);
-    let out_rho = [derive_output_rho(&nf1, 0), derive_output_rho(&nf1, 1)];
-    let cmo1 = l2_cm(outputs[0].value, outputs[0].asset, &outputs[0].rkm, &out_rho[0], &outputs[0].rseed);
-    let cmo2 = l2_cm(outputs[1].value, outputs[1].asset, &outputs[1].rkm, &out_rho[1], &outputs[1].rseed);
+    let out_rho: Vec<[u64; 4]> = (0..n_out).map(|j| derive_output_rho_l2(&nf1, j)).collect();
+    let cm_out: Vec<[u64; 4]> = outputs
+        .iter()
+        .zip(&out_rho)
+        .map(|(o, rho)| l2_cm(o.value, o.asset, &o.rkm, rho, &o.rseed))
+        .collect();
 
-    let mut program = vec![ROLE_DUMMY; PROGRAM_SLOTS_V2];
-    let mut sw = vec![L2SlotWitness::default(); PROGRAM_SLOTS_V2];
+    let mut program = vec![ROLE_DUMMY; period];
+    let mut sw = vec![L2SlotWitness::default(); period];
     let mut slot = 1usize;
     // NFA → bnf: nk in W9..12, ρ in W0..3.
     let nfa = |program: &mut Vec<u32>, sw: &mut Vec<L2SlotWitness>, slot: &mut usize, inp: &L2AuthInput, bnf: u32| {
@@ -2343,8 +2557,9 @@ pub fn build_bucket_l2_v2(
     nfa(&mut program, &mut sw, &mut slot, fee_in, ROLE_BNF3);
     auth_then_arkm(&mut program, &mut sw, &mut slot, fee_in);
     note_block(&mut program, &mut sw, &mut slot, fee_in, ROLE_ACMF, &fee_slot.witness());
-    for (j, (o, bcm)) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]).enumerate() {
-        if j == 1 {
+    for (j, o) in outputs.iter().enumerate() {
+        let bcm = if j == 0 { ROLE_BCM1 } else { ROLE_BCM2 };
+        if j >= 1 {
             program[slot] = ROLE_ARHO;
             sw[slot].w[5..9].copy_from_slice(&nf1);
             slot += 1;
@@ -2363,15 +2578,20 @@ pub fn build_bucket_l2_v2(
     slot += 1;
     program[slot] = ROLE_END;
     slot += 1;
-    assert_eq!(slot, SHAPE_S_PERMS_V2, "v2 program layout drifted");
+    assert_eq!(slot, perms, "{version:?} program layout drifted");
 
     let a1 = inputs[0].asset;
     let leaves = [inputs[0].auth.leaf, inputs[1].auth.leaf, fee_in.auth.leaf];
-    let pvs = pv_vec_l2_v2(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee, &registry_root, &nf3, &leaves);
-    L2BucketInstanceV2 {
+    let pvs = if n_out == 3 {
+        let cm3: [[u64; 4]; 3] = [cm_out[0], cm_out[1], cm_out[2]];
+        pv_vec_l2_v3(&anchor, &nf1, &nf2, &cm3, fee, &registry_root, &nf3, &leaves)
+    } else {
+        pv_vec_l2_v2(&anchor, &nf1, &nf2, &cm_out[0], &cm_out[1], fee, &registry_root, &nf3, &leaves)
+    };
+    AuthBuild {
         air: L2ShapeSAir {
             log_height,
-            version: L2Version::V2Auth,
+            version,
             program,
             slot_witness: sw,
             fee,
@@ -2381,12 +2601,11 @@ pub fn build_bucket_l2_v2(
             sel_f1: a1 == 0,
             sel_q: a1 == inputs[1].asset,
             d3: fee_slot.is_dummy(),
+            sel_o3a: n_out == 3 && outputs[2].asset == a1,
         },
         pvs,
-        anchor,
-        registry_root,
         nf: [nf1, nf2, nf3],
-        cm_out: [cmo1, cmo2],
+        cm_out,
         leaves,
     }
 }
@@ -2495,6 +2714,139 @@ pub fn verifier_air_s_v2() -> L2ShapeSAir {
     }
 }
 
+/// v3 perm slots: v2's 194 + `ARHO`, `ACMOUT`, `BCM2` = **197** at D12, at
+/// 3072 rows each = 605,184 rows → still 2^20 (341 perm capacity).
+pub const SHAPE_S_PERMS_V3: usize = SHAPE_S_PERMS_V2 + 3;
+const _: () = assert!(SHAPE_S_PERMS_V3 <= PROGRAM_SLOTS_V3);
+pub const SHAPE_S_LOG_HEIGHT_V3: usize = 20;
+const _: () = assert!(SHAPE_S_PERMS_V3 * ROWS_PER_PERM <= 1 << SHAPE_S_LOG_HEIGHT_V3);
+
+/// A v3 shape-S instance: v2's, with three output commitments.
+pub struct L2BucketInstanceV3 {
+    pub air: L2ShapeSAir,
+    pub pvs: Vec<u32>,
+    pub anchor: [u64; 4],
+    pub registry_root: [u64; 4],
+    pub nf: [[u64; 4]; 3],
+    pub cm_out: [[u64; 4]; 3],
+    pub leaves: [[u64; 4]; 3],
+}
+
+/// Build a v3 shape-S instance: [`build_bucket_l2_v2`]'s inputs, exactly
+/// three outputs. A transaction with nothing for the third output carries a
+/// zero-value note to the payer's own key (lab #937): same on-chain shape.
+#[allow(clippy::too_many_arguments)]
+pub fn build_bucket_l2_v3(
+    log_height: usize,
+    inputs: &[L2AuthInput; 2],
+    outputs: &[L2TxOutput; 3],
+    fee: u64,
+    witnesses: &[MerkleWitness; 2],
+    anchor: [u64; 4],
+    reg_leaves: &[RegistryLeaf; 2],
+    reg_witnesses: &[RegistryWitness; 2],
+    registry_root: [u64; 4],
+    fee_slot: &FeeSlotV2,
+    dv: bool,
+) -> L2BucketInstanceV3 {
+    let b = build_bucket_l2_auth(
+        L2Version::V3,
+        log_height,
+        inputs,
+        outputs,
+        fee,
+        witnesses,
+        anchor,
+        reg_leaves,
+        reg_witnesses,
+        registry_root,
+        fee_slot,
+        dv,
+    );
+    L2BucketInstanceV3 {
+        air: b.air,
+        pvs: b.pvs,
+        anchor,
+        registry_root,
+        nf: b.nf,
+        cm_out: [b.cm_out[0], b.cm_out[1], b.cm_out[2]],
+        leaves: b.leaves,
+    }
+}
+
+/// The canonical honest v3 instance at 2^20: inputs 100 (asset 0) + 50
+/// (asset 7), outputs 85 (asset 0) + 50 (asset 7) + 5 (asset 0, the third),
+/// fee 10, the fee slot a device-made dummy — [`fabricated_bucket_l2_v2`]
+/// with its asset-0 output split in two.
+pub fn fabricated_bucket_l2_v3() -> L2BucketInstanceV3 {
+    let inputs = [fabricated_auth_input(0x1111, 100, 0, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let outputs = [mk_out_v3(0x3333, 85, 0), mk_out_v3(0x4444, 50, 7), mk_out_v3(0x5555, 5, 0)];
+    let (_, _, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, _, cm2) = derive_input_l2_v2(&inputs[1]);
+    let (witnesses, anchor) = fabricated_shared_tree(&cm1, &cm2);
+    let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)];
+    let (rw, registry_root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    build_bucket_l2_v3(
+        SHAPE_S_LOG_HEIGHT_V3,
+        &inputs,
+        &outputs,
+        10,
+        &witnesses,
+        anchor,
+        &leaves,
+        &rw,
+        registry_root,
+        &FeeSlotV2::Dummy { input: fabricated_auth_input(0xfee0_d00d, 0, 0, 1833) },
+        false,
+    )
+}
+
+/// Three real input slots, three outputs (the third a zero-value self
+/// note): v3's counterpart of [`fabricated_bucket_l2_v2_exact_fee`] — the rig
+/// measurement's S instance.
+pub fn fabricated_bucket_l2_v3_exact_fee() -> L2BucketInstanceV3 {
+    let inputs = [fabricated_auth_input(0x1111, 100, 0, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let fee_in = fabricated_auth_input(0x9999, 10, 0, 3350);
+    let (_, _, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, _, cm2) = derive_input_l2_v2(&inputs[1]);
+    let (_, _, cm3) = derive_input_l2_v2(&fee_in);
+    let (w, anchor) = fabricated_tree3([&cm1, &cm2, &cm3]);
+    let leaves = [RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)];
+    let (rw, registry_root) = fabricated_registry_tree(&leaves[0].hash(), &leaves[1].hash());
+    build_bucket_l2_v3(
+        SHAPE_S_LOG_HEIGHT_V3,
+        &inputs,
+        &[mk_out_v3(0x3333, 100, 0), mk_out_v3(0x4444, 50, 7), mk_out_v3(0x5555, 0, 0)],
+        10,
+        &[w[0], w[1]],
+        anchor,
+        &leaves,
+        &rw,
+        registry_root,
+        &FeeSlotV2::Exact { input: fee_in, witness: w[2] },
+        false,
+    )
+}
+
+/// The fabricated outputs' shape (as the v2 fixtures build theirs).
+fn mk_out_v3(seed: u64, value: u64, asset: u64) -> L2TxOutput {
+    L2TxOutput {
+        value,
+        asset,
+        rkm: [seed, seed + 1, seed + 2, seed + 3],
+        rho: [seed + 4; 4],
+        rseed: [seed + 5; 4],
+    }
+}
+
+/// The witness-free v3 shape-S AIR a verifier uses.
+pub fn verifier_air_s_v3() -> L2ShapeSAir {
+    L2ShapeSAir {
+        program: fabricated_bucket_l2_v3().air.program,
+        ..L2ShapeSAir::chain_only_v3(SHAPE_S_LOG_HEIGHT_V3)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trace generation — narrow.rs's fill, mirrored constraint for constraint.
 // ---------------------------------------------------------------------------
@@ -2504,6 +2856,7 @@ impl L2ShapeSAir {
         let height = 1usize << self.log_height;
         let width = <Self as BaseAir<F>>::width(self);
         let v2 = self.is_v2();
+        let v3 = self.is_v3();
         let size = height * width;
         let mut values = Vec::with_capacity(size << extra_capacity_bits);
 
@@ -2541,6 +2894,10 @@ impl L2ShapeSAir {
         let mut eqa = [0i64; 16];
         let mut om: u32 = 0;
         let mut ac = [0i64; 6];
+        // v3: the second marker, output 3's held asset, its selector.
+        let mut om2: u32 = 0;
+        let mut ac3: i64 = 0;
+        let sel3: u32 = self.sel_o3a as u32;
         let sel2: [u32; 4] = [
             self.sel_o1a as u32,
             self.sel_o2a as u32,
@@ -2651,6 +3008,7 @@ impl L2ShapeSAir {
                     },
                     ROLE_ARHO => match l {
                         0..=3 => wbit[l + 5],
+                        4 if v3 => (z == 3) as u32 + om2 * z0,
                         4 => (z == 3) as u32,
                         5 => z0,
                         16 => z63,
@@ -2817,10 +3175,18 @@ impl L2ShapeSAir {
                 inj3e * (1 - latch),
                 inj3e * latch,
                 inj4e * (1 - om),
-                inj4e * om,
+                if v3 { inj4e * om * (1 - om2) } else { inj4e * om },
                 injre * (1 - latch),
                 injre * latch,
             ];
+            let ag_o3 = if v3 { inj4e * om * om2 } else { 0 };
+            let sg3 = ag_o3 * sel3;
+            if v3 {
+                row[OM2_COL] = F::from_u32(om2);
+                row[AG_O3_COL] = F::from_u32(ag_o3);
+                row[SEL_O3A_COL] = F::from_u32(sel3);
+                row[SG3_COL] = F::from_u32(sg3);
+            }
             for (k, vv) in ag.iter().enumerate() {
                 row[AG_OFF + k] = F::from_u32(*vv);
             }
@@ -2856,6 +3222,9 @@ impl L2ShapeSAir {
             for (k, acc) in ac.iter().enumerate() {
                 row[AC_OFF + k] = sgn(*acc);
             }
+            if v3 {
+                row[AC_O3_COL] = sgn(ac3);
+            }
             // Carry encodings. Under ¬q: row 1 owes f1·fee, row 2 the rest.
             // Under q: row 1's carries serve the SUMMED chain against the
             // whole fee (row 2's chain is unchecked; encoded anyway).
@@ -2879,8 +3248,18 @@ impl L2ShapeSAir {
                         cc[j] = tj >> 16;
                         prev = cc[j];
                     }
+                    // v3 carries are biased by 3 (a fourth debit per row), and
+                    // an out-of-range carry fails loudly rather than clamping:
+                    // an honest v3 witness keeps every carry in [−3, 1].
+                    let bias = if v3 { 3 } else { 2 };
                     for (j, cj) in cc.iter().enumerate() {
-                        let enc = (cj + 2).clamp(0, 7) as u32;
+                        if v3 {
+                            assert!(
+                                (0..=7).contains(&(cj + bias)),
+                                "v3 balance carry out of range at row {t}, chunk {j}: c = {cj} (encodable: −3..=4)"
+                            );
+                        }
+                        let enc = (cj + bias).clamp(0, 7) as u32;
                         for bb in 0..3 {
                             row[off + 3 * j + bb] = F::from_u32((enc >> bb) & 1);
                         }
@@ -2953,14 +3332,17 @@ impl L2ShapeSAir {
                 let vb = wbit[4] as i64;
                 bl[jc] += (ag[AG_IN1] as i64) * wgt * vb
                     - (sg[0] as i64) * wgt * vb
-                    - (sg[1] as i64) * wgt * vb;
+                    - (sg[1] as i64) * wgt * vb
+                    - (sg3 as i64) * wgt * vb;
                 bl2[jc] += (ag[AG_IN2] as i64) * wgt * vb
                     - ((ag[AG_O1] - sg[0]) as i64) * wgt * vb
-                    - ((ag[AG_O2] - sg[1]) as i64) * wgt * vb;
+                    - ((ag[AG_O2] - sg[1]) as i64) * wgt * vb
+                    - ((ag_o3 - sg3) as i64) * wgt * vb;
                 if jc == 0 {
                     for k in 0..6 {
                         ac[k] += (ag[k] as i64) * wgt * wbit[13] as i64;
                     }
+                    ac3 += (ag_o3 as i64) * wgt * wbit[13] as i64;
                 }
                 fb[jc] += (injf as i64) * wgt * vb;
                 if bgrst == 1 {
@@ -2983,6 +3365,9 @@ impl L2ShapeSAir {
                         - g3neg as i64 * wgt * a[l] as i64;
                 }
                 om = om * (1 - gpermv * selv[10]) + g3close * selv[SEL_ARHO];
+                if v3 {
+                    om2 += (1 - om2) * gpermv * selv[10];
+                }
                 ep *= 1 - gwrap;
                 latch = latch * (1 - bgc_banchor) + bgc_bnf2;
                 l3 = l3 * (1 - bgc_banchor) + bgc_bnf3;
@@ -4304,6 +4689,34 @@ pub fn audit_col_regions_v2() -> Vec<(&'static str, usize)> {
     v
 }
 
+/// Lab #937: shape S **v3**'s witness manifest is v2's — the third output
+/// span reuses `ARHO` / `ACMOUT` / `BCM2`, whose entries are per role.
+#[cfg(any(test, feature = "audit"))]
+pub fn witness_manifest_v3() -> Vec<crate::detaudit::ManifestEntry> {
+    witness_manifest_v2()
+}
+
+/// Lab #937: v2's regions plus every column v3 appends, up to
+/// [`L2_WIDTH_V3`].
+#[cfg(any(test, feature = "audit"))]
+pub fn audit_col_regions_v3() -> Vec<(&'static str, usize)> {
+    let mut v = audit_col_regions_v2();
+    v.extend([
+        ("XR3_COL", XR3_COL),
+        ("OM2_COL", OM2_COL),
+        ("AG_O3_COL", AG_O3_COL),
+        ("AC_O3_COL", AC_O3_COL),
+        ("SEL_O3A_COL", SEL_O3A_COL),
+        ("SG3_COL", SG3_COL),
+    ]);
+    v.sort_by_key(|(_, c)| *c);
+    v
+}
+
 #[cfg(test)]
 #[path = "l2_v2_tests.rs"]
 mod v2_tests;
+
+#[cfg(test)]
+#[path = "l2_v3_tests.rs"]
+mod v3_tests;
