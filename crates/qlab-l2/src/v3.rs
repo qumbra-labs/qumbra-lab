@@ -155,5 +155,16 @@ pub fn verify_p_u32(pvs: &[u32], proof: &Proof<Config>) -> bool {
 
 // ---------------------------------------------------------------- pins
 
-// The v3 shape digests are pinned from an `l2_goldens` run (lab #724's
-// print-then-pin), in a follow-up commit on this PR.
+/// The v3 shape digests (`digest::shape_digest_v3`), lower-case hex. Printed
+/// by `l2_goldens` at `991defb4` (two runs, byte-identical output; lab #937)
+/// and pinned from that output (lab #724's print-then-pin). A moved digest is
+/// a freeze event.
+pub const SHAPE_S_DIGEST_V3: &str = "9eff54d4bd2f10abee43edd9e6d2d9867ee9e1ac18d813bf13a28cd07315f1fe";
+/// See [`SHAPE_S_DIGEST_V3`].
+pub const SHAPE_P_DIGEST_V3: &str = "a2904d5cfeac003f403a263df8778693f7a80280314c3b35f28614ff718d6cd0";
+
+/// The digests' two halves and the constraint counts, from the same run.
+pub const PINS_V3: [(Shape, &str, &str, usize); 2] = [
+    (Shape::S, "c53b68bf3a42bf3af9473b4cb57fe7ed989a2b1ba3068f68ca1df378b5e9b238", "9a3c7b84d1342bd5a7052e2f5f3ee10a11a9ae0865c7c8789c07504b9dc0b58c", 1252),
+    (Shape::P, "779470ffb0a9e8ba393fdaf6b6a12778d6d0d07742a5d921edba74e4817f16f4", "be6e0338c5a509f0562e4d9095e6062c9682b77d14d3f52864d0e82161c1b42b", 1497),
+];

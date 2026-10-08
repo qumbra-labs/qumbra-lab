@@ -511,6 +511,21 @@ fn l2_v3_geometry_and_degree_p() {
     assert_eq!(fabricated_bucket_l2p_v3().air.program, air.program, "the verifier program is the builder's");
 }
 
+/// Lab #937: the v3 shape digests are pinned (from `l2_goldens` at
+/// `991defb4`). Constants, constraints (and their count) and the whole
+/// digest, so a move names its half.
+#[test]
+fn l2_v3_shape_digests_are_pinned() {
+    for (shape, pin) in [(Shape::S, v3::SHAPE_S_DIGEST_V3), (Shape::P, v3::SHAPE_P_DIGEST_V3)] {
+        assert_eq!(digest::hex(&digest::shape_digest_v3(shape)), pin, "{shape:?} shape digest v3 — a moved digest is a freeze event");
+    }
+    for (shape, consts, constr, n) in v3::PINS_V3 {
+        assert_eq!(digest::hex(&digest::constants_digest_v3(shape)), consts, "{shape:?} v3 constants");
+        let (c, count) = digest::constraints_digest_v3(shape);
+        assert_eq!((digest::hex(&c).as_str(), count), (constr, n), "{shape:?} v3 constraints");
+    }
+}
+
 /// Lab #937: the v3 shape identities (S and P). Geometry read off the v3
 /// verifier AIRs agrees with `v3::*`; `cm3` is the PV tail after v2's leaves;
 /// the v3 digests are deterministic, distinct, and equal no v1 or v2 pin.
