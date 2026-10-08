@@ -377,6 +377,12 @@ impl AuthJournal {
         Ok(())
     }
 
+    /// Every recorded `checked` height as `(generation, genesis, height)`, in
+    /// the text's order (lab #924 PR 3f: the shell's summary).
+    pub fn checked_heights(&self) -> Vec<(u32, Hash32, u64)> {
+        self.checked.iter().map(|(&(g, genesis), &h)| (g, genesis, h)).collect()
+    }
+
     /// How far generation `g`'s landed leaves on the net `genesis` have been
     /// checked (0: never).
     pub fn checked_to(&self, g: u32, genesis: &Hash32) -> u64 {
