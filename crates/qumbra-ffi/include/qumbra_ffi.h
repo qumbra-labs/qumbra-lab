@@ -824,6 +824,13 @@ int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, char **out_journal);
  * Show the reason, keep the stored journal, and restore again once the tip
  * is past the stored checked height. */
 int32_t qmb_auth_journal_advances(const char *stored_text, const char *new_text, char **out_why);
+/* Lab #924 PR 3f: the journal as JSON, for display and for the generations a
+ * scan names: {"active": g, "generations": [{"g", "state": "active"|"sweep"|
+ * "retired", "next", "checked": [{"genesis", "height"}], "gates": [{"genesis",
+ * "not_before_height"}]}]} — in the text's order, every net's entries listed.
+ * No handle, no key material (no roots). NULL with *err_out set for a NULL,
+ * over-64-KiB or unparsable text. Free with qmb_string_free. */
+char *qmb_auth_journal_summary(const char *journal_text, char **err_out);
 int32_t qmb_auth_open_next(const qmb_wallet_t *w, const char *journal_text, const qmb_spend_basis_t *basis,
                            char **out_journal);
 char *qmb_auth_journal(const qmb_auth_t *a);

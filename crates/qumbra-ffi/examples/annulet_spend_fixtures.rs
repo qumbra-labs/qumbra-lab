@@ -30,7 +30,9 @@
 //!   <out>/<auth case>/             first / restore / stale-check / revive /
 //!                                  rotated cases: journal_in.txt,
 //!                                  journal_out.txt, case.json (status,
-//!                                  refusal, the basis summary, wall ms); the
+//!                                  refusal, the basis summary, wall ms),
+//!                                  summary.json (each journal through
+//!                                  qmb_auth_journal_summary, PR 3f); the
 //!                                  scan names the journal's generations
 //!                                  (restore and first: the probe 0..8)
 //!   <out>/check_stale/then_restore/  the restore the STALE status asks for
@@ -52,7 +54,7 @@ use qumbra_ffi::annulet::{qmb_annulet_free, qmb_annulet_new_v2, qmb_annulet_step
 use qumbra_ffi::spend_v2::{
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
     qmb_auth_check_supply_err, qmb_auth_first_new, qmb_auth_open_next, qmb_auth_restore_new, qmb_spend_basis_free,
-    qmb_spend_basis_summary, AuthHandle, SpendBasis,
+    qmb_auth_journal_summary, qmb_spend_basis_summary, AuthHandle, SpendBasis,
     qmb_auth_free, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_v2_free, qmb_spend_v2_intent,
     qmb_spend_v2_new, qmb_spend_v2_step, qmb_spend_v2_supply, qmb_spend_v2_supply_err,
 };
@@ -273,9 +275,23 @@ unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&s
     if let Some(j) = &o.journal {
         std::fs::write(dir.join("journal_out.txt"), j).unwrap();
     }
+    // PR 3f: what the shell shows and scans — each journal through qmb_auth_journal_summary.
+    let summarize = |text: &str| {
+        let t = CString::new(text).unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let out = qmb_auth_journal_summary(t.as_ptr(), &mut err);
+        assert!(!out.is_null(), "{}", take_str(err));
+        serde_json::from_str::<Value>(&take_str(out)).unwrap()
+    };
+    let journals = json!({
+        "journal_in": journal_in.map(summarize),
+        "journal_out": o.journal.as_deref().map(summarize),
+    });
+    std::fs::write(dir.join("summary.json"), serde_json::to_vec_pretty(&journals).unwrap()).unwrap();
     json!({
         "journal_in": journal_in.map(|_| "journal_in.txt"),
         "journal_out": o.journal.as_ref().map(|_| "journal_out.txt"),
+        "summary": "summary.json",
         "status": o.status,
         "keys": o.a.is_some(),
         "refusal": o.refusal,

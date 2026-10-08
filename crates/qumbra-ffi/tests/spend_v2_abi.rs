@@ -28,6 +28,7 @@ use qlab_devnet::body::BlockBody;
 use qlab_l2spend::bundle::ProvingBundle;
 use qumbra_ffi::annulet::{qmb_annulet_free, qmb_annulet_new_v2, qmb_annulet_step, qmb_annulet_supply, qmb_annulet_supply_err, qmb_annulet_take_basis};
 use qumbra_ffi::spend_v2::{
+    qmb_auth_journal_summary,
     qmb_auth_journal_advances,
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
     qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
@@ -1085,5 +1086,65 @@ fn t_a_retired_generation_that_receives_is_revived() {
         qmb_spend_v2_free(s);
         qmb_auth_free(sweep.a);
         qmb_wallet_free(w);
+    }
+}
+
+/// Lab #924 PR 3f: the journal summary over the recorded fixture journals
+/// (`annulet_spend_fixtures` at c132d3f3: check_stale's restore, retired_revive's
+/// input), a gate on a second net, and the refusals.
+#[test]
+fn u_the_journal_summary_lists_every_generation_with_its_nets() {
+    let net = "4a996d02f37c60090c564da79ddf122d3c17775f503ae7e91e60fc9a27a1c4fd";
+    let other = "ab".repeat(32);
+    let (r0, r1) = (
+        "f3a6dd683c0d8cc9c632e80624194fffd723c58b31bce5b94af9e28ca5eeaadf",
+        "f59195087db98c32df51d80a5dfcdd1ddf66e6448edb1a9d4623600207811479",
+    );
+    let summary = |text: &str| unsafe {
+        let t = CString::new(text).unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let out = qmb_auth_journal_summary(t.as_ptr(), &mut err);
+        if out.is_null() {
+            Err(take_str(err))
+        } else {
+            assert!(err.is_null());
+            Ok(serde_json::from_str::<serde_json::Value>(&take_str(out)).unwrap())
+        }
+    };
+    let restored = format!(
+        "qumbra-wallet auth v2\n0 1 {r0} sweep {net}:1154,{other}:5\n1 0 {r1} active\nchecked 0 {net}:2\nchecked 1 {net}:2\n"
+    );
+    assert_eq!(
+        summary(&restored).unwrap(),
+        serde_json::json!({
+            "active": 1,
+            "generations": [
+                {
+                    "g": 0, "state": "sweep", "next": 1,
+                    "checked": [{"genesis": net, "height": 2}],
+                    "gates": [{"genesis": net, "not_before_height": 1154}, {"genesis": other, "not_before_height": 5}],
+                },
+                {
+                    "g": 1, "state": "active", "next": 0,
+                    "checked": [{"genesis": net, "height": 2}],
+                    "gates": [],
+                },
+            ],
+        })
+    );
+    let retired = summary(&format!("qumbra-wallet auth v1\n0 0 {r0} retired\n1 0 {r1} active\n")).unwrap();
+    assert_eq!(retired["active"], 1);
+    assert_eq!(retired["generations"][0]["state"], "retired");
+    assert_eq!(retired["generations"][0]["gates"], serde_json::json!([]));
+    assert_eq!(retired["generations"][0]["checked"], serde_json::json!([]));
+    assert!(!summary(&restored).unwrap().to_string().contains(r0), "no roots");
+
+    assert!(summary("not a journal").unwrap_err().contains("does not parse"));
+    assert!(summary(&(restored.clone() + &"#".repeat(64 * 1024))).unwrap_err().contains("the journal is"));
+    unsafe {
+        let mut err: *mut c_char = ptr::null_mut();
+        assert!(qmb_auth_journal_summary(ptr::null(), &mut err).is_null());
+        assert!(take_str(err).contains("NULL"));
+        assert!(qmb_auth_journal_summary(ptr::null(), ptr::null_mut()).is_null(), "err_out may be NULL");
     }
 }

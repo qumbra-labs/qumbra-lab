@@ -487,6 +487,63 @@ pub unsafe extern "C" fn qmb_auth_journal_advances(stored_text: *const c_char, n
     }
 }
 
+/// Lab #924 PR 3f: an `auth.v1` journal as JSON, for a shell's display and
+/// for the generations it scans —
+/// `{"active": g, "generations": [{"g", "state": "active"|"sweep"|"retired",
+/// "next", "checked": [{"genesis", "height"}], "gates": [{"genesis",
+/// "not_before_height"}]}]}`, generations in the text's order, every net's
+/// checked height and gate listed (empty lists where there are none). Hashes
+/// lowercase hex. A pure function of the text: no handle, no key material
+/// (the authorization roots are left out). NULL with `*err_out` set for a
+/// NULL, over-long or unparsable text.
+///
+/// # Safety
+/// `journal_text` NULL or NUL-terminated; `err_out` NULL or writable. Free
+/// the result with `qmb_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_journal_summary(journal_text: *const c_char, err_out: *mut *mut c_char) -> *mut c_char {
+    let parsed = text_arg("the journal", journal_text, MAX_JOURNAL_TEXT)
+        .and_then(|t| AuthJournal::from_text(t).map_err(|e| format!("the journal does not parse: {e}")));
+    match parsed {
+        Ok(j) => out_string(journal_summary(&j).to_string()),
+        Err(e) => {
+            set_err(err_out, e);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn journal_summary(j: &AuthJournal) -> serde_json::Value {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let checked = j.checked_heights();
+    let gens: Vec<serde_json::Value> = j
+        .generations()
+        .iter()
+        .map(|r| {
+            let (state, gates) = match &r.state {
+                GenState::Active => ("active", Vec::new()),
+                GenState::Sweep { gates } => ("sweep", gates.clone()),
+                GenState::Retired => ("retired", Vec::new()),
+            };
+            serde_json::json!({
+                "g": r.g,
+                "state": state,
+                "next": r.next,
+                "checked": checked
+                    .iter()
+                    .filter(|(g, _, _)| *g == r.g)
+                    .map(|(_, genesis, h)| serde_json::json!({ "genesis": hex(genesis), "height": h }))
+                    .collect::<Vec<_>>(),
+                "gates": gates
+                    .iter()
+                    .map(|x| serde_json::json!({ "genesis": hex(&x.genesis), "not_before_height": x.not_before_height }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "active": j.active().g, "generations": gens })
+}
+
 /// **The first journal of a wallet born in this process**
 /// (`qmb_wallet_new_fresh`): generation 0, fresh, active — offline, no body
 /// read, because a seed drawn here has signed nowhere. **Once per handle**:
