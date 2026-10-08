@@ -512,7 +512,7 @@ fn l2_v3_geometry_and_degree_p() {
 }
 
 /// Lab #937: the v3 shape digests are pinned (from `l2_goldens` at
-/// `991defb4`). Constants, constraints (and their count) and the whole
+/// `3d987c9e`, A′). Constants, constraints (and their count) and the whole
 /// digest, so a move names its half.
 #[test]
 fn l2_v3_shape_digests_are_pinned() {

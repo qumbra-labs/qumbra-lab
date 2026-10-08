@@ -156,15 +156,16 @@ pub fn verify_p_u32(pvs: &[u32], proof: &Proof<Config>) -> bool {
 // ---------------------------------------------------------------- pins
 
 /// The v3 shape digests (`digest::shape_digest_v3`), lower-case hex. Printed
-/// by `l2_goldens` at `991defb4` (two runs, byte-identical output; lab #937)
-/// and pinned from that output (lab #724's print-then-pin). A moved digest is
-/// a freeze event.
-pub const SHAPE_S_DIGEST_V3: &str = "9eff54d4bd2f10abee43edd9e6d2d9867ee9e1ac18d813bf13a28cd07315f1fe";
+/// by `l2_goldens` at `3d987c9e` (two runs, byte-identical output; lab #937
+/// A′, `o3f` — they moved from `991defb4`'s, which predate the fee bank) and
+/// pinned from that output (lab #724's print-then-pin). A moved digest is a
+/// freeze event.
+pub const SHAPE_S_DIGEST_V3: &str = "2b65c9d45b626dcbfc02bb49ae9574d5724d87a577a759b0a297ab1e0da015b8";
 /// See [`SHAPE_S_DIGEST_V3`].
-pub const SHAPE_P_DIGEST_V3: &str = "a2904d5cfeac003f403a263df8778693f7a80280314c3b35f28614ff718d6cd0";
+pub const SHAPE_P_DIGEST_V3: &str = "925d542ef83f4f2910394c21c30842bd64f5c17c32fba628fa6f16434b469b34";
 
 /// The digests' two halves and the constraint counts, from the same run.
 pub const PINS_V3: [(Shape, &str, &str, usize); 2] = [
-    (Shape::S, "c53b68bf3a42bf3af9473b4cb57fe7ed989a2b1ba3068f68ca1df378b5e9b238", "9a3c7b84d1342bd5a7052e2f5f3ee10a11a9ae0865c7c8789c07504b9dc0b58c", 1252),
-    (Shape::P, "779470ffb0a9e8ba393fdaf6b6a12778d6d0d07742a5d921edba74e4817f16f4", "be6e0338c5a509f0562e4d9095e6062c9682b77d14d3f52864d0e82161c1b42b", 1497),
+    (Shape::S, "4f4f603d6fc4cf646f4d7b32ead9f3c60220411ac749b31d991166952b5a4810", "f28a4afdc5d19725705e9e9c7246a6162fad8e1565bbbb18431c52ed026cc4cc", 1264),
+    (Shape::P, "79768b9f63c2695675f62b64227f3873a43049bb40ba8531c579d3bf276834a8", "2a72747c1bf6693605a3a057c243c5688c245fc8d237284ab027b59935f00feb", 1509),
 ];
