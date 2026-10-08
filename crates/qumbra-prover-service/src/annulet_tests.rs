@@ -644,3 +644,20 @@ fn a_node_s_answer_becomes_a_code_not_echoed_text() {
     assert_eq!(sanitize(b""), "unnamed");
     assert!(sanitize(&[b'a'; 200]).len() <= 48);
 }
+
+/// Lab #924 PR 3g: an Annulet node link is https, or plain http under the
+/// mode's own acknowledgement — never the L1 experiment's.
+#[test]
+fn a_plain_http_node_link_needs_the_annulet_acknowledgement() {
+    let name = "QUMBRA_PROVER_ANNULET_NODE_URL";
+    let plain = "http://54.210.95.232:39603";
+    assert!(annulet_node_url(name, "https://annulet-testnet.qumbra.org", None).is_ok());
+    let refused = annulet_node_url(name, plain, None).unwrap_err();
+    assert!(refused.contains(ANNULET_PLAIN_HTTP_VAR) && refused.contains(ANNULET_PLAIN_HTTP_ACK), "{refused}");
+    assert!(
+        annulet_node_url(name, plain, Some("I_UNDERSTAND_NODE_HTTP_IS_PRIVATE_AND_VALUELESS")).is_err(),
+        "the L1 experiment's acknowledgement does not open the Annulet link"
+    );
+    assert!(annulet_node_url(name, plain, Some(ANNULET_PLAIN_HTTP_ACK)).is_ok());
+    assert!(annulet_node_url(name, "ftp://x", Some(ANNULET_PLAIN_HTTP_ACK)).is_err());
+}

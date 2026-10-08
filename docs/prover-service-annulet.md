@@ -62,8 +62,9 @@ The Annulet mode is on exactly when `QUMBRA_PROVER_ANNULET_GENESIS_HASH` is set.
 |---|---|---|
 | `QUMBRA_PROVER_ANNULET_GENESIS_HASH` | — | 64 lowercase hex; the net's genesis file hash |
 | `QUMBRA_PROVER_ANNULET_SLOT_SECS` | — | the genesis `slot_secs` |
-| `QUMBRA_PROVER_ANNULET_NODE_URL` | — | a node accepting `POST /v1/tx`; https, unless the insecure-node acknowledgement is set |
-| `QUMBRA_PROVER_ANNULET_RELAY_URL` | unset | best-effort second submission |
+| `QUMBRA_PROVER_ANNULET_NODE_URL` | — | a node accepting `POST /v1/tx`; https, unless the plain-http acknowledgement below is set |
+| `QUMBRA_PROVER_ANNULET_RELAY_URL` | unset | best-effort second submission; same rule |
+| `QUMBRA_PROVER_ANNULET_ALLOW_PLAIN_HTTP_NODE` | unset | exactly `I_UNDERSTAND_THE_NODE_LINK_IS_PLAINTEXT_AND_FIREWALLED_TO_THIS_HOST` admits a plain `http://` node or relay URL. Use it only where a firewall admits this host alone to that port. What crosses the link is a signed, proved transaction that is public once submitted, and any change to it invalidates it, so the exposure is a dropped submission. The L1 experiment's `QUMBRA_PROVER_ALLOW_INSECURE_NODE_HTTP` does not apply to this mode |
 | `QUMBRA_PROVER_ANNULET_QUEUE` | 3 | 1..=8, queued jobs, not counting the running one |
 | `QUMBRA_PROVER_ANNULET_TIMEOUT_SECS` | 300 | 30..=1800, per prove |
 | `QUMBRA_PROVER_ANNULET_RESULT_TTL_SECS` | 600 | 60..=3600 |

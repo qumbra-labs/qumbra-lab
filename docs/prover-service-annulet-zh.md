@@ -62,8 +62,9 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 |---|---|---|
 | `QUMBRA_PROVER_ANNULET_GENESIS_HASH` | — | 64 位小写十六进制；该 net 的 genesis 文件哈希 |
 | `QUMBRA_PROVER_ANNULET_SLOT_SECS` | — | genesis 中的 `slot_secs` |
-| `QUMBRA_PROVER_ANNULET_NODE_URL` | — | 接受 `POST /v1/tx` 的节点；必须是 https，除非设置了 insecure-node 确认项 |
-| `QUMBRA_PROVER_ANNULET_RELAY_URL` | 未设置 | 尽力而为的第二次提交 |
+| `QUMBRA_PROVER_ANNULET_NODE_URL` | — | 接受 `POST /v1/tx` 的节点；必须是 https，除非设置了下面的明文 http 确认项 |
+| `QUMBRA_PROVER_ANNULET_RELAY_URL` | 未设置 | 尽力而为的第二次提交；规则同上 |
+| `QUMBRA_PROVER_ANNULET_ALLOW_PLAIN_HTTP_NODE` | 未设置 | 值恰为 `I_UNDERSTAND_THE_NODE_LINK_IS_PLAINTEXT_AND_FIREWALLED_TO_THIS_HOST` 时，才允许 `http://` 的节点或中继 URL。只在防火墙只放行本机访问该端口时使用。链路上传的是已签名、已证明的交易：一提交就公开，任何改动都会让它失效，所以最坏只是丢掉一次提交。L1 实验的 `QUMBRA_PROVER_ALLOW_INSECURE_NODE_HTTP` 对这个模式不起作用 |
 | `QUMBRA_PROVER_ANNULET_QUEUE` | 3 | 1..=8，排队的 job 数，不含正在运行的那个 |
 | `QUMBRA_PROVER_ANNULET_TIMEOUT_SECS` | 300 | 30..=1800，每次 prove |
 | `QUMBRA_PROVER_ANNULET_RESULT_TTL_SECS` | 600 | 60..=3600 |

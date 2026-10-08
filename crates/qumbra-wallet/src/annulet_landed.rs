@@ -167,13 +167,14 @@ pub fn restore_generations(
 pub struct GenTree {
     pub g: u32,
     pub master: Hash32,
-    pub tree: AuthTree,
+    /// Shared with a signer built from it (`LocalAuth::from_tree`, PR 3g).
+    pub tree: std::sync::Arc<AuthTree>,
 }
 
 impl GenTree {
     pub fn build(wallet: &Wallet, g: u32) -> Self {
         let master = auth_master(&wallet.auth_secret(), g);
-        let tree = AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth");
+        let tree = std::sync::Arc::new(AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth"));
         GenTree { g, master, tree }
     }
 
@@ -192,16 +193,22 @@ impl Drop for GenTree {
 }
 
 /// [`restore_generations`] over trees already built (`trees` holds every
-/// generation the restore may name: the probe set). The same journal, with
-/// no tree built twice.
-pub fn restore_generations_with(
-    trees: &[GenTree],
+/// generation the restore may name: the probe set) — owned, or shared from a
+/// cache (lab #924 PR 3g). The same journal, with no tree built twice.
+pub fn restore_generations_with<T: std::borrow::Borrow<GenTree>>(
+    trees: &[T],
     owned: &[OwnedL2Note],
     used: &LandedByGeneration,
     genesis: &Hash32,
     gate_tip: u64,
 ) -> Result<AuthJournal, JournalError> {
-    let of = |g: u32| trees.iter().find(|t| t.g == g).ok_or(JournalError::ProbeExhausted { probed: trees.len() as u32 });
+    let of = |g: u32| {
+        trees
+            .iter()
+            .map(|t| t.borrow())
+            .find(|t| t.g == g)
+            .ok_or(JournalError::ProbeExhausted { probed: trees.len() as u32 })
+    };
     let top = owned.iter().filter_map(|n| n.generation).chain(used.keys().copied()).max();
     let probed = crate::auth_journal::PROBE_GENERATIONS;
     match top {
