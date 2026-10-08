@@ -340,6 +340,17 @@ impl AnnuletFaucet {
     fn grant_v2<R: rand::CryptoRng>(&mut self, note: L2Note, to: &Recipient, rng: &mut R) -> Result<L2Note, AnnuletError> {
         let tip = self.served.stated_tip()?;
         let a = self.v2.as_mut().expect("a Candidate A faucet");
+        // Lab #937: on a format-34 net every S spend carries three outputs;
+        // the faucet's third is another zero-value note to itself.
+        let outputs = match qlab_devnet::forms::annulet_forms_of_genesis_format_version(a.genesis_format) {
+            Some((_, form)) if form.has_auth() => form.sp_outputs(),
+            _ => {
+                return Err(AnnuletError::Auth(format!(
+                    "genesis format {} is not a Candidate A Annulet (33 or 34): no grant is built",
+                    a.genesis_format
+                )))
+            }
+        };
         let path = a.keys.take().ok_or(JournalError::Exhausted { g: 0 })?;
         a.journal.advance(&a.lock, &a.dir, 0, a.keys.next())?;
         let input = L2AuthInput {
@@ -358,10 +369,6 @@ impl AnnuletFaucet {
             Out { to: to.clone(), value: note.value - self.fee_s, asset: 0 },
             Out { to: self.change.clone(), value: 0, asset: 0 },
         ];
-        // Lab #937: on a format-34 net every S spend carries three outputs;
-        // the faucet's third is another zero-value note to itself.
-        let outputs = qlab_devnet::forms::annulet_forms_of_genesis_format_version(a.genesis_format)
-            .map_or(2, |(_, form)| form.sp_outputs());
         if outputs == 3 {
             outs.push(Out { to: self.change.clone(), value: 0, asset: 0 });
         }

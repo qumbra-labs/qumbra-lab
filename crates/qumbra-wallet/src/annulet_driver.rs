@@ -102,9 +102,24 @@ pub struct AnnuletVerifyDriver {
     /// the journal's when the wallet has one ([`Self::with_generations`]),
     /// else the probe set, built only once the genesis says Candidate A.
     generations: Option<Vec<(u32, [u64; 4])>>,
+    /// Lab #937: an L2 axis this caller does not serve — refused by name
+    /// right after the genesis verifies, before any header is fetched
+    /// ([`Self::refusing`]). `None` for the wallet CLI.
+    refuse: Option<qlab_devnet::forms::L2AuthForm>,
 }
 
 impl AnnuletVerifyDriver {
+    /// Lab #937: refuse a net on the axis `form` by name
+    /// ([`VerifyRefusal::FormatNotSupported`]) as soon as its genesis is
+    /// verified — before any header, body or note is fetched. The kernel
+    /// (`qumbra-ffi`) refuses format 34 this way until lab #937 PR D; the
+    /// genesis check itself ([`crate::annulet_verify::genesis_from_bytes`])
+    /// is unchanged and the wallet CLI never sets this.
+    pub fn refusing(mut self, form: qlab_devnet::forms::L2AuthForm) -> Self {
+        self.refuse = Some(form);
+        self
+    }
+
     /// Lab #896 G: the wallet's known generations (its journal's). Used only
     /// if the pinned genesis is a Candidate A one; a v1 net scans as before.
     pub fn with_generations(mut self, generations: Vec<(u32, [u64; 4])>) -> Self {
@@ -136,6 +151,7 @@ impl AnnuletVerifyDriver {
             failed: None,
             generations: None,
             done: None,
+            refuse: None,
         }
     }
 
@@ -224,6 +240,12 @@ impl AnnuletVerifyDriver {
             Phase::Genesis => answer
                 .map_err(|why| VerifyRefusal::GenesisUnavailable { why })
                 .and_then(|bytes| genesis_from_bytes(self.pin, &bytes))
+                .and_then(|genesis| match self.refuse {
+                    Some(form) if genesis.l2_auth == form => {
+                        Err(VerifyRefusal::FormatNotSupported { format_version: genesis.file.format_version })
+                    }
+                    _ => Ok(genesis),
+                })
                 .and_then(|genesis| self.begin_chain(genesis)),
             Phase::Walk { mut walk, how } => {
                 let from = walk.want().expect("a Need was outstanding").0;

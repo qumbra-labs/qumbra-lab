@@ -99,6 +99,12 @@ fn b_parse_any_names_the_version_and_refuses_a_non_address() {
     let _ = std::fs::remove_dir_all(&w.dir);
 }
 
+thread_local! {
+    /// Every path `scan` was asked for, in order (lab #937: what the kernel
+    /// fetched before it refused).
+    static ASKED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// One scan of handle `w` through `qmb_annulet_new_v2` (`gens` = Some) or the
 /// old `qmb_annulet_new` (`gens` = None); the view or the refusal.
 unsafe fn scan(w: *mut qumbra_ffi::WalletState, ep: &Endpoint, gens: Option<&[u32]>) -> Result<Value, Value> {
@@ -125,6 +131,7 @@ unsafe fn scan(w: *mut qumbra_ffi::WalletState, ep: &Endpoint, gens: Option<&[u3
             match qmb_annulet_step(s, &mut out) {
                 1 => {
                     let path = take_str(out);
+                    ASKED.with(|a| a.borrow_mut().push(path.clone()));
                     match ep.fetch(&path) {
                         Ok(body) => qmb_annulet_supply(s, body.as_ptr(), body.len()),
                         Err(why) => {
@@ -247,9 +254,13 @@ fn e_a_format_34_net_is_refused_by_the_kernel_until_pr_d() {
     let _guard = WalletDirGuard(w);
     unsafe {
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        ASKED.with(|a| a.borrow_mut().clear());
         let refusal = scan(w, &ep, Some(&[])).expect_err("the kernel refuses format 34");
         assert_eq!(refusal["refusal"], "format_not_supported", "{refusal}");
         assert!(refusal["message"].as_str().unwrap().contains("lab #937 PR D"), "{refusal}");
+        // Review F3: refused right after the genesis verifies — nothing of
+        // the chain was asked for.
+        assert_eq!(ASKED.with(|a| a.borrow().clone()), vec!["/genesis.qmb".to_string()]);
         qmb_wallet_free(w);
     }
 }

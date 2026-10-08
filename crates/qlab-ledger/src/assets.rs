@@ -200,7 +200,14 @@ impl AssetNotes {
 /// unsubtracted notes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AssetIndex {
+    /// Per asset: the non-zero unspent notes (spendable) and the spent ones.
     pub by_asset: BTreeMap<u16, AssetNotes>,
+    /// Lab #937: unspent **zero-value** notes — a format-34 spend's third
+    /// output to this wallet, a merge's empty second output. Seen (history
+    /// can name them as zero-value outputs) but never spendable, and kept out
+    /// of `by_asset`: no plan selects one, no sweep or retire counts one, no
+    /// leaf budget reserves for one, no balance row exists for one.
+    pub zero: Vec<OwnedL2Note>,
 }
 
 impl AssetIndex {
@@ -218,19 +225,21 @@ impl AssetIndex {
                 (*a, AssetNotes { spendable, spent })
             })
             .collect();
-        AssetIndex { by_asset }
+        let zero = self.zero.iter().filter(|n| keep(n)).cloned().collect();
+        AssetIndex { by_asset, zero }
     }
 
     pub fn build(wallet: &Wallet, notes: Vec<OwnedL2Note>, spent: &SpentSet) -> Self {
         let mut by_asset: BTreeMap<u16, AssetNotes> = BTreeMap::new();
+        let mut zero = Vec::new();
         for note in notes {
-            let entry = by_asset.entry(note.asset).or_default();
             match spent.height_of(&note.nullifier(wallet)) {
-                Some(h) => entry.spent.push((note, h)),
-                None => entry.spendable.push(note),
+                Some(h) => by_asset.entry(note.asset).or_default().spent.push((note, h)),
+                None if note.note.value == 0 => zero.push(note),
+                None => by_asset.entry(note.asset).or_default().spendable.push(note),
             }
         }
-        Self { by_asset }
+        Self { by_asset, zero }
     }
 
     /// `(asset, spendable value)` per asset held, ascending by asset.
@@ -288,6 +297,31 @@ mod tests {
         assert_eq!(index.by_asset[&1].spent, vec![(notes[3].clone(), 9)]);
         assert_eq!(index.spendable(0).len(), 2);
         assert!(index.spendable(2).is_empty());
+    }
+
+    /// Lab #937: an unspent zero-value note is seen (`zero`) but never
+    /// spendable: not in `spendable`, no balance row of its own, carried by
+    /// `only_generation`; a spent one stays in `spent` (history).
+    #[test]
+    fn zero_value_notes_are_seen_but_never_spendable() {
+        let w = wallet();
+        let notes: Vec<OwnedL2Note> = [(0u64, 10u64, 7u64, 1u64), (0, 0, 7, 2), (0, 0, 9, 3), (0, 0, 7, 4)]
+            .iter()
+            .map(|&(idx, v, a, k)| OwnedL2Note::from_genesis(&w, idx, [k as u8; 32], note_to(&w, idx, v, a, k)).unwrap())
+            .collect();
+        let spent_zero = notes[3].nullifier(&w);
+        let spent = SpentSet::from_parts(Some((0, 9)), [(9, spent_zero)]);
+        let index = AssetIndex::build(&w, notes.clone(), &spent);
+        assert_eq!(index.spendable(7).iter().map(|n| n.note.value).collect::<Vec<_>>(), vec![10]);
+        assert!(index.spendable(9).is_empty(), "a zero-value note is never spendable");
+        assert_eq!(index.zero, vec![notes[1].clone(), notes[2].clone()], "seen");
+        assert_eq!(index.balances(), vec![(7, 10)], "no row for asset 9's zero-value note");
+        assert_eq!(index.by_asset[&7].spent, vec![(notes[3].clone(), 9)], "a spent zero-value note is history");
+        assert!(!index.by_asset.contains_key(&9));
+        let mut g = notes[1].clone();
+        g.generation = Some(3);
+        let only = AssetIndex::build(&w, vec![g.clone()], &SpentSet::from_parts(Some((0, 9)), [])).only_generation(3);
+        assert_eq!((only.zero, only.by_asset.len()), (vec![g], 0));
     }
 
     #[test]

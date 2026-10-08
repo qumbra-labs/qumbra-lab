@@ -500,6 +500,7 @@ fn bundle_refusal(e: &BundleError) -> ApiError {
         // Lab #937: a two-output bundle on a format-34 net or a three-output
         // one on 33 — the service serves 33 only until lab #937 PR E.
         BundleError::OutputsNotTheNets { .. } => err(422, "outputs-not-the-nets"),
+        BundleError::ThirdOutputAsset { .. } => err(422, "third-output-asset"),
     }
 }
 

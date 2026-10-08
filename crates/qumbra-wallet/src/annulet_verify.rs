@@ -167,8 +167,9 @@ pub enum VerifyRefusal {
     GenesisInvalid { why: String },
     /// Lab #937: a net this **caller** does not serve yet. The wallet CLI
     /// scans and builds format 34 since lab #937 PR C; the kernel
-    /// (`qumbra-ffi`) refuses a format-34 net by name until PR D, raising
-    /// this after its verified scan. Never raised by the verifier itself.
+    /// (`qumbra-ffi`) refuses a format-34 net by name until PR D, through
+    /// `AnnuletVerifyDriver::refusing` — right after the genesis verifies,
+    /// before any header is fetched. Never raised by `genesis_from_bytes`.
     FormatNotSupported { format_version: u32 },
     /// A headers page could not be read.
     HeadersUnavailable { from: u64, why: String },

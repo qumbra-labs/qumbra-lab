@@ -681,3 +681,17 @@ fn the_genesis_format_is_served_only_on_33_and_34_is_refused_by_name() {
     let a = api(FakeProver::new(Answer::Honest, false), Arc::default());
     assert_eq!(a.info().genesis_format, L2AuthForm::CandidateA.annulet_genesis_format_version());
 }
+
+/// Lab #937 PR C (review F4): this service serves format 33; a three-output
+/// (format-34, version-2) bundle is refused **by name** — `422
+/// outputs-not-the-nets` — before anything reaches the prover, and is not an
+/// admitted job.
+#[test]
+fn a_three_output_bundle_is_refused_by_name_on_a_format_33_service() {
+    let prover = FakeProver::new(Answer::Honest, false);
+    let a = api(Arc::clone(&prover), Arc::default());
+    let v3 = qlab_l2spend::fixtures::signed_bundle_v3(L2ShapeTag::S);
+    let Err(e) = admit(&a, &token(9, GENESIS_HASH, 0), &v3) else { panic!("a v3 bundle is admitted on a 33 service") };
+    assert_eq!((e.status, e.code), (422, "outputs-not-the-nets"));
+    assert_eq!(*prover.calls.lock().unwrap(), 0, "nothing reached the prover");
+}

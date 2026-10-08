@@ -110,13 +110,15 @@ fn a_format_34_send_carries_three_outputs_and_is_sealed_by_the_v3_verifier() {
         qumbra_wallet::annulet_verify::scan_annulet_verified(&w, &mut fetch, 0, v[1].state_tip, Some(hash), &mut scan_rng)
             .expect("the pinned format-34 chain verifies");
     let index = scanned.report().index.as_ref().expect("both halves known");
-    let mut values: Vec<u64> = index.spendable(ASSET).iter().map(|n| n.note.value).collect();
-    values.sort_unstable();
-    assert_eq!(values, vec![0, 10], "W holds its change and the zero-value third output");
-    assert!(
-        index.spendable(ASSET).iter().any(|n| n.note.value == 0 && n.note.commitment() != report.outputs[1].commitment()),
-        "the third output is its own note"
-    );
+    let values: Vec<u64> = index.spendable(ASSET).iter().map(|n| n.note.value).collect();
+    assert_eq!(values, vec![10], "only the change is spendable");
+    // The zero-value third output is seen, not spendable: it went to the
+    // change address and is held apart from every spendable row.
+    let zero: Vec<_> = index.zero.iter().filter(|n| n.note.asset == ASSET as u64).collect();
+    assert_eq!(zero.len(), 1, "the third output is seen");
+    assert_eq!(zero[0].note.value, 0);
+    assert_eq!(zero[0].note.rkm, report.outputs[1].rkm, "the third output went to the change address");
+    assert_ne!(zero[0].note.commitment(), report.outputs[1].commitment(), "the third output is its own note");
 
     // T finds 100; W's change is 10 — the zero-value third output adds nothing.
     assert_eq!(balances(&t, &urls[2], v[2].state_tip, hash), vec![(ASSET, 100)]);

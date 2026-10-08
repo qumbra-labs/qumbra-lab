@@ -435,15 +435,18 @@ fn prepare_signed<E: Endpoint>(
     let taken: Vec<u32> = paths.iter().map(|p| p.leaf_index).collect();
     let real: Vec<L2AuthInput> = notes.iter().zip(paths).map(|(n, p)| real_input(&wallet, n, p)).collect();
     // Lab #937: on a format-34 net every S/P spend carries a third output.
-    // Here it is a zero-value note to the run generation's own address 0
-    // (D3: an ordinary note, indistinguishable from a paying one), in input
-    // 1's asset — the AIR binds output 3's asset to an input's (`o3a`). The
-    // prover-fee third output is lab #937 PR D's.
+    // Here it is a zero-value note (D3: an ordinary note, indistinguishable
+    // from a paying one) to where this spend's change goes — `outs[1].to`,
+    // the active generation's change address, never the run generation's
+    // (a sweep must not leave a note behind in the generation it empties) —
+    // in input 1's asset: the AIR binds output 3's asset to an input's
+    // (`o3a`). The wallet never spends a zero-value note
+    // (`AssetIndex::zero`). The prover-fee third output is lab #937 PR D's.
     let outs: Vec<Out> = match run.auth_context().form.sp_outputs() {
         2 => outs.to_vec(),
         3 => {
             let mut v = outs.to_vec();
-            v.push(Out { to: me_v2(&wallet, &run.auth_root()), value: 0, asset: real[0].asset });
+            v.push(Out { to: outs[1].to.clone(), value: 0, asset: real[0].asset });
             v
         }
         n => unreachable!("an S/P spend carries two or three outputs, not {n}"),
@@ -1057,12 +1060,71 @@ mod tests {
         assert!(j.get(1).is_err());
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
-        let last = crate::auth_journal::PROBE_GENERATIONS - 1;
+        // Lab #937: a zero-value note (a format-34 third output) is never
+        // swept. Generation 0 holds only one and has landed leaves → retired,
+        // not sweep-only; generation 2 holds only one and nothing landed →
+        // not recorded, yet the active generation still opens above it (its
+        // address was handed out).
+        let zeros = [note_of(&wallet, 0, 0, 7), note_of(&wallet, 2, 0, 8)];
+        let landed: LandedByGeneration = [(0, leaves(0, 1))].into();
+        let j = restore_journal(&lock, &w, &wallet, &zeros, &landed, &genesis, 500).unwrap();
+        assert_eq!(j.get(0).unwrap().state, GenState::Retired, "only a zero-value note: nothing to sweep");
+        assert!(j.get(2).is_err(), "only a zero-value note and nothing landed: not recorded");
+        assert_eq!(j.active().g, 3);
+        std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
+
+        let last =crate::auth_journal::PROBE_GENERATIONS - 1;
         let edge = [note_of(&wallet, last, 1, 9)];
         assert!(matches!(
             restore_journal(&lock, &w, &wallet, &edge, &none, &genesis, 500),
             Err(SendRefusal::Auth(why)) if why.contains("last of the")
         ));
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// Lab #937: a zero-value note (a format-34 third output, a merge's empty
+    /// output) is never an input: the planner picks none — not as a payment
+    /// note, not merged, not as a fee note, not split — and the sweep floor
+    /// `check_budget` keeps does not count it.
+    #[test]
+    fn zero_value_notes_are_never_planned_nor_budgeted() {
+        use crate::annulet_plan::{plan_send, StepKind, Tiers};
+        use qlab_ledger::assets::AssetIndex;
+        use qlab_ledger::spent::SpentSet;
+        let w = wallet_dir("zero", 9);
+        let wallet = w.wallet();
+        let tiers = Tiers { s: 3, p: 5, r: 7 };
+        let of = |value: u64, asset: u64, k: u8| {
+            let mut n = note_of(&wallet, 0, value, k);
+            n.note.asset = asset;
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], n.note, &[(0, generation_root(&wallet, 0))]).unwrap()
+        };
+        let notes = vec![of(50, 7, 1), of(40, 7, 2), of(30, 7, 3), of(0, 7, 4), of(0, 7, 5), of(0, 0, 6), of(20, 0, 7)];
+        let index = AssetIndex::build(&wallet, notes, &SpentSet::from_parts(Some((0, 9)), [])).only_generation(0);
+        assert_eq!(index.zero.len(), 3, "seen");
+
+        // 120 of asset 7: all three non-zero notes, one merge, the fee notes
+        // split from the 20 — never a zero-value note anywhere.
+        let plan = plan_send(&index, 7, 120, L2ShapeTag::S, tiers).unwrap();
+        let held: Vec<u64> = plan
+            .steps
+            .iter()
+            .flat_map(|s| match &s.kind {
+                StepKind::FeeSplit { source, .. } => vec![source.clone()],
+                StepKind::Merge { inputs, fee } => vec![inputs[0].clone(), inputs[1].clone(), fee.clone()],
+                StepKind::Pay { inputs, fee } => inputs.iter().cloned().chain(fee.clone()).collect(),
+            })
+            .filter_map(|src| match src {
+                crate::annulet_plan::Src::Held(n) => Some(n.note.value),
+                _ => None,
+            })
+            .collect();
+        assert!(!held.is_empty() && !held.contains(&0), "no zero-value note is planned: {held:?}");
+        assert!(plan_send(&index, 7, 121, L2ShapeTag::S, tiers).is_err(), "120 is all of asset 7 there is");
+
+        // The sweep floor counts the four non-zero notes, not the three zeros.
+        let notes: u32 = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+        assert_eq!(notes, 4);
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 

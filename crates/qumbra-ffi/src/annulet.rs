@@ -431,7 +431,10 @@ unsafe fn annulet_new(
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
     let allocated = if n_indices == 0 { Vec::new() } else { std::slice::from_raw_parts(indices, n_indices).to_vec() };
     let wallet = (*w).wallet.clone();
-    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
+    // Lab #937: the kernel refuses a format-34 net by name as soon as its
+    // genesis verifies — before any header is fetched — until PR D.
+    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record))
+        .refusing(qlab_devnet::forms::L2AuthForm::CandidateAV3);
     if let Some(gens) = generations {
         let roots = gens.iter().map(|&g| (g, (*w).generation_root(g))).collect();
         driver = driver.with_generations(roots);
@@ -461,15 +464,6 @@ impl AnnuletState {
                         return Ok(Some(path));
                     }
                     AnnuletStep::Done(v) => {
-                        // Lab #937: the kernel reads format 34's three-output
-                        // chain only from PR D on; until then it refuses the
-                        // net by name (the wallet CLI builds and scans it).
-                        let g = &v.chain().genesis;
-                        if g.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateAV3 {
-                            let e = VerifyRefusal::FormatNotSupported { format_version: g.file.format_version };
-                            self.phase = Phase::Refused(e.clone());
-                            return Err(e);
-                        }
                         let held = held_assets(&v);
                         self.phase = Phase::Leaves { v, held, leaves: Leaves::new(), pending: None };
                     }

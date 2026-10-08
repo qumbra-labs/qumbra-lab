@@ -81,7 +81,8 @@ fn b_on_a_v1_net_the_empty_list_is_the_old_scan() {
 /// Lab #937 PR C: a format-34 genesis (three-output S/P) **verifies** in
 /// the wallet — its CLI scans and builds format 34 now — and names its axis;
 /// the kernel (`qumbra-ffi`) still refuses it by name until PR D
-/// (`VerifyRefusal::FormatNotSupported`, raised by the kernel after its scan).
+/// (`VerifyRefusal::FormatNotSupported`, raised by the kernel right after
+/// genesis verification, before any scan).
 #[test]
 fn z_a_format_34_genesis_verifies_in_the_wallet() {
     use qumbra_wallet::annulet_verify::genesis_from_bytes;

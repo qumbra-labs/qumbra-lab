@@ -92,6 +92,11 @@ pub enum BundleError {
     /// (v2) bundle on a format-34 net, or a three-output (v3) one on a
     /// format-33 net. Refused before the intent is rebuilt.
     OutputsNotTheNets { got: usize, want: usize },
+    /// Lab #937: the third output's asset is neither input's. The v3 AIR
+    /// binds output 3 to input 1's asset (`o3a`) or input 2's — on S and on P
+    /// alike (a P row's `vPublic` asset is that row's input asset) — so such
+    /// a witness has no proof; refused before the prove is spent on it.
+    ThirdOutputAsset { asset: u64, inputs: [u64; 2] },
 }
 
 impl std::fmt::Display for BundleError {
@@ -114,6 +119,11 @@ impl std::fmt::Display for BundleError {
             BundleError::Unauthorized(why) => {
                 write!(f, "the authorization section does not verify: {why}")
             }
+            BundleError::ThirdOutputAsset { asset, inputs } => write!(
+                f,
+                "the third output's asset {asset} is neither input's ({} or {}): the v3 AIR has no proof for it",
+                inputs[0], inputs[1]
+            ),
             BundleError::OutputsNotTheNets { got, want } => write!(
                 f,
                 "a {got}-output spend on a net whose S/P spends carry {want} (format 33: two; format 34: three)"
@@ -277,6 +287,15 @@ impl ProvingBundle {
         // legibly.
         if w.outputs.len() != ctx.form.sp_outputs() {
             return Err(BundleError::OutputsNotTheNets { got: w.outputs.len(), want: ctx.form.sp_outputs() });
+        }
+        // Lab #937: the v3 AIR's `o3a` binding — output 3 carries input 1's
+        // asset or input 2's (S and P). A signed witness that breaks it has
+        // no proof; it is refused here, by name, before ~30 GiB of proving.
+        if let Some(third) = w.outputs.get(2) {
+            let inputs = [w.inputs[0].asset, w.inputs[1].asset];
+            if !inputs.contains(&third.asset) {
+                return Err(BundleError::ThirdOutputAsset { asset: third.asset, inputs });
+            }
         }
         let surface = decoded_surface(&self.tx)?;
         if let Some(terms) = surface.vpublic {

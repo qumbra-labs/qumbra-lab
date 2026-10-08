@@ -143,7 +143,9 @@ pub fn restore_generations(
             };
             let mut gens = Vec::new();
             for g in 0..=g_star {
-                let has_notes = owned.iter().any(|n| n.generation == Some(g));
+                // Lab #937: a zero-value note is never swept — a generation
+                // holding only those retires.
+                let has_notes = owned.iter().any(|n| n.generation == Some(g) && n.note.value != 0);
                 let landed = used.get(&g);
                 if !has_notes && landed.is_none() {
                     continue;
@@ -221,7 +223,9 @@ pub fn restore_generations_with<T: std::borrow::Borrow<GenTree>>(
             };
             let mut gens = Vec::new();
             for g in 0..=g_star {
-                let has_notes = owned.iter().any(|n| n.generation == Some(g));
+                // Lab #937: a zero-value note is never swept — a generation
+                // holding only those retires.
+                let has_notes = owned.iter().any(|n| n.generation == Some(g) && n.note.value != 0);
                 let landed = used.get(&g);
                 if !has_notes && landed.is_none() {
                     continue;

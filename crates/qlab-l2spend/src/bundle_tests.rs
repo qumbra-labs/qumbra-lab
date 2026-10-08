@@ -611,5 +611,31 @@ fn the_v3_split_path_proves_and_verifies() {
     assert_eq!(wire(&without_proof(&tx)), wire(b.tx()), "only the proof is added");
     let proof: qlab_l2::Proof<qlab_l2::Config> = bincode::deserialize(&tx.proof).expect("the proof decodes");
     assert!(qlab_l2::v3::verify_s_u32(&b.witness().pvs(), &proof), "the v3 proof verifies");
-    assert!(!qlab_l2::v2::verify_s_u32(&b.witness().pvs()[..qlab_l2::v2::pv_len(Shape::S)], &proof), "not a v2 proof");
+    // Not a v2 proof — judged at v2's own PV length (the v3 vector without
+    // `cm3`), so the refusal is the v2 AIR's, not a length check's.
+    let as_v2 = &b.witness().pvs()[..qlab_l2::v2::pv_len(Shape::S)];
+    assert_eq!(as_v2.len(), qlab_l2::v2::pv_len(Shape::S));
+    assert!(!qlab_l2::v2::verify_s_u32(as_v2, &proof), "a v3 proof is not a v2 proof");
+}
+
+/// Lab #937 (review F2): a three-output witness whose third output carries
+/// neither input's asset has no v3 proof (`o3a`: output 3 is input 1's asset
+/// or input 2's — S and P alike); the lock refuses it by name before the
+/// prove, whatever the section says.
+#[test]
+fn a_third_output_of_neither_input_s_asset_is_refused_before_proving() {
+    for b in [bundle_s_v3(), bundle_p_v3()] {
+        let inputs = [b.witness().inputs[0].asset, b.witness().inputs[1].asset];
+        assert_eq!(inputs, [0, 7]);
+        let mut w = b.witness().clone();
+        w.outputs[2].asset = 9;
+        let bad = ProvingBundle::new(b.tx().clone(), w).expect("well formed");
+        assert_eq!(bad.check(&CTX_V3).err(), Some(BundleError::ThirdOutputAsset { asset: 9, inputs }));
+        // Input 2's asset is allowed by the rule (it may still not state the
+        // transaction — here it does not, and the statement check says so).
+        let mut w = b.witness().clone();
+        w.outputs[2].asset = 7;
+        let other = ProvingBundle::new(b.tx().clone(), w).expect("well formed");
+        assert_eq!(other.check(&CTX_V3).err(), Some(BundleError::StatementMismatch("output commitments")));
+    }
 }
