@@ -151,7 +151,7 @@ pub fn prove_s(air: &l2::L2ShapeSAir, pvs: &[u32]) -> (Vec<Val>, Proof<Config>) 
 
 pub fn prove_p(air: &l2p::L2ShapePAir, pvs: &[u32]) -> (Vec<Val>, Proof<Config>) {
     assert!(
-        air.is_v2() && air.log_height == log_height(Shape::P),
+        air.version == l2::L2Version::V2Auth && air.log_height == log_height(Shape::P),
         "a v2 shape-P instance at 2^20"
     );
     let pvs = public_values(pvs);
