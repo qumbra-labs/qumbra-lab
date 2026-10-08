@@ -34,6 +34,8 @@
 # on it is the intended behaviour — loud beats silent (lab #402 precedent).
 #
 # Usage: suite-expected-results.sh [manifest-dir]     (default: cwd)
+#   env SUITE_PACKAGES  space-separated package names: count only these
+#                       (the verify-l2 lane's `-p qlab-air -p qlab-l2`); unset = the workspace
 # Requires: cargo, python3. Both absent ⇒ exit 2 with a named reason.
 set -uo pipefail
 
@@ -57,7 +59,9 @@ import json, sys
 
 with open(sys.argv[1]) as f:
     m = json.load(f)
+import os
 members = set(m["workspace_members"])
+only = set(os.environ.get("SUITE_PACKAGES", "").split())
 binaries = 0
 doctests = 0
 skipped = []
@@ -79,7 +83,7 @@ def default_features(pkg):
     return enabled
 
 for pkg in m["packages"]:
-    if pkg["id"] not in members:
+    if pkg["id"] not in members or (only and pkg["name"] not in only):
         continue
     enabled = default_features(pkg)
     for t in pkg["targets"]:

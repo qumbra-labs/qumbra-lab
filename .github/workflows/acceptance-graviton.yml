@@ -91,7 +91,8 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'verify-graviton' ||
-      github.event.label.name == 'verify-pilot'
+      github.event.label.name == 'verify-pilot' ||
+      github.event.label.name == 'verify-l2'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -347,9 +348,79 @@ jobs:
             pilot.exit
           retention-days: 90
 
+  # ── job B″ ── the L2 iteration lane (lab #937): `qlab-air` + `qlab-l2` only,
+  # behind the `verify-l2` label, so an AIR change can be iterated in ~20
+  # minutes instead of the full suite's ~100. 🔴 IT IS NOT THE BAR: acceptance
+  # and merge read ONLY the `verify-graviton` suite (CLAUDE.md §5) — a green
+  # here says nothing about the other crates' cross-checks, which is exactly
+  # what a crate-scoped run cannot see (#166). It lives in this workflow for
+  # the same reason the pilot does: start/stop count only this workflow's runs.
+  l2:
+    needs: start
+    if: github.event.label.name == 'verify-l2'
+    runs-on: [self-hosted, graviton-rig]
+    timeout-minutes: 60
+    # No job-level concurrency group with the suite, deliberately: a pending
+    # job in a group is REPLACED (cancelled) by the next one queued into it,
+    # so a second verify-l2 label could silently cancel a queued acceptance
+    # suite. Each self-hosted runner takes one job at a time, so the two never
+    # share an instance; and both are runs of THIS workflow, so the start
+    # job's queue-depth count and the stop job's "is anyone else using the
+    # lane" guard see this job like any other — it can neither be parked
+    # under nor park the iron under an acceptance run.
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Persistent target dir (shared with the suite job)
+        run: |
+          echo "CARGO_TARGET_DIR=$HOME/.cache/qumbra-lab-target" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.cache/qumbra-lab-target"
+
+      - name: Provenance
+        run: |
+          echo "commit   $(git rev-parse HEAD)"
+          echo "run      ${{ github.run_id }}"
+          uname -m; nproc; free -g | head -2
+          rustc --version; cargo --version
+
+      # Same shape as the suite step (raw log for the reconciliation, stamped
+      # console, `l2.exit` only after cargo returns), two packages only.
+      - name: qlab-air + qlab-l2, serial (ITERATION ONLY — not the bar)
+        run: |
+          set -o pipefail
+          rc=0
+          /usr/bin/time -v cargo test --release -p qlab-air -p qlab-l2 --locked --no-fail-fast \
+            -- --test-threads=1 2>&1 | tee suite.log \
+            | awk '{ print strftime("[%H:%M:%S]"), $0; fflush() }' || rc=$?
+          echo "$rc" > suite.exit
+          exit "$rc"
+
+      # The standard reconciliation, its denominator scoped to the two packages.
+      - name: Reconciliation (two packages)
+        if: always()
+        env:
+          SUITE_LANE: graviton-rig, verify-l2 (qlab-air + qlab-l2 only — iteration, not acceptance)
+          SUITE_PACKAGES: qlab-air qlab-l2
+        run: bash .github/workflows/scripts/reconcile-suite.sh suite.log suite.exit
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: l2-log-graviton
+          path: |
+            suite.log
+            suite.exit
+          retention-days: 7
+
   # ── job C ── park the instance, unless someone else is using the lane.
   stop:
-    needs: [start, suite, pilot]
+    needs: [start, suite, pilot, l2]
     # `always()` so a failed or cancelled suite still parks the iron — but
     # re-gated on the same label condition as `start` (`types: [labeled]`
     # fires for ANY label, and a skipped start must not leave an always()
@@ -360,7 +431,8 @@ jobs:
       always() &&
       (github.event_name == 'workflow_dispatch' ||
        github.event.label.name == 'verify-graviton' ||
-       github.event.label.name == 'verify-pilot') &&
+       github.event.label.name == 'verify-pilot' ||
+       github.event.label.name == 'verify-l2') &&
       vars.CI_RUNNER_INSTANCE_ID != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
