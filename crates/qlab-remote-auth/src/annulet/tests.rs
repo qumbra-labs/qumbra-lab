@@ -84,7 +84,7 @@ fn intent_is_fixed_width_and_matches_the_independent_vectors() {
 
 /// Lab #937: a format-34 intent binds **three** S/P commitments (and R
 /// still two). The vectors are pycryptodome Keccak-256 over an independent
-/// encoder (`logs/937-prB-map-20261008/intent_golden.py`, PR body), which
+/// encoder (`intent_golden.py`, quoted in lab #937 PR B's body), which
 /// first reproduces this file's format-6 goldens above byte for byte.
 #[test]
 fn format_34_intent_binds_three_commitments_and_matches_the_independent_vectors() {

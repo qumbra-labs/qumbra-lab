@@ -275,7 +275,7 @@ const GOLDEN_E2_GENESIS_V2_ONE_NOTE: &str =
 
 /// Lab #937: the v3 (format-34) domains pinned to hex, by the same method as
 /// the v2 ones: an independent Python Keccak-256 rebuild
-/// (`logs/937-prB-map-20261008/body_golden.py`, quoted in the PR) that first
+/// (`body_golden.py`, quoted in lab #937 PR B's body) that first
 /// reproduces the four v2 goldens above byte for byte. The v3 body of the v2
 /// fixture differs from the v2 one by the domain alone; the format-34 golden
 /// carries a three-output transaction.
