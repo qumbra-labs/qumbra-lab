@@ -100,9 +100,11 @@ pub enum L2VerifyError {
     NoSurface,
     /// The surface bytes are not canonical.
     SurfaceMalformed,
-    /// Not the 3×2 shapes' arity (3 nullifiers — two inputs and the fee
-    /// input, A4 — and 2 commitments) — shapes S and P, under the 2×2 bucket
-    /// declaration.
+    /// Not the S/P arity of the verifier's version — 3 nullifiers (two inputs
+    /// and the fee input, A4) and 2 commitments (v1/v2) or 3 (v3, format 34,
+    /// lab #937) — under the 2×2 bucket declaration. The other version's
+    /// well-formed S/P spend has its own names
+    /// ([`L2VerifyError::V2SpendOnV3Net`], [`L2VerifyError::V3SpendOnV2Net`]).
     WrongArity,
     /// A registry write (shape R) that is not 1 nullifier / 1 commitment
     /// under the 2×2 bucket declaration (lab #728 Q2).

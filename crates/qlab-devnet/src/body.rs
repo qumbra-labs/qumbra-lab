@@ -806,9 +806,12 @@ pub enum BodyError {
     L2SurfaceMissing { index: usize },
     /// An Annulet transaction's L2 surface bytes do not decode canonically.
     L2SurfaceMalformed { index: usize, err: crate::annulet::L2SurfaceError },
-    /// An Annulet S/P transaction does not have the 3×2 shapes' arity (three
-    /// nullifiers — two inputs and the fee input, A4 — and two commitments),
-    /// or does not declare the 2×2 bucket.
+    /// An Annulet S/P transaction does not have its net's arity — three
+    /// nullifiers (two inputs and the fee input, A4) and the axis's output
+    /// count (two on formats 32/33, three on format 34, lab #937) — or does
+    /// not declare the 2×2 bucket. The other format's well-formed S/P spend
+    /// has its own names: [`BodyError::L2V2SpendOnV3Net`] /
+    /// [`BodyError::L2V3SpendOnV2Net`].
     L2WrongArity { index: usize },
     /// Lab #937: an S/P spend with two output commitments (the v2 shapes) on
     /// a format-34 net, where every S/P spend carries three.

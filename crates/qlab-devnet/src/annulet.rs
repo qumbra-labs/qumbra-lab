@@ -481,7 +481,9 @@ pub fn placeholder_discovery_annulet(commitments: &[Hash32]) -> Vec<u8> {
 /// 2. the header binds [`body_commitment_annulet`];
 /// 3. per transaction: anchor final; name rider absent (no name service);
 ///    L2 surface present and canonical; bucket 2×2 with the shape's arity
-///    ([`check_l2_arity`]: S/P 3 nullifiers, R 1; 2 commitments); `fee == posted_fee_l2(shape)`; no nullifier repeated
+///    ([`check_l2_arity`]: S/P 3 nullifiers and the axis's output count —
+///    2 on formats 32/33, 3 on format 34 (lab #937), the other format's spend
+///    refused by name; R 1 and 2); `fee == posted_fee_l2(shape)`; no nullifier repeated
 ///    in the block; the discovery group is canonical at the 128-B payload
 ///    width, binds the declared commitments, and carries no genesis plaintext
 ///    ([`check_tx_discovery_annulet`], lab #714); the surface's
@@ -1008,6 +1010,61 @@ mod tests {
 
     fn check(body: &BlockBody) -> Result<(), BodyError> {
         validate_body_annulet(&header_for(body), body, &OkProof, |r| *r == FINAL, &FEES)
+    }
+
+    /// Lab #937 (review F3): the whole body rule on formats 33 and 34 —
+    /// a two-output S spend on 34 and a three-output one on 33 are refused by
+    /// name (before any signature work), and a signed three-output S spend on
+    /// 34 passes every rule: arity, fee, surface, its v3 body commitment, the
+    /// authorization over the format-34 intent, the (mocked) proof.
+    #[test]
+    fn the_body_rule_takes_each_formats_arity_and_refuses_the_other_by_name() {
+        use qlab_remote_auth::annulet::AnnuletAuthSection;
+        use qlab_remote_auth::mldsa::Key;
+        let sign = |mut t: TxEntry, ctx: &AuthContext| {
+            let keys: Vec<Key> = (0..3u8).map(|i| Key::from_seed([0x90 + i; 32])).collect();
+            let descriptors: Vec<_> = keys.iter().enumerate().map(|(i, k)| k.descriptor(i as u32)).collect();
+            let intent = intent_for(&t, ctx.genesis_format(), &ctx.genesis_hash, 100, &descriptors).expect("intent");
+            let refs: Vec<&Key> = keys.iter().collect();
+            t.auth = AnnuletAuthSection::sign(&intent, &refs).and_then(|s| s.encode()).expect("signs");
+            t
+        };
+        let three = |nf: u8| {
+            let mut t = l2_tx(nf, &s_surface());
+            t.public.commitments.push([nf.wrapping_add(4); 32]);
+            t.discovery = placeholder_discovery_annulet(&t.public.commitments);
+            t
+        };
+        let check_on = |ctx: &AuthContext, body: &BlockBody| {
+            let header = BlockHeader::genesis_annulet(
+                AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [0x44; 32] },
+                body_commitment_annulet_for(body, ctx.form),
+                0,
+            );
+            validate_body_annulet_for(&header, body, &OkProof, |r| *r == FINAL, &FEES, ctx)
+        };
+        let (v2, v3) = (AuthContext::candidate_a([0x6E; 32]), AuthContext::candidate_a_v3([0x6E; 32]));
+        // Accepted: a signed three-output S spend on format 34 …
+        let ok34 = BlockBody::new(vec![sign(three(1), &v3)], vec![]);
+        assert_eq!(check_on(&v3, &ok34), Ok(()));
+        // … and a signed two-output one on format 33 (the control).
+        let ok33 = BlockBody::new(vec![sign(l2_tx(1, &s_surface()), &v2)], vec![]);
+        assert_eq!(check_on(&v2, &ok33), Ok(()));
+        // Refused by name, each on the other format, at the tx's index.
+        let two_on_34 = BlockBody::new(vec![sign(three(5), &v3), sign(l2_tx(1, &s_surface()), &v2)], vec![]);
+        assert_eq!(check_on(&v3, &two_on_34), Err(BodyError::L2V2SpendOnV3Net { index: 1 }));
+        let three_on_33 = BlockBody::new(vec![sign(l2_tx(5, &s_surface()), &v2), sign(three(1), &v3)], vec![]);
+        assert_eq!(check_on(&v2, &three_on_33), Err(BodyError::L2V3SpendOnV2Net { index: 1 }));
+        // A format-34 body committed under the v2 domain is not the header's.
+        let header_v2 = BlockHeader::genesis_annulet(
+            AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [0x44; 32] },
+            body_commitment_annulet_for(&ok34, L2AuthForm::CandidateA),
+            0,
+        );
+        assert!(matches!(
+            validate_body_annulet_for(&header_v2, &ok34, &OkProof, |r| *r == FINAL, &FEES, &v3),
+            Err(BodyError::CommitmentMismatch { .. })
+        ));
     }
 
     /// Lab #712 (the §5 ruling): a surface whose registry root is not the

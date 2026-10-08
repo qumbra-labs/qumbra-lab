@@ -17,7 +17,8 @@ B4 makes the node verify every Annulet transaction's proof against its **declare
 **The default:** `select_verifier(rehearsal, form, l2_auth)`.
 - On an Annulet genesis the real `L2Verifier` is the default. B2's rehearsal-only interim is retired: M10-T0-4's rule, real verifier before any public net.
 - On a Candidate A Annulet genesis (`L2AuthForm::CandidateA`, format 33) it is `L2VerifierV2` (lab #896 E3): the v2 shapes, with each auth-section slot's leaf appended to the PVs. Each verifier refuses the other version's transactions by name (`AuthOnV1Net`, `AuthMissing`); a section that does not decode for the shape is `AuthMalformed`, before the proof is read.
-- `--rehearsal-verifier` stays a loud ⚠️ opt-in on both forms.
+- On a format-34 genesis (`L2AuthForm::CandidateAV3`, lab #937) it is `L2VerifierV3`: S and P at the **v3** shapes (three output commitments, `cm3` appended after v2's PVs; `qlab_l2::v3::verify_{s,p}_u32`), R at v2. The S/P arity is the axis's — 3 nullifiers and 2 commitments on formats 32/33, 3 and 3 on format 34 — in the verifier (`WrongArity`), the body rule and the mempool (`check_l2_arity`, `BodyError::L2WrongArity`). The other format's well-formed S/P spend is refused **by name**, from its declared arity and before the proof is read (S v2 and S v3 are both 2^20, so the proof's height cannot tell them apart): `V2SpendOnV3Net` / `V3SpendOnV2Net` in the verifier, `L2V2SpendOnV3Net` / `L2V3SpendOnV2Net` in the body rule and the pool.
+- `--rehearsal-verifier` stays a loud ⚠️ opt-in on every form.
 - `ConsensusVerifier` refuses any transaction carrying an L2 surface.
 
 ## Block and mempool rules (no prover)

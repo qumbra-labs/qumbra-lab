@@ -93,7 +93,9 @@ pub const ANNULET_V3_GENESIS_FORMAT: u32 = 34;
 /// The output commitments an intent for `shape` binds on the net
 /// `genesis_format` names: S/P **3** on format 34, **2** on every other
 /// format (formats 33 and earlier — so every pre-#937 intent encodes byte for
-/// byte as before); R 2 everywhere.
+/// byte as before); R 2 everywhere. Defaulting every other format to 2 is
+/// add-don't-edit by design: format 34 is the one value that changes the
+/// count, and no existing intent's bytes or goldens move.
 pub const fn intent_outputs(genesis_format: u32, shape: Shape) -> usize {
     match shape {
         Shape::S | Shape::P if genesis_format == ANNULET_V3_GENESIS_FORMAT => 3,
