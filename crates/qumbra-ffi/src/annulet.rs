@@ -178,6 +178,7 @@ pub fn refusal_key(r: &VerifyRefusal) -> &'static str {
         GenesisTooLarge { .. } => "genesis_too_large",
         GenesisMismatch { .. } => "genesis_mismatch",
         GenesisInvalid { .. } => "genesis_invalid",
+        FormatNotSupported { .. } => "format_not_supported",
         HeadersUnavailable { .. } => "headers_unavailable",
         HeadersMalformed { .. } => "headers_malformed",
         HeaderGap { .. } => "header_gap",

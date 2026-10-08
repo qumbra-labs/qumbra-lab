@@ -377,7 +377,7 @@ pub fn send_annulet<E: Endpoint>(
     let wallet = w.wallet();
     // Lab #896 G (QG1): the recipient's address version must be the net's —
     // a note to the other derivation could never be spent.
-    let candidate_a = session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA;
+    let candidate_a = session.l2_auth.has_auth();
     let want = if candidate_a {
         qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A
     } else {
@@ -624,7 +624,7 @@ pub fn exit_annulet<E: Endpoint>(
     // Lab #896 G: a Candidate A note cannot leave by this path. An exit
     // file is for the V6 sequencer, whose members stay v1 (seam W ruled
     // (A)): a v2 note opens only under the v2 shapes, which V6 refuses.
-    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+    if session.l2_auth.has_auth() {
         return Err(SendRefusal::Auth(
             "this net's exits need V6 to accept Candidate A members first (lab #896 W, gate (B)): the V6 \
              bridge takes v1 members only, and a Candidate A note opens only under the v2 shapes"

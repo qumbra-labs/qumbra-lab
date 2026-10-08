@@ -84,6 +84,23 @@ impl Shape {
     }
 }
 
+/// Genesis format **34** (lab #937): the Annulet net whose S/P spends carry
+/// **three** output commitments. Mirrors `qlab_devnet::forms::
+/// ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION` (this crate does not depend on
+/// `qlab-devnet`; a test there cross-locks the two).
+pub const ANNULET_V3_GENESIS_FORMAT: u32 = 34;
+
+/// The output commitments an intent for `shape` binds on the net
+/// `genesis_format` names: S/P **3** on format 34, **2** on every other
+/// format (formats 33 and earlier — so every pre-#937 intent encodes byte for
+/// byte as before); R 2 everywhere.
+pub const fn intent_outputs(genesis_format: u32, shape: Shape) -> usize {
+    match shape {
+        Shape::S | Shape::P if genesis_format == ANNULET_V3_GENESIS_FORMAT => 3,
+        _ => 2,
+    }
+}
+
 /// A named refusal. Seam F maps these onto node errors one to one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthError {
@@ -93,6 +110,9 @@ pub enum AuthError {
     Scheme(u8),
     /// The slot count does not match the shape.
     SlotCount { expected: usize, got: usize },
+    /// Lab #937: the commitment count does not match the shape on the
+    /// intent's net ([`intent_outputs`]).
+    OutputCount { expected: usize, got: usize },
     /// The header's `valid_until_height` differs from the intent's.
     ValidityMismatch,
     /// A slot's descriptor differs from the intent's.
@@ -130,7 +150,9 @@ pub struct AnnuletIntent {
     pub anchor: Hash32,
     /// One per slot, in slot order (the fee slot last on S/P).
     pub nullifiers: Vec<Hash32>,
-    pub commitments: [Hash32; 2],
+    /// The output commitments: [`intent_outputs`]`(genesis_format, shape)`
+    /// of them — two, or three on format 34 (lab #937).
+    pub commitments: Vec<Hash32>,
     pub bucket: u8,
     pub valid_until_height: u64,
     pub fee: u64,
@@ -144,7 +166,13 @@ pub struct AnnuletIntent {
 }
 
 impl AnnuletIntent {
+    /// The encoded length with two output commitments (every format but 34).
     pub const fn encoded_len_for(shape: Shape) -> usize {
+        Self::encoded_len_with(shape, 2)
+    }
+
+    /// The encoded length with `outputs` output commitments.
+    pub const fn encoded_len_with(shape: Shape, outputs: usize) -> usize {
         let n = shape.slots();
         INTENT_DOMAIN.len()
             + 2
@@ -153,7 +181,7 @@ impl AnnuletIntent {
             + 1
             + 32
             + 32 * n
-            + 32 * 2
+            + 32 * outputs
             + 1
             + 8
             + 8
@@ -171,6 +199,10 @@ impl AnnuletIntent {
                 return Err(AuthError::SlotCount { expected, got });
             }
         }
+        let outputs = intent_outputs(self.genesis_format, self.shape);
+        if self.commitments.len() != outputs {
+            return Err(AuthError::OutputCount { expected: outputs, got: self.commitments.len() });
+        }
         if let Some(slot) = self
             .auth
             .iter()
@@ -185,7 +217,7 @@ impl AnnuletIntent {
 
     pub fn encode(&self) -> Result<Vec<u8>, AuthError> {
         self.validate_shape()?;
-        let len = Self::encoded_len_for(self.shape);
+        let len = Self::encoded_len_with(self.shape, self.commitments.len());
         let mut out = Vec::with_capacity(len);
         out.extend_from_slice(INTENT_DOMAIN);
         out.extend_from_slice(&INTENT_VERSION.to_le_bytes());

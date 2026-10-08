@@ -746,7 +746,7 @@ pub fn migrate<E: Endpoint>(
 ) -> Result<MigrateReport, SendRefusal> {
     use crate::annulet_send::{open_session, plan_send};
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
-    if session.l2_auth != qlab_devnet::forms::L2AuthForm::CandidateA {
+    if !session.l2_auth.has_auth() {
         return Err(SendRefusal::Auth("migrate is for a Candidate A net; this one is not".into()));
     }
     let wallet = w.wallet();

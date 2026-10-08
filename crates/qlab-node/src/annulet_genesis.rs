@@ -29,7 +29,7 @@ use qlab_devnet::annulet::{
 use qlab_devnet::committee::Validator;
 use qlab_devnet::forms::{
     annulet_forms_of_genesis_format_version, GenesisForm, L2AuthForm, ANNULET_AUTH_GENESIS_FORMAT_VERSION,
-    ANNULET_GENESIS_FORMAT_VERSION,
+    ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, ANNULET_GENESIS_FORMAT_VERSION,
 };
 use qlab_devnet::header::{BlockHeader, Hash32};
 
@@ -38,7 +38,8 @@ use qlab_devnet::header::{BlockHeader, Hash32};
 /// move, and converts back to it there with the message unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnnuletGenesisError {
-    /// The leading `format_version` is not 32 (`None`: shorter than four bytes).
+    /// The leading `format_version` is not an Annulet one — 32, 33 or 34
+    /// (`None`: shorter than four bytes).
     NotAnnuletGenesis { got: Option<u32> },
     /// The bytes do not decode as the file.
     Decode(String),
@@ -52,7 +53,7 @@ impl std::fmt::Display for AnnuletGenesisError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AnnuletGenesisError::NotAnnuletGenesis { got } => {
-                write!(f, "not an Annulet genesis file: leading format_version {got:?}, want 32")
+                write!(f, "not an Annulet genesis file: leading format_version {got:?}, want 32, 33 or 34")
             }
             AnnuletGenesisError::Decode(e) => write!(f, "genesis decode: {e}"),
             AnnuletGenesisError::BadAnnulet(why) => write!(f, "Annulet genesis: {why}"),
@@ -237,7 +238,11 @@ impl AnnuletGenesisFile {
     /// Decode, refusing a non-Annulet file **by name** before decoding a byte.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AnnuletGenesisError> {
         match leading_format_version(bytes) {
-            Some(ANNULET_GENESIS_FORMAT_VERSION | ANNULET_AUTH_GENESIS_FORMAT_VERSION) => {}
+            Some(
+                ANNULET_GENESIS_FORMAT_VERSION
+                | ANNULET_AUTH_GENESIS_FORMAT_VERSION
+                | ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION,
+            ) => {}
             got => {
                 return Err(AnnuletGenesisError::NotAnnuletGenesis { got });
             }
@@ -271,7 +276,8 @@ impl AnnuletGenesisFile {
     }
 
     /// The L2 authorization axis this genesis selects (lab #896 E2): format
-    /// 32 is [`L2AuthForm::None`], 33 is [`L2AuthForm::CandidateA`].
+    /// 32 is [`L2AuthForm::None`], 33 is [`L2AuthForm::CandidateA`], 34 is
+    /// [`L2AuthForm::CandidateAV3`] (lab #937).
     pub fn l2_auth(&self) -> Result<L2AuthForm, AnnuletGenesisError> {
         annulet_forms_of_genesis_format_version(self.format_version)
             .map(|(_, auth)| auth)
@@ -285,6 +291,7 @@ impl AnnuletGenesisFile {
         Ok(match self.l2_auth()? {
             L2AuthForm::None => qlab_devnet::annulet::AuthContext::NONE,
             L2AuthForm::CandidateA => qlab_devnet::annulet::AuthContext::candidate_a(self.hash()),
+            L2AuthForm::CandidateAV3 => qlab_devnet::annulet::AuthContext::candidate_a_v3(self.hash()),
         })
     }
 

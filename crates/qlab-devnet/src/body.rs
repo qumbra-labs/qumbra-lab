@@ -810,6 +810,12 @@ pub enum BodyError {
     /// nullifiers — two inputs and the fee input, A4 — and two commitments),
     /// or does not declare the 2×2 bucket.
     L2WrongArity { index: usize },
+    /// Lab #937: an S/P spend with two output commitments (the v2 shapes) on
+    /// a format-34 net, where every S/P spend carries three.
+    L2V2SpendOnV3Net { index: usize },
+    /// Lab #937: an S/P spend with three output commitments (the v3 shapes)
+    /// on a format-33 net, whose S/P spends carry two.
+    L2V3SpendOnV2Net { index: usize },
     /// Lab #911: a transaction lists more nullifiers or commitments than one
     /// byte counts (255) — refused before the body commitment, which writes
     /// each count in a byte, could be computed over it.

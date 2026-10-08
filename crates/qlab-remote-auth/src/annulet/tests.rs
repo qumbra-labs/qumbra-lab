@@ -34,7 +34,7 @@ fn fixture(shape: Shape) -> AnnuletIntent {
         shape,
         anchor: b(0x22),
         nullifiers,
-        commitments: [b(0x41), b(0x42)],
+        commitments: vec![b(0x41), b(0x42)],
         bucket: 0x02,
         valid_until_height: 1_000_256,
         fee: 0x0102_0304_0506_0708,

@@ -369,7 +369,7 @@ impl AnnuletVerifyDriver {
             chain.genesis.hash,
             genesis_notes.clone(),
         );
-        if chain.genesis.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+        if chain.genesis.l2_auth.has_auth() {
             let generations = match &self.generations {
                 Some(g) if !g.is_empty() => g.clone(),
                 _ => crate::auth_journal::probe_roots(&self.wallet),

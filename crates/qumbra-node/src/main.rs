@@ -102,7 +102,7 @@ fn usage() {
            --launch                         T2 ceremony path: committee keys from OS randomness.\n      \
                                             Requires --t2. Hash is NOT reproducible.\n      \
            --difficulty N                   launch-only; default stays the current placeholder\n  \
-         qumbra-node genesis annulet-devnet [--v2 | --rehearsal] [--out DIR] [--sequencer-data-dir DIR]\n      \
+         qumbra-node genesis annulet-devnet [--v2 | --v3] [--rehearsal] [--out DIR] [--sequencer-data-dir DIR]\n      \
                                             write the Annulet DEVNET genesis (pinned hash, dev keys);\n      \
                                             with --sequencer-data-dir, also its DEV sequencer key file.\n      \
                                             --v2: the Candidate A devnet (format 33); --rehearsal: its\n      \
@@ -989,15 +989,22 @@ fn audit(args: &[String]) -> Result<(), Box<dyn Error>> {
 ///
 /// `--v2` writes the Candidate A devnet (lab #896 H, format 33) and
 /// `--rehearsal` its one-second-slot rehearsal genesis; both share the v1
-/// devnet's dev keys.
+/// devnet's dev keys. `--v3` writes the format-34 devnet (lab #937: S/P spends
+/// carry three outputs), `--v3 --rehearsal` its rehearsal; `--v2` and `--v3`
+/// are exclusive.
 fn genesis_annulet_devnet(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile, SequencerKeyFile, SEQUENCER_KEY_FILE};
     let out = std::path::PathBuf::from(flag(args, "--out").unwrap_or("."));
     std::fs::create_dir_all(&out)?;
-    let (which, g) = match (has_flag(args, "--v2"), has_flag(args, "--rehearsal")) {
-        (false, false) => ("annulet devnet", AnnuletGenesisFile::devnet()),
-        (true, false) => ("annulet devnet v2", AnnuletGenesisFile::devnet_v2()),
-        (_, true) => ("annulet devnet v2 rehearsal", AnnuletGenesisFile::devnet_v2_rehearsal()),
+    if has_flag(args, "--v2") && has_flag(args, "--v3") {
+        return Err("--v2 and --v3 are exclusive".into());
+    }
+    let (which, g) = match (has_flag(args, "--v2"), has_flag(args, "--v3"), has_flag(args, "--rehearsal")) {
+        (false, false, false) => ("annulet devnet", AnnuletGenesisFile::devnet()),
+        (true, _, false) => ("annulet devnet v2", AnnuletGenesisFile::devnet_v2()),
+        (_, false, true) => ("annulet devnet v2 rehearsal", AnnuletGenesisFile::devnet_v2_rehearsal()),
+        (_, true, false) => ("annulet devnet v3 (format 34)", AnnuletGenesisFile::devnet_v3()),
+        (_, true, true) => ("annulet devnet v3 (format 34) rehearsal", AnnuletGenesisFile::devnet_v3_rehearsal()),
     };
     g.verify(None)?;
     let path = out.join("genesis.qmb");

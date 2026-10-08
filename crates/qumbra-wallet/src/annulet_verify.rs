@@ -165,6 +165,11 @@ pub enum VerifyRefusal {
     GenesisMismatch { pinned: [u8; 32], fetched: [u8; 32] },
     /// The pinned bytes do not decode, or fail the file's own structure check.
     GenesisInvalid { why: String },
+    /// Lab #937: a format-34 net (three-output S/P). This wallet scans and
+    /// builds the two-output shapes only; the three-output path is lab #937
+    /// PR C. Refused at genesis, before any scan, so no spend is ever built
+    /// with the wrong arity and no three-output body is misread.
+    FormatNotSupported { format_version: u32 },
     /// A headers page could not be read.
     HeadersUnavailable { from: u64, why: String },
     /// A headers page did not decode.
@@ -225,6 +230,10 @@ impl std::fmt::Display for VerifyRefusal {
                 hex(pinned)
             ),
             GenesisInvalid { why } => write!(f, "the pinned genesis file is invalid: {why}"),
+            FormatNotSupported { format_version } => write!(
+                f,
+                "genesis format {format_version} (three-output S/P spends) is not supported by this wallet yet (lab #937 PR C)"
+            ),
             HeadersUnavailable { from, why } => write!(f, "GET /v1/headers from {from}: {why}"),
             HeadersMalformed { from, why } => write!(f, "/v1/headers from {from} did not decode: {why}"),
             HeaderGap { want, got } => write!(f, "headers skip: expected height {want}, served {got}"),
@@ -313,6 +322,9 @@ pub fn genesis_from_bytes(pin: [u8; 32], bytes: &[u8]) -> Result<VerifiedGenesis
     file.verify(None).map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
     let header_hash = file.genesis_block_header().header_hash_for(GenesisForm::Annulet);
     let l2_auth = file.l2_auth().map_err(|e| VerifyRefusal::GenesisInvalid { why: e.to_string() })?;
+    if l2_auth == L2AuthForm::CandidateAV3 {
+        return Err(VerifyRefusal::FormatNotSupported { format_version: file.format_version });
+    }
     Ok(VerifiedGenesis { hash: fetched, file, header_hash, l2_auth })
 }
 

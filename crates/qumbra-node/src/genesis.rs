@@ -738,7 +738,7 @@ impl std::fmt::Display for GenesisError {
                  cannot run it — the Annulet node lands with B2 (lab #706)"
             ),
             GenesisError::NotAnnuletGenesis { got } => {
-                write!(f, "not an Annulet genesis file: leading format_version {got:?}, want 32")
+                write!(f, "not an Annulet genesis file: leading format_version {got:?}, want 32, 33 or 34")
             }
             GenesisError::BadAnnulet(why) => write!(f, "Annulet genesis: {why}"),
             GenesisError::NotV6Genesis { got } => {
@@ -959,7 +959,11 @@ impl GenesisFile {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, GenesisError> {
         if matches!(
             crate::annulet_genesis::leading_format_version(bytes),
-            Some(qlab_devnet::forms::ANNULET_GENESIS_FORMAT_VERSION | qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION)
+            Some(
+                qlab_devnet::forms::ANNULET_GENESIS_FORMAT_VERSION
+                    | qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION
+                    | qlab_devnet::forms::ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION
+            )
         ) {
             return Err(GenesisError::AnnuletGenesisNotServed);
         }

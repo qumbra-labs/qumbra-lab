@@ -94,6 +94,16 @@ pub enum L2AuthForm {
     None,
     /// Candidate A (format 33): the v2 shapes + the auth section.
     CandidateA,
+    /// Candidate A with the **three-output** S/P shapes (format 34, lab #937
+    /// D1 route 1): every S/P spend carries exactly three output commitments
+    /// (the v3 shapes; the third pays the prover or is a zero-value note to
+    /// self); R stays v2. The same auth section as [`L2AuthForm::CandidateA`].
+    /// A variant rather than a second axis (lab #937 PR B, ruled): every
+    /// exhaustive match learns it at compile time, and code that compared
+    /// against `CandidateA` must say which it means ([`L2AuthForm::has_auth`],
+    /// [`L2AuthForm::sp_outputs`]) — the source scan
+    /// `no_bare_candidate_a_comparisons` holds that line.
+    CandidateAV3,
 }
 
 /// Genesis format **33**: the Candidate A Annulet, `(Annulet, L2AuthForm::CandidateA)`.
@@ -103,23 +113,29 @@ pub enum L2AuthForm {
 /// says `None`); [`annulet_forms_of_genesis_format_version`] maps it.
 pub const ANNULET_AUTH_GENESIS_FORMAT_VERSION: u32 = 33;
 
+/// Genesis format **34**: `(Annulet, L2AuthForm::CandidateAV3)` — Candidate A
+/// with the three-output S/P shapes (lab #937). Not a bare form, like 33.
+pub const ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION: u32 = 34;
+
 /// The form **and** L2 authorization axis an Annulet genesis `format_version`
-/// selects: 32 → `(Annulet, None)`, 33 → `(Annulet, CandidateA)`; anything
-/// else is not an Annulet genesis.
+/// selects: 32 → `(Annulet, None)`, 33 → `(Annulet, CandidateA)`, 34 →
+/// `(Annulet, CandidateAV3)`; anything else is not an Annulet genesis.
 pub fn annulet_forms_of_genesis_format_version(v: u32) -> Option<(GenesisForm, L2AuthForm)> {
     match v {
         ANNULET_GENESIS_FORMAT_VERSION => Some((GenesisForm::Annulet, L2AuthForm::None)),
         ANNULET_AUTH_GENESIS_FORMAT_VERSION => Some((GenesisForm::Annulet, L2AuthForm::CandidateA)),
+        ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION => Some((GenesisForm::Annulet, L2AuthForm::CandidateAV3)),
         _ => None,
     }
 }
 
 impl L2AuthForm {
-    /// The Annulet genesis `format_version` this axis is keyed to (32 or 33).
+    /// The Annulet genesis `format_version` this axis is keyed to (32, 33 or 34).
     pub fn annulet_genesis_format_version(self) -> u32 {
         match self {
             L2AuthForm::None => ANNULET_GENESIS_FORMAT_VERSION,
             L2AuthForm::CandidateA => ANNULET_AUTH_GENESIS_FORMAT_VERSION,
+            L2AuthForm::CandidateAV3 => ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION,
         }
     }
 
@@ -128,6 +144,24 @@ impl L2AuthForm {
         match self {
             L2AuthForm::None => "none",
             L2AuthForm::CandidateA => "candidate-a",
+            L2AuthForm::CandidateAV3 => "candidate-a-v3",
+        }
+    }
+
+    /// Transactions carry an auth section (Candidate A, formats 33 and 34).
+    pub fn has_auth(self) -> bool {
+        match self {
+            L2AuthForm::None => false,
+            L2AuthForm::CandidateA | L2AuthForm::CandidateAV3 => true,
+        }
+    }
+
+    /// Output commitments an S/P spend carries on this net: 2 (formats 32,
+    /// 33), 3 (format 34). Shape R carries 2 everywhere.
+    pub fn sp_outputs(self) -> usize {
+        match self {
+            L2AuthForm::None | L2AuthForm::CandidateA => 2,
+            L2AuthForm::CandidateAV3 => 3,
         }
     }
 }

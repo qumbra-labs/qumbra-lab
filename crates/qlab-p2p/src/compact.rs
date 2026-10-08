@@ -37,8 +37,9 @@ use qlab_devnet::forms::{BodySections, GenesisForm, L2AuthForm};
 pub struct WireForm {
     pub form: GenesisForm,
     pub sections: BodySections,
-    /// The L2 authorization axis (lab #896 E2): `CandidateA` only on the
-    /// Candidate A Annulet, whose tx wire may carry an auth-section tail.
+    /// The L2 authorization axis (lab #896 E2): `CandidateA` / `CandidateAV3`
+    /// only on the Candidate A Annulets (formats 33 / 34), whose tx wire may
+    /// carry an auth-section tail.
     pub l2_auth: L2AuthForm,
 }
 
@@ -54,6 +55,13 @@ impl WireForm {
     /// The Candidate A Annulet net (lab #896 E2): `(Annulet, L2AuthForm::CandidateA)`.
     pub const ANNULET_AUTH: WireForm =
         WireForm { form: GenesisForm::Annulet, sections: BodySections::None, l2_auth: L2AuthForm::CandidateA };
+
+    /// The format-34 Annulet net (lab #937): `(Annulet, L2AuthForm::CandidateAV3)`.
+    /// The tx and body encodings are the Candidate A ones (the commitment
+    /// count is already a varint/byte); the form is its own so a format-33
+    /// and a format-34 peer never read each other's frames as their own.
+    pub const ANNULET_AUTH_V3: WireForm =
+        WireForm { form: GenesisForm::Annulet, sections: BodySections::None, l2_auth: L2AuthForm::CandidateAV3 };
 }
 
 impl From<GenesisForm> for WireForm {

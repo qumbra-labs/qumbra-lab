@@ -563,6 +563,7 @@ fn every_refusal_has_its_pinned_key() {
         GenesisTooLarge { got: 0 },
         GenesisMismatch { pinned: [0; 32], fetched: [0; 32] },
         GenesisInvalid { why: s() },
+        FormatNotSupported { format_version: 34 },
         HeadersUnavailable { from: 0, why: s() },
         HeadersMalformed { from: 0, why: s() },
         HeaderGap { want: 0, got: 0 },
@@ -592,6 +593,7 @@ fn every_refusal_has_its_pinned_key() {
             GenesisTooLarge { .. } => "genesis_too_large",
             GenesisMismatch { .. } => "genesis_mismatch",
             GenesisInvalid { .. } => "genesis_invalid",
+            FormatNotSupported { .. } => "format_not_supported",
             HeadersUnavailable { .. } => "headers_unavailable",
             HeadersMalformed { .. } => "headers_malformed",
             HeaderGap { .. } => "header_gap",
@@ -615,7 +617,7 @@ fn every_refusal_has_its_pinned_key() {
         assert_eq!(refusal_key(r), pinned);
         assert!(seen.insert(pinned), "{pinned} twice");
     }
-    assert_eq!(seen.len(), 25, "every variant listed once");
+    assert_eq!(seen.len(), 26, "every variant listed once");
 }
 
 /// The bounds' constants are the real sizes: the list key and signature are
