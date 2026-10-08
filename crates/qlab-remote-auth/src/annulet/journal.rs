@@ -397,6 +397,59 @@ impl AuthJournal {
         Ok(())
     }
 
+    /// Lab #924 PR 3d: whether `self` is a **monotone advance** of `stored`
+    /// — what a shell that keeps the journal as text (the extension) checks
+    /// before it overwrites the stored text with a kernel's output. `Ok` for
+    /// an unchanged journal. Otherwise the first rule broken, by name:
+    /// - every stored generation is still there, with the same `auth_root`;
+    /// - no cursor moves back;
+    /// - a generation leaves `Active` only forward (`Sweep` after a rotation,
+    ///   `Retired` after a restore found it used and empty), leaves `Sweep`
+    ///   only for `Retired`, and leaves `Retired` only for `Sweep` (a
+    ///   revive); nothing returns to `Active`;
+    /// - a sweep generation that stays sweep keeps every gate it had, none
+    ///   lowered;
+    /// - no `checked` height moves back or disappears.
+    ///
+    /// New generations may appear. The one-active rule is the parser's.
+    pub fn advances_from(&self, stored: &AuthJournal) -> Result<(), String> {
+        let name = |s: &GenState| match s {
+            GenState::Active => "active",
+            GenState::Sweep { .. } => "sweep",
+            GenState::Retired => "retired",
+        };
+        for old in &stored.gens {
+            let g = old.g;
+            let new = self.get(g).map_err(|_| format!("generation {g} is missing"))?;
+            if new.auth_root != old.auth_root {
+                return Err(format!("generation {g}'s authorization root changed"));
+            }
+            if new.next < old.next {
+                return Err(format!("generation {g}'s cursor moves back ({} → {})", old.next, new.next));
+            }
+            match (&old.state, &new.state) {
+                (GenState::Active, _) | (GenState::Retired, GenState::Retired | GenState::Sweep { .. }) => {}
+                (GenState::Sweep { gates: was }, GenState::Sweep { gates: now }) => {
+                    for gate in was {
+                        let kept = now.iter().any(|n| n.genesis == gate.genesis && n.not_before_height >= gate.not_before_height);
+                        if !kept {
+                            return Err(format!("generation {g}'s sweep gate at {} is lowered or gone", gate.not_before_height));
+                        }
+                    }
+                }
+                (GenState::Sweep { .. }, GenState::Retired) => {}
+                (from, to) => return Err(format!("generation {g} goes from {} to {}", name(from), name(to))),
+            }
+        }
+        for (&(g, genesis), &height) in &stored.checked {
+            let now = self.checked_to(g, &genesis);
+            if now < height {
+                return Err(format!("generation {g}'s checked height moves back ({height} → {now})"));
+            }
+        }
+        Ok(())
+    }
+
     /// The `auth.v1` text, exactly as [`Self::save`] writes it — what a shell
     /// that keeps no files (the browser extension) stores under its own lock.
     pub fn to_text(&self) -> String {
@@ -576,6 +629,72 @@ mod tests {
         for text in bad {
             assert!(AuthJournal::from_text(&text).is_err(), "{text}");
         }
+    }
+
+    /// Lab #924 PR 3d: `advances_from` over the recorded fixture journals
+    /// (`annulet_spend_fixtures` at c132d3f3: check_stale in → out → its
+    /// restore; retired_revive in → out) and every rule broken once.
+    #[test]
+    fn a_journal_only_advances() {
+        let net = "4a996d02f37c60090c564da79ddf122d3c17775f503ae7e91e60fc9a27a1c4fd";
+        let (r0, r1) = (
+            "f3a6dd683c0d8cc9c632e80624194fffd723c58b31bce5b94af9e28ca5eeaadf",
+            "f59195087db98c32df51d80a5dfcdd1ddf66e6448edb1a9d4623600207811479",
+        );
+        let stale_in = format!("qumbra-wallet auth v1\n0 0 {r0} active\n");
+        let stale_out = format!("qumbra-wallet auth v2\n0 1 {r0} active\nchecked 0 {net}:2\n");
+        let restored = format!(
+            "qumbra-wallet auth v2\n0 1 {r0} sweep {net}:1154\n1 0 {r1} active\nchecked 0 {net}:2\nchecked 1 {net}:2\n"
+        );
+        let retired_in = format!("qumbra-wallet auth v1\n0 0 {r0} retired\n1 0 {r1} active\n");
+        let revived = format!("qumbra-wallet auth v2\n0 0 {r0} sweep {net}:1153\n1 0 {r1} active\nchecked 0 {net}:1\n");
+        // Three generations: the retired middle one can be dropped and the text still parses.
+        let three = format!(
+            "qumbra-wallet auth v1\n0 1 {r0} sweep {net}:1154\n1 1 {r1} retired\n2 0 {} active\n",
+            "22".repeat(32)
+        );
+        let j = |t: &str| AuthJournal::from_text(t).unwrap_or_else(|e| panic!("{e}: {t}"));
+        let ok = |from: &str, to: &str| j(to).advances_from(&j(from));
+        for (from, to) in [
+            (&stale_in, &stale_in),
+            (&stale_out, &stale_out),
+            (&restored, &restored),
+            (&stale_in, &stale_out),
+            (&stale_out, &restored),
+            (&stale_in, &restored),
+            (&retired_in, &revived),
+            // A restore that finds generation 0 used and empty retires it.
+            (&stale_in, &format!("qumbra-wallet auth v1\n0 1 {r0} retired\n1 0 {r1} active\n")),
+            // A later gate on the same net, another net's gate added.
+            (&restored, &restored.replace(":1154\n", &format!(":1200,{}:5\n", "ab".repeat(32)))),
+            (&restored, &restored.replace(" sweep ", " retired ").replace(&format!("{net}:1154"), "").replace("retired \n", "retired\n")),
+        ] {
+            assert_eq!(ok(from, to), Ok(()), "{from} → {to}");
+        }
+        for (from, to, why) in [
+            // Generation 0 is checked first: sweep → active is the first rule broken here.
+            (&restored, &stale_out, "generation 0 goes from sweep to active"),
+            (&three, &three.replace(&format!("1 1 {r1} retired\n"), ""), "generation 1 is missing"),
+            (&restored, &restored.replace(&format!("0 1 {r0}"), &format!("0 0 {r0}")), "cursor moves back"),
+            (&restored, &restored.replace(&format!("checked 1 {net}:2"), &format!("checked 1 {net}:1")), "checked height moves back"),
+            (&stale_out, &stale_in, "cursor moves back"),
+            (&stale_out, &stale_out.replace(&format!(" {net}:2"), &format!(" {net}:1")), "checked height moves back"),
+            (&restored, &restored.replace(r1, &"11".repeat(32)), "authorization root changed"),
+            (&restored, &restored.replace(&format!("checked 1 {net}:2\n"), ""), "checked height moves back (2 → 0)"),
+            (&restored, &restored.replace(":1154", ":1153"), "lowered or gone"),
+            (&restored, &restored.replace(&format!("{net}:1154"), &format!("{}:1154", "ab".repeat(32))), "lowered or gone"),
+            (
+                &restored,
+                &format!("qumbra-wallet auth v2\n0 1 {r0} active\n1 0 {r1} retired\nchecked 0 {net}:2\nchecked 1 {net}:2\n"),
+                "generation 0 goes from sweep to active",
+            ),
+        ] {
+            let got = ok(from, to);
+            assert!(matches!(&got, Err(e) if e.contains(why)), "{from} → {to}: {got:?}, want {why}");
+        }
+        // Back to active from retired, with generation 1 retired too so one stays active.
+        let back = format!("qumbra-wallet auth v1\n0 0 {r0} active\n1 0 {r1} retired\n");
+        assert!(matches!(ok(&retired_in, &back), Err(e) if e.contains("goes from retired to active")));
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {

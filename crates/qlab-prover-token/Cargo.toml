@@ -1,0 +1,10 @@
+[package]
+name = "qlab-prover-token"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+qlab-remote-auth = { path = "../qlab-remote-auth" }
+qlab-wallet = { path = "../qlab-wallet" }
