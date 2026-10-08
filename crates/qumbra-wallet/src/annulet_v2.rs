@@ -410,6 +410,21 @@ pub fn assemble_and_submit<E: Endpoint>(
     Ok(built)
 }
 
+/// Lab #937: the asset of a format-34 spend's zero-value third output, from
+/// the two balance rows' assets `a1`, `a2` (a dummy slot 2 is asset 0). The
+/// AIR binds output 3 to a row's asset (`o3a`), so: **asset 0 whenever a row
+/// is asset 0** — a zero-value asset-0 note is dust no one mistakes for an
+/// asset's mint base (an R seed is a zero-value note of its asset, #941's
+/// lane). Two inputs of one non-zero asset (a merge, a two-note payment) have
+/// no asset-0 row until the fee bank (lab #937 A′ + PR D): input 1's asset.
+pub fn zero_third_asset(a1: u64, a2: u64) -> u64 {
+    if a1 == 0 || a2 == 0 {
+        0
+    } else {
+        a1
+    }
+}
+
 /// Take, draw the dummies, prepare and sign: the proof still empty.
 #[allow(clippy::too_many_arguments)]
 fn prepare_signed<E: Endpoint>(
@@ -439,14 +454,15 @@ fn prepare_signed<E: Endpoint>(
     // from a paying one) to where this spend's change goes — `outs[1].to`,
     // the active generation's change address, never the run generation's
     // (a sweep must not leave a note behind in the generation it empties) —
-    // in input 1's asset: the AIR binds output 3's asset to an input's
-    // (`o3a`). The wallet never spends a zero-value note
-    // (`AssetIndex::zero`). The prover-fee third output is lab #937 PR D's.
+    // in [`zero_third_asset`]'s asset. The wallet never spends a zero-value
+    // note (`AssetIndex::zero`). The prover-fee third output is lab #937
+    // PR D's.
     let outs: Vec<Out> = match run.auth_context().form.sp_outputs() {
         2 => outs.to_vec(),
         3 => {
+            let a2 = if matches!(spend, V2Spend::One(_)) { 0 } else { real[1].asset };
             let mut v = outs.to_vec();
-            v.push(Out { to: outs[1].to.clone(), value: 0, asset: real[0].asset });
+            v.push(Out { to: outs[1].to.clone(), value: 0, asset: zero_third_asset(real[0].asset, a2) });
             v
         }
         n => unreachable!("an S/P spend carries two or three outputs, not {n}"),
@@ -1125,6 +1141,51 @@ mod tests {
         // The sweep floor counts the four non-zero notes, not the three zeros.
         let notes: u32 = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
         assert_eq!(notes, 4);
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// Lab #937 (#941 lane): the zero-value third output is asset 0 whenever
+    /// a balance row is — one input with a dummy slot 2, an asset paid beside
+    /// an asset-0 note, either order — and input 1's asset only for two
+    /// inputs of one non-zero asset (no asset-0 row before the fee bank).
+    #[test]
+    fn the_zero_third_output_is_asset_0_whenever_a_row_is() {
+        assert_eq!(zero_third_asset(0, 0), 0, "an asset-0 spend, or one input beside a dummy");
+        assert_eq!(zero_third_asset(7, 0), 0, "asset 7 paid beside an asset-0 note; one input of 7 beside a dummy");
+        assert_eq!(zero_third_asset(0, 7), 0);
+        assert_eq!(zero_third_asset(7, 7), 7, "a merge / two-note payment: no asset-0 row yet");
+        assert_eq!(zero_third_asset(7, 9), 7);
+    }
+
+    /// Lab #937 (#941 lane): a wallet holding **only** zero-value notes —
+    /// an R seed of asset 7, an empty asset-0 output. Issuance finds its base
+    /// (`mint_base`); a payment of either asset gets the planner's existing
+    /// refusal, the sweep floor counts nothing, and no balance row exists.
+    #[test]
+    fn only_zero_value_notes_are_a_mint_base_and_nothing_else() {
+        use crate::annulet_plan::{plan_send, PlanRefusal, Tiers};
+        use qlab_ledger::assets::AssetIndex;
+        use qlab_ledger::spent::SpentSet;
+        let w = wallet_dir("zero_only", 10);
+        let wallet = w.wallet();
+        let tiers = Tiers { s: 3, p: 5, r: 7 };
+        let of = |asset: u64, k: u8| {
+            let mut n = note_of(&wallet, 0, 0, k);
+            n.note.asset = asset;
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], n.note, &[(0, generation_root(&wallet, 0))]).unwrap()
+        };
+        let seed = of(7, 1);
+        let index = AssetIndex::build(&wallet, vec![seed.clone(), of(0, 2)], &SpentSet::from_parts(Some((0, 9)), []))
+            .only_generation(0);
+        assert_eq!(index.mint_base(7), Some(&seed), "the seed is the mint base");
+        assert!(matches!(
+            plan_send(&index, 7, 1, L2ShapeTag::S, tiers),
+            Err(PlanRefusal::InsufficientAsset { asset: 7, amount: 1, spendable: 0 })
+        ));
+        assert!(matches!(plan_send(&index, 0, 1, L2ShapeTag::S, tiers), Err(PlanRefusal::NoSingleNoteCovers { asset: 0, .. })));
+        let notes: u32 = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+        assert_eq!(notes, 0, "the sweep floor counts no zero-value note");
+        assert!(index.balances().is_empty(), "no balance row");
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 

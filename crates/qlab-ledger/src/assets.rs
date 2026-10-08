@@ -206,7 +206,9 @@ pub struct AssetIndex {
     /// output to this wallet, a merge's empty second output. Seen (history
     /// can name them as zero-value outputs) but never spendable, and kept out
     /// of `by_asset`: no plan selects one, no sweep or retire counts one, no
-    /// leaf budget reserves for one, no balance row exists for one.
+    /// leaf budget reserves for one, no balance row exists for one. Issuance
+    /// alone reads them ([`AssetIndex::mint_base`]): an R seed or a genesis
+    /// base note is a zero-value note a mint rides.
     pub zero: Vec<OwnedL2Note>,
 }
 
@@ -250,6 +252,18 @@ impl AssetIndex {
     /// The spendable notes of one asset (empty when none).
     pub fn spendable(&self, asset: u16) -> &[OwnedL2Note] {
         self.by_asset.get(&asset).map(|n| n.spendable.as_slice()).unwrap_or(&[])
+    }
+
+    /// Lab #937: the note a mint of `asset` rides — the smallest unspent
+    /// note of the asset, **zero-value ones included and preferred** (an R
+    /// seed, a genesis base note, a merge's or a format-34 spend's empty
+    /// output). A note carries no issuer mark and needs none: the right to
+    /// mint is proven in-circuit by the issuer key (shape P's `AISS`), and
+    /// the mint returns the note's value to the issuer, so any note of the
+    /// asset serves. Issuance only — a payment, a sweep or a budget never
+    /// reads this.
+    pub fn mint_base(&self, asset: u16) -> Option<&OwnedL2Note> {
+        self.zero.iter().filter(|n| n.asset == asset).chain(self.spendable(asset)).min_by_key(|n| n.note.value)
     }
 }
 
@@ -322,6 +336,40 @@ mod tests {
         g.generation = Some(3);
         let only = AssetIndex::build(&w, vec![g.clone()], &SpentSet::from_parts(Some((0, 9)), [])).only_generation(3);
         assert_eq!((only.zero, only.by_asset.len()), (vec![g], 0));
+    }
+
+    /// Lab #937 (#941 lane): a zero-value note is never spendable but may be
+    /// the **mint base** — an R seed or a genesis base note is one. The base
+    /// is the smallest unspent note of the asset, zero-value preferred; a
+    /// spent one is not a base; with no zero-value note it is the smallest
+    /// spendable one; a wallet holding only zero-value notes of an asset has
+    /// no spendable note and no balance row for it, yet a base.
+    #[test]
+    fn a_zero_value_note_is_never_spendable_but_is_the_mint_base() {
+        let w = wallet();
+        let notes: Vec<OwnedL2Note> =
+            [(0u64, 10u64, 7u64, 1u64), (0, 0, 7, 2), (0, 0, 9, 3), (0, 0, 7, 4), (0, 40, 5, 5), (0, 30, 5, 6)]
+                .iter()
+                .map(|&(idx, v, a, k)| OwnedL2Note::from_genesis(&w, idx, [k as u8; 32], note_to(&w, idx, v, a, k)).unwrap())
+                .collect();
+        let spent = SpentSet::from_parts(Some((0, 9)), [(9, notes[3].nullifier(&w))]);
+        let index = AssetIndex::build(&w, notes.clone(), &spent);
+        // Asset 7: the zero-value note, not the 10 (and not the spent zero).
+        assert_eq!(index.mint_base(7), Some(&notes[1]), "a zero-value note is preferred");
+        assert!(!index.spendable(7).iter().any(|n| n.note.value == 0), "and is never spendable");
+        // Asset 9: only a zero-value note — a base, but nothing spendable, no row.
+        assert_eq!(index.mint_base(9), Some(&notes[2]));
+        assert!(index.spendable(9).is_empty() && !index.balances().iter().any(|(a, _)| *a == 9));
+        // Asset 5: no zero-value note — the smallest spendable.
+        assert_eq!(index.mint_base(5), Some(&notes[5]));
+        // No note of asset 8.
+        assert_eq!(index.mint_base(8), None);
+        // One generation's base only from that generation.
+        let mut g = notes[2].clone();
+        g.generation = Some(3);
+        let only = AssetIndex::build(&w, vec![g.clone(), notes[1].clone()], &SpentSet::from_parts(Some((0, 9)), []))
+            .only_generation(3);
+        assert_eq!((only.mint_base(9), only.mint_base(7)), (Some(&g), None));
     }
 
     #[test]

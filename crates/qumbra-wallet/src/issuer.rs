@@ -629,7 +629,7 @@ pub fn prepare_mint<E: Endpoint>(
         return prepare_issue_v2(w, session, asset, None, recipient, ctx, VPublic::mint(amount), split_wait, rng);
     }
     to.require_version(qlab_wallet::address::ADDRESS_VERSION).map_err(|e| SendRefusal::Auth(e.to_string()))?;
-    let base = session.index.spendable(asset).iter().min_by_key(|n| n.note.value).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?;
+    let base = session.index.mint_base(asset).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?;
     let recipient = recipient_of(to).ok_or(SendRefusal::Issuer("the recipient address has no valid ek".into()))?;
     let (fee, split) = exact_fee_note(w, &session, session.tiers.p, split_wait, rng)?;
     let wallet = w.wallet();
@@ -754,7 +754,9 @@ fn prepare_issue_v2<E: Endpoint>(
     run.check_budget(3, Some(notes))?;
     let a = u64::from(asset);
     let base = match redeem {
-        None => index.spendable(asset).iter().min_by_key(|n| n.note.value).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?,
+        // Lab #937: the mint base may be a zero-value note (an R seed, a
+        // genesis base) — `mint_base` reads them; `spendable` never does.
+        None => index.mint_base(asset).cloned().ok_or(SendRefusal::NoIssuerNote { asset })?,
         Some(amount) => index
             .spendable(asset)
             .iter()

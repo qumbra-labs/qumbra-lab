@@ -3,8 +3,10 @@
 //! (`L2AuthForm::CandidateAV3`) pays wallet `W`'s generation-0 v2 address two
 //! asset-7 notes (60, 50) and one exact S-tariff fee note; `W` sends 100 of
 //! asset 7 to `T` through a follower. The plan is the format-33 one (one S,
-//! both asset-7 notes, the fee note in slot 3); the builder adds the third
-//! output — a zero-value asset-7 note to `W`'s own address — the bundle's
+//! both asset-7 notes, the fee note in slot 3 — the **TwoAndFee** layout,
+//! no asset-0 balance row); the builder adds the third output — a
+//! zero-value note to `W`'s change address, of asset 7 because no row is
+//! asset 0 (`zero_third_asset`; beside an asset-0 row it is asset 0) — the bundle's
 //! lock runs under the format-34 context, the proof is a **v3** S proof, and
 //! three nodes running the **real `L2VerifierV3`** admit, seal and apply it.
 //! **One S v3 prove.**
@@ -114,8 +116,12 @@ fn a_format_34_send_carries_three_outputs_and_is_sealed_by_the_v3_verifier() {
     assert_eq!(values, vec![10], "only the change is spendable");
     // The zero-value third output is seen, not spendable: it went to the
     // change address and is held apart from every spendable row.
+    // TwoAndFee (A₁ = A₂ = 7, the fee in slot 3): no asset-0 row, so the
+    // zero-value third output is asset 7 (`zero_third_asset(7, 7)`).
+    assert_eq!(qumbra_wallet::annulet_v2::zero_third_asset(ASSET as u64, ASSET as u64), ASSET as u64);
+    assert_eq!(index.zero.len(), 1, "one zero-value note: the third output");
     let zero: Vec<_> = index.zero.iter().filter(|n| n.note.asset == ASSET as u64).collect();
-    assert_eq!(zero.len(), 1, "the third output is seen");
+    assert_eq!(zero.len(), 1, "the third output is seen, asset 7");
     assert_eq!(zero[0].note.value, 0);
     assert_eq!(zero[0].note.rkm, report.outputs[1].rkm, "the third output went to the change address");
     assert_ne!(zero[0].note.commitment(), report.outputs[1].commitment(), "the third output is its own note");

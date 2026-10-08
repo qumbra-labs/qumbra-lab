@@ -145,8 +145,9 @@ impl std::fmt::Display for SendRefusal {
             ),
             SendRefusal::NoIssuerNote { asset } => write!(
                 f,
-                "a mint rides an issuer-held note of asset {asset} and this wallet holds none (lab #722 P3: \
-                 the genesis seeds one; an issuer that spends its last one cannot mint again)"
+                "a mint rides a note of asset {asset} (any one, zero-value included) and this wallet holds \
+                 none it can sign with: an R update (`issuer update`) seeds one (lab #937: migrate does not \
+                 carry a zero-value seed into a new generation)"
             ),
             SendRefusal::Issuer(e) => write!(f, "issuer file: {e}"),
             SendRefusal::SlotTaken { asset } => write!(
