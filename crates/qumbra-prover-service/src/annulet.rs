@@ -52,7 +52,7 @@ use zeroize::Zeroize;
 
 use crate::token::{hex, hex_decode, Claims, TokenKeys};
 use crate::{
-    env_required, insecure_node_http_allowed, lock, parse_env_or, validate_base_url, ApiError,
+    env_required, lock, parse_env_or, validate_base_url, ApiError,
 };
 
 /// The Annulet API's protocol version.
@@ -75,6 +75,29 @@ pub const SUBMIT_SLACK_SECS: u64 = 60;
 pub const ANNULET_UPLOAD_DEADLINE: Duration = Duration::from_secs(30);
 /// The worker child's protocol tag.
 pub const ANNULET_WORKER_PROTOCOL: &str = "qumbra-prover-annulet-worker-v1";
+
+/// Lab #924 PR 3g: the Annulet mode's own acknowledgement for a plain-http
+/// node or relay link (the L1 experiment's `QUMBRA_PROVER_ALLOW_INSECURE_NODE_HTTP`,
+/// worded "private and valueless", does not fit and no longer applies here).
+/// It states what the link is: plaintext, its exposure bounded by a firewall
+/// that admits only this host. What crosses it is a signed, proved
+/// transaction — public once submitted, and any alteration invalidates it —
+/// so the plaintext costs at most a dropped submission.
+pub const ANNULET_PLAIN_HTTP_VAR: &str = "QUMBRA_PROVER_ANNULET_ALLOW_PLAIN_HTTP_NODE";
+pub const ANNULET_PLAIN_HTTP_ACK: &str = "I_UNDERSTAND_THE_NODE_LINK_IS_PLAINTEXT_AND_FIREWALLED_TO_THIS_HOST";
+
+/// An Annulet node or relay base URL: https, or plain http with exactly
+/// [`ANNULET_PLAIN_HTTP_ACK`] in [`ANNULET_PLAIN_HTTP_VAR`] (`ack`).
+fn annulet_node_url(name: &str, value: &str, ack: Option<&str>) -> Result<String, String> {
+    let plain_ok = ack == Some(ANNULET_PLAIN_HTTP_ACK);
+    validate_base_url(name, value, plain_ok).map_err(|e| {
+        if !plain_ok && value.starts_with("http://") {
+            format!("{name} must use https; a plain http node link needs {ANNULET_PLAIN_HTTP_VAR}={ANNULET_PLAIN_HTTP_ACK}")
+        } else {
+            e
+        }
+    })
+}
 
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
@@ -133,17 +156,17 @@ impl AnnuletConfig {
         if !(1..=1000).contains(&per_day_default) {
             return Err("QUMBRA_PROVER_ANNULET_PER_DAY must be between 1 and 1000".into());
         }
-        let insecure = insecure_node_http_allowed();
-        let node_url = validate_base_url(
+        let plain_ack = std::env::var(ANNULET_PLAIN_HTTP_VAR).ok();
+        let node_url = annulet_node_url(
             "QUMBRA_PROVER_ANNULET_NODE_URL",
             &env_required("QUMBRA_PROVER_ANNULET_NODE_URL")?,
-            insecure,
+            plain_ack.as_deref(),
         )?;
         let relay_url = match std::env::var("QUMBRA_PROVER_ANNULET_RELAY_URL") {
-            Ok(url) => Some(validate_base_url(
+            Ok(url) => Some(annulet_node_url(
                 "QUMBRA_PROVER_ANNULET_RELAY_URL",
                 &url,
-                insecure,
+                plain_ack.as_deref(),
             )?),
             Err(_) => None,
         };
