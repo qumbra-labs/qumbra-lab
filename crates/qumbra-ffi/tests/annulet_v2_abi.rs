@@ -222,3 +222,34 @@ fn d_the_generation_list_is_bounded_by_name() {
         qmb_wallet_free(w);
     }
 }
+
+/// Lab #937 PR C: the kernel refuses a format-34 net **by name** after its
+/// verified scan — `format_not_supported`, until PR D carries the
+/// three-output path into the kernel (the wallet CLI already builds it). The
+/// same holder's format-33 chain still scans.
+#[test]
+fn e_a_format_34_net_is_refused_by_the_kernel_until_pr_d() {
+    let w = wallet_dir("v2abi_e34", SEED);
+    let wallet = w.wallet();
+    let a2 = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 0));
+    let v2 = genesis_v2(&a2, Vec::new());
+    let v3 = qlab_node::annulet_genesis::AnnuletGenesisFile::assemble_with_auth(
+        "annulet-ad1-v3",
+        v2.params,
+        SEQ_SEED,
+        v2.registry_genesis.clone(),
+        v2.genesis_notes.clone(),
+        0,
+        qlab_devnet::forms::L2AuthForm::CandidateAV3,
+    );
+    assert_eq!(v3.format_version, 34);
+    let ep = Endpoint::new(v3, &[], None, Lie::None);
+    let _guard = WalletDirGuard(w);
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let refusal = scan(w, &ep, Some(&[])).expect_err("the kernel refuses format 34");
+        assert_eq!(refusal["refusal"], "format_not_supported", "{refusal}");
+        assert!(refusal["message"].as_str().unwrap().contains("lab #937 PR D"), "{refusal}");
+        qmb_wallet_free(w);
+    }
+}

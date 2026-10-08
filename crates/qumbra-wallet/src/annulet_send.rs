@@ -216,7 +216,9 @@ pub struct SendReport {
     pub plan: SendPlan,
     /// The first fee-split's exact-tariff note, when the plan split one.
     pub split_fee_note: Option<qlab_note::l2note::L2Note>,
-    /// The notes the payment created: `[to the recipient, change to this wallet]`.
+    /// The notes the payment created: `[to the recipient, change to this wallet]`
+    /// (on a format-34 net the third, a zero-value note to this wallet, is not
+    /// listed — lab #937).
     pub outputs: [qlab_note::l2note::L2Note; 2],
     pub shape: L2ShapeTag,
 }
@@ -409,7 +411,10 @@ pub fn send_annulet<E: Endpoint>(
             .iter()
             .position(|s| matches!(s.kind, StepKind::FeeSplit { .. }))
             .map(|i| made[i].0[0]);
-        let (outputs, shape) = *made.last().expect("a plan ends in its payment");
+        let (last, shape) = made.last().expect("a plan ends in its payment");
+        // On a format-34 net the payment's third output is the zero-value
+        // self note (lab #937); the report keeps `[recipient, change]`.
+        let (outputs, shape) = ([last[0], last[1]], *shape);
         return Ok(SendReport { plan, split_fee_note, outputs, shape });
     }
     if shape == L2ShapeTag::P

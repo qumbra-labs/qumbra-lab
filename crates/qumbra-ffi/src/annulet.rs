@@ -461,6 +461,15 @@ impl AnnuletState {
                         return Ok(Some(path));
                     }
                     AnnuletStep::Done(v) => {
+                        // Lab #937: the kernel reads format 34's three-output
+                        // chain only from PR D on; until then it refuses the
+                        // net by name (the wallet CLI builds and scans it).
+                        let g = &v.chain().genesis;
+                        if g.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateAV3 {
+                            let e = VerifyRefusal::FormatNotSupported { format_version: g.file.format_version };
+                            self.phase = Phase::Refused(e.clone());
+                            return Err(e);
+                        }
                         let held = held_assets(&v);
                         self.phase = Phase::Leaves { v, held, leaves: Leaves::new(), pending: None };
                     }

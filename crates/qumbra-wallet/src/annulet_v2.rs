@@ -362,7 +362,9 @@ pub struct PreparedSpendV2 {
     pub bundle: ProvingBundle,
     pub pvs: Vec<u32>,
     pub auth: Vec<qlab_remote_auth::intent::AuthDescriptor>,
-    pub outputs: [qlab_note::l2note::L2Note; 2],
+    /// The output notes: two (format 33) or three (format 34, the third a
+    /// zero-value note to this wallet — [`prepare_signed`]).
+    pub outputs: Vec<qlab_note::l2note::L2Note>,
     pub shape: L2ShapeTag,
 }
 
@@ -432,6 +434,21 @@ fn prepare_signed<E: Endpoint>(
     let paths = run.take(&w.dir, notes.len())?;
     let taken: Vec<u32> = paths.iter().map(|p| p.leaf_index).collect();
     let real: Vec<L2AuthInput> = notes.iter().zip(paths).map(|(n, p)| real_input(&wallet, n, p)).collect();
+    // Lab #937: on a format-34 net every S/P spend carries a third output.
+    // Here it is a zero-value note to the run generation's own address 0
+    // (D3: an ordinary note, indistinguishable from a paying one), in input
+    // 1's asset — the AIR binds output 3's asset to an input's (`o3a`). The
+    // prover-fee third output is lab #937 PR D's.
+    let outs: Vec<Out> = match run.auth_context().form.sp_outputs() {
+        2 => outs.to_vec(),
+        3 => {
+            let mut v = outs.to_vec();
+            v.push(Out { to: me_v2(&wallet, &run.auth_root()), value: 0, asset: real[0].asset });
+            v
+        }
+        n => unreachable!("an S/P spend carries two or three outputs, not {n}"),
+    };
+    let outs = outs.as_slice();
     let (mut prepared, keys) = match (shape, &spend) {
         (L2ShapeTag::S, V2Spend::One(_)) => {
             let (d2, k2) = run.dummy(1, &taken)?;
@@ -528,7 +545,7 @@ pub fn run_plan_v2<E: Endpoint>(
     freeze_keys: &[[u64; 4]],
     split_wait: std::time::Duration,
     rng: &mut StdRng,
-) -> Result<Vec<([qlab_note::l2note::L2Note; 2], L2ShapeTag)>, SendRefusal> {
+) -> Result<Vec<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>, SendRefusal> {
     use crate::annulet_send::{wait_in_tree, Src, StepKind};
     let wallet = w.wallet();
     let served = &session.served;
@@ -541,12 +558,12 @@ pub fn run_plan_v2<E: Endpoint>(
     let own_root = run.auth_root();
     let own = me_v2(&wallet, &own_root);
     let gens = [(run.generation, own_root)];
-    let mut made: Vec<Option<([qlab_note::l2note::L2Note; 2], L2ShapeTag)>> = vec![None; plan.steps.len()];
-    let owned = |made: &[Option<([qlab_note::l2note::L2Note; 2], L2ShapeTag)>], src: &Src| -> OwnedL2Note {
+    let mut made: Vec<Option<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>> = vec![None; plan.steps.len()];
+    let owned = |made: &[Option<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>], src: &Src| -> OwnedL2Note {
         match src {
             Src::Held(n) => n.clone(),
             Src::Made { step, out, .. } => {
-                let note = made[*step].expect("a step spends only notes of earlier rounds").0[*out];
+                let note = made[*step].as_ref().expect("a step spends only notes of earlier rounds").0[*out];
                 OwnedL2Note::from_genesis_v2(&wallet, 0, qlab_note::hash::digest_bytes(&note.commitment()), note, &gens)
                     .expect("a planned note was paid to the run generation's address 0")
             }
@@ -554,6 +571,12 @@ pub fn run_plan_v2<E: Endpoint>(
     };
     for round in 0..plan.rounds() {
         for (i, st) in plan.steps.iter().enumerate().filter(|(_, s)| s.round == round) {
+            // Lab #937: a planned third output (the prover fee) is PR D's;
+            // until then the third output is prepare_signed's zero-value
+            // self note, and a plan naming one is refused by name.
+            if st.third.is_some() {
+                return Err(SendRefusal::Auth("a planned third output (a prover fee) is not built here yet (lab #937 PR D)".into()));
+            }
             let built = match &st.kind {
                 StepKind::FeeSplit { source, tariff } => {
                     let src = owned(&made, source);
@@ -603,7 +626,7 @@ pub fn run_plan_v2<E: Endpoint>(
             for src in srcs {
                 if let Src::Made { step, out, .. } = src {
                     if plan.steps[*step].round == round {
-                        let note = made[*step].expect("made this round").0[*out];
+                        let note = made[*step].as_ref().expect("made this round").0[*out];
                         wait_in_tree(served, &note.commitment(), split_wait)?;
                     }
                 }

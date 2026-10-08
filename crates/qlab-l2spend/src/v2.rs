@@ -36,7 +36,8 @@ use qlab_remote_auth::intent::AuthDescriptor;
 use qlab_remote_auth::{mldsa, Hash32};
 
 use crate::{
-    discovery_for, l2_outputs, unproved_entry, output_notes, policy_input, random_d4, Endpoint, Out,
+    discovery_for_n, l2_outputs_n, output_notes_n, policy_input,
+    unproved_entry, random_d4, Endpoint, Out,
     PolicyContext, Recipient, Served, SpendError,
 };
 
@@ -48,7 +49,9 @@ pub struct BuiltV2 {
     /// One descriptor per slot, in slot order (the fee slot last): each
     /// slot's leaf index and the leaf its PVs carry.
     pub auth: Vec<AuthDescriptor>,
-    pub outputs: [L2Note; 2],
+    /// The output notes in output order: two (format 33) or three (format
+    /// 34, lab #937 — the third a zero-value note to self unless a prover fee).
+    pub outputs: Vec<L2Note>,
     pub shape: L2ShapeTag,
 }
 
@@ -72,7 +75,8 @@ pub struct PreparedV2 {
     pub tx: TxEntry,
     pub pvs: Vec<u32>,
     pub auth: Vec<AuthDescriptor>,
-    pub outputs: [L2Note; 2],
+    /// Two or three output notes, as [`BuiltV2::outputs`].
+    pub outputs: Vec<L2Note>,
     pub shape: L2ShapeTag,
     pub witness: SpendWitness,
 }
@@ -96,7 +100,10 @@ pub enum ShapeWitness {
 pub struct SpendWitness {
     pub inputs: [L2AuthInput; 2],
     pub witnesses: [MerkleWitness; 2],
-    pub outputs: [L2TxOutput; 2],
+    /// The outputs in output order: **two** (the v2 shapes, format 33) or
+    /// **three** (the v3 shapes, format 34, lab #937). The count selects the
+    /// AIR; nothing else does ([`Self::outputs_ok`]).
+    pub outputs: Vec<L2TxOutput>,
     pub fee: u64,
     pub anchor: [u64; 4],
     pub registry_root: [u64; 4],
@@ -113,6 +120,20 @@ impl SpendWitness {
         }
     }
 
+    /// Lab #937: a witness carries two outputs (the v2 shapes) or three (the
+    /// v3 shapes) — nothing else builds an instance.
+    pub fn outputs_ok(&self) -> bool {
+        matches!(self.outputs.len(), 2 | 3)
+    }
+
+    fn outputs2(&self) -> [L2TxOutput; 2] {
+        self.outputs.clone().try_into().unwrap_or_else(|_| unreachable!("a two-output witness"))
+    }
+
+    fn outputs3(&self) -> [L2TxOutput; 3] {
+        self.outputs.clone().try_into().unwrap_or_else(|_| unreachable!("a three-output witness"))
+    }
+
     fn instance_s(&self) -> qlab_air::l2::L2BucketInstanceV2 {
         let ShapeWitness::S { reg_leaves, reg_witnesses, dv } = &self.shape else {
             unreachable!("instance_s on a shape-S witness")
@@ -120,7 +141,27 @@ impl SpendWitness {
         qlab_air::l2::build_bucket_l2_v2(
             log_height_v2(L2ShapeTag::S),
             &self.inputs,
-            &self.outputs,
+            &self.outputs2(),
+            self.fee,
+            &self.witnesses,
+            self.anchor,
+            reg_leaves,
+            reg_witnesses,
+            self.registry_root,
+            &self.fee_slot,
+            *dv,
+        )
+    }
+
+    /// Lab #937: the v3 shape-S instance (three outputs).
+    fn instance_s_v3(&self) -> qlab_air::l2::L2BucketInstanceV3 {
+        let ShapeWitness::S { reg_leaves, reg_witnesses, dv } = &self.shape else {
+            unreachable!("instance_s_v3 on a shape-S witness")
+        };
+        qlab_air::l2::build_bucket_l2_v3(
+            qlab_air::l2::SHAPE_S_LOG_HEIGHT_V3,
+            &self.inputs,
+            &self.outputs3(),
             self.fee,
             &self.witnesses,
             self.anchor,
@@ -139,7 +180,28 @@ impl SpendWitness {
         qlab_air::l2p::build_bucket_l2p_v2(
             log_height_v2(L2ShapeTag::P),
             &self.inputs,
-            &self.outputs,
+            &self.outputs2(),
+            self.fee,
+            &self.witnesses,
+            self.anchor,
+            policy,
+            self.registry_root,
+            *vp,
+            &self.fee_slot,
+            [0; 4],
+            false,
+        )
+    }
+
+    /// Lab #937: the v3 shape-P instance (three outputs).
+    fn instance_p_v3(&self) -> qlab_air::l2p::L2PBucketInstanceV3 {
+        let ShapeWitness::P { policy, vp } = &self.shape else {
+            unreachable!("instance_p_v3 on a shape-P witness")
+        };
+        qlab_air::l2p::build_bucket_l2p_v3(
+            qlab_air::l2p::SHAPE_P_LOG_HEIGHT,
+            &self.inputs,
+            &self.outputs3(),
             self.fee,
             &self.witnesses,
             self.anchor,
@@ -189,20 +251,36 @@ impl SpendWitness {
     }
 
     /// What the instance states, without proving: its PVs, anchor, three
-    /// nullifiers (the inputs', then slot 3's) and two output commitments.
+    /// nullifiers (the inputs', then slot 3's) and its output commitments —
+    /// two, or three (lab #937).
     pub fn statement(&self) -> WitnessStatement {
-        match self.shape {
-            ShapeWitness::S { .. } => {
+        assert!(self.outputs_ok(), "a witness has two or three outputs");
+        let v3 = self.outputs.len() == 3;
+        match (&self.shape, v3) {
+            (ShapeWitness::S { .. }, false) => {
                 let i = self.instance_s();
-                WitnessStatement { pvs: i.pvs, anchor: i.anchor, nullifiers: i.nf, commitments: i.cm_out }
+                WitnessStatement { pvs: i.pvs, anchor: i.anchor, nullifiers: i.nf, commitments: i.cm_out.to_vec() }
             }
-            ShapeWitness::P { .. } => {
+            (ShapeWitness::S { .. }, true) => {
+                let i = self.instance_s_v3();
+                WitnessStatement { pvs: i.pvs, anchor: i.anchor, nullifiers: i.nf, commitments: i.cm_out.to_vec() }
+            }
+            (ShapeWitness::P { .. }, false) => {
                 let i = self.instance_p();
                 WitnessStatement {
                     pvs: i.pvs,
                     anchor: i.anchor,
                     nullifiers: [i.nf[0], i.nf[1], i.nf3],
-                    commitments: i.cm_out,
+                    commitments: i.cm_out.to_vec(),
+                }
+            }
+            (ShapeWitness::P { .. }, true) => {
+                let i = self.instance_p_v3();
+                WitnessStatement {
+                    pvs: i.pvs,
+                    anchor: i.anchor,
+                    nullifiers: [i.nf[0], i.nf[1], i.nf3],
+                    commitments: i.cm_out.to_vec(),
                 }
             }
         }
@@ -211,15 +289,27 @@ impl SpendWitness {
     #[cfg(feature = "prove")]
     /// Prove the instance: its public values and the serialized proof.
     pub fn prove(&self) -> (Vec<u32>, Vec<u8>) {
-        let (pvs, proof) = match self.shape {
-            ShapeWitness::S { .. } => {
+        assert!(self.outputs_ok(), "a witness has two or three outputs");
+        let v3 = self.outputs.len() == 3;
+        let (pvs, proof) = match (&self.shape, v3) {
+            (ShapeWitness::S { .. }, false) => {
                 let inst = self.instance_s();
                 let (_, proof) = qlab_l2::v2::prove_s(&inst.air, &inst.pvs);
                 (inst.pvs, proof)
             }
-            ShapeWitness::P { .. } => {
+            (ShapeWitness::S { .. }, true) => {
+                let inst = self.instance_s_v3();
+                let (_, proof) = qlab_l2::v3::prove_s(&inst.air, &inst.pvs);
+                (inst.pvs, proof)
+            }
+            (ShapeWitness::P { .. }, false) => {
                 let inst = self.instance_p();
                 let (_, proof) = qlab_l2::v2::prove_p(&inst.air, &inst.pvs);
+                (inst.pvs, proof)
+            }
+            (ShapeWitness::P { .. }, true) => {
+                let inst = self.instance_p_v3();
+                let (_, proof) = qlab_l2::v3::prove_p(&inst.air, &inst.pvs);
                 (inst.pvs, proof)
             }
         };
@@ -233,7 +323,8 @@ pub struct WitnessStatement {
     pub pvs: Vec<u32>,
     pub anchor: [u64; 4],
     pub nullifiers: [[u64; 4]; 3],
-    pub commitments: [[u64; 4]; 2],
+    /// Two output commitments, or three (lab #937).
+    pub commitments: Vec<[u64; 4]>,
 }
 
 #[cfg(feature = "prove")]
@@ -344,7 +435,7 @@ pub fn build_s_v2<E: Endpoint, R: rand::CryptoRng>(
     inputs: [&L2AuthInput; 2],
     dv: bool,
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     rng: &mut R,
 ) -> Result<BuiltV2, SpendError> {
@@ -362,7 +453,7 @@ pub fn prepare_s_v2<E: Endpoint, R: rand::CryptoRng>(
     inputs: [&L2AuthInput; 2],
     dv: bool,
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     rng: &mut R,
 ) -> Result<PreparedV2, SpendError> {
@@ -381,7 +472,7 @@ pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
     inputs: [&L2AuthInput; 2],
     dv: bool,
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     rng: &mut R,
 ) -> Result<PreparedV2, SpendError> {
@@ -400,8 +491,11 @@ pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
     if regs[0].root != regs[1].root {
         return Err(SpendError::RegistryMoved);
     }
+    if !matches!(outs.len(), 2 | 3) {
+        return Err(SpendError::OutputCount { got: outs.len() });
+    }
     let anchor = tree.root();
-    let outputs = l2_outputs(outs, rng);
+    let outputs = l2_outputs_n(outs, rng);
     let fee_slot = fee_slot_v2(tree, fee_in, fee)?;
     let witnesses = [
         witness_of_v2(tree, inputs[0])?,
@@ -425,26 +519,26 @@ pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
             dv,
         },
     };
-    let inst = witness.instance_s();
+    let st = witness.statement();
     let auth = descriptors(
         L2ShapeTag::S,
         &[&inputs[0].auth, &inputs[1].auth, &fee_slot.input().auth],
-        &inst.pvs,
+        &st.pvs,
     );
-    let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
-    let discovery = discovery_for(&notes, outs, rng);
+    let notes = output_notes_n(&witness.outputs, &st.nullifiers[0], &st.commitments);
+    let discovery = discovery_for_n(&notes, outs, rng);
     let surface = L2Surface {
         shape: L2ShapeTag::S,
-        registry_root: digest_bytes(&inst.registry_root),
+        registry_root: digest_bytes(&witness.registry_root),
         vpublic: None,
         write: None,
         exit_rkm: [0; 32],
     };
-    let nf = [inst.nf[0], inst.nf[1]];
-    let tx = unproved_entry(&anchor, &nf, &inst.nf[2], &inst.cm_out, fee, surface, discovery);
+    let nf = [st.nullifiers[0], st.nullifiers[1]];
+    let tx = unproved_entry(&anchor, &nf, &st.nullifiers[2], &st.commitments, fee, surface, discovery);
     Ok(PreparedV2 {
         tx,
-        pvs: inst.pvs,
+        pvs: st.pvs,
         auth,
         outputs: notes,
         shape: L2ShapeTag::S,
@@ -463,7 +557,7 @@ pub fn build_p_v2<E: Endpoint, R: rand::CryptoRng>(
     served: &Served<E>,
     inputs: [&L2AuthInput; 2],
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
@@ -480,7 +574,7 @@ pub fn prepare_p_v2<E: Endpoint, R: rand::CryptoRng>(
     served: &Served<E>,
     inputs: [&L2AuthInput; 2],
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
@@ -501,7 +595,7 @@ pub(crate) fn policies_then_p_v2<R: rand::CryptoRng>(
     regs: &[RegistryOpening; 2],
     inputs: [&L2AuthInput; 2],
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
@@ -533,15 +627,18 @@ fn assemble_p_v2<R: rand::CryptoRng>(
     tree: &CommitmentTree,
     inputs: [&L2AuthInput; 2],
     fee_in: FeeIn,
-    outs: &[Out; 2],
+    outs: &[Out],
     fee: u64,
     policy: [L2PolicyInput; 2],
     registry_root: [u64; 4],
     vp: [VPublic; 2],
     rng: &mut R,
 ) -> Result<PreparedV2, SpendError> {
+    if !matches!(outs.len(), 2 | 3) {
+        return Err(SpendError::OutputCount { got: outs.len() });
+    }
     let anchor = tree.root();
-    let outputs = l2_outputs(outs, rng);
+    let outputs = l2_outputs_n(outs, rng);
     let fee_slot = fee_slot_v2(tree, fee_in, fee)?;
     let witness = SpendWitness {
         inputs: [inputs[0].clone(), inputs[1].clone()],
@@ -553,14 +650,14 @@ fn assemble_p_v2<R: rand::CryptoRng>(
         fee_slot: fee_slot.clone(),
         shape: ShapeWitness::P { policy, vp },
     };
-    let inst = witness.instance_p();
+    let st = witness.statement();
     let auth = descriptors(
         L2ShapeTag::P,
         &[&inputs[0].auth, &inputs[1].auth, &fee_slot.input().auth],
-        &inst.pvs,
+        &st.pvs,
     );
-    let notes = output_notes(&outputs, &inst.nf[0], &inst.cm_out);
-    let discovery = discovery_for(&notes, outs, rng);
+    let notes = output_notes_n(&witness.outputs, &st.nullifiers[0], &st.commitments);
+    let discovery = discovery_for_n(&notes, outs, rng);
     let term = |k: usize| {
         if vp[k].amount == 0 {
             VPublicTerm::NONE
@@ -579,10 +676,11 @@ fn assemble_p_v2<R: rand::CryptoRng>(
         write: None,
         exit_rkm: [0; 32],
     };
-    let tx = unproved_entry(&anchor, &inst.nf, &inst.nf3, &inst.cm_out, fee, surface, discovery);
+    let nf = [st.nullifiers[0], st.nullifiers[1]];
+    let tx = unproved_entry(&anchor, &nf, &st.nullifiers[2], &st.commitments, fee, surface, discovery);
     Ok(PreparedV2 {
         tx,
-        pvs: inst.pvs,
+        pvs: st.pvs,
         auth,
         outputs: notes,
         shape: L2ShapeTag::P,

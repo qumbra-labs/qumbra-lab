@@ -45,8 +45,23 @@ use crate::v2::{ShapeWitness, SpendWitness};
 
 /// The bundle's domain tag, first on the wire.
 pub const BUNDLE_DOMAIN: &[u8] = b"qumbra:remote-auth:annulet-bundle:v1";
-/// The bundle format version.
+/// The bundle format version of a **two-output** (format-33, v2-shape)
+/// spend. Its bytes do not move: every format-33 bundle encodes as before.
 pub const BUNDLE_VERSION: u16 = 1;
+/// Lab #937: the bundle format version of a **three-output** (format-34,
+/// v3-shape) spend — the witness carries a third output; nothing else in the
+/// layout changes. The version is the output count's only spelling on the
+/// wire (the decoder is fixed-width), and a format-34 net takes only this one.
+pub const BUNDLE_VERSION_THREE_OUTPUTS: u16 = 2;
+
+/// The output count a bundle version carries, if it is one.
+fn outputs_of_version(version: u16) -> Option<usize> {
+    match version {
+        BUNDLE_VERSION => Some(2),
+        BUNDLE_VERSION_THREE_OUTPUTS => Some(3),
+        _ => None,
+    }
+}
 /// The most bytes the transaction section may claim: a v2 S/P transaction
 /// with an empty proof is its surface, three nullifiers, two commitments, the
 /// discovery group (two 256-B payloads plus KEM ciphertexts) and a
@@ -73,6 +88,10 @@ pub enum BundleError {
     /// The section does not verify against the intent rebuilt from the
     /// transaction (the node's own check, run before any proving).
     Unauthorized(String),
+    /// Lab #937: the spend's output count is not the net's — a two-output
+    /// (v2) bundle on a format-34 net, or a three-output (v3) one on a
+    /// format-33 net. Refused before the intent is rebuilt.
+    OutputsNotTheNets { got: usize, want: usize },
 }
 
 impl std::fmt::Display for BundleError {
@@ -95,6 +114,10 @@ impl std::fmt::Display for BundleError {
             BundleError::Unauthorized(why) => {
                 write!(f, "the authorization section does not verify: {why}")
             }
+            BundleError::OutputsNotTheNets { got, want } => write!(
+                f,
+                "a {got}-output spend on a net whose S/P spends carry {want} (format 33: two; format 34: three)"
+            ),
         }
     }
 }
@@ -123,6 +146,13 @@ impl ProvingBundle {
             return Err(BundleError::Malformed(
                 "a name rider on an Annulet transaction".into(),
             ));
+        }
+        if !witness.outputs_ok() || tx.public.commitments.len() != witness.outputs.len() {
+            return Err(BundleError::Malformed(format!(
+                "{} output commitments for a {}-output witness",
+                tx.public.commitments.len(),
+                witness.outputs.len()
+            )));
         }
         if decoded_surface(&tx)?.shape != witness.shape_tag() {
             return Err(BundleError::Malformed(
@@ -153,7 +183,12 @@ impl ProvingBundle {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Vec::new();
         w.extend_from_slice(BUNDLE_DOMAIN);
-        w.extend_from_slice(&BUNDLE_VERSION.to_le_bytes());
+        let version = match self.witness.outputs.len() {
+            2 => BUNDLE_VERSION,
+            3 => BUNDLE_VERSION_THREE_OUTPUTS,
+            _ => unreachable!("ProvingBundle::new admits two or three outputs"),
+        };
+        w.extend_from_slice(&version.to_le_bytes());
         w.push(shape_code(self.shape()));
         let tx = qlab_p2p::codec::encode_tx_annulet(&self.tx);
         assert!(
@@ -174,11 +209,11 @@ impl ProvingBundle {
             return Err(BundleError::Malformed("the domain tag".into()));
         }
         let version = u16::from_le_bytes(r.take(2, "version")?.try_into().expect("2 bytes"));
-        if version != BUNDLE_VERSION {
-            return Err(BundleError::Malformed(format!(
-                "version {version}, expected {BUNDLE_VERSION}"
-            )));
-        }
+        let outputs = outputs_of_version(version).ok_or_else(|| {
+            BundleError::Malformed(format!(
+                "version {version}, expected {BUNDLE_VERSION} or {BUNDLE_VERSION_THREE_OUTPUTS}"
+            ))
+        })?;
         let shape = match r.u8("shape")? {
             0 => L2ShapeTag::S,
             1 => L2ShapeTag::P,
@@ -198,10 +233,10 @@ impl ProvingBundle {
         let tx_bytes = r.take(tx_len, "tx")?;
         let tx = qlab_p2p::codec::decode_tx_annulet_with(tx_bytes, L2AuthForm::CandidateA)
             .map_err(|e| BundleError::Malformed(format!("the transaction: {e:?}")))?; // debug-ok: a named codec error
-        if tx.public.nullifiers.len() != 3 || tx.public.commitments.len() != 2 {
-            return Err(BundleError::Malformed(
-                "an S/P transaction states 3 nullifiers and 2 commitments".into(),
-            ));
+        if tx.public.nullifiers.len() != 3 || tx.public.commitments.len() != outputs {
+            return Err(BundleError::Malformed(format!(
+                "a version-{version} S/P transaction states 3 nullifiers and {outputs} commitments"
+            )));
         }
         let surface = L2Surface::decode(&tx.l2)
             .ok()
@@ -212,7 +247,7 @@ impl ProvingBundle {
                 "the surface's shape is not the bundle's".into(),
             ));
         }
-        let witness = get_witness(&mut r, shape)?;
+        let witness = get_witness(&mut r, shape, outputs)?;
         if r.at != bytes.len() {
             return Err(BundleError::Malformed(format!(
                 "{} trailing bytes",
@@ -237,6 +272,12 @@ impl ProvingBundle {
     /// section signs, and the prover service's idempotency key.
     pub fn check(&self, ctx: &AuthContext) -> Result<Hash32, BundleError> {
         let w = &self.witness;
+        // Lab #937: the net's output count first, by name — before any
+        // statement work, and before the intent rebuild would refuse it less
+        // legibly.
+        if w.outputs.len() != ctx.form.sp_outputs() {
+            return Err(BundleError::OutputsNotTheNets { got: w.outputs.len(), want: ctx.form.sp_outputs() });
+        }
         let surface = decoded_surface(&self.tx)?;
         if let Some(terms) = surface.vpublic {
             if terms.iter().any(|t| t.amount != 0) {
@@ -681,10 +722,10 @@ impl<'a> Rd<'a> {
     }
 }
 
-fn get_witness(r: &mut Rd<'_>, shape: L2ShapeTag) -> Result<SpendWitness, BundleError> {
+fn get_witness(r: &mut Rd<'_>, shape: L2ShapeTag, n_outputs: usize) -> Result<SpendWitness, BundleError> {
     let inputs = [r.auth_input()?, r.auth_input()?];
     let witnesses = [r.merkle()?, r.merkle()?];
-    let outputs = [r.output()?, r.output()?];
+    let outputs = (0..n_outputs).map(|_| r.output()).collect::<Result<Vec<_>, _>>()?;
     let fee = r.u64("fee")?;
     let anchor = r.lanes("anchor")?;
     let registry_root = r.lanes("registry root")?;

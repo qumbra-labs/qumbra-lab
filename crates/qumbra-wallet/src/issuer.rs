@@ -787,7 +787,10 @@ fn prepare_issue_v2<E: Endpoint>(
         rng,
     )?;
     let rearmed = built.outputs.iter().any(|n| n.asset == a && n.rkm == me2.rkm);
-    Ok(PreparedIssue { session, tx: built.tx, outputs: built.outputs, split_fee_note: split, rearmed })
+    // The issuance's `[issued, kept]` pair; a format-34 third output is the
+    // zero-value self note (lab #937) and is not listed.
+    let outputs = [built.outputs[0], built.outputs[1]];
+    Ok(PreparedIssue { session, tx: built.tx, outputs, split_fee_note: split, rearmed })
 }
 
 #[cfg(test)]

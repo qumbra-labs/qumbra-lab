@@ -30,7 +30,7 @@ L1 的 `WitnessBundle` 模式（`/v1/jobs`）保持不变。它现在只在设�
 2. 该 token 唯一的 in-flight job、唯一一个正在读取的上传，以及每日配额 → `429`,错误码为 `token-busy` 或 `quota-exhausted`。只有**已准入**的 job 才计入配额。已准入的上传必须在 30 s 内传完。超时后处理线程放弃(记为 `upload-deadline`),但该 token 的读取名额要等连接真正断开才释放，所以慢速上传只拖住它自己的 token。
 3. 字节上限，有界读取 → `413` `bundle-too-large`。
 4. 解码 → `400` `bundle-malformed`，或 `403` `issuer-shape`。
-5. 在本 net 上运行 bundle 的 lock → `422`，错误码为 `statement-mismatch`、`unauthorized-section`、`proof-present` 或 `auth-missing`。
+5. 在本 net 上运行 bundle 的 lock → `422`，错误码为 `statement-mismatch`、`unauthorized-section`、`proof-present`、`auth-missing` 或 `outputs-not-the-nets`（lab #937：bundle 的输出数与本 net 不符，例如 format 33 上的三输出 bundle）。
 
 准入之后，请求仍可能被 `409` `intent-in-flight`（另一个 token 持有该 intent）或 `503` `prover-busy`（队列已满）拒绝。
 

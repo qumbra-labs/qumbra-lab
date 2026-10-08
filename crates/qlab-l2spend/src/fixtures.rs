@@ -9,7 +9,7 @@ use qlab_air::l2p::{CanonicalFreezeTree, VPublic};
 use qlab_cbserver::registry::{RegistryOpening, RegistryTree};
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::annulet::L2ShapeTag;
-use qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION;
+use qlab_devnet::forms::{ANNULET_AUTH_GENESIS_FORMAT_VERSION, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION};
 use qlab_remote_auth::{mldsa, Hash32};
 use rand::SeedableRng;
 
@@ -72,6 +72,22 @@ pub fn recipient<R: rand::CryptoRng>(seed: u64, rng: &mut R) -> Recipient {
 /// device-made dummy. Prepared only — no proof — with the signer and the
 /// dummy's key: the bundle tests (lab #924) prepare it again and compare.
 pub fn prepared_s() -> (PreparedV2, LocalAuth, mldsa::Key) {
+    prepared_s_n(false)
+}
+
+/// Lab #937: [`prepared_s`] on a format-34 net — the same spend with a
+/// third output, a zero-value asset-0 note (input 1's asset).
+pub fn prepared_s_v3() -> (PreparedV2, LocalAuth, mldsa::Key) {
+    prepared_s_n(true)
+}
+
+/// The third output of a v3 fixture: zero value, input 1's asset (0). Drawn
+/// after the first two, so a two-output fixture's bytes do not move.
+fn third_out<R: rand::CryptoRng>(seed: u64, rng: &mut R) -> Out {
+    Out { to: recipient(seed, rng), value: 0, asset: 0 }
+}
+
+fn prepared_s_n(three: bool) -> (PreparedV2, LocalAuth, mldsa::Key) {
     let mut rng = rng(0x5e4);
     let mut local = LocalAuth::new(&[0x51; 32], 0, 0).expect("depth D_AUTH");
     let a = real(&mut local, 0x100, 100, 0);
@@ -83,7 +99,7 @@ pub fn prepared_s() -> (PreparedV2, LocalAuth, mldsa::Key) {
     let (dummy, key) = local
         .dummy(&[0xd5; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
         .unwrap();
-    let outs = [
+    let mut outs = vec![
         Out {
             to: recipient(0x31, &mut rng),
             value: 90,
@@ -95,6 +111,9 @@ pub fn prepared_s() -> (PreparedV2, LocalAuth, mldsa::Key) {
             asset: 7,
         },
     ];
+    if three {
+        outs.push(third_out(0x33, &mut rng));
+    }
     let prepared = assemble_s_v2(
         &tree,
         &regs,
@@ -112,6 +131,15 @@ pub fn prepared_s() -> (PreparedV2, LocalAuth, mldsa::Key) {
 /// P: 100 (asset 0) + 50 of Hybrid asset 7 (empty freeze list) → 90 + 50,
 /// fee 10, slot 3 a device-made dummy, `vPublic` none. Prepared only.
 pub fn prepared_p() -> (PreparedV2, LocalAuth, mldsa::Key) {
+    prepared_p_n(false)
+}
+
+/// Lab #937: [`prepared_p`] with a third, zero-value asset-0 output.
+pub fn prepared_p_v3() -> (PreparedV2, LocalAuth, mldsa::Key) {
+    prepared_p_n(true)
+}
+
+fn prepared_p_n(three: bool) -> (PreparedV2, LocalAuth, mldsa::Key) {
     let mut rng = rng(0x5e5);
     let mut local = LocalAuth::new(&[0x52; 32], 0, 0).expect("depth D_AUTH");
     let a = real(&mut local, 0x300, 100, 0);
@@ -130,7 +158,7 @@ pub fn prepared_p() -> (PreparedV2, LocalAuth, mldsa::Key) {
     let (dummy, key) = local
         .dummy(&[0xd6; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index])
         .unwrap();
-    let outs = [
+    let mut outs = vec![
         Out {
             to: recipient(0x41, &mut rng),
             value: 90,
@@ -142,6 +170,9 @@ pub fn prepared_p() -> (PreparedV2, LocalAuth, mldsa::Key) {
             asset: 7,
         },
     ];
+    if three {
+        outs.push(third_out(0x43, &mut rng));
+    }
     let ctx = PolicyContext::default();
     let prepared = policies_then_p_v2(
         &tree,
@@ -167,18 +198,29 @@ pub fn signed_bundle(shape: L2ShapeTag) -> ProvingBundle {
 /// The same prepared spend signed once per validity height: one bundle per
 /// height, each a distinct intent (tests that need several jobs).
 pub fn signed_bundles(shape: L2ShapeTag, valid_until: &[u64]) -> Vec<ProvingBundle> {
+    signed_bundles_n(shape, false, valid_until)
+}
+
+/// Lab #937: [`signed_bundle`] on a format-34 net — the three-output spend,
+/// its intent signed for format 34 (a version-2 bundle).
+pub fn signed_bundle_v3(shape: L2ShapeTag) -> ProvingBundle {
+    signed_bundles_n(shape, true, &[VALID_UNTIL]).remove(0)
+}
+
+fn signed_bundles_n(shape: L2ShapeTag, three: bool, valid_until: &[u64]) -> Vec<ProvingBundle> {
     let (p, local, key) = match shape {
-        L2ShapeTag::S => prepared_s(),
-        L2ShapeTag::P => prepared_p(),
+        L2ShapeTag::S => prepared_s_n(three),
+        L2ShapeTag::P => prepared_p_n(three),
         L2ShapeTag::R => panic!("shape R is never a bundle"),
     };
+    let format = if three { ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION } else { ANNULET_AUTH_GENESIS_FORMAT_VERSION };
     valid_until
         .iter()
         .map(|until| {
             let mut tx = p.tx.clone();
             let intent = intent_for(
                 &tx,
-                ANNULET_AUTH_GENESIS_FORMAT_VERSION,
+                format,
                 &GENESIS_HASH,
                 *until,
                 &p.auth,

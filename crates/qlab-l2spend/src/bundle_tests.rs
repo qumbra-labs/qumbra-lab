@@ -524,3 +524,92 @@ fn a_wiped_witness_holds_no_private_lane() {
     };
     assert!(policy.iter().all(|p| p.isk == [0; 4]));
 }
+
+// ------------------------------------------------------------- lab #937: three outputs
+
+const CTX_V3: AuthContext = AuthContext::candidate_a_v3(GENESIS_HASH);
+
+fn version_of(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes[BUNDLE_DOMAIN.len()..BUNDLE_DOMAIN.len() + 2].try_into().unwrap())
+}
+
+fn bundle_s_v3() -> &'static ProvingBundle {
+    static B: OnceLock<ProvingBundle> = OnceLock::new();
+    B.get_or_init(|| crate::fixtures::signed_bundle_v3(L2ShapeTag::S))
+}
+
+fn bundle_p_v3() -> &'static ProvingBundle {
+    static B: OnceLock<ProvingBundle> = OnceLock::new();
+    B.get_or_init(|| crate::fixtures::signed_bundle_v3(L2ShapeTag::P))
+}
+
+/// A three-output spend is a **version-2** bundle that round-trips whole and
+/// passes the lock on a format-34 net; a two-output one stays version 1 (its
+/// bytes are the ones every format-33 test above pins).
+#[test]
+fn a_three_output_bundle_is_version_2_and_round_trips() {
+    assert_eq!(version_of(&bundle_s().encode()), BUNDLE_VERSION);
+    assert_eq!(BUNDLE_VERSION, 1);
+    assert_eq!(BUNDLE_VERSION_THREE_OUTPUTS, 2);
+    for (b, shape, s) in [(bundle_s_v3(), L2ShapeTag::S, Shape::S), (bundle_p_v3(), L2ShapeTag::P, Shape::P)] {
+        assert_eq!(b.witness().outputs.len(), 3, "{shape:?}");
+        assert_eq!(b.tx().public.commitments.len(), 3, "{shape:?}");
+        let bytes = b.encode();
+        assert_eq!(version_of(&bytes), BUNDLE_VERSION_THREE_OUTPUTS, "{shape:?}");
+        let back = ProvingBundle::decode(&bytes).expect("a v3 bundle decodes");
+        assert_eq!(back.encode(), bytes, "{shape:?}: re-encodes to the same bytes");
+        assert_eq!(back.witness().statement(), b.witness().statement(), "{shape:?}");
+        assert_eq!(back.witness().pvs().len(), qlab_l2::v3::pv_len(s), "{shape:?}: the v3 PVs");
+        assert_eq!(back.witness().outputs[2].value, 0, "{shape:?}: the zero-value third output");
+        back.check(&CTX_V3).expect("an honest v3 bundle passes the lock on format 34");
+    }
+}
+
+/// Lab #937 (ruled): the lock compares the spend's output count with the
+/// net's **first**, by name, both directions — before the intent rebuild.
+#[test]
+fn the_output_count_is_the_nets_both_ways() {
+    for b in [bundle_s_v3(), bundle_p_v3()] {
+        assert_eq!(b.check(&CTX).err(), Some(BundleError::OutputsNotTheNets { got: 3, want: 2 }));
+    }
+    for b in [bundle_s(), bundle_p()] {
+        assert_eq!(b.check(&CTX_V3).err(), Some(BundleError::OutputsNotTheNets { got: 2, want: 3 }));
+    }
+}
+
+/// The version is the output count's spelling on the wire: relabelled, a
+/// bundle is refused at its transaction's arity; an unknown version by name.
+#[test]
+fn the_version_states_the_output_count() {
+    let refused = |bytes: &[u8], version: u16| {
+        let mut x = bytes.to_vec();
+        x[BUNDLE_DOMAIN.len()..BUNDLE_DOMAIN.len() + 2].copy_from_slice(&version.to_le_bytes());
+        match ProvingBundle::decode(&x) {
+            Err(BundleError::Malformed(why)) => why,
+            other => panic!("not refused as malformed: {:?}", other.err()),
+        }
+    };
+    assert!(refused(&bundle_s().encode(), BUNDLE_VERSION_THREE_OUTPUTS).contains("3 commitments"));
+    assert!(refused(&bundle_s_v3().encode(), BUNDLE_VERSION).contains("2 commitments"));
+    assert!(refused(&bundle_s_v3().encode(), 3).contains("version 3"));
+}
+
+/// A bundle's witness and transaction agree on the output count.
+#[test]
+fn a_bundle_s_witness_has_its_transaction_s_output_count() {
+    let mixed = ProvingBundle::new(bundle_s_v3().tx().clone(), bundle_s().witness().clone());
+    assert!(matches!(mixed.err(), Some(BundleError::Malformed(why)) if why.contains("output commitments")));
+}
+
+/// The v3 split path proves: the lock on format 34, then the v3 prove; the
+/// proof verifies against the witness's PVs under the v3 AIR (one 2^20 S v3
+/// prove on the lane).
+#[test]
+fn the_v3_split_path_proves_and_verifies() {
+    let b = ProvingBundle::decode(&bundle_s_v3().encode()).expect("decodes");
+    let tx = b.prove(&CTX_V3).expect("an honest v3 bundle proves");
+    assert_eq!(wire(&without_proof(&tx)), wire(b.tx()), "only the proof is added");
+    let proof: qlab_l2::Proof<qlab_l2::Config> = bincode::deserialize(&tx.proof).expect("the proof decodes");
+    assert!(qlab_l2::v3::verify_s_u32(&b.witness().pvs(), &proof), "the v3 proof verifies");
+    assert!(!qlab_l2::v2::verify_s_u32(&b.witness().pvs()[..qlab_l2::v2::pv_len(Shape::S)], &proof), "not a v2 proof");
+}

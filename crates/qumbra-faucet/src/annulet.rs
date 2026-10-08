@@ -354,10 +354,17 @@ impl AnnuletFaucet {
         let taken = [input.auth.leaf_index];
         let (d2, k2) = a.keys.dummy(&entropy(), 1, &taken).map_err(AnnuletError::Auth)?;
         let (d3, k3) = a.keys.dummy(&entropy(), 2, &[taken[0], d2.auth.leaf_index]).map_err(AnnuletError::Auth)?;
-        let outs = [
+        let mut outs = vec![
             Out { to: to.clone(), value: note.value - self.fee_s, asset: 0 },
             Out { to: self.change.clone(), value: 0, asset: 0 },
         ];
+        // Lab #937: on a format-34 net every S spend carries three outputs;
+        // the faucet's third is another zero-value note to itself.
+        let outputs = qlab_devnet::forms::annulet_forms_of_genesis_format_version(a.genesis_format)
+            .map_or(2, |(_, form)| form.sp_outputs());
+        if outputs == 3 {
+            outs.push(Out { to: self.change.clone(), value: 0, asset: 0 });
+        }
         let mut built = build_s_v2(&self.served, [&input, &d2], true, FeeIn::Dummy(&d3), &outs, self.fee_s, rng)?;
         let intent = intent_for(&built.tx, a.genesis_format, &a.genesis_hash, tip + GRANT_VALIDITY_BLOCKS, &built.auth)
             .map_err(|e| AnnuletError::Auth(format!("the intent does not rebuild: {e:?}")))?; // debug-ok: a named codec error

@@ -117,6 +117,12 @@ pub struct Step {
     pub fee: u64,
     pub kind: StepKind,
     pub outputs: [u64; 2],
+    /// Lab #937: the third output on a format-34 net, as `(value, asset)`.
+    /// `None` (every plan today): a zero-value note to this wallet, in the
+    /// first input's asset — the builder adds it. `Some` is the prover fee
+    /// lab #937 PR D plans (on the asset-0 row, `fee + price` exact); the
+    /// builders refuse it by name until then. Ignored on a format-33 net.
+    pub third: Option<(u64, u64)>,
 }
 
 /// **The one plan a send shows before it proves** (design #283 Q5).
@@ -224,6 +230,7 @@ fn plan_fee_splits(
             fee: s_tier,
             kind: StepKind::FeeSplit { source, tariff },
             outputs: [tariff, rest],
+            third: None,
         });
         made.push(Src::Made { step, out: 0, value: tariff, asset: 0 });
         if rest == tariff && made.len() < deficit {
@@ -263,6 +270,7 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
             fee: tiers.s,
             kind: StepKind::Pay { inputs: vec![Src::Held(note)], fee: None },
             outputs: [amount, change],
+            third: None,
         };
         return Ok(SendPlan { asset, amount, steps: vec![pay] });
     }
@@ -330,7 +338,7 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
         let fee = fees.next().expect("one fee note per merge");
         let round = a.ready(&steps).max(b.ready(&steps)).max(fee.ready(&steps));
         let value = a.value() + b.value();
-        steps.push(Step { round, shape, fee: tariff, kind: StepKind::Merge { inputs: [a, b], fee }, outputs: [value, 0] });
+        steps.push(Step { round, shape, fee: tariff, kind: StepKind::Merge { inputs: [a, b], fee }, outputs: [value, 0], third: None });
     }
     let pay_inputs: Vec<Src> = pay_inputs.into_iter().map(fix).collect();
     let fee = fees.next().expect("one fee note for the payment");
@@ -342,6 +350,7 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
         fee: tariff,
         kind: StepKind::Pay { inputs: pay_inputs, fee: Some(fee) },
         outputs: [amount, have - amount],
+        third: None,
     });
     Ok(SendPlan { asset, amount, steps })
 }
