@@ -194,10 +194,10 @@ fn l2pv3_exact_fee_zero_value_third_output_satisfies() {
 }
 
 /// A row with a `vPublic` term and the third output on it: redeem 15 of
-/// asset 7 on row 2 — 50 = 30 + 5 + 15.
+/// asset 7 on row 2 — 50 = 30 + 5 + 15; row 1: 100 = 90 + fee 10.
 #[test]
 fn l2pv3_third_output_on_a_vpublic_row_satisfies() {
-    let inst = two_in(0, 7, [mk_out_p(0x3333, 85, 0), mk_out_p(0x4444, 30, 7), mk_out_p(0x5555, 5, 7)], 10, [VPublic::NONE, VPublic::redeem(15)]);
+    let inst = two_in(0, 7, [mk_out_p(0x3333, 90, 0), mk_out_p(0x4444, 30, 7), mk_out_p(0x5555, 5, 7)], 10, [VPublic::NONE, VPublic::redeem(15)]);
     assert!(!inst.air.sel_o3a);
     assert_eq!(inst.pvs[pv_vp_asset(1)], 7);
     assert_sat(&inst, "o3 on the redeem row");
