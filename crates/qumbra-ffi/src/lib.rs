@@ -61,10 +61,15 @@ use report::DivScan;
 pub struct WalletState {
     seed: MasterSeed,
     wallet: Wallet,
-    /// Lab #896 (extension #68 D2): each Candidate A generation's
-    /// authorization-tree root, built once per handle — a build is 4,096
-    /// ML-DSA-44 key generations, seconds under wasm.
-    roots: std::sync::Mutex<std::collections::BTreeMap<u32, [u64; 4]>>,
+    /// Lab #896 (extension #68 D2) / #924 PR 3g: each Candidate A
+    /// generation's authorization tree, built once per handle — a build is
+    /// 4,096 ML-DSA-44 key generations, seconds under wasm. The scan's roots
+    /// and the open-time check (restore, first, check) share it, so a handle
+    /// that scanned the probe set never builds those trees again. Each tree's
+    /// master is wiped by its `Drop` when the handle is freed.
+    trees: std::sync::Mutex<std::collections::BTreeMap<u32, std::sync::Arc<qumbra_wallet::annulet_landed::GenTree>>>,
+    /// How many trees this handle has built (the cache's own test).
+    tree_builds: std::sync::atomic::AtomicU32,
     /// Lab #924 PR 3b: this handle's seed was drawn **here**, by
     /// [`qmb_wallet_new_fresh`] — so it cannot have signed anywhere. Lives
     /// only in this in-memory handle and is never serialized: a seed reopened
@@ -74,10 +79,18 @@ pub struct WalletState {
 }
 
 impl WalletState {
-    /// Generation `g`'s authorization-tree root (cached).
+    /// Generation `g`'s authorization tree, built on first use and kept.
+    pub(crate) fn gen_tree(&self, g: u32) -> std::sync::Arc<qumbra_wallet::annulet_landed::GenTree> {
+        let mut trees = self.trees.lock().unwrap_or_else(|p| p.into_inner());
+        std::sync::Arc::clone(trees.entry(g).or_insert_with(|| {
+            self.tree_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::sync::Arc::new(qumbra_wallet::annulet_landed::GenTree::build(&self.wallet, g))
+        }))
+    }
+
+    /// Generation `g`'s authorization-tree root (from the cached tree).
     fn generation_root(&self, g: u32) -> [u64; 4] {
-        let mut roots = self.roots.lock().unwrap_or_else(|p| p.into_inner());
-        *roots.entry(g).or_insert_with(|| qumbra_wallet::auth_journal::generation_root(&self.wallet, g))
+        self.gen_tree(g).root()
     }
 }
 
@@ -86,7 +99,13 @@ const HD_ACCOUNT: u32 = 0;
 
 fn into_handle(seed: MasterSeed) -> *mut WalletState {
     let wallet = Wallet::from_master_seed(&seed, HD_ACCOUNT);
-    Box::into_raw(Box::new(WalletState { seed, wallet, roots: Default::default(), born_here: Default::default() }))
+    Box::into_raw(Box::new(WalletState {
+        seed,
+        wallet,
+        trees: Default::default(),
+        tree_builds: Default::default(),
+        born_here: Default::default(),
+    }))
 }
 
 fn out_string(s: String) -> *mut c_char {
@@ -1875,6 +1894,25 @@ pub unsafe extern "C" fn qmb_spent_free(s: *mut SpentState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #924 PR 3g: a handle builds each generation's tree once — the
+    /// scan's root and the open-time check share it — and the cached tree's
+    /// root is the one the journal and the addresses bind.
+    #[test]
+    fn a_handle_builds_each_generation_tree_once() {
+        use std::sync::atomic::Ordering;
+        let w = unsafe { &mut *qmb_wallet_from_entropy([0x4B; 32].as_ptr()) };
+        let root = w.generation_root(3);
+        assert_eq!(w.tree_builds.load(Ordering::Relaxed), 1);
+        let tree = w.gen_tree(3);
+        assert_eq!(w.tree_builds.load(Ordering::Relaxed), 1, "the scan's tree, reused");
+        assert!(std::sync::Arc::ptr_eq(&tree, &w.gen_tree(3)));
+        assert_eq!(tree.root(), root);
+        assert_eq!(root, qumbra_wallet::auth_journal::generation_root(&w.wallet, 3), "the same root as before the cache");
+        w.gen_tree(4);
+        assert_eq!(w.tree_builds.load(Ordering::Relaxed), 2, "a new generation builds once");
+        unsafe { qmb_wallet_free(w) };
+    }
 
     // The shell's side of the fetch contract, exercised for real: malloc'd
     // buffers handed over to the library. Deliberately NOT CString::into_raw —

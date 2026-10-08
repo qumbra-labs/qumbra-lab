@@ -41,6 +41,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
+use std::sync::Arc;
 use std::ptr;
 
 use qlab_air::l2::{L2AuthInput, L2AuthPath};
@@ -309,7 +310,8 @@ enum CheckMode {
 pub struct CheckHandle {
     mode: CheckMode,
     basis: SpendBasis,
-    trees: Vec<GenTree>,
+    /// Shared with the wallet handle's cache (PR 3g): never rebuilt here.
+    trees: Vec<Arc<GenTree>>,
     landed: LandedByGeneration,
     at: u64,
     asked: bool,
@@ -319,7 +321,7 @@ pub struct CheckHandle {
 unsafe fn check_handle(
     w: *const WalletState,
     basis: *const SpendBasis,
-    build: impl FnOnce(&WalletState, &SpendBasis) -> Result<(CheckMode, Vec<GenTree>, u64), String>,
+    build: impl FnOnce(&WalletState, &SpendBasis) -> Result<(CheckMode, Vec<Arc<GenTree>>, u64), String>,
     err_out: *mut *mut c_char,
 ) -> *mut CheckHandle {
     if !err_out.is_null() {
@@ -381,7 +383,7 @@ pub unsafe extern "C" fn qmb_auth_check_new(
             if rec.state == GenState::Retired && !holds {
                 return Err(format!("generation {generation} is retired and holds nothing: nothing of it is spent again"));
             }
-            let tree = GenTree::build(&ws.wallet, generation);
+            let tree = ws.gen_tree(generation);
             if tree.root() != rec.auth_root {
                 return Err(format!("auth.v1's root for generation {generation} is not this wallet's tree"));
             }
@@ -413,7 +415,7 @@ pub unsafe extern "C" fn qmb_auth_restore_new(
         w,
         basis,
         |ws, _| {
-            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| GenTree::build(&ws.wallet, g)).collect();
+            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g)).collect();
             Ok((CheckMode::Restore, trees, 1))
         },
         err_out,
@@ -444,7 +446,7 @@ pub unsafe extern "C" fn qmb_auth_first_new(
         w,
         basis,
         |ws, _| {
-            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| GenTree::build(&ws.wallet, g)).collect();
+            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g)).collect();
             Ok((CheckMode::First, trees, 1))
         },
         err_out,
