@@ -648,6 +648,11 @@ mod tests {
         );
         let retired_in = format!("qumbra-wallet auth v1\n0 0 {r0} retired\n1 0 {r1} active\n");
         let revived = format!("qumbra-wallet auth v2\n0 0 {r0} sweep {net}:1153\n1 0 {r1} active\nchecked 0 {net}:1\n");
+        // Three generations: the retired middle one can be dropped and the text still parses.
+        let three = format!(
+            "qumbra-wallet auth v1\n0 1 {r0} sweep {net}:1154\n1 1 {r1} retired\n2 0 {} active\n",
+            "22".repeat(32)
+        );
         let j = |t: &str| AuthJournal::from_text(t).unwrap_or_else(|e| panic!("{e}: {t}"));
         let ok = |from: &str, to: &str| j(to).advances_from(&j(from));
         for (from, to) in [
@@ -667,7 +672,9 @@ mod tests {
             assert_eq!(ok(from, to), Ok(()), "{from} → {to}");
         }
         for (from, to, why) in [
-            (&restored, &stale_out, "generation 1 is missing"),
+            // Generation 0 is checked first: sweep → active is the first rule broken here.
+            (&restored, &stale_out, "generation 0 goes from sweep to active"),
+            (&three, &three.replace(&format!("1 1 {r1} retired\n"), ""), "generation 1 is missing"),
             (&restored, &restored.replace(&format!("0 1 {r0}"), &format!("0 0 {r0}")), "cursor moves back"),
             (&restored, &restored.replace(&format!("checked 1 {net}:2"), &format!("checked 1 {net}:1")), "checked height moves back"),
             (&stale_out, &stale_in, "cursor moves back"),
