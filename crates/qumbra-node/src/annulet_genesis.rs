@@ -575,10 +575,14 @@ mod tests {
     }
 
     /// The format-34 devnet and rehearsal genesis hashes (lab #937): from
-    /// `qumbra-node genesis annulet-devnet --v3` / `--v3 --rehearsal`, each run
-    /// twice, byte-identical (print-then-pin). `None` until that run.
-    const DEVNET_V3_GENESIS_HASH: Option<&str> = None;
-    const DEVNET_V3_REHEARSAL_GENESIS_HASH: Option<&str> = None;
+    /// `qumbra-node genesis annulet-devnet --v3` / `--v3 --rehearsal` at
+    /// d8ff3606, each run twice in fresh processes, byte-identical (5,241 B and
+    /// 5,251 B; the coordinator-named run, `logs/937-devnet-v3-pins-20261008/`).
+    /// The same run reproduced the v2 and v1 devnet pins unchanged.
+    const DEVNET_V3_GENESIS_HASH: Option<&str> =
+        Some("7673e01f2902344b902e40ad498e3bf4368e355dffa277669c947fbda700f65e");
+    const DEVNET_V3_REHEARSAL_GENESIS_HASH: Option<&str> =
+        Some("439de6fca8be1efb78996c0a0906e33ae43d854f50d5e299d0dfe6049b541fb5");
 
     /// The format-34 devnet genesis: format 34 on the `CandidateAV3` axis,
     /// deterministic, verifies, and is the v2 devnet in every field but the
@@ -621,6 +625,7 @@ mod tests {
             let pin = pin.expect("pinned (print-then-pin: see the doc comment)");
             a.verify(Some(pin)).expect("verifies and pins itself");
             assert_eq!(a.hash_hex(), pin, "{name}");
+            assert_eq!(a.to_bytes().len(), if name == "devnet_v3" { 5_241 } else { 5_251 }, "{name}");
         }
     }
 
