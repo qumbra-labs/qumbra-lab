@@ -106,12 +106,66 @@ fn a_genesis_whose_body_commitment_is_under_the_other_axis_is_refused() {
         relabelled.verify(None),
         Err(AnnuletGenesisError::BadAnnulet(_))
     ));
+    // Lab #937: format 33 and 34 relabelled as each other do not verify
+    // either (the v2 and v3 genesis-body domains differ).
+    let mut relabelled = genesis(L2AuthForm::CandidateA);
+    relabelled.format_version = 34;
+    assert!(matches!(
+        relabelled.verify(None),
+        Err(AnnuletGenesisError::BadAnnulet(_))
+    ));
+    let mut relabelled = genesis(L2AuthForm::CandidateAV3);
+    relabelled.format_version = 33;
+    assert!(matches!(
+        relabelled.verify(None),
+        Err(AnnuletGenesisError::BadAnnulet(_))
+    ));
     let mut other = genesis(L2AuthForm::None);
-    other.format_version = 34;
+    other.format_version = 35;
     assert_eq!(
         other.l2_auth(),
-        Err(AnnuletGenesisError::NotAnnuletGenesis { got: Some(34) })
+        Err(AnnuletGenesisError::NotAnnuletGenesis { got: Some(35) })
     );
+}
+
+/// Lab #937: a format-34 genesis assembles, verifies, loads from its bytes
+/// (leading u32 34), names the `CandidateAV3` axis and its v3 auth context,
+/// and differs from the format-33 file with equal fields; a node opens on it.
+#[test]
+fn a_format_34_genesis_loads_and_a_node_opens_on_its_axis() {
+    let v2 = genesis(L2AuthForm::CandidateA);
+    let v3 = genesis(L2AuthForm::CandidateAV3);
+    assert_eq!(v3.format_version, 34);
+    assert_eq!(v3.form(), Ok(GenesisForm::Annulet));
+    assert_eq!(v3.l2_auth(), Ok(L2AuthForm::CandidateAV3));
+    assert_eq!(
+        v3.auth_context(),
+        Ok(qlab_devnet::annulet::AuthContext::candidate_a_v3(v3.hash()))
+    );
+    v3.verify(None).expect("format 34 verifies");
+    let back = AnnuletGenesisFile::from_bytes(&v3.to_bytes()).expect("format 34 loads");
+    assert_eq!(back, v3);
+    assert_eq!(&v3.to_bytes()[..4], &34u32.to_le_bytes());
+    assert_ne!(v2.hash(), v3.hash());
+    assert_ne!(v2.genesis_header.body_commitment, v3.genesis_header.body_commitment);
+    assert_eq!((v2.params, &v2.notes()[0].cm), (v3.params, &v3.notes()[0].cm));
+    // Not an Annulet genesis: 35 is refused by name before decoding.
+    let mut bytes = v3.to_bytes();
+    bytes[..4].copy_from_slice(&35u32.to_le_bytes());
+    assert_eq!(
+        AnnuletGenesisFile::from_bytes(&bytes),
+        Err(AnnuletGenesisError::NotAnnuletGenesis { got: Some(35) })
+    );
+
+    let leaves = registry_leaves(&v3.registry_genesis);
+    let node = MemNode::in_memory_annulet_with_auth(
+        v3.genesis_block_header(),
+        &v3.notes(),
+        v3.params.fee_table(),
+        &leaves,
+        qlab_devnet::annulet::AuthContext::candidate_a_v3(v3.hash()),
+    );
+    assert_eq!(node.l2_auth_form(), L2AuthForm::CandidateAV3);
 }
 
 #[test]

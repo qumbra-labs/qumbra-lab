@@ -597,6 +597,12 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
             genesis.format_version,
             has_flag(args, "--fresh-journal"),
         )?,
+        // Lab #937: a format-34 net's S/P spends carry three outputs; the
+        // faucet's grants are built by the v2 (two-output) wallet path until
+        // lab #937 PR C. Refused by name rather than built and refused by the node.
+        qlab_devnet::forms::L2AuthForm::CandidateAV3 => {
+            return Err("format 34 (three-output S/P) grants are not built by this faucet yet (lab #937 PR C)".into())
+        }
     };
     let stock = faucet.stock_left();
     let bound = serve_grants(listen, Arc::new(std::sync::Mutex::new(faucet)))?;

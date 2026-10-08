@@ -114,7 +114,10 @@ pub fn load_any(bytes: &[u8]) -> Result<AnyGenesis, GenesisError> {
         return Ok(AnyGenesis::V6(Box::new(crate::genesis_v6::GenesisFileV6::from_bytes(bytes)?)));
     }
     // Lab #896 E2: format 33 is the Candidate A Annulet — not a bare form.
-    if got == qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION {
+    // Lab #937: format 34 (three-output S/P) likewise.
+    if got == qlab_devnet::forms::ANNULET_AUTH_GENESIS_FORMAT_VERSION
+        || got == qlab_devnet::forms::ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION
+    {
         return Ok(AnyGenesis::Annulet(Box::new(AnnuletGenesisFile::from_bytes(bytes)?)));
     }
     match GenesisForm::from_genesis_format_version(got) {
@@ -141,6 +144,10 @@ pub trait AnnuletGenesisBuild: Sized {
     fn devnet_v2() -> Self;
     /// **The Candidate A rehearsal genesis** (lab #896 H; see the impl).
     fn devnet_v2_rehearsal() -> Self;
+    /// **The format-34 devnet genesis** (lab #937; see the impl).
+    fn devnet_v3() -> Self;
+    /// **The format-34 rehearsal genesis** (lab #937; see the impl).
+    fn devnet_v3_rehearsal() -> Self;
 }
 
 impl AnnuletGenesisBuild for AnnuletGenesisFile {
@@ -255,10 +262,36 @@ impl AnnuletGenesisBuild for AnnuletGenesisFile {
     fn devnet_v2_rehearsal() -> Self {
         devnet_v2_with("annulet-devnet-v2-rehearsal", 1, 1)
     }
+    /// **The format-34 devnet genesis** (lab #937): [`Self::devnet_v2`] on
+    /// the `CandidateAV3` axis — format 34 (S/P spends carry three outputs),
+    /// the genesis body under the v3 domain — with the same parameters,
+    /// registry and notes (the same v2 `rkm`s: the keys and authorization are
+    /// Candidate A's). Its own network name and hash. Pinned by
+    /// `annulet_devnet_v3_genesis_hash_is_pinned`.
+    fn devnet_v3() -> Self {
+        devnet_candidate_a_with("annulet-devnet-v3", 10, 6, qlab_devnet::forms::L2AuthForm::CandidateAV3)
+    }
+    /// **The format-34 rehearsal genesis** (lab #937): [`Self::devnet_v3`]
+    /// with `slot_secs` 1 and `max_empty_slots` 1, as the v2 rehearsal.
+    fn devnet_v3_rehearsal() -> Self {
+        devnet_candidate_a_with("annulet-devnet-v3-rehearsal", 1, 1, qlab_devnet::forms::L2AuthForm::CandidateAV3)
+    }
 }
 
 /// The Candidate A devnet at the given slot parameters (lab #896 H).
 fn devnet_v2_with(network: &str, slot_secs: u64, max_empty_slots: u64) -> AnnuletGenesisFile {
+    devnet_candidate_a_with(network, slot_secs, max_empty_slots, qlab_devnet::forms::L2AuthForm::CandidateA)
+}
+
+/// The Candidate A devnets (formats 33 and 34) at the given slot parameters:
+/// the same registry and notes, the axis `auth` (lab #937).
+fn devnet_candidate_a_with(
+    network: &str,
+    slot_secs: u64,
+    max_empty_slots: u64,
+    auth: qlab_devnet::forms::L2AuthForm,
+) -> AnnuletGenesisFile {
+    assert!(auth.has_auth(), "a Candidate A devnet");
     let params = AnnuletParams {
         fee_tier_s: devnet::FEE_TIER_S,
         fee_tier_p: devnet::FEE_TIER_P,
@@ -289,7 +322,7 @@ fn devnet_v2_with(network: &str, slot_secs: u64, max_empty_slots: u64) -> Annule
         vec![RegistryLeafRecord::asset_zero(), usdt],
         notes,
         0,
-        qlab_devnet::forms::L2AuthForm::CandidateA,
+        auth,
     )
 }
 
@@ -539,6 +572,61 @@ mod tests {
         let opened = opened(&d);
         assert!(opened[..devnet::STOCK_NOTES as usize].iter().all(|n| n.rkm == faucet && n.asset == 0));
         assert_eq!(opened[devnet::STOCK_NOTES as usize].rkm, devnet::rkm_v2(devnet::HOLDER_SK, devnet::HOLDER_D));
+    }
+
+    /// The format-34 devnet and rehearsal genesis hashes (lab #937): from
+    /// `qumbra-node genesis annulet-devnet --v3` / `--v3 --rehearsal` at
+    /// d8ff3606, each run twice in fresh processes, byte-identical (5,241 B and
+    /// 5,251 B; the coordinator-named run, `logs/937-devnet-v3-pins-20261008/`).
+    /// The same run reproduced the v2 and v1 devnet pins unchanged.
+    const DEVNET_V3_GENESIS_HASH: Option<&str> =
+        Some("7673e01f2902344b902e40ad498e3bf4368e355dffa277669c947fbda700f65e");
+    const DEVNET_V3_REHEARSAL_GENESIS_HASH: Option<&str> =
+        Some("439de6fca8be1efb78996c0a0906e33ae43d854f50d5e299d0dfe6049b541fb5");
+
+    /// The format-34 devnet genesis: format 34 on the `CandidateAV3` axis,
+    /// deterministic, verifies, and is the v2 devnet in every field but the
+    /// format, the network name and the genesis-body domain (so the same
+    /// notes, keys and registry).
+    #[test]
+    fn annulet_devnet_v3_genesis_hash_is_pinned() {
+        use qlab_devnet::forms::{L2AuthForm, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION};
+        for (name, build, v2, pin) in [
+            (
+                "devnet_v3",
+                AnnuletGenesisFile::devnet_v3 as fn() -> AnnuletGenesisFile,
+                AnnuletGenesisFile::devnet_v2 as fn() -> AnnuletGenesisFile,
+                DEVNET_V3_GENESIS_HASH,
+            ),
+            (
+                "devnet_v3_rehearsal",
+                AnnuletGenesisFile::devnet_v3_rehearsal,
+                AnnuletGenesisFile::devnet_v2_rehearsal,
+                DEVNET_V3_REHEARSAL_GENESIS_HASH,
+            ),
+        ] {
+            let (a, v2) = (build(), v2());
+            assert_eq!(a.to_bytes(), build().to_bytes(), "{name}: deterministic");
+            println!("{name}: {} bytes, hash {}", a.to_bytes().len(), a.hash_hex());
+            assert_eq!(a.format_version, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, "{name}");
+            assert_eq!(leading_format_version(&a.to_bytes()), Some(ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION), "{name}");
+            assert_eq!(a.l2_auth().unwrap(), L2AuthForm::CandidateAV3, "{name}");
+            assert_eq!(
+                a.auth_context().unwrap(),
+                qlab_devnet::annulet::AuthContext::candidate_a_v3(a.hash()),
+                "{name}"
+            );
+            a.verify(None).expect("verifies");
+            assert_eq!(a.registry_genesis, v2.registry_genesis, "{name}: v2's registry");
+            assert_eq!(a.params, v2.params, "{name}: v2's parameters");
+            assert_eq!(a.genesis_notes, v2.genesis_notes, "{name}: v2's notes");
+            assert_ne!(a.genesis_header, v2.genesis_header, "{name}: the genesis body commits under the v3 domain");
+            assert_ne!(a.hash_hex(), v2.hash_hex(), "{name}");
+            let pin = pin.expect("pinned (print-then-pin: see the doc comment)");
+            a.verify(Some(pin)).expect("verifies and pins itself");
+            assert_eq!(a.hash_hex(), pin, "{name}");
+            assert_eq!(a.to_bytes().len(), if name == "devnet_v3" { 5_241 } else { 5_251 }, "{name}");
+        }
     }
 
     /// The dev keys' v2 `rkm` is the wallet's own derivation — `auth_secret`

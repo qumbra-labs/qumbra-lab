@@ -67,6 +67,11 @@ use zeroize::Zeroize;
 
 use crate::{out_string, set_err, WalletState};
 
+/// Lab #937: the kernel builds the two-output (format 33) spends only; a
+/// format-34 net's three-output path is lab #937 PR D. Refused by name.
+const FORMAT_34_NOT_YET: &str =
+    "this net is format 34 (three-output S/P spends): this kernel does not build them yet (lab #937 PR D)";
+
 // The prover must not reach this kernel: qlab-l2spend is taken without its
 // `prove` feature, and a wasm32 build that unified it back on would carry
 // qlab-l2 and every STARK crate into the extension. Checked at compile time.
@@ -334,9 +339,17 @@ unsafe fn check_handle(
         return ptr::null_mut();
     }
     let b = (*basis).clone();
-    if b.form != L2AuthForm::CandidateA {
-        set_err(err_out, "this net is not a Candidate A net".into());
-        return ptr::null_mut();
+    match b.form {
+        L2AuthForm::CandidateA => {}
+        L2AuthForm::None => {
+            set_err(err_out, "this net is not a Candidate A net".into());
+            return ptr::null_mut();
+        }
+        // Lab #937: format 34's three-output spends arrive with PR D.
+        L2AuthForm::CandidateAV3 => {
+            set_err(err_out, FORMAT_34_NOT_YET.into());
+            return ptr::null_mut();
+        }
     }
     match build(&*w, &b) {
         Ok((mode, trees, from)) => Box::into_raw(Box::new(CheckHandle {
@@ -1316,8 +1329,13 @@ pub unsafe extern "C" fn qmb_spend_v2_new(
         if seed32.is_null() || dummy_entropy64.is_null() {
             return Err("the entropy is NULL".to_string());
         }
-        if basis.form != L2AuthForm::CandidateA {
-            return Err("this net is not a Candidate A net: its sends are not signed by the wallet's keys".into());
+        match basis.form {
+            L2AuthForm::CandidateA => {}
+            L2AuthForm::None => {
+                return Err("this net is not a Candidate A net: its sends are not signed by the wallet's keys".into())
+            }
+            // Lab #937: format 34's three-output spends arrive with PR D.
+            L2AuthForm::CandidateAV3 => return Err(FORMAT_34_NOT_YET.into()),
         }
         if amount == 0 {
             return Err("the amount is 0".into());

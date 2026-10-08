@@ -340,36 +340,42 @@ pub const L2_AUTH_ABSENT: &[u8] = &[0x00];
 /// per-transaction region with the auth section committed after the surface.
 pub const BODY_PREIMAGE_DOMAIN_ANNULET_V2: &[u8] = b"qumbra:body:annulet:v2";
 
+/// Domain of the format-34 Annulet body preimage (lab #937): v2's layout
+/// under its own domain, so a format-33 and a format-34 body never commit
+/// alike (add-don't-edit; the per-tx commitment count is already a byte).
+pub const BODY_PREIMAGE_DOMAIN_ANNULET_V3: &[u8] = b"qumbra:body:annulet:v3";
+
 /// The Annulet body commitment under the net's [`L2AuthForm`]: v1's
 /// [`body_commitment_annulet`] byte for byte on `None`; on `CandidateA`, the
-/// v2 domain with `[proof, discovery, l2, auth]` length-prefixed per tx.
+/// v2 domain with `[proof, discovery, l2, auth]` length-prefixed per tx; on
+/// `CandidateAV3` the same layout under the v3 domain.
 pub fn body_commitment_annulet_for(body: &BlockBody, auth: L2AuthForm) -> Hash32 {
-    match auth {
-        L2AuthForm::None => body_commitment_annulet(body),
-        L2AuthForm::CandidateA => {
-            let mut buf = BODY_PREIMAGE_DOMAIN_ANNULET_V2.to_vec();
-            for tx in &body.txs {
-                buf.extend_from_slice(&tx.public.anchor);
-                assert!(tx.public.nullifiers.len() <= u8::MAX as usize);
-                buf.push(tx.public.nullifiers.len() as u8);
-                for nf in &tx.public.nullifiers {
-                    buf.extend_from_slice(nf);
-                }
-                assert!(tx.public.commitments.len() <= u8::MAX as usize);
-                buf.push(tx.public.commitments.len() as u8);
-                for cm in &tx.public.commitments {
-                    buf.extend_from_slice(cm);
-                }
-                buf.push(tx.public.bucket.wire_discriminant());
-                buf.extend_from_slice(&tx.public.fee.to_le_bytes());
-                for field in [&tx.proof, &tx.discovery, &tx.l2, &tx.auth] {
-                    buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
-                    buf.extend_from_slice(field);
-                }
-            }
-            keccak256(&buf)
+    let domain = match auth {
+        L2AuthForm::None => return body_commitment_annulet(body),
+        L2AuthForm::CandidateA => BODY_PREIMAGE_DOMAIN_ANNULET_V2,
+        L2AuthForm::CandidateAV3 => BODY_PREIMAGE_DOMAIN_ANNULET_V3,
+    };
+    let mut buf = domain.to_vec();
+    for tx in &body.txs {
+        buf.extend_from_slice(&tx.public.anchor);
+        assert!(tx.public.nullifiers.len() <= u8::MAX as usize);
+        buf.push(tx.public.nullifiers.len() as u8);
+        for nf in &tx.public.nullifiers {
+            buf.extend_from_slice(nf);
+        }
+        assert!(tx.public.commitments.len() <= u8::MAX as usize);
+        buf.push(tx.public.commitments.len() as u8);
+        for cm in &tx.public.commitments {
+            buf.extend_from_slice(cm);
+        }
+        buf.push(tx.public.bucket.wire_discriminant());
+        buf.extend_from_slice(&tx.public.fee.to_le_bytes());
+        for field in [&tx.proof, &tx.discovery, &tx.l2, &tx.auth] {
+            buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            buf.extend_from_slice(field);
         }
     }
+    keccak256(&buf)
 }
 
 /// One fee-unit note the Annulet genesis mints to the faucet (lab #706 Q5):
@@ -387,24 +393,28 @@ pub const GENESIS_BODY_DOMAIN_ANNULET: &[u8] = b"qumbra:body:annulet:genesis:v1"
 /// Domain of the Candidate A Annulet **genesis** body commitment (lab #896 E2).
 pub const GENESIS_BODY_DOMAIN_ANNULET_V2: &[u8] = b"qumbra:body:annulet:genesis:v2";
 
+/// Domain of the format-34 Annulet **genesis** body commitment (lab #937).
+pub const GENESIS_BODY_DOMAIN_ANNULET_V3: &[u8] = b"qumbra:body:annulet:genesis:v3";
+
 /// [`genesis_body_commitment_annulet`] under the net's [`L2AuthForm`]: v1's
 /// bytes on `None`; on `CandidateA` the v2 genesis domain over the empty
-/// body's v2 commitment, then the same notes.
+/// body's v2 commitment, then the same notes; on `CandidateAV3` the v3
+/// genesis domain over the empty body's v3 commitment.
 pub fn genesis_body_commitment_annulet_for(notes: &[GenesisNote], auth: L2AuthForm) -> Hash32 {
-    match auth {
-        L2AuthForm::None => genesis_body_commitment_annulet(notes),
-        L2AuthForm::CandidateA => {
-            let mut buf = GENESIS_BODY_DOMAIN_ANNULET_V2.to_vec();
-            buf.extend_from_slice(&body_commitment_annulet_for(&BlockBody::default(), L2AuthForm::CandidateA));
-            buf.extend_from_slice(&(notes.len() as u32).to_le_bytes());
-            for n in notes {
-                assert_eq!(n.payload.len(), qlab_note::l2note::L2_PAYLOAD_LEN, "genesis note payload width");
-                buf.extend_from_slice(&n.cm);
-                buf.extend_from_slice(&n.payload);
-            }
-            keccak256(&buf)
-        }
+    let domain = match auth {
+        L2AuthForm::None => return genesis_body_commitment_annulet(notes),
+        L2AuthForm::CandidateA => GENESIS_BODY_DOMAIN_ANNULET_V2,
+        L2AuthForm::CandidateAV3 => GENESIS_BODY_DOMAIN_ANNULET_V3,
+    };
+    let mut buf = domain.to_vec();
+    buf.extend_from_slice(&body_commitment_annulet_for(&BlockBody::default(), auth));
+    buf.extend_from_slice(&(notes.len() as u32).to_le_bytes());
+    for n in notes {
+        assert_eq!(n.payload.len(), qlab_note::l2note::L2_PAYLOAD_LEN, "genesis note payload width");
+        buf.extend_from_slice(&n.cm);
+        buf.extend_from_slice(&n.payload);
     }
+    keccak256(&buf)
 }
 
 /// The Annulet genesis body commitment: the empty body's Annulet commitment,
@@ -471,7 +481,9 @@ pub fn placeholder_discovery_annulet(commitments: &[Hash32]) -> Vec<u8> {
 /// 2. the header binds [`body_commitment_annulet`];
 /// 3. per transaction: anchor final; name rider absent (no name service);
 ///    L2 surface present and canonical; bucket 2×2 with the shape's arity
-///    ([`check_l2_arity`]: S/P 3 nullifiers, R 1; 2 commitments); `fee == posted_fee_l2(shape)`; no nullifier repeated
+///    ([`check_l2_arity`]: S/P 3 nullifiers and the axis's output count —
+///    2 on formats 32/33, 3 on format 34 (lab #937), the other format's spend
+///    refused by name; R 1 and 2); `fee == posted_fee_l2(shape)`; no nullifier repeated
 ///    in the block; the discovery group is canonical at the 128-B payload
 ///    width, binds the declared commitments, and carries no genesis plaintext
 ///    ([`check_tx_discovery_annulet`], lab #714); the surface's
@@ -551,7 +563,7 @@ where
         let surface = L2Surface::decode(&tx.l2)
             .map_err(|err| BodyError::L2SurfaceMalformed { index: i, err })?
             .ok_or(BodyError::L2SurfaceMissing { index: i })?;
-        check_l2_arity(&tx.public, surface.shape, i)?;
+        check_l2_arity(&tx.public, surface.shape, auth.form, i)?;
         check_l2_no_exit(&surface, i)?;
         if Some(surface.registry_root) != pre_root {
             return Err(BodyError::L2RegistryRootStale { index: i });
@@ -598,21 +610,30 @@ pub fn annulet_supply_delta(body: &BlockBody) -> std::collections::BTreeMap<u16,
 
 /// Lab #728 Q2: every Annulet surface declares the 2×2 bucket (the L1
 /// type's only L2 value — the Annulet prices by shape); the SHAPE gates the
-/// counts: S/P spend three (two inputs and the fee input, A4) and make two, R spends one and makes two — the fee
-/// change and the seed (A3, lab #731). The one rule the body check and the
-/// mempool both apply (`index` names the tx).
-pub fn check_l2_arity(public: &crate::body::TxPublic, shape: L2ShapeTag, index: usize) -> Result<(), BodyError> {
+/// counts: S/P spend three (two inputs and the fee input, A4) and make
+/// [`L2AuthForm::sp_outputs`] — two on formats 32/33, three on format 34
+/// (lab #937) — and R spends one and makes two — the fee change and the seed
+/// (A3, lab #731). The one rule the body check and the mempool both apply
+/// (`index` names the tx). The other format's S/P spend is refused by name.
+pub fn check_l2_arity(
+    public: &crate::body::TxPublic,
+    shape: L2ShapeTag,
+    auth: L2AuthForm,
+    index: usize,
+) -> Result<(), BodyError> {
     if public.bucket != ArityBucket::TwoByTwo {
         return Err(BodyError::L2WrongArity { index });
     }
     let (want_nf, want_cm) = match shape {
-        L2ShapeTag::S | L2ShapeTag::P => (3, 2),
+        L2ShapeTag::S | L2ShapeTag::P => (3, auth.sp_outputs()),
         L2ShapeTag::R => (1, 2),
     };
     if public.nullifiers.len() != want_nf || public.commitments.len() != want_cm {
-        return Err(match shape {
-            L2ShapeTag::S | L2ShapeTag::P => BodyError::L2WrongArity { index },
-            L2ShapeTag::R => BodyError::L2RegistryWriteArity { index },
+        return Err(match (shape, auth, public.nullifiers.len(), public.commitments.len()) {
+            (L2ShapeTag::S | L2ShapeTag::P, L2AuthForm::CandidateAV3, 3, 2) => BodyError::L2V2SpendOnV3Net { index },
+            (L2ShapeTag::S | L2ShapeTag::P, L2AuthForm::CandidateA, 3, 3) => BodyError::L2V3SpendOnV2Net { index },
+            (L2ShapeTag::S | L2ShapeTag::P, _, _, _) => BodyError::L2WrongArity { index },
+            (L2ShapeTag::R, _, _, _) => BodyError::L2RegistryWriteArity { index },
         });
     }
     Ok(())
@@ -679,8 +700,11 @@ pub enum IntentError {
     Surface(L2SurfaceError),
     /// The discovery group does not decode at the Annulet width.
     Discovery(qlab_note::compact::CodecError),
-    /// An Annulet transaction commits exactly two outputs.
+    /// The transaction's output count is not its shape's on the intent's
+    /// net: S/P two on format 33, three on format 34 (lab #937); R two.
     Commitments { got: usize },
+    /// The intent's `genesis_format` is not an Annulet Candidate A format.
+    GenesisFormat { got: u32 },
     /// The rebuilt intent's slot counts do not fit its shape.
     Auth(qlab_remote_auth::annulet::AuthError),
 }
@@ -715,9 +739,20 @@ pub fn intent_for(
     let (recipients, payloads) =
         decode_committed_discovery_with_width(&tx.discovery, L2_PAYLOAD_LEN).map_err(IntentError::Discovery)?;
     let discovery = encode_committed_discovery_with_width(&recipients, &payloads, L2_PAYLOAD_LEN);
-    let commitments: [Hash32; 2] = tx.public.commitments.as_slice().try_into().map_err(|_| IntentError::Commitments {
-        got: tx.public.commitments.len(),
-    })?;
+    // Lab #937: the output count is fixed by the net the intent binds
+    // (`genesis_format`): S/P 2 on format 33, 3 on format 34; R 2.
+    let form = match crate::forms::annulet_forms_of_genesis_format_version(genesis_format) {
+        Some((_, form)) if form.has_auth() => form,
+        _ => return Err(IntentError::GenesisFormat { got: genesis_format }),
+    };
+    let want = match surface.shape {
+        L2ShapeTag::S | L2ShapeTag::P => form.sp_outputs(),
+        L2ShapeTag::R => 2,
+    };
+    if tx.public.commitments.len() != want {
+        return Err(IntentError::Commitments { got: tx.public.commitments.len() });
+    }
+    let commitments = tx.public.commitments.clone();
     let intent = qlab_remote_auth::annulet::AnnuletIntent {
         genesis_format,
         genesis_hash: *genesis_hash,
@@ -771,6 +806,11 @@ impl AuthContext {
         Self { form: L2AuthForm::CandidateA, genesis_hash }
     }
 
+    /// A format-34 net (Candidate A, three-output S/P) under `genesis_hash`.
+    pub const fn candidate_a_v3(genesis_hash: Hash32) -> Self {
+        Self { form: L2AuthForm::CandidateAV3, genesis_hash }
+    }
+
     /// The intent's `genesis_format`: the axis's genesis `format_version`.
     pub fn genesis_format(&self) -> u32 {
         self.form.annulet_genesis_format_version()
@@ -814,11 +854,11 @@ pub enum AuthRefusal {
 /// header, so `DescriptorMismatch` / `ValidityMismatch` cannot arise here.
 pub fn check_auth(tx: &TxEntry, ctx: &AuthContext, height: u64) -> Result<Option<u64>, AuthRefusal> {
     let present = tx.auth != L2_AUTH_ABSENT;
-    match (ctx.form, present) {
-        (L2AuthForm::None, false) => return Ok(None),
-        (L2AuthForm::None, true) => return Err(AuthRefusal::AuthOnV1Net),
-        (L2AuthForm::CandidateA, false) => return Err(AuthRefusal::AuthMissing),
-        (L2AuthForm::CandidateA, true) => {}
+    match (ctx.form.has_auth(), present) {
+        (false, false) => return Ok(None),
+        (false, true) => return Err(AuthRefusal::AuthOnV1Net),
+        (true, false) => return Err(AuthRefusal::AuthMissing),
+        (true, true) => {}
     }
     let surface = L2Surface::decode(&tx.l2)
         .map_err(|e| AuthRefusal::Intent(IntentError::Surface(e)))?
@@ -871,7 +911,7 @@ mod tests {
             let body = BlockBody { txs: vec![l2_tx(9, &s_surface()), tx(nf, cm)], ..BlockBody::default() };
             assert_eq!(crate::body::check_tx_entry_counts(&body), Err(BodyError::TxEntriesOverByte { index: 1 }));
             let header = header_for(&BlockBody::default());
-            for ctx in [AuthContext::NONE, AuthContext::candidate_a([0x6E; 32])] {
+            for ctx in [AuthContext::NONE, AuthContext::candidate_a([0x6E; 32]), AuthContext::candidate_a_v3([0x6E; 32])] {
                 assert_eq!(
                     validate_body_annulet_for(&header, &body, &OkProof, |r| *r == FINAL, &FEES, &ctx),
                     Err(BodyError::TxEntriesOverByte { index: 1 }),
@@ -970,6 +1010,61 @@ mod tests {
 
     fn check(body: &BlockBody) -> Result<(), BodyError> {
         validate_body_annulet(&header_for(body), body, &OkProof, |r| *r == FINAL, &FEES)
+    }
+
+    /// Lab #937 (review F3): the whole body rule on formats 33 and 34 —
+    /// a two-output S spend on 34 and a three-output one on 33 are refused by
+    /// name (before any signature work), and a signed three-output S spend on
+    /// 34 passes every rule: arity, fee, surface, its v3 body commitment, the
+    /// authorization over the format-34 intent, the (mocked) proof.
+    #[test]
+    fn the_body_rule_takes_each_formats_arity_and_refuses_the_other_by_name() {
+        use qlab_remote_auth::annulet::AnnuletAuthSection;
+        use qlab_remote_auth::mldsa::Key;
+        let sign = |mut t: TxEntry, ctx: &AuthContext| {
+            let keys: Vec<Key> = (0..3u8).map(|i| Key::from_seed([0x90 + i; 32])).collect();
+            let descriptors: Vec<_> = keys.iter().enumerate().map(|(i, k)| k.descriptor(i as u32)).collect();
+            let intent = intent_for(&t, ctx.genesis_format(), &ctx.genesis_hash, 100, &descriptors).expect("intent");
+            let refs: Vec<&Key> = keys.iter().collect();
+            t.auth = AnnuletAuthSection::sign(&intent, &refs).and_then(|s| s.encode()).expect("signs");
+            t
+        };
+        let three = |nf: u8| {
+            let mut t = l2_tx(nf, &s_surface());
+            t.public.commitments.push([nf.wrapping_add(4); 32]);
+            t.discovery = placeholder_discovery_annulet(&t.public.commitments);
+            t
+        };
+        let check_on = |ctx: &AuthContext, body: &BlockBody| {
+            let header = BlockHeader::genesis_annulet(
+                AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [0x44; 32] },
+                body_commitment_annulet_for(body, ctx.form),
+                0,
+            );
+            validate_body_annulet_for(&header, body, &OkProof, |r| *r == FINAL, &FEES, ctx)
+        };
+        let (v2, v3) = (AuthContext::candidate_a([0x6E; 32]), AuthContext::candidate_a_v3([0x6E; 32]));
+        // Accepted: a signed three-output S spend on format 34 …
+        let ok34 = BlockBody::new(vec![sign(three(1), &v3)], vec![]);
+        assert_eq!(check_on(&v3, &ok34), Ok(()));
+        // … and a signed two-output one on format 33 (the control).
+        let ok33 = BlockBody::new(vec![sign(l2_tx(1, &s_surface()), &v2)], vec![]);
+        assert_eq!(check_on(&v2, &ok33), Ok(()));
+        // Refused by name, each on the other format, at the tx's index.
+        let two_on_34 = BlockBody::new(vec![sign(three(5), &v3), sign(l2_tx(1, &s_surface()), &v2)], vec![]);
+        assert_eq!(check_on(&v3, &two_on_34), Err(BodyError::L2V2SpendOnV3Net { index: 1 }));
+        let three_on_33 = BlockBody::new(vec![sign(l2_tx(5, &s_surface()), &v2), sign(three(1), &v3)], vec![]);
+        assert_eq!(check_on(&v2, &three_on_33), Err(BodyError::L2V3SpendOnV2Net { index: 1 }));
+        // A format-34 body committed under the v2 domain is not the header's.
+        let header_v2 = BlockHeader::genesis_annulet(
+            AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [0x44; 32] },
+            body_commitment_annulet_for(&ok34, L2AuthForm::CandidateA),
+            0,
+        );
+        assert!(matches!(
+            validate_body_annulet_for(&header_v2, &ok34, &OkProof, |r| *r == FINAL, &FEES, &v3),
+            Err(BodyError::CommitmentMismatch { .. })
+        ));
     }
 
     /// Lab #712 (the §5 ruling): a surface whose registry root is not the

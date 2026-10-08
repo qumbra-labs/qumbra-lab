@@ -62,6 +62,9 @@ pub fn wire_form_byte(wf: WireForm) -> u8 {
         // Lab #896 E2: the Candidate A Annulet — node-to-node bodies carry
         // each transaction's auth section, so its frame is its own form.
         (GenesisForm::Annulet, BodySections::None, L2AuthForm::CandidateA) => 5,
+        // Lab #937: the format-34 Annulet (three-output S/P) — the Candidate A
+        // frame, under its own byte so a format-33 reader refuses it by name.
+        (GenesisForm::Annulet, BodySections::None, L2AuthForm::CandidateAV3) => 6,
         (form, sections, auth) => panic!("no served wire form for {form:?} with {sections:?} / {auth:?} (lab #850)"),
     }
 }
@@ -73,6 +76,7 @@ fn wire_form_of(b: u8) -> Option<WireForm> {
         3 => Some(WireForm::plain(GenesisForm::Annulet)),
         4 => Some(WireForm::V6),
         5 => Some(WireForm::ANNULET_AUTH),
+        6 => Some(WireForm::ANNULET_AUTH_V3),
         _ => None,
     }
 }

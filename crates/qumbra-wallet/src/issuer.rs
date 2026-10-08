@@ -361,7 +361,7 @@ fn registry_write<E: Endpoint>(
     isk: [u64; 4],
     rng: &mut StdRng,
 ) -> Result<RegistryReport, SendRefusal> {
-    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+    if session.l2_auth.has_auth() {
         // Lab #896 G: the active generation's fee note and keys.
         let mut run = crate::annulet_v2::AuthRun::open(w, session, crate::annulet_v2::valid_for())?;
         let notes = session.index.only_generation(run.generation).by_asset.values().map(|n| n.spendable.len() as u32).sum();
@@ -622,7 +622,7 @@ pub fn prepare_mint<E: Endpoint>(
     let session = open_session(w, endpoint, scan_to, pin, rng)?;
     let leaf = session.served.registry(u64::from(asset))?.leaf;
     let isk = isk_from(w, isk, asset, &leaf.issuer_key)?.ok_or(SendRefusal::NotTheIssuer { asset })?;
-    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+    if session.l2_auth.has_auth() {
         to.require_version(qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A).map_err(|e| SendRefusal::Auth(e.to_string()))?;
         let recipient = recipient_of(to).ok_or(SendRefusal::Issuer("the recipient address has no valid ek".into()))?;
         let ctx = PolicyContext { freeze_keys: freeze_keys.to_vec(), isk, ..Default::default() };
@@ -691,7 +691,7 @@ pub fn prepare_redeem<E: Endpoint>(
         None if redeem_open => [0; 4],
         None => return Err(SendRefusal::NotTheIssuer { asset }),
     };
-    if session.l2_auth == qlab_devnet::forms::L2AuthForm::CandidateA {
+    if session.l2_auth.has_auth() {
         let ctx = PolicyContext { freeze_keys: freeze_keys.to_vec(), isk, ..Default::default() };
         let me2 = crate::annulet_v2::me_v2(&w.wallet(), &active_root(w)?);
         return prepare_issue_v2(w, session, asset, Some(amount), me2, ctx, VPublic::redeem(amount), split_wait, rng);

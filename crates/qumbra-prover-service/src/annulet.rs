@@ -101,10 +101,39 @@ fn annulet_node_url(name: &str, value: &str, ack: Option<&str>) -> Result<String
 
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
+/// The net's genesis `format_version` (lab #937 PR B review F2). Optional:
+/// unset is 33, the only format this service builds and proves for — so a
+/// deploy that predates the variable runs as before.
+pub const ANNULET_GENESIS_FORMAT_VAR: &str = "QUMBRA_PROVER_ANNULET_GENESIS_FORMAT";
+
+/// The service's net from [`ANNULET_GENESIS_FORMAT_VAR`]'s value, failing
+/// closed at startup: 33 (or unset) is served; **34 is refused by name** —
+/// its three-output bundles arrive with lab #937 PR E, and `/info` must never
+/// report 33 for a format-34 net; anything else is not a Candidate A Annulet.
+pub fn annulet_genesis_form(raw: Option<&str>) -> Result<L2AuthForm, String> {
+    let v: u32 = match raw {
+        None => return Ok(L2AuthForm::CandidateA),
+        Some(s) => s.parse().map_err(|_| format!("{ANNULET_GENESIS_FORMAT_VAR} is invalid"))?,
+    };
+    match qlab_devnet::forms::annulet_forms_of_genesis_format_version(v) {
+        Some((_, L2AuthForm::CandidateA)) => Ok(L2AuthForm::CandidateA),
+        Some((_, L2AuthForm::CandidateAV3)) => {
+            Err(format!("{ANNULET_GENESIS_FORMAT_VAR}={v}: format 34 is not served yet (lab #937 PR E)"))
+        }
+        Some((_, L2AuthForm::None)) | None => Err(format!(
+            "{ANNULET_GENESIS_FORMAT_VAR}={v}: not a Candidate A Annulet format (this service serves 33)"
+        )),
+    }
+}
+
 /// Fail-closed Annulet configuration (all `QUMBRA_PROVER_ANNULET_*`, plus
 /// the token key files and the scratch directory).
 pub struct AnnuletConfig {
     pub genesis_hash: Hash32,
+    /// The net's L2 authorization axis, from
+    /// `QUMBRA_PROVER_ANNULET_GENESIS_FORMAT` (default 33): only Candidate A
+    /// (format 33) is served — see [`annulet_genesis_form`].
+    pub l2_auth: L2AuthForm,
     pub slot_secs: u64,
     pub queue_capacity: usize,
     pub prove_timeout: Duration,
@@ -132,6 +161,7 @@ impl AnnuletConfig {
         .flatten()
         .and_then(|b| b.try_into().ok())
         .ok_or("QUMBRA_PROVER_ANNULET_GENESIS_HASH must be 64 lowercase hexadecimal characters")?;
+        let l2_auth = annulet_genesis_form(std::env::var(ANNULET_GENESIS_FORMAT_VAR).ok().as_deref())?;
         let slot_secs: u64 = env_required("QUMBRA_PROVER_ANNULET_SLOT_SECS")?
             .parse()
             .map_err(|_| "QUMBRA_PROVER_ANNULET_SLOT_SECS is invalid".to_string())?;
@@ -186,6 +216,7 @@ impl AnnuletConfig {
         }
         Ok(Some(Self {
             genesis_hash,
+            l2_auth,
             slot_secs,
             queue_capacity,
             prove_timeout: Duration::from_secs(timeout),
@@ -201,7 +232,7 @@ impl AnnuletConfig {
 
     /// The net a bundle must verify on.
     pub fn auth_context(&self) -> AuthContext {
-        AuthContext::candidate_a(self.genesis_hash)
+        AuthContext { form: self.l2_auth, genesis_hash: self.genesis_hash }
     }
 
     /// The validity a client should sign with so its transaction can still

@@ -49,6 +49,7 @@ fn token(id: u8, net: Hash32, per_day: u16) -> String {
 fn config(net: Hash32, queue: usize, ttl: Duration) -> AnnuletConfig {
     AnnuletConfig {
         genesis_hash: net,
+        l2_auth: qlab_devnet::forms::L2AuthForm::CandidateA,
         slot_secs: 10,
         queue_capacity: queue,
         prove_timeout: Duration::from_secs(300),
@@ -660,4 +661,23 @@ fn a_plain_http_node_link_needs_the_annulet_acknowledgement() {
     );
     assert!(annulet_node_url(name, plain, Some(ANNULET_PLAIN_HTTP_ACK)).is_ok());
     assert!(annulet_node_url(name, "ftp://x", Some(ANNULET_PLAIN_HTTP_ACK)).is_err());
+}
+
+/// Lab #937 PR B (review F2): the service's net fails closed at startup.
+/// Unset or 33 is served (`/info` then says 33); 34 is refused by name until
+/// lab #937 PR E; anything else is not a Candidate A Annulet.
+#[test]
+fn the_genesis_format_is_served_only_on_33_and_34_is_refused_by_name() {
+    use crate::annulet::annulet_genesis_form;
+    use qlab_devnet::forms::L2AuthForm;
+    assert_eq!(annulet_genesis_form(None), Ok(L2AuthForm::CandidateA));
+    assert_eq!(annulet_genesis_form(Some("33")), Ok(L2AuthForm::CandidateA));
+    let e = annulet_genesis_form(Some("34")).unwrap_err();
+    assert!(e.contains("format 34 is not served yet (lab #937 PR E)"), "{e}");
+    for bad in ["32", "35", "5", "x", ""] {
+        assert!(annulet_genesis_form(Some(bad)).is_err(), "{bad}");
+    }
+    // `/info` reports the configured net's format, never a hard-coded one.
+    let a = api(FakeProver::new(Answer::Honest, false), Arc::default());
+    assert_eq!(a.info().genesis_format, L2AuthForm::CandidateA.annulet_genesis_format_version());
 }

@@ -614,7 +614,7 @@ impl Mempool {
                 let surface = qlab_devnet::annulet::L2Surface::decode(&entry.l2)
                     .map_err(|err| MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMalformed { index: 0, err }))?
                     .ok_or(MempoolError::L2SurfaceInvalid(BodyError::L2SurfaceMissing { index: 0 }))?;
-                qlab_devnet::annulet::check_l2_arity(&entry.public, surface.shape, 0)
+                qlab_devnet::annulet::check_l2_arity(&entry.public, surface.shape, state.annulet_auth_context().form, 0)
                     .map_err(MempoolError::L2SurfaceInvalid)?;
                 // Lab #785 F5-4d: no bridge here — the body rule's twin.
                 qlab_devnet::annulet::check_l2_no_exit(&surface, 0).map_err(MempoolError::L2SurfaceInvalid)?;

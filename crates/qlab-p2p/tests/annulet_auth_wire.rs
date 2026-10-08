@@ -168,3 +168,51 @@ fn the_candidate_a_served_form_is_byte_5_and_carries_auth() {
         Err(ServedError::Frame(_))
     ));
 }
+
+/// Lab #937: the format-34 served form is byte 6 (unused before: 1 V4, 2 V5,
+/// 3 Annulet v1, 4 V6, 5 Candidate A). Its tx wire is Candidate A's (the
+/// auth tail read by `has_auth`, the commitment count a varint), so a
+/// three-output transaction round-trips; a format-33 and a format-34 reader
+/// refuse each other's frames by the form byte, both directions.
+#[test]
+fn the_format_34_served_form_is_byte_6_and_the_formats_refuse_each_other() {
+    let wf = WireForm::ANNULET_AUTH_V3;
+    assert_eq!((wf.form, wf.l2_auth), (GenesisForm::Annulet, L2AuthForm::CandidateAV3));
+    assert_eq!(served::wire_form_byte(wf), 6);
+    assert_eq!(served::wire_form_byte(WireForm::ANNULET_AUTH), 5, "format 33's byte does not move");
+    let all = [
+        WireForm::plain(GenesisForm::V4),
+        WireForm::plain(GenesisForm::V5),
+        fixture::AN,
+        WireForm::V6,
+        WireForm::ANNULET_AUTH,
+        WireForm::ANNULET_AUTH_V3,
+    ];
+    let bytes: Vec<u8> = all.iter().map(|w| served::wire_form_byte(*w)).collect();
+    assert_eq!(bytes, [1, 2, 3, 4, 5, 6], "one byte per form, none reused");
+
+    // A three-output transaction with its auth tail, through the tx codec.
+    let mut tx = signed_tx();
+    tx.public.commitments.push([0x77; 32]);
+    let enc = encode_tx_annulet(&tx);
+    assert!(same(&decode_tx_annulet_with(&enc, L2AuthForm::CandidateAV3).unwrap(), &tx));
+    assert!(same(&decode_tx_for_auth(GenesisForm::Annulet, L2AuthForm::CandidateAV3, &enc).unwrap(), &tx));
+
+    // And through the served body frame, under its own form only.
+    let (units, _) = fixture::chain();
+    let body = BlockBody { txs: vec![tx.clone()], ..BlockBody::default() };
+    let ann = qlab_p2p::node::whole_block_announce(units[1].clone(), body.clone());
+    let v3 = served::encode_body_answer(wf, 2, &ann).expect("a format-34 body encodes");
+    let back = served::decode_body_answer(wf, 2, &v3).expect("and decodes under its own form");
+    let got = served::body_of(&back).txs;
+    assert!(got.len() == 1 && same(&got[0], &tx));
+    assert!(matches!(
+        served::decode_body_answer(WireForm::ANNULET_AUTH, 2, &v3),
+        Err(ServedError::WrongForm { want: 5, got: 6 })
+    ));
+    let v2 = served::encode_body_answer(WireForm::ANNULET_AUTH, 2, &ann).expect("encodes");
+    assert!(matches!(
+        served::decode_body_answer(wf, 2, &v2),
+        Err(ServedError::WrongForm { want: 6, got: 5 })
+    ));
+}

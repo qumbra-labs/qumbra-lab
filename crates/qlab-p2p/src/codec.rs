@@ -697,7 +697,7 @@ pub fn decode_tx_annulet_with(buf: &[u8], auth_form: L2AuthForm) -> Result<TxEnt
         Ok(None) | Err(_) => return Err(DecodeError::BadL2Surface),
     }
     let mut auth = qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec();
-    if auth_form == L2AuthForm::CandidateA && r.remaining() > 0 {
+    if auth_form.has_auth() && r.remaining() > 0 {
         let n = r.varint()? as usize;
         let bytes = r.rest(n, "tx.auth")?;
         if bytes.is_empty() || bytes == qlab_devnet::annulet::L2_AUTH_ABSENT {

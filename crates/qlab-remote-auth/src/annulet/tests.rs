@@ -34,7 +34,7 @@ fn fixture(shape: Shape) -> AnnuletIntent {
         shape,
         anchor: b(0x22),
         nullifiers,
-        commitments: [b(0x41), b(0x42)],
+        commitments: vec![b(0x41), b(0x42)],
         bucket: 0x02,
         valid_until_height: 1_000_256,
         fee: 0x0102_0304_0506_0708,
@@ -80,6 +80,63 @@ fn intent_is_fixed_width_and_matches_the_independent_vectors() {
         "545e332f5e9da23d10726f32d8b6e759e9ca3aa18384afc8f4f668c26e376121"
     );
     assert!(s.encode().unwrap().starts_with(INTENT_DOMAIN));
+}
+
+/// Lab #937: a format-34 intent binds **three** S/P commitments (and R
+/// still two). The vectors are pycryptodome Keccak-256 over an independent
+/// encoder (`intent_golden.py`, quoted in lab #937 PR B's body), which
+/// first reproduces this file's format-6 goldens above byte for byte.
+#[test]
+fn format_34_intent_binds_three_commitments_and_matches_the_independent_vectors() {
+    assert_eq!(ANNULET_V3_GENESIS_FORMAT, 34);
+    let v3 = |shape: Shape| AnnuletIntent {
+        genesis_format: 34,
+        commitments: if shape == Shape::R { vec![b(0x41), b(0x42)] } else { vec![b(0x41), b(0x42), b(0x43)] },
+        ..fixture(shape)
+    };
+    let (s, p, r) = (v3(Shape::S), v3(Shape::P), v3(Shape::R));
+    assert_eq!(s.encode().unwrap().len(), 521);
+    assert_eq!(AnnuletIntent::encoded_len_with(Shape::S, 3), 521);
+    assert_eq!(
+        crate::hex(&s.digest().unwrap()),
+        "dcf31464829f77b7df3e05639ce3706cdd288d2b1d9ea492f7ad3caf3b3b20fe"
+    );
+    assert_eq!(
+        crate::hex(&p.digest().unwrap()),
+        "94cebad9cea2d2366389d8ca9b42975d345fce57de4499fb5de7c6ea2a200211"
+    );
+    assert_eq!(r.encode().unwrap().len(), 353);
+    assert_eq!(
+        crate::hex(&r.digest().unwrap()),
+        "7c8c47f4c812de36621ed4558f17f265e9451399c9f5f507331b2f19a5b41540"
+    );
+}
+
+/// Lab #937: the output count is the intent's net's — refused by name both
+/// ways: two S/P commitments on format 34, three on any other format (the
+/// format-6 fixture stands for 33 and earlier), and R with three on 34.
+#[test]
+fn the_output_count_is_fixed_by_the_genesis_format() {
+    for shape in [Shape::S, Shape::P] {
+        assert_eq!(intent_outputs(34, shape), 3);
+        assert_eq!(intent_outputs(33, shape), 2);
+        let two_on_34 = AnnuletIntent { genesis_format: 34, ..fixture(shape) };
+        assert_eq!(two_on_34.encode().err(), Some(AuthError::OutputCount { expected: 3, got: 2 }));
+        let three_on_33 = AnnuletIntent {
+            genesis_format: 33,
+            commitments: vec![b(0x41), b(0x42), b(0x43)],
+            ..fixture(shape)
+        };
+        assert_eq!(three_on_33.encode().err(), Some(AuthError::OutputCount { expected: 2, got: 3 }));
+        assert_eq!(
+            AnnuletIntent { genesis_format: 33, ..fixture(shape) }.encode().unwrap().len(),
+            AnnuletIntent::encoded_len_for(shape),
+            "format 33 encodes as before"
+        );
+    }
+    assert_eq!(intent_outputs(34, Shape::R), 2);
+    let r3 = AnnuletIntent { genesis_format: 34, commitments: vec![b(0x41), b(0x42), b(0x43)], ..fixture(Shape::R) };
+    assert_eq!(r3.encode().err(), Some(AuthError::OutputCount { expected: 2, got: 3 }));
 }
 
 #[test]

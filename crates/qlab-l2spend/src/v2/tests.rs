@@ -277,10 +277,26 @@ fn changed_context_breaks_the_section(f: &Signed) {
         section.verify_intent(&intent_for(&f.tx, format, hash, until, auth).unwrap())
     };
     let (fmt, until) = (ANNULET_AUTH_GENESIS_FORMAT_VERSION, VALID_UNTIL);
-    assert_eq!(
-        rebuild(fmt + 1, &GENESIS_HASH, until, &f.auth),
-        Err(AuthError::BadSignature { slot: 0 })
-    );
+    // The format is signed: the same intent under another format's number
+    // does not verify. (35: a format whose intents keep two outputs, so the
+    // intent still encodes — `intent_outputs`.)
+    let mut other = intent_for(&f.tx, fmt, &GENESIS_HASH, until, &f.auth).unwrap();
+    other.genesis_format = fmt + 2;
+    assert_eq!(section.verify_intent(&other), Err(AuthError::BadSignature { slot: 0 }));
+    // Lab #937: on format 34 a two-output S/P spend has no intent at all —
+    // refused by name before any signature is looked at. R keeps two outputs
+    // on format 34, so its intent rebuilds there (and, binding the format,
+    // does not verify a format-33 signature).
+    let on_34 = intent_for(&f.tx, fmt + 1, &GENESIS_HASH, until, &f.auth);
+    match f.shape {
+        qlab_l2::Shape::S | qlab_l2::Shape::P => {
+            assert_eq!(on_34.err(), Some(qlab_devnet::annulet::IntentError::Commitments { got: 2 }))
+        }
+        qlab_l2::Shape::R => {
+            let i = on_34.expect("R is unchanged on format 34: two outputs");
+            assert_eq!(section.verify_intent(&i), Err(AuthError::BadSignature { slot: 0 }));
+        }
+    }
     assert_eq!(
         rebuild(fmt, &[0x6f; 32], until, &f.auth),
         Err(AuthError::BadSignature { slot: 0 })

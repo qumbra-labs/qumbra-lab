@@ -111,6 +111,7 @@ pub fn auth_of(file: &AnnuletGenesisFile) -> L2AuthForm {
 pub fn wire_of(file: &AnnuletGenesisFile) -> WireForm {
     match auth_of(file) {
         L2AuthForm::CandidateA => WireForm::ANNULET_AUTH,
+        L2AuthForm::CandidateAV3 => WireForm::ANNULET_AUTH_V3,
         L2AuthForm::None => AN,
     }
 }

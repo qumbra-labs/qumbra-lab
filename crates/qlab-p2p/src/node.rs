@@ -6092,6 +6092,41 @@ mod tests {
         assert_eq!(peer.poll(), vec![], "unanswered");
     }
 
+    /// Lab #937 (review F4): formats 33 and 34 share every tx and compact
+    /// frame encoding (the commitment count is a varint), so what keeps the
+    /// two nets apart on the wire is this handshake: the `net_id` is the
+    /// genesis **file** hash, and the format is the file's leading u32 — two
+    /// genesis files equal in every field but the format (33 vs 34) are two
+    /// nets, and each node refuses the other's `Version` by name, both ways.
+    #[test]
+    fn i937_a_format_33_and_a_format_34_node_refuse_each_others_handshake() {
+        use qlab_devnet::forms::L2AuthForm;
+        use qlab_node::annulet_genesis::{AnnuletGenesisFile, AnnuletParams, RegistryLeafRecord};
+        let file = |auth| {
+            AnnuletGenesisFile::assemble_with_auth(
+                "annulet-i937",
+                AnnuletParams { fee_tier_s: 1, fee_tier_p: 2, fee_tier_r: 4, slot_secs: 10, max_empty_slots: 6 },
+                [0x5E; 32],
+                vec![RegistryLeafRecord::asset_zero()],
+                Vec::new(),
+                0,
+                auth,
+            )
+        };
+        let (g33, g34) = (file(L2AuthForm::CandidateA), file(L2AuthForm::CandidateAV3));
+        assert_eq!((g33.format_version, g34.format_version), (33, 34));
+        let (net33, net34) = (g33.hash(), g34.hash());
+        assert_ne!(net33, net34, "the format is in the bytes the net id hashes");
+        for (ours, theirs) in [(net33, net34), (net34, net33)] {
+            let (mut n0, peer, _hub) = node_and_raw_peer(stub_v5());
+            n0.set_net_id(ours);
+            peer.send(PeerId(1), &version_from(Some(theirs))).unwrap();
+            n0.tick(0);
+            assert!(n0.peers().get(PeerId(2)).is_none(), "the other format's peer is refused at the handshake");
+            assert_eq!(peer.poll(), vec![], "unanswered");
+        }
+    }
+
     /// A node never told its net cannot police one: with `set_net_id` never
     /// called the policy is inert on every vintage — which is what keeps every
     /// existing sim, stub and bench composition exactly as it was.
