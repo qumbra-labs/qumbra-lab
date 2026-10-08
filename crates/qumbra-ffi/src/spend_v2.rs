@@ -250,7 +250,9 @@ fn open_handle(w: &WalletState, journal: AuthJournal, g: u32) -> Result<AuthHand
         return Err(format!("generation {g} is retired: nothing of it is spent again"));
     }
     let wallet = w.wallet.clone();
-    let keys = LocalAuth::new(&wallet.auth_secret(), g, rec.next)?;
+    // The handle's cached tree (PR 3g): the scan or the check built it.
+    let tree = w.gen_tree(g);
+    let keys = LocalAuth::from_tree(tree.master, Arc::clone(&tree.tree), rec.next)?;
     if keys.auth_root() != rec.auth_root {
         return Err(format!(
             "auth.v1's root for generation {g} is not this wallet's tree: the journal was edited or belongs to another \

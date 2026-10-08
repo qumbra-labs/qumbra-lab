@@ -434,3 +434,23 @@ fn the_device_half_s_shape_constants_are_the_prover_s() {
     }
     const { assert!(crate::PROVER_LINKED) };
 }
+
+/// Lab #924 PR 3g: a signer over a tree already built is the signer `new`
+/// builds — the same root, the same next paths, the same (deterministic)
+/// signature bytes over one intent.
+#[test]
+fn a_signer_from_a_built_tree_is_the_one_new_builds() {
+    let f = fixture_r();
+    let sk = [0x53; 32];
+    let built = LocalAuth::new(&sk, 0, 0).unwrap();
+    let master = auth_master(&sk, 0);
+    let shared = LocalAuth::from_tree(master, std::sync::Arc::clone(&built.tree), 0).unwrap();
+    assert_eq!(shared.auth_root(), built.auth_root());
+    assert_eq!(shared.peek(2), built.peek(2));
+    assert_eq!(
+        sign_locally(&f.intent, &shared, &[]).unwrap(),
+        sign_locally(&f.intent, &built, &[]).unwrap()
+    );
+    let later = LocalAuth::from_tree(master, std::sync::Arc::clone(&built.tree), 5).unwrap();
+    assert_eq!(later.next(), 5);
+}

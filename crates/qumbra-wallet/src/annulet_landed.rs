@@ -167,13 +167,14 @@ pub fn restore_generations(
 pub struct GenTree {
     pub g: u32,
     pub master: Hash32,
-    pub tree: AuthTree,
+    /// Shared with a signer built from it (`LocalAuth::from_tree`, PR 3g).
+    pub tree: std::sync::Arc<AuthTree>,
 }
 
 impl GenTree {
     pub fn build(wallet: &Wallet, g: u32) -> Self {
         let master = auth_master(&wallet.auth_secret(), g);
-        let tree = AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth");
+        let tree = std::sync::Arc::new(AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth"));
         GenTree { g, master, tree }
     }
 

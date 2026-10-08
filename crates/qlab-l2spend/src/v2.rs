@@ -752,7 +752,9 @@ pub fn attach(tx: &mut TxEntry, section: &AnnuletAuthSection) -> Result<(), Auth
 /// wallet does the same steps on the device.
 pub struct LocalAuth {
     master: Hash32,
-    tree: AuthTree,
+    /// Shared, so a wallet that already built the generation's tree (its scan
+    /// did) hands it over instead of building it again ([`LocalAuth::from_tree`]).
+    tree: std::sync::Arc<AuthTree>,
     cursor: Cursor,
 }
 
@@ -764,8 +766,21 @@ impl LocalAuth {
         let master = auth_master(sk, generation);
         let depth = D_AUTH as u8;
         Ok(Self {
-            tree: AuthTree::build(&master, depth)?,
+            tree: std::sync::Arc::new(AuthTree::build(&master, depth)?),
             cursor: Cursor::new(&master, depth, next)?,
+            master,
+        })
+    }
+
+    /// [`LocalAuth::new`] over a tree already built (lab #924 PR 3g): `tree`
+    /// must be `AuthTree::build(&master, D_AUTH)` for this `master` — the
+    /// caller checks the result's [`LocalAuth::auth_root`] against the root it
+    /// recorded. The same keys, paths and signatures as `new`, without the
+    /// `2^D_AUTH` key generations.
+    pub fn from_tree(master: Hash32, tree: std::sync::Arc<AuthTree>, next: u32) -> Result<Self, String> {
+        Ok(Self {
+            cursor: Cursor::new(&master, D_AUTH as u8, next)?,
+            tree,
             master,
         })
     }
