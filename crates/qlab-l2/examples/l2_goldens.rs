@@ -43,6 +43,25 @@ fn main() {
         println!("{shape:?} v2: shape_digest       {}", digest::hex(&d1));
         println!("{shape:?} v2: shape_digest deterministic in-process: {}", d1 == d2);
     }
+    // Lab #937: the v3 (third output) shapes, S and P, under `qumbra:l2:shape:v3`.
+    for shape in [Shape::S, Shape::P] {
+        let (k1, n1) = digest::constraints_digest_v3(shape);
+        let (k2, n2) = digest::constraints_digest_v3(shape);
+        let d1 = digest::shape_digest_v3(shape);
+        let d2 = digest::shape_digest_v3(shape);
+        println!(
+            "{shape:?} v3: width {} perms {} log_height {} pv_len {}",
+            qlab_l2::v3::width(shape),
+            qlab_l2::v3::perms(shape),
+            qlab_l2::v3::log_height(shape),
+            qlab_l2::v3::pv_len(shape)
+        );
+        println!("{shape:?} v3: constants_digest   {}", digest::hex(&digest::constants_digest_v3(shape)));
+        println!("{shape:?} v3: constraints_digest {} ({n1} constraints)", digest::hex(&k1));
+        println!("{shape:?} v3: constraints deterministic in-process: {}", k1 == k2 && n1 == n2);
+        println!("{shape:?} v3: shape_digest       {}", digest::hex(&d1));
+        println!("{shape:?} v3: shape_digest deterministic in-process: {}", d1 == d2);
+    }
     let pv_s = fixture::shape_s().pvs;
     let pv_p = fixture::shape_p().pvs;
     println!("const GOLDEN_PV_S: [u32; {}] = {:?};", pv_s.len(), pv_s);

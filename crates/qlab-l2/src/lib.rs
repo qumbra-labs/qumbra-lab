@@ -49,6 +49,7 @@ pub use qlab_air::l2r::{
 pub mod claim;
 pub mod digest;
 pub mod v2;
+pub mod v3;
 pub mod fixture;
 
 // ---------------------------------------------------------------------------
