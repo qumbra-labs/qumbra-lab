@@ -574,6 +574,56 @@ mod tests {
         assert_eq!(opened[devnet::STOCK_NOTES as usize].rkm, devnet::rkm_v2(devnet::HOLDER_SK, devnet::HOLDER_D));
     }
 
+    /// The format-34 devnet and rehearsal genesis hashes (lab #937): from
+    /// `qumbra-node genesis annulet-devnet --v3` / `--v3 --rehearsal`, each run
+    /// twice, byte-identical (print-then-pin). `None` until that run.
+    const DEVNET_V3_GENESIS_HASH: Option<&str> = None;
+    const DEVNET_V3_REHEARSAL_GENESIS_HASH: Option<&str> = None;
+
+    /// The format-34 devnet genesis: format 34 on the `CandidateAV3` axis,
+    /// deterministic, verifies, and is the v2 devnet in every field but the
+    /// format, the network name and the genesis-body domain (so the same
+    /// notes, keys and registry).
+    #[test]
+    fn annulet_devnet_v3_genesis_hash_is_pinned() {
+        use qlab_devnet::forms::{L2AuthForm, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION};
+        for (name, build, v2, pin) in [
+            (
+                "devnet_v3",
+                AnnuletGenesisFile::devnet_v3 as fn() -> AnnuletGenesisFile,
+                AnnuletGenesisFile::devnet_v2 as fn() -> AnnuletGenesisFile,
+                DEVNET_V3_GENESIS_HASH,
+            ),
+            (
+                "devnet_v3_rehearsal",
+                AnnuletGenesisFile::devnet_v3_rehearsal,
+                AnnuletGenesisFile::devnet_v2_rehearsal,
+                DEVNET_V3_REHEARSAL_GENESIS_HASH,
+            ),
+        ] {
+            let (a, v2) = (build(), v2());
+            assert_eq!(a.to_bytes(), build().to_bytes(), "{name}: deterministic");
+            println!("{name}: {} bytes, hash {}", a.to_bytes().len(), a.hash_hex());
+            assert_eq!(a.format_version, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, "{name}");
+            assert_eq!(leading_format_version(&a.to_bytes()), Some(ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION), "{name}");
+            assert_eq!(a.l2_auth().unwrap(), L2AuthForm::CandidateAV3, "{name}");
+            assert_eq!(
+                a.auth_context().unwrap(),
+                qlab_devnet::annulet::AuthContext::candidate_a_v3(a.hash()),
+                "{name}"
+            );
+            a.verify(None).expect("verifies");
+            assert_eq!(a.registry_genesis, v2.registry_genesis, "{name}: v2's registry");
+            assert_eq!(a.params, v2.params, "{name}: v2's parameters");
+            assert_eq!(a.genesis_notes, v2.genesis_notes, "{name}: v2's notes");
+            assert_ne!(a.genesis_header, v2.genesis_header, "{name}: the genesis body commits under the v3 domain");
+            assert_ne!(a.hash_hex(), v2.hash_hex(), "{name}");
+            let pin = pin.expect("pinned (print-then-pin: see the doc comment)");
+            a.verify(Some(pin)).expect("verifies and pins itself");
+            assert_eq!(a.hash_hex(), pin, "{name}");
+        }
+    }
+
     /// The dev keys' v2 `rkm` is the wallet's own derivation — `auth_secret`
     /// the wallet's rule, the root the shared `generation_root`, the hash the
     /// circuit's — so a wallet holding a dev key finds these notes.

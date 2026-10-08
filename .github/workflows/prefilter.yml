@@ -101,6 +101,8 @@ jobs:
           cargo test -p qlab-node --lib --locked -- --test-threads=1 blocks_log_is_append_only_in_every_production_source
           # qumbra-node, lab #706: GenesisForm is matched exhaustively everywhere, never == / != / a catch-all arm (+ the scanner's own self-test)
           cargo test -p qumbra-node --test genesis_form_exhaustive --locked -- --test-threads=1
+          # qumbra-node, lab #937: no == / != / matches! against L2AuthForm::CandidateA outside an explicit allowlist — format 34 is CandidateAV3, so say has_auth() / sp_outputs() / match (+ the scanner's own self-test)
+          cargo test -p qumbra-node --test l2_auth_form_comparisons --locked -- --test-threads=1
           # qumbra-node, lab #238 (and #145): every ctrlc declaration is the workspace entry, which keeps `termination`
           cargo test -p qumbra-node --test ctrlc_pairing --locked -- --test-threads=1
           # qumbra-node, lab #785: no source calls the wrapper rule's test knobs; the knobs sit directly under their feature gate

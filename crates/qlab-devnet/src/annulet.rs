@@ -909,7 +909,7 @@ mod tests {
             let body = BlockBody { txs: vec![l2_tx(9, &s_surface()), tx(nf, cm)], ..BlockBody::default() };
             assert_eq!(crate::body::check_tx_entry_counts(&body), Err(BodyError::TxEntriesOverByte { index: 1 }));
             let header = header_for(&BlockBody::default());
-            for ctx in [AuthContext::NONE, AuthContext::candidate_a([0x6E; 32])] {
+            for ctx in [AuthContext::NONE, AuthContext::candidate_a([0x6E; 32]), AuthContext::candidate_a_v3([0x6E; 32])] {
                 assert_eq!(
                     validate_body_annulet_for(&header, &body, &OkProof, |r| *r == FINAL, &FEES, &ctx),
                     Err(BodyError::TxEntriesOverByte { index: 1 }),

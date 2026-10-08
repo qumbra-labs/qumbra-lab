@@ -1118,13 +1118,121 @@ mod tests {
         }
     }
 
-    /// The genesis axis selects the verifier: Candidate A → v2, `None` → v1.
+    // ------------------------------------------------ lab #937: format 34 (v3)
+
+    /// One real v3 shape-S proof (2^20, three outputs) over the fabricated v3
+    /// instance — shared by the v3 tests here (one prove per lane run).
+    fn s_v3_proof() -> &'static (qlab_air::l2::L2BucketInstanceV3, Proof<Config>) {
+        static P: std::sync::OnceLock<(qlab_air::l2::L2BucketInstanceV3, Proof<Config>)> = std::sync::OnceLock::new();
+        P.get_or_init(|| {
+            let inst = qlab_air::l2::fabricated_bucket_l2_v3();
+            let (_pvs, proof) = qlab_l2::v3::prove_s(&inst.air, &inst.pvs);
+            (inst, proof)
+        })
+    }
+
+    fn s_v3_entry() -> TxEntry {
+        let (i, proof) = s_v3_proof();
+        let mut e = l2_entry(
+            &i.anchor,
+            &[i.nf[0], i.nf[1]],
+            &i.nf[2],
+            &[i.cm_out[0], i.cm_out[1]],
+            &i.registry_root,
+            10,
+            qlab_devnet::annulet::L2ShapeTag::S,
+            None,
+            proof,
+        );
+        e.public.commitments.push(h32(&i.cm_out[2]));
+        e.auth = auth_section(&i.leaves);
+        e
+    }
+
+    /// A format-34 transaction verifies under the v3 verifier; its third
+    /// output commitment is bound (tampered, or swapped with the second, it
+    /// is refused by the STARK), as are its leaves.
+    #[test]
+    fn the_v3_verifier_accepts_a_real_v3_s_proof_and_binds_the_third_output() {
+        assert_eq!(L2VerifierV3.check(&s_v3_entry()), Ok(()));
+        let mut e = s_v3_entry();
+        e.public.commitments[2][0] ^= 1;
+        assert_eq!(L2VerifierV3.check(&e), Err(L2VerifyError::ProofInvalid), "cm3");
+        let mut e = s_v3_entry();
+        e.public.commitments.swap(1, 2);
+        assert_eq!(L2VerifierV3.check(&e), Err(L2VerifyError::ProofInvalid), "cm2/cm3 swapped");
+        let (i, _) = s_v3_proof();
+        let mut leaves = i.leaves;
+        leaves[2][0] ^= 1;
+        let mut e = s_v3_entry();
+        e.auth = auth_section(&leaves);
+        assert_eq!(L2VerifierV3.check(&e), Err(L2VerifyError::ProofInvalid), "leaf 3");
+    }
+
+    /// Lab #937 (D1 §1, ruled): a format-34 net takes only S/P v3 and a
+    /// format-33 net only S/P v2 — the other's spend refused **by name**,
+    /// before the proof, both directions; v1 still refuses either by its
+    /// section.
+    #[test]
+    fn v2_and_v3_spends_are_refused_by_name_on_the_other_format() {
+        assert_eq!(L2VerifierV3.check(&s_v2_entry()), Err(L2VerifyError::V2SpendOnV3Net));
+        assert_eq!(L2VerifierV2.check(&s_v3_entry()), Err(L2VerifyError::V3SpendOnV2Net));
+        assert_eq!(L2Verifier.check(&s_v3_entry()), Err(L2VerifyError::AuthOnV1Net));
+        assert_eq!(L2VerifierV3.check(&s_entry()), Err(L2VerifyError::AuthMissing));
+        // The name is decided by the declared arity, not by the proof: a
+        // v3 surface carrying garbage proof bytes still names itself.
+        let mut e = s_v3_entry();
+        e.proof = vec![0xff; 8];
+        assert_eq!(L2VerifierV2.check(&e), Err(L2VerifyError::V3SpendOnV2Net));
+        // Other arities stay `WrongArity` on the v3 net.
+        let mut e = s_v3_entry();
+        e.public.commitments.push([7; 32]);
+        assert_eq!(L2VerifierV3.check(&e), Err(L2VerifyError::WrongArity));
+    }
+
+    /// The node's v3 PV vector is the AIR crate's: v2's then `cm3` at
+    /// `qlab_l2::v3::pv_cm3`, of `pv_len` — host-only, S and P.
+    #[test]
+    fn the_v3_pv_vector_is_the_air_crates_layout() {
+        use qlab_l2::{v3, Shape};
+        let w = |k: u64| [k, k + 1, k + 2, k + 3];
+        let leaves = [w(100), w(200), w(300)];
+        let cm3 = w(400);
+        let with_cm3 = |mut v: Vec<u32>| {
+            v.extend_from_slice(&qlab_air::narrow::pv_chunks(&cm3));
+            v
+        };
+        let s = with_cm3(with_leaves(qlab_l2::pv_vec_s(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &w(8)), &leaves));
+        assert_eq!(s, qlab_air::l2::pv_vec_l2_v3(&w(1), &w(2), &w(3), &[w(4), w(5), cm3], 6, &w(7), &w(8), &leaves));
+        let t = [
+            qlab_devnet::annulet::VPublicTerm { redeem: true, amount: 0x0001_0002_0003_0004, asset: 9 },
+            qlab_devnet::annulet::VPublicTerm::NONE,
+        ];
+        let p = with_cm3(with_leaves(
+            qlab_l2::pv_vec_p(&w(1), &w(2), &w(3), &w(4), &w(5), 6, &w(7), &vpublic(&t), &vpublic_assets(&t), &w(8), &w(9)),
+            &leaves,
+        ));
+        assert_eq!(
+            p,
+            qlab_air::l2p::pv_vec_l2p_v3(&w(1), &w(2), &w(3), &[w(4), w(5), cm3], 6, &w(7), &vpublic(&t), &vpublic_assets(&t), &w(8), &w(9), &leaves)
+        );
+        for (shape, pvs) in [(Shape::S, &s), (Shape::P, &p)] {
+            assert_eq!(pvs.len(), v3::pv_len(shape), "{shape:?}");
+            assert_eq!(&pvs[v3::pv_cm3(shape)..], &qlab_air::narrow::pv_chunks(&cm3), "{shape:?} cm3");
+        }
+    }
+
+    /// The genesis axis selects the verifier: Candidate A → v2, format 34 →
+    /// v3, `None` → v1.
     #[test]
     fn select_verifier_follows_the_l2_authorization_axis() {
         use qlab_devnet::forms::{GenesisForm, L2AuthForm};
         let (v, log) = select_verifier(false, GenesisForm::Annulet, L2AuthForm::CandidateA);
         assert!(matches!(v, NodeVerifier::L2V2(_)));
         assert!(log.contains("Candidate A"), "{log}");
+        let (v, log) = select_verifier(false, GenesisForm::Annulet, L2AuthForm::CandidateAV3);
+        assert!(matches!(v, NodeVerifier::L2V3(_)));
+        assert!(log.contains("format 34"), "{log}");
         let (v, _) = select_verifier(false, GenesisForm::Annulet, L2AuthForm::None);
         assert!(matches!(v, NodeVerifier::L2(_)));
         // Rehearsal stays an explicit opt-in on either axis.

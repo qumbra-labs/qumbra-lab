@@ -675,3 +675,97 @@ fn an_expiring_transaction_is_evicted_when_the_tip_passes_it() {
         "the next landing height (2) is past its window: evicted"
     );
 }
+
+// ------------------------------------------------ lab #937: format 34
+
+const CTX_V3: AuthContext = AuthContext::candidate_a_v3(GENESIS_HASH);
+
+/// [`unsigned_tx`] with a third output commitment — a format-34 S spend.
+fn unsigned_tx_v3(anchor: Hash32, nf: u8) -> TxEntry {
+    let mut t = unsigned_tx(anchor, nf);
+    t.public.commitments.push([nf.wrapping_add(201); 32]);
+    t.discovery = qlab_devnet::annulet::placeholder_discovery_annulet(&t.public.commitments);
+    t
+}
+
+/// Sign `t` for the net `ctx` names (its intent binds `ctx`'s format).
+fn authorize_for(ctx: &AuthContext, mut t: TxEntry, seed: u8) -> TxEntry {
+    use qlab_remote_auth::annulet::AnnuletAuthSection;
+    use qlab_remote_auth::mldsa::Key;
+    let keys: Vec<Key> = (0..3u8).map(|i| Key::from_seed([seed.wrapping_add(i); 32])).collect();
+    let descriptors: Vec<_> = keys.iter().enumerate().map(|(i, k)| k.descriptor(i as u32)).collect();
+    let intent = intent_for(&t, ctx.genesis_format(), &ctx.genesis_hash, VALID_UNTIL, &descriptors)
+        .expect("the intent rebuilds");
+    let refs: Vec<&Key> = keys.iter().collect();
+    t.auth = AnnuletAuthSection::sign(&intent, &refs).and_then(|s| s.encode()).expect("signs");
+    t
+}
+
+/// Lab #937: on a format-34 net `check_auth` admits a three-output spend
+/// signed over the format-34 intent (which binds all three commitments) and
+/// refuses the other format's spend by its output count, both directions;
+/// presence is the same rule as on 33.
+#[test]
+fn check_auth_on_format_34_binds_three_outputs_and_refuses_the_other_format() {
+    use qlab_devnet::annulet::IntentError;
+    let anchor = [0x11; 32];
+    let t3 = authorize_for(&CTX_V3, unsigned_tx_v3(anchor, 8), 0x80);
+    assert_eq!(check_auth(&t3, &CTX_V3, 1), Ok(Some(VALID_UNTIL)));
+    // The third commitment is signed: changed after signing, refused.
+    let mut m = t3.clone();
+    m.public.commitments[2][0] ^= 1;
+    assert_eq!(check_auth(&m, &CTX_V3, 1), Err(bad_sig(0)), "cm3");
+    // The other format's spend, by its output count, both directions.
+    assert_eq!(
+        check_auth(&t3, &ctx(), 1),
+        Err(AuthRefusal::Intent(IntentError::Commitments { got: 3 })),
+        "a three-output spend on format 33"
+    );
+    let t2 = signed_tx(anchor, 8);
+    assert_eq!(
+        check_auth(&t2, &CTX_V3, 1),
+        Err(AuthRefusal::Intent(IntentError::Commitments { got: 2 })),
+        "a two-output spend on format 34"
+    );
+    // Presence: the same rule as format 33.
+    assert_eq!(check_auth(&unsigned_tx_v3(anchor, 8), &CTX_V3, 1), Err(AuthRefusal::AuthMissing));
+    assert_eq!(check_auth(&t3, &AuthContext::NONE, 1), Err(AuthRefusal::AuthOnV1Net));
+}
+
+/// Lab #937: a format-34 node's pool admits a signed three-output spend
+/// and refuses a two-output one by name before any signature work
+/// (`L2V2SpendOnV3Net`); a format-33 node refuses the three-output spend
+/// the same way (`L2V3SpendOnV2Net`).
+#[test]
+fn the_pools_refuse_the_other_formats_spend_by_name() {
+    use qlab_devnet::body::BodyError;
+    let make = |ctx: AuthContext| {
+        let ext = AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: root() };
+        let g = BlockHeader::genesis_annulet(ext, genesis_body_commitment_annulet_for(&[], ctx.form), 0);
+        NodeAdapter::annulet_with_auth(
+            g,
+            &[],
+            FEES,
+            &registry(),
+            key().verifying_key(),
+            KeccakPow,
+            MockProofVerifier,
+            SimConfig::default(),
+            ctx,
+        )
+    };
+    let mut v3: Adapter = make(CTX_V3);
+    let anchor = v3.state().commitment_root();
+    v3.submit_tx_typed(authorize_for(&CTX_V3, unsigned_tx_v3(anchor, 8), 0x80))
+        .expect("a format-34 node admits a signed three-output S spend");
+    assert_eq!(
+        v3.submit_tx_typed(signed_tx(anchor, 9)).err(),
+        Some(TxSubmitRefusal::Pool(MempoolError::L2SurfaceInvalid(BodyError::L2V2SpendOnV3Net { index: 0 })))
+    );
+    let mut v2: Adapter = make(ctx());
+    let anchor = v2.state().commitment_root();
+    assert_eq!(
+        v2.submit_tx_typed(authorize_for(&CTX_V3, unsigned_tx_v3(anchor, 8), 0x80)).err(),
+        Some(TxSubmitRefusal::Pool(MempoolError::L2SurfaceInvalid(BodyError::L2V3SpendOnV2Net { index: 0 })))
+    );
+}

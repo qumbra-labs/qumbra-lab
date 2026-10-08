@@ -77,3 +77,31 @@ fn b_on_a_v1_net_the_empty_list_is_the_old_scan() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Lab #937: a format-34 genesis (three-output S/P) is refused **by name**
+/// at genesis verification — the one gate every scan, send and the driver
+/// pass — until the three-output wallet path lands (lab #937 PR C). The same
+/// file on format 33 verifies.
+#[test]
+fn z_a_format_34_genesis_is_refused_by_name_until_pr_c() {
+    use qumbra_wallet::annulet_verify::{genesis_from_bytes, VerifyRefusal};
+    let w = wallet_dir("v2scan_z34", 0x61);
+    let wallet = w.wallet();
+    let holder = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 0));
+    let v2 = genesis_v2(&holder, Vec::new());
+    let v3 = qlab_node::annulet_genesis::AnnuletGenesisFile::assemble_with_auth(
+        "annulet-ad1-v3",
+        v2.params,
+        SEQ_SEED,
+        v2.registry_genesis.clone(),
+        v2.genesis_notes.clone(),
+        0,
+        L2AuthForm::CandidateAV3,
+    );
+    assert_eq!(v3.format_version, 34);
+    let bytes = v3.to_bytes();
+    let refusal = genesis_from_bytes(v3.hash(), &bytes).err();
+    assert_eq!(refusal, Some(VerifyRefusal::FormatNotSupported { format_version: 34 }));
+    assert!(refusal.unwrap().to_string().contains("lab #937 PR C"));
+    assert!(genesis_from_bytes(v2.hash(), &v2.to_bytes()).is_ok(), "format 33 still verifies");
+}
