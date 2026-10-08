@@ -309,7 +309,8 @@ const SG3_COL: usize = SEL_O3A_COL + 1; // 862
 const O3F_COL: usize = SG3_COL + 1; // 863
 /// `AG[o3] · o3f`.
 const SF3_COL: usize = O3F_COL + 1; // 864
-/// The fee bank's carry encodings (v3): three carries, 2 bits each, `c + 2`.
+/// The fee bank's carry encodings (v3): three carries, 2 bits each, `c + 2`
+/// — encoding range −2..=1, honest values {−1, 0} (shape S's argument).
 const FBC_OFF: usize = SF3_COL + 1; // 865: 6
 /// The shape-P v3 trace width.
 pub const L2P_WIDTH_V3: usize = FBC_OFF + 6; // 871
@@ -1532,7 +1533,8 @@ where
         if self.is_v3() {
             // Lab #937 A′: shape S's fee-bank chain, verbatim — the bank is
             // `v(fee note) − o3f·v(O3)`, closed against `(1 − d3)·fee` with
-            // carries in {−2, −1, 0} (the argument is at shape S's close).
+            // carries encoded −2..=1, honest {−1, 0} (the argument is at
+            // shape S's close).
             let fcarry = |j: usize| -> AB::Expr {
                 local[FBC_OFF + 2 * j].clone() + local[FBC_OFF + 2 * j + 1].clone() * two.clone()
                     - two.clone()

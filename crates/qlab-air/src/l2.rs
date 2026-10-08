@@ -315,7 +315,7 @@ const O3F_COL: usize = SG3_COL + 1; // 780
 /// `AG[o3] · o3f`, materialized like `SG3`.
 const SF3_COL: usize = O3F_COL + 1; // 781
 /// The fee bank's carry encodings (v3): three carries, 2 bits each, `c + 2`
-/// (`c ∈ {−2, −1, 0}`; see the fee-bank close).
+/// — encoding range −2..=1, honest values {−1, 0} (see the fee-bank close).
 const FBC_OFF: usize = SF3_COL + 1; // 782: 6
 /// The shape-S v3 trace width.
 pub const L2_WIDTH_V3: usize = FBC_OFF + 6; // 788
