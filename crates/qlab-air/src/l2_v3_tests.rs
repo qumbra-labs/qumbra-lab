@@ -301,6 +301,40 @@ fn l2v3_carry_of_minus_three_satisfies() {
     l2test::assert_satisfied(&inst.air, &trace, &pvs_f(&inst.pvs), "carry −3");
 }
 
+/// c = −4 is not encodable: the three carry bits are boolean, so `c = enc −
+/// 3 ≥ −3`. A carry block set to encode −4 (bit 0 = −1) is refused at the
+/// balance close row.
+#[test]
+fn l2v3_neg_carry_of_minus_four_is_refused() {
+    let fx = canonical();
+    let row = close_row(slot_of(&fx.inst.air.program, ROLE_BAL, 0));
+    for off in [BLC_OFF, BLC2_OFF] {
+        for j in 0..3 {
+            let mut bad = fx.trace.clone();
+            let w = bad.width();
+            bad.values[row * w + off + 3 * j] = -F::ONE;
+            bad.values[row * w + off + 3 * j + 1] = F::ZERO;
+            bad.values[row * w + off + 3 * j + 2] = F::ZERO;
+            assert!(
+                !l2test::violations_at(&fx.inst.air, &bad, &pvs_f(&fx.inst.pvs), row).is_empty(),
+                "carry block {off}+{j} encoding −4 VERIFIED"
+            );
+        }
+    }
+}
+
+/// The honest generator fails loudly on a carry outside −3..=4 instead of
+/// clamping it: five debits' worth on one row (here an unbalanced witness
+/// whose chunk 0 needs c = −4) panics, naming the chunk.
+#[test]
+#[should_panic(expected = "chunk 0: c = -4")]
+fn l2v3_generator_refuses_an_unencodable_carry() {
+    let m = 0xffff;
+    // Chunk 0: 0 − 3·0xffff − 0xffff = −262140 → c₀ = −4.
+    let inst = one_real_with(1 << 18, [out(0x7777, m, 0), out(0x8888, m, 0), out(0x9999, m, 0)], m);
+    let _ = inst.air.generate_trace::<F>(0);
+}
+
 // ------------------------------------------------------------------ PV negatives
 
 /// `PV_CM3` is bound at the second `BCM2`'s close; `PV_CM2` at the first's

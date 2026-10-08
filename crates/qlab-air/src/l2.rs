@@ -3248,9 +3248,17 @@ impl L2ShapeSAir {
                         cc[j] = tj >> 16;
                         prev = cc[j];
                     }
-                    // v3 carries are biased by 3 (a fourth debit per row).
+                    // v3 carries are biased by 3 (a fourth debit per row), and
+                    // an out-of-range carry fails loudly rather than clamping:
+                    // an honest v3 witness keeps every carry in [−3, 1].
                     let bias = if v3 { 3 } else { 2 };
                     for (j, cj) in cc.iter().enumerate() {
+                        if v3 {
+                            assert!(
+                                (0..=7).contains(&(cj + bias)),
+                                "v3 balance carry out of range at row {t}, chunk {j}: c = {cj} (encodable: −3..=4)"
+                            );
+                        }
                         let enc = (cj + bias).clamp(0, 7) as u32;
                         for bb in 0..3 {
                             row[off + 3 * j + bb] = F::from_u32((enc >> bb) & 1);
