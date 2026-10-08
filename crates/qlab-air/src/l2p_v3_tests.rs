@@ -125,7 +125,7 @@ fn l2pv3_v1_v2_geometry_is_unchanged() {
 
 #[test]
 fn l2pv3_geometry() {
-    assert_eq!((SHAPE_P_PERMS_V3, PROGRAM_SLOTS_V3, L2P_WIDTH_V3), (291, 292, 863));
+    assert_eq!((SHAPE_P_PERMS_V3, PROGRAM_SLOTS_V3, L2P_WIDTH_V3), (291, 292, 871));
     assert_eq!((PV_CM3, PV_LEN_V3), (PV_LEN_V2, PV_LEN_V2 + 16));
     let v3 = L2ShapePAir::chain_only_v3(SHAPE_P_LOG_HEIGHT);
     assert!(v3.is_v2() && v3.is_v3());
@@ -364,6 +364,75 @@ fn l2pv3_neg_om2_not_set() {
         !l2test::violations_at(&fx.inst.air, &bad, &pvs_f(&fx.inst.pvs), b1).is_empty(),
         "P OM2 held at 0 VERIFIED"
     );
+}
+
+// ------------------------------------------------------------------ o3f (A′)
+
+/// Lab #937 A′: shape S's fee-bank spend in P — two asset-7 notes, a fee
+/// note of 13 paying the fee 10 and an asset-0 output 3 of 3 (the prover's
+/// fee) through the bank; `o3a` off.
+#[test]
+fn l2pv3_o3f_prover_fee_beside_two_notes_of_one_asset_satisfies() {
+    let inst = fabricated_bucket_l2p_v3_prover_fee();
+    assert!(inst.air.sel_o3f && !inst.air.sel_o3a && !inst.air.d3 && inst.air.sel_q);
+    assert_sat(&inst, "P o3f prover fee");
+}
+
+/// Without `o3f` the same P spend is unprovable under either `o3a`.
+#[test]
+fn l2pv3_neg_asset_0_third_output_beside_two_asset_7_notes_needs_o3f() {
+    for o3a in [true, false] {
+        let mut inst = fabricated_bucket_l2p_v3_prover_fee();
+        inst.air.sel_o3f = false;
+        inst.air.sel_o3a = o3a;
+        let row = bal_row(&inst);
+        refused_at(&inst, row, &format!("P asset-0 output 3 in a row, o3a = {o3a}"));
+    }
+}
+
+/// The fee note one short of / one over fee + v(O3): refused at P's bank.
+#[test]
+fn l2pv3_neg_o3f_fee_note_not_fee_plus_output() {
+    let outs = [mk_out_p(0x3333, 100, 7), mk_out_p(0x4444, 10, 7), mk_out_p(0x5555, 3, 0)];
+    for note in [12, 14] {
+        let inst = fabricated_bucket_l2p_v3_fee_bank(note, outs, 10);
+        assert!(inst.air.sel_o3f);
+        let row = bal_row(&inst);
+        refused_at(&inst, row, &format!("P fee note {note} for 10 + 3"));
+    }
+}
+
+/// `o3f` with output 3 of asset 7: refused at P's balance close.
+#[test]
+fn l2pv3_neg_o3f_output_of_a_nonzero_asset() {
+    let mut inst =
+        fabricated_bucket_l2p_v3_fee_bank(13, [mk_out_p(0x3333, 100, 7), mk_out_p(0x4444, 10, 7), mk_out_p(0x5555, 3, 7)], 10);
+    assert!(!inst.air.sel_o3f);
+    inst.air.sel_o3f = true;
+    inst.air.sel_o3a = false;
+    let row = bal_row(&inst);
+    refused_at(&inst, row, "P o3f, output 3 of asset 7");
+}
+
+/// `o3f` beside a dummy slot 3, and `o3f` with `o3a`: both refused on row 0
+/// of the canonical trace (the two gates are ungated).
+#[test]
+fn l2pv3_neg_o3f_with_d3_or_o3a() {
+    let fx = canonical();
+    assert!(fx.inst.air.d3);
+    let w = fx.trace.width();
+    let mut bad = fx.trace.clone();
+    for r in 0..bad.height() {
+        bad.values[r * w + O3F_COL] = F::ONE;
+    }
+    assert!(!l2test::violations_at(&fx.inst.air, &bad, &pvs_f(&fx.inst.pvs), 0).is_empty(), "P o3f ∧ d3 VERIFIED");
+    // With d3 cleared too, `o3f ∧ o3a` alone (the canonical `o3a` is on).
+    assert!(fx.inst.air.sel_o3a);
+    for r in 0..bad.height() {
+        bad.values[r * w + D3_COL] = F::ZERO;
+        bad.values[r * w + L3D3_COL] = F::ZERO;
+    }
+    assert!(!l2test::violations_at(&fx.inst.air, &bad, &pvs_f(&fx.inst.pvs), 0).is_empty(), "P o3f ∧ o3a VERIFIED");
 }
 
 #[test]
