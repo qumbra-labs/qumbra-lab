@@ -140,7 +140,7 @@ pub fn verifier_air_r() -> l2r::L2ShapeRAir {
 /// Prove a v2 shape-S instance (its AIR and `u32` PVs) under the L2 lane.
 pub fn prove_s(air: &l2::L2ShapeSAir, pvs: &[u32]) -> (Vec<Val>, Proof<Config>) {
     assert!(
-        air.is_v2() && air.log_height == log_height(Shape::S),
+        air.version == l2::L2Version::V2Auth && air.log_height == log_height(Shape::S),
         "a v2 shape-S instance at 2^20"
     );
     let pvs = public_values(pvs);
