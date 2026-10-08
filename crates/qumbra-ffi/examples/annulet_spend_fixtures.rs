@@ -36,6 +36,11 @@
 //!                                  scan names the journal's generations
 //!                                  (restore and first: the probe 0..8)
 //!   <out>/check_stale/then_restore/  the restore the STALE status asks for
+//!   <out>/rotated_receive/         the rotated journal on a chain paying its
+//!                                  generation-1 address; only_g0/ holds the
+//!                                  same wallet's scan naming [0] alone, and
+//!                                  case.json's scan_only_g0 its basis (which
+//!                                  must miss that note)
 //!   <out>/SHA256SUMS               every file above, `sha256sum -c` form
 //!
 //! Run (a named local run, no prove):
@@ -116,6 +121,18 @@ fn chain(extra: Option<qlab_devnet::body::TxEntry>) -> (Endpoint, String, String
     let payee = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0)).encode();
     let _ = std::fs::remove_dir_all(&p.dir);
     (ep, payee, AuthJournal::fresh(root).to_text())
+}
+
+/// PR 3h: a payment of 7 fee units to the fixture wallet's GENERATION-1
+/// address 0 — an address only `qmb_auth_open_next` hands out
+/// (`qmb_wallet_address_v2(w, 0, 1)`).
+fn g1_payment() -> qlab_devnet::body::TxEntry {
+    let w = wallet_dir("spend_fixtures_g1", SEED);
+    let wallet = w.wallet();
+    let g1 = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 1));
+    let _ = std::fs::remove_dir_all(&w.dir);
+    let mut rng = StdRng::seed_from_u64(0x61);
+    pay_tx(&g1, &[note_to(&g1, 7, 0, 60)], 0x40, &mut rng)
 }
 
 /// The fixture wallet's two-generation journal: generation 0 (cursor 0) in
@@ -465,6 +482,11 @@ fn main() {
         std::fs::remove_dir_all(&scratch).unwrap();
         take_str(o)
     };
+    // rotated_receive (PR 3h): the same rotated journal on a chain where a
+    // note lands at height 2 on generation 1's address. A scan that names
+    // every journal generation ([0, 1]) owns it; one that names only [0]
+    // does not — the balance a shell loses by scanning too few generations.
+    let (received, _, _) = chain(Some(g1_payment()));
     for (name, chain_ep, open, journal_in) in [
         ("first_unspent", &ep, Open::First, None),
         ("restore_spent", &spent, Open::Restore, None),
@@ -472,6 +494,7 @@ fn main() {
         ("first_spent", &spent, Open::First, None),
         ("retired_revive", &ep, Open::Check(&retired, 0), Some(retired.as_str())),
         ("rotated_balance", &ep, Open::Check(&rotated, 0), Some(rotated.as_str())),
+        ("rotated_receive", &received, Open::Check(&rotated, 0), Some(rotated.as_str())),
     ] {
         let dir = out.join(name);
         let mut c = unsafe { auth_case(&dir, chain_ep, open, journal_in) };
@@ -482,8 +505,32 @@ fn main() {
             println!("  then_restore status {} keys {} {} ms", then["status"], then["keys"], then["wall_ms_native"]);
             c["then_restore"] = then;
         }
-        if name == "rotated_balance" {
+        if name == "rotated_balance" || name == "rotated_receive" {
             c["journal_in_made_by"] = json!("qmb_auth_open_next on the fresh journal, basis scanned at [0] on the unspent chain");
+        }
+        if name == "rotated_receive" {
+            // The same wallet's scan naming generation 0 alone, recorded into
+            // `only_g0/`: its basis must miss the generation-1 note.
+            let only_g0 = unsafe {
+                let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+                let (b, scan) = scan_basis(&dir.join("only_g0"), w, chain_ep, None, &[0]);
+                let basis: Value = serde_json::from_str(&take_str(qmb_spend_basis_summary(b))).unwrap();
+                qmb_spend_basis_free(b);
+                qmb_wallet_free(w);
+                json!({ "scan_generations": [0], "basis": basis, "scan": scan })
+            };
+            let g1_notes = |basis: &Value| {
+                basis["owned"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|n| n["generation"] == json!(1) && n["value"] == json!("7"))
+                    .count()
+            };
+            assert_eq!(g1_notes(&c["basis"]), 1, "the [0, 1] scan owns the generation-1 note: {}", c["basis"]);
+            assert_eq!(g1_notes(&only_g0["basis"]), 0, "the [0] scan does not: {}", only_g0["basis"]);
+            println!("  rotated_receive: g1 note owned by the [0,1] scan, not by the [0] scan");
+            c["scan_only_g0"] = only_g0;
         }
         std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
         println!("{name:<14} status {} keys {} {} ms{}", c["status"], c["keys"], c["wall_ms_native"], c["refusal"].as_str().map(|r| format!(" — {r}")).unwrap_or_default());
@@ -549,7 +596,7 @@ fn main() {
     // The seeds below are PUBLIC TEST CONSTANTS of this fixture, written so the
     // harness can replay the run — never a real wallet's, never to fund one.
     let manifest = json!({
-        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance) on a format-33 genesis. FIXTURE seeds only.",
+        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance / rotated receive) on a format-33 genesis. FIXTURE seeds only.",
         "lab_rev": rev,
         "wallet_entropy": hex(&[SEED; 32]),
         "payee_entropy": hex(&[PAYEE; 32]),
