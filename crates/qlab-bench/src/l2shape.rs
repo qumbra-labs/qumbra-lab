@@ -517,13 +517,29 @@ pub(crate) fn run_l2shape(power: &str, shape: &str, only: Option<&str>, pcs: Pcs
             sut.statement = P_V3_STATEMENT;
             sut
         }
+        // Lab #937 A′: the v3 shapes with output 3 through the fee bank
+        // (`o3f`: two notes of one asset, the prover's fee in asset 0).
+        "s-v3f" => {
+            let inst = qlab_air::l2::fabricated_bucket_l2_v3_prover_fee();
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut sut = shape_s_under_test("shape S v3 fee bank (3 real slots, o3f)", false, qlab_air::l2::SHAPE_S_PERMS_V3, inst.air, pvs);
+            sut.statement = S_V3_STATEMENT;
+            sut
+        }
+        "p-v3f" => {
+            let inst = qlab_air::l2p::fabricated_bucket_l2p_v3_prover_fee();
+            let pvs = qlab_l2::public_values(&inst.pvs);
+            let mut sut = shape_p_under_test("shape P v3 fee bank (3 real slots, o3f)", false, qlab_air::l2p::SHAPE_P_PERMS_V3, inst.air, pvs);
+            sut.statement = P_V3_STATEMENT;
+            sut
+        }
         "p19" => {
             let air = L2ShapePAir::chain_only(SHAPE_P_LOG_HEIGHT - 1);
             let pvs = vec![Val::ZERO; <L2ShapePAir as BaseAir<Val>>::num_public_values(&air)];
             shape_p_under_test("CANARY: shape-P AIR chain-only @ 2^19", true, 0, air, pvs)
         }
         other => {
-            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r|s3|p3 (or s|p|r with --v2, s|p with --v3)");
+            eprintln!("l2shape: unknown --shape `{other}`; expected s|s20|mock118|mock240|p|p19|r|s3|p3 (or s|p|r with --v2, s|p with --v3 [--fee-bank])");
             std::process::exit(2);
         }
     };

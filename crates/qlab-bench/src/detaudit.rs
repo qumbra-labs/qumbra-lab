@@ -661,6 +661,8 @@ pub(crate) fn run_detaudit(args: &[String]) {
             let inst = match f {
                 "house" => qlab_air::l2::fabricated_bucket_l2_v3(),
                 "exact" => qlab_air::l2::fabricated_bucket_l2_v3_exact_fee(),
+                // Lab #937 A′: output 3 through the fee bank (`o3f`).
+                "fee-bank" => qlab_air::l2::fabricated_bucket_l2_v3_prover_fee(),
                 other => bad_fixture("s3v3", other),
             };
             let pvs = qlab_l2::public_values(&inst.pvs);
@@ -670,6 +672,8 @@ pub(crate) fn run_detaudit(args: &[String]) {
             let inst = match f {
                 "house" => qlab_air::l2p::fabricated_bucket_l2p_v3(),
                 "exact" => qlab_air::l2p::fabricated_bucket_l2p_v3_exact_fee(),
+                // Lab #937 A′: output 3 through the fee bank (`o3f`).
+                "fee-bank" => qlab_air::l2p::fabricated_bucket_l2p_v3_prover_fee(),
                 other => bad_fixture("p3v3", other),
             };
             let pvs = qlab_l2::public_values(&inst.pvs);

@@ -304,8 +304,16 @@ const AG_O3_COL: usize = OM2_COL + 1; // 859
 const AC_O3_COL: usize = AG_O3_COL + 1; // 860
 const SEL_O3A_COL: usize = AC_O3_COL + 1; // 861
 const SG3_COL: usize = SEL_O3A_COL + 1; // 862
+/// `o3f` (lab #937 A′): output 3 is charged to the fee bank (shape S's
+/// `O3F_COL`, verbatim): the slot-3 fee note pays `fee + v(O3)`.
+const O3F_COL: usize = SG3_COL + 1; // 863
+/// `AG[o3] · o3f`.
+const SF3_COL: usize = O3F_COL + 1; // 864
+/// The fee bank's carry encodings (v3): three carries, 2 bits each, `c + 2`
+/// — encoding range −2..=1, honest values {−1, 0} (shape S's argument).
+const FBC_OFF: usize = SF3_COL + 1; // 865: 6
 /// The shape-P v3 trace width.
-pub const L2P_WIDTH_V3: usize = SG3_COL + 1; // 863
+pub const L2P_WIDTH_V3: usize = FBC_OFF + 6; // 871
 
 // Role codes 0..=16 are `l2.rs`'s (re-exported through the imports above);
 // 17..=22 are shape P's.
@@ -591,6 +599,8 @@ pub struct L2ShapePAir {
     pub xrkm: [u64; 4],
     /// v3: output 2 (the third) is accounted in row 1. Ignored below v3.
     pub sel_o3a: bool,
+    /// v3 (lab #937 A′): output 2 (the third) is charged to the fee bank.
+    pub sel_o3f: bool,
 }
 
 impl L2ShapePAir {
@@ -615,6 +625,7 @@ impl L2ShapePAir {
             asset: [0; 2],
             xrkm: [0; 4],
             sel_o3a: true,
+            sel_o3f: false,
         }
     }
 
@@ -1504,23 +1515,53 @@ where
             close.clone() * (AB::Expr::ONE - o2a) * (ac(AG_O2) - ac(AG_IN2)),
         );
         if self.is_v3() {
+            // Row 1 (`o3a`), the fee bank (`o3f`, asset 0) or row 2.
             let o3a = local[SEL_O3A_COL].clone();
+            let o3f = local[O3F_COL].clone();
             let ac3 = local[AC_O3_COL].clone();
             builder.assert_zero(close.clone() * o3a.clone() * (ac3.clone() - ac(AG_IN1)));
-            builder.assert_zero(close.clone() * (AB::Expr::ONE - o3a) * (ac3 - ac(AG_IN2)));
+            builder.assert_zero(
+                close.clone() * (AB::Expr::ONE - o3a - o3f.clone()) * (ac3.clone() - ac(AG_IN2)),
+            );
+            builder.assert_zero(close.clone() * o3f * ac3);
         }
         builder.assert_zero(close.clone() * d3.clone() * f1.clone() * ac(AG_IN1));
         builder.assert_zero(close.clone() * d3.clone() * (AB::Expr::ONE - f1) * ac(AG_IN2));
         // A4 — the fee input: asset 0 bit by bit; worth exactly the fee when
         // real, 0 when a dummy (the fee bank closes at `(1 − d3)·fee`).
         builder.assert_zero(inj(INJ_ACMF) * w(13));
-        for j in 0..4 {
+        if self.is_v3() {
+            // Lab #937 A′: shape S's fee-bank chain, verbatim — the bank is
+            // `v(fee note) − o3f·v(O3)`, closed against `(1 − d3)·fee` with
+            // carries encoded −2..=1, honest {−1, 0} (the argument is at
+            // shape S's close).
+            let fcarry = |j: usize| -> AB::Expr {
+                local[FBC_OFF + 2 * j].clone() + local[FBC_OFF + 2 * j + 1].clone() * two.clone()
+                    - two.clone()
+            };
+            let owed = |j: usize| (AB::Expr::ONE - d3.clone()) * pv(PV_FEE + j) * ep.clone();
             builder.assert_zero(
-                close.clone()
-                    * (local[FB_OFF + j].clone()
-                        - (AB::Expr::ONE - d3.clone()) * pv(PV_FEE + j) * ep.clone()),
+                close.clone() * (local[FB_OFF].clone() - owed(0) - w16.clone() * fcarry(0)),
             );
-            builder.when_first_row().assert_zero(local[FB_OFF + j].clone());
+            for j in 1..3 {
+                builder.assert_zero(
+                    close.clone()
+                        * (local[FB_OFF + j].clone() + fcarry(j - 1) - owed(j) - w16.clone() * fcarry(j)),
+                );
+            }
+            builder.assert_zero(close.clone() * (local[FB_OFF + 3].clone() + fcarry(2) - owed(3)));
+            for j in 0..4 {
+                builder.when_first_row().assert_zero(local[FB_OFF + j].clone());
+            }
+        } else {
+            for j in 0..4 {
+                builder.assert_zero(
+                    close.clone()
+                        * (local[FB_OFF + j].clone()
+                            - (AB::Expr::ONE - d3.clone()) * pv(PV_FEE + j) * ep.clone()),
+                );
+                builder.when_first_row().assert_zero(local[FB_OFF + j].clone());
+            }
         }
         builder.assert_bool(d3.clone());
         builder.assert_bool(local[L3_COL].clone());
@@ -1666,6 +1707,15 @@ where
             builder.assert_bool(local[OM2_COL].clone());
             builder.when_first_row().assert_zero(local[OM2_COL].clone());
             builder.when_first_row().assert_zero(local[AC_O3_COL].clone());
+            // Lab #937 A′: `o3f` — bool, `⇒ d3 = 0`, `⇒ ¬o3a`, `SF3 = AG[o3]·o3f`.
+            let o3f = local[O3F_COL].clone();
+            builder.assert_bool(o3f.clone());
+            builder.assert_zero(o3f.clone() * local[D3_COL].clone());
+            builder.assert_zero(o3f.clone() * local[SEL_O3A_COL].clone());
+            builder.assert_eq(local[SF3_COL].clone(), local[AG_O3_COL].clone() * o3f);
+            for k in 0..6 {
+                builder.assert_bool(local[FBC_OFF + k].clone());
+            }
         }
 
         // --- Transition constraints ---
@@ -1795,8 +1845,9 @@ where
                     * pw.clone()
                     * v.clone();
             if self.is_v3() {
+                // Output 3: row 1 under `o3a`, neither row under `o3f`, else row 2.
                 row1 -= local[SG3_COL].clone() * pw.clone() * v.clone();
-                row2 -= (local[AG_O3_COL].clone() - local[SG3_COL].clone()) * pw * v;
+                row2 -= (local[AG_O3_COL].clone() - local[SG3_COL].clone() - local[SF3_COL].clone()) * pw * v;
             }
             t.assert_eq(next[BL_OFF + j].clone(), row1);
             t.assert_eq(next[BL2_OFF + j].clone(), row2);
@@ -1821,6 +1872,7 @@ where
                     + local[AG_O3_COL].clone() * per[35].clone() * local[W_OFF + 13].clone(),
             );
             t.assert_eq(next[SEL_O3A_COL].clone(), local[SEL_O3A_COL].clone());
+            t.assert_eq(next[O3F_COL].clone(), local[O3F_COL].clone());
             let om2 = local[OM2_COL].clone();
             t.assert_eq(
                 next[OM2_COL].clone(),
@@ -1829,11 +1881,13 @@ where
         }
         // A4: the fee bank, the fee chain's latch, `d3` constant.
         for j in 0..4 {
-            t.assert_eq(
-                next[FB_OFF + j].clone(),
-                local[FB_OFF + j].clone()
-                    + local[INJ_OFF + INJ_ACMF].clone() * per[35 + j].clone() * local[W_OFF + 4].clone(),
-            );
+            let mut fb = local[FB_OFF + j].clone()
+                + local[INJ_OFF + INJ_ACMF].clone() * per[35 + j].clone() * local[W_OFF + 4].clone();
+            if self.is_v3() {
+                // Lab #937 A′: output 3 under `o3f` is debited here.
+                fb -= local[SF3_COL].clone() * per[35 + j].clone() * local[W_OFF + 4].clone();
+            }
+            t.assert_eq(next[FB_OFF + j].clone(), fb);
         }
         t.assert_eq(
             next[L3_COL].clone(),
@@ -2697,6 +2751,7 @@ pub fn build_bucket_l2p_exit_with_witnesses(
             asset: [inputs[0].asset, inputs[1].asset],
             xrkm,
             sel_o3a: false,
+            sel_o3f: false,
         },
         pvs,
         anchor,
@@ -3032,6 +3087,13 @@ fn build_bucket_l2p_auth(
         if vp[1].amount != 0 { inputs[1].asset } else { 0 },
     ];
     let leaves = [inputs[0].auth.leaf, inputs[1].auth.leaf, fee_in.auth.leaf];
+    // Lab #937 A′: shape S's rule — output 3 rides the fee bank when slot 3
+    // is a real fee note, output 3 is asset 0, and that note carries more
+    // than the fee or no row is asset 0.
+    let o3f = n_out == 3
+        && !fee_slot.is_dummy()
+        && outputs[2].asset == 0
+        && (fee_in.value != fee || (a1 != 0 && inputs[1].asset != 0));
     let pvs = if n_out == 3 {
         let cm3: [[u64; 4]; 3] = [cm_out[0], cm_out[1], cm_out[2]];
         pv_vec_l2p_v3(&anchor, &nf1, &nf2, &cm3, fee, &registry_root, &vp, &vpa, &nf3, &xrkm, &leaves)
@@ -3057,7 +3119,8 @@ fn build_bucket_l2p_auth(
             d3: fee_slot.is_dummy(),
             asset: [inputs[0].asset, inputs[1].asset],
             xrkm,
-            sel_o3a: n_out == 3 && outputs[2].asset == a1,
+            sel_o3a: n_out == 3 && !o3f && outputs[2].asset == a1,
+            sel_o3f: o3f,
         },
         pvs,
         nf: [nf1, nf2, nf3],
@@ -3325,6 +3388,47 @@ pub fn fabricated_bucket_l2p_v3_exact_fee() -> L2PBucketInstanceV3 {
     )
 }
 
+/// Lab #937 A′: shape S's fee-bank spend in P — two asset-7 (Hybrid) notes,
+/// 60 and 50, into 100 and 10; a fee note of `fee_note` pays `fee` and
+/// output 3 through the fee bank (`o3f`).
+pub fn fabricated_bucket_l2p_v3_fee_bank(fee_note: u64, outputs: [L2TxOutput; 3], fee: u64) -> L2PBucketInstanceV3 {
+    let inputs = [fabricated_auth_input(0x1111, 60, 7, 2885), fabricated_auth_input(0x2222, 50, 7, 2468)];
+    let fee_in = fabricated_auth_input(0x9999, fee_note, 0, 3350);
+    let (_, rkm1, cm1) = derive_input_l2_v2(&inputs[0]);
+    let (_, rkm2, cm2) = derive_input_l2_v2(&inputs[1]);
+    let (_, _, cm3) = derive_input_l2_v2(&fee_in);
+    let (w, anchor) = crate::l2::fabricated_tree3([&cm1, &cm2, &cm3]);
+    let asset = PolicyAsset::hybrid(7, [0x7a, 0x7b, 0x7c, 0x7d], false, &[]);
+    let (rw, registry_root) = fabricated_registry_tree(&asset.leaf().hash(), &asset.leaf().hash());
+    let policy = [
+        asset.policy_input_for(&rkm1, rw[0]).expect("input 0 policy"),
+        asset.policy_input_for(&rkm2, rw[1]).expect("input 1 policy"),
+    ];
+    build_bucket_l2p_v3(
+        SHAPE_P_LOG_HEIGHT,
+        &inputs,
+        &outputs,
+        fee,
+        &[w[0], w[1]],
+        anchor,
+        &policy,
+        registry_root,
+        [VPublic::NONE; 2],
+        &FeeSlotV2::Exact { input: fee_in, witness: w[2] },
+        [0; 4],
+        false,
+    )
+}
+
+/// Lab #937 A′: the canonical P fee-bank spend (fee 10, prover fee 3).
+pub fn fabricated_bucket_l2p_v3_prover_fee() -> L2PBucketInstanceV3 {
+    fabricated_bucket_l2p_v3_fee_bank(
+        13,
+        [mk_out_p(0x3333, 100, 7), mk_out_p(0x4444, 10, 7), mk_out_p(0x5555, 3, 0)],
+        10,
+    )
+}
+
 /// The witness-free v3 shape-P AIR a verifier uses.
 pub fn verifier_air_p_v3() -> L2ShapePAir {
     L2ShapePAir {
@@ -3379,6 +3483,7 @@ impl L2ShapePAir {
         let mut om2: u32 = 0;
         let mut ac3: i64 = 0;
         let sel3: u32 = self.sel_o3a as u32;
+        let o3fv: u32 = self.sel_o3f as u32;
         let sel2: [u32; 4] = [
             self.sel_o1a as u32,
             self.sel_o2a as u32,
@@ -3718,7 +3823,10 @@ impl L2ShapePAir {
             row[LATCH_COL] = F::from_u32(latch);
             row[DV_COL] = F::from_u32(dvv);
             row[LDV_COL] = F::from_u32(latch * dvv);
-            row[FB_OFF..FB_OFF + 4].iter_mut().zip(fb.iter()).for_each(|(c, v)| *c = F::from_u32(*v as u32));
+            // Signed: under `o3f` (lab #937 A′) the bank holds `v(fee) − v(O3)`.
+            row[FB_OFF..FB_OFF + 4].iter_mut().zip(fb.iter()).for_each(|(c, v)| {
+                *c = if *v >= 0 { F::from_u32(*v as u32) } else { -F::from_u32((-*v) as u32) }
+            });
             row[L3_COL] = F::from_u32(l3);
             row[D3_COL] = F::from_u32(d3v);
             row[L3D3_COL] = F::from_u32(l3 * d3v);
@@ -3749,11 +3857,14 @@ impl L2ShapePAir {
             ];
             let ag_o3 = if v3 { inj4e * om * om2 } else { 0 };
             let sg3 = ag_o3 * sel3;
+            let sf3 = ag_o3 * o3fv;
             if v3 {
                 row[OM2_COL] = F::from_u32(om2);
                 row[AG_O3_COL] = F::from_u32(ag_o3);
                 row[SEL_O3A_COL] = F::from_u32(sel3);
                 row[SG3_COL] = F::from_u32(sg3);
+                row[O3F_COL] = F::from_u32(o3fv);
+                row[SF3_COL] = F::from_u32(sf3);
             }
             for (k, vv) in ag.iter().enumerate() {
                 row[AG_OFF + k] = F::from_u32(*vv);
@@ -3886,6 +3997,22 @@ impl L2ShapePAir {
                         }
                     }
                 }
+                // Lab #937 A′: the fee bank's chain against `(1 − d3)·fee`.
+                if v3 {
+                    let owed = if self.d3 { 0 } else { self.fee };
+                    let mut prev = 0i64;
+                    for j in 0..3 {
+                        let cj = (fb[j] + prev - chunk(owed, j)) >> 16;
+                        prev = cj;
+                        assert!(
+                            (0..=3).contains(&(cj + 2)),
+                            "v3 fee-bank carry out of range at row {t}, chunk {j}: c = {cj} (encodable: −2..=1; honest: −1..=0)"
+                        );
+                        let enc = (cj + 2) as u32;
+                        row[FBC_OFF + 2 * j] = F::from_u32(enc & 1);
+                        row[FBC_OFF + 2 * j + 1] = F::from_u32((enc >> 1) & 1);
+                    }
+                }
             }
             row[PBIT_COL] = F::from_u32(pbv);
             for i in 0..NW {
@@ -3962,14 +4089,14 @@ impl L2ShapePAir {
                 bl2[jc] += (ag[AG_IN2] as i64) * wgt * vb
                     - ((ag[AG_O1] - sg[0]) as i64) * wgt * vb
                     - ((ag[AG_O2] - sg[1]) as i64) * wgt * vb
-                    - ((ag_o3 - sg3) as i64) * wgt * vb;
+                    - ((ag_o3 - sg3 - sf3) as i64) * wgt * vb;
                 if jc == 0 {
                     for k in 0..6 {
                         ac[k] += (ag[k] as i64) * wgt * wbit[13] as i64;
                     }
                     ac3 += (ag_o3 as i64) * wgt * wbit[13] as i64;
                 }
-                fb[jc] += (injf as i64) * wgt * vb;
+                fb[jc] += (injf as i64) * wgt * vb - (sf3 as i64) * wgt * vb;
                 if bgrst == 1 || arege == 1 {
                     bq = [0i64; 16];
                 }
@@ -5804,10 +5931,13 @@ pub fn audit_pv_inputs(pvs: &[u32]) -> Vec<usize> {
 }
 
 /// Lab #937: shape P **v3**'s witness manifest is v2's — the third output
-/// span reuses `ARHO` / `ACMOUT` / `BCM2`, whose entries are per role.
+/// span reuses `ARHO` / `ACMOUT` / `BCM2`, whose entries are per role — plus
+/// `o3f` (A′), a per-transaction declaration like `d3`.
 #[cfg(any(test, feature = "audit"))]
 pub fn witness_manifest_v3() -> Vec<crate::detaudit::ManifestEntry> {
-    witness_manifest_v2()
+    let mut m = witness_manifest_v2();
+    m.push(crate::detaudit::ManifestEntry::input(crate::detaudit::ANY_ROLE, vec![O3F_COL], "o3f"));
+    m
 }
 
 /// Lab #937: v2's regions plus every column v3 appends, up to
@@ -5822,6 +5952,9 @@ pub fn audit_col_regions_v3() -> Vec<(&'static str, usize)> {
         ("AC_O3_COL", AC_O3_COL),
         ("SEL_O3A_COL", SEL_O3A_COL),
         ("SG3_COL", SG3_COL),
+        ("O3F_COL", O3F_COL),
+        ("SF3_COL", SF3_COL),
+        ("FBC_OFF", FBC_OFF),
     ]);
     v.sort_by_key(|(_, c)| *c);
     v

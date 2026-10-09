@@ -1017,9 +1017,16 @@ fn main() {
                 eprintln!("l2shape: `--v2` and `--v3` are exclusive");
                 std::process::exit(2);
             }
+            // Lab #937 A′: `--v3 --fee-bank` measures output 3 through the
+            // fee bank (`s-v3f|p-v3f`).
+            let fee_bank = args.iter().any(|a| a == "--fee-bank");
+            if fee_bank && !v3 {
+                eprintln!("l2shape: `--fee-bank` needs `--v3`");
+                std::process::exit(2);
+            }
             let shape_vn;
             let (shape, only) = if v2 || v3 {
-                shape_vn = format!("{shape}-{}", if v3 { "v3" } else { "v2" });
+                shape_vn = format!("{shape}-{}", if fee_bank { "v3f" } else if v3 { "v3" } else { "v2" });
                 (shape_vn.as_str(), only.or(Some("b4/q45")))
             } else {
                 (shape, only)

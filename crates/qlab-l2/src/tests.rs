@@ -512,7 +512,7 @@ fn l2_v3_geometry_and_degree_p() {
 }
 
 /// Lab #937: the v3 shape digests are pinned (from `l2_goldens` at
-/// `991defb4`). Constants, constraints (and their count) and the whole
+/// `3d987c9e`, A′). Constants, constraints (and their count) and the whole
 /// digest, so a move names its half.
 #[test]
 fn l2_v3_shape_digests_are_pinned() {
@@ -568,6 +568,37 @@ fn l2_v3_shape_identities() {
     // The v3 typed entries refuse a v2-length PV vector before any proof work.
     assert!(!pv_u32_in_range(&vec![0; v2::pv_len(Shape::S)], &v3::audit_pv_bits(Shape::S)));
     assert!(!pv_u32_in_range(&vec![0; v2::pv_len(Shape::P)], &v3::audit_pv_bits(Shape::P)));
+}
+
+/// Lab #937 A′ (review F4): the fee bank closes on a carry chain, so the AIR
+/// no longer forces each fee PV lane into [0, 2¹⁶) itself. The typed v3
+/// entries do (`v3::verify_{s,p}_u32` → `pv_u32_in_range` with
+/// `v3::audit_pv_bits`): every fee lane is declared 16-bit, and the honest
+/// fee re-encoded with a lane at or above 2¹⁶ — lane 0 + 2¹⁶ with lane 1 at
+/// p − 1 (−1), the same integer fee — is refused before any proof work. The
+/// node builds the lanes from the transaction's `u64` fee
+/// (`qlab_l2::pv_vec_s`/`pv_vec_p`, `(fee >> 16j) & 0xffff`).
+#[test]
+fn l2_v3_fee_lanes_are_16_bit_at_the_typed_entries() {
+    use p3_field::PrimeField32;
+    use qlab_air::l2::PV_FEE;
+    let p = Val::ORDER_U32;
+    for (shape, pvs) in [
+        (Shape::S, qlab_air::l2::fabricated_bucket_l2_v3_prover_fee().pvs),
+        (Shape::P, qlab_air::l2p::fabricated_bucket_l2p_v3_prover_fee().pvs),
+    ] {
+        let bits = v3::audit_pv_bits(shape);
+        assert_eq!(&bits[PV_FEE..PV_FEE + 4], &[16; 4], "{shape:?}: the fee lanes are 16-bit");
+        assert_eq!(&pvs[PV_FEE..PV_FEE + 4], &[10, 0, 0, 0], "{shape:?}: the fixture's fee, lane by lane");
+        assert!(pv_u32_in_range(&pvs, &bits), "{shape:?}: the honest PVs");
+        let mut lie = pvs.clone();
+        lie[PV_FEE] += 1 << 16;
+        lie[PV_FEE + 1] = p - 1;
+        assert!(!pv_u32_in_range(&lie, &bits), "{shape:?}: a fee lane ≥ 2¹⁶");
+        let mut lie = pvs.clone();
+        lie[PV_FEE + 3] = 1 << 16;
+        assert!(!pv_u32_in_range(&lie, &bits), "{shape:?}: the top fee lane at 2¹⁶");
+    }
 }
 
 /// Lab #896 seam C: shape P **v2** geometry and degree, read off the
