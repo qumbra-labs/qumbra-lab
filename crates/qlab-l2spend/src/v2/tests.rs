@@ -470,3 +470,68 @@ fn a_signer_from_a_built_tree_is_the_one_new_builds() {
     let later = LocalAuth::from_tree(master, std::sync::Arc::clone(&built.tree), 5).unwrap();
     assert_eq!(later.next(), 5);
 }
+
+/// Lab #937: a **three-output** P spend (format 34) builds in process, signs
+/// over the format-34 intent (which binds all three commitments) and
+/// verifies under the v3 AIR at 2^20; its PVs are v3's (`cm3` appended after
+/// v2's, the leaves where v2 has them), the third output is the zero-value
+/// note the builder committed, and consensus' authorization check accepts it
+/// on a format-34 net. One 2^20 P v3 prove (the S v3 prove is the bundle
+/// split path's, `the_v3_split_path_proves_and_verifies`).
+#[test]
+fn v3_p_builds_signs_attaches_and_verifies_at_2_20() {
+    use qlab_devnet::forms::ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION;
+    let (prepared, local, key) = crate::fixtures::prepared_p_v3();
+    let built = prove_prepared(prepared);
+    assert_eq!((built.shape, built.outputs.len()), (L2ShapeTag::P, 3));
+    assert_eq!(built.outputs[2].value, 0, "the third output is the zero-value note");
+    assert_eq!(built.tx.public.commitments.len(), 3);
+    assert_eq!(
+        built.tx.public.commitments[2],
+        qlab_note::hash::digest_bytes(&built.outputs[2].commitment()),
+        "the third commitment opens to the third note"
+    );
+    let mut tx = built.tx.clone();
+    let intent = intent_for(&tx, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, &GENESIS_HASH, VALID_UNTIL, &built.auth)
+        .expect("a three-output tx has a format-34 intent");
+    assert_eq!(intent.commitments.len(), 3);
+    let section = sign_locally(&intent, &local, &[&key]).expect("every slot is ours or a dummy's");
+    attach(&mut tx, &section).expect("a signed section encodes");
+    let proof: qlab_l2::Proof<qlab_l2::Config> = bincode::deserialize(&tx.proof).expect("the proof decodes");
+    assert!(qlab_l2::v3::verify_p_u32(&built.pvs, &proof), "the v3 proof verifies");
+    assert_eq!(built.pvs.len(), qlab_l2::v3::pv_len(qlab_l2::Shape::P));
+    for (k, d) in built.auth.iter().enumerate() {
+        let at = qlab_l2::v2::pv_leaf(qlab_l2::Shape::P, k);
+        assert_eq!(built.pvs[at..at + 16], pv_chunks(&digest_from_bytes(&d.leaf())), "slot {k}: leaf = PV leaf");
+    }
+    let at = qlab_l2::v3::pv_cm3(qlab_l2::Shape::P);
+    assert_eq!(built.pvs[at..], pv_chunks(&built.outputs[2].commitment()), "cm3 = the third note's commitment");
+    let v3 = qlab_devnet::annulet::AuthContext::candidate_a_v3(GENESIS_HASH);
+    assert_eq!(qlab_devnet::annulet::check_auth(&tx, &v3, VALID_UNTIL), Ok(Some(VALID_UNTIL)));
+    // On format 33 the same transaction has no intent: three outputs.
+    let v2 = qlab_devnet::annulet::AuthContext::candidate_a(GENESIS_HASH);
+    assert!(matches!(
+        qlab_devnet::annulet::check_auth(&tx, &v2, VALID_UNTIL),
+        Err(qlab_devnet::annulet::AuthRefusal::Intent(IntentError::Commitments { got: 3 }))
+    ));
+}
+
+/// Lab #937: the builders refuse an output count that is neither two nor
+/// three, by name, before any instance is built.
+#[test]
+fn an_output_count_other_than_two_or_three_is_refused() {
+    let mut rng = rng(0x937);
+    let mut local = LocalAuth::new(&[0x54; 32], 0, 0).expect("depth D_AUTH");
+    let a = real(&mut local, 0x600, 100, 0);
+    let b = real(&mut local, 0x700, 50, 0);
+    let tree = tree_of(&[&a, &b]);
+    let reg = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0)]).unwrap();
+    let regs = [crate::fixtures::opening(&reg, 0), crate::fixtures::opening(&reg, 0)];
+    let (dummy, _) = local.dummy(&[0xd7; 32], 2, &[a.auth.leaf_index, b.auth.leaf_index]).unwrap();
+    let out = |v: u64, rng: &mut rand::rngs::StdRng| Out { to: recipient(0x61, rng), value: v, asset: 0 };
+    for n in [0usize, 1, 4] {
+        let outs: Vec<Out> = (0..n).map(|_| out(0, &mut rng)).collect();
+        let got = assemble_s_v2(&tree, &regs, [&a, &b], false, FeeIn::Dummy(&dummy), &outs, 10, &mut rng).err();
+        assert!(matches!(got, Some(SpendError::OutputCount { got }) if got == n), "{n} outputs");
+    }
+}

@@ -586,8 +586,9 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
             AnnuletFaucet::start(served(discovery), genesis.form()?, key, change.ek, genesis.params.fee_tier_s)?
         }
         // Lab #896 H (QH2): grants signed with the dev key's generation-0
-        // leaves; the cursor in `<data dir>/faucet-auth/auth.v1`.
-        qlab_devnet::forms::L2AuthForm::CandidateA => AnnuletFaucet::start_v2(
+        // leaves; the cursor in `<data dir>/faucet-auth/auth.v1`. Lab #937 PR
+        // C: format 34 too — its grants carry a third, zero-value self output.
+        qlab_devnet::forms::L2AuthForm::CandidateA | qlab_devnet::forms::L2AuthForm::CandidateAV3 => AnnuletFaucet::start_v2(
             served(discovery),
             key,
             change.ek,
@@ -597,12 +598,6 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
             genesis.format_version,
             has_flag(args, "--fresh-journal"),
         )?,
-        // Lab #937: a format-34 net's S/P spends carry three outputs; the
-        // faucet's grants are built by the v2 (two-output) wallet path until
-        // lab #937 PR C. Refused by name rather than built and refused by the node.
-        qlab_devnet::forms::L2AuthForm::CandidateAV3 => {
-            return Err("format 34 (three-output S/P) grants are not built by this faucet yet (lab #937 PR C)".into())
-        }
     };
     let stock = faucet.stock_left();
     let bound = serve_grants(listen, Arc::new(std::sync::Mutex::new(faucet)))?;

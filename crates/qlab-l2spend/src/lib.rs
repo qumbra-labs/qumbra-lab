@@ -82,6 +82,9 @@ pub enum SpendError {
     /// Lab #896 E4: an input slot declared the dummy (`dv`) carries value or
     /// an asset; the dummy contributes nothing to the balance and is asset 0.
     DummyNotEmpty { value: u64, asset: u64 },
+    /// Lab #937: an S/P spend has two outputs (format 33) or three (format
+    /// 34); any other count builds no instance.
+    OutputCount { got: usize },
 }
 
 impl std::fmt::Display for SpendError {
@@ -114,6 +117,9 @@ impl std::fmt::Display for SpendError {
                 "slot 3's fee note is {value} of asset {asset}; it must be exactly {fee} of asset 0 \
                  (spent whole — the 3×2 shapes have no fee change)"
             ),
+            SpendError::OutputCount { got } => {
+                write!(f, "an S/P spend has two outputs (format 33) or three (format 34), not {got}")
+            }
             SpendError::DummyNotEmpty { value, asset } => write!(
                 f,
                 "the dummy input slot holds {value} of asset {asset}; a dummy slot is 0 of asset 0"
@@ -483,6 +489,51 @@ fn discovery_for<R: rand::CryptoRng>(notes: &[L2Note; 2], outs: &[Out; 2], rng: 
     qlab_note::compact::encode_committed_discovery_with_width(&bundles, &payloads, L2_PAYLOAD_LEN)
 }
 
+/// [`output_notes`] for any output count (lab #937): two on formats 32/33,
+/// three on format 34. `ρ′ⱼ` is `qlab_air::l2::derive_output_rho_l2` — the
+/// frozen derivation for `j < 2` (byte for byte [`output_notes`]'s), and
+/// `H(nf₀ ‖ 9)` for the third.
+pub(crate) fn output_notes_n(outputs: &[L2TxOutput], nf0: &[u64; 4], cm_out: &[[u64; 4]]) -> Vec<L2Note> {
+    assert_eq!(outputs.len(), cm_out.len(), "one commitment per output");
+    outputs
+        .iter()
+        .enumerate()
+        .map(|(j, o)| {
+            let n = L2Note {
+                value: o.value,
+                asset: o.asset,
+                rkm: o.rkm,
+                rho: qlab_air::l2::derive_output_rho_l2(nf0, j),
+                rseed: o.rseed,
+            };
+            assert_eq!(n.commitment(), cm_out[j], "output {j}: the note is the one the proof commits");
+            n
+        })
+        .collect()
+}
+
+/// [`discovery_for`] for any output count (lab #937): one recipient bundle
+/// and payload per output, in output order — the same group, wider.
+pub(crate) fn discovery_for_n<R: rand::CryptoRng>(notes: &[L2Note], outs: &[Out], rng: &mut R) -> Vec<u8> {
+    assert_eq!(notes.len(), outs.len(), "one note per output");
+    let mut bundles: Vec<RecipientBundle> = Vec::new();
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    for j in 0..outs.len() {
+        let out = qlab_note::scan::encrypt_notes_to_recipient(&outs[j].to.ek, &notes[j..=j], rng);
+        bundles.push(out.bundle);
+        payloads.extend(out.payloads);
+    }
+    qlab_note::compact::encode_committed_discovery_with_width(&bundles, &payloads, L2_PAYLOAD_LEN)
+}
+
+/// [`l2_outputs`] for any output count (lab #937), drawing each output's
+/// `rseed` in output order as [`l2_outputs`] does.
+pub(crate) fn l2_outputs_n<R: Rng>(outs: &[Out], rng: &mut R) -> Vec<L2TxOutput> {
+    outs.iter()
+        .map(|o| L2TxOutput { value: o.value, asset: o.asset, rkm: o.to.rkm, rho: [0; 4], rseed: random_d4(rng) })
+        .collect()
+}
+
 /// A4: a dummy slot-3 fee input (`d3 = 1`) with fresh `sk`/`ρ`.
 fn dummy_fee_slot<R: Rng>(rng: &mut R) -> qlab_air::l2::FeeSlot {
     qlab_air::l2::FeeSlot::Dummy {
@@ -527,7 +578,7 @@ pub(crate) fn unproved_entry(
     anchor: &[u64; 4],
     nf: &[[u64; 4]; 2],
     nf3: &[u64; 4],
-    cm_out: &[[u64; 4]; 2],
+    cm_out: &[[u64; 4]],
     fee: u64,
     surface: L2Surface,
     discovery: Vec<u8>,

@@ -362,7 +362,9 @@ pub struct PreparedSpendV2 {
     pub bundle: ProvingBundle,
     pub pvs: Vec<u32>,
     pub auth: Vec<qlab_remote_auth::intent::AuthDescriptor>,
-    pub outputs: [qlab_note::l2note::L2Note; 2],
+    /// The output notes: two (format 33) or three (format 34, the third a
+    /// zero-value note to this wallet — [`prepare_signed`]).
+    pub outputs: Vec<qlab_note::l2note::L2Note>,
     pub shape: L2ShapeTag,
 }
 
@@ -408,6 +410,21 @@ pub fn assemble_and_submit<E: Endpoint>(
     Ok(built)
 }
 
+/// Lab #937: the asset of a format-34 spend's zero-value third output, from
+/// the two balance rows' assets `a1`, `a2` (a dummy slot 2 is asset 0). The
+/// AIR binds output 3 to a row's asset (`o3a`), so: **asset 0 whenever a row
+/// is asset 0** — a zero-value asset-0 note is dust no one mistakes for an
+/// asset's mint base (an R seed is a zero-value note of its asset, #941's
+/// lane). Two inputs of one non-zero asset (a merge, a two-note payment) have
+/// no asset-0 row until the fee bank (lab #937 A′ + PR D): input 1's asset.
+pub fn zero_third_asset(a1: u64, a2: u64) -> u64 {
+    if a1 == 0 || a2 == 0 {
+        0
+    } else {
+        a1
+    }
+}
+
 /// Take, draw the dummies, prepare and sign: the proof still empty.
 #[allow(clippy::too_many_arguments)]
 fn prepare_signed<E: Endpoint>(
@@ -432,6 +449,25 @@ fn prepare_signed<E: Endpoint>(
     let paths = run.take(&w.dir, notes.len())?;
     let taken: Vec<u32> = paths.iter().map(|p| p.leaf_index).collect();
     let real: Vec<L2AuthInput> = notes.iter().zip(paths).map(|(n, p)| real_input(&wallet, n, p)).collect();
+    // Lab #937: on a format-34 net every S/P spend carries a third output.
+    // Here it is a zero-value note (D3: an ordinary note, indistinguishable
+    // from a paying one) to where this spend's change goes — `outs[1].to`,
+    // the active generation's change address, never the run generation's
+    // (a sweep must not leave a note behind in the generation it empties) —
+    // in [`zero_third_asset`]'s asset. The wallet never spends a zero-value
+    // note (`AssetIndex::zero`). The prover-fee third output is lab #937
+    // PR D's.
+    let outs: Vec<Out> = match run.auth_context().form.sp_outputs() {
+        2 => outs.to_vec(),
+        3 => {
+            let a2 = if matches!(spend, V2Spend::One(_)) { 0 } else { real[1].asset };
+            let mut v = outs.to_vec();
+            v.push(Out { to: outs[1].to.clone(), value: 0, asset: zero_third_asset(real[0].asset, a2) });
+            v
+        }
+        n => unreachable!("an S/P spend carries two or three outputs, not {n}"),
+    };
+    let outs = outs.as_slice();
     let (mut prepared, keys) = match (shape, &spend) {
         (L2ShapeTag::S, V2Spend::One(_)) => {
             let (d2, k2) = run.dummy(1, &taken)?;
@@ -528,7 +564,7 @@ pub fn run_plan_v2<E: Endpoint>(
     freeze_keys: &[[u64; 4]],
     split_wait: std::time::Duration,
     rng: &mut StdRng,
-) -> Result<Vec<([qlab_note::l2note::L2Note; 2], L2ShapeTag)>, SendRefusal> {
+) -> Result<Vec<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>, SendRefusal> {
     use crate::annulet_send::{wait_in_tree, Src, StepKind};
     let wallet = w.wallet();
     let served = &session.served;
@@ -541,12 +577,12 @@ pub fn run_plan_v2<E: Endpoint>(
     let own_root = run.auth_root();
     let own = me_v2(&wallet, &own_root);
     let gens = [(run.generation, own_root)];
-    let mut made: Vec<Option<([qlab_note::l2note::L2Note; 2], L2ShapeTag)>> = vec![None; plan.steps.len()];
-    let owned = |made: &[Option<([qlab_note::l2note::L2Note; 2], L2ShapeTag)>], src: &Src| -> OwnedL2Note {
+    let mut made: Vec<Option<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>> = vec![None; plan.steps.len()];
+    let owned = |made: &[Option<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>], src: &Src| -> OwnedL2Note {
         match src {
             Src::Held(n) => n.clone(),
             Src::Made { step, out, .. } => {
-                let note = made[*step].expect("a step spends only notes of earlier rounds").0[*out];
+                let note = made[*step].as_ref().expect("a step spends only notes of earlier rounds").0[*out];
                 OwnedL2Note::from_genesis_v2(&wallet, 0, qlab_note::hash::digest_bytes(&note.commitment()), note, &gens)
                     .expect("a planned note was paid to the run generation's address 0")
             }
@@ -554,6 +590,12 @@ pub fn run_plan_v2<E: Endpoint>(
     };
     for round in 0..plan.rounds() {
         for (i, st) in plan.steps.iter().enumerate().filter(|(_, s)| s.round == round) {
+            // Lab #937: a planned third output (the prover fee) is PR D's;
+            // until then the third output is prepare_signed's zero-value
+            // self note, and a plan naming one is refused by name.
+            if st.third.is_some() {
+                return Err(SendRefusal::Auth("a planned third output (a prover fee) is not built here yet (lab #937 PR D)".into()));
+            }
             let built = match &st.kind {
                 StepKind::FeeSplit { source, tariff } => {
                     let src = owned(&made, source);
@@ -603,7 +645,7 @@ pub fn run_plan_v2<E: Endpoint>(
             for src in srcs {
                 if let Src::Made { step, out, .. } = src {
                     if plan.steps[*step].round == round {
-                        let note = made[*step].expect("made this round").0[*out];
+                        let note = made[*step].as_ref().expect("made this round").0[*out];
                         wait_in_tree(served, &note.commitment(), split_wait)?;
                     }
                 }
@@ -1034,12 +1076,116 @@ mod tests {
         assert!(j.get(1).is_err());
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
-        let last = crate::auth_journal::PROBE_GENERATIONS - 1;
+        // Lab #937: a zero-value note (a format-34 third output) is never
+        // swept. Generation 0 holds only one and has landed leaves → retired,
+        // not sweep-only; generation 2 holds only one and nothing landed →
+        // not recorded, yet the active generation still opens above it (its
+        // address was handed out).
+        let zeros = [note_of(&wallet, 0, 0, 7), note_of(&wallet, 2, 0, 8)];
+        let landed: LandedByGeneration = [(0, leaves(0, 1))].into();
+        let j = restore_journal(&lock, &w, &wallet, &zeros, &landed, &genesis, 500).unwrap();
+        assert_eq!(j.get(0).unwrap().state, GenState::Retired, "only a zero-value note: nothing to sweep");
+        assert!(j.get(2).is_err(), "only a zero-value note and nothing landed: not recorded");
+        assert_eq!(j.active().g, 3);
+        std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
+
+        let last =crate::auth_journal::PROBE_GENERATIONS - 1;
         let edge = [note_of(&wallet, last, 1, 9)];
         assert!(matches!(
             restore_journal(&lock, &w, &wallet, &edge, &none, &genesis, 500),
             Err(SendRefusal::Auth(why)) if why.contains("last of the")
         ));
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// Lab #937: a zero-value note (a format-34 third output, a merge's empty
+    /// output) is never an input: the planner picks none — not as a payment
+    /// note, not merged, not as a fee note, not split — and the sweep floor
+    /// `check_budget` keeps does not count it.
+    #[test]
+    fn zero_value_notes_are_never_planned_nor_budgeted() {
+        use crate::annulet_plan::{plan_send, StepKind, Tiers};
+        use qlab_ledger::assets::AssetIndex;
+        use qlab_ledger::spent::SpentSet;
+        let w = wallet_dir("zero", 9);
+        let wallet = w.wallet();
+        let tiers = Tiers { s: 3, p: 5, r: 7 };
+        let of = |value: u64, asset: u64, k: u8| {
+            let mut n = note_of(&wallet, 0, value, k);
+            n.note.asset = asset;
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], n.note, &[(0, generation_root(&wallet, 0))]).unwrap()
+        };
+        let notes = vec![of(50, 7, 1), of(40, 7, 2), of(30, 7, 3), of(0, 7, 4), of(0, 7, 5), of(0, 0, 6), of(20, 0, 7)];
+        let index = AssetIndex::build(&wallet, notes, &SpentSet::from_parts(Some((0, 9)), [])).only_generation(0);
+        assert_eq!(index.zero.len(), 3, "seen");
+
+        // 120 of asset 7: all three non-zero notes, one merge, the fee notes
+        // split from the 20 — never a zero-value note anywhere.
+        let plan = plan_send(&index, 7, 120, L2ShapeTag::S, tiers).unwrap();
+        let held: Vec<u64> = plan
+            .steps
+            .iter()
+            .flat_map(|s| match &s.kind {
+                StepKind::FeeSplit { source, .. } => vec![source.clone()],
+                StepKind::Merge { inputs, fee } => vec![inputs[0].clone(), inputs[1].clone(), fee.clone()],
+                StepKind::Pay { inputs, fee } => inputs.iter().cloned().chain(fee.clone()).collect(),
+            })
+            .filter_map(|src| match src {
+                crate::annulet_plan::Src::Held(n) => Some(n.note.value),
+                _ => None,
+            })
+            .collect();
+        assert!(!held.is_empty() && !held.contains(&0), "no zero-value note is planned: {held:?}");
+        assert!(plan_send(&index, 7, 121, L2ShapeTag::S, tiers).is_err(), "120 is all of asset 7 there is");
+
+        // The sweep floor counts the four non-zero notes, not the three zeros.
+        let notes: u32 = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+        assert_eq!(notes, 4);
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// Lab #937 (#941 lane): the zero-value third output is asset 0 whenever
+    /// a balance row is — one input with a dummy slot 2, an asset paid beside
+    /// an asset-0 note, either order — and input 1's asset only for two
+    /// inputs of one non-zero asset (no asset-0 row before the fee bank).
+    #[test]
+    fn the_zero_third_output_is_asset_0_whenever_a_row_is() {
+        assert_eq!(zero_third_asset(0, 0), 0, "an asset-0 spend, or one input beside a dummy");
+        assert_eq!(zero_third_asset(7, 0), 0, "asset 7 paid beside an asset-0 note; one input of 7 beside a dummy");
+        assert_eq!(zero_third_asset(0, 7), 0);
+        assert_eq!(zero_third_asset(7, 7), 7, "a merge / two-note payment: no asset-0 row yet");
+        assert_eq!(zero_third_asset(7, 9), 7);
+    }
+
+    /// Lab #937 (#941 lane): a wallet holding **only** zero-value notes —
+    /// an R seed of asset 7, an empty asset-0 output. Issuance finds its base
+    /// (`mint_base`); a payment of either asset gets the planner's existing
+    /// refusal, the sweep floor counts nothing, and no balance row exists.
+    #[test]
+    fn only_zero_value_notes_are_a_mint_base_and_nothing_else() {
+        use crate::annulet_plan::{plan_send, PlanRefusal, Tiers};
+        use qlab_ledger::assets::AssetIndex;
+        use qlab_ledger::spent::SpentSet;
+        let w = wallet_dir("zero_only", 10);
+        let wallet = w.wallet();
+        let tiers = Tiers { s: 3, p: 5, r: 7 };
+        let of = |asset: u64, k: u8| {
+            let mut n = note_of(&wallet, 0, 0, k);
+            n.note.asset = asset;
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], n.note, &[(0, generation_root(&wallet, 0))]).unwrap()
+        };
+        let seed = of(7, 1);
+        let index = AssetIndex::build(&wallet, vec![seed.clone(), of(0, 2)], &SpentSet::from_parts(Some((0, 9)), []))
+            .only_generation(0);
+        assert_eq!(index.mint_base(7), Some(&seed), "the seed is the mint base");
+        assert!(matches!(
+            plan_send(&index, 7, 1, L2ShapeTag::S, tiers),
+            Err(PlanRefusal::InsufficientAsset { asset: 7, amount: 1, spendable: 0 })
+        ));
+        assert!(matches!(plan_send(&index, 0, 1, L2ShapeTag::S, tiers), Err(PlanRefusal::NoSingleNoteCovers { asset: 0, .. })));
+        let notes: u32 = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+        assert_eq!(notes, 0, "the sweep floor counts no zero-value note");
+        assert!(index.balances().is_empty(), "no balance row");
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 

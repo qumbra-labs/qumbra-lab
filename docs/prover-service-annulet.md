@@ -30,7 +30,7 @@ The L1 `WitnessBundle` mode (`/v1/jobs`) is unchanged. It now runs only when its
 2. The token's single in-flight job, its single upload being read, and its daily quota → `429` with `token-busy` or `quota-exhausted`. Only **admitted** jobs count against the quota. An admitted upload must arrive within 30 s. Past that the handler gives up (counted as `upload-deadline`), but the token's reading slot stays taken until the connection actually ends, so a slow upload holds up only its own token.
 3. The byte ceiling, read bounded → `413` `bundle-too-large`.
 4. Decode → `400` `bundle-malformed`, or `403` `issuer-shape`.
-5. The bundle's lock, run on this net → `422` with `statement-mismatch`, `unauthorized-section`, `proof-present` or `auth-missing`.
+5. The bundle's lock, run on this net → `422` with `statement-mismatch`, `unauthorized-section`, `proof-present`, `auth-missing`, `outputs-not-the-nets` (lab #937: the bundle's output count is not this net's — a three-output bundle on format 33) or `third-output-asset` (lab #937: a three-output bundle whose third output carries neither input's asset — the v3 AIR has no proof for it).
 
 After admission the request can still be refused with `409` `intent-in-flight` (another token holds this intent) or `503` `prover-busy` (the queue is full).
 

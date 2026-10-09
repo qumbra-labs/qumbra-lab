@@ -431,7 +431,10 @@ unsafe fn annulet_new(
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
     let allocated = if n_indices == 0 { Vec::new() } else { std::slice::from_raw_parts(indices, n_indices).to_vec() };
     let wallet = (*w).wallet.clone();
-    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
+    // Lab #937: the kernel refuses a format-34 net by name as soon as its
+    // genesis verifies — before any header is fetched — until PR D.
+    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record))
+        .refusing(qlab_devnet::forms::L2AuthForm::CandidateAV3);
     if let Some(gens) = generations {
         let roots = gens.iter().map(|&g| (g, (*w).generation_root(g))).collect();
         driver = driver.with_generations(roots);

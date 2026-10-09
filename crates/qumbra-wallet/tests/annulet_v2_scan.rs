@@ -78,13 +78,14 @@ fn b_on_a_v1_net_the_empty_list_is_the_old_scan() {
     }
 }
 
-/// Lab #937: a format-34 genesis (three-output S/P) is refused **by name**
-/// at genesis verification — the one gate every scan, send and the driver
-/// pass — until the three-output wallet path lands (lab #937 PR C). The same
-/// file on format 33 verifies.
+/// Lab #937 PR C: a format-34 genesis (three-output S/P) **verifies** in
+/// the wallet — its CLI scans and builds format 34 now — and names its axis;
+/// the kernel (`qumbra-ffi`) still refuses it by name until PR D
+/// (`VerifyRefusal::FormatNotSupported`, raised by the kernel right after
+/// genesis verification, before any scan).
 #[test]
-fn z_a_format_34_genesis_is_refused_by_name_until_pr_c() {
-    use qumbra_wallet::annulet_verify::{genesis_from_bytes, VerifyRefusal};
+fn z_a_format_34_genesis_verifies_in_the_wallet() {
+    use qumbra_wallet::annulet_verify::genesis_from_bytes;
     let w = wallet_dir("v2scan_z34", 0x61);
     let wallet = w.wallet();
     let holder = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 0));
@@ -99,9 +100,8 @@ fn z_a_format_34_genesis_is_refused_by_name_until_pr_c() {
         L2AuthForm::CandidateAV3,
     );
     assert_eq!(v3.format_version, 34);
-    let bytes = v3.to_bytes();
-    let refusal = genesis_from_bytes(v3.hash(), &bytes).err();
-    assert_eq!(refusal, Some(VerifyRefusal::FormatNotSupported { format_version: 34 }));
-    assert!(refusal.unwrap().to_string().contains("lab #937 PR C"));
+    let g = genesis_from_bytes(v3.hash(), &v3.to_bytes()).expect("format 34 verifies in the wallet");
+    assert_eq!(g.l2_auth, L2AuthForm::CandidateAV3);
+    assert_eq!(g.wire(), qlab_p2p::compact::WireForm::ANNULET_AUTH_V3);
     assert!(genesis_from_bytes(v2.hash(), &v2.to_bytes()).is_ok(), "format 33 still verifies");
 }

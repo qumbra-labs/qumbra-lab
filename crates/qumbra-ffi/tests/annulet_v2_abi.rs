@@ -99,6 +99,12 @@ fn b_parse_any_names_the_version_and_refuses_a_non_address() {
     let _ = std::fs::remove_dir_all(&w.dir);
 }
 
+thread_local! {
+    /// Every path `scan` was asked for, in order (lab #937: what the kernel
+    /// fetched before it refused).
+    static ASKED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// One scan of handle `w` through `qmb_annulet_new_v2` (`gens` = Some) or the
 /// old `qmb_annulet_new` (`gens` = None); the view or the refusal.
 unsafe fn scan(w: *mut qumbra_ffi::WalletState, ep: &Endpoint, gens: Option<&[u32]>) -> Result<Value, Value> {
@@ -125,6 +131,7 @@ unsafe fn scan(w: *mut qumbra_ffi::WalletState, ep: &Endpoint, gens: Option<&[u3
             match qmb_annulet_step(s, &mut out) {
                 1 => {
                     let path = take_str(out);
+                    ASKED.with(|a| a.borrow_mut().push(path.clone()));
                     match ep.fetch(&path) {
                         Ok(body) => qmb_annulet_supply(s, body.as_ptr(), body.len()),
                         Err(why) => {
@@ -219,6 +226,41 @@ fn d_the_generation_list_is_bounded_by_name() {
         assert_eq!(bound.len(), 8);
         let view = scan(w, &ep, Some(&bound)).expect("eight generations scan");
         assert_eq!(spendable(&view, USDT).as_deref(), Some("1000000"), "generation 0 is among them");
+        qmb_wallet_free(w);
+    }
+}
+
+/// Lab #937 PR C: the kernel refuses a format-34 net **by name** after its
+/// verified scan — `format_not_supported`, until PR D carries the
+/// three-output path into the kernel (the wallet CLI already builds it). The
+/// same holder's format-33 chain still scans.
+#[test]
+fn e_a_format_34_net_is_refused_by_the_kernel_until_pr_d() {
+    let w = wallet_dir("v2abi_e34", SEED);
+    let wallet = w.wallet();
+    let a2 = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 0));
+    let v2 = genesis_v2(&a2, Vec::new());
+    let v3 = qlab_node::annulet_genesis::AnnuletGenesisFile::assemble_with_auth(
+        "annulet-ad1-v3",
+        v2.params,
+        SEQ_SEED,
+        v2.registry_genesis.clone(),
+        v2.genesis_notes.clone(),
+        0,
+        qlab_devnet::forms::L2AuthForm::CandidateAV3,
+    );
+    assert_eq!(v3.format_version, 34);
+    let ep = Endpoint::new(v3, &[], None, Lie::None);
+    let _guard = WalletDirGuard(w);
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        ASKED.with(|a| a.borrow_mut().clear());
+        let refusal = scan(w, &ep, Some(&[])).expect_err("the kernel refuses format 34");
+        assert_eq!(refusal["refusal"], "format_not_supported", "{refusal}");
+        assert!(refusal["message"].as_str().unwrap().contains("lab #937 PR D"), "{refusal}");
+        // Review F3: refused right after the genesis verifies — nothing of
+        // the chain was asked for.
+        assert_eq!(ASKED.with(|a| a.borrow().clone()), vec!["/genesis.qmb".to_string()]);
         qmb_wallet_free(w);
     }
 }
