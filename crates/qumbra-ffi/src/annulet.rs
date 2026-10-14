@@ -197,6 +197,10 @@ pub fn refusal_key(r: &VerifyRefusal) -> &'static str {
         ChainCacheInvalid { .. } => "chain_cache_invalid",
         CachedTipForked { .. } => "cached_tip_forked",
         DriverMisuse { .. } => "driver_misuse",
+        // Lab #937: the CLI wallet's imported openings. The kernel never
+        // hands the driver any, so it never answers this; listed because the
+        // match is exhaustive.
+        ImportedOpenings { .. } => "imported_openings",
     }
 }
 

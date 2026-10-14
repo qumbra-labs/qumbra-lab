@@ -184,7 +184,7 @@ IP 从不进日志。拒绝计数记在一个按进程随机加盐的键的 4 �
 
 *崩溃时。* 写到一半崩溃，可能留下没有换行的最后一行，读取方跳过它。
 
-运维把这个文件拷到 payee 钱包所在的机器上，payee 的 seed 不上这台机器。导入工具（`qumbra-wallet`）另开 PR。诚实的内核也会把第三个输出的 discovery 载荷加密给 payee，所以 payee 平常扫链就能找到这些 note。台账是为没这么做的钱包兜底的。
+运维把这个文件拷到 payee 钱包所在的机器上，payee 的 seed 不上这台机器。然后用 `qumbra-wallet import-openings --net annulet` 导入，见 [`prover-payee-wallet-zh.md`](prover-payee-wallet-zh.md)。诚实的内核也会把第三个输出的 discovery 载荷加密给 payee，所以 payee 平常扫链就能找到这些 note。台账是为没这么做的钱包兜底的。
 
 **34 上的配置**，在上面那张表之外（token 那几行不适用）：
 

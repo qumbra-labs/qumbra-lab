@@ -8,6 +8,8 @@
 //! (b) On the v1 fixture chain, the old `scan_annulet_verified` and the new one
 //!     with an empty list give the same figures, the same range and the same
 //!     body cost; the net reads as v1.
+//! (y) Lab #937: the verified scan owns the wallet's imported openings from
+//!     `openings.v1` on disk; on a v1 net the same wallet is refused by name.
 //!
 //! Fixture seeds only; nothing proves.
 
@@ -102,4 +104,64 @@ fn z_a_format_34_genesis_verifies_in_the_wallet() {
     assert_eq!(g.l2_auth, L2AuthForm::CandidateAV3);
     assert_eq!(g.wire(), qlab_p2p::compact::WireForm::ANNULET_AUTH_V3);
     assert!(genesis_from_bytes(v2.hash(), &v2.to_bytes()).is_ok(), "format 33 still verifies");
+}
+
+/// Lab #937 (the importer, pre-review A): the **verified** scan loads the
+/// wallet's `openings.v1` from disk and its driver hands them to the core —
+/// a third output paid to the wallet but encrypted to another key is owned,
+/// at its chain position, and counted in `imported`. The same wallet on a v1
+/// net has its whole scan refused by name (`ImportedOpenings`).
+#[test]
+fn y_the_verified_scan_owns_the_wallets_imported_openings() {
+    use qlab_note::hash::digest_bytes;
+    use qumbra_wallet::annulet_verify::VerifyRefusal;
+    use qumbra_wallet::auth_journal::AuthJournal;
+    use qumbra_wallet::openings::{import_openings, Verdict, PAID_LEDGER_HEADER};
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let lanes = |l: &[u64; 4]| hex(&digest_bytes(l));
+
+    let w = wallet_dir("v2scan_y", 0x62);
+    let wallet = w.wallet();
+    AuthJournal::fresh(generation_root(&wallet, 0)).save(&w.dir).unwrap();
+    let payee = wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 0));
+    let s = wallet_dir("v2scan_y_s", 0x63);
+    let other = s.wallet().address_candidate_a_at_index(0, &generation_root(&s.wallet(), 0));
+    let hidden = note_to(&payee, 3, 0, 60); // the payee's, encrypted to `other`
+    let mut rng = StdRng::seed_from_u64(0x62);
+    let body = BlockBody { txs: vec![pay_tx(&other, &[hidden], 0x30, &mut rng)], ..BlockBody::default() };
+
+    let cm = digest_bytes(&hidden.commitment());
+    let ledger = format!(
+        "{PAID_LEDGER_HEADER}\n1 cm={} value=3 asset=0 rkm={} rho={} rseed={} shape=S at=1800000000\n",
+        hex(&cm),
+        lanes(&hidden.rkm),
+        lanes(&hidden.rho),
+        lanes(&hidden.rseed)
+    );
+    let verdicts = import_openings(&w, &ledger).expect("a version-1 paid ledger");
+    assert_eq!(verdicts.iter().map(|v| v.verdict.clone()).collect::<Vec<_>>(), vec![Verdict::Imported]);
+
+    // Candidate A: owned through the real driver, from the file on disk.
+    let file = genesis_v2(&payee, Vec::new());
+    let pin = file.hash();
+    let ep = Endpoint::new(file, std::slice::from_ref(&body), None, Lie::None);
+    let mut fetch = |p: &str| ep.fetch(p);
+    let v = scan_annulet_verified(&w, &mut fetch, 0, u64::MAX, Some(pin), &mut rng).expect("the format-33 chain verifies");
+    assert_eq!(v.report().imported, (1, 0));
+    assert!(v.report().owned.iter().any(|n| n.note == hidden && n.height == 1 && n.tx_index == Some(0)), "the hidden note is owned");
+    let index = v.report().index.clone().expect("both halves known");
+    assert_eq!(index.balances(), vec![(0, 3), (USDT as u16, 1_000_000)], "the imported note and the genesis note");
+
+    // A v1 net: the same wallet's scan is refused by name.
+    let file = genesis(&payee);
+    let pin = file.hash();
+    let ep = Endpoint::new(file, &[body], None, Lie::None);
+    let mut fetch = |p: &str| ep.fetch(p);
+    match scan_annulet_verified(&w, &mut fetch, 0, u64::MAX, Some(pin), &mut rng) {
+        Err(VerifyRefusal::ImportedOpenings { why }) => assert!(why.contains("not of a Candidate A net"), "{why}"),
+        other => panic!("a v1 scan with imported openings: {:?}", other.err()),
+    }
+    for d in [w.dir, s.dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }

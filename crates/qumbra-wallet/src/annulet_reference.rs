@@ -365,7 +365,8 @@ where
         (Some(set), true) => Some(AssetIndex::build(&wallet, owned.clone(), set)),
         _ => None,
     };
-    AnnuletReport { genesis_hash, rows, genesis_owned, owned, spent, index, refused }
+    // The reference scan predates imported openings (lab #937): none.
+    AnnuletReport { genesis_hash, rows, genesis_owned, owned, spent, index, refused, imported: (0, 0) }
 }
 
 /// One row per allocated index, scanned over **one** fetch of the range (lab

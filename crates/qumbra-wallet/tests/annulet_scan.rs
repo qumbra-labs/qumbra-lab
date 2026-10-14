@@ -371,3 +371,278 @@ fn w1_no_nullifier_stream_is_a_receipts_only_ledger() {
     assert!(text.contains("receipts only"), "{text}");
     let _ = std::fs::remove_dir_all(&w.dir);
 }
+
+
+/// Lab #937 (the importer, after PR E): **a remote prover's paid ledger,
+/// imported** — `import-openings` checks each line offline and keeps what the
+/// wallet owns in `openings.v1`; the scan then owns an imported note wherever
+/// the compact stream carries its `cm`, decrypted or not, at the chain's
+/// position. Over this file's in-process fixture chain; no node, no proving.
+mod imported_openings {
+    use std::collections::BTreeMap;
+
+    use super::{FixtureChain, GENESIS};
+
+    use qlab_note::hash::digest_bytes;
+    use qlab_note::l2note::L2Note;
+    use qlab_note::scan::encrypt_notes_to_recipient;
+    use qlab_wallet::address::Address;
+    use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+    use qumbra_wallet::annulet::{AnnuletReport, AnnuletScanCore, CoreStep};
+    use qumbra_wallet::auth_journal::{generation_root, AuthJournal};
+    use qumbra_wallet::openings::{
+        import_openings, load_openings, render, ImportedOpening, LineRefusal, OpeningsError, Verdict, OPENINGS_FILE,
+        PAID_LEDGER_HEADER,
+    };
+    use qumbra_wallet::store::WalletDir;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn wallet_dir(tag: &str, seed: u8, journal: bool) -> WalletDir {
+        let dir = std::env::temp_dir().join(format!("qmb_937_import_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = WalletDir::create(&dir, MasterSeed::from_entropy([seed; ENTROPY_LEN])).unwrap();
+        if journal {
+            AuthJournal::fresh(generation_root(&w.wallet(), 0)).save(&w.dir).unwrap();
+        }
+        w
+    }
+
+    /// The wallet's generation-0 version-2 address 0 — the payee a prover pins.
+    fn v2(w: &WalletDir) -> Address {
+        let wallet = w.wallet();
+        wallet.address_candidate_a_at_index(0, &generation_root(&wallet, 0))
+    }
+
+    fn note_to(addr: &Address, value: u64, k: u64) -> L2Note {
+        L2Note { value, asset: 0, rkm: addr.rkm_lanes(), rho: [k, 1, 2, 3], rseed: [k, 4, 5, 6] }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn lanes(l: &[u64; 4]) -> String {
+        hex(&digest_bytes(l))
+    }
+
+    /// One paid-ledger line, as the prover service writes it.
+    fn line(note: &L2Note, cm: [u8; 32], asset: u64) -> String {
+        format!(
+            "1 cm={} value={} asset={asset} rkm={} rho={} rseed={} shape=S at=1800000000\n",
+            hex(&cm),
+            note.value,
+            lanes(&note.rkm),
+            lanes(&note.rho),
+            lanes(&note.rseed)
+        )
+    }
+
+    fn cm_of(note: &L2Note) -> [u8; 32] {
+        digest_bytes(&note.commitment())
+    }
+
+    /// Lab #937 (the importer ruling): every line gets a verdict by name — in
+    /// the ruled order — and only owned openings are kept, 0600, once each. The
+    /// output names a `cm` prefix and a verdict, never `rho` or `rseed`. A
+    /// header that is not a version-1 paid ledger refuses the whole file.
+    #[test]
+    fn a_paid_ledger_imports_line_by_line_and_never_prints_an_opening() {
+        let w = wallet_dir("lines", 0x61, true);
+        let stranger = wallet_dir("lines_s", 0x62, true);
+        let paid = note_to(&v2(&w), 3, 10);
+        let zero = note_to(&v2(&w), 0, 11);
+        let theirs = note_to(&v2(&stranger), 3, 12);
+        let mut flipped = paid;
+        flipped.rho[0] ^= 1;
+        let mut ledger = format!("{PAID_LEDGER_HEADER}\n");
+        ledger += &line(&paid, cm_of(&paid), 0); // 2 imported
+        ledger += &line(&paid, cm_of(&paid), 0); // 3 already imported
+        ledger += &line(&paid, cm_of(&paid), 0).replacen('1', "2", 1); // 4 entry version 2
+        ledger += &line(&paid, cm_of(&paid), 0).replace("rkm=", "rkm=zz"); // 5 malformed rkm
+        ledger += &line(&paid, cm_of(&paid), 7); // 6 asset 7
+        ledger += &line(&flipped, cm_of(&paid), 0); // 7 a lane flipped: cm mismatch
+        ledger += &line(&theirs, cm_of(&theirs), 0); // 8 another wallet's
+        ledger += &format!("{}\n", "1 ".repeat(600)); // 9 over 1 KiB
+        ledger += &line(&zero, cm_of(&zero), 0); // 10 a price of 0: imported
+        ledger += "1 cm=00"; // 11 torn: no newline
+        let verdicts = import_openings(&w, &ledger).expect("a version-1 paid ledger");
+        let got: Vec<(usize, Verdict)> = verdicts.iter().map(|v| (v.line, v.verdict.clone())).collect();
+        use LineRefusal::*;
+        assert_eq!(
+            got,
+            vec![
+                (2, Verdict::Imported),
+                (3, Verdict::AlreadyImported),
+                (4, Verdict::Refused(EntryVersionUnknown("2".into()))),
+                (5, Verdict::Refused(Malformed("rkm"))),
+                (6, Verdict::Refused(NotAsset0)),
+                (7, Verdict::Refused(CmMismatch)),
+                (8, Verdict::Refused(NotThisWallet)),
+                (9, Verdict::Refused(Malformed("length"))),
+                (10, Verdict::Imported),
+                (11, Verdict::SkippedTornLastLine),
+            ]
+        );
+
+        // The output: a cm prefix and a verdict per line, and the counts — no
+        // opening's rho or rseed, in any form.
+        let out = render(&verdicts);
+        assert!(out.starts_with(&format!("line 2: cm {}… imported\n", &hex(&cm_of(&paid))[..16])), "{out}");
+        assert!(out.contains("line 9: cm - refused:malformed(length)\n"), "{out}");
+        assert!(out.contains("imported 2, already imported 1, refused 6, skipped 1"), "{out}");
+        for n in [&paid, &zero, &theirs, &flipped] {
+            for secret in [lanes(&n.rho), lanes(&n.rseed)] {
+                assert!(!out.contains(&secret) && !out.contains(&secret[..16]), "an opening's secret in the output");
+            }
+        }
+
+        // Kept: the two owned openings, 0600, once each — and a re-import adds nothing.
+        let kept = load_openings(&w).unwrap();
+        assert_eq!(kept.iter().map(|o| o.note).collect::<Vec<_>>(), vec![paid, zero]);
+        assert!(kept.iter().all(|o| (o.div_index, o.generation) == (0, 0)));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(w.dir.join(OPENINGS_FILE)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let again = import_openings(&w, &ledger).unwrap();
+        assert!(again.iter().all(|v| !matches!(v.verdict, Verdict::Imported)));
+        assert_eq!(load_openings(&w).unwrap(), kept);
+
+        // Not a version-1 paid ledger: the whole file, nothing written.
+        let before = std::fs::read(w.dir.join(OPENINGS_FILE)).unwrap();
+        for bad in ["qumbra-prover-paid-ledger 2\n", "", PAID_LEDGER_HEADER] {
+            assert_eq!(import_openings(&w, bad), Err(OpeningsError::NotAPaidLedger), "{bad:?}");
+        }
+        assert_eq!(std::fs::read(w.dir.join(OPENINGS_FILE)).unwrap(), before);
+
+        // A hand edit that moves an opening to an index never allocated is
+        // refused on load.
+        let text = String::from_utf8(before).unwrap().replace("index=0", "index=5");
+        std::fs::write(w.dir.join(OPENINGS_FILE), text).unwrap();
+        let e = load_openings(&w).unwrap_err().to_string();
+        assert!(e.contains("never allocated"), "{e}");
+    }
+
+    /// Lab #937 (the importer ruling, pre-review B): the **command's** output —
+    /// the real binary, stdout and stderr — carries a verdict line per entry
+    /// and the counts, and no opening's `rho` or `rseed`, whole or as a 16-hex
+    /// prefix.
+    #[test]
+    fn the_import_command_prints_verdicts_and_never_an_opening() {
+        let w = wallet_dir("cmd", 0x64, true);
+        let stranger = wallet_dir("cmd_s", 0x65, true);
+        let a = note_to(&v2(&w), 3, 40);
+        let b = note_to(&v2(&w), 7, 41);
+        let theirs = note_to(&v2(&stranger), 3, 42);
+        let mut ledger = format!("{PAID_LEDGER_HEADER}\n");
+        for n in [&a, &b, &theirs] {
+            ledger += &line(n, cm_of(n), 0);
+        }
+        let file = w.dir.join("paid-ledger.txt");
+        std::fs::write(&file, &ledger).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_qumbra-wallet"))
+            .args(["import-openings", "--net", "annulet", "--dir"])
+            .arg(&w.dir)
+            .arg("--ledger")
+            .arg(&file)
+            .output()
+            .expect("the binary runs");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{text}");
+        for (n, verdict) in [(2, "imported"), (3, "imported"), (4, "refused:not-this-wallet")] {
+            let head = format!("line {n}: cm ");
+            assert!(text.lines().any(|l| l.starts_with(&head) && l.ends_with(verdict)), "line {n}: {text}");
+        }
+        assert!(text.contains("imported 2, already imported 0, refused 1, skipped 0"), "{text}");
+        for n in [&a, &b, &theirs] {
+            for secret in [lanes(&n.rho), lanes(&n.rseed)] {
+                assert!(!text.contains(&secret) && !text.contains(&secret[..16]), "an opening's secret in the output: {text}");
+            }
+        }
+        assert_eq!(load_openings(&w).unwrap().len(), 2);
+        for d in [w.dir, stranger.dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    fn scan(w: &WalletDir, chain: &FixtureChain, imported: Vec<ImportedOpening>) -> AnnuletReport {
+        let wallet = w.wallet();
+        let core = AnnuletScanCore::new(wallet.clone(), w.allocated.clone(), 0, 10, GENESIS, Vec::new())
+            .with_generations(vec![(0, generation_root(&wallet, 0))])
+            .with_imported(imported)
+            .expect("a Candidate A scan takes imported openings");
+        let mut core = core;
+        let mut rng = StdRng::seed_from_u64(937);
+        loop {
+            match core.step(&mut rng) {
+                CoreStep::Need(path) => core.supply(chain.fetch(&path)),
+                CoreStep::Done(report) => return report,
+                CoreStep::Failed(why) => panic!("{why}"),
+            }
+        }
+    }
+
+    /// Lab #937 (the importer ruling): a third output whose discovery payload
+    /// was **not** encrypted to the payee (the case the ledger exists for) is not
+    /// the payee's to a plain scan; imported, it is owned at the chain's height
+    /// and transaction, its spend is subtracted, a 0-value one lands in the zero
+    /// bucket, one the scan also opened counts once, and one the chain does not
+    /// carry is a count, never a figure. A scan that is not Candidate A refuses
+    /// imported openings by name, as does an import into a wallet without a
+    /// Candidate A journal.
+    #[test]
+    fn the_scan_owns_an_imported_opening_where_the_chain_carries_its_cm() {
+        let w = wallet_dir("scan", 0x71, true);
+        let stranger = wallet_dir("scan_s", 0x72, true);
+        let (payee, other) = (v2(&w), v2(&stranger));
+        let mut rng = StdRng::seed_from_u64(1);
+        let hidden = note_to(&payee, 3, 20); // to the payee, encrypted to the stranger
+        let seen = note_to(&payee, 5, 21); // to the payee, encrypted to the payee
+        let zero = note_to(&payee, 0, 22); // a price of 0, encrypted to the stranger
+        let absent = note_to(&payee, 4, 23); // never on chain
+        let pay = |to: &Address, notes: &[L2Note], rng: &mut StdRng| {
+            encrypt_notes_to_recipient(&to.encapsulation_key().unwrap(), notes, rng)
+        };
+        let mut blocks = BTreeMap::new();
+        blocks.insert(1, vec![vec![pay(&other, &[note_to(&other, 9, 30), hidden], &mut rng)]]);
+        blocks.insert(2, vec![vec![pay(&payee, &[seen], &mut rng)], vec![pay(&other, &[zero], &mut rng)]]);
+        let mut chain = FixtureChain { genesis: Vec::new(), blocks, nullifiers: BTreeMap::new(), tip: 4, annulet: true };
+
+        let plain = scan(&w, &chain, Vec::new());
+        assert_eq!(plain.owned.iter().map(|n| n.note).collect::<Vec<_>>(), vec![seen], "only what it decrypts");
+        assert_eq!(plain.imported, (0, 0));
+
+        let opening = |n: L2Note| ImportedOpening { cm: cm_of(&n), note: n, div_index: 0, generation: 0 };
+        let imported = vec![opening(hidden), opening(seen), opening(zero), opening(absent)];
+        let report = scan(&w, &chain, imported.clone());
+        let owned: Vec<(u64, Option<u64>, L2Note)> = report.owned.iter().map(|n| (n.height, n.tx_index, n.note)).collect();
+        assert_eq!(owned.len(), 3, "{owned:?}");
+        for want in [(1, Some(0), hidden), (2, Some(0), seen), (2, Some(1), zero)] {
+            assert!(owned.contains(&want), "{want:?} not in {owned:?}");
+        }
+        assert_eq!(report.imported, (3, 1), "three on chain (one also decrypted), one absent");
+        let index = report.index.as_ref().expect("both halves known");
+        assert_eq!(index.balances(), vec![(0, 8)], "3 + 5; the absent one is never a figure");
+        assert_eq!(index.zero.iter().map(|n| n.note).collect::<Vec<_>>(), vec![zero], "the 0-value one: seen, never spendable");
+        let rendered = qumbra_wallet::annulet::render(&report, "fixture", (0, 4));
+        assert!(rendered.contains("imported: 3 opening(s) found on chain; 1 not found in 0..=4"), "{rendered}");
+
+        // Its spend lands: subtracted like any note's.
+        let spent = report.owned.iter().find(|n| n.note == hidden).unwrap().nullifier(&w.wallet());
+        chain.nullifiers.insert(3, vec![spent]);
+        let report = scan(&w, &chain, imported.clone());
+        assert_eq!(report.index.as_ref().unwrap().balances(), vec![(0, 5)]);
+
+        // Not Candidate A: refused by name, at the scan and at the import.
+        let v1 = AnnuletScanCore::new(w.wallet(), w.allocated.clone(), 0, 10, GENESIS, Vec::new());
+        let e = v1.with_imported(imported).err().expect("a v1 scan refuses imported openings");
+        assert!(e.contains("not of a Candidate A net"), "{e}");
+        let no_journal = wallet_dir("scan_v1", 0x73, false);
+        let ledger = format!("{PAID_LEDGER_HEADER}\n{}", line(&hidden, cm_of(&hidden), 0));
+        assert_eq!(import_openings(&no_journal, &ledger), Err(OpeningsError::NotCandidateA));
+        assert!(!no_journal.dir.join(OPENINGS_FILE).exists());
+    }
+}

@@ -151,6 +151,11 @@ pub struct AnnuletReport {
     /// Notes a scan opened that did not become owned records (an asset lane
     /// out of range, or an `rkm` that is not the address's), by reason.
     pub refused: Vec<String>,
+    /// Lab #937: the imported openings ([`crate::openings`]) — `(found on
+    /// chain in this range, not found)`. A found one is in `owned` (once, if
+    /// the scan also opened it); one not found is only this count, never a
+    /// figure. `(0, 0)` when none were imported.
+    pub imported: (usize, usize),
 }
 
 /// **The Annulet scan**: verify the form, scan every allocated address at
@@ -229,6 +234,10 @@ pub struct AnnuletScanCore {
     /// Lab #896 G: on a Candidate A net, the generations whose `rkm` a note
     /// may carry ([`Self::with_generations`]); empty on a v1 net.
     generations: Vec<(u32, [u64; 4])>,
+    /// Lab #937: the imported openings by `cm` ([`Self::with_imported`]),
+    /// and where the compact stream placed each one seen: `(height, tx_index)`.
+    imported: std::collections::HashMap<[u8; 32], crate::openings::ImportedOpening>,
+    imported_at: std::collections::BTreeMap<[u8; 32], (u64, u64)>,
 }
 
 enum CorePhase {
@@ -244,6 +253,8 @@ struct Tally {
     refused: Vec<String>,
     genesis_owned: usize,
     outputs: Option<(u64, u64)>,
+    /// Lab #937: imported openings `(found, not found)`.
+    imported: (usize, usize),
     /// The paging's verdict, once a page or the transport ended it.
     stream: Option<Result<SpentSet, SpentRefusal>>,
 }
@@ -270,6 +281,8 @@ impl AnnuletScanCore {
             pending: None,
             failed: None,
             generations: Vec::new(),
+            imported: std::collections::HashMap::new(),
+            imported_at: std::collections::BTreeMap::new(),
         }
     }
 
@@ -282,6 +295,45 @@ impl AnnuletScanCore {
         assert!(!generations.is_empty(), "a Candidate A scan needs at least one generation");
         self.generations = generations;
         self
+    }
+
+    /// Lab #937: own the notes whose openings the wallet imported (a
+    /// prover's paid ledger) wherever the compact stream carries their `cm`,
+    /// decrypted or not — at the chain's height and transaction, never the
+    /// file's. Refused by name on a scan that is not Candidate A: a v1 net has
+    /// no prover fee. Call after [`Self::with_generations`].
+    pub fn with_imported(mut self, openings: Vec<crate::openings::ImportedOpening>) -> Result<Self, String> {
+        if openings.is_empty() {
+            return Ok(self);
+        }
+        if self.generations.is_empty() {
+            return Err(format!(
+                "{} imported opening(s), but this scan is not of a Candidate A net: a v1 net has no prover fee",
+                openings.len()
+            ));
+        }
+        self.imported = openings.into_iter().map(|o| (o.cm, o)).collect();
+        Ok(self)
+    }
+
+    /// Lab #937: note where a `/v1/compact` page places any imported `cm`.
+    /// Only reads the page; the scan driver still judges it.
+    fn locate_imported(&mut self, path: &str, answer: &Result<Vec<u8>, String>) {
+        if self.imported.is_empty() || !path.starts_with("/v1/compact?") {
+            return;
+        }
+        let Ok(Ok(blocks)) = answer.as_ref().map(|b| qlab_cbserver::codec::decode_compact_response(b)) else {
+            return;
+        };
+        for block in &blocks {
+            for group in &block.groups {
+                for entry in group.recipients.iter().flat_map(|r| r.entries.iter()) {
+                    if self.imported.contains_key(&entry.cm) {
+                        self.imported_at.entry(entry.cm).or_insert((block.height, group.tx_index));
+                    }
+                }
+            }
+        }
     }
 
     /// Whether `note` (at `idx`) is the wallet's under this scan's derivation.
@@ -356,6 +408,9 @@ impl AnnuletScanCore {
             self.failed = Some("scan core received a response without requesting a path".into());
             return;
         };
+        if matches!(self.phase, CorePhase::Rows(Some(_))) {
+            self.locate_imported(&path, &answer);
+        }
         match &mut self.phase {
             CorePhase::Rows(Some(multi)) => multi.supply(answer),
             CorePhase::Spent { tally, catch } => {
@@ -400,6 +455,22 @@ impl AnnuletScanCore {
             }
         }
 
+        // Lab #937: the imported openings the compact stream placed, owned at
+        // the chain's position — once, if the scan also opened them.
+        let mut imported_found = 0;
+        for (cm, (height, tx_index)) in &self.imported_at {
+            imported_found += 1;
+            if owned.iter().any(|n: &OwnedL2Note| n.cm == *cm) {
+                continue;
+            }
+            let o = &self.imported[cm];
+            match OwnedL2Note::from_imported_v2(wallet, o.div_index, o.note, *height, *tx_index, *cm, &self.generations) {
+                Ok(n) => owned.push(n),
+                Err(e) => refused.push(format!("imported opening at height {height} tx {tx_index}: {e}")),
+            }
+        }
+        let imported = (imported_found, self.imported.len() - imported_found);
+
         // The nullifier stream must cover everything the owned notes could have
         // been spent in: a genesis note from height 1 on (from 0 when the scan
         // starts at 0, which also covers a chain still at its genesis).
@@ -411,19 +482,19 @@ impl AnnuletScanCore {
                 .chain(std::iter::once((genesis_owned > 0).then_some((genesis_from(from), genesis_from(from))))),
         );
         let nf_from = if genesis_owned > 0 { genesis_from(from) } else { from };
-        let tally = Box::new(Tally { rows, owned, refused, genesis_owned, outputs, stream: None });
+        let tally = Box::new(Tally { rows, owned, refused, genesis_owned, outputs, imported, stream: None });
         self.phase = CorePhase::Spent { tally, catch: SpentCatchUp::new(nf_from, self.to) };
     }
 
     fn report(&self, tally: Tally, stream: Result<SpentSet, SpentRefusal>) -> AnnuletReport {
-        let Tally { rows, owned, refused, genesis_owned, outputs, .. } = tally;
+        let Tally { rows, owned, refused, genesis_owned, outputs, imported, .. } = tally;
         let (spent, set): (SpentCoverage, Option<SpentSet>) = coverage_of(stream, outputs);
         let every_scan_started = rows.iter().all(|r| r.scan.is_ok());
         let index = match (&set, every_scan_started) {
             (Some(set), true) => Some(AssetIndex::build(&self.wallet, owned.clone(), set)),
             _ => None,
         };
-        AnnuletReport { genesis_hash: self.genesis_hash, rows, genesis_owned, owned, spent, index, refused }
+        AnnuletReport { genesis_hash: self.genesis_hash, rows, genesis_owned, owned, spent, index, refused, imported }
     }
 }
 
@@ -538,6 +609,14 @@ pub fn render(report: &AnnuletReport, url: &str, range: (u64, u64)) -> String {
                 ));
             }
         }
+    }
+    // Lab #937: imported openings — the found ones are in the figures above
+    // like any note; the rest are this count only, never a figure.
+    if report.imported != (0, 0) {
+        out.push_str(&format!(
+            "imported: {} opening(s) found on chain; {} not found in {}..={} (counted only, never in a figure)\n",
+            report.imported.0, report.imported.1, range.0, range.1
+        ));
     }
     for why in &report.refused {
         out.push_str(&format!("refused:  {why}\n"));
