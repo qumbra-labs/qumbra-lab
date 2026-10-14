@@ -92,6 +92,22 @@ impl OwnedL2Note {
         Self::checked_v2(wallet, div_index, located.detected.note, located.height, Some(located.tx_index), located.cm, generations)
     }
 
+    /// Lab #937: a note whose opening the wallet **imported** (a prover's paid
+    /// ledger) rather than decrypted, located by the scan at `height` /
+    /// `tx_index` with the served `cm` — owned under the same Candidate A rule
+    /// as [`Self::from_located_v2`].
+    pub fn from_imported_v2(
+        wallet: &Wallet,
+        div_index: u64,
+        note: L2Note,
+        height: u64,
+        tx_index: u64,
+        cm: [u8; 32],
+        generations: &GenerationRoots,
+    ) -> Result<Self, AssetError> {
+        Self::checked_v2(wallet, div_index, note, height, Some(tx_index), cm, generations)
+    }
+
     /// Lab #896 G: [`Self::from_genesis`] on a Candidate A net.
     pub fn from_genesis_v2(
         wallet: &Wallet,

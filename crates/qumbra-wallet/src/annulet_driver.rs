@@ -102,6 +102,8 @@ pub struct AnnuletVerifyDriver {
     /// the journal's when the wallet has one ([`Self::with_generations`]),
     /// else the probe set, built only once the genesis says Candidate A.
     generations: Option<Vec<(u32, [u64; 4])>>,
+    /// Lab #937: the wallet's imported openings ([`Self::with_imported`]).
+    imported: Vec<crate::openings::ImportedOpening>,
 }
 
 impl AnnuletVerifyDriver {
@@ -109,6 +111,15 @@ impl AnnuletVerifyDriver {
     /// if the pinned genesis is a Candidate A one; a v1 net scans as before.
     pub fn with_generations(mut self, generations: Vec<(u32, [u64; 4])>) -> Self {
         self.generations = Some(generations);
+        self
+    }
+
+    /// Lab #937: the wallet's imported openings ([`crate::openings`]), owned
+    /// where the scan sees their `cm`. If the pinned genesis is not a
+    /// Candidate A one, the scan is refused by name
+    /// ([`VerifyRefusal::ImportedOpenings`]): a v1 net has no prover fee.
+    pub fn with_imported(mut self, openings: Vec<crate::openings::ImportedOpening>) -> Self {
+        self.imported = openings;
         self
     }
 
@@ -135,6 +146,7 @@ impl AnnuletVerifyDriver {
             pending: None,
             failed: None,
             generations: None,
+            imported: Vec::new(),
             done: None,
         }
     }
@@ -151,6 +163,11 @@ impl AnnuletVerifyDriver {
             return AnnuletStep::Need(path.clone());
         }
         loop {
+            // A refusal recorded while advancing (lab #937: imported openings
+            // on a net that is not Candidate A).
+            if let Some(e) = &self.failed {
+                return AnnuletStep::Failed(e.clone());
+            }
             let need = match std::mem::replace(&mut self.phase, Phase::Finished) {
                 Phase::Genesis => {
                     self.phase = Phase::Genesis;
@@ -376,6 +393,13 @@ impl AnnuletVerifyDriver {
             };
             core = core.with_generations(generations);
         }
+        core = match core.with_imported(std::mem::take(&mut self.imported)) {
+            Ok(core) => core,
+            Err(why) => {
+                self.failed = Some(VerifyRefusal::ImportedOpenings { why });
+                return;
+            }
+        };
         let core = Box::new(core);
         let post = Post {
             chain,

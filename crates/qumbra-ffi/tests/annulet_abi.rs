@@ -582,6 +582,7 @@ fn every_refusal_has_its_pinned_key() {
         ChainCacheInvalid { why: s() },
         CachedTipForked { height: 0 },
         DriverMisuse { why: s() },
+        ImportedOpenings { why: s() },
     ];
     let mut seen = BTreeSet::new();
     for r in &all {
@@ -611,13 +612,16 @@ fn every_refusal_has_its_pinned_key() {
             ChainCacheInvalid { .. } => "chain_cache_invalid",
             CachedTipForked { .. } => "cached_tip_forked",
             DriverMisuse { .. } => "driver_misuse",
+            ImportedOpenings { .. } => "imported_openings",
         };
         assert_eq!(refusal_key(r), pinned);
         assert!(seen.insert(pinned), "{pinned} twice");
     }
     // 25 since lab #937 PR D: `format_not_supported` (the kernel's format-34
-    // refusal, PR C) is gone — the kernel builds format 34.
-    assert_eq!(seen.len(), 25, "every variant listed once");
+    // refusal, PR C) is gone — the kernel builds format 34. 26 since the
+    // importer (lab #937): `imported_openings`, the CLI wallet's; the kernel
+    // never answers it.
+    assert_eq!(seen.len(), 26, "every variant listed once");
 }
 
 /// The bounds' constants are the real sizes: the list key and signature are

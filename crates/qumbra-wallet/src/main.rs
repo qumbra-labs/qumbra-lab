@@ -45,6 +45,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("issuer") => issuer(&args[1..]),
         Some("ivk") => ivk(&args[1..]),
         Some("migrate") => migrate_cmd(&args[1..]),
+        Some("import-openings") => import_openings_cmd(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -433,6 +434,12 @@ fn usage() {
                             once their wait on this net has passed\n\
                             Candidate A writes (send, issuer, migrate) take --valid-for N: blocks\n\
                             past the tip the transaction may land (default 256, at most 1,152)\n  \
+         qumbra-wallet import-openings --net annulet --dir DIR --ledger FILE\n\
+                            Candidate A (lab #937): import a remote prover's paid ledger (copied\n\
+                            by hand from its box) — openings of notes paid to this wallet. Checked\n\
+                            offline (version, fields, asset 0, cm, this wallet's rkm) and kept in\n\
+                            openings.v1 (0600); `scan --net annulet` then owns each one the chain\n\
+                            carries. Prints a cm prefix and a verdict per line, never rho/rseed\n  \
          qumbra-wallet contact add NAME QADDR --dir DIR  save a full address under a local name\n  \
          qumbra-wallet contact list --dir DIR            show NAME → qs1… (short)\n  \
          qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
@@ -702,6 +709,25 @@ fn resolve_net(
     }
 }
 
+
+/// `import-openings --net annulet --dir DIR --ledger FILE` (lab #937): check a
+/// remote prover's paid ledger — copied by hand from the prover's box —
+/// against this wallet, offline, and keep the openings it owns in
+/// `openings.v1`. Prints one verdict per line (a `cm` prefix and the verdict,
+/// never `rho` or `rseed`) and a count. Membership is the scan's: a later
+/// `scan --net annulet` owns an imported note where the chain carries it.
+fn import_openings_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    if flag(args, "--net") != Some("annulet") {
+        return Err("import-openings is for a Candidate A Annulet net: pass --net annulet (a v1 net has no prover fee)".into());
+    }
+    let dir = dir_of(args)?;
+    let ledger = flag(args, "--ledger").ok_or("import-openings requires --ledger FILE (the prover's paid ledger)")?;
+    let text = std::fs::read_to_string(ledger).map_err(|e| format!("--ledger {ledger} could not be read: {e}"))?;
+    let w = qumbra_wallet::store::WalletDir::open(&dir)?;
+    let verdicts = qumbra_wallet::openings::import_openings(&w, &text)?;
+    print!("{}", qumbra_wallet::openings::render(&verdicts));
+    Ok(())
+}
 
 fn dir_of(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(flag(args, "--dir").ok_or("--dir DIR is required")?))

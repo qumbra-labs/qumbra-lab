@@ -206,6 +206,11 @@ pub enum VerifyRefusal {
     /// a terminal step, or an answer with no `Need` outstanding. Never an
     /// endpoint's fault, and never reached by the synchronous pump.
     DriverMisuse { why: String },
+    /// Lab #937: the wallet's imported openings (`openings.v1`) could not be
+    /// read or re-checked, or the pinned net is not a Candidate A one (a v1
+    /// net has no prover fee). The scan will not guess which notes are the
+    /// wallet's.
+    ImportedOpenings { why: String },
 }
 
 impl std::fmt::Display for VerifyRefusal {
@@ -258,6 +263,7 @@ impl std::fmt::Display for VerifyRefusal {
                  the record is discarded"
             ),
             DriverMisuse { why } => write!(f, "the verified-scan driver was misused: {why}"),
+            ImportedOpenings { why } => write!(f, "imported openings: {why}"),
         }
     }
 }
@@ -721,7 +727,9 @@ where
 /// (a receive-only wallet passes generation 0 alone); an empty list is
 /// [`scan_annulet_verified`]'s own rule — the wallet's journal when it has
 /// one, else the driver's probe. A v1 net does not read them. The record is
-/// read and written exactly as [`scan_annulet_verified`] does.
+/// read and written exactly as [`scan_annulet_verified`] does. The wallet's
+/// imported openings (lab #937, `openings.v1`) are loaded here too, so every
+/// verified scan — `scan`, `history`, `send` — owns them alike.
 pub fn scan_annulet_verified_with_generations<F>(
     w: &WalletDir,
     fetch: &mut F,
@@ -751,6 +759,16 @@ where
             Err(e) => return Err(VerifyRefusal::AuthJournal { why: e.to_string() }),
         }
     }
+    // Lab #937: the openings the wallet imported from a prover's paid ledger,
+    // re-checked against the generations this scan owns notes under (none
+    // when the wallet has no `openings.v1`).
+    let imported = if generations.is_empty() {
+        crate::openings::load_openings(w)
+    } else {
+        crate::openings::load_openings_with(w, generations)
+    }
+    .map_err(|e| VerifyRefusal::ImportedOpenings { why: e.to_string() })?;
+    driver = driver.with_imported(imported);
     let mut v = loop {
         match driver.step(rng) {
             AnnuletStep::Need(path) => driver.supply(fetch(&path)),
