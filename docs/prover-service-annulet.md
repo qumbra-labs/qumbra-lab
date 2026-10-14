@@ -112,7 +112,7 @@ Lab #937 PR E (rulings D4 and D5, and the PR E ruling on issue #937). On a forma
    - absent, repeated or not an IP → `400 client-ip-unknown`;
    - a second live job or a second upload from the same IP → `429 ip-busy`.
 
-   An IPv4-mapped IPv6 address counts as its IPv4 address. An IPv6 address counts by its /64.
+   An IPv4-mapped IPv6 address counts as its IPv4 address. An IPv6 address counts by its /64. So several users behind one NAT or CGNAT share one slot: they wait for each other's job. That is accepted on the testnet.
 2. The byte ceiling, decode and the bundle's lock, as on 33. A two-output bundle is `422 outputs-not-the-nets`.
 3. **The fee**, read from the witness's output 3, which the lock has already bound to the transaction's third commitment:
    - not the payee's `rkm`, or not asset 0 → `402 prover-fee-missing`;
@@ -124,7 +124,7 @@ Lab #937 PR E (rulings D4 and D5, and the PR E ruling on issue #937). On a forma
    - the follow is not ready → `503 nullifiers-catching-up` or `503 nullifiers-stale`;
    - one is claimed by a job here that may still land (queued, proving, submitting, or submitted within the result TTL) → `409 nullifier-in-flight`.
 
-   The intent is still the idempotency key, and the client's IP is its submitter. A retry from that IP gets the existing job; another IP gets `409 intent-in-flight`.
+   The intent is still the idempotency key, and the client's IP is its submitter. While the job is live, a retry from that IP is already refused at step 1 (`429 ip-busy`, as `token-busy` is on 33). Once the job has ended (`submitted`, `failed`, `refused`, `cancelled`), a retry from that IP gets the existing job back, or a fresh one if it ended without a transaction. Another IP gets `409 intent-in-flight`.
 5. The retained-job and queue bounds, as on 33.
 
 **The client IP and its premise.** The service trusts `X-Qumbra-Client-IP` because it listens only on the internal ingress network. The `QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` acknowledgement covers that premise.
@@ -141,7 +141,7 @@ The IP is never logged. Refusals are counted under a 4-byte hash of a per-proces
 - the tip is read from `GET /v1/registry/root`;
 - the landed nullifiers are paged from `GET /v1/nullifiers`, starting at height 1.
 
-It polls every half slot. Every height must be served, in order. A page that skips a height, a page with no block, or a tip below the followed height is an error, and the set does not advance past it.
+It polls every quarter slot (no more often than every 200 ms), so a slow poll still lands well inside the one slot after which the set is stale. Every height must be served, in order. A page that skips a height or a page with no block is an error, and the set does not advance past it. A tip below the followed height (a reorganisation deeper than the set, or a node rolled back) empties the set: it is logged as `error:` and rebuilt from height 1, catching up again.
 
 The set lives in memory (32 bytes per nullifier) and is rebuilt from height 1 at every start. The first catch-up logs its size and how long it took. If that rebuild grows past 60 s, a persisted set gets its own issue.
 
@@ -152,8 +152,8 @@ The set lives in memory (32 bytes per nullifier) and is rebuilt from height 1 at
 A follow failure is logged once as `error:`, and its recovery once.
 
 *Residuals.*
-- A transaction that loses a race to a spend the follow has not yet seen costs one wasted prove (accepted at D4).
-- A nullifier from a block that is later reorganised away stays in the set until the next restart, and its notes are refused as `nullifier-landed` until then.
+- **At most one wasted prove per IP per prove time.** A transaction that loses a race to a spend the follow has not yet seen still gets proved, and its landed spend costs the attacker real notes (accepted at D4).
+- A nullifier from a block that is later reorganised away, by a reorganisation shallower than the set, stays in the set until the next restart or the next rebuild. Until then its notes are refused as `nullifier-landed`.
 
 **The paid ledger (D5).** `QUMBRA_PROVER_ANNULET_PAID_LEDGER` names a file.
 

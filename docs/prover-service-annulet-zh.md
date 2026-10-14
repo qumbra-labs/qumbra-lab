@@ -112,7 +112,7 @@ Lab #937 PR E（裁定 D4、D5，以及 issue #937 上对 PR E 的裁定）。�
    - 缺失、重复或不是 IP → `400 client-ip-unknown`；
    - 同一个 IP 已有一个活着的任务，或已有一个正在上传的请求 → `429 ip-busy`。
 
-   IPv4-mapped 的 IPv6 地址按其 IPv4 地址算。IPv6 按 /64 网段算作同一个来源。
+   IPv4-mapped 的 IPv6 地址按其 IPv4 地址算。IPv6 按 /64 网段算作同一个来源。因此同一个 NAT 或 CGNAT 后面的多个用户共用一个名额，要互相等对方的任务结束。测试网上接受这一点。
 2. 字节上限、解码和 bundle 的 lock，和 33 上一样。两输出的 bundle 返回 `422 outputs-not-the-nets`。
 3. **手续费**，从 witness 的第三个输出读取。lock 已经把这个输出绑定到交易的第三个 commitment 上：
    - 收款方不是 payee 的 `rkm`，或资产不是 asset 0 → `402 prover-fee-missing`；
@@ -124,7 +124,7 @@ Lab #937 PR E（裁定 D4、D5，以及 issue #937 上对 PR E 的裁定）。�
    - 跟读还没就绪 → `503 nullifiers-catching-up` 或 `503 nullifiers-stale`；
    - 其中一个已被本服务里一个仍可能上链的任务占用（排队中、证明中、提交中，或在结果 TTL 内已提交）→ `409 nullifier-in-flight`。
 
-   幂等键仍然是 intent，提交者就是客户端的 IP。同一 IP 重试拿回已有的任务；换一个 IP 则返回 `409 intent-in-flight`。
+   幂等键仍然是 intent，提交者就是客户端的 IP。任务还活着的时候，同一 IP 的重试在第 1 步就会被拒（`429 ip-busy`，33 上的 `token-busy` 同理）。任务结束之后（`submitted`、`failed`、`refused`、`cancelled`），同一 IP 重试会拿回原来的任务；如果原任务没有产出交易，则新建一个。换一个 IP 则返回 `409 intent-in-flight`。
 5. 保留任务数和队列上限，和 33 上一样。
 
 **客户端 IP 及其前提。** 服务之所以信任 `X-Qumbra-Client-IP`，是因为它只监听内部 ingress 网络。`QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` 这个确认项涵盖的就是这个前提。
@@ -141,7 +141,7 @@ IP 从不进日志。拒绝计数记在一个按进程随机加盐的键的 4 �
 - tip 从 `GET /v1/registry/root` 读；
 - 已上链的 nullifier 从高度 1 起，按页读 `GET /v1/nullifiers`。
 
-每半个 slot 轮询一次。每个高度都必须按顺序给出。跳过某个高度的页、一个块都没有的页、或者 tip 低于已跟读高度，都算错误，集合不会越过它往前走。
+每四分之一个 slot 轮询一次（最快 200 ms 一次），这样即使某次轮询较慢，也远在"超过一个 slot 即判为过期"的界限之内。每个高度都必须按顺序给出。跳过某个高度的页、或一个块都没有的页，都算错误，集合不会越过它往前走。如果 tip 低于已跟读的高度（重组深过了集合，或节点被回滚），集合会被清空：记一条 `error:` 日志，然后从高度 1 重建，重新追赶。
 
 集合放在内存里（每个 nullifier 32 字节），每次启动都从高度 1 重建。第一次追上时日志会记下集合大小和耗时。如果重建超过 60 秒，持久化另开 issue。
 
@@ -152,8 +152,8 @@ IP 从不进日志。拒绝计数记在一个按进程随机加盐的键的 4 �
 跟读失败以 `error:` 记一次日志，恢复时再记一次。
 
 *残余风险。*
-- 如果一笔交易输给了一笔跟读还没看到的花费，代价是白跑一次证明（D4 已接受）。
-- 某个块后来被重组掉了，其中的 nullifier 会一直留在集合里，直到下次重启。在那之前，相关的 note 会被当作 `nullifier-landed` 拒绝。
+- **每个 IP 每个证明时长最多浪费一次证明。** 如果一笔交易输给了一笔跟读还没看到的花费，它仍会被证明一次；而对方那笔上链的花费要花掉攻击者真实的 note（D4 已接受）。
+- 某个块后来被重组掉（重组没有深过集合），其中的 nullifier 会一直留在集合里，直到下次重启或下次重建。在那之前，相关的 note 会被当作 `nullifier-landed` 拒绝。
 
 **付费台账（D5）。** `QUMBRA_PROVER_ANNULET_PAID_LEDGER` 指定一个文件。
 

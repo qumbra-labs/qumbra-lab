@@ -1148,13 +1148,22 @@ fn dispatch(
                 // the commitment, for the operator to recover by hand.
                 if let Some(ledger) = &ledger {
                     let paid = lock(&state).jobs.get_mut(&item.cap).and_then(|j| j.paid.take());
-                    if let Some(entry) = paid {
-                        if let Err(e) = ledger.append(&entry, unix_now()) {
-                            eprintln!(
-                                "qumbra-prover-service: error: annulet paid ledger write failed for cm={}: {e}",
-                                hex(&entry.cm)
-                            );
+                    match paid {
+                        Some(entry) => {
+                            if let Err(e) = ledger.append(&entry, unix_now()) {
+                                eprintln!(
+                                    "qumbra-prover-service: error: annulet paid ledger write failed for cm={}: {e}",
+                                    hex(&entry.cm)
+                                );
+                            }
                         }
+                        // Admission recorded an opening for every format-34
+                        // job; a job without one is a defect, never silent.
+                        // (The job-id prefix only: the capability is secret.)
+                        None => eprintln!(
+                            "qumbra-prover-service: error: annulet job {}: accepted with no output-3 opening to record in the paid ledger",
+                            &item.cap[..8]
+                        ),
                     }
                 }
                 let _ = submitter.relay(&wire);

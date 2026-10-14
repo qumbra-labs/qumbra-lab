@@ -214,8 +214,10 @@ impl Drop for PaidEntry {
 /// The paid ledger (D5): an append-only file of [`PaidEntry`] lines under a
 /// version header. Created 0600 by this process; an existing one must be
 /// 0600 and start with [`PAID_LEDGER_HEADER`]. Each append is fsynced before
-/// the job reports `submitted`. A crash mid-write can leave a last line
-/// without its newline: a reader skips it.
+/// the job reports `submitted`. A torn line never swallows the next entry: an
+/// append that fails is cut back to the length before it, and a crash's
+/// newline-less tail is closed with a newline when the ledger is next
+/// opened — so a reader skips one malformed line and loses no good one.
 pub struct PaidLedger {
     file: Mutex<File>,
 }
@@ -243,10 +245,12 @@ impl PaidLedger {
                         "{PAID_LEDGER_VAR} is not a version-1 paid ledger (its first line is not `{PAID_LEDGER_HEADER}`)"
                     ));
                 }
-                let file = OpenOptions::new()
+                let mut file = OpenOptions::new()
+                    .read(true)
                     .append(true)
                     .open(path)
                     .map_err(|_| format!("{PAID_LEDGER_VAR} could not be opened for appending"))?;
+                close_torn_tail(&mut file).map_err(|_| format!("{PAID_LEDGER_VAR}'s torn last line could not be closed"))?;
                 Ok(Self { file: Mutex::new(file) })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -272,12 +276,37 @@ impl PaidLedger {
         }
     }
 
-    /// Append `entry`'s line and fsync it.
+    /// Append `entry`'s line and fsync it. On failure the file is cut back
+    /// to its length before the write (best effort), so a partial line does
+    /// not prefix the next entry.
     pub fn append(&self, entry: &PaidEntry, at_unix: u64) -> std::io::Result<()> {
         let mut file = lock(&self.file);
-        file.write_all(entry.line(at_unix).as_bytes())?;
-        file.sync_data()
+        let before = file.metadata()?.len();
+        let written = file.write_all(entry.line(at_unix).as_bytes()).and_then(|()| file.sync_data());
+        if written.is_err() {
+            let _ = file.set_len(before).and_then(|()| file.sync_data());
+        }
+        written
     }
+}
+
+/// A ledger whose last byte is not a newline ends in a torn line (a crash
+/// mid-write): close it with a newline, fsynced, so the next entry starts on
+/// its own line.
+fn close_torn_tail(file: &mut File) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1))?;
+    file.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------- the follow
@@ -373,14 +402,20 @@ impl NullifierFollow {
 
     /// One follow step: read the tip, then page the nullifiers from the
     /// followed height + 1 to it. Every height must be served, in order; a
-    /// page that skips one, or a tip below the followed height, is an error
-    /// (the set does not advance past what it saw).
+    /// page that skips one is an error (the set does not advance past what it
+    /// saw). A tip below the followed height — a reorganisation deeper than
+    /// the set, or a node rolled back — empties the set: it is rebuilt from
+    /// height 1, catching up again, rather than holding admission at 503
+    /// until the chain regrows past the old height.
     pub fn poll(&self, node: &dyn ChainFollow) -> Result<(), String> {
         let asked = Instant::now();
         let tip = node.tip()?;
         let followed = lock(&self.state).height;
         if tip < followed {
-            return Err(format!("the node's tip {tip} is below the followed height {followed}"));
+            *lock(&self.state) = Followed::default();
+            return Err(format!(
+                "the node's tip {tip} is below the followed height {followed}: rebuilding the set from height 1"
+            ));
         }
         let mut next = followed + 1;
         while next <= tip {
@@ -406,11 +441,13 @@ impl NullifierFollow {
     }
 }
 
-/// The follow's thread: poll every half slot (at least every 200 ms) until
-/// the service is dropped. The first catch-up logs the rebuild's size and
-/// time; a failure logs once, and its recovery once.
+/// The follow's thread: poll every quarter slot (no more often than every
+/// 200 ms) until the service is dropped — so a poll that takes a while still
+/// lands well inside the one slot after which the set is stale. The first
+/// catch-up logs the rebuild's size and time; a failure logs once, and its
+/// recovery once, with the set's size.
 pub fn follow(follow: Weak<NullifierFollow>, node: Arc<dyn ChainFollow>, slot: Duration) {
-    let every = (slot / 2).max(Duration::from_millis(200));
+    let every = (slot / 4).max(Duration::from_millis(200));
     let started = Instant::now();
     let mut rebuilt = false;
     let mut failing: Option<String> = None;
@@ -426,7 +463,10 @@ pub fn follow(follow: Weak<NullifierFollow>, node: Arc<dyn ChainFollow>, slot: D
                         started.elapsed().as_millis()
                     );
                 } else if failing.is_some() {
-                    eprintln!("qumbra-prover-service: annulet nullifier follow recovered");
+                    let (n, height) = f.size();
+                    eprintln!(
+                        "qumbra-prover-service: annulet nullifier follow recovered: {n} nullifiers through height {height}"
+                    );
                 }
                 failing = None;
             }

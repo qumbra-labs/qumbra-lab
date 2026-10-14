@@ -1031,8 +1031,9 @@ fn landed_and_in_flight_nullifiers_are_refused_409() {
 /// Lab #937 PR E (the ruling: fail loudly): until the follow has caught up,
 /// admission is `503 nullifiers-catching-up`; once the node is unreachable
 /// for more than a slot, `503 nullifiers-stale` — and `ready()`, which is
-/// what `/healthz` reports, says the same. A node that skips a height, serves
-/// none, or reports a tip below the followed height is an error, not a gap.
+/// what `/healthz` reports, says the same. A node that skips a height or
+/// serves none is an error, not a gap; a tip below the followed height empties
+/// the set, which is rebuilt from height 1.
 #[test]
 fn the_nullifier_follow_fails_loudly() {
     let chain = FakeChain::new(2, &[]);
@@ -1074,9 +1075,19 @@ fn the_nullifier_follow_fails_loudly() {
     assert!(e.contains("skips height 2"), "{e}");
     let f = NullifierFollow::new(Duration::from_secs(1));
     assert!(f.poll(&Lying(2, vec![])).unwrap_err().contains("served no block at height 1"));
+    // A tip regression: the set is emptied and rebuilt from height 1, not
+    // held at 503 until the chain regrows past the old height.
     let f = NullifierFollow::new(Duration::from_secs(1));
-    f.poll(&Lying(2, vec![(1, vec![]), (2, vec![])])).unwrap();
-    assert!(f.poll(&Lying(1, vec![])).unwrap_err().contains("below the followed height 2"));
+    f.poll(&Lying(2, vec![(1, vec![[1; 32]]), (2, vec![[2; 32]])])).unwrap();
+    assert_eq!(f.size(), (2, 2));
+    let e = f.poll(&Lying(1, vec![(1, vec![[9; 32]])])).unwrap_err();
+    assert!(e.contains("below the followed height 2: rebuilding"), "{e}");
+    assert_eq!(f.size(), (0, 0));
+    assert_eq!(code(f.readiness()), Some((503, "nullifiers-catching-up")));
+    f.poll(&Lying(1, vec![(1, vec![[9; 32]])])).unwrap();
+    assert_eq!(f.size(), (1, 1), "rebuilt from the node's chain, the old height-2 nullifier gone");
+    assert_eq!(f.check(&[[2; 32]]), Ok(()));
+    assert_eq!(code(f.check(&[[9; 32]])), Some((409, "nullifier-landed")));
     assert_eq!(code(NullifierFollow::new(Duration::from_secs(1)).readiness()), Some((503, "nullifiers-catching-up")));
 }
 
@@ -1129,4 +1140,36 @@ fn an_accepted_submission_writes_one_ledger_line_and_a_refused_one_none() {
     assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "failed");
     assert_eq!(code(admit_ip(&a, "192.0.2.22", v3(L2ShapeTag::P))), Some((402, "prover-fee-short")));
     assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{PAID_LEDGER_HEADER}\n"));
+}
+
+/// Lab #937 PR E (pre-review): a torn last line — a crash mid-write — never
+/// swallows the next entry. Reopening closes it with a newline, so the next
+/// append starts its own line: the reader skips one malformed line and every
+/// whole entry still parses.
+#[test]
+fn a_torn_ledger_line_never_swallows_the_next_entry() {
+    use crate::annulet_v3::PaidEntry;
+    let at = ledger_path("torn");
+    drop(PaidLedger::open(&at).unwrap());
+    let torn = "1 cm=00ff value=3 asse";
+    let mut f = std::fs::OpenOptions::new().append(true).open(&at).unwrap();
+    std::io::Write::write_all(&mut f, torn.as_bytes()).unwrap();
+    drop(f);
+    let ledger = PaidLedger::open(&at).unwrap();
+    let out3 = qlab_air::l2::L2TxOutput { value: 7, asset: 0, rkm: PAYEE_RKM, rho: [1; 4], rseed: [2; 4] };
+    let entry = PaidEntry::of(&out3, [0xab; 32], L2ShapeTag::P);
+    ledger.append(&entry, 1_800_000_000).unwrap();
+    let text = std::fs::read_to_string(&at).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, [PAID_LEDGER_HEADER, torn, entry.line(1_800_000_000).trim_end()], "{text}");
+    assert!(text.ends_with('\n'));
+    // Every whole entry parses: version, then the eight fields.
+    let whole: Vec<&str> = lines[1..].iter().copied().filter(|l| l.split(' ').count() == 9).collect();
+    assert_eq!(whole.len(), 1);
+    assert!(whole[0].starts_with(&format!("1 cm={} value=7 asset=0 ", hex(&[0xab; 32]))));
+    assert!(whole[0].ends_with("shape=P at=1800000000"));
+    // A clean ledger is left as it is on reopen.
+    drop(PaidLedger::open(&at).unwrap());
+    assert_eq!(std::fs::read_to_string(&at).unwrap(), text);
+    let _ = std::fs::remove_file(&at);
 }
