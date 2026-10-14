@@ -658,12 +658,16 @@ fn an_asset_0_third_output_rides_the_fee_bank_only_when_the_note_pays_it() {
         );
     }
     // The same output 3 beside a dummy slot 3: no row is asset 0, no fee
-    // bank — no place for it.
+    // bank — no place for it. (A dummy slot is empty — value 0, asset 0,
+    // `d = 0` — or `ProvingBundle::new` refuses it first.)
     let mut w = b.witness().clone();
-    let input = match &w.fee_slot {
+    let mut input = match &w.fee_slot {
         FeeSlotV2::Exact { input, .. } => input.clone(),
         FeeSlotV2::Dummy { .. } => unreachable!(),
     };
+    input.value = 0;
+    input.asset = 0;
+    input.d = [0, 0];
     w.fee_slot = FeeSlotV2::Dummy { input };
     let bad = ProvingBundle::new(b.tx().clone(), w).expect("well formed");
     assert_eq!(bad.check(&CTX_V3).err(), Some(BundleError::ThirdOutputAsset { asset: 0, inputs: [7, 7] }));
