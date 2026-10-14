@@ -36,7 +36,7 @@ Lab #937，PR F。format 34 是在交易内付 prover 费用的 Candidate A Annu
 |---|---|---|---|
 | 创世 format 版本 | 34 ↔ `(Annulet, CandidateAV3)` | `qlab-devnet/src/forms.rs`（`ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION`、`annulet_forms_of_genesis_format_version`） | lab PR #940 |
 | S/P 输出数 | 3（R 仍是 2） | `qlab-devnet/src/forms.rs`（`L2AuthForm::sp_outputs`） | lab PR #940 |
-| body 和创世 body 的域 | v3 的两个域 | `qlab-devnet/src/annulet.rs`（`BODY_PREIMAGE_DOMAIN_ANNULET_V3`、`GENESIS_BODY_DOMAIN_ANNULET_V3`） | lab PR #940 |
+| body 和创世 body 的域 | v3 的两个域 | `qlab-devnet/src/annulet.rs`（`BODY_PREIMAGE_DOMAIN_ANNULET_V3`、`GENESIS_BODY_DOMAIN_ANNULET_V3`），测试 `format_34_is_frozen` | lab PR #940 |
 | served wire form | 字节 6 | `qlab-p2p/src/served.rs`（`wire_form_byte`）、`qlab-p2p/src/compact.rs`（`WireForm::ANNULET_AUTH_V3`） | lab PR #940 |
 | 证明 bundle 版本（三输出） | 2 | `qlab-l2spend/src/bundle.rs`（`BUNDLE_VERSION_THREE_OUTPUTS`） | lab PR #941 |
 | S v3 shape digest | `2b65c9d45b626dcbfc02bb49ae9574d5724d87a577a759b0a297ab1e0da015b8` | `qlab-l2/src/v3.rs`（`SHAPE_S_DIGEST_V3`），由 `l2_v3_shape_digests_are_pinned` 重算 | `3d987c9e` 上的 `l2_goldens`（A′，lab PR #943） |

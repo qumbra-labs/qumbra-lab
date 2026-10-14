@@ -36,7 +36,7 @@ The base is lab main `5a719644`. Lane run 38589728298 passed every pin below, wi
 |---|---|---|---|
 | Genesis format version | 34 ↔ `(Annulet, CandidateAV3)` | `qlab-devnet/src/forms.rs` (`ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION`, `annulet_forms_of_genesis_format_version`) | lab PR #940 |
 | S/P outputs | 3 (R stays 2) | `qlab-devnet/src/forms.rs` (`L2AuthForm::sp_outputs`) | lab PR #940 |
-| Body and genesis-body domains | the v3 domains | `qlab-devnet/src/annulet.rs` (`BODY_PREIMAGE_DOMAIN_ANNULET_V3`, `GENESIS_BODY_DOMAIN_ANNULET_V3`) | lab PR #940 |
+| Body and genesis-body domains | the v3 domains | `qlab-devnet/src/annulet.rs` (`BODY_PREIMAGE_DOMAIN_ANNULET_V3`, `GENESIS_BODY_DOMAIN_ANNULET_V3`); test `format_34_is_frozen` | lab PR #940 |
 | Served wire form | byte 6 | `qlab-p2p/src/served.rs` (`wire_form_byte`), `qlab-p2p/src/compact.rs` (`WireForm::ANNULET_AUTH_V3`) | lab PR #940 |
 | Proving-bundle version (three outputs) | 2 | `qlab-l2spend/src/bundle.rs` (`BUNDLE_VERSION_THREE_OUTPUTS`) | lab PR #941 |
 | S v3 shape digest | `2b65c9d45b626dcbfc02bb49ae9574d5724d87a577a759b0a297ab1e0da015b8` | `qlab-l2/src/v3.rs` (`SHAPE_S_DIGEST_V3`); recomputed by `l2_v3_shape_digests_are_pinned` | `l2_goldens` at `3d987c9e` (A′, lab PR #943) |

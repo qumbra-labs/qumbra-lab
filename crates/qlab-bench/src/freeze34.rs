@@ -33,6 +33,17 @@ mod tests {
         assert_eq!(L2AuthForm::CandidateAV3.annulet_genesis_format_version(), 34, "CandidateAV3 → 34: {MSG}");
         // Three S/P outputs.
         assert_eq!(L2AuthForm::CandidateAV3.sp_outputs(), 3, "S/P outputs on format 34: {MSG}");
+        // The v3 body and genesis-body commitment domains.
+        assert_eq!(
+            qlab_devnet::annulet::BODY_PREIMAGE_DOMAIN_ANNULET_V3,
+            b"qumbra:body:annulet:v3",
+            "the format-34 body preimage domain: {MSG}"
+        );
+        assert_eq!(
+            qlab_devnet::annulet::GENESIS_BODY_DOMAIN_ANNULET_V3,
+            b"qumbra:body:annulet:genesis:v3",
+            "the format-34 genesis body domain: {MSG}"
+        );
         // The served wire-form byte.
         assert_eq!(
             qlab_p2p::served::wire_form_byte(qlab_p2p::compact::WireForm::ANNULET_AUTH_V3),
