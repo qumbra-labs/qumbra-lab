@@ -526,6 +526,48 @@ mod imported_openings {
         assert!(e.contains("never allocated"), "{e}");
     }
 
+    /// Lab #937 (the importer ruling, pre-review B): the **command's** output —
+    /// the real binary, stdout and stderr — carries a verdict line per entry
+    /// and the counts, and no opening's `rho` or `rseed`, whole or as a 16-hex
+    /// prefix.
+    #[test]
+    fn the_import_command_prints_verdicts_and_never_an_opening() {
+        let w = wallet_dir("cmd", 0x64, true);
+        let stranger = wallet_dir("cmd_s", 0x65, true);
+        let a = note_to(&v2(&w), 3, 40);
+        let b = note_to(&v2(&w), 7, 41);
+        let theirs = note_to(&v2(&stranger), 3, 42);
+        let mut ledger = format!("{PAID_LEDGER_HEADER}\n");
+        for n in [&a, &b, &theirs] {
+            ledger += &line(n, cm_of(n), 0);
+        }
+        let file = w.dir.join("paid-ledger.txt");
+        std::fs::write(&file, &ledger).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_qumbra-wallet"))
+            .args(["import-openings", "--net", "annulet", "--dir"])
+            .arg(&w.dir)
+            .arg("--ledger")
+            .arg(&file)
+            .output()
+            .expect("the binary runs");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{text}");
+        for (n, verdict) in [(2, "imported"), (3, "imported"), (4, "refused:not-this-wallet")] {
+            let head = format!("line {n}: cm ");
+            assert!(text.lines().any(|l| l.starts_with(&head) && l.ends_with(verdict)), "line {n}: {text}");
+        }
+        assert!(text.contains("imported 2, already imported 0, refused 1, skipped 0"), "{text}");
+        for n in [&a, &b, &theirs] {
+            for secret in [lanes(&n.rho), lanes(&n.rseed)] {
+                assert!(!text.contains(&secret) && !text.contains(&secret[..16]), "an opening's secret in the output: {text}");
+            }
+        }
+        assert_eq!(load_openings(&w).unwrap().len(), 2);
+        for d in [w.dir, stranger.dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     fn scan(w: &WalletDir, chain: &FixtureChain, imported: Vec<ImportedOpening>) -> AnnuletReport {
         let wallet = w.wallet();
         let core = AnnuletScanCore::new(wallet.clone(), w.allocated.clone(), 0, 10, GENESIS, Vec::new())

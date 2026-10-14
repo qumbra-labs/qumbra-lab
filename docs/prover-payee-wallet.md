@@ -50,14 +50,16 @@ qumbra-wallet import-openings --net annulet --dir WALLET --ledger paid-ledger.tx
 | The opening `(value, 0, rkm, rho, rseed)` recomputes to the line's `cm` | `refused:cm-mismatch` |
 | The `rkm` is one of this wallet's: an allocated address under a generation in its journal | `refused:not-this-wallet` |
 
-**A last line without a newline** is a write torn by a crash on the service. It reads `skipped:torn-last-line`.
+**A last line without a newline** is a write torn by a crash on the service. It reads `skipped:torn-last-line`. The service closes that line with a newline when it next starts, so copying the file again after that imports it.
 
 **`shape` and `at`** are checked for their format only. They are not stored and never affect a verdict.
 
 **What is kept.** Accepted openings go to `openings.v1` in the wallet directory:
-- written 0600, by a temporary file and a rename;
+- written by a temporary file and a rename, created owner-only (0600) where the platform has permission bits — on Windows it inherits the folder's ACL, as the seed file does;
 - one entry per `cm`;
 - together with the address index and generation each one is owned under.
+
+The permission is set when the file is created and not checked when it is opened, as for the wallet's other files.
 
 When a scan loads the file, it re-checks each entry: the index must be allocated, and the opening must open its `cm` at that address and generation. A hand-edited file is refused by name, never guessed at.
 

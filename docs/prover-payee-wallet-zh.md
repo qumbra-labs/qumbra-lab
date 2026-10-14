@@ -50,14 +50,16 @@ qumbra-wallet import-openings --net annulet --dir WALLET --ledger paid-ledger.tx
 | 用 opening `(value, 0, rkm, rho, rseed)` 重算出的 cm 等于这一行的 `cm` | `refused:cm-mismatch` |
 | `rkm` 属于本钱包：某个已分配地址在 journal 里某一代下的 rkm | `refused:not-this-wallet` |
 
-**最后一行如果没有换行**，说明服务写到一半崩溃了，这一行显示 `skipped:torn-last-line`。
+**最后一行如果没有换行**，说明服务写到一半崩溃了，这一行显示 `skipped:torn-last-line`。服务下次启动时会给这一行补上换行，之后再拷一次文件就能导入。
 
 **`shape` 和 `at`** 只检查格式，不保存，也不影响结论。
 
 **保存下来的内容：** 通过的 opening 写进钱包目录里的 `openings.v1`：
-- 权限 0600，先写临时文件再改名替换；
+- 先写临时文件再改名替换；创建时设为只有所有者可读写（0600），前提是平台有权限位——Windows 上没有，文件继承所在文件夹的 ACL，和 seed 文件一样；
 - 每个 `cm` 只记一次；
 - 同时记下每个 opening 归属的地址序号和 generation。
+
+权限只在创建时设置，打开时不检查，和钱包的其他文件一样。
 
 扫链加载这个文件时会逐条复核：地址序号必须是已分配的，opening 在那个地址和 generation 下必须能打开它的 `cm`。手工改过的文件会被按名拒绝，不会去猜。
 

@@ -761,7 +761,9 @@ where
     }
     // Lab #937: the openings the wallet imported from a prover's paid ledger,
     // re-checked against the generations this scan owns notes under (none
-    // when the wallet has no `openings.v1`).
+    // when the wallet has no `openings.v1`). A caller that passes an explicit
+    // subset of generations, while the file holds an opening under another,
+    // has the whole scan refused by name; every production caller passes `&[]`.
     let imported = if generations.is_empty() {
         crate::openings::load_openings(w)
     } else {
