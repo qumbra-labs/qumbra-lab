@@ -824,6 +824,12 @@ fn a_format_34_bundle_pays_the_payee_its_price_or_is_refused_402() {
     let (v, created) = admit_ip(&a, "198.51.100.1", &fee_bank()[0]).unwrap();
     assert!(created);
     assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "submitted");
+    // The P spend shares the fee-bank spend's signer and notes — its
+    // nullifiers — so it gets a service of its own (on `a` it is 409
+    // `nullifier-in-flight`, rightly).
+    let at = ledger_path("fee-ok-p");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), FakeChain::new(3, &[]), ProverPrice { s: 3, p: 0 }, &at);
+    wait_ready(&a);
     let (v, _) = admit_ip(&a, "198.51.100.2", v3(L2ShapeTag::P)).unwrap();
     assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "submitted");
 
