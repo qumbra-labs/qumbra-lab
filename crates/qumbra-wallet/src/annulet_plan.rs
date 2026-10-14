@@ -29,17 +29,41 @@ impl Tiers {
     }
 }
 
+/// Lab #937 PR D: **what a remote prover is paid**, per transaction, in
+/// asset 0 — fixed once for the whole plan (the kernel's prover handle reads
+/// the service's advertised price once and never again; a multi-step plan
+/// pays every step at that price). Each step's third output carries its
+/// shape's price to the prover; each exact fee note is worth the step's
+/// network fee **plus** that price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProverPrice {
+    pub s: u64,
+    pub p: u64,
+}
+
+impl ProverPrice {
+    /// The price of one transaction of `shape` (R is never remote-proved).
+    pub fn of(&self, shape: L2ShapeTag) -> u64 {
+        match shape {
+            L2ShapeTag::S => self.s,
+            L2ShapeTag::P => self.p,
+            L2ShapeTag::R => 0,
+        }
+    }
+}
+
 /// Why a send cannot be planned — by name ([`crate::annulet_send`]'s
 /// `SendRefusal` carries the same variants).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanRefusal {
     /// No single spendable note of `asset` covers `amount` (asset 0: the
-    /// amount plus its own S fee).
+    /// amount plus its own S fee, plus the prover's S price when one is paid).
     NoSingleNoteCovers { asset: u16, amount: u64, largest: u64 },
     /// All of this wallet's spendable `asset` together is below `amount`.
     InsufficientAsset { asset: u16, amount: u64, spendable: u128 },
     /// The plan needs `needed` exact-`tariff` fee notes; the wallet holds
     /// `held` and its asset-0 notes can be split into only `splittable` more.
+    /// With a prover, `tariff` is the network fee plus the prover's price.
     FeeNotesShort { tariff: u64, needed: usize, held: usize, splittable: usize },
 }
 
@@ -118,10 +142,11 @@ pub struct Step {
     pub kind: StepKind,
     pub outputs: [u64; 2],
     /// Lab #937: the third output on a format-34 net, as `(value, asset)`.
-    /// `None` (every plan today): a zero-value note to this wallet, in the
-    /// first input's asset — the builder adds it. `Some` is the prover fee
-    /// lab #937 PR D plans (on the asset-0 row, `fee + price` exact); the
-    /// builders refuse it by name until then. Ignored on a format-33 net.
+    /// `None` (a self-proved plan): a zero-value asset-0 note to this wallet
+    /// — the builder adds it. `Some((price, 0))` (a remote-proved plan, PR
+    /// D): the prover's fee, paid to its pinned payee — on the asset-0 row,
+    /// or through the fee bank beside two notes of one non-zero asset; the
+    /// step's exact fee note is then `fee + price`. Ignored on format 33.
     pub third: Option<(u64, u64)>,
 }
 
@@ -134,9 +159,14 @@ pub struct SendPlan {
 }
 
 impl SendPlan {
-    /// Everything the plan pays, in asset 0.
+    /// The network fees the plan pays, in asset 0.
     pub fn total_fee(&self) -> u64 {
         self.steps.iter().map(|s| s.fee).sum()
+    }
+    /// Lab #937 PR D: the prover fees the plan pays (every step's third
+    /// output, when it pays one), in asset 0.
+    pub fn prover_fees(&self) -> u64 {
+        self.steps.iter().filter_map(|s| s.third.map(|(v, _)| v)).fold(0u64, u64::saturating_add)
     }
     /// Rounds: each waits for the previous one to land.
     pub fn rounds(&self) -> usize {
@@ -159,12 +189,16 @@ impl std::fmt::Display for SendPlan {
         let vals = |v: &[Src]| v.iter().map(|x| x.value().to_string()).collect::<Vec<_>>().join(" + ");
         writeln!(
             f,
-            "plan: send {} of asset {} — {} transaction(s) in {} round(s), total fee {} (asset 0)",
+            "plan: send {} of asset {} — {} transaction(s) in {} round(s), total fee {} (asset 0){}",
             self.amount,
             self.asset,
             self.steps.len(),
             self.rounds(),
-            self.total_fee()
+            self.total_fee(),
+            match self.prover_fees() {
+                0 => String::new(),
+                n => format!(" + prover fees {n}"),
+            }
         )?;
         for (i, st) in self.steps.iter().enumerate() {
             let what = match &st.kind {
@@ -200,17 +234,21 @@ pub(crate) fn largest(notes: &[OwnedL2Note]) -> u64 {
 
 /// Plan `deficit` exact-`tariff` fee notes from this wallet's asset-0 notes
 /// (not the exact ones, which are stock): split the smallest note that can
-/// pay a tariff plus its own S fee, earliest-ready first; a split whose rest
-/// is itself exact yields two, a rest large enough to split again goes back
-/// in the pool for the next round. The steps are appended to `steps`.
+/// pay a tariff plus its own S fee (and, remote-proved, the prover's S
+/// price `s_price`, the split's own third output), earliest-ready first; a
+/// split whose rest is itself exact yields two, a rest large enough to split
+/// again goes back in the pool for the next round. The steps are appended
+/// to `steps`.
 fn plan_fee_splits(
     index: &AssetIndex,
     tariff: u64,
     s_tier: u64,
+    s_price: Option<u64>,
     deficit: usize,
     steps: &mut Vec<Step>,
 ) -> Result<Vec<Src>, usize> {
-    let split_needs = tariff + s_tier;
+    // The tiers are the node's (`/v1/annulet/params`), unbounded: saturate.
+    let split_needs = tariff.saturating_add(s_tier).saturating_add(s_price.unwrap_or(0));
     let mut pool: Vec<(Src, usize)> =
         index.spendable(0).iter().filter(|n| n.note.value != tariff).map(|n| (Src::Held(n.clone()), 0)).collect();
     let mut made = Vec::new();
@@ -230,7 +268,7 @@ fn plan_fee_splits(
             fee: s_tier,
             kind: StepKind::FeeSplit { source, tariff },
             outputs: [tariff, rest],
-            third: None,
+            third: s_price.map(|p| (p, 0)),
         });
         made.push(Src::Made { step, out: 0, value: tariff, asset: 0 });
         if rest == tariff && made.len() < deficit {
@@ -255,12 +293,32 @@ fn plan_fee_splits(
 /// is short ([`PlanRefusal::InsufficientAsset`]) or the asset-0 funds cannot
 /// make the fee notes ([`PlanRefusal::FeeNotesShort`]).
 pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag, tiers: Tiers) -> Result<SendPlan, PlanRefusal> {
+    plan_send_paying(index, asset, amount, shape, tiers, None)
+}
+
+/// Lab #937 PR D: [`plan_send`] for a **remote-proved** send when `prover`
+/// is set — every step pays the prover its shape's price as an asset-0
+/// third output, and every exact fee note is `tier + price` (a split's
+/// source pays the split's own S tier and S price too). `None` is
+/// [`plan_send`] exactly: exact notes are `tier`, the stock the CLI and the
+/// faucet hold today, and no step names a third output.
+pub fn plan_send_paying(
+    index: &AssetIndex,
+    asset: u16,
+    amount: u64,
+    shape: L2ShapeTag,
+    tiers: Tiers,
+    prover: Option<ProverPrice>,
+) -> Result<SendPlan, PlanRefusal> {
+    let price = |sh: L2ShapeTag| prover.map(|p| p.of(sh));
+    let third = |sh: L2ShapeTag| price(sh).map(|v| (v, 0u64));
     let smallest_covering = |a: u16, need: u64| {
         index.spendable(a).iter().filter(|n| n.note.value >= need).min_by_key(|n| n.note.value).cloned()
     };
     if asset == 0 {
-        // The fee comes out of the same note: one input, shape S.
-        let need = amount.saturating_add(tiers.s);
+        // The fee (and, remote-proved, the prover's S price) comes out of
+        // the same note: one input, shape S.
+        let need = amount.saturating_add(tiers.s).saturating_add(price(L2ShapeTag::S).unwrap_or(0));
         let note = smallest_covering(0, need)
             .ok_or(PlanRefusal::NoSingleNoteCovers { asset, amount: need, largest: largest(index.spendable(0)) })?;
         let change = note.note.value - need;
@@ -270,11 +328,15 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
             fee: tiers.s,
             kind: StepKind::Pay { inputs: vec![Src::Held(note)], fee: None },
             outputs: [amount, change],
-            third: None,
+            third: third(L2ShapeTag::S),
         };
         return Ok(SendPlan { asset, amount, steps: vec![pay] });
     }
-    let tariff = tiers.of(shape);
+    // The exact fee note each merge and the payment spend whole: the
+    // network fee, plus the prover's price when one is paid (lab #937 PR D;
+    // `None` keeps today's exact-tier stock).
+    let tier = tiers.of(shape);
+    let tariff = tier.saturating_add(price(shape).unwrap_or(0));
 
     // The A notes the payment will consume, and the merges that reduce them
     // to at most two.
@@ -320,7 +382,7 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
     let stock: Vec<Src> =
         index.spendable(0).iter().filter(|n| n.note.value == tariff).take(needed).map(|n| Src::Held(n.clone())).collect();
     let mut steps: Vec<Step> = Vec::new();
-    let made = plan_fee_splits(index, tariff, tiers.s, needed - stock.len(), &mut steps).map_err(|made| {
+    let made = plan_fee_splits(index, tariff, tiers.s, price(L2ShapeTag::S), needed - stock.len(), &mut steps).map_err(|made| {
         PlanRefusal::FeeNotesShort { tariff, needed, held: stock.len(), splittable: made }
     })?;
     let mut fees: Vec<Src> = stock.into_iter().chain(made).collect();
@@ -338,7 +400,7 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
         let fee = fees.next().expect("one fee note per merge");
         let round = a.ready(&steps).max(b.ready(&steps)).max(fee.ready(&steps));
         let value = a.value() + b.value();
-        steps.push(Step { round, shape, fee: tariff, kind: StepKind::Merge { inputs: [a, b], fee }, outputs: [value, 0], third: None });
+        steps.push(Step { round, shape, fee: tier, kind: StepKind::Merge { inputs: [a, b], fee }, outputs: [value, 0], third: third(shape) });
     }
     let pay_inputs: Vec<Src> = pay_inputs.into_iter().map(fix).collect();
     let fee = fees.next().expect("one fee note for the payment");
@@ -347,10 +409,10 @@ pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag,
     steps.push(Step {
         round,
         shape,
-        fee: tariff,
+        fee: tier,
         kind: StepKind::Pay { inputs: pay_inputs, fee: Some(fee) },
         outputs: [amount, have - amount],
-        third: None,
+        third: third(shape),
     });
     Ok(SendPlan { asset, amount, steps })
 }

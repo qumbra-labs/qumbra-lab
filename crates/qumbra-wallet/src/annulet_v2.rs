@@ -410,21 +410,6 @@ pub fn assemble_and_submit<E: Endpoint>(
     Ok(built)
 }
 
-/// Lab #937: the asset of a format-34 spend's zero-value third output, from
-/// the two balance rows' assets `a1`, `a2` (a dummy slot 2 is asset 0). The
-/// AIR binds output 3 to a row's asset (`o3a`), so: **asset 0 whenever a row
-/// is asset 0** — a zero-value asset-0 note is dust no one mistakes for an
-/// asset's mint base (an R seed is a zero-value note of its asset, #941's
-/// lane). Two inputs of one non-zero asset (a merge, a two-note payment) have
-/// no asset-0 row until the fee bank (lab #937 A′ + PR D): input 1's asset.
-pub fn zero_third_asset(a1: u64, a2: u64) -> u64 {
-    if a1 == 0 || a2 == 0 {
-        0
-    } else {
-        a1
-    }
-}
-
 /// Take, draw the dummies, prepare and sign: the proof still empty.
 #[allow(clippy::too_many_arguments)]
 fn prepare_signed<E: Endpoint>(
@@ -450,19 +435,26 @@ fn prepare_signed<E: Endpoint>(
     let taken: Vec<u32> = paths.iter().map(|p| p.leaf_index).collect();
     let real: Vec<L2AuthInput> = notes.iter().zip(paths).map(|(n, p)| real_input(&wallet, n, p)).collect();
     // Lab #937: on a format-34 net every S/P spend carries a third output.
-    // Here it is a zero-value note (D3: an ordinary note, indistinguishable
+    // This wallet proves its own spends, so it pays no prover: the third
+    // output is a zero-value note (D3: an ordinary note, indistinguishable
     // from a paying one) to where this spend's change goes — `outs[1].to`,
-    // the active generation's change address, never the run generation's
-    // (a sweep must not leave a note behind in the generation it empties) —
-    // in [`zero_third_asset`]'s asset. The wallet never spends a zero-value
-    // note (`AssetIndex::zero`). The prover-fee third output is lab #937
-    // PR D's.
+    // the active generation's change address, never the run generation's (a
+    // sweep must not leave a note behind in the generation it empties) — of
+    // **asset 0, always**: a zero-value asset-0 note is dust no one mistakes
+    // for an asset's mint base (an R seed is a zero-value note of its asset,
+    // the #941 lane). Every layout can place it: a single input (slot 2 a
+    // dummy, asset 0) and an asset paid beside an asset-0 note put it in an
+    // asset-0 balance row (`o3a`); two inputs of one non-zero asset with the
+    // exact fee note in slot 3 (a merge, a two-note payment) have no asset-0
+    // row, and the AIR's fee bank carries it — `o3f`'s second clause (no row
+    // is asset 0), the note exactly `fee + 0` (lab #937 A′,
+    // `qlab_l2spend::v2::rides_fee_bank`). The wallet never spends a
+    // zero-value note (`AssetIndex::zero`).
     let outs: Vec<Out> = match run.auth_context().form.sp_outputs() {
         2 => outs.to_vec(),
         3 => {
-            let a2 = if matches!(spend, V2Spend::One(_)) { 0 } else { real[1].asset };
             let mut v = outs.to_vec();
-            v.push(Out { to: outs[1].to.clone(), value: 0, asset: zero_third_asset(real[0].asset, a2) });
+            v.push(Out { to: outs[1].to.clone(), value: 0, asset: 0 });
             v
         }
         n => unreachable!("an S/P spend carries two or three outputs, not {n}"),
@@ -590,11 +582,14 @@ pub fn run_plan_v2<E: Endpoint>(
     };
     for round in 0..plan.rounds() {
         for (i, st) in plan.steps.iter().enumerate().filter(|(_, s)| s.round == round) {
-            // Lab #937: a planned third output (the prover fee) is PR D's;
-            // until then the third output is prepare_signed's zero-value
-            // self note, and a plan naming one is refused by name.
+            // Lab #937: this wallet proves its own spends and plans with no
+            // prover (`plan_send(.., None)`), so no step carries a prover's
+            // fee; the third output is prepare_signed's zero-value note. A
+            // plan naming one is not this wallet's and is refused by name.
             if st.third.is_some() {
-                return Err(SendRefusal::Auth("a planned third output (a prover fee) is not built here yet (lab #937 PR D)".into()));
+                return Err(SendRefusal::Auth(
+                    "a planned prover fee: this wallet proves its own spends and pays no prover".into(),
+                ));
             }
             let built = match &st.kind {
                 StepKind::FeeSplit { source, tariff } => {
@@ -1144,17 +1139,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 
-    /// Lab #937 (#941 lane): the zero-value third output is asset 0 whenever
-    /// a balance row is — one input with a dummy slot 2, an asset paid beside
-    /// an asset-0 note, either order — and input 1's asset only for two
-    /// inputs of one non-zero asset (no asset-0 row before the fee bank).
+    /// Lab #937 PR D (ruling, §2): the exact fee note's target follows the
+    /// mode. Self-proved (`plan_send`, no prover): the target is the tier —
+    /// an exact-tier note is stock and nothing is split, the CLI's and the
+    /// faucet's stock exactly as before. Remote-proved (`plan_send_paying`
+    /// with a price): the target is tier + price — the same exact-tier note
+    /// is no longer stock, a split makes the note, and every step pays the
+    /// prover its price as an asset-0 third output while its `fee` stays the
+    /// network fee.
     #[test]
-    fn the_zero_third_output_is_asset_0_whenever_a_row_is() {
-        assert_eq!(zero_third_asset(0, 0), 0, "an asset-0 spend, or one input beside a dummy");
-        assert_eq!(zero_third_asset(7, 0), 0, "asset 7 paid beside an asset-0 note; one input of 7 beside a dummy");
-        assert_eq!(zero_third_asset(0, 7), 0);
-        assert_eq!(zero_third_asset(7, 7), 7, "a merge / two-note payment: no asset-0 row yet");
-        assert_eq!(zero_third_asset(7, 9), 7);
+    fn the_exact_fee_note_target_follows_the_prover_mode() {
+        use crate::annulet_plan::{plan_send, plan_send_paying, ProverPrice, StepKind, Tiers};
+        use qlab_ledger::assets::AssetIndex;
+        use qlab_ledger::spent::SpentSet;
+        let w = wallet_dir("target", 11);
+        let wallet = w.wallet();
+        let tiers = Tiers { s: 3, p: 5, r: 7 };
+        let price = ProverPrice { s: 1, p: 2 };
+        let of = |value: u64, asset: u64, k: u8| {
+            let mut n = note_of(&wallet, 0, value, k);
+            n.note.asset = asset;
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], n.note, &[(0, generation_root(&wallet, 0))]).unwrap()
+        };
+        let notes = vec![of(60, 7, 1), of(3, 0, 2), of(20, 0, 3)];
+        let index = AssetIndex::build(&wallet, notes, &SpentSet::from_parts(Some((0, 9)), [])).only_generation(0);
+
+        // Self-proved: the exact 3 is stock; one transaction, no split, no third.
+        let plan = plan_send(&index, 7, 50, L2ShapeTag::S, tiers).unwrap();
+        assert_eq!(plan.steps.len(), 1, "{plan}");
+        let pay = &plan.steps[0];
+        assert!(matches!(&pay.kind, StepKind::Pay { fee: Some(f), .. } if f.value() == 3), "{plan}");
+        assert_eq!((pay.fee, pay.third, plan.prover_fees()), (3, None, 0));
+
+        // Remote-proved: the target is 3 + 1 = 4; the 3 is not stock, the 20
+        // splits (4 + 3 tier + 1 price = 8 needed) into 4 and 12.
+        let plan = plan_send_paying(&index, 7, 50, L2ShapeTag::S, tiers, Some(price)).unwrap();
+        assert_eq!(plan.steps.len(), 2, "{plan}");
+        assert!(matches!(&plan.steps[0].kind, StepKind::FeeSplit { tariff: 4, .. }), "{plan}");
+        assert_eq!(plan.steps[0].outputs, [4, 12]);
+        assert!(matches!(&plan.steps[1].kind, StepKind::Pay { fee: Some(f), .. } if f.value() == 4), "{plan}");
+        assert!(plan.steps.iter().all(|s| s.fee == 3 && s.third == Some((1, 0))), "{plan}");
+        assert_eq!((plan.total_fee(), plan.prover_fees()), (6, 2));
+
+        // Shape P: the target is 5 + 2 = 7; the split pays S's 3 + 1.
+        let plan = plan_send_paying(&index, 7, 50, L2ShapeTag::P, tiers, Some(price)).unwrap();
+        assert!(matches!(&plan.steps[0].kind, StepKind::FeeSplit { tariff: 7, .. }), "{plan}");
+        assert_eq!((plan.steps[0].fee, plan.steps[0].third), (3, Some((1, 0))));
+        assert_eq!((plan.steps[1].fee, plan.steps[1].third), (5, Some((2, 0))));
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// Lab #937 PR D: with a prover, an asset-0 payment's one note covers the
+    /// amount, the S fee and the S price (refused by name otherwise), and a
+    /// merge plan pays the prover on every step — merges, splits, payment.
+    #[test]
+    fn a_remote_proved_plan_pays_the_prover_on_every_step() {
+        use crate::annulet_plan::{plan_send_paying, PlanRefusal, ProverPrice, StepKind, Tiers};
+        use qlab_ledger::assets::AssetIndex;
+        use qlab_ledger::spent::SpentSet;
+        let w = wallet_dir("every_step", 12);
+        let wallet = w.wallet();
+        let tiers = Tiers { s: 3, p: 5, r: 7 };
+        let price = Some(ProverPrice { s: 1, p: 2 });
+        let of = |value: u64, asset: u64, k: u8| {
+            let mut n = note_of(&wallet, 0, value, k);
+            n.note.asset = asset;
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], n.note, &[(0, generation_root(&wallet, 0))]).unwrap()
+        };
+        let notes = vec![of(10, 0, 1), of(50, 7, 2), of(40, 7, 3), of(30, 7, 4), of(30, 0, 5)];
+        let index = AssetIndex::build(&wallet, notes, &SpentSet::from_parts(Some((0, 9)), [])).only_generation(0);
+
+        // Asset 0: 6 + 3 + 1 = 10 — the 10 covers it exactly; 7 does not fit.
+        let plan = plan_send_paying(&index, 0, 6, L2ShapeTag::S, tiers, price).unwrap();
+        assert_eq!((plan.steps.len(), plan.steps[0].outputs, plan.steps[0].third), (1, [6, 0], Some((1, 0))));
+        assert!(matches!(
+            plan_send_paying(&index, 0, 27, L2ShapeTag::S, tiers, price),
+            Err(PlanRefusal::NoSingleNoteCovers { asset: 0, amount: 31, largest: 30 })
+        ));
+
+        // 120 of asset 7: one merge (30 + 40) and the payment, each an exact
+        // 4; two splits make them — the 10 (4 + 2, the 2 left as dust) and
+        // the 30 (4 + 22), each paying 3 + 1.
+        let plan = plan_send_paying(&index, 7, 120, L2ShapeTag::S, tiers, price).unwrap();
+        assert_eq!((plan.merges(), plan.splits()), (1, 2), "{plan}");
+        assert!(plan.steps.iter().all(|s| s.third == Some((1, 0)) && s.fee == 3), "{plan}");
+        for st in &plan.steps {
+            match &st.kind {
+                StepKind::Merge { fee, .. } => assert_eq!(fee.value(), 4),
+                StepKind::Pay { fee: Some(f), .. } => assert_eq!(f.value(), 4),
+                StepKind::FeeSplit { tariff, .. } => assert_eq!(*tariff, 4),
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        assert_eq!(plan.prover_fees(), plan.steps.len() as u64);
+        let _ = std::fs::remove_dir_all(&w.dir);
     }
 
     /// Lab #937 (#941 lane): a wallet holding **only** zero-value notes —

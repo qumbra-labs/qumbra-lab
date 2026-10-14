@@ -130,6 +130,8 @@ pub mod annulet;
 pub mod annulet_plan;
 /// Lab #896 G: the Candidate A authorization journal (`auth.v1`).
 pub mod auth_journal;
+/// Lab #937 PR D: the remote prover a wallet pays, pinned per network (lean).
+pub mod prover_pins;
 #[cfg(feature = "verify")]
 pub mod annulet_driver;
 /// What a Candidate A wallet's authorizations did on chain (lean; lab #924 PR 3b).

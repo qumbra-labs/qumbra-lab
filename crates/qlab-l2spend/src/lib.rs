@@ -77,7 +77,9 @@ pub enum SpendError {
     /// A registry write's fee note holds less than the fee (lab #728).
     FeeExceedsInput { have: u64, fee: u64 },
     /// A4: slot 3's fee note must be asset 0 and worth exactly the fee — it
-    /// is spent whole and the 3×2 shapes have no fee change.
+    /// is spent whole and the 3×2 shapes have no fee change. Lab #937 PR D:
+    /// or exactly `fee + v(O3)` beside an asset-0 output 3 (the fee bank,
+    /// `v2::fee_note_exact`).
     FeeNoteNotExact { value: u64, asset: u64, fee: u64 },
     /// Lab #896 E4: an input slot declared the dummy (`dv`) carries value or
     /// an asset; the dummy contributes nothing to the balance and is asset 0.
@@ -114,8 +116,8 @@ impl std::fmt::Display for SpendError {
             }
             SpendError::FeeNoteNotExact { value, asset, fee } => write!(
                 f,
-                "slot 3's fee note is {value} of asset {asset}; it must be exactly {fee} of asset 0 \
-                 (spent whole — the 3×2 shapes have no fee change)"
+                "slot 3's fee note is {value} of asset {asset}; it must be exactly {fee} of asset 0, or the \
+                 fee plus an asset-0 output 3 (spent whole — the 3×2 shapes have no fee change)"
             ),
             SpendError::OutputCount { got } => {
                 write!(f, "an S/P spend has two outputs (format 33) or three (format 34), not {got}")

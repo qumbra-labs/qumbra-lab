@@ -32,7 +32,8 @@ use qumbra_ffi::spend_v2::{
     qmb_auth_journal_advances,
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
     qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
-    qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_refusal, qmb_spend_v2_step, qmb_spend_v2_supply,
+    qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_prover, qmb_spend_v2_refusal, qmb_spend_v2_step,
+    qmb_spend_v2_supply,
     qmb_spend_v2_supply_err, AuthHandle, CheckHandle, SpendBasis, SpendHandle, QMB_AUTH_CHECKED, QMB_AUTH_JOURNAL_STALE,
     QMB_AUTH_RESTORED, QMB_AUTH_SWEEP_WAITING,
 };
@@ -1148,3 +1149,247 @@ fn u_the_journal_summary_lists_every_generation_with_its_nets() {
         assert!(qmb_auth_journal_summary(ptr::null(), ptr::null_mut()).is_null(), "err_out may be NULL");
     }
 }
+
+// ------------------------------------------------------------ format 34 (lab #937 PR D)
+
+const PROVER: u8 = 0x4D;
+
+/// The prover's pinned payee for the fixture nets: a third wallet's
+/// version-2 address.
+fn prover_address() -> qlab_wallet::address::Address {
+    let p = wallet_dir("sv3_prover", PROVER);
+    let pw = p.wallet();
+    let a = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0));
+    let _ = std::fs::remove_dir_all(&p.dir);
+    a
+}
+
+/// A **format-34** chain (no blocks after genesis): the genesis pays the
+/// wallet's v2 address 0 the holder's 1,000,000 USDT-test and `notes(a2)`.
+/// With `pin`, this net's prover is pinned (fixture pins): the payee
+/// [`prover_address`], at most S 1 / P 2 fee units per transaction.
+fn chain_v3(tag: &str, notes: impl Fn(&qlab_wallet::address::Address) -> Vec<qlab_note::l2note::L2Note>, pin: bool) -> Fixture {
+    let w = wallet_dir(tag, SEED);
+    let wallet = w.wallet();
+    let root = generation_root(&wallet, 0);
+    let a2 = wallet.address_candidate_a_at_index(0, &root);
+    let file = genesis_v3(&a2, notes(&a2));
+    assert_eq!(file.format_version, 34);
+    if pin {
+        qumbra_wallet::prover_pins::pin_fixture(
+            file.hash(),
+            qumbra_wallet::prover_pins::ProverPin {
+                payee: prover_address().encode(),
+                max_price: qumbra_wallet::annulet_plan::ProverPrice { s: 1, p: 2 },
+            },
+        );
+    }
+    let ep = Endpoint::new(file, &[], None, Lie::None);
+    let payee = wallet_dir(&format!("{tag}_payee"), PAYEE);
+    let pw = payee.wallet();
+    let to = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0)).encode();
+    let _ = std::fs::remove_dir_all(&payee.dir);
+    Fixture { _dir: WalletDirGuard(w), ep, payee: to, fresh: AuthJournal::fresh(root).to_text() }
+}
+
+/// The prover service's `/v2/annulet/info` for `f`'s net.
+fn info(f: &Fixture, s: u64, p: u64, payee: &str) -> Vec<u8> {
+    let hex: String = f.ep.file.hash().iter().map(|b| format!("{b:02x}")).collect();
+    format!(r#"{{"protocol_version":2,"genesis_hash":"{hex}","fee_asset":0,"price":{{"S":{s},"P":{p}}},"payee":"{payee}"}}"#)
+        .into_bytes()
+}
+
+unsafe fn set_prover(s: *mut SpendHandle, info: &[u8]) -> Result<(), String> {
+    let mut err: *mut c_char = ptr::null_mut();
+    match qmb_spend_v2_prover(s, info.as_ptr(), info.len(), &mut err) {
+        0 => {
+            assert!(err.is_null());
+            Ok(())
+        }
+        -1 => Err(take_str(err)),
+        other => panic!("qmb_spend_v2_prover returned {other}"),
+    }
+}
+
+/// One whole format-34 spend paying the prover at the advertised S 1 / P 2.
+unsafe fn send_v3(f: &Fixture, asset: u16, amount: u64, slots: u32, shape: L2ShapeTag) -> (ProvingBundle, String) {
+    let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+    let a = auth(w, &f.ep, &f.fresh).unwrap();
+    let s = spend(basis(w, &f.ep), &f.payee, asset, amount, 96).unwrap();
+    set_prover(s, &info(f, 1, 2, &prover_address().encode())).expect("the pinned prover");
+    pump(a, s, &f.ep, 0).expect("READY");
+    let journal = take(a, s).expect("the take");
+    assert_eq!(next_of(&journal), slots, "one leaf per real slot");
+    let i = intent(s);
+    let text = review(s, &i).expect("the review");
+    let bundle = sign(a, s, &i, &journal).expect("signed with the persisted journal");
+    let b = ProvingBundle::decode(&bundle).expect("the export is a bundle");
+    assert_eq!(b.shape(), shape);
+    b.check(&AuthContext::candidate_a_v3(f.ep.file.hash())).expect("the prover's own lock accepts it on format 34");
+    assert!(b.tx().proof.is_empty(), "the kernel never proves");
+    qmb_spend_v2_free(s);
+    qmb_auth_free(a);
+    qmb_wallet_free(w);
+    (b, text)
+}
+
+/// Output 3 of `b` pays the pinned prover `value` of asset 0.
+fn pays_the_prover(b: &ProvingBundle, value: u64) {
+    let w = b.witness();
+    assert_eq!(w.outputs.len(), 3, "a format-34 spend has three outputs");
+    let o = &w.outputs[2];
+    assert_eq!((o.value, o.asset, o.rkm), (value, 0, prover_address().rkm_lanes()), "output 3 is the prover's fee");
+}
+
+/// Lab #937 PR D: an asset-0 payment on format 34 — one note pays the
+/// amount, the S fee and the prover's S price (10 + 1 + 1 of 50; 38 back);
+/// output 3 pays the pinned prover 1. One transaction: no total line.
+#[test]
+fn v3_a_an_asset_0_payment_pays_its_prover() {
+    let f = chain_v3("sv3_a", |a| vec![note_to(a, 50, 0, 30)], true);
+    let (b, text) = unsafe { send_v3(&f, 0, 10, 1, L2ShapeTag::S) };
+    assert_eq!(b.tx().public.fee, 1, "the S tier");
+    pays_the_prover(&b, 1);
+    let short = prover_address().short().encode();
+    assert!(text.contains("send 10 fee units to "), "{text}");
+    assert!(text.contains("38 fee units returns to this wallet"), "{text}");
+    assert!(text.contains(&format!("fee: 1 fee unit\nprover fee: 1 fee unit to {short}\nvalid until block ")), "{text}");
+    assert!(!text.contains("this plan from here"), "one transaction, no total line: {text}");
+}
+
+/// A P payment of the Hybrid asset beside an exact asset-0 note of the P
+/// tier **plus** the P price (2 + 2 = 4): output 3 (2 fee units to the
+/// prover) sits on the asset-0 row.
+#[test]
+fn v3_b_a_p_payment_pays_its_prover_from_the_asset_0_row() {
+    let f = chain_v3("sv3_b", |a| vec![note_to(a, 4, 0, 40)], true);
+    let (b, text) = unsafe { send_v3(&f, USDT as u16, 1_000, 2, L2ShapeTag::P) };
+    assert_eq!(b.tx().public.fee, 2, "the P tier");
+    pays_the_prover(&b, 2);
+    assert!(text.contains("999,000 base units of QIA #1 (no list for this network) returns to this wallet"), "{text}");
+    assert!(text.contains("fee: 2 fee units\nprover fee: 2 fee units to "), "{text}");
+}
+
+/// A plan of two transactions: no exact 4 is held, so step 1 splits the 50
+/// (4 for the payment + 1 S fee + 1 S price; 44 back) and step 2 pays. The
+/// review of step 1 states its own prover fee and the plan from here,
+/// summed per step at the price fixed for the handle — verbatim.
+#[test]
+fn v3_c_a_multi_step_plan_states_its_total_from_here() {
+    let f = chain_v3("sv3_c", |a| vec![note_to(a, 50, 0, 30)], true);
+    let (b, text) = unsafe { send_v3(&f, USDT as u16, 1_000, 1, L2ShapeTag::S) };
+    pays_the_prover(&b, 1);
+    let w = b.witness();
+    assert_eq!((w.outputs[0].value, w.outputs[1].value), (4, 44), "the split: the exact 4 and the rest");
+    assert!(text.contains("step 1 of 2: a fee-split"), "{text}");
+    assert!(
+        text.contains("prover fee: 1 fee unit to ")
+            && text.contains("\nthis plan from here: 2 transactions; network fees 3 + prover fees 3 = 6 fee units\n"),
+        "{text}"
+    );
+}
+
+/// Two notes of the Hybrid asset and the exact 4 in slot 3: no balance row
+/// is asset 0, so output 3 rides the fee bank (`o3f`, lab #937 A′) — the
+/// slot-3 note pays the P tier and the P price.
+#[test]
+fn v3_d_a_two_note_payment_pays_its_prover_through_the_fee_bank() {
+    let f = chain_v3("sv3_d", |a| vec![note_to(a, 500, USDT, 60), note_to(a, 4, 0, 40)], true);
+    let (b, text) = unsafe { send_v3(&f, USDT as u16, 1_000_200, 3, L2ShapeTag::P) };
+    pays_the_prover(&b, 2);
+    let w = b.witness();
+    assert_eq!([w.inputs[0].asset, w.inputs[1].asset], [USDT, USDT], "no asset-0 row");
+    match &w.fee_slot {
+        qlab_air::l2::FeeSlotV2::Exact { input, .. } => assert_eq!(input.value, 4, "the P tier plus the P price"),
+        qlab_air::l2::FeeSlotV2::Dummy { .. } => panic!("slot 3 is the exact fee note"),
+    }
+    assert!(text.contains("prover fee: 2 fee units to "), "{text}");
+}
+
+/// The refusals, by name: a format-34 spend with no prover set; a payee
+/// that is not the pin; a price over the pinned maximum; a net with no pin;
+/// a second set (the price is fixed for the handle); a set after the first
+/// step; and a prover on a format-33 net (no third output).
+#[test]
+fn v3_e_the_prover_is_set_once_on_its_pin_or_refused_by_name() {
+    let f = chain_v3("sv3_e", |a| vec![note_to(a, 50, 0, 30)], true);
+    let pinned = prover_address().encode();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let a = auth(w, &f.ep, &f.fresh).unwrap();
+        // No prover: refused by the attempt once the params and registry
+        // reads are in — before the take, so no leaf is consumed.
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        let why = pump(a, s, &f.ep, 0).expect_err("refused");
+        assert!(why.contains("set the prover with qmb_spend_v2_prover first"), "{why}");
+        qmb_spend_v2_free(s);
+        // Payee, price, twice.
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        let other = qlab_wallet::address::Address::decode_any(&f.payee).unwrap().encode();
+        let why = set_prover(s, &info(&f, 1, 2, &other)).expect_err("another payee");
+        assert!(why.contains("not this network's pinned payee"), "{why}");
+        let why = set_prover(s, &info(&f, 2, 2, &pinned)).expect_err("over the maximum");
+        assert!(why.contains("asks 2 fee unit(s) for shape S, above this wallet's maximum of 1"), "{why}");
+        set_prover(s, &info(&f, 1, 1, &pinned)).expect("at or below the maximum");
+        let why = set_prover(s, &info(&f, 1, 2, &pinned)).expect_err("twice");
+        assert!(why.contains("already set: its price is fixed"), "{why}");
+        qmb_spend_v2_free(s);
+        // After the first step.
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_spend_v2_step(a, s, &mut out), 1, "the first step asks for the params");
+        qmb_string_free(out);
+        let why = set_prover(s, &info(&f, 1, 2, &pinned)).expect_err("after a step");
+        assert!(why.contains("before the first step"), "{why}");
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+        qmb_wallet_free(w);
+    }
+    // A format-34 net with no pin.
+    let g = chain_v3("sv3_e_unpinned", |a| vec![note_to(a, 51, 0, 31)], false);
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let s = spend(basis(w, &g.ep), &g.payee, 0, 10, 96).unwrap();
+        let why = set_prover(s, &info(&g, 1, 2, &pinned)).expect_err("no pin");
+        assert!(why.contains("no prover is pinned for this network"), "{why}");
+        qmb_spend_v2_free(s);
+        qmb_wallet_free(w);
+    }
+    // Format 33.
+    let h = chain("sv3_e_33");
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let s = spend(basis(w, &h.ep), &h.payee, 0, 10, 96).unwrap();
+        let why = set_prover(s, &info(&h, 1, 2, &pinned)).expect_err("format 33");
+        assert!(why.contains("this net is not format 34"), "{why}");
+        qmb_spend_v2_free(s);
+        qmb_wallet_free(w);
+    }
+}
+
+/// Lab #937 PR D (ruling §3): the test prover pins never reach a release
+/// build — `cargo tree` of qumbra-ffi's normal and build edges (what
+/// `cargo build -p qumbra-ffi --release` resolves; dev edges excluded) names
+/// neither `fixture-pins` nor `test-support` (the TEST list signer).
+#[test]
+fn w_no_test_feature_is_in_the_release_feature_tree() {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let tree = |edges: &str| {
+        let out = std::process::Command::new(&cargo)
+            .args(["tree", "--offline", "--manifest-path", manifest, "-p", "qumbra-ffi", "-e", edges, "--prefix", "none"])
+            .output()
+            .expect("run cargo tree");
+        assert!(out.status.success(), "cargo tree failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).expect("utf-8")
+    };
+    let release = tree("normal,build,features");
+    assert!(release.contains("qumbra-wallet feature \"verify\""), "the probe reads the feature tree: {release}");
+    for test_only in ["\"fixture-pins\"", "\"test-support\""] {
+        assert!(!release.contains(test_only), "{test_only} is in qumbra-ffi's release feature tree");
+    }
+    // The probe can see them: through the dev edges, both are there.
+    let with_dev = tree("normal,build,dev,features");
+    assert!(with_dev.contains("\"fixture-pins\"") && with_dev.contains("\"test-support\""), "the dev tree names them");
+}
+

@@ -165,12 +165,6 @@ pub enum VerifyRefusal {
     GenesisMismatch { pinned: [u8; 32], fetched: [u8; 32] },
     /// The pinned bytes do not decode, or fail the file's own structure check.
     GenesisInvalid { why: String },
-    /// Lab #937: a net this **caller** does not serve yet. The wallet CLI
-    /// scans and builds format 34 since lab #937 PR C; the kernel
-    /// (`qumbra-ffi`) refuses a format-34 net by name until PR D, through
-    /// `AnnuletVerifyDriver::refusing` — right after the genesis verifies,
-    /// before any header is fetched. Never raised by `genesis_from_bytes`.
-    FormatNotSupported { format_version: u32 },
     /// A headers page could not be read.
     HeadersUnavailable { from: u64, why: String },
     /// A headers page did not decode.
@@ -231,10 +225,6 @@ impl std::fmt::Display for VerifyRefusal {
                 hex(pinned)
             ),
             GenesisInvalid { why } => write!(f, "the pinned genesis file is invalid: {why}"),
-            FormatNotSupported { format_version } => write!(
-                f,
-                "genesis format {format_version} (three-output S/P spends) is not supported by this kernel yet (lab #937 PR D)"
-            ),
             HeadersUnavailable { from, why } => write!(f, "GET /v1/headers from {from}: {why}"),
             HeadersMalformed { from, why } => write!(f, "/v1/headers from {from} did not decode: {why}"),
             HeaderGap { want, got } => write!(f, "headers skip: expected height {want}, served {got}"),

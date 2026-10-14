@@ -5,8 +5,9 @@
 //! asset 7 to `T` through a follower. The plan is the format-33 one (one S,
 //! both asset-7 notes, the fee note in slot 3 — the **TwoAndFee** layout,
 //! no asset-0 balance row); the builder adds the third output — a
-//! zero-value note to `W`'s change address, of asset 7 because no row is
-//! asset 0 (`zero_third_asset`; beside an asset-0 row it is asset 0) — the bundle's
+//! zero-value **asset-0** note to `W`'s change address, carried by the AIR's
+//! fee bank (`o3f`, lab #937 A′: no row is asset 0, the slot-3 note is
+//! exactly `fee + 0`) — the bundle's
 //! lock runs under the format-34 context, the proof is a **v3** S proof, and
 //! three nodes running the **real `L2VerifierV3`** admit, seal and apply it.
 //! **One S v3 prove.**
@@ -115,13 +116,14 @@ fn a_format_34_send_carries_three_outputs_and_is_sealed_by_the_v3_verifier() {
     let values: Vec<u64> = index.spendable(ASSET).iter().map(|n| n.note.value).collect();
     assert_eq!(values, vec![10], "only the change is spendable");
     // The zero-value third output is seen, not spendable: it went to the
-    // change address and is held apart from every spendable row.
-    // TwoAndFee (A₁ = A₂ = 7, the fee in slot 3): no asset-0 row, so the
-    // zero-value third output is asset 7 (`zero_third_asset(7, 7)`).
-    assert_eq!(qumbra_wallet::annulet_v2::zero_third_asset(ASSET as u64, ASSET as u64), ASSET as u64);
+    // change address and is held apart from every spendable row. TwoAndFee
+    // (A₁ = A₂ = 7, the fee in slot 3): no asset-0 row, so the fee bank
+    // carries it — asset 0 (lab #937 PR D), never a zero-value note of
+    // asset 7 that could pass for a mint base.
     assert_eq!(index.zero.len(), 1, "one zero-value note: the third output");
-    let zero: Vec<_> = index.zero.iter().filter(|n| n.note.asset == ASSET as u64).collect();
-    assert_eq!(zero.len(), 1, "the third output is seen, asset 7");
+    let zero: Vec<_> = index.zero.iter().filter(|n| n.note.asset == 0).collect();
+    assert_eq!(zero.len(), 1, "the third output is seen, asset 0");
+    assert!(index.mint_base(ASSET).is_none_or(|n| n.note.value != 0), "no zero-value asset-7 note was made");
     assert_eq!(zero[0].note.value, 0);
     assert_eq!(zero[0].note.rkm, report.outputs[1].rkm, "the third output went to the change address");
     assert_ne!(zero[0].note.commitment(), report.outputs[1].commitment(), "the third output is its own note");

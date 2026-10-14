@@ -361,10 +361,40 @@ fn witness_of_v2(tree: &CommitmentTree, input: &L2AuthInput) -> Result<MerkleWit
     Ok(tree.auth_path(pos, tree.len()))
 }
 
-fn fee_slot_v2(tree: &CommitmentTree, fee_in: FeeIn, fee: u64) -> Result<FeeSlotV2, SpendError> {
+/// Lab #937 A′: whether output 3 rides the **fee bank** (`o3f`) — the AIR
+/// builder's rule (`build_bucket_l2_v3` / `_l2p_v3`), stated once here:
+/// output 3 is asset 0 beside a real slot-3 note, and that note carries more
+/// than the fee or no balance row is asset 0. `inputs` are the two input
+/// slots' assets, `third` output 3's `(value, asset)`.
+pub fn rides_fee_bank(note_value: u64, fee: u64, inputs: [u64; 2], third: Option<(u64, u64)>) -> bool {
+    matches!(third, Some((_, 0))) && (note_value != fee || (inputs[0] != 0 && inputs[1] != 0))
+}
+
+/// **The slot-3 fee note's one rule** (lab #937 PR D), shared by the
+/// builder ([`FeeIn::Exact`]) and the bundle's lock (`ProvingBundle::check`)
+/// so neither accepts half of it: an asset-0 note spent whole, worth exactly
+/// the fee — or, when output 3 rides the fee bank ([`rides_fee_bank`]),
+/// exactly `fee + v(O3)` (the AIR's `o3f` close).
+pub fn fee_note_exact(value: u64, asset: u64, fee: u64, inputs: [u64; 2], third: Option<(u64, u64)>) -> bool {
+    if asset != 0 {
+        return false;
+    }
+    match third {
+        Some((v3, _)) if rides_fee_bank(value, fee, inputs, third) => fee.checked_add(v3) == Some(value),
+        _ => value == fee,
+    }
+}
+
+fn fee_slot_v2(
+    tree: &CommitmentTree,
+    fee_in: FeeIn,
+    fee: u64,
+    inputs: [u64; 2],
+    third: Option<(u64, u64)>,
+) -> Result<FeeSlotV2, SpendError> {
     Ok(match fee_in {
         FeeIn::Exact(note) => {
-            if note.asset != 0 || note.value != fee {
+            if !fee_note_exact(note.value, note.asset, fee, inputs, third) {
                 return Err(SpendError::FeeNoteNotExact {
                     value: note.value,
                     asset: note.asset,
@@ -496,7 +526,13 @@ pub(crate) fn assemble_s_v2<R: rand::CryptoRng>(
     }
     let anchor = tree.root();
     let outputs = l2_outputs_n(outs, rng);
-    let fee_slot = fee_slot_v2(tree, fee_in, fee)?;
+    let fee_slot = fee_slot_v2(
+        tree,
+        fee_in,
+        fee,
+        [inputs[0].asset, inputs[1].asset],
+        outs.get(2).map(|o| (o.value, o.asset)),
+    )?;
     let witnesses = [
         witness_of_v2(tree, inputs[0])?,
         if dv {
@@ -639,7 +675,13 @@ fn assemble_p_v2<R: rand::CryptoRng>(
     }
     let anchor = tree.root();
     let outputs = l2_outputs_n(outs, rng);
-    let fee_slot = fee_slot_v2(tree, fee_in, fee)?;
+    let fee_slot = fee_slot_v2(
+        tree,
+        fee_in,
+        fee,
+        [inputs[0].asset, inputs[1].asset],
+        outs.get(2).map(|o| (o.value, o.asset)),
+    )?;
     let witness = SpendWitness {
         inputs: [inputs[0].clone(), inputs[1].clone()],
         witnesses: [witness_of_v2(tree, inputs[0])?, witness_of_v2(tree, inputs[1])?],

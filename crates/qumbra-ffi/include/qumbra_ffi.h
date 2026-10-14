@@ -726,6 +726,12 @@ char *qmb_spend_basis_summary(const qmb_spend_basis_t *b);
  *                                             crypto.getRandomValues; valid_for
  *                                             from the service's
  *                                             recommended_valid_for_blocks
+ *   qmb_spend_v2_prover(s, info, len, &err)  format 34 only, before the first
+ *                                             step: the service's
+ *                                             /v2/annulet/info, checked against
+ *                                             this kernel's pin (payee, maximum
+ *                                             price); its price is fixed for
+ *                                             the handle (lab #937 PR D)
  *   loop qmb_spend_v2_step(a, s, &out):  1 NEED -> GET *out, then
  *        qmb_spend_v2_supply / _supply_err;  0 READY;  -2 REFUSED (*out why)
  *   qmb_auth_take(a, s, &journal)            leaves taken; PERSIST *journal,
@@ -839,6 +845,7 @@ void qmb_auth_free(qmb_auth_t *a);
 qmb_spend_v2_t *qmb_spend_v2_new(qmb_spend_basis_t *basis, const char *to, uint16_t asset, uint64_t amount,
                                  uint64_t valid_for, const uint8_t *seed32, const uint8_t *dummy_entropy64,
                                  char **err_out);
+int32_t qmb_spend_v2_prover(qmb_spend_v2_t *s, const uint8_t *info, size_t len, char **err_out);
 int32_t qmb_spend_v2_step(const qmb_auth_t *a, qmb_spend_v2_t *s, char **out);
 void qmb_spend_v2_supply(qmb_spend_v2_t *s, const uint8_t *body, size_t len);
 void qmb_spend_v2_supply_err(qmb_spend_v2_t *s, const char *reason);

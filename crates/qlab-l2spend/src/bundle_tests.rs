@@ -603,10 +603,16 @@ fn a_bundle_s_witness_has_its_transaction_s_output_count() {
 
 /// The v3 split path proves: the lock on format 34, then the v3 prove; the
 /// proof verifies against the witness's PVs under the v3 AIR (one 2^20 S v3
-/// prove on the lane).
+/// prove on the lane). Lab #937 PR D: the bundle proved is the **fee-bank**
+/// spend (two asset-7 notes, the prover's fee as an asset-0 output 3 paid by
+/// a slot-3 note of fee + 3) — the path a remote-proved merge takes; the
+/// plain v3 bundle's lock is checked here too (no second prove).
 #[test]
 fn the_v3_split_path_proves_and_verifies() {
-    let b = ProvingBundle::decode(&bundle_s_v3().encode()).expect("decodes");
+    bundle_s_v3().check(&CTX_V3).expect("the plain v3 bundle passes the lock");
+    let b = ProvingBundle::decode(&crate::fixtures::signed_bundle_fee_bank().encode()).expect("decodes");
+    let w = b.witness();
+    assert_eq!(([w.inputs[0].asset, w.inputs[1].asset], w.outputs[2].asset, w.outputs[2].value), ([7, 7], 0, 3));
     let tx = b.prove(&CTX_V3).expect("an honest v3 bundle proves");
     assert_eq!(wire(&without_proof(&tx)), wire(b.tx()), "only the proof is added");
     let proof: qlab_l2::Proof<qlab_l2::Config> = bincode::deserialize(&tx.proof).expect("the proof decodes");
@@ -616,6 +622,55 @@ fn the_v3_split_path_proves_and_verifies() {
     let as_v2 = &b.witness().pvs()[..qlab_l2::v2::pv_len(Shape::S)];
     assert_eq!(as_v2.len(), qlab_l2::v2::pv_len(Shape::S));
     assert!(!qlab_l2::v2::verify_s_u32(as_v2, &proof), "a v3 proof is not a v2 proof");
+}
+
+/// Lab #937 PR D: an asset-0 output 3 beside two non-zero inputs is
+/// accepted only through the fee bank — slot 3 a real note of exactly
+/// `fee + v(O3)` (`v2::fee_note_exact`, the builder's rule). A note of
+/// neither the fee nor fee + v(O3) is refused by name, at the builder and at
+/// the lock alike; an asset-0 output 3 beside a dummy slot 3 and no asset-0
+/// row has no place at all.
+#[test]
+fn an_asset_0_third_output_rides_the_fee_bank_only_when_the_note_pays_it() {
+    use crate::fixtures::{prepared_s_fee_bank, signed_bundle_fee_bank};
+    let b = signed_bundle_fee_bank();
+    b.check(&CTX_V3).expect("note 13 = fee 10 + output 3 of 3: the fee bank");
+    // The builder refuses every other note (12, 14, and 10 — the bare fee,
+    // which the AIR's fee bank cannot close against an output of 3).
+    for note in [12, 14, 10] {
+        assert!(
+            matches!(prepared_s_fee_bank(note), Err(crate::SpendError::FeeNoteNotExact { value, fee: 10, .. }) if value == note),
+            "the builder accepted a slot-3 note of {note}"
+        );
+    }
+    // The lock refuses the same notes, by name, before any statement work.
+    for note in [12, 14, 10] {
+        let mut w = b.witness().clone();
+        match &mut w.fee_slot {
+            FeeSlotV2::Exact { input, .. } => input.value = note,
+            FeeSlotV2::Dummy { .. } => unreachable!("the fee-bank spend has a real slot 3"),
+        }
+        let bad = ProvingBundle::new(b.tx().clone(), w).expect("well formed");
+        assert_eq!(
+            bad.check(&CTX_V3).err(),
+            Some(BundleError::FeeNoteNotExact { value: note, fee: 10, third: Some(3) }),
+            "the lock accepted a slot-3 note of {note}"
+        );
+    }
+    // The same output 3 beside a dummy slot 3: no row is asset 0, no fee
+    // bank — no place for it. (A dummy slot is empty — value 0, asset 0,
+    // `d = 0` — or `ProvingBundle::new` refuses it first.)
+    let mut w = b.witness().clone();
+    let mut input = match &w.fee_slot {
+        FeeSlotV2::Exact { input, .. } => input.clone(),
+        FeeSlotV2::Dummy { .. } => unreachable!(),
+    };
+    input.value = 0;
+    input.asset = 0;
+    input.d = [0, 0];
+    w.fee_slot = FeeSlotV2::Dummy { input };
+    let bad = ProvingBundle::new(b.tx().clone(), w).expect("well formed");
+    assert_eq!(bad.check(&CTX_V3).err(), Some(BundleError::ThirdOutputAsset { asset: 0, inputs: [7, 7] }));
 }
 
 /// Lab #937 (review F2): a three-output witness whose third output carries

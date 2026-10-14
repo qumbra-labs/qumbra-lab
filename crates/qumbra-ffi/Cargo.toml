@@ -96,7 +96,7 @@ qlab-devnet = { path = "../qlab-devnet" }
 # list key — `test-support` here only, never in [dependencies], so no release
 # or wasm build of this crate can reach the test signer (pinned by
 # `the_test_list_key_is_not_reachable_from_a_release_build`).
-qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["verify", "test-support"] }
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["verify", "test-support", "fixture-pins"] }
 qlab-p2p = { path = "../qlab-p2p" }
 qlab-air = { path = "../qlab-air" }
 qlab-node = { path = "../qlab-node" }

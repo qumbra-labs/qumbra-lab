@@ -56,7 +56,9 @@ use qlab_note::hash::digest_bytes;
 use qlab_remote_auth::annulet::AnnuletIntent;
 use qlab_remote_auth::mldsa;
 use qlab_wallet::Wallet;
-use qumbra_wallet::annulet_plan::{plan_send, plan_slots, real_input, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA};
+use qumbra_wallet::annulet_plan::{
+    plan_send_paying, plan_slots, real_input, ProverPrice, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA,
+};
 use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
 use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, label_of, render_amount, AssetLabel, AssetList};
 use qumbra_wallet::annulet_landed::{bind_body, landed_in, landed_next_with, restore_generations_with, GenTree, LandedByGeneration};
@@ -67,10 +69,15 @@ use zeroize::Zeroize;
 
 use crate::{out_string, set_err, WalletState};
 
-/// Lab #937: the kernel builds the two-output (format 33) spends only; a
-/// format-34 net's three-output path is lab #937 PR D. Refused by name.
-const FORMAT_34_NOT_YET: &str =
-    "this net is format 34 (three-output S/P spends): this kernel does not build them yet (lab #937 PR D)";
+// Lab #937 PR D: the fixture-pin registry is a test-only feature
+// (`qumbra-wallet/fixture-pins`, reached through this crate's dev-dependency
+// alone); a wasm32 build that unified it on would let a host-side caller pin
+// its own prover. Checked at compile time, as `PROVER_LINKED` below.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(
+    !qumbra_wallet::prover_pins::FIXTURE_PINS,
+    "qumbra-wallet's `fixture-pins` (the test prover pins) reached a wasm32 build of qumbra-ffi"
+);
 
 // The prover must not reach this kernel: qlab-l2spend is taken without its
 // `prove` feature, and a wasm32 build that unified it back on would carry
@@ -340,14 +347,10 @@ unsafe fn check_handle(
     }
     let b = (*basis).clone();
     match b.form {
-        L2AuthForm::CandidateA => {}
+        // Lab #937 PR D: format 34 (three-output spends) as format 33.
+        L2AuthForm::CandidateA | L2AuthForm::CandidateAV3 => {}
         L2AuthForm::None => {
             set_err(err_out, "this net is not a Candidate A net".into());
-            return ptr::null_mut();
-        }
-        // Lab #937: format 34's three-output spends arrive with PR D.
-        L2AuthForm::CandidateAV3 => {
-            set_err(err_out, FORMAT_34_NOT_YET.into());
             return ptr::null_mut();
         }
     }
@@ -968,6 +971,13 @@ struct Review {
     to_short: String,
     spends_verified: bool,
     names: Names,
+    /// Lab #937 PR D: the prover this step pays (format 34) — its payee's
+    /// `rkm`, its short address, and this step's price (output 3, asset 0).
+    prover: Option<([u64; 4], String, u64)>,
+    /// Lab #937 PR D: the plan from this step on — transactions, network
+    /// fees, prover fees — for the total line (a remote-proved plan of more
+    /// than one transaction).
+    plan_from_here: (usize, u64, u64),
 }
 
 /// How the review names the spend's asset (lab #924 PR 3c).
@@ -1035,6 +1045,19 @@ pub struct SpendHandle {
     answers: HashMap<String, Result<Vec<u8>, String>>,
     asked: Option<String>,
     phase: Phase,
+    /// Lab #937 PR D: the prover this spend pays (format 34), admitted once
+    /// by `qmb_spend_v2_prover` against this network's pin — its price is
+    /// fixed for every step of the plan; `/info` is never read again.
+    prover: Option<Prover>,
+}
+
+/// An admitted prover: the advertised price (≤ the pinned maximum) and the
+/// pinned payee.
+#[derive(Clone)]
+struct Prover {
+    price: ProverPrice,
+    payee: Recipient,
+    short: String,
 }
 
 impl Drop for SpendHandle {
@@ -1112,9 +1135,21 @@ impl SpendHandle {
             return Err(Attempt::Refused("shape R is a registry write, not a spend".into()));
         }
 
+        // Lab #937 PR D: a format-34 spend pays its prover in the
+        // transaction (the third output); this kernel cannot prove, so it
+        // builds none unpaid.
+        let three = b.form.sp_outputs() == 3;
+        if three && self.prover.is_none() {
+            return Err(Attempt::Refused(
+                "a format-34 spend pays its prover in the transaction: set the prover with qmb_spend_v2_prover first"
+                    .into(),
+            ));
+        }
+        let price = self.prover.as_ref().map(|p| p.price);
         // The active generation's notes, its keys, its address (the CLI's rule).
         let index = b.index.only_generation(auth.generation);
-        let plan = plan_send(&index, self.asset, self.amount, shape, tiers).map_err(|e| Attempt::Refused(e.to_string()))?;
+        let plan = plan_send_paying(&index, self.asset, self.amount, shape, tiers, price)
+            .map_err(|e| Attempt::Refused(e.to_string()))?;
         // The budget is judged before the take; after it the cursor has moved
         // by this step's own leaves, and the plan's whole count would refuse
         // a transaction whose leaves are already spent.
@@ -1182,6 +1217,15 @@ impl SpendHandle {
                     }
                 }
             };
+        // Lab #937 PR D: format 34's third output — the prover's fee at this
+        // step's price, to the pinned payee.
+        let mut outs: Vec<Out> = outs.to_vec();
+        if three {
+            let (Some(p), Some((value, asset))) = (&self.prover, step.third) else {
+                return Err(Attempt::Refused("a format-34 step without its prover fee".into()));
+            };
+            outs.push(Out { to: p.payee.clone(), value, asset });
+        }
         if let Some(n) = notes.iter().find(|n| n.generation != Some(auth.generation)) {
             return Err(Attempt::Refused(format!(
                 "a note of generation {:?} cannot be spent beside generation {}'s keys (one key per transaction)",
@@ -1254,6 +1298,8 @@ impl SpendHandle {
             to_short: self.to_short.clone(),
             spends_verified: b.spends_verified,
             names,
+            prover: self.prover.as_ref().zip(step.third).map(|(p, (v, _))| (p.payee.rkm, p.short.clone(), v)),
+            plan_from_here: (plan.steps.len(), plan.total_fee(), plan.prover_fees()),
         };
         Ok(Prepared { prepared, intent, dummies, paths, review })
     }
@@ -1330,12 +1376,12 @@ pub unsafe extern "C" fn qmb_spend_v2_new(
             return Err("the entropy is NULL".to_string());
         }
         match basis.form {
-            L2AuthForm::CandidateA => {}
+            // Lab #937 PR D: a format-34 spend also pays its prover — set
+            // with `qmb_spend_v2_prover` before the first step.
+            L2AuthForm::CandidateA | L2AuthForm::CandidateAV3 => {}
             L2AuthForm::None => {
                 return Err("this net is not a Candidate A net: its sends are not signed by the wallet's keys".into())
             }
-            // Lab #937: format 34's three-output spends arrive with PR D.
-            L2AuthForm::CandidateAV3 => return Err(FORMAT_34_NOT_YET.into()),
         }
         if amount == 0 {
             return Err("the amount is 0".into());
@@ -1369,6 +1415,7 @@ pub unsafe extern "C" fn qmb_spend_v2_new(
             answers: HashMap::new(),
             asked: None,
             phase: Phase::Pumping,
+            prover: None,
         })
     })();
     match built {
@@ -1376,6 +1423,71 @@ pub unsafe extern "C" fn qmb_spend_v2_new(
         Err(e) => {
             set_err(err_out, e);
             ptr::null_mut()
+        }
+    }
+}
+
+/// The longest `/v2/annulet/info` answer accepted.
+const MAX_PROVER_INFO: usize = 16 * 1024;
+
+/// **The prover this spend pays** (lab #937 PR D; format 34 only), from the
+/// prover service's `/v2/annulet/info` answer `info` (`len` bytes) as the
+/// host fetched it. Checked against **this kernel's pin** for the spend's
+/// network (`qumbra_wallet::prover_pins`): the genesis hash, the fee asset
+/// (0), the payee (the pinned one, by decoded `rkm`) and the price (each
+/// shape ≤ the pinned maximum). The advertised price is then **fixed for the
+/// whole handle** — every step of the plan pays it, the review's total line
+/// sums it, and `/info` is never read again. Call once, before the first
+/// `qmb_spend_v2_step`. Returns 0, or -1 with `*err_out` the refusal by name
+/// (the handle is unchanged).
+///
+/// # Safety
+/// `s` live; `info` `len` readable bytes; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spend_v2_prover(
+    s: *mut SpendHandle,
+    info: *const u8,
+    len: usize,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if s.is_null() || info.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return -1;
+    }
+    let h = &mut *s;
+    let admitted = (|| {
+        if !matches!(h.phase, Phase::Pumping) || h.asked.is_some() || !h.answers.is_empty() {
+            return Err("the prover is set before the first step".to_string());
+        }
+        if h.prover.is_some() {
+            return Err("the prover is already set: its price is fixed for this spend".into());
+        }
+        if h.basis.form.sp_outputs() != 3 {
+            return Err("this net is not format 34: its spends carry no third output, so no prover is paid in them".into());
+        }
+        if len > MAX_PROVER_INFO {
+            return Err(format!("a {len}-byte /v2/annulet/info, over the {MAX_PROVER_INFO} B bound"));
+        }
+        let bytes = std::slice::from_raw_parts(info, len);
+        let p = qumbra_wallet::prover_pins::admit(bytes, &h.basis.genesis_hash).map_err(|e| e.to_string())?;
+        let ek = p.payee.encapsulation_key().ok_or("the pinned payee has no valid encapsulation key")?;
+        Ok(Prover {
+            price: p.price,
+            payee: Recipient { rkm: p.payee.rkm_lanes(), ek },
+            short: p.payee.short().encode(),
+        })
+    })();
+    match admitted {
+        Ok(p) => {
+            h.prover = Some(p);
+            0
+        }
+        Err(e) => {
+            set_err(err_out, e);
+            -1
         }
     }
 }
@@ -1611,7 +1723,26 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
     // this wallet before it is named.
     let mut to_payee: Vec<(u64, u64)> = Vec::new();
     let mut to_self: Vec<(u64, u64)> = Vec::new();
+    // Lab #937 PR D: a format-34 step's third output pays the prover —
+    // checked here against the admitted payee and this step's price, and
+    // named on its own line below.
+    let mut prover_line = None;
     for (k, note) in t.prepared.outputs.iter().enumerate() {
+        if k == 2 {
+            if let Some((rkm, short, price)) = &r.prover {
+                if note.rkm != *rkm {
+                    return Err(format!("output {k} does not pay the prover's pinned payee"));
+                }
+                if note.asset != 0 || note.value != *price {
+                    return Err(format!(
+                        "output {k} pays the prover {} of asset {}, not its price of {price} fee unit(s)",
+                        note.value, note.asset
+                    ));
+                }
+                prover_line = Some(format!("prover fee: {} to {short}\n", r.names.amount(*price, 0)));
+                continue;
+            }
+        }
         let bucket = if Some(note.rkm) == r.payee_rkm {
             &mut to_payee
         } else if note.rkm == r.own_rkm {
@@ -1631,6 +1762,18 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
         out.push_str(&format!("{} returns to this wallet\n", r.names.amount(*value, *asset)));
     }
     out.push_str(&format!("fee: {}\n", r.names.amount(i.fee, 0)));
+    if let Some(line) = prover_line {
+        out.push_str(&line);
+        // A remote-proved plan of more than one transaction: what is left of
+        // it, from this step on, at the price fixed for the whole handle.
+        let (steps, network, prover) = r.plan_from_here;
+        if steps > 1 {
+            out.push_str(&format!(
+                "this plan from here: {steps} transactions; network fees {network} + prover fees {prover} = {}\n",
+                r.names.amount(network.saturating_add(prover), 0)
+            ));
+        }
+    }
     out.push_str(&format!("valid until block {}\n", i.valid_until_height));
     if !r.spends_verified {
         // Design D5: stated beside every plan while it holds.
