@@ -8,7 +8,8 @@
 //! only thing this service can add is the proof; a proof of anything else
 //! fails the node's PV binding, and a changed byte fails the section.
 //!
-//! **Admission, in order, refusing by name before anything is spawned:**
+//! **Admission on format 33, in order, refusing by name before anything is
+//! spawned:**
 //! 1. the bearer token ([`crate::token`]): signature, window, net, revocation;
 //! 2. the token's quota (admitted jobs per UTC day) and its one in-flight job;
 //! 3. the body's byte ceiling ([`MAX_ANNULET_BUNDLE_BYTES`]), read bounded;
@@ -17,6 +18,23 @@
 //! 5. [`ProvingBundle::check`] on this net: the witness states the
 //!    transaction, the openings resolve, the section verifies. Its intent
 //!    digest is the idempotency key.
+//!
+//! **On format 34** (lab #937 PR E, [`crate::annulet_v3`]) the prover is paid
+//! inside the transaction and there is no token: the token configuration is
+//! not read, and `/quota` is not served. Admission, in order:
+//! 1. the client IP ([`crate::annulet_v3::client_key`]), then one live job
+//!    and one upload per IP (`429 ip-busy`);
+//! 2. the byte ceiling, `decode` and `check`, as above;
+//! 3. the fee: output 3 pays the payee at least the shape's price
+//!    ([`crate::annulet_v3::prover_fee`], `402`);
+//! 4. the nullifiers: none landed (the follow, `409 nullifier-landed`; not
+//!    ready is `503`), none claimed by a live or submitted job here (`409
+//!    nullifier-in-flight`). The intent is still the idempotency key, the
+//!    same IP its submitter;
+//! 5. the queue and retained-job bounds, as above.
+//!
+//! An accepted submission's output-3 opening is appended to the paid ledger
+//! and fsynced before the job reads `submitted` (D5).
 //!
 //! Then one job: queued → proving (a fresh child process, one at a time,
 //! core dumps off, scratch on tmpfs, no network) → submitting (this process
@@ -50,6 +68,7 @@ use rand::TryRng;
 use serde::Serialize;
 use zeroize::Zeroize;
 
+use crate::annulet_v3::{self, HttpFollow, NullifierFollow, PaidEntry, PaidLedger, V3Config};
 use crate::token::{hex, hex_decode, Claims, TokenKeys};
 use crate::{
     env_required, lock, parse_env_or, validate_base_url, ApiError,
@@ -107,9 +126,9 @@ const TMPFS_MAGIC: i64 = 0x0102_1994;
 pub const ANNULET_GENESIS_FORMAT_VAR: &str = "QUMBRA_PROVER_ANNULET_GENESIS_FORMAT";
 
 /// The service's net from [`ANNULET_GENESIS_FORMAT_VAR`]'s value, failing
-/// closed at startup: 33 (or unset) is served; **34 is refused by name** —
-/// its three-output bundles arrive with lab #937 PR E, and `/info` must never
-/// report 33 for a format-34 net; anything else is not a Candidate A Annulet.
+/// closed at startup: 33 (or unset) and 34 (lab #937 PR E: three outputs,
+/// the prover paid in output 3) are served; anything else is not a
+/// Candidate A Annulet.
 pub fn annulet_genesis_form(raw: Option<&str>) -> Result<L2AuthForm, String> {
     let v: u32 = match raw {
         None => return Ok(L2AuthForm::CandidateA),
@@ -117,13 +136,38 @@ pub fn annulet_genesis_form(raw: Option<&str>) -> Result<L2AuthForm, String> {
     };
     match qlab_devnet::forms::annulet_forms_of_genesis_format_version(v) {
         Some((_, L2AuthForm::CandidateA)) => Ok(L2AuthForm::CandidateA),
-        Some((_, L2AuthForm::CandidateAV3)) => {
-            Err(format!("{ANNULET_GENESIS_FORMAT_VAR}={v}: format 34 is not served yet (lab #937 PR E)"))
-        }
+        Some((_, L2AuthForm::CandidateAV3)) => Ok(L2AuthForm::CandidateAV3),
         Some((_, L2AuthForm::None)) | None => Err(format!(
-            "{ANNULET_GENESIS_FORMAT_VAR}={v}: not a Candidate A Annulet format (this service serves 33)"
+            "{ANNULET_GENESIS_FORMAT_VAR}={v}: not a Candidate A Annulet format (this service serves 33 and 34)"
         )),
     }
+}
+
+/// The token configuration for the net `form` (the PR E ruling): on 33 the
+/// keys file is required and the deny file optional, as before; **on 34
+/// neither is read** — the prover is paid in the transaction and admission
+/// has no identity. A token file left configured on 34 (prover-1's, until
+/// D6 retires it) is ignored, not refused: the third value says so for the
+/// startup log.
+pub fn token_config(
+    form: L2AuthForm,
+    keys_file: Option<String>,
+    deny_file: Option<PathBuf>,
+) -> Result<(TokenKeys, Option<PathBuf>, bool), String> {
+    if form == L2AuthForm::CandidateAV3 {
+        return Ok((TokenKeys::default(), None, keys_file.is_some() || deny_file.is_some()));
+    }
+    let keys_file = keys_file.ok_or("QUMBRA_PROVER_TOKEN_KEYS_FILE is required")?;
+    let mut tokens = TokenKeys::parse(
+        &std::fs::read_to_string(&keys_file)
+            .map_err(|_| "QUMBRA_PROVER_TOKEN_KEYS_FILE could not be read".to_string())?,
+    )?;
+    if let Some(path) = &deny_file {
+        tokens.set_denied(
+            &std::fs::read_to_string(path).map_err(|_| "QUMBRA_PROVER_TOKEN_DENY_FILE could not be read".to_string())?,
+        )?;
+    }
+    Ok((tokens, deny_file, false))
 }
 
 /// Fail-closed Annulet configuration (all `QUMBRA_PROVER_ANNULET_*`, plus
@@ -131,8 +175,8 @@ pub fn annulet_genesis_form(raw: Option<&str>) -> Result<L2AuthForm, String> {
 pub struct AnnuletConfig {
     pub genesis_hash: Hash32,
     /// The net's L2 authorization axis, from
-    /// `QUMBRA_PROVER_ANNULET_GENESIS_FORMAT` (default 33): only Candidate A
-    /// (format 33) is served — see [`annulet_genesis_form`].
+    /// `QUMBRA_PROVER_ANNULET_GENESIS_FORMAT` (default 33): Candidate A on
+    /// format 33 or 34 — see [`annulet_genesis_form`].
     pub l2_auth: L2AuthForm,
     pub slot_secs: u64,
     pub queue_capacity: usize,
@@ -144,6 +188,9 @@ pub struct AnnuletConfig {
     pub scratch: PathBuf,
     pub tokens: TokenKeys,
     pub deny_file: Option<PathBuf>,
+    /// Format 34's payee, price, ledger and chain follow (lab #937 PR E):
+    /// `Some` exactly when `l2_auth` is `CandidateAV3`.
+    pub v3: Option<V3Config>,
 }
 
 impl AnnuletConfig {
@@ -202,18 +249,24 @@ impl AnnuletConfig {
         };
         let scratch = PathBuf::from(env_required("QUMBRA_PROVER_SCRATCH")?);
         scratch_is_tmpfs(&scratch)?;
-        let keys_file = env_required("QUMBRA_PROVER_TOKEN_KEYS_FILE")?;
-        let mut tokens = TokenKeys::parse(
-            &std::fs::read_to_string(&keys_file)
-                .map_err(|_| "QUMBRA_PROVER_TOKEN_KEYS_FILE could not be read".to_string())?,
+        let (tokens, deny_file, ignored) = token_config(
+            l2_auth,
+            std::env::var("QUMBRA_PROVER_TOKEN_KEYS_FILE").ok(),
+            std::env::var_os("QUMBRA_PROVER_TOKEN_DENY_FILE").map(PathBuf::from),
         )?;
-        let deny_file = std::env::var_os("QUMBRA_PROVER_TOKEN_DENY_FILE").map(PathBuf::from);
-        if let Some(path) = &deny_file {
-            tokens
-                .set_denied(&std::fs::read_to_string(path).map_err(|_| {
-                    "QUMBRA_PROVER_TOKEN_DENY_FILE could not be read".to_string()
-                })?)?;
+        if ignored {
+            eprintln!("qumbra-prover-service: the token configuration is ignored on format 34 (the prover is paid in the transaction)");
         }
+        let v3 = match l2_auth {
+            L2AuthForm::CandidateAV3 => Some(V3Config::from_values(
+                std::env::var(annulet_v3::PAYEE_VAR).ok(),
+                std::env::var(annulet_v3::PRICE_S_VAR).ok(),
+                std::env::var(annulet_v3::PRICE_P_VAR).ok(),
+                std::env::var(annulet_v3::PAID_LEDGER_VAR).ok(),
+                Arc::new(HttpFollow::new(&node_url)),
+            )?),
+            _ => None,
+        };
         Ok(Some(Self {
             genesis_hash,
             l2_auth,
@@ -227,6 +280,7 @@ impl AnnuletConfig {
             scratch,
             tokens,
             deny_file,
+            v3,
         }))
     }
 
@@ -358,6 +412,15 @@ pub struct InfoView {
     pub prove_timeout_secs: u64,
     pub slot_secs: u64,
     pub recommended_valid_for_blocks: u64,
+    /// Format 34 only (lab #937 PR E): what the kernel's `prover_pins::admit`
+    /// checks against its pin — the fee's asset (0), the price per shape,
+    /// and the payee's full address. Absent on 33, whose `/info` is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_asset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<annulet_v3::ProverPrice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payee: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -390,12 +453,17 @@ struct Job {
     phase: Phase,
     updated: Instant,
     cancel: Arc<AtomicBool>,
-    token_id: [u8; 16],
+    /// Who submitted it: the token id on 33, the salted client-IP key on 34.
+    who: [u8; 16],
     shape: L2ShapeTag,
     bundle_bytes: usize,
     /// The bundle's transaction on the wire, proof empty: what the child's
     /// answer must equal but for the proof.
     tx_wire: Vec<u8>,
+    /// The transaction's nullifiers (format 34's dedupe).
+    nullifiers: Vec<[u8; 32]>,
+    /// Format 34: output 3's opening, for the paid ledger once accepted.
+    paid: Option<PaidEntry>,
 }
 
 #[derive(Default)]
@@ -406,16 +474,25 @@ struct State {
     /// The live queue: the dispatcher pulls from its front; a cancel takes
     /// its job out at once, so a cancelled job holds no slot (lab #924 F2).
     pending: VecDeque<WorkItem>,
-    /// Tokens with an upload being read (one at a time per token).
+    /// Submitters (tokens, or client-IP keys) with an upload being read: one
+    /// at a time each.
     reading: HashSet<[u8; 16]>,
     refusals: BTreeMap<(String, &'static str), u64>,
 }
 
 impl State {
-    fn in_flight(&self, token_id: &[u8; 16]) -> bool {
+    fn in_flight(&self, who: &[u8; 16]) -> bool {
         self.jobs
             .values()
-            .any(|j| j.token_id == *token_id && !j.phase.terminal())
+            .any(|j| j.who == *who && !j.phase.terminal())
+    }
+    /// A nullifier of `nfs` is claimed by a retained job that may still
+    /// land: queued, proving, submitting, or submitted within the result TTL.
+    fn nullifier_claimed(&self, nfs: &[[u8; 32]]) -> bool {
+        self.jobs.values().any(|j| {
+            !matches!(j.phase, Phase::Refused(_) | Phase::Failed(_) | Phase::Cancelled)
+                && j.nullifiers.iter().any(|nf| nfs.contains(nf))
+        })
     }
     fn used_today(&self, token_id: &[u8; 16], day: u64) -> u16 {
         match self.usage.get(token_id) {
@@ -452,24 +529,35 @@ struct Inner {
     state: Arc<Mutex<State>>,
     work: Arc<Condvar>,
     now: fn() -> u64,
+    /// Format 34: the client-IP keys' per-process salt.
+    salt: [u8; 32],
+    /// Format 34: the landed nullifiers.
+    follow: Option<Arc<NullifierFollow>>,
 }
 
-/// A token admitted to upload (steps 1–2 passed): it holds the token's one
-/// reading slot until dropped, so a slow upload occupies its own token only.
+/// A submitter admitted to upload — a token (steps 1–2 passed) on 33, a
+/// client IP on 34: it holds the submitter's one reading slot until dropped,
+/// so a slow upload occupies its own token or IP only.
 pub struct Admission {
-    claims: Claims,
+    who: [u8; 16],
+    claims: Option<Claims>,
     state: Arc<Mutex<State>>,
 }
 
 impl Admission {
-    pub fn claims(&self) -> &Claims {
-        &self.claims
+    /// The token's claims (format 33); `None` on 34.
+    pub fn claims(&self) -> Option<&Claims> {
+        self.claims.as_ref()
+    }
+    /// The submitter's key: the token id, or the salted client-IP key.
+    pub fn who(&self) -> [u8; 16] {
+        self.who
     }
 }
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        lock(&self.state).reading.remove(&self.claims.token_id);
+        lock(&self.state).reading.remove(&self.who);
     }
 }
 
@@ -480,9 +568,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// A token id's short log hash: abuse is visible per token, the token is not.
-fn token_tag(token_id: &[u8; 16]) -> String {
-    hex(&keccak256(&[b"qumbra:prover-token-log:v1", token_id])[..4])
+/// A submitter's short log hash — a token id's, or a salted client-IP key's:
+/// abuse is visible per submitter, the token or IP is not.
+fn token_tag(who: &[u8; 16]) -> String {
+    hex(&keccak256(&[b"qumbra:prover-token-log:v1", who])[..4])
 }
 
 fn err(status: u16, code: &'static str) -> ApiError {
@@ -498,7 +587,7 @@ fn bundle_refusal(e: &BundleError) -> ApiError {
         BundleError::StatementMismatch(_) => err(422, "statement-mismatch"),
         BundleError::Unauthorized(_) => err(422, "unauthorized-section"),
         // Lab #937: a two-output bundle on a format-34 net or a three-output
-        // one on 33 — the service serves 33 only until lab #937 PR E.
+        // one on 33.
         BundleError::OutputsNotTheNets { .. } => err(422, "outputs-not-the-nets"),
         BundleError::ThirdOutputAsset { .. } => err(422, "third-output-asset"),
         // Lab #937 PR D: slot 3's fee note is neither the fee nor the fee
@@ -527,17 +616,33 @@ impl AnnuletApi {
         let config = Arc::new(config);
         let work = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(State::default()));
+        let mut salt = [0u8; 32];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut salt)
+            .expect("the client-IP salt comes from the OS");
+        let slot = Duration::from_secs(config.slot_secs);
+        let follow = config.v3.as_ref().map(|_| Arc::new(NullifierFollow::new(slot)));
         let inner = Arc::new(Inner {
             config: Arc::clone(&config),
             tokens: RwLock::new(tokens),
             state: Arc::clone(&state),
             work: Arc::clone(&work),
             now,
+            salt,
+            follow: follow.clone(),
         });
+        if let (Some(f), Some(v3)) = (&follow, &config.v3) {
+            let (f, node) = (Arc::downgrade(f), Arc::clone(&v3.follow));
+            std::thread::Builder::new()
+                .name("annulet-nullifiers".into())
+                .spawn(move || annulet_v3::follow(f, node, slot))
+                .expect("the Annulet nullifier follow starts");
+        }
         let s = Arc::clone(&state);
+        let (form, ledger) = (config.l2_auth, config.v3.as_ref().map(|v| Arc::clone(&v.ledger)));
         std::thread::Builder::new()
             .name("annulet-dispatch".into())
-            .spawn(move || dispatch(s, work, prover, submitter))
+            .spawn(move || dispatch(s, work, prover, submitter, form, ledger))
             .expect("the Annulet dispatcher starts");
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -595,15 +700,50 @@ impl AnnuletApi {
         }
         state.reading.insert(claims.token_id);
         Ok(Admission {
-            claims,
+            who: claims.token_id,
+            claims: Some(claims),
             state: Arc::clone(&self.inner.state),
         })
     }
 
+    /// Whether this service admits by client IP (format 34) rather than by
+    /// token (33). On 34 the HTTP layer reads [`annulet_v3::CLIENT_IP_HEADER`]
+    /// and never `Authorization`, and `/quota` is not served.
+    pub fn admits_by_ip(&self) -> bool {
+        self.inner.config.v3.is_some()
+    }
+
+    /// **Format 34, step 1**: the client IP (`400 client-ip-unknown`), then its
+    /// one live job and its one reading slot (`429 ip-busy`) — before the
+    /// body is read. The slot is held until the returned [`Admission`] drops.
+    pub fn authorize_ip(&self, client_ip: Option<&str>) -> Result<Admission, ApiError> {
+        let who = annulet_v3::client_key(client_ip, &self.inner.salt).inspect_err(|e| {
+            lock(&self.inner.state).refuse("-".into(), e.code);
+        })?;
+        let mut state = lock(&self.inner.state);
+        state.cleanup(self.inner.config.result_ttl);
+        if state.in_flight(&who) || state.reading.contains(&who) {
+            state.refuse(token_tag(&who), "ip-busy");
+            return Err(err(429, "ip-busy"));
+        }
+        state.reading.insert(who);
+        Ok(Admission {
+            who,
+            claims: None,
+            state: Arc::clone(&self.inner.state),
+        })
+    }
+
+    /// Format 34: the nullifier follow is ready (`Ok` on 33, which has none)
+    /// — what `/healthz` reports.
+    pub fn ready(&self) -> Result<(), ApiError> {
+        self.inner.follow.as_ref().map_or(Ok(()), |f| f.readiness())
+    }
+
     /// Count a refusal the HTTP layer made after admission (`415`, `413`,
-    /// an upload past its deadline) under the token's tag.
-    pub fn count_refusal(&self, claims: &Claims, code: &'static str) {
-        lock(&self.inner.state).refuse(token_tag(&claims.token_id), code);
+    /// an upload past its deadline) under the submitter's tag.
+    pub fn count_refusal(&self, who: [u8; 16], code: &'static str) {
+        lock(&self.inner.state).refuse(token_tag(&who), code);
     }
 
     /// **Steps 3–5 and the job**: the bundle's bytes (already bounded by the
@@ -613,8 +753,9 @@ impl AnnuletApi {
         admission: &Admission,
         mut bundle: Vec<u8>,
     ) -> Result<(AnnuletJobView, bool), ApiError> {
-        let claims = &admission.claims;
-        let who = token_tag(&claims.token_id);
+        let submitter = admission.who;
+        let claims = admission.claims.as_ref();
+        let who = token_tag(&submitter);
         let refuse = |e: ApiError| {
             lock(&self.inner.state).refuse(who.clone(), e.code);
             e
@@ -636,7 +777,27 @@ impl AnnuletApi {
         };
         let tx_wire = qlab_p2p::codec::encode_tx_annulet(parsed.tx());
         let shape = parsed.shape();
+        let nullifiers = parsed.tx().public.nullifiers.clone();
+        // Format 34: the fee, read from the witness — output 3 pays the payee
+        // at least the shape's price.
+        let paid = match &self.inner.config.v3 {
+            Some(v3) => {
+                let out3 = parsed.witness().outputs.get(2);
+                if let Err(e) = annulet_v3::prover_fee(out3, &v3.payee_rkm, v3.price.of(shape)) {
+                    drop(parsed);
+                    bundle.zeroize();
+                    return Err(refuse(e));
+                }
+                let cm = parsed.tx().public.commitments.get(2).copied();
+                out3.zip(cm).map(|(o, cm)| PaidEntry::of(o, cm, shape))
+            }
+            None => None,
+        };
         drop(parsed); // its witness is wiped on drop
+        // Format 34: the chain's side of the dedupe, read before the job
+        // state is locked (its verdict waits until a retry of a known intent
+        // has been answered).
+        let landed = self.inner.follow.as_ref().map_or(Ok(()), |f| f.check(&nullifiers));
 
         let mut state = lock(&self.inner.state);
         let ttl = self.inner.config.result_ttl;
@@ -646,7 +807,7 @@ impl AnnuletApi {
                 .jobs
                 .get(&cap)
                 .expect("by_intent points at retained jobs");
-            if job.token_id != claims.token_id {
+            if job.who != submitter {
                 drop(state);
                 bundle.zeroize();
                 return Err(refuse(err(409, "intent-in-flight")));
@@ -663,15 +824,28 @@ impl AnnuletApi {
                 return Ok((view(&cap, job, &state.pending, ttl), false));
             }
         }
-        // The race between `authorize` and here: re-check under the lock.
-        if state.in_flight(&claims.token_id) {
-            state.refuse(who, "token-busy");
+        // Format 34: no nullifier landed, none claimed by a job here.
+        if let Err(e) = landed {
+            state.refuse(who, e.code);
             bundle.zeroize();
-            return Err(err(429, "token-busy"));
+            return Err(e);
         }
+        if self.inner.follow.is_some() && state.nullifier_claimed(&nullifiers) {
+            state.refuse(who, "nullifier-in-flight");
+            bundle.zeroize();
+            return Err(err(409, "nullifier-in-flight"));
+        }
+        // The race between `authorize` and here: re-check under the lock.
+        if state.in_flight(&submitter) {
+            let busy = if claims.is_some() { "token-busy" } else { "ip-busy" };
+            state.refuse(who, busy);
+            bundle.zeroize();
+            return Err(err(429, busy));
+        }
+        // The daily quota is a token's (33); an IP has none.
         let day = self.day();
-        let used = state.used_today(&claims.token_id, day);
-        if used >= self.per_day(claims) {
+        let used = state.used_today(&submitter, day);
+        if claims.is_some_and(|c| used >= self.per_day(c)) {
             state.refuse(who, "quota-exhausted");
             bundle.zeroize();
             return Err(err(429, "quota-exhausted"));
@@ -713,14 +887,18 @@ impl AnnuletApi {
                 phase: Phase::Queued,
                 updated: Instant::now(),
                 cancel,
-                token_id: claims.token_id,
+                who: submitter,
                 shape,
                 bundle_bytes,
                 tx_wire,
+                nullifiers,
+                paid,
             },
         );
         state.by_intent.insert(intent, cap.clone());
-        state.usage.insert(claims.token_id, (day, used + 1));
+        if claims.is_some() {
+            state.usage.insert(submitter, (day, used + 1));
+        }
         let job = state.jobs.get(&cap).expect("just inserted");
         Ok((view(&cap, job, &state.pending, ttl), true))
     }
@@ -770,6 +948,9 @@ impl AnnuletApi {
             prove_timeout_secs: c.prove_timeout.as_secs(),
             slot_secs: c.slot_secs,
             recommended_valid_for_blocks: c.recommended_valid_for_blocks(),
+            fee_asset: c.v3.as_ref().map(|_| 0),
+            price: c.v3.as_ref().map(|v| v.price),
+            payee: c.v3.as_ref().map(|v| v.payee.clone()),
         }
     }
 
@@ -829,9 +1010,14 @@ fn view(cap: &str, job: &Job, queue: &VecDeque<WorkItem>, ttl: Duration) -> Annu
 
 /// The child's answer must be the bundle's transaction with a proof added
 /// and nothing else: decoded on this net's wire, a non-empty proof, every
-/// other byte the bundle's.
+/// other byte the bundle's. [`proof_added_on`] a format-33 net.
 pub fn proof_added(bundle_tx_wire: &[u8], proved_wire: &[u8]) -> Result<TxEntry, &'static str> {
-    let tx = qlab_p2p::codec::decode_tx_annulet_with(proved_wire, L2AuthForm::CandidateA)
+    proof_added_on(L2AuthForm::CandidateA, bundle_tx_wire, proved_wire)
+}
+
+/// [`proof_added`] on the net `form` (33 or 34).
+pub fn proof_added_on(form: L2AuthForm, bundle_tx_wire: &[u8], proved_wire: &[u8]) -> Result<TxEntry, &'static str> {
+    let tx = qlab_p2p::codec::decode_tx_annulet_with(proved_wire, form)
         .map_err(|_| "proof-mismatch")?;
     if tx.proof.is_empty()
         || tx.rider != qlab_devnet::names::RIDER_ABSENT
@@ -856,6 +1042,8 @@ fn dispatch(
     work: Arc<Condvar>,
     prover: Arc<dyn AnnuletProver>,
     submitter: Arc<dyn Submitter>,
+    form: L2AuthForm,
+    ledger: Option<Arc<PaidLedger>>,
 ) {
     loop {
         let queued_at;
@@ -931,7 +1119,7 @@ fn dispatch(
                 continue;
             }
         };
-        let tx = match proof_added(&expected, &wire) {
+        let tx = match proof_added_on(form, &expected, &wire) {
             Ok(tx) => tx,
             Err(code) => {
                 finish(Phase::Failed(code.into()), wire.len());
@@ -954,6 +1142,30 @@ fn dispatch(
         }
         let phase = match submitter.submit(&wire) {
             Ok(()) => {
+                // Format 34 (D5): the node accepted it — append output 3's
+                // opening and fsync, before the job reads `submitted`. A write
+                // that fails cannot undo the submission: it is logged, with
+                // the commitment, for the operator to recover by hand.
+                if let Some(ledger) = &ledger {
+                    let paid = lock(&state).jobs.get_mut(&item.cap).and_then(|j| j.paid.take());
+                    match paid {
+                        Some(entry) => {
+                            if let Err(e) = ledger.append(&entry, unix_now()) {
+                                eprintln!(
+                                    "qumbra-prover-service: error: annulet paid ledger write failed for cm={}: {e}",
+                                    hex(&entry.cm)
+                                );
+                            }
+                        }
+                        // Admission recorded an opening for every format-34
+                        // job; a job without one is a defect, never silent.
+                        // (The job-id prefix only: the capability is secret.)
+                        None => eprintln!(
+                            "qumbra-prover-service: error: annulet job {}: accepted with no output-3 opening to record in the paid ledger",
+                            &item.cap[..8]
+                        ),
+                    }
+                }
                 let _ = submitter.relay(&wire);
                 Phase::Submitted(qlab_p2p::codec::tx_id(&tx))
             }
@@ -1008,6 +1220,8 @@ fn housekeeping(inner: std::sync::Weak<Inner>) {
 pub struct AnnuletProcessProver {
     pub executable: PathBuf,
     pub genesis_hash: Hash32,
+    /// The net's form: the child proves on it (33 or 34).
+    pub form: L2AuthForm,
     pub scratch: PathBuf,
     pub timeout: Duration,
 }
@@ -1022,6 +1236,10 @@ impl AnnuletProver for AnnuletProcessProver {
             .env(
                 "QUMBRA_PROVER_ANNULET_GENESIS_HASH",
                 hex(&self.genesis_hash),
+            )
+            .env(
+                ANNULET_GENESIS_FORMAT_VAR,
+                self.form.annulet_genesis_format_version().to_string(),
             )
             .env("TMPDIR", &self.scratch)
             .current_dir(&self.scratch)
@@ -1184,11 +1402,13 @@ fn worker_code(code: &[u8]) -> &'static str {
 }
 
 /// **The child**: read one framed bundle from `input`, decode and prove it
-/// on the net `genesis_hash` names ([`ProvingBundle::prove`] runs the lock
-/// again), answer the proved transaction's wire bytes. No network, no file.
+/// on the net `genesis_hash` and `form` name ([`ProvingBundle::prove`] runs
+/// the lock again), answer the proved transaction's wire bytes. No network,
+/// no file.
 pub fn annulet_worker_once(
     mut input: impl Read,
     genesis_hash: &Hash32,
+    form: L2AuthForm,
 ) -> Result<Vec<u8>, &'static str> {
     let mut len = [0u8; 4];
     input
@@ -1206,7 +1426,7 @@ pub fn annulet_worker_once(
     // The server checked this bundle before queueing it; a refusal here is
     // the same lock on the same bytes, so it is the bundle's, by name.
     let tx = bundle
-        .prove(&AuthContext::candidate_a(*genesis_hash))
+        .prove(&AuthContext { form, genesis_hash: *genesis_hash })
         .map_err(|_| "bundle-refused")?;
     drop(bundle); // its witness is wiped on drop
     let wire = qlab_p2p::codec::encode_tx_annulet(&tx);

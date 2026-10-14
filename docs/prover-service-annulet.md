@@ -2,7 +2,9 @@
 
 *Chinese translation: [`prover-service-annulet-zh.md`](prover-service-annulet-zh.md). EN is authoritative.*
 
-Lab issue #924, 5A-D3/D4. Code: `crates/qumbra-prover-service` (`src/annulet.rs`, `src/token.rs`).
+Lab issue #924, 5A-D3/D4; format 34 from lab #937 PR E. Code: `crates/qumbra-prover-service` (`src/annulet.rs`, `src/annulet_v3.rs`, `src/token.rs`).
+
+The service serves one net, format 33 or format 34. Everything below up to [Format 34](#format-34-the-prover-is-paid-in-the-transaction) describes format 33; that section says what differs on 34.
 
 ## What it is
 
@@ -78,7 +80,7 @@ The Annulet mode is on exactly when `QUMBRA_PROVER_ANNULET_GENESIS_HASH` is set.
 
 Proofs run one at a time, each in a fresh `annulet-worker` child process:
 
-- the environment is cleared except for the protocol tag and the genesis hash, so the child has no URL and no token;
+- the environment is cleared except for the protocol tag, the genesis hash and the genesis format, so the child has no URL and no token;
 - core dumps are off: `RLIMIT_CORE = 0` is set between fork and exec. On Linux the child also clears `PR_SET_DUMPABLE` itself, first thing after exec (the kernel resets that flag on `execve`). After that, a same-uid process cannot `ptrace` it or read `/proc/<pid>/mem`. The server does the same to itself at startup, because it holds bundles too;
 - the working directory and `TMPDIR` are the tmpfs scratch;
 - stderr is closed;
@@ -94,11 +96,111 @@ The child re-runs the bundle's lock and proves. The server then checks that the 
 - Every minute: admission refusals counted per code, under a 4-byte hash of the token id (`-` before a token verified). This shows abuse without naming the user.
 - **Per-day counts, in-flight state and jobs live in memory and reset on restart.**
 
+## Format 34: the prover is paid in the transaction
+
+Lab #937 PR E (rulings D4 and D5, and the PR E ruling on issue #937). On a format-34 net (`QUMBRA_PROVER_ANNULET_GENESIS_FORMAT=34`) a bundle's **third output pays this service**: the configured payee's `rkm`, asset 0, at least the advertised price of the bundle's shape. There is no token and no account.
+
+**What differs from format 33:**
+
+- **No token.** `QUMBRA_PROVER_TOKEN_KEYS_FILE` and `QUMBRA_PROVER_TOKEN_DENY_FILE` are not read. If they are still configured (prover-1's are, until D6 retires them), they are ignored, not refused, and startup logs that they were ignored. `Authorization` is never read. `GET /v2/annulet/quota` answers `404 quota-not-served`. There is no daily quota.
+- **`/v2/annulet/info`** also carries `fee_asset` (0), `price` (`{"S": n, "P": n}`) and `payee` (the full address). These are the fields the kernel's `prover_pins::admit` checks against the network's pin. On 33 these fields are absent.
+- **`/healthz`** answers `503` with the follow's code until the nullifier follow has caught up, and again whenever it falls more than one slot behind (see below).
+
+**Admission order on 34.** Every refusal is by name, and nothing is queued before step 5:
+
+1. **The client IP**, from `X-Qumbra-Client-IP`:
+   - absent, repeated or not an IP → `400 client-ip-unknown`;
+   - a second live job or a second upload from the same IP → `429 ip-busy`.
+
+   An IPv4-mapped IPv6 address counts as its IPv4 address. An IPv6 address counts by its /64. So several users behind one NAT or CGNAT share one slot: they wait for each other's job. That is accepted on the testnet.
+2. The byte ceiling, decode and the bundle's lock, as on 33. A two-output bundle is `422 outputs-not-the-nets`.
+3. **The fee**, read from the witness's output 3, which the lock has already bound to the transaction's third commitment:
+   - not the payee's `rkm`, or not asset 0 → `402 prover-fee-missing`;
+   - a value below the shape's price → `402 prover-fee-short`.
+
+   More than the price is accepted.
+4. **The nullifiers**:
+   - one has landed on chain → `409 nullifier-landed`;
+   - the follow is not ready → `503 nullifiers-catching-up` or `503 nullifiers-stale`;
+   - one is claimed by a job here that may still land (queued, proving, submitting, or submitted within the result TTL) → `409 nullifier-in-flight`.
+
+   The intent is still the idempotency key, and the client's IP is its submitter. While the job is live, a retry from that IP is already refused at step 1 (`429 ip-busy`, as `token-busy` is on 33). Once the job has ended (`submitted`, `failed`, `refused`, `cancelled`), a retry from that IP gets the existing job back, or a fresh one if it ended without a transaction. Another IP gets `409 intent-in-flight`.
+5. The retained-job and queue bounds, as on 33.
+
+**The client IP and its premise.** The service trusts `X-Qumbra-Client-IP` because it listens only on the internal ingress network. The `QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` acknowledgement covers that premise.
+
+Caddy sets the header (the cut-over's deploy change, not this PR):
+- `trusted_proxies static <Cloudflare's published ranges>`, with `client_ip_headers CF-Connecting-IP`;
+- `header_up X-Qumbra-Client-IP {client_ip}` on `/v2/annulet/*`. This overwrites any copy a client sends.
+
+A connection that does not come from a Cloudflare range gets its own socket address as its client IP, so going around Cloudflare cannot impersonate another IP. Closing 443 to non-Cloudflare sources is an operator step at the cut-over.
+
+The IP is never logged. Refusals are counted under a 4-byte hash of a per-process salted key.
+
+**The nullifier follow.** The service follows its pinned node itself (`QUMBRA_PROVER_ANNULET_NODE_URL`):
+- the tip is read from `GET /v1/registry/root`;
+- the landed nullifiers are paged from `GET /v1/nullifiers`, starting at height 1.
+
+It polls every quarter slot (no more often than every 200 ms), so a slow poll still lands well inside the one slot after which the set is stale. Every height must be served, in order. A page that skips a height or a page with no block is an error, and the set does not advance past it. A tip below the followed height (a reorganisation deeper than the set, or a node rolled back) empties the set: it is logged as `error:` and rebuilt from height 1, catching up again.
+
+The set lives in memory (32 bytes per nullifier) and is rebuilt from height 1 at every start. The first catch-up logs its size and how long it took. If that rebuild grows past 60 s, a persisted set gets its own issue.
+
+**It fails loudly.** Admission answers `503`, and `/healthz` is not ready:
+- `nullifiers-catching-up` until the first catch-up;
+- `nullifiers-stale` once the last catch-up is more than one slot old. That covers an unreachable node and a follow that has fallen behind.
+
+A follow failure is logged once as `error:`, and its recovery once.
+
+*Residuals.*
+- **At most one wasted prove per IP per prove time.** A transaction that loses a race to a spend the follow has not yet seen still gets proved, and its landed spend costs the attacker real notes (accepted at D4).
+- A nullifier from a block that is later reorganised away, by a reorganisation shallower than the set, stays in the set until the next restart or the next rebuild. Until then its notes are refused as `nullifier-landed`.
+
+**The paid ledger (D5).** `QUMBRA_PROVER_ANNULET_PAID_LEDGER` names a file.
+
+*The file:*
+- The service creates it with mode 0600 and writes the header line `qumbra-prover-paid-ledger 1`.
+- An existing file must already be 0600 and start with that header. Otherwise startup refuses it by name.
+- Mount it from durable storage. `/scratch` is tmpfs and is lost on restart.
+- It is never logged and never goes in git.
+
+*Writing order.* After the node **accepts** `POST /v1/tx`, the service appends one line and fsyncs it. Only then does the job read `submitted`.
+
+*The line.* The entry version `1`, then space-separated fields:
+
+```
+1 cm=<64 hex> value=<n> asset=0 rkm=<64 hex> rho=<64 hex> rseed=<64 hex> shape=<S|P> at=<unix seconds>
+```
+
+- `cm` is the transaction's third commitment, as on chain.
+- `rkm`, `rho` and `rseed` are the four `u64` lanes, each little-endian, as 64 hex.
+- There is no height, because the service does not know where the transaction lands. A reader finds `cm` in the tree.
+
+*What writes nothing:*
+- A submission the node refuses.
+- Anything refused at admission.
+- A replay of the same transaction, which the nullifier dedupe refuses.
+
+*If the write fails.* The submission cannot be undone. The service logs `error: annulet paid ledger write failed for cm=<hex>` for the operator to recover by hand.
+
+*Crashes.* A crash mid-write can leave a last line without its newline. A reader skips that line.
+
+The operator copies the file to the payee wallet's machine; the payee's seed stays off the box. The importer (`qumbra-wallet`) is a separate PR. An honest kernel also encrypts output 3's discovery payload to the payee, so the payee's ordinary scan already finds these notes. The ledger covers a wallet that did not.
+
+**Configuration on 34**, in addition to the table above (the token rows do not apply):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `QUMBRA_PROVER_ANNULET_GENESIS_FORMAT` | 33 | `34` serves the three-output net |
+| `QUMBRA_PROVER_ANNULET_PAYEE` | — | the payee's **full** version-2 address (a `qs1…` short address is a hash and cannot be checked); compared by its decoded `rkm` |
+| `QUMBRA_PROVER_ANNULET_PRICE_S` | — | the price of shape S, in asset-0 fee units |
+| `QUMBRA_PROVER_ANNULET_PRICE_P` | — | the price of shape P |
+| `QUMBRA_PROVER_ANNULET_PAID_LEDGER` | — | the paid ledger's path, on durable storage |
+
 ## The pilot box (prover-1)
 
 - **Host:** r7g.2xlarge (64 GiB, arm64). One P prove peaks at about 32 GiB.
 - **Container:** `mem_limit` about 58g, no swap, `ulimits: core: 0`, a tmpfs mounted at `/scratch` (1g), read-only root filesystem.
-- **Env:** the variables above. The net is format 33; take the genesis hash from the deploy repo. The node URL must point at a node that accepts `POST /v1/tx`.
+- **Env:** the variables above. The net is format 33 until the lab #937 cut-over moves it to 34; take the genesis hash from the deploy repo. The node URL must point at a node that accepts `POST /v1/tx`.
 - **Ingress:** TLS, rate limiting and a request-header size cap (Caddy), plus the non-loopback acknowledgement. Security group 443 is open, because the extension calls the service directly. **Keep `/v2/annulet/jobs/<cap>` out of the ingress access log**, or log only the path prefix: the capability in that URL is the job's secret.
 - **Operator-held, not on the box:** the issuer seed.
 - **Manual operator steps:** the Terraform apply for the host and its security group, DNS, keeping the issuer seed, and starting and stopping the host by hand.

@@ -18,6 +18,7 @@ fn prover() -> AnnuletProcessProver {
     AnnuletProcessProver {
         executable: env!("CARGO_BIN_EXE_qumbra-prover-service").into(),
         genesis_hash: GENESIS_HASH,
+        form: qlab_devnet::forms::L2AuthForm::CandidateA,
         scratch: std::env::temp_dir(),
         timeout: Duration::from_secs(900),
     }

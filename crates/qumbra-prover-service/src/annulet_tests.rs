@@ -60,6 +60,7 @@ fn config(net: Hash32, queue: usize, ttl: Duration) -> AnnuletConfig {
         scratch: PathBuf::from("/nonexistent"),
         tokens: TokenKeys::parse(&format!("1 {}", hex(&verifying_key(&SEED)))).unwrap(),
         deny_file: None,
+        v3: None,
     }
 }
 
@@ -326,7 +327,7 @@ fn a_bundle_is_refused_by_name_before_it_is_queued() {
     let a = api(Arc::clone(&prover), Arc::default());
     let t = token(6, GENESIS_HASH, 0);
     let admission = a.authorize(Some(&t)).unwrap();
-    let claims = *admission.claims();
+    let claims = *admission.claims().unwrap();
     let code = |bytes: Vec<u8>| {
         a.submit(&admission, bytes)
             .err()
@@ -486,7 +487,7 @@ fn an_upload_holds_its_token_s_reading_slot() {
         a.authorize(Some(&token(17, GENESIS_HASH, 0))).is_ok(),
         "other tokens are not held up"
     );
-    a.count_refusal(reading.claims(), "upload-deadline");
+    a.count_refusal(reading.who(), "upload-deadline");
     drop(reading);
     assert!(
         a.authorize(Some(&t)).is_ok(),
@@ -609,26 +610,26 @@ fn the_child_refuses_a_bad_frame_without_proving() {
         f
     };
     assert_eq!(
-        annulet_worker_once(framed(b"").as_slice(), &GENESIS_HASH).err(),
+        annulet_worker_once(framed(b"").as_slice(), &GENESIS_HASH, L2AuthForm::CandidateA).err(),
         Some("bundle-refused")
     );
     assert_eq!(
-        annulet_worker_once(framed(b"nope").as_slice(), &GENESIS_HASH).err(),
+        annulet_worker_once(framed(b"nope").as_slice(), &GENESIS_HASH, L2AuthForm::CandidateA).err(),
         Some("bundle-refused")
     );
     let over = ((MAX_ANNULET_BUNDLE_BYTES + 1) as u32).to_le_bytes();
     assert_eq!(
-        annulet_worker_once(over.as_slice(), &GENESIS_HASH).err(),
+        annulet_worker_once(over.as_slice(), &GENESIS_HASH, L2AuthForm::CandidateA).err(),
         Some("bundle-refused")
     );
     assert_eq!(
-        annulet_worker_once([1u8, 0].as_slice(), &GENESIS_HASH).err(),
+        annulet_worker_once([1u8, 0].as_slice(), &GENESIS_HASH, L2AuthForm::CandidateA).err(),
         Some("worker-protocol-refused")
     );
     // A real bundle for another net: refused by the lock, before any prove.
     let other = framed(&bundle_s().encode());
     assert_eq!(
-        annulet_worker_once(other.as_slice(), &[0x6f; 32]).err(),
+        annulet_worker_once(other.as_slice(), &[0x6f; 32], L2AuthForm::CandidateA).err(),
         Some("bundle-refused")
     );
 }
@@ -663,17 +664,16 @@ fn a_plain_http_node_link_needs_the_annulet_acknowledgement() {
     assert!(annulet_node_url(name, "ftp://x", Some(ANNULET_PLAIN_HTTP_ACK)).is_err());
 }
 
-/// Lab #937 PR B (review F2): the service's net fails closed at startup.
-/// Unset or 33 is served (`/info` then says 33); 34 is refused by name until
-/// lab #937 PR E; anything else is not a Candidate A Annulet.
+/// Lab #937 PR B (review F2), PR E: the service's net fails closed at
+/// startup. Unset or 33 is served (`/info` then says 33), and 34 since PR E;
+/// anything else is not a Candidate A Annulet.
 #[test]
-fn the_genesis_format_is_served_only_on_33_and_34_is_refused_by_name() {
+fn the_genesis_format_is_33_or_34_and_nothing_else() {
     use crate::annulet::annulet_genesis_form;
     use qlab_devnet::forms::L2AuthForm;
     assert_eq!(annulet_genesis_form(None), Ok(L2AuthForm::CandidateA));
     assert_eq!(annulet_genesis_form(Some("33")), Ok(L2AuthForm::CandidateA));
-    let e = annulet_genesis_form(Some("34")).unwrap_err();
-    assert!(e.contains("format 34 is not served yet (lab #937 PR E)"), "{e}");
+    assert_eq!(annulet_genesis_form(Some("34")), Ok(L2AuthForm::CandidateAV3));
     for bad in ["32", "35", "5", "x", ""] {
         assert!(annulet_genesis_form(Some(bad)).is_err(), "{bad}");
     }
@@ -694,4 +694,488 @@ fn a_three_output_bundle_is_refused_by_name_on_a_format_33_service() {
     let Err(e) = admit(&a, &token(9, GENESIS_HASH, 0), &v3) else { panic!("a v3 bundle is admitted on a 33 service") };
     assert_eq!((e.status, e.code), (422, "outputs-not-the-nets"));
     assert_eq!(*prover.calls.lock().unwrap(), 0, "nothing reached the prover");
+}
+
+// ------------------------------------------------- format 34 (lab #937 PR E)
+
+use crate::annulet_v3::{prover_fee, ChainFollow, ProverPrice, PAID_LEDGER_HEADER};
+use qumbra_wallet::spent::NullifierChunk;
+
+/// The v3 fixtures' output 3: the fee-bank spend (S) pays `[0x43; 4]` 3
+/// units; the P v3 spend pays `[0x43; 4]` 0 units; the S v3 spend pays
+/// `[0x33; 4]` 0 units. Every one is asset 0.
+const PAYEE_RKM: [u64; 4] = [0x43; 4];
+
+/// The pinned node as the follow sees it: a tip, the blocks' nullifiers,
+/// pages of at most `page` blocks, and a switch that takes it down.
+struct FakeChain {
+    blocks: Mutex<Vec<(u64, Vec<[u8; 32]>)>>,
+    down: AtomicBool,
+    page: usize,
+}
+
+impl FakeChain {
+    /// Blocks 1..=`tip`, `landed` in the last one.
+    fn new(tip: u64, landed: &[[u8; 32]]) -> Arc<Self> {
+        let mut blocks: Vec<_> = (1..=tip).map(|h| (h, vec![[h as u8; 32]])).collect();
+        if let Some(last) = blocks.last_mut() {
+            last.1.extend_from_slice(landed);
+        }
+        Arc::new(Self { blocks: Mutex::new(blocks), down: AtomicBool::new(false), page: 2 })
+    }
+    fn push(&self, nullifiers: &[[u8; 32]]) {
+        let mut b = self.blocks.lock().unwrap();
+        let next = b.len() as u64 + 1;
+        b.push((next, nullifiers.to_vec()));
+    }
+}
+
+impl ChainFollow for FakeChain {
+    fn tip(&self) -> Result<u64, String> {
+        if self.down.load(Ordering::Acquire) {
+            return Err("node-unreachable".into());
+        }
+        Ok(self.blocks.lock().unwrap().len() as u64)
+    }
+    fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
+        if self.down.load(Ordering::Acquire) {
+            return Err("node-unreachable".into());
+        }
+        let blocks = self.blocks.lock().unwrap();
+        let blocks = blocks.iter().filter(|(h, _)| (from..=to).contains(h)).take(self.page).cloned().collect();
+        Ok(NullifierChunk { from, to, blocks })
+    }
+}
+
+/// A fresh ledger path of this process's.
+fn ledger_path(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("qumbra-paid-ledger-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+fn config_v3(chain: Arc<FakeChain>, price: ProverPrice, ledger: &std::path::Path) -> AnnuletConfig {
+    let mut c = config(GENESIS_HASH, 2, Duration::from_secs(60));
+    c.l2_auth = L2AuthForm::CandidateAV3;
+    c.slot_secs = 1;
+    c.tokens = TokenKeys::default();
+    c.v3 = Some(V3Config {
+        payee: "qaddr-fixture-payee".into(),
+        payee_rkm: PAYEE_RKM,
+        price,
+        ledger: Arc::new(PaidLedger::open(ledger).unwrap()),
+        follow: chain,
+    });
+    c
+}
+
+fn api_v3(
+    prover: Arc<FakeProver>,
+    node: Arc<FakeNode>,
+    chain: Arc<FakeChain>,
+    price: ProverPrice,
+    ledger: &std::path::Path,
+) -> AnnuletApi {
+    AnnuletApi::with_clock(config_v3(chain, price, ledger), prover, node, clock)
+}
+
+/// Until the follow has caught up.
+fn wait_ready(a: &AnnuletApi) {
+    let started = Instant::now();
+    while a.ready().is_err() {
+        assert!(started.elapsed() < Duration::from_secs(20), "the follow never caught up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn admit_ip(a: &AnnuletApi, ip: &str, bundle: &ProvingBundle) -> Result<(AnnuletJobView, bool), ApiError> {
+    let admission = a.authorize_ip(Some(ip))?;
+    a.submit(&admission, bundle.encode())
+}
+
+fn code<T>(r: Result<T, ApiError>) -> Option<(u16, &'static str)> {
+    r.err().map(|e| (e.status, e.code))
+}
+
+fn fee_bank() -> &'static [ProvingBundle] {
+    static B: OnceLock<Vec<ProvingBundle>> = OnceLock::new();
+    B.get_or_init(|| {
+        qlab_l2spend::fixtures::signed_bundles_fee_bank(&[VALID_UNTIL, VALID_UNTIL + 1, VALID_UNTIL + 2])
+    })
+}
+
+fn v3(shape: L2ShapeTag) -> &'static ProvingBundle {
+    static S: OnceLock<ProvingBundle> = OnceLock::new();
+    static P: OnceLock<ProvingBundle> = OnceLock::new();
+    let cell = if shape == L2ShapeTag::S { &S } else { &P };
+    cell.get_or_init(|| qlab_l2spend::fixtures::signed_bundle_v3(shape))
+}
+
+/// Lab #937 PR E (D4): on format 34 output 3 pays the payee at least the
+/// shape's price, read from the witness — else `402`, by name, before
+/// anything reaches the prover. More than the price is accepted.
+#[test]
+fn a_format_34_bundle_pays_the_payee_its_price_or_is_refused_402() {
+    // S 3 and P 0: the fee-bank spend pays exactly 3, the P spend 0.
+    let prover = FakeProver::new(Answer::Honest, false);
+    let at = ledger_path("fee-ok");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), FakeChain::new(3, &[]), ProverPrice { s: 3, p: 0 }, &at);
+    wait_ready(&a);
+    let (v, created) = admit_ip(&a, "198.51.100.1", &fee_bank()[0]).unwrap();
+    assert!(created);
+    assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "submitted");
+    // The P spend shares the fee-bank spend's signer and notes — its
+    // nullifiers — so it gets a service of its own (on `a` it is 409
+    // `nullifier-in-flight`, rightly).
+    let at = ledger_path("fee-ok-p");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), FakeChain::new(3, &[]), ProverPrice { s: 3, p: 0 }, &at);
+    wait_ready(&a);
+    let (v, _) = admit_ip(&a, "198.51.100.2", v3(L2ShapeTag::P)).unwrap();
+    assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "submitted");
+
+    // S 4 and P 1: both short; the S v3 spend pays another key — missing.
+    let prover = FakeProver::new(Answer::Honest, false);
+    let at = ledger_path("fee-short");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), FakeChain::new(3, &[]), ProverPrice { s: 4, p: 1 }, &at);
+    wait_ready(&a);
+    assert_eq!(code(admit_ip(&a, "198.51.100.3", &fee_bank()[0])), Some((402, "prover-fee-short")));
+    assert_eq!(code(admit_ip(&a, "198.51.100.4", v3(L2ShapeTag::P))), Some((402, "prover-fee-short")));
+    assert_eq!(code(admit_ip(&a, "198.51.100.5", v3(L2ShapeTag::S))), Some((402, "prover-fee-missing")));
+    // A format-33 (two-output) bundle has no output 3: the lock refuses it.
+    assert_eq!(code(admit_ip(&a, "198.51.100.6", bundle_s())), Some((422, "outputs-not-the-nets")));
+    assert_eq!(*prover.calls.lock().unwrap(), 0, "nothing reached the prover");
+
+    // The rule itself: the payee's `rkm`, asset 0, at least the price.
+    let out = |rkm, asset, value| qlab_air::l2::L2TxOutput { value, asset, rkm, rho: [0; 4], rseed: [0; 4] };
+    assert_eq!(prover_fee(Some(&out(PAYEE_RKM, 0, 5)), &PAYEE_RKM, 4), Ok(()));
+    assert_eq!(prover_fee(Some(&out(PAYEE_RKM, 0, 4)), &PAYEE_RKM, 4), Ok(()));
+    assert_eq!(code(prover_fee(Some(&out(PAYEE_RKM, 0, 3)), &PAYEE_RKM, 4)), Some((402, "prover-fee-short")));
+    assert_eq!(code(prover_fee(Some(&out(PAYEE_RKM, 7, 9)), &PAYEE_RKM, 4)), Some((402, "prover-fee-missing")));
+    assert_eq!(code(prover_fee(Some(&out([0x44; 4], 0, 9)), &PAYEE_RKM, 4)), Some((402, "prover-fee-missing")));
+    assert_eq!(code(prover_fee(None, &PAYEE_RKM, 0)), Some((402, "prover-fee-missing")));
+}
+
+/// Lab #937 PR E (D4, the ruling's IP conditions): on format 34 admission
+/// keys on `X-Qumbra-Client-IP` — absent or not an IP is `400`; one live job
+/// and one upload per IP (`429 ip-busy`), an IPv4-mapped address as its IPv4
+/// and IPv6 by /64; another IP is admitted; the refusal counts never carry
+/// the IP; the intent stays the idempotency key, its IP the submitter.
+#[test]
+fn on_format_34_admission_keys_on_the_client_ip() {
+    let prover = FakeProver::new(Answer::Honest, true);
+    let at = ledger_path("ip");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), FakeChain::new(1, &[]), ProverPrice { s: 3, p: 0 }, &at);
+    assert!(a.admits_by_ip());
+    wait_ready(&a);
+    for bad in [None, Some(""), Some("not-an-ip"), Some("203.0.113.7:443"), Some("203.0.113.7, 10.0.0.1")] {
+        assert_eq!(code(a.authorize_ip(bad)), Some((400, "client-ip-unknown")), "{bad:?}");
+    }
+    let (v, _) = admit_ip(&a, "203.0.113.7", &fee_bank()[0]).unwrap();
+    assert_eq!(code(a.authorize_ip(Some("203.0.113.7"))), Some((429, "ip-busy")));
+    assert_eq!(code(a.authorize_ip(Some("::ffff:203.0.113.7"))), Some((429, "ip-busy")), "IPv4-mapped is the IPv4");
+    assert!(a.authorize_ip(Some("203.0.113.8")).is_ok(), "another IP is not held up");
+
+    // A reading slot per IP; an IPv6 /64 is one IP.
+    let reading = a.authorize_ip(Some("2001:db8:1:2::1")).unwrap();
+    assert_eq!(code(a.authorize_ip(Some("2001:db8:1:2:ffff::9"))), Some((429, "ip-busy")));
+    assert!(a.authorize_ip(Some("2001:db8:1:3::1")).is_ok(), "another /64");
+    drop(reading);
+    assert!(a.authorize_ip(Some("2001:db8:1:2:ffff::9")).is_ok(), "the slot frees when the read ends");
+
+    // The intent is the idempotency key: its IP gets the job back, another
+    // IP is refused.
+    prover.release();
+    wait(&a, &v, &["submitted"]);
+    let (again, created) = admit_ip(&a, "203.0.113.7", &fee_bank()[0]).unwrap();
+    assert!(!created);
+    assert_eq!(again.job_url, v.job_url);
+    assert_eq!(code(admit_ip(&a, "203.0.113.9", &fee_bank()[0])), Some((409, "intent-in-flight")));
+
+    let counts = a.drain_refusals();
+    assert!(counts.iter().any(|((_, c), _)| *c == "ip-busy"), "{counts:?}");
+    // Each refusal is counted under `-` or an 8-hex-digit tag of the salted
+    // key — never an address.
+    assert!(
+        counts
+            .iter()
+            .all(|((who, _), _)| who == "-" || (who.len() == 8 && who.bytes().all(|b| b.is_ascii_hexdigit()))),
+        "{counts:?}"
+    );
+}
+
+/// Lab #937 PR E (the ruling): on format 34 the token configuration is not
+/// read — a token file left configured is ignored, not refused — and `/quota`
+/// is not served; on 33 the keys file stays required.
+#[test]
+fn the_token_configuration_is_ignored_on_34_and_required_on_33() {
+    let (_, deny, ignored) =
+        token_config(L2AuthForm::CandidateAV3, Some("/nonexistent/keys".into()), Some("/nonexistent/deny".into()))
+            .expect("34 reads no token file");
+    assert_eq!((deny, ignored), (None, true));
+    let (_, _, ignored) = token_config(L2AuthForm::CandidateAV3, None, None).unwrap();
+    assert!(!ignored);
+    let e = token_config(L2AuthForm::CandidateA, None, None).err().unwrap();
+    assert!(e.contains("QUMBRA_PROVER_TOKEN_KEYS_FILE is required"), "{e}");
+    let e = token_config(L2AuthForm::CandidateA, Some("/nonexistent/keys".into()), None).err().unwrap();
+    assert!(e.contains("could not be read"), "{e}");
+    // The 33 service admits by token; the 34 one by IP.
+    assert!(!api(FakeProver::new(Answer::Honest, false), Arc::default()).admits_by_ip());
+}
+
+/// Lab #937 PR E: `/info` on format 34 carries what the kernel's
+/// `prover_pins::admit` checks — `fee_asset` 0, `price: {"S", "P"}`, the
+/// payee — and on 33 none of them.
+#[test]
+fn info_on_format_34_carries_what_the_kernel_pins_and_33_s_does_not() {
+    let at = ledger_path("info");
+    let a = api_v3(
+        FakeProver::new(Answer::Honest, false),
+        Arc::default(),
+        FakeChain::new(1, &[]),
+        ProverPrice { s: 2, p: 3 },
+        &at,
+    );
+    let info = serde_json::to_value(a.info()).unwrap();
+    assert_eq!(info["genesis_format"], 34);
+    assert_eq!(info["fee_asset"], 0);
+    assert_eq!(info["price"], serde_json::json!({"S": 2, "P": 3}));
+    assert_eq!(info["payee"], "qaddr-fixture-payee");
+    assert_eq!(info["genesis_hash"], hex(&GENESIS_HASH));
+    let info = serde_json::to_value(api(FakeProver::new(Answer::Honest, false), Arc::default()).info()).unwrap();
+    for absent in ["fee_asset", "price", "payee"] {
+        assert!(info.get(absent).is_none(), "{absent} on a format-33 /info");
+    }
+}
+
+/// Lab #937 PR E: format 34's startup configuration refuses by name — the
+/// payee (a full version-2 address), the prices, the ledger (created 0600
+/// with its version header; an existing one must be 0600 and start with it).
+#[test]
+fn the_format_34_configuration_refuses_by_name_at_startup() {
+    use crate::annulet_v3::{payee_rkm, PAID_LEDGER_VAR, PAYEE_VAR, PRICE_P_VAR, PRICE_S_VAR};
+    use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+    let w = qlab_wallet::Wallet::from_master_seed(&MasterSeed::from_entropy([7; ENTROPY_LEN]), 0);
+    let v2 = w.address_candidate_a_at_index(0, &[1, 2, 3, 4]);
+    let v1 = w.address_at_index(0).encode();
+    assert_eq!(payee_rkm(&format!(" {} ", v2.encode())), Ok(v2.rkm_lanes()));
+    let s = |x: &str| Some(x.to_string());
+    let chain: Arc<dyn ChainFollow> = FakeChain::new(1, &[]);
+    let at = ledger_path("startup");
+    let try_ = |payee: Option<String>, ps: Option<String>, pp: Option<String>, ledger: Option<String>| {
+        V3Config::from_values(payee, ps, pp, ledger, Arc::clone(&chain)).err().unwrap_or_default()
+    };
+    let l = at.to_str().map(str::to_string);
+    let refusals = [
+        (try_(None, s("1"), s("1"), l.clone()), format!("{PAYEE_VAR} is required on format 34")),
+        (try_(s("qaddr1nope"), s("1"), s("1"), l.clone()), format!("{PAYEE_VAR} is not an address")),
+        (try_(s(&v1), s("1"), s("1"), l.clone()), format!("{PAYEE_VAR} must be a full version-2 address")),
+        (try_(s(&v2.encode()), None, s("1"), l.clone()), format!("{PRICE_S_VAR} is required on format 34")),
+        (try_(s(&v2.encode()), s("1"), s("-1"), l.clone()), format!("{PRICE_P_VAR} must be a whole number")),
+        (try_(s(&v2.encode()), s("1"), s("1"), None), format!("{PAID_LEDGER_VAR} is required on format 34")),
+    ];
+    for (got, want) in refusals {
+        assert!(got.contains(&want), "{got:?} does not name {want:?}");
+    }
+    assert!(!at.exists(), "nothing created before the configuration is whole");
+    // Created 0600 with its header; reopened as it is.
+    let ok = V3Config::from_values(s(&v2.encode()), s("2"), s("3"), l.clone(), Arc::clone(&chain)).unwrap();
+    assert_eq!((ok.payee_rkm, ok.price), (v2.rkm_lanes(), ProverPrice { s: 2, p: 3 }));
+    assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{PAID_LEDGER_HEADER}\n"));
+    assert!(PaidLedger::open(&at).is_ok());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&at).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = PaidLedger::open(&at).err().unwrap();
+        assert!(e.contains("owner only (0600)"), "{e}");
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::write(&at, "something else\n").unwrap();
+    let e = PaidLedger::open(&at).err().unwrap();
+    assert!(e.contains("not a version-1 paid ledger"), "{e}");
+    let _ = std::fs::remove_file(&at);
+}
+
+/// Lab #937 PR E (D4): a nullifier that landed — the follow's set, paged
+/// from height 1 — is `409 nullifier-landed`; one claimed by a live or
+/// submitted job here is `409 nullifier-in-flight`; the follow keeps up as
+/// blocks land. Nothing refused reaches the prover.
+#[test]
+fn landed_and_in_flight_nullifiers_are_refused_409() {
+    let nf = fee_bank()[0].tx().public.nullifiers[0];
+    let prover = FakeProver::new(Answer::Honest, false);
+    let at = ledger_path("landed");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), FakeChain::new(5, &[nf]), ProverPrice { s: 3, p: 0 }, &at);
+    wait_ready(&a);
+    assert_eq!(a.inner.follow.as_ref().unwrap().size(), (6, 5), "five blocks over pages of two, one more nullifier");
+    assert_eq!(code(admit_ip(&a, "192.0.2.1", &fee_bank()[0])), Some((409, "nullifier-landed")));
+    assert_eq!(*prover.calls.lock().unwrap(), 0);
+
+    let prover = FakeProver::new(Answer::Honest, true);
+    let chain = FakeChain::new(1, &[]);
+    let at = ledger_path("in-flight");
+    let a = api_v3(Arc::clone(&prover), Arc::default(), Arc::clone(&chain), ProverPrice { s: 3, p: 0 }, &at);
+    wait_ready(&a);
+    let [x, y, z] = fee_bank() else { unreachable!() };
+    let (v, _) = admit_ip(&a, "192.0.2.2", x).unwrap();
+    assert_eq!(code(admit_ip(&a, "192.0.2.3", y)), Some((409, "nullifier-in-flight")), "queued");
+    prover.release();
+    wait(&a, &v, &["submitted"]);
+    assert_eq!(code(admit_ip(&a, "192.0.2.3", y)), Some((409, "nullifier-in-flight")), "submitted, not yet landed");
+    // It lands: the follow sees it, and the refusal says so.
+    chain.push(&x.tx().public.nullifiers);
+    let started = Instant::now();
+    while a.inner.follow.as_ref().unwrap().size().1 < 2 {
+        assert!(started.elapsed() < Duration::from_secs(20), "the follow did not advance");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(code(admit_ip(&a, "192.0.2.4", z)), Some((409, "nullifier-landed")));
+    assert_eq!(*prover.calls.lock().unwrap(), 1, "only the first was proved");
+}
+
+/// Lab #937 PR E (the ruling: fail loudly): until the follow has caught up,
+/// admission is `503 nullifiers-catching-up`; once the node is unreachable
+/// for more than a slot, `503 nullifiers-stale` — and `ready()`, which is
+/// what `/healthz` reports, says the same. A node that skips a height or
+/// serves none is an error, not a gap; a tip below the followed height empties
+/// the set, which is rebuilt from height 1.
+#[test]
+fn the_nullifier_follow_fails_loudly() {
+    let chain = FakeChain::new(2, &[]);
+    chain.down.store(true, Ordering::Release);
+    let at = ledger_path("loud");
+    let a = api_v3(
+        FakeProver::new(Answer::Honest, false),
+        Arc::default(),
+        Arc::clone(&chain),
+        ProverPrice { s: 3, p: 0 },
+        &at,
+    );
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert_eq!(code(a.ready()), Some((503, "nullifiers-catching-up")));
+    assert_eq!(code(admit_ip(&a, "192.0.2.10", &fee_bank()[0])), Some((503, "nullifiers-catching-up")));
+    chain.down.store(false, Ordering::Release);
+    wait_ready(&a);
+    chain.down.store(true, Ordering::Release);
+    let started = Instant::now();
+    while a.ready().is_ok() {
+        assert!(started.elapsed() < Duration::from_secs(20), "an unreachable node never made the follow stale");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(code(a.ready()), Some((503, "nullifiers-stale")));
+    assert_eq!(code(admit_ip(&a, "192.0.2.11", &fee_bank()[0])), Some((503, "nullifiers-stale")));
+
+    // What the follow will not paper over.
+    struct Lying(u64, Vec<(u64, Vec<[u8; 32]>)>);
+    impl ChainFollow for Lying {
+        fn tip(&self) -> Result<u64, String> {
+            Ok(self.0)
+        }
+        fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
+            Ok(NullifierChunk { from, to, blocks: self.1.clone() })
+        }
+    }
+    let f = NullifierFollow::new(Duration::from_secs(1));
+    let e = f.poll(&Lying(3, vec![(1, vec![]), (3, vec![])])).unwrap_err();
+    assert!(e.contains("skips height 2"), "{e}");
+    let f = NullifierFollow::new(Duration::from_secs(1));
+    assert!(f.poll(&Lying(2, vec![])).unwrap_err().contains("served no block at height 1"));
+    // A tip regression: the set is emptied and rebuilt from height 1, not
+    // held at 503 until the chain regrows past the old height.
+    let f = NullifierFollow::new(Duration::from_secs(1));
+    f.poll(&Lying(2, vec![(1, vec![[1; 32]]), (2, vec![[2; 32]])])).unwrap();
+    assert_eq!(f.size(), (2, 2));
+    let e = f.poll(&Lying(1, vec![(1, vec![[9; 32]])])).unwrap_err();
+    assert!(e.contains("below the followed height 2: rebuilding"), "{e}");
+    assert_eq!(f.size(), (0, 0));
+    assert_eq!(code(f.readiness()), Some((503, "nullifiers-catching-up")));
+    f.poll(&Lying(1, vec![(1, vec![[9; 32]])])).unwrap();
+    assert_eq!(f.size(), (1, 1), "rebuilt from the node's chain, the old height-2 nullifier gone");
+    assert_eq!(f.check(&[[2; 32]]), Ok(()));
+    assert_eq!(code(f.check(&[[9; 32]])), Some((409, "nullifier-landed")));
+    assert_eq!(code(NullifierFollow::new(Duration::from_secs(1)).readiness()), Some((503, "nullifiers-catching-up")));
+}
+
+/// Lab #937 PR E (D5): an accepted submission appends exactly one line —
+/// the entry version, then output 3's opening (`cm` as on chain, value,
+/// `rkm`, `rho`, `rseed`, shape, time) — under the version header, and the
+/// file stays 0600. A submission the node refuses, and a bundle admission
+/// refuses, write nothing.
+#[test]
+fn an_accepted_submission_writes_one_ledger_line_and_a_refused_one_none() {
+    let lanes = |l: &[u64; 4]| l.iter().map(|x| hex(&x.to_le_bytes())).collect::<String>();
+    let at = ledger_path("ledger");
+    let a = api_v3(
+        FakeProver::new(Answer::Honest, false),
+        Arc::default(),
+        FakeChain::new(1, &[]),
+        ProverPrice { s: 3, p: 0 },
+        &at,
+    );
+    wait_ready(&a);
+    let b = &fee_bank()[0];
+    let (v, _) = admit_ip(&a, "192.0.2.20", b).unwrap();
+    assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "submitted");
+    let text = std::fs::read_to_string(&at).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0], PAID_LEDGER_HEADER);
+    let o = &b.witness().outputs[2];
+    let want = format!(
+        "1 cm={} value=3 asset=0 rkm={} rho={} rseed={} shape=S at=",
+        hex(&b.tx().public.commitments[2]),
+        lanes(&PAYEE_RKM),
+        lanes(&o.rho),
+        lanes(&o.rseed),
+    );
+    assert!(lines[1].starts_with(&want), "{}\nwant {want}…", lines[1]);
+    assert!(lines[1]["at=".len() + lines[1].find("at=").unwrap()..].parse::<u64>().is_ok());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&at).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    // The node refuses it: no line. A 402: no line.
+    let at = ledger_path("ledger-refused");
+    let node = Arc::new(FakeNode { refuse: Some("node-refused:expired"), ..FakeNode::default() });
+    let a = api_v3(FakeProver::new(Answer::Honest, false), node, FakeChain::new(1, &[]), ProverPrice { s: 3, p: 1 }, &at);
+    wait_ready(&a);
+    let (v, _) = admit_ip(&a, "192.0.2.21", b).unwrap();
+    assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "failed");
+    assert_eq!(code(admit_ip(&a, "192.0.2.22", v3(L2ShapeTag::P))), Some((402, "prover-fee-short")));
+    assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{PAID_LEDGER_HEADER}\n"));
+}
+
+/// Lab #937 PR E (pre-review): a torn last line — a crash mid-write — never
+/// swallows the next entry. Reopening closes it with a newline, so the next
+/// append starts its own line: the reader skips one malformed line and every
+/// whole entry still parses.
+#[test]
+fn a_torn_ledger_line_never_swallows_the_next_entry() {
+    use crate::annulet_v3::PaidEntry;
+    let at = ledger_path("torn");
+    drop(PaidLedger::open(&at).unwrap());
+    let torn = "1 cm=00ff value=3 asse";
+    let mut f = std::fs::OpenOptions::new().append(true).open(&at).unwrap();
+    std::io::Write::write_all(&mut f, torn.as_bytes()).unwrap();
+    drop(f);
+    let ledger = PaidLedger::open(&at).unwrap();
+    let out3 = qlab_air::l2::L2TxOutput { value: 7, asset: 0, rkm: PAYEE_RKM, rho: [1; 4], rseed: [2; 4] };
+    let entry = PaidEntry::of(&out3, [0xab; 32], L2ShapeTag::P);
+    ledger.append(&entry, 1_800_000_000).unwrap();
+    let text = std::fs::read_to_string(&at).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, [PAID_LEDGER_HEADER, torn, entry.line(1_800_000_000).trim_end()], "{text}");
+    assert!(text.ends_with('\n'));
+    // Every whole entry parses: version, then the eight fields.
+    let whole: Vec<&str> = lines[1..].iter().copied().filter(|l| l.split(' ').count() == 9).collect();
+    assert_eq!(whole.len(), 1);
+    assert!(whole[0].starts_with(&format!("1 cm={} value=7 asset=0 ", hex(&[0xab; 32]))));
+    assert!(whole[0].ends_with("shape=P at=1800000000"));
+    // A clean ledger is left as it is on reopen.
+    drop(PaidLedger::open(&at).unwrap());
+    assert_eq!(std::fs::read_to_string(&at).unwrap(), text);
+    let _ = std::fs::remove_file(&at);
 }
