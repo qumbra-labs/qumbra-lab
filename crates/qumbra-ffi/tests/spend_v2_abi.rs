@@ -1317,7 +1317,8 @@ fn v3_e_the_prover_is_set_once_on_its_pin_or_refused_by_name() {
     unsafe {
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
         let a = auth(w, &f.ep, &f.fresh).unwrap();
-        // No prover: refused at the first step, nothing taken.
+        // No prover: refused by the attempt once the params and registry
+        // reads are in — before the take, so no leaf is consumed.
         let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
         let why = pump(a, s, &f.ep, 0).expect_err("refused");
         assert!(why.contains("set the prover with qmb_spend_v2_prover first"), "{why}");

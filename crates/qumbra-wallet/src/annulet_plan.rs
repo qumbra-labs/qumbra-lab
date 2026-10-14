@@ -166,7 +166,7 @@ impl SendPlan {
     /// Lab #937 PR D: the prover fees the plan pays (every step's third
     /// output, when it pays one), in asset 0.
     pub fn prover_fees(&self) -> u64 {
-        self.steps.iter().filter_map(|s| s.third.map(|(v, _)| v)).sum()
+        self.steps.iter().filter_map(|s| s.third.map(|(v, _)| v)).fold(0u64, u64::saturating_add)
     }
     /// Rounds: each waits for the previous one to land.
     pub fn rounds(&self) -> usize {
@@ -247,7 +247,8 @@ fn plan_fee_splits(
     deficit: usize,
     steps: &mut Vec<Step>,
 ) -> Result<Vec<Src>, usize> {
-    let split_needs = tariff + s_tier + s_price.unwrap_or(0);
+    // The tiers are the node's (`/v1/annulet/params`), unbounded: saturate.
+    let split_needs = tariff.saturating_add(s_tier).saturating_add(s_price.unwrap_or(0));
     let mut pool: Vec<(Src, usize)> =
         index.spendable(0).iter().filter(|n| n.note.value != tariff).map(|n| (Src::Held(n.clone()), 0)).collect();
     let mut made = Vec::new();
@@ -335,7 +336,7 @@ pub fn plan_send_paying(
     // network fee, plus the prover's price when one is paid (lab #937 PR D;
     // `None` keeps today's exact-tier stock).
     let tier = tiers.of(shape);
-    let tariff = tier + price(shape).unwrap_or(0);
+    let tariff = tier.saturating_add(price(shape).unwrap_or(0));
 
     // The A notes the payment will consume, and the merges that reduce them
     // to at most two.

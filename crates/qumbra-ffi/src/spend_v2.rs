@@ -1770,7 +1770,7 @@ fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
         if steps > 1 {
             out.push_str(&format!(
                 "this plan from here: {steps} transactions; network fees {network} + prover fees {prover} = {}\n",
-                r.names.amount(network + prover, 0)
+                r.names.amount(network.saturating_add(prover), 0)
             ));
         }
     }
