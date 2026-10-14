@@ -184,7 +184,7 @@ A follow failure is logged once as `error:`, and its recovery once.
 
 *Crashes.* A crash mid-write can leave a last line without its newline. A reader skips that line.
 
-The operator copies the file to the payee wallet's machine; the payee's seed stays off the box. The importer (`qumbra-wallet`) is a separate PR. An honest kernel also encrypts output 3's discovery payload to the payee, so the payee's ordinary scan already finds these notes. The ledger covers a wallet that did not.
+The operator copies the file to the payee wallet's machine; the payee's seed stays off the box. It imports it with `qumbra-wallet import-openings --net annulet` — see [`prover-payee-wallet.md`](prover-payee-wallet.md). An honest kernel also encrypts output 3's discovery payload to the payee, so the payee's ordinary scan already finds these notes. The ledger covers a wallet that did not.
 
 **Configuration on 34**, in addition to the table above (the token rows do not apply):
 
