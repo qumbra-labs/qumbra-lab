@@ -500,7 +500,8 @@ fn l2_v3_prove_verify_roundtrip_s() {
 
 /// Lab #937: shape P **v3** geometry and degree, read off the witness-free
 /// v3 AIR. No prove here, as for P v2 (`l2_v2_geometry_and_degree_p`): the
-/// P v3 prove and memory figure is the rig measurement before the freeze.
+/// P v3 prove and memory figures are the box's, recorded in
+/// docs/annulet-format-34-freeze.md ("The AIR's measurements").
 #[test]
 fn l2_v3_geometry_and_degree_p() {
     use qlab_air::l2p::{fabricated_bucket_l2p_v3, verifier_air_p_v3, L2P_WIDTH_V3, PV_LEN_V3};

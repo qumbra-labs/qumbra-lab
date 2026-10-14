@@ -24,6 +24,8 @@ mod zkpeak;
 mod f2;
 mod f3;
 mod f4;
+// Lab #937 PR F: the format-34 freeze test (test-only).
+mod freeze34;
 #[cfg(feature = "phasemem")]
 mod phasemem;
 
