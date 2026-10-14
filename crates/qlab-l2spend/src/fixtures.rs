@@ -128,6 +128,42 @@ fn prepared_s_n(three: bool) -> (PreparedV2, LocalAuth, mldsa::Key) {
     (prepared, local, key)
 }
 
+/// Lab #937 PR D: the **fee-bank** spend on format 34 — two notes of
+/// Cloaked asset 7 (60 + 50 → 100 + 10), slot 3 a real asset-0 note of
+/// `note`, the fee 10, output 3 the prover's fee of 3 in asset 0. No balance
+/// row is asset 0, so output 3 rides the fee bank (`o3f`) and the note must
+/// be exactly 13. Prepared through the builder — `FeeIn::Exact`'s rule
+/// refuses any other `note`.
+pub fn prepared_s_fee_bank(note: u64) -> Result<(PreparedV2, LocalAuth), crate::SpendError> {
+    let mut rng = rng(0xfeeb);
+    let mut local = LocalAuth::new(&[0x52; 32], 0, 0).expect("depth D_AUTH");
+    let a = real(&mut local, 0x300, 60, 7);
+    let b = real(&mut local, 0x400, 50, 7);
+    let f = real(&mut local, 0x500, note, 0);
+    let tree = tree_of(&[&a, &b, &f]);
+    let reg = RegistryTree::from_leaves(&[RegistryLeaf::cloaked(0), RegistryLeaf::cloaked(7)]).unwrap();
+    let regs = [opening(&reg, 7), opening(&reg, 7)];
+    let outs = [
+        Out { to: recipient(0x41, &mut rng), value: 100, asset: 7 },
+        Out { to: recipient(0x42, &mut rng), value: 10, asset: 7 },
+        Out { to: recipient(0x43, &mut rng), value: 3, asset: 0 },
+    ];
+    let prepared = assemble_s_v2(&tree, &regs, [&a, &b], false, FeeIn::Exact(&f), &outs, 10, &mut rng)?;
+    Ok((prepared, local))
+}
+
+/// [`prepared_s_fee_bank`] with the exact note (13), signed for format 34:
+/// three real slots, no dummy.
+pub fn signed_bundle_fee_bank() -> ProvingBundle {
+    let (p, local) = prepared_s_fee_bank(13).expect("13 = fee 10 + output 3 of 3");
+    let mut tx = p.tx.clone();
+    let intent = intent_for(&tx, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, &GENESIS_HASH, VALID_UNTIL, &p.auth)
+        .expect("an honest tx has an intent");
+    let section = sign_locally(&intent, &local, &[]).expect("every slot is ours");
+    attach(&mut tx, &section).expect("a signed section encodes");
+    ProvingBundle::new(tx, p.witness.clone()).expect("an honest fee-bank spend is a bundle")
+}
+
 /// P: 100 (asset 0) + 50 of Hybrid asset 7 (empty freeze list) → 90 + 50,
 /// fee 10, slot 3 a device-made dummy, `vPublic` none. Prepared only.
 pub fn prepared_p() -> (PreparedV2, LocalAuth, mldsa::Key) {

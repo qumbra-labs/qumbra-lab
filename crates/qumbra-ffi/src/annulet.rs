@@ -178,7 +178,6 @@ pub fn refusal_key(r: &VerifyRefusal) -> &'static str {
         GenesisTooLarge { .. } => "genesis_too_large",
         GenesisMismatch { .. } => "genesis_mismatch",
         GenesisInvalid { .. } => "genesis_invalid",
-        FormatNotSupported { .. } => "format_not_supported",
         HeadersUnavailable { .. } => "headers_unavailable",
         HeadersMalformed { .. } => "headers_malformed",
         HeaderGap { .. } => "header_gap",
@@ -431,10 +430,9 @@ unsafe fn annulet_new(
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
     let allocated = if n_indices == 0 { Vec::new() } else { std::slice::from_raw_parts(indices, n_indices).to_vec() };
     let wallet = (*w).wallet.clone();
-    // Lab #937: the kernel refuses a format-34 net by name as soon as its
-    // genesis verifies — before any header is fetched — until PR D.
-    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record))
-        .refusing(qlab_devnet::forms::L2AuthForm::CandidateAV3);
+    // Lab #937 PR D: format 34 scans here as format 33 does (its spends pay
+    // their prover — `qmb_spend_v2_prover`).
+    let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
     if let Some(gens) = generations {
         let roots = gens.iter().map(|&g| (g, (*w).generation_root(g))).collect();
         driver = driver.with_generations(roots);

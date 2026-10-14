@@ -125,7 +125,7 @@ required-features = ["pilot"]
 [dev-dependencies]
 # Lab #850 AD2: the crate's own tests reach `test-support` (the TEST list
 # signer); nothing else does.
-qumbra-wallet = { path = ".", features = ["test-support"] }
+qumbra-wallet = { path = ".", features = ["test-support", "fixture-pins"] }
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
 qumbra-node = { path = "../qumbra-node" }
@@ -157,6 +157,12 @@ verify = ["dep:qlab-p2p", "dep:ml-dsa", "dep:serde_json"]
 # this crate's own dev-dependency and the `ad_goldens` example enable it, so a
 # release shell cannot compile the test signer in.
 test-support = ["verify"]
+# Lab #937 PR D: the runtime fixture-pin registry (`prover_pins::pin_fixture`)
+# for test chains whose genesis hash is computed at test time. Only
+# qumbra-ffi's (and this crate's own) dev-dependency enables it — resolver 2
+# keeps it out of every normal build; qumbra-ffi asserts it off on wasm32 and
+# a test reads `cargo tree` to keep it out of the release feature tree.
+fixture-pins = []
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.

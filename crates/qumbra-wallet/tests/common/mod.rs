@@ -101,6 +101,21 @@ pub fn genesis_v2(holder: &Address, notes: Vec<L2Note>) -> AnnuletGenesisFile {
     )
 }
 
+/// Lab #937 PR D: [`genesis_v2`] on **format 34** (`CandidateAV3`): the same
+/// registry and notes, three-output S/P spends.
+pub fn genesis_v3(holder: &Address, notes: Vec<L2Note>) -> AnnuletGenesisFile {
+    let v1 = genesis_with(holder, Vec::new(), notes);
+    AnnuletGenesisFile::assemble_with_auth(
+        "annulet-ad1-v3",
+        v1.params,
+        SEQ_SEED,
+        v1.registry_genesis,
+        v1.genesis_notes,
+        0,
+        L2AuthForm::CandidateAV3,
+    )
+}
+
 /// The file's authorization axis (v1 when it does not name one).
 pub fn auth_of(file: &AnnuletGenesisFile) -> L2AuthForm {
     file.l2_auth().unwrap_or(L2AuthForm::None)

@@ -501,6 +501,9 @@ fn bundle_refusal(e: &BundleError) -> ApiError {
         // one on 33 — the service serves 33 only until lab #937 PR E.
         BundleError::OutputsNotTheNets { .. } => err(422, "outputs-not-the-nets"),
         BundleError::ThirdOutputAsset { .. } => err(422, "third-output-asset"),
+        // Lab #937 PR D: slot 3's fee note is neither the fee nor the fee
+        // plus an asset-0 output 3.
+        BundleError::FeeNoteNotExact { .. } => err(422, "fee-note-not-exact"),
     }
 }
 

@@ -97,6 +97,11 @@ pub enum BundleError {
     /// alike (a P row's `vPublic` asset is that row's input asset) — so such
     /// a witness has no proof; refused before the prove is spent on it.
     ThirdOutputAsset { asset: u64, inputs: [u64; 2] },
+    /// Lab #937 PR D: on a three-output spend, slot 3's real fee note is
+    /// neither exactly the fee nor exactly the fee plus an asset-0 output 3
+    /// (`v2::fee_note_exact` — the builder's rule, the AIR's fee bank).
+    /// `third` is output 3's value when it is asset 0.
+    FeeNoteNotExact { value: u64, fee: u64, third: Option<u64> },
 }
 
 impl std::fmt::Display for BundleError {
@@ -124,6 +129,13 @@ impl std::fmt::Display for BundleError {
                 "the third output's asset {asset} is neither input's ({} or {}): the v3 AIR has no proof for it",
                 inputs[0], inputs[1]
             ),
+            BundleError::FeeNoteNotExact { value, fee, third } => match third {
+                Some(v3) => write!(
+                    f,
+                    "slot 3's fee note is {value}: neither the fee {fee} nor the fee plus output 3 ({v3}) — the AIR's fee bank closes on neither"
+                ),
+                None => write!(f, "slot 3's fee note is {value}, not exactly the fee {fee}"),
+            },
             BundleError::OutputsNotTheNets { got, want } => write!(
                 f,
                 "a {got}-output spend on a net whose S/P spends carry {want} (format 33: two; format 34: three)"
@@ -288,12 +300,32 @@ impl ProvingBundle {
         if w.outputs.len() != ctx.form.sp_outputs() {
             return Err(BundleError::OutputsNotTheNets { got: w.outputs.len(), want: ctx.form.sp_outputs() });
         }
-        // Lab #937: the v3 AIR's `o3a` binding — output 3 carries input 1's
-        // asset or input 2's (S and P). A signed witness that breaks it has
-        // no proof; it is refused here, by name, before ~30 GiB of proving.
+        // Lab #937: the v3 AIR places output 3 in a balance row — input 1's
+        // asset or input 2's (`o3a`, S and P alike) — or, asset 0 only, in
+        // the fee bank (`o3f`, A′): slot 3's real note then pays exactly
+        // `fee + v(O3)`. A signed witness that fits neither has no proof; it
+        // is refused here, by name, before ~30 GiB of proving. The fee note's
+        // rule is `v2::fee_note_exact`, the builder's own — the lock does not
+        // accept half of it. Format 33 carries no third output: none of this
+        // runs there, and its lock is unchanged.
         if let Some(third) = w.outputs.get(2) {
             let inputs = [w.inputs[0].asset, w.inputs[1].asset];
-            if !inputs.contains(&third.asset) {
+            let note = match &w.fee_slot {
+                FeeSlotV2::Exact { input, .. } => Some(input),
+                FeeSlotV2::Dummy { .. } => None,
+            };
+            let o3 = Some((third.value, third.asset));
+            if let Some(n) = note {
+                if !crate::v2::fee_note_exact(n.value, n.asset, w.fee, inputs, o3) {
+                    return Err(BundleError::FeeNoteNotExact {
+                        value: n.value,
+                        fee: w.fee,
+                        third: (third.asset == 0).then_some(third.value),
+                    });
+                }
+            }
+            let fee_bank = note.is_some_and(|n| crate::v2::rides_fee_bank(n.value, w.fee, inputs, o3));
+            if !fee_bank && !inputs.contains(&third.asset) {
                 return Err(BundleError::ThirdOutputAsset { asset: third.asset, inputs });
             }
         }
