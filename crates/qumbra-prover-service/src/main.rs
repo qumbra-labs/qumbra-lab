@@ -8,6 +8,7 @@ use qumbra_prover_service::annulet::{
     annulet_worker_once, frame, harden_process, AnnuletApi, AnnuletConfig, AnnuletProcessProver,
     HttpSubmitter, ANNULET_UPLOAD_DEADLINE, ANNULET_WORKER_PROTOCOL, MAX_ANNULET_BUNDLE_BYTES,
 };
+use qumbra_prover_service::annulet_v3::CLIENT_IP_HEADER;
 use qumbra_prover_service::token;
 use qumbra_prover_service::{
     Api, ApiError, Config, SecretBytes, SubmitRequest, Worker, WorkerConfig, WorkerOutcome,
@@ -96,6 +97,7 @@ fn server_entry() -> Result<(), String> {
                 executable: std::env::current_exe()
                     .map_err(|_| "cannot resolve the prover-service executable".to_string())?,
                 genesis_hash: config.genesis_hash,
+                form: config.l2_auth,
                 scratch: config.scratch.clone(),
                 timeout: config.prove_timeout,
             });
@@ -180,6 +182,17 @@ fn route(request: tiny_http::Request, l1: Option<(&Api, &Config)>, annulet: Opti
         handle_annulet(request, api);
         return;
     }
+    // Lab #937 PR E: on format 34 the service is not ready until its
+    // nullifier follow has caught up, nor while it is more than a slot
+    // behind — `/healthz` says so (503, the follow's code), as admission does.
+    if path == "/healthz" {
+        if let Some(Err(e)) = annulet.map(AnnuletApi::ready) {
+            if *request.method() != tiny_http::Method::Get {
+                return respond_method(request, "GET");
+            }
+            return respond_error(request, e);
+        }
+    }
     match l1 {
         Some((api, config)) => handle_http(request, api, config),
         None if path == "/healthz" => {
@@ -229,6 +242,16 @@ fn handle_annulet(request: tiny_http::Request, api: &AnnuletApi) {
             if method != tiny_http::Method::Get {
                 return respond_method(request, "GET");
             }
+            // Format 34 has no token, so no quota (lab #937 PR E).
+            if api.admits_by_ip() {
+                return respond_error(
+                    request,
+                    ApiError {
+                        status: 404,
+                        code: "quota-not-served",
+                    },
+                );
+            }
             match api.authorize_only(unique_header(&request, "Authorization")) {
                 Ok(claims) => respond_json(request, 200, &api.quota(&claims), None),
                 Err(e) => respond_error(request, e),
@@ -238,15 +261,22 @@ fn handle_annulet(request: tiny_http::Request, api: &AnnuletApi) {
             if method != tiny_http::Method::Post {
                 return respond_method(request, "POST");
             }
-            // Token, quota, in-flight and the token's one reading slot first:
-            // nothing is read before them.
-            let admission = match api.authorize(unique_header(&request, "Authorization")) {
+            // Token, quota, in-flight and the token's one reading slot first
+            // (33) — or the client IP, its in-flight job and its one reading
+            // slot (34, which never reads `Authorization`): nothing is read
+            // before them.
+            let admission = if api.admits_by_ip() {
+                api.authorize_ip(unique_header(&request, CLIENT_IP_HEADER))
+            } else {
+                api.authorize(unique_header(&request, "Authorization"))
+            };
+            let admission = match admission {
                 Ok(a) => a,
                 Err(e) => return respond_error(request, e),
             };
-            let claims = *admission.claims();
+            let who = admission.who();
             let refuse = |request: tiny_http::Request, status: u16, code: &'static str| {
-                api.count_refusal(&claims, code);
+                api.count_refusal(who, code);
                 respond_error(request, ApiError { status, code });
             };
             if !unique_header(&request, "Content-Type")
@@ -262,9 +292,9 @@ fn handle_annulet(request: tiny_http::Request, api: &AnnuletApi) {
             }
             // tiny_http has no socket timeout: read on a thread of its own and
             // wait for it under a deadline. The admission travels with the
-            // read, so the token's reading slot stays taken until the
-            // connection really ends — a slow upload holds its own token only,
-            // and this handler's slot frees at the deadline.
+            // read, so the submitter's reading slot stays taken until the
+            // connection really ends — a slow upload holds its own token or
+            // IP only, and this handler's slot frees at the deadline.
             let (done, finished) = std::sync::mpsc::channel();
             let reader = std::thread::Builder::new()
                 .name("annulet-upload".into())
@@ -284,7 +314,7 @@ fn handle_annulet(request: tiny_http::Request, api: &AnnuletApi) {
                     }
                 });
             if reader.is_err() {
-                api.count_refusal(&claims, "ingress-busy");
+                api.count_refusal(who, "ingress-busy");
                 return;
             }
             match finished.recv_timeout(ANNULET_UPLOAD_DEADLINE) {
@@ -305,7 +335,7 @@ fn handle_annulet(request: tiny_http::Request, api: &AnnuletApi) {
                     body.zeroize();
                     refuse(request, 400, "request-unreadable");
                 }
-                Err(_) => api.count_refusal(&claims, "upload-deadline"),
+                Err(_) => api.count_refusal(who, "upload-deadline"),
             }
         }
         _ => {
@@ -759,8 +789,12 @@ fn annulet_worker_entry() -> Result<(), String> {
         .ok()
         .and_then(|h| hex32_decode(&h))
         .ok_or("internal worker protocol is absent")?;
+    // The parent passes its net's format (lab #937 PR E): 33 or 34.
+    let form = qumbra_prover_service::annulet::annulet_genesis_form(
+        std::env::var(qumbra_prover_service::annulet::ANNULET_GENESIS_FORMAT_VAR).ok().as_deref(),
+    )?;
     let answer = match std::panic::catch_unwind(|| {
-        annulet_worker_once(std::io::stdin().lock(), &genesis_hash)
+        annulet_worker_once(std::io::stdin().lock(), &genesis_hash, form)
     }) {
         Ok(Ok(wire)) => frame(0, &wire),
         Ok(Err(code)) => frame(1, code.as_bytes()),

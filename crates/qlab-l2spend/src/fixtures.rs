@@ -155,13 +155,25 @@ pub fn prepared_s_fee_bank(note: u64) -> Result<(PreparedV2, LocalAuth), crate::
 /// [`prepared_s_fee_bank`] with the exact note (13), signed for format 34:
 /// three real slots, no dummy.
 pub fn signed_bundle_fee_bank() -> ProvingBundle {
+    signed_bundles_fee_bank(&[VALID_UNTIL]).remove(0)
+}
+
+/// [`signed_bundle_fee_bank`] signed once per validity height: one spend —
+/// the same nullifiers — under distinct intents (lab #937 PR E: the prover
+/// service's nullifier dedupe).
+pub fn signed_bundles_fee_bank(valid_until: &[u64]) -> Vec<ProvingBundle> {
     let (p, local) = prepared_s_fee_bank(13).expect("13 = fee 10 + output 3 of 3");
-    let mut tx = p.tx.clone();
-    let intent = intent_for(&tx, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, &GENESIS_HASH, VALID_UNTIL, &p.auth)
-        .expect("an honest tx has an intent");
-    let section = sign_locally(&intent, &local, &[]).expect("every slot is ours");
-    attach(&mut tx, &section).expect("a signed section encodes");
-    ProvingBundle::new(tx, p.witness.clone()).expect("an honest fee-bank spend is a bundle")
+    valid_until
+        .iter()
+        .map(|until| {
+            let mut tx = p.tx.clone();
+            let intent = intent_for(&tx, ANNULET_AUTH_V3_GENESIS_FORMAT_VERSION, &GENESIS_HASH, *until, &p.auth)
+                .expect("an honest tx has an intent");
+            let section = sign_locally(&intent, &local, &[]).expect("every slot is ours");
+            attach(&mut tx, &section).expect("a signed section encodes");
+            ProvingBundle::new(tx, p.witness.clone()).expect("an honest fee-bank spend is a bundle")
+        })
+        .collect()
 }
 
 /// P: 100 (asset 0) + 50 of Hybrid asset 7 (empty freeze list) → 90 + 50,

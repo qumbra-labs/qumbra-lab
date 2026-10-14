@@ -18,6 +18,8 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 zeroize = "1.9"
 # Lab #924 5A-D3/D4: the Annulet mode — bundles, tokens, the proved tx's wire.
 qlab-air = { path = "../qlab-air" }
+# Lab #937 PR E: the nullifier follow reads the node's tip off `/v1/registry/root`.
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
 qlab-l2spend = { path = "../qlab-l2spend" }
 qlab-p2p = { path = "../qlab-p2p", default-features = false }

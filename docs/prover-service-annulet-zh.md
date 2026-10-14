@@ -2,7 +2,9 @@
 
 *英文版：[`prover-service-annulet.md`](prover-service-annulet.md)。技术细节以英文版为准。*
 
-Lab issue #924，5A-D3/D4。代码：`crates/qumbra-prover-service`（`src/annulet.rs`、`src/token.rs`）。
+Lab issue #924，5A-D3/D4；format 34 部分来自 lab #937 PR E。代码：`crates/qumbra-prover-service`（`src/annulet.rs`、`src/annulet_v3.rs`、`src/token.rs`）。
+
+服务只服务一个 net，format 33 或 format 34。下文直到[「Format 34」](#format-34prover-在交易里收费)一节之前讲的都是 format 33；34 上的不同之处集中写在那一节。
 
 ## 它是什么
 
@@ -78,7 +80,7 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 
 证明一次只跑一个，每个都在全新的 `annulet-worker` 子进程中运行：
 
-- 环境变量被清空，只保留协议标签和 genesis hash，因此子进程没有 URL，也没有 token；
+- 环境变量被清空，只保留协议标签、genesis hash 和 genesis format，因此子进程没有 URL，也没有 token；
 - 关闭 core dump：`RLIMIT_CORE = 0` 在 fork 与 exec 之间设置。Linux 上，子进程 exec 之后的第一件事是自己清掉 `PR_SET_DUMPABLE`(内核在 `execve` 时会重置这个标志)。此后同 uid 的进程既不能 `ptrace` 它，也读不了 `/proc/<pid>/mem`。服务进程启动时也对自己做同样的处理，因为它同样持有 bundle;
 - 工作目录和 `TMPDIR` 都是 tmpfs scratch；
 - stderr 被关闭；
@@ -94,11 +96,111 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 - 每分钟：按错误码统计的准入拒绝次数，以 token id 的 4 字节哈希为键（token 通过验证之前用 `-`）。这样既能看出滥用，又不会点出用户是谁。
 - **每日计数、in-flight 状态和 job 都在内存中，重启后重置。**
 
+## Format 34：prover 在交易里收费
+
+Lab #937 PR E（裁定 D4、D5，以及 issue #937 上对 PR E 的裁定）。在 format 34 的 net 上（`QUMBRA_PROVER_ANNULET_GENESIS_FORMAT=34`），bundle 的**第三个输出就是付给本服务的费用**：收款方是配置的 payee 的 `rkm`，资产是 asset 0，金额不低于该 shape 公布的价格。没有 token，也没有账户。
+
+**和 format 33 的区别：**
+
+- **没有 token。** 不读 `QUMBRA_PROVER_TOKEN_KEYS_FILE` 和 `QUMBRA_PROVER_TOKEN_DENY_FILE`。如果这两项还配着（prover-1 上就配着，要到 D6 才撤），服务会忽略它们而不是拒绝启动，并在启动日志里说明已忽略。服务从不读 `Authorization`。`GET /v2/annulet/quota` 返回 `404 quota-not-served`。没有每日额度。
+- **`/v2/annulet/info`** 多出 `fee_asset`（0）、`price`（`{"S": n, "P": n}`）和 `payee`（完整地址）三个字段。内核的 `prover_pins::admit` 就是拿这三项去和该网络的 pin 比对。format 33 上没有这三个字段。
+- **`/healthz`**：nullifier 跟读第一次追上之前，以及之后落后超过一个 slot 的时候，都返回 `503` 加跟读的错误码（见下文）。
+
+**34 上的准入顺序。** 每一种拒绝都有名字，第 5 步通过之前什么都不会进队列：
+
+1. **客户端 IP**，取自 `X-Qumbra-Client-IP`：
+   - 缺失、重复或不是 IP → `400 client-ip-unknown`；
+   - 同一个 IP 已有一个活着的任务，或已有一个正在上传的请求 → `429 ip-busy`。
+
+   IPv4-mapped 的 IPv6 地址按其 IPv4 地址算。IPv6 按 /64 网段算作同一个来源。
+2. 字节上限、解码和 bundle 的 lock，和 33 上一样。两输出的 bundle 返回 `422 outputs-not-the-nets`。
+3. **手续费**，从 witness 的第三个输出读取。lock 已经把这个输出绑定到交易的第三个 commitment 上：
+   - 收款方不是 payee 的 `rkm`，或资产不是 asset 0 → `402 prover-fee-missing`；
+   - 金额低于该 shape 的价格 → `402 prover-fee-short`。
+
+   付得比价格多是接受的。
+4. **nullifier**：
+   - 其中一个已经上链 → `409 nullifier-landed`；
+   - 跟读还没就绪 → `503 nullifiers-catching-up` 或 `503 nullifiers-stale`；
+   - 其中一个已被本服务里一个仍可能上链的任务占用（排队中、证明中、提交中，或在结果 TTL 内已提交）→ `409 nullifier-in-flight`。
+
+   幂等键仍然是 intent，提交者就是客户端的 IP。同一 IP 重试拿回已有的任务；换一个 IP 则返回 `409 intent-in-flight`。
+5. 保留任务数和队列上限，和 33 上一样。
+
+**客户端 IP 及其前提。** 服务之所以信任 `X-Qumbra-Client-IP`，是因为它只监听内部 ingress 网络。`QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` 这个确认项涵盖的就是这个前提。
+
+这个请求头由 Caddy 设置（属于切换时的部署改动，不在本 PR）：
+- `trusted_proxies static <Cloudflare 公布的网段>`，配合 `client_ip_headers CF-Connecting-IP`；
+- 在 `/v2/annulet/*` 上设 `header_up X-Qumbra-Client-IP {client_ip}`。这会覆盖客户端自己发来的同名请求头。
+
+不是从 Cloudflare 网段来的连接，其客户端 IP 就是它自己的 socket 地址，所以绕开 Cloudflare 也冒充不了别的 IP。安全组只对 Cloudflare 网段开放 443，是切换时运维的步骤。
+
+IP 从不进日志。拒绝计数记在一个按进程随机加盐的键的 4 字节哈希下面。
+
+**nullifier 跟读。** 服务自己跟读它钉定的节点（`QUMBRA_PROVER_ANNULET_NODE_URL`）：
+- tip 从 `GET /v1/registry/root` 读；
+- 已上链的 nullifier 从高度 1 起，按页读 `GET /v1/nullifiers`。
+
+每半个 slot 轮询一次。每个高度都必须按顺序给出。跳过某个高度的页、一个块都没有的页、或者 tip 低于已跟读高度，都算错误，集合不会越过它往前走。
+
+集合放在内存里（每个 nullifier 32 字节），每次启动都从高度 1 重建。第一次追上时日志会记下集合大小和耗时。如果重建超过 60 秒，持久化另开 issue。
+
+**失败要响亮。** 下面两种情况，准入都回 `503`，`/healthz` 也报未就绪：
+- 第一次追上之前：`nullifiers-catching-up`；
+- 上次追上已超过一个 slot：`nullifiers-stale`。节点连不上和跟读落后都属于这种情况。
+
+跟读失败以 `error:` 记一次日志，恢复时再记一次。
+
+*残余风险。*
+- 如果一笔交易输给了一笔跟读还没看到的花费，代价是白跑一次证明（D4 已接受）。
+- 某个块后来被重组掉了，其中的 nullifier 会一直留在集合里，直到下次重启。在那之前，相关的 note 会被当作 `nullifier-landed` 拒绝。
+
+**付费台账（D5）。** `QUMBRA_PROVER_ANNULET_PAID_LEDGER` 指定一个文件。
+
+*文件：*
+- 由服务以 0600 权限创建，第一行写版本头 `qumbra-prover-paid-ledger 1`。
+- 已存在的文件必须本来就是 0600，且以这一行开头，否则启动时按名拒绝。
+- 要挂载在持久存储上。`/scratch` 是 tmpfs，重启就没了。
+- 它从不进日志，也从不进 git。
+
+*写入顺序。* 节点**接受** `POST /v1/tx` 之后，服务追加一行并 fsync，之后任务才显示 `submitted`。
+
+*每行内容。* 先是条目版本号 `1`，后面是空格分隔的字段：
+
+```
+1 cm=<64 hex> value=<n> asset=0 rkm=<64 hex> rho=<64 hex> rseed=<64 hex> shape=<S|P> at=<unix 秒>
+```
+
+- `cm` 是交易的第三个 commitment，和链上一致。
+- `rkm`、`rho`、`rseed` 是四个 `u64` lane，各自按 little-endian 写成 64 位 hex。
+- 不记高度，因为服务不知道交易会落在哪个块。读取方按 `cm` 去树里找。
+
+*不会写入的情况：*
+- 节点拒收的提交。
+- 准入阶段被拒的请求。
+- 同一笔交易的重放，它会被 nullifier 去重拒掉。
+
+*写入失败时。* 提交已经无法撤回。服务会记 `error: annulet paid ledger write failed for cm=<hex>`，由运维手工补救。
+
+*崩溃时。* 写到一半崩溃，可能留下没有换行的最后一行，读取方跳过它。
+
+运维把这个文件拷到 payee 钱包所在的机器上，payee 的 seed 不上这台机器。导入工具（`qumbra-wallet`）另开 PR。诚实的内核也会把第三个输出的 discovery 载荷加密给 payee，所以 payee 平常扫链就能找到这些 note。台账是为没这么做的钱包兜底的。
+
+**34 上的配置**，在上面那张表之外（token 那几行不适用）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `QUMBRA_PROVER_ANNULET_GENESIS_FORMAT` | 33 | 设为 `34` 即服务三输出的 net |
+| `QUMBRA_PROVER_ANNULET_PAYEE` | — | payee 的**完整** version-2 地址（`qs1…` 短地址只是哈希，无法校验）；按解码后的 `rkm` 比对 |
+| `QUMBRA_PROVER_ANNULET_PRICE_S` | — | shape S 的价格，单位是 asset-0 的手续费单位 |
+| `QUMBRA_PROVER_ANNULET_PRICE_P` | — | shape P 的价格 |
+| `QUMBRA_PROVER_ANNULET_PAID_LEDGER` | — | 付费台账的路径，放在持久存储上 |
+
 ## 试点机器（prover-1）
 
 - **主机：** r7g.2xlarge（64 GiB，arm64）。一次 P prove 的峰值约为 32 GiB。
 - **容器：** `mem_limit` 约 58g，无 swap，`ulimits: core: 0`，在 `/scratch` 挂载一个 tmpfs（1g），根文件系统只读。
-- **环境变量：** 上文列出的变量。该 net 为 format 33；genesis hash 从 deploy 仓库取。node URL 必须指向一个接受 `POST /v1/tx` 的节点。
+- **环境变量：** 上文列出的变量。该 net 在 lab #937 切换之前是 format 33，切换后改为 34；genesis hash 从 deploy 仓库取。node URL 必须指向一个接受 `POST /v1/tx` 的节点。
 - **Ingress:** TLS、限流和请求头大小上限(Caddy),外加 non-loopback 确认项。安全组开放 443,因为扩展直接调用该服务。**`/v2/annulet/jobs/<cap>` 不要进 ingress 的访问日志**,或者只记路径前缀：这个 URL 里的 capability 就是该任务的秘密。
 - **由运维人员持有、不放在机器上：** issuer seed。
 - **需要运维手动完成的步骤：** 主机及其安全组的 Terraform apply、DNS、保管 issuer seed，以及手动启停主机。
