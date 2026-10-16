@@ -40,8 +40,17 @@ use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+/// A value-taking flag. Present without a value (last on the line, or followed by another `--flag`)
+/// is refused, never read as absent: a bare `--lie-payee` would otherwise be an honest send.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+    let i = args.iter().position(|a| a == name)?;
+    match args.get(i + 1) {
+        Some(v) if !v.starts_with("--") => Some(v.as_str()),
+        _ => {
+            eprintln!("{name} needs a value");
+            std::process::exit(2)
+        }
+    }
 }
 
 fn need<'a>(args: &'a [String], name: &str) -> &'a str {
@@ -121,6 +130,10 @@ fn pin(args: &[String], genesis: &[u8; 32]) {
 
 fn check(args: &[String]) -> bool {
     let mut r = Report { failed: false };
+    if args.iter().any(|a| a == "--lie-payee" || a == "--lie-price") {
+        eprintln!("--lie-payee / --lie-price are send-only");
+        std::process::exit(2)
+    }
     let genesis = genesis_of(args);
     pin(args, &genesis);
     let mut t = HttpProver { base: need(args, "--prover").to_string() };
@@ -276,11 +289,12 @@ impl ProverTransport for Lying {
             return Ok((status, bytes));
         }
         let mut v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "the service's /info is not JSON".to_string())?;
+        let o = v.as_object_mut().ok_or_else(|| "the service's /info is not a JSON object".to_string())?;
         if let Some(p) = &self.payee {
-            v["payee"] = serde_json::Value::String(p.clone());
+            o.insert("payee".into(), serde_json::Value::String(p.clone()));
         }
         if let Some((s, p)) = self.price {
-            v["price"] = serde_json::json!({ "S": s, "P": p });
+            o.insert("price".into(), serde_json::json!({ "S": s, "P": p }));
         }
         println!("INFO lying /info: {v}");
         Ok((status, v.to_string().into_bytes()))
