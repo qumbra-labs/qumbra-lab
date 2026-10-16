@@ -69,16 +69,35 @@ The v1 devnet has no rehearsal construction. The fixture genesis (`85dd805d…`)
 
 ## The AIR's measurements
 
-*Pending: the o3f box re-measure on prover-1. This PR does not merge without this section.*
+The o3f box re-measure on prover-1 (r7g.2xlarge, 64 GiB, Ubuntu 24.04 arm64, rustc 1.99.0), at lab main `5a719644`, host idle, 2026-10-15 06:18–07:23 UTC. Script `run-o3f-box.sh`; tarball sha256 `1ab0b639a822c3be621fa8eebdf758d013b967247baff77891fdba3ffc0527bc`. All eight runs exited 0.
 
-The measurement is `run-o3f-box.sh`, run on prover-1 by the coordinator:
-- `l2shape` S and P on the fee-bank and exact v3 instances, for peak RSS and wall time;
-- then the detaudit census on `s3v3` and `p3v3` (fee-bank fixture).
+**Proving** (`l2shape`, b4/q45 lane, log height 20; peak RSS and wall time from `/usr/bin/time -v` on the process, prove time the bench's best of three):
 
-This section will record:
-- the run's date and tarball digest;
-- for S and P on each instance, the peak RSS and wall time;
-- the census verdict, as an aggregate only.
+| Shape | Instance | Width | Peak RSS (kB) | Wall | Prove (ms) | Verify (ms) | Proof (KB) |
+|---|---|---|---|---|---|---|---|
+| P | fee bank (o3f = 1), run 1 | 871 | 33,701,756 | 2:55.87 | 55,774 | 12.2 | 470.5 |
+| P | fee bank (o3f = 1), run 2 | 871 | 33,701,756 | 2:58.08 | 56,852 | 12.0 | 470.2 |
+| P | exact (o3f = 0) | 871 | 33,701,796 | 2:57.28 | 55,603 | 12.1 | 470.3 |
+| S | fee bank (o3f = 1), run 1 | 788 | 30,981,600 | 2:42.40 | 51,552 | 11.5 | 449.3 |
+| S | fee bank (o3f = 1), run 2 | 788 | 30,981,388 | 2:41.44 | 51,413 | 11.7 | 449.5 |
+| S | exact (o3f = 0) | 788 | 30,981,400 | 2:41.11 | 51,190 | 11.8 | 449.3 |
+
+The fee bank costs nothing measurable over exact on the same AIR: peak RSS within 0.001 %, wall time within 1.5 %. Against lab PR #939's pre-o3f box on the same instance type (2026-10-08, widths 780/863), o3f adds 0.8 % peak memory to S and to P, and no prove time.
+
+**The determination census** (fee-bank fixture; aggregate only):
+
+| AIR | Cells | Determined | Public values undetermined | Wall | Peak RSS (kB) |
+|---|---|---|---|---|---|
+| s3v3 | 826,277,888 | 728,755,477 | **0** | 32:06 | 23,476,344 |
+| p3v3 (`--no-pv-inputs --cr-premise`) | 913,309,696 | 832,201,994 | 55, **all the `q = 1` accounting freedom** (below) | 45:55 | 27,539,712 |
+
+**The p3v3 verdict.** The fee-bank fixture spends two inputs of the same asset (`q = 1`). Every public value its census leaves undetermined, the output commitments included, belongs to the accounting freedom that the i758 census found on the P3 merge (`docs/i758-determination-census.md`, P3): which balance row each output is charged to. It is closed the way i758 closed it, by follow-up runs on the same host, sha and premises (2026-10-15; tarball sha256 `2d9de314497e70d8e5ccddb2a9b11fcfdd438c727b51be840560e03cb16fe770` and `bdce8f9528b9a79dcaea9ae9c0fcee4943773eb5fcfd194a0310809972e462bb`):
+- With the output-row selectors `o1a`/`o2a`/`o3a` declared sources (`--pin-sel2`, i758's diagnostic premise), 3 public values stay undetermined: the same 3 as i758's P3 merge under that premise. The output commitments are determined.
+- Unpinned, the flip of `o1a` and the flip of `o2a` each confirm **SAT with no public value moved**, and the independent p3 check on the full repaired trace is SAT for both (1:14:46 and 1:13:32, peak 30,594,636 kB).
+- `o3a` is not free here: the AIR forces `o3f · o3a = 0`, and the fee-bank fixture has `o3f = 1`.
+- An earlier confirm aimed at the output commitments directly picked a dummy-role witness root and was UNSAT with the other roots held. That is not a refutation, so it is not counted.
+
+The same follows from the constraints. The selectors only move how an amount splits between the two balance rows. Summed, rows 1 and 2 advance by `(AG_IN1 + AG_IN2 − AG_O1 − AG_O2 − AG_O3 + SF3) · pw · v`, so `SG₀`, `SG₁` and `SG₃` cancel. Under `q` the close reads only the summed chain. This is i758's `o1a` argument, extended by output 3's terms.
 
 ## Not frozen here
 
