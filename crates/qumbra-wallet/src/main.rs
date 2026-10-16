@@ -421,6 +421,8 @@ fn usage() {
                             (the seed file's actual protection is printed by `keygen` — it is\n  \
                             0600 on unix and an inherited ACL on Windows, lab #478)\n  \
          qumbra-wallet restore --dir DIR                 seed from a Qumbra mnemonic on STDIN\n  \
+                            (no --candidate-a: a restored seed may have signed elsewhere —\n  \
+                            restore, then `migrate` on the Candidate A net)\n  \
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
                             [--uri] [--amount-qmb DECIMAL] [--label TEXT] [--qr] [--qr-svg FILE]\n\
                             --uri prints a qumbra: payment URI for the selected address (index 0\n\

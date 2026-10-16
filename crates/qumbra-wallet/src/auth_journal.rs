@@ -28,6 +28,11 @@ pub fn probe_roots(wallet: &qlab_wallet::Wallet) -> Vec<(u32, [u64; 4])> {
 /// signed elsewhere and keeps `migrate`'s checked path; so a directory that
 /// already holds a seed or an `auth.v1` is refused by name, before any
 /// entropy is drawn, and nothing is written.
+///
+/// The seed is written first, then the journal. Should the journal's write
+/// fail after the seed's, the directory holds a seed with no journal: a
+/// second `keygen --candidate-a` is refused (`SeedExists`), and `migrate`
+/// on a Candidate A net writes the journal by its checked path.
 pub fn create_fresh_candidate_a(
     dir: &std::path::Path,
 ) -> Result<(crate::store::WalletDir, AuthJournal), Box<dyn std::error::Error>> {
