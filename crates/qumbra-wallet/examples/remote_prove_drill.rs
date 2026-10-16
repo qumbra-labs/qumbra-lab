@@ -22,6 +22,11 @@
 //!       service events with times (upload → accepted → proving → submitted),
 //!       the transaction ids. `--busy-probe`: once step 1's job is live, POST
 //!       its recorded bundle again from this machine → expect 429 ip-busy.
+//!       The service's fee checks (M4 checklist 7), a rehearsal genesis only:
+//!       `--lie-payee V2ADDR` rewrites /info's payee to V2ADDR and pins it,
+//!       so output 3 pays V2ADDR → expect 402 prover-fee-missing;
+//!       `--lie-price S,P` rewrites /info's price (below the service's) →
+//!       expect 402 prover-fee-short. Either spends the step's leaves.
 //!
 //! What it cannot reach (host-side, through the coordinator's driver): the
 //! paid ledger's line count, a direct call without the ingress header (400
@@ -35,8 +40,17 @@ use qumbra_wallet::store::WalletDir;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+/// A value-taking flag. Present without a value (last on the line, or followed by another `--flag`)
+/// is refused, never read as absent: a bare `--lie-payee` would otherwise be an honest send.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+    let i = args.iter().position(|a| a == name)?;
+    match args.get(i + 1) {
+        Some(v) if !v.starts_with("--") => Some(v.as_str()),
+        _ => {
+            eprintln!("{name} needs a value");
+            std::process::exit(2)
+        }
+    }
 }
 
 fn need<'a>(args: &'a [String], name: &str) -> &'a str {
@@ -75,10 +89,20 @@ fn genesis_of(args: &[String]) -> [u8; 32] {
 }
 
 /// The pin for `genesis`: compiled in, or (a rehearsal chain only) a fixture
-/// pin from `--pin-payee` / `--pin-max S,P`.
+/// pin from `--pin-payee` / `--pin-max S,P` — or, for the fee-check drill,
+/// the lied payee (`--lie-payee`, which takes `--pin-payee`'s place).
 fn pin(args: &[String], genesis: &[u8; 32]) {
     let compiled = qumbra_wallet::prover_pins::PINS.iter().any(|(g, ..)| g == genesis);
-    match (flag(args, "--pin-payee"), compiled) {
+    let lying = flag(args, "--lie-payee").is_some() || flag(args, "--lie-price").is_some();
+    if lying && compiled {
+        eprintln!("this genesis is pinned in this build: --lie-payee / --lie-price are refused (a rehearsal genesis only)");
+        std::process::exit(2)
+    }
+    if flag(args, "--lie-payee").is_some() && flag(args, "--pin-payee").is_some() {
+        eprintln!("--lie-payee pins the lied payee itself: drop --pin-payee");
+        std::process::exit(2)
+    }
+    match (flag(args, "--pin-payee").or(flag(args, "--lie-payee")), compiled) {
         (Some(_), true) => {
             eprintln!("this genesis is pinned in this build: --pin-payee is refused (the drill uses the compiled-in pin)");
             std::process::exit(2)
@@ -106,6 +130,10 @@ fn pin(args: &[String], genesis: &[u8; 32]) {
 
 fn check(args: &[String]) -> bool {
     let mut r = Report { failed: false };
+    if args.iter().any(|a| a == "--lie-payee" || a == "--lie-price") {
+        eprintln!("--lie-payee / --lie-price are send-only");
+        std::process::exit(2)
+    }
     let genesis = genesis_of(args);
     pin(args, &genesis);
     let mut t = HttpProver { base: need(args, "--prover").to_string() };
@@ -155,7 +183,27 @@ fn send(args: &[String]) -> bool {
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let mut rng = StdRng::from_seed(seed);
-    let mut t = HttpProver { base: base.clone() };
+    let lie_payee = flag(args, "--lie-payee").map(str::to_string);
+    let lie_price = flag(args, "--lie-price").map(|v| {
+        v.split_once(',').and_then(|(s, p)| Some((s.parse::<u64>().ok()?, p.parse::<u64>().ok()?))).unwrap_or_else(|| {
+            eprintln!("--lie-price S,P (whole fee units)");
+            std::process::exit(2)
+        })
+    });
+    let expect = match (&lie_payee, lie_price) {
+        (Some(_), Some(_)) => {
+            eprintln!("one lie at a time: --lie-payee or --lie-price");
+            std::process::exit(2)
+        }
+        (Some(_), None) => Some("HTTP 402 prover-fee-missing"),
+        (None, Some(_)) => Some("HTTP 402 prover-fee-short"),
+        (None, None) => None,
+    };
+    if expect.is_some() && busy_probe {
+        eprintln!("--busy-probe needs an honest send");
+        std::process::exit(2)
+    }
+    let mut t = Lying { inner: HttpProver { base: base.clone() }, payee: lie_payee, price: lie_price };
     let started = Instant::now();
     let mut marks: Vec<(usize, String, Duration)> = Vec::new();
     let mut probed = None;
@@ -199,15 +247,20 @@ fn send(args: &[String]) -> bool {
     for (step, what, at) in &marks {
         println!("TIME step {} {what} at {:.1}s", step + 1, at.as_secs_f64());
     }
-    match result {
-        Ok(report) => {
+    match (result, expect) {
+        (Ok(report), None) => {
             for (i, id) in report.tx_ids.iter().enumerate() {
                 let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
                 println!("INFO step {} submitted by the service: tx {hex}", i + 1);
             }
             r.pass(&format!("send: {} step(s) submitted in {:.1}s", report.tx_ids.len(), started.elapsed().as_secs_f64()));
         }
-        Err(e) => r.fail(&format!("send: {e}")),
+        (Err(e), None) => r.fail(&format!("send: {e}")),
+        (Err(e), Some(want)) => {
+            let e = e.to_string();
+            r.check(e.contains(want), &format!("the service refused the lying bundle: {e} (want {want})"));
+        }
+        (Ok(_), Some(want)) => r.fail(&format!("the service SUBMITTED a bundle that should have been refused ({want})")),
     }
     if busy_probe {
         match probed {
@@ -218,6 +271,34 @@ fn send(args: &[String]) -> bool {
         }
     }
     !r.failed
+}
+
+/// The fee-check drill's transport: `/v2/annulet/info` with its payee and/or
+/// price rewritten (the service's own answer otherwise), everything else
+/// passed through untouched.
+struct Lying {
+    inner: HttpProver,
+    payee: Option<String>,
+    price: Option<(u64, u64)>,
+}
+
+impl ProverTransport for Lying {
+    fn call(&mut self, method: &str, path: &str, body: Option<&[u8]>, max_bytes: usize) -> Result<(u16, Vec<u8>), String> {
+        let (status, bytes) = self.inner.call(method, path, body, max_bytes)?;
+        if (method, path, status) != ("GET", "/v2/annulet/info", 200) || (self.payee.is_none() && self.price.is_none()) {
+            return Ok((status, bytes));
+        }
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "the service's /info is not JSON".to_string())?;
+        let o = v.as_object_mut().ok_or_else(|| "the service's /info is not a JSON object".to_string())?;
+        if let Some(p) = &self.payee {
+            o.insert("payee".into(), serde_json::Value::String(p.clone()));
+        }
+        if let Some((s, p)) = self.price {
+            o.insert("price".into(), serde_json::json!({ "S": s, "P": p }));
+        }
+        println!("INFO lying /info: {v}");
+        Ok((status, v.to_string().into_bytes()))
+    }
 }
 
 /// The newest recorded bundle, POSTed again from this machine while its job
