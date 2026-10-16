@@ -23,6 +23,13 @@ required-features = ["net", "prove", "verify"]
 name = "ad_goldens"
 required-features = ["verify", "test-support"]
 
+# Lab #937 cut-over (M4): drives a format-34 prover service from an operator's
+# machine through the wallet's remote-prove client. `fixture-pins` (a
+# rehearsal chain's pin) keeps it out of every release build.
+[[example]]
+name = "remote_prove_drill"
+required-features = ["net", "prove", "fixture-pins"]
+
 [[bin]]
 name = "qumbra-prover-host"
 path = "src/bin/prover_host.rs"

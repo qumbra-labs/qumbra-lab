@@ -311,7 +311,7 @@ pub fn build_spend_v2<E: Endpoint>(
     rng: &mut StdRng,
 ) -> Result<BuiltV2, SendRefusal> {
     if is_issuer_operation(ctx, vp) {
-        return Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?));
+        return Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, None, rng)?));
     }
     let prepared = prepare_v2(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?;
     let proved = prove_bundle_v2(&prepared.bundle, &run.auth_context())?;
@@ -350,7 +350,52 @@ pub fn prepare_v2<E: Endpoint>(
             "an issuer operation (an issuer secret or a non-zero vPublic) is not delegated to a prover".into(),
         ));
     }
-    let p = prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?;
+    prepare_v2_with(w, run, served, shape, spend, outs, fee, ctx, vp, None, rng)
+}
+
+/// Lab #937 cut-over (D-C7): [`prepare_v2`] for a **remote-proved** step on
+/// a format-34 net — its third output is `third`, the prover's fee (asset 0,
+/// to the admitted payee, at its price), not the self-proved zero-value
+/// note. The step's exact fee note (if any) is the planner's `tier + price`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_v2_paying<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    served: &Served<E>,
+    shape: L2ShapeTag,
+    spend: V2Spend<'_>,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    third: &Out,
+    rng: &mut StdRng,
+) -> Result<PreparedSpendV2, SendRefusal> {
+    if third.asset != 0 {
+        return Err(SendRefusal::Auth("a prover is paid in asset 0".into()));
+    }
+    prepare_v2_with(w, run, served, shape, spend, outs, fee, ctx, [VPublic::NONE; 2], Some(third), rng)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_v2_with<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    served: &Served<E>,
+    shape: L2ShapeTag,
+    spend: V2Spend<'_>,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: [&PolicyContext; 2],
+    vp: [VPublic; 2],
+    third: Option<&Out>,
+    rng: &mut StdRng,
+) -> Result<PreparedSpendV2, SendRefusal> {
+    if is_issuer_operation(ctx, vp) {
+        return Err(SendRefusal::Auth(
+            "an issuer operation (an issuer secret or a non-zero vPublic) is not delegated to a prover".into(),
+        ));
+    }
+    let p = prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, third, rng)?;
     let bundle = ProvingBundle::new(p.tx, p.witness).map_err(|e| SendRefusal::Auth(e.to_string()))?;
     Ok(PreparedSpendV2 { bundle, pvs: p.pvs, auth: p.auth, outputs: p.outputs, shape: p.shape })
 }
@@ -422,6 +467,7 @@ fn prepare_signed<E: Endpoint>(
     fee: u64,
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
+    third: Option<&Out>,
     rng: &mut StdRng,
 ) -> Result<PreparedV2, SendRefusal> {
     let wallet = w.wallet();
@@ -450,14 +496,26 @@ fn prepare_signed<E: Endpoint>(
     // is asset 0), the note exactly `fee + 0` (lab #937 A′,
     // `qlab_l2spend::v2::rides_fee_bank`). The wallet never spends a
     // zero-value note (`AssetIndex::zero`).
-    let outs: Vec<Out> = match run.auth_context().form.sp_outputs() {
-        2 => outs.to_vec(),
-        3 => {
+    // Lab #937 cut-over (D-C7): a remote-proved step names its third output
+    // — the prover's fee — and only a format-34 net carries one.
+    let outs: Vec<Out> = match (run.auth_context().form.sp_outputs(), third) {
+        (2, None) => outs.to_vec(),
+        (2, Some(_)) => {
+            return Err(SendRefusal::Auth(
+                "this net is not format 34: its spends carry no third output, so no prover is paid in them".into(),
+            ))
+        }
+        (3, Some(t)) => {
+            let mut v = outs.to_vec();
+            v.push(t.clone());
+            v
+        }
+        (3, None) => {
             let mut v = outs.to_vec();
             v.push(Out { to: outs[1].to.clone(), value: 0, asset: 0 });
             v
         }
-        n => unreachable!("an S/P spend carries two or three outputs, not {n}"),
+        (n, _) => unreachable!("an S/P spend carries two or three outputs, not {n}"),
     };
     let outs = outs.as_slice();
     let (mut prepared, keys) = match (shape, &spend) {
@@ -539,6 +597,100 @@ pub fn root_of(wallet: &Wallet, g: u32) -> [u64; 4] {
     generation_root(wallet, g)
 }
 
+/// Who proves the steps of a run (lab #937 cut-over, D-C7).
+#[allow(clippy::large_enum_variant)] // one per run, on the stack
+pub enum Proving<'a> {
+    /// This process: build, prove, sign and submit each step (the CLI).
+    Local,
+    /// A remote prover service: each step's signed bundle is recorded,
+    /// handed to the service, and followed until the service has submitted
+    /// it — the service submits, never this process.
+    Remote(RemoteRun<'a>),
+}
+
+/// A remote-proved run: the admitted prover, the service, and the hooks a
+/// shell or the drill watches.
+pub struct RemoteRun<'a> {
+    pub prover: crate::prover_pins::AdmittedProver,
+    pub transport: &'a mut dyn crate::remote_prover::ProverTransport,
+    /// Waits between re-sends and polls (a test passes a no-op).
+    pub sleep: &'a mut dyn FnMut(std::time::Duration),
+    /// `(step, event)` as each step's bundle goes to the service.
+    pub events: &'a mut dyn FnMut(usize, crate::remote_prover::Event),
+    /// The transaction ids the service submitted, in plan order.
+    pub submitted: Vec<[u8; 32]>,
+    /// When the run's transactions can no longer land (the validity, or its
+    /// wall-clock bound when the node's tip cannot be read).
+    pub deadline: crate::remote_prover::Deadline,
+}
+
+/// One step of a run: [`spend_v2`] (local), or the remote-prove path —
+/// prepared paying the prover its `price`, **recorded before upload**
+/// ([`crate::remote_prover::record`]), handed to the service and followed
+/// to its end (D-C8). Returns the step's output notes and shape.
+#[allow(clippy::too_many_arguments)]
+fn step_v2<E: Endpoint>(
+    w: &WalletDir,
+    run: &mut AuthRun,
+    served: &Served<E>,
+    proving: &mut Proving<'_>,
+    step: usize,
+    price: Option<u64>,
+    shape: L2ShapeTag,
+    spend: V2Spend<'_>,
+    outs: &[Out; 2],
+    fee: u64,
+    ctx: &PolicyContext,
+    rng: &mut StdRng,
+) -> Result<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag), SendRefusal> {
+    use crate::remote_prover::{prove_remote, record, record_outcome, Outcome};
+    let rr = match proving {
+        Proving::Local => {
+            let built = spend_v2(w, run, served, shape, spend, outs, fee, ctx, rng)?;
+            return Ok((built.outputs, built.shape));
+        }
+        Proving::Remote(rr) => rr,
+    };
+    let price = price.ok_or_else(|| SendRefusal::Auth("a remote-proved step without its prover fee".into()))?;
+    let payee = crate::annulet_send::recipient_of(&rr.prover.payee)
+        .ok_or_else(|| SendRefusal::Auth("the pinned payee has no valid encapsulation key".into()))?;
+    let third = Out { to: payee, value: price, asset: 0 };
+    let prepared = prepare_v2_paying(w, run, served, shape, spend, outs, fee, [ctx, &PolicyContext::default()], &third, rng)?;
+    let bytes = prepared.bundle.encode();
+    let key = *prepared
+        .bundle
+        .tx()
+        .public
+        .nullifiers
+        .first()
+        .ok_or_else(|| SendRefusal::Auth("a prepared spend with no nullifier".into()))?;
+    record(&w.dir, &key, &bytes).map_err(|e| SendRefusal::Auth(format!("the signed bundle could not be recorded before upload: {e}")))?;
+    let deadline = rr.deadline;
+    let mut expired = || deadline.passed(served.stated_tip().ok(), std::time::Instant::now());
+    let outcome = {
+        let RemoteRun { transport, sleep, events, .. } = rr;
+        prove_remote(&mut **transport, &bytes, &mut expired, &mut **sleep, &mut |e| events(step, e))
+    };
+    // The record stays: it is what this wallet sent. A failure to note the
+    // outcome beside it loses nothing the scan cannot settle.
+    let _ = record_outcome(&w.dir, &key, &outcome);
+    match outcome {
+        Outcome::Submitted { tx_id } => {
+            rr.submitted.push(tx_id);
+            Ok((prepared.outputs, prepared.shape))
+        }
+        Outcome::InFlight { code } => Err(SendRefusal::Auth(format!(
+            "the prover already holds this transaction ({code}): wait, and let the next scan settle it"
+        ))),
+        Outcome::Failed { status, code } => Err(SendRefusal::Auth(format!(
+            "the prover did not submit this transaction (HTTP {status} {code}): its authorizations stay used; a retry is a new send"
+        ))),
+        Outcome::Expired { last } => Err(SendRefusal::Auth(format!(
+            "the transaction's validity passed while the prover kept answering not now ({last}): its authorizations stay used; a retry is a new send"
+        ))),
+    }
+}
+
 /// Run `plan` on a Candidate A net under `run`'s generation: v1's
 /// [`crate::annulet_send`] round structure, each step a v2 spend. Notes a
 /// later step spends (fee splits, merges) are paid to the run generation's
@@ -555,6 +707,7 @@ pub fn run_plan_v2<E: Endpoint>(
     change: &Recipient,
     freeze_keys: &[[u64; 4]],
     split_wait: std::time::Duration,
+    proving: &mut Proving<'_>,
     rng: &mut StdRng,
 ) -> Result<Vec<(Vec<qlab_note::l2note::L2Note>, L2ShapeTag)>, SendRefusal> {
     use crate::annulet_send::{wait_in_tree, Src, StepKind};
@@ -582,15 +735,26 @@ pub fn run_plan_v2<E: Endpoint>(
     };
     for round in 0..plan.rounds() {
         for (i, st) in plan.steps.iter().enumerate().filter(|(_, s)| s.round == round) {
-            // Lab #937: this wallet proves its own spends and plans with no
-            // prover (`plan_send(.., None)`), so no step carries a prover's
-            // fee; the third output is prepare_signed's zero-value note. A
-            // plan naming one is not this wallet's and is refused by name.
-            if st.third.is_some() {
-                return Err(SendRefusal::Auth(
-                    "a planned prover fee: this wallet proves its own spends and pays no prover".into(),
-                ));
+            // Lab #937: a self-proved run plans with no prover (`plan_send(..,
+            // None)`), so no step carries a prover's fee; the third output is
+            // prepare_signed's zero-value note. A remote-proved run (lab #937
+            // cut-over, D-C7) plans with its admitted price
+            // (`plan_send_paying`), so every step names one. A plan of the
+            // other kind is refused by name.
+            match (&*proving, st.third) {
+                (Proving::Local, Some(_)) => {
+                    return Err(SendRefusal::Auth(
+                        "a planned prover fee: this wallet proves its own spends and pays no prover".into(),
+                    ))
+                }
+                (Proving::Remote(_), None) => {
+                    return Err(SendRefusal::Auth(
+                        "a remote-proved run needs a plan that pays its prover (plan_send_paying)".into(),
+                    ))
+                }
+                _ => {}
             }
+            let price = st.third.map(|(v, _)| v);
             let built = match &st.kind {
                 StepKind::FeeSplit { source, tariff } => {
                     let src = owned(&made, source);
@@ -598,7 +762,7 @@ pub fn run_plan_v2<E: Endpoint>(
                         Out { to: own.clone(), value: *tariff, asset: 0 },
                         Out { to: own.clone(), value: st.outputs[1], asset: 0 },
                     ];
-                    spend_v2(w, run, served, L2ShapeTag::S, V2Spend::One(&src), &outs, s_tier, &ctx, rng)?
+                    step_v2(w, run, served, proving, i, price, L2ShapeTag::S, V2Spend::One(&src), &outs, s_tier, &ctx, rng)?
                 }
                 StepKind::Merge { inputs, fee } => {
                     let (x, y, f) = (owned(&made, &inputs[0]), owned(&made, &inputs[1]), owned(&made, fee));
@@ -606,7 +770,7 @@ pub fn run_plan_v2<E: Endpoint>(
                         Out { to: own.clone(), value: st.outputs[0], asset: a },
                         Out { to: own.clone(), value: 0, asset: a },
                     ];
-                    spend_v2(w, run, served, st.shape, V2Spend::TwoAndFee([&x, &y], &f), &outs, st.fee, &ctx, rng)?
+                    step_v2(w, run, served, proving, i, price, st.shape, V2Spend::TwoAndFee([&x, &y], &f), &outs, st.fee, &ctx, rng)?
                 }
                 StepKind::Pay { inputs, fee } => {
                     let ins: Vec<OwnedL2Note> = inputs.iter().map(|x| owned(&made, x)).collect();
@@ -615,20 +779,20 @@ pub fn run_plan_v2<E: Endpoint>(
                         Out { to: change.clone(), value: st.outputs[1], asset: a },
                     ];
                     match (fee, ins.as_slice()) {
-                        (None, [one]) => spend_v2(w, run, served, L2ShapeTag::S, V2Spend::One(one), &outs, st.fee, &ctx, rng)?,
+                        (None, [one]) => step_v2(w, run, served, proving, i, price, L2ShapeTag::S, V2Spend::One(one), &outs, st.fee, &ctx, rng)?,
                         (Some(fee), [one]) => {
                             let f = owned(&made, fee);
-                            spend_v2(w, run, served, st.shape, V2Spend::Two([one, &f]), &outs, st.fee, &ctx, rng)?
+                            step_v2(w, run, served, proving, i, price, st.shape, V2Spend::Two([one, &f]), &outs, st.fee, &ctx, rng)?
                         }
                         (Some(fee), [x, y]) => {
                             let f = owned(&made, fee);
-                            spend_v2(w, run, served, st.shape, V2Spend::TwoAndFee([x, y], &f), &outs, st.fee, &ctx, rng)?
+                            step_v2(w, run, served, proving, i, price, st.shape, V2Spend::TwoAndFee([x, y], &f), &outs, st.fee, &ctx, rng)?
                         }
                         _ => unreachable!("a payment is planned with one or two inputs"),
                     }
                 }
             };
-            made[i] = Some((built.outputs, built.shape));
+            made[i] = Some(built);
         }
         // Every note a later round spends must be in the tree first.
         for later in plan.steps.iter().filter(|s| s.round > round) {
@@ -864,7 +1028,7 @@ pub fn migrate<E: Endpoint>(
             let shape = qlab_l2spend::shape_for(&leaf);
             let plan = plan_send(&index, asset, amount, shape, session.tiers)?;
             txs += plan.steps.len();
-            run_plan_v2(w, &mut run, &session, &plan, &to_active, &to_active, &[], split_wait, rng)?;
+            run_plan_v2(w, &mut run, &session, &plan, &to_active, &to_active, &[], split_wait, &mut Proving::Local, rng)?;
         }
         // Asset 0, note by note, each paying its own S fee. No up-front budget
         // check here: each note takes one leaf, and a generation that runs out
