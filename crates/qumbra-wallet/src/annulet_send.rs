@@ -455,6 +455,14 @@ pub struct RemoteHooks<'a> {
     pub transport: &'a mut dyn crate::remote_prover::ProverTransport,
     pub sleep: &'a mut dyn FnMut(Duration),
     pub events: &'a mut dyn FnMut(usize, crate::remote_prover::Event),
+    /// Lab #937 cut-over (M1(b)): each step's review, **before it is signed**
+    /// (`crate::annulet_v2::StepReview`; render it with its `render`). `false`
+    /// refuses the step by name: nothing is signed, recorded or uploaded, and
+    /// the leaves it took stay used (the journal never rolls back).
+    pub review: &'a mut dyn FnMut(usize, &crate::annulet_v2::StepReview) -> bool,
+    /// The verified asset list the review names the asset from (`None`: raw
+    /// base units, said so).
+    pub list: Option<&'a crate::asset_view::AssetList>,
 }
 
 /// **The remote-proved send** (lab #937 cut-over, D-C7): [`send_annulet`]'s
@@ -489,7 +497,7 @@ pub fn send_annulet_remote<E: Endpoint>(
             "this net is not format 34: its spends carry no third output, so no prover is paid in them".into(),
         ));
     }
-    let RemoteHooks { transport, sleep, events } = remote;
+    let RemoteHooks { transport, sleep, events, review, list } = remote;
     let info = crate::remote_prover::info(&mut *transport).map_err(SendRefusal::Auth)?;
     let admitted = crate::prover_pins::admit(&info, &session.genesis_hash).map_err(|e| SendRefusal::Auth(e.to_string()))?;
     let slot_secs = crate::remote_prover::slot_secs_of(&info).map_err(SendRefusal::Auth)?;
@@ -512,6 +520,22 @@ pub fn send_annulet_remote<E: Endpoint>(
         return Err(SendRefusal::PlanDeclined);
     }
     let price = admitted.price;
+    // The review's names: the asset's leaf, as bytes, bound to the verified
+    // tip (lab #924 PR 3c's rule, the FFI's) — one read for every step's
+    // review. `served.registry` above parsed the shape's read and kept no
+    // bytes, so this is a second read of the same route.
+    let bound = (asset != 0).then(|| {
+        let answer = session.served.endpoint.get(&crate::annulet_verify::registry_leaf_path(asset));
+        crate::asset_view::check_leaf_at_verified_tip(&session.chain, asset, answer)
+    });
+    let basis = crate::annulet_v2::ReviewBasis {
+        to_rkm: recipient.rkm,
+        own_rkm: change.rkm,
+        to_short: to.short().encode(),
+        spends_verified: session.spends_verified,
+        names: crate::annulet_review::names_for(asset, list, &session.genesis_hash, bound),
+        prover: (admitted.payee.rkm_lanes(), admitted.payee.short().encode()),
+    };
     let deadline = crate::remote_prover::Deadline::new(
         run.valid_until,
         session.tip,
@@ -525,6 +549,8 @@ pub fn send_annulet_remote<E: Endpoint>(
         events,
         submitted: Vec::new(),
         deadline,
+        basis,
+        review,
     });
     let made = crate::annulet_v2::run_plan_v2(
         w, &mut run, &session, &plan, &recipient, &change, freeze_keys, split_wait, &mut proving, rng,

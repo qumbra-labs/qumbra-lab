@@ -121,12 +121,27 @@ fn next_of(w: &qumbra_wallet::store::WalletDir) -> u32 {
     AuthJournal::load(&w.dir).unwrap().unwrap().active().next
 }
 
-type Ran = (Result<qumbra_wallet::annulet_send::RemoteSendReport, String>, Vec<(usize, Event)>, Vec<u64>);
+type Sent = Result<qumbra_wallet::annulet_send::RemoteSendReport, String>;
+type Ran = (Sent, Vec<(usize, Event)>, Vec<u64>);
 
 fn run(s: &Setup, svc: &mut Service) -> Ran {
+    let (r, events, shown, _) = run_reviewed(s, svc, true);
+    (r, events, shown)
+}
+
+type Reviews = Vec<(usize, Result<String, String>, Vec<qlab_note::l2note::L2Note>)>;
+
+/// [`run`], every step's review (rendered by the kernel) kept, each answered
+/// `approve`.
+fn run_reviewed(
+    s: &Setup,
+    svc: &mut Service,
+    approve: bool,
+) -> (Sent, Vec<(usize, Event)>, Vec<u64>, Reviews) {
     let mut rng = StdRng::seed_from_u64(0x937c);
     let mut events = Vec::new();
     let mut shown = Vec::new();
+    let mut reviews = Vec::new();
     let r = send_annulet_remote(
         &s.w,
         Fx(&s.ep),
@@ -137,7 +152,24 @@ fn run(s: &Setup, svc: &mut Service) -> Ran {
         s.ep.file.hash(),
         &[],
         Duration::from_secs(1),
-        RemoteHooks { transport: svc, sleep: &mut |_| {}, events: &mut |i, e| events.push((i, e)) },
+        RemoteHooks {
+            transport: svc,
+            sleep: &mut |_| {},
+            events: &mut |i, e| events.push((i, e)),
+            review: &mut |i, r| {
+                // The text is the kernel's renderer over the very bytes the
+                // step signs; any other bytes are refused by it.
+                assert_eq!(r.signing, r.intent.encode().unwrap(), "the signing bytes are the intent's");
+                let direct = qumbra_wallet::annulet_review::render(&r.review, &r.intent, &r.signing, &r.signing, &r.outputs);
+                assert_eq!(r.render(), direct);
+                let mut other = r.signing.clone();
+                other[0] ^= 1;
+                assert!(qumbra_wallet::annulet_review::render(&r.review, &r.intent, &r.signing, &other, &r.outputs).is_err());
+                reviews.push((i, r.render(), r.outputs.clone()));
+                approve
+            },
+            list: None,
+        },
         &mut |plan, p| {
             shown.push(p.price.s);
             shown.push(plan.prover_fees());
@@ -146,7 +178,7 @@ fn run(s: &Setup, svc: &mut Service) -> Ran {
         &mut rng,
     )
     .map_err(|e| e.to_string());
-    (r, events, shown)
+    (r, events, shown, reviews)
 }
 
 /// D-C7: the admitted price is planned and shown before anything is taken;
@@ -238,5 +270,63 @@ fn a_service_that_is_not_the_pin_is_refused_before_the_take() {
     assert!(shown.is_empty() && events.is_empty() && svc.posted.borrow().is_empty());
     assert_eq!(next_of(&s.w), 0, "nothing taken");
     assert!(!s.w.dir.join(RECORD_DIR).exists(), "nothing recorded");
+    let _ = std::fs::remove_dir_all(&s.w.dir);
+}
+
+/// Lab #937 cut-over (M1(b)): each step's review is the kernel's, rendered
+/// from the intent the step then signs — before it is signed. Approved: the
+/// text names the payment, the prover's fee at its price and the step; the
+/// review's bytes are the intent's encoding, and the uploaded bundle carries
+/// exactly the outputs the review was rendered from.
+#[test]
+fn each_step_is_reviewed_before_it_is_signed_and_the_review_is_the_kernels() {
+    let s = setup("rs_review");
+    let genesis = s.ep.file.hash();
+    let mut svc = Service {
+        info: info(&genesis, &s.prover.encode()),
+        genesis,
+        answers: VecDeque::from([(202, view("queued", None)), (200, view("submitted", Some(TX)))]),
+        posted: RefCell::new(Vec::new()),
+    };
+    let (r, _, _, reviews) = run_reviewed(&s, &mut svc, true);
+    r.expect("submitted");
+    assert_eq!(reviews.len(), 1, "one step, one review");
+    let (i, text, outputs) = &reviews[0];
+    assert_eq!(*i, 0);
+    let text = text.as_ref().expect("the review renders");
+    assert!(text.contains("step 1 of 1: the payment"), "{text}");
+    assert!(text.contains(&format!("prover fee: 1 fee unit to {}", s.prover.short().encode())), "{text}");
+    assert!(text.contains("send 10 fee units to "), "{text}");
+    assert!(text.lines().next().unwrap().starts_with("asset list: none"), "no list was given: {text}");
+    let posted = svc.posted.borrow();
+    let b = ProvingBundle::decode(&posted[0]).unwrap();
+    let sent: Vec<_> = b.witness().outputs.iter().map(|o| (o.value, o.asset, o.rkm)).collect();
+    let reviewed: Vec<_> = outputs.iter().map(|o| (o.value, o.asset, o.rkm)).collect();
+    assert_eq!(sent, reviewed, "the bundle carries the outputs the review was rendered from");
+    let _ = std::fs::remove_dir_all(&s.w.dir);
+}
+
+/// A review the shell refuses refuses the step by name: nothing is signed,
+/// recorded or uploaded (no POST reaches the service, no record file), and
+/// the leaves the step took stay used.
+#[test]
+fn a_refused_review_signs_records_and_uploads_nothing() {
+    let s = setup("rs_review_no");
+    let genesis = s.ep.file.hash();
+    let mut svc = Service {
+        info: info(&genesis, &s.prover.encode()),
+        genesis,
+        answers: VecDeque::new(),
+        posted: RefCell::new(Vec::new()),
+    };
+    let (r, events, _, reviews) = run_reviewed(&s, &mut svc, false);
+    let why = r.err().expect("refused");
+    assert!(why.contains("step 1 of 1 refused at review"), "{why}");
+    assert_eq!(reviews.len(), 1, "the review was shown");
+    assert!(svc.posted.borrow().is_empty(), "nothing uploaded");
+    assert!(events.is_empty(), "no upload was begun");
+    let dir = s.w.dir.join(RECORD_DIR);
+    assert!(!dir.exists() || std::fs::read_dir(&dir).unwrap().next().is_none(), "nothing recorded");
+    assert_eq!(next_of(&s.w), 1, "the leaf the step took stays used");
     let _ = std::fs::remove_dir_all(&s.w.dir);
 }

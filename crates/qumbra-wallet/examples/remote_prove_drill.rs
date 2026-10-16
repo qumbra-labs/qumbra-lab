@@ -230,7 +230,26 @@ fn send(args: &[String]) -> bool {
         genesis,
         &[],
         Duration::from_secs(600),
-        RemoteHooks { transport: &mut t, sleep: &mut std::thread::sleep, events: &mut events },
+        RemoteHooks {
+            transport: &mut t,
+            sleep: &mut std::thread::sleep,
+            events: &mut events,
+            // The drill states each step's kernel review before it is signed
+            // and signs only a review that renders.
+            review: &mut |i, r| match r.render() {
+                Ok(text) => {
+                    for line in text.lines() {
+                        println!("REVIEW step {} {line}", i + 1);
+                    }
+                    true
+                }
+                Err(why) => {
+                    println!("FAIL step {} review refused: {why}", i + 1);
+                    false
+                }
+            },
+            list: None,
+        },
         &mut |plan, p| {
             println!(
                 "INFO plan: {} transaction(s), network fees {}, prover fees {} at S {} / P {}",

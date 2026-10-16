@@ -59,8 +59,8 @@ use qumbra_wallet::annulet_plan::{
     plan_send_paying, plan_slots, real_input, ProverPrice, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA,
 };
 use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
-use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, label_of, AssetList};
-use qumbra_wallet::annulet_review::{leaf_refusal_text, short, Names, Review};
+use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, AssetList};
+use qumbra_wallet::annulet_review::{names_for, step_review, Review};
 use qumbra_wallet::auth_check::{AuthCheck, CheckBasis, CheckStep};
 use qumbra_wallet::auth_journal::{AuthJournal, GenState, SweepGate};
 use rand::rngs::StdRng;
@@ -140,16 +140,6 @@ impl SpendBasis {
             gate_tip: v.chain().tip().max(v.stated_tip().unwrap_or(0)),
             list: list.cloned(),
         })
-    }
-
-    /// The list, if it is this network's.
-    fn own_list(&self) -> Option<&AssetList> {
-        qumbra_wallet::annulet_review::own_list(self.list.as_ref(), &self.genesis_hash)
-    }
-
-    /// The review's line naming the list (its short id) or its absence.
-    fn list_line(&self) -> String {
-        qumbra_wallet::annulet_review::list_line(self.list.as_ref(), &self.genesis_hash)
     }
 }
 
@@ -916,19 +906,7 @@ impl SpendHandle {
                 Some(check_leaf_at_verified_tip(&b.chain, a, answer))
             }
         };
-        let listed = b.own_list().and_then(|l| l.assets.get(&self.asset));
-        let leaf_problem = match &bound {
-            Some(Err(e)) => Some(leaf_refusal_text(e)),
-            _ => None,
-        };
-        let bound = bound.and_then(Result::ok);
-        let names = Names {
-            asset: self.asset,
-            label: label_of(self.asset, listed, bound.as_ref()),
-            leaf_problem,
-            list_line: b.list_line(),
-            list_short: b.own_list().map(|l| short(&l.digest)),
-        };
+        let names = names_for(self.asset, b.list.as_ref(), &b.genesis_hash, bound);
         if shape == L2ShapeTag::R {
             return Err(Attempt::Refused("shape R is a registry write, not a spend".into()));
         }
@@ -1087,18 +1065,19 @@ impl SpendHandle {
         };
         let intent = intent_for(&prepared.tx, b.form.annulet_genesis_format_version(), &b.genesis_hash, self.valid_until, &prepared.auth)
             .map_err(|e| Attempt::Refused(format!("the intent does not rebuild: {e:?}")))?; // debug-ok: a named codec error
-        let review = Review {
-            step: 1,
-            steps: plan.steps.len(),
-            kind: label,
-            payee_rkm: (label == "payment").then_some(self.to.rkm),
-            own_rkm: own.rkm,
-            to_short: self.to_short.clone(),
-            spends_verified: b.spends_verified,
+        // The kernel's one construction (`step_review`, shared with the Rust
+        // send): this handle prepares the plan's first step.
+        let review = step_review(
+            &plan,
+            0,
+            self.to.rkm,
+            own.rkm,
+            self.to_short.clone(),
+            b.spends_verified,
             names,
-            prover: self.prover.as_ref().zip(step.third).map(|(p, (v, _))| (p.payee.rkm, p.short.clone(), v)),
-            plan_from_here: (plan.steps.len(), plan.total_fee(), plan.prover_fees()),
-        };
+            self.prover.as_ref().map(|p| (p.payee.rkm, p.short.clone())),
+        );
+        debug_assert_eq!(review.kind, label);
         Ok(Prepared { prepared, intent, dummies, paths, review })
     }
 }
