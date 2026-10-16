@@ -110,6 +110,79 @@ pub fn leaf_refusal_text(e: &LeafRefusal) -> String {
     }
 }
 
+/// **How a review names `asset`** (lab #937 cut-over, M1(b): moved from
+/// qumbra-ffi so the FFI and the Rust send build it once): from `list` only
+/// while it is the network `genesis`'s, and the asset's name only while its
+/// registry leaf, bound to the verified tip (`bound`, `None` for asset 0),
+/// carries the listed issuer key; otherwise raw base units, saying why.
+pub fn names_for(
+    asset: u16,
+    list: Option<&AssetList>,
+    genesis: &[u8; 32],
+    bound: Option<Result<qlab_air::l2::RegistryLeaf, LeafRefusal>>,
+) -> Names {
+    let own = own_list(list, genesis);
+    let listed = own.and_then(|l| l.assets.get(&asset));
+    let leaf_problem = match &bound {
+        Some(Err(e)) => Some(leaf_refusal_text(e)),
+        _ => None,
+    };
+    let bound = bound.and_then(Result::ok);
+    Names {
+        asset,
+        label: crate::asset_view::label_of(asset, listed, bound.as_ref()),
+        leaf_problem,
+        list_line: list_line(list, genesis),
+        list_short: own.map(|l| short(&l.digest)),
+    }
+}
+
+/// What step `i` of a plan is, by the name the review gives it.
+pub fn step_kind(kind: &crate::annulet_plan::StepKind) -> &'static str {
+    match kind {
+        crate::annulet_plan::StepKind::FeeSplit { .. } => "fee-split",
+        crate::annulet_plan::StepKind::Merge { .. } => "merge",
+        crate::annulet_plan::StepKind::Pay { .. } => "payment",
+    }
+}
+
+/// **The review of step `i` of `plan`** (lab #937 cut-over, M1(b): moved
+/// from qumbra-ffi): "step i+1 of N", the payee only on the payment
+/// (`to_rkm`), the prover (`(payee rkm, short address)`, when one is paid)
+/// at this step's price, and the plan from this step on. The FFI prepares one
+/// step at a time and calls it with `i = 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn step_review(
+    plan: &crate::annulet_plan::SendPlan,
+    i: usize,
+    to_rkm: [u64; 4],
+    own_rkm: [u64; 4],
+    to_short: String,
+    spends_verified: bool,
+    names: Names,
+    prover: Option<([u64; 4], String)>,
+) -> Review {
+    let step = &plan.steps[i];
+    let kind = step_kind(&step.kind);
+    let rest = &plan.steps[i..];
+    Review {
+        step: i + 1,
+        steps: plan.steps.len(),
+        kind,
+        payee_rkm: (kind == "payment").then_some(to_rkm),
+        own_rkm,
+        to_short,
+        spends_verified,
+        names,
+        prover: prover.zip(step.third).map(|((rkm, short), (v, _))| (rkm, short, v)),
+        plan_from_here: (
+            rest.len(),
+            rest.iter().map(|s| s.fee).sum(),
+            rest.iter().filter_map(|s| s.third.map(|(v, _)| v)).fold(0u64, u64::saturating_add),
+        ),
+    }
+}
+
 /// **Render the review from the intent bytes to be signed**: refused unless
 /// `shown` are `signing` (the pending intent's bytes); an output is stated
 /// only after its note (`outputs`, the prepared notes) is checked to open

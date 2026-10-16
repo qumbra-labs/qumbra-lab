@@ -211,6 +211,17 @@ impl AuthRun {
         self.keys.dummy(&entropy, slot, taken).map_err(SendRefusal::Auth)
     }
 
+    /// The intent `tx` signs on this run's net and validity: what [`Self::sign`]
+    /// signs, and what a step's review is rendered from before it.
+    pub(crate) fn intent(
+        &self,
+        tx: &qlab_devnet::body::TxEntry,
+        auth: &[qlab_remote_auth::intent::AuthDescriptor],
+    ) -> Result<qlab_remote_auth::annulet::AnnuletIntent, SendRefusal> {
+        intent_for(tx, self.genesis_format, &self.genesis_hash, self.valid_until, auth)
+            .map_err(|e| SendRefusal::Auth(format!("the intent does not rebuild: {e:?}"))) // debug-ok: a named codec error, no opening
+    }
+
     /// Rebuild the intent from `tx`, sign every slot, attach the section.
     /// Nothing is submitted here.
     pub(crate) fn sign(
@@ -219,8 +230,7 @@ impl AuthRun {
         auth: &[qlab_remote_auth::intent::AuthDescriptor],
         dummies: &[&qlab_remote_auth::mldsa::Key],
     ) -> Result<(), SendRefusal> {
-        let intent = intent_for(tx, self.genesis_format, &self.genesis_hash, self.valid_until, auth)
-            .map_err(|e| SendRefusal::Auth(format!("the intent does not rebuild: {e:?}")))?; // debug-ok: a named codec error, no opening
+        let intent = self.intent(tx, auth)?;
         let section = sign_locally(&intent, &self.keys, dummies)
             .map_err(|e| SendRefusal::Auth(format!("signing refused: {e:?}")))?; // debug-ok: a named auth error, no key
         attach(tx, &section).map_err(|e| SendRefusal::Auth(format!("the section does not encode: {e:?}"))) // debug-ok
@@ -311,7 +321,7 @@ pub fn build_spend_v2<E: Endpoint>(
     rng: &mut StdRng,
 ) -> Result<BuiltV2, SendRefusal> {
     if is_issuer_operation(ctx, vp) {
-        return Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, None, rng)?));
+        return Ok(prove_prepared(prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, None, None, rng)?));
     }
     let prepared = prepare_v2(w, run, served, shape, spend, outs, fee, ctx, vp, rng)?;
     let proved = prove_bundle_v2(&prepared.bundle, &run.auth_context())?;
@@ -350,7 +360,7 @@ pub fn prepare_v2<E: Endpoint>(
             "an issuer operation (an issuer secret or a non-zero vPublic) is not delegated to a prover".into(),
         ));
     }
-    prepare_v2_with(w, run, served, shape, spend, outs, fee, ctx, vp, None, rng)
+    prepare_v2_with(w, run, served, shape, spend, outs, fee, ctx, vp, None, None, rng)
 }
 
 /// Lab #937 cut-over (D-C7): [`prepare_v2`] for a **remote-proved** step on
@@ -373,8 +383,13 @@ pub fn prepare_v2_paying<E: Endpoint>(
     if third.asset != 0 {
         return Err(SendRefusal::Auth("a prover is paid in asset 0".into()));
     }
-    prepare_v2_with(w, run, served, shape, spend, outs, fee, ctx, [VPublic::NONE; 2], Some(third), rng)
+    prepare_v2_with(w, run, served, shape, spend, outs, fee, ctx, [VPublic::NONE; 2], Some(third), None, rng)
 }
+
+/// What a step's review gate is shown before the step is signed: the intent,
+/// its signing bytes and the prepared outputs. `Err` refuses the step.
+pub(crate) type ReviewGate<'g> =
+    &'g mut dyn FnMut(&qlab_remote_auth::annulet::AnnuletIntent, &[u8], &[qlab_note::l2note::L2Note]) -> Result<(), SendRefusal>;
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_v2_with<E: Endpoint>(
@@ -388,6 +403,7 @@ fn prepare_v2_with<E: Endpoint>(
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
     third: Option<&Out>,
+    gate: Option<ReviewGate<'_>>,
     rng: &mut StdRng,
 ) -> Result<PreparedSpendV2, SendRefusal> {
     if is_issuer_operation(ctx, vp) {
@@ -395,7 +411,7 @@ fn prepare_v2_with<E: Endpoint>(
             "an issuer operation (an issuer secret or a non-zero vPublic) is not delegated to a prover".into(),
         ));
     }
-    let p = prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, third, rng)?;
+    let p = prepare_signed(w, run, served, shape, spend, outs, fee, ctx, vp, third, gate, rng)?;
     let bundle = ProvingBundle::new(p.tx, p.witness).map_err(|e| SendRefusal::Auth(e.to_string()))?;
     Ok(PreparedSpendV2 { bundle, pvs: p.pvs, auth: p.auth, outputs: p.outputs, shape: p.shape })
 }
@@ -468,6 +484,7 @@ fn prepare_signed<E: Endpoint>(
     ctx: [&PolicyContext; 2],
     vp: [VPublic; 2],
     third: Option<&Out>,
+    gate: Option<ReviewGate<'_>>,
     rng: &mut StdRng,
 ) -> Result<PreparedV2, SendRefusal> {
     let wallet = w.wallet();
@@ -548,6 +565,16 @@ fn prepare_signed<E: Endpoint>(
             return Err(SendRefusal::Spend(SpendError::Served("shape R is a registry write, not a spend".into())))
         }
     };
+    // Lab #937 cut-over (M1(b)): the review, from the very intent `run.sign`
+    // signs below, before it is signed. A refusal here is before signing; the
+    // leaves taken above stay used (the journal never rolls back).
+    if let Some(gate) = gate {
+        let intent = run.intent(&prepared.tx, &prepared.auth)?;
+        let signing = intent
+            .encode()
+            .map_err(|e| SendRefusal::Auth(format!("the intent does not encode: {e:?}")))?; // debug-ok: a named codec error
+        gate(&intent, &signing, &prepared.outputs)?;
+    }
     let dummies: Vec<&qlab_remote_auth::mldsa::Key> = keys.iter().collect();
     run.sign(&mut prepared.tx, &prepared.auth.clone(), &dummies)?;
     Ok(prepared)
@@ -622,6 +649,43 @@ pub struct RemoteRun<'a> {
     /// When the run's transactions can no longer land (the validity, or its
     /// wall-clock bound when the node's tip cannot be read).
     pub deadline: crate::remote_prover::Deadline,
+    /// What every step's review is built from.
+    pub basis: ReviewBasis,
+    /// `(step, review)` before each step is signed: `false` refuses the step
+    /// by name — nothing is signed, recorded or uploaded; the leaves it took
+    /// stay used.
+    pub review: &'a mut dyn FnMut(usize, &StepReview) -> bool,
+}
+
+/// What a run's step reviews share: the payee, this wallet, the names, the
+/// prover (lab #937 cut-over, M1(b)).
+#[derive(Clone)]
+pub struct ReviewBasis {
+    pub to_rkm: [u64; 4],
+    pub own_rkm: [u64; 4],
+    pub to_short: String,
+    pub spends_verified: bool,
+    pub names: crate::annulet_review::Names,
+    /// The admitted prover's payee `rkm` and its short address.
+    pub prover: ([u64; 4], String),
+}
+
+/// **A step, as it is reviewed before it is signed** (lab #937 cut-over,
+/// M1(b)): the kernel-built review, the intent the step will sign, its
+/// signing bytes, and the prepared outputs. A shell renders it with
+/// [`crate::annulet_review::render`] — never a format of its own.
+pub struct StepReview {
+    pub review: crate::annulet_review::Review,
+    pub intent: qlab_remote_auth::annulet::AnnuletIntent,
+    pub signing: Vec<u8>,
+    pub outputs: Vec<qlab_note::l2note::L2Note>,
+}
+
+impl StepReview {
+    /// The review's text: [`crate::annulet_review::render`] over these bytes.
+    pub fn render(&self) -> Result<String, String> {
+        crate::annulet_review::render(&self.review, &self.intent, &self.signing, &self.signing, &self.outputs)
+    }
 }
 
 /// One step of a run: [`spend_v2`] (local), or the remote-prove path —
@@ -634,6 +698,7 @@ fn step_v2<E: Endpoint>(
     run: &mut AuthRun,
     served: &Served<E>,
     proving: &mut Proving<'_>,
+    plan: &crate::annulet_plan::SendPlan,
     step: usize,
     price: Option<u64>,
     shape: L2ShapeTag,
@@ -655,7 +720,49 @@ fn step_v2<E: Endpoint>(
     let payee = crate::annulet_send::recipient_of(&rr.prover.payee)
         .ok_or_else(|| SendRefusal::Auth("the pinned payee has no valid encapsulation key".into()))?;
     let third = Out { to: payee, value: price, asset: 0 };
-    let prepared = prepare_v2_paying(w, run, served, shape, spend, outs, fee, [ctx, &PolicyContext::default()], &third, rng)?;
+    let b = &rr.basis;
+    let review = crate::annulet_review::step_review(
+        plan,
+        step,
+        b.to_rkm,
+        b.own_rkm,
+        b.to_short.clone(),
+        b.spends_verified,
+        b.names.clone(),
+        Some(b.prover.clone()),
+    );
+    let prepared = {
+        let hook = &mut *rr.review;
+        let mut gate = |intent: &qlab_remote_auth::annulet::AnnuletIntent,
+                        signing: &[u8],
+                        outputs: &[qlab_note::l2note::L2Note]|
+         -> Result<(), SendRefusal> {
+            let sr = StepReview { review: review.clone(), intent: intent.clone(), signing: signing.to_vec(), outputs: outputs.to_vec() };
+            if hook(step, &sr) {
+                Ok(())
+            } else {
+                Err(SendRefusal::Auth(format!(
+                    "step {} of {} refused at review: nothing was signed, recorded or uploaded; the authorizations it took stay used",
+                    step + 1,
+                    plan.steps.len()
+                )))
+            }
+        };
+        prepare_v2_with(
+            w,
+            run,
+            served,
+            shape,
+            spend,
+            outs,
+            fee,
+            [ctx, &PolicyContext::default()],
+            [VPublic::NONE; 2],
+            Some(&third),
+            Some(&mut gate),
+            rng,
+        )?
+    };
     let bytes = prepared.bundle.encode();
     let key = *prepared
         .bundle
@@ -762,7 +869,7 @@ pub fn run_plan_v2<E: Endpoint>(
                         Out { to: own.clone(), value: *tariff, asset: 0 },
                         Out { to: own.clone(), value: st.outputs[1], asset: 0 },
                     ];
-                    step_v2(w, run, served, proving, i, price, L2ShapeTag::S, V2Spend::One(&src), &outs, s_tier, &ctx, rng)?
+                    step_v2(w, run, served, proving, plan, i, price, L2ShapeTag::S, V2Spend::One(&src), &outs, s_tier, &ctx, rng)?
                 }
                 StepKind::Merge { inputs, fee } => {
                     let (x, y, f) = (owned(&made, &inputs[0]), owned(&made, &inputs[1]), owned(&made, fee));
@@ -770,7 +877,7 @@ pub fn run_plan_v2<E: Endpoint>(
                         Out { to: own.clone(), value: st.outputs[0], asset: a },
                         Out { to: own.clone(), value: 0, asset: a },
                     ];
-                    step_v2(w, run, served, proving, i, price, st.shape, V2Spend::TwoAndFee([&x, &y], &f), &outs, st.fee, &ctx, rng)?
+                    step_v2(w, run, served, proving, plan, i, price, st.shape, V2Spend::TwoAndFee([&x, &y], &f), &outs, st.fee, &ctx, rng)?
                 }
                 StepKind::Pay { inputs, fee } => {
                     let ins: Vec<OwnedL2Note> = inputs.iter().map(|x| owned(&made, x)).collect();
@@ -779,14 +886,14 @@ pub fn run_plan_v2<E: Endpoint>(
                         Out { to: change.clone(), value: st.outputs[1], asset: a },
                     ];
                     match (fee, ins.as_slice()) {
-                        (None, [one]) => step_v2(w, run, served, proving, i, price, L2ShapeTag::S, V2Spend::One(one), &outs, st.fee, &ctx, rng)?,
+                        (None, [one]) => step_v2(w, run, served, proving, plan, i, price, L2ShapeTag::S, V2Spend::One(one), &outs, st.fee, &ctx, rng)?,
                         (Some(fee), [one]) => {
                             let f = owned(&made, fee);
-                            step_v2(w, run, served, proving, i, price, st.shape, V2Spend::Two([one, &f]), &outs, st.fee, &ctx, rng)?
+                            step_v2(w, run, served, proving, plan, i, price, st.shape, V2Spend::Two([one, &f]), &outs, st.fee, &ctx, rng)?
                         }
                         (Some(fee), [x, y]) => {
                             let f = owned(&made, fee);
-                            step_v2(w, run, served, proving, i, price, st.shape, V2Spend::TwoAndFee([x, y], &f), &outs, st.fee, &ctx, rng)?
+                            step_v2(w, run, served, proving, plan, i, price, st.shape, V2Spend::TwoAndFee([x, y], &f), &outs, st.fee, &ctx, rng)?
                         }
                         _ => unreachable!("a payment is planned with one or two inputs"),
                     }
