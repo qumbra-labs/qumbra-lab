@@ -10,8 +10,9 @@
 //! hostile service can neither redirect nor reprice; the advertised price
 //! (≤ the maximum) is what is paid, and the review shows it every time.
 //!
-//! **Production pins** ([`PINS`]): none yet — the format-34 network has no
-//! genesis; the cut-over runbook adds its pin and releases the kernel.
+//! **Production pins** ([`PINS`]): none yet. Format 34 is frozen
+//! (docs/annulet-format-34-freeze.md) but its production genesis is not
+//! minted; the cut-over runbook adds the pin and releases the kernel.
 //!
 //! **Fixture pins** ([`pin_fixture`]): behind the `fixture-pins` feature,
 //! which only test builds enable (`qumbra-ffi`'s dev-dependency; resolver 2
@@ -31,7 +32,8 @@ pub struct ProverPin {
 }
 
 /// The production pins: `(genesis hash, payee address, max S, max P)`.
-/// Empty until the format-34 genesis exists (lab #937 cut-over).
+/// Empty until the format-34 production genesis is minted — the cut-over,
+/// not the freeze (docs/annulet-format-34-freeze.md, "Not frozen here").
 pub const PINS: &[([u8; 32], &str, u64, u64)] = &[];
 
 /// Whether this build carries the fixture-pin registry — `false` in every
