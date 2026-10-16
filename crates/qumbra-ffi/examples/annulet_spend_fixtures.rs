@@ -5,7 +5,8 @@
 //! JavaScript over its wasm build. This example RECORDS the native run of the
 //! same calls — the scan that yields the basis, the spend's served reads,
 //! the take, the intent, the review, the signature — against qumbra-wallet's
-//! fixture `Endpoint` on a format-33 genesis, every path the kernel asked in
+//! fixture `Endpoint` on a format-33 genesis (and, for the v3_* cases, on
+//! format-34 genesis files), every path the kernel asked in
 //! order with its exact answer. ML-DSA signing is deterministic and every
 //! random input is host-given, so the harness, replaying the transcripts
 //! through its wasm build with the same inputs, must reproduce **the same
@@ -41,6 +42,20 @@
 //!                                  same wallet's scan naming [0] alone, and
 //!                                  case.json's scan_only_g0 its basis (which
 //!                                  must miss that note)
+//!   <out>/v3_*/                    lab #937 cut-over (D-C6): format-34 spends
+//!                                  that pay a fixture prover, each on its own
+//!                                  chain (case.json `genesis`): v3_s_asset0,
+//!                                  v3_p_usdt, v3_fee_bank, v3_split (step 1 of
+//!                                  2). Each one's shape, output 3 and review
+//!                                  lines are asserted, not only named.
+//!   <out>/v3_*/info.json           the /info bytes the kernel admits before the
+//!                                  first step: an admit-equivalent SUBSET of a
+//!                                  format-34 service's answer (no shapes,
+//!                                  d_auth, slot_secs, …), not its bytes
+//!   <out>/v3_not_pinned/           the same on a net with no pin: the
+//!                                  NotPinned refusal a release kernel replays
+//!   manifest.json `prover_pin`     what the harness kernel registers per v3_*
+//!                                  genesis (qmb_harness_pin_fixture)
 //!   <out>/SHA256SUMS               every file above, `sha256sum -c` form
 //!
 //! Run (a named local run, no prove):
@@ -61,7 +76,7 @@ use qumbra_ffi::spend_v2::{
     qmb_auth_check_supply_err, qmb_auth_first_new, qmb_auth_open_next, qmb_auth_restore_new, qmb_spend_basis_free,
     qmb_auth_journal_summary, qmb_spend_basis_summary, AuthHandle, SpendBasis,
     qmb_auth_free, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_v2_free, qmb_spend_v2_intent,
-    qmb_spend_v2_new, qmb_spend_v2_step, qmb_spend_v2_supply, qmb_spend_v2_supply_err,
+    qmb_spend_v2_new, qmb_spend_v2_prover, qmb_spend_v2_step, qmb_spend_v2_supply, qmb_spend_v2_supply_err,
 };
 use qumbra_ffi::{qmb_dealloc, qmb_string_free, qmb_wallet_free, qmb_wallet_from_entropy};
 use qumbra_wallet::auth_journal::{generation_root, AuthJournal, GenState, Generation};
@@ -71,6 +86,12 @@ use serde_json::{json, Value};
 
 const SEED: u8 = 0x4B;
 const PAYEE: u8 = 0x4C;
+/// Lab #937 cut-over (D-C6): the fixture prover's payee wallet.
+const PROVER: u8 = 0x4D;
+/// The fixture prover's pinned maximum and its advertised price (D-C2's
+/// shape: the maximum S 2 / P 4, the price S 1 / P 2).
+const PIN_MAX: (u64, u64) = (2, 4);
+const PRICE: (u64, u64) = (1, 2);
 const RNG: [u8; 32] = [0x59; 32];
 const SPEND_SEED: [u8; 32] = [0x5A; 32];
 const DUMMIES: [u8; 64] = [0x5B; 64];
@@ -146,6 +167,62 @@ fn journal_of(g0: GenState) -> String {
     ];
     let _ = std::fs::remove_dir_all(&w.dir);
     AuthJournal::from_generations(gens).unwrap().to_text()
+}
+
+/// Lab #937 cut-over (D-C6): the fixture prover's payee — a third
+/// wallet's version-2 address 0.
+fn prover_address() -> qlab_wallet::address::Address {
+    let p = wallet_dir("spend_fixtures_prover", PROVER);
+    let pw = p.wallet();
+    let a = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0));
+    let _ = std::fs::remove_dir_all(&p.dir);
+    a
+}
+
+/// A **format-34** fixture chain (no blocks after genesis): the payer's v2
+/// address 0 holds the genesis 1,000,000 USDT-test and `notes(a2)`. With
+/// `pin`, this net's prover is pinned in this process's fixture registry —
+/// what the harness kernel's `qmb_harness_pin_fixture` does from the
+/// manifest's `prover_pin`.
+fn chain_v3(tag: &str, notes: impl Fn(&qlab_wallet::address::Address) -> Vec<qlab_note::l2note::L2Note>, pin: bool) -> (Endpoint, String, String) {
+    let w = wallet_dir(tag, SEED);
+    let wallet = w.wallet();
+    let root = generation_root(&wallet, 0);
+    let a2 = wallet.address_candidate_a_at_index(0, &root);
+    let file = genesis_v3(&a2, notes(&a2));
+    assert_eq!(file.format_version, 34);
+    if pin {
+        qumbra_wallet::prover_pins::pin_fixture(
+            file.hash(),
+            qumbra_wallet::prover_pins::ProverPin {
+                payee: prover_address().encode(),
+                max_price: qumbra_wallet::annulet_plan::ProverPrice { s: PIN_MAX.0, p: PIN_MAX.1 },
+            },
+        );
+    }
+    let ep = Endpoint::new(file, &[], None, Lie::None);
+    let _ = std::fs::remove_dir_all(&w.dir);
+    let p = wallet_dir(&format!("{tag}_payee"), PAYEE);
+    let pw = p.wallet();
+    let payee = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0)).encode();
+    let _ = std::fs::remove_dir_all(&p.dir);
+    (ep, payee, AuthJournal::fresh(root).to_text())
+}
+
+/// The prover service's `/v2/annulet/info` for `ep`'s net, as a format-34
+/// service answers it (the fields `prover_pins::admit` reads, and the rest).
+fn prover_info(ep: &Endpoint) -> Vec<u8> {
+    json!({
+        "protocol_version": 1,
+        "genesis_format": 34,
+        "genesis_hash": hex(&ep.file.hash()),
+        "fee_asset": 0,
+        "price": { "S": PRICE.0, "P": PRICE.1 },
+        "payee": prover_address().encode(),
+        "recommended_valid_for_blocks": VALID_FOR,
+    })
+    .to_string()
+    .into_bytes()
 }
 
 /// (bytes, signature) of a TEST-signed list naming USDT-test on `genesis`
@@ -321,6 +398,7 @@ unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&s
 }
 
 /// One whole spend through the ABI, recorded into `dir`.
+#[allow(clippy::too_many_arguments)]
 unsafe fn case(
     dir: &Path,
     ep: &Endpoint,
@@ -329,6 +407,7 @@ unsafe fn case(
     asset: u16,
     amount: u64,
     list: Option<&(Vec<u8>, Vec<u8>)>,
+    prover: Option<&[u8]>,
 ) -> Value {
     std::fs::create_dir_all(dir.join("spend")).unwrap();
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
@@ -341,6 +420,12 @@ unsafe fn case(
     let to = CString::new(payee).unwrap();
     let sp = qmb_spend_v2_new(basis, to.as_ptr(), asset, amount, VALID_FOR, SPEND_SEED.as_ptr(), DUMMIES.as_ptr(), &mut err);
     assert!(!sp.is_null(), "{}", take_str(err));
+    // Lab #937 cut-over (D-C6): a format-34 spend pays its prover — the
+    // service's /info bytes, as the host fetched them, before the first step.
+    if let Some(info) = prover {
+        std::fs::write(dir.join("info.json"), info).unwrap();
+        assert_eq!(qmb_spend_v2_prover(sp, info.as_ptr(), info.len(), &mut err), 0, "{}", take_str(err));
+    }
     let mut spend = Vec::new();
     loop {
         let mut out: *mut c_char = ptr::null_mut();
@@ -384,6 +469,8 @@ unsafe fn case(
     json!({
         "request": { "to": payee, "asset": asset, "amount": amount.to_string(), "valid_for": VALID_FOR },
         "list": list.map(|_| json!({ "bytes": "list.json", "sig": "list.sig" })),
+        "genesis": hex(&ep.file.hash()),
+        "prover": prover.map(|_| json!({ "info": "info.json" })),
         "scan": scan,
         "auth": opened.transcript,
         "auth_status": opened.status,
@@ -451,7 +538,7 @@ fn main() {
     for (name, asset, amount, list) in [("s_asset0", 0u16, 10u64, None), ("p_usdt", USDT as u16, 1_000, Some(&usdt_list))] {
         let dir = out.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let c = unsafe { case(&dir, &ep, &payee, &journal, asset, amount, list) };
+        let c = unsafe { case(&dir, &ep, &payee, &journal, asset, amount, list, None) };
         std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
         println!("{name:<10} {} scan + {} spend reads → bundle {} B", c["scan"].as_array().unwrap().len(), c["spend"].as_array().unwrap().len(), c["bundle_len"]);
         cases.insert(name.into(), json!(name));
@@ -593,10 +680,89 @@ fn main() {
         qmb_wallet_free(born);
         cases.insert("first_fresh".into(), json!("first_fresh (varies run to run: entropy drawn by the kernel)"));
     }
+    // Lab #937 cut-over (D-C6): format-34 spends that pay the fixture prover.
+    // Each case is its own chain (its own genesis, in case.json); the harness
+    // kernel registers the manifest's `prover_pin` for each before replaying.
+    let mut v3_genesis = Vec::new();
+    use qlab_devnet::annulet::L2ShapeTag;
+    for (name, notes, asset, amount, shape, want, what) in [
+        ("v3_s_asset0", vec![(50u64, 0u64, 30u64)], 0u16, 10u64, L2ShapeTag::S, "step 1 of 1: the payment", "S: one asset-0 note pays 10 + the S tier + the S price"),
+        ("v3_p_usdt", vec![(4, 0, 40)], USDT as u16, 1_000, L2ShapeTag::P, "step 1 of 1: the payment", "P: the asset-0 row's exact note is the P tier + the P price"),
+        ("v3_fee_bank", vec![(500, USDT, 60), (4, 0, 40)], USDT as u16, 1_000_200, L2ShapeTag::P, "step 1 of 1: the payment", "P: two USDT notes and the exact fee note in slot 3; output 3 rides the fee bank"),
+        ("v3_split", vec![(50, 0, 30)], USDT as u16, 1_000, L2ShapeTag::S, "step 1 of 2: a fee-split", "step 1 of 2: a fee split, paying its own S price"),
+    ] {
+        let dir = out.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cep, cpayee, cjournal) =
+            chain_v3(&format!("spend_fixtures_{name}"), |a| notes.iter().map(|&(v, asset, k)| note_to(a, v, asset, k)).collect(), true);
+        let info = prover_info(&cep);
+        let mut c = unsafe { case(&dir, &cep, &cpayee, &cjournal, asset, amount, None, Some(&info)) };
+        // What was recorded is the shape this case names — asserted on the
+        // bundle and the review, never only stated.
+        let b = qlab_l2spend::bundle::ProvingBundle::decode(&std::fs::read(dir.join("bundle.bin")).unwrap()).unwrap();
+        let review = std::fs::read_to_string(dir.join("review.txt")).unwrap();
+        assert_eq!(b.shape(), shape, "{name}: the bundle's shape");
+        assert!(review.contains(want), "{name}: {review}");
+        let price = if shape == L2ShapeTag::S { PRICE.0 } else { PRICE.1 };
+        let wit = b.witness();
+        assert_eq!(wit.outputs.len(), 3, "{name}: three outputs");
+        let o3 = &wit.outputs[2];
+        assert_eq!((o3.value, o3.asset, o3.rkm), (price, 0, prover_address().rkm_lanes()), "{name}: output 3 pays the prover");
+        assert!(review.contains(&format!("prover fee: {price} fee unit")), "{name}: {review}");
+        if name == "v3_fee_bank" {
+            assert_eq!([wit.inputs[0].asset, wit.inputs[1].asset], [USDT, USDT], "{name}: no asset-0 row");
+            match &wit.fee_slot {
+                qlab_air::l2::FeeSlotV2::Exact { input, .. } => {
+                    assert_eq!(input.value, 2 + PRICE.1, "{name}: slot 3 is the P tier + the P price")
+                }
+                qlab_air::l2::FeeSlotV2::Dummy { .. } => panic!("{name}: slot 3 is the exact fee note"),
+            }
+        }
+        if name == "v3_split" {
+            assert!(review.contains("this plan from here: 2 transactions"), "{name}: {review}");
+        }
+        c["what"] = json!(what);
+        std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        println!("{name:<14} {} scan + {} spend reads → bundle {} B (pays its prover)", c["scan"].as_array().unwrap().len(), c["spend"].as_array().unwrap().len(), c["bundle_len"]);
+        v3_genesis.push(json!({ "case": name, "genesis": hex(&cep.file.hash()) }));
+        cases.insert(name.into(), json!(name));
+    }
+    // What a RELEASE kernel replays: a format-34 net with no pin — the
+    // prover's /info is refused by name (`NotPinned`), before any step.
+    unsafe {
+        let name = "v3_not_pinned";
+        let dir = out.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cep, cpayee, _) = chain_v3("spend_fixtures_v3_not_pinned", |a| vec![note_to(a, 51, 0, 31)], false);
+        let info = prover_info(&cep);
+        std::fs::write(dir.join("info.json"), &info).unwrap();
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let (basis, scan) = scan_basis(&dir, w, &cep, None, &[0]);
+        let to = CString::new(cpayee.as_str()).unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let sp = qmb_spend_v2_new(basis, to.as_ptr(), 0, 10, VALID_FOR, SPEND_SEED.as_ptr(), DUMMIES.as_ptr(), &mut err);
+        assert!(!sp.is_null(), "{}", take_str(err));
+        assert_eq!(qmb_spend_v2_prover(sp, info.as_ptr(), info.len(), &mut err), -1, "no pin: refused");
+        let refusal = take_str(err);
+        assert!(refusal.contains("no prover is pinned for this network"), "{refusal}");
+        qmb_spend_v2_free(sp);
+        qmb_wallet_free(w);
+        let c = json!({
+            "what": "a format-34 net with no prover pin: what a release kernel refuses (NotPinned), before any step",
+            "genesis": hex(&cep.file.hash()),
+            "request": { "to": cpayee, "asset": 0, "amount": "10", "valid_for": VALID_FOR },
+            "scan": scan,
+            "prover": { "info": "info.json" },
+            "prover_refusal": refusal,
+        });
+        std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        println!("{name:<14} refused: {}", c["prover_refusal"]);
+        cases.insert(name.into(), json!(name));
+    }
     // The seeds below are PUBLIC TEST CONSTANTS of this fixture, written so the
     // harness can replay the run — never a real wallet's, never to fund one.
     let manifest = json!({
-        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance / rotated receive) on a format-33 genesis. FIXTURE seeds only.",
+        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance / rotated receive) on a format-33 genesis; and (lab #937 cut-over, D-C6) format-34 spends that pay a fixture prover (v3_*), each on its own chain, plus the NotPinned refusal a release kernel replays. FIXTURE seeds only.",
         "lab_rev": rev,
         "wallet_entropy": hex(&[SEED; 32]),
         "payee_entropy": hex(&[PAYEE; 32]),
@@ -606,6 +772,14 @@ fn main() {
         "dummy_entropy": hex(&DUMMIES),
         "indices": [0, 1],
         "list_key": hex(&qumbra_wallet::asset_view::test_list_key::encoded()),
+        "prover_pin": {
+            "what": "register for each v3_* genesis below with qmb_harness_pin_fixture (the harness kernel only) before replaying it; v3_not_pinned is replayed WITHOUT it",
+            "payee": prover_address().encode(),
+            "max_s": PIN_MAX.0,
+            "max_p": PIN_MAX.1,
+            "genesis": v3_genesis,
+        },
+        "prover_price": { "S": PRICE.0, "P": PRICE.1 },
         "cases": cases,
     });
     std::fs::write(out.join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();

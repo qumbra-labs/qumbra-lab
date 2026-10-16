@@ -72,10 +72,12 @@ use crate::{out_string, set_err, WalletState};
 // Lab #937 PR D: the fixture-pin registry is a test-only feature
 // (`qumbra-wallet/fixture-pins`, reached through this crate's dev-dependency
 // alone); a wasm32 build that unified it on would let a host-side caller pin
-// its own prover. Checked at compile time, as `PROVER_LINKED` below.
+// its own prover. Checked at compile time, as `PROVER_LINKED` below. The one
+// exception is the harness-only artifact (`harness-pins`, lab #937 D-C6),
+// built under its own name and refused by the packager.
 #[cfg(target_arch = "wasm32")]
 const _: () = assert!(
-    !qumbra_wallet::prover_pins::FIXTURE_PINS,
+    !qumbra_wallet::prover_pins::FIXTURE_PINS || cfg!(feature = "harness-pins"),
     "qumbra-wallet's `fixture-pins` (the test prover pins) reached a wasm32 build of qumbra-ffi"
 );
 

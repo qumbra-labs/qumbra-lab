@@ -144,6 +144,8 @@ jobs:
           rustup target add wasm32-unknown-unknown
           RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-wallet --no-default-features --target wasm32-unknown-unknown --locked
           RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-ffi --target wasm32-unknown-unknown --locked
+          # lab #937 cut-over (D-C6): the harness-only kernel (never packaged) stays buildable too
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-ffi --features harness-pins --target wasm32-unknown-unknown --locked
 
       # lab #858 WA2: the TEST list signer (qumbra-wallet's `test-support`)
       # must not reach qumbra-ffi's release graph — native/iOS here; wasm32 is

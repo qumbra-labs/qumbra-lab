@@ -1385,7 +1385,7 @@ fn w_no_test_feature_is_in_the_release_feature_tree() {
     };
     let release = tree("normal,build,features");
     assert!(release.contains("qumbra-wallet feature \"verify\""), "the probe reads the feature tree: {release}");
-    for test_only in ["\"fixture-pins\"", "\"test-support\""] {
+    for test_only in ["\"fixture-pins\"", "\"test-support\"", "\"harness-pins\""] {
         assert!(!release.contains(test_only), "{test_only} is in qumbra-ffi's release feature tree");
     }
     // The probe can see them: through the dev edges, both are there.

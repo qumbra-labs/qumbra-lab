@@ -26,6 +26,9 @@ pub mod names;
 pub mod pairing;
 pub mod report;
 pub mod spend_v2;
+/// Lab #937 cut-over (D-C6): the harness-only pin export — never packaged.
+#[cfg(feature = "harness-pins")]
+pub mod harness;
 // MERGED INERT (lab #568 step 2): the resume artifact's codec and its tests.
 // Nothing consumes it yet — the `qmb_scan_*` resume arguments are step 3, and
 // they remove this attribute. Landing the codec alone is deliberate, the shape
