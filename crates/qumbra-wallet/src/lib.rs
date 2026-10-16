@@ -151,6 +151,9 @@ pub mod annulet_review;
 /// The open-time check of a Candidate A journal (lab #937 cut-over: moved from qumbra-ffi).
 #[cfg(feature = "verify")]
 pub mod auth_check;
+/// The remote-prove client (lab #937 cut-over, D-C7/D-C8): the Rust twin of the extension's.
+#[cfg(feature = "verify")]
+pub mod remote_prover;
 #[cfg(feature = "prove")]
 pub mod annulet_send;
 /// Lab #896 G: Candidate A sends (v2 shapes, the wallet's own signatures).

@@ -506,6 +506,25 @@ fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 trait ReadWrite: std::io::Read + std::io::Write {}
 impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 
+/// How long one TCP connect may take (lab #937 cut-over): reads and writes
+/// were bounded by [`REQUEST_TIMEOUT`], the connect itself was the OS's (a
+/// minute or more against an address that drops SYNs).
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `TcpStream::connect` over every address `dial` resolves to, in order,
+/// each bounded by [`CONNECT_TIMEOUT`]; the last failure if none answers.
+fn connect_bounded(dial: &str) -> std::io::Result<std::net::TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = None;
+    for addr in dial.to_socket_addrs()? {
+        match std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{dial} resolves to no address"))))
+}
+
 /// **The connect seam.** Everything scheme-dependent in this module is here;
 /// both verbs above it are written once, against a stream.
 ///
@@ -513,7 +532,7 @@ impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
 /// authority from the URL a second time.
 fn connect(base_url: &str) -> std::io::Result<(Box<dyn ReadWrite>, String)> {
     let ep = endpoint_of(base_url)?;
-    let tcp = std::net::TcpStream::connect(&ep.dial)?;
+    let tcp = connect_bounded(&ep.dial)?;
     tcp.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     tcp.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     match ep.sni {
@@ -761,6 +780,37 @@ pub fn http_post_bytes(base_url: &str, path: &str, body: &[u8]) -> std::io::Resu
     stream.flush()?;
 
     read_response(stream.as_mut())
+}
+
+/// Lab #937 cut-over (D-C7): one request of `method` to `path`, answered as
+/// `(status, body)` with **every status a payload** — the prover service
+/// refuses by name in a JSON body on its 4xx/5xx, which a non-200-is-an-error
+/// GET would discard. `body`, when given, goes as `application/octet-stream`.
+/// The whole response is read bounded by `max_bytes`.
+pub fn http_call(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    max_bytes: usize,
+) -> std::io::Result<(u16, Vec<u8>)> {
+    use std::io::Write;
+
+    let (mut stream, host) = connect(base_url)?;
+    let head = match body {
+        Some(b) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/octet-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            b.len()
+        ),
+        None => format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+    };
+    stream.write_all(head.as_bytes())?;
+    if let Some(b) = body {
+        stream.write_all(b)?;
+    }
+    stream.flush()?;
+    read_response_limited(stream.as_mut(), Some(max_bytes))
 }
 
 #[cfg(test)]

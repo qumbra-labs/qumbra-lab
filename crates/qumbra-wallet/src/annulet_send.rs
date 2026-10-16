@@ -405,7 +405,8 @@ pub fn send_annulet<E: Endpoint>(
             return Err(SendRefusal::PlanDeclined);
         }
         let made = crate::annulet_v2::run_plan_v2(
-            w, &mut run, &session, &plan, &recipient, &change, freeze_keys, split_wait, rng,
+            w, &mut run, &session, &plan, &recipient, &change, freeze_keys, split_wait,
+            &mut crate::annulet_v2::Proving::Local, rng,
         )?;
         let split_fee_note = plan
             .steps
@@ -435,6 +436,105 @@ pub fn send_annulet<E: Endpoint>(
         .map(|i| made[i].0[0]);
     let (outputs, shape) = *made.last().expect("a plan ends in its payment");
     Ok(SendReport { plan, split_fee_note, outputs, shape })
+}
+
+/// What a remote-proved send did (lab #937 cut-over, D-C7).
+pub struct RemoteSendReport {
+    pub plan: SendPlan,
+    /// The admitted prover's price, fixed for the whole send.
+    pub price: crate::annulet_plan::ProverPrice,
+    /// The payment's notes: `[to the recipient, change to this wallet]`.
+    pub outputs: [qlab_note::l2note::L2Note; 2],
+    pub shape: L2ShapeTag,
+    /// The transaction id the service submitted for each step, in plan order.
+    pub tx_ids: Vec<[u8; 32]>,
+}
+
+/// The remote prover a send hands its bundles to, and the hooks it reports to.
+pub struct RemoteHooks<'a> {
+    pub transport: &'a mut dyn crate::remote_prover::ProverTransport,
+    pub sleep: &'a mut dyn FnMut(Duration),
+    pub events: &'a mut dyn FnMut(usize, crate::remote_prover::Event),
+}
+
+/// **The remote-proved send** (lab #937 cut-over, D-C7): [`send_annulet`]'s
+/// Candidate A path on a **format-34** net, every step proved by a prover
+/// service that is paid in the step itself. The service's raw
+/// `/v2/annulet/info` is admitted against this network's pin
+/// ([`crate::prover_pins::admit`]: payee by `rkm`, asset 0, each price ≤
+/// the pinned maximum) **before** anything is planned; the plan pays the
+/// admitted price on every step (`plan_send_paying`) and is shown with it
+/// (`on_plan`); then each step's bundle is signed, recorded before upload,
+/// handed to the service and followed until it is submitted (D-C8's retry
+/// table, [`crate::remote_prover::prove_remote`]). The service submits —
+/// this process never does.
+#[allow(clippy::too_many_arguments)]
+pub fn send_annulet_remote<E: Endpoint>(
+    w: &WalletDir,
+    endpoint: E,
+    asset: u16,
+    amount: u64,
+    to: &Address,
+    scan_to: u64,
+    pin: [u8; 32],
+    freeze_keys: &[[u64; 4]],
+    split_wait: Duration,
+    remote: RemoteHooks<'_>,
+    on_plan: &mut dyn FnMut(&SendPlan, &crate::prover_pins::AdmittedProver) -> bool,
+    rng: &mut StdRng,
+) -> Result<RemoteSendReport, SendRefusal> {
+    let session = open_session(w, endpoint, scan_to, Some(pin), rng)?;
+    if session.l2_auth.sp_outputs() != 3 {
+        return Err(SendRefusal::Auth(
+            "this net is not format 34: its spends carry no third output, so no prover is paid in them".into(),
+        ));
+    }
+    let RemoteHooks { transport, sleep, events } = remote;
+    let info = crate::remote_prover::info(&mut *transport).map_err(SendRefusal::Auth)?;
+    let admitted = crate::prover_pins::admit(&info, &session.genesis_hash).map_err(|e| SendRefusal::Auth(e.to_string()))?;
+    let slot_secs = crate::remote_prover::slot_secs_of(&info).map_err(SendRefusal::Auth)?;
+    let leaf = session.served.registry(u64::from(asset))?.leaf;
+    let shape = shape_for(&leaf);
+    to.require_version(qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A).map_err(|e| SendRefusal::Auth(e.to_string()))?;
+    let recipient = recipient_of(to).ok_or(SendRefusal::Spend(SpendError::Served("the recipient address has no valid ek".into())))?;
+    let wallet = w.wallet();
+    let mut run = crate::annulet_v2::AuthRun::open(w, &session, crate::annulet_v2::valid_for())?;
+    let change = crate::annulet_v2::me_v2(&wallet, &run.auth_root());
+    if shape == L2ShapeTag::P && qlab_air::l2p::CanonicalFreezeTree::from_keys(freeze_keys).is_frozen(&change.rkm) {
+        return Err(SendRefusal::Spend(SpendError::Frozen { asset: u64::from(asset) }));
+    }
+    let index = session.index.only_generation(run.generation);
+    let plan = crate::annulet_plan::plan_send_paying(&index, asset, amount, shape, session.tiers, Some(admitted.price))
+        .map_err(SendRefusal::from)?;
+    let notes = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
+    run.check_budget(crate::annulet_v2::plan_slots(&plan), Some(notes))?;
+    if !on_plan(&plan, &admitted) {
+        return Err(SendRefusal::PlanDeclined);
+    }
+    let price = admitted.price;
+    let deadline = crate::remote_prover::Deadline::new(
+        run.valid_until,
+        session.tip,
+        slot_secs,
+        std::time::Instant::now(),
+    );
+    let mut proving = crate::annulet_v2::Proving::Remote(crate::annulet_v2::RemoteRun {
+        prover: admitted,
+        transport,
+        sleep,
+        events,
+        submitted: Vec::new(),
+        deadline,
+    });
+    let made = crate::annulet_v2::run_plan_v2(
+        w, &mut run, &session, &plan, &recipient, &change, freeze_keys, split_wait, &mut proving, rng,
+    )?;
+    let tx_ids = match proving {
+        crate::annulet_v2::Proving::Remote(rr) => rr.submitted,
+        crate::annulet_v2::Proving::Local => unreachable!("this send is remote-proved"),
+    };
+    let (last, shape) = made.last().expect("a plan ends in its payment");
+    Ok(RemoteSendReport { plan, price, outputs: [last[0], last[1]], shape: *shape, tx_ids })
 }
 
 /// Run `plan` round by round: build, prove and submit each step, then wait
