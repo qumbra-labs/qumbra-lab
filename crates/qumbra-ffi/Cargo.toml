@@ -78,6 +78,14 @@ qlab-air = { path = "../qlab-air" }
 qlab-remote-auth = { path = "../qlab-remote-auth" }
 zeroize = "1.9"
 
+[features]
+# Lab #937 cut-over (D-C6): the HARNESS-ONLY kernel — `src/harness.rs`'s
+# `qmb_harness_pin_fixture` over qumbra-wallet's fixture-pin registry, so a
+# shell's harness can replay a paid format-34 spend on a fixture chain. Never
+# default, never packaged: built only by scripts/build-harness-wasm.sh under
+# its own name; a packager refuses any artifact naming `qmb_harness_`.
+harness-pins = ["qumbra-wallet/fixture-pins"]
+
 # wasm32 (the browser-extension shell): getrandom needs the JS backend wired
 # explicitly (crypto.getRandomValues). Build with
 #   RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
