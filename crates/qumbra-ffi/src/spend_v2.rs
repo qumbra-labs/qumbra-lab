@@ -52,7 +52,6 @@ use qlab_l2spend::bundle::ProvingBundle;
 use qlab_l2spend::v2::{attach, intent_for, prepare_p_v2, prepare_s_v2, sign_locally, FeeIn, LocalAuth, PreparedV2};
 use qlab_l2spend::{shape_for, Endpoint, Out, PolicyContext, Recipient, Served};
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
-use qlab_note::hash::digest_bytes;
 use qlab_remote_auth::annulet::AnnuletIntent;
 use qlab_remote_auth::mldsa;
 use qlab_wallet::Wallet;
@@ -60,9 +59,10 @@ use qumbra_wallet::annulet_plan::{
     plan_send_paying, plan_slots, real_input, ProverPrice, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA,
 };
 use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
-use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, label_of, render_amount, AssetLabel, AssetList};
-use qumbra_wallet::annulet_landed::{bind_body, landed_in, landed_next_with, restore_generations_with, GenTree, LandedByGeneration};
-use qumbra_wallet::auth_journal::{AuthJournal, GenState, JournalError, SweepGate};
+use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, label_of, AssetList};
+use qumbra_wallet::annulet_review::{leaf_refusal_text, short, Names, Review};
+use qumbra_wallet::auth_check::{AuthCheck, CheckBasis, CheckStep};
+use qumbra_wallet::auth_journal::{AuthJournal, GenState, SweepGate};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use zeroize::Zeroize;
@@ -144,38 +144,13 @@ impl SpendBasis {
 
     /// The list, if it is this network's.
     fn own_list(&self) -> Option<&AssetList> {
-        self.list.as_ref().filter(|l| l.genesis == self.genesis_hash)
+        qumbra_wallet::annulet_review::own_list(self.list.as_ref(), &self.genesis_hash)
     }
 
     /// The review's line naming the list (its short id) or its absence.
     fn list_line(&self) -> String {
-        match (&self.list, self.own_list()) {
-            (_, Some(l)) => format!(
-                "asset list: {} {}, signed by {}{}",
-                l.network,
-                short(&l.digest),
-                short(&l.signer),
-                if l.testnet { " — a test network: test money" } else { "" }
-            ),
-            (Some(l), None) => format!("asset list: for another network ({}), ignored — assets shown by id", short(&l.genesis)),
-            (None, None) => "asset list: none — every asset is unlisted; amounts in base units".to_string(),
-        }
+        qumbra_wallet::annulet_review::list_line(self.list.as_ref(), &self.genesis_hash)
     }
-}
-
-/// A leaf refusal, by name, for the review.
-fn leaf_refusal_text(e: &qumbra_wallet::asset_view::LeafRefusal) -> String {
-    use qumbra_wallet::asset_view::LeafRefusal as L;
-    match e {
-        L::Unavailable { why } => format!("the endpoint did not serve the asset's registry leaf ({why})"),
-        L::WrongAsset { got } => format!("the endpoint answered with asset {got}'s leaf"),
-        L::PathMismatch => "the endpoint's registry path does not fold to its root".into(),
-        L::NotAtVerifiedTip => "the endpoint's registry root is not the verified tip's".into(),
-    }
-}
-
-fn short(b: &[u8; 32]) -> String {
-    b[..4].iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// The basis as JSON, for the host's own display and for fixtures: the
@@ -313,31 +288,42 @@ pub const QMB_AUTH_SWEEP_WAITING: i32 = 4;
 /// fresh, active (no leaf of any probe generation has landed).
 pub const QMB_AUTH_FIRST: i32 = 5;
 
-enum CheckMode {
-    Check { g: u32, journal: AuthJournal },
-    Restore,
-    First,
-}
+// The verdicts are `qumbra_wallet::auth_check::CheckStatus` (lab #937
+// cut-over): these values are its codes.
+const _: () = {
+    use qumbra_wallet::auth_check::CheckStatus as S;
+    assert!(S::Checked.code() == QMB_AUTH_CHECKED);
+    assert!(S::JournalStale.code() == QMB_AUTH_JOURNAL_STALE);
+    assert!(S::SweepFloorRaised.code() == QMB_AUTH_SWEEP_FLOOR_RAISED);
+    assert!(S::Restored.code() == QMB_AUTH_RESTORED);
+    assert!(S::SweepWaiting.code() == QMB_AUTH_SWEEP_WAITING);
+    assert!(S::First.code() == QMB_AUTH_FIRST);
+};
 
 /// The open-time check (lab #924 PR 3b): every verified body above the
 /// journal's `checked_to` on this net, each bound to its verified header,
 /// each slot's leaf matched against the generation's own tree — "landed" is
-/// judged here, never taken from a node's nullifier list.
+/// judged here, never taken from a node's nullifier list. The judgment is
+/// `qumbra_wallet::auth_check` (lab #937 cut-over: moved there so every
+/// shell opens its keys by it); this handle is its C pump.
 pub struct CheckHandle {
-    mode: CheckMode,
-    basis: SpendBasis,
-    /// Shared with the wallet handle's cache (PR 3g): never rebuilt here.
-    trees: Vec<Arc<GenTree>>,
-    landed: LandedByGeneration,
-    at: u64,
-    asked: bool,
-    refused: Option<String>,
+    check: AuthCheck,
+}
+
+fn check_basis(b: &SpendBasis) -> CheckBasis {
+    CheckBasis {
+        genesis_hash: b.genesis_hash,
+        form: b.form,
+        chain: b.chain.clone(),
+        gate_tip: b.gate_tip,
+        owned: b.owned.clone(),
+    }
 }
 
 unsafe fn check_handle(
     w: *const WalletState,
     basis: *const SpendBasis,
-    build: impl FnOnce(&WalletState, &SpendBasis) -> Result<(CheckMode, Vec<Arc<GenTree>>, u64), String>,
+    build: impl FnOnce(&WalletState, &SpendBasis) -> Result<AuthCheck, String>,
     err_out: *mut *mut c_char,
 ) -> *mut CheckHandle {
     if !err_out.is_null() {
@@ -347,25 +333,13 @@ unsafe fn check_handle(
         set_err(err_out, "NULL argument".into());
         return ptr::null_mut();
     }
-    let b = (*basis).clone();
-    match b.form {
-        // Lab #937 PR D: format 34 (three-output spends) as format 33.
-        L2AuthForm::CandidateA | L2AuthForm::CandidateAV3 => {}
-        L2AuthForm::None => {
-            set_err(err_out, "this net is not a Candidate A net".into());
-            return ptr::null_mut();
-        }
+    let b = &*basis;
+    if let Err(e) = qumbra_wallet::auth_check::require_candidate_a(b.form) {
+        set_err(err_out, e);
+        return ptr::null_mut();
     }
-    match build(&*w, &b) {
-        Ok((mode, trees, from)) => Box::into_raw(Box::new(CheckHandle {
-            mode,
-            basis: b,
-            trees,
-            landed: LandedByGeneration::new(),
-            at: from,
-            asked: false,
-            refused: None,
-        })),
+    match build(&*w, b) {
+        Ok(check) => Box::into_raw(Box::new(CheckHandle { check })),
         Err(e) => {
             set_err(err_out, e);
             ptr::null_mut()
@@ -396,22 +370,7 @@ pub unsafe extern "C" fn qmb_auth_check_new(
         |ws, b| {
             let text = text_arg("the journal", journal_text, MAX_JOURNAL_TEXT)?;
             let journal = AuthJournal::from_text(text).map_err(|e| format!("auth.v1: {e}"))?;
-            let rec = journal.get(generation).map_err(|e| format!("auth.v1: {e}"))?;
-            // A retired generation is opened only to be revived: a note of it
-            // arrived (a published address is still paid). Without one, refused.
-            let holds = b.index.only_generation(generation).by_asset.values().any(|n| !n.spendable.is_empty());
-            if rec.state == GenState::Retired && !holds {
-                return Err(format!("generation {generation} is retired and holds nothing: nothing of it is spent again"));
-            }
-            let tree = ws.gen_tree(generation);
-            if tree.root() != rec.auth_root {
-                return Err(format!("auth.v1's root for generation {generation} is not this wallet's tree"));
-            }
-            // Beyond the verified tip (a node that rolled back, an edited
-            // backup): walk everything again — the cursor only rises.
-            let checked = journal.checked_to(generation, &b.genesis_hash);
-            let from = if checked > b.chain.tip() { 1 } else { checked.saturating_add(1) };
-            Ok((CheckMode::Check { g: generation, journal }, vec![tree], from))
+            AuthCheck::check(journal, generation, || ws.gen_tree(generation), &b.index, check_basis(b))
         },
         err_out,
     )
@@ -434,9 +393,9 @@ pub unsafe extern "C" fn qmb_auth_restore_new(
     check_handle(
         w,
         basis,
-        |ws, _| {
+        |ws, b| {
             let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g)).collect();
-            Ok((CheckMode::Restore, trees, 1))
+            Ok(AuthCheck::restore(trees, check_basis(b)))
         },
         err_out,
     )
@@ -465,9 +424,9 @@ pub unsafe extern "C" fn qmb_auth_first_new(
     check_handle(
         w,
         basis,
-        |ws, _| {
+        |ws, b| {
             let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g)).collect();
-            Ok((CheckMode::First, trees, 1))
+            Ok(AuthCheck::first(trees, check_basis(b)))
         },
         err_out,
     )
@@ -608,20 +567,21 @@ pub unsafe extern "C" fn qmb_auth_check_step(c: *mut CheckHandle, out: *mut *mut
         return -1;
     }
     *out = ptr::null_mut();
-    let c = &mut *c;
-    if let Some(why) = &c.refused {
-        *out = out_string(why.clone());
-        return -2;
-    }
-    if c.asked {
+    let c = &mut (*c).check;
+    if c.is_asking() {
         return -1;
     }
-    if c.at > c.basis.chain.tip() {
-        return 0;
+    match c.step() {
+        CheckStep::Need(path) => {
+            *out = out_string(path);
+            1
+        }
+        CheckStep::Ready => 0,
+        CheckStep::Refused(why) => {
+            *out = out_string(why);
+            -2
+        }
     }
-    c.asked = true;
-    *out = out_string(format!("/v1/block/{}/body", c.at));
-    1
 }
 
 /// Answer the outstanding NEED with the body.
@@ -640,7 +600,7 @@ pub unsafe extern "C" fn qmb_auth_check_supply(c: *mut CheckHandle, body: *const
     } else {
         Ok(std::slice::from_raw_parts(body, len))
     };
-    check_supply(&mut *c, answer);
+    (*c).check.supply(answer);
 }
 
 /// Answer the outstanding NEED with a transport failure: the check is
@@ -659,35 +619,7 @@ pub unsafe extern "C" fn qmb_auth_check_supply_err(c: *mut CheckHandle, reason: 
     } else {
         CStr::from_ptr(reason).to_string_lossy().chars().take(256).collect()
     };
-    check_supply(&mut *c, Err(why));
-}
-
-fn check_supply(c: &mut CheckHandle, answer: Result<&[u8], String>) {
-    if c.refused.is_some() {
-        return;
-    }
-    if !c.asked {
-        c.refused = Some("a response with no NEED outstanding".into());
-        return;
-    }
-    c.asked = false;
-    let h = c.at;
-    let bound = answer.map_err(|why| format!("block {h}'s body is unavailable: {why}")).and_then(|bytes| {
-        let header = c.basis.chain.header(h).ok_or_else(|| format!("height {h} is above the verified tip"))?;
-        bind_body(&header, c.basis.form, h, bytes).map_err(|e| format!("block {h}'s body {e}"))
-    });
-    match bound {
-        Ok(body) => {
-            for t in &c.trees {
-                let hits = landed_in(&t.tree, &body);
-                if !hits.is_empty() {
-                    c.landed.entry(t.g).or_default().extend(hits);
-                }
-            }
-            c.at += 1;
-        }
-        Err(why) => c.refused = Some(why),
-    }
+    (*c).check.supply(Err(why));
 }
 
 /// **Finish the check** (READY only): the keys, and the journal the shell
@@ -732,83 +664,8 @@ pub unsafe extern "C" fn qmb_auth_check_finish(
     }
     *out_journal = ptr::null_mut();
     *out_status = -1;
-    let (ws, c) = (&*w, &mut *c);
-    if let Some(why) = &c.refused {
-        set_err(err_out, why.clone());
-        return ptr::null_mut();
-    }
-    if c.asked || c.at <= c.basis.chain.tip() {
-        set_err(err_out, "finish: the check is not READY".into());
-        return ptr::null_mut();
-    }
-    let b = &c.basis;
-    let tip = b.chain.tip();
-    let gate = SweepGate {
-        genesis: b.genesis_hash,
-        not_before_height: b.gate_tip.saturating_add(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS),
-    };
-    let finished: Result<(AuthJournal, u32, i32), String> = (|| match std::mem::replace(&mut c.mode, CheckMode::Restore) {
-        CheckMode::Check { g, mut journal } => {
-            let t = &c.trees[0];
-            let floor = landed_next_with(&t.master, &t.tree, c.landed.get(&g).map_or(&[][..], |v| v.as_slice()));
-            let rec = journal.get(g).map_err(|e| e.to_string())?.clone();
-            let raised = floor > rec.next;
-            if raised {
-                journal.advance_mem(g, floor).map_err(|e| e.to_string())?;
-            }
-            journal.set_checked_mem(g, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
-            match rec.state {
-                // Older than the chain. Not opened here: this check matched
-                // only g's tree, and a later generation the lost device may
-                // have opened and used was never looked at. The raised cursor
-                // goes back to be persisted; a restore does the rest.
-                GenState::Active if raised => Ok((journal, g, QMB_AUTH_JOURNAL_STALE)),
-                GenState::Active => Ok((journal, g, QMB_AUTH_CHECKED)),
-                GenState::Sweep { .. } => match journal.sweep_allowed(g, &b.genesis_hash, b.chain.tip()) {
-                    Ok(()) => Ok((journal, g, if raised { QMB_AUTH_SWEEP_FLOOR_RAISED } else { QMB_AUTH_CHECKED })),
-                    Err(JournalError::SweepNoGate { .. }) => {
-                        journal.add_gate_mem(g, gate).map_err(|e| e.to_string())?;
-                        Ok((journal, g, QMB_AUTH_SWEEP_WAITING))
-                    }
-                    Err(JournalError::SweepNotYet { .. }) => Ok((journal, g, QMB_AUTH_SWEEP_WAITING)),
-                    Err(e) => Err(e.to_string()),
-                },
-                // Revived (the check was let in only because it holds notes):
-                // sweep-only with a new gate — waiting, no keys.
-                GenState::Retired => {
-                    journal.revive_mem(g, gate).map_err(|e| e.to_string())?;
-                    Ok((journal, g, QMB_AUTH_SWEEP_WAITING))
-                }
-            }
-        }
-        CheckMode::First => {
-            // A note at generation > 0 means an address of a generation only
-            // `open_next` makes: a journal existed.
-            if let Some(g) = b.owned.iter().filter_map(|n| n.generation).find(|g| *g > 0) {
-                return Err(format!("this seed opened generation {g} (a note is paid to it): use restore"));
-            }
-            if let Some((g, _)) = c.landed.iter().find(|(_, slots)| !slots.is_empty()) {
-                return Err(format!(
-                    "this seed has signed (a leaf of generation {g} has landed on this net): use restore"
-                ));
-            }
-            let mut journal = AuthJournal::fresh(c.trees[0].root());
-            journal.set_checked_mem(0, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
-            Ok((journal, 0, QMB_AUTH_FIRST))
-        }
-        CheckMode::Restore => {
-            let mut journal = restore_generations_with(&c.trees, &b.owned, &c.landed, &b.genesis_hash, b.gate_tip)
-                .map_err(|e| format!("restore: {e}"))?;
-            let gens: Vec<u32> = journal.generations().iter().map(|r| r.g).collect();
-            for g in gens {
-                journal.set_checked_mem(g, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
-            }
-            let active = journal.active().g;
-            Ok((journal, active, QMB_AUTH_RESTORED))
-        }
-    })();
-    c.refused = Some("this check was finished".into());
-    let (journal, g, status) = match finished {
+    let (ws, c) = (&*w, &mut (*c).check);
+    let (journal, g, status) = match c.finish() {
         Ok(x) => x,
         Err(e) => {
             set_err(err_out, e);
@@ -816,12 +673,12 @@ pub unsafe extern "C" fn qmb_auth_check_finish(
         }
     };
     *out_journal = out_string(journal.to_text());
-    *out_status = status;
-    if status == QMB_AUTH_SWEEP_WAITING {
+    *out_status = status.code();
+    if status == qumbra_wallet::auth_check::CheckStatus::SweepWaiting {
         set_err(err_out, format!("generation {g} may not sweep yet on this net: its gate is not reached"));
         return ptr::null_mut();
     }
-    if status == QMB_AUTH_JOURNAL_STALE {
+    if status == qumbra_wallet::auth_check::CheckStatus::JournalStale {
         set_err(
             err_out,
             format!(
@@ -958,67 +815,6 @@ impl Signable {
         }
         self.paths.clear();
         self.intent_bytes.zeroize();
-    }
-}
-
-#[derive(Clone)]
-struct Review {
-    step: usize,
-    steps: usize,
-    kind: &'static str,
-    /// Whom an output may pay, by `rkm`: the payee (a payment only) and
-    /// this wallet. The review states each output from its prepared note.
-    payee_rkm: Option<[u64; 4]>,
-    own_rkm: [u64; 4],
-    to_short: String,
-    spends_verified: bool,
-    names: Names,
-    /// Lab #937 PR D: the prover this step pays (format 34) — its payee's
-    /// `rkm`, its short address, and this step's price (output 3, asset 0).
-    prover: Option<([u64; 4], String, u64)>,
-    /// Lab #937 PR D: the plan from this step on — transactions, network
-    /// fees, prover fees — for the total line (a remote-proved plan of more
-    /// than one transaction).
-    plan_from_here: (usize, u64, u64),
-}
-
-/// How the review names the spend's asset (lab #924 PR 3c).
-#[derive(Clone)]
-struct Names {
-    asset: u16,
-    label: (AssetLabel, u32, String),
-    /// Why the asset's leaf could not be bound to the verified tip, by name:
-    /// an endpoint's lie is told apart from data not yet served.
-    leaf_problem: Option<String>,
-    list_line: String,
-    list_short: Option<String>,
-}
-
-impl Names {
-    /// `units` of `asset`, as the list and the bound leaf allow.
-    fn amount(&self, units: u64, asset: u64) -> String {
-        if asset == 0 {
-            return format!("{} fee unit{}", render_amount(u128::from(units), 0), if units == 1 { "" } else { "s" });
-        }
-        if asset != u64::from(self.asset) {
-            return format!("{} base units of QIA #{asset} (not this spend's asset)", render_amount(u128::from(units), 0));
-        }
-        let (label, decimals, unit) = &self.label;
-        let figure = render_amount(u128::from(units), *decimals);
-        match label {
-            AssetLabel::Listed { name, .. } => format!("{figure} {unit} ({name})"),
-            AssetLabel::IssuerChanged { listed_ticker } => format!(
-                "{figure} {unit} (listed as {listed_ticker}, but its issuer key changed: name withheld)"
-            ),
-            AssetLabel::Unconfirmed { listed_ticker } => format!(
-                "{figure} {unit} (listed as {listed_ticker}; its issuer could not be confirmed: {}; name withheld)",
-                self.leaf_problem.as_deref().unwrap_or("the leaf was not bound")
-            ),
-            AssetLabel::Unlisted | AssetLabel::FeeUnit => match &self.list_short {
-                Some(id) => format!("{figure} {unit} (not on list {id})"),
-                None => format!("{figure} {unit} (no list for this network)"),
-            },
-        }
     }
 }
 
@@ -1701,87 +1497,7 @@ pub unsafe extern "C" fn qmb_spend_v2_refusal(s: *const SpendHandle) -> *mut c_c
 /// note is checked to open the intent's commitment at that index. No leaf
 /// index, no anchor. Free with `qmb_string_free`.
 fn review_text(t: &Signable, bytes: &[u8]) -> Result<String, String> {
-    if bytes != t.intent_bytes.as_slice() {
-        return Err("these are not the bytes this spend would sign".into());
-    }
-    let i = &t.intent;
-    for (k, note) in t.prepared.outputs.iter().enumerate() {
-        if digest_bytes(&note.commitment()) != i.commitments[k] {
-            return Err(format!("output {k} does not open the intent's commitment"));
-        }
-    }
-    let r = &t.review;
-    let mut out = format!("{}\n", r.names.list_line);
-    if r.kind == "payment" {
-        out.push_str(&format!("step {} of {}: the payment\n", r.step, r.steps));
-    } else {
-        out.push_str(&format!(
-            "step {} of {}: a {} — it prepares the payment; nothing leaves this wallet\n",
-            r.step, r.steps, r.kind
-        ));
-    }
-    // Per-asset totals, by where they go — each from the prepared note that
-    // opens the intent's commitment, its `rkm` matched to the payee or to
-    // this wallet before it is named.
-    let mut to_payee: Vec<(u64, u64)> = Vec::new();
-    let mut to_self: Vec<(u64, u64)> = Vec::new();
-    // Lab #937 PR D: a format-34 step's third output pays the prover —
-    // checked here against the admitted payee and this step's price, and
-    // named on its own line below.
-    let mut prover_line = None;
-    for (k, note) in t.prepared.outputs.iter().enumerate() {
-        if k == 2 {
-            if let Some((rkm, short, price)) = &r.prover {
-                if note.rkm != *rkm {
-                    return Err(format!("output {k} does not pay the prover's pinned payee"));
-                }
-                if note.asset != 0 || note.value != *price {
-                    return Err(format!(
-                        "output {k} pays the prover {} of asset {}, not its price of {price} fee unit(s)",
-                        note.value, note.asset
-                    ));
-                }
-                prover_line = Some(format!("prover fee: {} to {short}\n", r.names.amount(*price, 0)));
-                continue;
-            }
-        }
-        let bucket = if Some(note.rkm) == r.payee_rkm {
-            &mut to_payee
-        } else if note.rkm == r.own_rkm {
-            &mut to_self
-        } else {
-            return Err(format!("output {k} pays neither the payee nor this wallet"));
-        };
-        match bucket.iter_mut().find(|(a, _)| *a == note.asset) {
-            Some((_, v)) => *v += note.value,
-            None => bucket.push((note.asset, note.value)),
-        }
-    }
-    for (asset, value) in &to_payee {
-        out.push_str(&format!("send {} to {}\n", r.names.amount(*value, *asset), r.to_short));
-    }
-    for (asset, value) in to_self.iter().filter(|(_, v)| *v > 0) {
-        out.push_str(&format!("{} returns to this wallet\n", r.names.amount(*value, *asset)));
-    }
-    out.push_str(&format!("fee: {}\n", r.names.amount(i.fee, 0)));
-    if let Some(line) = prover_line {
-        out.push_str(&line);
-        // A remote-proved plan of more than one transaction: what is left of
-        // it, from this step on, at the price fixed for the whole handle.
-        let (steps, network, prover) = r.plan_from_here;
-        if steps > 1 {
-            out.push_str(&format!(
-                "this plan from here: {steps} transactions; network fees {network} + prover fees {prover} = {}\n",
-                r.names.amount(network.saturating_add(prover), 0)
-            ));
-        }
-    }
-    out.push_str(&format!("valid until block {}\n", i.valid_until_height));
-    if !r.spends_verified {
-        // Design D5: stated beside every plan while it holds.
-        out.push_str("note: the notes already spent were taken from the endpoint's word, not verified\n");
-    }
-    Ok(out)
+    qumbra_wallet::annulet_review::render(&t.review, &t.intent, &t.intent_bytes, bytes, &t.prepared.outputs)
 }
 
 /// The review of `intent` (from `qmb_spend_v2_intent`), or NULL + `err_out`.

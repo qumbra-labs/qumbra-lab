@@ -145,6 +145,12 @@ pub mod annulet_reference;
 pub mod annulet_verify;
 #[cfg(feature = "verify")]
 pub mod asset_view;
+/// The review of a Candidate A spend, from the intent bytes (lab #937 cut-over: moved from qumbra-ffi).
+#[cfg(feature = "verify")]
+pub mod annulet_review;
+/// The open-time check of a Candidate A journal (lab #937 cut-over: moved from qumbra-ffi).
+#[cfg(feature = "verify")]
+pub mod auth_check;
 #[cfg(feature = "prove")]
 pub mod annulet_send;
 /// Lab #896 G: Candidate A sends (v2 shapes, the wallet's own signatures).
