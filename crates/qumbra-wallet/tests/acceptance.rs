@@ -40,6 +40,45 @@ fn run(args: &[&str], stdin: Option<&str>) -> (String, String, bool) {
     )
 }
 
+/// Lab #937 cut-over (D-C3): `keygen --candidate-a` makes a prover's payee
+/// wallet before its net exists — a fresh seed and generation 0 fresh, the
+/// version-2 address printed offline and the same one `address --candidate-a`
+/// reads back from the journal; no key material out. A second keygen into the
+/// directory, and `restore --candidate-a`, are refused by name.
+#[test]
+fn keygen_candidate_a_prints_the_v2_address_offline_and_restore_cannot() {
+    let dir = tmp("ca_keygen");
+    let d = dir.to_str().unwrap();
+    let (stdout, stderr, ok) = run(&["keygen", "--dir", d, "--candidate-a"], None);
+    assert!(ok, "{stderr}");
+    let printed = stdout
+        .lines()
+        .skip_while(|l| !l.contains("Candidate A (version 2) address [0]"))
+        .nth(1)
+        .expect("the address line")
+        .trim()
+        .to_string();
+    let (shown, stderr2, ok2) = run(&["address", "--dir", d, "--candidate-a", "--index", "0"], None);
+    assert!(ok2, "{stderr2}");
+    assert!(shown.lines().any(|l| l.trim() == printed), "the journal's address is keygen's: {printed} vs {shown}");
+    let w = WalletDir::open(&dir).unwrap();
+    let combined = format!("{stdout}{stderr}");
+    assert!(!combined.contains(&reveal_mnemonic(&w)), "the mnemonic never leaves keygen");
+    let entropy_hex: String = w.seed.entropy().iter().map(|b| format!("{b:02x}")).collect();
+    assert!(!combined.to_lowercase().contains(&entropy_hex), "no entropy hex either");
+
+    let (_, again, ok3) = run(&["keygen", "--dir", d, "--candidate-a"], None);
+    assert!(!ok3, "a second keygen into the directory is refused");
+    assert!(again.contains("auth.v1"), "{again}");
+
+    let r = tmp("ca_restore");
+    let (_, err4, ok4) = run(&["restore", "--dir", r.to_str().unwrap(), "--candidate-a"], None);
+    assert!(!ok4, "restore never starts a fresh journal");
+    assert!(err4.contains("migrate"), "{err4}");
+    assert!(!r.join("wallet.seed").exists() && !r.join("auth.v1").exists(), "nothing written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn keygen_prints_an_address_and_no_key_material_and_backup_needs_reveal() {
     let dir = tmp("proc1");
