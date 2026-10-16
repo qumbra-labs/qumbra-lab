@@ -4,6 +4,23 @@
 
 Lab #937, the importer (after PR E). Code: `crates/qumbra-wallet` (`src/openings.rs`, the `import-openings` command, the scan merge in `src/annulet.rs`).
 
+## Making the payee wallet
+
+Make it once, on the operator's own machine, before the net whose prover it is paid by:
+
+```sh
+qumbra-wallet keygen --dir ~/.qumbra/prover-payee --candidate-a
+```
+
+This draws a new seed and writes the wallet's first Candidate A authorization journal (`auth.v1`: generation 0, fresh, active). It is offline: a seed drawn in this process has signed nowhere, so no chain is read. It prints the full version-2 address [0] and its short form. It prints no mnemonic and no seed. Back the seed up with `backup --reveal` when you choose.
+
+**The seed directory never goes to a host.**
+- The prover's box and its configuration get the **full** version-2 address only (`QUMBRA_PROVER_ANNULET_PAYEE`).
+- So does the wallets' pin for the net (`prover_pins::PINS`, lab #937 PR D).
+- A short `qs1…` address is a hash and cannot be checked, so neither place takes one.
+
+**Only a new wallet.** A directory that already holds a seed or an `auth.v1` is refused by name, and nothing is written. `restore --candidate-a` is refused too: a restored seed may have signed elsewhere, so it takes `migrate`'s checked path on the net.
+
 ## Why there is a file to import
 
 On a format-34 net the remote prover is paid inside each transaction, in its third output: asset 0, to the prover's payee address (`docs/prover-service-annulet.md`, "Format 34").

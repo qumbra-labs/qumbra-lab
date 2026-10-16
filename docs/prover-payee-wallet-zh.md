@@ -4,6 +4,23 @@
 
 Lab #937 的导入工具（在 PR E 之后）。代码：`crates/qumbra-wallet`（`src/openings.rs`、`import-openings` 命令，以及 `src/annulet.rs` 里扫链时的合并）。
 
+## 建收款钱包
+
+在运维自己的机器上建一次，要早于向这个 prover 付费的那条 net：
+
+```sh
+qumbra-wallet keygen --dir ~/.qumbra/prover-payee --candidate-a
+```
+
+这条命令生成一个新 seed，同时写入钱包的第一份 Candidate A 授权日志（`auth.v1`：generation 0、fresh、active）。全程离线：在本进程里刚生成的 seed 没有在任何地方签过名，所以不需要读链。它打印完整的 version-2 地址 [0] 和对应的短地址，不打印助记词，也不打印 seed。什么时候备份 seed 由你决定，用 `backup --reveal`。
+
+**seed 目录永远不上主机。**
+- prover 的机器和它的配置只拿到**完整的** version-2 地址（`QUMBRA_PROVER_ANNULET_PAYEE`）。
+- 钱包里这条 net 的 pin（`prover_pins::PINS`，lab #937 PR D）也只拿完整地址。
+- 短地址 `qs1…` 是一个哈希，没法校验，所以这两处都不收短地址。
+
+**只用于新钱包。** 如果目录里已经有 seed 或 `auth.v1`，命令会说明原因并拒绝，不写入任何东西。`restore --candidate-a` 同样会被拒绝：恢复出来的 seed 可能在别处签过名，所以它要在 net 上走 `migrate` 的检查流程。
+
 ## 为什么会有这个文件要导入
 
 在 format 34 的 net 上，远程 prover 在每笔交易里收费，费用就是交易的第三个输出：asset 0，付给 prover 的收款地址（见 `docs/prover-service-annulet-zh.md` 的「Format 34」一节）。

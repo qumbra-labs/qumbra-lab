@@ -2,7 +2,7 @@
 //! (`store`, `view`), the same posture as every other binary here.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use qumbra_wallet::store::{seed_from_phrase, reveal_mnemonic, WalletDir};
@@ -415,6 +415,9 @@ fn usage() {
         "qumbra-wallet — the end-user wallet CLI (issue #243)\n\n\
          USAGE:\n  \
          qumbra-wallet keygen  --dir DIR                 new seed + address 0; prints NO key material\n  \
+                            --candidate-a also writes the first auth journal (generation 0,\n  \
+                            fresh: the seed was drawn here) and shows the version-2 address [0]\n  \
+                            offline — e.g. a prover's payee wallet, made before its net (lab #937)\n  \
                             (the seed file's actual protection is printed by `keygen` — it is\n  \
                             0600 on unix and an inherited ACL on Windows, lab #478)\n  \
          qumbra-wallet restore --dir DIR                 seed from a Qumbra mnemonic on STDIN\n  \
@@ -735,6 +738,9 @@ fn dir_of(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
 
 fn keygen(args: &[String]) -> Result<(), Box<dyn Error>> {
     let dir = dir_of(args)?;
+    if has_flag(args, "--candidate-a") {
+        return keygen_candidate_a(&dir);
+    }
     // Entropy → seed → seed file is the library's job since lab #475
     // (`create_from_os_entropy_gated`), so this binary and `qumbra-node mine`
     // mint a wallet by the same code rather than by two copies of it. The gate
@@ -765,8 +771,39 @@ fn keygen(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `keygen --candidate-a` (lab #937 cut-over, D-C3): a new wallet and its
+/// first journal — generation 0, fresh, active — so its version-2 address
+/// exists offline, before any Candidate A net (a prover's payee). Prints the
+/// full address [0] and its short form; no key material.
+fn keygen_candidate_a(dir: &Path) -> Result<(), Box<dyn Error>> {
+    let (w, journal) = qumbra_wallet::auth_journal::create_fresh_candidate_a(dir)?;
+    let addr = w.wallet().address_candidate_a_at_index(0, &journal.active().auth_root);
+    println!("qumbra-wallet keygen --candidate-a");
+    println!(
+        "  seed:    {} ({} — NEVER printed; back it up with `backup --reveal`)",
+        dir.join(qumbra_wallet::store::SEED_FILE).display(),
+        qumbra_wallet::store::secret_file_protection(),
+    );
+    println!(
+        "  journal: {} (generation 0, fresh: this seed was drawn here and has signed nowhere)",
+        dir.join(qumbra_wallet::auth_journal::AUTH_FILE).display()
+    );
+    println!("  Candidate A (version 2) address [0]:");
+    println!("    {}", addr.encode());
+    println!("    short: {}", addr.short().encode());
+    if let Some(note) = qumbra_wallet::store::secret_file_protection_note(dir) {
+        println!("{note}");
+    }
+    Ok(())
+}
+
 fn restore(args: &[String]) -> Result<(), Box<dyn Error>> {
     let dir = dir_of(args)?;
+    if has_flag(args, "--candidate-a") {
+        return Err("restore --candidate-a: a restored seed may have signed elsewhere, so it never starts a fresh \
+                    journal; restore, then run `qumbra-wallet migrate --net annulet …` on the Candidate A net"
+            .into());
+    }
     eprintln!("paste the Qumbra mnemonic, then EOF (Ctrl-D):");
     // Stdin, never argv: argv is visible to `ps` and shell history.
     let seed = seed_from_phrase(&mut std::io::stdin().lock())?;
