@@ -211,8 +211,9 @@ impl AuthRun {
         self.keys.dummy(&entropy, slot, taken).map_err(SendRefusal::Auth)
     }
 
-    /// The intent `tx` signs on this run's net and validity: what [`Self::sign`]
-    /// signs, and what a step's review is rendered from before it.
+    /// The intent `tx` signs on this run's net and validity: built once by a
+    /// caller, reviewed (a remote-proved step), then handed to
+    /// [`Self::sign_intent`] — the intent shown is the intent signed.
     pub(crate) fn intent(
         &self,
         tx: &qlab_devnet::body::TxEntry,
@@ -231,7 +232,18 @@ impl AuthRun {
         dummies: &[&qlab_remote_auth::mldsa::Key],
     ) -> Result<(), SendRefusal> {
         let intent = self.intent(tx, auth)?;
-        let section = sign_locally(&intent, &self.keys, dummies)
+        self.sign_intent(tx, &intent, dummies)
+    }
+
+    /// Sign every slot of `intent` (built by [`Self::intent`] from this `tx`)
+    /// and attach the section. Nothing is submitted here.
+    pub(crate) fn sign_intent(
+        &self,
+        tx: &mut qlab_devnet::body::TxEntry,
+        intent: &qlab_remote_auth::annulet::AnnuletIntent,
+        dummies: &[&qlab_remote_auth::mldsa::Key],
+    ) -> Result<(), SendRefusal> {
+        let section = sign_locally(intent, &self.keys, dummies)
             .map_err(|e| SendRefusal::Auth(format!("signing refused: {e:?}")))?; // debug-ok: a named auth error, no key
         attach(tx, &section).map_err(|e| SendRefusal::Auth(format!("the section does not encode: {e:?}"))) // debug-ok
     }
@@ -565,18 +577,20 @@ fn prepare_signed<E: Endpoint>(
             return Err(SendRefusal::Spend(SpendError::Served("shape R is a registry write, not a spend".into())))
         }
     };
-    // Lab #937 cut-over (M1(b)): the review, from the very intent `run.sign`
-    // signs below, before it is signed. A refusal here is before signing; the
-    // leaves taken above stay used (the journal never rolls back).
+    // The intent is built once: reviewed (lab #937 cut-over, M1(b): a
+    // remote-proved step's gate, before anything is signed), then signed —
+    // the same value, so the intent shown is the intent signed by
+    // construction. A refusal at the gate is before signing; the leaves taken
+    // above stay used (the journal never rolls back).
+    let intent = run.intent(&prepared.tx, &prepared.auth)?;
     if let Some(gate) = gate {
-        let intent = run.intent(&prepared.tx, &prepared.auth)?;
         let signing = intent
             .encode()
             .map_err(|e| SendRefusal::Auth(format!("the intent does not encode: {e:?}")))?; // debug-ok: a named codec error
         gate(&intent, &signing, &prepared.outputs)?;
     }
     let dummies: Vec<&qlab_remote_auth::mldsa::Key> = keys.iter().collect();
-    run.sign(&mut prepared.tx, &prepared.auth.clone(), &dummies)?;
+    run.sign_intent(&mut prepared.tx, &intent, &dummies)?;
     Ok(prepared)
 }
 

@@ -520,8 +520,10 @@ pub fn send_annulet_remote<E: Endpoint>(
         return Err(SendRefusal::PlanDeclined);
     }
     let price = admitted.price;
-    // The review's names: the asset's leaf bound to the verified tip, read
-    // once for the whole send (lab #924 PR 3c's rule, the FFI's).
+    // The review's names: the asset's leaf, as bytes, bound to the verified
+    // tip (lab #924 PR 3c's rule, the FFI's) — one read for every step's
+    // review. `served.registry` above parsed the shape's read and kept no
+    // bytes, so this is a second read of the same route.
     let bound = (asset != 0).then(|| {
         let answer = session.served.endpoint.get(&crate::annulet_verify::registry_leaf_path(asset));
         crate::asset_view::check_leaf_at_verified_tip(&session.chain, asset, answer)

@@ -149,8 +149,8 @@ pub fn step_kind(kind: &crate::annulet_plan::StepKind) -> &'static str {
 /// **The review of step `i` of `plan`** (lab #937 cut-over, M1(b): moved
 /// from qumbra-ffi): "step i+1 of N", the payee only on the payment
 /// (`to_rkm`), the prover (`(payee rkm, short address)`, when one is paid)
-/// at this step's price, and the plan from this step on. The FFI prepares one
-/// step at a time and calls it with `i = 0`.
+/// at this step's price, and the plan from this step on (in run order). The
+/// FFI prepares one step at a time and calls it with `i = 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn step_review(
     plan: &crate::annulet_plan::SendPlan,
@@ -164,7 +164,13 @@ pub fn step_review(
 ) -> Review {
     let step = &plan.steps[i];
     let kind = step_kind(&step.kind);
-    let rest = &plan.steps[i..];
+    // "From here" in the order a run executes: round by round, by index
+    // within a round (`run_plan_v2`). Plan index alone is not that order —
+    // a merge of held notes (round 0) may follow a split of round 1. The
+    // plan's first step is always round 0 (a split's source or a payment's
+    // inputs are held notes), so `i = 0` (the FFI) is the whole plan.
+    let rest: Vec<&crate::annulet_plan::Step> =
+        plan.steps.iter().enumerate().filter(|(j, s)| (s.round, *j) >= (step.round, i)).map(|(_, s)| s).collect();
     Review {
         step: i + 1,
         steps: plan.steps.len(),
