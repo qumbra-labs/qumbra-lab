@@ -121,6 +121,7 @@ impl FullNode {
     pub fn mine_and_announce(&mut self, nonce: u64) -> bool {
         match self.p2p.node_mut().mine_block() {
             Some((header, body)) => {
+                // Every live cap is 1 (lab #790); N-payee apply changes this.
                 let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
                 self.p2p.announce_block(header, body.txs, coinbase, rkm, nonce);
                 true

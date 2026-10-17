@@ -145,8 +145,13 @@ Bringing it up means **narrowing the SG first, then starting the profile**, in t
 // crates/qlab-devnet/src/body.rs
 pub const COINBASE_PAYEE_CAP_V5: usize          = 8;
 pub const COINBASE_PAYEE_CAP_V5_AT_BIRTH: usize = 1;
-pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = Some(11_520);
+pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = None;
 ```
+
+**Since lab #790 the V5 cap is 1 at every height.** The boundary was stamped `Some(11_520)` on
+2026-08-22 and withdrawn: above it validation accepted 2-payee blocks that the node's single-payee
+store then panicked applying. Splitting the mint between miners waits for N-payee apply, its own
+baton; until then the paragraphs below describe every height, not only those below 11,520.
 
 T2 measured **tip 4,802** on 2026-08-24 15:49 +08 (`explorer.qumbra.org/v1/health.json`), so the
 active cap is **1**. `payee::pick_payees` then sorts the PPLNS window by weight, truncates to the

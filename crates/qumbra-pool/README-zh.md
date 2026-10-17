@@ -130,8 +130,12 @@ XMRig 打公开端点。**没有被证明的是:这个矿池能付钱给矿工�
 // crates/qlab-devnet/src/body.rs
 pub const COINBASE_PAYEE_CAP_V5: usize          = 8;
 pub const COINBASE_PAYEE_CAP_V5_AT_BIRTH: usize = 1;
-pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = Some(11_520);
+pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = None;
 ```
+
+**自 lab #790 起，V5 的上限在所有高度都是 1。** 边界在 2026-08-22 定为 `Some(11_520)`，后来撤回：
+越过它之后，校验会接受 2 个收款人的块，而节点只能存单个收款人，应用时就会 panic。让多个矿工分一个块的
+产出，要等 N 个收款人的应用（单独一棒）；在那之前，下面几段说的是所有高度，不只是 11,520 以下。
 
 T2 在 2026-08-24 15:49 +08 实测 **tip 4,802**(`explorer.qumbra.org/v1/health.json`),所以
 生效上限是 **1**。`payee::pick_payees` 于是把 PPLNS 窗口按权重排序、截到上限,把**整份**产出

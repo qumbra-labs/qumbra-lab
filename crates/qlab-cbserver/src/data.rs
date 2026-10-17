@@ -374,6 +374,7 @@ impl Devnet {
             .iter()
             .filter(|blk| blk.height >= from && blk.height <= to)
             .map(|blk| {
+                // Every live cap is 1 (lab #790); N-payee apply changes this.
                 let (coinbase, rkm) =
                     blk.body.single_payee_parts().expect("accepted body is at the current cap");
                 BlockCoinbase {

@@ -122,31 +122,29 @@ pub const COINBASE_PAYEE_CAP_V5: usize = 8;
 /// The v5 coinbase payee cap before activation, including the network's birth.
 pub const COINBASE_PAYEE_CAP_V5_AT_BIRTH: usize = 1;
 
-/// Last height at which the birth cap remains in force.
+/// Last height at which the birth cap remains in force: **`None` — the V5 cap
+/// is 1 at every height** (lab #790, ruled on the issue).
 ///
-/// **Stamped 2026-08-22 (Larry's ruling): `11_520`.** Height `11_520` still uses
-/// cap 1; `11_521` is the first height at which a block may name up to
-/// [`COINBASE_PAYEE_CAP_V5`] payees. Inclusive by design — the byte-exactness
-/// requirement is "at and below the boundary", not "below".
+/// **History.** Stamped `Some(11_520)` on 2026-08-22 (`11_520 = 1_152 × 10`, a
+/// whole committee epoch multiple): above it a block could name up to
+/// [`COINBASE_PAYEE_CAP_V5`] payees. **Withdrawn**, failing closed, because
+/// validation then accepted what the node cannot apply: the log record
+/// (`StoredBlock::from_parts`), the coinbase note and the matured leaf are
+/// single-payee, so a validated 2-payee block panicked every node that applied
+/// it (lab #790: a latent consensus crash, never hit — T2 stopped near 2.5 k).
 ///
-/// **Why this number.** `11_520 = 1_152 × 10`, a whole committee epoch multiple,
-/// following `8_640` and `19_008`. From tip `2_230` at `2026-08-22T02:13:00Z` it
-/// is **9,290 blocks ≈ 7.6 days** at a measured **70.4 s/block** — two tip reads
-/// taken 9.02 h apart off `/v1/coinbase` (`1_769 → 2_230`, 461 blocks), which is
-/// within 6 % of the 75 s design target, so the LWMA is holding.
+/// **Why this is not a fork of any chain.** Every V5 block that ever landed
+/// carries one payee — a node that applied two would have panicked in
+/// `from_parts` — so every stored V5 history is valid under cap 1, and a node
+/// on this rule replays the same chain. The change refuses blocks that never
+/// existed. The V5 commitment bytes do not depend on the cap (asserted by
+/// `v5_payee_cap_boundary_is_inclusive_and_commitment_bytes_do_not_move`).
 ///
-/// 🔴 **This is a consensus rule change and the roll is the whole fleet, not one
-/// host.** Above the boundary a block may carry more than one coinbase payee; a
-/// node still on an older binary rejects such a block and forks off. Unlike the
-/// 8,640 emission boundary this is a **no-halt** crossing, so there is no halt to
-/// catch a straggler — every validating host must carry this constant *before*
-/// `11_521`. The runway is deliberately generous for that reason.
-///
-/// **The practical risk window is narrower than the rule**: nothing forks until a
-/// block actually names two or more payees, which the pool only does when its
-/// PPLNS window has two or more winners. That narrows the blast radius; it does
-/// not change what must be rolled.
-pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = Some(11_520);
+/// [`COINBASE_PAYEE_CAP_V5`] and the injected-boundary seam
+/// ([`coinbase_payee_cap_v5_above`]) stay: N-payee apply (a list-carrying log
+/// record, one matured leaf per payee) is its own baton, and it is what
+/// raises this again. V6's cap is native ([`COINBASE_PAYEE_CAP_V6`]).
+pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = None;
 
 /// The shipped v5 payee cap at `height`.
 pub fn coinbase_payee_cap_v5(height: u64) -> usize {
@@ -3288,20 +3286,46 @@ mod tests {
     }
 
     #[test]
-    fn the_stamped_cap_boundary_is_the_ruled_height_and_the_live_cap_below_it_is_one() {
-        // lab #470 / QUM-160, stamped 2026-08-22. This is the golden that a later
-        // edit has to walk past deliberately: the constant is a consensus rule
-        // activation on a running chain, so it must not drift the way an ordinary
-        // tunable can. #336 set the precedent when the emission pins landed —
-        // the "unpinned at merge" guards became assertions on the pinned values.
-        assert_eq!(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, Some(11_520));
-        // Inclusive: the boundary height itself is still the birth cap.
-        assert_eq!(coinbase_payee_cap_v5(11_520), COINBASE_PAYEE_CAP_V5_AT_BIRTH);
-        assert_eq!(coinbase_payee_cap_v5(11_521), COINBASE_PAYEE_CAP_V5);
-        // And every height the live chain has actually reached is still cap 1,
-        // so this merge changes nothing until the boundary arrives.
-        assert_eq!(coinbase_payee_cap_v5(0), COINBASE_PAYEE_CAP_V5_AT_BIRTH);
-        assert_eq!(coinbase_payee_cap_v5(2_230), COINBASE_PAYEE_CAP_V5_AT_BIRTH);
+    fn the_v5_payee_cap_is_one_at_every_height_lab_790() {
+        // Lab #790: the 2026-08-22 stamp (`Some(11_520)`) is withdrawn on
+        // purpose — validation accepted 2-payee blocks the node then panicked
+        // applying. This is the golden a later N-payee baton walks past.
+        assert_eq!(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, None);
+        for height in [0, 2_230, 11_520, 11_521, 1_000_000, u64::MAX] {
+            assert_eq!(coinbase_payee_cap_v5(height), COINBASE_PAYEE_CAP_V5_AT_BIRTH, "height {height}");
+        }
+        assert_eq!(COINBASE_PAYEE_CAP_V5_AT_BIRTH, 1);
+    }
+
+    /// Lab #790, the negative: a 2-payee V5 body whose amounts sum exactly to
+    /// the schedule — at the old boundary, just above it, and far above — is
+    /// refused by name by the rule funnel `apply_block_gated` runs before
+    /// `StoredBlock::from_parts`, by the binding check, and by the announce
+    /// decoder a peer's frame goes through. None reaches the single-payee
+    /// store.
+    #[test]
+    fn a_two_payee_v5_body_is_refused_at_every_height_lab_790() {
+        for height in [11_520u64, 11_521, 1_000_000] {
+            let total = coinbase_exact(height);
+            let payees = vec![
+                CoinbasePayee { rkm: [1; 4], amount: total / 2 },
+                CoinbasePayee { rkm: [2; 4], amount: total - total / 2 },
+            ];
+            let body = BlockBody::new(Vec::new(), payees);
+            let header = BlockHeader {
+                height,
+                // Committed under the dormant cap of 8 (the bytes do not
+                // depend on the cap); hashing under cap 1 would assert.
+                ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, body.commitment_v5_above(Some(0), height))
+            };
+            let refused = Err(BodyError::TooManyCoinbasePayees { got: 2, cap: 1 });
+            assert_eq!(
+                validate_body_v5(&header, &body, &MockVerifier, is_final, &names::EmptyNameView),
+                refused,
+                "validate, height {height}"
+            );
+            assert_eq!(check_body_binding_v5(&header, &body), refused, "binding, height {height}");
+        }
     }
 
     #[test]
@@ -3728,7 +3752,8 @@ mod tests {
         };
         let cv = Cv { recorded: None, anchor_heights: vec![] };
         let too_many = |got: usize, cap: usize| Err(BodyError::TooManyCoinbasePayees { got, cap });
-        let b = COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT.expect("stamped");
+        // The withdrawn stamp (lab #790): both sides of it stay walked.
+        let b = 11_520;
         for h in [0, 1, b, b + 1] {
             let hdr = header_at(h);
             // V4: one payee pair, at every height.
