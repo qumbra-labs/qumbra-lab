@@ -55,7 +55,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::{rkm_lanes_from_hex, NodeConfig};
-use crate::genesis::GenesisFile;
+use crate::annulet_genesis::{leading_format_version, load_any, AnyGenesis};
+use crate::genesis_v6::GenesisFileV6;
 
 /// The four **public** entry points, from `t1-sg-posture-decision` via
 /// `docs/join-and-mine.md` §1 (node0 is deliberately not one of them).
@@ -127,8 +128,8 @@ pub const NET_T1: NetProfile = NetProfile {
 /// 🔴 **This value cannot be derived from anything in this tree, and that is the
 /// whole lesson of lab #527.** The live T2 genesis was minted at the launch
 /// ceremony from OS-random committee keys
-/// ([`GenesisFile::new_t2_with_committee_seeds`]), so the in-tree rehearsal mint
-/// [`GenesisFile::new_t2_v5`] hashes to a *different* value — a third number that
+/// ([`GenesisFile::new_t2_with_committee_seeds`](crate::genesis::GenesisFile::new_t2_with_committee_seeds)), so the in-tree rehearsal mint
+/// [`GenesisFile::new_t2_v5`](crate::genesis::GenesisFile::new_t2_v5) hashes to a *different* value — a third number that
 /// tracks neither this constant nor the live net. Any test that pins this to an
 /// in-tree mint is asserting a falsehood; the guard that keeps it honest is
 /// `the_net_table_is_the_release_lanes_net_table`, which compares it to
@@ -476,6 +477,10 @@ pub enum MineError {
     GenesisNotCanonical { source: String, got_len: usize, canonical_len: usize },
     /// It decodes canonically and is a *different net*.
     GenesisWrongHash { source: String, got: String, want: String },
+    /// It is a genesis file, but for a net `mine` cannot join: an Annulet
+    /// genesis (lab #818). `mine` joins a proof-of-work L1 net (an L1 or a V6
+    /// genesis).
+    GenesisNotMineable { source: String, format: u32 },
     /// The fetch itself failed.
     GenesisFetch { url: String, why: String },
     /// `DIR/node.toml` exists and is not what this command would write.
@@ -515,6 +520,12 @@ impl std::fmt::Display for MineError {
                  Nothing was written and no socket was opened. If you meant to join another \
                  net, point --genesis-url at its file and put its own genesis.qmb in place \
                  yourself — this command will not mine onto a chain it cannot name."
+            ),
+            MineError::GenesisNotMineable { source, format } => write!(
+                f,
+                "{source} is an Annulet genesis (format {format}), not a net `mine` can join: \
+                 `mine` joins a proof-of-work L1 net (an L1 or a V6 genesis). Nothing was \
+                 written and no socket was opened."
             ),
             MineError::GenesisFetch { url, why } => write!(
                 f,
@@ -969,9 +980,16 @@ pub enum GenesisOutcome {
 /// Verify candidate genesis bytes against a pinned hash, **before** they are
 /// written anywhere or anything binds.
 ///
+/// Dispatched by the file's leading format version ([`load_any`], lab #818),
+/// as `run` dispatches it: an **L1** genesis (format 8/9) and a **V6** genesis
+/// (format 10) are each verified by their own type; an **Annulet** genesis is
+/// refused by name ([`MineError::GenesisNotMineable`]) — `mine` joins a
+/// proof-of-work L1 net, and before lab #818 a V6 file was refused here as
+/// "not a genesis file" although `run` would have opened it.
+///
 /// Three checks, and the middle one is why this is not just a hash comparison:
 ///
-/// 1. the bytes decode as a [`GenesisFile`];
+/// 1. the bytes decode as a [`GenesisFile`](crate::genesis::GenesisFile) (or a [`GenesisFileV6`]);
 /// 2. **they are the canonical encoding of what they decode to.** The pinned
 ///    hash is `keccak256` over `bincode::serialize(&file)`, not over the file
 ///    on disk, so bytes with a different framing — trailing padding, a
@@ -987,28 +1005,61 @@ pub fn verify_genesis_bytes(
     expected_hash: &str,
     source: &str,
 ) -> Result<String, MineError> {
-    let file = GenesisFile::from_bytes(bytes).map_err(|e| MineError::GenesisUndecodable {
+    let undecodable = |e: crate::genesis::GenesisError| MineError::GenesisUndecodable {
         source: source.to_string(),
         why: e.to_string(),
-    })?;
-    let canonical = file.to_bytes();
-    if canonical != bytes {
-        return Err(MineError::GenesisNotCanonical {
-            source: source.to_string(),
-            got_len: bytes.len(),
-            canonical_len: canonical.len(),
-        });
-    }
-    file.verify_startup(Some(expected_hash)).map_err(|e| match e {
+    };
+    let startup = |e: crate::genesis::GenesisError| match e {
         crate::genesis::GenesisError::WrongGenesisHash { got, want } => {
             MineError::GenesisWrongHash { source: source.to_string(), got, want }
         }
-        other => MineError::GenesisUndecodable {
+        other => undecodable(other),
+    };
+    // The V6 decoder refuses non-canonical bytes itself (as `Decode`), so the
+    // canonical check runs on the format alone, before either decoder: one
+    // refusal, by the same name, for both forms.
+    if leading_format_version(bytes) == Some(qlab_devnet::forms::V6_GENESIS_FORMAT_VERSION) {
+        if let Ok(file) = bincode_v6(bytes) {
+            let canonical = file.to_bytes();
+            if canonical != bytes {
+                return Err(MineError::GenesisNotCanonical {
+                    source: source.to_string(),
+                    got_len: bytes.len(),
+                    canonical_len: canonical.len(),
+                });
+            }
+        }
+    }
+    match load_any(bytes).map_err(undecodable)? {
+        AnyGenesis::L1(file) => {
+            let canonical = file.to_bytes();
+            if canonical != bytes {
+                return Err(MineError::GenesisNotCanonical {
+                    source: source.to_string(),
+                    got_len: bytes.len(),
+                    canonical_len: canonical.len(),
+                });
+            }
+            file.verify_startup(Some(expected_hash)).map_err(startup)?;
+            Ok(file.hash_hex())
+        }
+        AnyGenesis::V6(file) => {
+            // `from_bytes` already required canonical bytes (above).
+            file.verify_startup(Some(expected_hash)).map_err(startup)?;
+            Ok(file.hash_hex())
+        }
+        AnyGenesis::Annulet(_) => Err(MineError::GenesisNotMineable {
             source: source.to_string(),
-            why: other.to_string(),
-        },
-    })?;
-    Ok(file.hash_hex())
+            format: leading_format_version(bytes).unwrap_or_default(),
+        }),
+    }
+}
+
+/// The V6 file's bincode decode with no canonical check — only so a
+/// non-canonical V6 file is refused as [`MineError::GenesisNotCanonical`], as
+/// an L1 one is, rather than as undecodable.
+fn bincode_v6(bytes: &[u8]) -> Result<GenesisFileV6, bincode::Error> {
+    bincode::deserialize(bytes)
 }
 
 /// Put a verified genesis file at `path`, downloading it only if it is absent.
@@ -1262,6 +1313,7 @@ pub fn http_fetch(url: &str) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genesis::GenesisFile;
     use std::io::Cursor;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -2515,5 +2567,57 @@ mod tests {
         // by name, and still before any socket.
         let e = http_fetch("ftp://seed.qumbra.org/genesis.qmb").expect_err("bad scheme");
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// Lab #818: a V6 genesis (format 10) is verified by its own type and its
+    /// own hash — it is accepted at that hash, refused as a DIFFERENT NET at its
+    /// L1 base's hash (the pin a V6 node must not take), and refused as
+    /// non-canonical with a trailing byte, by the same names an L1 file gets.
+    #[test]
+    fn a_v6_genesis_verifies_by_its_own_hash_and_refuses_the_l1_bases() {
+        let v6 = GenesisFileV6::new_rehearsal();
+        let bytes = v6.to_bytes();
+        let own = v6.hash_hex();
+        let base = v6.base.hash_hex();
+        assert_ne!(own, base, "the V6 hash and its base's hash must differ, or the pin case proves nothing");
+
+        assert_eq!(verify_genesis_bytes(&bytes, &own, "the V6 file").expect("a V6 genesis at its own hash"), own);
+
+        match verify_genesis_bytes(&bytes, &base, "the V6 file").expect_err("the base's hash is another net") {
+            MineError::GenesisWrongHash { source, got, want } => {
+                assert_eq!(source, "the V6 file");
+                assert_eq!(got, own);
+                assert_eq!(want, base);
+            }
+            other => panic!("expected GenesisWrongHash, got {other:?}"),
+        }
+
+        let mut padded = bytes.clone();
+        padded.push(0);
+        match verify_genesis_bytes(&padded, &own, "the padded file").expect_err("trailing bytes") {
+            MineError::GenesisNotCanonical { got_len, canonical_len, .. } => {
+                assert_eq!((got_len, canonical_len), (bytes.len() + 1, bytes.len()));
+            }
+            other => panic!("expected GenesisNotCanonical, got {other:?}"),
+        }
+    }
+
+    /// Lab #818: an Annulet genesis is a genesis file, for a net `mine` cannot
+    /// join — refused by that name, not as "not a Qumbra genesis file".
+    #[test]
+    fn an_annulet_genesis_is_refused_by_name_not_as_undecodable() {
+        use crate::annulet_genesis::AnnuletGenesisBuild;
+        let annulet = qlab_node::annulet_genesis::AnnuletGenesisFile::devnet_v3();
+        let bytes = annulet.to_bytes();
+        let err = verify_genesis_bytes(&bytes, &annulet.hash_hex(), "the Annulet file")
+            .expect_err("an Annulet genesis is not mineable");
+        match &err {
+            MineError::GenesisNotMineable { source, format } => {
+                assert_eq!(source, "the Annulet file");
+                assert_eq!(Some(*format), leading_format_version(&bytes));
+            }
+            other => panic!("expected GenesisNotMineable, got {other:?}"),
+        }
+        assert!(err.to_string().contains("is an Annulet genesis"), "{err}");
     }
 }

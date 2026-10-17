@@ -1,7 +1,7 @@
 //! Lab #475: `qumbra-node mine` through the REAL binary.
 //!
 //! `src/mine.rs`'s unit tests drive the seams directly, which is where the
-//! backup gate and the genesis verification are actually pinned. These five
+//! backup gate and the genesis verification are actually pinned. These six
 //! exist for the things a seam test structurally cannot see: that the
 //! subcommand is dispatched at all, that `--help` names it, that the refusals
 //! reach an operator's stderr with a non-zero exit, and — the one that matters
@@ -160,6 +160,58 @@ fn the_config_mine_writes_passes_the_binarys_own_preflight() {
         cout.contains(&pinned),
         "the pre-flight reports the pinned genesis: {cout}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lab #818: the same claim on a **V6** net (format 10). `mine` used to
+/// refuse a V6 `genesis.qmb` as "not a Qumbra genesis file" — it decoded it as
+/// its L1 base — although `run` dispatches it. The file is the one `genesis
+/// init --t2` writes (`GenesisFileV6::new_rehearsal`), pinned by its own hash
+/// on the command line; the written config then passes the binary's `check`,
+/// which reports the V6 hash.
+#[test]
+fn the_config_mine_writes_on_a_v6_net_passes_the_binarys_own_preflight() {
+    let dir = tmp("preflight_v6");
+    let v6 = qumbra_node::genesis_v6::GenesisFileV6::new_rehearsal();
+    std::fs::write(dir.join(GENESIS_FILE_NAME), v6.to_bytes()).expect("write V6 genesis");
+    let pinned = v6.hash_hex();
+
+    let out = Command::new(bin())
+        .args([
+            "mine",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--genesis-hash",
+            pinned.as_str(),
+            "--rkm",
+            MANUAL_RKM,
+            "--listen",
+            "this-is-not-an-address",
+        ])
+        .output()
+        .expect("spawn qumbra-node");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "an unbindable listen address must fail the run");
+    assert!(!stderr.contains("is not a Qumbra genesis file"), "the V6 file is a genesis file: {stderr}");
+    assert!(stdout.contains(&format!("already present, verified {pinned}")), "{stdout} {stderr}");
+    assert!(stdout.contains("starting the ordinary run path"), "{stdout}");
+    assert!(stdout.contains("qumbra-node starting"), "the run path was entered: {stdout}");
+
+    let cfg = dir.join(CONFIG_FILE_NAME);
+    let text = std::fs::read_to_string(&cfg).expect("mine wrote a config");
+    assert!(text.contains(&format!("expected_genesis_hash = \"{pinned}\"")), "{text}");
+    std::fs::write(&cfg, text.replace("this-is-not-an-address", "127.0.0.1:0")).expect("rewrite listen addr");
+    let check = Command::new(bin())
+        .args(["check", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn qumbra-node check");
+    let cout = String::from_utf8_lossy(&check.stdout);
+    let cerr = String::from_utf8_lossy(&check.stderr);
+    assert!(check.status.success(), "preflight failed: {cout}{cerr}");
+    assert!(cout.contains("check: OK"), "{cout}");
+    assert!(cout.contains(&format!("genesis hash: {pinned}")), "the V6 hash is reported: {cout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
