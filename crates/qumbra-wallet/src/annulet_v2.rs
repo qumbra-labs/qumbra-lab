@@ -112,7 +112,8 @@ impl AuthRun {
             Some(j) => j,
             None => {
                 let used = landed_generations(session, &wallet)?;
-                restore_journal(&lock, w, &wallet, &session.owned, &used, &session.genesis_hash, session.gate_tip)?
+                let seeds = issuer_seeds(w, session)?;
+                restore_journal(&lock, w, &wallet, &session.owned, &seeds, &used, &session.genesis_hash, session.gate_tip)?
             }
         };
         let (g, next) = (journal.active().g, journal.active().next);
@@ -146,6 +147,14 @@ impl AuthRun {
             auth_ctx: AuthContext { form: session.l2_auth, genesis_hash: session.genesis_hash },
             valid_until: session.tip.saturating_add(validity),
         })
+    }
+
+    /// End the run, handing back its lock and its journal as the run left it
+    /// (every leaf it took already persisted) — so the same lock opens the
+    /// next run on another generation (lab #942: a carry's pre-fund from the
+    /// active generation, then the carry from the swept one).
+    pub(crate) fn release(self) -> (AuthLock, AuthJournal) {
+        (self.lock, self.journal)
     }
 
     /// The active generation's root: what this wallet's change and its new
@@ -617,21 +626,46 @@ fn prepare_signed<E: Endpoint>(
 /// generation with notes is sweep-only; a used one with none left is
 /// retired, its position kept (a leaf of it is never drawn again). The sweep
 /// still takes `max(journal, landed_next)` as its floor.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_journal(
     lock: &AuthLock,
     w: &WalletDir,
     wallet: &Wallet,
     owned: &[OwnedL2Note],
+    seeds: &[OwnedL2Note],
     used: &LandedByGeneration,
     genesis: &[u8; 32],
     gate_tip: u64,
 ) -> Result<AuthJournal, SendRefusal> {
-    let journal = restore_generations(wallet, owned, used, genesis, gate_tip)?;
+    let journal = restore_generations(wallet, owned, seeds, used, genesis, gate_tip)?;
     journal.save(&w.dir)?;
     let _ = lock;
     Ok(journal)
 }
 
+/// Lab #942: **the issuer's seeds** — the unspent zero-value notes of the
+/// assets this wallet issues (`issuer.v1` holds a secret for the issuer key
+/// the chain's registry leaf shows), in every generation. A mint rides one
+/// ([`qlab_ledger::assets::AssetIndex::mint_base`]): an R write's seed, a
+/// genesis base note. Restore keeps a generation holding one sweep-only, and
+/// [`migrate`] carries one per asset to the active generation. A wallet with
+/// no `issuer.v1` has none, and nothing is fetched.
+pub fn issuer_seeds<E: Endpoint>(w: &WalletDir, session: &Session<E>) -> Result<Vec<OwnedL2Note>, SendRefusal> {
+    use crate::issuer::{IssuerFile, ISSUER_FILE};
+    if !w.dir.join(ISSUER_FILE).exists() {
+        return Ok(Vec::new());
+    }
+    let assets: std::collections::BTreeSet<u16> =
+        session.index.zero.iter().map(|n| n.asset).filter(|a| *a != 0).collect();
+    let mut issued = std::collections::BTreeSet::new();
+    for asset in assets {
+        let leaf = session.served.registry(u64::from(asset))?.leaf;
+        if IssuerFile::isk_for_key(&w.dir, asset, &leaf.issuer_key).map_err(SendRefusal::Issuer)?.is_some() {
+            issued.insert(asset);
+        }
+    }
+    Ok(session.index.zero.iter().filter(|n| issued.contains(&n.asset)).cloned().collect())
+}
 
 /// The root of generation `g` for `wallet` — re-exported for the CLI.
 pub fn root_of(wallet: &Wallet, g: u32) -> [u64; 4] {
@@ -1046,6 +1080,23 @@ pub struct MigrateReport {
     /// holding other assets too sweeps those first (their fees come from its
     /// asset-0 notes), and its asset 0 on the next `migrate`.
     pub asset0_left: Vec<u32>,
+    /// Lab #942: issuer seeds carried by this run: `(g, asset)`.
+    pub carried: Vec<(u32, u16)>,
+    /// Lab #942: carries the active generation cannot fund: `(g, asset,
+    /// fee units needed)` — the generation stays sweep-only.
+    pub carry_unfunded: Vec<(u32, u16, u64)>,
+    /// Lab #942: carries left for the next `migrate` (one pre-fund and one
+    /// self-funded carry per generation per run): `(g, asset)`.
+    pub carry_next: Vec<(u32, u16)>,
+}
+
+/// Lab #942: how a carry's fee is paid.
+enum CarryFee {
+    /// From the swept generation's own asset-0 notes (an exact note, or one
+    /// split off): (i).
+    Own,
+    /// From a note the active generation sends to the swept one first: (ii).
+    PreFund { source: OwnedL2Note, tariff: u64 },
 }
 
 /// **`migrate`** (§9): set the journal up if the wallet has none (restore →
@@ -1056,6 +1107,22 @@ pub struct MigrateReport {
 /// ordinary planner (fee notes from the swept generation), then each asset-0
 /// note on its own (paying its own fee). A sweep's cursor starts above every
 /// position the generation's landed spends used ([`landed_next`]).
+///
+/// Lab #942: a sweep-only generation also holding an **issuer's seed**
+/// ([`issuer_seeds`]) of an asset the active generation has no note of —
+/// one per asset — has it **carried**: `[seed, exact fee note] → [0 of A, 0
+/// of A]`, both to the active generation's address 0, so the issuer mints
+/// from the active generation without a new R write. One key per
+/// transaction, so the fee note is the swept generation's: (i) from its own
+/// asset-0 notes when it holds only asset 0 (and its asset-0 pass then
+/// waits for the next run), or (ii) when it holds no asset-0 note that pays,
+/// sent to it first by the active generation (an S of exactly the tariff,
+/// waited for in the served tree). Should the carry fail after that
+/// pre-fund landed, the pre-fund is the generation's own asset-0 note and
+/// the next run carries through (i). The active generation's notes are
+/// read once per run, so at most one pre-fund is made per run; an active
+/// generation with no asset-0 note covering S + tariff is reported
+/// ([`MigrateReport::carry_unfunded`]) and the generation stays sweep-only.
 #[allow(clippy::too_many_arguments)]
 pub fn migrate<E: Endpoint>(
     w: &WalletDir,
@@ -1072,12 +1139,13 @@ pub fn migrate<E: Endpoint>(
         return Err(SendRefusal::Auth("migrate is for a Candidate A net; this one is not".into()));
     }
     let wallet = w.wallet();
+    let seeds = issuer_seeds(w, &session)?;
     let lock = AuthLock::acquire(&w.dir)?;
     let (mut journal, initialized) = match AuthJournal::load(&w.dir)? {
         Some(j) => (j, false),
         None => {
             let used = landed_generations(&session, &wallet)?;
-            (restore_journal(&lock, w, &wallet, &session.owned, &used, &session.genesis_hash, session.gate_tip)?, true)
+            (restore_journal(&lock, w, &wallet, &session.owned, &seeds, &used, &session.genesis_hash, session.gate_tip)?, true)
         }
     };
     if open_next {
@@ -1097,7 +1165,16 @@ pub fn migrate<E: Endpoint>(
         waiting: Vec::new(),
         retired: Vec::new(),
         asset0_left: Vec::new(),
+        carried: Vec::new(),
+        carry_unfunded: Vec::new(),
+        carry_next: Vec::new(),
     };
+    let active_g = journal.active().g;
+    let active_index = session.index.only_generation(active_g);
+    // One carry per asset per run; one pre-fund per run (the active
+    // generation's notes are read once).
+    let mut carry_assets = std::collections::BTreeSet::new();
+    let mut prefunded = false;
     let sweeps: Vec<u32> = journal
         .generations()
         .iter()
@@ -1112,7 +1189,18 @@ pub fn migrate<E: Endpoint>(
             .ok_or_else(|| SendRefusal::Auth("auth.v1 disappeared while migrating".into()))?;
         let index = session.index.only_generation(g);
         let spendable: Vec<OwnedL2Note> = index.by_asset.values().flat_map(|n| n.spendable.iter().cloned()).collect();
-        if spendable.is_empty() {
+        // Lab #942: the seeds to carry from g — of assets the active
+        // generation holds no note of, and g holds no spendable note of (its
+        // sweep moves those, a mint base with them).
+        let owed: Vec<&OwnedL2Note> = seeds
+            .iter()
+            .filter(|n| n.generation == Some(g))
+            .filter(|n| active_index.mint_base(n.asset).is_none() && index.spendable(n.asset).is_empty())
+            .collect();
+        // A seed whose asset another generation carries this run still keeps
+        // g: the next run sees the active generation's note and retires it.
+        let carries: Vec<OwnedL2Note> = owed.iter().filter(|n| carry_assets.insert(n.asset)).map(|n| (*n).clone()).collect();
+        if spendable.is_empty() && owed.is_empty() {
             j.retire(&lock, &w.dir, g)?;
             report.retired.push(g);
             continue;
@@ -1135,10 +1223,92 @@ pub fn migrate<E: Endpoint>(
         let spent: Vec<(OwnedL2Note, u64)> = index.by_asset.values().flat_map(|n| n.spent.iter().cloned()).collect();
         let landed = landed_slots(&session, &wallet, &spent)?;
         let floor = landed_next(&wallet, g, &landed);
+        // Lab #942: how each carry is paid — (i) at most once per run from g's
+        // own asset-0 notes, and only when g holds nothing else (its other
+        // assets' plans would pick fee notes from the same stale index);
+        // (ii) a pre-fund from the active generation, at most once per run.
+        let only_asset0 = index.by_asset.iter().all(|(a, n)| *a == 0 || n.spendable.is_empty());
+        let mut own_fee_used = false;
+        // An asset-0 note of g the carry's fee did not take (a split's
+        // change, or another note) — it moves on the next run.
+        let mut own_left = false;
+        let mut planned: Vec<(OwnedL2Note, CarryFee)> = Vec::new();
+        for seed in carries {
+            let leaf = session.served.registry(u64::from(seed.asset))?.leaf;
+            let tariff = session.tiers.of(qlab_l2spend::shape_for(&leaf));
+            let own_pays = index.spendable(0).iter().any(|n| n.note.value == tariff || n.note.value >= tariff + session.tiers.s);
+            if own_pays && only_asset0 && !own_fee_used {
+                own_fee_used = true;
+                planned.push((seed, CarryFee::Own));
+                continue;
+            }
+            if own_pays || prefunded {
+                report.carry_next.push((g, seed.asset));
+                continue;
+            }
+            let needs = tariff + session.tiers.s;
+            match active_index.spendable(0).iter().filter(|n| n.note.value >= needs).min_by_key(|n| n.note.value) {
+                Some(source) => {
+                    prefunded = true;
+                    planned.push((seed, CarryFee::PreFund { source: source.clone(), tariff }));
+                }
+                None => report.carry_unfunded.push((g, seed.asset, needs)),
+            }
+        }
+        if spendable.is_empty() && planned.is_empty() {
+            continue;
+        }
+        // (ii): the active generation pays g's address 0 exactly the tariff
+        // (shape S, its own fee), waited for in the served tree, before g's
+        // run opens on the same lock.
+        let g_root = j.get(g)?.auth_root;
+        let mut prefund: Option<OwnedL2Note> = None;
+        let (lock, mut j) = match planned.iter().find_map(|(_, f)| match f {
+            CarryFee::PreFund { source, tariff } => Some((source.clone(), *tariff)),
+            CarryFee::Own => None,
+        }) {
+            None => (lock, j),
+            Some((source, tariff)) => {
+                let next = j.get(active_g)?.next;
+                let mut run = AuthRun::for_generation(lock, j, &wallet, active_g, next, &session, valid_for())?;
+                let outs = [
+                    Out { to: me_v2(&wallet, &g_root), value: tariff, asset: 0 },
+                    Out { to: to_active.clone(), value: source.note.value - tariff - session.tiers.s, asset: 0 },
+                ];
+                let sent = spend_v2(w, &mut run, &session.served, L2ShapeTag::S, V2Spend::One(&source), &outs, session.tiers.s, &PolicyContext::default(), rng)?;
+                let made = sent.outputs[0];
+                crate::annulet_send::wait_in_tree(&session.served, &made.commitment(), split_wait)?;
+                prefund = Some(
+                    OwnedL2Note::from_genesis_v2(&wallet, 0, qlab_note::hash::digest_bytes(&made.commitment()), made, &[(g, g_root)])
+                        .expect("the pre-fund paid generation g's address 0"),
+                );
+                run.release()
+            }
+        };
         let next = j.get(g)?.next.max(floor);
         j.advance(&lock, &w.dir, g, next)?;
         let mut run = AuthRun::for_generation(lock, j, &wallet, g, next, &session, valid_for())?;
         let mut txs = 0usize;
+        // Lab #942: the carries, before anything else of g moves.
+        for (seed, fee) in &planned {
+            let leaf = session.served.registry(u64::from(seed.asset))?.leaf;
+            let shape = qlab_l2spend::shape_for(&leaf);
+            let tariff = session.tiers.of(shape);
+            let fee_note = match fee {
+                CarryFee::PreFund { .. } => prefund.clone().expect("the pre-fund was made above"),
+                CarryFee::Own => {
+                    let (note, split) = exact_fee_note_v2(w, &mut run, &session, tariff, split_wait, rng)?;
+                    txs += usize::from(split.is_some());
+                    own_left = split.is_some() || index.spendable(0).len() > 1;
+                    note
+                }
+            };
+            let a = u64::from(seed.asset);
+            let outs = [Out { to: to_active.clone(), value: 0, asset: a }, Out { to: to_active.clone(), value: 0, asset: a }];
+            spend_v2(w, &mut run, &session.served, shape, V2Spend::Two([seed, &fee_note]), &outs, tariff, &PolicyContext::default(), rng)?;
+            txs += 1;
+            report.carried.push((g, seed.asset));
+        }
         // Non-zero assets: the planner, paying the active generation.
         for (&asset, notes) in &index.by_asset {
             if asset == 0 || notes.spendable.is_empty() {
@@ -1158,10 +1328,12 @@ pub fn migrate<E: Endpoint>(
         // Note: the planner above may have spent some asset-0 notes as fees;
         // the session's index predates that, so a fresh scan is the next
         // migrate's job — this pass sweeps only notes it did not just spend.
-        if !index.by_asset.keys().all(|a| *a == 0) && !index.spendable(0).is_empty() {
+        if (!index.by_asset.keys().all(|a| *a == 0) && !index.spendable(0).is_empty()) || own_left {
             report.asset0_left.push(g);
         }
-        if index.by_asset.keys().all(|a| *a == 0) {
+        // Lab #942: a carry paid from g's asset 0 took one of these notes;
+        // the rest move on the next run, from a fresh scan.
+        if index.by_asset.keys().all(|a| *a == 0) && !own_fee_used {
             for n in index.spendable(0) {
                 if n.note.value <= session.tiers.s {
                     continue;
@@ -1318,7 +1490,7 @@ mod tests {
         let genesis = [0x33; 32];
         let owned = [note_of(&wallet, 0, 1, 1), note_of(&wallet, 2, 1, 2)];
         let none = LandedByGeneration::new();
-        let j = restore_journal(&lock, &w, &wallet, &owned, &none, &genesis, 500).unwrap();
+        let j = restore_journal(&lock, &w, &wallet, &owned, &[], &none, &genesis, 500).unwrap();
         assert_eq!(j.active().g, 3);
         assert_eq!(j.active().next, 0);
         assert_eq!(j.active().auth_root, generation_root(&wallet, 3));
@@ -1329,7 +1501,7 @@ mod tests {
         assert_eq!(AuthJournal::load(&w.dir).unwrap(), Some(j), "persisted");
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
 
-        let fresh = restore_journal(&lock, &w, &wallet, &[], &none, &genesis, 500).unwrap();
+        let fresh = restore_journal(&lock, &w, &wallet, &[], &[], &none, &genesis, 500).unwrap();
         assert_eq!(fresh.active().g, 0, "no notes: nothing was ever exported");
         assert_eq!(fresh.generations().len(), 1);
         std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
@@ -1348,7 +1520,7 @@ mod tests {
                 .collect()
         };
         let landed: LandedByGeneration = [(0, leaves(0, 2)), (4, leaves(4, 3))].into();
-        let j = restore_journal(&lock, &w, &wallet, &owned[..1], &landed, &genesis, 500).unwrap();
+        let j = restore_journal(&lock, &w, &wallet, &owned[..1], &[], &landed, &genesis, 500).unwrap();
         assert_eq!(j.active().g, 5, "the generation above every used one");
         assert_eq!((j.get(0).unwrap().next, j.get(4).unwrap().next), (2, 3), "the landed floors");
         assert!(matches!(j.get(0).unwrap().state, GenState::Sweep { .. }));
@@ -1363,7 +1535,7 @@ mod tests {
         // address was handed out).
         let zeros = [note_of(&wallet, 0, 0, 7), note_of(&wallet, 2, 0, 8)];
         let landed: LandedByGeneration = [(0, leaves(0, 1))].into();
-        let j = restore_journal(&lock, &w, &wallet, &zeros, &landed, &genesis, 500).unwrap();
+        let j = restore_journal(&lock, &w, &wallet, &zeros, &[], &landed, &genesis, 500).unwrap();
         assert_eq!(j.get(0).unwrap().state, GenState::Retired, "only a zero-value note: nothing to sweep");
         assert!(j.get(2).is_err(), "only a zero-value note and nothing landed: not recorded");
         assert_eq!(j.active().g, 3);
@@ -1372,9 +1544,53 @@ mod tests {
         let last =crate::auth_journal::PROBE_GENERATIONS - 1;
         let edge = [note_of(&wallet, last, 1, 9)];
         assert!(matches!(
-            restore_journal(&lock, &w, &wallet, &edge, &none, &genesis, 500),
+            restore_journal(&lock, &w, &wallet, &edge, &[], &none, &genesis, 500),
             Err(SendRefusal::Auth(why)) if why.contains("last of the")
         ));
+        let _ = std::fs::remove_dir_all(&w.dir);
+    }
+
+    /// Lab #942: a generation holding an **issuer's seed** (a zero-value
+    /// note of an asset this wallet issues — the `seeds` list) is kept
+    /// sweep-only, landed leaves or not, so migrate can carry the seed; a
+    /// generation whose only notes are zero-value notes that are no seed
+    /// still retires (landed) or goes unrecorded (nothing landed).
+    #[test]
+    fn restore_keeps_a_generation_holding_an_issuer_seed() {
+        let w = wallet_dir("restore_seed", 6);
+        let wallet = w.wallet();
+        let lock = AuthLock::acquire(&w.dir).unwrap();
+        let genesis = [0x42; 32];
+        let zero_of = |g: u32, asset: u64, k: u8| {
+            let root = generation_root(&wallet, g);
+            let rkm = wallet.address_candidate_a_at_index(0, &root).rkm_lanes();
+            let note = qlab_note::l2note::L2Note { value: 0, asset, rkm, rho: [k as u64; 4], rseed: [k as u64 + 1; 4] };
+            OwnedL2Note::from_genesis_v2(&wallet, 0, [k; 32], note, &[(g, root)]).expect("its own v2 note")
+        };
+        let leaf_of = |g: u32| {
+            let mut la = LocalAuth::new(&wallet.auth_secret(), g, 0).unwrap();
+            let p = la.take().unwrap();
+            vec![(p.leaf_index, qlab_note::hash::digest_bytes(&p.leaf))]
+        };
+        // Generation 0: the seed of asset 7, nothing landed. Generation 1: a
+        // zero-value asset-7 note that is no seed (another issuer's), leaves
+        // landed. Generation 2: the same, nothing landed.
+        let seed = zero_of(0, 7, 1);
+        let owned = [seed.clone(), zero_of(1, 7, 2), zero_of(2, 7, 3)];
+        let landed: LandedByGeneration = [(1, leaf_of(1))].into();
+        let j = restore_journal(&lock, &w, &wallet, &owned, std::slice::from_ref(&seed), &landed, &genesis, 500).unwrap();
+        let gate = vec![SweepGate { genesis, not_before_height: 500 + MAX_AUTH_VALIDITY_BLOCKS }];
+        assert_eq!(j.get(0).unwrap().state, GenState::Sweep { gates: gate }, "the seed keeps generation 0 sweep-only");
+        assert_eq!(j.get(1).unwrap().state, GenState::Retired, "a zero-value note that is no seed: retired");
+        assert!(j.get(2).is_err(), "no seed and nothing landed: not recorded");
+        assert_eq!(j.active().g, 3);
+        std::fs::remove_file(w.dir.join(crate::auth_journal::AUTH_FILE)).unwrap();
+
+        // The same notes with no seeds (a wallet that issues nothing):
+        // generation 0 is not recorded either.
+        let j = restore_journal(&lock, &w, &wallet, &owned, &[], &landed, &genesis, 500).unwrap();
+        assert!(j.get(0).is_err(), "not the issuer's: the zero-value note keeps nothing");
+        assert_eq!(j.get(1).unwrap().state, GenState::Retired);
         let _ = std::fs::remove_dir_all(&w.dir);
     }
 
