@@ -36,7 +36,9 @@
 //!   `node-refused:…` (the node's refusal of these bytes is deterministic: a
 //!   re-send only proves them again): the spend failed; its leaves stay used
 //!   (the journal never rolls back) and a retry is a new take. A transaction
-//!   that did land is caught on the re-send as `409 nullifier-landed`.
+//!   that did land is caught on the re-send as `409 nullifier-landed`. The
+//!   new take of the same note replaces the record, the old pair kept beside
+//!   it ([`record`], lab #957).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -411,8 +413,16 @@ pub const RECORD_DIR: &str = "remote.v1";
 /// **Record before upload** (D-C8): write the signed `bundle` under the
 /// wallet, named by `key` (the transaction's first nullifier, hex), through
 /// a temporary file, owner-only (0600 where the platform has permission
-/// bits), fsynced, before it is sent anywhere. Returns the file. A record of
-/// the same key is overwritten only by the same bytes.
+/// bits), fsynced, before it is sent anywhere. Returns the file.
+///
+/// A record of the same key takes other bytes only once its bundle has
+/// **ended definitively** (lab #957): its `<key>.outcome` reads
+/// `failed <4xx> …`, `failed 0 …` (the job refused, or the node refused the
+/// bytes) or `expired …`. The spend failed and a retry is a new take of the
+/// same note — so the old pair is kept beside it as `<key>.<n>.outcome` /
+/// `<key>.<n>.bundle` (the first free `n` from 1) and the new bundle takes
+/// the key. `submitted`, `in-flight` and no outcome at all still refuse: the
+/// nullifier is with the service, landed, or its upload's answer is unknown.
 pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
     let dir = wallet_dir.join(RECORD_DIR);
@@ -423,10 +433,25 @@ pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Resu
         if existing == bundle {
             return Ok(path);
         }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} holds another bundle for this nullifier", path.display()),
-        ));
+        let outcome = dir.join(format!("{name}.outcome"));
+        let ended = std::fs::read_to_string(&outcome).ok();
+        if !ended.as_deref().is_some_and(ended_definitively) {
+            let why = ended.as_deref().map_or("no outcome yet".to_string(), |l| format!("its outcome: {}", l.trim_end()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} holds another bundle for this nullifier ({why})", path.display()),
+            ));
+        }
+        let n = (1u32..)
+            .find(|n| {
+                !dir.join(format!("{name}.{n}.bundle")).exists() && !dir.join(format!("{name}.{n}.outcome")).exists()
+            })
+            .expect("a free archive number");
+        // The outcome first: a crash between the two renames leaves a bundle
+        // with no outcome — refused again, never a new bundle beside an old
+        // bundle's definitive outcome.
+        std::fs::rename(&outcome, dir.join(format!("{name}.{n}.outcome")))?;
+        std::fs::rename(&path, dir.join(format!("{name}.{n}.bundle")))?;
     }
     let tmp = dir.join(format!("{name}.bundle.tmp"));
     {
@@ -443,6 +468,22 @@ pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Resu
     #[cfg(unix)]
     std::fs::File::open(&dir)?.sync_all()?;
     Ok(path)
+}
+
+/// Whether an `<key>.outcome` line ([`record_outcome`]'s) is a definitive
+/// end (D-C8): `failed` with a 4xx status, or with status 0 (a job that ended
+/// `refused`, or `failed` with `node-refused:…` — [`job_end`]'s only
+/// definitive endings), or `expired` (the validity height passed).
+/// `submitted` and `in-flight` are not.
+pub fn ended_definitively(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some("failed"), Some(status)) => {
+            status.parse::<u16>().is_ok_and(|s| s == 0 || (400..500).contains(&s))
+        }
+        (Some("expired"), _) => true,
+        _ => false,
+    }
 }
 
 /// Note the end of a recorded bundle beside it (`<key>.outcome`, one line):
@@ -698,6 +739,58 @@ mod tests {
         record_outcome(&d, &key, &Outcome::Submitted { tx_id: [0xab; 32] }).unwrap();
         let line = std::fs::read_to_string(p.with_extension("outcome")).unwrap();
         assert!(line.starts_with("submitted abab"), "{line}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Lab #957: after a definitive end, a new take of the same note — other
+    /// bytes under the same nullifier — is recorded, and the old pair is kept
+    /// as `<key>.<n>.*`; `submitted`, `in-flight` and no outcome still refuse.
+    #[test]
+    fn a_definitive_end_lets_a_new_take_of_the_note_be_recorded() {
+        let d = std::env::temp_dir().join(format!("qmb_remote_retake_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let key = [9u8; 32];
+        let name = "09".repeat(32);
+        let at = |f: &str| d.join(RECORD_DIR).join(format!("{name}{f}"));
+
+        // No outcome yet: the upload's answer is unknown — refused.
+        record(&d, &key, b"take-1").unwrap();
+        let e = record(&d, &key, b"take-2").unwrap_err();
+        assert!(e.to_string().contains("holds another bundle for this nullifier (no outcome yet)"), "{e}");
+        // In flight, submitted: the nullifier is with the service or landed — refused.
+        for o in [Outcome::InFlight { code: "nullifier-in-flight".into() }, Outcome::Submitted { tx_id: [0xab; 32] }] {
+            record_outcome(&d, &key, &o).unwrap();
+            let e = record(&d, &key, b"take-2").unwrap_err();
+            assert!(e.to_string().contains("its outcome: "), "{e}");
+            assert_eq!(std::fs::read(at(".bundle")).unwrap(), b"take-1");
+        }
+
+        // Each definitive end: the new take is recorded, the old pair kept.
+        let ends = [
+            Outcome::Failed { status: 402, code: "prover-fee-missing".into() },
+            Outcome::Failed { status: 0, code: "node-refused:validity".into() },
+            Outcome::Failed { status: 0, code: "unprovable".into() },
+            Outcome::Expired { last: "nullifiers-stale".into() },
+        ];
+        for (i, o) in ends.iter().enumerate() {
+            let n = i + 1;
+            let old = format!("take-{n}");
+            let new = format!("take-{}", n + 1);
+            record_outcome(&d, &key, o).unwrap();
+            let line = std::fs::read_to_string(at(".outcome")).unwrap();
+            assert_eq!(record(&d, &key, new.as_bytes()).unwrap(), at(".bundle"));
+            assert_eq!(std::fs::read(at(".bundle")).unwrap(), new.as_bytes());
+            assert!(!at(".outcome").exists(), "the new take has no outcome yet");
+            assert_eq!(std::fs::read(at(&format!(".{n}.bundle"))).unwrap(), old.as_bytes());
+            assert_eq!(std::fs::read_to_string(at(&format!(".{n}.outcome"))).unwrap(), line);
+            // And the new take is guarded again until it, too, ends.
+            assert!(record(&d, &key, b"another").is_err());
+        }
+
+        assert!(!ended_definitively("submitted abab"));
+        assert!(!ended_definitively("in-flight nullifier-in-flight"));
+        assert!(!ended_definitively("failed 503 prover-busy"), "a 5xx is never recorded as failed, and is not definitive");
+        assert!(!ended_definitively(""));
         let _ = std::fs::remove_dir_all(&d);
     }
 }
