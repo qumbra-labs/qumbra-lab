@@ -264,6 +264,7 @@ impl AnnuletConfig {
                 std::env::var(annulet_v3::PRICE_P_VAR).ok(),
                 std::env::var(annulet_v3::PAID_LEDGER_VAR).ok(),
                 Arc::new(HttpFollow::new(&node_url)),
+                &genesis_hash,
             )?),
             _ => None,
         };
@@ -613,6 +614,7 @@ impl AnnuletApi {
         now: fn() -> u64,
     ) -> Self {
         let tokens = std::mem::take(&mut config.tokens);
+        let store = config.v3.as_mut().and_then(|v| v.nullifier_store.take());
         let config = Arc::new(config);
         let work = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(State::default()));
@@ -621,7 +623,22 @@ impl AnnuletApi {
             .try_fill_bytes(&mut salt)
             .expect("the client-IP salt comes from the OS");
         let slot = Duration::from_secs(config.slot_secs);
-        let follow = config.v3.as_ref().map(|_| Arc::new(NullifierFollow::new(slot)));
+        let follow = config.v3.as_ref().map(|_| {
+            Arc::new(match store {
+                Some((store, replayed)) => {
+                    if replayed.height > 0 {
+                        eprintln!(
+                            "qumbra-prover-service: annulet nullifier store resumed: {} nullifiers through height {} ({})",
+                            replayed.landed.len(),
+                            replayed.height,
+                            store.path().display()
+                        );
+                    }
+                    NullifierFollow::with_store(slot, store, replayed)
+                }
+                None => NullifierFollow::new(slot),
+            })
+        });
         let inner = Arc::new(Inner {
             config: Arc::clone(&config),
             tokens: RwLock::new(tokens),

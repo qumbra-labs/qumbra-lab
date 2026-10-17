@@ -14,14 +14,15 @@
 //!   logged IP;
 //! - [`prover_fee`]: the fee read from the witness's output 3, which
 //!   `ProvingBundle::check` has already bound to the transaction's commitment;
-//! - [`NullifierFollow`]: the landed nullifiers, followed from height 1 on
-//!   the pinned node's `/v1/nullifiers` — loudly: until it has caught up, or
-//!   once it is more than one slot behind, admission answers 503 and
-//!   `/healthz` is not ready;
+//! - [`NullifierFollow`]: the landed nullifiers, followed on the pinned
+//!   node's `/v1/nullifiers` and `/v1/headers` — persisted beside the paid
+//!   ledger ([`crate::nullifier_store`], lab #945), rolled back on a
+//!   reorganisation up to [`REORG_WINDOW`] blocks deep — loudly: until it has
+//!   caught up, or once it is more than one slot behind, admission answers
+//!   503 and `/healthz` is not ready;
 //! - [`PaidLedger`]: one line per accepted submission, the opening of
 //!   output 3, fsynced before the job reads `submitted` (D5).
 
-use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
@@ -37,6 +38,7 @@ use qumbra_wallet::spent::{NullifierChunk, NullifierSource};
 use serde::Serialize;
 use zeroize::Zeroize;
 
+use crate::nullifier_store::{FollowedBlock, NullifierStore, Replayed, REORG_WINDOW};
 use crate::token::hex;
 use crate::{lock, ApiError};
 
@@ -88,6 +90,10 @@ pub struct V3Config {
     pub price: ProverPrice,
     pub ledger: Arc<PaidLedger>,
     pub follow: Arc<dyn ChainFollow>,
+    /// The landed-nullifier store (lab #945), opened and replayed at
+    /// startup; taken by the service when it starts its follow. `None`: the
+    /// set lives in memory only and is rebuilt from height 1.
+    pub nullifier_store: Option<(NullifierStore, Replayed)>,
 }
 
 /// The payee's `rkm`, or the startup refusal by name: not an address, or
@@ -103,13 +109,16 @@ pub fn payee_rkm(raw: &str) -> Result<[u64; 4], String> {
 impl V3Config {
     /// The configuration from its variables' values (each `None` when
     /// unset), refusing by name. The ledger is opened (or created) here, so
-    /// a ledger the service could not write stops it at startup.
+    /// a ledger the service could not write stops it at startup; so is the
+    /// landed-nullifier store beside it (`<ledger>.nullifiers`, lab #945),
+    /// written for `genesis`.
     pub fn from_values(
         payee: Option<String>,
         price_s: Option<String>,
         price_p: Option<String>,
         ledger: Option<String>,
         follow: Arc<dyn ChainFollow>,
+        genesis: &[u8; 32],
     ) -> Result<Self, String> {
         let payee = payee.ok_or_else(|| format!("{PAYEE_VAR} is required on format 34"))?;
         let payee_rkm = payee_rkm(&payee)?;
@@ -120,8 +129,10 @@ impl V3Config {
         };
         let price = ProverPrice { s: price(PRICE_S_VAR, price_s)?, p: price(PRICE_P_VAR, price_p)? };
         let ledger = ledger.ok_or_else(|| format!("{PAID_LEDGER_VAR} is required on format 34"))?;
+        let store_path = NullifierStore::path_for(Path::new(&ledger));
         let ledger = Arc::new(PaidLedger::open(Path::new(&ledger))?);
-        Ok(Self { payee: payee.trim().to_string(), payee_rkm, price, ledger, follow })
+        let nullifier_store = Some(NullifierStore::open(&store_path, genesis)?);
+        Ok(Self { payee: payee.trim().to_string(), payee_rkm, price, ledger, follow, nullifier_store })
     }
 }
 
@@ -328,6 +339,23 @@ pub trait ChainFollow: Send + Sync + 'static {
     fn tip(&self) -> Result<u64, String>;
     /// One page of `GET /v1/nullifiers?from=&to=`.
     fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String>;
+    /// The blocks `from..=to` (at most [`HEADERS_PAGE`] of them) as the
+    /// node's `GET /v1/headers` serves them, in height order: what a
+    /// rollback compares and each new block's `prev` is checked against.
+    fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String>;
+}
+
+/// The most blocks one follow step reads: one `/v1/headers` page.
+pub const HEADERS_PAGE: u64 = qlab_p2p::served::MAX_HEADERS_PAGE as u64;
+
+/// One served header, as the follow reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockLink {
+    pub height: u64,
+    /// The block id (`SealedHeader::id`, the unsigned preimage's hash).
+    pub id: [u8; 32],
+    /// The parent's id.
+    pub prev: [u8; 32],
 }
 
 /// [`ChainFollow`] over HTTP(S): the tip is `/v1/registry/root`'s height (the
@@ -355,31 +383,60 @@ impl ChainFollow for HttpFollow {
     fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
         self.source.fetch_range(from, to)
     }
+    /// The seals are not verified: the node is the operator's pinned node,
+    /// the trust every other read here already takes (lab #945 ruling).
+    fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String> {
+        use qlab_p2p::served::{decode_headers_page, sealed};
+        let path = format!("/v1/headers?from={from}&to={to}");
+        let cap = 10 + 9 + qlab_p2p::served::MAX_HEADERS_PAGE * qlab_devnet::annulet::SEALED_HEADER_LEN_ANNULET;
+        let body = qumbra_wallet::net::http_get_limited(&self.node_url, &path, Some(cap))
+            .map_err(|e| format!("GET {path}: {e}"))?;
+        let units = decode_headers_page(qlab_p2p::compact::WireForm::ANNULET_AUTH_V3, from, &body)
+            .map_err(|e| format!("GET {path} did not decode: {e}"))?;
+        units
+            .iter()
+            .map(|u| {
+                let s = sealed(u).map_err(|e| format!("GET {path}: {e}"))?;
+                Ok(BlockLink { height: s.header.height, id: s.id(), prev: s.header.prev })
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
 struct Followed {
-    landed: HashSet<[u8; 32]>,
-    /// The highest height followed; 0 before the first block (genesis spends
-    /// nothing).
-    height: u64,
+    /// The landed set, the height it reaches (0 before the first block:
+    /// genesis spends nothing) and the last [`REORG_WINDOW`] blocks.
+    set: Replayed,
     /// When the tip this set reaches was read: `None` until the first
     /// catch-up.
     caught_up_at: Option<Instant>,
 }
 
-/// The landed nullifiers, in memory, rebuilt from height 1 at each start
-/// (the PR E ruling: a rebuild over 60 s opens a persistence issue; the
-/// first catch-up logs how long it took).
+/// The landed nullifiers: in memory, and (lab #945) persisted in a
+/// [`NullifierStore`] — resumed from its last whole height at a start,
+/// rolled back to the common block when the node's chain changes within
+/// [`REORG_WINDOW`], rebuilt from height 1 past it.
 pub struct NullifierFollow {
     state: Mutex<Followed>,
+    store: Option<Mutex<NullifierStore>>,
     /// Behind by more than this is stale: one slot.
     slot: Duration,
 }
 
 impl NullifierFollow {
+    /// In memory only: rebuilt from height 1 at each start.
     pub fn new(slot: Duration) -> Self {
-        Self { state: Mutex::new(Followed::default()), slot }
+        Self { state: Mutex::new(Followed::default()), store: None, slot }
+    }
+
+    /// Over `store`, resumed from what it replayed.
+    pub fn with_store(slot: Duration, store: NullifierStore, replayed: Replayed) -> Self {
+        Self {
+            state: Mutex::new(Followed { set: replayed, caught_up_at: None }),
+            store: Some(Mutex::new(store)),
+            slot,
+        }
     }
 
     /// Ready when the set reached the node's tip within the last slot. Not
@@ -399,7 +456,7 @@ impl NullifierFollow {
     pub fn check(&self, nullifiers: &[[u8; 32]]) -> Result<(), ApiError> {
         self.readiness()?;
         let state = lock(&self.state);
-        if nullifiers.iter().any(|nf| state.landed.contains(nf)) {
+        if nullifiers.iter().any(|nf| state.set.landed.contains(nf)) {
             return Err(ApiError { status: 409, code: "nullifier-landed" });
         }
         Ok(())
@@ -408,47 +465,147 @@ impl NullifierFollow {
     /// `(nullifiers held, height followed)`.
     pub fn size(&self) -> (usize, u64) {
         let s = lock(&self.state);
-        (s.landed.len(), s.height)
+        (s.set.landed.len(), s.set.height)
     }
 
-    /// One follow step: read the tip, then page the nullifiers from the
-    /// followed height + 1 to it. Every height must be served, in order; a
-    /// page that skips one is an error (the set does not advance past what it
-    /// saw). A tip below the followed height — a reorganisation deeper than
-    /// the set, or a node rolled back — empties the set: it is rebuilt from
-    /// height 1, catching up again, rather than holding admission at 503
-    /// until the chain regrows past the old height.
+    /// One follow step (lab #945):
+    ///
+    /// 1. read the tip;
+    /// 2. **check the followed block**: the node's block at the followed
+    ///    height must still be the one followed (the same id). If it is not,
+    ///    or the tip is below it, walk the window down to the highest height
+    ///    whose block the node still serves, and roll back to it (`rollback
+    ///    <h>` appended, fsynced, then the set); no such height in the window
+    ///    is `reorg-deeper-than-64` — the store is emptied and the set is
+    ///    rebuilt from height 1;
+    /// 3. **extend** up to the tip a headers page at a time — headers, then
+    ///    nullifiers, then the page's last header again (a chain that changed
+    ///    between the reads fails the poll): every height served, in order (a
+    ///    page that skips one is an error and the set does not advance past
+    ///    what it saw), each block's `prev` the id before it (`headers-break`
+    ///    otherwise), appended and fsynced before the set advances
+    ///    (`store-unwritable` otherwise).
     pub fn poll(&self, node: &dyn ChainFollow) -> Result<(), String> {
         let asked = Instant::now();
         let tip = node.tip()?;
-        let followed = lock(&self.state).height;
-        if tip < followed {
-            *lock(&self.state) = Followed::default();
-            return Err(format!(
-                "the node's tip {tip} is below the followed height {followed}: rebuilding the set from height 1"
-            ));
-        }
-        let mut next = followed + 1;
+        self.reconcile(node, tip)?;
+        let mut next = lock(&self.state).set.height + 1;
         while next <= tip {
-            let chunk = node.nullifiers(next, tip)?;
-            if (chunk.from, chunk.to) != (next, tip) {
-                return Err(format!("the node's nullifier page answers {}..={}, not {next}..={tip}", chunk.from, chunk.to));
+            let to = tip.min(next + HEADERS_PAGE - 1);
+            // Headers, then nullifiers, then the last header again: a chain
+            // that changes between the reads fails this poll rather than
+            // pairing one chain's ids with the other's nullifiers.
+            let links = node.headers(next, to)?;
+            let chunk = node.nullifiers(next, to)?;
+            if (chunk.from, chunk.to) != (next, to) {
+                return Err(format!("the node's nullifier page answers {}..={}, not {next}..={to}", chunk.from, chunk.to));
             }
             if chunk.blocks.is_empty() {
                 return Err(format!("the node served no block at height {next}"));
             }
-            let mut state = lock(&self.state);
-            for (height, nullifiers) in chunk.blocks {
-                if height != next {
-                    return Err(format!("the node's nullifier page skips height {next} (it serves {height})"));
+            for (i, (height, _)) in chunk.blocks.iter().enumerate() {
+                let want = next + i as u64;
+                if *height != want {
+                    return Err(format!("the node's nullifier page skips height {want} (it serves {height})"));
                 }
-                state.landed.extend(nullifiers);
-                state.height = height;
-                next = height + 1;
             }
+            let n = chunk.blocks.len();
+            let last = next + n as u64 - 1;
+            if links.len() < n || links[..n].iter().zip(next..).any(|(l, h)| l.height != h) {
+                return Err(format!("headers-break: the node's headers for {next}..={last} are not its nullifier page's blocks"));
+            }
+            let links = &links[..n];
+            let mut parent = lock(&self.state).set.window.back().map(|b| b.id);
+            for l in links {
+                if parent.is_some_and(|p| p != l.prev) {
+                    return Err(format!("headers-break: the block at height {} does not follow the one before it", l.height));
+                }
+                parent = Some(l.id);
+            }
+            let again = node.headers(last, last)?;
+            if again.first().map(|l| (l.height, l.id)) != Some((last, links[n - 1].id)) {
+                return Err(format!(
+                    "the node's chain changed during the poll at height {last}: the set does not advance, and the next poll re-reads it"
+                ));
+            }
+            let blocks: Vec<FollowedBlock> = chunk
+                .blocks
+                .into_iter()
+                .zip(links)
+                .map(|((height, nullifiers), l)| FollowedBlock { height, id: l.id, nullifiers })
+                .collect();
+            if let Some(store) = &self.store {
+                lock(store).append_blocks(&blocks).map_err(|e| {
+                    format!("store-unwritable: the nullifier store could not be appended ({e}); the set does not advance")
+                })?;
+            }
+            let mut state = lock(&self.state);
+            for b in blocks {
+                state.set.push(b);
+            }
+            next = last + 1;
         }
         lock(&self.state).caught_up_at = Some(asked);
         Ok(())
+    }
+
+    /// Step 2 of [`Self::poll`]: keep, roll back, or rebuild.
+    fn reconcile(&self, node: &dyn ChainFollow, tip: u64) -> Result<(), String> {
+        let (followed, window): (u64, Vec<(u64, [u8; 32])>) = {
+            let s = lock(&self.state);
+            (s.set.height, s.set.window.iter().map(|b| (b.height, b.id)).collect())
+        };
+        if followed == 0 {
+            return Ok(());
+        }
+        if tip >= followed {
+            let served = node.headers(followed, followed)?;
+            if served.len() == 1 && window.last().is_some_and(|(h, id)| (*h, *id) == (served[0].height, served[0].id)) {
+                return Ok(());
+            }
+        }
+        // The node's chain changed under the followed block (or fell below
+        // it): the highest window height whose block it still serves.
+        let top = followed.min(tip);
+        let common = match window.first() {
+            Some((lowest, _)) if *lowest <= top => {
+                let served = node.headers(*lowest, top)?;
+                window
+                    .iter()
+                    .filter(|(h, _)| *h <= top)
+                    .rev()
+                    .find(|(h, id)| served.iter().any(|l| l.height == *h && l.id == *id))
+                    .map(|(h, _)| *h)
+                    .or_else(|| (*lowest == 1).then_some(0))
+            }
+            _ => None,
+        };
+        match common {
+            Some(a) => {
+                if let Some(store) = &self.store {
+                    lock(store).rollback(a).map_err(|e| {
+                        format!("store-unwritable: the nullifier store could not record a rollback ({e}); the set does not move")
+                    })?;
+                }
+                let mut s = lock(&self.state);
+                s.set.roll_back_to(a);
+                eprintln!(
+                    "qumbra-prover-service: annulet nullifier follow rolled back from height {followed} to {a}: the node's chain changed above it (tip {tip})"
+                );
+                Ok(())
+            }
+            None => {
+                if let Some(store) = &self.store {
+                    lock(store).reset().map_err(|e| {
+                        format!("store-unwritable: the nullifier store could not be emptied ({e}); the set does not move")
+                    })?;
+                }
+                *lock(&self.state) = Followed::default();
+                Err(format!(
+                    "reorg-deeper-than-{REORG_WINDOW}: the node's chain (tip {tip}) holds none of the last followed blocks below height {followed}: rebuilding the set from height 1"
+                ))
+            }
+        }
     }
 }
 

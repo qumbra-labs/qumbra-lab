@@ -698,7 +698,7 @@ fn a_three_output_bundle_is_refused_by_name_on_a_format_33_service() {
 
 // ------------------------------------------------- format 34 (lab #937 PR E)
 
-use crate::annulet_v3::{prover_fee, ChainFollow, ProverPrice, PAID_LEDGER_HEADER};
+use crate::annulet_v3::{prover_fee, BlockLink, ChainFollow, ProverPrice, PAID_LEDGER_HEADER};
 use qumbra_wallet::spent::NullifierChunk;
 
 /// The v3 fixtures' output 3: the fee-bank spend (S) pays `[0x43; 4]` 3
@@ -706,12 +706,23 @@ use qumbra_wallet::spent::NullifierChunk;
 /// `[0x33; 4]` 0 units. Every one is asset 0.
 const PAYEE_RKM: [u64; 4] = [0x43; 4];
 
-/// The pinned node as the follow sees it: a tip, the blocks' nullifiers,
-/// pages of at most `page` blocks, and a switch that takes it down.
+/// The pinned node as the follow sees it: a tip, the blocks' nullifiers
+/// and ids (lab #945), pages of at most `page` blocks, and a switch that
+/// takes it down. A block's id is its height and its branch, so a reorg
+/// changes the ids above the fork.
 struct FakeChain {
     blocks: Mutex<Vec<(u64, Vec<[u8; 32]>)>>,
+    ids: Mutex<Vec<[u8; 32]>>,
     down: AtomicBool,
     page: usize,
+    /// Every `from` the nullifier route was asked.
+    asked: Mutex<Vec<u64>>,
+}
+
+fn block_id(height: u64, branch: u8) -> [u8; 32] {
+    let mut id = [branch; 32];
+    id[..8].copy_from_slice(&height.to_le_bytes());
+    id
 }
 
 impl FakeChain {
@@ -721,12 +732,32 @@ impl FakeChain {
         if let Some(last) = blocks.last_mut() {
             last.1.extend_from_slice(landed);
         }
-        Arc::new(Self { blocks: Mutex::new(blocks), down: AtomicBool::new(false), page: 2 })
+        let ids = (1..=tip).map(|h| block_id(h, 0)).collect();
+        Arc::new(Self {
+            blocks: Mutex::new(blocks),
+            ids: Mutex::new(ids),
+            down: AtomicBool::new(false),
+            page: 2,
+            asked: Mutex::default(),
+        })
     }
     fn push(&self, nullifiers: &[[u8; 32]]) {
+        self.push_on(nullifiers, 0);
+    }
+    fn push_on(&self, nullifiers: &[[u8; 32]], branch: u8) {
         let mut b = self.blocks.lock().unwrap();
         let next = b.len() as u64 + 1;
         b.push((next, nullifiers.to_vec()));
+        self.ids.lock().unwrap().push(block_id(next, branch));
+    }
+    /// Keep heights 1..=`keep`; the blocks above are replaced by `new`, on
+    /// branch `branch`.
+    fn reorg(&self, keep: u64, new: &[Vec<[u8; 32]>], branch: u8) {
+        self.blocks.lock().unwrap().truncate(keep as usize);
+        self.ids.lock().unwrap().truncate(keep as usize);
+        for nfs in new {
+            self.push_on(nfs, branch);
+        }
     }
 }
 
@@ -741,9 +772,24 @@ impl ChainFollow for FakeChain {
         if self.down.load(Ordering::Acquire) {
             return Err("node-unreachable".into());
         }
+        self.asked.lock().unwrap().push(from);
         let blocks = self.blocks.lock().unwrap();
         let blocks = blocks.iter().filter(|(h, _)| (from..=to).contains(h)).take(self.page).cloned().collect();
         Ok(NullifierChunk { from, to, blocks })
+    }
+    fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String> {
+        if self.down.load(Ordering::Acquire) {
+            return Err("node-unreachable".into());
+        }
+        let ids = self.ids.lock().unwrap();
+        Ok((from..=to.min(ids.len() as u64))
+            .take(256)
+            .map(|h| BlockLink {
+                height: h,
+                id: ids[h as usize - 1],
+                prev: if h == 1 { [0; 32] } else { ids[h as usize - 2] },
+            })
+            .collect())
     }
 }
 
@@ -765,6 +811,7 @@ fn config_v3(chain: Arc<FakeChain>, price: ProverPrice, ledger: &std::path::Path
         price,
         ledger: Arc::new(PaidLedger::open(ledger).unwrap()),
         follow: chain,
+        nullifier_store: None,
     });
     c
 }
@@ -962,7 +1009,7 @@ fn the_format_34_configuration_refuses_by_name_at_startup() {
     let chain: Arc<dyn ChainFollow> = FakeChain::new(1, &[]);
     let at = ledger_path("startup");
     let try_ = |payee: Option<String>, ps: Option<String>, pp: Option<String>, ledger: Option<String>| {
-        V3Config::from_values(payee, ps, pp, ledger, Arc::clone(&chain)).err().unwrap_or_default()
+        V3Config::from_values(payee, ps, pp, ledger, Arc::clone(&chain), &GENESIS_HASH).err().unwrap_or_default()
     };
     let l = at.to_str().map(str::to_string);
     let refusals = [
@@ -978,7 +1025,10 @@ fn the_format_34_configuration_refuses_by_name_at_startup() {
     }
     assert!(!at.exists(), "nothing created before the configuration is whole");
     // Created 0600 with its header; reopened as it is.
-    let ok = V3Config::from_values(s(&v2.encode()), s("2"), s("3"), l.clone(), Arc::clone(&chain)).unwrap();
+    let ok = V3Config::from_values(s(&v2.encode()), s("2"), s("3"), l.clone(), Arc::clone(&chain), &GENESIS_HASH).unwrap();
+    // Lab #945: the landed-nullifier store is created beside the ledger.
+    let store = crate::nullifier_store::NullifierStore::path_for(&at);
+    assert!(ok.nullifier_store.is_some() && store.exists(), "the store is opened at startup");
     assert_eq!((ok.payee_rkm, ok.price), (v2.rkm_lanes(), ProverPrice { s: 2, p: 3 }));
     assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{PAID_LEDGER_HEADER}\n"));
     assert!(PaidLedger::open(&at).is_ok());
@@ -995,6 +1045,7 @@ fn the_format_34_configuration_refuses_by_name_at_startup() {
     let e = PaidLedger::open(&at).err().unwrap();
     assert!(e.contains("not a version-1 paid ledger"), "{e}");
     let _ = std::fs::remove_file(&at);
+    let _ = std::fs::remove_file(&store);
 }
 
 /// Lab #937 PR E (D4): a nullifier that landed — the follow's set, paged
@@ -1075,26 +1126,266 @@ fn the_nullifier_follow_fails_loudly() {
         fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
             Ok(NullifierChunk { from, to, blocks: self.1.clone() })
         }
+        fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String> {
+            let prev = |h: u64| if h == 1 { [0; 32] } else { block_id(h - 1, 0) };
+            Ok((from..=to).map(|h| BlockLink { height: h, id: block_id(h, 0), prev: prev(h) }).collect())
+        }
     }
     let f = NullifierFollow::new(Duration::from_secs(1));
     let e = f.poll(&Lying(3, vec![(1, vec![]), (3, vec![])])).unwrap_err();
     assert!(e.contains("skips height 2"), "{e}");
     let f = NullifierFollow::new(Duration::from_secs(1));
     assert!(f.poll(&Lying(2, vec![])).unwrap_err().contains("served no block at height 1"));
-    // A tip regression: the set is emptied and rebuilt from height 1, not
-    // held at 503 until the chain regrows past the old height.
+    // A tip regression within the window (lab #945): a rollback to the
+    // highest block the node still serves, not a rebuild — and not held at
+    // 503 until the chain regrows past the old height.
     let f = NullifierFollow::new(Duration::from_secs(1));
     f.poll(&Lying(2, vec![(1, vec![[1; 32]]), (2, vec![[2; 32]])])).unwrap();
     assert_eq!(f.size(), (2, 2));
-    let e = f.poll(&Lying(1, vec![(1, vec![[9; 32]])])).unwrap_err();
-    assert!(e.contains("below the followed height 2: rebuilding"), "{e}");
+    f.poll(&Lying(1, vec![(1, vec![[1; 32]])])).unwrap();
+    assert_eq!(f.size(), (1, 1), "rolled back to height 1, the height-2 nullifier gone");
+    assert_eq!(f.check(&[[2; 32]]), Ok(()));
+    assert_eq!(code(f.check(&[[1; 32]])), Some((409, "nullifier-landed")));
+    assert_eq!(code(NullifierFollow::new(Duration::from_secs(1)).readiness()), Some((503, "nullifiers-catching-up")));
+}
+
+// ------------------------------------------- the nullifier store (lab #945)
+
+use crate::nullifier_store::{NullifierStore, NULLIFIER_STORE_HEADER, REORG_WINDOW};
+
+/// A fresh store path of this process's.
+fn store_path(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("qumbra-nullifiers-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+/// A follow over a store at `at`, caught up with `chain`.
+fn followed(at: &std::path::Path, chain: &FakeChain) -> NullifierFollow {
+    let (store, replayed) = NullifierStore::open(at, &GENESIS_HASH).unwrap();
+    let f = NullifierFollow::with_store(Duration::from_secs(1), store, replayed);
+    f.poll(chain).unwrap();
+    f
+}
+
+/// Lab #945: a restart resumes from the store's last whole height — the
+/// node is asked only for what is new — and a torn last line (a crash
+/// mid-append) is cut away and re-read. The store is 0600, with its
+/// version and genesis header.
+#[test]
+fn the_nullifier_store_resumes_without_a_rebuild() {
+    let at = store_path("resume");
+    let chain = FakeChain::new(5, &[[0xee; 32]]);
+    let f = followed(&at, &chain);
+    assert_eq!(f.size(), (6, 5));
+    drop(f);
+    let text = std::fs::read_to_string(&at).unwrap();
+    assert!(text.starts_with(&format!("{NULLIFIER_STORE_HEADER}{}\n", hex(&GENESIS_HASH))), "{text}");
+    assert_eq!(text.lines().count(), 6, "the header and one line per block");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&at).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    // Restart: the set is back without paging from height 1.
+    chain.push(&[[0x66; 32]]);
+    chain.asked.lock().unwrap().clear();
+    let f = followed(&at, &chain);
+    assert_eq!(f.size(), (7, 6));
+    assert_eq!(*chain.asked.lock().unwrap(), vec![6], "only height 6 is read");
+    assert_eq!(code(f.check(&[[0xee; 32]])), Some((409, "nullifier-landed")), "a resumed nullifier is landed");
+    drop(f);
+
+    // A torn last line: cut away, and that height is read again.
+    let mut file = std::fs::OpenOptions::new().append(true).open(&at).unwrap();
+    std::io::Write::write_all(&mut file, b"7 0123").unwrap();
+    drop(file);
+    chain.asked.lock().unwrap().clear();
+    let f = followed(&at, &chain);
+    assert_eq!(f.size(), (7, 6), "the torn line was no block");
+    assert!(chain.asked.lock().unwrap().is_empty(), "nothing new to read");
+    assert!(std::fs::read_to_string(&at).unwrap().ends_with('\n'), "the torn tail is gone");
+    let _ = std::fs::remove_file(&at);
+}
+
+/// Lab #945: a store that disagrees with itself refuses the start-up by
+/// line, naming the operator's move; one written for another genesis is
+/// emptied and rebuilt; one readable by others is refused like the ledger.
+#[test]
+fn the_nullifier_store_refuses_a_corrupt_file_and_restarts_another_genesis() {
+    let at = store_path("corrupt");
+    let head = format!("{NULLIFIER_STORE_HEADER}{}\n", hex(&GENESIS_HASH));
+    let line = |h: u64| format!("{h} {}\n", hex(&block_id(h, 0)));
+    let write = |body: &str| {
+        let _ = std::fs::remove_file(&at);
+        drop(NullifierStore::open(&at, &GENESIS_HASH).unwrap());
+        let mut file = std::fs::OpenOptions::new().append(true).open(&at).unwrap();
+        std::io::Write::write_all(&mut file, body.as_bytes()).unwrap();
+    };
+    let refused = |want: &str| {
+        let e = NullifierStore::open(&at, &GENESIS_HASH).err().unwrap_or_default();
+        assert!(e.starts_with("store-corrupt:") && e.contains(want), "{e} does not name {want}");
+        assert!(e.contains(&format!("move {} aside and the follow rebuilds from height 1", at.display())), "{e}");
+    };
+    write(&format!("{}{}", line(1), line(3)));
+    refused("line 3: height 3 follows height 1");
+    write(&format!("{}{} nothex\n", line(1), &line(2)[..line(2).len() - 1]));
+    refused("line 3: a malformed nullifier");
+    write(&format!("{}rollback 7\n", line(1)));
+    refused("line 3: a rollback to 7 outside the followed window");
+    write("garbage\n");
+    refused("line 2: not a block line");
+
+    // Another genesis: emptied to this one's header, nothing replayed.
+    write(&format!("{}{}", line(1), line(2)));
+    let (_, replayed) = NullifierStore::open(&at, &[0x77; 32]).unwrap();
+    assert_eq!(replayed.height, 0);
+    assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{NULLIFIER_STORE_HEADER}{}\n", hex(&[0x77; 32])));
+    assert_ne!(std::fs::read_to_string(&at).unwrap(), head);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = NullifierStore::open(&at, &[0x77; 32]).err().unwrap_or_default();
+        assert!(e.starts_with("store-unwritable:") && e.contains("owner only (0600)"), "{e}");
+    }
+    let _ = std::fs::remove_file(&at);
+}
+
+/// Lab #945: a reorganisation three blocks deep removes exactly the
+/// flipped blocks' nullifiers and adds the new branch's, records `rollback
+/// 7` in the store (a restart replays the same set), and a tip that falls
+/// back within the window is a rollback too, not a rebuild.
+#[test]
+fn a_shallow_reorganisation_rolls_back_exactly_the_flipped_nullifiers() {
+    let at = store_path("shallow");
+    let chain = FakeChain::new(10, &[]);
+    let f = followed(&at, &chain);
+    assert_eq!(f.size(), (10, 10));
+    let new: Vec<Vec<[u8; 32]>> = (0..3).map(|i| vec![[0xa0 + i; 32]]).collect();
+    chain.reorg(7, &new, 1);
+    f.poll(&*chain).unwrap();
+    assert_eq!(f.size(), (10, 10));
+    for h in 8u8..=10 {
+        assert_eq!(f.check(&[[h; 32]]), Ok(()), "height {h}'s old nullifier is gone");
+    }
+    for nf in [[7u8; 32], [0xa0; 32], [0xa2; 32]] {
+        assert_eq!(code(f.check(&[nf])), Some((409, "nullifier-landed")));
+    }
+    assert!(std::fs::read_to_string(&at).unwrap().contains("\nrollback 7\n"));
+    drop(f);
+    let (_, replayed) = NullifierStore::open(&at, &GENESIS_HASH).unwrap();
+    assert_eq!((replayed.landed.len(), replayed.height), (10, 10));
+    assert!(replayed.landed.contains(&[0xa1; 32]) && !replayed.landed.contains(&[9; 32]), "the replay is the same set");
+
+    // The tip falls back to 8 (the node rolled back): a rollback to 8.
+    let f = followed(&at, &chain);
+    chain.reorg(8, &[], 1);
+    f.poll(&*chain).unwrap();
+    assert_eq!(f.size(), (8, 8));
+    assert_eq!(f.check(&[[0xa1; 32]]), Ok(()), "height 9's nullifier is gone");
+    let _ = std::fs::remove_file(&at);
+}
+
+/// Lab #945: a reorganisation 64 deep is still a rollback; one block
+/// deeper, no block of the window is still served — the store is emptied
+/// and the set rebuilt from height 1, loudly.
+#[test]
+fn a_reorganisation_deeper_than_the_window_rebuilds_from_height_1() {
+    let at = store_path("deep");
+    let chain = FakeChain::new(70, &[]);
+    let f = followed(&at, &chain);
+    assert_eq!(f.size(), (70, 70));
+    let depth = REORG_WINDOW as u64 + 1;
+    let branch = |n: u64, tag: u8| -> Vec<Vec<[u8; 32]>> {
+        (0..n)
+            .map(|i| {
+                let mut nf = [tag; 32];
+                nf[1] = i as u8;
+                vec![nf]
+            })
+            .collect()
+    };
+    // 64 deep: the common block (height 6) is the window's oldest — a rollback.
+    let near = FakeChain::new(70, &[]);
+    let g = NullifierFollow::new(Duration::from_secs(1));
+    g.poll(&*near).unwrap();
+    near.reorg(70 - REORG_WINDOW as u64, &branch(REORG_WINDOW as u64, 0xb1), 2);
+    g.poll(&*near).unwrap();
+    assert_eq!(g.size(), (70, 70), "64 deep is rolled back, not rebuilt");
+    assert_eq!(g.check(&[[7; 32]]), Ok(()));
+    // 65 deep: no block of the window is still served.
+    let new = branch(depth, 0xb0);
+    chain.reorg(70 - depth, &new, 2);
+    let e = f.poll(&*chain).unwrap_err();
+    assert!(e.starts_with("reorg-deeper-than-64:") && e.contains("rebuilding the set from height 1"), "{e}");
     assert_eq!(f.size(), (0, 0));
     assert_eq!(code(f.readiness()), Some((503, "nullifiers-catching-up")));
-    f.poll(&Lying(1, vec![(1, vec![[9; 32]])])).unwrap();
-    assert_eq!(f.size(), (1, 1), "rebuilt from the node's chain, the old height-2 nullifier gone");
-    assert_eq!(f.check(&[[2; 32]]), Ok(()));
-    assert_eq!(code(f.check(&[[9; 32]])), Some((409, "nullifier-landed")));
-    assert_eq!(code(NullifierFollow::new(Duration::from_secs(1)).readiness()), Some((503, "nullifiers-catching-up")));
+    assert_eq!(std::fs::read_to_string(&at).unwrap().lines().count(), 1, "the store is emptied to its header");
+    f.poll(&*chain).unwrap();
+    assert_eq!(f.size(), (70, 70));
+    assert_eq!(f.check(&[[60; 32]]), Ok(()), "the old branch's height 60 is gone");
+    assert_eq!(code(f.check(&[[5; 32]])), Some((409, "nullifier-landed")), "below the fork it is the same chain");
+    let _ = std::fs::remove_file(&at);
+}
+
+/// Lab #945: a served block whose `prev` is not the block before it fails
+/// the poll and the set does not move; a chain that changes between the
+/// poll's reads fails it too — and the next poll rolls back and reads the
+/// new branch, so the old branch's nullifiers never pair with the new ids.
+#[test]
+fn a_broken_prev_link_or_a_chain_changing_mid_poll_fails_the_poll() {
+    struct Broken(Arc<FakeChain>);
+    impl ChainFollow for Broken {
+        fn tip(&self) -> Result<u64, String> {
+            self.0.tip()
+        }
+        fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
+            self.0.nullifiers(from, to)
+        }
+        fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String> {
+            let mut links = self.0.headers(from, to)?;
+            for l in links.iter_mut().filter(|l| l.height == 4) {
+                l.prev = [0xff; 32];
+            }
+            Ok(links)
+        }
+    }
+    let chain = FakeChain::new(3, &[]);
+    let f = NullifierFollow::new(Duration::from_secs(1));
+    f.poll(&*chain).unwrap();
+    chain.push(&[[0x44; 32]]);
+    let e = f.poll(&Broken(Arc::clone(&chain))).unwrap_err();
+    assert!(e.starts_with("headers-break:") && e.contains("height 4"), "{e}");
+    assert_eq!(f.size(), (3, 3), "the set did not move");
+
+    // The chain flips right after the nullifier page is read.
+    struct Flips(Arc<FakeChain>, AtomicBool);
+    impl ChainFollow for Flips {
+        fn tip(&self) -> Result<u64, String> {
+            self.0.tip()
+        }
+        fn nullifiers(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
+            let page = self.0.nullifiers(from, to)?;
+            if self.1.swap(false, Ordering::SeqCst) {
+                self.0.reorg(3, &[vec![[0xc4; 32]]], 3);
+            }
+            Ok(page)
+        }
+        fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String> {
+            self.0.headers(from, to)
+        }
+    }
+    let flips = Flips(Arc::clone(&chain), AtomicBool::new(true));
+    let e = f.poll(&flips).unwrap_err();
+    assert!(e.contains("changed during the poll at height 4"), "{e}");
+    assert_eq!(f.size(), (3, 3), "the old branch's height 4 was not taken");
+    f.poll(&flips).unwrap();
+    assert_eq!(f.size(), (4, 4));
+    assert_eq!(f.check(&[[0x44; 32]]), Ok(()), "the old branch's nullifier never landed here");
+    assert_eq!(code(f.check(&[[0xc4; 32]])), Some((409, "nullifier-landed")));
 }
 
 /// Lab #937 PR E (D5): an accepted submission appends exactly one line —
