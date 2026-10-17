@@ -63,6 +63,11 @@ pub enum CodecError {
     /// moment these bytes enter a consensus commitment
     /// (`discovery-on-the-consensus-wire.md` D6), so the decoder refuses them.
     NonCanonicalVarint { len: usize },
+    /// A well-formed varint whose value is above what its field can hold
+    /// (lab #795): a length read into `usize` (32 bits on wasm32) or an index
+    /// into `u32`. Refused by name, never narrowed with `as` — a narrowing cast
+    /// would read `2^32 + k` as `k` and accept a second byte string for it.
+    VarintRange { got: u64, max: u64 },
     /// Trailing bytes remained after a whole-buffer decode.
     TrailingBytes { remaining: usize },
     /// The committed region's payload section is not `n_entries × PAYLOAD_LEN`
@@ -184,6 +189,30 @@ pub fn read_varint(b: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
         }
         shift += 7;
     }
+}
+
+/// [`read_varint`], refused as [`CodecError::VarintRange`] above `max`
+/// (lab #795). The one place a varint is narrowed: [`read_varint_usize`] and
+/// [`read_varint_u32`] are this at their types' maxima.
+pub fn read_varint_at_most(b: &[u8], pos: &mut usize, max: u64) -> Result<u64, CodecError> {
+    let got = read_varint(b, pos)?;
+    if got > max {
+        return Err(CodecError::VarintRange { got, max });
+    }
+    Ok(got)
+}
+
+/// A varint read as a `usize` length or count — refused by name above
+/// `usize::MAX` (only reachable on a 32-bit target such as wasm32).
+pub fn read_varint_usize(b: &[u8], pos: &mut usize) -> Result<usize, CodecError> {
+    let got = read_varint_at_most(b, pos, usize::MAX as u64)?;
+    Ok(usize::try_from(got).expect("bounded by usize::MAX above"))
+}
+
+/// A varint read as a `u32` — refused by name above `u32::MAX`.
+pub fn read_varint_u32(b: &[u8], pos: &mut usize) -> Result<u32, CodecError> {
+    let got = read_varint_at_most(b, pos, u32::MAX as u64)?;
+    Ok(u32::try_from(got).expect("bounded by u32::MAX above"))
 }
 
 // ---- per-output entry --------------------------------------------------------
@@ -773,5 +802,166 @@ mod tests {
         assert!(payload_tag_is_zero(&p));
         p[l2 - 1] = 1;
         assert!(!payload_tag_is_zero(&p));
+    }
+
+    // ---- lab #795: bounded varint reads ------------------------------------
+
+    #[test]
+    fn read_varint_at_most_takes_max_and_refuses_max_plus_one() {
+        for max in [0u64, 1, 127, 128, 300, u32::MAX as u64] {
+            let mut at = Vec::new();
+            write_varint(&mut at, max);
+            let mut pos = 0;
+            assert_eq!(read_varint_at_most(&at, &mut pos, max), Ok(max));
+            assert_eq!(pos, at.len());
+            let mut over = Vec::new();
+            write_varint(&mut over, max + 1);
+            let mut pos = 0;
+            assert_eq!(
+                read_varint_at_most(&over, &mut pos, max),
+                Err(CodecError::VarintRange { got: max + 1, max })
+            );
+        }
+        // A malformed varint is still refused as itself, not as a range error.
+        let mut pos = 0;
+        assert_eq!(read_varint_at_most(&[0x80, 0x00], &mut pos, 5), Err(CodecError::NonCanonicalVarint { len: 2 }));
+    }
+
+    #[test]
+    fn the_u32_reader_refuses_2_pow_32() {
+        let mut b = Vec::new();
+        write_varint(&mut b, u32::MAX as u64);
+        let mut pos = 0;
+        assert_eq!(read_varint_u32(&b, &mut pos), Ok(u32::MAX));
+        let mut b = Vec::new();
+        write_varint(&mut b, 1u64 << 32);
+        let mut pos = 0;
+        assert_eq!(
+            read_varint_u32(&b, &mut pos),
+            Err(CodecError::VarintRange { got: 1 << 32, max: u32::MAX as u64 }),
+            "2^32 is refused by name, not read as 0"
+        );
+    }
+
+    #[test]
+    fn the_usize_reader_is_the_bounded_reader_at_usize_max() {
+        for v in [0u64, 1, 1 << 31, u32::MAX as u64, 1 << 32, u64::MAX] {
+            let mut b = Vec::new();
+            write_varint(&mut b, v);
+            let (mut p1, mut p2) = (0, 0);
+            let bounded = read_varint_at_most(&b, &mut p1, usize::MAX as u64);
+            let as_usize = read_varint_usize(&b, &mut p2);
+            assert_eq!(as_usize.map(|n| n as u64), bounded, "value {v}");
+            assert_eq!(p1, p2);
+        }
+    }
+
+    /// The narrowing the scan below refuses: a varint read (`read_varint(` or
+    /// `.varint()`), its `?`, an optional `.map_err(..)?`, then `as` an
+    /// integer narrower than u64 — across line breaks, which a line grep
+    /// misses (lab #795: `punish.rs` had one). Comments are dropped first;
+    /// whitespace is removed, so rustfmt cannot hide a site.
+    fn narrowing_casts(src: &str) -> Vec<String> {
+        let code: String = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .flat_map(|l| l.chars().chain(std::iter::once(' ')))
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let bytes = code.as_bytes();
+        // The index just past the `)` that closes the `(` at `open`.
+        let close = |open: usize| -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, &c) in bytes.iter().enumerate().skip(open) {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+        let mut found = Vec::new();
+        for needle in ["read_varint(", ".varint("] {
+            let mut from = 0;
+            while let Some(at) = code[from..].find(needle).map(|i| i + from) {
+                from = at + needle.len();
+                if needle == "read_varint(" && at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+                    continue; // `write_read_varint(`, `fn read_varint(` etc. are other names
+                }
+                let Some(mut i) = close(at + needle.len() - 1) else { continue };
+                if code[i..].starts_with('?') {
+                    i += 1;
+                }
+                if code[i..].starts_with(".map_err(") {
+                    let Some(j) = close(i + ".map_err".len()) else { continue };
+                    i = j;
+                    if code[i..].starts_with('?') {
+                        i += 1;
+                    }
+                }
+                for t in ["asusize", "asu32", "asu16", "asu8"] {
+                    if code[i..].starts_with(t) {
+                        let end = (i + t.len()).min(code.len());
+                        found.push(code[at..end].to_string());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_narrowing_scanner_sees_a_cast_across_lines() {
+        // Spelled with `_X` so this fixture is not itself a site the scan below
+        // finds in this file; the `_X` is removed before scanning.
+        let src = "let a = r.varint_X()? as usize;\n\
+                   let b = read_varint_X(buf, &mut pos)\n    .map_err(|_| E::T { what: \"x\" })?\n    as usize;\n\
+                   let c = r.varint_X()? as u32; // a comment: read_varint_X(x)? as u8\n\
+                   let ok = read_varint_usize(buf, &mut pos)?;\n\
+                   let ok2 = read_varint_X(b, &mut pos)?;\n\
+                   fn read_varint_X(b: &[u8]) -> u64 { 0 }\n"
+            .replace("_X", "");
+        let src = src.as_str();
+        let got = narrowing_casts(src);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(got[0].ends_with("asusize") && got[1].ends_with("asusize"), "{got:?}");
+        assert!(got.iter().any(|g| g.contains(".map_err(")), "the cross-line .map_err form is seen: {got:?}");
+        assert!(got.iter().any(|g| g.ends_with("asu32")), "{got:?}");
+    }
+
+    /// Lab #795: no source narrows a varint with `as`. Lengths go through
+    /// [`read_varint_usize`], indexes through [`read_varint_u32`] (or a
+    /// crate's own `try_from` with its own named error), so a value above the
+    /// field is refused by name instead of read modulo 2^32 on wasm32.
+    #[test]
+    fn no_decoder_narrows_a_varint_with_as() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut offenders = Vec::new();
+        let mut scanned = 0;
+        for krate in std::fs::read_dir(&root).unwrap() {
+            let mut stack = vec![krate.unwrap().path().join("src")];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else { continue };
+                for e in entries {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().is_some_and(|x| x == "rs") {
+                        scanned += 1;
+                        for hit in narrowing_casts(&std::fs::read_to_string(&p).unwrap()) {
+                            offenders.push(format!("{}: {hit}", p.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(scanned > 100, "the scan found the workspace's sources ({scanned} files)");
+        assert!(offenders.is_empty(), "varints narrowed with `as` (use read_varint_usize / read_varint_u32):\n{}", offenders.join("\n"));
     }
 }

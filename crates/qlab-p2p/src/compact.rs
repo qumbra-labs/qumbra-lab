@@ -398,28 +398,28 @@ fn decode_announce_inner(payee_boundary: Option<u64>, wf: WireForm, buf: &[u8]) 
         }
     };
     let (finality, bundle) = if wf.sections == BodySections::V6 {
-        let n = r.varint()? as usize;
+        let n = r.varint_usize()?;
         let finality = r.rest(n, "announce.finality")?;
-        let n = r.varint()? as usize;
+        let n = r.varint_usize()?;
         let bundle = r.rest(n, "announce.bundle")?;
         (finality, bundle)
     } else {
         (Vec::new(), Vec::new())
     };
-    let n_short = r.varint()? as usize;
+    let n_short = r.varint_usize()?;
     let mut short_ids = Vec::with_capacity(n_short.min(r.remaining() / SHORTID_LEN));
     for _ in 0..n_short {
         let s = r.rest(SHORTID_LEN, "announce.shortid")?;
         short_ids.push(s.try_into().unwrap());
     }
-    let n_pf = r.varint()? as usize;
+    let n_pf = r.varint_usize()?;
     // Every prefilled entry is at least an index varint, a length varint and a
     // tx whose wire opens with its 32-byte anchor (L1 and Annulet alike): the
     // bound reserves at most remaining / 34 entries, never a count's worth.
     let mut prefilled = Vec::with_capacity(n_pf.min(r.remaining() / MIN_PREFILLED_BYTES));
     for _ in 0..n_pf {
-        let index = r.varint()? as u32;
-        let tx_len = r.varint()? as usize;
+        let index = r.varint_u32()?;
+        let tx_len = r.varint_usize()?;
         let tx_bytes = r.rest(tx_len, "announce.prefilled.tx")?;
         prefilled.push(PrefilledTx { index, tx: decode_tx_for_auth(form, wf.l2_auth, &tx_bytes)? });
     }
@@ -444,12 +444,12 @@ pub fn encode_get_block_txn(g: &GetBlockTxn) -> Vec<u8> {
 pub fn decode_get_block_txn(buf: &[u8]) -> Result<GetBlockTxn, DecodeError> {
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("gbt.block_hash")?;
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     // Each index is a varint of at least one byte; the reservation is at most
     // 4 B (a u32) per remaining byte.
     let mut indexes = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
-        indexes.push(r.varint()? as u32);
+        indexes.push(r.varint_u32()?);
     }
     r.finish()?;
     Ok(GetBlockTxn { block_hash, indexes })
@@ -491,12 +491,12 @@ pub fn decode_block_txn_for_wire(wf: WireForm, buf: &[u8]) -> Result<BlockTxn, D
     let form = wf.form;
     let mut r = Reader::new(buf);
     let block_hash = r.hash32("bt.block_hash")?;
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     // Every entry is at least a length varint and a tx opening with its
     // 32-byte anchor: at most remaining / 33 entries are reserved.
     let mut txs = Vec::with_capacity(n.min(r.remaining() / MIN_BLOCK_TXN_ENTRY_BYTES));
     for _ in 0..n {
-        let tx_len = r.varint()? as usize;
+        let tx_len = r.varint_usize()?;
         let tx_bytes = r.rest(tx_len, "bt.tx")?;
         txs.push(decode_tx_for_auth(form, wf.l2_auth, &tx_bytes)?);
     }
@@ -676,6 +676,50 @@ mod tests {
             Reconstruct::Complete(_) => panic!("expected missing"),
         }
     }
+    // ── lab #795: indexes above u32 are refused by name ─────────────────────
+
+    /// The varint `v`'s bytes, through the one encoder.
+    fn varint_bytes(v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::varint::write_varint(&mut out, v);
+        out
+    }
+
+    #[test]
+    fn a_compact_block_index_above_u32_is_refused_by_name() {
+        let with = sample_announce();
+        let without = BlockAnnounce { prefilled: vec![], ..sample_announce() };
+        let base = encode_announce(GenesisForm::V4, &with);
+        // The prefilled section is the frame's tail: `n_pf` sits where the
+        // empty announce ends, and the first entry's index (0) right after it.
+        let at = encode_announce(GenesisForm::V4, &without).len();
+        assert_eq!((base[at - 1], base[at]), (1, 0), "n_pf = 1, then index 0");
+        let mut f = base[..at].to_vec();
+        f.extend_from_slice(&varint_bytes(1 << 32));
+        f.extend_from_slice(&base[at + 1..]);
+        match decode_announce(GenesisForm::V4, &f) {
+            Err(DecodeError::VarintRange { got, max }) => assert_eq!((got, max), (1 << 32, u32::MAX as u64)),
+            Err(e) => panic!("expected VarintRange, got {e:?}"),
+            Ok(_) => panic!("decoded (before lab #795 this read index 0)"),
+        }
+        // u32::MAX itself is a legal index on the wire.
+        let mut ok = base[..at].to_vec();
+        ok.extend_from_slice(&varint_bytes(u32::MAX as u64));
+        ok.extend_from_slice(&base[at + 1..]);
+        assert_eq!(decode_announce(GenesisForm::V4, &ok).unwrap().prefilled[0].index, u32::MAX);
+    }
+
+    #[test]
+    fn a_getblocktxn_index_above_u32_is_refused_by_name() {
+        let mut g = [5u8; 32].to_vec();
+        g.extend_from_slice(&varint_bytes(1));
+        g.extend_from_slice(&varint_bytes((1 << 32) + 7));
+        match decode_get_block_txn(&g) {
+            Err(DecodeError::VarintRange { got, max }) => assert_eq!((got, max), ((1 << 32) + 7, u32::MAX as u64)),
+            other => panic!("expected VarintRange (before lab #795 this read index 7), got {other:?}"),
+        }
+    }
+
     // ── v5 payee-list announce (lab #470 stage 2) ───────────────────────────
 
     fn sample_announce() -> BlockAnnounce {

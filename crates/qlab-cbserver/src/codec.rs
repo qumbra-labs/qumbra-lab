@@ -70,7 +70,8 @@ pub use qlab_note::compact::{
     committed_contents_prefix, committed_payloads_per_recipient, contents_commitments,
     contents_entry_count, decode_committed_discovery, decode_group, decode_group_contents,
     encode_committed_discovery, encode_group, encode_group_contents, group_len, groups_eq,
-    read_bundle, read_entry, read_group, read_group_contents, read_varint, write_bundle,
+    read_bundle, read_entry, read_group, read_group_contents, read_varint, read_varint_at_most, read_varint_u32,
+    read_varint_usize, write_bundle,
     write_entry, write_group, write_group_contents, write_varint, CodecError, CompactGroup,
     PAYLOAD_LEN,
 };
@@ -181,7 +182,7 @@ pub fn decode_full_response(b: &[u8]) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
         pos += 1;
         let mut payloads = Vec::with_capacity(n_payloads as usize);
         for _ in 0..n_payloads {
-            let len = read_varint(b, &mut pos)? as usize;
+            let len = read_varint_usize(b, &mut pos)?;
             let end = pos.checked_add(len).filter(|end| *end <= b.len());
             let Some(end) = end else { return Err(CodecError::Truncated { what: "payload" }) };
             payloads.push(b[pos..end].to_vec());
@@ -464,7 +465,7 @@ impl NamesPage {
             // Vec (24 B) per input byte.
             let mut riders = Vec::with_capacity((n_tx as usize).min(b.len()));
             for _ in 0..n_tx {
-                let len = read_varint(b, &mut pos)? as usize;
+                let len = read_varint_usize(b, &mut pos)?;
                 let end = pos.checked_add(len).filter(|end| *end <= b.len());
                 let Some(end) = end else { return Err(CodecError::Truncated { what: "rider" }) };
                 riders.push(b[pos..end].to_vec());

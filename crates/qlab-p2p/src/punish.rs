@@ -85,7 +85,7 @@ use qlab_devnet::ebbflow::{equivocation_slash, verify_equivocation, Equivocation
 use qlab_devnet::epoch::EpochCommittee;
 
 use crate::codec::{decode_evidence_msg, encode_evidence_msg, DecodeError};
-use crate::varint::{read_varint, write_varint};
+use crate::varint::{read_varint, read_varint_usize, write_varint};
 
 /// On-disk format version for the punishment ledger. Independent of the P2P
 /// protocol version and of `qlab_node::FORMAT_VERSION` — this is a node-local
@@ -212,9 +212,8 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<EquivocationEvidence>, LedgerError> {
     }
     let mut out = Vec::with_capacity(n as usize);
     for index in 0..n as usize {
-        let len = read_varint(bytes, &mut pos)
-            .map_err(|_| LedgerError::Truncated { what: "record length" })?
-            as usize;
+        let len = read_varint_usize(bytes, &mut pos)
+            .map_err(|_| LedgerError::Truncated { what: "record length" })?;
         let end = pos.checked_add(len).ok_or(LedgerError::Truncated { what: "record" })?;
         let body = bytes.get(pos..end).ok_or(LedgerError::Truncated { what: "record" })?;
         pos = end;

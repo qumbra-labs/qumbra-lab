@@ -172,7 +172,9 @@ impl Envelope {
         let addr_commitment: [u8; 32] = take(buf, &mut pos, 32)?.try_into().unwrap();
         let output_index = *buf.get(pos).ok_or(EnvelopeError::Malformed("no output_index"))?;
         pos += 1;
-        let proof_len = read_varint(buf, &mut pos)? as usize;
+        // Lab #795: refused by name above usize::MAX (wasm32), never narrowed.
+        let proof_len = usize::try_from(read_varint(buf, &mut pos)?)
+            .map_err(|_| EnvelopeError::Malformed("proof length above usize::MAX"))?;
         let proof_bytes = take(buf, &mut pos, proof_len)?;
         if pos != buf.len() {
             return Err(EnvelopeError::Malformed("trailing bytes"));

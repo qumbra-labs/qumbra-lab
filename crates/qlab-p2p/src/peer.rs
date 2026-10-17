@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use qlab_devnet::header::Hash32;
 
 use crate::codec::{DecodeError, Reader};
-use crate::varint::{read_varint, write_varint};
+use crate::varint::{read_varint_usize, write_varint};
 
 /// A local handle to one transport connection. Not a network identity — see
 /// [`NodeId`]. Assigned by the transport; unique within one process/transport.
@@ -87,7 +87,7 @@ impl VersionMsg {
         let node_id = r.hash32("version.node_id")?;
         let services = r.u64_le("version.services")?;
         let tip_height = r.u64_le("version.tip_height")?;
-        let ua_len = r.varint()? as usize;
+        let ua_len = r.varint_usize()?;
         let ua_bytes = r.rest(ua_len, "version.user_agent")?;
         // Presence-conditional net id (lab #474): absent on the legacy vintage,
         // exactly 32 bytes when present. `has_more` is the one honest probe
@@ -116,12 +116,12 @@ pub fn encode_addrs(addrs: &[String]) -> Vec<u8> {
 /// Decode an `Addr` payload.
 pub fn decode_addrs(buf: &[u8]) -> Result<Vec<String>, DecodeError> {
     let mut pos = 0usize;
-    let n = read_varint(buf, &mut pos)? as usize;
+    let n = read_varint_usize(buf, &mut pos)?;
     // Each address is at least a one-byte length varint: at most one String
     // (24 B) is reserved per input byte.
     let mut addrs = Vec::with_capacity(n.min(buf.len()));
     for _ in 0..n {
-        let len = read_varint(buf, &mut pos)? as usize;
+        let len = read_varint_usize(buf, &mut pos)?;
         let end = pos.checked_add(len).filter(|end| *end <= buf.len());
         let Some(end) = end else { return Err(DecodeError::Truncated { what: "addr" }) };
         let s = String::from_utf8(buf[pos..end].to_vec()).map_err(|_| DecodeError::Varint)?;

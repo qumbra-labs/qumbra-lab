@@ -113,6 +113,8 @@ jobs:
           cargo test -p qumbra-node --lib --locked -- --test-threads=1 --exact bundle::tests::no_workflow_or_script_enables_the_test_knobs
           # qlab-devnet, lab #303: the exact-emission module's code contains no float token (the rule clippy states but the bar never runs)
           cargo test -p qlab-devnet --lib --locked -- --test-threads=1 --exact emission_exact::tests::the_module_source_contains_no_float
+          # qlab-note, lab #795: no source narrows a varint with `as` (read_varint_usize / read_varint_u32 refuse by name) (+ the scanner's own self-test)
+          cargo test -p qlab-note --lib --locked -- --test-threads=1 --exact compact::tests::no_decoder_narrows_a_varint_with_as compact::tests::the_narrowing_scanner_sees_a_cast_across_lines
           # qlab-p2p, lab #86 / #289: node.rs has exactly one dial call site (one path, one cap, one backoff)
           cargo test -p qlab-p2p --lib --locked -- --test-threads=1 the_node_has_exactly_one_dial_call_site
           # qlab-bench, lab #847: no f5box source (incl. its qumbra-sequencer half) calls the wrapper rule's test knobs

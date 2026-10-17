@@ -6,7 +6,7 @@
 //! a varint appears — so there is exactly one LEB128 in the tree, the one whose
 //! output is locked to the spec digest `3ee2a5e6…`.
 
-pub use qlab_cbserver::codec::{read_varint, write_varint, CodecError};
+pub use qlab_cbserver::codec::{read_varint, read_varint_u32, read_varint_usize, write_varint, CodecError};
 
 /// The §5 wire-version lead byte (`0x01`), re-exported for the compact-block
 /// relay path so it reads the same constant the note-discovery server writes.
