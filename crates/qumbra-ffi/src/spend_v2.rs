@@ -574,6 +574,35 @@ pub unsafe extern "C" fn qmb_auth_check_step(c: *mut CheckHandle, out: *mut *mut
     }
 }
 
+/// **Lab #936, opt-in:** ask the check's bodies in `/v1/bodies` pages of up
+/// to `n` (1 ..= 256) instead of one `/v1/block/{h}/body` per NEED; `0` is
+/// the default (one per NEED). Call it before the first
+/// [`qmb_auth_check_step`], and only for an endpoint that serves
+/// `/v1/bodies`. Each body in a page is bound to its verified header as a
+/// single one is; the verdict is the same. `0` set, `-1` misuse or refused
+/// (`n` above 256, or a step already taken; `*err_out` why when given).
+///
+/// # Safety
+/// `c` live (or NULL); `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_set_page(c: *mut CheckHandle, n: u32, err_out: *mut *mut c_char) -> i32 {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if c.is_null() {
+        return -1;
+    }
+    match (*c).check.set_page(n as u64) {
+        Ok(()) => 0,
+        Err(why) => {
+            if !err_out.is_null() {
+                *err_out = out_string(why);
+            }
+            -1
+        }
+    }
+}
+
 /// Answer the outstanding NEED with the body.
 ///
 /// # Safety

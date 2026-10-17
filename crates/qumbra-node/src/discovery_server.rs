@@ -194,7 +194,7 @@ use qlab_node::{
     compact_response, full_response, BlockDiscovery, FullRefusal, Hash32, MempoolError, TreeLeaves,
 };
 use qlab_p2p::adapter::TxSubmitRefusal;
-use qlab_p2p::served::{BODY_PATH_SHAPE, HEADERS_PATH, MAX_HEADERS_PAGE};
+use qlab_p2p::served::{BODIES_PATH, BODY_PATH_SHAPE, HEADERS_PATH, MAX_BODIES_PAGE, MAX_HEADERS_PAGE};
 
 /// The note-discovery route (issue #188 baton 2).
 pub const COMPACT_PATH: &str = "/v1/compact";
@@ -1208,6 +1208,15 @@ impl DiscoveryServer {
                         };
                         respond_headers(&snapshot, wire_form(&form_view), query)
                     }
+                    // Lab #936: a page of whole-block bodies, each the
+                    // `/v1/block/{h}/body` answer, same projection.
+                    BODIES_PATH => {
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_bodies(&snapshot, wire_form(&form_view), query)
+                    }
                     // Lab #860 R1: the V6 L2 index, one snapshot per answer.
                     p if p.starts_with(L2_INDEX_PREFIX) => {
                         let snapshot = match l2_index.lock() {
@@ -1276,7 +1285,7 @@ impl DiscoveryServer {
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {COINBASE_PATH}?from=&to=, {EXITS_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
                                  {REGISTRY_ROOT_PATH}, {REGISTRY_PATH_PREFIX}{{asset}}, {REGISTRY_SLOT_PREFIX}{{asset}}, {GENESIS_NOTES_PATH}, \
-                                 {FULL_PATH_SHAPE}, {HEADERS_PATH}?from=&to=, {BODY_PATH_SHAPE}, {BUNDLE_PATH_PREFIX}{{height}}, or POST {TX_SUBMIT_PATH}"
+                                 {FULL_PATH_SHAPE}, {HEADERS_PATH}?from=&to=, {BODY_PATH_SHAPE}, {BODIES_PATH}?from=&to=, {BUNDLE_PATH_PREFIX}{{height}}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
                     },
@@ -1668,6 +1677,12 @@ pub fn respond_body(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, h: &s
             ),
         ));
     };
+    body_answer_of(wf, height, block)
+}
+
+/// One stored block's body answer — the bytes `/v1/block/{h}/body` serves
+/// and each element of a `/v1/bodies` page is.
+fn body_answer_of(wf: qlab_p2p::compact::WireForm, height: u64, block: &qlab_node::StoredBlock) -> Result<Vec<u8>, (u16, String)> {
     let unit = header_unit(wf.form, block)
         .ok_or_else(|| (500, format!("height {height} holds an Annulet block with no seal")))?;
     let body = block.try_body().map_err(|e| (503, format!("height {height}: the body cannot be read back: {e}")))?;
@@ -1678,6 +1693,62 @@ pub fn respond_body(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, h: &s
         return Err((500, format!("height {height}: a {} B body exceeds the served bound", bytes.len())));
     }
     Ok(bytes)
+}
+
+/// Whether a body answer of `len` bytes joins a bodies page that already
+/// holds `held` answers of `bytes` in all (lab #936): always the first —
+/// a block alone is never refused for its size, `respond_body`'s own bound
+/// holds it — and after that only while the page stays within
+/// [`qlab_p2p::node::MAX_SERVED_BODY_BYTES`].
+fn joins_the_page(held: usize, bytes: usize, len: usize) -> bool {
+    held == 0 || bytes.saturating_add(len) <= qlab_p2p::node::MAX_SERVED_BODY_BYTES
+}
+
+/// The socket-free **`GET /v1/bodies?from=&to=`** core (lab #936): a
+/// contiguous page of body answers over `from ..= to`, each byte for byte
+/// [`respond_body`]'s at its height, so a light client binds each exactly as
+/// it binds one — a journal birth reads a page per request, not a block.
+///
+/// At most [`MAX_BODIES_PAGE`] bodies (`to` is clamped, as on
+/// `/v1/headers`), and their answers add up to at most
+/// [`qlab_p2p::node::MAX_SERVED_BODY_BYTES`] — but the first body is always
+/// served, so a block near that bound alone still is. A short page is a fact
+/// (the client continues after it); an empty one means this node holds no
+/// main-chain height `from`.
+///
+/// Refusals, as on `/v1/headers` and `/v1/block/{h}/body`: a missing or
+/// invalid bound or an inverted range — 400; `from = 0` on an Annulet net —
+/// 400, by name; a body that cannot be read back — 503; a projection without
+/// its blocks — 503.
+pub fn respond_bodies(view: &DiscoveryView, wf: qlab_p2p::compact::WireForm, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+    if to < from {
+        return Err((400, "'to' < 'from'".to_string()));
+    }
+    if genesis_is_the_files(wf.form, from) {
+        return Err((
+            400,
+            "the Annulet genesis body is the genesis file's notes: read /genesis.qmb and verify it by its hash; ask from=1"
+                .to_string(),
+        ));
+    }
+    if let Some(gap) = stored_gap(view) {
+        return Err(gap);
+    }
+    let last = to.min(from.saturating_add(MAX_BODIES_PAGE as u64 - 1));
+    let mut answers: Vec<Vec<u8>> = Vec::new();
+    let mut bytes = 0usize;
+    for h in from..=last {
+        let Some(block) = view.stored.get(h as usize) else { break };
+        let answer = body_answer_of(wf, h, block)?;
+        if !joins_the_page(answers.len(), bytes, answer.len()) {
+            break;
+        }
+        bytes += answer.len();
+        answers.push(answer);
+    }
+    Ok(qlab_p2p::served::encode_bodies_page(wf, from, &answers))
 }
 
 /// Handle one `POST /v1/tx` on its own bounded thread: read the body, decode,
@@ -2849,11 +2920,26 @@ mod tests {
         let Ok(ann) = decode_body_answer(v4, 2, &body) else { panic!("a whole body decodes") };
         assert_eq!(ann.header, units[2].header());
 
+        // Lab #936: a bodies page is the single-body answers, byte for byte.
+        let (status, page) = get(addr, "/v1/bodies?from=1&to=9");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let split = qlab_p2p::served::split_bodies_page(v4, 1, &page).expect("a bodies page splits");
+        assert_eq!(split.len(), 2, "heights 1 and 2: the page stops at the tip");
+        for (i, b) in split.iter().enumerate() {
+            let (_, one) = get(addr, &format!("/v1/block/{}/body", 1 + i));
+            assert_eq!(*b, &one[..], "page element {i} is the /v1/block/{}/body answer", 1 + i);
+        }
+        let (_, past) = get(addr, "/v1/bodies?from=7&to=9");
+        assert_eq!(qlab_p2p::served::split_bodies_page(v4, 7, &past).unwrap().len(), 0, "past the tip: an empty page");
+
         for (path, code) in [
             ("/v1/block/9/body", "404"),
             ("/v1/block/zz/body", "400"),
             ("/v1/headers?from=1", "400"),
             ("/v1/headers?from=2&to=1", "400"),
+            ("/v1/bodies?from=1", "400"),
+            ("/v1/bodies?from=2&to=1", "400"),
+            ("/v1/bodies?to=2", "400"),
             ("/genesis.qmb", "404"),
         ] {
             let (status, _) = get(addr, path);
@@ -2868,7 +2954,50 @@ mod tests {
         *shared.lock().unwrap() = Arc::new(without);
         let (status, _) = get(addr, "/v1/headers?from=0&to=9");
         assert!(status.starts_with("HTTP/1.1 503"), "{status}");
+        let (status, _) = get(addr, "/v1/bodies?from=0&to=9");
+        assert!(status.starts_with("HTTP/1.1 503"), "{status}");
         srv.shutdown();
+    }
+
+    /// **Lab #936**: a bodies page clamps to [`MAX_BODIES_PAGE`] bodies, as a
+    /// headers page clamps to its own, and is its single-body answers in order.
+    #[test]
+    fn a_bodies_page_clamps_to_its_count_and_equals_the_single_body_answers() {
+        use qlab_node::{ChainStore, MemChainStore};
+        let v4 = qlab_p2p::compact::WireForm::plain(qlab_devnet::forms::GenesisForm::V4);
+        let genesis = stored(0, [0; 32], vec![]);
+        let mut prev = genesis.header().header_hash();
+        let mut store = MemChainStore::new(genesis);
+        let top = MAX_BODIES_PAGE as u64 + 3;
+        for h in 1..=top {
+            let b = stored(h, prev, vec![]);
+            prev = b.header().header_hash();
+            store.put_block(b).expect("applies");
+        }
+        let mut view = DiscoveryView::default();
+        assert!(view.refresh(&store));
+        let page = respond_bodies(&view, v4, &format!("from=1&to={top}")).expect("a page");
+        let split = qlab_p2p::served::split_bodies_page(v4, 1, &page).expect("splits");
+        assert_eq!(split.len(), MAX_BODIES_PAGE, "clamped to the page");
+        for (i, b) in split.iter().enumerate() {
+            assert_eq!(*b, &respond_body(&view, v4, &(1 + i).to_string()).unwrap()[..], "element {i}");
+        }
+        let tail = respond_bodies(&view, v4, &format!("from={}&to={top}", MAX_BODIES_PAGE + 1)).unwrap();
+        assert_eq!(qlab_p2p::served::split_bodies_page(v4, MAX_BODIES_PAGE as u64 + 1, &tail).unwrap().len(), 3);
+    }
+
+    /// **Lab #936**: the page's byte budget — the first body always joins (a
+    /// block is never refused for its size here; its own bound holds it), and
+    /// after it a body joins only while the answers stay within
+    /// `MAX_SERVED_BODY_BYTES`.
+    #[test]
+    fn a_bodies_page_stops_at_its_byte_budget_and_serves_at_least_one() {
+        let cap = qlab_p2p::node::MAX_SERVED_BODY_BYTES;
+        assert!(joins_the_page(0, 0, cap + 10), "the first body joins whatever its size");
+        assert!(joins_the_page(1, cap - 100, 100), "exactly at the budget");
+        assert!(!joins_the_page(1, cap - 100, 101), "one byte over");
+        assert!(!joins_the_page(1, cap + 10, 1), "after a lone large body, nothing more");
+        assert!(!joins_the_page(2, usize::MAX, 1), "no overflow");
     }
 
     /// **Lab #850 AD1**: an Annulet node serves its genesis file at
@@ -2898,7 +3027,7 @@ mod tests {
         let (status, body) = get(addr, GENESIS_FILE_PATH);
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
         assert_eq!(qlab_devnet::hash::keccak256(&body), file.hash(), "the served bytes are the pinned genesis");
-        for path in ["/v1/headers?from=0&to=3", "/v1/block/0/body"] {
+        for path in ["/v1/headers?from=0&to=3", "/v1/block/0/body", "/v1/bodies?from=0&to=3"] {
             let (status, _) = get(addr, path);
             assert!(status.starts_with("HTTP/1.1 400"), "{path} => {status}");
         }

@@ -31,7 +31,7 @@ use qumbra_ffi::spend_v2::{
     qmb_auth_journal_summary,
     qmb_auth_journal_advances,
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
-    qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
+    qmb_auth_check_set_page, qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
     qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_prover, qmb_spend_v2_refusal, qmb_spend_v2_step,
     qmb_spend_v2_supply,
     qmb_spend_v2_supply_err, AuthHandle, CheckHandle, SpendBasis, SpendHandle, QMB_AUTH_CHECKED, QMB_AUTH_JOURNAL_STALE,
@@ -212,8 +212,9 @@ unsafe fn finish_check(w: *mut WalletState, c: *mut CheckHandle, ep: &Endpoint, 
             1 => {
                 let path = take_str(out);
                 paths.push(path.clone());
-                let h: u64 = path.split('/').nth(3).unwrap().parse().unwrap();
-                if fail_at == Some(h) {
+                // A per-block NEED names its height; a page NEED (lab #936) does not.
+                let h: Option<u64> = path.split('/').nth(3).and_then(|s| s.parse().ok());
+                if fail_at.is_some() && fail_at == h {
                     qmb_auth_check_supply_err(c, CString::new("connection reset").unwrap().as_ptr());
                     continue;
                 }
@@ -1393,3 +1394,118 @@ fn w_no_test_feature_is_in_the_release_feature_tree() {
     assert!(with_dev.contains("\"fixture-pins\"") && with_dev.contains("\"test-support\""), "the dev tree names them");
 }
 
+/// Lab #936: a restore (`paged = Some(n)`: `qmb_auth_check_set_page(n)` first).
+unsafe fn restore_paged(w: *mut WalletState, ep: &Endpoint, paged: Option<u32>) -> Result<Opened, String> {
+    let b = basis_g(w, ep, &PROBE);
+    let mut err: *mut c_char = ptr::null_mut();
+    let c = qmb_auth_restore_new(w, b, &mut err);
+    qmb_spend_basis_free(b);
+    assert!(!c.is_null(), "{}", take_str(err));
+    if let Some(n) = paged {
+        assert_eq!(qmb_auth_check_set_page(c, n, &mut err), 0, "{}", if err.is_null() { String::new() } else { take_str(err) });
+    }
+    finish_check(w, c, ep, None)
+}
+
+/// **Lab #936**: paging is opt-in and changes only how bodies are asked
+/// for — the same restore, the same journal and verdict, the bodies read as
+/// `/v1/bodies` pages; an open check reads its pages from past `checked_to`.
+#[test]
+fn x_a_paged_check_reaches_the_per_block_verdict() {
+    let (f, persisted) = spent_chain();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let one = restore_paged(w, &f.ep, None).unwrap();
+        assert_eq!(one.paths, vec!["/v1/block/1/body".to_string(), "/v1/block/2/body".to_string()], "the default is unchanged");
+        let paged = restore_paged(w, &f.ep, Some(256)).unwrap();
+        assert_eq!(paged.paths, vec!["/v1/bodies?from=1&to=2".to_string()], "one page to the verified tip");
+        assert_eq!((paged.status, &paged.journal), (one.status, &one.journal), "the same verdict and journal");
+        let ones = restore_paged(w, &f.ep, Some(1)).unwrap();
+        assert_eq!(ones.paths, vec!["/v1/bodies?from=1&to=1".to_string(), "/v1/bodies?from=2&to=2".to_string()]);
+        assert_eq!((ones.status, &ones.journal), (one.status, &one.journal));
+        for o in [one, paged, ones] {
+            qmb_auth_free(o.a);
+        }
+        // An open check pages from past its checked_to, as it walks one at a time.
+        let gens: Vec<u32> = AuthJournal::from_text(persisted).unwrap().generations().iter().map(|r| r.g).collect();
+        let b = basis_g(w, &f.ep, &gens);
+        let j = CString::new(persisted.as_str()).unwrap();
+        let mut err: *mut c_char = ptr::null_mut();
+        let c = qmb_auth_check_new(w, j.as_ptr(), b, 0, &mut err);
+        qmb_spend_basis_free(b);
+        assert_eq!(qmb_auth_check_set_page(c, 256, ptr::null_mut()), 0);
+        let ok = finish_check(w, c, &f.ep, None).unwrap();
+        assert_eq!(ok.paths, vec!["/v1/bodies?from=2&to=2".to_string()]);
+        assert_eq!(ok.status, QMB_AUTH_CHECKED);
+        qmb_auth_free(ok.a);
+        qmb_wallet_free(w);
+    }
+}
+
+/// **Lab #936**: a body in a page that does not bind to its verified header
+/// refuses the check at that height, by the per-block check's own words; the
+/// page size is bounded and fixed before the first step.
+#[test]
+fn y_a_paged_check_refuses_a_lying_body_and_the_page_is_bounded() {
+    let lying = {
+        let payee = wallet_dir("sv2_y_lie_payee", PAYEE);
+        let pw = payee.wallet();
+        let to = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0));
+        let _ = std::fs::remove_dir_all(&payee.dir);
+        let mut rng = StdRng::seed_from_u64(0x59);
+        let paid = BlockBody { txs: vec![pay_tx(&to, &[note_to(&to, 3, 0, 60)], 0x60, &mut rng)], ..BlockBody::default() };
+        chain_full("sv2_y_lie", Lie::None, vec![paid], true)
+    };
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let why = restore_paged(w, &lying.ep, Some(256)).err().unwrap();
+        assert!(why.contains("block 2's body is not the one its verified header commits to"), "{why}");
+
+        let b = basis_g(w, &lying.ep, &PROBE);
+        let mut err: *mut c_char = ptr::null_mut();
+        let c = qmb_auth_restore_new(w, b, &mut err);
+        qmb_spend_basis_free(b);
+        assert_eq!(qmb_auth_check_set_page(c, 257, &mut err), -1);
+        assert!(take_str(err).contains("exceeds 256"));
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_auth_check_step(c, &mut out), 1);
+        let _ = take_str(out);
+        assert_eq!(qmb_auth_check_set_page(c, 8, &mut err), -1, "fixed once a step is taken");
+        assert!(take_str(err).contains("before the first step"));
+        assert_eq!(qmb_auth_check_set_page(ptr::null_mut(), 8, ptr::null_mut()), -1, "NULL-safe");
+        qumbra_ffi::spend_v2::qmb_auth_check_free(c);
+        qmb_wallet_free(w);
+    }
+}
+
+/// **Lab #936**: a page shorter than asked is taken for what it holds and
+/// the next NEED asks on from there; an empty page is the body missing —
+/// refused by name, never read as "nothing landed".
+#[test]
+fn z_a_short_page_continues_and_an_empty_page_refuses() {
+    let (f, _) = spent_chain();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let b = basis_g(w, &f.ep, &PROBE);
+        let mut err: *mut c_char = ptr::null_mut();
+        let c = qmb_auth_restore_new(w, b, &mut err);
+        qmb_spend_basis_free(b);
+        assert_eq!(qmb_auth_check_set_page(c, 256, ptr::null_mut()), 0);
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_auth_check_step(c, &mut out), 1);
+        assert_eq!(take_str(out), "/v1/bodies?from=1&to=2");
+        // The endpoint answers with height 1 only.
+        let short = f.ep.fetch("/v1/bodies?from=1&to=1").unwrap();
+        qmb_auth_check_supply(c, short.as_ptr(), short.len());
+        assert_eq!(qmb_auth_check_step(c, &mut out), 1);
+        assert_eq!(take_str(out), "/v1/bodies?from=2&to=2", "asked on from past what the page held");
+        // Then with nothing at all.
+        let empty = qlab_p2p::served::encode_bodies_page(f.ep.wire, 2, &[]);
+        qmb_auth_check_supply(c, empty.as_ptr(), empty.len());
+        assert_eq!(qmb_auth_check_step(c, &mut out), -2);
+        let why = take_str(out);
+        assert!(why.contains("block 2's body is unavailable: the endpoint served an empty page"), "{why}");
+        qumbra_ffi::spend_v2::qmb_auth_check_free(c);
+        qmb_wallet_free(w);
+    }
+}

@@ -126,6 +126,9 @@ pub fn response_ceiling(path: &str) -> Option<usize> {
         MAX_HEADERS_ANSWER_BYTES
     } else if route.starts_with("/v1/block/") && route.ends_with("/body") {
         MAX_BODY_ANSWER_BYTES
+    } else if route == qlab_p2p::served::BODIES_PATH {
+        // Lab #936: a page of body answers, framed.
+        qlab_p2p::served::MAX_BODIES_PAGE_BYTES
     } else if route.starts_with("/v1/registry/") && route != "/v1/registry/root" {
         MAX_REGISTRY_ANSWER_BYTES
     } else if route.starts_with(crate::v6_bundle::BUNDLE_PATH_PREFIX) {

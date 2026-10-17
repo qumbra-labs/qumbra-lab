@@ -120,11 +120,51 @@ pub struct AuthCheck {
     at: u64,
     asked: bool,
     refused: Option<String>,
+    /// Lab #936: bodies per NEED — 0 asks one `/v1/block/{h}/body` at a time
+    /// (the default; every recorded fixture's NEED sequence), `n` asks a
+    /// `/v1/bodies` page of up to `n` ([`AuthCheck::set_page`]).
+    page: u64,
+    /// The last height the outstanding page NEED asked for.
+    asked_to: u64,
+    /// A step has been taken: the page size is fixed from here.
+    started: bool,
 }
+
+/// The most bodies one page NEED asks for: the served page's own bound.
+pub const MAX_CHECK_PAGE: u64 = qlab_p2p::served::MAX_BODIES_PAGE as u64;
 
 impl AuthCheck {
     fn new(mode: CheckMode, basis: CheckBasis, trees: Vec<Arc<GenTree>>, from: u64) -> AuthCheck {
-        AuthCheck { mode, basis, trees, landed: LandedByGeneration::new(), at: from, asked: false, refused: None }
+        AuthCheck {
+            mode,
+            basis,
+            trees,
+            landed: LandedByGeneration::new(),
+            at: from,
+            asked: false,
+            refused: None,
+            page: 0,
+            asked_to: 0,
+            started: false,
+        }
+    }
+
+    /// **Lab #936, opt-in:** ask the bodies in `/v1/bodies` pages of up to
+    /// `n` (1 ..= [`MAX_CHECK_PAGE`]) instead of one per NEED; 0 restores the
+    /// default. Each body in a page is bound exactly as a single one is —
+    /// header, counts, commitment — and judged in height order, so the
+    /// verdict is the per-block check's. Set before the first step: a shell
+    /// turns pages on only for an endpoint it knows serves the route (no
+    /// fallback that would read a transient error as "not served").
+    pub fn set_page(&mut self, n: u64) -> Result<(), String> {
+        if n > MAX_CHECK_PAGE {
+            return Err(format!("a page of {n} bodies exceeds {MAX_CHECK_PAGE}"));
+        }
+        if self.started {
+            return Err("the page size is set before the first step".to_string());
+        }
+        self.page = n;
+        Ok(())
     }
 
     /// **Open generation `generation` of `journal`, checked against the
@@ -182,11 +222,16 @@ impl AuthCheck {
         if self.asked {
             return CheckStep::Refused("a step with an answer outstanding".into());
         }
+        self.started = true;
         if self.at > self.basis.chain.tip() {
             return CheckStep::Ready;
         }
         self.asked = true;
-        CheckStep::Need(format!("/v1/block/{}/body", self.at))
+        if self.page == 0 {
+            return CheckStep::Need(format!("/v1/block/{}/body", self.at));
+        }
+        self.asked_to = self.basis.chain.tip().min(self.at.saturating_add(self.page - 1));
+        CheckStep::Need(format!("{}?from={}&to={}", qlab_p2p::served::BODIES_PATH, self.at, self.asked_to))
     }
 
     /// A step was asked with an answer outstanding (the kernel's misuse).
@@ -206,23 +251,66 @@ impl AuthCheck {
             return;
         }
         self.asked = false;
-        let h = self.at;
-        let bound = answer.map_err(|why| format!("block {h}'s body is unavailable: {why}")).and_then(|bytes| {
-            let header = self.basis.chain.header(h).ok_or_else(|| format!("height {h} is above the verified tip"))?;
-            bind_body(&header, self.basis.form, h, bytes).map_err(|e| format!("block {h}'s body {e}"))
-        });
-        match bound {
-            Ok(body) => {
-                for t in &self.trees {
-                    let hits = landed_in(&t.tree, &body);
-                    if !hits.is_empty() {
-                        self.landed.entry(t.g).or_default().extend(hits);
-                    }
-                }
-                self.at += 1;
-            }
-            Err(why) => self.refused = Some(why),
+        if self.page > 0 {
+            return self.supply_page(answer);
         }
+        let h = self.at;
+        let bound = answer.map_err(|why| format!("block {h}'s body is unavailable: {why}"));
+        if let Err(why) = bound.and_then(|bytes| self.judge(h, bytes)) {
+            self.refused = Some(why);
+        }
+    }
+
+    /// Lab #936: a `/v1/bodies` page — split, then each body judged at its
+    /// height in order exactly as [`AuthCheck::supply`] judges one. A short
+    /// page moves `at` past what it held and the next step asks on from
+    /// there; an empty page is the body at `at` missing.
+    fn supply_page(&mut self, answer: Result<&[u8], String>) {
+        let from = self.at;
+        let wire = qlab_p2p::compact::WireForm {
+            form: qlab_devnet::forms::GenesisForm::Annulet,
+            sections: qlab_devnet::forms::BodySections::None,
+            l2_auth: self.basis.form,
+        };
+        let judged = answer
+            .map_err(|why| format!("block {from}'s body is unavailable: {why}"))
+            .and_then(|bytes| {
+                let bodies = qlab_p2p::served::split_bodies_page(wire, from, bytes)
+                    .map_err(|e| format!("the bodies page from {from} is refused: {e}"))?;
+                if bodies.is_empty() {
+                    return Err(format!("block {from}'s body is unavailable: the endpoint served an empty page"));
+                }
+                let asked = (self.asked_to - from + 1) as usize;
+                if bodies.len() > asked {
+                    return Err(format!(
+                        "the bodies page from {from} holds {} bodies, {asked} were asked",
+                        bodies.len()
+                    ));
+                }
+                for (i, bytes) in bodies.into_iter().enumerate() {
+                    self.judge(from + i as u64, bytes)?;
+                }
+                Ok(())
+            });
+        if let Err(why) = judged {
+            self.refused = Some(why);
+        }
+    }
+
+    /// Bind the body at `h` (= `at`) to its verified header and take its
+    /// landed leaves; `at` moves past it.
+    fn judge(&mut self, h: u64, bytes: &[u8]) -> Result<(), String> {
+        debug_assert_eq!(h, self.at);
+        let header = self.basis.chain.header(h).ok_or_else(|| format!("height {h} is above the verified tip"))?;
+        let body = bind_body(&header, self.basis.form, h, bytes).map_err(|e| format!("block {h}'s body {e}"))?;
+        for t in &self.trees {
+            let hits = landed_in(&t.tree, &body);
+            if !hits.is_empty() {
+                self.landed.entry(t.g).or_default().extend(hits);
+            }
+        }
+        self.at += 1;
+        Ok(())
     }
 
     /// **Finish** (after [`CheckStep::Ready`], once): the journal to

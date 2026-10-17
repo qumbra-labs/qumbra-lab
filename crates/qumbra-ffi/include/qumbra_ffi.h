@@ -762,7 +762,9 @@ typedef struct qmb_spend_v2_t qmb_spend_v2_t;
  *     (restore and first have no journal to name generations: build their
  *     basis from a scan over the probe generations 0..8, so a note paid to
  *     a later generation is seen; the check walks the same 8 trees)
- * loop qmb_auth_check_step(c, &out): 1 NEED -> GET *out (a block body), then
+ * optional, lab #936: qmb_auth_check_set_page(c, n, &err) before the first step:
+ *     NEEDs become /v1/bodies?from=&to= pages of <= n (an endpoint that serves them)
+ * loop qmb_auth_check_step(c, &out): 1 NEED -> GET *out (a block body, or a page), then
  *      qmb_auth_check_supply / _supply_err;  0 READY;  -2 REFUSED (*out why)
  * a = qmb_auth_check_finish(w, c, &journal, &status, &err)  PERSIST *journal
  *     status: QMB_AUTH_CHECKED; _JOURNAL_STALE (NULL keys: the journal is
@@ -810,6 +812,7 @@ qmb_auth_check_t *qmb_auth_check_new(const qmb_wallet_t *w, const char *journal_
                                      uint32_t generation, char **err_out);
 qmb_auth_check_t *qmb_auth_restore_new(const qmb_wallet_t *w, const qmb_spend_basis_t *basis, char **err_out);
 qmb_auth_check_t *qmb_auth_first_new(const qmb_wallet_t *w, const qmb_spend_basis_t *basis, char **err_out);
+int32_t qmb_auth_check_set_page(qmb_auth_check_t *c, uint32_t n, char **err_out);
 int32_t qmb_auth_check_step(qmb_auth_check_t *c, char **out);
 void qmb_auth_check_supply(qmb_auth_check_t *c, const uint8_t *body, size_t len);
 void qmb_auth_check_supply_err(qmb_auth_check_t *c, const char *reason);
