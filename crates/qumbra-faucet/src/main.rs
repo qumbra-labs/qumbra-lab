@@ -539,9 +539,23 @@ const FAUCET_AUTH_DIR: &str = "faucet-auth";
 /// `qumbra-faucet run`), any genesis other than the devnet's (the only
 /// Annulet faucet key is the devnet's **dev** key, public by construction),
 /// and a node that would be the sequencer.
+/// The devnet genesis files the dev key is minted into: v1, the Candidate A
+/// devnet and its rehearsal twin (lab #896 H), and the format-34 devnet and
+/// its rehearsal twin (lab #937: the same notes to the same keys).
+fn devnet_genesis_hashes() -> [qlab_devnet::header::Hash32; 5] {
+    use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, AnnuletGenesisFile};
+    [
+        AnnuletGenesisFile::devnet().hash(),
+        AnnuletGenesisFile::devnet_v2().hash(),
+        AnnuletGenesisFile::devnet_v2_rehearsal().hash(),
+        AnnuletGenesisFile::devnet_v3().hash(),
+        AnnuletGenesisFile::devnet_v3_rehearsal().hash(),
+    ]
+}
+
 fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qumbra_faucet::annulet::{served, serve_grants, AnnuletFaucet, SpendKey};
-    use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, devnet, AnnuletGenesisFile};
+    use qumbra_node::annulet_genesis::devnet;
     let cfg_path = flag(args, "--node-config").ok_or("annulet requires --node-config FILE")?;
     let listen = flag(args, "--listen").unwrap_or("127.0.0.1:8090");
     let node_cfg = NodeConfig::load(cfg_path)?;
@@ -553,16 +567,9 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         AnyGenesis::Annulet(g) => g,
     };
-    // The devnet genesis files the dev key is minted into: v1, and the
-    // Candidate A devnet and its rehearsal twin (lab #896 H).
-    let devnets = [
-        AnnuletGenesisFile::devnet().hash(),
-        AnnuletGenesisFile::devnet_v2().hash(),
-        AnnuletGenesisFile::devnet_v2_rehearsal().hash(),
-    ];
-    if !devnets.contains(&genesis.hash()) {
-        return Err("this Annulet genesis is not the devnet genesis (v1, Candidate A, or its rehearsal); \
-                    the Annulet faucet holds only the devnet dev key (lab #716, lab #896 H)"
+    if !devnet_genesis_hashes().contains(&genesis.hash()) {
+        return Err("this Annulet genesis is not the devnet genesis (v1, Candidate A, the format-34 devnet, \
+                    or their rehearsals); the Annulet faucet holds only the devnet dev key (lab #716, lab #896 H)"
             .into());
     }
     let l2_auth = genesis.l2_auth()?;
@@ -614,4 +621,28 @@ fn annulet(args: &[String]) -> Result<(), Box<dyn Error>> {
     node.run_until(&shutdown);
     qlab_devnet::jprintln!("shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qumbra_node::annulet_genesis::{AnnuletGenesisBuild, AnnuletGenesisFile};
+
+    /// Lab #937 M4: the faucet's gate admits the format-34 devnet and its
+    /// rehearsal (the box mints `439de6fc…`), five distinct genesis files.
+    /// No node, no proving.
+    #[test]
+    fn the_faucet_gate_admits_every_devnet_genesis_incl_format_34() {
+        let hashes = devnet_genesis_hashes();
+        assert!(hashes.contains(&AnnuletGenesisFile::devnet_v3().hash()));
+        assert!(hashes.contains(&AnnuletGenesisFile::devnet_v3_rehearsal().hash()));
+        assert!(hashes
+            .iter()
+            .any(|h| hex32(h) == "439de6fca8be1efb78996c0a0906e33ae43d854f50d5e299d0dfe6049b541fb5"));
+        let mut sorted = hashes.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "five distinct devnet genesis files");
+        assert!(!hashes.contains(&AnnuletGenesisFile::fixture().hash()), "the fixture is not a devnet");
+    }
 }
