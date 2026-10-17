@@ -904,6 +904,8 @@ mod tests {
             ("/genesis.qmb", MAX_GENESIS_FILE_BYTES),
             ("/v1/headers?from=1&to=256", MAX_HEADERS_ANSWER_BYTES),
             ("/v1/block/7/body", MAX_BODY_ANSWER_BYTES),
+            // Lab #936: a bodies page.
+            ("/v1/bodies?from=1&to=256", qlab_p2p::served::MAX_BODIES_PAGE_BYTES),
             ("/v1/registry/1", MAX_REGISTRY_ANSWER_BYTES),
             // Lab #860 R2: the raw bundle route.
             ("/v1/bundle/48", qlab_devnet::body::MAX_V6_BODY_BYTES),

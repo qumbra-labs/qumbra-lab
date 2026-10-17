@@ -8,7 +8,16 @@
 //! ```text
 //! /v1/headers        ver(u8 = 1) ‖ wire_form(u8) ‖ from(u64 LE) ‖ encode_wire_headers(form, units)
 //! /v1/block/{h}/body ver(u8 = 1) ‖ wire_form(u8) ‖ height(u64 LE) ‖ encode_announce_for(wf, whole_block_announce(..))
+//! /v1/bodies         ver(u8 = 1) ‖ wire_form(u8) ‖ from(u64 LE) ‖ n(u32 LE) ‖ n × (len(u32 LE) ‖ body answer)
 //! ```
+//!
+//! **`/v1/bodies?from=&to=`** (lab #936) is a page of body answers, each byte
+//! for byte the `/v1/block/{h}/body` answer at `from + i`, so a reader binds
+//! each exactly as it binds one. A page holds at most [`MAX_BODIES_PAGE`]
+//! bodies, and its body answers add up to at most
+//! [`crate::node::MAX_SERVED_BODY_BYTES`] — except that a page holds at least
+//! one body when there is one, so a single body that alone is near that bound
+//! is still served. The reader's bound is [`MAX_BODIES_PAGE_BYTES`].
 //!
 //! - A **header unit** is the net's header message unit
 //!   ([`crate::codec::header_msg_len`]): the bare L1 header, or the Annulet
@@ -51,6 +60,18 @@ pub const BODY_PATH_SHAPE: &str = "/v1/block/{h}/body";
 
 /// The most header units one page carries.
 pub const MAX_HEADERS_PAGE: usize = 256;
+
+/// `GET /v1/bodies?from=&to=` — a contiguous page of body answers (lab #936).
+pub const BODIES_PATH: &str = "/v1/bodies";
+
+/// The most body answers one page carries: a headers page's span.
+pub const MAX_BODIES_PAGE: usize = MAX_HEADERS_PAGE;
+
+/// The most bytes a bodies page can be: its prefix and count, one length per
+/// body, and body answers that add up to at most
+/// [`crate::node::MAX_SERVED_BODY_BYTES`] — or one body answer, which is at
+/// most that plus its own 10-byte prefix.
+pub const MAX_BODIES_PAGE_BYTES: usize = 10 + 4 + 4 * MAX_BODIES_PAGE + crate::node::MAX_SERVED_BODY_BYTES + 10;
 
 /// The wire-form byte: which header units and which body frame follow.
 pub fn wire_form_byte(wf: WireForm) -> u8 {
@@ -108,6 +129,11 @@ pub enum ServedError {
     PrefilledNotWhole { at: usize, index: u32 },
     /// The frame after the prefix did not decode.
     Frame(DecodeError),
+    /// A bodies page with more body answers than [`MAX_BODIES_PAGE`], or
+    /// longer than [`MAX_BODIES_PAGE_BYTES`] (lab #936).
+    BodiesPageTooLong { bodies: usize, bytes: usize },
+    /// A bodies page whose count or lengths do not frame its bytes exactly.
+    BodiesPageFraming,
 }
 
 impl std::fmt::Display for ServedError {
@@ -135,6 +161,13 @@ impl std::fmt::Display for ServedError {
                 write!(f, "body answer's prefilled entry {at} is index {index}: not every transaction, in order")
             }
             ServedError::Frame(e) => write!(f, "served-chain frame does not decode: {e:?}"),
+            ServedError::BodiesPageTooLong { bodies, bytes } => write!(
+                f,
+                "bodies page of {bodies} body(ies) / {bytes} B exceeds {MAX_BODIES_PAGE} / {MAX_BODIES_PAGE_BYTES} B"
+            ),
+            ServedError::BodiesPageFraming => {
+                write!(f, "bodies page's count and lengths do not frame its bytes exactly")
+            }
         }
     }
 }
@@ -226,6 +259,54 @@ pub fn decode_body_answer(wf: WireForm, height: u64, buf: &[u8]) -> Result<Block
         return Err(ServedError::PrefilledNotWhole { at, index: p.index });
     }
     Ok(ann)
+}
+
+/// Encode a bodies page starting at `from` from body answers already
+/// encoded ([`encode_body_answer`] at `from`, `from + 1`, …). Locally built,
+/// so the bounds are asserted.
+pub fn encode_bodies_page(wf: WireForm, from: u64, answers: &[Vec<u8>]) -> Vec<u8> {
+    assert!(answers.len() <= MAX_BODIES_PAGE, "a bodies page holds at most {MAX_BODIES_PAGE} bodies");
+    let mut out = prefix(wf, from);
+    out.extend_from_slice(&(answers.len() as u32).to_le_bytes());
+    for a in answers {
+        out.extend_from_slice(&u32::try_from(a.len()).expect("a body answer is under 4 GiB").to_le_bytes());
+        out.extend_from_slice(a);
+    }
+    assert!(out.len() <= MAX_BODIES_PAGE_BYTES, "a bodies page is at most {MAX_BODIES_PAGE_BYTES} B");
+    out
+}
+
+/// Split a bodies page asked `from` on a net of form `wf` into its body
+/// answers, in height order (`from`, `from + 1`, …). Each is still a raw
+/// [`decode_body_answer`] input — the reader binds each to its height and
+/// header as it binds one. An empty page is "this node holds no main-chain
+/// height from `from` on", as for headers.
+pub fn split_bodies_page(wf: WireForm, from: u64, buf: &[u8]) -> Result<Vec<&[u8]>, ServedError> {
+    if buf.len() > MAX_BODIES_PAGE_BYTES {
+        return Err(ServedError::BodiesPageTooLong { bodies: 0, bytes: buf.len() });
+    }
+    let (got, rest) = read_prefix(wf, buf)?;
+    if got != from {
+        return Err(ServedError::WrongFrom { want: from, got });
+    }
+    let n = rest.get(..4).ok_or(ServedError::Truncated)?;
+    let n = u32::from_le_bytes(n.try_into().expect("4 bytes")) as usize;
+    if n > MAX_BODIES_PAGE {
+        return Err(ServedError::BodiesPageTooLong { bodies: n, bytes: buf.len() });
+    }
+    let mut rest = &rest[4..];
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = rest.get(..4).ok_or(ServedError::BodiesPageFraming)?;
+        let len = u32::from_le_bytes(len.try_into().expect("4 bytes")) as usize;
+        let body = rest.get(4..4usize.checked_add(len).ok_or(ServedError::BodiesPageFraming)?).ok_or(ServedError::BodiesPageFraming)?;
+        out.push(body);
+        rest = &rest[4 + len..];
+    }
+    if !rest.is_empty() {
+        return Err(ServedError::BodiesPageFraming);
+    }
+    Ok(out)
 }
 
 /// The body a whole-block answer carries (its prefilled transactions in
@@ -372,6 +453,61 @@ mod tests {
     const GOLDEN_HEADERS_KECCAK: &str = "32d382f3bc30faa5a0bd1bf6f9df2b251efcc0a3f9d7e0aec18ab36ea29351dd";
     const GOLDEN_BODY_LEN: usize = 5217;
     const GOLDEN_BODY_KECCAK: &str = "4475ff1961823112712cfc0df44a25e2b507f817731de9e57f85aa379f11d586";
+
+    /// Lab #936: a bodies page is its body answers, framed — each one byte
+    /// for byte what `/v1/block/{h}/body` answers — and it splits back into
+    /// exactly them.
+    #[test]
+    fn a_bodies_page_round_trips_each_body_byte_for_byte() {
+        let answers: Vec<Vec<u8>> = (3..6)
+            .map(|h| {
+                let ann = crate::node::whole_block_announce(sealed_unit(h), BlockBody::default());
+                encode_body_answer(AN, h, &ann).unwrap()
+            })
+            .collect();
+        let page = encode_bodies_page(AN, 3, &answers);
+        let mut want = vec![SERVED_CHAIN_VERSION, wire_form_byte(AN)];
+        want.extend_from_slice(&3u64.to_le_bytes());
+        want.extend_from_slice(&3u32.to_le_bytes());
+        for a in &answers {
+            want.extend_from_slice(&(a.len() as u32).to_le_bytes());
+            want.extend_from_slice(a);
+        }
+        assert_eq!(page, want, "the documented frame, exactly");
+        let split = split_bodies_page(AN, 3, &page).unwrap();
+        assert_eq!(split.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), answers);
+        for (i, b) in split.iter().enumerate() {
+            let Ok(ann) = decode_body_answer(AN, 3 + i as u64, b) else { panic!("body {i} decodes at its height") };
+            assert_eq!(ann.header, sealed_unit(3 + i as u64).header());
+        }
+        let empty = encode_bodies_page(AN, 9, &[]);
+        assert_eq!(split_bodies_page(AN, 9, &empty).unwrap(), Vec::<&[u8]>::new());
+    }
+
+    /// Lab #936: a lying count or length, a short or long buffer, another
+    /// start, a count above the page — each refused by name, never a panic.
+    #[test]
+    fn a_bodies_page_with_a_lying_length_or_count_is_refused_by_name() {
+        let ann = crate::node::whole_block_announce(sealed_unit(3), BlockBody::default());
+        let page = encode_bodies_page(AN, 3, &[encode_body_answer(AN, 3, &ann).unwrap()]);
+        for n in 0..page.len() {
+            assert!(split_bodies_page(AN, 3, &page[..n]).is_err(), "prefix {n}");
+        }
+        let mut long = page.clone();
+        long.push(0);
+        assert_eq!(split_bodies_page(AN, 3, &long), Err(ServedError::BodiesPageFraming));
+        assert_eq!(split_bodies_page(AN, 4, &page), Err(ServedError::WrongFrom { want: 4, got: 3 }));
+        let mut count = page.clone();
+        count[10..14].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(split_bodies_page(AN, 3, &count), Err(ServedError::BodiesPageFraming));
+        count[10..14].copy_from_slice(&(MAX_BODIES_PAGE as u32 + 1).to_le_bytes());
+        assert!(matches!(split_bodies_page(AN, 3, &count), Err(ServedError::BodiesPageTooLong { .. })));
+        let mut len = page.clone();
+        len[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(split_bodies_page(AN, 3, &len), Err(ServedError::BodiesPageFraming));
+        let huge = vec![0u8; MAX_BODIES_PAGE_BYTES + 1];
+        assert!(matches!(split_bodies_page(AN, 3, &huge), Err(ServedError::BodiesPageTooLong { .. })));
+    }
 
     #[test]
     fn an_l1_unit_has_no_seal_by_name() {

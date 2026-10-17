@@ -306,6 +306,24 @@ impl Endpoint {
                 let parts: Vec<&str> = p.split('/').collect();
                 respond_full(&self.served, (parts[3], parts[5])).map_err(err)
             }
+            // Lab #936: a bodies page — each element exactly what this
+            // endpoint's own `/v1/block/{h}/body` answers (its lies included),
+            // up to the first height it does not hold.
+            "/v1/bodies" => {
+                let q = |k: &str| {
+                    query.split('&').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('=')?.parse::<u64>().ok())
+                };
+                let (from, to) = (q("from").ok_or("400 from")?, q("to").ok_or("400 to")?);
+                let mut answers = Vec::new();
+                for h in from..=to.min(from + qlab_p2p::served::MAX_BODIES_PAGE as u64 - 1) {
+                    match self.fetch(&format!("/v1/block/{h}/body")) {
+                        Ok(b) => answers.push(b),
+                        Err(e) if e.starts_with("404") => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(qlab_p2p::served::encode_bodies_page(self.wire, from, &answers))
+            }
             p if p.ends_with("/body") => {
                 let h = p.split('/').nth(3).unwrap();
                 if self.lie == Lie::BodyHeader {
