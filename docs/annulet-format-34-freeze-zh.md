@@ -101,7 +101,7 @@ o3f 箱子复测：prover-1（r7g.2xlarge，64 GiB，Ubuntu 24.04 arm64，rustc 
 
 ## 本次不冻结的
 
-- **生产创世和 prover pin。** format 34 的生产创世在割接时铸出；割接 runbook 加上它的 prover pin（`qumbra-wallet/src/prover_pins.rs` 的 `PINS`，在那之前为空），并发布内核。
+- **生产创世和 prover pin。** format 34 的生产创世在割接时铸出；割接 runbook 加上它的 prover pin（`qumbra-wallet/src/prover_pins.rs` 的 `PINS`，在那之前为空），并发布内核。**annulet-testnet-3** 已加：创世 `024ed17b…8b70`、它的收款方、最高 S 2 / P 4（测试 `the_production_pin_is_annulet_testnet_3s`）。
 - **价格。** 属于部署配置，不超过 pin 里的上限。
 - **token 退役**（#937 D6）。在割接之后。
 - **割接演练。** 在 prover-1 上用真实 ingress 跑（`X-Qumbra-Client-IP` 由 Caddy 加），由内核客户端驱动：先对 `devnet_v3_rehearsal`，再对生产创世。服务路径上 S 和 P 的实测数字也出自这次演练。
