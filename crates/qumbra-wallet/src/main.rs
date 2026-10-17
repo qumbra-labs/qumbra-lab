@@ -485,7 +485,7 @@ fn usage() {
                             exit one claim credit WHOLE from the V6 L2 to an L1 address (the P lane, about\n\
                             30 GiB, local only), anchored to the last landed bundle after checking the\n\
                             node's L2 index against that bundle's own stated roots; --submit hands the\n\
-                            file to the sequencer's intake, which HOLDS exits until it plans them (R3b)\n  \
+                            file to the sequencer's intake, which queues it for a posting pass (R3b)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet ivk export --dir DIR [--i-understand-this-is-a-viewing-key]\n  \
                             the incoming viewing key as hex on stdout, for a scan-only host; writes\n\
@@ -1432,7 +1432,7 @@ fn exit_v6_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
          a credit already spent would be refused by the chain, not here"
     );
     println!("  prove:  the P lane, about 30 GiB, on this machine only");
-    println!("  HELD:   the sequencer holds exits until it plans them (lab #860 R3b) — this exit will not land before that");
+    println!("  queue:  a posting pass carries at most one wallet exit (lab #860 R3b) — this exit lands when a bundle carries it");
     if plan_only {
         println!("--plan-only: nothing proved or written");
         return Ok(());

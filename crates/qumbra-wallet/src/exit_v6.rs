@@ -199,18 +199,20 @@ pub fn anchor_of(index: &qlab_ledger::deposits::L2IndexAnswer) -> Result<(u64, [
 }
 
 /// The intake's answer to a handed-over exit file: 202 (new or a replay) or
-/// 409 (its nullifiers already held) is taken — and HELD until the sequencer
-/// plans exits (R3b); anything else is the intake's refusal, named.
+/// 409 (its nullifiers already held) is taken — and QUEUED for a posting
+/// pass, which carries at most one wallet exit (R3b); anything else is the
+/// intake's refusal, named.
 pub fn intake_verdict(status: u16, body: &[u8]) -> Result<String, String> {
     let body = String::from_utf8_lossy(body);
     match status {
         202 => Ok(format!(
-            "the intake took it (202: {}) — HELD: the sequencer does not plan exits until lab #860 R3b lands",
+            "the intake took it (202: {}) — QUEUED: a posting pass carries at most one wallet exit (lab #860 R3b); \
+             this exit lands when a bundle carries it",
             body.trim()
         )),
         409 => Ok(format!(
-            "already held by the intake (409 — a replay or an earlier submission: {}) — HELD: the sequencer does not \
-             plan exits until lab #860 R3b lands",
+            "already held by the intake (409 — a replay or an earlier submission: {}) — QUEUED: a posting pass \
+             carries at most one wallet exit (lab #860 R3b); this exit lands when a bundle carries it",
             body.trim()
         )),
         _ => Err(format!("the intake refused the exit ({status}: {})", body.trim())),
@@ -448,13 +450,14 @@ mod tests {
         assert!(err.contains("the bundle served for height 244 hashes to"), "the id mismatch is named: {err}");
     }
 
-    /// The intake's answer: taken (and said HELD) or refused by name.
+    /// The intake's answer: taken (and said QUEUED) or refused by name.
     #[test]
-    fn the_intake_answer_is_taken_and_held_or_named() {
+    fn the_intake_answer_is_taken_and_queued_or_named() {
         let taken = intake_verdict(202, br#"{"v":1,"id":"ab","kind":"exit","replay":false}"#).unwrap();
-        assert!(taken.contains("HELD") && taken.contains("R3b"), "{taken}");
+        assert!(taken.contains("QUEUED") && taken.contains("R3b"), "{taken}");
+        assert!(!taken.contains("until lab #860 R3b lands"), "R3b has landed (#888): {taken}");
         let again = intake_verdict(409, b"conflict").unwrap();
-        assert!(again.starts_with("already held by the intake (409") && again.contains("HELD"), "{again}");
+        assert!(again.starts_with("already held by the intake (409") && again.contains("QUEUED"), "{again}");
         assert_eq!(intake_verdict(400, br#"{"error":"refused","why":"x"}"#).unwrap_err(), r#"the intake refused the exit (400: {"error":"refused","why":"x"})"#);
     }
 
