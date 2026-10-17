@@ -1988,6 +1988,18 @@ fn migrate_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     for g in &r.asset0_left {
         println!("generation {g}: its asset-0 notes paid this sweep's fees and move on the next `migrate`");
     }
+    for (g, asset) in &r.carried {
+        println!("carried the issuer seed of asset {asset} from generation {g} to generation {}", r.active);
+    }
+    for (g, asset, needs) in &r.carry_unfunded {
+        println!(
+            "carry of asset {asset} from generation {g} needs {needs} fee units in the active generation \
+             (one asset-0 note of at least that); generation {g} stays sweep-only"
+        );
+    }
+    for (g, asset) in &r.carry_next {
+        println!("carry of asset {asset} from generation {g} runs on the next `migrate`");
+    }
     Ok(())
 }
 

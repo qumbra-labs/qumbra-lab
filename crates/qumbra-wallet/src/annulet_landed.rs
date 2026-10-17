@@ -124,9 +124,15 @@ pub fn landed_next(wallet: &Wallet, g: u32, landed: &[(u32, [u8; 32])]) -> u32 {
 /// with notes is sweep-only (gated on `genesis` at `gate_tip +
 /// MAX_AUTH_VALIDITY_BLOCKS`), a used one without is retired, each at a
 /// cursor above its landed positions, and `g* + 1` opens active.
+///
+/// Lab #942: a generation holding one of `seeds` — an issuer's unspent
+/// zero-value note of an asset it issues (`annulet_v2::issuer_seeds`) — is
+/// kept sweep-only too, so `migrate` can carry the seed to the active
+/// generation; any other zero-value note still retires its generation.
 pub fn restore_generations(
     wallet: &Wallet,
     owned: &[OwnedL2Note],
+    seeds: &[OwnedL2Note],
     used: &LandedByGeneration,
     genesis: &Hash32,
     gate_tip: u64,
@@ -144,8 +150,10 @@ pub fn restore_generations(
             let mut gens = Vec::new();
             for g in 0..=g_star {
                 // Lab #937: a zero-value note is never swept — a generation
-                // holding only those retires.
-                let has_notes = owned.iter().any(|n| n.generation == Some(g) && n.note.value != 0);
+                // holding only those retires; lab #942: unless one is an
+                // issuer's seed, which migrate carries.
+                let has_notes = owned.iter().any(|n| n.generation == Some(g) && n.note.value != 0)
+                    || seeds.iter().any(|n| n.generation == Some(g));
                 let landed = used.get(&g);
                 if !has_notes && landed.is_none() {
                     continue;
