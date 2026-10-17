@@ -19,7 +19,7 @@ use qlab_devnet::header::{
     HEADER_PREIMAGE_LEN_V5, HEADER_VERSION_BYTE_V5,
 };
 
-use crate::varint::{read_varint, write_varint, CodecError};
+use crate::varint::{read_varint, read_varint_u32, read_varint_usize, write_varint, CodecError};
 
 /// The fixed on-wire length of a **v4** block header = its 98-byte hash
 /// preimage (`prev(32) ‖ height(8) ‖ timestamp(8) ‖ difficulty(8) ‖ nonce(8) ‖
@@ -94,6 +94,10 @@ pub enum DecodeError {
     /// it in one byte, so such a transaction is refused here, at the wire,
     /// before anything could hash it.
     TooManyEntries { what: &'static str, got: usize },
+    /// Lab #795: a well-formed varint above what its field holds — a length
+    /// above `usize::MAX` (wasm32) or an index above `u32::MAX`. Refused by
+    /// name; before, a narrowing `as` read `2^32 + k` as `k`.
+    VarintRange { got: u64, max: u64 },
 }
 
 /// Lab #911: the most nullifiers, and the most commitments, one transaction
@@ -102,7 +106,7 @@ pub const MAX_TX_ENTRIES: usize = u8::MAX as usize;
 
 /// A per-transaction count, refused above [`MAX_TX_ENTRIES`] by name.
 fn tx_count(r: &mut Reader<'_>, what: &'static str) -> Result<usize, DecodeError> {
-    let got = r.varint()? as usize;
+    let got = r.varint_usize()?;
     if got > MAX_TX_ENTRIES {
         return Err(DecodeError::TooManyEntries { what, got });
     }
@@ -114,6 +118,7 @@ impl From<CodecError> for DecodeError {
         match e {
             CodecError::VarintOverflow => DecodeError::Varint,
             CodecError::Truncated { what } => DecodeError::Truncated { what },
+            CodecError::VarintRange { got, max } => DecodeError::VarintRange { got, max },
             _ => DecodeError::Varint,
         }
     }
@@ -170,6 +175,18 @@ impl<'a> Reader<'a> {
 
     pub fn varint(&mut self) -> Result<u64, DecodeError> {
         Ok(read_varint(self.buf, &mut self.pos)?)
+    }
+
+    /// A varint length or count, refused as [`DecodeError::VarintRange`]
+    /// above `usize::MAX` (lab #795) — never narrowed with `as`.
+    pub fn varint_usize(&mut self) -> Result<usize, DecodeError> {
+        Ok(read_varint_usize(self.buf, &mut self.pos)?)
+    }
+
+    /// A varint index, refused as [`DecodeError::VarintRange`] above
+    /// `u32::MAX` (lab #795).
+    pub fn varint_u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(read_varint_u32(self.buf, &mut self.pos)?)
     }
 
     pub fn rest(&mut self, n: usize, what: &'static str) -> Result<Vec<u8>, DecodeError> {
@@ -371,7 +388,7 @@ pub fn encode_wire_headers(form: GenesisForm, headers: &[WireHeader]) -> Vec<u8>
 pub fn decode_wire_headers(form: GenesisForm, buf: &[u8]) -> Result<Vec<WireHeader>, DecodeError> {
     let mut r = Reader::new(buf);
     let unit = header_msg_len(form);
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     let mut headers = Vec::with_capacity(n.min(buf.len() / unit));
     for _ in 0..n {
         let raw = r.rest(unit, "headers.item")?;
@@ -433,8 +450,8 @@ fn write_vote(out: &mut Vec<u8>, v: &Vote) {
 }
 
 fn read_vote(r: &mut Reader) -> Result<Vote, DecodeError> {
-    let signer = r.varint()? as usize;
-    let sig_len = r.varint()? as usize;
+    let signer = r.varint_usize()?;
+    let sig_len = r.varint_usize()?;
     let sig_bytes = r.rest(sig_len, "vote.signature")?;
     let enc = EncodedSignature::<MlDsa65>::try_from(sig_bytes.as_slice())
         .map_err(|_| DecodeError::BadSignature)?;
@@ -463,7 +480,7 @@ pub fn decode_checkpoint_msg(buf: &[u8]) -> Result<(Checkpoint, Vec<Vote>), Deco
     // signature), so a tiny payload claiming 2^60 votes is a truncation refusal
     // on its first read and never a giant allocation. Same shape as decode_tx
     // (issue #275 / PR #277); remaining sites closed by issue #279.
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     let mut votes = Vec::with_capacity(n.min(buf.len() / SIG_LEN));
     for _ in 0..n {
         votes.push(read_vote(&mut r)?);
@@ -690,7 +707,7 @@ pub fn decode_tx_annulet(buf: &[u8]) -> Result<TxEntry, DecodeError> {
 pub fn decode_tx_annulet_with(buf: &[u8], auth_form: L2AuthForm) -> Result<TxEntry, DecodeError> {
     let mut r = Reader::new(buf);
     let (proof, discovery, public) = decode_tx_through_discovery(&mut r, buf.len())?;
-    let l2_len = r.varint()? as usize;
+    let l2_len = r.varint_usize()?;
     let l2 = r.rest(l2_len, "tx.l2")?;
     match qlab_devnet::annulet::L2Surface::decode(&l2) {
         Ok(Some(_)) => {}
@@ -698,7 +715,7 @@ pub fn decode_tx_annulet_with(buf: &[u8], auth_form: L2AuthForm) -> Result<TxEnt
     }
     let mut auth = qlab_devnet::annulet::L2_AUTH_ABSENT.to_vec();
     if auth_form.has_auth() && r.remaining() > 0 {
-        let n = r.varint()? as usize;
+        let n = r.varint_usize()?;
         let bytes = r.rest(n, "tx.auth")?;
         if bytes.is_empty() || bytes == qlab_devnet::annulet::L2_AUTH_ABSENT {
             return Err(DecodeError::BadAuthSection);
@@ -728,9 +745,9 @@ fn decode_tx_through_discovery(
     }
     let bucket = bucket_from_u8(r.u8("tx.bucket")?)?;
     let fee = r.u64_le("tx.fee")?;
-    let proof_len = r.varint()? as usize;
+    let proof_len = r.varint_usize()?;
     let proof = r.rest(proof_len, "tx.proof")?;
-    let discovery_len = r.varint()? as usize;
+    let discovery_len = r.varint_usize()?;
     let discovery = r.rest(discovery_len, "tx.discovery")?;
     Ok((proof, discovery, TxPublic { anchor, nullifiers, commitments, bucket, fee }))
 }
@@ -755,13 +772,13 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
     }
     let bucket = bucket_from_u8(r.u8("tx.bucket")?)?;
     let fee = r.u64_le("tx.fee")?;
-    let proof_len = r.varint()? as usize;
+    let proof_len = r.varint_usize()?;
     let proof = r.rest(proof_len, "tx.proof")?;
-    let discovery_len = r.varint()? as usize;
+    let discovery_len = r.varint_usize()?;
     let discovery = r.rest(discovery_len, "tx.discovery")?;
     // Lab #367: presence-conditional rider section — see encode_tx's note.
     let rider = if r.has_more() {
-        let rider_len = r.varint()? as usize;
+        let rider_len = r.varint_usize()?;
         let rider = r.rest(rider_len, "tx.rider")?;
         if rider == qlab_devnet::names::RIDER_ABSENT {
             // Absence is spelled by omission on this wire; an explicit absent
@@ -910,7 +927,7 @@ pub fn encode_inv(items: &[InvItem]) -> Vec<u8> {
 /// the sender's fault. The **only** thing that moved is the kind code.
 pub fn decode_inv(buf: &[u8]) -> Result<InvVec, DecodeError> {
     let mut r = Reader::new(buf);
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     let mut out = InvVec::default();
     for _ in 0..n {
         // The id is read either way: the item is fixed-width, so an unknown kind
@@ -957,7 +974,7 @@ pub fn decode_locator(buf: &[u8]) -> Result<Locator, DecodeError> {
     // tiny payload claiming 2^60 hashes is a truncation refusal on its first
     // read and never a giant allocation. Same shape as decode_tx (issue #275 /
     // PR #277); remaining sites closed by issue #279.
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     let mut have = Vec::with_capacity(n.min(buf.len() / 32));
     for _ in 0..n {
         have.push(r.hash32("loc.have")?);
@@ -986,7 +1003,7 @@ pub fn decode_headers(form: GenesisForm, buf: &[u8]) -> Result<Vec<BlockHeader>,
     // refusal on its first read and never a giant allocation. Same shape as
     // decode_tx (issue #275 / PR #277); remaining sites closed by issue #279.
     let wire_len = header_wire_len(form);
-    let n = r.varint()? as usize;
+    let n = r.varint_usize()?;
     let mut headers = Vec::with_capacity(n.min(buf.len() / wire_len));
     for _ in 0..n {
         let raw = r.rest(wire_len, "headers.item")?;
