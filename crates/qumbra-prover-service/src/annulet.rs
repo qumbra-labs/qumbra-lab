@@ -788,8 +788,11 @@ impl AnnuletApi {
                     bundle.zeroize();
                     return Err(refuse(e));
                 }
+                // Output 3's ρ is the kernel's, derived from the first
+                // nullifier — not the witness's field (lab #958).
                 let cm = parsed.tx().public.commitments.get(2).copied();
-                out3.zip(cm).map(|(o, cm)| PaidEntry::of(o, cm, shape))
+                let nf0 = nullifiers.first();
+                out3.zip(cm).zip(nf0).map(|((o, cm), nf0)| PaidEntry::of(o, nf0, cm, shape))
             }
             None => None,
         };

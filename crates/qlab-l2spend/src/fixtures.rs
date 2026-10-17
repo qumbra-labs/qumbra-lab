@@ -135,6 +135,17 @@ fn prepared_s_n(three: bool) -> (PreparedV2, LocalAuth, mldsa::Key) {
 /// be exactly 13. Prepared through the builder — `FeeIn::Exact`'s rule
 /// refuses any other `note`.
 pub fn prepared_s_fee_bank(note: u64) -> Result<(PreparedV2, LocalAuth), crate::SpendError> {
+    prepared_s_fee_bank_to(note, None)
+}
+
+/// [`prepared_s_fee_bank`] with output 3 paying `payee` — a real wallet's
+/// address — instead of the fixture recipient `[0x43; 4]` (lab #958: the
+/// paid ledger's round trip into the payee's wallet). `None` is
+/// [`prepared_s_fee_bank`], byte for byte.
+pub fn prepared_s_fee_bank_to(
+    note: u64,
+    payee: Option<Recipient>,
+) -> Result<(PreparedV2, LocalAuth), crate::SpendError> {
     let mut rng = rng(0xfeeb);
     let mut local = LocalAuth::new(&[0x52; 32], 0, 0).expect("depth D_AUTH");
     let a = real(&mut local, 0x300, 60, 7);
@@ -146,7 +157,7 @@ pub fn prepared_s_fee_bank(note: u64) -> Result<(PreparedV2, LocalAuth), crate::
     let outs = [
         Out { to: recipient(0x41, &mut rng), value: 100, asset: 7 },
         Out { to: recipient(0x42, &mut rng), value: 10, asset: 7 },
-        Out { to: recipient(0x43, &mut rng), value: 3, asset: 0 },
+        Out { to: payee.unwrap_or_else(|| recipient(0x43, &mut rng)), value: 3, asset: 0 },
     ];
     let prepared = assemble_s_v2(&tree, &regs, [&a, &b], false, FeeIn::Exact(&f), &outs, 10, &mut rng)?;
     Ok((prepared, local))
@@ -162,7 +173,16 @@ pub fn signed_bundle_fee_bank() -> ProvingBundle {
 /// the same nullifiers — under distinct intents (lab #937 PR E: the prover
 /// service's nullifier dedupe).
 pub fn signed_bundles_fee_bank(valid_until: &[u64]) -> Vec<ProvingBundle> {
-    let (p, local) = prepared_s_fee_bank(13).expect("13 = fee 10 + output 3 of 3");
+    signed_fee_bank(prepared_s_fee_bank(13).expect("13 = fee 10 + output 3 of 3"), valid_until)
+}
+
+/// [`signed_bundle_fee_bank`] with output 3 paying `payee` (lab #958).
+pub fn signed_bundle_fee_bank_to(payee: Recipient) -> ProvingBundle {
+    let prepared = prepared_s_fee_bank_to(13, Some(payee)).expect("13 = fee 10 + output 3 of 3");
+    signed_fee_bank(prepared, &[VALID_UNTIL]).remove(0)
+}
+
+fn signed_fee_bank((p, local): (PreparedV2, LocalAuth), valid_until: &[u64]) -> Vec<ProvingBundle> {
     valid_until
         .iter()
         .map(|until| {

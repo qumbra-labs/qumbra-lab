@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use qlab_air::l2::L2TxOutput;
+use qlab_air::l2::{derive_output_rho_l2, L2TxOutput};
 use qlab_devnet::annulet::L2ShapeTag;
 use qlab_remote_auth::keccak256;
 use qlab_wallet::address::{Address, ADDRESS_VERSION_CANDIDATE_A};
@@ -167,7 +167,9 @@ pub fn prover_fee(out3: Option<&L2TxOutput>, payee_rkm: &[u64; 4], price: u64) -
 
 /// One paid opening: output 3 of an accepted submission. The payee's wallet
 /// needs `value`, `rho`, `rseed` (and checks `rkm`) to rebuild the note and
-/// find `cm` in the tree.
+/// find `cm` in the tree. `rho` is the note's on chain — the kernel's
+/// `ρ′₂ = H(nf₀ ‖ 9)` — not the witness's output field, which the kernel
+/// overrides (lab #958).
 pub struct PaidEntry {
     /// The transaction's third commitment, as on chain.
     pub cm: [u8; 32],
@@ -179,9 +181,18 @@ pub struct PaidEntry {
 }
 
 impl PaidEntry {
-    /// `out3` (the witness's) and `cm` (the transaction's third commitment).
-    pub fn of(out3: &L2TxOutput, cm: [u8; 32], shape: L2ShapeTag) -> Self {
-        Self { cm, value: out3.value, rkm: out3.rkm, rho: out3.rho, rseed: out3.rseed, shape }
+    /// `out3` (the witness's), `nf0` (the transaction's first nullifier) and
+    /// `cm` (its third commitment). `value`, `rkm` and `rseed` are the
+    /// witness's — the kernel commits them as they are; `rho` is derived from
+    /// `nf0` as the kernel derives it (`derive_output_rho_l2(nf₀, 2)`). The
+    /// witness's own `rho` is a placeholder the kernel never reads (lab #958:
+    /// a ledger that recorded it was refused `cm-mismatch` row by row).
+    pub fn of(out3: &L2TxOutput, nf0: &[u8; 32], cm: [u8; 32], shape: L2ShapeTag) -> Self {
+        let nf0: [u64; 4] = core::array::from_fn(|i| {
+            u64::from_le_bytes(nf0[i * 8..i * 8 + 8].try_into().expect("8 bytes"))
+        });
+        let rho = derive_output_rho_l2(&nf0, 2);
+        Self { cm, value: out3.value, rkm: out3.rkm, rho, rseed: out3.rseed, shape }
     }
 
     /// The entry's line: the entry version, then `key=value` fields — the
