@@ -9,18 +9,23 @@
 //!   the carry and says so by name (`carry_unfunded`, S + the S tariff).
 //!   Generation 0 stays sweep-only and nothing is proved.
 //! - `W` issues asset 7. Its generation 0 holds only the seed; its active
-//!   generation holds 10 of asset 0. The first `migrate` pre-funds
-//!   generation 0 from the active one (an S of exactly the tariff) and is
-//!   given no time to see it in the served tree, so it stops there,
-//!   `SplitNotIncluded`. The pre-fund lands anyway. The second `migrate`
-//!   finds it in generation 0 and carries through (i):
+//!   generation holds 10 of asset 0. The first `migrate` runs over an
+//!   endpoint that refuses its second `POST /v1/tx` ([`HoldSecondTx`] — a
+//!   test endpoint, no hook in the wallet): it pre-funds generation 0 from
+//!   the active one (an S of exactly the tariff), waits for it in the served
+//!   tree, proves the carry, and is refused at its submit. Deterministic: the
+//!   pre-fund has landed and the carry has not, whatever the harness timing.
+//!   The second `migrate` finds the pre-fund in generation 0 and carries
+//!   through (i), on fresh leaves:
 //!   `[seed, pre-fund] → [0 of 7, 0 of 7]` to the active generation. A third
 //!   `migrate` retires generation 0 and moves nothing.
 //!
 //! Throughout, asset 0 drops by exactly the two fees, and the net's
 //! nullifier count rises by three per transaction, with nothing extra: no
-//! note is spent twice. **Two S v3 proves** (the pre-fund and the carry).
+//! note is spent twice. **Three S v3 proves** (the pre-fund, the refused
+//! carry, the carry).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use qlab_air::l2::RegistryLeaf;
@@ -30,7 +35,8 @@ use qlab_note::l2note::L2Note;
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qumbra_faucet::devnet_harness::Net;
 use qumbra_node::annulet_genesis::{devnet, AnnuletGenesisFile, AnnuletParams, GenesisNoteRecord, RegistryLeafRecord};
-use qumbra_wallet::annulet_send::{SendRefusal, WalletEndpoint};
+use qlab_l2spend::Endpoint;
+use qumbra_wallet::annulet_send::WalletEndpoint;
 use qumbra_wallet::annulet_v2::migrate;
 use qumbra_wallet::auth_journal::{generation_root, AuthJournal, GenState, Generation, SweepGate};
 use qumbra_wallet::issuer::IssuerFile;
@@ -84,6 +90,27 @@ fn index(w: &WalletDir, url: &str, tip: u64, hash: [u8; 32]) -> qlab_ledger::ass
     let v = qumbra_wallet::annulet_verify::scan_annulet_verified(w, &mut fetch, 0, tip, Some(hash), &mut rng)
         .expect("the pinned format-34 chain verifies");
     v.report().index.clone().expect("both halves known")
+}
+
+/// The node, except that the second `POST /v1/tx` through it is refused
+/// before it leaves the process: the carry after a landed pre-fund.
+struct HoldSecondTx {
+    inner: WalletEndpoint,
+    posts: AtomicUsize,
+}
+
+const HELD: &str = "held by the test: the carry is not submitted";
+
+impl Endpoint for HoldSecondTx {
+    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.inner.get(path)
+    }
+    fn post(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+        if path == "/v1/tx" && self.posts.fetch_add(1, Ordering::SeqCst) == 1 {
+            return Err(HELD.into());
+        }
+        self.inner.post(path, body)
+    }
 }
 
 fn values(index: &qlab_ledger::assets::AssetIndex, asset: u16) -> Vec<u64> {
@@ -145,11 +172,15 @@ fn migrate_carries_an_issuer_seed_and_completes_a_carry_whose_pre_fund_landed() 
     assert!(matches!(j.get(0).unwrap().state, GenState::Sweep { .. }), "U's generation 0 stays sweep-only");
     let v = net.settle_spends(0, "U: nothing moved");
 
-    // W, first run: the pre-fund is submitted, and the run is given no time
-    // to see it in the served tree — it stops there, before the carry.
-    let first = migrate(&w, ep(), v[1].state_tip, Some(hash), false, Duration::ZERO, &mut rng);
-    assert!(matches!(first, Err(SendRefusal::SplitNotIncluded { .. })), "{:?}", first.map(|_| ()));
-    let v = net.settle_spends(3, "the pre-fund lands anyway");
+    // W, first run: the pre-fund is submitted and seen in the served tree;
+    // the carry is proved and refused at its submit.
+    let held = HoldSecondTx { inner: ep(), posts: AtomicUsize::new(0) };
+    let first = migrate(&w, held, v[1].state_tip, Some(hash), false, wait, &mut rng);
+    let why = first.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(why.contains(HELD), "the first migrate stops at the carry's submit: {why:?}");
+    let v = net.settle_spends(3, "the pre-fund landed, the carry did not");
+    let next0 = AuthJournal::load(&w.dir).unwrap().unwrap().get(0).unwrap().next;
+    assert_eq!(next0, 2, "the refused carry took its two leaves of generation 0");
     let idx = index(&w, &urls[1], v[1].state_tip, hash);
     assert_eq!(values(&idx.only_generation(0), 0), vec![tier_s], "generation 0 holds exactly the tariff");
     assert_eq!(values(&idx.only_generation(1), 0), vec![10 - 2 * tier_s], "the active change: 10 − tariff − S");
@@ -158,6 +189,8 @@ fn migrate_carries_an_issuer_seed_and_completes_a_carry_whose_pre_fund_landed() 
     let r = migrate(&w, ep(), v[1].state_tip, Some(hash), false, wait, &mut rng).expect("W's second migrate");
     assert_eq!(r.carried, vec![(0, ASSET)]);
     assert_eq!(r.swept, vec![(0, 1)], "one transaction: the carry, no split");
+    let next0 = AuthJournal::load(&w.dir).unwrap().unwrap().get(0).unwrap().next;
+    assert_eq!(next0, 4, "the carry signed with fresh leaves, never the refused one's");
     assert!(r.carry_unfunded.is_empty() && r.carry_next.is_empty() && r.retired.is_empty(), "{r:?}");
     assert!(r.asset0_left.is_empty(), "the pre-fund was its only asset-0 note, and the fee took it");
     let v = net.settle_spends(6, "the carry");
