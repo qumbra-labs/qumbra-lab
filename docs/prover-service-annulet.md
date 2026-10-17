@@ -139,11 +139,24 @@ The IP is never logged. Refusals are counted under a 4-byte hash of a per-proces
 
 **The nullifier follow.** The service follows its pinned node itself (`QUMBRA_PROVER_ANNULET_NODE_URL`):
 - the tip is read from `GET /v1/registry/root`;
-- the landed nullifiers are paged from `GET /v1/nullifiers`, starting at height 1.
+- the landed nullifiers are paged from `GET /v1/nullifiers`;
+- each block's id and `prev` are read from `GET /v1/headers` (lab #945).
 
-It polls every quarter slot (no more often than every 200 ms), so a slow poll still lands well inside the one slot after which the set is stale. Every height must be served, in order. A page that skips a height or a page with no block is an error, and the set does not advance past it. A tip below the followed height (a reorganisation deeper than the set, or a node rolled back) empties the set: it is logged as `error:` and rebuilt from height 1, catching up again.
+It polls every quarter slot (no more often than every 200 ms), so a slow poll still lands well inside the one slot after which the set is stale. Every height must be served, in order. A page that skips a height or a page with no block is an error, and the set does not advance past it. A step reads one headers page (at most 256 blocks): the headers, then the nullifiers, then the page's last header again. A chain that changed between those reads fails the poll, and so does a block whose `prev` is not the block before it (`headers-break`).
 
-The set lives in memory (32 bytes per nullifier) and is rebuilt from height 1 at every start. The first catch-up logs its size and how long it took. If that rebuild grows past 60 s, a persisted set gets its own issue.
+**The trust it takes.** The follow does not verify the sequencer's seals on the headers it reads. The node is the operator's pinned node, which is the trust the service already takes for every other read (the tip, the nullifiers, the submission); a seal check would add about 3.3 KB of verify input per block and no protection against that node (the lab #945 ruling).
+
+**Reorganisations (lab #945).** Each poll first checks the followed block: the node's block at the followed height must still have the id the follow recorded. If it does not, or the tip has fallen below it, the follow walks its window (the last 65 blocks) down to the highest height whose block the node still serves and **rolls back** to it: exactly those blocks' nullifiers leave the set (a nullifier is in at most one block), and the new branch is read from there. A reorganisation up to 64 blocks deep (about 10.7 min at a 10 s slot) is rolled back this way. Deeper, no block of the window is still served: the set and its store are emptied, `reorg-deeper-than-64:` is logged as `error:`, and the set is rebuilt from height 1.
+
+**The store (lab #945).** The set is persisted beside the paid ledger, at `<QUMBRA_PROVER_ANNULET_PAID_LEDGER>.nullifiers`, created 0600 like the ledger. It is append-only text: a header line `qumbra-prover nullifiers v1 genesis=<64 hex>`, then one line per block (`<height> <block id> <nullifier>*`, a block that spends nothing included), and a `rollback <h>` line for each rollback. A poll's lines are fsynced before the set in memory advances. There is no compaction in v1.
+
+At a start the store is replayed and the follow resumes from its last whole height, so a restart reads only what is new. The full set is kept: no nullifier is ever dropped for age, because a forgotten spend would get a full prove the chain then refuses, unpaid. At start-up:
+- a torn last line (a crash mid-append) is cut away, and that height is read again;
+- a store written for another genesis is logged as `genesis-mismatch`, emptied, and rebuilt from height 1;
+- `store-corrupt:` refuses the start-up for a malformed line, a height out of order, or a rollback outside the window. The refusal names the line and the move: move the file aside, and the follow rebuilds from height 1;
+- `store-unwritable:` refuses the start-up for a store that cannot be created, opened or read, or that is not 0600. An append that fails later is a failed poll, and the set does not advance.
+
+The first catch-up logs the set's size and how long it took; a resumed store is logged at start with the height it reached. (Before the store, the set was rebuilt from height 1 at every start; on prover-1 at about 27,000 rehearsal blocks that took seconds.)
 
 **It fails loudly.** Admission answers `503`, and `/healthz` is not ready:
 - `nullifiers-catching-up` until the first catch-up;
@@ -153,7 +166,7 @@ A follow failure is logged once as `error:`, and its recovery once.
 
 *Residuals.*
 - **At most one wasted prove per IP per prove time.** A transaction that loses a race to a spend the follow has not yet seen still gets proved, and its landed spend costs the attacker real notes (accepted at D4).
-- A nullifier from a block that is later reorganised away, by a reorganisation shallower than the set, stays in the set until the next restart or the next rebuild. Until then its notes are refused as `nullifier-landed`.
+- A nullifier from a block reorganised away is out of the set by the next poll (a rollback), or after the rebuild for a reorganisation deeper than 64 blocks. Until then its notes are refused as `nullifier-landed`.
 
 **The paid ledger (D5).** `QUMBRA_PROVER_ANNULET_PAID_LEDGER` names a file.
 

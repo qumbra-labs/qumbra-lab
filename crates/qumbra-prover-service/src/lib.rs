@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 pub mod annulet;
 pub mod annulet_v3;
+pub mod nullifier_store;
 pub mod token;
 
 use qlab_wallet::uri::{b64url_decode, b64url_encode};
