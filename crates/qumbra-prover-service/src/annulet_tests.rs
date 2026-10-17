@@ -1122,11 +1122,14 @@ fn an_accepted_submission_writes_one_ledger_line_and_a_refused_one_none() {
     assert_eq!(lines.len(), 2, "{text}");
     assert_eq!(lines[0], PAID_LEDGER_HEADER);
     let o = &b.witness().outputs[2];
+    // ρ is the kernel's, from the first nullifier — not the witness's (lab #958).
+    let nf0 = &b.tx().public.nullifiers[0];
+    let nf0: [u64; 4] = core::array::from_fn(|i| u64::from_le_bytes(nf0[i * 8..i * 8 + 8].try_into().unwrap()));
     let want = format!(
         "1 cm={} value=3 asset=0 rkm={} rho={} rseed={} shape=S at=",
         hex(&b.tx().public.commitments[2]),
         lanes(&PAYEE_RKM),
-        lanes(&o.rho),
+        lanes(&qlab_air::l2::derive_output_rho_l2(&nf0, 2)),
         lanes(&o.rseed),
     );
     assert!(lines[1].starts_with(&want), "{}\nwant {want}…", lines[1]);
@@ -1148,6 +1151,69 @@ fn an_accepted_submission_writes_one_ledger_line_and_a_refused_one_none() {
     assert_eq!(std::fs::read_to_string(&at).unwrap(), format!("{PAID_LEDGER_HEADER}\n"));
 }
 
+/// Lab #958: **the paid ledger's round trip into the payee's wallet.** A
+/// real kernel-built v3 S bundle whose output 3 pays a real wallet's address
+/// goes through the service's ledger path, and that wallet's import
+/// (`qumbra_wallet::openings::check_ledger`) takes the row: `Imported`, its
+/// `cm` the transaction's third commitment. The negative twin: the same row
+/// with the witness's placeholder ρ — what the ledger wrote before #958 —
+/// is refused `cm-mismatch`.
+#[test]
+fn a_paid_ledger_row_imports_into_the_payees_wallet_and_the_witness_rho_does_not() {
+    use std::collections::HashSet;
+
+    use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+    use qlab_wallet::Wallet;
+    use qumbra_wallet::auth_journal::generation_root;
+    use qumbra_wallet::openings::{check_ledger, LineRefusal, Verdict};
+
+    let lanes = |l: &[u64; 4]| l.iter().map(|x| hex(&x.to_le_bytes())).collect::<String>();
+    let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([0x58; ENTROPY_LEN]), qumbra_wallet::store::HD_ACCOUNT);
+    let root = generation_root(&wallet, 0);
+    let addr = wallet.address_candidate_a_at_index(0, &root);
+    let payee = qlab_l2spend::Recipient {
+        rkm: addr.rkm_lanes(),
+        ek: addr.encapsulation_key().expect("a Candidate A address carries an ek"),
+    };
+    let b = qlab_l2spend::fixtures::signed_bundle_fee_bank_to(payee);
+
+    let at = ledger_path("round-trip");
+    let mut c = config_v3(FakeChain::new(1, &[]), ProverPrice { s: 3, p: 0 }, &at);
+    c.v3.as_mut().expect("a format-34 config").payee_rkm = addr.rkm_lanes();
+    let a = AnnuletApi::with_clock(c, FakeProver::new(Answer::Honest, false), Arc::<FakeNode>::default(), clock);
+    wait_ready(&a);
+    let (v, _) = admit_ip(&a, "192.0.2.30", &b).unwrap();
+    assert_eq!(wait(&a, &v, &["submitted", "failed"]).state, "submitted");
+    let ledger = std::fs::read_to_string(&at).unwrap();
+    let _ = std::fs::remove_file(&at);
+    let cm = b.tx().public.commitments[2];
+    assert_eq!(ledger.lines().count(), 2, "{ledger}");
+    assert!(ledger.lines().nth(1).unwrap().starts_with(&format!("1 cm={} value=3 ", hex(&cm))), "{ledger}");
+
+    // The payee's wallet imports it: the note it rebuilds is the one on chain.
+    let generations = [(0u32, root)];
+    let (verdicts, added) = check_ledger(&ledger, &wallet, &[0], &generations, &HashSet::new()).unwrap();
+    let got: Vec<Verdict> = verdicts.iter().map(|v| v.verdict.clone()).collect();
+    assert_eq!(got, vec![Verdict::Imported], "{ledger}");
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].cm, cm);
+    assert!(b.tx().public.commitments.contains(&added[0].cm), "the row's cm is one the transaction states");
+    assert_eq!((added[0].note.value, added[0].note.asset, added[0].note.rkm), (3, 0, addr.rkm_lanes()));
+
+    // The negative twin: the witness's placeholder ρ in the same row.
+    let witness_rho = b.witness().outputs[2].rho;
+    assert_ne!(witness_rho, added[0].note.rho, "the witness's ρ is not the chain's");
+    let placeholder = ledger.replace(
+        &format!(" rho={} ", lanes(&added[0].note.rho)),
+        &format!(" rho={} ", lanes(&witness_rho)),
+    );
+    assert_ne!(placeholder, ledger);
+    let (verdicts, added) = check_ledger(&placeholder, &wallet, &[0], &generations, &HashSet::new()).unwrap();
+    let got: Vec<Verdict> = verdicts.iter().map(|v| v.verdict.clone()).collect();
+    assert_eq!(got, vec![Verdict::Refused(LineRefusal::CmMismatch)], "{placeholder}");
+    assert!(added.is_empty());
+}
+
 /// Lab #937 PR E (pre-review): a torn last line — a crash mid-write — never
 /// swallows the next entry. Reopening closes it with a newline, so the next
 /// append starts its own line: the reader skips one malformed line and every
@@ -1163,7 +1229,7 @@ fn a_torn_ledger_line_never_swallows_the_next_entry() {
     drop(f);
     let ledger = PaidLedger::open(&at).unwrap();
     let out3 = qlab_air::l2::L2TxOutput { value: 7, asset: 0, rkm: PAYEE_RKM, rho: [1; 4], rseed: [2; 4] };
-    let entry = PaidEntry::of(&out3, [0xab; 32], L2ShapeTag::P);
+    let entry = PaidEntry::of(&out3, &[0xcd; 32], [0xab; 32], L2ShapeTag::P);
     ledger.append(&entry, 1_800_000_000).unwrap();
     let text = std::fs::read_to_string(&at).unwrap();
     let lines: Vec<&str> = text.lines().collect();
