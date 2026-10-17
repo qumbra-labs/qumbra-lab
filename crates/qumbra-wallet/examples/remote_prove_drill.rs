@@ -28,12 +28,22 @@
 //!       `--lie-price S,P` rewrites /info's price (below the service's) →
 //!       expect 402 prover-fee-short. Either spends the step's leaves.
 //!
+//! Lab #966, measurement only: a send also prints where its time before the
+//! first upload went — `TIME scan|build <route>: calls, bytes, fetch, wallet`
+//! per route class (`wallet` is the wallet's own time on that route's answers,
+//! up to its next request), then `TIME plan at`, `TIME step N review at`, and
+//! the existing `TIME step N upload #1 at`. Nothing the send does changes.
+//!
 //! What it cannot reach (host-side, through the coordinator's driver): the
 //! paid ledger's line count, a direct call without the ingress header (400
 //! client-ip-unknown), and `import-openings` (the CLI's own command).
 
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use qlab_l2spend::Endpoint;
 use qumbra_wallet::annulet_send::{send_annulet_remote, RemoteHooks, WalletEndpoint};
 use qumbra_wallet::remote_prover::{self, Event, HttpProver, ProverTransport, RECORD_DIR};
 use qumbra_wallet::store::WalletDir;
@@ -205,6 +215,8 @@ fn send(args: &[String]) -> bool {
     }
     let mut t = Lying { inner: HttpProver { base: base.clone() }, payee: lie_payee, price: lie_price };
     let started = Instant::now();
+    let timing = Rc::new(Timing::default());
+    let phases: RefCell<Vec<(String, Duration)>> = RefCell::new(Vec::new());
     let mut marks: Vec<(usize, String, Duration)> = Vec::new();
     let mut probed = None;
     let mut events = |step: usize, e: Event| {
@@ -222,7 +234,7 @@ fn send(args: &[String]) -> bool {
     };
     let result = send_annulet_remote(
         &w,
-        WalletEndpoint { url: need(args, "--url").to_string() },
+        Timed { inner: WalletEndpoint { url: need(args, "--url").to_string() }, timing: Rc::clone(&timing) },
         asset,
         amount,
         &to,
@@ -238,6 +250,8 @@ fn send(args: &[String]) -> bool {
             // and signs only a review that renders.
             review: &mut |i, r| match r.render() {
                 Ok(text) => {
+                    timing.close();
+                    phases.borrow_mut().push((format!("step {} review", i + 1), started.elapsed()));
                     for line in text.lines() {
                         println!("REVIEW step {} {line}", i + 1);
                     }
@@ -251,6 +265,9 @@ fn send(args: &[String]) -> bool {
             list: None,
         },
         &mut |plan, p| {
+            timing.close();
+            timing.planned.set(true);
+            phases.borrow_mut().push(("plan".to_string(), started.elapsed()));
             println!(
                 "INFO plan: {} transaction(s), network fees {}, prover fees {} at S {} / P {}",
                 plan.steps.len(),
@@ -263,6 +280,11 @@ fn send(args: &[String]) -> bool {
         },
         &mut rng,
     );
+    timing.close();
+    timing.print();
+    for (what, at) in phases.borrow().iter() {
+        println!("TIME {what} at {:.1}s", at.as_secs_f64());
+    }
     for (step, what, at) in &marks {
         println!("TIME step {} {what} at {:.1}s", step + 1, at.as_secs_f64());
     }
@@ -290,6 +312,103 @@ fn send(args: &[String]) -> bool {
         }
     }
     !r.failed
+}
+
+/// Lab #966: the node endpoint with a stopwatch — per route class, how many
+/// reads, how many bytes, the time waiting for each answer, and the wallet's
+/// time on it (from the answer to the next request, or to the next mark).
+/// Only times; every byte passes through unchanged.
+struct Timed {
+    inner: WalletEndpoint,
+    timing: Rc<Timing>,
+}
+
+#[derive(Default)]
+struct Timing {
+    /// `false` until the plan is shown: reads before it are the scan's,
+    /// reads after it the build's (registry, tree paths, splits).
+    planned: Cell<bool>,
+    /// The route class whose answer the wallet is working on, and since when.
+    open: RefCell<Option<(String, Instant)>>,
+    /// (phase, route class) → (calls, bytes, fetch, wallet).
+    by: RefCell<BTreeMap<(&'static str, String), RouteTime>>,
+}
+
+/// calls, bytes, fetch, wallet.
+type RouteTime = (u32, u64, Duration, Duration);
+
+impl Timing {
+    /// `/v1/block/123/tx/4/full?x=1` → `/v1/block/N/tx/N/full`: a class, not a URL.
+    fn class(path: &str) -> String {
+        let path = path.split('?').next().unwrap_or(path);
+        let mut out = String::new();
+        let mut digits = false;
+        for c in path.chars() {
+            if c.is_ascii_digit() {
+                if !digits {
+                    out.push('N');
+                }
+                digits = true;
+            } else {
+                digits = false;
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn phase(&self) -> &'static str {
+        if self.planned.get() { "build" } else { "scan" }
+    }
+
+    /// End the wallet's time on the last answer, now.
+    fn close(&self) {
+        if let Some((class, since)) = self.open.borrow_mut().take() {
+            let key = (self.phase(), class);
+            self.by.borrow_mut().entry(key).or_default().3 += since.elapsed();
+        }
+    }
+
+    fn print(&self) {
+        let mut totals: BTreeMap<&'static str, (Duration, Duration)> = BTreeMap::new();
+        for ((phase, class), (calls, bytes, fetch, wallet)) in self.by.borrow().iter() {
+            println!(
+                "TIME {phase} {class}: {calls} call(s), {bytes} B, fetch {:.1}s, wallet {:.1}s",
+                fetch.as_secs_f64(),
+                wallet.as_secs_f64()
+            );
+            let t = totals.entry(phase).or_default();
+            t.0 += *fetch;
+            t.1 += *wallet;
+        }
+        for (phase, (fetch, wallet)) in totals {
+            println!("TIME {phase} total: fetch {:.1}s, wallet {:.1}s", fetch.as_secs_f64(), wallet.as_secs_f64());
+        }
+    }
+}
+
+impl Endpoint for Timed {
+    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.timing.close();
+        let class = Timing::class(path);
+        let asked = Instant::now();
+        let got = self.inner.get(path);
+        let fetch = asked.elapsed();
+        {
+            let mut by = self.timing.by.borrow_mut();
+            let e = by.entry((self.timing.phase(), class.clone())).or_default();
+            e.0 += 1;
+            e.1 += got.as_ref().map_or(0, |b| b.len() as u64);
+            e.2 += fetch;
+        }
+        *self.timing.open.borrow_mut() = Some((class, Instant::now()));
+        got
+    }
+
+    fn post(&self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+        self.timing.close();
+        self.inner.post(path, body)
+    }
 }
 
 /// The fee-check drill's transport: `/v2/annulet/info` with its payee and/or
