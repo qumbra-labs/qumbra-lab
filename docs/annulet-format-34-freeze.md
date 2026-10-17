@@ -101,7 +101,7 @@ The same follows from the constraints. The selectors only move how an amount spl
 
 ## Not frozen here
 
-- **The production genesis and the prover pin.** The format-34 production genesis is minted at the cut-over, and the runbook adds its prover pin (`qumbra-wallet/src/prover_pins.rs`, `PINS`, empty until then) and releases the kernel.
+- **The production genesis and the prover pin.** The format-34 production genesis is minted at the cut-over, and the runbook adds its prover pin (`qumbra-wallet/src/prover_pins.rs`, `PINS`, empty until then) and releases the kernel. Done for **annulet-testnet-3**: genesis `024ed17b…8b70`, its payee, and a maximum of S 2 / P 4 (test `the_production_pin_is_annulet_testnet_3s`).
 - **The price.** It is deploy configuration, at or below the pinned maximum.
 - **The token retirement** (#937 D6). It happens after the cut-over.
 - **The cut-over rehearsal.** It runs on prover-1 with the real ingress (Caddy adds `X-Qumbra-Client-IP`), driven by the kernel client: first against `devnet_v3_rehearsal`, then against the production genesis. It also yields the service path's S and P figures.
