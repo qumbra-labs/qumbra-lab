@@ -518,8 +518,9 @@ mod tests {
     }
 
     /// Lab #785, M1: a block tagged `sections: "v6"` is pre-checked under the
-    /// V6 payee cap (1) even above V5's 11,520 boundary; untagged, V5's cap
-    /// applies; a token that names no section set is refused.
+    /// V6 payee cap (1); untagged, V5's cap applies — also 1 at every height
+    /// since lab #790, so two payees at 11,521 are refused either way; a token
+    /// that names no section set is refused.
     #[test]
     fn a_v6_tagged_block_is_prechecked_under_the_v6_payee_cap() {
         let mut header = BlockHeader::genesis_for(GenesisForm::V5, 8, 0);
@@ -537,7 +538,7 @@ mod tests {
             sections: sections.into(),
             bundle_id: String::new(),
         };
-        assert!(wire("").decode().is_ok(), "V5 above its boundary allows two");
+        assert!(matches!(wire("").decode(), Err(e) if e.contains("cap 1")), "V5 allows one payee at every height (lab #790)");
         assert!(matches!(wire("v6").decode(), Err(e) if e.contains("cap 1")));
         assert!(wire("v9").decode().is_err());
     }

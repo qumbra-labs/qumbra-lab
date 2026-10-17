@@ -380,6 +380,9 @@ impl BundleRef {
 impl StoredBlock {
     /// Build the persisted form from a live devnet header + body.
     pub fn from_parts(header: &BlockHeader, body: &BlockBody) -> Self {
+        // Single-payee by construction: every V4/V5/V6 cap is 1 (lab #790 —
+        // V5's raise to 8 was withdrawn because this panicked on a validated
+        // 2-payee body); N-payee apply replaces this record before any raise.
         let (coinbase, coinbase_rkm) =
             body.single_payee_parts().expect("accepted body is at the current cap");
         Self { annulet: None,

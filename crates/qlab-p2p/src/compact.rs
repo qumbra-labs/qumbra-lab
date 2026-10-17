@@ -1009,15 +1009,20 @@ mod tests {
         );
     }
 
-    /// V6's payee cap is 1 on the wire as in the body rule (ruling (b)).
+    /// V6's payee cap is 1 on the wire as in the body rule (ruling (b)), and
+    /// since lab #790 so is V5's at every height: a peer's 2-payee frame is
+    /// refused by name before any body is built from it.
     #[test]
     fn the_v6_announce_refuses_a_second_payee() {
         let mut a = golden_l1_announce(GenesisForm::V5);
         a.header.height = 11_521;
         a.coinbase_payees.push(CoinbasePayee { rkm: [9; 4], amount: 1 });
-        // V5 above its boundary accepts two; the same frame shape under V6 does not.
-        let v5 = encode_announce(GenesisForm::V5, &a);
-        assert!(decode_announce(GenesisForm::V5, &v5).is_ok());
+        // The frame, built under the dormant cap of 8 (the drill seam).
+        let v5 = encode_announce_above(Some(0), GenesisForm::V5, &a);
+        assert!(matches!(
+            decode_announce(GenesisForm::V5, &v5),
+            Err(DecodeError::TooManyCoinbasePayees { got: 2, cap: 1 })
+        ));
         let at = header_msg_len(GenesisForm::V5) + 8 + 1 + 80;
         let mut v6 = v5[..at].to_vec();
         v6.extend_from_slice(&[0, 0]);

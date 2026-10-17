@@ -258,6 +258,8 @@ pub fn coinbase_note_value_parts(coinbase: u64, total_fees: u64, total_name_burn
 /// #559 is what that costs: the T2 faucet funded its entire inventory this way
 /// and could not pay a single grant.
 pub fn coinbase_note(height: u64, body: &BlockBody) -> Option<Note> {
+    // `None` for more than one payee: no live cap allows one (lab #790), and
+    // N-payee apply mints one leaf per payee before any cap is raised.
     let (amount, rkm) = body.single_payee_parts()?;
     coinbase_note_parts(
         height,
@@ -365,6 +367,7 @@ pub fn coinbase_note_for(
     height: u64,
     body: &BlockBody,
 ) -> Option<Note> {
+    // As in `coinbase_note`: single-payee while every cap is 1 (lab #790).
     let (amount, rkm) = body.single_payee_parts()?;
     coinbase_note_parts_for(
         form,

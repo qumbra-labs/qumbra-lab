@@ -1,7 +1,8 @@
 //! Payee-list assembly, form-keyed.
 //!
-//! - **V5**: native [`CoinbasePayee`] list, capped at one before the payee-cap
-//!   boundary and [`qlab_devnet::body::COINBASE_PAYEE_CAP_V5`] (8) after it.
+//! - **V5**: native [`CoinbasePayee`] list, capped at one — at every height
+//!   since lab #790 (the boundary is unset; the injected-boundary drills still
+//!   exercise [`qlab_devnet::body::COINBASE_PAYEE_CAP_V5`] (8) above one).
 //!   Validated through [`check_scheduled_coinbase_payees_above`] — we do not
 //!   re-derive Σ.
 //! - **V4**: N=1 single-payee (`coinbase` + `coinbase_rkm`). Accounting
@@ -9,8 +10,9 @@
 //!
 //! Before activation, PPLNS cannot split the mint: the highest-weight miner in
 //! the window (or the pool rkm if the window is empty / the winner has no
-//! registered rkm) takes the whole `coinbase_exact(height)`. Above the boundary
-//! the same assembler selects up to eight winners and splits proportionally.
+//! registered rkm) takes the whole `coinbase_exact(height)`. Above a boundary
+//! (drills only, while it is unset) the same assembler selects up to eight
+//! winners and splits proportionally.
 //!
 //! ## 🔴 The payout and refusal path (lab #547 + #553)
 //!
@@ -492,10 +494,12 @@ mod tests {
     }
 
     /// Lab #785, M1 on PR #791: on a V6 node the pool pays ONE winner at
-    /// every height — above V5's 11,520 boundary too, where the same window
-    /// on V5 pays up to eight. Σ still equals the schedule.
+    /// every height. Lab #790: so does V5 now — the same ten-miner window at
+    /// the old 11,521 boundary pays one winner, because the pool takes its
+    /// payee count from the chain's cap ([`payee_cap`]) and has no setting of
+    /// its own that could ask for more. Σ still equals the schedule.
     #[test]
-    fn a_v6_pool_pays_one_winner_where_v5_pays_eight() {
+    fn a_v5_or_v6_pool_pays_one_winner_at_every_height() {
         let mut accounts = Accounts::default();
         let mut pairs = Vec::new();
         for i in 1..=10u64 {
@@ -514,16 +518,20 @@ mod tests {
             assert_eq!(payees.len(), 1, "height {height}");
             assert_eq!(payees[0].amount, coinbase_exact(height));
         }
-        let v5 = assemble_coinbase_for(
-            GenesisForm::V5,
-            qlab_devnet::forms::BodySections::None,
-            11_521,
-            &w,
-            &accounts,
-            rkm(99),
-        )
-        .unwrap();
-        assert_eq!(v5.payees().len(), qlab_devnet::body::COINBASE_PAYEE_CAP_V5);
+        for height in [1u64, 11_520, 11_521, 1_000_000] {
+            assert_eq!(payee_cap(GenesisForm::V5, height), 1, "the V5 cap, height {height}");
+            let v5 = assemble_coinbase_for(
+                GenesisForm::V5,
+                qlab_devnet::forms::BodySections::None,
+                height,
+                &w,
+                &accounts,
+                rkm(99),
+            )
+            .unwrap();
+            assert_eq!(v5.payees().len(), 1, "V5 pays one winner, height {height}");
+            assert_eq!(v5.payees()[0].amount, coinbase_exact(height));
+        }
         assert!(matches!(
             assemble_coinbase_for(GenesisForm::V4, v6, 5, &w, &accounts, rkm(99)),
             Err(AssembleError::NoCoinbaseOnForm(GenesisForm::V4))
