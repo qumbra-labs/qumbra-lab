@@ -18,9 +18,10 @@
 //! - `W` issues Hybrid asset 7. Its generation 0 (active) holds the asset's
 //!   zero-value base and an exact P fee note; its generation 1 address holds
 //!   an exact P fee note (the pre-fund, issue #197 step 2). `W` re-arms (one
-//!   P), runs `migrate --open-next` (no prove; generation 0's gate is in the
-//!   future), and mints 5 to `T` from generation 1 at once (one P). The
-//!   address the re-arm paid is the one `open_next` made active.
+//!   P), runs `migrate --open-next` (no prove; generation 0, left with only
+//!   its zero-value base and no `issuer.v1` seed, is retired in the same
+//!   run), and mints 5 to `T` from generation 1 at once (one P). The address
+//!   the re-arm paid is the one `open_next` made active.
 //! - `U` issues asset 8 with the same holdings and skips the re-arm: after
 //!   `open_next` its mint is refused `NoIssuerNote` before anything is
 //!   proved — the stall the re-arm removes.
@@ -167,12 +168,17 @@ fn a_zero_amount_mint_re_arms_the_base_in_the_next_generation_before_open_next()
     let idx = index(&w, &urls[1], v[1].state_tip, hash);
     assert!(idx.only_generation(1).mint_base(ASSET).is_none(), "generation 1 is not in the journal yet");
 
-    // open_next: no prove; generation 0's gate is tip + 1,152.
+    // open_next: no prove. Generation 0 is left holding only its zero-value
+    // base (the re-arm spent the exact fee note), and `W` keeps no
+    // `issuer.v1` (the secret is `Given`, as the gateway's is), so it has no
+    // issuer seed to carry: the same run retires it rather than leaving it
+    // sweep-only behind its gate.
     let r = migrate(&w, ep(), v[1].state_tip, Some(hash), true, wait, &mut rng).expect("W opens generation 1");
     assert_eq!(r.active, 1);
-    assert!(r.swept.is_empty() && r.carried.is_empty(), "{r:?}");
+    assert!(r.swept.is_empty() && r.carried.is_empty() && r.waiting.is_empty(), "{r:?}");
+    assert_eq!(r.retired, vec![0], "{r:?}");
     let j = AuthJournal::load(&w.dir).unwrap().unwrap();
-    assert!(matches!(j.get(0).unwrap().state, GenState::Sweep { .. }));
+    assert_eq!(j.get(0).unwrap().state, GenState::Retired);
     let wallet = w.wallet();
     assert_eq!(
         wallet.address_candidate_a_at_index(0, &j.active().auth_root).rkm_lanes(),
