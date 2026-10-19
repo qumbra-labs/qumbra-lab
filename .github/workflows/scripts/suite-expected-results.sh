@@ -36,6 +36,8 @@
 # Usage: suite-expected-results.sh [manifest-dir]     (default: cwd)
 #   env SUITE_PACKAGES  space-separated package names: count only these
 #                       (the verify-l2 lane's `-p qlab-air -p qlab-l2`); unset = the workspace
+#       SUITE_DOCTESTS  0 = count no doc-test sets (the split lane's `proving` half,
+#                       lab #977, runs `--lib --bins --tests`); unset or 1 = count them
 # Requires: cargo, python3. Both absent ⇒ exit 2 with a named reason.
 set -uo pipefail
 
@@ -62,6 +64,7 @@ with open(sys.argv[1]) as f:
 import os
 members = set(m["workspace_members"])
 only = set(os.environ.get("SUITE_PACKAGES", "").split())
+with_doctests = os.environ.get("SUITE_DOCTESTS", "1") != "0"
 binaries = 0
 doctests = 0
 skipped = []
@@ -99,7 +102,7 @@ for pkg in m["packages"]:
             continue
         if t.get("test", True):
             binaries += 1
-        if is_lib and t.get("doctest", True):
+        if is_lib and t.get("doctest", True) and with_doctests:
             doctests += 1
 
 for s in skipped:

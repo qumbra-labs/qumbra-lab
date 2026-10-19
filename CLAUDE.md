@@ -138,6 +138,18 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    are a partial run, however healthy they look. The lane's exit code is still the only gate — the
    reconciliation reports and never rules.
 
+   **The lane runs the bar in two halves on two rigs (added 2026-10-19, lab #977)**, because the
+   serial suite reached 114–118 min against the 120-min cap. Both halves run the command above
+   over the whole workspace (the `proving` half adds `--lib --bins --tests`, leaving the doc-tests
+   to `rest`), so the build, its features and the warm cache are the bar's; a cargo target runner,
+   `.github/workflows/scripts/lane-split-runner.sh`, executes each test binary in one half by
+   package (`qlab-bench` + `qumbra-wallet` in `proving`, the rest in `rest`) and filters it to zero
+   tests in the other. **This is not a crate-scoped run**: nothing is excluded from the build
+   (`-p`/`--exclude` would change member features — measured, see the runner's header), every
+   binary reports in both jobs, and the union is the bar. **Acceptance = both jobs green and
+   complete; the totals are the two jobs' passed/failed/ignored added**, and each job's
+   `filtered out` cross-checks the other's run.
+
    *(Updated 2026-08-21. The bar used to be `suite-arm64.yml` on the GitHub-hosted
    `qumbra-arm64-8`, with the Graviton lane named as "the same bar on cheaper iron once its
    instance is registered". The instances have been registered since 2026-08-18 — three of them

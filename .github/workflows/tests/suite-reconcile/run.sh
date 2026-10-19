@@ -247,8 +247,81 @@ T
     FAIL=$((FAIL + 1)); echo "FAIL [derive] metadata > 128 KiB: wanted 1 (rc 0), got '$got' (rc $rc)"; sed 's/^/      | /' "$TMP/bigmeta.err"; fi
   # No manifest ⇒ non-zero and a named reason, never a number.
   if out=$(bash "$EXPECT" "$TMP" 2>&1); then FAIL=$((FAIL + 1)); echo "FAIL [derive] printed '$out' for a directory with no manifest"; else PASS=$((PASS + 1)); fi
+  # The split lane's `proving` half (lab #977) runs `--lib --bins --tests`: no doc-test sets.
+  got=$(SUITE_DOCTESTS=0 bash "$EXPECT" "$W" 2> "$TMP/derive-nodoc.err"); rc=$?
+  if [ "$rc" = 0 ] && [ "$got" = 5 ]; then PASS=$((PASS + 1)); else
+    FAIL=$((FAIL + 1)); echo "FAIL [derive] SUITE_DOCTESTS=0: wanted 5 (rc 0), got '$got' (rc $rc)"; sed 's/^/      | /' "$TMP/derive-nodoc.err"; fi
 else
   FAIL=$((FAIL + 1)); echo "FAIL [derive] cargo not on PATH — the derivation case cannot run, and it must not be skipped silently"
+fi
+
+# ── 10. A half of the split lane names its own command; filtered_out is printed. ─
+echo 0 > "$TMP/half.exit"
+GITHUB_SHA=0123456789abcdef GITHUB_STEP_SUMMARY="$TMP/half.summary" SUITE_LANE=test-lane SUITE_EXPECTED_RESULTS=143 \
+  SUITE_COMMAND='cargo test --release --workspace --locked --no-fail-fast --lib --bins --tests -- --test-threads=1' \
+  bash "$RECON" "$GREEN" "$TMP/half.exit" > "$TMP/half.out" 2>&1; echo $? > "$TMP/half.rc"
+expect half "exits 0"                            rc      '^0$'
+expect half "quotes the half's own command"      summary '`cargo test --release --workspace --locked --no-fail-fast --lib --bins --tests -- --test-threads=1`'
+expect green "an unsplit run filtered nothing"   out     '^filtered_out=0$'
+refute green "no filtered-out sentence unsplit"  summary 'filtered out\*\*'
+
+# ── 11. The split's target runner (scripts/lane-split-runner.sh). ─────────────
+# A stand-in "test binary" prints its argv, so what the runner execs is visible.
+RUNNER="$HERE/../../scripts/lane-split-runner.sh"
+FAKE="$TMP/fakebin"; printf '#!/usr/bin/env bash\necho "ARGV $*"\n' > "$FAKE"; chmod +x "$FAKE"
+runner() {  # runner <name> <LANE_SPLIT|-> <CARGO_PKG_NAME|->
+  local name=$1 half=$2 pkg=$3
+  local -a env=()
+  [ "$half" = - ] || env+=(LANE_SPLIT="$half")
+  [ "$pkg" = - ] || env+=(CARGO_PKG_NAME="$pkg")
+  env -u LANE_SPLIT -u CARGO_PKG_NAME "${env[@]}" bash "$RUNNER" "$FAKE" --test-threads=1 > "$TMP/$name.out" 2>&1
+  echo $? > "$TMP/$name.rc"
+}
+runner own-proving proving qumbra-wallet
+expect own-proving "runs its own half unfiltered"   out '^ARGV --test-threads=1$'
+expect own-proving "exits with the binary's code"   rc  '^0$'
+runner other-rest rest qumbra-wallet
+expect other-rest "filters the other half to zero"  out '^ARGV --test-threads=1 --exact lane-split: runs in the other half$'
+expect other-rest "says so in the log"              out '^lane-split: qumbra-wallet runs in the other half; filtered here$'
+runner own-rest rest qlab-air
+expect own-rest "rest runs the complement"          out '^ARGV --test-threads=1$'
+runner other-proving proving qlab-air
+expect other-proving "proving filters the complement" out '--exact lane-split: runs in the other half$'
+runner nopkg rest -
+expect nopkg "no CARGO_PKG_NAME is a failure"       rc  '^101$'
+refute nopkg "and nothing ran"                      out '^ARGV'
+runner nohalf - qlab-air
+expect nohalf "no LANE_SPLIT is a failure"          rc  '^101$'
+runner badhalf both qlab-air
+expect badhalf "an unknown half is a failure"       rc  '^101$'
+refute badhalf "and nothing ran"                    out '^ARGV'
+
+# ── 12. Every package of THIS workspace runs in exactly one half. ─────────────
+# The complement is by construction; this pins it against the real manifests
+# (a renamed package in PROVING would otherwise silently leave no package there).
+if command -v cargo >/dev/null 2>&1; then
+  pkgs=$(cd "$HERE/../../.." && cargo metadata --no-deps --offline --format-version 1 2>/dev/null \
+    | python3 -c 'import json,sys; m=json.load(sys.stdin); ids=set(m["workspace_members"]); print("\n".join(p["name"] for p in m["packages"] if p["id"] in ids))')
+  if [ -z "$pkgs" ]; then
+    FAIL=$((FAIL + 1)); echo "FAIL [split] could not list the workspace's packages"
+  else
+    bad=""; proving_n=0
+    for p in $pkgs; do
+      n=0
+      for half in rest proving; do
+        out=$(env LANE_SPLIT=$half CARGO_PKG_NAME="$p" bash "$RUNNER" "$FAKE" 2>&1)
+        [ "$out" = "ARGV " ] && { n=$((n + 1)); [ "$half" = proving ] && proving_n=$((proving_n + 1)); }
+      done
+      [ "$n" = 1 ] || bad="$bad $p($n)"
+    done
+    if [ -z "$bad" ]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "FAIL [split] packages not run exactly once:$bad"; fi
+    # Every name in PROVING must be a workspace package.
+    want=$(sed -n 's/^PROVING="\(.*\)"$/\1/p' "$RUNNER" | wc -w | tr -d ' ')
+    if [ "$want" -gt 0 ] && [ "$proving_n" = "$want" ]; then PASS=$((PASS + 1)); else
+      FAIL=$((FAIL + 1)); echo "FAIL [split] PROVING names $want packages, $proving_n of them are in the workspace"; fi
+  fi
+else
+  FAIL=$((FAIL + 1)); echo "FAIL [split] cargo not on PATH — the split's workspace check cannot run"
 fi
 
 echo

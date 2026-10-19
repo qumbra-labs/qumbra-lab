@@ -130,15 +130,23 @@ jobs:
       # dead runner service, the suite sits queued (bounded: GitHub queue
       # limit + the 2 h idle watchdog on the woken instance) where the old
       # behavior might have been saved by the second box. Priced, accepted.
+      #
+      # A suite run is TWO jobs since lab #977 (the split below), so it asks
+      # for one instance more than its own run counts for: `+1` when this
+      # run carries the suite. The other active runs are still counted as one
+      # each — the cap at the instance count makes that exact for two
+      # instances, and an under-count costs a queued half, never a wrong stop.
       - name: Start as many instances as the queue needs
         env:
           INSTANCE_ID: ${{ vars.CI_RUNNER_INSTANCE_ID }}
           GH_TOKEN: ${{ github.token }}
+          SUITE_HALVES: ${{ (github.event.label.name == 'verify-graviton' || (github.event_name == 'workflow_dispatch' && inputs.run != 'pilot')) && '1' || '0' }}
         run: |
           active=$(gh api \
             "repos/${{ github.repository }}/actions/workflows/acceptance-graviton.yml/runs?per_page=100" \
             --jq '[.workflow_runs[] | select(.status != "completed")] | length')
           [ "$active" -ge 1 ] || active=1
+          active=$((active + SUITE_HALVES))
           set -- $INSTANCE_ID   # unquoted on purpose: space-separated LIST (deploy #184)
           want=$active; [ "$want" -gt $# ] && want=$#
           to_start=$(printf '%s\n' "$@" | head -n "$want" | tr '\n' ' ')
@@ -162,7 +170,29 @@ jobs:
       # protected by S1's 2 h idle watchdog, so the sat-queued failure mode
       # costs minutes of hosted time, not a night of Graviton.
 
-  # ── job B ── the bar on the self-hosted Graviton rig.
+  # ── job B ── the bar on the self-hosted Graviton rigs, in two halves.
+  #
+  # THE SPLIT (lab #977). The serial suite reached 114–118 min on a quiet rig
+  # (runs 39234060268 / 39234789040) and run 39248927331 was cut by the
+  # 120-min cap with nothing wrong in it. Both halves run the bar's own
+  # command over the whole workspace — the same build, the same features,
+  # the same warm cache — and a cargo target runner
+  # (scripts/lane-split-runner.sh) assigns each test BINARY to one half by
+  # its package; in the other half that binary still runs, filtered to zero
+  # tests, so it reports `0 passed … N filtered out`. Not a crate-scoped
+  # run (CLAUDE.md §5): nothing is excluded from the build, and the union of
+  # the two halves is the bar, binary for binary.
+  #
+  #   proving  qlab-bench + qumbra-wallet — 49–53 lane-min of tests on
+  #            2026-10-19, ~57–60 min with the build; new Annulet proving
+  #            tests land here
+  #   rest     everything else + every doc-test set — 60.5 lane-min of
+  #            tests, ~65 min with the build
+  #
+  # Acceptance reads BOTH jobs: each must be green and complete, and the
+  # suite's totals are the two jobs' passed/failed/ignored added together.
+  # With one rig free the halves queue one behind the other: each keeps its
+  # own 120-min timeout, so the wall time grows and nothing is cut.
   suite:
     needs: start
     # Not on a `verify-pilot` run: that label asks for the pilot alone.
@@ -171,11 +201,29 @@ jobs:
       github.event.label.name == 'verify-graviton'
     runs-on: [self-hosted, graviton-rig]
     timeout-minutes: 120      # beyond this it is not viable as the bar
+    strategy:
+      # A red half must not cancel the other: --no-fail-fast's whole point
+      # (lab #691) is one cycle that returns every failure.
+      fail-fast: false
+      matrix:
+        include:
+          - half: rest
+            targets: ""
+            doctests: "1"
+            artifact: suite-log-graviton
+          - half: proving
+            # The doc-tests are not intercepted by a target runner (stable
+            # cargo), so they run in `rest` only; `--lib --bins --tests` is
+            # every binary `cargo test` runs, without the doc-test pass.
+            targets: "--lib --bins --tests"
+            doctests: "0"
+            artifact: suite-log-graviton-proving
     permissions:
       contents: read
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
+      LANE_SPLIT: ${{ matrix.half }}
 
     steps:
       - uses: actions/checkout@v7
@@ -199,9 +247,21 @@ jobs:
       - name: Provenance
         run: |
           echo "commit   $(git rev-parse HEAD)"
+          echo "half     $LANE_SPLIT"
           uname -m; nproc; free -g | head -2
           rustc --version; cargo --version; cmake --version | head -1
           echo "target   $CARGO_TARGET_DIR"; df -h "$HOME" | tail -1
+
+      # The split's runner, for the host triple only: a runner changes how a
+      # built binary is EXECUTED, never what is built, so the warm cache and
+      # every fingerprint stay the bar's. Build scripts do not use it.
+      - name: The split's target runner
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          [ -n "$host" ] || { echo "::error::rustc -vV printed no host triple"; exit 1; }
+          var="CARGO_TARGET_$(echo "$host" | tr 'a-z-' 'A-Z_')_RUNNER"
+          echo "$var=$GITHUB_WORKSPACE/.github/workflows/scripts/lane-split-runner.sh" >> "$GITHUB_ENV"
+          echo "$var → lane-split-runner.sh (half: $LANE_SPLIT)"
 
       # THE BAR (CLAUDE.md §5) — this command, verbatim. §5 quotes it; if the
       # command changes, §5 changes in the same PR.
@@ -221,14 +281,17 @@ jobs:
       # OOM of cargo itself, eviction, cancel) rather than finished. `rc` is
       # cargo's own code via pipefail; the step still exits with it, so pass/
       # fail stays this step's exit code and nothing else's.
-      - name: Full workspace suite, serial, unfiltered
+      #
+      # `${{ matrix.targets }}` is empty in the `rest` half — the command
+      # there is §5's, verbatim — and `--lib --bins --tests` in `proving`.
+      - name: Full workspace suite, serial, unfiltered (one half executed)
         run: |
           set -o pipefail
           rc=0
           # suite.log stays RAW (the reconcile script parses it); the job console gets a
           # wall-clock stamp per line so a watcher can see where the run is and what each
           # test cost — libtest's own --report-time is nightly-only (asked 2026-09-23).
-          /usr/bin/time -v cargo test --release --workspace --locked --no-fail-fast \
+          /usr/bin/time -v cargo test --release --workspace --locked --no-fail-fast ${{ matrix.targets }} \
             -- --test-threads=1 2>&1 | tee suite.log \
             | awk '{ print strftime("[%H:%M:%S]"), $0; fflush() }' || rc=$?
           echo "$rc" > suite.exit
@@ -250,13 +313,17 @@ jobs:
       - name: Reconciliation and the four answers
         if: always()
         env:
-          SUITE_LANE: graviton-rig
+          SUITE_LANE: graviton-rig, ${{ matrix.half }} half
+          SUITE_DOCTESTS: ${{ matrix.doctests }}
+          SUITE_COMMAND: cargo test --release --workspace --locked --no-fail-fast ${{ matrix.targets }} -- --test-threads=1
         run: bash .github/workflows/scripts/reconcile-suite.sh suite.log suite.exit
 
+      # `rest` keeps the pre-split artifact name, so a reader of the old name
+      # still finds a log (now the larger half); `proving` is beside it.
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: suite-log-graviton
+          name: ${{ matrix.artifact }}
           path: |
             suite.log
             suite.exit
