@@ -63,6 +63,7 @@ fn start(tag: &str, g: &AnnuletGenesisFile) -> RunningNode<KeccakPow, DevnetRehe
         miner_rkm: None,
         template_serving: false,
         operator_addr: None,
+        sequencer_key: None,
     };
     let mut node = RunningNode::start_annulet(&config, g, KeccakPow, DevnetRehearsalVerifier).expect("starts");
     node.start_discovery_endpoint("127.0.0.1:0").expect("discovery binds");

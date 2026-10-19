@@ -333,6 +333,7 @@ fn a_discovery_refresh_on_an_unchanged_tip_copies_nothing() {
         miner_rkm: None,
         template_serving: false,
         operator_addr: None,
+        sequencer_key: None,
     };
     let mut node =
         RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();

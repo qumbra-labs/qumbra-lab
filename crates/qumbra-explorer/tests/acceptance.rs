@@ -54,6 +54,7 @@ fn observer_rig(tag: &str) -> (NodeConfig, GenesisFile, PathBuf) {
         miner_rkm: None,
         template_serving: false,
         operator_addr: None,
+        sequencer_key: None,
     };
     (config, genesis, base)
 }
