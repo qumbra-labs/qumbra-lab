@@ -70,9 +70,9 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 | `QUMBRA_PROVER_ANNULET_QUEUE` | 3 | 1..=8，排队的 job 数，不含正在运行的那个 |
 | `QUMBRA_PROVER_ANNULET_TIMEOUT_SECS` | 300 | 30..=1800，每次 prove |
 | `QUMBRA_PROVER_ANNULET_RESULT_TTL_SECS` | 600 | 60..=3600 |
-| `QUMBRA_PROVER_ANNULET_PER_DAY` | 20 | token 中写 0 时使用的默认值 |
-| `QUMBRA_PROVER_TOKEN_KEYS_FILE` | — | 每行一条 `key_id verifying_key_hex` |
-| `QUMBRA_PROVER_TOKEN_DENY_FILE` | 未设置 | 已吊销的 token id |
+| `QUMBRA_PROVER_ANNULET_PER_DAY` | 20 | 仅 format 33:1..=1000,token 中写 0 时使用的默认值 |
+| `QUMBRA_PROVER_TOKEN_KEYS_FILE` | — | 仅 format 33(在那里必填):每行一条 `key_id verifying_key_hex` |
+| `QUMBRA_PROVER_TOKEN_DENY_FILE` | 未设置 | 仅 format 33:已吊销的 token id |
 | `QUMBRA_PROVER_SCRATCH` | — | **必须是 tmpfs 挂载**（启动时检查；仅 Linux） |
 | `QUMBRA_PROVER_LISTEN`、`QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` | 同 L1 | TLS、限流和请求头大小上限都在 ingress 层 |
 
@@ -102,7 +102,7 @@ Lab #937 PR E（裁定 D4、D5，以及 issue #937 上对 PR E 的裁定）。�
 
 **和 format 33 的区别：**
 
-- **没有 token。** 不读 `QUMBRA_PROVER_TOKEN_KEYS_FILE` 和 `QUMBRA_PROVER_TOKEN_DENY_FILE`。如果这两项还配着（prover-1 上就配着，要到 D6 才撤），服务会忽略它们而不是拒绝启动，并在启动日志里说明已忽略。服务从不读 `Authorization`。`GET /v2/annulet/quota` 返回 `404 quota-not-served`。没有每日额度。
+- **没有 token。** 不读 `QUMBRA_PROVER_TOKEN_KEYS_FILE`、`QUMBRA_PROVER_TOKEN_DENY_FILE` 和 `QUMBRA_PROVER_ANNULET_PER_DAY`,三者都不是必填项（lab #937 D6）。如果还配着，即使文件读不了或值不合法，服务也只是忽略而不拒绝启动，并用一行启动日志列出被忽略的变量。服务从不读 `Authorization`。`GET /v2/annulet/quota` 返回 `404 quota-not-served`。没有每日额度。
 - **`/v2/annulet/info`** 多出 `fee_asset`（0）、`price`（`{"S": n, "P": n}`）和 `payee`（完整地址）三个字段。内核的 `prover_pins::admit` 就是拿这三项去和该网络的 pin 比对。format 33 上没有这三个字段。
 - **`/healthz`**：nullifier 跟读第一次追上之前，以及之后落后超过一个 slot 的时候，都返回 `503` 加跟读的错误码（见下文）。
 

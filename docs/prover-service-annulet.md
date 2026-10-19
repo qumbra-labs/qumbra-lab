@@ -70,9 +70,9 @@ The Annulet mode is on exactly when `QUMBRA_PROVER_ANNULET_GENESIS_HASH` is set.
 | `QUMBRA_PROVER_ANNULET_QUEUE` | 3 | 1..=8, queued jobs, not counting the running one |
 | `QUMBRA_PROVER_ANNULET_TIMEOUT_SECS` | 300 | 30..=1800, per prove |
 | `QUMBRA_PROVER_ANNULET_RESULT_TTL_SECS` | 600 | 60..=3600 |
-| `QUMBRA_PROVER_ANNULET_PER_DAY` | 20 | the default for tokens that state 0 |
-| `QUMBRA_PROVER_TOKEN_KEYS_FILE` | — | `key_id verifying_key_hex` per line |
-| `QUMBRA_PROVER_TOKEN_DENY_FILE` | unset | revoked token ids |
+| `QUMBRA_PROVER_ANNULET_PER_DAY` | 20 | format 33 only: 1..=1000, the default for tokens that state 0 |
+| `QUMBRA_PROVER_TOKEN_KEYS_FILE` | — | format 33 only (required there): `key_id verifying_key_hex` per line |
+| `QUMBRA_PROVER_TOKEN_DENY_FILE` | unset | format 33 only: revoked token ids |
 | `QUMBRA_PROVER_SCRATCH` | — | **must be a tmpfs mount** (checked at start; Linux only) |
 | `QUMBRA_PROVER_LISTEN`, `QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` | as for L1 | TLS, rate limiting and a request-header size cap live at ingress |
 
@@ -102,7 +102,7 @@ Lab #937 PR E (rulings D4 and D5, and the PR E ruling on issue #937). On a forma
 
 **What differs from format 33:**
 
-- **No token.** `QUMBRA_PROVER_TOKEN_KEYS_FILE` and `QUMBRA_PROVER_TOKEN_DENY_FILE` are not read. If they are still configured (prover-1's are, until D6 retires them), they are ignored, not refused, and startup logs that they were ignored. `Authorization` is never read. `GET /v2/annulet/quota` answers `404 quota-not-served`. There is no daily quota.
+- **No token.** `QUMBRA_PROVER_TOKEN_KEYS_FILE`, `QUMBRA_PROVER_TOKEN_DENY_FILE` and `QUMBRA_PROVER_ANNULET_PER_DAY` are not read, and none is required (lab #937 D6). Any still configured is ignored, not refused, even when unreadable or malformed, and one startup line names each ignored variable. `Authorization` is never read. `GET /v2/annulet/quota` answers `404 quota-not-served`. There is no daily quota.
 - **`/v2/annulet/info`** also carries `fee_asset` (0), `price` (`{"S": n, "P": n}`) and `payee` (the full address). These are the fields the kernel's `prover_pins::admit` checks against the network's pin. On 33 these fields are absent.
 - **`/healthz`** answers `503` with the follow's code until the nullifier follow has caught up, and again whenever it falls more than one slot behind (see below).
 
