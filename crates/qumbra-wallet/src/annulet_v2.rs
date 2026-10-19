@@ -667,6 +667,27 @@ pub fn issuer_seeds<E: Endpoint>(w: &WalletDir, session: &Session<E>) -> Result<
     Ok(session.index.zero.iter().filter(|n| issued.contains(&n.asset)).cloned().collect())
 }
 
+/// The generation `migrate --open-next` opens next: one above the highest
+/// the journal records (gateway issue #197).
+pub fn next_generation(journal: &AuthJournal) -> u32 {
+    journal.generations().iter().map(|r| r.g).max().expect("a journal is never empty") + 1
+}
+
+/// **Gateway issue #197 Q2**: the next generation and its address 0 — the
+/// address `migrate --open-next` makes active, read before it is opened. An
+/// issuer re-arms an asset's mint base there with a zero-amount mint
+/// (`issuer::prepare_mint(.., 0, &address, ..)`) while the current
+/// generation is still active, so the first mint after `open_next` has a
+/// base without waiting for the old generation's sweep gate. Reads the
+/// journal and derives; writes nothing and needs no lock.
+pub fn next_generation_address(w: &WalletDir) -> Result<(u32, qlab_wallet::address::Address), SendRefusal> {
+    let journal = AuthJournal::load(&w.dir)?
+        .ok_or_else(|| SendRefusal::Auth("no auth journal yet: run `qumbra-wallet migrate` first".into()))?;
+    let g = next_generation(&journal);
+    let wallet = w.wallet();
+    Ok((g, wallet.address_candidate_a_at_index(0, &generation_root(&wallet, g))))
+}
+
 /// The root of generation `g` for `wallet` — re-exported for the CLI.
 pub fn root_of(wallet: &Wallet, g: u32) -> [u64; 4] {
     generation_root(wallet, g)
@@ -1149,7 +1170,7 @@ pub fn migrate<E: Endpoint>(
         }
     };
     if open_next {
-        let next_g = journal.generations().iter().map(|r| r.g).max().expect("non-empty") + 1;
+        let next_g = next_generation(&journal);
         let gate = SweepGate {
             genesis: session.genesis_hash,
             not_before_height: session.gate_tip.saturating_add(MAX_AUTH_VALIDITY_BLOCKS),
