@@ -118,6 +118,7 @@ fn rig_t2(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
         miner_rkm: Some(rkm_hex(&RIG_RKM)),
         template_serving: false,
         operator_addr: None,
+        sequencer_key: None,
     };
     (config, genesis, base)
 }

@@ -312,6 +312,9 @@ pub enum RunError {
     /// A configuration this Annulet (sequencer) genesis cannot run under,
     /// refused by name before anything opens (lab #708).
     Annulet(&'static str),
+    /// The sequencer key's source refused by name (lab #972): see
+    /// `NodeConfig::sequencer_key`.
+    SequencerKey(String),
 }
 
 impl std::fmt::Display for RunError {
@@ -325,6 +328,7 @@ impl std::fmt::Display for RunError {
             RunError::Supply(e) => write!(f, "supply attestation: {e:?}"),
             RunError::MiningWithoutPayout => write!(f, "{MINING_WITHOUT_PAYOUT}"),
             RunError::Annulet(why) => write!(f, "annulet: {why} (lab #708)"),
+            RunError::SequencerKey(why) => write!(f, "sequencer key: {why} (lab #972)"),
         }
     }
 }
@@ -434,6 +438,18 @@ pub fn check_miner_payout(config: &NodeConfig) -> Result<(), RunError> {
     }
 }
 
+/// `sequencer_key` on an L1 or V6 genesis, refused by name (lab #972): only
+/// an Annulet net has a sequencer, and a pipe nobody reads would hold the
+/// operator's writer open forever.
+fn refuse_sequencer_key_without_a_sequencer(config: &NodeConfig) -> Result<(), RunError> {
+    match config.sequencer_key {
+        Some(_) => Err(RunError::SequencerKey(
+            "sequencer_key is set, but only an Annulet genesis has a sequencer".into(),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Validate a node's `config` against its `genesis` exactly as startup would — the
 /// genesis byte-verify + optional hash pin (item 2) and every held key
 /// cross-checked against committee₀ — but bind nothing and touch no disk state.
@@ -441,6 +457,7 @@ pub fn check_miner_payout(config: &NodeConfig) -> Result<(), RunError> {
 /// pre-listener phase (wrong hash, tampered committee, a key for the wrong index).
 pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight, RunError> {
     genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
+    refuse_sequencer_key_without_a_sequencer(config)?;
     let validators = genesis.load_validators(&config.committee_key_paths)?;
     // Lab #475: the payout key is parsed HERE too, by the same parser startup
     // uses. It was the one config field a pre-flight did not touch, so a
@@ -500,6 +517,7 @@ pub fn preflight_any(config: &NodeConfig, genesis: &crate::annulet_genesis::AnyG
         }
         AnyGenesis::V6(g) => {
             g.verify_startup(config.expected_genesis_hash.as_deref())?;
+            refuse_sequencer_key_without_a_sequencer(config)?;
             let validators = g.base.load_validators(&config.committee_key_paths)?;
             check_miner_payout(config)?;
             config.operator_bind().map_err(RunError::Config)?;
@@ -520,6 +538,9 @@ pub fn preflight_any(config: &NodeConfig, genesis: &crate::annulet_genesis::AnyG
                 ));
             }
             config.operator_bind().map_err(RunError::Config)?;
+            // Lab #972: the key's source is checked as `run` checks it, but a
+            // pipe is never read here — `check` must not consume the key.
+            annulet::sequencer_source(config)?;
             Ok(summary(g.hash_hex(), 0, 0, 0))
         }
     }
@@ -1017,6 +1038,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         release.validate()?;
         let marker = HaltMarker::load(&config.data_dir)?;
         release.check_against_marker(marker.as_ref())?;
+        refuse_sequencer_key_without_a_sequencer(config)?;
         //     (c) #81: the schedule is a property of this release AND of this data
         //         dir. A routine release after an upgrade declares no boundary of its
         //         own, and must still apply the post-halt rule domain recorded on
@@ -4087,6 +4109,7 @@ mod tests {
             miner_rkm: None,
             template_serving: false,
             operator_addr: None,
+            sequencer_key: None,
         };
         (config, genesis, base)
     }
@@ -6505,6 +6528,7 @@ mod tests {
             miner_rkm: miner_rkm.map(str::to_string),
             template_serving: false,
             operator_addr: None,
+            sequencer_key: None,
         }
     }
 

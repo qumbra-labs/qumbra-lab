@@ -214,7 +214,28 @@ pub struct NodeConfig {
     /// before this change. Ship the binary first, then the config.
     #[serde(default)]
     pub operator_addr: Option<String>,
+    /// OPTIONAL — where an Annulet sequencer reads its key at start instead of
+    /// `data_dir/sequencer.key` (lab #972): `"fifo:<path>"`, a named pipe (or
+    /// `fifo:/dev/stdin` when stdin is a pipe). The node opens it once, waits
+    /// for the operator to write the key file's TOML into it, and keeps the key
+    /// in memory only, so a production key never sits on the host's disk
+    /// (design #380 Q4). **Unset = the data-dir file decides**, as before: with
+    /// it the node produces, without it the node follows (devnets).
+    ///
+    /// Refused by name: any other value; a path that does not exist or is not
+    /// a pipe; the pipe configured while `sequencer.key` is also on disk; and
+    /// the key set on a genesis that has no sequencer.
+    ///
+    /// Deployment ordering caveat, same as `metrics_addr`: `deny_unknown_fields`
+    /// is deliberate, so a config carrying this key is REFUSED by a binary built
+    /// before this change. Ship the binary first, then the config.
+    #[serde(default)]
+    pub sequencer_key: Option<String>,
 }
+
+/// The one accepted form of [`NodeConfig::sequencer_key`]: this prefix, then
+/// the pipe's path (lab #972).
+pub const SEQUENCER_KEY_PIPE_PREFIX: &str = "fifo:";
 
 /// The serde default behind [`NodeConfig::discovery_addr`]: **on, loopback**.
 ///
@@ -280,6 +301,20 @@ impl NodeConfig {
             None => Ok(None),
             Some(a) if crate::operator_server::is_loopback_hostport(a.trim()) => Ok(Some(a.trim())),
             Some(a) => Err(ConfigError::Parse(crate::operator_server::non_loopback_refusal(a))),
+        }
+    }
+
+    /// The sequencer key pipe's path (lab #972), or a refusal naming a value
+    /// that is not `fifo:<path>`. `Ok(None)` = not configured.
+    pub fn sequencer_key_pipe(&self) -> Result<Option<&std::path::Path>, ConfigError> {
+        let Some(v) = self.sequencer_key.as_deref() else { return Ok(None) };
+        match v.trim().strip_prefix(SEQUENCER_KEY_PIPE_PREFIX) {
+            Some(p) if !p.is_empty() => Ok(Some(std::path::Path::new(p))),
+            _ => Err(ConfigError::Parse(format!(
+                "sequencer_key = {v:?}: the only accepted form is \"{SEQUENCER_KEY_PIPE_PREFIX}<path>\" \
+                 (a named pipe the key is written into at start); for a key file, leave sequencer_key \
+                 unset and put it at data_dir/sequencer.key (lab #972)"
+            ))),
         }
     }
 

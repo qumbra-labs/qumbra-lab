@@ -85,14 +85,124 @@ impl AnnuletRun {
     pub(super) fn role_line(&self) -> String {
         match self.sequencer {
             Some(_) => format!(
-                "ANNULET role=producer slot_secs={} max_empty_slots={} (sequencer key file present; \
+                "ANNULET role=producer slot_secs={} max_empty_slots={} (sequencer key held; \
                  finality is operator governance: final on acceptance)",
                 self.slot.as_secs(),
                 self.max_empty_slots
             ),
-            None => "ANNULET role=follower (no sequencer key file; production off)".to_string(),
+            None => "ANNULET role=follower (no sequencer key; production off)".to_string(),
         }
     }
+}
+
+/// Where an Annulet node's sequencer key comes from (lab #972), decided
+/// without reading it, so `check` can ask the same question `run` does.
+#[derive(Debug)]
+pub(crate) enum SequencerSource<'a> {
+    /// No key: the node follows.
+    None,
+    /// `data_dir/sequencer.key` (devnets; the convention since lab #708).
+    File(std::path::PathBuf),
+    /// `sequencer_key = "fifo:<path>"`: read once at start, kept in memory.
+    Pipe(&'a std::path::Path),
+}
+
+/// The most bytes read from the sequencer key pipe. The key file's TOML is
+/// about 100 B; anything near this is not a key file.
+pub const SEQUENCER_KEY_PIPE_MAX_BYTES: u64 = 4096;
+
+/// [`SequencerSource`] for `config`, or a refusal by name (lab #972): a
+/// `sequencer_key` that is not `fifo:<path>`, a pipe path that does not
+/// exist or is not a pipe, or the pipe configured while the key file is
+/// also on disk.
+pub(crate) fn sequencer_source(config: &NodeConfig) -> Result<SequencerSource<'_>, RunError> {
+    let file = config.data_dir.join(SEQUENCER_KEY_FILE);
+    let file_present = file.try_exists().map_err(RunError::Io)?;
+    let Some(pipe) = config.sequencer_key_pipe().map_err(RunError::Config)? else {
+        return Ok(if file_present { SequencerSource::File(file) } else { SequencerSource::None });
+    };
+    if file_present {
+        return Err(RunError::SequencerKey(format!(
+            "sequencer_key names the pipe {}, but {} is also on disk: remove the file (a production \
+             key is never written to the host) or unset sequencer_key",
+            pipe.display(),
+            file.display()
+        )));
+    }
+    let meta = match std::fs::metadata(pipe) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RunError::SequencerKey(format!(
+                "sequencer_key names the pipe {}, which does not exist, and there is no {}: create the \
+                 pipe (mkfifo) before start and write the key into it, or unset sequencer_key to follow",
+                pipe.display(),
+                file.display()
+            )))
+        }
+        Err(e) => return Err(RunError::Io(e)),
+    };
+    if !is_pipe(&meta) {
+        return Err(RunError::SequencerKey(format!(
+            "sequencer_key names {}, which is not a pipe: a key in a regular file belongs at {} \
+             (devnets only)",
+            pipe.display(),
+            file.display()
+        )));
+    }
+    Ok(SequencerSource::Pipe(pipe))
+}
+
+#[cfg(unix)]
+fn is_pipe(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    meta.file_type().is_fifo() || meta.file_type().is_socket()
+}
+
+#[cfg(not(unix))]
+fn is_pipe(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Read the sequencer key from its pipe (lab #972): opening blocks until the
+/// operator's writer opens the other end; the read ends at the writer's
+/// close. The content is the key file's TOML ([`SequencerKeyFile`]). The
+/// buffers that held it are zeroed before return (best effort: the TOML
+/// parser's own copies are not reachable from here).
+pub(crate) fn read_sequencer_key_pipe(path: &std::path::Path) -> Result<[u8; 32], RunError> {
+    use std::io::Read;
+    qlab_devnet::jprintln!("STARTUP waiting for the sequencer key on the pipe {} (lab #972)", path.display());
+    let mut buf = Vec::with_capacity(SEQUENCER_KEY_PIPE_MAX_BYTES as usize + 1);
+    std::fs::File::open(path)
+        .and_then(|f| f.take(SEQUENCER_KEY_PIPE_MAX_BYTES + 1).read_to_end(&mut buf))
+        .map_err(RunError::Io)?;
+    let seed = parse_piped_key(&buf);
+    wipe(&mut buf);
+    seed
+}
+
+fn parse_piped_key(buf: &[u8]) -> Result<[u8; 32], RunError> {
+    if buf.iter().all(u8::is_ascii_whitespace) {
+        return Err(RunError::SequencerKey(
+            "the sequencer key pipe closed without a key: write the key file's TOML into it".into(),
+        ));
+    }
+    if buf.len() as u64 > SEQUENCER_KEY_PIPE_MAX_BYTES {
+        return Err(RunError::SequencerKey(format!(
+            "more than {SEQUENCER_KEY_PIPE_MAX_BYTES} B arrived on the sequencer key pipe: not a key file"
+        )));
+    }
+    let text = std::str::from_utf8(buf)
+        .map_err(|_| RunError::SequencerKey("the sequencer key pipe carried bytes that are not UTF-8 TOML".into()))?;
+    let mut file = SequencerKeyFile::from_toml(text)?;
+    let seed = file.seed();
+    let mut hex = std::mem::take(&mut file.seed_hex).into_bytes();
+    wipe(&mut hex);
+    Ok(seed?)
+}
+
+fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(bytes);
 }
 
 /// What one producer slot did.
@@ -131,8 +241,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             ));
         }
         let pinned = genesis.sequencer()?;
-        let sequencer = match std::fs::read_to_string(config.data_dir.join(SEQUENCER_KEY_FILE)) {
-            Ok(text) => {
+        let sequencer = match sequencer_source(config)? {
+            SequencerSource::None => None,
+            SequencerSource::File(path) => {
+                let text = std::fs::read_to_string(path).map_err(RunError::Io)?;
                 let key = SequencerKey::from_seed(SequencerKeyFile::from_toml(&text)?.seed()?);
                 if key.verifying_key() != pinned {
                     return Err(RunError::Annulet(
@@ -141,8 +253,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 }
                 Some(key)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(RunError::Io(e)),
+            SequencerSource::Pipe(path) => {
+                let key = SequencerKey::from_seed(read_sequencer_key_pipe(path)?);
+                if key.verifying_key() != pinned {
+                    return Err(RunError::Annulet(
+                        "the key read from the sequencer key pipe is not the genesis sequencer key",
+                    ));
+                }
+                qlab_devnet::jprintln!(
+                    "STARTUP sequencer key read from the pipe {}; held in memory only (lab #972)",
+                    path.display()
+                );
+                Some(key)
+            }
         };
         Ok(PreparedNode {
             config,
@@ -294,6 +417,7 @@ mod tests {
             miner_rkm: None,
             template_serving: false,
             operator_addr: None,
+            sequencer_key: None,
         };
         (config, genesis, base)
     }
@@ -455,6 +579,116 @@ mod tests {
         }
         assert_eq!(node.seal_slot(t_after(&genesis, max)), SlotOutcome::Sealed { height: 1, txs: 0, peers: 0 });
         assert_eq!(node.seal_slot(t_after(&genesis, max + 1)), SlotOutcome::EmptySlot { empty_run: 1 });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The fixture genesis's sequencer key file (the one `annulet_rig` writes).
+    fn fixture_key_toml() -> String {
+        SequencerKeyFile { seed_hex: "5e".repeat(32), note: "fixture sequencer key (test)".into() }.to_toml()
+    }
+
+    /// A named pipe at `path` (lab #972), made by the system's `mkfifo`.
+    #[cfg(unix)]
+    fn mkfifo(path: &std::path::Path) {
+        let ok = std::process::Command::new("mkfifo").arg(path).status().expect("mkfifo runs").success();
+        assert!(ok, "mkfifo {}", path.display());
+    }
+
+    /// Open the pipe's write end on a thread (the open blocks until the node
+    /// opens the read end), write `bytes`, close.
+    #[cfg(unix)]
+    fn write_into_pipe(path: PathBuf, bytes: Vec<u8>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut w = std::fs::OpenOptions::new().write(true).open(&path).expect("open the pipe's write end");
+            w.write_all(&bytes).expect("write the key");
+        })
+    }
+
+    fn prepare_err(config: &NodeConfig, genesis: &AnnuletGenesisFile) -> Option<String> {
+        RunningNode::<KeccakPow, DevnetRehearsalVerifier>::prepare_annulet(config, genesis, KeccakPow, DevnetRehearsalVerifier)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// 🔴 **Lab #972: the producer starts from a key written into its pipe**,
+    /// and nothing is written to the data dir. `check`'s preflight on the same
+    /// config does not read the pipe (a reader there would consume the key).
+    #[cfg(unix)]
+    #[test]
+    fn a_sequencer_starts_from_the_key_written_into_its_pipe_lab_972() {
+        let (mut config, genesis, base) = annulet_rig("i972_pipe", false);
+        let pipe = base.join("sequencer.fifo");
+        mkfifo(&pipe);
+        config.sequencer_key = Some(format!("fifo:{}", pipe.display()));
+        let any = crate::annulet_genesis::AnyGenesis::Annulet(Box::new(genesis.clone()));
+        assert!(crate::run::preflight_any(&config, &any).is_ok(), "check accepts the pipe without reading it");
+        let writer = write_into_pipe(pipe.clone(), fixture_key_toml().into_bytes());
+        let node = start(&config, &genesis);
+        writer.join().expect("the writer finished");
+        assert!(node.is_sequencer(), "the piped key makes the node the producer");
+        assert!(!config.data_dir.join(SEQUENCER_KEY_FILE).exists(), "the key never reaches the data dir");
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Lab #972 refusals, each by name: the pipe named but absent (and no key
+    /// file either); a regular file where the pipe should be; the pipe and
+    /// the key file both present; a value that is not `fifo:<path>`; a pipe
+    /// closed empty; a wrong key through the pipe; the key set on a genesis
+    /// with no sequencer.
+    #[cfg(unix)]
+    #[test]
+    fn the_sequencer_key_pipe_refusals_lab_972() {
+        let (mut config, genesis, base) = annulet_rig("i972_refusals", false);
+        let pipe = base.join("sequencer.fifo");
+        config.sequencer_key = Some(format!("fifo:{}", pipe.display()));
+        // Neither the pipe nor the file.
+        assert!(prepare_err(&config, &genesis).is_some_and(|e| e.contains("does not exist") && e.contains("lab #972")));
+        // A regular file is not a pipe.
+        std::fs::write(&pipe, fixture_key_toml()).unwrap();
+        assert!(prepare_err(&config, &genesis).is_some_and(|e| e.contains("not a pipe")));
+        std::fs::remove_file(&pipe).unwrap();
+        mkfifo(&pipe);
+        // The pipe configured while the key file is also on disk.
+        std::fs::write(config.data_dir.join(SEQUENCER_KEY_FILE), fixture_key_toml()).unwrap();
+        assert!(prepare_err(&config, &genesis).is_some_and(|e| e.contains("also on disk")));
+        std::fs::remove_file(config.data_dir.join(SEQUENCER_KEY_FILE)).unwrap();
+        // Any value but fifo:<path>.
+        for bad in ["file:/x", "fifo:", "/run/annulet/sequencer.fifo"] {
+            let mut c = config.clone();
+            c.sequencer_key = Some(bad.to_string());
+            assert!(prepare_err(&c, &genesis).is_some_and(|e| e.contains("the only accepted form")), "{bad}");
+        }
+        // The writer closes without writing.
+        let writer = write_into_pipe(pipe.clone(), Vec::new());
+        assert!(prepare_err(&config, &genesis).is_some_and(|e| e.contains("closed without a key")));
+        writer.join().unwrap();
+        // A key that is not the genesis sequencer key.
+        let wrong = SequencerKeyFile { seed_hex: "5f".repeat(32), note: String::new() }.to_toml();
+        let writer = write_into_pipe(pipe.clone(), wrong.into_bytes());
+        assert!(prepare_err(&config, &genesis).is_some_and(|e| e.contains("pipe is not the genesis sequencer key")));
+        writer.join().unwrap();
+        // On an L1 genesis there is no sequencer to read it.
+        let l1 = crate::genesis::GenesisFile::new_devnet_t0();
+        let any = crate::annulet_genesis::AnyGenesis::L1(Box::new(l1));
+        config.expected_genesis_hash = None;
+        assert!(crate::run::preflight_any(&config, &any)
+            .err()
+            .is_some_and(|e| e.to_string().contains("only an Annulet genesis has a sequencer")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Lab #972: with `sequencer_key` unset the data-dir file decides, as
+    /// before — present: the producer; absent: a follower.
+    #[test]
+    fn without_sequencer_key_the_data_dir_file_still_decides_the_role_lab_972() {
+        let (config, genesis, base) = annulet_rig("i972_file", true);
+        assert_eq!(config.sequencer_key, None);
+        assert!(start(&config, &genesis).is_sequencer());
+        let _ = std::fs::remove_dir_all(&base);
+        let (config, genesis, base) = annulet_rig("i972_nofile", false);
+        assert!(!start(&config, &genesis).is_sequencer());
         let _ = std::fs::remove_dir_all(&base);
     }
 
