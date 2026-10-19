@@ -18,6 +18,9 @@
 #
 #   env  SUITE_EXPECTED_RESULTS  override the derived denominator (tests only)
 #        SUITE_LANE              heading suffix, default "graviton-rig"
+#        SUITE_COMMAND           the command line the heading quotes, default the
+#                                bar's (the split lane's halves name their own, lab #977)
+#        SUITE_DOCTESTS          passed through to suite-expected-results.sh
 #        GITHUB_STEP_SUMMARY     where the table goes; stdout if unset
 #        GITHUB_SHA              for the heading
 #
@@ -62,6 +65,8 @@ set -uo pipefail
 log="${1:?usage: reconcile-suite.sh <suite.log> <suite.exit>}"
 exitfile="${2:?usage: reconcile-suite.sh <suite.log> <suite.exit>}"
 lane="${SUITE_LANE:-graviton-rig}"
+command="${SUITE_COMMAND:-cargo test --release --workspace --locked --no-fail-fast -- --test-threads=1}"
+command=$(printf '%s' "$command" | tr -s ' ')   # an empty `${{ matrix.targets }}` leaves two spaces
 sha="${GITHUB_SHA:-}"
 summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,9 +97,11 @@ panic_c=$(grep -c 'panicked at' "$plain" || true)
 err_c=$(grep -cE '^error' "$plain" || true)
 mark() { [ "$1" = "0" ] && echo "OK" || echo "SEE LOG"; }
 
-# Sums. `test result: ok. 11 passed; 0 failed; 0 ignored; …` — fields 4/6/8.
-read -r passed failed ignored < <(grep -E '^test result:' "$plain" \
-  | awk '{p+=$4; f+=$6; i+=$8} END {print p+0, f+0, i+0}')
+# Sums. `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; …`
+# — fields 4/6/8/12. `filtered out` is zero on an unsplit run; in a half of the
+# split lane (lab #977) it is what the other half ran of the same binaries.
+read -r passed failed ignored filtered < <(grep -E '^test result:' "$plain" \
+  | awk '{p+=$4; f+=$6; i+=$8; x+=$12} END {print p+0, f+0, i+0, x+0}')
 
 # Signal 1 — did cargo return?
 cargo_returned=0; cargo_rc=""
@@ -149,7 +156,7 @@ loud() {  # $1 = one-line message; goes to the summary AND to an annotation
 {
   echo "## Workspace suite — $lane${sha:+ (\`${sha:0:12}\`)}"
   echo
-  echo "\`cargo test --release --workspace --locked --no-fail-fast -- --test-threads=1\`"
+  echo "\`$command\`"
   echo
   echo "### Completeness"
   echo
@@ -203,6 +210,13 @@ esac
   echo '|---|---:|---:|---:|'
   echo "| **total** | **$passed** | **$failed** | **$ignored** |"
   echo
+  if [ "$filtered" != 0 ]; then
+    echo "**$filtered filtered out** — tests this job built and did not run. In a half of the split"
+    echo "lane (lab #977) that is the other half's share of the same binaries: the bar's totals are"
+    echo "the two halves' passed/failed/ignored added, and this figure should equal the other"
+    echo "half's passed + failed + ignored outside its doc-tests."
+    echo
+  fi
   echo "The coordinator's arithmetic is \`total == main's baseline + this branch's new tests\`."
   echo "**This job does not know the baseline and does not assert one** — it reports the"
   echo "left-hand side only. The per-binary table below is here so a delta is attributable"
@@ -251,6 +265,7 @@ echo "=== 0. completeness ==="
 echo "verdict=$verdict cargo_returned=$cargo_returned cargo_exit=${cargo_rc:-none} results=$of_expected running=$running_c"
 echo "=== 2. counts ==="
 echo "passed=$passed failed=$failed ignored=$ignored"
+echo "filtered_out=$filtered"
 echo "(the rig baseline is compared by the coordinator at acceptance,"
 echo " not asserted here -- this job reports, it does not rule)"
 echo "=== negatives ==="
