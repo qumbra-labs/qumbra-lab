@@ -143,19 +143,48 @@ pub fn annulet_genesis_form(raw: Option<&str>) -> Result<L2AuthForm, String> {
     }
 }
 
-/// The token configuration for the net `form` (the PR E ruling): on 33 the
-/// keys file is required and the deny file optional, as before; **on 34
-/// neither is read** — the prover is paid in the transaction and admission
-/// has no identity. A token file left configured on 34 (prover-1's, until
-/// D6 retires it) is ignored, not refused: the third value says so for the
-/// startup log.
+/// The token admission's settings for one net: the verifying keys, the deny
+/// file and the default daily quota.
+pub struct TokenSettings {
+    pub tokens: TokenKeys,
+    pub deny_file: Option<PathBuf>,
+    pub per_day_default: u16,
+    /// The startup line naming the token variables a format-34 service was
+    /// given and ignores; `None` when it was given none (or on 33).
+    pub ignored: Option<String>,
+}
+
+/// The token variables, one set per format-34 ignore line (lab #937 D6).
+pub const TOKEN_VARS: [&str; 3] =
+    ["QUMBRA_PROVER_TOKEN_KEYS_FILE", "QUMBRA_PROVER_TOKEN_DENY_FILE", "QUMBRA_PROVER_ANNULET_PER_DAY"];
+
+/// The token configuration for the net `form` (the PR E ruling; lab #937
+/// D6). On 33 the keys file is required, the deny file optional and
+/// `QUMBRA_PROVER_ANNULET_PER_DAY` 1..=1000 (default 20), as before. **On 34
+/// none of the three is read**: the prover is paid in the transaction and
+/// admission has no identity. Any left configured (prover-1's, until the
+/// deploy drops them) is ignored, not refused, and named in one startup line
+/// ([`TokenSettings::ignored`]) — a stale or malformed value cannot stop a
+/// format-34 service.
 pub fn token_config(
     form: L2AuthForm,
     keys_file: Option<String>,
     deny_file: Option<PathBuf>,
-) -> Result<(TokenKeys, Option<PathBuf>, bool), String> {
+    per_day: Option<String>,
+) -> Result<TokenSettings, String> {
     if form == L2AuthForm::CandidateAV3 {
-        return Ok((TokenKeys::default(), None, keys_file.is_some() || deny_file.is_some()));
+        let given: Vec<&str> = TOKEN_VARS
+            .iter()
+            .zip([keys_file.is_some(), deny_file.is_some(), per_day.is_some()])
+            .filter_map(|(name, set)| set.then_some(*name))
+            .collect();
+        let ignored = (!given.is_empty()).then(|| {
+            format!(
+                "qumbra-prover-service: ignored on format 34 (the prover is paid in the transaction; no token, no quota): {}",
+                given.join(", ")
+            )
+        });
+        return Ok(TokenSettings { tokens: TokenKeys::default(), deny_file: None, per_day_default: DEFAULT_PER_DAY, ignored });
     }
     let keys_file = keys_file.ok_or("QUMBRA_PROVER_TOKEN_KEYS_FILE is required")?;
     let mut tokens = TokenKeys::parse(
@@ -167,7 +196,14 @@ pub fn token_config(
             &std::fs::read_to_string(path).map_err(|_| "QUMBRA_PROVER_TOKEN_DENY_FILE could not be read".to_string())?,
         )?;
     }
-    Ok((tokens, deny_file, false))
+    let per_day_default = match per_day {
+        None => DEFAULT_PER_DAY,
+        Some(v) => v.parse().map_err(|_| "QUMBRA_PROVER_ANNULET_PER_DAY is invalid".to_string())?,
+    };
+    if !(1..=1000).contains(&per_day_default) {
+        return Err("QUMBRA_PROVER_ANNULET_PER_DAY must be between 1 and 1000".into());
+    }
+    Ok(TokenSettings { tokens, deny_file, per_day_default, ignored: None })
 }
 
 /// Fail-closed Annulet configuration (all `QUMBRA_PROVER_ANNULET_*`, plus
@@ -229,10 +265,6 @@ impl AnnuletConfig {
         if !(60..=3600).contains(&ttl) {
             return Err("QUMBRA_PROVER_ANNULET_RESULT_TTL_SECS must be between 60 and 3600".into());
         }
-        let per_day_default = parse_env_or("QUMBRA_PROVER_ANNULET_PER_DAY", DEFAULT_PER_DAY)?;
-        if !(1..=1000).contains(&per_day_default) {
-            return Err("QUMBRA_PROVER_ANNULET_PER_DAY must be between 1 and 1000".into());
-        }
         let plain_ack = std::env::var(ANNULET_PLAIN_HTTP_VAR).ok();
         let node_url = annulet_node_url(
             "QUMBRA_PROVER_ANNULET_NODE_URL",
@@ -249,13 +281,18 @@ impl AnnuletConfig {
         };
         let scratch = PathBuf::from(env_required("QUMBRA_PROVER_SCRATCH")?);
         scratch_is_tmpfs(&scratch)?;
-        let (tokens, deny_file, ignored) = token_config(
+        let TokenSettings { tokens, deny_file, per_day_default, ignored } = token_config(
             l2_auth,
             std::env::var("QUMBRA_PROVER_TOKEN_KEYS_FILE").ok(),
             std::env::var_os("QUMBRA_PROVER_TOKEN_DENY_FILE").map(PathBuf::from),
+            match std::env::var("QUMBRA_PROVER_ANNULET_PER_DAY") {
+                Ok(v) => Some(v),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
+            },
         )?;
-        if ignored {
-            eprintln!("qumbra-prover-service: the token configuration is ignored on format 34 (the prover is paid in the transaction)");
+        if let Some(line) = ignored {
+            eprintln!("{line}");
         }
         let v3 = match l2_auth {
             L2AuthForm::CandidateAV3 => Some(V3Config::from_values(

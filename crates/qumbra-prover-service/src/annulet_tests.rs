@@ -950,20 +950,35 @@ fn on_format_34_admission_keys_on_the_client_ip() {
     );
 }
 
-/// Lab #937 PR E (the ruling): on format 34 the token configuration is not
-/// read — a token file left configured is ignored, not refused — and `/quota`
-/// is not served; on 33 the keys file stays required.
+/// Lab #937 PR E (the ruling) and D6: on format 34 the token configuration
+/// — the keys file, the deny file and `QUMBRA_PROVER_ANNULET_PER_DAY` — is
+/// not read: absent, the service starts; present (even unreadable or
+/// malformed), it starts and names each ignored variable in one log line.
+/// `/quota` is not served. On 33 the keys file stays required, by name, and
+/// the quota default is range-checked as before.
 #[test]
 fn the_token_configuration_is_ignored_on_34_and_required_on_33() {
-    let (_, deny, ignored) =
-        token_config(L2AuthForm::CandidateAV3, Some("/nonexistent/keys".into()), Some("/nonexistent/deny".into()))
-            .expect("34 reads no token file");
-    assert_eq!((deny, ignored), (None, true));
-    let (_, _, ignored) = token_config(L2AuthForm::CandidateAV3, None, None).unwrap();
-    assert!(!ignored);
-    let e = token_config(L2AuthForm::CandidateA, None, None).err().unwrap();
+    let none = token_config(L2AuthForm::CandidateAV3, None, None, None).expect("34 starts without the token variables");
+    assert!(none.ignored.is_none(), "nothing given, nothing logged");
+    let given = token_config(
+        L2AuthForm::CandidateAV3,
+        Some("/nonexistent/keys".into()),
+        Some("/nonexistent/deny".into()),
+        Some("not a number".into()),
+    )
+    .expect("34 starts with them, unread");
+    assert_eq!(given.deny_file, None);
+    let line = given.ignored.expect("one ignore line");
+    assert!(line.contains("ignored on format 34"), "{line}");
+    for var in TOKEN_VARS {
+        assert!(line.contains(var), "{var} named: {line}");
+    }
+    let one = token_config(L2AuthForm::CandidateAV3, None, None, Some("5".into())).unwrap();
+    let line = one.ignored.unwrap();
+    assert!(line.ends_with("QUMBRA_PROVER_ANNULET_PER_DAY") && !line.contains("KEYS_FILE"), "only what was given: {line}");
+    let e = token_config(L2AuthForm::CandidateA, None, None, None).err().unwrap();
     assert!(e.contains("QUMBRA_PROVER_TOKEN_KEYS_FILE is required"), "{e}");
-    let e = token_config(L2AuthForm::CandidateA, Some("/nonexistent/keys".into()), None).err().unwrap();
+    let e = token_config(L2AuthForm::CandidateA, Some("/nonexistent/keys".into()), None, None).err().unwrap();
     assert!(e.contains("could not be read"), "{e}");
     // The 33 service admits by token; the 34 one by IP.
     assert!(!api(FakeProver::new(Answer::Honest, false), Arc::default()).admits_by_ip());
