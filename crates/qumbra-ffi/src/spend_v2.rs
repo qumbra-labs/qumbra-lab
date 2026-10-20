@@ -61,7 +61,7 @@ use qumbra_wallet::annulet_plan::{
 use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
 use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, AssetList};
 use qumbra_wallet::annulet_review::{names_for, step_review, Review};
-use qumbra_wallet::auth_check::{AuthCheck, CheckBasis, CheckStep};
+use qumbra_wallet::auth_check::{restore_across, AuthCheck, CheckBasis, CheckStep};
 use qumbra_wallet::auth_journal::{AuthJournal, GenState, SweepGate};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -480,6 +480,57 @@ pub unsafe extern "C" fn qmb_auth_journal_summary(journal_text: *const c_char, e
         Err(e) => {
             set_err(err_out, e);
             ptr::null_mut()
+        }
+    }
+}
+
+/// The most journals [`qmb_auth_restore_across`] merges: one per live net,
+/// far past any wallet's table.
+pub const MAX_RESTORE_NETS: usize = 16;
+
+/// Lab #971: **one key's journal from its restores on every live Candidate A
+/// net** (`qumbra_wallet::auth_check::restore_across`) — the journal is per
+/// key, so a restore from one net's chain alone can re-offer a leaf landed on
+/// another. `journal_texts[0..n]` are the `auth.v1` texts each net's
+/// `qmb_auth_restore_new` check finished with. 0 with `*out_journal` the
+/// merged text to persist; -1 with `*out_journal` why: `n` of 0 or over
+/// [`MAX_RESTORE_NETS`], a NULL, over-long or unparsable text, or two texts
+/// that give one generation different roots (not one key's). A pure function
+/// of the texts: no handle, no key material.
+///
+/// # Safety
+/// `journal_texts` NULL or `n` readable pointers, each NULL or NUL-terminated;
+/// `out_journal` writable. Free `*out_journal` with `qmb_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_restore_across(journal_texts: *const *const c_char, n: usize, out_journal: *mut *mut c_char) -> i32 {
+    if out_journal.is_null() {
+        return -1;
+    }
+    let merged = (|| {
+        if journal_texts.is_null() || n == 0 {
+            return Err("a restore across nets needs at least one net's restored journal".to_string());
+        }
+        if n > MAX_RESTORE_NETS {
+            return Err(format!("{n} journals, over the {MAX_RESTORE_NETS} a restore across nets merges"));
+        }
+        let journals = std::slice::from_raw_parts(journal_texts, n)
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let text = text_arg(&format!("journal {k}"), *p, MAX_JOURNAL_TEXT)?;
+                AuthJournal::from_text(text).map_err(|e| format!("journal {k} does not parse: {e}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        restore_across(&journals).map_err(|e| e.to_string())
+    })();
+    match merged {
+        Ok(j) => {
+            *out_journal = out_string(j.to_text());
+            0
+        }
+        Err(why) => {
+            *out_journal = out_string(why);
+            -1
         }
     }
 }
