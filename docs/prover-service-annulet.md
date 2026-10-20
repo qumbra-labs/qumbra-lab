@@ -75,6 +75,7 @@ The Annulet mode is on exactly when `QUMBRA_PROVER_ANNULET_GENESIS_HASH` is set.
 | `QUMBRA_PROVER_TOKEN_DENY_FILE` | unset | format 33 only: revoked token ids |
 | `QUMBRA_PROVER_SCRATCH` | — | **must be a tmpfs mount** (checked at start; Linux only) |
 | `QUMBRA_PROVER_LISTEN`, `QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` | as for L1 | TLS, rate limiting and a request-header size cap live at ingress |
+| `QUMBRA_PROVER_METRICS_LISTEN` | unset | lab #976: an IP socket address for the `/metrics` listener (below); off unless set, and off loopback only with the acknowledgement above |
 
 ## The worker child
 
@@ -95,6 +96,21 @@ The child re-runs the bundle's lock and proves. The server then checks that the 
 - Per job: an 8-hex job prefix, the shape, bundle and tx sizes, queue wait, prove time, and an outcome code. Bundle bytes, transaction bytes, token ids and tx ids are never logged.
 - Every minute: admission refusals counted per code, under a 4-byte hash of the token id (`-` before a token verified). This shows abuse without naming the user.
 - **Per-day counts, in-flight state and jobs live in memory and reset on restart.**
+
+## Metrics (lab #976)
+
+With `QUMBRA_PROVER_METRICS_LISTEN` set, a second listener serves `GET /metrics` in the Prometheus text format, and nothing else (`405` for another method, `404` for another path). It shares no socket with the API, so no ingress route reaches it. Nothing authenticates it: its exposure is the network it is bound on, and on prover-1 that network is a deploy decision.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `qumbra_prover_queue_depth` | gauge | — queued jobs, the running one not counted |
+| `qumbra_prover_in_flight` | gauge | — jobs proving or submitting (0 or 1) |
+| `qumbra_prover_jobs_total` | counter | `outcome`: `admitted` when queued; then `refused` (the child refused the bundle), `failed`, or `proved` followed by `submitted` or `failed`. A cancelled job ends under no outcome |
+| `qumbra_prover_refusals_total` | counter | `reason`: the refusal codes above, each exported from zero; any other code is `other` |
+| `qumbra_prover_http_responses_total` | counter | `class`: `2xx`, `4xx`, `5xx`, every response the API listener writes |
+| `qumbra_prover_prove_seconds` | histogram | `shape`: `S`, `P`; buckets 5, 10, 20, 30, 45, 60, 90, 120, 180, 300 s |
+
+No label names a submitter: the minute log line keeps its 4-byte tag, the counters do not. The counters reset on restart. The valueless L1 mode exports `qumbra_prover_http_responses_total` only.
 
 ## Format 34: the prover is paid in the transaction
 

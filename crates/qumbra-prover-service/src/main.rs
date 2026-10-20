@@ -9,6 +9,7 @@ use qumbra_prover_service::annulet::{
     HttpSubmitter, ANNULET_UPLOAD_DEADLINE, ANNULET_WORKER_PROTOCOL, MAX_ANNULET_BUNDLE_BYTES,
 };
 use qumbra_prover_service::annulet_v3::CLIENT_IP_HEADER;
+use qumbra_prover_service::metrics::{self, HttpClasses};
 use qumbra_prover_service::token;
 use qumbra_prover_service::{
     Api, ApiError, Config, SecretBytes, SubmitRequest, Worker, WorkerConfig, WorkerOutcome,
@@ -20,6 +21,9 @@ use serde::Serialize;
 const MAX_HTTP_HANDLERS: usize = 16;
 const WORKER_PROTOCOL: &str = "qumbra-prover-worker-v1";
 const MAX_WORKER_ERROR_BYTES: usize = 64;
+
+/// Every response the API listener writes, by class (lab #976).
+static HTTP_CLASSES: HttpClasses = HttpClasses::new();
 
 fn main() {
     let result = match std::env::args().nth(1).as_deref() {
@@ -113,6 +117,17 @@ fn server_entry() -> Result<(), String> {
         return Err(
             "no mode configured: set QUMBRA_PROVER_ANNULET_GENESIS_HASH (and the Annulet configuration) or the L1 valueless experiment".into(),
         );
+    }
+    // Lab #976: the scrape endpoint, on its own listener and only when set.
+    if let Some(at) = qumbra_prover_service::metrics_listen_from_env()? {
+        let annulet = annulet.clone();
+        let bound = metrics::serve(
+            at,
+            Arc::new(move || {
+                metrics::render(&HTTP_CLASSES, annulet.as_ref().map(AnnuletApi::metrics).as_ref())
+            }),
+        )?;
+        eprintln!("qumbra-prover-service: metrics on {bound}");
     }
     let server = tiny_http::Server::http(listen)
         .map_err(|_| "prover listener could not bind".to_string())?;
@@ -556,6 +571,7 @@ fn respond_method(request: tiny_http::Request, allow: &'static str) {
     let allow = tiny_http::Header::from_bytes("Allow", allow).expect("static Allow header");
     let response =
         base_response(405, br#"{"error":"method-not-allowed"}"#.to_vec()).with_header(allow);
+    HTTP_CLASSES.observe(405);
     let _ = request.respond(response);
 }
 
@@ -573,6 +589,7 @@ fn respond_json<T: Serialize>(
             response.add_header(header);
         }
     }
+    HTTP_CLASSES.observe(status);
     let _ = request.respond(response);
 }
 

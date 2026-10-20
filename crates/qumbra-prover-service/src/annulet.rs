@@ -69,6 +69,7 @@ use serde::Serialize;
 use zeroize::Zeroize;
 
 use crate::annulet_v3::{self, HttpFollow, NullifierFollow, PaidEntry, PaidLedger, V3Config};
+use crate::metrics::{AnnuletCounters, AnnuletSnapshot, JobOutcome};
 use crate::token::{hex, hex_decode, Claims, TokenKeys};
 use crate::{
     env_required, lock, parse_env_or, validate_base_url, ApiError,
@@ -516,6 +517,8 @@ struct State {
     /// at a time each.
     reading: HashSet<[u8; 16]>,
     refusals: BTreeMap<(String, &'static str), u64>,
+    /// Lab #976: what `/metrics` reads — never drained, no submitter tag.
+    counters: AnnuletCounters,
 }
 
 impl State {
@@ -540,6 +543,7 @@ impl State {
     }
     fn refuse(&mut self, who: String, code: &'static str) {
         *self.refusals.entry((who, code)).or_default() += 1;
+        self.counters.refusal(code);
     }
     fn cleanup(&mut self, ttl: Duration) {
         self.jobs
@@ -956,6 +960,7 @@ impl AnnuletApi {
         if claims.is_some() {
             state.usage.insert(submitter, (day, used + 1));
         }
+        state.counters.job(JobOutcome::Admitted);
         let job = state.jobs.get(&cap).expect("just inserted");
         Ok((view(&cap, job, &state.pending, ttl), true))
     }
@@ -1018,6 +1023,21 @@ impl AnnuletApi {
             per_day: self.per_day(claims),
             used_today: state.used_today(&claims.token_id, self.day()),
             in_flight: state.in_flight(&claims.token_id),
+        }
+    }
+
+    /// What a `/metrics` scrape reads (lab #976): the queue, the job proving
+    /// or submitting, and the counters.
+    pub fn metrics(&self) -> AnnuletSnapshot {
+        let state = lock(&self.inner.state);
+        AnnuletSnapshot {
+            queue_depth: state.pending.len(),
+            in_flight: state
+                .jobs
+                .values()
+                .filter(|j| matches!(j.phase, Phase::Proving | Phase::Submitting))
+                .count(),
+            counters: state.counters.clone(),
         }
     }
 
@@ -1133,11 +1153,16 @@ fn dispatch(
         let prove_ms = started.elapsed().as_millis();
 
         let (shape, bundle_bytes, expected) = {
-            let s = lock(&state);
+            let mut s = lock(&state);
             let Some(job) = s.jobs.get(&item.cap) else {
                 continue;
             };
-            (job.shape, job.bundle_bytes, job.tx_wire.clone())
+            let (shape, bundle_bytes, expected) = (job.shape, job.bundle_bytes, job.tx_wire.clone());
+            // A prove that answered: a cancelled one stopped short of its time.
+            if !item.cancel.load(Ordering::Acquire) {
+                s.counters.prove(shape, u64::try_from(prove_ms).unwrap_or(u64::MAX));
+            }
+            (shape, bundle_bytes, expected)
         };
         let finish = |phase: Phase, artifact: usize| {
             let code = match &phase {
@@ -1153,10 +1178,22 @@ fn dispatch(
                 &item.cap[..8],
                 started.duration_since(queued_at).as_millis(),
             );
-            let mut s = lock(&state);
+            let mut guard = lock(&state);
+            let s = &mut *guard;
+            let outcome = match &phase {
+                Phase::Submitted(_) => Some(JobOutcome::Submitted),
+                Phase::Refused(_) => Some(JobOutcome::Refused),
+                Phase::Failed(_) => Some(JobOutcome::Failed),
+                _ => None,
+            };
             if let Some(job) = s.jobs.get_mut(&item.cap) {
                 if !matches!(job.phase, Phase::Cancelled) || matches!(phase, Phase::Submitted(_)) {
                     job.phase = phase;
+                    // Counted as the job ends: a job cancelled meanwhile ends
+                    // under no outcome.
+                    if let Some(o) = outcome {
+                        s.counters.job(o);
+                    }
                 }
                 job.updated = Instant::now();
             }
@@ -1184,14 +1221,16 @@ fn dispatch(
             }
         };
         {
-            let mut s = lock(&state);
+            let mut guard = lock(&state);
+            let s = &mut *guard;
             match s.jobs.get_mut(&item.cap) {
                 Some(job) if !item.cancel.load(Ordering::Acquire) => {
                     job.phase = Phase::Submitting;
                     job.updated = Instant::now();
+                    s.counters.job(JobOutcome::Proved);
                 }
                 _ => {
-                    drop(s);
+                    drop(guard);
                     finish(Phase::Cancelled, wire.len());
                     continue;
                 }

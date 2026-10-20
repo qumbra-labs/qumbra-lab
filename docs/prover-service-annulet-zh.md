@@ -75,6 +75,7 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 | `QUMBRA_PROVER_TOKEN_DENY_FILE` | 未设置 | 仅 format 33:已吊销的 token id |
 | `QUMBRA_PROVER_SCRATCH` | — | **必须是 tmpfs 挂载**（启动时检查；仅 Linux） |
 | `QUMBRA_PROVER_LISTEN`、`QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN` | 同 L1 | TLS、限流和请求头大小上限都在 ingress 层 |
+| `QUMBRA_PROVER_METRICS_LISTEN` | 不设 | lab #976：`/metrics` 监听的 IP 套接字地址（见下文）；不设就不开，非回环地址同样需要上面那条确认 |
 
 ## worker 子进程
 
@@ -95,6 +96,21 @@ qumbra-prover-service mint-token --seed-file issuer.seed --key-id 1 \
 - 每个 job：8 位十六进制的 job 前缀、shape、bundle 和 tx 的大小、排队等待时间、prove 时间，以及一个结果码。bundle 字节、交易字节、token id 和 tx id 一律不记录。
 - 每分钟：按错误码统计的准入拒绝次数，以 token id 的 4 字节哈希为键（token 通过验证之前用 `-`）。这样既能看出滥用，又不会点出用户是谁。
 - **每日计数、in-flight 状态和 job 都在内存中，重启后重置。**
+
+## 指标（lab #976）
+
+设了 `QUMBRA_PROVER_METRICS_LISTEN` 后，服务另开一个监听，用 Prometheus 文本格式提供 `GET /metrics`，别的都不提供（其他方法回 `405`，其他路径回 `404`）。它和 API 不共用套接字，所以任何 ingress 路由都到不了它。它不做认证：暴露面取决于它绑在哪个网络上，在 prover-1 上这是部署层的决定。
+
+| 指标 | 类型 | 标签 |
+|---|---|---|
+| `qumbra_prover_queue_depth` | gauge | 无；排队中的 job，不含正在跑的那个 |
+| `qumbra_prover_in_flight` | gauge | 无；正在证明或提交的 job（0 或 1） |
+| `qumbra_prover_jobs_total` | counter | `outcome`：入队时记 `admitted`；之后是 `refused`（子进程拒收 bundle）、`failed`，或先 `proved` 再 `submitted` 或 `failed`。被取消的 job 不记任何结果 |
+| `qumbra_prover_refusals_total` | counter | `reason`：上文的拒绝码，每个都从 0 开始导出；其他码一律记为 `other` |
+| `qumbra_prover_http_responses_total` | counter | `class`：`2xx`、`4xx`、`5xx`，API 监听写出的每个响应 |
+| `qumbra_prover_prove_seconds` | histogram | `shape`：`S`、`P`；分桶 5、10、20、30、45、60、90、120、180、300 秒 |
+
+没有任何标签指向提交者：每分钟的日志行保留 4 字节标记，计数器不保留。计数器重启后归零。valueless L1 模式只导出 `qumbra_prover_http_responses_total`。
 
 ## Format 34：prover 在交易里收费
 
