@@ -33,11 +33,16 @@
 //!                               of each, all through the ABI
 //!
 //! Cases whose `entry` is `qmb_annulet_new_v2` (lab #896) run on a
-//! **format-33** genesis with the case's `generations`; every other case is
-//! `qmb_annulet_new`, unchanged.
+//! **format-33** genesis with the case's `generations` — except `v3_receive`,
+//! the same receive on a **format-34** genesis (lab #937); every other case is
+//! `qmb_annulet_new`, unchanged. Cases are only ever appended: each case's
+//! wallet and rng are its own, so an earlier case's bytes never move.
 //!
 //! Run (a named local run on the ad_goldens rule):
-//!   cargo run -p qumbra-ffi --example annulet_fixtures -- <out> --lab-rev <commit> [--force]
+//!   cargo run -p qumbra-ffi --example annulet_fixtures -- <out> --lab-rev <commit> [--recorded-at <commit>] [--force]
+//! `--lab-rev` is the manifest's kernel pin, which the shells compare against;
+//! `--recorded-at` (optional) is written into `v3_receive/case.json` only —
+//! the lab commit this example ran at, when that differs from `--lab-rev`.
 //! Nothing recomputes an example: regenerate by hand when the kernel's ABI,
 //! its encoder or the fixture changes; the manifest's `--lab-rev` is what the
 //! harness compares against. (The prefilter's `cargo check --workspace
@@ -240,6 +245,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = PathBuf::from(args.first().expect("usage: annulet_fixtures <out> --lab-rev <commit> [--force]"));
     let lab_rev = args.iter().position(|a| a == "--lab-rev").and_then(|i| args.get(i + 1)).expect("--lab-rev <commit> is required");
+    let recorded_at = args.iter().position(|a| a == "--recorded-at").map(|i| args.get(i + 1).expect("--recorded-at <commit>"));
     if out.exists() {
         if !args.iter().any(|a| a == "--force") {
             eprintln!("{} exists — refusing to overwrite (pass --force)", out.display());
@@ -341,13 +347,36 @@ fn main() {
     std::fs::write(out.join("lists").join("listed_d.sig"), &listed_d.1).unwrap();
     run(Case { name: "v2_receive", seed: D, ep: &ep_d, list: ("listed", Some((&listed_d, "lists/listed_d"))), record_in: None, generations: Some(&[0]) });
     run(Case { name: "v2_other_generation", seed: D, ep: &ep_d, list: ("none", None), record_in: None, generations: Some(&[1]) });
+
+    // Lab #937 (format 34, annulet-testnet-3's format): wallet D's same
+    // receive on a format-34 genesis — the genesis 1,000,000 USDT-test to v2
+    // address 0 (generation 0), height 1 another 5 fee units, height 2
+    // another 7 USDT-test. Its own rng, so no earlier case moves.
+    let mut rng = StdRng::seed_from_u64(0xD3);
+    let d3b = vec![
+        BlockBody { txs: vec![pay_tx(&d2, &[note_to(&d2, 5, 0, 22)], 0x32, &mut rng)], ..BlockBody::default() },
+        BlockBody { txs: vec![pay_tx(&d2, &[note_to(&d2, 7, USDT, 23)], 0x33, &mut rng)], ..BlockBody::default() },
+    ];
+    let file_d3 = genesis_v3(&d2, Vec::new());
+    assert_eq!(file_d3.format_version, 34);
+    let ep_d3 = Endpoint::new(file_d3.clone(), &d3b, None, Lie::None);
+    let listed_d3 = list_for(&file_d3.hash());
+    std::fs::write(out.join("lists").join("listed_d3.json"), &listed_d3.0).unwrap();
+    std::fs::write(out.join("lists").join("listed_d3.sig"), &listed_d3.1).unwrap();
+    run(Case { name: "v3_receive", seed: D, ep: &ep_d3, list: ("listed", Some((&listed_d3, "lists/listed_d3"))), record_in: None, generations: Some(&[0]) });
+    if let Some(rev) = recorded_at {
+        let f = out.join("v3_receive").join("case.json");
+        let mut case: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+        case["recordedAt"] = json!(rev);
+        std::fs::write(&f, serde_json::to_string_pretty(&case).unwrap()).unwrap();
+    }
     write_addresses(&out, D);
 
     for w in [wa, wb, wc, wd] {
         let _ = std::fs::remove_dir_all(&w.dir);
     }
     let manifest = json!({
-        "what": "lab #858 WA3a + lab #896 (extension #68 D2) — Annulet fixture transcripts, recorded from the real ABI pump; v2_* cases on a format-33 genesis via qmb_annulet_new_v2. FIXTURE seeds only.",
+        "what": "lab #858 WA3a + lab #896 (extension #68 D2) — Annulet fixture transcripts, recorded from the real ABI pump; v2_* cases on a format-33 genesis via qmb_annulet_new_v2; v3_receive (lab #937) the same on format 34. FIXTURE seeds only.",
         "labRev": lab_rev,
         "rngSeed": hex(&RNG),
         "endpointLabel": ENDPOINT,
