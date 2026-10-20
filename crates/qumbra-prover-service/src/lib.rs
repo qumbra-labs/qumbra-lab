@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 pub mod annulet;
 pub mod annulet_v3;
+pub mod metrics;
 pub mod nullifier_store;
 pub mod token;
 
@@ -272,6 +273,31 @@ pub fn listen_from_env() -> Result<SocketAddr, String> {
         ));
     }
     Ok(listen)
+}
+
+/// Lab #976: the metrics listener's address from `QUMBRA_PROVER_METRICS_LISTEN`
+/// — `None` (no listener) unless it is set.
+pub fn metrics_listen_from_env() -> Result<Option<SocketAddr>, String> {
+    metrics_listen(
+        std::env::var("QUMBRA_PROVER_METRICS_LISTEN").ok().as_deref(),
+        std::env::var("QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN").ok().as_deref(),
+    )
+}
+
+/// [`metrics_listen_from_env`]'s rule over the two values: unset is no
+/// listener; set, an IP socket address, refused off loopback without the
+/// API listener's acknowledgement.
+pub fn metrics_listen(value: Option<&str>, ack: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let listen: SocketAddr = value
+        .parse()
+        .map_err(|_| "QUMBRA_PROVER_METRICS_LISTEN is not an IP socket address".to_string())?;
+    if !listen.ip().is_loopback() && ack != Some(NON_LOOPBACK_ACK) {
+        return Err(format!(
+            "a non-loopback QUMBRA_PROVER_METRICS_LISTEN requires QUMBRA_PROVER_ALLOW_NON_LOOPBACK_LISTEN={NON_LOOPBACK_ACK}"
+        ));
+    }
+    Ok(Some(listen))
 }
 
 /// Whether node URLs may be plain HTTP (a private, valueless setup).
@@ -846,6 +872,24 @@ mod tests {
         assert!(bundle < artifact);
         assert_eq!(artifact, 256 * 1024);
         assert!(request >= bundle * 4 / 3);
+    }
+
+    #[test]
+    fn the_metrics_listener_is_off_unless_set_and_loopback_unless_acknowledged() {
+        assert_eq!(metrics_listen(None, None), Ok(None));
+        assert_eq!(
+            metrics_listen(Some("127.0.0.1:9188"), None),
+            Ok(Some("127.0.0.1:9188".parse().unwrap()))
+        );
+        assert!(metrics_listen(Some("[::1]:9188"), None).unwrap().is_some());
+        assert!(metrics_listen(Some("9188"), None).is_err());
+        let open = metrics_listen(Some("0.0.0.0:9188"), None).unwrap_err();
+        assert!(open.contains(NON_LOOPBACK_ACK), "{open}");
+        assert!(metrics_listen(Some("0.0.0.0:9188"), Some("yes")).is_err());
+        assert_eq!(
+            metrics_listen(Some("0.0.0.0:9188"), Some(NON_LOOPBACK_ACK)),
+            Ok(Some("0.0.0.0:9188".parse().unwrap()))
+        );
     }
 
     #[test]

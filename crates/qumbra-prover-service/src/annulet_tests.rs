@@ -1551,3 +1551,101 @@ fn a_torn_ledger_line_never_swallows_the_next_entry() {
     assert_eq!(std::fs::read_to_string(&at).unwrap(), text);
     let _ = std::fs::remove_file(&at);
 }
+
+/// Lab #976: the `/metrics` numbers move with the jobs — admitted, proved,
+/// submitted, refused, failed; the queue and the running job; refusals by
+/// code; the prove time by shape — and no label carries a submitter.
+#[test]
+fn metrics_count_the_jobs_and_refusals_by_code_never_by_submitter() {
+    use crate::metrics::{render, HttpClasses, PROVE_BUCKETS_SECS, REFUSAL_CODES};
+    let prover = FakeProver::new(Answer::Honest, true);
+    let a = api(Arc::clone(&prover), Arc::default());
+    let (t1, t2) = (token(31, GENESIS_HASH, 0), token(32, GENESIS_HASH, 0));
+    let (v1, _) = admit(&a, &t1, bundle_s()).unwrap();
+    wait(&a, &v1, &["proving"]);
+    let (v2, _) = admit(&a, &t2, bundle_p()).unwrap();
+    let m = a.metrics();
+    assert_eq!((m.queue_depth, m.in_flight), (1, 1));
+    // Two submitters refused under the same code, one with no token.
+    for t in [&t1, &t2] {
+        assert_eq!(a.authorize(Some(t)).err().map(|e| e.code), Some("token-busy"));
+    }
+    assert_eq!(a.authorize(None).err().map(|e| e.code), Some("unauthorized"));
+    prover.release();
+    wait(&a, &v1, &["submitted"]);
+    wait(&a, &v2, &["submitted"]);
+    // The minute log's drain leaves the counters alone.
+    assert!(!a.drain_refusals().is_empty());
+    let m = a.metrics();
+    assert_eq!((m.queue_depth, m.in_flight), (0, 0));
+    let c = &m.counters;
+    assert_eq!(
+        [JobOutcome::Admitted, JobOutcome::Proved, JobOutcome::Submitted, JobOutcome::Refused, JobOutcome::Failed]
+            .map(|o| c.jobs(o)),
+        [2, 2, 2, 0, 0]
+    );
+    assert_eq!((c.refusals("token-busy"), c.refusals("unauthorized"), c.refusals("other")), (2, 1, 0));
+    assert_eq!((c.proves(L2ShapeTag::S).count(), c.proves(L2ShapeTag::P).count()), (1, 1));
+
+    let text = render(&HttpClasses::new(), Some(&m));
+    for id in [31u8, 32] {
+        assert!(!text.contains(&token_tag(&[id; 16])), "a submitter's tag in the exposition");
+    }
+    let les: Vec<String> = PROVE_BUCKETS_SECS.iter().map(u64::to_string).chain(["+Inf".into()]).collect();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let Some(open) = line.find('{') else { continue };
+        let labels = &line[open + 1..line.find('}').expect("closed")];
+        for pair in labels.split(',') {
+            let (k, v) = pair.split_once('=').expect("k=v");
+            let v = v.trim_matches('"');
+            let known = match k {
+                "class" => ["2xx", "4xx", "5xx"].contains(&v),
+                "outcome" => ["admitted", "refused", "proved", "submitted", "failed"].contains(&v),
+                "reason" => REFUSAL_CODES.contains(&v) || v == "other",
+                "shape" => ["S", "P"].contains(&v),
+                "le" => les.iter().any(|l| l == v),
+                _ => false,
+            };
+            assert!(known, "label {k}={v:?} in {line:?}");
+        }
+    }
+}
+
+/// The child's refusal is a job `refused`; its failure, or an answer that is
+/// not the bundle's transaction plus a proof, a job `failed`; a cancelled job
+/// ends under no outcome and adds no prove time.
+#[test]
+fn metrics_count_refused_failed_and_cancelled_jobs_apart() {
+    for (answer, refused, failed) in [
+        (Answer::Fail("bundle-refused"), 1, 0),
+        (Answer::Fail("worker-timeout"), 0, 1),
+        (Answer::Tampered, 0, 1),
+    ] {
+        let a = api(FakeProver::new(answer, false), Arc::default());
+        let (v, _) = admit(&a, &token(33, GENESIS_HASH, 0), bundle_s()).unwrap();
+        wait(&a, &v, &["refused", "failed"]);
+        let c = a.metrics().counters;
+        assert_eq!(
+            [JobOutcome::Admitted, JobOutcome::Refused, JobOutcome::Failed, JobOutcome::Proved, JobOutcome::Submitted]
+                .map(|o| c.jobs(o)),
+            [1, refused, failed, 0, 0]
+        );
+        assert_eq!(c.proves(L2ShapeTag::S).count(), 1, "the prove answered");
+    }
+    let prover = FakeProver::new(Answer::Honest, true);
+    let a = api(Arc::clone(&prover), Arc::default());
+    let (v, _) = admit(&a, &token(34, GENESIS_HASH, 0), bundle_s()).unwrap();
+    wait(&a, &v, &["proving"]);
+    a.cancel(cap_of(&v)).unwrap();
+    assert_eq!(a.metrics().in_flight, 0, "a cancelled job is not in flight");
+    // The held prove sees the cancel and returns; the dispatcher finishes it.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(*prover.calls.lock().unwrap(), 1);
+    let c = a.metrics().counters;
+    assert_eq!(c.jobs(JobOutcome::Admitted), 1);
+    assert_eq!(
+        [JobOutcome::Refused, JobOutcome::Failed, JobOutcome::Proved, JobOutcome::Submitted].map(|o| c.jobs(o)),
+        [0; 4]
+    );
+    assert_eq!(c.proves(L2ShapeTag::S).count(), 0);
+}
