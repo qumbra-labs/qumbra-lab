@@ -840,6 +840,15 @@ int32_t qmb_auth_journal_advances(const char *stored_text, const char *new_text,
  * No handle, no key material (no roots). NULL with *err_out set for a NULL,
  * over-64-KiB or unparsable text. Free with qmb_string_free. */
 char *qmb_auth_journal_summary(const char *journal_text, char **err_out);
+/* Lab #971: one key's journal from its restores on every live Candidate A
+ * net. The journal is per key, not per net, so a restore from one net's chain
+ * alone can re-offer a leaf already landed on another: restore on EVERY live
+ * net (qmb_auth_restore_new, one check per net), then merge the n finished
+ * texts here and persist the result. 0 with *out_journal the merged text; -1
+ * with *out_journal why (n of 0 or over 16, a NULL / over-64-KiB / unparsable
+ * text, or texts of two keys). No handle, no key material. Free *out_journal
+ * with qmb_string_free. */
+int32_t qmb_auth_restore_across(const char *const *journal_texts, size_t n, char **out_journal);
 int32_t qmb_auth_open_next(const qmb_wallet_t *w, const char *journal_text, const qmb_spend_basis_t *basis,
                            char **out_journal);
 char *qmb_auth_journal(const qmb_auth_t *a);

@@ -972,6 +972,58 @@ fn q_the_header_pins_the_open_statuses() {
     }
 }
 
+/// Lab #971's ABI door over `restore_across`: the #971 counterexample by
+/// text (net A fresh, net B with generation 0's leaves landed) merges to
+/// generation 1 above B's cursor, and every refusal is by name. Records
+/// only: no chain, no tree, no handle.
+#[test]
+fn q_restore_across_merges_restored_texts_and_refuses_by_name() {
+    use qumbra_ffi::spend_v2::qmb_auth_restore_across;
+    use qumbra_wallet::auth_journal::{GenState, Generation};
+    let root = |g: u32| [0x5eed, u64::from(g), 7, 9];
+    let a = AuthJournal::fresh(root(0));
+    let b = AuthJournal::from_generations(vec![
+        Generation { g: 0, next: 3, auth_root: root(0), state: GenState::Retired },
+        Generation { g: 1, next: 0, auth_root: root(1), state: GenState::Active },
+    ])
+    .unwrap();
+    let other = AuthJournal::fresh([1, 2, 3, 4]);
+    let text = |j: &AuthJournal| CString::new(j.to_text()).unwrap();
+    let (ta, tb, tother) = (text(&a), text(&b), text(&other));
+    let junk = CString::new("not a journal").unwrap();
+    unsafe {
+        let mut out: *mut c_char = ptr::null_mut();
+        let both = [ta.as_ptr(), tb.as_ptr()];
+        assert_eq!(qmb_auth_restore_across(both.as_ptr(), 2, &mut out), 0);
+        let merged = AuthJournal::from_text(&take_str(out)).unwrap();
+        assert_eq!((merged.active().g, merged.active().next), (1, 0));
+        assert_eq!(merged.get(0).unwrap().next, 3);
+        assert_eq!(merged.to_text(), qumbra_wallet::auth_check::restore_across(&[a.clone(), b.clone()]).unwrap().to_text());
+
+        let one = [tb.as_ptr()];
+        assert_eq!(qmb_auth_restore_across(one.as_ptr(), 1, &mut out), 0);
+        assert_eq!(take_str(out), b.to_text(), "one journal comes back unchanged");
+
+        assert_eq!(qmb_auth_restore_across(both.as_ptr(), 0, &mut out), -1);
+        assert!(take_str(out).contains("at least one net's restored journal"));
+        assert_eq!(qmb_auth_restore_across(ptr::null(), 2, &mut out), -1);
+        assert!(take_str(out).contains("at least one net's restored journal"));
+        let many = [ta.as_ptr(); 17];
+        assert_eq!(qmb_auth_restore_across(many.as_ptr(), 17, &mut out), -1);
+        assert!(take_str(out).contains("over the 16"));
+        let with_null = [ta.as_ptr(), ptr::null()];
+        assert_eq!(qmb_auth_restore_across(with_null.as_ptr(), 2, &mut out), -1);
+        assert!(take_str(out).contains("journal 1 is NULL"));
+        let with_junk = [ta.as_ptr(), junk.as_ptr()];
+        assert_eq!(qmb_auth_restore_across(with_junk.as_ptr(), 2, &mut out), -1);
+        assert!(take_str(out).contains("journal 1 does not parse"));
+        let two_keys = [ta.as_ptr(), tother.as_ptr()];
+        assert_eq!(qmb_auth_restore_across(two_keys.as_ptr(), 2, &mut out), -1);
+        assert!(take_str(out).contains("generation 0 different authorization roots"));
+        assert_eq!(qmb_auth_restore_across(both.as_ptr(), 2, ptr::null_mut()), -1, "out_journal NULL");
+    }
+}
+
 /// A chain on which BOTH generations signed: generation 0 at height 2, then
 /// (after `open_next`) generation 1 at height 3 — the lost-device case a
 /// stale journal hides. Built once.
