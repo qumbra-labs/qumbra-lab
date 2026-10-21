@@ -696,7 +696,8 @@ qmb_annulet_t *qmb_annulet_new(const qmb_wallet_t *w, const char *endpoint_label
  * Lab #971: auth_derivation is the pinned net's authorization derivation (1
  * or 2; anything else, or one other than this build's pin for the genesis,
  * is NULL with *err_out by name). The trees are of it, and the basis this
- * scan leaves carries it: every qmb_auth_* call on that basis derives so. */
+ * scan leaves carries it: every authorization call on that basis (check,
+ * restore, first, open_next) derives so. */
 qmb_annulet_t *qmb_annulet_new_v2(const qmb_wallet_t *w, const char *endpoint_label,
                                   const uint8_t *pin32, uint8_t auth_derivation, uint64_t from, uint64_t to,
                                   const uint64_t *indices, size_t n_indices,
