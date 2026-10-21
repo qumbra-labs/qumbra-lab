@@ -433,6 +433,67 @@ fn auth_master_and_leaf_seed_match_the_independent_vectors() {
     );
 }
 
+/// Lab #971: annulet-testnet-3's genesis hash, here as data only (the v2
+/// vector's genesis input).
+const TESTNET_3_GENESIS_HEX: &str = "024ed17be2634a59dfb061e123356b9d1798d8e067d7097248915537431c8b70";
+
+fn genesis_of(hex: &str) -> Hash32 {
+    core::array::from_fn(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+}
+
+/// Lab #971, derivation v2: `auth_master_v2([0x07; 32], 0, testnet-3)` and
+/// its leaf-0 seed, cross-checked against an independent pure-Python
+/// Keccak-256 (original `0x01` padding; `auth_master_v2.py`, quoted in the
+/// lab #971 PR body, which reproduces the v1 vectors above byte for byte
+/// first), run as `python3 -I auth_master_v2.py`: the master is the Keccak
+/// of the v2 domain, `bytes([7] * 32)`, `(0).to_bytes(4, "little")` and the
+/// genesis, concatenated. The leaf-0 descriptor leaf is a
+/// **regression pin** from this kernel's own ML-DSA-44 keygen (no independent
+/// ML-DSA implementation was at hand), not an independent check.
+#[test]
+fn auth_master_v2_matches_the_independent_vector() {
+    let m = auth_master_v2(&b(0x07), 0, &genesis_of(TESTNET_3_GENESIS_HEX));
+    assert_eq!(crate::hex(&m), "198a6584abfdfed501ce67b4d25d36d17ad8a8e43d34d442e6673928ef00a20a");
+    assert_eq!(crate::hex(&leaf_seed(&m, 0)), "58c8ce4f79987485ea1f7c4da0df6176750c1c06ce3efa8daa13b2b02e4a3776");
+    let leaf0 = leaf_key(&m, 0).descriptor(0).leaf();
+    assert_eq!(crate::hex(&leaf0), "68db23fd830751bbe3a0b83936aabad49a2af77074381d35167beb0045550509");
+    assert_eq!(leaf0, mldsa_leaf(0, &leaf_key(&m, 0).verifying_key_bytes()));
+    // The net's derivation picks the master; v1 is untouched by v2.
+    let t3 = AuthNet::of(2, &genesis_of(TESTNET_3_GENESIS_HEX)).unwrap();
+    assert_eq!(t3.master(&b(0x07), 0), m);
+    assert_eq!(t3.derivation(), 2);
+    assert_eq!(AuthNet::of(1, &genesis_of(TESTNET_3_GENESIS_HEX)).unwrap(), AuthNet::V1);
+    assert_eq!(AuthNet::V1.master(&b(0x07), 0), auth_master(&b(0x07), 0));
+}
+
+/// Lab #971: two genesis hashes give two v2 masters for one `(sk, g)`, and
+/// v2 is not v1 on the same inputs — on every generation tried.
+#[test]
+fn v2_masters_are_per_genesis_and_not_v1() {
+    let (a, b2) = (genesis_of(TESTNET_3_GENESIS_HEX), [0xb2; 32]);
+    assert_eq!(
+        crate::hex(&auth_master_v2(&b(0x07), 0, &b2)),
+        "5d1933702527df587f694b21261cefa0a219e27891cd426ed4b1fe3b1c7d1247",
+        "the independent script's second genesis"
+    );
+    for g in [0u32, 1, 7] {
+        let (ma, mb, m1) = (auth_master_v2(&b(0x07), g, &a), auth_master_v2(&b(0x07), g, &b2), auth_master(&b(0x07), g));
+        assert_ne!(ma, mb, "g {g}: one master for two nets");
+        assert_ne!(ma, m1, "g {g}: v2 is v1");
+        assert_ne!(mb, m1, "g {g}: v2 is v1");
+        // And so are the leaves.
+        assert_ne!(leaf_seed(&ma, 0), leaf_seed(&mb, 0));
+    }
+}
+
+#[test]
+fn an_unknown_derivation_is_refused_by_name() {
+    for d in [0u8, 3, 255] {
+        let e = AuthNet::of(d, &[0; 32]).unwrap_err();
+        assert!(e.contains(&format!("authorization derivation {d} is not one this build knows")), "{e}");
+    }
+}
+
 #[test]
 fn auth_tree_paths_fold_to_its_root() {
     let m = auth_master(&b(0x07), 0);

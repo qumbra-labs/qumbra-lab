@@ -28,11 +28,15 @@ use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
 use crate::annulet_landed::{bind_body, landed_in, landed_next_with, restore_generations_with, GenTree, LandedByGeneration};
 use crate::annulet_verify::VerifiedChain;
 use crate::auth_journal::{AuthJournal, GenState, JournalError, SweepGate};
+use qlab_remote_auth::annulet::AuthNet;
 
 /// What a check reads of the verified scan.
 #[derive(Clone)]
 pub struct CheckBasis {
     pub genesis_hash: [u8; 32],
+    /// Lab #971: the net's authorization derivation, 1 or 2 — a property of
+    /// the net (its pin, or the shell's net table), beside its genesis.
+    pub auth_derivation: u8,
     pub form: L2AuthForm,
     /// The verified header chain: every body is bound to it.
     pub chain: VerifiedChain,
@@ -42,6 +46,49 @@ pub struct CheckBasis {
     /// Every note the scan made the wallet's (a restore reads their
     /// generations; `first` refuses a note at generation > 0).
     pub owned: Vec<OwnedL2Note>,
+}
+
+impl CheckBasis {
+    /// The net's derivation, or refused by name (lab #971).
+    pub fn auth_net(&self) -> Result<AuthNet, String> {
+        AuthNet::of(self.auth_derivation, &self.genesis_hash)
+    }
+}
+
+/// A genesis hash's first 8 hex digits, for a refusal that names a net.
+fn short(genesis: &[u8; 32]) -> String {
+    genesis[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A net as a refusal names it: its derivation and genesis.
+fn net_name(net: &AuthNet, genesis: &[u8; 32]) -> String {
+    format!("derivation {} (genesis {}…)", net.derivation(), short(genesis))
+}
+
+/// Lab #971: a journal is opened only on the net its roots are of. A
+/// derivation-2 journal names its genesis, which must be the basis's; a
+/// derivation-1 journal is opened only on a derivation-1 net.
+/// `net` is the scan's, `genesis` its genesis hash.
+pub fn require_journal_net(journal: &AuthJournal, net: &AuthNet, genesis: &[u8; 32]) -> Result<(), String> {
+    match (journal.net(), net) {
+        (AuthNet::V1, AuthNet::V1) => Ok(()),
+        (AuthNet::V2 { genesis: j }, AuthNet::V2 { genesis: b }) if j == b => Ok(()),
+        (AuthNet::V2 { genesis: j }, AuthNet::V2 { .. }) => Err(format!(
+            "auth.v1 is the journal of another net: it was born on genesis {}…, this scan is of genesis {}…",
+            short(j),
+            short(genesis)
+        )),
+        (jn, _) => {
+            let born = match jn {
+                AuthNet::V2 { genesis } => net_name(jn, genesis),
+                AuthNet::V1 => "derivation 1".to_string(),
+            };
+            Err(format!(
+                "auth.v1 is a {born} journal; this net is {}: its keys are not this net's",
+                net_name(net, genesis)
+            ))
+        }
+    }
 }
 
 /// The net is a Candidate A net (format 33 or 34), or refused by name.
@@ -135,6 +182,19 @@ pub const MAX_CHECK_PAGE: u64 = qlab_p2p::served::MAX_BODIES_PAGE as u64;
 
 impl AuthCheck {
     fn new(mode: CheckMode, basis: CheckBasis, trees: Vec<Arc<GenTree>>, from: u64) -> AuthCheck {
+        // Lab #971: every tree is of the basis's derivation, or the check is
+        // refused before its first step (a tree of another net would match
+        // nothing and write a journal of the wrong keys).
+        let refused = match basis.auth_net() {
+            Err(why) => Some(why),
+            Ok(net) => trees.iter().find(|t| t.net != net).map(|t| {
+                format!(
+                    "generation {}'s tree is not of this net's authorization derivation ({})",
+                    t.g,
+                    net_name(&net, &basis.genesis_hash)
+                )
+            }),
+        };
         AuthCheck {
             mode,
             basis,
@@ -142,7 +202,7 @@ impl AuthCheck {
             landed: LandedByGeneration::new(),
             at: from,
             asked: false,
-            refused: None,
+            refused,
             page: 0,
             asked_to: 0,
             started: false,
@@ -180,6 +240,7 @@ impl AuthCheck {
         index: &AssetIndex,
         basis: CheckBasis,
     ) -> Result<AuthCheck, String> {
+        require_journal_net(&journal, &basis.auth_net()?, &basis.genesis_hash)?;
         let rec = journal.get(generation).map_err(|e| format!("auth.v1: {e}"))?;
         // A retired generation is opened only to be revived: a note of it
         // arrived (a published address is still paid). Without one, refused.
@@ -376,13 +437,14 @@ impl AuthCheck {
                         "this seed has signed (a leaf of generation {g} has landed on this net): use restore"
                     ));
                 }
-                let mut journal = AuthJournal::fresh(trees[0].root());
+                let mut journal = AuthJournal::fresh(trees[0].root()).on_net(trees[0].net);
                 journal.set_checked_mem(0, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
                 Ok((journal, 0, CheckStatus::First))
             }
             CheckMode::Restore => {
                 let mut journal = restore_generations_with(trees, &b.owned, landed, &b.genesis_hash, b.gate_tip)
-                    .map_err(|e| format!("restore: {e}"))?;
+                    .map_err(|e| format!("restore: {e}"))?
+                    .on_net(trees[0].net);
                 let gens: Vec<u32> = journal.generations().iter().map(|r| r.g).collect();
                 for g in gens {
                     journal.set_checked_mem(g, &b.genesis_hash, tip).map_err(|e| e.to_string())?;
@@ -406,6 +468,9 @@ pub enum RestoreAcrossError {
     MixedKeys { g: u32 },
     /// The merged records do not form a journal.
     Journal(JournalError),
+    /// Lab #971: a derivation-2 journal is one net's by construction; it is
+    /// restored from that net alone and never merged.
+    DerivationV2 { genesis: [u8; 32] },
 }
 
 impl std::fmt::Display for RestoreAcrossError {
@@ -417,6 +482,11 @@ impl std::fmt::Display for RestoreAcrossError {
                 "the restored journals give generation {g} different authorization roots: they are not one key's"
             ),
             RestoreAcrossError::Journal(e) => write!(f, "the merged journal is refused: {e}"),
+            RestoreAcrossError::DerivationV2 { genesis } => write!(
+                f,
+                "a derivation-2 journal (genesis {}…) is one net's: restore it from that net alone, never across nets",
+                short(genesis)
+            ),
         }
     }
 }
@@ -441,6 +511,10 @@ impl std::error::Error for RestoreAcrossError {}
 ///
 /// One journal comes back unchanged. Empty input and two roots for one
 /// generation are refused by name.
+///
+/// **Derivation-1 nets only** (lab #971): a derivation-2 journal is refused
+/// by name, alone or among others — its master is per genesis, so its
+/// restore from its own net is already complete.
 pub fn restore_across(journals: &[AuthJournal]) -> Result<AuthJournal, RestoreAcrossError> {
     use crate::auth_journal::Generation;
     use std::collections::BTreeMap;
@@ -455,6 +529,9 @@ pub fn restore_across(journals: &[AuthJournal]) -> Result<AuthJournal, RestoreAc
         used: bool,
     }
 
+    if let Some(AuthNet::V2 { genesis }) = journals.iter().map(|j| *j.net()).find(|n| *n != AuthNet::V1) {
+        return Err(RestoreAcrossError::DerivationV2 { genesis });
+    }
     let top = journals.iter().map(|j| j.active().g).max().ok_or(RestoreAcrossError::Empty)?;
     let mut merged: BTreeMap<u32, Named> = BTreeMap::new();
     for j in journals {
@@ -534,6 +611,122 @@ mod tests {
         assert!(require_candidate_a(L2AuthForm::CandidateA).is_ok());
         assert!(require_candidate_a(L2AuthForm::CandidateAV3).is_ok());
         assert_eq!(require_candidate_a(L2AuthForm::None).err().as_deref(), Some("this net is not a Candidate A net"));
+    }
+
+    /// Lab #971, derivation v2. Trees here are depth 3 (8 keys) and leaves
+    /// are single keygens, so these run in milliseconds.
+    mod derivation_v2 {
+        use super::super::*;
+        use crate::annulet_landed::restore_generations_with;
+        use qlab_remote_auth::annulet::{leaf_key, AuthTree, Cursor, D_AUTH};
+
+        const NET_A: [u8; 32] = [0xa1; 32];
+        const NET_B: [u8; 32] = [0xb2; 32];
+        const SK: [u8; 32] = [0x31; 32];
+
+        fn gen_tree(net: AuthNet, g: u32) -> GenTree {
+            let master = net.master(&SK, g);
+            let tree = Arc::new(AuthTree::build(&master, 3).unwrap());
+            GenTree { g, net, master, tree }
+        }
+
+        /// The leaves the cursor of generation `g` on `net` hands out at
+        /// positions `0 .. n` — what `n` sends on that net used.
+        fn used(net: AuthNet, g: u32, n: u32) -> Vec<(u32, [u8; 32])> {
+            let master = net.master(&SK, g);
+            let mut c = Cursor::new(&master, D_AUTH, 0).unwrap();
+            (0..n)
+                .map(|_| {
+                    let i = c.take().unwrap();
+                    (i, leaf_key(&master, i).descriptor(i).leaf())
+                })
+                .collect()
+        }
+
+        /// The leaf a journal offers next: its active generation's cursor.
+        fn offered(j: &AuthJournal, net: AuthNet) -> [u8; 32] {
+            let a = j.active();
+            let master = net.master(&SK, a.g);
+            let mut c = Cursor::new(&master, D_AUTH, a.next).unwrap();
+            let i = c.take().unwrap();
+            leaf_key(&master, i).descriptor(i).leaf()
+        }
+
+        /// A restore on one net: that net's chain, read through `read`, is
+        /// matched against that net's trees; nothing else is an input.
+        fn restore_on(net: AuthNet, genesis: &[u8; 32], read: impl Fn() -> Vec<(u32, [u8; 32])>) -> AuthJournal {
+            let trees = [gen_tree(net, 0), gen_tree(net, 1)];
+            let mut landed = crate::annulet_landed::LandedByGeneration::new();
+            for (i, leaf) in read() {
+                for t in &trees {
+                    if i < 8 && t.tree.leaf(i) == leaf {
+                        landed.entry(t.g).or_default().push((i, leaf));
+                    }
+                }
+            }
+            restore_generations_with(&trees, &[], &landed, genesis, 100).unwrap().on_net(trees[0].net)
+        }
+
+        /// #971's test 4: a seed used on two derivation-2 nets. B consumed
+        /// generation 0's first three positions; a restore on A (which saw
+        /// nothing) offers A's position 0 — a leaf B never used, and never
+        /// could: A's tree is A's own. B's chain is no input of the restore
+        /// (its only inputs are A's trees and A's chain), so it needs B
+        /// neither listed nor reachable. Under derivation 1 the same restore re-offers a leaf B
+        /// consumed — the case `restore_across` exists for.
+        #[test]
+        fn a_v2_restore_on_one_net_reoffers_nothing_used_on_the_other_and_never_reads_it() {
+            let (a, b) = (AuthNet::V2 { genesis: NET_A }, AuthNet::V2 { genesis: NET_B });
+            let used_on_b = used(b, 0, 3);
+            let j = restore_on(a, &NET_A, Vec::new);
+            assert_eq!(j.net(), &a);
+            assert_eq!((j.active().g, j.active().next), (0, 0), "A saw nothing of this seed");
+            let leaf = offered(&j, a);
+            assert!(used_on_b.iter().all(|(_, l)| *l != leaf), "A offers a leaf B consumed");
+            // B's leaves are not A's at any position B used.
+            let a0 = a.master(&SK, 0);
+            assert!(used_on_b.iter().all(|(i, l)| leaf_key(&a0, *i).descriptor(*i).leaf() != *l));
+
+            // Derivation 1, the same history: A's restore re-offers B's leaf.
+            let used_on_b_v1 = used(AuthNet::V1, 0, 3);
+            let j1 = restore_on(AuthNet::V1, &NET_A, Vec::new);
+            assert!(used_on_b_v1.iter().any(|(_, l)| *l == offered(&j1, AuthNet::V1)), "v1 shares the cursor across nets");
+        }
+
+        /// A journal opens only on its own net, refused by name with both
+        /// genesis hashes (first 8 hex) where two derivation-2 nets differ.
+        #[test]
+        fn a_journal_is_opened_only_on_its_own_net() {
+            let (a, b) = (AuthNet::V2 { genesis: NET_A }, AuthNet::V2 { genesis: NET_B });
+            let v1 = AuthJournal::fresh([1, 2, 3, 4]);
+            let on_a = AuthJournal::fresh([1, 2, 3, 4]).on_net(a);
+            assert!(require_journal_net(&v1, &AuthNet::V1, &NET_A).is_ok());
+            assert!(require_journal_net(&v1, &AuthNet::V1, &NET_B).is_ok(), "v1: one journal serves every v1 net");
+            assert!(require_journal_net(&on_a, &a, &NET_A).is_ok());
+            let e = require_journal_net(&on_a, &b, &NET_B).unwrap_err();
+            assert!(e.contains("born on genesis a1a1a1a1…") && e.contains("this scan is of genesis b2b2b2b2…"), "{e}");
+            let e = require_journal_net(&v1, &a, &NET_A).unwrap_err();
+            assert!(e.contains("a derivation 1 journal") && e.contains("derivation 2 (genesis a1a1a1a1…)"), "{e}");
+            let e = require_journal_net(&on_a, &AuthNet::V1, &NET_B).unwrap_err();
+            assert!(e.contains("derivation 2 (genesis a1a1a1a1…) journal") && e.contains("this net is derivation 1"), "{e}");
+        }
+
+        /// `restore_across` refuses a derivation-2 journal by name, alone or
+        /// among derivation-1 ones (#971 test 5; the v1 cases are `across`).
+        #[test]
+        fn restore_across_refuses_a_derivation_2_journal_by_name() {
+            let v1 = AuthJournal::fresh([1, 2, 3, 4]);
+            let on_a = AuthJournal::fresh([1, 2, 3, 4]).on_net(AuthNet::V2 { genesis: NET_A });
+            for inputs in [vec![on_a.clone()], vec![v1.clone(), on_a.clone()], vec![on_a.clone(), v1.clone()]] {
+                let e = restore_across(&inputs).unwrap_err();
+                assert!(matches!(e, RestoreAcrossError::DerivationV2 { genesis } if genesis == NET_A), "{e:?}");
+                assert_eq!(
+                    e.to_string(),
+                    "a derivation-2 journal (genesis a1a1a1a1…) is one net's: restore it from that net alone, never across nets"
+                );
+            }
+            assert_eq!(restore_across(std::slice::from_ref(&v1)).unwrap(), v1, "v1 unchanged");
+        }
     }
 
     /// Lab #971: restored journals built as records, no tree built (the

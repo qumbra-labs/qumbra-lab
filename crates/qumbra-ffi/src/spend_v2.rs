@@ -52,7 +52,7 @@ use qlab_l2spend::bundle::ProvingBundle;
 use qlab_l2spend::v2::{attach, intent_for, prepare_p_v2, prepare_s_v2, sign_locally, FeeIn, LocalAuth, PreparedV2};
 use qlab_l2spend::{shape_for, Endpoint, Out, PolicyContext, Recipient, Served};
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
-use qlab_remote_auth::annulet::AnnuletIntent;
+use qlab_remote_auth::annulet::{AnnuletIntent, AuthNet};
 use qlab_remote_auth::mldsa;
 use qlab_wallet::Wallet;
 use qumbra_wallet::annulet_plan::{
@@ -123,12 +123,15 @@ pub struct SpendBasis {
     /// at `qmb_annulet_new_v2`) — the review's only source of names and
     /// decimals. Never a host-supplied name table.
     list: Option<AssetList>,
+    /// Lab #971: the net's authorization derivation, as the scan was given
+    /// it (`qmb_annulet_new_v2`): every `qmb_auth_*` on this basis derives so.
+    auth_net: AuthNet,
 }
 
 impl SpendBasis {
     /// The basis of a finished verified scan, or `None` when it established
     /// no index.
-    pub(crate) fn of(v: &VerifiedAnnulet, list: Option<&AssetList>) -> Option<Self> {
+    pub(crate) fn of(v: &VerifiedAnnulet, list: Option<&AssetList>, auth_net: AuthNet) -> Option<Self> {
         Some(SpendBasis {
             index: v.report().index.clone()?,
             genesis_hash: v.chain().genesis.hash,
@@ -139,6 +142,7 @@ impl SpendBasis {
             owned: v.report().owned.clone(),
             gate_tip: v.chain().tip().max(v.stated_tip().unwrap_or(0)),
             list: list.cloned(),
+            auth_net,
         })
     }
 }
@@ -175,6 +179,7 @@ pub unsafe extern "C" fn qmb_spend_basis_summary(b: *const SpendBasis) -> *mut c
     out_string(
         serde_json::json!({
             "genesis": hex(&b.genesis_hash),
+            "auth_derivation": b.auth_net.derivation(),
             "tip": b.tip,
             "gate_tip": b.gate_tip,
             "spends_verified": b.spends_verified,
@@ -223,14 +228,14 @@ unsafe fn text_arg<'a>(what: &str, p: *const c_char, max: usize) -> Result<&'a s
 /// The keys of generation `g` of `journal`, checked: its root is the
 /// wallet's, the active generation's root is re-derived from the wallet and
 /// must be the journal's, and a retired generation has none.
-fn open_handle(w: &WalletState, journal: AuthJournal, g: u32) -> Result<AuthHandle, String> {
+fn open_handle(w: &WalletState, journal: AuthJournal, g: u32, net: AuthNet) -> Result<AuthHandle, String> {
     let rec = journal.get(g).map_err(|e| format!("auth.v1: {e}"))?.clone();
     if rec.state == GenState::Retired {
         return Err(format!("generation {g} is retired: nothing of it is spent again"));
     }
     let wallet = w.wallet.clone();
     // The handle's cached tree (PR 3g): the scan or the check built it.
-    let tree = w.gen_tree(g);
+    let tree = w.gen_tree(g, net);
     let keys = LocalAuth::from_tree(tree.master, Arc::clone(&tree.tree), rec.next)?;
     if keys.auth_root() != rec.auth_root {
         return Err(format!(
@@ -239,7 +244,7 @@ fn open_handle(w: &WalletState, journal: AuthJournal, g: u32) -> Result<AuthHand
         ));
     }
     let active = journal.active().clone();
-    let active_root = w.generation_root(active.g);
+    let active_root = w.generation_root(active.g, net);
     if active_root != active.auth_root {
         return Err(format!("auth.v1's active generation {} is not this wallet's tree", active.g));
     }
@@ -298,11 +303,14 @@ const _: () = {
 /// shell opens its keys by it); this handle is its C pump.
 pub struct CheckHandle {
     check: AuthCheck,
+    /// Lab #971: the basis's net, whose keys a passed check opens.
+    net: AuthNet,
 }
 
 fn check_basis(b: &SpendBasis) -> CheckBasis {
     CheckBasis {
         genesis_hash: b.genesis_hash,
+        auth_derivation: b.auth_net.derivation(),
         form: b.form,
         chain: b.chain.clone(),
         gate_tip: b.gate_tip,
@@ -329,7 +337,7 @@ unsafe fn check_handle(
         return ptr::null_mut();
     }
     match build(&*w, b) {
-        Ok(check) => Box::into_raw(Box::new(CheckHandle { check })),
+        Ok(check) => Box::into_raw(Box::new(CheckHandle { check, net: b.auth_net })),
         Err(e) => {
             set_err(err_out, e);
             ptr::null_mut()
@@ -360,7 +368,7 @@ pub unsafe extern "C" fn qmb_auth_check_new(
         |ws, b| {
             let text = text_arg("the journal", journal_text, MAX_JOURNAL_TEXT)?;
             let journal = AuthJournal::from_text(text).map_err(|e| format!("auth.v1: {e}"))?;
-            AuthCheck::check(journal, generation, || ws.gen_tree(generation), &b.index, check_basis(b))
+            AuthCheck::check(journal, generation, || ws.gen_tree(generation, b.auth_net), &b.index, check_basis(b))
         },
         err_out,
     )
@@ -384,7 +392,8 @@ pub unsafe extern "C" fn qmb_auth_restore_new(
         w,
         basis,
         |ws, b| {
-            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g)).collect();
+            let trees =
+                (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g, b.auth_net)).collect();
             Ok(AuthCheck::restore(trees, check_basis(b)))
         },
         err_out,
@@ -415,7 +424,8 @@ pub unsafe extern "C" fn qmb_auth_first_new(
         w,
         basis,
         |ws, b| {
-            let trees = (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g)).collect();
+            let trees =
+                (0..qumbra_wallet::auth_journal::PROBE_GENERATIONS).map(|g| ws.gen_tree(g, b.auth_net)).collect();
             Ok(AuthCheck::first(trees, check_basis(b)))
         },
         err_out,
@@ -575,13 +585,32 @@ fn journal_summary(j: &AuthJournal) -> serde_json::Value {
 /// `qmb_wallet_from_parts` is refused by name — its seed came from outside
 /// and may have signed (use `qmb_auth_first_new` or `qmb_auth_restore_new`).
 ///
+///
+/// Lab #971: the journal is of the net's authorization derivation —
+/// `auth_derivation` 1 (`genesis32` may be NULL) or 2 (`genesis32` the net's
+/// genesis hash: the journal is that net's alone). Any other derivation, or
+/// 2 with a NULL `genesis32`, is refused by name **before** the mark is
+/// consumed.
+///
 /// # Safety
-/// `w` live; `out_journal` writable.
+/// `w` live; `genesis32` NULL or 32 readable bytes; `out_journal` writable.
 #[no_mangle]
-pub unsafe extern "C" fn qmb_auth_first_fresh(w: *const WalletState, out_journal: *mut *mut c_char) -> i32 {
+pub unsafe extern "C" fn qmb_auth_first_fresh(
+    w: *const WalletState,
+    auth_derivation: u8,
+    genesis32: *const u8,
+    out_journal: *mut *mut c_char,
+) -> i32 {
     if w.is_null() || out_journal.is_null() {
         return -1;
     }
+    let net = match crate::auth_net_arg(auth_derivation, genesis32) {
+        Ok(net) => net,
+        Err(why) => {
+            *out_journal = out_string(why);
+            return -1;
+        }
+    };
     let ws = &*w;
     // Once: the mark is consumed, so a second call — after this handle has
     // signed — is refused like any outside door.
@@ -593,7 +622,7 @@ pub unsafe extern "C" fn qmb_auth_first_fresh(w: *const WalletState, out_journal
         );
         return -1;
     }
-    *out_journal = out_string(AuthJournal::fresh(ws.generation_root(0)).to_text());
+    *out_journal = out_string(AuthJournal::fresh(ws.generation_root(0, net)).on_net(net).to_text());
     0
 }
 
@@ -734,7 +763,7 @@ pub unsafe extern "C" fn qmb_auth_check_finish(
     }
     *out_journal = ptr::null_mut();
     *out_status = -1;
-    let (ws, c) = (&*w, &mut (*c).check);
+    let (ws, net, c) = (&*w, (*c).net, &mut (*c).check);
     let (journal, g, status) = match c.finish() {
         Ok(x) => x,
         Err(e) => {
@@ -758,7 +787,7 @@ pub unsafe extern "C" fn qmb_auth_check_finish(
         );
         return ptr::null_mut();
     }
-    match open_handle(ws, journal, g) {
+    match open_handle(ws, journal, g, net) {
         Ok(h) => Box::into_raw(Box::new(h)),
         Err(e) => {
             set_err(err_out, e);
@@ -802,7 +831,10 @@ pub unsafe extern "C" fn qmb_auth_open_next(
             genesis: b.genesis_hash,
             not_before_height: b.gate_tip.saturating_add(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS),
         };
-        journal.open_next_mem((*w).generation_root(next_g), gate).map_err(|e| e.to_string())?;
+        if journal.net() != &b.auth_net {
+            return Err("auth.v1 is not of this net's authorization derivation".to_string());
+        }
+        journal.open_next_mem((*w).generation_root(next_g, b.auth_net), gate).map_err(|e| e.to_string())?;
         Ok::<_, String>(journal.to_text())
     })();
     match done {

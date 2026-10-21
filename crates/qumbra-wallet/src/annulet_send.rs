@@ -297,10 +297,24 @@ pub fn open_session<E: Endpoint>(
     if params.genesis_hash != report.genesis_hash {
         return Err(SendRefusal::ParamsGenesisMismatch);
     }
+    require_v1_derivation(&report.genesis_hash).map_err(SendRefusal::Auth)?;
     let tiers = Tiers { s: params.fee_tier_s, p: params.fee_tier_p, r: params.fee_tier_r };
     let owned = report.owned.clone();
     let index = report.index.ok_or(SendRefusal::NoBalance)?;
     Ok(Session { served, tiers, index, genesis_hash: report.genesis_hash, spends_verified, l2_auth, tip, owned, chain, gate_tip })
+}
+
+/// Lab #971: this CLI derives authorization keys by derivation 1 only, so a
+/// net whose pin says 2 is refused by name before anything is planned (its
+/// keys, its addresses and its journal are another derivation's).
+pub fn require_v1_derivation(genesis: &[u8; 32]) -> Result<(), String> {
+    match crate::prover_pins::pinned_auth_derivation(genesis) {
+        Some(d) if d != 1 => Err(format!(
+            "this net (genesis {}…) derives authorization v{d}; this build derives authorization v1 only",
+            genesis[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// This wallet's receiving [`Recipient`] (address 0: change, split notes).

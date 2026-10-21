@@ -57,17 +57,55 @@ fn a_the_v2_address_is_the_wallets_over_the_generation_root() {
         for (index, g) in [(0u64, 0u32), (1, 0), (0, 1)] {
             let want = wallet.address_candidate_a_at_index(index, &generation_root(&wallet, g));
             assert_eq!(want.version, qlab_wallet::address::ADDRESS_VERSION_CANDIDATE_A);
-            assert_eq!(take_str(qmb_wallet_address_v2(h, index, g)), want.encode(), "index {index}, generation {g}");
-            assert_eq!(take_str(qmb_wallet_address_v2_short(h, index, g)), want.short().encode());
+            assert_eq!(take_str(qmb_wallet_address_v2(h, index, g, 1, std::ptr::null())), want.encode(), "index {index}, generation {g}");
+            assert_eq!(take_str(qmb_wallet_address_v2_short(h, index, g, 1, std::ptr::null())), want.short().encode());
         }
         let v1 = take_str(qmb_wallet_address(h, 0));
-        let v2g0 = take_str(qmb_wallet_address_v2(h, 0, 0));
-        let v2g1 = take_str(qmb_wallet_address_v2(h, 0, 1));
+        let v2g0 = take_str(qmb_wallet_address_v2(h, 0, 0, 1, std::ptr::null()));
+        let v2g1 = take_str(qmb_wallet_address_v2(h, 0, 1, 1, std::ptr::null()));
         assert_ne!(v1, v2g0, "not the v1 address");
         assert_ne!(v2g0, v2g1, "each generation binds its own root");
         // The cache: a second call answers the same.
-        assert_eq!(take_str(qmb_wallet_address_v2(h, 0, 0)), v2g0);
-        assert!(qmb_wallet_address_v2(std::ptr::null(), 0, 0).is_null());
+        assert_eq!(take_str(qmb_wallet_address_v2(h, 0, 0, 1, std::ptr::null())), v2g0);
+        assert!(qmb_wallet_address_v2(std::ptr::null(), 0, 0, 1, std::ptr::null()).is_null());
+        qmb_wallet_free(h);
+    }
+    let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// Lab #971: the Candidate A address follows the net's derivation — on
+/// derivation 1 one address whatever genesis is passed (or none); on
+/// derivation 2 one per genesis, each the wallet's address over that net's
+/// root; an unknown derivation, or 2 with no genesis, is NULL.
+#[test]
+fn a2_the_v2_address_is_per_genesis_on_derivation_2_only() {
+    use qlab_remote_auth::annulet::AuthNet;
+    use qumbra_wallet::auth_journal::generation_root_on;
+    let w = wallet_dir("v2abi_a2", SEED);
+    let wallet = w.wallet();
+    let (ga, gb) = ([0xa1u8; 32], [0xb2u8; 32]);
+    unsafe {
+        let h = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let v1_none = take_str(qmb_wallet_address_v2(h, 0, 0, 1, std::ptr::null()));
+        assert_eq!(take_str(qmb_wallet_address_v2(h, 0, 0, 1, ga.as_ptr())), v1_none, "v1: the genesis is not an input");
+        assert_eq!(take_str(qmb_wallet_address_v2(h, 0, 0, 1, gb.as_ptr())), v1_none);
+        let (a, b) = (
+            take_str(qmb_wallet_address_v2(h, 0, 0, 2, ga.as_ptr())),
+            take_str(qmb_wallet_address_v2(h, 0, 0, 2, gb.as_ptr())),
+        );
+        assert_ne!(a, b, "v2: one address per net");
+        assert_ne!(a, v1_none);
+        for (genesis, got) in [(ga, &a), (gb, &b)] {
+            let root = generation_root_on(&wallet.auth_secret(), 0, &AuthNet::V2 { genesis });
+            assert_eq!(*got, wallet.address_candidate_a_at_index(0, &root).encode());
+            assert_eq!(
+                take_str(qmb_wallet_address_v2_short(h, 0, 0, 2, genesis.as_ptr())),
+                wallet.address_candidate_a_at_index(0, &root).short().encode()
+            );
+        }
+        assert!(qmb_wallet_address_v2(h, 0, 0, 2, std::ptr::null()).is_null(), "derivation 2 needs its genesis");
+        assert!(qmb_wallet_address_v2(h, 0, 0, 3, ga.as_ptr()).is_null(), "derivation 3 is no derivation");
+        assert!(qmb_wallet_address_v2_short(h, 0, 0, 0, std::ptr::null()).is_null());
         qmb_wallet_free(h);
     }
     let _ = std::fs::remove_dir_all(&w.dir);
@@ -110,7 +148,7 @@ unsafe fn scan(w: *mut qumbra_ffi::WalletState, ep: &Endpoint, gens: Option<&[u3
         let mut err: *mut c_char = std::ptr::null_mut();
         let s = match gens {
             Some(g) => qmb_annulet_new_v2(
-                w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, null, 0,
+                w, endpoint.as_ptr(), pin.as_ptr(), 1, 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, null, 0,
                 null, 0, null, 0, std::ptr::null(), if g.is_empty() { std::ptr::null() } else { g.as_ptr() }, g.len(),
                 &mut err,
             ),
@@ -207,7 +245,7 @@ fn d_the_generation_list_is_bounded_by_name() {
         ] {
             let mut err: *mut c_char = std::ptr::null_mut();
             let s = qmb_annulet_new_v2(
-                w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, nu64, 0, RNG.as_ptr(), nu8, 0, nu8, 0, nu8, 0,
+                w, endpoint.as_ptr(), pin.as_ptr(), 1, 0, u64::MAX, nu64, 0, RNG.as_ptr(), nu8, 0, nu8, 0, nu8, 0,
                 nu8, 0, std::ptr::null(), p, n, &mut err,
             );
             assert!(s.is_null(), "{n} generations refused");

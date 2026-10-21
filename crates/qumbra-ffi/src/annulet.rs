@@ -25,6 +25,7 @@
 use std::ffi::{c_char, CStr};
 use std::ptr;
 
+use qlab_remote_auth::annulet::AuthNet;
 use qlab_wallet::Wallet;
 use qumbra_wallet::annulet_driver::{AnnuletStep, AnnuletVerifyDriver};
 use qumbra_wallet::annulet_verify::{
@@ -236,6 +237,8 @@ pub struct AnnuletState {
     /// Lab #924 PR 3: what a Candidate A spend plans from — the verified
     /// scan's index, kept at DONE for [`qmb_annulet_take_basis`].
     basis: Option<crate::spend_v2::SpendBasis>,
+    /// Lab #971: the net's authorization derivation, as the host named it.
+    auth_net: AuthNet,
 }
 
 /// Bytes from a (pointer, length) pair: `None` for NULL or zero length, and
@@ -284,7 +287,7 @@ pub unsafe extern "C" fn qmb_annulet_new(
 ) -> *mut AnnuletState {
     annulet_new(
         w, endpoint_label, pin32, from, to, indices, n_indices, rng_seed32, record, record_len, list, list_len,
-        list_sig, sig_len, list_key, key_len, list_source_commit, None, err_out,
+        list_sig, sig_len, list_key, key_len, list_source_commit, None, 1, err_out,
     )
 }
 
@@ -293,6 +296,7 @@ pub unsafe extern "C" fn qmb_annulet_new(
 pub const MAX_ANNULET_GENERATIONS: usize = qumbra_wallet::auth_journal::PROBE_GENERATIONS as usize;
 
 /// Lab #896 (extension #68 D2): [`qmb_annulet_new`] with the **authorization
+/// derivation** of the pinned net and the **authorization
 /// generations** a Candidate A (format-33) scan owns notes under: `n` u32s,
 /// at most [`MAX_ANNULET_GENERATIONS`]; NULL/0 means `[0]` — the receive-only
 /// wallet's one generation. Same pump protocol. Each listed generation's
@@ -300,6 +304,12 @@ pub const MAX_ANNULET_GENERATIONS: usize = qumbra_wallet::auth_journal::PROBE_GE
 /// the net; a v1 net's scan does not use them. [`qmb_annulet_new`] is
 /// unchanged: on a Candidate A net it probes generations
 /// `0 .. MAX_ANNULET_GENERATIONS`.
+///
+/// Lab #971: `auth_derivation` is the net's (1 or 2; anything else refused
+/// by name), its genesis the pin: the generations' trees are of it, and the
+/// basis this scan leaves (`qmb_annulet_take_basis`) carries it, so every
+/// `qmb_auth_*` call on that basis derives as the scan did. A derivation
+/// other than the one this build pins for the genesis is refused by name.
 ///
 /// # Safety
 /// As [`qmb_annulet_new`]; `generations` `n_generations` readable u32s,
@@ -310,6 +320,7 @@ pub unsafe extern "C" fn qmb_annulet_new_v2(
     w: *const WalletState,
     endpoint_label: *const c_char,
     pin32: *const u8,
+    auth_derivation: u8,
     from: u64,
     to: u64,
     indices: *const u64,
@@ -347,7 +358,7 @@ pub unsafe extern "C" fn qmb_annulet_new_v2(
     }
     annulet_new(
         w, endpoint_label, pin32, from, to, indices, n_indices, rng_seed32, record, record_len, list, list_len,
-        list_sig, sig_len, list_key, key_len, list_source_commit, Some(&gens), err_out,
+        list_sig, sig_len, list_key, key_len, list_source_commit, Some(&gens), auth_derivation, err_out,
     )
 }
 
@@ -371,6 +382,7 @@ unsafe fn annulet_new(
     key_len: usize,
     list_source_commit: *const c_char,
     generations: Option<&[u32]>,
+    auth_derivation: u8,
     err_out: *mut *mut c_char,
 ) -> *mut AnnuletState {
     if !err_out.is_null() {
@@ -430,6 +442,24 @@ unsafe fn annulet_new(
     };
     let mut pin = [0u8; 32];
     pin.copy_from_slice(std::slice::from_raw_parts(pin32, 32));
+    // Lab #971: the net's derivation, refused by name if unknown or not the
+    // one this build pins for the genesis.
+    let auth_net = match AuthNet::of(auth_derivation, &pin) {
+        Ok(net) => net,
+        Err(why) => {
+            set_err(err_out, why);
+            return ptr::null_mut();
+        }
+    };
+    if let Some(pinned) = qumbra_wallet::prover_pins::pinned_auth_derivation(&pin) {
+        if pinned != auth_derivation {
+            set_err(
+                err_out,
+                format!("this net derives authorization v{pinned} (its pin), not v{auth_derivation} as asked"),
+            );
+            return ptr::null_mut();
+        }
+    }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
     let allocated = if n_indices == 0 { Vec::new() } else { std::slice::from_raw_parts(indices, n_indices).to_vec() };
@@ -438,7 +468,7 @@ unsafe fn annulet_new(
     // their prover — `qmb_spend_v2_prover`).
     let mut driver = AnnuletVerifyDriver::new(wallet.clone(), allocated, pin, from, to, Ok(record));
     if let Some(gens) = generations {
-        let roots = gens.iter().map(|&g| (g, (*w).generation_root(g))).collect();
+        let roots = gens.iter().map(|&g| (g, (*w).generation_root(g, auth_net))).collect();
         driver = driver.with_generations(roots);
     }
     Box::into_raw(Box::new(AnnuletState {
@@ -452,6 +482,7 @@ unsafe fn annulet_new(
         view: None,
         record: None,
         basis: None,
+        auth_net,
     }))
 }
 
@@ -523,7 +554,7 @@ impl AnnuletState {
         let json = view_json(&self.endpoint, &view, v.body_cost(), self.list_source_commit.as_deref());
         self.view = Some(json.to_string());
         self.record = v.record_to_write().map(|headers| encode_chain_cache(&v.chain().genesis.hash, headers));
-        self.basis = crate::spend_v2::SpendBasis::of(v, self.list.as_ref());
+        self.basis = crate::spend_v2::SpendBasis::of(v, self.list.as_ref(), self.auth_net);
         self.phase = Phase::Done;
     }
 }

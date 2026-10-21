@@ -127,7 +127,7 @@ fn pump(dir: &Path, seed: u8, ep: &Endpoint, list: Option<&Signed>, record: Opti
                 sl, kp, kl, commit.as_ptr(), &mut err,
             ),
             Some(g) => qmb_annulet_new_v2(
-                w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), rp, rl, lp, ll, sp,
+                w, endpoint.as_ptr(), pin.as_ptr(), 1, 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), rp, rl, lp, ll, sp,
                 sl, kp, kl, commit.as_ptr(), g.as_ptr(), g.len(), &mut err,
             ),
         };
@@ -221,8 +221,8 @@ fn write_addresses(out: &Path, seed: u8) {
         let w = qmb_wallet_from_entropy([seed; 32].as_ptr());
         let v1 = take_str(qmb_wallet_address(w, 0));
         let v1s = take_str(qmb_wallet_address_short(w, 0));
-        let v2 = take_str(qmb_wallet_address_v2(w, 0, 0));
-        let v2s = take_str(qmb_wallet_address_v2_short(w, 0, 0));
+        let v2 = take_str(qmb_wallet_address_v2(w, 0, 0, 1, std::ptr::null()));
+        let v2s = take_str(qmb_wallet_address_v2_short(w, 0, 0, 1, std::ptr::null()));
         let parse = |a: &str| -> Value {
             let c = CString::new(a).unwrap();
             let mut err: *mut c_char = std::ptr::null_mut();

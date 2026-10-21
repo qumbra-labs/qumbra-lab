@@ -13,7 +13,7 @@ use qlab_devnet::body::{BlockBody, TxEntry};
 use qlab_devnet::forms::L2AuthForm;
 use qlab_devnet::header::BlockHeader;
 use qlab_ledger::assets::OwnedL2Note;
-use qlab_remote_auth::annulet::{auth_master, AuthTree, Cursor, D_AUTH};
+use qlab_remote_auth::annulet::{auth_master, AuthNet, AuthTree, Cursor, D_AUTH};
 use qlab_remote_auth::Hash32;
 use qlab_wallet::Wallet;
 
@@ -176,16 +176,24 @@ pub fn restore_generations(
 /// lab #924 PR 3b).
 pub struct GenTree {
     pub g: u32,
+    /// The derivation the master is of (lab #971).
+    pub net: AuthNet,
     pub master: Hash32,
     /// Shared with a signer built from it (`LocalAuth::from_tree`, PR 3g).
     pub tree: std::sync::Arc<AuthTree>,
 }
 
 impl GenTree {
+    /// Derivation 1 (the CLI's; lab #971).
     pub fn build(wallet: &Wallet, g: u32) -> Self {
-        let master = auth_master(&wallet.auth_secret(), g);
+        Self::build_on(wallet, g, AuthNet::V1)
+    }
+
+    /// Generation `g`'s tree on `net`'s derivation (lab #971).
+    pub fn build_on(wallet: &Wallet, g: u32, net: AuthNet) -> Self {
+        let master = net.master(&wallet.auth_secret(), g);
         let tree = std::sync::Arc::new(AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth"));
-        GenTree { g, master, tree }
+        GenTree { g, net, master, tree }
     }
 
     /// The tree's root as lanes — what the generation's addresses bind.

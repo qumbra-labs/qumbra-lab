@@ -32,10 +32,13 @@ pub struct ProverPin {
     pub max_price: ProverPrice,
 }
 
-/// The production pins: `(genesis hash, payee address, max S, max P)`.
-/// Added at the cut-over, not the freeze (docs/annulet-format-34-freeze.md,
-/// "Not frozen here").
-pub const PINS: &[([u8; 32], &str, u64, u64)] = &[(TESTNET_3_GENESIS, TESTNET_3_PAYEE, 2, 4)];
+/// The production pins: `(genesis hash, payee address, max S, max P,
+/// auth_derivation)`. Added at the cut-over, not the freeze
+/// (docs/annulet-format-34-freeze.md, "Not frozen here"). Lab #971: the last
+/// field is the net's authorization derivation (1: the master has no genesis
+/// in it; 2: per genesis); annulet-testnet-3 is 1, and every registered
+/// generation there keeps its keys.
+pub const PINS: &[([u8; 32], &str, u64, u64, u8)] = &[(TESTNET_3_GENESIS, TESTNET_3_PAYEE, 2, 4, 1)];
 
 /// **annulet-testnet-3**'s genesis hash (format 34, lab #937 cut-over M2),
 /// `024ed17be2634a59dfb061e123356b9d1798d8e067d7097248915537431c8b70`.
@@ -69,7 +72,7 @@ pub fn pin_fixture(genesis: [u8; 32], pin: ProverPin) {
 
 /// The pinned prover of the network `genesis`, if any.
 pub fn pinned(genesis: &[u8; 32]) -> Option<ProverPin> {
-    if let Some((_, payee, s, p)) = PINS.iter().find(|(g, ..)| g == genesis) {
+    if let Some((_, payee, s, p, _)) = PINS.iter().find(|(g, ..)| g == genesis) {
         return Some(ProverPin { payee: (*payee).to_string(), max_price: ProverPrice { s: *s, p: *p } });
     }
     #[cfg(feature = "fixture-pins")]
@@ -77,6 +80,13 @@ pub fn pinned(genesis: &[u8; 32]) -> Option<ProverPin> {
         return Some(pin.clone());
     }
     None
+}
+
+/// Lab #971: the pinned net's authorization derivation (1 or 2), or `None`
+/// for a genesis this build pins nothing for (a shell's own net table
+/// decides then).
+pub fn pinned_auth_derivation(genesis: &[u8; 32]) -> Option<u8> {
+    PINS.iter().find(|(g, ..)| g == genesis).map(|(.., d)| *d)
 }
 
 /// Why a service is not paid — by name.
@@ -231,10 +241,14 @@ mod tests {
     fn the_production_pin_is_annulet_testnet_3s() {
         const { assert!(FIXTURE_PINS) };
         assert_eq!(PINS.len(), 1);
-        let (genesis, payee, s, p) = PINS[0];
+        let (genesis, payee, s, p, d) = PINS[0];
         let hex: String = genesis.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "024ed17be2634a59dfb061e123356b9d1798d8e067d7097248915537431c8b70");
         assert_eq!((s, p), (2, 4), "D-C2: at most S 2 / P 4");
+        // Lab #971: annulet-testnet-3 stays on derivation 1.
+        assert_eq!(d, 1);
+        assert_eq!(pinned_auth_derivation(&genesis), Some(1));
+        assert_eq!(pinned_auth_derivation(&[0x9a; 32]), None, "an unpinned net: the shell's table decides");
         let decoded = Address::decode_any(payee).expect("the pinned payee decodes");
         decoded.require_version(ADDRESS_VERSION_CANDIDATE_A).expect("a version-2 address");
         let ok = admit(&info(&genesis, 0, 1, 2, payee), &genesis).expect("the deployed price is admitted");
