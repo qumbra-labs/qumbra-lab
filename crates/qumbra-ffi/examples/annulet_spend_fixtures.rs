@@ -146,7 +146,7 @@ fn chain(extra: Option<qlab_devnet::body::TxEntry>) -> (Endpoint, String, String
 
 /// PR 3h: a payment of 7 fee units to the fixture wallet's GENERATION-1
 /// address 0 — an address only `qmb_auth_open_next` hands out
-/// (`qmb_wallet_address_v2(w, 0, 1)`).
+/// (`qmb_wallet_address_v2(w, 0, 1, 1, ptr::null())`).
 fn g1_payment() -> qlab_devnet::body::TxEntry {
     let w = wallet_dir("spend_fixtures_g1", SEED);
     let wallet = w.wallet();
@@ -262,7 +262,7 @@ unsafe fn scan_basis(
         None => (null, 0, null, 0, null, 0),
     };
     let s = qmb_annulet_new_v2(
-        w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl, kp,
+        w, endpoint.as_ptr(), pin.as_ptr(), 1, 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl, kp,
         kl, ptr::null(), gens.as_ptr(), gens.len(), &mut err,
     );
     assert!(!s.is_null());
@@ -644,13 +644,13 @@ fn main() {
         let mut refused = serde_json::Map::new();
         for (door, h) in outside {
             let mut jout: *mut c_char = ptr::null_mut();
-            let rc = qumbra_ffi::spend_v2::qmb_auth_first_fresh(h, &mut jout);
+            let rc = qumbra_ffi::spend_v2::qmb_auth_first_fresh(h, 1, ptr::null(), &mut jout);
             refused.insert(door.into(), json!({ "rc": rc, "refusal": take_str(jout) }));
             qmb_wallet_free(h);
         }
         let born = qumbra_ffi::qmb_wallet_new_fresh();
         let mut jout: *mut c_char = ptr::null_mut();
-        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, &mut jout), 0);
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, 1, ptr::null(), &mut jout), 0);
         let fresh = take_str(jout);
         let mut entropy = [0u8; 32];
         qumbra_ffi::qmb_wallet_seed_entropy(born, entropy.as_mut_ptr());

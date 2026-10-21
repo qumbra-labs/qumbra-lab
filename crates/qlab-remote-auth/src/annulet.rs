@@ -32,6 +32,9 @@ pub const D_AUTH: u8 = 12;
 
 /// `auth_master_g = H(D_AUTH_MASTER ‖ sk ‖ g)` (§2).
 pub const AUTH_MASTER_DOMAIN: &[u8] = b"qumbra:remote-auth:annulet-auth-master:v1";
+/// Derivation v2's master domain (lab #971; design §2 amendment 2026-10-21):
+/// the master per genesis, on nets that declare `auth_derivation = 2`.
+pub const AUTH_MASTER_V2_DOMAIN: &[u8] = b"qumbra:remote-auth:annulet-auth-master:v2";
 /// The frozen `v1` leaf-seed domain (§2; the spike's is `…-seed:spike-v1`).
 pub const LEAF_SEED_DOMAIN: &[u8] = b"qumbra:remote-auth:mldsa44-seed:v1";
 /// The cursor's private permutation stream (§5).
@@ -432,6 +435,56 @@ impl AnnuletAuthSection {
 /// note key's 32 bytes (lanes LE). Independent of `nk = H(sk ‖ D_N)`.
 pub fn auth_master(sk: &Hash32, generation: u32) -> Hash32 {
     keccak256(&[AUTH_MASTER_DOMAIN, sk, &generation.to_le_bytes()])
+}
+
+/// Lab #971, derivation v2: `Keccak(D_AUTH_MASTER_V2 ‖ sk ‖ g ‖ genesis)`,
+/// `g` u32 LE, the net's 32-byte genesis hash last. Leaf seeds, leaf keys and
+/// the selection order take it as they take [`auth_master`].
+pub fn auth_master_v2(sk: &Hash32, generation: u32, genesis: &Hash32) -> Hash32 {
+    keccak256(&[
+        AUTH_MASTER_V2_DOMAIN,
+        sk,
+        &generation.to_le_bytes(),
+        genesis,
+    ])
+}
+
+/// Which master a net derives (lab #971): a property of the net, carried
+/// beside its genesis hash. v1 has no genesis in it; v2 is per genesis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AuthNet {
+    V1,
+    V2 { genesis: Hash32 },
+}
+
+impl AuthNet {
+    /// The net's `auth_derivation` (1 or 2) and genesis hash, or refused by
+    /// name for any other derivation.
+    pub fn of(auth_derivation: u8, genesis: &Hash32) -> Result<AuthNet, String> {
+        match auth_derivation {
+            1 => Ok(AuthNet::V1),
+            2 => Ok(AuthNet::V2 { genesis: *genesis }),
+            d => Err(format!(
+                "authorization derivation {d} is not one this build knows (1 or 2)"
+            )),
+        }
+    }
+
+    /// The net's `auth_derivation` number.
+    pub fn derivation(&self) -> u8 {
+        match self {
+            AuthNet::V1 => 1,
+            AuthNet::V2 { .. } => 2,
+        }
+    }
+
+    /// Generation `g`'s master on this net.
+    pub fn master(&self, sk: &Hash32, generation: u32) -> Hash32 {
+        match self {
+            AuthNet::V1 => auth_master(sk, generation),
+            AuthNet::V2 { genesis } => auth_master_v2(sk, generation, genesis),
+        }
+    }
 }
 
 pub fn leaf_seed(auth_master: &Hash32, leaf_index: u32) -> Hash32 {

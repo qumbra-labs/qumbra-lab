@@ -43,6 +43,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
 use qlab_note::kem::Dk;
+use qlab_remote_auth::annulet::AuthNet;
 
 use qlab_cbserver::client::{
     light_client_scan, light_client_scan_with, ScanConfig, ScanDriver, ScanDriverStep,
@@ -69,8 +70,12 @@ pub struct WalletState {
     /// 4,096 ML-DSA-44 key generations, seconds under wasm. The scan's roots
     /// and the open-time check (restore, first, check) share it, so a handle
     /// that scanned the probe set never builds those trees again. Each tree's
-    /// master is wiped by its `Drop` when the handle is freed.
-    trees: std::sync::Mutex<std::collections::BTreeMap<u32, std::sync::Arc<qumbra_wallet::annulet_landed::GenTree>>>,
+    /// master is wiped by its `Drop` when the handle is freed. Lab #971:
+    /// keyed by generation **and** net — on a derivation-2 net the tree is
+    /// per genesis.
+    trees: std::sync::Mutex<
+        std::collections::BTreeMap<(u32, AuthNet), std::sync::Arc<qumbra_wallet::annulet_landed::GenTree>>,
+    >,
     /// How many trees this handle has built (the cache's own test).
     tree_builds: std::sync::atomic::AtomicU32,
     /// Lab #924 PR 3b: this handle's seed was drawn **here**, by
@@ -82,19 +87,39 @@ pub struct WalletState {
 }
 
 impl WalletState {
-    /// Generation `g`'s authorization tree, built on first use and kept.
-    pub(crate) fn gen_tree(&self, g: u32) -> std::sync::Arc<qumbra_wallet::annulet_landed::GenTree> {
+    /// Generation `g`'s authorization tree on `net`, built on first use and
+    /// kept.
+    pub(crate) fn gen_tree(&self, g: u32, net: AuthNet) -> std::sync::Arc<qumbra_wallet::annulet_landed::GenTree> {
         let mut trees = self.trees.lock().unwrap_or_else(|p| p.into_inner());
-        std::sync::Arc::clone(trees.entry(g).or_insert_with(|| {
+        std::sync::Arc::clone(trees.entry((g, net)).or_insert_with(|| {
             self.tree_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::sync::Arc::new(qumbra_wallet::annulet_landed::GenTree::build(&self.wallet, g))
+            std::sync::Arc::new(qumbra_wallet::annulet_landed::GenTree::build_on(&self.wallet, g, net))
         }))
     }
 
-    /// Generation `g`'s authorization-tree root (from the cached tree).
-    fn generation_root(&self, g: u32) -> [u64; 4] {
-        self.gen_tree(g).root()
+    /// Generation `g`'s authorization-tree root on `net` (from the cached tree).
+    fn generation_root(&self, g: u32, net: AuthNet) -> [u64; 4] {
+        self.gen_tree(g, net).root()
     }
+}
+
+/// Lab #971: a host's `(auth_derivation, genesis32)` as the net it names —
+/// derivation 1 (`genesis32` may be NULL) or 2 (`genesis32` the net's 32-byte
+/// genesis hash); anything else refused by name.
+///
+/// # Safety
+/// `genesis32` NULL or 32 readable bytes.
+pub(crate) unsafe fn auth_net_arg(auth_derivation: u8, genesis32: *const u8) -> Result<AuthNet, String> {
+    if genesis32.is_null() {
+        return match auth_derivation {
+            1 => Ok(AuthNet::V1),
+            2 => Err("authorization derivation 2 needs the net's genesis hash (genesis32 is NULL)".into()),
+            d => AuthNet::of(d, &[0; 32]),
+        };
+    }
+    let mut genesis = [0u8; 32];
+    genesis.copy_from_slice(std::slice::from_raw_parts(genesis32, 32));
+    AuthNet::of(auth_derivation, &genesis)
 }
 
 /// The HD account, same constant and same reasoning as the CLI's.
@@ -338,29 +363,49 @@ pub unsafe extern "C" fn qmb_wallet_address_short(
 /// at a diversifier index, bound to authorization generation `generation`'s
 /// tree root — what a format-33 Annulet net pays. A pure derivation from the
 /// seed: a receive-only wallet needs no journal for it. The first call per
-/// generation builds the tree (cached on the handle).
+/// generation and net builds the tree (cached on the handle).
+///
+/// Lab #971: the root is of the net's authorization derivation —
+/// `auth_derivation` 1 (`genesis32` may be NULL; the address is the same on
+/// every derivation-1 net) or 2 (`genesis32` the net's genesis hash; the
+/// address is that net's alone). NULL for any other derivation, for 2 with
+/// a NULL `genesis32`, or for a NULL handle.
 ///
 /// # Safety
-/// `w` must be a live handle.
+/// `w` must be a live handle; `genesis32` NULL or 32 readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn qmb_wallet_address_v2(w: *const WalletState, index: u64, generation: u32) -> *mut c_char {
+pub unsafe extern "C" fn qmb_wallet_address_v2(
+    w: *const WalletState,
+    index: u64,
+    generation: u32,
+    auth_derivation: u8,
+    genesis32: *const u8,
+) -> *mut c_char {
     if w.is_null() {
         return ptr::null_mut();
     }
-    let root = (*w).generation_root(generation);
+    let Ok(net) = auth_net_arg(auth_derivation, genesis32) else { return ptr::null_mut() };
+    let root = (*w).generation_root(generation, net);
     out_string((*w).wallet.address_candidate_a_at_index(index, &root).encode())
 }
 
-/// The short form (`qs1…`) of [`qmb_wallet_address_v2`].
+/// The short form (`qs1…`) of [`qmb_wallet_address_v2`], same arguments.
 ///
 /// # Safety
-/// `w` must be a live handle.
+/// `w` must be a live handle; `genesis32` NULL or 32 readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn qmb_wallet_address_v2_short(w: *const WalletState, index: u64, generation: u32) -> *mut c_char {
+pub unsafe extern "C" fn qmb_wallet_address_v2_short(
+    w: *const WalletState,
+    index: u64,
+    generation: u32,
+    auth_derivation: u8,
+    genesis32: *const u8,
+) -> *mut c_char {
     if w.is_null() {
         return ptr::null_mut();
     }
-    let root = (*w).generation_root(generation);
+    let Ok(net) = auth_net_arg(auth_derivation, genesis32) else { return ptr::null_mut() };
+    let root = (*w).generation_root(generation, net);
     out_string((*w).wallet.address_candidate_a_at_index(index, &root).short().encode())
 }
 
@@ -1905,15 +1950,24 @@ mod tests {
     fn a_handle_builds_each_generation_tree_once() {
         use std::sync::atomic::Ordering;
         let w = unsafe { &mut *qmb_wallet_from_entropy([0x4B; 32].as_ptr()) };
-        let root = w.generation_root(3);
+        let v1 = AuthNet::V1;
+        let root = w.generation_root(3, v1);
         assert_eq!(w.tree_builds.load(Ordering::Relaxed), 1);
-        let tree = w.gen_tree(3);
+        let tree = w.gen_tree(3, v1);
         assert_eq!(w.tree_builds.load(Ordering::Relaxed), 1, "the scan's tree, reused");
-        assert!(std::sync::Arc::ptr_eq(&tree, &w.gen_tree(3)));
+        assert!(std::sync::Arc::ptr_eq(&tree, &w.gen_tree(3, v1)));
         assert_eq!(tree.root(), root);
         assert_eq!(root, qumbra_wallet::auth_journal::generation_root(&w.wallet, 3), "the same root as before the cache");
-        w.gen_tree(4);
+        w.gen_tree(4, v1);
         assert_eq!(w.tree_builds.load(Ordering::Relaxed), 2, "a new generation builds once");
+        // Lab #971: a derivation-2 net's tree is its own, cached per genesis.
+        let a = AuthNet::V2 { genesis: [0xa1; 32] };
+        let b = AuthNet::V2 { genesis: [0xb2; 32] };
+        assert_ne!(w.generation_root(3, a), root, "v2 is not v1");
+        assert_ne!(w.generation_root(3, a), w.generation_root(3, b), "each genesis its own tree");
+        assert_eq!(w.tree_builds.load(Ordering::Relaxed), 4);
+        assert!(std::sync::Arc::ptr_eq(&w.gen_tree(3, a), &w.gen_tree(3, a)));
+        assert_eq!(w.tree_builds.load(Ordering::Relaxed), 4, "cached per (generation, net)");
         unsafe { qmb_wallet_free(w) };
     }
 

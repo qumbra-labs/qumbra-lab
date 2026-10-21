@@ -249,6 +249,8 @@ impl AnnuletFaucet {
         std::fs::create_dir_all(dir).map_err(JournalError::Io)?;
         let lock = AuthLock::acquire(dir)?;
         let secret = key.auth_secret();
+        // Derivation 1 (lab #971): a faucet serves testnets only, and no
+        // testnet derives v2; the production chain, the v2 net, has no faucet.
         let root = generation_root(&secret, 0);
         let rkm = key.rkm_v2(&root);
         let nk = key.nk();

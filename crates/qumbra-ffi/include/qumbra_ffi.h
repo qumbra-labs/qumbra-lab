@@ -70,9 +70,15 @@ char *qmb_wallet_address_short(const qmb_wallet_t *w, uint64_t index);
  * format-33 Annulet net pays (a receive-only wallet passes 0). A pure
  * derivation from the seed; no journal. The first call per generation builds
  * that generation's tree (4,096 ML-DSA-44 keys: seconds under wasm), cached
- * on the handle. Full form and short (qs1…) form. */
-char *qmb_wallet_address_v2(const qmb_wallet_t *w, uint64_t index, uint32_t generation);
-char *qmb_wallet_address_v2_short(const qmb_wallet_t *w, uint64_t index, uint32_t generation);
+ * on the handle per (generation, net). Full form and short (qs1…) form.
+ * Lab #971: auth_derivation is the net's — 1 (genesis32 may be NULL; the same
+ * address on every derivation-1 net) or 2 (genesis32 the net's 32-byte
+ * genesis hash; the address is that net's alone). NULL for any other
+ * derivation or for 2 with a NULL genesis32. */
+char *qmb_wallet_address_v2(const qmb_wallet_t *w, uint64_t index, uint32_t generation,
+                            uint8_t auth_derivation, const uint8_t *genesis32);
+char *qmb_wallet_address_v2_short(const qmb_wallet_t *w, uint64_t index, uint32_t generation,
+                                  uint8_t auth_derivation, const uint8_t *genesis32);
 
 /* Parse a full qaddr1… address of ANY version:
  *   {"version":N,"canonical":"qaddr1…","short":"qs1…"}
@@ -686,9 +692,14 @@ qmb_annulet_t *qmb_annulet_new(const qmb_wallet_t *w, const char *endpoint_label
  * built at this call, once per wallet handle (seconds under wasm), whatever
  * the net; a v1 net's scan does not use them. An out-of-bound list is NULL
  * with *err_out set. qmb_annulet_new itself is unchanged (on a Candidate A
- * net it probes generations 0..8). */
+ * net it probes generations 0..8, derivation 1).
+ * Lab #971: auth_derivation is the pinned net's authorization derivation (1
+ * or 2; anything else, or one other than this build's pin for the genesis,
+ * is NULL with *err_out by name). The trees are of it, and the basis this
+ * scan leaves carries it: every authorization call on that basis (check,
+ * restore, first, open_next) derives so. */
 qmb_annulet_t *qmb_annulet_new_v2(const qmb_wallet_t *w, const char *endpoint_label,
-                                  const uint8_t *pin32, uint64_t from, uint64_t to,
+                                  const uint8_t *pin32, uint8_t auth_derivation, uint64_t from, uint64_t to,
                                   const uint64_t *indices, size_t n_indices,
                                   const uint8_t *rng_seed32,
                                   const uint8_t *record, size_t record_len,
@@ -796,7 +807,9 @@ typedef struct qmb_spend_v2_t qmb_spend_v2_t;
  * qmb_wallet_new_fresh() draws the seed IN THE KERNEL (getrandom; under wasm
  * crypto.getRandomValues) — the one exception to "the platform sources all
  * entropy" — so the handle can attest its birth (in memory only, never
- * serialized). qmb_auth_first_fresh(w, &journal) then gives generation 0
+ * serialized). qmb_auth_first_fresh(w, auth_derivation, genesis32, &journal)
+ * then gives generation 0 of that net's derivation (as qmb_wallet_address_v2
+ * takes them; refused before the mark is consumed if they are not a net)
  * offline, ONCE per handle (the mark is consumed); any handle from
  * _from_entropy / _restore / _from_parts is refused by name. Persist the seed with
  * qmb_wallet_seed_version and qmb_wallet_seed_entropy, as for any wallet. */
@@ -819,7 +832,8 @@ void qmb_auth_check_supply_err(qmb_auth_check_t *c, const char *reason);
 qmb_auth_t *qmb_auth_check_finish(const qmb_wallet_t *w, qmb_auth_check_t *c, char **out_journal, int32_t *out_status,
                                   char **err_out);
 void qmb_auth_check_free(qmb_auth_check_t *c);
-int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, char **out_journal);
+int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, uint8_t auth_derivation, const uint8_t *genesis32,
+                             char **out_journal);
 /* Lab #924 PR 3d: is new_text a monotone advance of stored_text? Run it
  * before overwriting a stored journal with a kernel's output. 1 yes (an
  * unchanged journal included); 0 no, *out_why the first rule broken (a

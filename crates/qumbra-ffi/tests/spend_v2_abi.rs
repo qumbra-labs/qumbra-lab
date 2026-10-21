@@ -158,6 +158,11 @@ unsafe fn basis_g(w: *mut WalletState, ep: &Endpoint, gens: &[u32]) -> *mut Spen
 }
 
 unsafe fn basis_full(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>, Vec<u8>)>, gens: &[u32]) -> *mut SpendBasis {
+    basis_d(w, ep, list, gens, 1)
+}
+
+/// [`basis_full`] on authorization derivation `d` (lab #971).
+unsafe fn basis_d(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>, Vec<u8>)>, gens: &[u32], d: u8) -> *mut SpendBasis {
     let key = qumbra_wallet::asset_view::test_list_key::encoded();
     let (lp, ll, sp, sl, kp, kl) = match list {
         Some((b, s)) => (b.as_ptr(), b.len(), s.as_ptr(), s.len(), key.as_ptr(), key.len()),
@@ -169,7 +174,7 @@ unsafe fn basis_full(w: *mut WalletState, ep: &Endpoint, list: Option<&(Vec<u8>,
     let null = ptr::null();
     let mut err: *mut c_char = ptr::null_mut();
     let s = qmb_annulet_new_v2(
-        w, endpoint.as_ptr(), pin.as_ptr(), 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl,
+        w, endpoint.as_ptr(), pin.as_ptr(), d, 0, u64::MAX, indices.as_ptr(), 2, RNG.as_ptr(), null, 0, lp, ll, sp, sl,
         kp, kl, ptr::null(), if gens.is_empty() { ptr::null() } else { gens.as_ptr() }, gens.len(), &mut err,
     );
     assert!(!s.is_null(), "{}", if err.is_null() { String::new() } else { take_str(err) });
@@ -825,7 +830,7 @@ fn n_open_next_then_the_sweep_gate_and_its_target() {
         assert!(why.contains("sweep-only"), "{why}");
         qmb_spend_v2_free(s);
         // To this wallet's active generation: a bundle the prover accepts.
-        let active = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 1));
+        let active = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 1, 1, ptr::null()));
         let s = spend(basis(w, &f.ep), &active, 0, 10, 96).unwrap();
         pump(sweep.a, s, &f.ep, 0).expect("READY");
         let journal = take(sweep.a, s).unwrap();
@@ -879,12 +884,12 @@ fn p_first_fresh_is_only_for_a_seed_born_here() {
         let born = qumbra_ffi::qmb_wallet_new_fresh();
         assert!(!born.is_null());
         let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, &mut out), 0);
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, 1, ptr::null(), &mut out), 0);
         let fresh = take_str(out);
         assert_eq!(next_of(&fresh), 0);
         assert!(fresh.starts_with("qumbra-wallet auth v1\n"), "{fresh}");
         // Once: the mark is consumed.
-        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, &mut out), -1);
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, 1, ptr::null(), &mut out), -1);
         assert!(take_str(out).contains("use qmb_auth_first_new or qmb_auth_restore_new"));
 
         // The same seed through the three outside doors: refused by name.
@@ -900,7 +905,7 @@ fn p_first_fresh_is_only_for_a_seed_born_here() {
         ];
         for h in outside {
             assert!(!h.is_null());
-            assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(h, &mut out), -1);
+            assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(h, 1, ptr::null(), &mut out), -1);
             let why = take_str(out);
             assert!(why.contains("use qmb_auth_first_new or qmb_auth_restore_new"), "{why}");
         }
@@ -1024,6 +1029,101 @@ fn q_restore_across_merges_restored_texts_and_refuses_by_name() {
     }
 }
 
+/// Lab #971 through the ABI: a scan on authorization derivation 2 leaves a
+/// basis the `qmb_auth_*` calls derive from — restore and first write an
+/// `auth v3` journal naming the scan's genesis; that journal is refused on a
+/// derivation-1 basis and by `qmb_auth_restore_across`, and a derivation-1
+/// journal on the derivation-2 basis; `qmb_auth_first_fresh` takes the net
+/// (refusing a bad one before consuming the mark); a scan with an unknown
+/// derivation, or one other than the build's pin for the genesis, is
+/// refused by name before any read.
+#[test]
+fn v_a_derivation_2_basis_writes_and_opens_only_its_nets_journal() {
+    let f = chain("sv2_v");
+    let pin = f.ep.file.hash();
+    let pin_hex: String = pin.iter().map(|b| format!("{b:02x}")).collect();
+    let v3_head = format!("qumbra-wallet auth v3\nderivation 2 {pin_hex}\n");
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        // Restore on the derivation-2 basis: the v1 notes of this fixture are
+        // not this net's keys, so generation 0 fresh — of derivation 2.
+        let b2 = basis_d(w, &f.ep, None, &PROBE, 2);
+        let summary = take_str(qumbra_ffi::spend_v2::qmb_spend_basis_summary(b2));
+        assert!(summary.contains(r#""auth_derivation":2"#), "{summary}");
+        let mut err: *mut c_char = ptr::null_mut();
+        let c = qmb_auth_restore_new(w, b2, &mut err);
+        assert!(!c.is_null(), "{}", take_str(err));
+        let restored = finish_check(w, c, &f.ep, None).unwrap();
+        assert_eq!(restored.status, qumbra_ffi::spend_v2::QMB_AUTH_RESTORED);
+        assert!(restored.journal.starts_with(&v3_head), "{}", restored.journal);
+        let j = AuthJournal::from_text(&restored.journal).unwrap();
+        assert_ne!(j.active().auth_root, generation_root(&f._dir.0.wallet(), 0), "not the derivation-1 root");
+        qmb_auth_free(restored.a);
+        let c = qumbra_ffi::spend_v2::qmb_auth_first_new(w, b2, &mut err);
+        assert!(!c.is_null(), "{}", take_str(err));
+        let first = finish_check(w, c, &f.ep, None).unwrap();
+        assert_eq!(first.journal, restored.journal, "first and restore agree on a seed with nothing here");
+        qmb_auth_free(first.a);
+
+        // The v3 journal reopens on its own basis, and on no other kind.
+        let opened = open_on(w, b2, &f.ep, &restored.journal, 0).unwrap();
+        qmb_auth_free(opened);
+        let b1 = basis_g(w, &f.ep, &PROBE);
+        let why = open_on(w, b1, &f.ep, &restored.journal, 0).unwrap_err();
+        assert!(why.contains("derivation 2 (genesis") && why.contains("this net is derivation 1"), "{why}");
+        let why = open_on(w, b2, &f.ep, &f.fresh, 0).unwrap_err();
+        assert!(why.contains("a derivation 1 journal") && why.contains("this net is derivation 2"), "{why}");
+        qmb_spend_basis_free(b1);
+        qmb_spend_basis_free(b2);
+
+        // restore_across: a derivation-2 journal by name.
+        let t = CString::new(restored.journal.clone()).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_restore_across([t.as_ptr()].as_ptr(), 1, &mut out), -1);
+        assert!(take_str(out).contains("is one net's: restore it from that net alone"));
+
+        // A scan with an unknown derivation, or against the build's pin.
+        for (pin, d, why) in [
+            (pin, 3u8, "authorization derivation 3"),
+            (qumbra_wallet::prover_pins::PINS[0].0, 2, "derives authorization v1 (its pin), not v2"),
+        ] {
+            let endpoint = CString::new("fixture").unwrap();
+            let mut err: *mut c_char = ptr::null_mut();
+            let s = qmb_annulet_new_v2(
+                w, endpoint.as_ptr(), pin.as_ptr(), d, 0, u64::MAX, ptr::null(), 0, RNG.as_ptr(), ptr::null(), 0,
+                ptr::null(), 0, ptr::null(), 0, ptr::null(), 0, ptr::null(), ptr::null(), 0, &mut err,
+            );
+            assert!(s.is_null());
+            let e = take_str(err);
+            assert!(e.contains(why), "{e}");
+        }
+        qmb_wallet_free(w);
+
+        // first_fresh on a net: derivation 2 names the genesis; a bad net is
+        // refused before the once-only mark is consumed.
+        let born = qumbra_ffi::qmb_wallet_new_fresh();
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, 2, ptr::null(), &mut out), -1);
+        assert!(take_str(out).contains("needs the net's genesis hash"));
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, 3, pin.as_ptr(), &mut out), -1);
+        assert!(take_str(out).contains("authorization derivation 3"));
+        assert_eq!(qumbra_ffi::spend_v2::qmb_auth_first_fresh(born, 2, pin.as_ptr(), &mut out), 0, "the mark was kept");
+        let fresh = take_str(out);
+        assert!(fresh.starts_with(&v3_head), "{fresh}");
+        qmb_wallet_free(born);
+    }
+}
+
+/// [`open_g`] on a given basis (not consumed): the open-time check, pumped.
+unsafe fn open_on(w: *mut WalletState, b: *mut SpendBasis, ep: &Endpoint, journal: &str, g: u32) -> Result<*mut AuthHandle, String> {
+    let text = CString::new(journal).unwrap();
+    let mut err: *mut c_char = ptr::null_mut();
+    let c = qmb_auth_check_new(w, text.as_ptr(), b, g, &mut err);
+    if c.is_null() {
+        return Err(take_str(err));
+    }
+    finish_check(w, c, ep, None).map(|o| o.a)
+}
+
 /// A chain on which BOTH generations signed: generation 0 at height 2, then
 /// (after `open_next`) generation 1 at height 3 — the lost-device case a
 /// stale journal hides. Built once.
@@ -1129,12 +1229,12 @@ fn t_a_retired_generation_that_receives_is_revived() {
             .unwrap()
             .to_text();
         let sweep = open_g(w, &f.ep, &open_gate, 0).unwrap();
-        let own_g0 = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 0));
+        let own_g0 = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 0, 1, ptr::null()));
         let s = spend(basis_g(w, &f.ep, &[0, 1]), &own_g0, 0, 10, 96).unwrap();
         assert!(pump(sweep.a, s, &f.ep, 0).unwrap_err().contains("sweep-only"));
         qmb_spend_v2_free(s);
         // ... and pays the active generation's address.
-        let active = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 1));
+        let active = take_str(qumbra_ffi::qmb_wallet_address_v2(w, 0, 1, 1, ptr::null()));
         let s = spend(basis_g(w, &f.ep, &[0, 1]), &active, 0, 10, 96).unwrap();
         pump(sweep.a, s, &f.ep, 0).unwrap();
         qmb_spend_v2_free(s);

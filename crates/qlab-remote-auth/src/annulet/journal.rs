@@ -24,8 +24,11 @@
 //! `auth.lock`; the OS drops it when the process exits, crash included, so a
 //! stale lock cannot outlive its holder.
 //!
-//! The journal is per key, not per net: one `(sk, g)` cursor serves every net
-//! the seed is used on, so no leaf is ever used twice, anywhere.
+//! On a derivation-1 net the journal is per key, not per net: one `(sk, g)`
+//! cursor serves every net the seed is used on, so no leaf is ever used
+//! twice, anywhere. On a derivation-2 net (lab #971) the master is per
+//! genesis, so the journal is per `(sk, g, genesis)`: it names its net
+//! (`auth v3`, a `derivation 2 <genesis>` line) and serves that net only.
 //!
 //! Lives here, beside the cursor it persists and below both `qumbra-wallet`
 //! and `qumbra-faucet` (seam H, QH2), so the faucet keeps its own journal
@@ -37,6 +40,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
+use super::AuthNet;
 use crate::Hash32;
 
 /// The journal file in the wallet directory.
@@ -49,6 +53,10 @@ const AUTH_HEADER: &str = "qumbra-wallet auth v1";
 /// Written only when it has such a line, so a journal without one is the v1
 /// text byte for byte; both are read.
 const AUTH_HEADER_V2: &str = "qumbra-wallet auth v2";
+/// Lab #971: a journal of a derivation-2 net, its second line
+/// `derivation 2 <genesis>`. A derivation-1 journal is never written so: it
+/// stays the v1/v2 text byte for byte, and both read as derivation 1.
+const AUTH_HEADER_V3: &str = "qumbra-wallet auth v3";
 /// Generations a journal may name: `0 .. 2^16` (lab #924 PR 3b). Far past
 /// any wallet's; it keeps `max + 1` from wrapping.
 pub const MAX_GENERATIONS: u32 = 1 << 16;
@@ -65,9 +73,17 @@ pub const PROBE_GENERATIONS: u32 = 8;
 /// `auth_master(auth_secret, g)` at `D_AUTH` (design 2b §2), as lanes — what
 /// its v2 addresses bind. Takes the secret's bytes, not a wallet, so the
 /// faucet (which holds a dev key and no `qlab_wallet::Wallet`) shares it.
+///
+/// Derivation 1 (the faucet's: no faucet serves a derivation-2 net, lab #971);
+/// [`generation_root_on`] takes the net.
 pub fn generation_root(auth_secret: &[u8; 32], g: u32) -> [u64; 4] {
-    use super::{auth_master, AuthTree, D_AUTH};
-    let master = auth_master(auth_secret, g);
+    generation_root_on(auth_secret, g, &AuthNet::V1)
+}
+
+/// [`generation_root`] on `net`'s derivation (lab #971).
+pub fn generation_root_on(auth_secret: &[u8; 32], g: u32, net: &AuthNet) -> [u64; 4] {
+    use super::{AuthTree, D_AUTH};
+    let master = net.master(auth_secret, g);
     let tree = AuthTree::build(&master, D_AUTH).expect("D_AUTH is a valid depth");
     let root = tree.root();
     // As lanes: four little-endian u64s (`qlab_note::hash::digest_from_bytes`).
@@ -202,6 +218,9 @@ pub struct AuthJournal {
     /// generation's landed leaves on that net were matched against its tree
     /// (the open-time `landed_next` check). Absent = 0.
     checked: std::collections::BTreeMap<(u32, Hash32), u64>,
+    /// Lab #971: the derivation its roots are of — `V1` for every journal
+    /// written before, `V2 { genesis }` for one net's.
+    net: AuthNet,
 }
 
 impl AuthJournal {
@@ -210,12 +229,25 @@ impl AuthJournal {
         AuthJournal {
             gens: vec![Generation { g: 0, next: 0, auth_root: auth_root_0, state: GenState::Active }],
             checked: Default::default(),
+            net: AuthNet::V1,
         }
+    }
+
+    /// Lab #971: the same journal, its roots declared of `net`'s derivation
+    /// (a fresh or restored journal on a derivation-2 net).
+    pub fn on_net(mut self, net: AuthNet) -> Self {
+        self.net = net;
+        self
+    }
+
+    /// The derivation this journal's roots are of (lab #971).
+    pub fn net(&self) -> &AuthNet {
+        &self.net
     }
 
     /// A journal from explicit records (restore). Checked like a loaded one.
     pub fn from_generations(gens: Vec<Generation>) -> Result<Self, JournalError> {
-        let j = AuthJournal { gens, checked: Default::default() };
+        let j = AuthJournal { gens, checked: Default::default(), net: AuthNet::V1 };
         j.check()?;
         Ok(j)
     }
@@ -424,6 +456,9 @@ impl AuthJournal {
             GenState::Sweep { .. } => "sweep",
             GenState::Retired => "retired",
         };
+        if self.net != stored.net {
+            return Err("the journal's authorization derivation changed".to_string());
+        }
         for old in &stored.gens {
             let g = old.g;
             let new = self.get(g).map_err(|_| format!("generation {g} is missing"))?;
@@ -468,8 +503,14 @@ impl AuthJournal {
     }
 
     fn render(&self) -> String {
-        let header = if self.checked.is_empty() { AUTH_HEADER } else { AUTH_HEADER_V2 };
-        let mut out = format!("{header}\n");
+        let mut out = match &self.net {
+            AuthNet::V1 if self.checked.is_empty() => format!("{AUTH_HEADER}\n"),
+            AuthNet::V1 => format!("{AUTH_HEADER_V2}\n"),
+            AuthNet::V2 { genesis } => format!(
+                "{AUTH_HEADER_V3}\nderivation 2 {}\n",
+                genesis.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+        };
         for r in &self.gens {
             let root: String = r.auth_root.iter().map(|w| format!("{w:016x}")).collect();
             let state = match &r.state {
@@ -494,11 +535,24 @@ impl AuthJournal {
     fn parse(text: &str) -> Result<Self, JournalError> {
         let bad = |why: String| JournalError::Malformed(why);
         let mut lines = text.lines();
-        let v2 = match lines.next() {
-            Some(AUTH_HEADER) => false,
-            Some(AUTH_HEADER_V2) => true,
-            _ => return Err(bad(format!("the first line is neither `{AUTH_HEADER}` nor `{AUTH_HEADER_V2}`"))),
+        let (v2, net) = match lines.next() {
+            Some(AUTH_HEADER) => (false, AuthNet::V1),
+            Some(AUTH_HEADER_V2) => (true, AuthNet::V1),
+            Some(AUTH_HEADER_V3) => {
+                let line = lines.next().unwrap_or("");
+                let genesis = line
+                    .strip_prefix("derivation 2 ")
+                    .and_then(hex32)
+                    .ok_or_else(|| bad("an `auth v3` journal's second line is not `derivation 2 <64 lowercase hex>`".into()))?;
+                (true, AuthNet::V2 { genesis })
+            }
+            _ => {
+                return Err(bad(format!(
+                    "the first line is not `{AUTH_HEADER}`, `{AUTH_HEADER_V2}` or `{AUTH_HEADER_V3}`"
+                )))
+            }
         };
+        let v3 = net != AuthNet::V1;
         let mut gens = Vec::new();
         let mut checked = std::collections::BTreeMap::new();
         for (i, line) in lines.enumerate() {
@@ -561,10 +615,11 @@ impl AuthJournal {
         if let Some((g, _)) = checked.keys().find(|(g, _)| j.get(*g).is_err()) {
             return Err(bad(format!("a `checked` line names generation {g}, which has no record")));
         }
-        if v2 && checked.is_empty() {
+        if v2 && !v3 && checked.is_empty() {
             return Err(bad("a v2 journal with no `checked` line (a writer emits v1 then)".into()));
         }
         j.checked = checked;
+        j.net = net;
         Ok(j)
     }
 
@@ -635,6 +690,67 @@ mod tests {
         for text in bad {
             assert!(AuthJournal::from_text(&text).is_err(), "{text}");
         }
+    }
+
+    /// Lab #971: a derivation-2 journal is `auth v3` naming its genesis
+    /// (with or without `checked` lines) and round-trips; a derivation-1
+    /// journal is the v1/v2 text byte for byte and reads as derivation 1; a
+    /// v3 text with a bad or missing `derivation` line is refused; and a
+    /// journal never changes derivation in an advance.
+    #[test]
+    fn a_derivation_2_journal_names_its_net_and_v1_texts_are_unchanged() {
+        let genesis = [0xa1; 32];
+        let net = AuthNet::V2 { genesis };
+        let v1 = AuthJournal::fresh([1, 2, 3, 4]);
+        assert_eq!(v1.net(), &AuthNet::V1);
+        assert_eq!(v1.to_text(), "qumbra-wallet auth v1\n0 0 0000000000000001000000000000000200000000000000030000000000000004 active\n");
+        assert_eq!(AuthJournal::from_text(&v1.to_text()).unwrap().net(), &AuthNet::V1);
+
+        let mut j = AuthJournal::fresh([1, 2, 3, 4]).on_net(net);
+        let fresh = j.to_text();
+        assert_eq!(
+            fresh,
+            format!("qumbra-wallet auth v3\nderivation 2 {}\n0 0 0000000000000001000000000000000200000000000000030000000000000004 active\n", "a1".repeat(32))
+        );
+        assert_eq!(AuthJournal::from_text(&fresh).unwrap(), j);
+        j.set_checked_mem(0, &genesis, 12).unwrap();
+        let checked = j.to_text();
+        assert!(checked.starts_with("qumbra-wallet auth v3\nderivation 2 ") && checked.ends_with(":12\n"), "{checked}");
+        let back = AuthJournal::from_text(&checked).unwrap();
+        assert_eq!((back.net(), back.checked_to(0, &genesis)), (&net, 12));
+
+        let bad = [
+            fresh.replacen(&format!("derivation 2 {}\n", "a1".repeat(32)), "", 1),
+            fresh.replacen("derivation 2 ", "derivation 1 ", 1),
+            fresh.replacen("derivation 2 ", "derivation 3 ", 1),
+            fresh.replacen(&"a1".repeat(32), &"A1".repeat(32), 1),
+            fresh.replacen(&"a1".repeat(32), &"a1".repeat(31), 1),
+            v1.to_text().replacen("auth v1", "auth v3", 1),
+        ];
+        for text in bad {
+            assert!(AuthJournal::from_text(&text).is_err(), "{text}");
+        }
+
+        // The derivation is part of what a journal is: no advance changes it.
+        let e = j.advances_from(&v1).unwrap_err();
+        assert!(e.contains("derivation changed"), "{e}");
+        let e = v1.advances_from(&j).unwrap_err();
+        assert!(e.contains("derivation changed"), "{e}");
+        let other = AuthJournal::fresh([1, 2, 3, 4]).on_net(AuthNet::V2 { genesis: [0xb2; 32] });
+        assert!(other.advances_from(&j).is_err(), "another net's journal is not an advance");
+        assert!(j.advances_from(&AuthJournal::fresh([1, 2, 3, 4]).on_net(net)).is_ok());
+    }
+
+    /// Lab #971: a generation's root on a derivation-2 net is that net's
+    /// alone; on derivation 1 it is [`generation_root`] as before.
+    #[test]
+    fn generation_roots_follow_the_net() {
+        let sk = [0x07; 32];
+        let (a, b) = (AuthNet::V2 { genesis: [0xa1; 32] }, AuthNet::V2 { genesis: [0xb2; 32] });
+        let r1 = generation_root(&sk, 0);
+        assert_eq!(generation_root_on(&sk, 0, &AuthNet::V1), r1);
+        assert_ne!(generation_root_on(&sk, 0, &a), r1);
+        assert_ne!(generation_root_on(&sk, 0, &a), generation_root_on(&sk, 0, &b));
     }
 
     /// Lab #924 PR 3d: `advances_from` over the recorded fixture journals
