@@ -123,6 +123,8 @@ jobs:
           cargo test -p qumbra-sequencer --lib --locked -- --test-threads=1 tests::non_test_cuts_at_either_test_module_spelling tests::no_source_debug_formats_an_opening tests::every_debug_format_is_marked
           # qumbra-sequencer, lab #847 Q4 / #860 R3b: the pass plans no R member and builds no P of its own; the binary names the one real prover
           cargo test -p qumbra-sequencer --lib --locked -- --test-threads=1 tests::the_pass_plans_no_r_member tests::the_pass_builds_no_p_of_its_own tests::run_names_the_real_prover
+          # qumbra-ffi, lab #922: the hand-written header declares every exported function with the source's signature (argument types, order, arity, return) — not just its name (+ the pin's own self-test)
+          cargo test -p qumbra-ffi --lib --locked -- --test-threads=1 --exact tests::the_header_declares_every_exported_signature tests::the_signature_pin_maps_types_and_finds_a_changed_prototype
 
       # lab #740: the L2-E1 pilot scenario sits behind `--features pilot` so the
       # workspace suite does not compile it (it runs as its own `verify-pilot`

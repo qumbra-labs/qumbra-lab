@@ -3140,6 +3140,278 @@ mod tests {
         }
     }
 
+    /// Lab #922: the C type a Rust type in an exported signature crosses the
+    /// ABI as. A closed table on purpose: a type it does not name is an error
+    /// by name, never skipped, so a new argument type cannot pass the pin by
+    /// being unknown. Paths are read by their last segment
+    /// (`crate::spend_v2::SpendBasis` is `SpendBasis`).
+    fn abi_c_type(rust: &str) -> Result<String, String> {
+        const MAP: [(&str, &str); 20] = [
+            ("u8", "uint8_t"),
+            ("u16", "uint16_t"),
+            ("u32", "uint32_t"),
+            ("u64", "uint64_t"),
+            ("i32", "int32_t"),
+            ("i64", "int64_t"),
+            ("usize", "size_t"),
+            ("bool", "bool"),
+            ("c_char", "char"),
+            ("c_void", "void"),
+            ("WalletState", "qmb_wallet_t"),
+            ("ScanState", "qmb_scan_t"),
+            ("SelectState", "qmb_select_t"),
+            ("SpentState", "qmb_spent_t"),
+            ("Session", "qmb_pair_t"),
+            ("AnnuletState", "qmb_annulet_t"),
+            ("SpendBasis", "qmb_spend_basis_t"),
+            ("AuthHandle", "qmb_auth_t"),
+            ("SpendHandle", "qmb_spend_v2_t"),
+            ("CheckHandle", "qmb_auth_check_t"),
+        ];
+        let t = rust.split_whitespace().collect::<Vec<_>>().join(" ");
+        if t == "()" {
+            return Ok("void".into());
+        }
+        if t == "Option<QmbFetchFn>" {
+            return Ok("qmb_fetch_fn".into());
+        }
+        for (prefix, konst) in [("*const ", true), ("*mut ", false)] {
+            if let Some(inner) = t.strip_prefix(prefix) {
+                let c = abi_c_type(inner)?;
+                // A pointer to a pointer puts the const after the pointee:
+                // `*const *const c_char` is `const char *const *`.
+                return Ok(match (inner.starts_with('*'), konst) {
+                    (true, true) => format!("{c} const *"),
+                    (false, true) => format!("const {c} *"),
+                    (_, false) => format!("{c} *"),
+                });
+            }
+        }
+        let base = t.rsplit("::").next().unwrap_or(&t);
+        MAP.iter()
+            .find(|(r, _)| *r == base)
+            .map(|(_, c)| c.to_string())
+            .ok_or_else(|| format!("no C type for the Rust type `{t}`: add it to the pin's table"))
+    }
+
+    /// A C type with its `*`s as their own tokens and single spaces:
+    /// `char **` and `char * *` are one type.
+    fn abi_canon(c: &str) -> String {
+        c.replace('*', " * ").split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `(name, argument C types, return C type)`, canonical.
+    type AbiSig = (String, Vec<String>, String);
+
+    /// Every `pub (unsafe) extern "C" fn` in `src` (signatures may span
+    /// lines), its types mapped to C.
+    fn abi_exported(src: &str) -> Result<Vec<AbiSig>, String> {
+        let prefixes = ["pub unsafe extern \"C\" fn ", "pub extern \"C\" fn "];
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for line in src.split_inclusive('\n') {
+            let t = line.trim_start();
+            if let Some(p) = prefixes.iter().find(|p| t.starts_with(**p)) {
+                out.push(abi_signature(src, offset + (line.len() - t.len()) + p.len())?);
+            }
+            offset += line.len();
+        }
+        Ok(out)
+    }
+
+    /// The signature whose name starts at `src[start..]`.
+    fn abi_signature(src: &str, start: usize) -> Result<AbiSig, String> {
+        let open = start + src[start..].find('(').ok_or("an exported fn with no `(`")?;
+        let name = src[start..open].trim().to_string();
+        let mut depth = 0;
+        let mut close = None;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.ok_or_else(|| format!("`{name}`: unbalanced parentheses"))?;
+        let body = close + src[close..].find('{').ok_or_else(|| format!("`{name}`: no body"))?;
+        let rest = src[close + 1..body].trim();
+        let ret = rest.strip_prefix("->").map(str::trim).unwrap_or("()");
+        // Split the arguments at top-level commas (`Option<…>` holds none
+        // today, but a generic argument must not split).
+        let (mut parts, mut cur, mut angle) = (Vec::new(), String::new(), 0i32);
+        for c in src[open + 1..close].chars() {
+            match c {
+                '<' => angle += 1,
+                '>' => angle -= 1,
+                ',' if angle == 0 => {
+                    parts.push(std::mem::take(&mut cur));
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(c);
+        }
+        parts.push(cur);
+        let mut args = Vec::new();
+        for p in parts.iter().filter(|p| !p.trim().is_empty()) {
+            let (_, ty) = p.split_once(':').ok_or_else(|| format!("`{name}`: argument `{}` has no type", p.trim()))?;
+            args.push(abi_canon(&abi_c_type(ty).map_err(|e| format!("`{name}`: {e}"))?));
+        }
+        let ret = abi_canon(&abi_c_type(ret).map_err(|e| format!("`{name}`: {e}"))?);
+        Ok((name, args, ret))
+    }
+
+    /// The header's `qmb_*` prototypes, `name → (argument types, return
+    /// type)`: comments and preprocessor lines stripped, statements split at
+    /// `;`, `{` and `}` (prototypes may span lines), parameter names dropped.
+    fn abi_header_prototypes(header: &str) -> std::collections::BTreeMap<String, (Vec<String>, String)> {
+        let mut text = String::new();
+        let mut rest = header;
+        while let Some(i) = rest.find("/*") {
+            text.push_str(&rest[..i]);
+            text.push(' ');
+            rest = rest[i..].find("*/").map_or("", |j| &rest[i + j + 2..]);
+        }
+        text.push_str(rest);
+        let text: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim_start().starts_with("//"))
+            .collect();
+        let text = text.join("\n");
+        let is_ident = |s: &str| {
+            s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let mut out = std::collections::BTreeMap::new();
+        for statement in text.split([';', '{', '}']) {
+            let Some((before, after)) = statement.split_once('(') else { continue };
+            let Some(last) = before.split_whitespace().last() else { continue };
+            let name = last.trim_start_matches('*');
+            if !name.starts_with("qmb_") {
+                continue;
+            }
+            let at = before.rfind(last).expect("the last token is in the text");
+            let ret = abi_canon(&format!("{}{}", &before[..at], &last[..last.len() - name.len()]));
+            let params = &after[..after.rfind(')').unwrap_or(after.len())];
+            let args = params
+                .split(',')
+                .filter_map(|a| {
+                    let mut tokens: Vec<&str> = Vec::new();
+                    let canon = abi_canon(a);
+                    tokens.extend(canon.split(' ').filter(|t| !t.is_empty()));
+                    if tokens.is_empty() || tokens == ["void"] {
+                        return None;
+                    }
+                    if tokens.len() > 1 && is_ident(tokens[tokens.len() - 1]) && tokens[tokens.len() - 1] != "const" {
+                        tokens.pop();
+                    }
+                    Some(tokens.join(" "))
+                })
+                .collect();
+            out.insert(name.to_string(), (args, ret));
+        }
+        out
+    }
+
+    /// Every exported signature against the header's prototype for it: the
+    /// mismatches, by name, with both sides.
+    fn abi_mismatches(exported: &[AbiSig], header: &str) -> Vec<String> {
+        let prototypes = abi_header_prototypes(header);
+        let mut wrong = Vec::new();
+        for (name, args, ret) in exported {
+            match prototypes.get(name) {
+                None => wrong.push(format!("`{name}`: the header has no prototype for it")),
+                Some((h_args, h_ret)) if h_args != args || h_ret != ret => wrong.push(format!(
+                    "`{name}`: the source exports `{ret} {name}({})`, the header declares `{h_ret} {name}({})`",
+                    args.join(", "),
+                    h_args.join(", ")
+                )),
+                Some(_) => {}
+            }
+        }
+        wrong
+    }
+
+    /// Lab #922: the header declares every exported function with the
+    /// source's signature — argument by argument and the return type — not
+    /// just its name ([`the_header_names_every_exported_function_and_nothing_else`]
+    /// keeps the name list in both directions). The macOS and iOS shells link
+    /// this header, and the extension calls the wasm exports by position, so
+    /// a type, order or arity drift here is a caller passing the wrong thing.
+    #[test]
+    fn the_header_declares_every_exported_signature() {
+        let header = include_str!("../include/qumbra_ffi.h");
+        let src = concat!(include_str!("lib.rs"), include_str!("names.rs"), include_str!("annulet.rs"), include_str!("spend_v2.rs"));
+        // The name test's own count of exported functions: the parser must
+        // find every one of them, so a parser that matches nothing cannot
+        // pass as agreement (the floor that test keeps, for the same reason).
+        let named = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                t.starts_with("pub unsafe extern \"C\" fn ") || t.starts_with("pub extern \"C\" fn ")
+            })
+            .count();
+        let exported = abi_exported(src).unwrap_or_else(|e| panic!("{e}"));
+        assert!(named >= 60, "expected the full ABI, matched {named}");
+        assert_eq!(exported.len(), named, "the signature parser read {} of {named} exported functions", exported.len());
+        let wrong = abi_mismatches(&exported, header);
+        assert!(wrong.is_empty(), "the header's prototypes disagree with the source:\n{}", wrong.join("\n"));
+    }
+
+    /// The pin's own self-test: the type table on the shapes the surface
+    /// uses, an unmapped type refused by name, a multi-line signature read
+    /// whole, and a header with one argument type, one return type, one
+    /// arity or one prototype changed — each found, by name.
+    #[test]
+    fn the_signature_pin_maps_types_and_finds_a_changed_prototype() {
+        for (rust, c) in [
+            ("*const u8", "const uint8_t *"),
+            ("*mut *mut c_char", "char * *"),
+            ("*const *const c_char", "const char * const *"),
+            ("*const WalletState", "const qmb_wallet_t *"),
+            ("*mut crate::spend_v2::SpendBasis", "qmb_spend_basis_t *"),
+            ("*mut pairing::Session", "qmb_pair_t *"),
+            ("*mut c_void", "void *"),
+            ("Option<QmbFetchFn>", "qmb_fetch_fn"),
+            ("()", "void"),
+            ("usize", "size_t"),
+        ] {
+            assert_eq!(abi_canon(&abi_c_type(rust).unwrap()), c, "{rust}");
+        }
+        let e = abi_c_type("*const Mystery").unwrap_err();
+        assert!(e.contains("`Mystery`"), "{e}");
+        // Built so no line of this file starts with the export prefix (the
+        // real scan reads this file too).
+        let src = [
+            "pub unsafe ",
+            "extern \"C\" fn qmb_t(\n    w: *const WalletState,\n    n: u64,\n    out: *mut *mut c_char,\n) -> i32 {\n}\n",
+        ]
+        .concat();
+        let sig = abi_exported(&src).unwrap();
+        let want = ("qmb_t".to_string(), vec!["const qmb_wallet_t *".into(), "uint64_t".into(), "char * *".into()], "int32_t".to_string());
+        assert_eq!(sig, vec![want]);
+        let good = "/* qmb_t(w) is documented here */\nint32_t qmb_t(const qmb_wallet_t *w,\n              uint64_t n, char **out);\n";
+        assert!(abi_mismatches(&sig, good).is_empty(), "{:?}", abi_mismatches(&sig, good));
+        for (header, why) in [
+            ("int32_t qmb_t(const qmb_wallet_t *w, uint32_t n, char **out);", "an argument type"),
+            ("uint32_t qmb_t(const qmb_wallet_t *w, uint64_t n, char **out);", "the return type"),
+            ("int32_t qmb_t(const qmb_wallet_t *w, char **out);", "the arity"),
+            ("int32_t qmb_t(qmb_wallet_t *w, uint64_t n, char **out);", "a const"),
+            ("int32_t qmb_u(const qmb_wallet_t *w, uint64_t n, char **out);", "the prototype itself"),
+        ] {
+            let wrong = abi_mismatches(&sig, header);
+            assert_eq!(wrong.len(), 1, "{why} changed, not found: {header}");
+            assert!(wrong[0].starts_with("`qmb_t`"), "{}", wrong[0]);
+        }
+    }
+
     /// The #246 pin, extended to the event-kind values (lab #432): the header's
     /// `#define QMB_EVENT_*` list and `events.rs`'s `pub const QMB_EVENT_*`
     /// list must be the same set with the same values, in both directions. The
