@@ -25,7 +25,7 @@ use std::sync::Arc;
 use qlab_devnet::forms::L2AuthForm;
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
 
-use crate::annulet_landed::{bind_body, landed_in, landed_next_with, restore_generations_with, GenTree, LandedByGeneration};
+use crate::annulet_landed::{bind_body, landed_in, landed_next_with, restore_generations_with, slots_of, GenTree, LandedByGeneration};
 use crate::annulet_verify::VerifiedChain;
 use crate::auth_journal::{AuthJournal, GenState, JournalError, SweepGate};
 use qlab_remote_auth::annulet::AuthNet;
@@ -151,6 +151,37 @@ pub enum CheckStep {
     Refused(String),
 }
 
+/// Lab #935: one transaction of a bound body that carries this wallet's
+/// leaves — a spend of this key, landed, as the bodies the check walked
+/// prove it. `tx_id` is the id a prover service returns for it
+/// (`qlab_p2p::codec::tx_id`); `intent_digest` is the digest the device
+/// signed, rebuilt from the transaction as the node's `check_auth` does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LandedSpend {
+    pub height: u64,
+    pub tx_id: [u8; 32],
+    pub intent_digest: [u8; 32],
+    /// How many of its slots are this wallet's leaves.
+    pub leaves: u32,
+}
+
+/// The digest of the intent `tx` carries, rebuilt from the transaction
+/// alone exactly as the node's `check_auth` rebuilds it: the section's
+/// validity height and descriptors, the net's genesis format and hash.
+fn intent_digest_of(tx: &qlab_devnet::body::TxEntry, form: L2AuthForm, genesis_hash: &[u8; 32]) -> Result<[u8; 32], String> {
+    use qlab_devnet::annulet::{auth_shape, intent_for, L2Surface};
+    use qlab_remote_auth::annulet::AnnuletAuthSection;
+    let surface = L2Surface::decode(&tx.l2)
+        .map_err(|e| format!("its surface does not decode: {e:?}"))?
+        .ok_or("it carries no surface")?;
+    let section =
+        AnnuletAuthSection::decode(auth_shape(surface.shape), &tx.auth).map_err(|e| format!("its auth section does not decode: {e:?}"))?;
+    let descriptors: Vec<_> = section.slots.iter().map(|s| s.descriptor).collect();
+    let intent = intent_for(tx, form.annulet_genesis_format_version(), genesis_hash, section.valid_until_height, &descriptors)
+        .map_err(|e| format!("its intent does not rebuild: {e:?}"))?;
+    intent.digest().map_err(|e| format!("its intent does not encode: {e:?}"))
+}
+
 enum CheckMode {
     Check { g: u32, journal: AuthJournal },
     Restore,
@@ -175,6 +206,11 @@ pub struct AuthCheck {
     asked_to: u64,
     /// A step has been taken: the page size is fixed from here.
     started: bool,
+    /// Lab #935: every transaction of a walked body that carries this
+    /// wallet's leaves, in height order.
+    spends: Vec<LandedSpend>,
+    /// `finish` returned a journal: [`AuthCheck::landed_spends`] may be read.
+    finished: bool,
 }
 
 /// The most bodies one page NEED asks for: the served page's own bound.
@@ -206,6 +242,8 @@ impl AuthCheck {
             page: 0,
             asked_to: 0,
             started: false,
+            spends: Vec::new(),
+            finished: false,
         }
     }
 
@@ -370,8 +408,38 @@ impl AuthCheck {
                 self.landed.entry(t.g).or_default().extend(hits);
             }
         }
+        // Lab #935: each transaction carrying one of these leaves, by the ids
+        // a shell holds for its own sends.
+        for (i, tx) in body.txs.iter().enumerate() {
+            let mine = slots_of(tx)
+                .unwrap_or_default()
+                .iter()
+                .filter(|(index, leaf)| {
+                    (*index as usize) < (1usize << qlab_remote_auth::annulet::D_AUTH)
+                        && self.trees.iter().any(|t| t.tree.leaf(*index) == *leaf)
+                })
+                .count();
+            if mine == 0 {
+                continue;
+            }
+            let intent_digest = intent_digest_of(tx, self.basis.form, &self.basis.genesis_hash)
+                .map_err(|why| format!("block {h}'s transaction {i} carries this wallet's leaves but {why}"))?;
+            self.spends.push(LandedSpend { height: h, tx_id: qlab_p2p::codec::tx_id(tx), intent_digest, leaves: mine as u32 });
+        }
         self.at += 1;
         Ok(())
+    }
+
+    /// Lab #935: **this key's spends the check found landed** — in check mode
+    /// those since the journal's checked height on this net, in restore and
+    /// first the key's whole history here — in height order, empty when
+    /// none. Read after [`AuthCheck::finish`] returned a journal (any status);
+    /// refused by name before.
+    pub fn landed_spends(&self) -> Result<&[LandedSpend], String> {
+        if !self.finished {
+            return Err("the landed spends are read after the check finished with a journal".into());
+        }
+        Ok(&self.spends)
     }
 
     /// **Finish** (after [`CheckStep::Ready`], once): the journal to
@@ -454,6 +522,7 @@ impl AuthCheck {
             }
         })();
         self.refused = Some("this check was finished".into());
+        self.finished = finished.is_ok();
         finished
     }
 }

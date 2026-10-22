@@ -796,6 +796,51 @@ pub unsafe extern "C" fn qmb_auth_check_finish(
     }
 }
 
+/// **Lab #935: this key's spends the check found landed**, as JSON:
+/// `[{"height": N, "tx_id": "<64 hex>", "intent_digest": "<64 hex>",
+/// "leaves": K}, …]` in height order, `[]` when none. `tx_id` is the id a
+/// prover service returns for the transaction; `intent_digest` the digest
+/// the device signed (rebuilt from the transaction as the node does). Each
+/// is from a body bound to its verified header. In a check, the spends
+/// since the journal's checked height on this net; in a restore or first,
+/// the key's whole history here. Valid after [`qmb_auth_check_finish`]
+/// returned a journal (any status); before, NULL and `*err_out` why. Free
+/// with `qmb_string_free`.
+///
+/// # Safety
+/// `c` live (or NULL); `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_auth_check_take_landed(c: *const CheckHandle, err_out: *mut *mut c_char) -> *mut c_char {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if c.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let hex = |x: &[u8]| x.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    match (*c).check.landed_spends() {
+        Ok(spends) => {
+            let list: Vec<_> = spends
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "height": s.height,
+                        "tx_id": hex(&s.tx_id),
+                        "intent_digest": hex(&s.intent_digest),
+                        "leaves": s.leaves,
+                    })
+                })
+                .collect();
+            out_string(serde_json::Value::Array(list).to_string())
+        }
+        Err(why) => {
+            set_err(err_out, why);
+            ptr::null_mut()
+        }
+    }
+}
+
 /// # Safety
 /// `c` live (or NULL); never used after.
 #[no_mangle]

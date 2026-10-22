@@ -832,6 +832,15 @@ void qmb_auth_check_supply_err(qmb_auth_check_t *c, const char *reason);
 qmb_auth_t *qmb_auth_check_finish(const qmb_wallet_t *w, qmb_auth_check_t *c, char **out_journal, int32_t *out_status,
                                   char **err_out);
 void qmb_auth_check_free(qmb_auth_check_t *c);
+/* Lab #935: this key's spends the check found landed, after
+ * qmb_auth_check_finish returned a journal (any status):
+ *   [{"height":N,"tx_id":"<64 hex>","intent_digest":"<64 hex>","leaves":K}, …]
+ * in height order, [] when none. tx_id is the prover service's id for the
+ * transaction, intent_digest the digest the device signed; both from bodies
+ * bound to their verified headers (a check: since its checked height; a
+ * restore or first: the key's whole history on this net). NULL with
+ * *err_out before finish. Free with qmb_string_free. */
+char *qmb_auth_check_take_landed(const qmb_auth_check_t *c, char **err_out);
 int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, uint8_t auth_derivation, const uint8_t *genesis32,
                              char **out_journal);
 /* Lab #924 PR 3d: is new_text a monotone advance of stored_text? Run it

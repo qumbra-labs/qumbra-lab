@@ -31,7 +31,7 @@ use qumbra_ffi::spend_v2::{
     qmb_auth_journal_summary,
     qmb_auth_journal_advances,
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
-    qmb_auth_check_set_page, qmb_auth_check_supply_err, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
+    qmb_auth_check_set_page, qmb_auth_check_supply_err, qmb_auth_check_take_landed, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
     qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_prover, qmb_spend_v2_refusal, qmb_spend_v2_step,
     qmb_spend_v2_supply,
     qmb_spend_v2_supply_err, AuthHandle, CheckHandle, SpendBasis, SpendHandle, QMB_AUTH_CHECKED, QMB_AUTH_JOURNAL_STALE,
@@ -206,6 +206,8 @@ struct Opened {
     status: i32,
     /// The body paths the check asked for, in order.
     paths: Vec<String>,
+    /// Lab #935: `qmb_auth_check_take_landed` after the finish.
+    landed: String,
 }
 
 /// Pump a check (or restore) handle over `ep`'s bodies and finish it.
@@ -237,12 +239,20 @@ unsafe fn finish_check(w: *mut WalletState, c: *mut CheckHandle, ep: &Endpoint, 
     }
     let (mut jout, mut status, mut err) = (ptr::null_mut(), -1i32, ptr::null_mut());
     let a = qmb_auth_check_finish(w, c, &mut jout, &mut status, &mut err);
+    let landed = if a.is_null() {
+        String::new()
+    } else {
+        let mut why: *mut c_char = ptr::null_mut();
+        let l = qmb_auth_check_take_landed(c, &mut why);
+        assert!(!l.is_null(), "a finished check lists its landed spends: {}", take_str(why));
+        take_str(l)
+    };
     qmb_auth_check_free(c);
     let journal = if jout.is_null() { String::new() } else { take_str(jout) };
     if a.is_null() {
         return Err(format!("{} [status {status}] {journal}", take_str(err)));
     }
-    Ok(Opened { a, journal, status, paths })
+    Ok(Opened { a, journal, status, paths, landed })
 }
 
 /// The checked open of `journal`'s generation `g` over `ep`'s verified chain.
@@ -673,6 +683,22 @@ fn j_the_review_names_the_asset_from_the_verified_list_only() {
 /// block transaction it would land as (a placeholder proof: the fixture
 /// chain seals without verifying), and the journal the take wrote.
 unsafe fn landed_spend(f: &Fixture) -> (qlab_devnet::body::TxEntry, String) {
+    let (tx, journal, _) = landed_spend_recorded(f);
+    (tx, journal)
+}
+
+/// Lab #935: what the spend's own parties hold for it, recorded as it is
+/// made — the id the prover service returns for the transaction it submits
+/// (`qlab_p2p::codec::tx_id`, the service's own call) and the digest of the
+/// intent bytes the device signed.
+#[derive(Clone, Copy)]
+struct SpendRecord {
+    tx_id: [u8; 32],
+    intent_digest: [u8; 32],
+}
+
+/// [`landed_spend`] with its [`SpendRecord`].
+unsafe fn landed_spend_recorded(f: &Fixture) -> (qlab_devnet::body::TxEntry, String, SpendRecord) {
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
     let a = auth(w, &f.ep, &f.fresh).unwrap();
     let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
@@ -682,20 +708,26 @@ unsafe fn landed_spend(f: &Fixture) -> (qlab_devnet::body::TxEntry, String) {
     let bundle = sign(a, s, &i, &journal).unwrap();
     let mut tx = ProvingBundle::decode(&bundle).unwrap().tx().clone();
     tx.proof = vec![0xAB; 64];
+    let record = SpendRecord { tx_id: qlab_p2p::codec::tx_id(&tx), intent_digest: qlab_remote_auth::keccak256(&[&i]) };
     qmb_spend_v2_free(s);
     qmb_auth_free(a);
     qmb_wallet_free(w);
-    (tx, journal)
+    (tx, journal, record)
 }
 
 /// The fixture chain on which our spend landed at height 2 — built once.
 fn spent_chain() -> &'static (Fixture, String) {
-    static F: std::sync::OnceLock<(Fixture, String)> = std::sync::OnceLock::new();
+    &spent_chain_recorded().0
+}
+
+/// [`spent_chain`] with the spend's [`SpendRecord`].
+fn spent_chain_recorded() -> &'static ((Fixture, String), SpendRecord) {
+    static F: std::sync::OnceLock<((Fixture, String), SpendRecord)> = std::sync::OnceLock::new();
     F.get_or_init(|| {
         let f = chain("sv2_spent_src");
-        let (tx, journal) = unsafe { landed_spend(&f) };
+        let (tx, journal, record) = unsafe { landed_spend_recorded(&f) };
         let landed = chain_full("sv2_spent", Lie::None, vec![BlockBody { txs: vec![tx], ..BlockBody::default() }], false);
-        (landed, journal)
+        ((landed, journal), record)
     })
 }
 
@@ -758,6 +790,132 @@ fn l_restore_never_resumes_a_used_generation() {
         assert_eq!((j.active().g, j.get(0).unwrap().next), (1, 1), "{}", r.journal);
         assert!(r.journal.contains(&format!("checked 1 {}:2", genesis_hex(f))), "{}", r.journal);
         qmb_auth_free(r.a);
+        qmb_wallet_free(w);
+    }
+}
+
+// ------------------------------------------------------------ lab #935
+
+/// `qmb_auth_check_take_landed`'s JSON as `(height, tx_id, intent_digest,
+/// leaves)` rows.
+fn landed_rows(json: &str) -> Vec<(u64, String, String, u64)> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}"));
+    v.as_array()
+        .unwrap_or_else(|| panic!("not an array: {json}"))
+        .iter()
+        .map(|r| {
+            (
+                r["height"].as_u64().unwrap(),
+                r["tx_id"].as_str().unwrap().to_string(),
+                r["intent_digest"].as_str().unwrap().to_string(),
+                r["leaves"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The landed send names the id the prover service returned for it and the
+/// digest its device signed — both RECORDED when the spend was made
+/// (`SpendRecord`), here found again from the bound body alone.
+#[test]
+fn a_landed_spend_names_the_provers_tx_id_and_the_signed_intents_digest() {
+    let ((f, persisted), record) = spent_chain_recorded();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let ok = open_g(w, &f.ep, persisted, 0).unwrap();
+        assert_eq!(landed_rows(&ok.landed), vec![(2, hex32(&record.tx_id), hex32(&record.intent_digest), 1)], "{}", ok.landed);
+        qmb_auth_free(ok.a);
+        qmb_wallet_free(w);
+    }
+}
+
+/// A check lists what landed since its journal's checked height: the take's
+/// journal (checked through 1) lists the height-2 spend; the journal that
+/// check returns (checked through 2) lists nothing.
+#[test]
+fn a_check_lists_only_spends_since_its_checked_height() {
+    let ((f, persisted), record) = spent_chain_recorded();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let first = open_g(w, &f.ep, persisted, 0).unwrap();
+        let rows = landed_rows(&first.landed);
+        assert_eq!(rows.iter().map(|r| (r.0, r.1.clone())).collect::<Vec<_>>(), vec![(2, hex32(&record.tx_id))]);
+        qmb_auth_free(first.a);
+        let again = open_g(w, &f.ep, &first.journal, 0).unwrap();
+        assert!(again.paths.is_empty(), "nothing past checked_to: {:?}", again.paths);
+        assert_eq!(again.landed, "[]");
+        qmb_auth_free(again.a);
+        // A seed with no spend on its chain lists none.
+        let quiet = chain("sv2_landed_quiet");
+        let none = open_g(w, &quiet.ep, &quiet.fresh, 0).unwrap();
+        assert_eq!(none.landed, "[]");
+        qmb_auth_free(none.a);
+        qmb_wallet_free(w);
+    }
+}
+
+/// A restore lists the key's whole history on this net: the one spend on
+/// the spent chain, recorded ids and all; both generations' spends on the
+/// two-generation chain, in height order, one leaf each, distinct.
+#[test]
+fn a_restore_lists_the_keys_whole_history_on_this_net() {
+    let ((f, _), record) = spent_chain_recorded();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let r = first_or_restore(w, &f.ep, true).unwrap();
+        assert_eq!(r.status, QMB_AUTH_RESTORED);
+        assert_eq!(landed_rows(&r.landed), vec![(2, hex32(&record.tx_id), hex32(&record.intent_digest), 1)]);
+        qmb_auth_free(r.a);
+        let two = two_gen_chain();
+        let r = first_or_restore(w, &two.ep, true).unwrap();
+        let rows = landed_rows(&r.landed);
+        assert_eq!(rows.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>(), vec![(2, 1), (3, 1)], "{}", r.landed);
+        assert_ne!(rows[0].1, rows[1].1, "two transactions");
+        assert_ne!(rows[0].2, rows[1].2, "two intents");
+        qmb_auth_free(r.a);
+        qmb_wallet_free(w);
+    }
+}
+
+/// The list is read after the finish returned a journal; before, NULL and
+/// why, by name — and NULL for a NULL handle.
+#[test]
+fn qmb_auth_check_take_landed_refuses_before_finish() {
+    let (f, _) = spent_chain();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let b = basis_g(w, &f.ep, &PROBE);
+        let mut err: *mut c_char = ptr::null_mut();
+        let c = qmb_auth_restore_new(w, b, &mut err);
+        qmb_spend_basis_free(b);
+        assert!(!c.is_null(), "{}", take_str(err));
+        let mut why: *mut c_char = ptr::null_mut();
+        assert!(qmb_auth_check_take_landed(c, &mut why).is_null());
+        assert!(take_str(why).contains("after the check finished with a journal"));
+        // Finished, it lists (finish_check takes it, asserting non-NULL).
+        let r = finish_check(w, c, &f.ep, None).unwrap();
+        assert_eq!(landed_rows(&r.landed).len(), 1);
+        qmb_auth_free(r.a);
+        // A check refused at a body never finishes with a journal: refused.
+        let b = basis_g(w, &f.ep, &PROBE);
+        let c = qmb_auth_restore_new(w, b, &mut err);
+        qmb_spend_basis_free(b);
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_auth_check_step(c, &mut out), 1);
+        let _ = take_str(out);
+        qumbra_ffi::spend_v2::qmb_auth_check_supply_err(c, CString::new("connection reset").unwrap().as_ptr());
+        let (mut jout, mut status) = (ptr::null_mut(), -1i32);
+        assert!(qmb_auth_check_finish(w, c, &mut jout, &mut status, &mut err).is_null());
+        let _ = take_str(err);
+        assert!(qmb_auth_check_take_landed(c, &mut why).is_null());
+        assert!(take_str(why).contains("after the check finished with a journal"));
+        qmb_auth_check_free(c);
+        assert!(qmb_auth_check_take_landed(ptr::null(), &mut why).is_null());
+        assert_eq!(take_str(why), "NULL argument");
         qmb_wallet_free(w);
     }
 }
