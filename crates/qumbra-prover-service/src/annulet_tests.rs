@@ -1709,11 +1709,17 @@ fn a_full_headers_page_over_http_is_read_whole_and_links_in_order() {
 }
 
 #[test]
-fn a_headers_answer_one_byte_over_the_ceiling_is_refused_unparsed() {
-    use qumbra_wallet::annulet_verify::{MAX_HEADERS_ANSWER_BYTES, RESPONSE_HEAD_SLACK};
-
-    let (url, server) = serve_once(vec![0; MAX_HEADERS_ANSWER_BYTES + RESPONSE_HEAD_SLACK + 1]);
+fn a_headers_answer_whose_body_fits_but_whose_response_does_not_is_refused_unparsed() {
+    let ceiling = annulet_v3::HEADERS_RESPONSE_CEILING;
+    // The shape prover-1 refused on 2026-10-23: the body within the body cap,
+    // head + body over the whole-response ceiling — the `take` guard fires.
+    let (url, server) = serve_once(vec![0; ceiling]);
     let e = HttpFollow::new(&url).headers(1, 256).unwrap_err();
     server.join().unwrap();
     assert!(e.contains("exceeds this route's") && !e.contains("did not decode"), "{e}");
+    // A declared body over the cap is the framing's own guard, read off the head.
+    let (url, server) = serve_once(vec![0; ceiling + 1]);
+    let e = HttpFollow::new(&url).headers(1, 256).unwrap_err();
+    server.join().unwrap();
+    assert!(e.contains("body-too-large") && !e.contains("did not decode"), "{e}");
 }
