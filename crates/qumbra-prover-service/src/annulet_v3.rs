@@ -358,6 +358,18 @@ pub struct BlockLink {
     pub prev: [u8; 32],
 }
 
+/// The whole-response ceiling on one `/v1/headers` read: the wallet's own
+/// bound for the route (`annulet_verify::response_ceiling`) — a full page's
+/// body plus room for the HTTP head, since the transport's ceiling covers the
+/// status line and headers too (lab #987: a body-only cap refused every full
+/// 256-unit page).
+pub const HEADERS_RESPONSE_CEILING: usize = qumbra_wallet::annulet_verify::MAX_HEADERS_ANSWER_BYTES
+    + qumbra_wallet::annulet_verify::RESPONSE_HEAD_SLACK;
+const _: () = assert!(
+    HEADERS_RESPONSE_CEILING
+        >= qumbra_wallet::annulet_verify::MAX_HEADERS_ANSWER_BYTES + qumbra_wallet::annulet_verify::RESPONSE_HEAD_SLACK
+);
+
 /// [`ChainFollow`] over HTTP(S): the tip is `/v1/registry/root`'s height (the
 /// Annulet node's own word on its tip, as the wallet reads it), the
 /// nullifiers `/v1/nullifiers` through the wallet's own source.
@@ -388,8 +400,7 @@ impl ChainFollow for HttpFollow {
     fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockLink>, String> {
         use qlab_p2p::served::{decode_headers_page, sealed};
         let path = format!("/v1/headers?from={from}&to={to}");
-        let cap = 10 + 9 + qlab_p2p::served::MAX_HEADERS_PAGE * qlab_devnet::annulet::SEALED_HEADER_LEN_ANNULET;
-        let body = qumbra_wallet::net::http_get_limited(&self.node_url, &path, Some(cap))
+        let body = qumbra_wallet::net::http_get_limited(&self.node_url, &path, Some(HEADERS_RESPONSE_CEILING))
             .map_err(|e| format!("GET {path}: {e}"))?;
         let units = decode_headers_page(qlab_p2p::compact::WireForm::ANNULET_AUTH_V3, from, &body)
             .map_err(|e| format!("GET {path} did not decode: {e}"))?;
