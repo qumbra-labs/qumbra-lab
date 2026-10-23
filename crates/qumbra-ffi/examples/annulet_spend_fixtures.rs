@@ -28,6 +28,14 @@
 //!                                  case with one; signed with the TEST list
 //!                                  key — `test-support`, dev-only)
 //!   <out>/<case>/auth/NNN.bin      the open-time check's bodies (PR 3b)
+//!   <out>/<case>/landed.json       lab #935 (extension #95 §3):
+//!                                  qmb_auth_check_take_landed after a finish
+//!                                  that returned a journal (`[]` when none) —
+//!                                  every auth case and every spend case's
+//!                                  check; case.json `landed` names it (null
+//!                                  when the finish gave no journal)
+//!   case.json `page`               the qmb_auth_check_set_page size the open
+//!                                  ran with: 0 = one body per NEED, as before
 //!   <out>/<auth case>/             first / restore / stale-check / revive /
 //!                                  rotated cases: journal_in.txt,
 //!                                  journal_out.txt, case.json (status,
@@ -37,6 +45,17 @@
 //!                                  scan names the journal's generations
 //!                                  (restore and first: the probe 0..8)
 //!   <out>/check_stale/then_restore/  the restore the STALE status asks for
+//!   <out>/restore_spent_paged/, restore_spent_paged1/, check_stale_paged/
+//!                                  lab #936 (extension #95 §3): restore_spent
+//!                                  and check_stale walked in pages of 256, 1
+//!                                  and 256 bodies (/v1/bodies) — asserted to
+//!                                  reach the unpaged case's journal_out,
+//!                                  status, keys and landed.json
+//!   <out>/restore_spent/landed_expected.json  the matching pair, asserted
+//!                                  here and written for the harness to
+//!                                  compare the kernel's answer against:
+//!                                  keccak256(s_asset0/intent.bin) and the
+//!                                  tx_id of the transaction landed at height 2
 //!   <out>/rotated_receive/         the rotated journal on a chain paying its
 //!                                  generation-1 address; only_g0/ holds the
 //!                                  same wallet's scan naming [0] alone, and
@@ -52,6 +71,11 @@
 //!                                  first step: an admit-equivalent SUBSET of a
 //!                                  format-34 service's answer (no shapes,
 //!                                  d_auth, slot_secs, …), not its bytes
+//!   <out>/v3_s_asset0_landed/      v3_s_asset0's transaction landed at
+//!                                  height 1 of the same genesis, and a check
+//!                                  of its journal_after.txt there: CHECKED,
+//!                                  one landed spend, landed_expected.json as
+//!                                  restore_spent's (extension #95 §3 (d))
 //!   <out>/v3_not_pinned/           the same on a net with no pin: the
 //!                                  NotPinned refusal a release kernel replays
 //!   manifest.json `prover_pin`     what the harness kernel registers per v3_*
@@ -72,8 +96,8 @@ use common::*;
 use qlab_devnet::body::BlockBody;
 use qumbra_ffi::annulet::{qmb_annulet_free, qmb_annulet_new_v2, qmb_annulet_step, qmb_annulet_supply, qmb_annulet_supply_err, qmb_annulet_take_basis};
 use qumbra_ffi::spend_v2::{
-    qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
-    qmb_auth_check_supply_err, qmb_auth_first_new, qmb_auth_open_next, qmb_auth_restore_new, qmb_spend_basis_free,
+    qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_set_page, qmb_auth_check_step,
+    qmb_auth_check_supply, qmb_auth_check_supply_err, qmb_auth_check_take_landed, qmb_auth_first_new, qmb_auth_open_next, qmb_auth_restore_new, qmb_spend_basis_free,
     qmb_auth_journal_summary, qmb_spend_basis_summary, AuthHandle, SpendBasis,
     qmb_auth_free, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_v2_free, qmb_spend_v2_intent,
     qmb_spend_v2_new, qmb_spend_v2_prover, qmb_spend_v2_step, qmb_spend_v2_supply, qmb_spend_v2_supply_err,
@@ -179,12 +203,18 @@ fn prover_address() -> qlab_wallet::address::Address {
     a
 }
 
-/// A **format-34** fixture chain (no blocks after genesis): the payer's v2
-/// address 0 holds the genesis 1,000,000 USDT-test and `notes(a2)`. With
+/// A **format-34** fixture chain: the payer's v2 address 0 holds the genesis
+/// 1,000,000 USDT-test and `notes(a2)`; `extra`, when given, is the one
+/// transaction of block 1 (no blocks after genesis otherwise). With
 /// `pin`, this net's prover is pinned in this process's fixture registry —
 /// what the harness kernel's `qmb_harness_pin_fixture` does from the
 /// manifest's `prover_pin`.
-fn chain_v3(tag: &str, notes: impl Fn(&qlab_wallet::address::Address) -> Vec<qlab_note::l2note::L2Note>, pin: bool) -> (Endpoint, String, String) {
+fn chain_v3(
+    tag: &str,
+    notes: impl Fn(&qlab_wallet::address::Address) -> Vec<qlab_note::l2note::L2Note>,
+    pin: bool,
+    extra: Option<qlab_devnet::body::TxEntry>,
+) -> (Endpoint, String, String) {
     let w = wallet_dir(tag, SEED);
     let wallet = w.wallet();
     let root = generation_root(&wallet, 0);
@@ -200,7 +230,8 @@ fn chain_v3(tag: &str, notes: impl Fn(&qlab_wallet::address::Address) -> Vec<qla
             },
         );
     }
-    let ep = Endpoint::new(file, &[], None, Lie::None);
+    let bodies: Vec<BlockBody> = extra.into_iter().map(|tx| BlockBody { txs: vec![tx], ..BlockBody::default() }).collect();
+    let ep = Endpoint::new(file, &bodies, None, Lie::None);
     let _ = std::fs::remove_dir_all(&w.dir);
     let p = wallet_dir(&format!("{tag}_payee"), PAYEE);
     let pw = p.wallet();
@@ -302,13 +333,23 @@ struct Opened {
     journal: Option<String>,
     status: i32,
     refusal: Option<String>,
+    /// `qmb_auth_check_take_landed`'s JSON, when the finish gave a journal.
+    landed: Option<String>,
     transcript: Vec<Value>,
     millis: u128,
 }
 
 /// The open-time check (or first / restore) through the ABI, its bodies
-/// recorded into `dir/auth`.
-unsafe fn auth_phase(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint, basis: *const SpendBasis, open: Open) -> Opened {
+/// recorded into `dir/auth`. `page > 0` walks in pages of that many bodies
+/// (`qmb_auth_check_set_page`, lab #936); 0 is one body per NEED.
+unsafe fn auth_phase(
+    dir: &Path,
+    w: *mut qumbra_ffi::WalletState,
+    ep: &Endpoint,
+    basis: *const SpendBasis,
+    open: Open,
+    page: u32,
+) -> Opened {
     std::fs::create_dir_all(dir.join("auth")).unwrap();
     let started = std::time::Instant::now();
     let mut err: *mut c_char = ptr::null_mut();
@@ -321,6 +362,9 @@ unsafe fn auth_phase(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint,
         Open::Restore => qmb_auth_restore_new(w, basis, &mut err),
     };
     assert!(!c.is_null(), "{}", take_str(err));
+    if page > 0 {
+        assert_eq!(qmb_auth_check_set_page(c, page, &mut err), 0, "set_page({page}): {}", take_str(err));
+    }
     let mut transcript = Vec::new();
     loop {
         let mut out: *mut c_char = ptr::null_mut();
@@ -339,15 +383,30 @@ unsafe fn auth_phase(dir: &Path, w: *mut qumbra_ffi::WalletState, ep: &Endpoint,
     }
     let (mut jout, mut status) = (ptr::null_mut(), -1i32);
     let a = qmb_auth_check_finish(w, c, &mut jout, &mut status, &mut err);
-    qmb_auth_check_free(c);
     let journal = (!jout.is_null()).then(|| take_str(jout));
     let refusal = (a.is_null() && !err.is_null()).then(|| take_str(err));
-    Opened { a: (!a.is_null()).then_some(a), journal, status, refusal, transcript, millis: started.elapsed().as_millis() }
+    // Lab #935: read before the free, after a finish that gave a journal.
+    let landed = journal.as_ref().map(|_| {
+        let mut lerr: *mut c_char = ptr::null_mut();
+        let l = qmb_auth_check_take_landed(c, &mut lerr);
+        assert!(!l.is_null(), "take_landed: {}", take_str(lerr));
+        take_str(l)
+    });
+    qmb_auth_check_free(c);
+    Opened {
+        a: (!a.is_null()).then_some(a),
+        journal,
+        status,
+        refusal,
+        landed,
+        transcript,
+        millis: started.elapsed().as_millis(),
+    }
 }
 
 /// An open-only case (lab #924 PR 3b, the extension's e2e): `open` on `ep`,
 /// recorded into `dir`.
-unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&str>) -> Value {
+unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&str>, page: u32) -> Value {
     std::fs::create_dir_all(dir).unwrap();
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
     // The host scans every generation its journal names; with none, the probe.
@@ -357,7 +416,7 @@ unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&s
     };
     let (basis, scan) = scan_basis(dir, w, ep, None, &gens);
     let summary: Value = serde_json::from_str(&take_str(qmb_spend_basis_summary(basis))).unwrap();
-    let o = auth_phase(dir, w, ep, basis, open);
+    let o = auth_phase(dir, w, ep, basis, open, page);
     qmb_spend_basis_free(basis);
     if let Some(a) = o.a {
         qmb_auth_free(a);
@@ -368,6 +427,9 @@ unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&s
     }
     if let Some(j) = &o.journal {
         std::fs::write(dir.join("journal_out.txt"), j).unwrap();
+    }
+    if let Some(l) = &o.landed {
+        std::fs::write(dir.join("landed.json"), l).unwrap();
     }
     // PR 3f: what the shell shows and scans — each journal through qmb_auth_journal_summary.
     let summarize = |text: &str| {
@@ -389,6 +451,8 @@ unsafe fn auth_case(dir: &Path, ep: &Endpoint, open: Open, journal_in: Option<&s
         "status": o.status,
         "keys": o.a.is_some(),
         "refusal": o.refusal,
+        "landed": o.landed.as_ref().map(|_| "landed.json"),
+        "page": page,
         "scan_generations": gens,
         "basis": summary,
         "scan": scan,
@@ -414,7 +478,7 @@ unsafe fn case(
     let mut err: *mut c_char = ptr::null_mut();
     let (basis, scan) = scan_basis(dir, w, ep, list, &[0]);
     // The keys: the open-time check of the account's journal.
-    let opened = auth_phase(dir, w, ep, basis, Open::Check(journal, 0));
+    let opened = auth_phase(dir, w, ep, basis, Open::Check(journal, 0), 0);
     let a = opened.a.expect("the fresh journal opens");
     let checked = opened.journal.clone().expect("a checked journal");
     let to = CString::new(payee).unwrap();
@@ -462,6 +526,7 @@ unsafe fn case(
 
     std::fs::write(dir.join("journal_before.txt"), journal).unwrap();
     std::fs::write(dir.join("journal_checked.txt"), &checked).unwrap();
+    std::fs::write(dir.join("landed.json"), opened.landed.as_deref().expect("a finish with a journal")).unwrap();
     std::fs::write(dir.join("journal_after.txt"), &after).unwrap();
     std::fs::write(dir.join("intent.bin"), &intent).unwrap();
     std::fs::write(dir.join("review.txt"), &review).unwrap();
@@ -474,6 +539,8 @@ unsafe fn case(
         "scan": scan,
         "auth": opened.transcript,
         "auth_status": opened.status,
+        "landed": "landed.json",
+        "page": 0,
         "spend": spend,
         "files": {
             "journal_before": "journal_before.txt", "journal_checked": "journal_checked.txt", "journal_after": "journal_after.txt",
@@ -482,6 +549,28 @@ unsafe fn case(
         "intent_len": intent.len(),
         "bundle_len": bundle.len(),
     })
+}
+
+/// Lab #935 (extension #95 §3): the matching pair. `dir/landed.json` must
+/// hold exactly one spend, whose intent digest is keccak256 of
+/// `<intent_case>/intent.bin` (the bytes the device signed) and whose tx_id is
+/// `tx`'s (the transaction the chain carries). Asserted here, then written as
+/// `landed_expected.json` so a harness compares the kernel's answer to these
+/// values rather than recomputing both sides in one place.
+fn landed_expected(dir: &Path, intent_case: &str, tx: &qlab_devnet::body::TxEntry) -> Value {
+    let landed: Value = serde_json::from_slice(&std::fs::read(dir.join("landed.json")).unwrap()).unwrap();
+    let intent = std::fs::read(dir.join("..").join(intent_case).join("intent.bin")).unwrap();
+    let want = json!({
+        "intent_digest": hex(&qlab_remote_auth::keccak256(&[&intent])),
+        "tx_id": hex(&qlab_p2p::codec::tx_id(tx)),
+        "intent_file": format!("../{intent_case}/intent.bin"),
+    });
+    let spends = landed.as_array().expect("landed.json is a list");
+    assert_eq!(spends.len(), 1, "{}: exactly one landed spend: {landed}", dir.display());
+    assert_eq!(spends[0]["intent_digest"], want["intent_digest"], "{}: the intent digest", dir.display());
+    assert_eq!(spends[0]["tx_id"], want["tx_id"], "{}: the transaction id", dir.display());
+    std::fs::write(dir.join("landed_expected.json"), serde_json::to_vec_pretty(&want).unwrap()).unwrap();
+    want
 }
 
 /// `--force` removes `<out>`: never `/`, the home directory, the working
@@ -551,6 +640,7 @@ fn main() {
         .tx()
         .clone();
     landed.proof = vec![0xAB; 64];
+    let landed_tx = landed.clone();
     let (spent, _, _) = chain(Some(landed));
     // retired_revive: generation 0 retired while it still holds the
     // chain's notes, generation 1 active → check(0) revives it (F9).
@@ -584,13 +674,17 @@ fn main() {
         ("rotated_receive", &received, Open::Check(&rotated, 0), Some(rotated.as_str())),
     ] {
         let dir = out.join(name);
-        let mut c = unsafe { auth_case(&dir, chain_ep, open, journal_in) };
+        let mut c = unsafe { auth_case(&dir, chain_ep, open, journal_in, 0) };
         if name == "check_stale" {
             // What STALE asks of the host: persist journal_out, tell the
             // user, run the restore.
-            let then = unsafe { auth_case(&dir.join("then_restore"), chain_ep, Open::Restore, None) };
+            let then = unsafe { auth_case(&dir.join("then_restore"), chain_ep, Open::Restore, None, 0) };
             println!("  then_restore status {} keys {} {} ms", then["status"], then["keys"], then["wall_ms_native"]);
             c["then_restore"] = then;
+        }
+        if name == "restore_spent" {
+            let want = landed_expected(&dir, "s_asset0", &landed_tx);
+            println!("  restore_spent landed: intent {} tx {}", want["intent_digest"], want["tx_id"]);
         }
         if name == "rotated_balance" || name == "rotated_receive" {
             c["journal_in_made_by"] = json!("qmb_auth_open_next on the fresh journal, basis scanned at [0] on the unspent chain");
@@ -621,6 +715,37 @@ fn main() {
         }
         std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
         println!("{name:<14} status {} keys {} {} ms{}", c["status"], c["keys"], c["wall_ms_native"], c["refusal"].as_str().map(|r| format!(" — {r}")).unwrap_or_default());
+        cases.insert(name.into(), json!(name));
+    }
+    // Lab #936 (extension #95 §3 (b)): the same opens walked in pages — the
+    // NEEDs are asserted path by path, and the outcome must be the unpaged
+    // case's to the byte.
+    for (name, base, open, journal_in, page, needs) in [
+        ("restore_spent_paged", "restore_spent", Open::Restore, None, 256u32, &["/v1/bodies?from=1&to=2"][..]),
+        (
+            "restore_spent_paged1",
+            "restore_spent",
+            Open::Restore,
+            None,
+            1,
+            &["/v1/bodies?from=1&to=1", "/v1/bodies?from=2&to=2"][..],
+        ),
+        ("check_stale_paged", "check_stale", Open::Check(&journal, 0), Some(journal.as_str()), 256, &["/v1/bodies?from=1&to=2"][..]),
+    ] {
+        let dir = out.join(name);
+        let c = unsafe { auth_case(&dir, &spent, open, journal_in, page) };
+        let asked: Vec<&str> = c["auth"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+        assert_eq!(asked, needs, "{name}: the page NEEDs");
+        let base_case: Value = serde_json::from_slice(&std::fs::read(out.join(base).join("case.json")).unwrap()).unwrap();
+        for k in ["status", "keys"] {
+            assert_eq!(c[k], base_case[k], "{name}: {k} as {base}'s");
+        }
+        for f in ["journal_out.txt", "landed.json"] {
+            let read = |d: &str| std::fs::read(out.join(d).join(f)).unwrap_or_else(|e| panic!("{d}/{f}: {e}"));
+            assert_eq!(read(name), read(base), "{name}: {f} as {base}'s");
+        }
+        std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        println!("{name:<14} status {} keys {} page {page}: {} → {base}'s journal and landed {} ms", c["status"], c["keys"], asked.join(", "), c["wall_ms_native"]);
         cases.insert(name.into(), json!(name));
     }
     // (v) first_fresh refused on the three outside doors, for the fixture seed.
@@ -660,7 +785,7 @@ fn main() {
         let _ = std::fs::remove_dir_all(&p.dir);
         let empty = Endpoint::new(genesis_v2(&holder, Vec::new()), &[], None, Lie::None);
         let (basis, _) = scan_basis(&dir, w, &empty, None, &PROBE);
-        let o = auth_phase(&dir, w, &empty, basis, Open::First);
+        let o = auth_phase(&dir, w, &empty, basis, Open::First, 0);
         qmb_spend_basis_free(basis);
         if let Some(a) = o.a {
             qmb_auth_free(a);
@@ -694,7 +819,7 @@ fn main() {
         let dir = out.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let (cep, cpayee, cjournal) =
-            chain_v3(&format!("spend_fixtures_{name}"), |a| notes.iter().map(|&(v, asset, k)| note_to(a, v, asset, k)).collect(), true);
+            chain_v3(&format!("spend_fixtures_{name}"), |a| notes.iter().map(|&(v, asset, k)| note_to(a, v, asset, k)).collect(), true, None);
         let info = prover_info(&cep);
         let mut c = unsafe { case(&dir, &cep, &cpayee, &cjournal, asset, amount, None, Some(&info)) };
         // What was recorded is the shape this case names — asserted on the
@@ -727,13 +852,44 @@ fn main() {
         v3_genesis.push(json!({ "case": name, "genesis": hex(&cep.file.hash()) }));
         cases.insert(name.into(), json!(name));
     }
+    // Extension #95 §3 (d): v3_s_asset0's own transaction landed at height 1
+    // of the same genesis (same wallet, same notes — asserted by hash), and a
+    // check of the journal that spend left: the chain the popup scans after
+    // the recorded send, and the landed spend it settles by.
+    unsafe {
+        let name = "v3_s_asset0_landed";
+        let dir = out.join(name);
+        let mut tx = qlab_l2spend::bundle::ProvingBundle::decode(&std::fs::read(out.join("v3_s_asset0/bundle.bin")).unwrap())
+            .unwrap()
+            .tx()
+            .clone();
+        tx.proof = vec![0xAB; 64];
+        let (cep, _, _) = chain_v3("spend_fixtures_v3_s_asset0_landed", |a| vec![note_to(a, 50, 0, 30)], true, Some(tx.clone()));
+        let genesis = hex(&cep.file.hash());
+        assert_eq!(json!(genesis), v3_genesis[0]["genesis"], "{name}: v3_s_asset0's genesis");
+        let after = std::fs::read_to_string(out.join("v3_s_asset0/journal_after.txt")).unwrap();
+        let mut c = auth_case(&dir, &cep, Open::Check(&after, 0), Some(&after), 0);
+        assert!(
+            c["scan"].as_array().unwrap().iter().any(|e| e["path"] == json!("/v1/block/1/body")),
+            "{name}: the scan reads the landed body: {}",
+            c["scan"]
+        );
+        assert_eq!((c["status"].clone(), c["keys"].clone()), (json!(0), json!(true)), "{name}: CHECKED, keys given: {}", c["refusal"]);
+        let want = landed_expected(&dir, "v3_s_asset0", &tx);
+        c["genesis"] = json!(genesis);
+        c["what"] = json!("v3_s_asset0's transaction landed at height 1 of its genesis; a check of its journal_after there");
+        std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        println!("{name:<14} status {} keys {}: landed intent {} tx {}", c["status"], c["keys"], want["intent_digest"], want["tx_id"]);
+        v3_genesis.push(json!({ "case": name, "genesis": genesis }));
+        cases.insert(name.into(), json!(name));
+    }
     // What a RELEASE kernel replays: a format-34 net with no pin — the
     // prover's /info is refused by name (`NotPinned`), before any step.
     unsafe {
         let name = "v3_not_pinned";
         let dir = out.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let (cep, cpayee, _) = chain_v3("spend_fixtures_v3_not_pinned", |a| vec![note_to(a, 51, 0, 31)], false);
+        let (cep, cpayee, _) = chain_v3("spend_fixtures_v3_not_pinned", |a| vec![note_to(a, 51, 0, 31)], false, None);
         let info = prover_info(&cep);
         std::fs::write(dir.join("info.json"), &info).unwrap();
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
@@ -762,7 +918,7 @@ fn main() {
     // The seeds below are PUBLIC TEST CONSTANTS of this fixture, written so the
     // harness can replay the run — never a real wallet's, never to fund one.
     let manifest = json!({
-        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance / rotated receive) on a format-33 genesis; and (lab #937 cut-over, D-C6) format-34 spends that pay a fixture prover (v3_*), each on its own chain, plus the NotPinned refusal a release kernel replays. FIXTURE seeds only.",
+        "what": "lab #924 PR 3/3b — Candidate A spend and open fixtures, recorded from the real ABI (scan → basis → checked open → spend → take → intent → review → sign; first / restore / stale-check then restore / retired revive / rotated balance / rotated receive) on a format-33 genesis; and (lab #937 cut-over, D-C6) format-34 spends that pay a fixture prover (v3_*), each on its own chain, plus the NotPinned refusal a release kernel replays; and (lab #935/#936, extension #95 §3) each open's landed spends (landed.json), the paged walks, and the matching pair asserted in landed_expected.json. FIXTURE seeds only.",
         "lab_rev": rev,
         "wallet_entropy": hex(&[SEED; 32]),
         "payee_entropy": hex(&[PAYEE; 32]),
