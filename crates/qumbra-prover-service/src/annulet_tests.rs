@@ -1649,3 +1649,71 @@ fn metrics_count_refused_failed_and_cancelled_jobs_apart() {
     );
     assert_eq!(c.proves(L2ShapeTag::S).count(), 0);
 }
+
+/// One loopback HTTP answer (lab #987): reads the request head, replies
+/// with a realistic head and `body`, closes. The request line comes back
+/// over the join handle.
+fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut req = Vec::new();
+        let mut byte = [0u8; 1];
+        while !req.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+            req.push(byte[0]);
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\
+             Date: Fri, 23 Oct 2026 14:09:00 GMT\r\nServer: test\r\n\r\n",
+            body.len()
+        );
+        // The client may hang up mid-body (the over-ceiling case): not an error here.
+        let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(&body));
+        String::from_utf8_lossy(&req).lines().next().unwrap_or_default().to_string()
+    });
+    (url, handle)
+}
+
+#[test]
+fn a_full_headers_page_over_http_is_read_whole_and_links_in_order() {
+    use qlab_devnet::annulet::{AnnuletHeaderFields, SequencerKey};
+    use qlab_devnet::header::BlockHeader;
+    use qlab_p2p::codec::WireHeader;
+    use qumbra_wallet::annulet_verify::{response_ceiling, MAX_HEADERS_ANSWER_BYTES};
+
+    // The prover's cap is the wallet's own for the route.
+    assert_eq!(response_ceiling("/v1/headers?from=1&to=256"), Some(annulet_v3::HEADERS_RESPONSE_CEILING));
+
+    // 256 sealed units over one genesis, as `qlab_p2p::served::fixture::chain` builds two.
+    let key = SequencerKey::from_seed([0x5E; 32]);
+    let ext = AnnuletHeaderFields { l1_anchor_height: 0, l1_anchor_root: [0; 32], registry_root: [7; 32] };
+    let mut parent = BlockHeader::genesis_annulet(ext, [1; 32], 0);
+    let mut units = Vec::new();
+    for h in 1..=annulet_v3::HEADERS_PAGE {
+        let child = BlockHeader::child_of_annulet(&parent, 10 * h, ext, [2; 32]);
+        units.push(WireHeader::Sealed(key.seal(child)));
+        parent = child;
+    }
+    let body = qlab_p2p::served::encode_headers_page(qlab_p2p::compact::WireForm::ANNULET_AUTH_V3, 1, &units);
+    // The page prover-1 refused: its body fits the old body-only cap, the
+    // whole response does not.
+    assert!(body.len() <= MAX_HEADERS_ANSWER_BYTES && body.len() + 100 > MAX_HEADERS_ANSWER_BYTES, "{}", body.len());
+
+    let (url, server) = serve_once(body);
+    let links = HttpFollow::new(&url).headers(1, 256).unwrap();
+    assert_eq!(server.join().unwrap(), "GET /v1/headers?from=1&to=256 HTTP/1.1");
+    assert_eq!(links.len(), 256);
+    assert!(links.iter().zip(1u64..).all(|(l, h)| l.height == h));
+    assert!(links.windows(2).all(|w| w[1].prev == w[0].id), "the prev chain links");
+}
+
+#[test]
+fn a_headers_answer_one_byte_over_the_ceiling_is_refused_unparsed() {
+    use qumbra_wallet::annulet_verify::{MAX_HEADERS_ANSWER_BYTES, RESPONSE_HEAD_SLACK};
+
+    let (url, server) = serve_once(vec![0; MAX_HEADERS_ANSWER_BYTES + RESPONSE_HEAD_SLACK + 1]);
+    let e = HttpFollow::new(&url).headers(1, 256).unwrap_err();
+    server.join().unwrap();
+    assert!(e.contains("exceeds this route's") && !e.contains("did not decode"), "{e}");
+}
