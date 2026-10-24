@@ -841,6 +841,113 @@ pub unsafe extern "C" fn qmb_auth_check_take_landed(c: *const CheckHandle, err_o
     }
 }
 
+/// The longest `records_json` [`qmb_remote_settle`] accepts: hex bundles,
+/// a few hundred KiB each.
+pub const MAX_SETTLE_RECORDS_JSON: usize = 64 * 1024 * 1024;
+/// The longest `landed_json` [`qmb_remote_settle`] accepts.
+pub const MAX_SETTLE_LANDED_JSON: usize = 4 * 1024 * 1024;
+
+fn hex32_arg(what: &str, v: Option<&serde_json::Value>) -> Result<[u8; 32], String> {
+    let s = v.and_then(serde_json::Value::as_str).ok_or_else(|| format!("{what} is not a string"))?;
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(format!("{what} is not 64 lowercase hex digits"));
+    }
+    let b = crate::names::unhex(s).ok_or_else(|| format!("{what} is not hex"))?;
+    Ok(b.try_into().expect("64 hex digits"))
+}
+
+fn settle_json(basis: &SpendBasis, records: &str, landed: &str, checked_to: u64) -> Result<String, String> {
+    use qumbra_wallet::auth_check::LandedSpend;
+    use qumbra_wallet::remote_prover::{settle_records, SettleRecord};
+    let hex = |x: &[u8]| x.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let records: Vec<serde_json::Value> =
+        serde_json::from_str(records).map_err(|e| format!("records_json is not a JSON array: {e}"))?;
+    let records = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let key = hex32_arg(&format!("records[{i}].key"), r.get("key"))?;
+            let bundle = r
+                .get("bundle")
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::names::unhex)
+                .ok_or_else(|| format!("records[{i}].bundle is not hex"))?;
+            let outcome = match r.get("outcome") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(l)) => Some(l.clone()),
+                Some(_) => return Err(format!("records[{i}].outcome is neither a string nor null")),
+            };
+            Ok(SettleRecord { key, bundle, outcome })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let landed: Vec<serde_json::Value> =
+        serde_json::from_str(landed).map_err(|e| format!("landed_json is not a JSON array: {e}"))?;
+    let landed = landed
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let num = |k: &str| l.get(k).and_then(serde_json::Value::as_u64).ok_or_else(|| format!("landed[{i}].{k} is not a number"));
+            Ok(LandedSpend {
+                height: num("height")?,
+                tx_id: hex32_arg(&format!("landed[{i}].tx_id"), l.get("tx_id"))?,
+                intent_digest: hex32_arg(&format!("landed[{i}].intent_digest"), l.get("intent_digest"))?,
+                leaves: u32::try_from(num("leaves")?).map_err(|_| format!("landed[{i}].leaves is out of range"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let r = settle_records(&records, basis.form, &basis.genesis_hash, &landed, checked_to);
+    Ok(serde_json::json!({
+        "lines": r.lines.iter().map(|(k, o)| serde_json::json!({"key": hex(k), "outcome": o})).collect::<Vec<_>>(),
+        "landed": r.landed.iter().map(|(k, h, t)| serde_json::json!({"key": hex(k), "height": h, "tx_id": hex(t)})).collect::<Vec<_>>(),
+        "expired": r.expired.iter().map(|(k, v)| serde_json::json!({"key": hex(k), "valid_until": v})).collect::<Vec<_>>(),
+        "undecodable": r.undecodable.iter().map(|(k, w)| serde_json::json!({"key": hex(k), "why": w})).collect::<Vec<_>>(),
+    })
+    .to_string())
+}
+
+/// Lab #989: **settle recorded remote sends from the chain** — the kernel's
+/// `remote_prover::settle_records` over the caller's own records, on the
+/// basis's net (its form and genesis). `records_json` is
+/// `[{"key":"<64 hex>","bundle":"<hex>","outcome":"<line>"|null}, …]`,
+/// `landed_json` is [`qmb_auth_check_take_landed`]'s output and `checked_to`
+/// the finished journal's checked height. Returns
+/// `{"lines":[{"key","outcome"}],"landed":[{"key","height","tx_id"}],
+/// "expired":[{"key","valid_until"}],"undecodable":[{"key","why"}]}`: the
+/// caller writes each line as that record's outcome. NULL with `*err_out` on
+/// a malformed argument.
+///
+/// # Safety
+/// `basis` live (or NULL); the strings NUL-terminated (or NULL); `err_out`
+/// NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_remote_settle(
+    basis: *const SpendBasis,
+    records_json: *const c_char,
+    landed_json: *const c_char,
+    checked_to: u64,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if basis.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let run = || -> Result<String, String> {
+        let records = text_arg("records_json", records_json, MAX_SETTLE_RECORDS_JSON)?;
+        let landed = text_arg("landed_json", landed_json, MAX_SETTLE_LANDED_JSON)?;
+        settle_json(&*basis, records, landed, checked_to)
+    };
+    match run() {
+        Ok(json) => out_string(json),
+        Err(why) => {
+            set_err(err_out, why);
+            ptr::null_mut()
+        }
+    }
+}
+
 /// # Safety
 /// `c` live (or NULL); never used after.
 #[no_mangle]

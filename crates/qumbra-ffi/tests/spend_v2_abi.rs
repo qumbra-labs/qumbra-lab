@@ -691,10 +691,12 @@ unsafe fn landed_spend(f: &Fixture) -> (qlab_devnet::body::TxEntry, String) {
 /// made — the id the prover service returns for the transaction it submits
 /// (`qlab_p2p::codec::tx_id`, the service's own call) and the digest of the
 /// intent bytes the device signed.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SpendRecord {
     tx_id: [u8; 32],
     intent_digest: [u8; 32],
+    /// Lab #989: the signed bundle as a remote send records it.
+    bundle: Vec<u8>,
 }
 
 /// [`landed_spend`] with its [`SpendRecord`].
@@ -708,7 +710,7 @@ unsafe fn landed_spend_recorded(f: &Fixture) -> (qlab_devnet::body::TxEntry, Str
     let bundle = sign(a, s, &i, &journal).unwrap();
     let mut tx = ProvingBundle::decode(&bundle).unwrap().tx().clone();
     tx.proof = vec![0xAB; 64];
-    let record = SpendRecord { tx_id: qlab_p2p::codec::tx_id(&tx), intent_digest: qlab_remote_auth::keccak256(&[&i]) };
+    let record = SpendRecord { tx_id: qlab_p2p::codec::tx_id(&tx), intent_digest: qlab_remote_auth::keccak256(&[&i]), bundle };
     qmb_spend_v2_free(s);
     qmb_auth_free(a);
     qmb_wallet_free(w);
@@ -1816,6 +1818,262 @@ fn z_a_short_page_continues_and_an_empty_page_refuses() {
         let why = take_str(out);
         assert!(why.contains("block 2's body is unavailable: the endpoint served an empty page"), "{why}");
         qumbra_ffi::spend_v2::qmb_auth_check_free(c);
+        qmb_wallet_free(w);
+    }
+}
+
+// ------------------------------------------------------------ lab #989
+
+/// The spent chain's check, once: its `take_landed` JSON (the height-2
+/// spend) and the checked height the journal it returned names.
+fn settle_inputs() -> &'static (String, u64) {
+    static S: std::sync::OnceLock<(String, u64)> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let (f, persisted) = spent_chain();
+        unsafe {
+            let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+            let ok = open_g(w, &f.ep, persisted, 0).unwrap();
+            assert!(ok.journal.contains(&format!("checked 0 {}:2", genesis_hex(f))), "{}", ok.journal);
+            qmb_auth_free(ok.a);
+            qmb_wallet_free(w);
+            (ok.landed, 2)
+        }
+    })
+}
+
+/// [`settle_inputs`]' JSON as the kernel's `LandedSpend`s.
+fn landed_spends() -> Vec<qumbra_wallet::auth_check::LandedSpend> {
+    let unhex = |s: &str| -> [u8; 32] {
+        let v: Vec<u8> = (0..64).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+        v.try_into().unwrap()
+    };
+    landed_rows(&settle_inputs().0)
+        .into_iter()
+        .map(|(height, tx, intent, leaves)| qumbra_wallet::auth_check::LandedSpend {
+            height,
+            tx_id: unhex(&tx),
+            intent_digest: unhex(&intent),
+            leaves: leaves as u32,
+        })
+        .collect()
+}
+
+/// The landed bundle's key (its transaction's first nullifier), and the
+/// validity height its section signs.
+fn bundle_key_and_validity(bundle: &[u8]) -> ([u8; 32], u64) {
+    use qlab_devnet::annulet::{auth_shape, L2Surface};
+    let b = ProvingBundle::decode(bundle).unwrap();
+    let tx = b.tx();
+    let shape = L2Surface::decode(&tx.l2).unwrap().unwrap().shape;
+    let section = qlab_remote_auth::annulet::AnnuletAuthSection::decode(auth_shape(shape), &tx.auth).unwrap();
+    (tx.public.nullifiers[0], section.valid_until_height)
+}
+
+/// A temporary wallet directory holding `records` in `remote.v1`, each
+/// `(key, bundle, outcome line or none)` — written as a send writes them.
+struct Records(std::path::PathBuf);
+
+impl Records {
+    fn new(tag: &str, records: &[([u8; 32], &[u8], Option<&str>)]) -> Records {
+        let dir = std::env::temp_dir().join(format!("qmb-989-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (key, bundle, outcome) in records {
+            qumbra_wallet::remote_prover::record(&dir, key, bundle).unwrap();
+            if let Some(line) = outcome {
+                std::fs::write(dir.join("remote.v1").join(format!("{}.outcome", hex32(key))), format!("{line}\n")).unwrap();
+            }
+        }
+        Records(dir)
+    }
+
+    fn outcome(&self, key: &[u8; 32]) -> Option<String> {
+        std::fs::read_to_string(self.0.join("remote.v1").join(format!("{}.outcome", hex32(key)))).ok()
+    }
+
+    fn settle(&self, landed: &[qumbra_wallet::auth_check::LandedSpend], checked_to: u64) -> qumbra_wallet::remote_prover::SettleReport {
+        let f = &spent_chain().0;
+        qumbra_wallet::remote_prover::settle(&self.0, f.ep.wire.l2_auth, &f.ep.file.hash(), landed, checked_to).unwrap()
+    }
+}
+
+impl Drop for Records {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// t1: a `submitted` record whose bundle is the landed height-2
+/// transaction's settles `landed 2 <tx_id>`, the id the chain's
+/// (`qlab_p2p::codec::tx_id` of that transaction), found by its intent.
+#[test]
+fn t1_a_submitted_record_whose_bundle_landed_settles_landed() {
+    let (_, record) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t1", &[(key, &record.bundle, Some(&format!("submitted {}", hex32(&record.tx_id))))]);
+    let report = r.settle(&landed_spends(), settle_inputs().1);
+    let line = format!("landed 2 {}", hex32(&record.tx_id));
+    assert_eq!(report.lines, vec![(key, line.clone())]);
+    assert_eq!(report.landed, vec![(key, 2, record.tx_id)]);
+    assert!(report.expired.is_empty() && report.undecodable.is_empty(), "{report:?}");
+    assert_eq!(r.outcome(&key), Some(format!("{line}\n")));
+    assert_eq!(
+        qumbra_wallet::remote_prover::intent_digest_of_bundle(&record.bundle, spent_chain().0.ep.wire.l2_auth, &spent_chain().0.ep.file.hash()),
+        Ok(record.intent_digest),
+        "the bundle's rebuild is the digest the device signed"
+    );
+    // Settled once: a second pass leaves it.
+    assert_eq!(r.settle(&landed_spends(), settle_inputs().1), Default::default());
+}
+
+/// t2: the record said `submitted <another id>`: the chain's id is the
+/// record's, the prover's kept as what it said.
+#[test]
+fn t2_a_prover_tx_id_the_chain_does_not_carry_is_kept_as_what_it_said() {
+    let (_, record) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&record.bundle);
+    let wrong = hex32(&[0xee; 32]);
+    let r = Records::new("t2", &[(key, &record.bundle, Some(&format!("submitted {wrong}")))]);
+    let report = r.settle(&landed_spends(), settle_inputs().1);
+    let line = format!("landed 2 {} prover-said {wrong}", hex32(&record.tx_id));
+    assert_eq!(report.lines, vec![(key, line.clone())]);
+    assert_eq!(r.outcome(&key), Some(format!("{line}\n")));
+}
+
+/// t3: an `in-flight` record that did not land expires once every block
+/// that could carry it is walked — `valid_until < checked_to` — and is left
+/// while the last such block is not.
+#[test]
+fn t3_an_unlanded_record_expires_only_past_its_validity() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t3", &[(key, &record.bundle, Some("in-flight intent-in-flight"))]);
+    assert_eq!(r.settle(&[], v), Default::default(), "checked_to == valid_until: the chain has not said");
+    assert_eq!(r.outcome(&key).as_deref(), Some("in-flight intent-in-flight\n"));
+    let report = r.settle(&[], v + 1);
+    assert_eq!(report.lines, vec![(key, format!("expired {v} unlanded-through {}", v + 1))]);
+    assert_eq!(report.expired, vec![(key, v)]);
+    assert_eq!(r.outcome(&key), Some(format!("expired {v} unlanded-through {}\n", v + 1)));
+    // No outcome at all (the upload's answer unknown) is open too.
+    let none = Records::new("t3n", &[(key, &record.bundle, None)]);
+    assert_eq!(none.settle(&[], v + 1).expired, vec![(key, v)]);
+}
+
+/// t4 (L3): a landed spend of this key's leaves under ANOTHER intent is
+/// another send — it does not confirm this record, whatever the key, and
+/// neither does the prover's tx_id.
+#[test]
+fn t4_matching_is_by_intent_digest_only() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t4", &[(key, &record.bundle, Some(&format!("submitted {}", hex32(&record.tx_id))))]);
+    let mut other = landed_spends();
+    assert_eq!(other.len(), 1);
+    other[0].intent_digest[0] ^= 1;
+    assert_eq!(r.settle(&other, settle_inputs().1), Default::default(), "same key and tx_id, another intent");
+    assert_eq!(r.outcome(&key), Some(format!("submitted {}\n", hex32(&record.tx_id))));
+    // And it still expires on its own validity, not by the other send.
+    assert_eq!(r.settle(&other, v + 1).expired, vec![(key, v)]);
+}
+
+/// t5: a record that ended (`failed 400 …`) is not reopened, nor its bundle
+/// read — an unreadable one is not reported.
+#[test]
+fn t5_an_ended_record_is_left_untouched() {
+    let (_, record) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t5", &[(key, &record.bundle, Some("failed 400 bad-bundle")), ([0x77; 32], b"junk", Some("failed 0 refused"))]);
+    assert_eq!(r.settle(&landed_spends(), settle_inputs().1), Default::default());
+    assert_eq!(r.outcome(&key).as_deref(), Some("failed 400 bad-bundle\n"));
+}
+
+/// t6: an open record whose bundle does not decode is reported by key and
+/// why; the others are settled in the same pass.
+#[test]
+fn t6_an_undecodable_bundle_is_reported_and_the_rest_settled() {
+    let (_, record) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&record.bundle);
+    let junk = [0x01; 32];
+    let r = Records::new("t6", &[(junk, b"not a bundle", Some("in-flight nullifier-in-flight")), (key, &record.bundle, None)]);
+    let report = r.settle(&landed_spends(), settle_inputs().1);
+    assert_eq!(report.undecodable.len(), 1, "{report:?}");
+    assert_eq!(report.undecodable[0].0, junk);
+    assert!(report.undecodable[0].1.contains("does not decode"), "{}", report.undecodable[0].1);
+    assert_eq!(report.lines, vec![(key, format!("landed 2 {}", hex32(&record.tx_id)))]);
+    assert_eq!(r.outcome(&junk).as_deref(), Some("in-flight nullifier-in-flight\n"), "reported, not rewritten");
+}
+
+/// t7 (L2): `landed` is a definitive end, as `expired` and a 4xx `failed`
+/// are; `submitted` and `in-flight` are not.
+#[test]
+fn t7_landed_is_a_definitive_end() {
+    use qumbra_wallet::remote_prover::ended_definitively;
+    assert!(ended_definitively("landed 2 aa"));
+    assert!(ended_definitively("landed 2 aa prover-said bb\n"));
+    assert!(ended_definitively("expired 5 unlanded-through 6"));
+    assert!(!ended_definitively("submitted aa"));
+    assert!(!ended_definitively("in-flight intent-in-flight"));
+}
+
+/// `qmb_remote_settle`'s JSON, pinned: the caller's records and
+/// `qmb_auth_check_take_landed`'s own output in, the report out — and each
+/// malformed argument refused by name.
+#[test]
+fn qmb_remote_settle_answers_the_pinned_json_over_the_callers_records() {
+    use qumbra_ffi::spend_v2::qmb_remote_settle;
+    let (f, _) = spent_chain();
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let records = serde_json::json!([
+        {"key": hex32(&key), "bundle": hex(&record.bundle), "outcome": format!("submitted {}", hex32(&record.tx_id))},
+        {"key": hex32(&[0x01; 32]), "bundle": hex(b"not a bundle"), "outcome": null},
+        {"key": hex32(&[0x02; 32]), "bundle": hex(b"junk"), "outcome": "failed 400 x"},
+    ])
+    .to_string();
+    let (landed, checked_to) = settle_inputs();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let b = basis(w, &f.ep);
+        let call = |records: &str, landed: &str, checked_to: u64| -> Result<serde_json::Value, String> {
+            let (r, l) = (CString::new(records).unwrap(), CString::new(landed).unwrap());
+            let mut err: *mut c_char = ptr::null_mut();
+            let out = qmb_remote_settle(b, r.as_ptr(), l.as_ptr(), checked_to, &mut err);
+            if out.is_null() {
+                Err(take_str(err))
+            } else {
+                assert!(err.is_null());
+                Ok(serde_json::from_str(&take_str(out)).unwrap())
+            }
+        };
+        let got = call(&records, landed, *checked_to).unwrap();
+        let undecodable = got["undecodable"].as_array().unwrap();
+        assert_eq!(undecodable.len(), 1, "{got}");
+        assert_eq!(undecodable[0]["key"], hex32(&[0x01; 32]));
+        let want = serde_json::json!({
+            "lines": [{"key": hex32(&key), "outcome": format!("landed 2 {}", hex32(&record.tx_id))}],
+            "landed": [{"key": hex32(&key), "height": 2, "tx_id": hex32(&record.tx_id)}],
+            "expired": [],
+            "undecodable": [{"key": hex32(&[0x01; 32]), "why": undecodable[0]["why"].clone()}],
+        });
+        assert_eq!(got, want);
+        // Not landed, past its validity: expired.
+        let got = call(&records, "[]", v + 1).unwrap();
+        assert_eq!(got["expired"], serde_json::json!([{"key": hex32(&key), "valid_until": v}]));
+        assert_eq!(got["lines"][0]["outcome"], format!("expired {v} unlanded-through {}", v + 1));
+        // Refusals, by name.
+        assert!(call("{}", "[]", 2).unwrap_err().contains("records_json is not a JSON array"));
+        assert!(call(r#"[{"key":"AB","bundle":"00","outcome":null}]"#, "[]", 2).unwrap_err().contains("records[0].key is not 64 lowercase hex"));
+        assert!(call(r#"[{"key":"0000000000000000000000000000000000000000000000000000000000000000","bundle":"zz","outcome":null}]"#, "[]", 2)
+            .unwrap_err()
+            .contains("records[0].bundle is not hex"));
+        assert!(call("[]", r#"[{"height":2}]"#, 2).unwrap_err().contains("landed[0].tx_id is not a string"));
+        let mut err: *mut c_char = ptr::null_mut();
+        let empty = CString::new("[]").unwrap();
+        assert!(qmb_remote_settle(ptr::null(), empty.as_ptr(), empty.as_ptr(), 2, &mut err).is_null());
+        assert_eq!(take_str(err), "NULL argument");
+        assert!(qmb_remote_settle(b, ptr::null(), empty.as_ptr(), 2, &mut err).is_null());
+        assert!(take_str(err).contains("records_json is NULL"));
+        qmb_spend_basis_free(b);
         qmb_wallet_free(w);
     }
 }

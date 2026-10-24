@@ -841,6 +841,24 @@ void qmb_auth_check_free(qmb_auth_check_t *c);
  * restore or first: the key's whole history on this net). NULL with
  * *err_out before finish. Free with qmb_string_free. */
 char *qmb_auth_check_take_landed(const qmb_auth_check_t *c, char **err_out);
+/* Lab #989: settle recorded remote sends from the chain, on the basis's net
+ * (its form and genesis), over the CALLER's own records (the kernel keeps
+ * none here):
+ *   records_json  [{"key":"<64 hex>","bundle":"<hex>","outcome":"<line>"|null}, ...]
+ *   landed_json   qmb_auth_check_take_landed's output
+ *   checked_to    the finished journal's checked height
+ * A record whose outcome is null, "submitted ..." or "in-flight ..." is
+ * matched by the intent digest its bundle signed (never by the prover's
+ * tx_id or the key): landed -> "landed <h> <tx_id>" (or "... prover-said
+ * <tx>" when the record's submitted id differs); not landed and its
+ * valid_until_height < checked_to -> "expired <v> unlanded-through <c>";
+ * else untouched. Returns
+ *   {"lines":[{"key","outcome"}],"landed":[{"key","height","tx_id"}],
+ *    "expired":[{"key","valid_until"}],"undecodable":[{"key","why"}]}
+ * the caller writes each line as that record's outcome. NULL with *err_out
+ * on a malformed argument. Free with qmb_string_free. */
+char *qmb_remote_settle(const qmb_spend_basis_t *basis, const char *records_json, const char *landed_json,
+                        uint64_t checked_to, char **err_out);
 int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, uint8_t auth_derivation, const uint8_t *genesis32,
                              char **out_journal);
 /* Lab #924 PR 3d: is new_text a monotone advance of stored_text? Run it

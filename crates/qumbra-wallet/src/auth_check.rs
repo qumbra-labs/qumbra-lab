@@ -169,6 +169,17 @@ pub struct LandedSpend {
 /// alone exactly as the node's `check_auth` rebuilds it: the section's
 /// validity height and descriptors, the net's genesis format and hash.
 fn intent_digest_of(tx: &qlab_devnet::body::TxEntry, form: L2AuthForm, genesis_hash: &[u8; 32]) -> Result<[u8; 32], String> {
+    intent_of(tx, form, genesis_hash).map(|(digest, _)| digest)
+}
+
+/// [`intent_digest_of`]'s one rebuild, with the section's validity height
+/// beside the digest: shared with [`crate::remote_prover::settle_records`]
+/// (lab #989), which rebuilds a recorded bundle's transaction the same way.
+pub(crate) fn intent_of(
+    tx: &qlab_devnet::body::TxEntry,
+    form: L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<([u8; 32], u64), String> {
     use qlab_devnet::annulet::{auth_shape, intent_for, L2Surface};
     use qlab_remote_auth::annulet::AnnuletAuthSection;
     let surface = L2Surface::decode(&tx.l2)
@@ -179,7 +190,8 @@ fn intent_digest_of(tx: &qlab_devnet::body::TxEntry, form: L2AuthForm, genesis_h
     let descriptors: Vec<_> = section.slots.iter().map(|s| s.descriptor).collect();
     let intent = intent_for(tx, form.annulet_genesis_format_version(), genesis_hash, section.valid_until_height, &descriptors)
         .map_err(|e| format!("its intent does not rebuild: {e:?}"))?;
-    intent.digest().map_err(|e| format!("its intent does not encode: {e:?}"))
+    let digest = intent.digest().map_err(|e| format!("its intent does not encode: {e:?}"))?;
+    Ok((digest, section.valid_until_height))
 }
 
 enum CheckMode {
