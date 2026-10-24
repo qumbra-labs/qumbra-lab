@@ -720,6 +720,11 @@ pub struct RemoteRun<'a> {
     pub deadline: crate::remote_prover::Deadline,
     /// What every step's review is built from.
     pub basis: ReviewBasis,
+    /// The verified tip the run's spends were built on (the session's
+    /// `tip`, which its validity is set from): each step's record is born
+    /// `pending unlanded-through <this>` (lab #992). Never the stated tip — a
+    /// height above the real tip is not known unlanded.
+    pub signed_above: u64,
     /// `(step, review)` before each step is signed: `false` refuses the step
     /// by name — nothing is signed, recorded or uploaded; the leaves it took
     /// stay used.
@@ -840,7 +845,7 @@ fn step_v2<E: Endpoint>(
         .nullifiers
         .first()
         .ok_or_else(|| SendRefusal::Auth("a prepared spend with no nullifier".into()))?;
-    record(&w.dir, &key, &bytes).map_err(|e| SendRefusal::Auth(format!("the signed bundle could not be recorded before upload: {e}")))?;
+    record(&w.dir, &key, &bytes, rr.signed_above).map_err(|e| SendRefusal::Auth(format!("the signed bundle could not be recorded before upload: {e}")))?;
     let deadline = rr.deadline;
     let mut expired = || deadline.passed(served.stated_tip().ok(), std::time::Instant::now());
     let outcome = {

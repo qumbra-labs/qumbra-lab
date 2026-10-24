@@ -1870,7 +1870,9 @@ fn bundle_key_and_validity(bundle: &[u8]) -> ([u8; 32], u64) {
 }
 
 /// A temporary wallet directory holding `records` in `remote.v1`, each
-/// `(key, bundle, outcome line or none)` — written as a send writes them.
+/// `(key, bundle, outcome line or none)` — written as a send writes them,
+/// then the outcome set: none is a record with no `.outcome` at all (one
+/// from before lab #992's birth line, or whose birth write was lost).
 struct Records(std::path::PathBuf);
 
 impl Records {
@@ -1878,9 +1880,11 @@ impl Records {
         let dir = std::env::temp_dir().join(format!("qmb-989-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for (key, bundle, outcome) in records {
-            qumbra_wallet::remote_prover::record(&dir, key, bundle).unwrap();
-            if let Some(line) = outcome {
-                std::fs::write(dir.join("remote.v1").join(format!("{}.outcome", hex32(key))), format!("{line}\n")).unwrap();
+            qumbra_wallet::remote_prover::record(&dir, key, bundle, 0).unwrap();
+            let at = dir.join("remote.v1").join(format!("{}.outcome", hex32(key)));
+            match outcome {
+                Some(line) => std::fs::write(at, format!("{line}\n")).unwrap(),
+                None => std::fs::remove_file(at).unwrap(),
             }
         }
         Records(dir)
@@ -2310,7 +2314,7 @@ fn t16_a_progress_line_and_pending_stay_open_to_record() {
     for (i, line) in lines.iter().enumerate() {
         assert!(!ended_definitively(line), "{line}");
         let r = Records::new(&format!("t16-{i}"), &[(key, &rec.bundle, Some(line))]);
-        let err = record(&r.0, &key, b"another bundle").unwrap_err();
+        let err = record(&r.0, &key, b"another bundle", 0).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{line}");
         assert!(err.to_string().contains(line.as_str()), "{err}");
     }
@@ -2347,4 +2351,67 @@ fn qmb_remote_settle_reports_an_uncovered_record() {
         qmb_spend_basis_free(b);
         qmb_wallet_free(w);
     }
+}
+
+// ------------------------------------------------------- lab #992 amendment
+
+/// t17 (steady state, end to end, no restore): a record is born `pending
+/// unlanded-through T` at the verified tip `T` it was signed above;
+/// `submitted` carries that progress over; the next check-mode walk, from
+/// `T + 1` (above `lo`), past the validity and not landing it, expires it.
+/// (Mutation: without the birth line the record has no progress, the walk
+/// is uncovered, and this fails.)
+#[test]
+fn t17_a_record_born_with_progress_expires_in_check_mode() {
+    use qumbra_wallet::remote_prover::{record as take, record_outcome, Outcome};
+    let (_, rec) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&rec.bundle);
+    // The tip the default validity (256) was signed from, never below lo.
+    let t = v.saturating_sub(256).max(lo_of(v));
+    assert!(t < v);
+    let r = Records::new("t17", &[]);
+    take(&r.0, &key, &rec.bundle, t).unwrap();
+    assert_eq!(r.outcome(&key), Some(format!("pending unlanded-through {t}\n")));
+    record_outcome(&r.0, &key, &Outcome::Submitted { tx_id: rec.tx_id }).unwrap();
+    assert_eq!(r.outcome(&key), Some(format!("submitted {} unlanded-through {t}\n", hex32(&rec.tx_id))));
+    assert!(t + 1 > lo_of(v), "the walk alone does not cover it");
+    let report = r.settle_from(&[], t + 1, v + 1);
+    assert_eq!(report.lines, vec![(key, format!("expired {v} unlanded-through {}", v + 1))]);
+    assert_eq!(report.expired, vec![(key, v)]);
+    assert!(report.uncovered.is_empty(), "{report:?}");
+}
+
+/// t18: `in-flight` keeps the progress; `failed` and `expired` end the
+/// record and carry none.
+#[test]
+fn t18_record_outcome_carries_progress_only_on_open_forms() {
+    use qumbra_wallet::remote_prover::{record_outcome, Outcome};
+    let (_, rec) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&rec.bundle);
+    let r = Records::new("t18", &[(key, &rec.bundle, Some(&format!("submitted {} unlanded-through 7", hex32(&rec.tx_id))))]);
+    record_outcome(&r.0, &key, &Outcome::InFlight { code: "nullifier-in-flight".into() }).unwrap();
+    assert_eq!(r.outcome(&key).as_deref(), Some("in-flight nullifier-in-flight unlanded-through 7\n"));
+    record_outcome(&r.0, &key, &Outcome::Failed { status: 402, code: "prover-fee-short".into() }).unwrap();
+    assert_eq!(r.outcome(&key).as_deref(), Some("failed 402 prover-fee-short\n"));
+    let e = Records::new("t18e", &[(key, &rec.bundle, Some("pending unlanded-through 7"))]);
+    record_outcome(&e.0, &key, &Outcome::Expired { last: "nullifiers-stale".into() }).unwrap();
+    assert_eq!(e.outcome(&key).as_deref(), Some("expired nullifiers-stale\n"));
+}
+
+/// t19: the same bytes recorded again leave the outcome as it is; after a
+/// definitive end, a new take of the note is born `pending` at its own tip.
+#[test]
+fn t19_a_re_record_keeps_the_outcome_and_a_new_take_is_born_pending() {
+    use qumbra_wallet::remote_prover::{record as take, record_outcome, Outcome};
+    let (_, rec) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&rec.bundle);
+    let open = format!("submitted {} unlanded-through 3", hex32(&rec.tx_id));
+    let r = Records::new("t19", &[(key, &rec.bundle, Some(&open))]);
+    take(&r.0, &key, &rec.bundle, 99).unwrap();
+    assert_eq!(r.outcome(&key), Some(format!("{open}\n")), "the same bytes: untouched");
+    record_outcome(&r.0, &key, &Outcome::Failed { status: 402, code: "prover-fee-short".into() }).unwrap();
+    take(&r.0, &key, b"take-2", 42).unwrap();
+    assert_eq!(r.outcome(&key).as_deref(), Some("pending unlanded-through 42\n"));
+    let archived = r.0.join("remote.v1").join(format!("{}.1.outcome", hex32(&key)));
+    assert_eq!(std::fs::read_to_string(archived).unwrap(), "failed 402 prover-fee-short\n");
 }
