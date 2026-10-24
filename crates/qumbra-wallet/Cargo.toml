@@ -71,7 +71,10 @@ qlab-devnet = { path = "../qlab-devnet", default-features = false }
 qlab-p2p = { path = "../qlab-p2p", default-features = false, optional = true }
 # The L2 spend assembly (lab #720): selection is here, the witness assembly,
 # the prove and the tx wire are qlab-l2spend's — shared with the faucet.
-qlab-l2spend = { path = "../qlab-l2spend", optional = true }
+# Lean under `verify` (lab #989: the record settle decodes a bundle; no
+# prover — the ffi/wasm graph already carries it lean); `prove` turns its
+# defaults (the prover) back on, so a native build resolves as before.
+qlab-l2spend = { path = "../qlab-l2spend", optional = true, default-features = false }
 # Lab #860 R3: a V6 exit reads W's stated public values off the one bundle it
 # anchors to (`stated_pvs`, `roots_at`) — the wrapper's own readers, never a
 # second derivation. Under `prove` only (it already brings qlab-consensus and
@@ -159,7 +162,7 @@ default = ["net", "prove", "randomx", "host", "verify"]
 # qlab-p2p (headers + whole-block frames), no prover. In default for the CLI
 # and the desktop/macOS shells; qumbra-ffi builds this crate with
 # default-features = false, so the iOS/Android/wasm graphs are unchanged.
-verify = ["dep:qlab-p2p", "dep:ml-dsa", "dep:serde_json"]
+verify = ["dep:qlab-p2p", "dep:qlab-l2spend", "dep:ml-dsa", "dep:serde_json"]
 # Lab #850 AD2: the TEST asset-list signer (`asset_view::test_list_key`). Only
 # this crate's own dev-dependency and the `ad_goldens` example enable it, so a
 # release shell cannot compile the test signer in.
@@ -175,7 +178,7 @@ net = ["dep:rustls", "dep:webpki-roots", "dep:qlab-http-framing"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.
 # Lab #869: every Annulet write opens its session on the verified scan, so
 # the prover half carries `verify`.
-prove = ["dep:qlab-consensus", "dep:qlab-p2p", "dep:qlab-l2spend", "dep:qlab-wrapper", "verify"]
+prove = ["dep:qlab-consensus", "dep:qlab-p2p", "dep:qlab-l2spend", "qlab-l2spend/default", "dep:qlab-wrapper", "verify"]
 # the RandomX C++ chain, via the qlab-devnet/qlab-node passthroughs.
 randomx = ["qlab-devnet/randomx", "qlab-node/randomx", "qlab-p2p?/randomx"]
 # the native-messaging prover host (lab #400 rung): prove + submit behind a

@@ -470,20 +470,178 @@ pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Resu
     Ok(path)
 }
 
-/// Whether an `<key>.outcome` line ([`record_outcome`]'s) is a definitive
-/// end (D-C8): `failed` with a 4xx status, or with status 0 (a job that ended
-/// `refused`, or `failed` with `node-refused:…` — [`job_end`]'s only
-/// definitive endings), or `expired` (the validity height passed).
-/// `submitted` and `in-flight` are not.
+/// Whether an `<key>.outcome` line ([`record_outcome`]'s or
+/// [`settle_records`]') is a definitive end (D-C8): `failed` with a 4xx
+/// status, or with status 0 (a job that ended `refused`, or `failed` with
+/// `node-refused:…` — [`job_end`]'s only definitive endings), `expired` (the
+/// validity height passed), or `landed` (lab #989: the chain carries it — its
+/// nullifier is spent, and a planner that asks hears "landed", not "in
+/// flight"). `submitted` and `in-flight` are not.
 pub fn ended_definitively(line: &str) -> bool {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
         (Some("failed"), Some(status)) => {
             status.parse::<u16>().is_ok_and(|s| s == 0 || (400..500).contains(&s))
         }
-        (Some("expired"), _) => true,
+        (Some("expired" | "landed"), _) => true,
         _ => false,
     }
+}
+
+/// The intent digest a recorded bundle signed (lab #989): the bundle's
+/// transaction, rebuilt as a landed transaction is
+/// ([`crate::auth_check::LandedSpend::intent_digest`]) — one rebuild for both.
+pub fn intent_digest_of_bundle(
+    bundle: &[u8],
+    form: qlab_devnet::forms::L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<[u8; 32], String> {
+    bundle_intent(bundle, form, genesis_hash).map(|(digest, _)| digest)
+}
+
+/// The digest and the section's validity height of a recorded bundle.
+fn bundle_intent(
+    bundle: &[u8],
+    form: qlab_devnet::forms::L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<([u8; 32], u64), String> {
+    let b = qlab_l2spend::bundle::ProvingBundle::decode(bundle).map_err(|e| format!("the bundle does not decode: {e}"))?;
+    crate::auth_check::intent_of(b.tx(), form, genesis_hash)
+}
+
+/// One record as [`settle_records`] reads it: the key (the transaction's
+/// first nullifier), the bundle's bytes, and its `<key>.outcome` line if any.
+#[derive(Clone, Debug)]
+pub struct SettleRecord {
+    pub key: [u8; 32],
+    pub bundle: Vec<u8>,
+    pub outcome: Option<String>,
+}
+
+/// What [`settle_records`] found (lab #989).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SettleReport {
+    /// The new `<key>.outcome` line of each record it settled (no newline).
+    pub lines: Vec<([u8; 32], String)>,
+    /// `(key, height, the chain's tx_id)`.
+    pub landed: Vec<([u8; 32], u64, [u8; 32])>,
+    /// `(key, valid_until_height)`.
+    pub expired: Vec<([u8; 32], u64)>,
+    /// A record still open whose bundle does not rebuild: `(key, why)`.
+    pub undecodable: Vec<([u8; 32], String)>,
+}
+
+fn hex_of(x: &[u8; 32]) -> String {
+    x.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// **Settle recorded remote sends from the chain** (lab #989). For each
+/// record still open — no outcome, `submitted …` or `in-flight …` — the
+/// bundle's intent digest is rebuilt ([`intent_digest_of_bundle`]) and:
+/// - a landed spend with that digest (matched by digest only: never by the
+///   prover's `tx_id`, never by key or nullifier — a landed spend of this
+///   key's leaves under another intent is another send) settles it
+///   `landed <height> <tx_id>`; when the record said `submitted <tx>` and the
+///   chain's id differs, `landed <height> <chain tx_id> prover-said <tx>`;
+/// - else, when the section's `valid_until_height` is below `checked_to`
+///   (the node refuses a height above it, so every block that could carry it
+///   has been walked), `expired <valid_until> unlanded-through <checked_to>`;
+/// - else nothing: the chain has not said.
+///
+/// `landed` and `checked_to` are a finished check's
+/// ([`crate::auth_check::AuthCheck::landed_spends`] and its journal's
+/// checked height); every other record is left as it is.
+pub fn settle_records(
+    records: &[SettleRecord],
+    form: qlab_devnet::forms::L2AuthForm,
+    genesis_hash: &[u8; 32],
+    landed: &[crate::auth_check::LandedSpend],
+    checked_to: u64,
+) -> SettleReport {
+    let mut report = SettleReport::default();
+    for r in records {
+        let open = match r.outcome.as_deref().map(str::trim) {
+            None | Some("") => true,
+            Some(line) => matches!(line.split_whitespace().next(), Some("submitted" | "in-flight")),
+        };
+        if !open {
+            continue;
+        }
+        let (digest, valid_until) = match bundle_intent(&r.bundle, form, genesis_hash) {
+            Ok(x) => x,
+            Err(why) => {
+                report.undecodable.push((r.key, why));
+                continue;
+            }
+        };
+        if let Some(s) = landed.iter().find(|s| s.intent_digest == digest) {
+            let said = r.outcome.as_deref().and_then(|l| {
+                let mut w = l.split_whitespace();
+                (w.next() == Some("submitted")).then(|| w.next()).flatten()
+            });
+            let chain = hex_of(&s.tx_id);
+            let line = match said {
+                Some(tx) if tx != chain => format!("landed {} {chain} prover-said {tx}", s.height),
+                _ => format!("landed {} {chain}", s.height),
+            };
+            report.lines.push((r.key, line));
+            report.landed.push((r.key, s.height, s.tx_id));
+        } else if valid_until < checked_to {
+            report.lines.push((r.key, format!("expired {valid_until} unlanded-through {checked_to}")));
+            report.expired.push((r.key, valid_until));
+        }
+    }
+    report
+}
+
+/// [`settle_records`] over the wallet's own records (`<wallet>/remote.v1/`):
+/// each keyed `<key>.bundle` (never a `<key>.<n>` history pair) with its
+/// `<key>.outcome`; every settled line is written beside it through a
+/// temporary file, fsynced, renamed. No record directory is no record.
+pub fn settle(
+    wallet_dir: &Path,
+    form: qlab_devnet::forms::L2AuthForm,
+    genesis_hash: &[u8; 32],
+    landed: &[crate::auth_check::LandedSpend],
+    checked_to: u64,
+) -> std::io::Result<SettleReport> {
+    use std::io::Write;
+    let dir = wallet_dir.join(RECORD_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SettleReport::default()),
+        Err(e) => return Err(e),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".bundle")) else { continue };
+        let Some(key) = hex32(stem) else { continue };
+        let bundle = std::fs::read(dir.join(format!("{stem}.bundle")))?;
+        let outcome = match std::fs::read_to_string(dir.join(format!("{stem}.outcome"))) {
+            Ok(l) => Some(l),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        records.push(SettleRecord { key, bundle, outcome });
+    }
+    records.sort_by_key(|r| r.key);
+    let report = settle_records(&records, form, genesis_hash, landed, checked_to);
+    for (key, line) in &report.lines {
+        let name = hex_of(key);
+        let tmp = dir.join(format!("{name}.outcome.tmp"));
+        {
+            let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+            f.write_all(format!("{line}\n").as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, dir.join(format!("{name}.outcome")))?;
+    }
+    #[cfg(unix)]
+    if !report.lines.is_empty() {
+        std::fs::File::open(&dir)?.sync_all()?;
+    }
+    Ok(report)
 }
 
 /// Note the end of a recorded bundle beside it (`<key>.outcome`, one line):
