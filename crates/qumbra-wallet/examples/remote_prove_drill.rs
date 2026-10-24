@@ -27,6 +27,12 @@
 //!       so output 3 pays V2ADDR → expect 402 prover-fee-missing;
 //!       `--lie-price S,P` rewrites /info's price (below the service's) →
 //!       expect 402 prover-fee-short. Either spends the step's leaves.
+//!   scan  --url NODE --genesis-hash HEX --dir WALLET --scan-to H|tip [--cold]
+//!       lab #966: only the session a send opens (`open_session`, the
+//!       verified scan to H), timed per route class, then exit — no plan, no
+//!       prover, no upload; every request a GET. A `--dir` without a seed gets
+//!       a fresh Candidate A wallet (no key material printed). `--cold` drops
+//!       the dir's verified-header record first, so headers verify from 1.
 //!
 //! Lab #966, measurement only: a send also prints where its time before the
 //! first upload went — `TIME scan|build <route>: calls, bytes, fetch, wallet`
@@ -314,6 +320,68 @@ fn send(args: &[String]) -> bool {
     !r.failed
 }
 
+/// Lab #966: the scan a send opens with, alone — where the time before a
+/// plan goes, against the height scanned to.
+fn scan(args: &[String]) -> bool {
+    let mut r = Report { failed: false };
+    let genesis = genesis_of(args);
+    let dir = std::path::PathBuf::from(need(args, "--dir"));
+    let scan_to = match need(args, "--scan-to") {
+        "tip" => u64::MAX,
+        h => h.parse().unwrap_or_else(|_| {
+            eprintln!("--scan-to H|tip");
+            std::process::exit(2)
+        }),
+    };
+    if !dir.join(qumbra_wallet::store::SEED_FILE).exists() {
+        if let Err(e) = qumbra_wallet::auth_journal::create_fresh_candidate_a(&dir) {
+            eprintln!("--dir: {e}");
+            std::process::exit(2)
+        }
+        println!("INFO a fresh Candidate A wallet in --dir (no key material printed)");
+    }
+    let w = WalletDir::open(&dir).unwrap_or_else(|e| {
+        eprintln!("--dir: {e}");
+        std::process::exit(2)
+    });
+    if args.iter().any(|a| a == "--cold") {
+        let hex: String = genesis.iter().map(|b| format!("{b:02x}")).collect();
+        let record = dir.join(format!("annulet-chain.{hex}"));
+        match std::fs::remove_file(&record) {
+            Ok(()) => println!("INFO cold: the verified-header record dropped"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("INFO cold: no verified-header record"),
+            Err(e) => {
+                eprintln!("--cold: {}: {e}", record.display());
+                std::process::exit(2)
+            }
+        }
+    }
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut rng = StdRng::from_seed(seed);
+    let started = Instant::now();
+    let timing = Rc::new(Timing::default());
+    let session = qumbra_wallet::annulet_send::open_session(
+        &w,
+        Timed { inner: WalletEndpoint { url: need(args, "--url").to_string() }, timing: Rc::clone(&timing) },
+        scan_to,
+        Some(genesis),
+        &mut rng,
+    );
+    timing.close();
+    let took = started.elapsed();
+    timing.print();
+    match session {
+        Ok(s) => {
+            println!("INFO verified tip {}, owned notes {}", s.tip, s.owned.len());
+            println!("TIME session at {:.1}s", took.as_secs_f64());
+            r.pass(&format!("scan to {} verified", s.tip));
+        }
+        Err(e) => r.fail(&format!("scan: {e}")),
+    }
+    !r.failed
+}
+
 /// Lab #966: the node endpoint with a stopwatch — per route class, how many
 /// reads, how many bytes, the time waiting for each answer, and the wallet's
 /// time on it (from the answer to the next request, or to the next mark).
@@ -459,8 +527,9 @@ fn main() {
     let ok = match args.first().map(String::as_str) {
         Some("check") => check(&args[1..]),
         Some("send") => send(&args[1..]),
+        Some("scan") => scan(&args[1..]),
         _ => {
-            eprintln!("usage: remote_prove_drill check|send … (see the file's header)");
+            eprintln!("usage: remote_prove_drill check|send|scan … (see the file's header)");
             std::process::exit(2)
         }
     };
