@@ -63,6 +63,9 @@ pub enum SendRefusal {
     /// A4: the plan needs `needed` exact-`tariff` fee notes; the wallet holds
     /// `held` and its asset-0 notes can be split into only `splittable` more.
     FeeNotesShort { tariff: u64, needed: usize, held: usize, splittable: usize },
+    /// Lab #995: `refusal`, over the notes left once those an open remote
+    /// send spends were held back (`count` notes, `value` of `asset`).
+    WhileHeld { refusal: Box<SendRefusal>, asset: u16, count: usize, value: u128 },
     /// The plan was shown and not accepted: nothing was proved.
     PlanDeclined,
     /// The wallet has no quotable balance (the scan or the spends were not
@@ -127,6 +130,11 @@ impl std::fmt::Display for SendRefusal {
                 "the plan needs {needed} asset-0 fee note(s) of exactly {tariff} (one per merge and one for \
                  the payment — each is spent whole); this wallet holds {held} and its other asset-0 notes \
                  split into {splittable} more"
+            ),
+            SendRefusal::WhileHeld { refusal, asset, count, value } => write!(
+                f,
+                "{refusal}; {count} note(s) holding {value} of asset {asset} are not planned: an open remote send \
+                 of this wallet spends them, and they free up when it lands or ends"
             ),
             SendRefusal::PlanDeclined => write!(f, "the plan was not accepted; nothing was proved"),
             SendRefusal::NoBalance => write!(
@@ -202,6 +210,9 @@ impl From<crate::annulet_plan::PlanRefusal> for SendRefusal {
             P::InsufficientAsset { asset, amount, spendable } => SendRefusal::InsufficientAsset { asset, amount, spendable },
             P::FeeNotesShort { tariff, needed, held, splittable } => {
                 SendRefusal::FeeNotesShort { tariff, needed, held, splittable }
+            }
+            P::WhileHeld { refusal, asset, count, value } => {
+                SendRefusal::WhileHeld { refusal: Box::new(SendRefusal::from(*refusal)), asset, count, value }
             }
         }
     }
@@ -526,8 +537,22 @@ pub fn send_annulet_remote<E: Endpoint>(
         return Err(SendRefusal::Spend(SpendError::Frozen { asset: u64::from(asset) }));
     }
     let index = session.index.only_generation(run.generation);
-    let plan = crate::annulet_plan::plan_send_paying(&index, asset, amount, shape, session.tiers, Some(admitted.price))
-        .map_err(SendRefusal::from)?;
+    // Lab #995: a note an open remote send already spends is never planned
+    // again (the kernel's floor, `qmb_spend_v2_exclude`); the budget still
+    // counts it — it is the generation's until that send lands.
+    let held = crate::remote_prover::open_record_nullifiers(&w.dir)
+        .map_err(|e| SendRefusal::Auth(format!("this wallet's remote records could not be read: {e}")))?;
+    let plan = crate::annulet_plan::plan_send_holding(
+        &index,
+        &wallet,
+        &held,
+        asset,
+        amount,
+        shape,
+        session.tiers,
+        Some(admitted.price),
+    )
+    .map_err(SendRefusal::from)?;
     let notes = index.by_asset.values().map(|n| n.spendable.len() as u32).sum();
     run.check_budget(crate::annulet_v2::plan_slots(&plan), Some(notes))?;
     if !on_plan(&plan, &admitted) {
@@ -846,6 +871,48 @@ mod tests {
                 (k, s.round, s.fee)
             })
             .collect()
+    }
+
+    /// Lab #995, the CLI's floor: a note whose nullifier an open
+    /// `remote.v1/` record holds is never planned — the next note is — and a
+    /// definitive end frees it. With every covering note held, the refusal
+    /// says how many notes were held and their value.
+    #[test]
+    fn a_held_note_is_skipped_and_the_next_one_planned() {
+        let w = wallet();
+        let ix = index(&[(0, 20), (0, 8), (0, 30)]);
+        let pay = |held: &std::collections::BTreeSet<[u8; 32]>| {
+            crate::annulet_plan::plan_send_holding(&ix, &w, held, 0, 7, L2ShapeTag::S, TIERS, None)
+                .map_err(SendRefusal::from)
+                .map(|plan| match &plan.pay().kind {
+                    StepKind::Pay { inputs, .. } => inputs[0].value(),
+                    other => panic!("{other:?}"),
+                })
+        };
+        let nf = |v: u64| ix.spendable(0).iter().find(|n| n.note.value == v).unwrap().nullifier(&w);
+        let d = std::env::temp_dir().join(format!("qmb_send_held_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let held = || crate::remote_prover::open_record_nullifiers(&d).unwrap();
+        assert_eq!(pay(&held()), Ok(8), "nothing held: the smallest covering note");
+        crate::remote_prover::record(&d, &nf(8), b"a signed take of the 8", 5).unwrap();
+        assert_eq!(pay(&held()), Ok(20), "the 8 is held by its open record: the next note");
+        let name: String = nf(8).iter().map(|b| format!("{b:02x}")).collect();
+        let outcome = d.join(crate::remote_prover::RECORD_DIR).join(format!("{name}.outcome"));
+        std::fs::write(&outcome, "expired 40\n").unwrap();
+        assert_eq!(pay(&held()), Ok(8), "a definitive end frees it");
+        let all = [nf(8), nf(20), nf(30)].into_iter().collect();
+        let why = pay(&all).unwrap_err();
+        assert_eq!(
+            why,
+            SendRefusal::WhileHeld {
+                refusal: Box::new(SendRefusal::NoSingleNoteCovers { asset: 0, amount: 8, largest: 0 }),
+                asset: 0,
+                count: 3,
+                value: 58,
+            }
+        );
+        assert!(why.to_string().contains("3 note(s) holding 58 of asset 0 are not planned"), "{why}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

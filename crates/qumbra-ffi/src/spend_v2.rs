@@ -20,7 +20,10 @@
 //! **The order, each step refused by name when it cannot be met:**
 //! 1. `qmb_spend_v2_new` — the request, the basis, the host's entropy (the
 //!    output/discovery seed and one 32-byte draw per dummy slot, from
-//!    `crypto.getRandomValues`; this kernel draws none);
+//!    `crypto.getRandomValues`; this kernel draws none); then, before the
+//!    first step, `qmb_spend_v2_prover` (format 34) and, optionally,
+//!    `qmb_spend_v2_exclude` (lab #995: the notes the host's open remote
+//!    sends spend, never planned again);
 //! 2. `qmb_spend_v2_step` / `_supply` / `_supply_err` — the served reads the
 //!    plan and the prepare need (`/v1/annulet/params`, the registry, the
 //!    commitment tree). Nothing is taken before they are all in: a network
@@ -56,7 +59,7 @@ use qlab_remote_auth::annulet::{AnnuletIntent, AuthNet};
 use qlab_remote_auth::mldsa;
 use qlab_wallet::Wallet;
 use qumbra_wallet::annulet_plan::{
-    plan_send_paying, plan_slots, real_input, ProverPrice, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA,
+    plan_send_holding, plan_slots, real_input, ProverPrice, SendPlan, Src, StepKind, Tiers, SWEEP_FLOOR_EXTRA,
 };
 use qumbra_wallet::annulet_verify::{registry_leaf_path, VerifiedAnnulet, VerifiedChain};
 use qumbra_wallet::asset_view::{check_leaf_at_verified_tip, AssetList};
@@ -1117,6 +1120,9 @@ pub struct SpendHandle {
     /// by `qmb_spend_v2_prover` against this network's pin — its price is
     /// fixed for every step of the plan; `/info` is never read again.
     prover: Option<Prover>,
+    /// Lab #995: the nullifiers the planner must not pick (the inputs of the
+    /// host's open remote sends), set once by `qmb_spend_v2_exclude`.
+    exclude: Option<std::collections::BTreeSet<[u8; 32]>>,
 }
 
 /// An admitted prover: the advertised price (≤ the pinned maximum) and the
@@ -1204,7 +1210,12 @@ impl SpendHandle {
         let price = self.prover.as_ref().map(|p| p.price);
         // The active generation's notes, its keys, its address (the CLI's rule).
         let index = b.index.only_generation(auth.generation);
-        let plan = plan_send_paying(&index, self.asset, self.amount, shape, tiers, price)
+        // Lab #995: a note the host's open remote sends spend is never
+        // planned (the CLI's floor, `plan_send_holding`); the budget below
+        // still counts it — it is the generation's until that send lands.
+        let none = std::collections::BTreeSet::new();
+        let exclude = self.exclude.as_ref().unwrap_or(&none);
+        let plan = plan_send_holding(&index, &auth.wallet, exclude, self.asset, self.amount, shape, tiers, price)
             .map_err(|e| Attempt::Refused(e.to_string()))?;
         // The budget is judged before the take; after it the cursor has moved
         // by this step's own leaves, and the plan's whole count would refuse
@@ -1473,6 +1484,7 @@ pub unsafe extern "C" fn qmb_spend_v2_new(
             asked: None,
             phase: Phase::Pumping,
             prover: None,
+            exclude: None,
         })
     })();
     match built {
@@ -1545,6 +1557,117 @@ pub unsafe extern "C" fn qmb_spend_v2_prover(
         Err(e) => {
             set_err(err_out, e);
             -1
+        }
+    }
+}
+
+/// The most nullifiers one `qmb_spend_v2_exclude` takes.
+const MAX_EXCLUDE: usize = 4096;
+
+/// **The notes this spend must not plan** (lab #995): `nullifiers_json` is
+/// a JSON array of 64-hex nullifiers — the real inputs of the host's open
+/// remote sends (from `qmb_proving_bundle_nullifiers` at signing). A note
+/// whose nullifier is listed is never an input of this spend's plan; the
+/// planner picks others, and when nothing else plans the refusal names how
+/// many notes were held and their value. Call at most once, before the
+/// first `qmb_spend_v2_step`. Returns 0, or -1 with `*err_out` the refusal
+/// by name — malformed JSON, an entry that is not 64 hex, over 4096
+/// entries, a second call, or a call after the first step — and the handle
+/// unchanged (nothing is partially applied).
+///
+/// # Safety
+/// `s` live; `nullifiers_json` NUL-terminated UTF-8; `err_out` NULL or
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spend_v2_exclude(
+    s: *mut SpendHandle,
+    nullifiers_json: *const c_char,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if s.is_null() || nullifiers_json.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return -1;
+    }
+    let h = &mut *s;
+    let parsed = (|| {
+        if !matches!(h.phase, Phase::Pumping) || h.asked.is_some() || !h.answers.is_empty() {
+            return Err("the exclude set is set before the first step".to_string());
+        }
+        if h.exclude.is_some() {
+            return Err("the exclude set is already set for this spend".into());
+        }
+        let text = text_arg("the exclude set", nullifiers_json, MAX_EXCLUDE * 70 + 64)?;
+        let list: Vec<String> =
+            serde_json::from_str(text).map_err(|e| format!("the exclude set is not a JSON array of strings: {e}"))?;
+        if list.len() > MAX_EXCLUDE {
+            return Err(format!("{} nullifiers to exclude, over {MAX_EXCLUDE}", list.len()));
+        }
+        list.iter()
+            .enumerate()
+            .map(|(i, hex)| {
+                hex32_of(hex).ok_or_else(|| format!("exclude entry {i} is not a 64-hex nullifier: {hex:?}"))
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+    })();
+    match parsed {
+        Ok(set) => {
+            h.exclude = Some(set);
+            0
+        }
+        Err(e) => {
+            set_err(err_out, e);
+            -1
+        }
+    }
+}
+
+/// 64 lowercase-or-uppercase hex characters as 32 bytes.
+fn hex32_of(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// **A proving bundle's real-input nullifiers** (lab #995): the
+/// version-1/-2 `ProvingBundle` a v2 spend signs (`qmb_spend_v2_bundle`),
+/// as a JSON array of 64-hex strings in slot order — input 1, input 2 unless
+/// it is a dummy, slot 3 when it holds a fee note. The bytes the transaction
+/// states, so the ones its landing publishes: what a host records beside the
+/// bundle at signing and passes to `qmb_spend_v2_exclude` while the send is
+/// open. NULL + `*err_out` for anything that is not a proving bundle, by
+/// name (a witness bundle included: `qmb_bundle_nullifiers` reads those).
+///
+/// # Safety
+/// `bytes` points to `len` readable bytes; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_proving_bundle_nullifiers(
+    bytes: *const u8,
+    len: usize,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if !err_out.is_null() {
+        *err_out = ptr::null_mut();
+    }
+    if bytes.is_null() {
+        set_err(err_out, "bundle bytes are NULL".into());
+        return ptr::null_mut();
+    }
+    match ProvingBundle::decode(std::slice::from_raw_parts(bytes, len)) {
+        Ok(b) => {
+            let hex = |nf: &[u8; 32]| nf.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            out_string(serde_json::Value::from(b.real_nullifiers().iter().map(hex).collect::<Vec<_>>()).to_string())
+        }
+        Err(e) => {
+            set_err(err_out, e.to_string());
+            ptr::null_mut()
         }
     }
 }

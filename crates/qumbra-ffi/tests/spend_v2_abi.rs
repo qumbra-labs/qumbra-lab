@@ -32,12 +32,13 @@ use qumbra_ffi::spend_v2::{
     qmb_auth_journal_advances,
     qmb_auth_check_finish, qmb_auth_check_free, qmb_auth_check_new, qmb_auth_check_step, qmb_auth_check_supply,
     qmb_auth_check_set_page, qmb_auth_check_supply_err, qmb_auth_check_take_landed, qmb_auth_free, qmb_auth_journal, qmb_auth_open_next, qmb_auth_restore_new, qmb_auth_take, qmb_intent_review, qmb_intent_sign, qmb_spend_basis_free,
+    qmb_proving_bundle_nullifiers, qmb_spend_v2_exclude,
     qmb_spend_v2_free, qmb_spend_v2_intent, qmb_spend_v2_new, qmb_spend_v2_prover, qmb_spend_v2_refusal, qmb_spend_v2_step,
     qmb_spend_v2_supply,
     qmb_spend_v2_supply_err, AuthHandle, CheckHandle, SpendBasis, SpendHandle, QMB_AUTH_CHECKED, QMB_AUTH_JOURNAL_STALE,
     QMB_AUTH_RESTORED, QMB_AUTH_SWEEP_WAITING,
 };
-use qumbra_ffi::{qmb_dealloc, qmb_string_free, qmb_wallet_free, qmb_wallet_from_entropy, WalletState};
+use qumbra_ffi::{qmb_bundle_nullifiers, qmb_dealloc, qmb_string_free, qmb_wallet_free, qmb_wallet_from_entropy, WalletState};
 use qumbra_wallet::auth_journal::{generation_root, AuthJournal};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -1526,11 +1527,32 @@ unsafe fn set_prover(s: *mut SpendHandle, info: &[u8]) -> Result<(), String> {
 
 /// One whole format-34 spend paying the prover at the advertised S 1 / P 2.
 unsafe fn send_v3(f: &Fixture, asset: u16, amount: u64, slots: u32, shape: L2ShapeTag) -> (ProvingBundle, String) {
+    send_v3_holding(f, asset, amount, slots, shape, None).expect("READY")
+}
+
+/// [`send_v3`] with `exclude` (a JSON array of 64-hex nullifiers) set by
+/// `qmb_spend_v2_exclude` first (lab #995); `Err` is the pump's refusal.
+unsafe fn send_v3_holding(
+    f: &Fixture,
+    asset: u16,
+    amount: u64,
+    slots: u32,
+    shape: L2ShapeTag,
+    exclude: Option<&str>,
+) -> Result<(ProvingBundle, String), String> {
     let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
     let a = auth(w, &f.ep, &f.fresh).unwrap();
     let s = spend(basis(w, &f.ep), &f.payee, asset, amount, 96).unwrap();
     set_prover(s, &info(f, 1, 2, &prover_address().encode())).expect("the pinned prover");
-    pump(a, s, &f.ep, 0).expect("READY");
+    if let Some(json) = exclude {
+        set_exclude(s, json).expect("a well-formed exclude set");
+    }
+    if let Err(why) = pump(a, s, &f.ep, 0) {
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+        qmb_wallet_free(w);
+        return Err(why);
+    }
     let journal = take(a, s).expect("the take");
     assert_eq!(next_of(&journal), slots, "one leaf per real slot");
     let i = intent(s);
@@ -1543,7 +1565,99 @@ unsafe fn send_v3(f: &Fixture, asset: u16, amount: u64, slots: u32, shape: L2Sha
     qmb_spend_v2_free(s);
     qmb_auth_free(a);
     qmb_wallet_free(w);
-    (b, text)
+    Ok((b, text))
+}
+
+unsafe fn set_exclude(s: *mut SpendHandle, json: &str) -> Result<(), String> {
+    let j = CString::new(json).unwrap();
+    let mut err: *mut c_char = ptr::null_mut();
+    match qmb_spend_v2_exclude(s, j.as_ptr(), &mut err) {
+        0 => {
+            assert!(err.is_null());
+            Ok(())
+        }
+        -1 => Err(take_str(err)),
+        other => panic!("qmb_spend_v2_exclude returned {other}"),
+    }
+}
+
+/// Lab #995's net: two asset-0 notes (50 and 60) on a pinned format-34 chain.
+fn held_chain() -> &'static Fixture {
+    static F: std::sync::OnceLock<Fixture> = std::sync::OnceLock::new();
+    F.get_or_init(|| chain_v3("sv3_held", |a| vec![note_to(a, 50, 0, 30), note_to(a, 60, 0, 31)], true))
+}
+
+fn json_hex(nfs: &[[u8; 32]]) -> String {
+    serde_json::Value::from(nfs.iter().map(hex32).collect::<Vec<_>>()).to_string()
+}
+
+/// Lab #995: a note in the exclude set is never planned — the planner pays
+/// from the next note — and with both held the refusal names the two notes
+/// and their 110. The nullifiers come from `qmb_proving_bundle_nullifiers` on
+/// the signed bundle (its real inputs, slot order), which the old witness
+/// parser still refuses as before.
+#[test]
+fn v3_f_an_excluded_note_is_never_planned() {
+    let f = held_chain();
+    unsafe {
+        let (b, _) = send_v3(f, 0, 10, 1, L2ShapeTag::S);
+        assert_eq!(b.witness().inputs[0].value, 50, "unheld: the smallest covering note");
+        let bytes = b.encode();
+        let mut err: *mut c_char = ptr::null_mut();
+        let view = qmb_proving_bundle_nullifiers(bytes.as_ptr(), bytes.len(), &mut err);
+        assert!(!view.is_null(), "{}", take_str(err));
+        let nfs = b.real_nullifiers();
+        assert_eq!(nfs.len(), 1, "one real input; input 2 and slot 3 are dummies");
+        assert_eq!(take_str(view), json_hex(&nfs));
+        let old = qmb_bundle_nullifiers(bytes.as_ptr(), bytes.len(), &mut err);
+        assert!(old.is_null());
+        assert!(take_str(err).contains("witness-bundle magic is absent"), "the old parser keeps its refusal");
+
+        let (b2, _) = send_v3_holding(f, 0, 10, 1, L2ShapeTag::S, Some(&json_hex(&nfs))).expect("the 60 pays");
+        assert_eq!(b2.witness().inputs[0].value, 60, "the held 50 is skipped");
+        assert!(!b2.real_nullifiers().contains(&nfs[0]), "the held note's nullifier is not spent again");
+
+        let both = [nfs[0], b2.real_nullifiers()[0]];
+        let Err(why) = send_v3_holding(f, 0, 10, 1, L2ShapeTag::S, Some(&json_hex(&both))) else {
+            panic!("nothing else to plan, yet a spend was signed")
+        };
+        assert!(why.contains("no single spendable note of asset 0 covers 12 (the largest is 0)"), "{why}");
+        assert!(why.contains("2 note(s) holding 110 of asset 0 are not planned"), "{why}");
+    }
+}
+
+/// Lab #995: the exclude set is set once, before the first step; malformed
+/// JSON, a non-64-hex entry, a second set and a set after the first step
+/// are each refused by name, and a refused set applies nothing (a valid set
+/// after a refused one still takes).
+#[test]
+fn v3_g_the_exclude_set_is_set_once_before_the_first_step_or_refused_whole() {
+    let f = held_chain();
+    let good = json_hex(&[[0x11; 32]]);
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let a = auth(w, &f.ep, &f.fresh).unwrap();
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        let why = set_exclude(s, "not json").unwrap_err();
+        assert!(why.contains("the exclude set is not a JSON array of strings"), "{why}");
+        let half = format!("[\"{}\",\"abc\"]", "11".repeat(32));
+        let why = set_exclude(s, &half).unwrap_err();
+        assert!(why.contains("exclude entry 1 is not a 64-hex nullifier"), "{why}");
+        set_exclude(s, &good).expect("nothing of the refused sets was applied");
+        let why = set_exclude(s, &good).unwrap_err();
+        assert!(why.contains("the exclude set is already set for this spend"), "{why}");
+        qmb_spend_v2_free(s);
+
+        let s = spend(basis(w, &f.ep), &f.payee, 0, 10, 96).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(qmb_spend_v2_step(a, s, &mut out), 1, "the first step asks for a read");
+        take_str(out);
+        let why = set_exclude(s, &good).unwrap_err();
+        assert!(why.contains("the exclude set is set before the first step"), "{why}");
+        qmb_spend_v2_free(s);
+        qmb_auth_free(a);
+        qmb_wallet_free(w);
+    }
 }
 
 /// Output 3 of `b` pays the pinned prover `value` of asset 0.
