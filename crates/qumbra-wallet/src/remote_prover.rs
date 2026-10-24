@@ -476,7 +476,8 @@ pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Resu
 /// `node-refused:…` — [`job_end`]'s only definitive endings), `expired` (the
 /// validity height passed), or `landed` (lab #989: the chain carries it — its
 /// nullifier is spent, and a planner that asks hears "landed", not "in
-/// flight"). `submitted` and `in-flight` are not.
+/// flight"). `submitted`, `in-flight` and [`PENDING`] are not, with or
+/// without a trailing `unlanded-through <p>` (lab #992).
 pub fn ended_definitively(line: &str) -> bool {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
@@ -509,6 +510,19 @@ fn bundle_intent(
     crate::auth_check::intent_of(b.tx(), form, genesis_hash)
 }
 
+/// [`bundle_intent`] for the settle path (lab #991): `Ok(Err(why))` is a
+/// bundle whose auth section does not verify against the intent rebuilt for
+/// `genesis_hash` — another net's record (`remote.v1/` is per wallet, not per
+/// net), which this net must not judge.
+fn verified_bundle_intent(
+    bundle: &[u8],
+    form: qlab_devnet::forms::L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<Result<([u8; 32], u64), String>, String> {
+    let b = qlab_l2spend::bundle::ProvingBundle::decode(bundle).map_err(|e| format!("the bundle does not decode: {e}"))?;
+    crate::auth_check::verified_intent_of(b.tx(), form, genesis_hash)
+}
+
 /// One record as [`settle_records`] reads it: the key (the transaction's
 /// first nullifier), the bundle's bytes, and its `<key>.outcome` line if any.
 #[derive(Clone, Debug)]
@@ -529,6 +543,31 @@ pub struct SettleReport {
     pub expired: Vec<([u8; 32], u64)>,
     /// A record still open whose bundle does not rebuild: `(key, why)`.
     pub undecodable: Vec<([u8; 32], String)>,
+    /// A record still open whose auth section does not verify against the
+    /// intent rebuilt for this net's genesis (lab #991): not this net's, so
+    /// not judged — no line, it stays open. `(key, why)`.
+    pub foreign: Vec<([u8; 32], String)>,
+    /// A record still open, not landed in this walk, whose unlanded span is
+    /// not covered from the earliest height it could land (lab #992): no
+    /// line. `(key, lo, walked_from)` — a restore of this net walks from 0
+    /// and settles it.
+    pub uncovered: Vec<([u8; 32], u64, u64)>,
+}
+
+/// The first token [`settle_records`] gives a record that had no outcome
+/// when it wrote its progress (lab #992). Open, as `submitted` and
+/// `in-flight` are: [`ended_definitively`] is false for it.
+pub const PENDING: &str = "pending";
+
+/// An open outcome line split into its form and its trailing progress
+/// `unlanded-through <p>` (lab #992); no line is [`PENDING`] with none.
+fn open_line_parts(line: &str) -> (String, Option<u64>) {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    match words.as_slice() {
+        [] => (PENDING.to_string(), None),
+        [form @ .., "unlanded-through", p] if !form.is_empty() => (form.join(" "), p.parse().ok()),
+        _ => (words.join(" "), None),
+    }
 }
 
 fn hex_of(x: &[u8; 32]) -> String {
@@ -537,38 +576,53 @@ fn hex_of(x: &[u8; 32]) -> String {
 
 /// **Settle recorded remote sends from the chain** (lab #989). For each
 /// record still open — no outcome, `submitted …` or `in-flight …` — the
-/// bundle's intent digest is rebuilt ([`intent_digest_of_bundle`]) and:
+/// bundle's intent is rebuilt for `genesis_hash` and its auth section verified
+/// against it (lab #991: a section signed for another net's genesis does not
+/// verify, and that record is `foreign` — never judged by this net's heights);
+/// then:
 /// - a landed spend with that digest (matched by digest only: never by the
 ///   prover's `tx_id`, never by key or nullifier — a landed spend of this
 ///   key's leaves under another intent is another send) settles it
 ///   `landed <height> <tx_id>`; when the record said `submitted <tx>` and the
 ///   chain's id differs, `landed <height> <chain tx_id> prover-said <tx>`;
-/// - else, when the section's `valid_until_height` is below `checked_to`
-///   (the node refuses a height above it, so every block that could carry it
-///   has been walked), `expired <valid_until> unlanded-through <checked_to>`;
-/// - else nothing: the chain has not said.
+/// - else only with **coverage** (lab #992): the node lands the bundle at
+///   no height below `lo = valid_until − MAX_AUTH_VALIDITY_BLOCKS`, so the
+///   walks must have covered `[lo, checked_to]` without a gap. This walk
+///   began at `walked_from`; the record carries what earlier walks proved as a
+///   trailing `unlanded-through <p>` on its open line. Covered iff
+///   `walked_from ≤ lo` or `walked_from ≤ p + 1`. Then:
+///   - `valid_until < checked_to` (the node refuses a height above it):
+///     `expired <valid_until> unlanded-through <checked_to>`;
+///   - else the open line with `unlanded-through <checked_to>` — progress
+///     (a record with no outcome takes the [`PENDING`] form);
+/// - not covered: nothing written, the record in `uncovered`.
 ///
-/// `landed` and `checked_to` are a finished check's
-/// ([`crate::auth_check::AuthCheck::landed_spends`] and its journal's
-/// checked height); every other record is left as it is.
+/// `landed`, `walked_from` and `checked_to` are a finished check's
+/// ([`crate::auth_check::AuthCheck::landed_spends`], the first height it
+/// walked — the previous checked height + 1 in check mode, 0 for a restore
+/// or a first — and its journal's checked height); every other record is
+/// left as it is.
 pub fn settle_records(
     records: &[SettleRecord],
     form: qlab_devnet::forms::L2AuthForm,
     genesis_hash: &[u8; 32],
     landed: &[crate::auth_check::LandedSpend],
+    walked_from: u64,
     checked_to: u64,
 ) -> SettleReport {
     let mut report = SettleReport::default();
     for r in records {
-        let open = match r.outcome.as_deref().map(str::trim) {
-            None | Some("") => true,
-            Some(line) => matches!(line.split_whitespace().next(), Some("submitted" | "in-flight")),
-        };
+        let current = r.outcome.as_deref().map_or("", str::trim);
+        let open = current.is_empty() || matches!(current.split_whitespace().next(), Some("submitted" | "in-flight" | PENDING));
         if !open {
             continue;
         }
-        let (digest, valid_until) = match bundle_intent(&r.bundle, form, genesis_hash) {
-            Ok(x) => x,
+        let (digest, valid_until) = match verified_bundle_intent(&r.bundle, form, genesis_hash) {
+            Ok(Ok(x)) => x,
+            Ok(Err(why)) => {
+                report.foreign.push((r.key, why));
+                continue;
+            }
             Err(why) => {
                 report.undecodable.push((r.key, why));
                 continue;
@@ -586,9 +640,21 @@ pub fn settle_records(
             };
             report.lines.push((r.key, line));
             report.landed.push((r.key, s.height, s.tx_id));
-        } else if valid_until < checked_to {
-            report.lines.push((r.key, format!("expired {valid_until} unlanded-through {checked_to}")));
-            report.expired.push((r.key, valid_until));
+        } else {
+            let lo = valid_until.saturating_sub(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS);
+            let (open_form, progress) = open_line_parts(current);
+            let covered = walked_from <= lo || progress.is_some_and(|p| walked_from <= p.saturating_add(1));
+            if !covered {
+                report.uncovered.push((r.key, lo, walked_from));
+            } else if valid_until < checked_to {
+                report.lines.push((r.key, format!("expired {valid_until} unlanded-through {checked_to}")));
+                report.expired.push((r.key, valid_until));
+            } else {
+                let line = format!("{open_form} unlanded-through {checked_to}");
+                if line != current {
+                    report.lines.push((r.key, line));
+                }
+            }
         }
     }
     report
@@ -603,6 +669,7 @@ pub fn settle(
     form: qlab_devnet::forms::L2AuthForm,
     genesis_hash: &[u8; 32],
     landed: &[crate::auth_check::LandedSpend],
+    walked_from: u64,
     checked_to: u64,
 ) -> std::io::Result<SettleReport> {
     use std::io::Write;
@@ -626,7 +693,7 @@ pub fn settle(
         records.push(SettleRecord { key, bundle, outcome });
     }
     records.sort_by_key(|r| r.key);
-    let report = settle_records(&records, form, genesis_hash, landed, checked_to);
+    let report = settle_records(&records, form, genesis_hash, landed, walked_from, checked_to);
     for (key, line) in &report.lines {
         let name = hex_of(key);
         let tmp = dir.join(format!("{name}.outcome.tmp"));

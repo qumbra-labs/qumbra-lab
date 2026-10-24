@@ -856,7 +856,7 @@ fn hex32_arg(what: &str, v: Option<&serde_json::Value>) -> Result<[u8; 32], Stri
     Ok(b.try_into().expect("64 hex digits"))
 }
 
-fn settle_json(basis: &SpendBasis, records: &str, landed: &str, checked_to: u64) -> Result<String, String> {
+fn settle_json(basis: &SpendBasis, records: &str, landed: &str, walked_from: u64, checked_to: u64) -> Result<String, String> {
     use qumbra_wallet::auth_check::LandedSpend;
     use qumbra_wallet::remote_prover::{settle_records, SettleRecord};
     let hex = |x: &[u8]| x.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -895,12 +895,18 @@ fn settle_json(basis: &SpendBasis, records: &str, landed: &str, checked_to: u64)
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let r = settle_records(&records, basis.form, &basis.genesis_hash, &landed, checked_to);
+    let r = settle_records(&records, basis.form, &basis.genesis_hash, &landed, walked_from, checked_to);
     Ok(serde_json::json!({
         "lines": r.lines.iter().map(|(k, o)| serde_json::json!({"key": hex(k), "outcome": o})).collect::<Vec<_>>(),
         "landed": r.landed.iter().map(|(k, h, t)| serde_json::json!({"key": hex(k), "height": h, "tx_id": hex(t)})).collect::<Vec<_>>(),
         "expired": r.expired.iter().map(|(k, v)| serde_json::json!({"key": hex(k), "valid_until": v})).collect::<Vec<_>>(),
         "undecodable": r.undecodable.iter().map(|(k, w)| serde_json::json!({"key": hex(k), "why": w})).collect::<Vec<_>>(),
+        "foreign": r.foreign.iter().map(|(k, w)| serde_json::json!({"key": hex(k), "why": w})).collect::<Vec<_>>(),
+        "uncovered": r
+            .uncovered
+            .iter()
+            .map(|(k, lo, from)| serde_json::json!({"key": hex(k), "lo": lo, "walked_from": from}))
+            .collect::<Vec<_>>(),
     })
     .to_string())
 }
@@ -909,12 +915,21 @@ fn settle_json(basis: &SpendBasis, records: &str, landed: &str, checked_to: u64)
 /// `remote_prover::settle_records` over the caller's own records, on the
 /// basis's net (its form and genesis). `records_json` is
 /// `[{"key":"<64 hex>","bundle":"<hex>","outcome":"<line>"|null}, …]`,
-/// `landed_json` is [`qmb_auth_check_take_landed`]'s output and `checked_to`
-/// the finished journal's checked height. Returns
+/// `landed_json` is [`qmb_auth_check_take_landed`]'s output, `walked_from`
+/// the first height that check walked (lab #992: one past the previous
+/// checked height in check mode, 0 for a restore or a first) and
+/// `checked_to` the finished journal's checked height. Returns
 /// `{"lines":[{"key","outcome"}],"landed":[{"key","height","tx_id"}],
-/// "expired":[{"key","valid_until"}],"undecodable":[{"key","why"}]}`: the
-/// caller writes each line as that record's outcome. NULL with `*err_out` on
-/// a malformed argument.
+/// "expired":[{"key","valid_until"}],"undecodable":[{"key","why"}],
+/// "foreign":[{"key","why"}],"uncovered":[{"key","lo","walked_from"}]}`: the
+/// caller writes each line as that record's outcome. `foreign` (lab #991) is
+/// a record whose auth section does not verify for this basis's genesis —
+/// another net's: no line, leave it open. `uncovered` (lab #992) is a record
+/// whose walks do not cover its earliest landing height `lo`: no line; a
+/// restore of this net settles it. An open line may gain a trailing
+/// `unlanded-through <p>` (progress; `pending …` for a record with no
+/// outcome) — still open.
+/// NULL with `*err_out` on a malformed argument.
 ///
 /// # Safety
 /// `basis` live (or NULL); the strings NUL-terminated (or NULL); `err_out`
@@ -924,6 +939,7 @@ pub unsafe extern "C" fn qmb_remote_settle(
     basis: *const SpendBasis,
     records_json: *const c_char,
     landed_json: *const c_char,
+    walked_from: u64,
     checked_to: u64,
     err_out: *mut *mut c_char,
 ) -> *mut c_char {
@@ -937,7 +953,7 @@ pub unsafe extern "C" fn qmb_remote_settle(
     let run = || -> Result<String, String> {
         let records = text_arg("records_json", records_json, MAX_SETTLE_RECORDS_JSON)?;
         let landed = text_arg("landed_json", landed_json, MAX_SETTLE_LANDED_JSON)?;
-        settle_json(&*basis, records, landed, checked_to)
+        settle_json(&*basis, records, landed, walked_from, checked_to)
     };
     match run() {
         Ok(json) => out_string(json),

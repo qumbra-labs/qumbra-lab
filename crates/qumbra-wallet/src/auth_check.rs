@@ -180,6 +180,37 @@ pub(crate) fn intent_of(
     form: L2AuthForm,
     genesis_hash: &[u8; 32],
 ) -> Result<([u8; 32], u64), String> {
+    let (section, intent) = rebuild_intent(tx, form, genesis_hash)?;
+    let digest = intent.digest().map_err(|e| format!("its intent does not encode: {e:?}"))?;
+    Ok((digest, section.valid_until_height))
+}
+
+/// [`intent_of`] for a transaction the chain has not verified (lab #991): a
+/// recorded bundle settled under a net. `Ok(Err(why))` is a bundle that
+/// rebuilds but whose auth section does not verify against the intent
+/// rebuilt for `genesis_hash` (`AnnuletAuthSection::verify_intent`) — it was
+/// signed for another net's genesis, or is not what the wallet signed. The
+/// on-chain callers keep [`intent_of`]: the node verified those sections.
+pub(crate) fn verified_intent_of(
+    tx: &qlab_devnet::body::TxEntry,
+    form: L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<Result<([u8; 32], u64), String>, String> {
+    let (section, intent) = rebuild_intent(tx, form, genesis_hash)?;
+    if let Err(e) = section.verify_intent(&intent) {
+        return Ok(Err(format!("its auth section does not verify for this genesis: {e:?}")));
+    }
+    let digest = intent.digest().map_err(|e| format!("its intent does not encode: {e:?}"))?;
+    Ok(Ok((digest, section.valid_until_height)))
+}
+
+/// The auth section `tx` carries and the intent rebuilt from it for
+/// `genesis_hash`.
+fn rebuild_intent(
+    tx: &qlab_devnet::body::TxEntry,
+    form: L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<(qlab_remote_auth::annulet::AnnuletAuthSection, qlab_remote_auth::annulet::AnnuletIntent), String> {
     use qlab_devnet::annulet::{auth_shape, intent_for, L2Surface};
     use qlab_remote_auth::annulet::AnnuletAuthSection;
     let surface = L2Surface::decode(&tx.l2)
@@ -190,8 +221,7 @@ pub(crate) fn intent_of(
     let descriptors: Vec<_> = section.slots.iter().map(|s| s.descriptor).collect();
     let intent = intent_for(tx, form.annulet_genesis_format_version(), genesis_hash, section.valid_until_height, &descriptors)
         .map_err(|e| format!("its intent does not rebuild: {e:?}"))?;
-    let digest = intent.digest().map_err(|e| format!("its intent does not encode: {e:?}"))?;
-    Ok((digest, section.valid_until_height))
+    Ok((section, intent))
 }
 
 enum CheckMode {

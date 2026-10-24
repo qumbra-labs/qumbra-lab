@@ -1890,9 +1890,30 @@ impl Records {
         std::fs::read_to_string(self.0.join("remote.v1").join(format!("{}.outcome", hex32(key)))).ok()
     }
 
+    /// A walk from 0 (a restore's or a first's: every record covered).
     fn settle(&self, landed: &[qumbra_wallet::auth_check::LandedSpend], checked_to: u64) -> qumbra_wallet::remote_prover::SettleReport {
-        let f = &spent_chain().0;
-        qumbra_wallet::remote_prover::settle(&self.0, f.ep.wire.l2_auth, &f.ep.file.hash(), landed, checked_to).unwrap()
+        self.settle_from(landed, 0, checked_to)
+    }
+
+    /// [`Records::settle`] for a walk that began at `walked_from` (lab #992).
+    fn settle_from(
+        &self,
+        landed: &[qumbra_wallet::auth_check::LandedSpend],
+        walked_from: u64,
+        checked_to: u64,
+    ) -> qumbra_wallet::remote_prover::SettleReport {
+        self.settle_on(&spent_chain().0.ep.file.hash(), landed, walked_from, checked_to)
+    }
+
+    /// [`Records::settle_from`] under the net of `genesis` (lab #991).
+    fn settle_on(
+        &self,
+        genesis: &[u8; 32],
+        landed: &[qumbra_wallet::auth_check::LandedSpend],
+        walked_from: u64,
+        checked_to: u64,
+    ) -> qumbra_wallet::remote_prover::SettleReport {
+        qumbra_wallet::remote_prover::settle(&self.0, spent_chain().0.ep.wire.l2_auth, genesis, landed, walked_from, checked_to).unwrap()
     }
 }
 
@@ -1940,15 +1961,17 @@ fn t2_a_prover_tx_id_the_chain_does_not_carry_is_kept_as_what_it_said() {
 }
 
 /// t3: an `in-flight` record that did not land expires once every block
-/// that could carry it is walked — `valid_until < checked_to` — and is left
-/// while the last such block is not.
+/// that could carry it is walked — `valid_until < checked_to` — and while the
+/// last such block is not, stays open with its progress (lab #992).
 #[test]
 fn t3_an_unlanded_record_expires_only_past_its_validity() {
     let (_, record) = spent_chain_recorded();
     let (key, v) = bundle_key_and_validity(&record.bundle);
     let r = Records::new("t3", &[(key, &record.bundle, Some("in-flight intent-in-flight"))]);
-    assert_eq!(r.settle(&[], v), Default::default(), "checked_to == valid_until: the chain has not said");
-    assert_eq!(r.outcome(&key).as_deref(), Some("in-flight intent-in-flight\n"));
+    let report = r.settle(&[], v);
+    assert_eq!(report.lines, vec![(key, format!("in-flight intent-in-flight unlanded-through {v}"))], "checked_to == valid_until: progress only");
+    assert!(report.expired.is_empty(), "{report:?}");
+    assert_eq!(r.outcome(&key), Some(format!("in-flight intent-in-flight unlanded-through {v}\n")));
     let report = r.settle(&[], v + 1);
     assert_eq!(report.lines, vec![(key, format!("expired {v} unlanded-through {}", v + 1))]);
     assert_eq!(report.expired, vec![(key, v)]);
@@ -1969,8 +1992,11 @@ fn t4_matching_is_by_intent_digest_only() {
     let mut other = landed_spends();
     assert_eq!(other.len(), 1);
     other[0].intent_digest[0] ^= 1;
-    assert_eq!(r.settle(&other, settle_inputs().1), Default::default(), "same key and tx_id, another intent");
-    assert_eq!(r.outcome(&key), Some(format!("submitted {}\n", hex32(&record.tx_id))));
+    let report = r.settle(&other, settle_inputs().1);
+    assert!(report.landed.is_empty() && report.expired.is_empty(), "same key and tx_id, another intent: {report:?}");
+    let open = format!("submitted {} unlanded-through {}", hex32(&record.tx_id), settle_inputs().1);
+    assert_eq!(report.lines, vec![(key, open.clone())], "still open, its progress noted");
+    assert_eq!(r.outcome(&key), Some(format!("{open}\n")));
     // And it still expires on its own validity, not by the other send.
     assert_eq!(r.settle(&other, v + 1).expired, vec![(key, v)]);
 }
@@ -2037,7 +2063,7 @@ fn qmb_remote_settle_answers_the_pinned_json_over_the_callers_records() {
         let call = |records: &str, landed: &str, checked_to: u64| -> Result<serde_json::Value, String> {
             let (r, l) = (CString::new(records).unwrap(), CString::new(landed).unwrap());
             let mut err: *mut c_char = ptr::null_mut();
-            let out = qmb_remote_settle(b, r.as_ptr(), l.as_ptr(), checked_to, &mut err);
+            let out = qmb_remote_settle(b, r.as_ptr(), l.as_ptr(), 0, checked_to, &mut err);
             if out.is_null() {
                 Err(take_str(err))
             } else {
@@ -2054,6 +2080,8 @@ fn qmb_remote_settle_answers_the_pinned_json_over_the_callers_records() {
             "landed": [{"key": hex32(&key), "height": 2, "tx_id": hex32(&record.tx_id)}],
             "expired": [],
             "undecodable": [{"key": hex32(&[0x01; 32]), "why": undecodable[0]["why"].clone()}],
+            "foreign": [],
+            "uncovered": [],
         });
         assert_eq!(got, want);
         // Not landed, past its validity: expired.
@@ -2069,10 +2097,253 @@ fn qmb_remote_settle_answers_the_pinned_json_over_the_callers_records() {
         assert!(call("[]", r#"[{"height":2}]"#, 2).unwrap_err().contains("landed[0].tx_id is not a string"));
         let mut err: *mut c_char = ptr::null_mut();
         let empty = CString::new("[]").unwrap();
-        assert!(qmb_remote_settle(ptr::null(), empty.as_ptr(), empty.as_ptr(), 2, &mut err).is_null());
+        assert!(qmb_remote_settle(ptr::null(), empty.as_ptr(), empty.as_ptr(), 0, 2, &mut err).is_null());
         assert_eq!(take_str(err), "NULL argument");
-        assert!(qmb_remote_settle(b, ptr::null(), empty.as_ptr(), 2, &mut err).is_null());
+        assert!(qmb_remote_settle(b, ptr::null(), empty.as_ptr(), 0, 2, &mut err).is_null());
         assert!(take_str(err).contains("records_json is NULL"));
+        qmb_spend_basis_free(b);
+        qmb_wallet_free(w);
+    }
+}
+
+// ------------------------------------------------------------ lab #991
+
+/// Genesis B: a second format-33 net — the spent chain's form, its genesis
+/// paying nothing, so another genesis hash. Built, not hand-made: the records
+/// settled under it are the spent chain's real recorded bundle, signed for
+/// genesis A (the spent chain's), unchanged.
+fn foreign_net() -> &'static Endpoint {
+    static E: std::sync::OnceLock<Endpoint> = std::sync::OnceLock::new();
+    E.get_or_init(|| {
+        let w = wallet_dir("sv2_991_foreign", SEED);
+        let holder = w.wallet().address_candidate_a_at_index(0, &generation_root(&w.wallet(), 0));
+        let _ = std::fs::remove_dir_all(&w.dir);
+        let ep = Endpoint::new(genesis_v2(&holder, Vec::new()), &[], None, Lie::None);
+        let a = &spent_chain().0.ep;
+        assert_ne!(ep.file.hash(), a.file.hash(), "another genesis");
+        assert_eq!(ep.wire.l2_auth, a.wire.l2_auth, "the same form: only the genesis differs");
+        ep
+    })
+}
+
+/// t8: a record signed for genesis A, settled under genesis B past its
+/// validity, is not judged: no line, no `expired`, its key in `foreign`, its
+/// outcome untouched — B's heights say nothing about A's spend. (Mutation:
+/// without the settle path's `verify_intent` this record expires.)
+#[test]
+fn t8_a_record_of_another_net_is_foreign_and_not_expired() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t8", &[(key, &record.bundle, Some("in-flight intent-in-flight"))]);
+    let report = r.settle_on(&foreign_net().file.hash(), &landed_spends(), 0, v + 1);
+    assert!(report.lines.is_empty() && report.expired.is_empty() && report.landed.is_empty(), "{report:?}");
+    assert!(report.undecodable.is_empty(), "it decodes: {report:?}");
+    assert_eq!(report.foreign.len(), 1, "{report:?}");
+    assert_eq!(report.foreign[0].0, key);
+    let why = &report.foreign[0].1;
+    assert!(why.contains("does not verify for this genesis") && why.contains("BadSignature"), "{why}");
+    assert_eq!(r.outcome(&key).as_deref(), Some("in-flight intent-in-flight\n"), "nothing written");
+}
+
+/// t9: the same record under its own genesis A, past its validity and not
+/// landed, still expires: the verify step does not stand in expiry's way.
+#[test]
+fn t9_the_same_record_under_its_own_net_still_expires() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t9", &[(key, &record.bundle, Some("in-flight intent-in-flight"))]);
+    let report = r.settle_on(&spent_chain().0.ep.file.hash(), &[], 0, v + 1);
+    assert_eq!(report.lines, vec![(key, format!("expired {v} unlanded-through {}", v + 1))]);
+    assert_eq!(report.expired, vec![(key, v)]);
+    assert!(report.foreign.is_empty(), "{report:?}");
+}
+
+/// t10: the same record under genesis A with its landing settles landed.
+#[test]
+fn t10_the_same_record_under_its_own_net_still_lands() {
+    let (_, record) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t10", &[(key, &record.bundle, Some("in-flight intent-in-flight"))]);
+    let report = r.settle_on(&spent_chain().0.ep.file.hash(), &landed_spends(), 0, settle_inputs().1);
+    assert_eq!(report.lines, vec![(key, format!("landed 2 {}", hex32(&record.tx_id)))]);
+    assert_eq!(report.landed, vec![(key, 2, record.tx_id)]);
+    assert!(report.foreign.is_empty(), "{report:?}");
+}
+
+/// `qmb_remote_settle` on a basis of genesis B carries the record of genesis
+/// A under `foreign`, and nothing else.
+#[test]
+fn qmb_remote_settle_reports_another_nets_record_as_foreign() {
+    use qumbra_ffi::spend_v2::qmb_remote_settle;
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let records = CString::new(serde_json::json!([{"key": hex32(&key), "bundle": hex(&record.bundle), "outcome": null}]).to_string()).unwrap();
+    let landed = CString::new(settle_inputs().0.as_str()).unwrap();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let b = basis(w, foreign_net());
+        let mut err: *mut c_char = ptr::null_mut();
+        let out = qmb_remote_settle(b, records.as_ptr(), landed.as_ptr(), 0, v + 1, &mut err);
+        assert!(!out.is_null(), "{}", take_str(err));
+        let got: serde_json::Value = serde_json::from_str(&take_str(out)).unwrap();
+        let foreign = got["foreign"].as_array().unwrap();
+        assert_eq!(foreign.len(), 1, "{got}");
+        assert!(foreign[0]["why"].as_str().unwrap().contains("does not verify for this genesis"), "{got}");
+        let want = serde_json::json!({
+            "lines": [], "landed": [], "expired": [], "undecodable": [],
+            "foreign": [{"key": hex32(&key), "why": foreign[0]["why"].clone()}],
+            "uncovered": [],
+        });
+        assert_eq!(got, want);
+        qmb_spend_basis_free(b);
+        qmb_wallet_free(w);
+    }
+}
+
+// ------------------------------------------------------------ lab #992
+
+/// The landed bundle's earliest landing height: `valid_until − 1152`.
+fn lo_of(v: u64) -> u64 {
+    v.saturating_sub(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS)
+}
+
+/// t11 (the upgrade case): a `submitted` record with no progress, settled by
+/// a check that began above its earliest landing height and walked past its
+/// validity without seeing it land, is not expired — the walk did not cover
+/// the heights it could have landed at. No line; `uncovered`. (Mutation:
+/// without the coverage test this record expires.)
+#[test]
+fn t11_a_walk_that_began_above_lo_does_not_expire_a_record_without_progress() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let submitted = format!("submitted {}", hex32(&record.tx_id));
+    let r = Records::new("t11", &[(key, &record.bundle, Some(&submitted))]);
+    let from = lo_of(v) + 1;
+    let report = r.settle_from(&[], from, v + 1);
+    assert!(report.lines.is_empty() && report.expired.is_empty(), "{report:?}");
+    assert_eq!(report.uncovered, vec![(key, lo_of(v), from)]);
+    assert_eq!(r.outcome(&key), Some(format!("{submitted}\n")), "nothing written");
+}
+
+/// t12 (steady state): a covered walk that ends below the validity notes
+/// progress; the next walk, contiguous with it, past the validity expires
+/// the record. Exact lines both times.
+#[test]
+fn t12_progress_then_a_contiguous_walk_expires() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    assert!(v >= 2, "the fixture's validity leaves room for a walk below it: {v}");
+    let r = Records::new("t12", &[(key, &record.bundle, Some("in-flight intent-in-flight"))]);
+    let p = v - 1;
+    let report = r.settle_from(&[], lo_of(v), p);
+    assert_eq!(report.lines, vec![(key, format!("in-flight intent-in-flight unlanded-through {p}"))]);
+    assert_eq!(r.outcome(&key), Some(format!("in-flight intent-in-flight unlanded-through {p}\n")));
+    let report = r.settle_from(&[], p + 1, v + 1);
+    assert_eq!(report.lines, vec![(key, format!("expired {v} unlanded-through {}", v + 1))]);
+    assert_eq!(report.expired, vec![(key, v)]);
+    assert!(report.uncovered.is_empty(), "{report:?}");
+    assert_eq!(r.outcome(&key), Some(format!("expired {v} unlanded-through {}\n", v + 1)));
+}
+
+/// t13 (a gap): progress through `p`, then a walk from `p + 2` — height
+/// `p + 1` unwalked — writes nothing and reports the record uncovered.
+#[test]
+fn t13_a_gap_after_the_progress_is_uncovered() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let p = v - 1;
+    let open = format!("submitted {} unlanded-through {p}", hex32(&record.tx_id));
+    let r = Records::new("t13", &[(key, &record.bundle, Some(&open))]);
+    assert!(p + 2 > lo_of(v));
+    let report = r.settle_from(&[], p + 2, v + 1);
+    assert!(report.lines.is_empty() && report.expired.is_empty(), "{report:?}");
+    assert_eq!(report.uncovered, vec![(key, lo_of(v), p + 2)]);
+    assert_eq!(r.outcome(&key), Some(format!("{open}\n")));
+}
+
+/// t14 (a restore): a walk from 0, no progress, past the validity: expired,
+/// as before lab #992. A record with no outcome gets the `pending` form when
+/// the walk ends below its validity.
+#[test]
+fn t14_a_walk_from_zero_expires_and_a_record_without_outcome_turns_pending() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t14", &[(key, &record.bundle, Some(&format!("submitted {}", hex32(&record.tx_id))))]);
+    let report = r.settle_from(&[], 0, v + 1);
+    assert_eq!(report.lines, vec![(key, format!("expired {v} unlanded-through {}", v + 1))]);
+    assert_eq!(report.expired, vec![(key, v)]);
+    let none = Records::new("t14n", &[(key, &record.bundle, None)]);
+    assert_eq!(none.settle_from(&[], 0, v).lines, vec![(key, format!("pending unlanded-through {v}"))]);
+    // `pending` is open: the next contiguous walk past the validity expires it.
+    assert_eq!(none.settle_from(&[], v + 1, v + 1).expired, vec![(key, v)]);
+}
+
+/// t15: a landing beats everything — a record carrying progress whose
+/// spend lands in a walk that does not even cover it settles `landed`, the
+/// progress suffix gone.
+#[test]
+fn t15_a_landing_settles_landed_whatever_the_progress_or_coverage() {
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let r = Records::new("t15", &[(key, &record.bundle, Some(&format!("submitted {} unlanded-through 1", hex32(&record.tx_id))))]);
+    let report = r.settle_from(&landed_spends(), lo_of(v) + 5, settle_inputs().1);
+    let line = format!("landed 2 {}", hex32(&record.tx_id));
+    assert_eq!(report.lines, vec![(key, line.clone())]);
+    assert!(report.uncovered.is_empty(), "{report:?}");
+    assert_eq!(r.outcome(&key), Some(format!("{line}\n")));
+}
+
+/// t16: an open line carrying progress, and the `pending` form, are not
+/// definitive ends: `record` still refuses another bundle for that key.
+#[test]
+fn t16_a_progress_line_and_pending_stay_open_to_record() {
+    use qumbra_wallet::remote_prover::{ended_definitively, record, PENDING};
+    let (_, rec) = spent_chain_recorded();
+    let (key, _) = bundle_key_and_validity(&rec.bundle);
+    assert_eq!(PENDING, "pending");
+    let lines = [
+        format!("submitted {} unlanded-through 7", hex32(&rec.tx_id)),
+        "in-flight intent-in-flight unlanded-through 7".to_string(),
+        "pending unlanded-through 7".to_string(),
+    ];
+    for (i, line) in lines.iter().enumerate() {
+        assert!(!ended_definitively(line), "{line}");
+        let r = Records::new(&format!("t16-{i}"), &[(key, &rec.bundle, Some(line))]);
+        let err = record(&r.0, &key, b"another bundle").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{line}");
+        assert!(err.to_string().contains(line.as_str()), "{err}");
+    }
+}
+
+/// `qmb_remote_settle` takes `walked_from` and reports an uncovered record
+/// under `uncovered`, writing it no line.
+#[test]
+fn qmb_remote_settle_reports_an_uncovered_record() {
+    use qumbra_ffi::spend_v2::qmb_remote_settle;
+    let (f, _) = spent_chain();
+    let (_, record) = spent_chain_recorded();
+    let (key, v) = bundle_key_and_validity(&record.bundle);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let records = CString::new(serde_json::json!([{"key": hex32(&key), "bundle": hex(&record.bundle), "outcome": null}]).to_string()).unwrap();
+    let none = CString::new("[]").unwrap();
+    unsafe {
+        let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
+        let b = basis(w, &f.ep);
+        let call = |walked_from: u64, checked_to: u64| -> serde_json::Value {
+            let mut err: *mut c_char = ptr::null_mut();
+            let out = qmb_remote_settle(b, records.as_ptr(), none.as_ptr(), walked_from, checked_to, &mut err);
+            assert!(!out.is_null(), "{}", take_str(err));
+            serde_json::from_str(&take_str(out)).unwrap()
+        };
+        let from = lo_of(v) + 1;
+        let want = serde_json::json!({
+            "lines": [], "landed": [], "expired": [], "undecodable": [], "foreign": [],
+            "uncovered": [{"key": hex32(&key), "lo": lo_of(v), "walked_from": from}],
+        });
+        assert_eq!(call(from, v + 1), want);
+        // The same record from 0: covered, expired.
+        assert_eq!(call(0, v + 1)["expired"], serde_json::json!([{"key": hex32(&key), "valid_until": v}]));
         qmb_spend_basis_free(b);
         qmb_wallet_free(w);
     }

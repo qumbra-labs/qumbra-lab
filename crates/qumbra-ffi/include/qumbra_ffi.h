@@ -846,19 +846,31 @@ char *qmb_auth_check_take_landed(const qmb_auth_check_t *c, char **err_out);
  * none here):
  *   records_json  [{"key":"<64 hex>","bundle":"<hex>","outcome":"<line>"|null}, ...]
  *   landed_json   qmb_auth_check_take_landed's output
+ *   walked_from   the first height that check walked (lab #992): the
+ *                 previous checked height + 1 in check mode, 0 for a
+ *                 restore or a first
  *   checked_to    the finished journal's checked height
  * A record whose outcome is null, "submitted ..." or "in-flight ..." is
  * matched by the intent digest its bundle signed (never by the prover's
  * tx_id or the key): landed -> "landed <h> <tx_id>" (or "... prover-said
- * <tx>" when the record's submitted id differs); not landed and its
- * valid_until_height < checked_to -> "expired <v> unlanded-through <c>";
- * else untouched. Returns
+ * <tx>" when the record's submitted id differs). Not landed, it is judged
+ * only when the walks cover its earliest landing height
+ * lo = valid_until - 1152: walked_from <= lo, or walked_from <= p + 1 for
+ * the progress p its line carries as a trailing "unlanded-through <p>".
+ * Covered and valid_until < checked_to -> "expired <v> unlanded-through <c>";
+ * covered otherwise -> its open line with "unlanded-through <checked_to>"
+ * ("pending unlanded-through <c>" for a record with no outcome; still
+ * open); not covered -> no line, listed under "uncovered". Returns
  *   {"lines":[{"key","outcome"}],"landed":[{"key","height","tx_id"}],
- *    "expired":[{"key","valid_until"}],"undecodable":[{"key","why"}]}
- * the caller writes each line as that record's outcome. NULL with *err_out
- * on a malformed argument. Free with qmb_string_free. */
+ *    "expired":[{"key","valid_until"}],"undecodable":[{"key","why"}],
+ *    "foreign":[{"key","why"}],"uncovered":[{"key","lo","walked_from"}]}
+ * the caller writes each line as that record's outcome. A "foreign" record
+ * (lab #991) has an auth section that does not verify for the basis's
+ * genesis — another net's: no line, leave it open. An "uncovered" record
+ * (lab #992) may be settled by a restore of this net, which walks from 0.
+ * NULL with *err_out on a malformed argument. Free with qmb_string_free. */
 char *qmb_remote_settle(const qmb_spend_basis_t *basis, const char *records_json, const char *landed_json,
-                        uint64_t checked_to, char **err_out);
+                        uint64_t walked_from, uint64_t checked_to, char **err_out);
 int32_t qmb_auth_first_fresh(const qmb_wallet_t *w, uint8_t auth_derivation, const uint8_t *genesis32,
                              char **out_journal);
 /* Lab #924 PR 3d: is new_text a monotone advance of stored_text? Run it
