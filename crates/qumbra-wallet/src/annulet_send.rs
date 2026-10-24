@@ -564,6 +564,7 @@ pub fn send_annulet_remote<E: Endpoint>(
         submitted: Vec::new(),
         deadline,
         basis,
+        signed_above: session.tip,
         review,
     });
     let made = crate::annulet_v2::run_plan_v2(

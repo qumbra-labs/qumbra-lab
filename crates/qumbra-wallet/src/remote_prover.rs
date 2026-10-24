@@ -421,9 +421,17 @@ pub const RECORD_DIR: &str = "remote.v1";
 /// bytes) or `expired …`. The spend failed and a retry is a new take of the
 /// same note — so the old pair is kept beside it as `<key>.<n>.outcome` /
 /// `<key>.<n>.bundle` (the first free `n` from 1) and the new bundle takes
-/// the key. `submitted`, `in-flight` and no outcome at all still refuse: the
-/// nullifier is with the service, landed, or its upload's answer is unknown.
-pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Result<PathBuf> {
+/// the key. `submitted`, `in-flight`, [`PENDING`] and no outcome at all still
+/// refuse: the nullifier is with the service, landed, or its upload's answer
+/// is unknown.
+///
+/// A fresh record (no `<key>.outcome` beside it, an archived one included)
+/// is born `pending unlanded-through <signed_above>` (lab #992):
+/// `signed_above` is the verified tip the spend was built on — no block at
+/// or below it can carry a transaction that did not exist yet, so the first
+/// check from there on covers it ([`settle_records`]). The same bytes again
+/// return the record and leave its outcome alone.
+pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8], signed_above: u64) -> std::io::Result<PathBuf> {
     use std::io::Write;
     let dir = wallet_dir.join(RECORD_DIR);
     std::fs::create_dir_all(&dir)?;
@@ -465,9 +473,25 @@ pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Resu
         f.sync_all()?;
     }
     std::fs::rename(&tmp, &path)?;
+    if !dir.join(format!("{name}.outcome")).exists() {
+        write_outcome(&dir, &name, &format!("{PENDING} unlanded-through {signed_above}"))?;
+    }
     #[cfg(unix)]
     std::fs::File::open(&dir)?.sync_all()?;
     Ok(path)
+}
+
+/// `<name>.outcome` = `line` and a newline, through a temporary file,
+/// fsynced, renamed (the caller fsyncs the directory).
+fn write_outcome(dir: &Path, name: &str, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = dir.join(format!("{name}.outcome.tmp"));
+    {
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+        f.write_all(format!("{line}\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(format!("{name}.outcome")))
 }
 
 /// Whether an `<key>.outcome` line ([`record_outcome`]'s or
@@ -476,7 +500,8 @@ pub fn record(wallet_dir: &Path, key: &[u8; 32], bundle: &[u8]) -> std::io::Resu
 /// `node-refused:…` — [`job_end`]'s only definitive endings), `expired` (the
 /// validity height passed), or `landed` (lab #989: the chain carries it — its
 /// nullifier is spent, and a planner that asks hears "landed", not "in
-/// flight"). `submitted` and `in-flight` are not.
+/// flight"). `submitted`, `in-flight` and [`PENDING`] are not, with or
+/// without a trailing `unlanded-through <p>` (lab #992).
 pub fn ended_definitively(line: &str) -> bool {
     let mut words = line.split_whitespace();
     match (words.next(), words.next()) {
@@ -509,6 +534,19 @@ fn bundle_intent(
     crate::auth_check::intent_of(b.tx(), form, genesis_hash)
 }
 
+/// [`bundle_intent`] for the settle path (lab #991): `Ok(Err(why))` is a
+/// bundle whose auth section does not verify against the intent rebuilt for
+/// `genesis_hash` — another net's record (`remote.v1/` is per wallet, not per
+/// net), which this net must not judge.
+fn verified_bundle_intent(
+    bundle: &[u8],
+    form: qlab_devnet::forms::L2AuthForm,
+    genesis_hash: &[u8; 32],
+) -> Result<Result<([u8; 32], u64), String>, String> {
+    let b = qlab_l2spend::bundle::ProvingBundle::decode(bundle).map_err(|e| format!("the bundle does not decode: {e}"))?;
+    crate::auth_check::verified_intent_of(b.tx(), form, genesis_hash)
+}
+
 /// One record as [`settle_records`] reads it: the key (the transaction's
 /// first nullifier), the bundle's bytes, and its `<key>.outcome` line if any.
 #[derive(Clone, Debug)]
@@ -529,6 +567,38 @@ pub struct SettleReport {
     pub expired: Vec<([u8; 32], u64)>,
     /// A record still open whose bundle does not rebuild: `(key, why)`.
     pub undecodable: Vec<([u8; 32], String)>,
+    /// A record still open whose auth section does not verify against the
+    /// intent rebuilt for this net's genesis (lab #991): not this net's, so
+    /// not judged — no line, it stays open. `(key, why)`.
+    pub foreign: Vec<([u8; 32], String)>,
+    /// A record still open, not landed in this walk, whose unlanded span is
+    /// not covered from the earliest height it could land (lab #992): no
+    /// line. `(key, lo, walked_from)` — a restore of this net walks from 0
+    /// and settles it.
+    pub uncovered: Vec<([u8; 32], u64, u64)>,
+}
+
+/// The first token [`settle_records`] gives a record that had no outcome
+/// when it wrote its progress (lab #992). Open, as `submitted` and
+/// `in-flight` are: [`ended_definitively`] is false for it.
+pub const PENDING: &str = "pending";
+
+/// Whether an outcome line (or none: empty) is open — `submitted`,
+/// `in-flight` or [`PENDING`] — the forms [`settle_records`] judges and
+/// [`record_outcome`] carries progress over.
+fn is_open(line: &str) -> bool {
+    matches!(line.split_whitespace().next(), None | Some("submitted" | "in-flight" | PENDING))
+}
+
+/// An open outcome line split into its form and its trailing progress
+/// `unlanded-through <p>` (lab #992); no line is [`PENDING`] with none.
+fn open_line_parts(line: &str) -> (String, Option<u64>) {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    match words.as_slice() {
+        [] => (PENDING.to_string(), None),
+        [form @ .., "unlanded-through", p] if !form.is_empty() => (form.join(" "), p.parse().ok()),
+        _ => (words.join(" "), None),
+    }
 }
 
 fn hex_of(x: &[u8; 32]) -> String {
@@ -537,38 +607,52 @@ fn hex_of(x: &[u8; 32]) -> String {
 
 /// **Settle recorded remote sends from the chain** (lab #989). For each
 /// record still open — no outcome, `submitted …` or `in-flight …` — the
-/// bundle's intent digest is rebuilt ([`intent_digest_of_bundle`]) and:
+/// bundle's intent is rebuilt for `genesis_hash` and its auth section verified
+/// against it (lab #991: a section signed for another net's genesis does not
+/// verify, and that record is `foreign` — never judged by this net's heights);
+/// then:
 /// - a landed spend with that digest (matched by digest only: never by the
 ///   prover's `tx_id`, never by key or nullifier — a landed spend of this
 ///   key's leaves under another intent is another send) settles it
 ///   `landed <height> <tx_id>`; when the record said `submitted <tx>` and the
 ///   chain's id differs, `landed <height> <chain tx_id> prover-said <tx>`;
-/// - else, when the section's `valid_until_height` is below `checked_to`
-///   (the node refuses a height above it, so every block that could carry it
-///   has been walked), `expired <valid_until> unlanded-through <checked_to>`;
-/// - else nothing: the chain has not said.
+/// - else only with **coverage** (lab #992): the node lands the bundle at
+///   no height below `lo = valid_until − MAX_AUTH_VALIDITY_BLOCKS`, so the
+///   walks must have covered `[lo, checked_to]` without a gap. This walk
+///   began at `walked_from`; the record carries what earlier walks proved as a
+///   trailing `unlanded-through <p>` on its open line. Covered iff
+///   `walked_from ≤ lo` or `walked_from ≤ p + 1`. Then:
+///   - `valid_until < checked_to` (the node refuses a height above it):
+///     `expired <valid_until> unlanded-through <checked_to>`;
+///   - else the open line with `unlanded-through <checked_to>` — progress
+///     (a record with no outcome takes the [`PENDING`] form);
+/// - not covered: nothing written, the record in `uncovered`.
 ///
-/// `landed` and `checked_to` are a finished check's
-/// ([`crate::auth_check::AuthCheck::landed_spends`] and its journal's
-/// checked height); every other record is left as it is.
+/// `landed`, `walked_from` and `checked_to` are a finished check's
+/// ([`crate::auth_check::AuthCheck::landed_spends`], the first height it
+/// walked — the previous checked height + 1 in check mode, 0 for a restore
+/// or a first — and its journal's checked height); every other record is
+/// left as it is.
 pub fn settle_records(
     records: &[SettleRecord],
     form: qlab_devnet::forms::L2AuthForm,
     genesis_hash: &[u8; 32],
     landed: &[crate::auth_check::LandedSpend],
+    walked_from: u64,
     checked_to: u64,
 ) -> SettleReport {
     let mut report = SettleReport::default();
     for r in records {
-        let open = match r.outcome.as_deref().map(str::trim) {
-            None | Some("") => true,
-            Some(line) => matches!(line.split_whitespace().next(), Some("submitted" | "in-flight")),
-        };
-        if !open {
+        let current = r.outcome.as_deref().map_or("", str::trim);
+        if !is_open(current) {
             continue;
         }
-        let (digest, valid_until) = match bundle_intent(&r.bundle, form, genesis_hash) {
-            Ok(x) => x,
+        let (digest, valid_until) = match verified_bundle_intent(&r.bundle, form, genesis_hash) {
+            Ok(Ok(x)) => x,
+            Ok(Err(why)) => {
+                report.foreign.push((r.key, why));
+                continue;
+            }
             Err(why) => {
                 report.undecodable.push((r.key, why));
                 continue;
@@ -586,9 +670,21 @@ pub fn settle_records(
             };
             report.lines.push((r.key, line));
             report.landed.push((r.key, s.height, s.tx_id));
-        } else if valid_until < checked_to {
-            report.lines.push((r.key, format!("expired {valid_until} unlanded-through {checked_to}")));
-            report.expired.push((r.key, valid_until));
+        } else {
+            let lo = valid_until.saturating_sub(qlab_devnet::annulet::MAX_AUTH_VALIDITY_BLOCKS);
+            let (open_form, progress) = open_line_parts(current);
+            let covered = walked_from <= lo || progress.is_some_and(|p| walked_from <= p.saturating_add(1));
+            if !covered {
+                report.uncovered.push((r.key, lo, walked_from));
+            } else if valid_until < checked_to {
+                report.lines.push((r.key, format!("expired {valid_until} unlanded-through {checked_to}")));
+                report.expired.push((r.key, valid_until));
+            } else {
+                let line = format!("{open_form} unlanded-through {checked_to}");
+                if line != current {
+                    report.lines.push((r.key, line));
+                }
+            }
         }
     }
     report
@@ -603,9 +699,9 @@ pub fn settle(
     form: qlab_devnet::forms::L2AuthForm,
     genesis_hash: &[u8; 32],
     landed: &[crate::auth_check::LandedSpend],
+    walked_from: u64,
     checked_to: u64,
 ) -> std::io::Result<SettleReport> {
-    use std::io::Write;
     let dir = wallet_dir.join(RECORD_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -626,16 +722,9 @@ pub fn settle(
         records.push(SettleRecord { key, bundle, outcome });
     }
     records.sort_by_key(|r| r.key);
-    let report = settle_records(&records, form, genesis_hash, landed, checked_to);
+    let report = settle_records(&records, form, genesis_hash, landed, walked_from, checked_to);
     for (key, line) in &report.lines {
-        let name = hex_of(key);
-        let tmp = dir.join(format!("{name}.outcome.tmp"));
-        {
-            let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
-            f.write_all(format!("{line}\n").as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, dir.join(format!("{name}.outcome")))?;
+        write_outcome(&dir, &hex_of(key), line)?;
     }
     #[cfg(unix)]
     if !report.lines.is_empty() {
@@ -645,16 +734,25 @@ pub fn settle(
 }
 
 /// Note the end of a recorded bundle beside it (`<key>.outcome`, one line):
-/// the record stays — it is what the wallet sent.
+/// the record stays — it is what the wallet sent. `Submitted` and `InFlight`
+/// are open and carry over the line's trailing `unlanded-through <p>` (lab
+/// #992: the progress [`record`] was born with, or a settle wrote); `Failed`
+/// and `Expired` end it and carry none.
 pub fn record_outcome(wallet_dir: &Path, key: &[u8; 32], outcome: &Outcome) -> std::io::Result<()> {
     let name: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let path = wallet_dir.join(RECORD_DIR).join(format!("{name}.outcome"));
+    let progress = std::fs::read_to_string(&path).ok().filter(|l| is_open(l)).and_then(|l| open_line_parts(l.trim()).1);
+    let open = |line: String| match progress {
+        Some(p) => format!("{line} unlanded-through {p}\n"),
+        None => format!("{line}\n"),
+    };
     let line = match outcome {
-        Outcome::Submitted { tx_id } => format!("submitted {}\n", tx_id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
-        Outcome::InFlight { code } => format!("in-flight {code}\n"),
+        Outcome::Submitted { tx_id } => open(format!("submitted {}", tx_id.iter().map(|b| format!("{b:02x}")).collect::<String>())),
+        Outcome::InFlight { code } => open(format!("in-flight {code}")),
         Outcome::Failed { status, code } => format!("failed {status} {code}\n"),
         Outcome::Expired { last } => format!("expired {}\n", last.replace('\n', " ")),
     };
-    std::fs::write(wallet_dir.join(RECORD_DIR).join(format!("{name}.outcome")), line)
+    std::fs::write(path, line)
 }
 
 /// The price a step of `shape` pays an admitted prover.
@@ -885,15 +983,15 @@ mod tests {
         let d = std::env::temp_dir().join(format!("qmb_remote_record_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let key = [7u8; 32];
-        let p = record(&d, &key, b"signed").expect("recorded");
+        let p = record(&d, &key, b"signed", 5).expect("recorded");
         assert_eq!(std::fs::read(&p).unwrap(), b"signed");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        assert_eq!(record(&d, &key, b"signed").expect("the same bytes again"), p);
-        assert!(record(&d, &key, b"other").is_err(), "never other bytes under the same nullifier");
+        assert_eq!(record(&d, &key, b"signed", 5).expect("the same bytes again"), p);
+        assert!(record(&d, &key, b"other", 5).is_err(), "never other bytes under the same nullifier");
         record_outcome(&d, &key, &Outcome::Submitted { tx_id: [0xab; 32] }).unwrap();
         let line = std::fs::read_to_string(p.with_extension("outcome")).unwrap();
         assert!(line.starts_with("submitted abab"), "{line}");
@@ -911,14 +1009,14 @@ mod tests {
         let name = "09".repeat(32);
         let at = |f: &str| d.join(RECORD_DIR).join(format!("{name}{f}"));
 
-        // No outcome yet: the upload's answer is unknown — refused.
-        record(&d, &key, b"take-1").unwrap();
-        let e = record(&d, &key, b"take-2").unwrap_err();
-        assert!(e.to_string().contains("holds another bundle for this nullifier (no outcome yet)"), "{e}");
+        // Born pending (lab #992): the upload's answer is unknown — refused.
+        record(&d, &key, b"take-1", 5).unwrap();
+        let e = record(&d, &key, b"take-2", 5).unwrap_err();
+        assert!(e.to_string().contains("holds another bundle for this nullifier (its outcome: pending unlanded-through 5)"), "{e}");
         // In flight, submitted: the nullifier is with the service or landed — refused.
         for o in [Outcome::InFlight { code: "nullifier-in-flight".into() }, Outcome::Submitted { tx_id: [0xab; 32] }] {
             record_outcome(&d, &key, &o).unwrap();
-            let e = record(&d, &key, b"take-2").unwrap_err();
+            let e = record(&d, &key, b"take-2", 5).unwrap_err();
             assert!(e.to_string().contains("its outcome: "), "{e}");
             assert_eq!(std::fs::read(at(".bundle")).unwrap(), b"take-1");
         }
@@ -936,13 +1034,13 @@ mod tests {
             let new = format!("take-{}", n + 1);
             record_outcome(&d, &key, o).unwrap();
             let line = std::fs::read_to_string(at(".outcome")).unwrap();
-            assert_eq!(record(&d, &key, new.as_bytes()).unwrap(), at(".bundle"));
+            assert_eq!(record(&d, &key, new.as_bytes(), 5).unwrap(), at(".bundle"));
             assert_eq!(std::fs::read(at(".bundle")).unwrap(), new.as_bytes());
-            assert!(!at(".outcome").exists(), "the new take has no outcome yet");
+            assert_eq!(std::fs::read_to_string(at(".outcome")).unwrap(), "pending unlanded-through 5\n", "the new take is born pending");
             assert_eq!(std::fs::read(at(&format!(".{n}.bundle"))).unwrap(), old.as_bytes());
             assert_eq!(std::fs::read_to_string(at(&format!(".{n}.outcome"))).unwrap(), line);
             // And the new take is guarded again until it, too, ends.
-            assert!(record(&d, &key, b"another").is_err());
+            assert!(record(&d, &key, b"another", 5).is_err());
         }
 
         assert!(!ended_definitively("submitted abab"));
