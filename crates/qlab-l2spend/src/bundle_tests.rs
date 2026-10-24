@@ -701,7 +701,7 @@ fn a_third_output_of_neither_input_s_asset_is_refused_before_proving() {
 /// out.
 #[test]
 fn a_bundles_real_nullifiers_are_its_real_slots_only() {
-    let nf = |i: &L2AuthInput| digest_bytes(&derive_input_l2_v2(i).1);
+    let nf = |i: &L2AuthInput| digest_bytes(&derive_input_l2_v2(i).0);
     for b in [bundle_s_v3(), bundle_p_v3()] {
         let w = b.witness();
         let real = [
