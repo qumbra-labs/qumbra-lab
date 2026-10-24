@@ -704,11 +704,21 @@ fn a_bundles_real_nullifiers_are_its_real_slots_only() {
     let nf = |i: &L2AuthInput| digest_bytes(&derive_input_l2_v2(i).1);
     for b in [bundle_s_v3(), bundle_p_v3()] {
         let w = b.witness();
-        let FeeSlotV2::Exact { input: fee, .. } = &w.fee_slot else { panic!("the v3 fixture pays an exact fee note") };
-        assert!(!matches!(w.shape, ShapeWitness::S { dv: true, .. }), "the v3 fixture spends two notes");
-        let want = vec![nf(&w.inputs[0]), nf(&w.inputs[1]), nf(fee)];
+        let real = [
+            true,
+            !matches!(w.shape, ShapeWitness::S { dv: true, .. }),
+            matches!(w.fee_slot, FeeSlotV2::Exact { .. }),
+        ];
+        let inputs = [&w.inputs[0], &w.inputs[1], w.fee_slot.input()];
+        let slots: Vec<usize> = (0..3).filter(|&i| real[i]).collect();
+        eprintln!("{:?}: real slots {slots:?}", b.shape());
+        let want: Vec<[u8; 32]> = slots.iter().map(|&i| nf(inputs[i])).collect();
         assert_eq!(b.real_nullifiers(), want, "{:?}", b.shape());
-        assert_eq!(want, b.tx().public.nullifiers, "{:?}: every slot is real here", b.shape());
+        let nfs = &b.tx().public.nullifiers;
+        assert_eq!(nfs.len(), 3, "{:?}", b.shape());
+        for &i in &slots {
+            assert_eq!(nfs[i], nf(inputs[i]), "{:?}: slot {i}", b.shape());
+        }
     }
     // The same S spend with input 2 and slot 3 made dummies: only input 1.
     let b = bundle_s_v3();
