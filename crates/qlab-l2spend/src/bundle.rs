@@ -201,6 +201,22 @@ impl ProvingBundle {
         self.witness.shape_tag()
     }
 
+    /// Lab #995: the transaction's nullifiers that spend **real** notes, in
+    /// slot order — input 1, input 2 unless it is shape S's dummy (`dv`),
+    /// slot 3 when it holds an exact fee note. The bytes the transaction
+    /// states, so the ones a landed spend publishes; a dummy slot's
+    /// nullifier spends nothing and is left out.
+    pub fn real_nullifiers(&self) -> Vec<[u8; 32]> {
+        let nf = &self.tx.public.nullifiers;
+        let dv = matches!(self.witness.shape, ShapeWitness::S { dv: true, .. });
+        let fee = matches!(self.witness.fee_slot, FeeSlotV2::Exact { .. });
+        [(0, true), (1, !dv), (2, fee)]
+            .into_iter()
+            .filter(|&(_, real)| real)
+            .filter_map(|(i, _)| nf.get(i).copied())
+            .collect()
+    }
+
     /// The wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Vec::new();

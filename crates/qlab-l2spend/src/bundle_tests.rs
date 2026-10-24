@@ -694,3 +694,41 @@ fn a_third_output_of_neither_input_s_asset_is_refused_before_proving() {
         assert_eq!(other.check(&CTX_V3).err(), Some(BundleError::StatementMismatch("output commitments")));
     }
 }
+
+/// Lab #995: a bundle's real nullifiers are its real slots' own `nf`
+/// (derived from the witness's inputs, not read back from the transaction),
+/// in slot order; a dummy slot — shape S's `dv`, a dummy fee slot — is left
+/// out.
+#[test]
+fn a_bundles_real_nullifiers_are_its_real_slots_only() {
+    let nf = |i: &L2AuthInput| digest_bytes(&derive_input_l2_v2(i).0);
+    for b in [bundle_s_v3(), bundle_p_v3()] {
+        let w = b.witness();
+        let real = [
+            true,
+            !matches!(w.shape, ShapeWitness::S { dv: true, .. }),
+            matches!(w.fee_slot, FeeSlotV2::Exact { .. }),
+        ];
+        let inputs = [&w.inputs[0], &w.inputs[1], w.fee_slot.input()];
+        let slots: Vec<usize> = (0..3).filter(|&i| real[i]).collect();
+        eprintln!("{:?}: real slots {slots:?}", b.shape());
+        let want: Vec<[u8; 32]> = slots.iter().map(|&i| nf(inputs[i])).collect();
+        assert_eq!(b.real_nullifiers(), want, "{:?}", b.shape());
+        let nfs = &b.tx().public.nullifiers;
+        assert_eq!(nfs.len(), 3, "{:?}", b.shape());
+        for &i in &slots {
+            assert_eq!(nfs[i], nf(inputs[i]), "{:?}: slot {i}", b.shape());
+        }
+    }
+    // The same S spend with input 2 and slot 3 made dummies: only input 1.
+    let b = bundle_s_v3();
+    let mut w = b.witness().clone();
+    let empty = |i: &L2AuthInput| L2AuthInput { value: 0, asset: 0, d: [0, 0], ..i.clone() };
+    w.inputs[1] = empty(&w.inputs[1]);
+    w.fee_slot = FeeSlotV2::Dummy { input: empty(w.fee_slot.input()) };
+    if let ShapeWitness::S { dv, .. } = &mut w.shape {
+        *dv = true;
+    }
+    let dummied = ProvingBundle::new(b.tx().clone(), w).expect("dummies are empty");
+    assert_eq!(dummied.real_nullifiers(), vec![b.tx().public.nullifiers[0]]);
+}

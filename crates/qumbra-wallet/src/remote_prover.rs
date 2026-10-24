@@ -703,9 +703,28 @@ pub fn settle(
     checked_to: u64,
 ) -> std::io::Result<SettleReport> {
     let dir = wallet_dir.join(RECORD_DIR);
-    let entries = match std::fs::read_dir(&dir) {
+    let records = read_records(&dir)?;
+    if records.is_empty() {
+        return Ok(SettleReport::default());
+    }
+    let report = settle_records(&records, form, genesis_hash, landed, walked_from, checked_to);
+    for (key, line) in &report.lines {
+        write_outcome(&dir, &hex_of(key), line)?;
+    }
+    #[cfg(unix)]
+    if !report.lines.is_empty() {
+        std::fs::File::open(&dir)?.sync_all()?;
+    }
+    Ok(report)
+}
+
+/// Every current record in `dir` (`<64 hex>.bundle` and its outcome, if
+/// any), by key; an archived pair (`<key>.<n>.*`) is not one. No directory
+/// is no records.
+fn read_records(dir: &Path) -> std::io::Result<Vec<SettleRecord>> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SettleReport::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let mut records = Vec::new();
@@ -722,15 +741,32 @@ pub fn settle(
         records.push(SettleRecord { key, bundle, outcome });
     }
     records.sort_by_key(|r| r.key);
-    let report = settle_records(&records, form, genesis_hash, landed, walked_from, checked_to);
-    for (key, line) in &report.lines {
-        write_outcome(&dir, &hex_of(key), line)?;
+    Ok(records)
+}
+
+/// **The notes this wallet's open remote sends spend** (lab #995): for each
+/// record that has not **ended definitively** — no outcome, `submitted`,
+/// `in-flight`, [`PENDING`], and a `failed 5xx` too: exactly the records
+/// [`record`] refuses a new take beside, so a plan never picks a note whose
+/// signed spend would be refused after signing — its key (the
+/// transaction's first nullifier) and, when the bundle decodes, every real
+/// input's nullifier ([`qlab_l2spend::bundle::ProvingBundle::real_nullifiers`]).
+/// A bundle that does not decode still holds its key. The set a send plans
+/// around ([`crate::annulet_plan::plan_send_holding`]).
+pub fn open_nullifiers_of(records: &[SettleRecord]) -> std::collections::BTreeSet<[u8; 32]> {
+    let mut held = std::collections::BTreeSet::new();
+    for r in records.iter().filter(|r| !r.outcome.as_deref().is_some_and(ended_definitively)) {
+        held.insert(r.key);
+        if let Ok(b) = qlab_l2spend::bundle::ProvingBundle::decode(&r.bundle) {
+            held.extend(b.real_nullifiers());
+        }
     }
-    #[cfg(unix)]
-    if !report.lines.is_empty() {
-        std::fs::File::open(&dir)?.sync_all()?;
-    }
-    Ok(report)
+    held
+}
+
+/// [`open_nullifiers_of`] over `<wallet>/remote.v1/` as it stands.
+pub fn open_record_nullifiers(wallet_dir: &Path) -> std::io::Result<std::collections::BTreeSet<[u8; 32]>> {
+    Ok(open_nullifiers_of(&read_records(&wallet_dir.join(RECORD_DIR))?))
 }
 
 /// Note the end of a recorded bundle beside it (`<key>.outcome`, one line):
@@ -978,6 +1014,48 @@ mod tests {
 
     /// Record before upload: the bytes are on disk, owner-only, and the same
     /// key never takes other bytes.
+    /// Lab #995: a record holds its notes until it has ended definitively —
+    /// no outcome, `submitted`, `in-flight`, `pending`, a `failed 5xx` (the
+    /// records `record` refuses a retake beside) — and a definitive end frees
+    /// them.
+    /// A bundle that does not decode still holds its key; an archived pair
+    /// (`<key>.<n>.*`) is not a record.
+    #[test]
+    fn only_open_records_hold_their_notes() {
+        let rec = |k: u8, outcome: Option<&str>| SettleRecord {
+            key: [k; 32],
+            bundle: b"not a proving bundle".to_vec(),
+            outcome: outcome.map(str::to_string),
+        };
+        let records = [
+            rec(1, None),
+            rec(2, Some("submitted abab\n")),
+            rec(3, Some("in-flight 5\n")),
+            rec(4, Some("pending unlanded-through 9\n")),
+            rec(5, Some("failed 400 refused\n")),
+            rec(6, Some("failed 0 the node refused\n")),
+            rec(7, Some("expired 12\n")),
+            rec(8, Some("landed 12 abab\n")),
+            rec(9, Some("failed 503 busy\n")),
+        ];
+        let held: Vec<u8> = open_nullifiers_of(&records).iter().map(|k| k[0]).collect();
+        assert_eq!(held, vec![1, 2, 3, 4, 9]);
+
+        let d = std::env::temp_dir().join(format!("qmb_remote_held_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(open_record_nullifiers(&d).unwrap().is_empty(), "no records, nothing held");
+        let key = [9u8; 32];
+        let name: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        record(&d, &key, b"take 1", 5).unwrap();
+        assert_eq!(open_record_nullifiers(&d).unwrap().into_iter().collect::<Vec<_>>(), vec![key], "born pending");
+        std::fs::write(d.join(RECORD_DIR).join(format!("{name}.outcome")), "failed 400 refused\n").unwrap();
+        assert!(open_record_nullifiers(&d).unwrap().is_empty(), "a definitive end frees the note");
+        record(&d, &key, b"take 2", 5).unwrap();
+        assert!(d.join(RECORD_DIR).join(format!("{name}.1.bundle")).exists(), "the first take archived");
+        assert_eq!(open_record_nullifiers(&d).unwrap().len(), 1, "the new take holds; the archive is no record");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_bundle_is_recorded_once_with_its_bytes() {
         let d = std::env::temp_dir().join(format!("qmb_remote_record_{}", std::process::id()));

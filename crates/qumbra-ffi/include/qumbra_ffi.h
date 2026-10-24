@@ -432,6 +432,15 @@ int32_t qmb_amount_parse(const char *decimal, uint64_t *out_bessel,
  * them can later be marked CONFIRMED by the chain's own nullifier stream. */
 char *qmb_bundle_nullifiers(const uint8_t *bytes, size_t len, char **err_out);
 
+/* Lab #995: a v2 spend's signed ProvingBundle (version 1 or 2, from
+ * qmb_intent_sign) -> its REAL-input nullifiers as a JSON array of 64-hex
+ * strings, in slot order (input 1, input 2 unless a dummy, slot 3 when it
+ * holds a fee note). Record them beside the bundle at signing; pass them to
+ * qmb_spend_v2_exclude while that send is open. NULL + *err_out for anything
+ * else, by name ("not a proving bundle: ..."; a witness bundle included —
+ * qmb_bundle_nullifiers reads those). */
+char *qmb_proving_bundle_nullifiers(const uint8_t *bytes, size_t len, char **err_out);
+
 /* The bulk nullifier stream, caller-pumped (same vocabulary as scan/select;
  * the accumulation checks are the ONE copy shared with the CLI and the select
  * driver). qmb_spent_step: 1 NEED (*out = page path) · 0 DONE (query with
@@ -743,6 +752,12 @@ char *qmb_spend_basis_summary(const qmb_spend_basis_t *b);
  *                                             this kernel's pin (payee, maximum
  *                                             price); its price is fixed for
  *                                             the handle (lab #937 PR D)
+ *   qmb_spend_v2_exclude(s, nfs_json, &err)  optional, once, before the first
+ *                                             step: a JSON array of 64-hex
+ *                                             nullifiers the plan must not
+ *                                             spend (the host's open remote
+ *                                             sends, lab #995); a malformed
+ *                                             set is refused whole
  *   loop qmb_spend_v2_step(a, s, &out):  1 NEED -> GET *out, then
  *        qmb_spend_v2_supply / _supply_err;  0 READY;  -2 REFUSED (*out why)
  *   qmb_auth_take(a, s, &journal)            leaves taken; PERSIST *journal,
@@ -911,6 +926,7 @@ qmb_spend_v2_t *qmb_spend_v2_new(qmb_spend_basis_t *basis, const char *to, uint1
                                  uint64_t valid_for, const uint8_t *seed32, const uint8_t *dummy_entropy64,
                                  char **err_out);
 int32_t qmb_spend_v2_prover(qmb_spend_v2_t *s, const uint8_t *info, size_t len, char **err_out);
+int32_t qmb_spend_v2_exclude(qmb_spend_v2_t *s, const char *nullifiers_json, char **err_out);
 int32_t qmb_spend_v2_step(const qmb_auth_t *a, qmb_spend_v2_t *s, char **out);
 void qmb_spend_v2_supply(qmb_spend_v2_t *s, const uint8_t *body, size_t len);
 void qmb_spend_v2_supply_err(qmb_spend_v2_t *s, const char *reason);

@@ -294,6 +294,11 @@ fn bundle_nullifiers_cross_and_the_spent_pump_answers() {
         let lines: Vec<&str> = nfs.lines().collect();
         assert_eq!(lines.len(), 1, "one real input: {nfs}");
         assert_eq!(lines[0].len(), 64, "hex nullifier: {nfs}");
+        // Lab #995: the ProvingBundle view refuses a witness bundle by name.
+        let pb = qumbra_ffi::spend_v2::qmb_proving_bundle_nullifiers(bundle.as_ptr(), bundle.len(), &mut err2);
+        assert!(pb.is_null());
+        let why = err_text(err2).unwrap_or_default();
+        assert!(why.contains("not a proving bundle: the domain tag"), "{why}");
 
         // The chain has NOT seen this spend — the pump must answer 0, not guess.
         let sp = qmb_spent_new(0, to);

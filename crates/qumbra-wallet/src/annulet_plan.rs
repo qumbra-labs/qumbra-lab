@@ -8,6 +8,7 @@ use qlab_air::l2::{L2AuthInput, L2AuthPath};
 use qlab_devnet::annulet::L2ShapeTag;
 use qlab_wallet::Wallet;
 use qlab_ledger::assets::{AssetIndex, OwnedL2Note};
+use std::collections::BTreeSet;
 
 /// The fee tiers a send pays, from the node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +66,10 @@ pub enum PlanRefusal {
     /// `held` and its asset-0 notes can be split into only `splittable` more.
     /// With a prover, `tariff` is the network fee plus the prover's price.
     FeeNotesShort { tariff: u64, needed: usize, held: usize, splittable: usize },
+    /// Lab #995: `refusal`, over the index without the notes an open remote
+    /// send already spends — `count` of them were left out, `value` of the
+    /// payment `asset` among them. They free up when those sends land or end.
+    WhileHeld { refusal: Box<PlanRefusal>, asset: u16, count: usize, value: u128 },
 }
 
 impl std::fmt::Display for PlanRefusal {
@@ -82,6 +87,11 @@ impl std::fmt::Display for PlanRefusal {
                 f,
                 "the plan needs {needed} asset-0 fee note(s) of exactly {tariff}; this wallet holds {held} and \
                  its other asset-0 notes split into {splittable} more"
+            ),
+            PlanRefusal::WhileHeld { refusal, asset, count, value } => write!(
+                f,
+                "{refusal}; {count} note(s) holding {value} of asset {asset} are not planned: an open remote send \
+                 of this wallet spends them, and they free up when it lands or ends"
             ),
         }
     }
@@ -294,6 +304,49 @@ fn plan_fee_splits(
 /// make the fee notes ([`PlanRefusal::FeeNotesShort`]).
 pub fn plan_send(index: &AssetIndex, asset: u16, amount: u64, shape: L2ShapeTag, tiers: Tiers) -> Result<SendPlan, PlanRefusal> {
     plan_send_paying(index, asset, amount, shape, tiers, None)
+}
+
+/// Lab #995: `index` without the spendable notes whose nullifier is in
+/// `exclude` (the inputs of this wallet's open remote sends), and the notes
+/// left out. Zero-value notes are never spendable and stay as they are.
+pub fn hold(index: &AssetIndex, wallet: &Wallet, exclude: &BTreeSet<[u8; 32]>) -> (AssetIndex, Vec<OwnedL2Note>) {
+    let mut kept = index.clone();
+    let mut held = Vec::new();
+    if exclude.is_empty() {
+        return (kept, held);
+    }
+    for notes in kept.by_asset.values_mut() {
+        let (out, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut notes.spendable).into_iter().partition(|n| exclude.contains(&n.nullifier(wallet)));
+        notes.spendable = keep;
+        held.extend(out);
+    }
+    (kept, held)
+}
+
+/// Lab #995: [`plan_send_paying`] over `index` without the notes `exclude`
+/// holds ([`hold`]) — a held note is never planned; the planner picks others.
+/// When nothing else plans and notes were held, the refusal says so
+/// ([`PlanRefusal::WhileHeld`]). One floor for the kernel and the CLI.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_send_holding(
+    index: &AssetIndex,
+    wallet: &Wallet,
+    exclude: &BTreeSet<[u8; 32]>,
+    asset: u16,
+    amount: u64,
+    shape: L2ShapeTag,
+    tiers: Tiers,
+    prover: Option<ProverPrice>,
+) -> Result<SendPlan, PlanRefusal> {
+    let (kept, held) = hold(index, wallet, exclude);
+    plan_send_paying(&kept, asset, amount, shape, tiers, prover).map_err(|refusal| {
+        if held.is_empty() {
+            return refusal;
+        }
+        let value = held.iter().filter(|n| n.asset == asset).map(|n| u128::from(n.note.value)).sum();
+        PlanRefusal::WhileHeld { refusal: Box::new(refusal), asset, count: held.len(), value }
+    })
 }
 
 /// Lab #937 PR D: [`plan_send`] for a **remote-proved** send when `prover`
