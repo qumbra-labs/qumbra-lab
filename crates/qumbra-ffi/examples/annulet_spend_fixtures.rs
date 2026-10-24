@@ -76,6 +76,16 @@
 //!                                  of its journal_after.txt there: CHECKED,
 //!                                  one landed spend, landed_expected.json as
 //!                                  restore_spent's (extension #95 §3 (d))
+//!   <out>/v3_s_asset0_expired/     extension #97 D6 (a): v3_s_asset0's send
+//!                                  never lands; the chain passes its
+//!                                  valid_until (VALID_FOR) by two empty
+//!                                  blocks; a check of its journal_after
+//!                                  walks from 1 to the tip: no landed spend
+//!   <out>/v3_s_asset0_uncovered/   extension #97 D6 (b): landed at height 1,
+//!                                  tip 3, journal_in already checked to 3: the
+//!                                  check sees no landed spend; then_restore/
+//!                                  (walked from 0) does — landed_expected.json
+//!                                  in then_restore/
 //!   <out>/v3_not_pinned/           the same on a net with no pin: the
 //!                                  NotPinned refusal a release kernel replays
 //!   manifest.json `prover_pin`     what the harness kernel registers per v3_*
@@ -204,8 +214,8 @@ fn prover_address() -> qlab_wallet::address::Address {
 }
 
 /// A **format-34** fixture chain: the payer's v2 address 0 holds the genesis
-/// 1,000,000 USDT-test and `notes(a2)`; `extra`, when given, is the one
-/// transaction of block 1 (no blocks after genesis otherwise). With
+/// 1,000,000 USDT-test and `notes(a2)`; `blocks` are the bodies of heights
+/// 1, 2, … in order (none: no block after genesis). With
 /// `pin`, this net's prover is pinned in this process's fixture registry —
 /// what the harness kernel's `qmb_harness_pin_fixture` does from the
 /// manifest's `prover_pin`.
@@ -213,7 +223,7 @@ fn chain_v3(
     tag: &str,
     notes: impl Fn(&qlab_wallet::address::Address) -> Vec<qlab_note::l2note::L2Note>,
     pin: bool,
-    extra: Option<qlab_devnet::body::TxEntry>,
+    blocks: Vec<BlockBody>,
 ) -> (Endpoint, String, String) {
     let w = wallet_dir(tag, SEED);
     let wallet = w.wallet();
@@ -230,14 +240,18 @@ fn chain_v3(
             },
         );
     }
-    let bodies: Vec<BlockBody> = extra.into_iter().map(|tx| BlockBody { txs: vec![tx], ..BlockBody::default() }).collect();
-    let ep = Endpoint::new(file, &bodies, None, Lie::None);
+    let ep = Endpoint::new(file, &blocks, None, Lie::None);
     let _ = std::fs::remove_dir_all(&w.dir);
     let p = wallet_dir(&format!("{tag}_payee"), PAYEE);
     let pw = p.wallet();
     let payee = pw.address_candidate_a_at_index(0, &generation_root(&pw, 0)).encode();
     let _ = std::fs::remove_dir_all(&p.dir);
     (ep, payee, AuthJournal::fresh(root).to_text())
+}
+
+/// A block carrying `tx` alone.
+fn tx_block(tx: qlab_devnet::body::TxEntry) -> BlockBody {
+    BlockBody { txs: vec![tx], ..BlockBody::default() }
 }
 
 /// The prover service's `/v2/annulet/info` for `ep`'s net, as a format-34
@@ -558,12 +572,18 @@ unsafe fn case(
 /// `landed_expected.json` so a harness compares the kernel's answer to these
 /// values rather than recomputing both sides in one place.
 fn landed_expected(dir: &Path, intent_case: &str, tx: &qlab_devnet::body::TxEntry) -> Value {
+    landed_expected_at(dir, 1, intent_case, tx)
+}
+
+/// `landed_expected` for a case `depth` directories below `<out>`.
+fn landed_expected_at(dir: &Path, depth: usize, intent_case: &str, tx: &qlab_devnet::body::TxEntry) -> Value {
     let landed: Value = serde_json::from_slice(&std::fs::read(dir.join("landed.json")).unwrap()).unwrap();
-    let intent = std::fs::read(dir.join("..").join(intent_case).join("intent.bin")).unwrap();
+    let up = "../".repeat(depth);
+    let intent = std::fs::read(dir.join(&up).join(intent_case).join("intent.bin")).unwrap();
     let want = json!({
         "intent_digest": hex(&qlab_remote_auth::keccak256(&[&intent])),
         "tx_id": hex(&qlab_p2p::codec::tx_id(tx)),
-        "intent_file": format!("../{intent_case}/intent.bin"),
+        "intent_file": format!("{up}{intent_case}/intent.bin"),
     });
     let spends = landed.as_array().expect("landed.json is a list");
     assert_eq!(spends.len(), 1, "{}: exactly one landed spend: {landed}", dir.display());
@@ -819,7 +839,7 @@ fn main() {
         let dir = out.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let (cep, cpayee, cjournal) =
-            chain_v3(&format!("spend_fixtures_{name}"), |a| notes.iter().map(|&(v, asset, k)| note_to(a, v, asset, k)).collect(), true, None);
+            chain_v3(&format!("spend_fixtures_{name}"), |a| notes.iter().map(|&(v, asset, k)| note_to(a, v, asset, k)).collect(), true, Vec::new());
         let info = prover_info(&cep);
         let mut c = unsafe { case(&dir, &cep, &cpayee, &cjournal, asset, amount, None, Some(&info)) };
         // What was recorded is the shape this case names — asserted on the
@@ -864,7 +884,7 @@ fn main() {
             .tx()
             .clone();
         tx.proof = vec![0xAB; 64];
-        let (cep, _, _) = chain_v3("spend_fixtures_v3_s_asset0_landed", |a| vec![note_to(a, 50, 0, 30)], true, Some(tx.clone()));
+        let (cep, _, _) = chain_v3("spend_fixtures_v3_s_asset0_landed", |a| vec![note_to(a, 50, 0, 30)], true, vec![tx_block(tx.clone())]);
         let genesis = hex(&cep.file.hash());
         assert_eq!(json!(genesis), v3_genesis[0]["genesis"], "{name}: v3_s_asset0's genesis");
         let after = std::fs::read_to_string(out.join("v3_s_asset0/journal_after.txt")).unwrap();
@@ -883,13 +903,113 @@ fn main() {
         v3_genesis.push(json!({ "case": name, "genesis": genesis }));
         cases.insert(name.into(), json!(name));
     }
+    // Extension #97 D6: the chains the extension's expiry is judged on. The
+    // send is v3_s_asset0's, signed at tip 0 (`signed_above`) with VALID_FOR,
+    // so valid until block VALID_FOR (the review says so; asserted). The
+    // coverage rule and the expiry are the extension's; these record the
+    // check (and restore) answers it judges from, one body per NEED (a
+    // harness's local endpoint is never paged: extension #95 P1).
+    let checked_at = |dir: &Path, which: &str, genesis: &str| -> u64 {
+        let s: Value = serde_json::from_slice(&std::fs::read(dir.join("summary.json")).unwrap()).unwrap();
+        let g0 = s[which]["generations"].as_array().unwrap().iter().find(|g| g["g"] == json!(0)).expect("generation 0");
+        let h = g0["checked"].as_array().unwrap().iter().find(|c| c["genesis"] == json!(genesis));
+        h.map(|c| c["height"].as_u64().unwrap()).unwrap_or(0)
+    };
+    let landed_list = |dir: &Path| -> Vec<Value> {
+        serde_json::from_slice::<Value>(&std::fs::read(dir.join("landed.json")).unwrap()).unwrap().as_array().unwrap().clone()
+    };
+    let body_paths = |c: &Value| -> Vec<String> {
+        c["auth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap().to_string())
+            .filter(|p| p.starts_with("/v1/bodies") || p.ends_with("/body"))
+            .collect()
+    };
+    let s_review = std::fs::read_to_string(out.join("v3_s_asset0/review.txt")).unwrap();
+    assert!(s_review.contains(&format!("valid until block {VALID_FOR}")), "v3_s_asset0 signed at tip 0: {s_review}");
+    let s_after = std::fs::read_to_string(out.join("v3_s_asset0/journal_after.txt")).unwrap();
+    // (a) v3_s_asset0_expired: the send never lands; the chain runs two
+    // empty blocks past valid_until. A check of the journal the spend left
+    // walks from signed_above + 1 to the tip: CHECKED, no landed spend, the
+    // checked height past valid_until — covered, and expired.
+    unsafe {
+        let name = "v3_s_asset0_expired";
+        let dir = out.join(name);
+        let tip = VALID_FOR + 2;
+        let blocks = (0..tip).map(|_| BlockBody::default()).collect();
+        let (cep, _, _) = chain_v3("spend_fixtures_v3_s_asset0_expired", |a| vec![note_to(a, 50, 0, 30)], true, blocks);
+        let genesis = hex(&cep.file.hash());
+        assert_eq!(json!(genesis), v3_genesis[0]["genesis"], "{name}: v3_s_asset0's genesis");
+        let mut c = auth_case(&dir, &cep, Open::Check(&s_after, 0), Some(&s_after), 0);
+        assert_eq!((c["status"].clone(), c["keys"].clone()), (json!(0), json!(true)), "{name}: CHECKED, keys given: {}", c["refusal"]);
+        let walked: Vec<String> = (1..=tip).map(|h| format!("/v1/block/{h}/body")).collect();
+        assert_eq!(body_paths(&c), walked, "{name}: every body from signed_above + 1 to the tip");
+        assert!(landed_list(&dir).is_empty(), "{name}: no landed spend");
+        assert_eq!(checked_at(&dir, "journal_in", &genesis), 0, "{name}: the spend's journal was checked at 0");
+        assert_eq!(checked_at(&dir, "journal_out", &genesis), tip, "{name}: checked to the tip, past valid_until");
+        c["genesis"] = json!(genesis);
+        c["signed_above"] = json!(0);
+        c["valid_until"] = json!(VALID_FOR);
+        c["what"] = json!("v3_s_asset0's send never lands; the chain passes its valid_until by two empty blocks; a check of its journal_after walks from 1 to the tip");
+        std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        println!("{name:<14} status {} keys {}: walked 1..{tip}, no landed spend, checked {tip} > valid_until {VALID_FOR}", c["status"], c["keys"]);
+        v3_genesis.push(json!({ "case": name, "genesis": genesis }));
+        cases.insert(name.into(), json!(name));
+    }
+    // (b) v3_s_asset0_uncovered: the send landed at height 1, and the
+    // account's journal was checked past it (journal_in: a check of the
+    // spend's journal on this tip, run here and not recorded) before any
+    // record was settled. A check from that journal walks nothing at or
+    // below the landing and sees no landed spend — not covered; the restore
+    // (then_restore/, walked from 0) sees it.
+    unsafe {
+        let name = "v3_s_asset0_uncovered";
+        let dir = out.join(name);
+        let mut tx = qlab_l2spend::bundle::ProvingBundle::decode(&std::fs::read(out.join("v3_s_asset0/bundle.bin")).unwrap())
+            .unwrap()
+            .tx()
+            .clone();
+        tx.proof = vec![0xAB; 64];
+        let tip = 3u64;
+        let blocks = vec![tx_block(tx.clone()), BlockBody::default(), BlockBody::default()];
+        let (cep, _, _) = chain_v3("spend_fixtures_v3_s_asset0_uncovered", |a| vec![note_to(a, 50, 0, 30)], true, blocks);
+        let genesis = hex(&cep.file.hash());
+        assert_eq!(json!(genesis), v3_genesis[0]["genesis"], "{name}: v3_s_asset0's genesis");
+        let scratch = out.join(format!("{name}.checked_by"));
+        let earlier = auth_case(&scratch, &cep, Open::Check(&s_after, 0), Some(&s_after), 0);
+        assert_eq!(earlier["status"], json!(0), "{name}: the earlier check: {}", earlier["refusal"]);
+        let journal_in = std::fs::read_to_string(scratch.join("journal_out.txt")).unwrap();
+        std::fs::remove_dir_all(&scratch).unwrap();
+        let mut c = auth_case(&dir, &cep, Open::Check(&journal_in, 0), Some(&journal_in), 0);
+        assert_eq!((c["status"].clone(), c["keys"].clone()), (json!(0), json!(true)), "{name}: CHECKED, keys given: {}", c["refusal"]);
+        assert_eq!(checked_at(&dir, "journal_in", &genesis), tip, "{name}: the stored journal is checked to the tip");
+        assert!(body_paths(&c).is_empty(), "{name}: nothing to walk above the checked height: {:?}", body_paths(&c));
+        assert!(landed_list(&dir).is_empty(), "{name}: the check sees no landed spend");
+        let then = auth_case(&dir.join("then_restore"), &cep, Open::Restore, None, 0);
+        assert_eq!(then["keys"], json!(true), "{name}: the restore gives keys: {}", then["refusal"]);
+        let walked: Vec<String> = (1..=tip).map(|h| format!("/v1/block/{h}/body")).collect();
+        assert_eq!(body_paths(&then), walked, "{name}: the restore walks from 1");
+        let want = landed_expected_at(&dir.join("then_restore"), 2, "v3_s_asset0", &tx);
+        c["then_restore"] = then;
+        c["genesis"] = json!(genesis);
+        c["signed_above"] = json!(0);
+        c["valid_until"] = json!(VALID_FOR);
+        c["landed_height"] = json!(1);
+        c["what"] = json!("v3_s_asset0's transaction landed at height 1, tip 3; journal_in is checked to 3 (a check of its journal_after there); a check from it sees no landed spend, the restore (then_restore/) does");
+        std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+        println!("{name:<14} check: no landed spend above {tip}; restore: landed intent {} tx {}", want["intent_digest"], want["tx_id"]);
+        v3_genesis.push(json!({ "case": name, "genesis": genesis }));
+        cases.insert(name.into(), json!(name));
+    }
     // What a RELEASE kernel replays: a format-34 net with no pin — the
     // prover's /info is refused by name (`NotPinned`), before any step.
     unsafe {
         let name = "v3_not_pinned";
         let dir = out.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let (cep, cpayee, _) = chain_v3("spend_fixtures_v3_not_pinned", |a| vec![note_to(a, 51, 0, 31)], false, None);
+        let (cep, cpayee, _) = chain_v3("spend_fixtures_v3_not_pinned", |a| vec![note_to(a, 51, 0, 31)], false, Vec::new());
         let info = prover_info(&cep);
         std::fs::write(dir.join("info.json"), &info).unwrap();
         let w = qmb_wallet_from_entropy([SEED; 32].as_ptr());
